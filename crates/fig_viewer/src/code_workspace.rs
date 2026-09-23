@@ -2,12 +2,14 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use collections::HashSet;
 use editor::{Editor, MultiBufferOffset, SelectionEffects, scroll::Autoscroll};
 use fanta_doc::NodeId;
 use gpui::{
     AnyElement, App, ClipboardItem, Context, Entity, FocusHandle, Focusable, IntoElement, Render,
     SharedString, Subscription, Task, Window, div, px,
 };
+use language::Buffer;
 use project::Project;
 use serde::Deserialize;
 use ui::Tooltip;
@@ -15,11 +17,7 @@ use ui::prelude::*;
 
 use crate::document::{FigItem, FigItemEvent};
 
-/// The alpha ships a code *viewer*: the canvas follows the file on disk, and
-/// the file is authored by the agent or by an ordinary editor — never by this
-/// pane. Stated once, where the panes are; kept short so the path header —
-/// the thing that answers "which file is this?" — gets the room.
-const READ_ONLY_STATUS: &str = "Read-only — the canvas follows this file.";
+const READ_ONLY_STATUS: &str = "Formatted preview · source unchanged";
 
 /// Every JSX tag the FNX printer can emit: the canonical node tags plus the
 /// two authoring-sugar shape tags. Restricting the opening-tag scan to these
@@ -106,6 +104,12 @@ pub struct FantaCodeWorkspace {
     json_path: Option<PathBuf>,
     fnx_editor: Option<Entity<Editor>>,
     json_editor: Option<Entity<Editor>>,
+    fnx_source_buffer: Option<Entity<Buffer>>,
+    json_source_buffer: Option<Entity<Buffer>>,
+    fnx_source_observation: Option<Subscription>,
+    json_source_observation: Option<Subscription>,
+    fnx_source_version: Option<clock::Global>,
+    json_source_version: Option<clock::Global>,
     loading_fnx: bool,
     loading_json: bool,
     error_message: Option<SharedString>,
@@ -141,10 +145,11 @@ impl FantaCodeWorkspace {
                 } else if matches!(event, FigItemEvent::Saved) {
                     // Renaming a page/master moves its source directory;
                     // first materialization creates paths the pane did not
-                    // have. Unchanged buffers reload themselves, so preserve
-                    // their editor entities and only re-derive the caret.
+                    // have. Preserve the editor when paths stay the same.
                     if this.saved_source_paths_changed(cx) {
                         this.refresh_from_item(window, cx);
+                    } else {
+                        this.reload_saved_sources(window, cx);
                     }
                     this.last_synced_selection = None;
                     this.sync_selection_to_source(window, cx);
@@ -165,6 +170,12 @@ impl FantaCodeWorkspace {
             json_path: None,
             fnx_editor: None,
             json_editor: None,
+            fnx_source_buffer: None,
+            json_source_buffer: None,
+            fnx_source_observation: None,
+            json_source_observation: None,
+            fnx_source_version: None,
+            json_source_version: None,
             loading_fnx: false,
             loading_json: false,
             error_message: None,
@@ -246,6 +257,37 @@ impl FantaCodeWorkspace {
         self.fnx_path != fnx_path || self.json_path != json_path
     }
 
+    fn reload_saved_sources(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let buffers: HashSet<_> = [
+            self.fnx_source_buffer.as_ref(),
+            self.json_source_buffer.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|buffer| !buffer.read(cx).has_unsaved_edits())
+        .cloned()
+        .collect();
+        if buffers.is_empty() {
+            return;
+        }
+        let reload = self
+            .project
+            .update(cx, |project, cx| project.reload_buffers(buffers, false, cx));
+        cx.spawn_in(window, async move |this, cx| {
+            let result = reload.await;
+            if let Err(error) = this.update_in(cx, |this, _, cx| {
+                if let Err(error) = result {
+                    this.error_message =
+                        Some(format!("Could not refresh saved source: {error:#}").into());
+                    cx.notify();
+                }
+            }) {
+                log::debug!("dropping source refresh for closed workspace: {error:#}");
+            }
+        })
+        .detach();
+    }
+
     fn refresh_from_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (project_root, page, component) = {
             let item = self.item.read(cx);
@@ -312,10 +354,7 @@ impl FantaCodeWorkspace {
                 self.open_json(json_path, window, cx);
             }
             None => {
-                self.fnx_path = None;
-                self.json_path = None;
-                self.fnx_editor = None;
-                self.json_editor = None;
+                self.clear_editors();
                 self.error_message = Some("This document has no page source to display.".into());
             }
         }
@@ -327,6 +366,12 @@ impl FantaCodeWorkspace {
         self.json_path = None;
         self.fnx_editor = None;
         self.json_editor = None;
+        self.fnx_source_buffer = None;
+        self.json_source_buffer = None;
+        self.fnx_source_observation = None;
+        self.json_source_observation = None;
+        self.fnx_source_version = None;
+        self.json_source_version = None;
         self.loading_fnx = false;
         self.loading_json = false;
         self.fnx_load_task = None;
@@ -339,10 +384,16 @@ impl FantaCodeWorkspace {
     /// the file belongs to whoever is authoring it.
     fn open_fnx(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if self.fnx_path.as_ref() == Some(&path) && self.fnx_editor.is_some() {
+            if let Some(buffer) = self.fnx_source_buffer.clone() {
+                self.show_fnx_preview(buffer, window, cx);
+            }
             return;
         }
         self.fnx_path = Some(path.clone());
         self.fnx_editor = None;
+        self.fnx_source_buffer = None;
+        self.fnx_source_observation = None;
+        self.fnx_source_version = None;
         self.loading_fnx = true;
         self.error_message = None;
         let open_task = self
@@ -357,16 +408,12 @@ impl FantaCodeWorkspace {
                 this.loading_fnx = false;
                 match result {
                     Ok(buffer) => {
-                        // `Some(project)` is what gives the buffer its
-                        // language and syntax highlighting; the editor itself
-                        // refuses edits.
-                        let project = this.project.clone();
-                        let editor = cx.new(|cx| {
-                            let mut editor = Editor::for_buffer(buffer, Some(project), window, cx);
-                            editor.set_read_only(true);
-                            editor
-                        });
-                        this.fnx_editor = Some(editor);
+                        this.fnx_source_observation =
+                            Some(cx.observe_in(&buffer, window, |this, buffer, window, cx| {
+                                this.show_fnx_preview(buffer.clone(), window, cx);
+                            }));
+                        this.fnx_source_buffer = Some(buffer.clone());
+                        this.show_fnx_preview(buffer, window, cx);
                         // The buffer arrives long after the selection that
                         // should be revealed in it, so catch up once here.
                         this.last_synced_selection = None;
@@ -386,10 +433,16 @@ impl FantaCodeWorkspace {
 
     fn open_json(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if self.json_path.as_ref() == Some(&path) && self.json_editor.is_some() {
+            if let Some(buffer) = self.json_source_buffer.clone() {
+                self.show_json_preview(buffer, window, cx);
+            }
             return;
         }
         self.json_path = Some(path.clone());
         self.json_editor = None;
+        self.json_source_buffer = None;
+        self.json_source_observation = None;
+        self.json_source_version = None;
         self.loading_json = true;
         let open_task = self
             .project
@@ -403,13 +456,12 @@ impl FantaCodeWorkspace {
                 this.loading_json = false;
                 match result {
                     Ok(buffer) => {
-                        let project = this.project.clone();
-                        let editor = cx.new(|cx| {
-                            let mut editor = Editor::for_buffer(buffer, Some(project), window, cx);
-                            editor.set_read_only(true);
-                            editor
-                        });
-                        this.json_editor = Some(editor);
+                        this.json_source_observation =
+                            Some(cx.observe_in(&buffer, window, |this, buffer, window, cx| {
+                                this.show_json_preview(buffer.clone(), window, cx);
+                            }));
+                        this.json_source_buffer = Some(buffer.clone());
+                        this.show_json_preview(buffer, window, cx);
                     }
                     Err(error) => {
                         this.error_message =
@@ -421,6 +473,65 @@ impl FantaCodeWorkspace {
                 log::debug!("dropping JSON editor load for closed workspace: {error:#}");
             }
         }));
+    }
+
+    fn show_fnx_preview(
+        &mut self,
+        source_buffer: Entity<Buffer>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let version = source_buffer.read(cx).version();
+        if self.fnx_source_version.as_ref() == Some(&version) && self.fnx_editor.is_some() {
+            return;
+        }
+        let source = source_buffer.read(cx).text();
+        let language = source_buffer.read(cx).language().cloned();
+        let formatted = format_fnx_preview(&source);
+        let project = self.project.clone();
+        let preview = project.update(cx, |project, cx| {
+            project.create_local_buffer(&formatted, language, false, cx)
+        });
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::for_buffer(preview, Some(project), window, cx);
+            editor.set_read_only(true);
+            editor
+        });
+        self.fnx_editor = Some(editor);
+        self.fnx_source_version = Some(version);
+        self.last_synced_selection = None;
+        self.sync_selection_to_source(window, cx);
+        cx.notify();
+    }
+
+    fn show_json_preview(
+        &mut self,
+        source_buffer: Entity<Buffer>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let version = source_buffer.read(cx).version();
+        if self.json_source_version.as_ref() == Some(&version) && self.json_editor.is_some() {
+            return;
+        }
+        let source = source_buffer.read(cx).text();
+        let formatted = serde_json::from_str::<serde_json::Value>(&source)
+            .ok()
+            .and_then(|value| serde_json::to_string_pretty(&value).ok())
+            .unwrap_or_else(|| source.clone());
+        let language = source_buffer.read(cx).language().cloned();
+        let project = self.project.clone();
+        let preview = project.update(cx, |project, cx| {
+            project.create_local_buffer(&formatted, language, false, cx)
+        });
+        let editor = cx.new(|cx| {
+            let mut editor = Editor::for_buffer(preview, Some(project), window, cx);
+            editor.set_read_only(true);
+            editor
+        });
+        self.json_editor = Some(editor);
+        self.json_source_version = Some(version);
+        cx.notify();
     }
 
     fn select_file(
@@ -774,6 +885,120 @@ fn identifier_end(bytes: &[u8], start: usize) -> usize {
     index
 }
 
+/// Reflow only FNX opening tags for the read-only Code view. Keeping the
+/// authoritative buffer untouched avoids saving a whitespace-only edit when
+/// someone merely switches tabs, while the sidecar still maps by tag order.
+fn format_fnx_preview(source: &str) -> String {
+    let mut formatted = String::with_capacity(source.len());
+    let mut copied_through = 0;
+    let mut scanned_through = 0;
+    let mut line_start = 0;
+    for tag in opening_tags(source) {
+        let name_end = identifier_end(source.as_bytes(), tag.offset + 1);
+        let (end, _) = scan_tag(source, name_end);
+        if end <= copied_through || end > source.len() {
+            continue;
+        }
+        if let Some(newline) = source[scanned_through..tag.offset].rfind('\n') {
+            line_start = scanned_through + newline + 1;
+        }
+        scanned_through = tag.offset;
+        formatted.push_str(&source[copied_through..tag.offset]);
+        let leading = &source[line_start..tag.offset];
+        let indent = if leading.bytes().all(|byte| byte == b' ' || byte == b'\t') {
+            leading
+        } else {
+            ""
+        };
+        formatted.push_str(&format_opening_tag_preview(
+            &source[tag.offset..end],
+            indent,
+        ));
+        copied_through = end;
+    }
+    formatted.push_str(&source[copied_through..]);
+    formatted
+}
+
+fn format_opening_tag_preview(tag: &str, indent: &str) -> String {
+    let bytes = tag.as_bytes();
+    let name_end = identifier_end(bytes, 1);
+    if name_end <= 1 || !tag.ends_with('>') || tag.len() <= 100 && !tag.contains('\n') {
+        return tag.to_owned();
+    }
+    let mut attributes = Vec::new();
+    let mut index = name_end;
+    while index < bytes.len() {
+        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
+            index += 1;
+        }
+        if matches!(bytes.get(index), None | Some(b'>' | b'/')) {
+            break;
+        }
+        let start = index;
+        let mut brace_depth = 0usize;
+        while index < bytes.len() {
+            match bytes[index] {
+                b'"' | b'\'' => index = quoted_end(bytes, index),
+                b'{' => {
+                    brace_depth += 1;
+                    index += 1;
+                }
+                b'}' => {
+                    brace_depth = brace_depth.saturating_sub(1);
+                    index += 1;
+                }
+                byte if brace_depth == 0 && byte.is_ascii_whitespace() => break,
+                b'>' if brace_depth == 0 => break,
+                b'/' if brace_depth == 0 && bytes.get(index + 1) == Some(&b'>') => break,
+                _ => index += 1,
+            }
+        }
+        if index == start {
+            break;
+        }
+        attributes.push(&tag[start..index]);
+    }
+    if attributes.is_empty() {
+        return tag.to_owned();
+    }
+    let mut result = tag[..name_end].to_owned();
+    for attribute in attributes {
+        result.push('\n');
+        result.push_str(indent);
+        result.push_str("  ");
+        let expression = attribute
+            .split_once("={")
+            .filter(|(_, value)| value.ends_with('}'));
+        if let Some((name, value)) = expression
+            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&value[..value.len() - 1])
+            && let Ok(pretty) = serde_json::to_string_pretty(&json)
+        {
+            result.push_str(name);
+            result.push_str("={");
+            for (line_index, line) in pretty.lines().enumerate() {
+                if line_index > 0 {
+                    result.push('\n');
+                    result.push_str(indent);
+                    result.push_str("    ");
+                }
+                result.push_str(line);
+            }
+            result.push('}');
+        } else {
+            result.push_str(attribute);
+        }
+    }
+    result.push('\n');
+    result.push_str(indent);
+    if tag.trim_end().ends_with("/>") {
+        result.push_str("/>");
+    } else {
+        result.push('>');
+    }
+    result
+}
+
 impl Focusable for FantaCodeWorkspace {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.active_editor()
@@ -829,6 +1054,25 @@ mod tests {
     use fanta_doc::{CanvasNode, Doc, GroupNode, IndexKey, NodeData};
     use gpui::TestAppContext;
     use project::{ProjectItem as _, ProjectPath};
+
+    #[test]
+    fn fnx_preview_wraps_attributes_without_changing_tag_mapping() {
+        let source = "  <Frame name=\"A <Frame> B\" meta={{\"a\":1,\"b\":[2,3]}} explicit_modes={{\"very-long-variable-collection\":\"some-mode\"}} width={120} height={90}>\n    <Rect name=\"Child\" />\n  </Frame>\n";
+        let formatted = format_fnx_preview(source);
+        assert!(formatted.contains("\n    meta={{\n"));
+        assert!(formatted.contains("\n    width={120}\n"));
+        assert!(formatted.contains("A <Frame> B"));
+        assert_eq!(
+            opening_tags(source)
+                .iter()
+                .map(|tag| tag.name.as_deref())
+                .collect::<Vec<_>>(),
+            opening_tags(&formatted)
+                .iter()
+                .map(|tag| tag.name.as_deref())
+                .collect::<Vec<_>>()
+        );
+    }
 
     fn init_test(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
@@ -1343,6 +1587,41 @@ mod tests {
                 );
             })
             .expect("read preserved editors");
+    }
+
+    #[gpui::test]
+    async fn saved_canvas_edits_update_the_formatted_preview(cx: &mut TestAppContext) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("temporary project");
+        let (_page, child) = write_project_with_children(temporary.path());
+        let (_project, item, workspace) = open_code_workspace(temporary.path(), cx).await;
+        cx.run_until_parked();
+
+        item.update(cx, |item, cx| {
+            item.apply(
+                fanta_doc::Operation::SetName {
+                    id: child,
+                    old: "Second child".into(),
+                    new: "Updated child".into(),
+                },
+                cx,
+            )
+            .expect("rename child");
+        });
+        item.update(cx, |item, cx| {
+            item.save(crate::document::SaveKind::Auto, cx)
+        })
+        .await
+        .expect("save renamed child");
+        cx.run_until_parked();
+
+        workspace
+            .read_with(cx, |workspace, cx| {
+                let editor = workspace.fnx_editor.as_ref().expect("FNX preview");
+                let source = editor.read(cx).buffer().read(cx).snapshot(cx).text();
+                assert!(source.contains("name=\"Updated child\""));
+            })
+            .expect("read updated preview");
     }
 
     fn remove_editor_prelude(source: &str) -> String {

@@ -14,7 +14,7 @@
 //! bookkeeping. Tools never reach past it.
 
 use fanta_canvas::{SnapEngine, screen_to_world, world_to_screen};
-use fanta_doc::{CanvasNode, Color, Doc, NodeId, Transform2D, Viewport};
+use fanta_doc::{BlendMode, CanvasNode, Color, Doc, NodeId, Transform2D, Viewport};
 use glam::DVec2;
 
 /// Neutral fill a shape-creation tool uses when the shell doesn't specify one
@@ -58,6 +58,12 @@ pub struct ToolContext<'a> {
     /// transaction and lost the color on undo→redo.)
     pub new_shape_fill: Color,
 
+    /// Settings baked into a newly drawn vector stroke, so undo and redo keep
+    /// the exact mark that was shown while drawing.
+    pub new_stroke_width: f64,
+    pub stroke_smoothing: f64,
+    pub new_blend_mode: BlendMode,
+
     /// The subtree root the active editor view is scoped to (selection
     /// container-walk, deep hit-test base, and new-node parent). The shell sets
     /// it from `AppState::focus_root()` so a component-edit tab scopes tools to
@@ -81,6 +87,9 @@ impl<'a> ToolContext<'a> {
             snap,
             screen_size,
             new_shape_fill: DEFAULT_NEW_SHAPE_FILL,
+            new_stroke_width: 2.0,
+            stroke_smoothing: 1.2,
+            new_blend_mode: BlendMode::Normal,
             scope_root: None,
         }
     }

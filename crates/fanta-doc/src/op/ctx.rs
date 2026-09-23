@@ -2,6 +2,7 @@
 //! [`Operation`](crate::op::Operation) may touch, and [`ModeScope`].
 
 use crate::component::ComponentLibrary;
+use crate::doc::{Flow, PresentationConfig};
 use crate::id::{ModeId, NodeId, VariableCollectionId};
 use crate::motion::MotionLibrary;
 use crate::op::Operation;
@@ -28,6 +29,8 @@ pub struct OpCtx<'a> {
     pub active_modes: &'a mut BTreeMap<VariableCollectionId, ModeId>,
     pub motion: &'a mut MotionLibrary,
     pub flow_start: &'a mut Option<NodeId>,
+    pub flows: &'a mut Vec<Flow>,
+    pub presentation: &'a mut Option<PresentationConfig>,
 }
 
 impl OpCtx<'_> {

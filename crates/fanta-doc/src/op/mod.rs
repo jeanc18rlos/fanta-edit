@@ -85,6 +85,8 @@ mod tests {
         active_modes: BTreeMap<VariableCollectionId, ModeId>,
         motion: crate::motion::MotionLibrary,
         flow_start: Option<NodeId>,
+        flows: Vec<crate::doc::Flow>,
+        presentation: Option<crate::doc::PresentationConfig>,
     }
     impl TestDoc {
         fn new() -> Self {
@@ -97,6 +99,8 @@ mod tests {
                 active_modes: BTreeMap::new(),
                 motion: crate::motion::MotionLibrary::new(),
                 flow_start: None,
+                flows: Vec::new(),
+                presentation: None,
             }
         }
         fn ctx(&mut self) -> OpCtx<'_> {
@@ -109,6 +113,8 @@ mod tests {
                 active_modes: &mut self.active_modes,
                 motion: &mut self.motion,
                 flow_start: &mut self.flow_start,
+                flows: &mut self.flows,
+                presentation: &mut self.presentation,
             }
         }
     }
@@ -121,6 +127,39 @@ mod tests {
             10.0,
             Color::WHITE,
         )))
+    }
+
+    #[test]
+    fn prototype_presentation_and_named_flow_are_undoable() {
+        let mut doc = crate::doc::Doc::new();
+        let frame = NodeId::new();
+        let config = crate::doc::PresentationConfig {
+            device_size: Some([390.0, 844.0]),
+            preset: Some("phone".into()),
+            landscape: false,
+            frame_color: Some(Color::rgb(0x12, 0x34, 0x56)),
+        };
+        doc.apply(Operation::SetPresentation {
+            old: None,
+            new: Some(config.clone()),
+        })
+        .expect("set presentation");
+        doc.apply(Operation::SetFlows {
+            old: Vec::new(),
+            new: vec![crate::doc::Flow {
+                name: "Onboarding".into(),
+                start: frame,
+            }],
+        })
+        .expect("name flow");
+        assert_eq!(doc.presentation, Some(config.clone()));
+        assert_eq!(doc.flows[0].name, "Onboarding");
+        assert!(doc.undo().expect("undo flow"));
+        assert!(doc.flows.is_empty());
+        assert!(doc.undo().expect("undo presentation"));
+        assert!(doc.presentation.is_none());
+        assert!(doc.redo().expect("redo presentation"));
+        assert_eq!(doc.presentation, Some(config));
     }
 
     #[test]

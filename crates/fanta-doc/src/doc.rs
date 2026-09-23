@@ -289,6 +289,8 @@ impl Doc {
             active_modes: &mut self.active_modes,
             motion: &mut self.motion,
             flow_start: &mut self.flow_start,
+            flows: &mut self.flows,
+            presentation: &mut self.presentation,
         };
         self.history.apply(op, &mut ctx)?;
         self.metadata.modified_at = unix_seconds_now();
@@ -311,6 +313,8 @@ impl Doc {
             active_modes: &mut self.active_modes,
             motion: &mut self.motion,
             flow_start: &mut self.flow_start,
+            flows: &mut self.flows,
+            presentation: &mut self.presentation,
         };
         self.history.apply_transaction(tx, &mut ctx)?;
         self.metadata.modified_at = unix_seconds_now();
@@ -333,6 +337,8 @@ impl Doc {
             active_modes: &mut self.active_modes,
             motion: &mut self.motion,
             flow_start: &mut self.flow_start,
+            flows: &mut self.flows,
+            presentation: &mut self.presentation,
         };
         self.history.abort_with(&mut ctx)
     }
@@ -360,6 +366,8 @@ impl Doc {
             active_modes: &mut self.active_modes,
             motion: &mut self.motion,
             flow_start: &mut self.flow_start,
+            flows: &mut self.flows,
+            presentation: &mut self.presentation,
         };
         let did = self.history.undo(&mut ctx)?;
         if did {
@@ -379,6 +387,8 @@ impl Doc {
             active_modes: &mut self.active_modes,
             motion: &mut self.motion,
             flow_start: &mut self.flow_start,
+            flows: &mut self.flows,
+            presentation: &mut self.presentation,
         };
         let did = self.history.redo(&mut ctx)?;
         if did {

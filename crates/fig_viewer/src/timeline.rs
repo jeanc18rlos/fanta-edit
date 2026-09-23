@@ -24,6 +24,33 @@ const TIMELINE_RULER_HEIGHT: Pixels = px(32.);
 const TIMELINE_LAYER_HEIGHT: Pixels = px(30.);
 const TIMELINE_TRACK_HEIGHT: Pixels = px(28.);
 
+fn ping_pong_position(elapsed_us: i64, duration_us: i64) -> i64 {
+    let duration_us = duration_us.max(1);
+    let period = duration_us.saturating_mul(2);
+    let position = elapsed_us.rem_euclid(period);
+    if position > duration_us {
+        period - position
+    } else {
+        position
+    }
+}
+
+#[cfg(test)]
+mod playback_tests {
+    use super::ping_pong_position;
+
+    #[test]
+    fn ping_pong_reverses_at_both_ends() {
+        let duration = 1_000;
+        assert_eq!(ping_pong_position(0, duration), 0);
+        assert_eq!(ping_pong_position(500, duration), 500);
+        assert_eq!(ping_pong_position(1_000, duration), 1_000);
+        assert_eq!(ping_pong_position(1_500, duration), 500);
+        assert_eq!(ping_pong_position(2_000, duration), 0);
+        assert_eq!(ping_pong_position(2_500, duration), 500);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimelineViewModel {
     pub clip_name: Option<SharedString>,
@@ -171,6 +198,7 @@ pub struct TimelineShell {
     playhead_us: i64,
     playing: bool,
     loop_playback: bool,
+    ping_pong_playback: bool,
     zoom: f32,
     scrubbing: bool,
     selected_keyframe: Option<TimelineKeyframeSelection>,
@@ -197,6 +225,7 @@ impl TimelineShell {
             playhead_us: 0,
             playing: false,
             loop_playback: false,
+            ping_pong_playback: false,
             zoom: TIMELINE_MIN_ZOOM,
             scrubbing: false,
             selected_keyframe: None,
@@ -735,6 +764,10 @@ impl TimelineShell {
         self.loop_playback
     }
 
+    pub(crate) fn ping_pong_playback_enabled(&self) -> bool {
+        self.ping_pong_playback
+    }
+
     /// Accepted-value transport entry points for the editor toolbar: the
     /// toolbar's Play/Loop chips carry the value the user accepted, so these
     /// set rather than toggle. Starting playback keeps `toggle_playback`'s
@@ -752,10 +785,20 @@ impl TimelineShell {
     }
 
     pub(crate) fn set_loop_playback(&mut self, loop_playback: bool, cx: &mut Context<Self>) {
-        if self.loop_playback == loop_playback {
+        if self.loop_playback == loop_playback && !self.ping_pong_playback {
             return;
         }
         self.loop_playback = loop_playback;
+        self.ping_pong_playback = false;
+        cx.notify();
+    }
+
+    pub(crate) fn set_ping_pong_playback(&mut self, cx: &mut Context<Self>) {
+        if self.ping_pong_playback {
+            return;
+        }
+        self.ping_pong_playback = true;
+        self.loop_playback = false;
         cx.notify();
     }
 
@@ -979,6 +1022,7 @@ impl TimelineShell {
 
     fn toggle_loop_playback(&mut self, cx: &mut Context<Self>) {
         self.loop_playback = !self.loop_playback;
+        self.ping_pong_playback = false;
         cx.notify();
     }
 
@@ -1016,6 +1060,11 @@ impl TimelineShell {
                     let elapsed_us =
                         i64::try_from(started.elapsed().as_micros()).unwrap_or(i64::MAX);
                     let next = start_playhead_us.saturating_add(elapsed_us);
+                    if timeline.ping_pong_playback {
+                        timeline
+                            .set_playhead(ping_pong_position(next, timeline.model.duration_us), cx);
+                        return true;
+                    }
                     if next >= timeline.model.duration_us {
                         if timeline.loop_playback {
                             let looped = next.rem_euclid(timeline.model.duration_us.max(1));

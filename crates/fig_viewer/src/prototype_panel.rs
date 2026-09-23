@@ -3516,7 +3516,7 @@ impl Render for FantaPrototypePanel {
 impl FantaPrototypePanel {
     fn render_shared(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         use fanta_gpui::properties_tabs::{
-            PrototypeConnection, PrototypeInspector, PrototypeInspectorViewData,
+            InspectorChoice, PrototypeConnection, PrototypeInspector, PrototypeInspectorViewData,
         };
         self.ensure_parameter_editor(window, cx);
         if self.shared.is_none() {
@@ -3528,15 +3528,55 @@ impl FantaPrototypePanel {
             self.shared = Some(panel);
         }
         let mut data = PrototypeInspectorViewData {
-            read_only: true,
+            read_only: !self.item.read(cx).is_editable(),
+            can_present: self
+                .item
+                .read(cx)
+                .document()
+                .is_some_and(|document| prototype_entry_frame(&document.doc).is_some()),
             ..Default::default()
         };
+        data.devices = [
+            ("none", "No device"),
+            ("phone", "Phone"),
+            ("tablet", "Tablet"),
+            ("desktop", "Desktop"),
+        ]
+        .into_iter()
+        .map(|(id, label)| InspectorChoice::new(id, label))
+        .collect();
+        if let Some(config) = self
+            .item
+            .read(cx)
+            .document()
+            .and_then(|document| document.doc.presentation.as_ref())
+        {
+            if let Some(preset) = &config.preset {
+                if !data
+                    .devices
+                    .iter()
+                    .any(|choice| choice.id == preset.as_str())
+                {
+                    data.devices
+                        .push(InspectorChoice::new(preset.clone(), preset.clone()));
+                }
+                data.device = preset.clone().into();
+            } else if config.device_size.is_some() {
+                data.devices.push(InspectorChoice::new("custom", "Custom"));
+                data.device = "custom".into();
+            }
+            if let Some(color) = config.frame_color {
+                data.background_hex = color.to_hex().trim_start_matches('#').to_owned().into();
+            }
+        }
         let snapshot = self.snapshot(cx);
         let mut detail = None;
         if let PrototypeSnapshot::Selection {
             editable,
             node,
             name,
+            can_start_flow,
+            can_present,
             is_flow_start,
             reactions,
             frame_targets,
@@ -3549,38 +3589,48 @@ impl FantaPrototypePanel {
         {
             data.selection_name = name.clone();
             data.read_only = !editable;
-            data.flow_name = is_flow_start.then(|| name.clone());
+            data.can_start_flow = *can_start_flow;
+            data.can_present = *can_present;
+            data.flow_name = self
+                .item
+                .read(cx)
+                .document()
+                .and_then(|document| {
+                    document
+                        .doc
+                        .flows
+                        .iter()
+                        .find(|flow| flow.start == *node)
+                        .map(|flow| flow.name.clone().into())
+                })
+                .or_else(|| is_flow_start.then(|| name.clone()));
             data.connections = reactions
                 .iter()
-                .map(|reaction| {
-                    let trigger_choice = TriggerChoice::from_trigger(&reaction.trigger);
-                    let trigger = TRIGGER_CHOICES
-                        .iter()
-                        .find(|(choice, _)| *choice == trigger_choice)
-                        .map(|(_, label)| *label)
-                        .unwrap_or("Trigger");
-                    PrototypeConnection {
-                        id: reaction.id.to_string().into(),
-                        trigger: trigger.into(),
-                        action: format!("{:?}", ActionChoice::from_action(&reaction.action)).into(),
-                        destination: action_target(&reaction.action)
-                            .and_then(|target| {
-                                frame_targets
-                                    .iter()
-                                    .chain(scroll_targets)
-                                    .find(|candidate| candidate.id == target)
-                                    .map(|candidate| candidate.name.clone())
-                            })
-                            .unwrap_or_default(),
-                        animation: reaction
-                            .transition
-                            .as_ref()
-                            .map(|transition| {
-                                format!("{:?} · {} ms", transition.style, transition.duration_ms)
-                                    .into()
-                            })
-                            .unwrap_or_else(|| "Instant".into()),
-                    }
+                .map(|reaction| PrototypeConnection {
+                    id: reaction.id.to_string().into(),
+                    trigger: trigger_label(&reaction.trigger).into(),
+                    action: action_label(&reaction.action).into(),
+                    destination: action_target(&reaction.action)
+                        .and_then(|target| {
+                            frame_targets
+                                .iter()
+                                .chain(scroll_targets)
+                                .find(|candidate| candidate.id == target)
+                                .map(|candidate| candidate.name.clone())
+                        })
+                        .unwrap_or_default(),
+                    animation: reaction
+                        .transition
+                        .as_ref()
+                        .map(|transition| {
+                            format!(
+                                "{} · {} ms",
+                                transition_label(Some(transition)),
+                                transition.duration_ms
+                            )
+                            .into()
+                        })
+                        .unwrap_or_else(|| "Instant".into()),
                 })
                 .collect();
             if let Some((index, reaction)) = reactions
@@ -3630,6 +3680,63 @@ impl FantaPrototypePanel {
         cx: &mut Context<Self>,
     ) {
         use fanta_gpui::properties_tabs::PrototypeInspectorAction as Intent;
+        if matches!(action, Intent::PresentRequested) {
+            window.dispatch_action(Box::new(PlayPrototype), cx);
+            return;
+        }
+        if !self.item.read(cx).is_editable() {
+            return;
+        }
+        match action {
+            Intent::DeviceChangeRequested { id } => {
+                let preset = id.to_string();
+                let size = match preset.as_str() {
+                    "none" => None,
+                    "phone" => Some([390.0, 844.0]),
+                    "tablet" => Some([820.0, 1180.0]),
+                    "desktop" => Some([1440.0, 900.0]),
+                    _ => self
+                        .item
+                        .read(cx)
+                        .document()
+                        .and_then(|document| document.doc.presentation.as_ref())
+                        .and_then(|config| config.device_size),
+                };
+                self.apply_operation(
+                    |doc| {
+                        let old = doc.presentation.clone();
+                        let mut config = old.clone().unwrap_or_default();
+                        config.preset = (preset != "none").then_some(preset);
+                        config.device_size = size;
+                        let new =
+                            (config != fanta_doc::PresentationConfig::default()).then_some(config);
+                        (new != old).then_some(Operation::SetPresentation { old, new })
+                    },
+                    cx,
+                );
+                cx.notify();
+                return;
+            }
+            Intent::BackgroundChangeRequested { hex } => {
+                let value = format!("#{}", hex.trim_start_matches('#'));
+                let Some(color) = fanta_doc::Color::from_hex(&value) else {
+                    return;
+                };
+                self.apply_operation(
+                    |doc| {
+                        let old = doc.presentation.clone();
+                        let mut config = old.clone().unwrap_or_default();
+                        config.frame_color = Some(color);
+                        let new = Some(config);
+                        (new != old).then_some(Operation::SetPresentation { old, new })
+                    },
+                    cx,
+                );
+                cx.notify();
+                return;
+            }
+            _ => {}
+        }
         let PrototypeSnapshot::Selection {
             node,
             editable,
@@ -3677,25 +3784,25 @@ impl FantaPrototypePanel {
             Intent::FlowRenameRequested { name } if !name.trim().is_empty() => {
                 self.apply_operation(
                     |doc| {
-                        let current = doc.scene.get(node)?;
-                        Some(Operation::SetName {
-                            id: node,
-                            old: current.name.clone(),
-                            new: name.trim().to_owned(),
-                        })
+                        let old = doc.flows.clone();
+                        let mut new = old.clone();
+                        if let Some(flow) = new.iter_mut().find(|flow| flow.start == node) {
+                            flow.name = name.trim().to_owned();
+                        } else {
+                            new.push(fanta_doc::Flow {
+                                name: name.trim().to_owned(),
+                                start: node,
+                            });
+                        }
+                        (new != old).then_some(Operation::SetFlows { old, new })
                     },
                     cx,
                 );
             }
             Intent::FlowRenameRequested { .. } => {}
-            Intent::PresentRequested => window.dispatch_action(Box::new(PlayPrototype), cx),
-            Intent::DeviceChangeRequested { .. } | Intent::BackgroundChangeRequested { .. } => {
-                crate::view::notify_unavailable(
-                    "Prototype device and presentation background overrides",
-                    window,
-                    cx,
-                )
-            }
+            Intent::PresentRequested
+            | Intent::DeviceChangeRequested { .. }
+            | Intent::BackgroundChangeRequested { .. } => {}
         }
         cx.notify();
     }

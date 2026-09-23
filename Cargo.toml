@@ -192,7 +192,7 @@ clock = { path = "crates/clock" }
 cloud_api_client = { path = "crates/cloud_api_client" }
 cloud_api_types = { path = "crates/cloud_api_types" }
 cloud_llm_client = { path = "crates/cloud_llm_client" }
-collections = {package = "fanta-gpui-collections", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
+collections = {package = "fanta-gpui-collections", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
 command_palette = { path = "crates/command_palette" }
 command_palette_hooks = { path = "crates/command_palette_hooks" }
 component = { path = "crates/component" }
@@ -203,7 +203,7 @@ credentials_provider = { path = "crates/credentials_provider" }
 crossbeam = "0.8.4"
 dap = { path = "crates/dap" }
 db = { path = "crates/db" }
-derive_refineable = {package = "fanta-gpui-derive-refineable", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
+derive_refineable = {package = "fanta-gpui-derive-refineable", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
 design_surface = { path = "crates/design_surface" }
 dialoguer = { version = "0.12", default-features = false }
 editor = { path = "crates/editor" }
@@ -235,22 +235,22 @@ git_ui = { path = "crates/git_ui" }
 go_to_line = { path = "crates/go_to_line" }
 google_ai = { path = "crates/google_ai" }
 grammars = { path = "crates/grammars" }
-gpui = {default-features = false, package = "fanta-gpui-core", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
-gpui-component = {package = "fanta-gpui-components", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
-fanta-gpui = {package = "fanta-gpui", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
-gpui_shared_string = {package = "fanta-gpui-gpui-shared-string", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
-gpui_linux = {default-features = false, package = "fanta-gpui-gpui-linux", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
-gpui_macos = {default-features = false, package = "fanta-gpui-gpui-macos", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
-gpui_macros = {package = "fanta-gpui-gpui-macros", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
-gpui_platform = {default-features = false, package = "fanta-gpui-gpui-platform", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
-gpui_web = {package = "fanta-gpui-gpui-web", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
-gpui_wgpu = {package = "fanta-gpui-gpui-wgpu", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
-gpui_windows = {default-features = false, package = "fanta-gpui-gpui-windows", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
-gpui_tokio = {package = "fanta-gpui-gpui-tokio", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
-gpui_util = {package = "fanta-gpui-gpui-util", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
+gpui = {default-features = false, package = "fanta-gpui-core", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
+gpui-component = {package = "fanta-gpui-components", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
+fanta-gpui = {package = "fanta-gpui", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
+gpui_shared_string = {package = "fanta-gpui-gpui-shared-string", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
+gpui_linux = {default-features = false, package = "fanta-gpui-gpui-linux", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
+gpui_macos = {default-features = false, package = "fanta-gpui-gpui-macos", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
+gpui_macros = {package = "fanta-gpui-gpui-macros", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
+gpui_platform = {default-features = false, package = "fanta-gpui-gpui-platform", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
+gpui_web = {package = "fanta-gpui-gpui-web", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
+gpui_wgpu = {package = "fanta-gpui-gpui-wgpu", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
+gpui_windows = {default-features = false, package = "fanta-gpui-gpui-windows", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
+gpui_tokio = {package = "fanta-gpui-gpui-tokio", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
+gpui_util = {package = "fanta-gpui-gpui-util", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
 html_to_markdown = { path = "crates/html_to_markdown" }
-http_client = {package = "fanta-gpui-http-client", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
-http_client_tls = {package = "fanta-gpui-http-client-tls", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
+http_client = {package = "fanta-gpui-http-client", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
+http_client_tls = {package = "fanta-gpui-http-client-tls", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
 http_proxy = { path = "crates/http_proxy" }
 icons = { path = "crates/icons" }
 image_viewer = { path = "crates/image_viewer" }
@@ -268,7 +268,7 @@ lsp = { path = "crates/lsp" }
 markdown = { path = "crates/markdown" }
 markdown_preview = { path = "crates/markdown_preview" }
 mermaid_render = { path = "crates/mermaid_render" }
-media = {package = "fanta-gpui-media", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
+media = {package = "fanta-gpui-media", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
 menu = { path = "crates/menu" }
 mime = "0.3.17"
 migrator = { path = "crates/migrator" }
@@ -283,7 +283,7 @@ outline = { path = "crates/outline" }
 outline_panel = { path = "crates/outline_panel" }
 panel = { path = "crates/panel" }
 paths = { path = "crates/paths" }
-perf = {package = "fanta-gpui-perf", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
+perf = {package = "fanta-gpui-perf", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
 picker = { path = "crates/picker" }
 picker_preview = { path = "crates/picker_preview" }
 prettier = { path = "crates/prettier" }
@@ -292,15 +292,15 @@ project_panel = { path = "crates/project_panel" }
 prompt_store = { path = "crates/prompt_store" }
 proto = { path = "crates/proto" }
 recent_projects = { path = "crates/recent_projects" }
-refineable = {package = "fanta-gpui-refineable", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
+refineable = {package = "fanta-gpui-refineable", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
 release_channel = { path = "crates/release_channel" }
 remote = { path = "crates/remote" }
 remote_connection = { path = "crates/remote_connection" }
-reqwest_client = {package = "fanta-gpui-reqwest-client", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
+reqwest_client = {package = "fanta-gpui-reqwest-client", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
 rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9de0dda6b90af4ed1fb66a", features = ["wav", "playback", "wav_output", "recording"] }
 rope = { path = "crates/rope" }
 rpc = { path = "crates/rpc" }
-scheduler = {package = "fanta-gpui-scheduler", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
+scheduler = {package = "fanta-gpui-scheduler", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
 sandbox = { path = "crates/sandbox" }
 search = { path = "crates/search" }
 session = { path = "crates/session" }
@@ -315,7 +315,7 @@ snippet_provider = { path = "crates/snippet_provider" }
 sqlez = { path = "crates/sqlez" }
 sqlez_macros = { path = "crates/sqlez_macros" }
 streaming_diff = { path = "crates/streaming_diff" }
-sum_tree = {package = "fanta-gpui-sum-tree", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
+sum_tree = {package = "fanta-gpui-sum-tree", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
 system_specs = { path = "crates/system_specs" }
 syntax_theme = { path = "crates/syntax_theme" }
 task = { path = "crates/task" }
@@ -334,8 +334,8 @@ ui = { path = "crates/ui" }
 ui_input = { path = "crates/ui_input" }
 ui_macros = { path = "crates/ui_macros" }
 ui_prompt = { path = "crates/ui_prompt" }
-util = {package = "fanta-gpui-util", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
-util_macros = {package = "fanta-gpui-util-macros", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
+util = {package = "fanta-gpui-util", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
+util_macros = {package = "fanta-gpui-util-macros", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
 vim = { path = "crates/vim" }
 vim_mode_setting = { path = "crates/vim_mode_setting" }
 
@@ -349,10 +349,10 @@ zed_actions = { path = "crates/zed_actions" }
 zed_credentials_provider = { path = "crates/zed_credentials_provider" }
 zed_env_vars = { path = "crates/zed_env_vars" }
 zeta_prompt = { path = "crates/zeta_prompt" }
-zlog = {package = "fanta-gpui-zlog", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
+zlog = {package = "fanta-gpui-zlog", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
 zlog_settings = { path = "crates/zlog_settings" }
-ztracing = {package = "fanta-gpui-ztracing", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
-ztracing_macro = {package = "fanta-gpui-ztracing-macro", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
+ztracing = {package = "fanta-gpui-ztracing", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
+ztracing_macro = {package = "fanta-gpui-ztracing-macro", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
 
 #
 # External crates
@@ -388,7 +388,7 @@ async-tar = "0.5.1"
 async-task = "4.7"
 async-trait = "0.1"
 async-tungstenite = "0.31.0"
-async-process = {package = "fanta-gpui-async-process", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
+async-process = {package = "fanta-gpui-async-process", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
 async_zip = { version = "0.0.18", features = ["deflate", "deflate64"] }
 aws-config = { version = "1.8.10", features = ["behavior-version-latest"] }
 aws-credential-types = { version = "1.2.8", features = [
@@ -560,7 +560,7 @@ pretty_assertions = { version = "1.3.0", features = ["unstable"] }
 proc-macro2 = "1.0.93"
 profiling = "1"
 # replace this with main when #635 is merged
-proptest = {features = ["attr-macro"], package = "fanta-gpui-proptest", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
+proptest = {features = ["attr-macro"], package = "fanta-gpui-proptest", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
 proptest-derive = "0.8.0"
 proxyvars = "0.2"
 prost = "0.9"
@@ -618,7 +618,7 @@ simplelog = "0.12.2"
 slotmap = "1.0.6"
 skia-safe = { version = "0.84", features = ["textlayout"] }
 smallvec = { version = "1.6", features = ["union", "const_new"] }
-smol = {package = "fanta-gpui-smol", git = "https://github.com/squidred-dev/fanta-ui", rev = "812f6506f256ffc72d5505b9653267c1f12f6281"}
+smol = {package = "fanta-gpui-smol", git = "https://github.com/squidred-dev/fanta-ui", rev = "ed4f317ba91960a89159e589c0a4167510a01690"}
 sqlformat = "0.2"
 stacksafe = "0.1"
 streaming-iterator = "0.1"

@@ -44,10 +44,10 @@ use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use super::layout::{
     ACTIVE_MODES_JSON, ASSETS_DIR, COMPONENTS_DIR, DEF_JSON, DOC_DIR, EXPORTS_DIR, FANTA_JSON,
-    FLOW_START_JSON, LOOSE_DIR, MASTER_FNX, MASTER_IDS, METADATA_JSON, MOTION_JSON, NODES_DIR,
-    PAGE_FNX, PAGE_IDS, PAGE_JSON, PAGES_DIR, PREVIEWS_DIR, PROJECT_VERSION, ProjectManifest,
-    SETS_JSON, VARIABLES_JSON, WORKSPACE_FNX, id_from_key, json_bytes, json_key, slugify,
-    sorted_entries,
+    FLOW_START_JSON, FLOWS_JSON, LOOSE_DIR, MASTER_FNX, MASTER_IDS, METADATA_JSON, MOTION_JSON,
+    NODES_DIR, PAGE_FNX, PAGE_IDS, PAGE_JSON, PAGES_DIR, PRESENTATION_JSON, PREVIEWS_DIR,
+    PROJECT_VERSION, ProjectManifest, SETS_JSON, VARIABLES_JSON, WORKSPACE_FNX, id_from_key,
+    json_bytes, json_key, slugify, sorted_entries,
 };
 use super::media::{ASSET_INDEX_FILE, MediaRegistry, asset_index_bytes, sniff_media};
 
@@ -551,6 +551,8 @@ fn project_doc_singletons(files: &mut ProjectedFiles, doc: &Doc) -> Result<()> {
         (ACTIVE_MODES_JSON, serde_json::to_value(&doc.active_modes)?),
         (MOTION_JSON, motion),
         (FLOW_START_JSON, serde_json::to_value(doc.flow_start)?),
+        (FLOWS_JSON, serde_json::to_value(&doc.flows)?),
+        (PRESENTATION_JSON, serde_json::to_value(&doc.presentation)?),
     ];
     for (name, value) in singletons {
         files.insert(doc_dir.join(name), Arc::new(json_bytes(&value)?));
@@ -1227,6 +1229,8 @@ fn is_generated_artifact(relative: &Path) -> bool {
             ACTIVE_MODES_JSON,
             MOTION_JSON,
             FLOW_START_JSON,
+            FLOWS_JSON,
+            PRESENTATION_JSON,
         ]
         .contains(name),
         [COMPONENTS_DIR, SETS_JSON] | [ASSETS_DIR, ASSET_INDEX_FILE] => true,
@@ -1769,6 +1773,34 @@ fn ensure_parent_directories(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn prototype_presentation_survives_project_round_trip() {
+        let directory = tempfile::tempdir().expect("project directory");
+        let mut document = Doc::new();
+        let page =
+            fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(fanta_doc::GroupNode::default()));
+        let page_id = page.id;
+        document.scene.insert(page).expect("insert prototype page");
+        document.add_page(page_id);
+        document.flow_start = Some(page_id);
+        document.flows.push(fanta_doc::Flow {
+            name: "Onboarding".into(),
+            start: page_id,
+        });
+        document.presentation = Some(fanta_doc::PresentationConfig {
+            device_size: Some([390.0, 844.0]),
+            preset: Some("phone".into()),
+            landscape: false,
+            frame_color: Some(fanta_doc::Color::rgb(0x12, 0x34, 0x56)),
+        });
+        write_project_tree(directory.path(), &document, &BTreeMap::new())
+            .expect("save presentation");
+        let (reopened, _) =
+            super::super::read_project_tree(directory.path()).expect("reopen presentation");
+        assert_eq!(reopened.presentation, document.presentation);
+        assert_eq!(reopened.flows, document.flows);
+    }
 
     fn assert_project_source_write_preserves_previous_bytes(name: &str, original: &[u8]) {
         let directory = tempfile::tempdir().expect("project directory");

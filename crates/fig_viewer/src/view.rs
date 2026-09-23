@@ -1028,7 +1028,8 @@ impl FigView {
     }
 
     pub fn set_editor_mode(&mut self, mode: EditorMode, cx: &mut Context<Self>) {
-        if self.editor_mode(cx) == mode {
+        let previous_mode = self.editor_mode(cx);
+        if previous_mode == mode {
             return;
         }
         if self.prototype_player.is_some() && mode != EditorMode::Prototype {
@@ -1039,8 +1040,13 @@ impl FigView {
             self.timeline_shell
                 .update(cx, |timeline, cx| timeline.pause(cx));
         }
-        if mode != EditorMode::Design {
-            self.activate_tool(ToolKind::Select, cx);
+        match mode {
+            EditorMode::Draw => self.activate_tool(ToolKind::Pencil, cx),
+            EditorMode::Design if previous_mode == EditorMode::Draw => {
+                self.activate_tool(ToolKind::Select, cx)
+            }
+            EditorMode::Design => {}
+            _ => self.activate_tool(ToolKind::Select, cx),
         }
         self.editor_session
             .update(cx, |session, cx| session.set_mode(mode, cx));
@@ -1833,6 +1839,34 @@ impl FigView {
         let cursor_before = self.tools.cursor;
 
         let active_tool = self.tools.kind();
+        #[cfg(feature = "fanta-gpui-ui")]
+        let draw_stroke = (self.editor_mode(cx) == EditorMode::Draw
+            && active_tool == ToolKind::Pencil)
+            .then(|| {
+                let draw = self
+                    .gpui_properties
+                    .as_ref()?
+                    .draw
+                    .read(cx)
+                    .view_data()
+                    .clone();
+                let color = fanta_doc::Color::from_hex(&format!("#{}", draw.color_hex))?;
+                let opacity = u16::from(color.a) * u16::from(draw.options.opacity) / 100;
+                let color = fanta_doc::Color::rgba(color.r, color.g, color.b, opacity as u8);
+                let blend = match draw.blend_mode.as_ref() {
+                    "multiply" => fanta_doc::BlendMode::Multiply,
+                    "screen" => fanta_doc::BlendMode::Screen,
+                    "overlay" => fanta_doc::BlendMode::Overlay,
+                    _ => fanta_doc::BlendMode::Normal,
+                };
+                Some((
+                    color,
+                    f64::from(draw.options.size),
+                    0.2 + f64::from(draw.options.smoothing) * 0.058,
+                    blend,
+                ))
+            })
+            .flatten();
         let tools = &mut self.tools;
         let mut wants_exit = false;
         let mut content_changed = false;
@@ -1845,6 +1879,13 @@ impl FigView {
 
                 let mut ctx =
                     tool_context(&mut document.doc, &mut viewport, screen_size, active_tool);
+                #[cfg(feature = "fanta-gpui-ui")]
+                if let Some((color, width, smoothing, blend)) = draw_stroke {
+                    ctx.new_shape_fill = color;
+                    ctx.new_stroke_width = width;
+                    ctx.stroke_smoothing = smoothing;
+                    ctx.new_blend_mode = blend;
+                }
                 let response = tools.handle_event(&mut ctx, event);
                 wants_exit = response.wants_exit;
 
@@ -2861,7 +2902,7 @@ impl FigView {
     /// select `select` afterwards. A refusal (a page in the selection, no
     /// group to ungroup) is shown as a canvas notice: the command came from a
     /// visible control, so silence would read as a broken button.
-    fn apply_structure_edit(
+    pub(crate) fn apply_structure_edit(
         &mut self,
         label: &str,
         build: impl FnOnce(&Doc) -> Result<(Vec<Operation>, Vec<NodeId>)>,
@@ -4188,7 +4229,11 @@ impl FigView {
             .into_any_element()
     }
 
-    fn render_prototype_presentation(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_prototype_presentation(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let (title, position, can_go_back, can_go_forward) = self
             .prototype_player
             .as_ref()
@@ -4234,6 +4279,27 @@ impl FigView {
             .unwrap_or_else(|| "—".to_string());
         let chrome_border = cx.theme().colors().border;
         let chrome_background = cx.theme().colors().panel_background;
+        let presentation_background = self
+            .prototype_player
+            .as_ref()
+            .and_then(PrototypePlayerState::presentation)
+            .and_then(|config| config.frame_color)
+            .map(|color| {
+                gpui::rgb(
+                    (u32::from(color.r) << 16) | (u32::from(color.g) << 8) | u32::from(color.b),
+                )
+                .into()
+            })
+            .unwrap_or_else(|| cx.theme().colors().editor_background);
+        let device_size = fitted_presentation_device_size(
+            self.prototype_player
+                .as_ref()
+                .and_then(PrototypePlayerState::presentation),
+            (
+                f32::from(window.viewport_size().width),
+                f32::from(window.viewport_size().height),
+            ),
+        );
         let chrome = move |child: AnyElement| {
             h_flex()
                 .h_9()
@@ -4249,26 +4315,46 @@ impl FigView {
 
         div()
             .id("fanta-prototype-presentation")
+            .debug_selector(|| "fanta-prototype-presentation".to_owned())
             .size_full()
             .relative()
             .overflow_hidden()
-            .bg(cx.theme().colors().editor_background)
+            .bg(presentation_background)
             .child(
                 div()
-                    .id("fig-prototype-container")
                     .absolute()
                     .inset_0()
-                    .overflow_hidden()
-                    .cursor_pointer()
-                    .on_hover(cx.listener(|view, hovered: &bool, _, cx| {
-                        if !*hovered {
-                            view.leave_prototype_surface(cx);
-                        }
-                    }))
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
-                    .on_mouse_move(cx.listener(Self::handle_mouse_move))
-                    .child(CanvasElement::new(cx.entity())),
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .id("fig-prototype-container")
+                            .debug_selector(|| "fig-prototype-container".to_owned())
+                            .relative()
+                            .overflow_hidden()
+                            .cursor_pointer()
+                            .when_some(device_size, |surface, (width, height)| {
+                                surface
+                                    .w(px(width))
+                                    .h(px(height))
+                                    .rounded_lg()
+                                    .border_1()
+                                    .border_color(chrome_border)
+                                    .shadow_lg()
+                            })
+                            .when(device_size.is_none(), |surface| surface.size_full())
+                            .on_hover(cx.listener(|view, hovered: &bool, _, cx| {
+                                if !*hovered {
+                                    view.leave_prototype_surface(cx);
+                                }
+                            }))
+                            .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
+                            .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
+                            .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
+                            .on_mouse_move(cx.listener(Self::handle_mouse_move))
+                            .child(CanvasElement::new(cx.entity())),
+                    ),
             )
             .child(
                 h_flex()
@@ -5451,7 +5537,7 @@ impl Render for FigView {
             .when(!has_error && !is_loading, |this| {
                 let presenting_prototype = self.prototype_player.is_some();
                 let workspace_body = if presenting_prototype {
-                    self.render_prototype_presentation(cx)
+                    self.render_prototype_presentation(window, cx)
                 } else if editor_workspace == EditorWorkspace::Variables {
                     div()
                         .id("fanta-variables-workspace-body")
@@ -5641,6 +5727,26 @@ impl Render for FigView {
                     .children((!presenting_prototype).then(|| self.render_workspace_tabs(cx)))
             })
     }
+}
+
+fn fitted_presentation_device_size(
+    presentation: Option<&fanta_doc::PresentationConfig>,
+    viewport_size: (f32, f32),
+) -> Option<(f32, f32)> {
+    let presentation = presentation?;
+    let [mut width, mut height] = presentation.device_size?;
+    if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+        return None;
+    }
+    if presentation.landscape && height > width {
+        std::mem::swap(&mut width, &mut height);
+    }
+    let available_width = (f64::from(viewport_size.0) - 160.0).max(1.0);
+    let available_height = (f64::from(viewport_size.1) - 160.0).max(1.0);
+    let scale = (available_width / width)
+        .min(available_height / height)
+        .min(1.0);
+    Some(((width * scale) as f32, (height * scale) as f32))
 }
 
 fn single_selection(doc: &fanta_doc::Doc) -> Option<NodeId> {
@@ -8778,6 +8884,61 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn prototype_phone_preset_sizes_the_visible_presentation_surface(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut document = doc_with_one_page();
+        let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([390.0, 844.0]),
+            ..GroupNode::default()
+        }));
+        frame.parent = document.active_page();
+        document
+            .apply(Operation::create_node(frame))
+            .expect("create prototype frame");
+        document.presentation = Some(fanta_doc::PresentationConfig {
+            device_size: Some([390.0, 844.0]),
+            preset: Some("phone".into()),
+            ..Default::default()
+        });
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/PhonePrototype.fig"),
+            document,
+            cx,
+        );
+        let window = cx.add_window(move |window, cx| FigView::new(item, project, window, cx));
+        window
+            .update(cx, |view, window, cx| {
+                view.play_prototype(&PlayPrototype, window, cx)
+            })
+            .expect("start prototype presentation");
+        cx.run_until_parked();
+        window
+            .read_with(cx, |view, _| assert!(view.is_presenting_prototype()))
+            .expect("read prototype presentation state");
+
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1200.0), px(900.0)));
+        visual.update(|window, cx| window.draw(cx).clear());
+        assert!(
+            visual
+                .debug_bounds("fanta-prototype-presentation")
+                .is_some()
+        );
+        let surface = visual
+            .debug_bounds("fig-prototype-container")
+            .expect("phone presentation surface");
+        let width = f32::from(surface.size.width);
+        let height = f32::from(surface.size.height);
+        assert!((300.0..400.0).contains(&width), "phone width: {width}");
+        assert!((700.0..800.0).contains(&height), "phone height: {height}");
+        assert!(height > width * 2.0);
+    }
+
+    #[gpui::test]
     async fn prototype_presentation_navigates_and_restores_the_editor_viewport(
         cx: &mut TestAppContext,
     ) {
@@ -9408,6 +9569,10 @@ impl FigView {
                 ..
             } => self.set_editor_workspace(EditorWorkspace::Variables, cx),
             ToolbarAction::ToolChangeRequested {
+                tool: ToolbarTool::ColorPicker,
+                ..
+            } => self.open_toolbar_color_picker(window, cx),
+            ToolbarAction::ToolChangeRequested {
                 tool: ToolbarTool::Inspect,
                 ..
             } => self.set_editor_mode(EditorMode::Code, cx),
@@ -9420,8 +9585,7 @@ impl FigView {
                 ..
             } => {
                 let playing = !self.timeline_shell.read(cx).is_playing();
-                self.timeline_shell
-                    .update(cx, |clock, cx| clock.set_playing(playing, cx));
+                self.set_toolbar_motion_playing(playing, window, cx);
             }
             ToolbarAction::ToolChangeRequested { tool, .. } => {
                 match crate::gpui_adapters::toolbar::tool_kind(*tool) {
@@ -9499,6 +9663,18 @@ impl FigView {
                 ToolbarCommand::Group => self.group_selection(&GroupSelection, window, cx),
                 ToolbarCommand::Ungroup => self.ungroup_selection(&UngroupSelection, window, cx),
                 ToolbarCommand::FrameSelection => self.frame_selection(&FrameSelection, window, cx),
+                ToolbarCommand::AddAutoLayout => self.apply_toolbar_layer_command(
+                    fanta_gpui::layers::LayersPanelContextAction::AddAutoLayout,
+                    window,
+                    cx,
+                ),
+                ToolbarCommand::CreateComponent => self.apply_toolbar_layer_command(
+                    fanta_gpui::layers::LayersPanelContextAction::CreateComponent,
+                    window,
+                    cx,
+                ),
+                ToolbarCommand::DetachInstance => self.detach_toolbar_instance(window, cx),
+                ToolbarCommand::MakePrototype => self.set_editor_mode(EditorMode::Prototype, cx),
                 other => match toolbar_agent_prompt_template(*other) {
                     Some(template) => self.route_toolbar_agent_prompt(template, window, cx),
                     None => notify_unavailable(other.label(), window, cx),
@@ -9511,11 +9687,21 @@ impl FigView {
                 self.handle_toolbar_secondary_control(*control, window, cx);
             }
             ToolbarAction::DrawOptionsChangeRequested { options } => {
+                let options = options.clone().normalized();
                 if let Some(adapter) = self.gpui_toolbar.as_mut() {
                     adapter.draw_options = options.clone();
                     adapter.panel.update(cx, |toolbar, cx| {
                         toolbar.set_draw_options(options.clone(), cx)
                     });
+                }
+                if let Some(adapter) = &self.gpui_properties {
+                    let mut draw = adapter.draw.read(cx).view_data().clone();
+                    if draw.options != options {
+                        draw.options = options;
+                        adapter
+                            .draw
+                            .update(cx, |panel, cx| panel.set_view_data(draw, cx));
+                    }
                 }
                 cx.notify();
             }
@@ -9568,6 +9754,147 @@ impl FigView {
             self.create_motion_clip(cx);
         }
         self.add_motion_keyframe(TimelineProperty::Opacity, cx);
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn set_toolbar_motion_playing(
+        &mut self,
+        playing: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.timeline_shell
+            .update(cx, |clock, cx| clock.set_playing(playing, cx));
+        if playing && !self.timeline_shell.read(cx).is_playing() {
+            show_canvas_notice(
+                "Add an animation to a layer before playing the Motion preview.".into(),
+                window,
+                cx,
+            );
+        }
+        cx.notify();
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn apply_toolbar_layer_command(
+        &mut self,
+        action: fanta_gpui::layers::LayersPanelContextAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_structure_edit(
+            action.label(),
+            move |doc| {
+                let id = single_selection(doc).context("select exactly one layer")?;
+                let operations = crate::layer_context_ops::simple(doc, id, action)?;
+                let roots = crate::layer_context_ops::created_roots(&operations);
+                let selection = if roots.is_empty() { vec![id] } else { roots };
+                Ok((operations, selection))
+            },
+            window,
+            cx,
+        );
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn detach_toolbar_instance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.apply_structure_edit(
+            "Detach instance",
+            |doc| {
+                let id = single_selection(doc).context("select exactly one component instance")?;
+                anyhow::ensure!(
+                    doc.scene
+                        .get(id)
+                        .is_some_and(|node| matches!(&node.data, NodeData::Instance(_))),
+                    "select a component instance"
+                );
+                anyhow::ensure!(
+                    crate::layer_context_ops::editable(doc, id),
+                    "the selected instance is locked"
+                );
+                let operations = crate::properties_ops::detach_instance_operations(doc, id);
+                anyhow::ensure!(!operations.is_empty(), "the instance cannot be detached");
+                Ok((operations, vec![id]))
+            },
+            window,
+            cx,
+        );
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn open_toolbar_color_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor_mode(cx) == EditorMode::Draw {
+            let color = self.item.read(cx).document().and_then(|document| {
+                let page = document
+                    .page(self.selected_page_index)
+                    .and_then(|page| page.root);
+                crate::gpui_adapters::toolbar::draw_sample_color(&document.doc, page)
+            });
+            let Some(color) = color else {
+                show_canvas_notice(
+                    "Select one layer with a solid color, or deselect to sample the page background."
+                        .into(),
+                    window,
+                    cx,
+                );
+                return;
+            };
+            if !self.inspector_sidebar_visible {
+                self.toggle_inspector_sidebar(&ToggleInspectorSidebar, window, cx);
+            }
+            self.refresh_properties_inspector(window, cx);
+            let Some(draw) = self
+                .gpui_properties
+                .as_ref()
+                .map(|adapter| adapter.draw.clone())
+            else {
+                show_canvas_notice("The Draw inspector is unavailable.".into(), window, cx);
+                return;
+            };
+            draw.update(cx, |inspector, cx| {
+                let mut data = inspector.view_data().clone();
+                data.color_hex = color.to_hex().trim_start_matches('#').to_owned().into();
+                inspector.set_view_data(data, cx);
+            });
+            return;
+        }
+        self.set_editor_mode(EditorMode::Design, cx);
+        if !self.inspector_sidebar_visible {
+            self.toggle_inspector_sidebar(&ToggleInspectorSidebar, window, cx);
+        }
+        self.refresh_properties_inspector(window, cx);
+        let Some(inspector) = self
+            .gpui_properties
+            .as_ref()
+            .map(|adapter| adapter.design.downgrade())
+        else {
+            show_canvas_notice("The design inspector is unavailable.".into(), window, cx);
+            return;
+        };
+        cx.defer(move |cx| {
+            let Some(window) = cx.active_window() else {
+                return;
+            };
+            window
+                .update(cx, |_, window, cx| {
+                    match inspector.update(cx, |inspector, cx| {
+                        inspector
+                            .controller()
+                            .update(cx, |panel, cx| panel.open_color_picker(window, cx))
+                    }) {
+                        Ok(true) => {}
+                        Ok(false) => show_canvas_notice(
+                            "Select a page or a layer with a fill to edit its color.".into(),
+                            window,
+                            cx,
+                        ),
+                        Err(error) => {
+                            log::warn!("opening the design color picker failed: {error:#}");
+                        }
+                    }
+                })
+                .log_err();
+        });
     }
 
     /// The toolbar's Export command runs the inspector's export flow — the
@@ -9706,9 +10033,7 @@ impl FigView {
         use fanta_gpui::toolbar::{ToolbarControlValue, ToolbarSecondaryControl};
         match (control, value) {
             (ToolbarSecondaryControl::MotionPlayPause, ToolbarControlValue::Toggle(playing)) => {
-                self.timeline_shell
-                    .update(cx, |timeline, cx| timeline.set_playing(*playing, cx));
-                cx.notify();
+                self.set_toolbar_motion_playing(*playing, window, cx);
             }
             (ToolbarSecondaryControl::MotionLoop, ToolbarControlValue::Toggle(looping)) => {
                 self.timeline_shell
@@ -9716,6 +10041,21 @@ impl FigView {
                 cx.notify();
             }
             (ToolbarSecondaryControl::MotionAnimationStyle, ToolbarControlValue::Choice(style)) => {
+                let can_apply = self.is_editable(cx)
+                    && self.item.read(cx).document().is_some_and(|document| {
+                        single_selection(&document.doc).is_some_and(|id| {
+                            document.doc.scene.contains(id)
+                                && crate::layer_context_ops::editable(&document.doc, id)
+                        })
+                    });
+                if !can_apply {
+                    show_canvas_notice(
+                        "Select one editable layer before applying an animation style.".into(),
+                        window,
+                        cx,
+                    );
+                    return;
+                }
                 let accepted = self
                     .gpui_toolbar
                     .as_mut()

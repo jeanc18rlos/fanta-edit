@@ -12,9 +12,10 @@ use super::types::{
 };
 use crate::project::layout::{
     ACTIVE_MODES_JSON, AUDIO_DIR, COMPONENTS_DIR, DEF_JSON, DOC_DIR, FANTA_JSON, FLOW_START_JSON,
-    GRAPHICS_DIR, GRAPHICS_JSON, METADATA_JSON, MOTION_DIR, MOTION_JSON, PAGE_JSON, PAGES_DIR,
-    PROTOTYPES_DIR, ProjectManifest, SETS_JSON, VARIABLES_JSON, id_from_key, is_project_dir,
-    json_bytes, read_json_file, read_json_or, read_manifest, sorted_entries, write_json_file,
+    FLOWS_JSON, GRAPHICS_DIR, GRAPHICS_JSON, METADATA_JSON, MOTION_DIR, MOTION_JSON, PAGE_JSON,
+    PAGES_DIR, PRESENTATION_JSON, PROTOTYPES_DIR, ProjectManifest, SETS_JSON, VARIABLES_JSON,
+    id_from_key, is_project_dir, json_bytes, read_json_file, read_json_or, read_manifest,
+    sorted_entries, write_json_file,
 };
 use crate::project::read::{component_id_of_dir, page_id_of_dir, select_design_winners};
 use fanta_doc::{
@@ -102,6 +103,8 @@ impl WorkspaceSession {
         let other_singleton_disk_hashes = [
             PathBuf::from(DOC_DIR).join(MOTION_JSON),
             PathBuf::from(DOC_DIR).join(FLOW_START_JSON),
+            PathBuf::from(DOC_DIR).join(FLOWS_JSON),
+            PathBuf::from(DOC_DIR).join(PRESENTATION_JSON),
             PathBuf::from(COMPONENTS_DIR).join(SETS_JSON),
         ]
         .into_iter()
@@ -866,6 +869,16 @@ impl WorkspaceSession {
             (
                 PathBuf::from(DOC_DIR).join(FLOW_START_JSON),
                 serde_json::to_value(document.flow_start)
+                    .map_err(|error| SessionError::other(error.to_string()))?,
+            ),
+            (
+                PathBuf::from(DOC_DIR).join(FLOWS_JSON),
+                serde_json::to_value(&document.flows)
+                    .map_err(|error| SessionError::other(error.to_string()))?,
+            ),
+            (
+                PathBuf::from(DOC_DIR).join(PRESENTATION_JSON),
+                serde_json::to_value(&document.presentation)
                     .map_err(|error| SessionError::other(error.to_string()))?,
             ),
             (

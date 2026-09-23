@@ -616,6 +616,14 @@ impl Operation {
                 *ctx.flow_start = *dir.pick(old, new);
                 Ok(())
             }
+            Self::SetFlows { old, new } => {
+                *ctx.flows = dir.pick(old, new).clone();
+                Ok(())
+            }
+            Self::SetPresentation { old, new } => {
+                *ctx.presentation = dir.pick(old, new).clone();
+                Ok(())
+            }
         }
     }
 }

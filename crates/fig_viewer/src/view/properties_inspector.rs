@@ -9,10 +9,10 @@ use fanta_gpui::properties_tabs::*;
 
 pub(super) struct PropertiesAdapter {
     pub layout: Entity<PropertiesInspector>,
-    design: Entity<DesignInspector>,
+    pub(super) design: Entity<DesignInspector>,
     code: Entity<CodeInspector>,
     comments: Entity<CommentsInspector>,
-    draw: Entity<DrawInspector>,
+    pub(super) draw: Entity<DrawInspector>,
     motion: Entity<MotionInspector>,
     code_snapshot: Option<(u64, Vec<NodeId>, Option<usize>)>,
     comments_snapshot: Option<(u64, bool, Option<String>)>,
@@ -62,17 +62,26 @@ impl FigView {
                 CommentsInspector::new("editor-comments-inspector", Default::default(), cx)
             });
             let draw = cx.new(|cx| {
-                DrawInspector::new(
+                let mut inspector = DrawInspector::new(
                     "editor-draw-inspector",
                     DrawInspectorViewData {
                         read_only: true,
                         ..Default::default()
                     },
                     cx,
-                )
+                );
+                inspector.set_capabilities(
+                    fanta_gpui::toolbar::DrawBrushCapabilities::VECTOR_PENCIL,
+                    cx,
+                );
+                inspector
             });
-            let motion = cx
-                .new(|cx| MotionInspector::new("editor-motion-inspector", Default::default(), cx));
+            let motion = cx.new(|cx| {
+                let mut inspector =
+                    MotionInspector::new("editor-motion-inspector", Default::default(), cx);
+                inspector.set_auto_keyframe_available(false, cx);
+                inspector
+            });
             let children = PropertiesInspectorChildren {
                 design: design.clone().into(),
                 motion: motion.clone().into(),
@@ -122,6 +131,7 @@ impl FigView {
                         .update(cx, |code, cx| code.set_view_data(data, cx));
                 }),
                 cx.subscribe_in(&comments, window, Self::handle_inspector_comment_action),
+                cx.subscribe_in(&draw, window, Self::handle_inspector_draw_action),
                 cx.subscribe_in(&motion, window, Self::handle_inspector_motion_action),
             ];
             self.gpui_properties = Some(PropertiesAdapter {
@@ -139,6 +149,7 @@ impl FigView {
         }
         let mode = inspector_tab(self.editor_mode(cx));
         let zoom = self.current_zoom_percent(cx);
+        let editable = self.is_editable(cx);
         let collapsed = !self.inspector_sidebar_visible;
         let Some(adapter) = self.gpui_properties.as_mut() else {
             return;
@@ -174,6 +185,7 @@ impl FigView {
             PropertiesInspectorTab::Draw => {
                 let mut draw = adapter.draw.read(cx).view_data().clone();
                 draw.tool_name = self.tools.kind().label().into();
+                draw.read_only = !editable;
                 if let Some(toolbar) = &self.gpui_toolbar {
                     draw.options = toolbar.draw_options.clone();
                 }
@@ -466,7 +478,9 @@ fn motion_view_data(
 ) -> MotionInspectorViewData {
     let mut data = MotionInspectorViewData {
         playing: clock.is_playing(),
-        playback: if clock.loop_playback_enabled() {
+        playback: if clock.ping_pong_playback_enabled() {
+            fanta_gpui::timeline::TimelinePlayback::PingPong
+        } else if clock.loop_playback_enabled() {
             fanta_gpui::timeline::TimelinePlayback::Loop
         } else {
             fanta_gpui::timeline::TimelinePlayback::Once
@@ -491,6 +505,7 @@ fn motion_view_data(
         .join(", ")
         .into();
     if let Some(clip) = active_clip.and_then(|id| document.doc.motion.clip(id)) {
+        data.can_preview = true;
         let tracks = clip
             .tracks
             .values()
@@ -500,6 +515,7 @@ fn motion_view_data(
             .iter()
             .flat_map(|track| track.keyframes.values())
             .collect::<Vec<_>>();
+        data.can_edit_timing = !keys.is_empty();
         data.delay_ms = keys.iter().map(|key| key.time_ms).min().unwrap_or(0);
         data.duration_ms = keys
             .iter()
@@ -525,6 +541,54 @@ fn motion_view_data(
 }
 
 impl FigView {
+    fn handle_inspector_draw_action(
+        &mut self,
+        _: &Entity<DrawInspector>,
+        action: &DrawInspectorAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_editable(cx) {
+            return;
+        }
+        let Some(adapter) = &self.gpui_properties else {
+            return;
+        };
+        let mut draw = adapter.draw.read(cx).view_data().clone();
+        match action {
+            DrawInspectorAction::OptionsChangeRequested { options } => {
+                draw.options = options.clone().normalized();
+                if let Some(toolbar) = &mut self.gpui_toolbar {
+                    toolbar.draw_options = draw.options.clone();
+                    toolbar.panel.update(cx, |panel, cx| {
+                        panel.set_draw_options(draw.options.clone(), cx)
+                    });
+                }
+            }
+            DrawInspectorAction::ColorChangeRequested { hex } => {
+                if fanta_doc::Color::from_hex(&format!("#{}", hex.trim_start_matches('#')))
+                    .is_none()
+                {
+                    show_canvas_notice("Enter a six or eight digit hex color".into(), window, cx);
+                    return;
+                }
+                draw.color_hex = hex.trim_start_matches('#').to_ascii_uppercase().into();
+            }
+            DrawInspectorAction::BlendModeChangeRequested { id } => {
+                if !draw.blend_modes.iter().any(|choice| choice.id == *id) {
+                    return;
+                }
+                draw.blend_mode = id.clone();
+            }
+            DrawInspectorAction::BrushPresetSaveRequested => {
+                return;
+            }
+        }
+        adapter
+            .draw
+            .update(cx, |panel, cx| panel.set_view_data(draw, cx));
+    }
+
     fn handle_inspector_motion_action(
         &mut self,
         _: &Entity<MotionInspector>,
@@ -540,7 +604,8 @@ impl FigView {
             }
             MotionInspectorAction::PlaybackChangeRequested { playback } => {
                 if *playback == TimelinePlayback::PingPong {
-                    notify_unavailable("Ping-pong playback", window, cx);
+                    self.timeline_shell
+                        .update(cx, |clock, cx| clock.set_ping_pong_playback(cx));
                 } else {
                     self.timeline_shell.update(cx, |clock, cx| {
                         clock.set_loop_playback(*playback == TimelinePlayback::Loop, cx)

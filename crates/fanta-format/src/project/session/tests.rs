@@ -1593,6 +1593,24 @@ fn cached_source_preconditions_reject_external_edit_at_writer() {
 }
 
 #[test]
+fn prototype_singletons_reject_external_edits_before_canvas_save() {
+    let (directory, _) = page_fixture();
+    let workspace = WorkspaceSession::open(directory.path()).expect("open project");
+    let (document, _) = crate::read_project_tree(directory.path()).expect("read project");
+
+    for name in ["flows.json", "presentation.json"] {
+        let path = directory.path().join("doc").join(name);
+        let original = std::fs::read(&path).expect("read prototype source");
+        std::fs::write(&path, b"externally edited").expect("change prototype source");
+        assert!(matches!(
+            workspace.source_write_preconditions(&document),
+            Err(SessionError::SaveBlocked(SaveBlocked::DiskChangedAgain))
+        ));
+        std::fs::write(&path, original).expect("restore prototype source");
+    }
+}
+
+#[test]
 fn canvas_save_keeps_unopened_authored_source_without_projecting_it() {
     let directory = tempdir().expect("project directory");
     let mut document = Doc::new();

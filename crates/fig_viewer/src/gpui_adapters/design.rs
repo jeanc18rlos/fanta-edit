@@ -34,6 +34,8 @@ use fanta_gpui::design::{
     DesignPanelAutoLayoutWrap, DesignPanelCollection, DesignPanelEditPhase, DesignPanelNode,
     DesignPanelNodeCapabilities, DesignPanelNodeKind, DesignPanelParentLayout, DesignPanelProperty,
     DesignPanelPropertyValueState, DesignPanelSection, DesignPanelTarget, DesignPanelValue,
+    DesignSelectionHeaderCommand, DesignSelectionHeaderControl, DesignSelectionHeaderControlKind,
+    DesignSelectionHeaderMenu, DesignSelectionHeaderMenuItem, DesignSelectionHeaderViewData,
     DesignSizingMode, DesignStroke, DesignStrokeAlign, DesignStrokeCap, DesignStrokeDashMode,
     DesignStrokeDashes, DesignStrokeJoin, DesignStrokeWeightMode, DesignStrokeWeights,
     DesignTextDecoration, DesignTextHorizontalAlignment, DesignTextResize,
@@ -178,6 +180,120 @@ pub(crate) fn design_kind(
         | NodeData::AiArtifact(_)
         | NodeData::Embed(_) => DesignPanelNodeKind::Other,
     }
+}
+
+fn matching_design_layers<'a>(
+    doc: &'a Doc,
+    id: NodeId,
+    page: Option<NodeId>,
+) -> impl Iterator<Item = NodeId> + 'a {
+    let masters = crate::properties_snapshot::master_roots(&doc.components);
+    let kind = doc
+        .scene
+        .get(id)
+        .map(|node| design_kind(id, &node.data, &masters));
+    let roots = page
+        .map(|page| doc.scene.children_of(Some(page)))
+        .unwrap_or_else(|| doc.scene.children_of(None));
+    roots
+        .iter()
+        .copied()
+        .flat_map(|root| doc.scene.descendants_of(root))
+        .filter(move |candidate| {
+            kind.as_ref().is_some_and(|kind| {
+                doc.scene.get(*candidate).is_some_and(|candidate_node| {
+                    design_kind(*candidate, &candidate_node.data, &masters) == *kind
+                })
+            })
+        })
+}
+
+pub(crate) fn selection_header_for_doc(
+    doc: &Doc,
+    selection: &[NodeId],
+    page: Option<NodeId>,
+    editable: bool,
+) -> Option<DesignSelectionHeaderViewData> {
+    use DesignSelectionHeaderControlKind as Kind;
+    use fanta_gpui::layers::LayersPanelContextAction as LayerAction;
+
+    let first = *selection.first()?;
+    let node = doc.scene.get(first)?;
+    let masters = crate::properties_snapshot::master_roots(&doc.components);
+    let kind = design_kind(first, &node.data, &masters);
+    let can_edit = editable
+        && selection
+            .iter()
+            .all(|id| crate::layer_context_ops::editable(doc, *id));
+    let mut controls = Vec::new();
+    if selection.len() == 1 && matching_design_layers(doc, first, page).take(2).count() > 1 {
+        controls.push(DesignSelectionHeaderControl::direct(
+            Kind::SelectMatchingLayers,
+        ));
+    }
+    if can_edit {
+        let actions = crate::gpui_adapters::layers::context_actions(doc, first);
+        if selection.len() > 1
+            || (!doc.is_component_root(first) && actions.contains(&LayerAction::CreateComponent))
+        {
+            controls.push(DesignSelectionHeaderControl::direct(Kind::CreateComponent));
+        }
+        if selection.len() == 1 && actions.contains(&LayerAction::UseAsMask) {
+            controls.push(DesignSelectionHeaderControl::direct(Kind::UseAsMask));
+        }
+        let can_boolean = selection.len() > 1
+            && selection.iter().all(|id| {
+                doc.scene.get(*id).is_some_and(|member| {
+                    member.parent == node.parent && matches!(member.data, NodeData::Vector(_))
+                })
+            });
+        let can_flatten = actions.contains(&LayerAction::Flatten);
+        if can_boolean || can_flatten {
+            let mut menu = DesignSelectionHeaderControl::boolean_flatten_menu();
+            menu.menu_items.retain(|item| match item.command {
+                DesignSelectionHeaderCommand::Boolean(_) => can_boolean,
+                DesignSelectionHeaderCommand::Flatten => can_flatten,
+                _ => false,
+            });
+            if !can_boolean {
+                menu = menu.with_tooltip("Flatten");
+            }
+            controls.push(menu);
+        }
+        if selection.len() == 1 && matches!(node.data, NodeData::Vector(_) | NodeData::Text(_)) {
+            controls.push(DesignSelectionHeaderControl::direct(Kind::EditObject));
+        }
+    }
+    let title = if selection.len() > 1 {
+        format!("{} layers", selection.len())
+    } else if crate::layer_context_ops::is_section(node) {
+        "Section".to_string()
+    } else {
+        kind.label().to_string()
+    };
+    let mut header = DesignSelectionHeaderViewData::new(title, controls);
+    if can_edit && selection.len() == 1 && matches!(node.data, NodeData::Group(_)) {
+        let actions = crate::gpui_adapters::layers::context_actions(doc, first);
+        let menu_items = [
+            ("frame", "Frame", LayerAction::ConvertToFrame),
+            ("section", "Section", LayerAction::ConvertToSection),
+        ]
+        .into_iter()
+        .filter(|(_, _, action)| actions.contains(action))
+        .map(|(id, label, _)| {
+            DesignSelectionHeaderMenuItem::new(
+                id,
+                label,
+                DesignSelectionHeaderCommand::TitleMenuItem { item_id: id.into() },
+            )
+        })
+        .collect::<Vec<_>>();
+        if !menu_items.is_empty() {
+            header =
+                header.with_title_menu(DesignSelectionHeaderMenu::new("layer-type", menu_items));
+        }
+    }
+    Some(header)
 }
 
 // =============================================================================
@@ -1026,6 +1142,7 @@ impl FigView {
         // unchanged Page projection is a no-op inside `apply_page_view_data`,
         // so carrying the retained value forward costs nothing.
         let page_view_data = view_data.projections.page.take();
+        let selection_header = view_data.projections.selection_header.take();
         let inspection_context = view_data.inspection_context;
         let property_states = view_data.property_states;
         let Some(adapter) = self.gpui_design.as_mut() else {
@@ -1037,6 +1154,15 @@ impl FigView {
                 panel.set_page_view_data(page_view_data, cx);
             }
             panel.set_inspection_context(inspection_context, cx);
+            if let Some(selection_header) = selection_header {
+                panel.set_selection_header_view_data_for_target(
+                    selection_header.target,
+                    selection_header.view_data,
+                    cx,
+                );
+            } else {
+                panel.clear_selection_header_view_data(cx);
+            }
             panel.set_property_value_states(property_states, cx);
         });
     }
@@ -1170,6 +1296,9 @@ impl FigView {
             }
             DesignPanelAction::TargetedNodeActionRequested { target, action } => {
                 self.handle_design_targeted_action(target, action, window, cx);
+            }
+            DesignPanelAction::SelectionHeaderCommandRequested { target, command } => {
+                self.handle_design_selection_header_command(target, command, window, cx);
             }
             DesignPanelAction::ArrangeRequested { target, operation } => {
                 self.handle_design_arrange(target, *operation, window, cx);
@@ -1540,11 +1669,17 @@ impl FigView {
             }
         };
         self.finish_document_edits_for_external_change(cx);
+        let mut unsupported = false;
         let ops = self.design_ops(cx, |doc| {
-            ids.iter()
-                .flat_map(|id| property_operations(doc, *id, property, &value).unwrap_or_default())
-                .collect()
+            targeted_property_operations(doc, &ids, property, &value).unwrap_or_else(|| {
+                unsupported = true;
+                Vec::new()
+            })
         });
+        if unsupported {
+            crate::view::notify_unavailable(UNWIRED_CONTROL, window, cx);
+            return;
+        }
         self.design_apply_ops(ops, cx);
     }
 
@@ -1601,6 +1736,224 @@ impl FigView {
             DesignTransformOperation::FlipVertical => flip_operations(doc, &ids, false),
         });
         self.design_apply_ops(ops, cx);
+    }
+
+    fn handle_design_selection_header_command(
+        &mut self,
+        target: &DesignPanelTarget,
+        command: &DesignSelectionHeaderCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        use fanta_gpui::layers::LayersPanelContextAction as LayerAction;
+
+        if !self.design_target_matches_selection(target, cx) {
+            log::warn!("fig design adapter: rejecting stale selection-header target");
+            return;
+        }
+        let DesignPanelTarget::Nodes { node_ids } = target else {
+            return;
+        };
+        let ids: Vec<NodeId> = node_ids.iter().filter_map(node_id).collect();
+        let Some(first) = ids.first().copied() else {
+            return;
+        };
+        let page = self
+            .selected_page_index()
+            .and_then(|index| {
+                self.item()
+                    .read(cx)
+                    .document()
+                    .and_then(|document| document.doc.pages().get(index).copied())
+            })
+            .or_else(|| {
+                self.item()
+                    .read(cx)
+                    .document()
+                    .and_then(|document| document.doc.active_page())
+            });
+        let supported = self.item().read(cx).document().is_some_and(|document| {
+            let editable = self.is_editable(cx);
+            selection_header_for_doc(&document.doc, &ids, page, editable).is_some_and(|header| {
+                header
+                    .primary_controls
+                    .iter()
+                    .chain(header.overflow_controls.iter())
+                    .any(|control| {
+                        control.command().as_ref() == Some(command)
+                            || control
+                                .menu_items
+                                .iter()
+                                .any(|item| &item.command == command)
+                    })
+                    || header
+                        .title_menu
+                        .as_ref()
+                        .is_some_and(|menu| menu.items.iter().any(|item| &item.command == command))
+            })
+        });
+        if !supported {
+            log::warn!(
+                "fig design adapter: rejecting unavailable selection-header command {command:?}"
+            );
+            return;
+        }
+        match command {
+            DesignSelectionHeaderCommand::SelectMatchingLayers => {
+                let item = self.item().clone();
+                item.update(cx, |item, cx| {
+                    item.with_document(cx, |document| {
+                        let matching =
+                            matching_design_layers(&document.doc, first, page).collect::<Vec<_>>();
+                        if matching.is_empty() {
+                            return ((), DocChange::None);
+                        }
+                        document.doc.selection.replace_with(matching);
+                        ((), DocChange::Selection)
+                    });
+                });
+            }
+            DesignSelectionHeaderCommand::CreateComponent => {
+                self.apply_structure_edit(
+                    "Create component",
+                    move |doc| {
+                        if ids.len() == 1 {
+                            let operations = crate::layer_context_ops::simple(
+                                doc,
+                                first,
+                                LayerAction::CreateComponent,
+                            )?;
+                            anyhow::ensure!(
+                                !operations.is_empty(),
+                                "The layer is already a component"
+                            );
+                            let roots = crate::layer_context_ops::created_roots(&operations);
+                            return Ok((
+                                operations,
+                                if roots.is_empty() { vec![first] } else { roots },
+                            ));
+                        }
+                        let grouped =
+                            crate::structure::frame_selection_operations(doc, &ids, None)?;
+                        let mut scratch = doc.clone();
+                        for operation in &grouped.operations {
+                            scratch.apply(operation.clone())?;
+                        }
+                        let component = crate::properties_ops::create_component_operations(
+                            &scratch,
+                            grouped.group,
+                        );
+                        anyhow::ensure!(
+                            !component.is_empty(),
+                            "Could not create a component from this selection"
+                        );
+                        let mut operations = grouped.operations;
+                        operations.extend(component);
+                        Ok((operations, vec![grouped.group]))
+                    },
+                    window,
+                    cx,
+                );
+            }
+            DesignSelectionHeaderCommand::UseAsMask
+            | DesignSelectionHeaderCommand::Flatten
+            | DesignSelectionHeaderCommand::TitleMenuItem { .. } => {
+                let action = match command {
+                    DesignSelectionHeaderCommand::UseAsMask => LayerAction::UseAsMask,
+                    DesignSelectionHeaderCommand::Flatten => LayerAction::Flatten,
+                    DesignSelectionHeaderCommand::TitleMenuItem { item_id }
+                        if item_id.as_ref() == "frame" =>
+                    {
+                        LayerAction::ConvertToFrame
+                    }
+                    DesignSelectionHeaderCommand::TitleMenuItem { item_id }
+                        if item_id.as_ref() == "section" =>
+                    {
+                        LayerAction::ConvertToSection
+                    }
+                    _ => return,
+                };
+                self.apply_structure_edit(
+                    action.label(),
+                    move |doc| {
+                        let operations = crate::layer_context_ops::simple(doc, first, action)?;
+                        let roots = crate::layer_context_ops::created_roots(&operations);
+                        let selection = if roots.is_empty() { ids } else { roots };
+                        Ok((operations, selection))
+                    },
+                    window,
+                    cx,
+                );
+            }
+            DesignSelectionHeaderCommand::Boolean(operation) => {
+                let operation = match operation {
+                    fanta_gpui::design::DesignBooleanOperation::Union => {
+                        fanta_doc::BooleanOp::Union
+                    }
+                    fanta_gpui::design::DesignBooleanOperation::Subtract => {
+                        fanta_doc::BooleanOp::Subtract
+                    }
+                    fanta_gpui::design::DesignBooleanOperation::Intersect => {
+                        fanta_doc::BooleanOp::Intersect
+                    }
+                    fanta_gpui::design::DesignBooleanOperation::Exclude => {
+                        fanta_doc::BooleanOp::Exclude
+                    }
+                };
+                self.finish_document_edits_for_external_change(cx);
+                let item = self.item().clone();
+                let result = item.update(cx, |item, cx| {
+                    item.with_document(cx, |document| {
+                        let doc = &mut document.doc;
+                        let original = doc.clone();
+                        let mut operands = ids;
+                        operands.sort_by_key(|id| doc.scene.get(*id).map(|node| node.index));
+                        doc.history.begin("Boolean selection", &mut doc.scene);
+                        let result = fanta_tools::make_boolean(doc, &operands, operation).filter(
+                            |created| doc.scene.children_of(Some(*created)).len() == operands.len(),
+                        );
+                        match result {
+                            Some(created) => {
+                                doc.selection.replace_with([created]);
+                                doc.history.commit(&mut doc.scene);
+                                (Ok(()), DocChange::Content)
+                            }
+                            None => {
+                                *doc = original;
+                                (
+                                    Err(anyhow::anyhow!("Could not combine these layers")),
+                                    DocChange::None,
+                                )
+                            }
+                        }
+                    })
+                    .unwrap_or_else(|| Err(anyhow::anyhow!("The document is no longer available")))
+                });
+                if let Err(error) = result {
+                    log::warn!("boolean selection failed: {error:#}");
+                    crate::view::notify_unavailable("Boolean selection", window, cx);
+                }
+            }
+            DesignSelectionHeaderCommand::EditObject => {
+                let kind = self.item().read(cx).document().and_then(|document| {
+                    document
+                        .doc
+                        .scene
+                        .get(first)
+                        .map(|node| matches!(node.data, NodeData::Text(_)))
+                });
+                match kind {
+                    Some(true) => {
+                        self.open_text_edit(first, crate::view::TextEditSeed::SelectAll, window, cx)
+                    }
+                    Some(false) => self.activate_tool(crate::tools::ToolKind::NodeEdit, cx),
+                    None => {}
+                }
+            }
+            DesignSelectionHeaderCommand::CreateLink
+            | DesignSelectionHeaderCommand::ApplyTextContentVariable
+            | DesignSelectionHeaderCommand::HostDefined { .. } => {}
+        }
     }
 
     fn design_target_matches_selection(
@@ -1972,6 +2325,9 @@ impl FigView {
         let color = fanta_color(color);
         self.finish_document_edits_for_external_change(cx);
         let ops = self.design_ops(cx, |doc| {
+            if doc.active_page() != Some(root) {
+                return Vec::new();
+            }
             replace_data_operation(doc, root, |data| {
                 if let NodeData::Group(group) = data {
                     group.background = Some(Fill::solid(color));
@@ -1985,6 +2341,105 @@ impl FigView {
 // =============================================================================
 // Intent → operation builders
 // =============================================================================
+
+fn targeted_property_operations(
+    doc: &Doc,
+    ids: &[NodeId],
+    property: DesignPanelProperty,
+    value: &DesignPanelValue,
+) -> Option<Vec<Operation>> {
+    if matches!(
+        property,
+        DesignPanelProperty::X
+            | DesignPanelProperty::Y
+            | DesignPanelProperty::Width
+            | DesignPanelProperty::Height
+    ) {
+        let coordinate = match value {
+            DesignPanelValue::Number(value) => f64::from(*value),
+            DesignPanelValue::Integer(value) => *value as f64,
+            _ => return None,
+        };
+        if !coordinate.is_finite() {
+            return None;
+        }
+        let bounds = ids
+            .iter()
+            .try_fold(None, |bounds: Option<fanta_doc::Bounds>, id| {
+                let current = doc.scene.world_bounds(*id)?;
+                Some(Some(
+                    bounds.map_or(current, |bounds| bounds.union(&current)),
+                ))
+            })??;
+        let world_change = match property {
+            DesignPanelProperty::X => {
+                if coordinate == bounds.min_x {
+                    return Some(Vec::new());
+                }
+                Transform2D::translation(coordinate - bounds.min_x, 0.0)
+            }
+            DesignPanelProperty::Y => {
+                if coordinate == bounds.min_y {
+                    return Some(Vec::new());
+                }
+                Transform2D::translation(0.0, coordinate - bounds.min_y)
+            }
+            DesignPanelProperty::Width => {
+                let width = bounds.max_x - bounds.min_x;
+                if coordinate <= 0.0 || width <= 0.0 {
+                    return None;
+                }
+                if coordinate == width {
+                    return Some(Vec::new());
+                }
+                Transform2D::translation(-bounds.min_x, 0.0)
+                    .then(&Transform2D::scale_xy(coordinate / width, 1.0))
+                    .then(&Transform2D::translation(bounds.min_x, 0.0))
+            }
+            DesignPanelProperty::Height => {
+                let height = bounds.max_y - bounds.min_y;
+                if coordinate <= 0.0 || height <= 0.0 {
+                    return None;
+                }
+                if coordinate == height {
+                    return Some(Vec::new());
+                }
+                Transform2D::translation(0.0, -bounds.min_y)
+                    .then(&Transform2D::scale_xy(1.0, coordinate / height))
+                    .then(&Transform2D::translation(0.0, bounds.min_y))
+            }
+            _ => return None,
+        };
+        return ids
+            .iter()
+            .map(|id| {
+                let node = doc.scene.get(*id)?;
+                let parent_world = node
+                    .parent
+                    .and_then(|parent| doc.scene.world_transform(parent))
+                    .unwrap_or(Transform2D::IDENTITY);
+                let determinant = parent_world.0.matrix2.determinant();
+                if !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
+                    return None;
+                }
+                Some(Operation::SetTransform {
+                    id: *id,
+                    old: node.transform,
+                    new: node
+                        .transform
+                        .then(&parent_world)
+                        .then(&world_change)
+                        .then(&parent_world.inverse()),
+                })
+            })
+            .collect();
+    }
+
+    ids.iter()
+        .map(|id| property_operations(doc, *id, property, value))
+        .collect::<Option<Vec<_>>>()
+        .map(|operations| operations.into_iter().flatten().collect())
+}
 
 /// Maps one panel arrange command onto engine operations, or `None` when the
 /// engine has no equivalent (Tidy up, which is auto-layout inference rather
@@ -2907,11 +3362,113 @@ mod tests {
         (doc, page_id, ids)
     }
 
+    #[test]
+    fn selection_header_only_exposes_commands_supported_by_the_current_selection() {
+        use DesignSelectionHeaderControlKind as Kind;
+
+        let (doc, page, ids) = doc_with_three_squares();
+        let single = selection_header_for_doc(&doc, &ids[..1], Some(page), true)
+            .expect("selected layer has a header");
+        assert!(
+            single
+                .primary_controls
+                .iter()
+                .any(|control| control.kind == Kind::SelectMatchingLayers)
+        );
+        assert!(
+            single
+                .primary_controls
+                .iter()
+                .any(|control| control.kind == Kind::CreateComponent)
+        );
+        assert!(
+            single
+                .primary_controls
+                .iter()
+                .any(|control| control.kind == Kind::EditObject)
+        );
+        assert!(single.primary_controls.iter().all(|control| {
+            control.kind != Kind::CreateLink && control.kind != Kind::ApplyTextContentVariable
+        }));
+
+        let multiple = selection_header_for_doc(&doc, &ids[..2], Some(page), true)
+            .expect("multiple selection has a header");
+        let boolean_menu = multiple
+            .primary_controls
+            .iter()
+            .find(|control| control.kind == Kind::BooleanFlattenMenu)
+            .expect("two vector layers support boolean operations");
+        assert_eq!(
+            boolean_menu
+                .menu_items
+                .iter()
+                .filter(|item| matches!(item.command, DesignSelectionHeaderCommand::Boolean(_)))
+                .count(),
+            4
+        );
+        assert!(
+            !multiple
+                .primary_controls
+                .iter()
+                .any(|control| control.kind == Kind::UseAsMask)
+        );
+
+        let viewer = selection_header_for_doc(&doc, &ids[..1], Some(page), false)
+            .expect("viewers can inspect the selection");
+        assert_eq!(viewer.primary_controls.len(), 1);
+        assert_eq!(viewer.primary_controls[0].kind, Kind::SelectMatchingLayers);
+    }
+
     fn min_x(doc: &Doc, id: NodeId) -> f64 {
         doc.scene
             .world_bounds(id)
             .expect("the square has world bounds")
             .min_x
+    }
+
+    #[test]
+    fn multi_selection_position_moves_the_selection_box_without_collapsing_spacing() {
+        let (mut doc, _page, ids) = doc_with_three_squares();
+        let operations = targeted_property_operations(
+            &doc,
+            &ids,
+            DesignPanelProperty::X,
+            &DesignPanelValue::Number(40.0),
+        )
+        .expect("selection X is supported");
+        assert_eq!(operations.len(), 3);
+        for operation in operations {
+            doc.apply(operation).expect("move selection");
+        }
+        for (id, expected_x) in ids.into_iter().zip([40.0, 80.0, 150.0]) {
+            assert!((min_x(&doc, id) - expected_x).abs() < 1e-9);
+        }
+
+        let operations = targeted_property_operations(
+            &doc,
+            &ids,
+            DesignPanelProperty::Width,
+            &DesignPanelValue::Number(260.0),
+        )
+        .expect("selection width is supported");
+        for operation in operations {
+            doc.apply(operation).expect("resize selection");
+        }
+        let first = doc.scene.world_bounds(ids[0]).expect("first bounds");
+        let last = doc.scene.world_bounds(ids[2]).expect("last bounds");
+        assert!((first.min_x - 40.0).abs() < 1e-9);
+        assert!((last.max_x - 300.0).abs() < 1e-9);
+
+        assert!(
+            targeted_property_operations(
+                &doc,
+                &ids,
+                DesignPanelProperty::LockAspectRatio,
+                &DesignPanelValue::Bool(true),
+            )
+            .is_none(),
+            "an unsupported aggregate leaf cannot partially edit members"
+        );
     }
 
     #[test]
@@ -3106,6 +3663,43 @@ mod tests {
                 (panel.node().opacity - 100.0).abs() < 1e-3,
                 "the undo echoes back into the panel"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn page_background_rejects_a_stale_page_id(cx: &mut TestAppContext) {
+        let (doc, page, rect) = doc_with_rect();
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        let color = DesignColor::rgb(0x12, 0x34, 0x56);
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::PageBackgroundChangeRequested {
+                page_id: SharedString::from(rect.to_string()),
+                color,
+            });
+        });
+        cx.run_until_parked();
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        item.read_with(cx, |item, _| {
+            assert!(!item.is_dirty());
+            let doc = &item.document().expect("document ready").doc;
+            assert!(doc.scene.get(rect).is_some());
+            assert!(!doc.history.can_undo());
+        });
+
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::PageBackgroundChangeRequested {
+                page_id: SharedString::from(page.to_string()),
+                color,
+            });
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            let NodeData::Group(group) = &doc.scene.get(page).expect("page exists").data else {
+                panic!("page is a group");
+            };
+            assert_eq!(group.background, Some(Fill::solid(fanta_color(color))));
         });
     }
 

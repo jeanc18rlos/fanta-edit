@@ -105,6 +105,10 @@ impl FigView {
         }
         if self.gpui_timeline.is_none() {
             let panel = cx.new(|cx| Timeline::new("editor-timeline", Default::default(), cx));
+            panel.update(cx, |panel, cx| {
+                panel.set_auto_keyframe_available(false, cx);
+                panel.set_comments_available(false, cx);
+            });
             let subscription = cx.subscribe_in(&panel, window, Self::handle_shared_timeline_action);
             self.gpui_timeline = Some(TimelineAdapter {
                 panel,
@@ -129,7 +133,9 @@ impl FigView {
             current_time_ms: (clock.playhead_us().max(0) / 1000) as u32,
             playing: clock.is_playing(),
             looping: clock.loop_playback_enabled(),
-            playback: if clock.loop_playback_enabled() {
+            playback: if clock.ping_pong_playback_enabled() {
+                TimelinePlayback::PingPong
+            } else if clock.loop_playback_enabled() {
                 TimelinePlayback::Loop
             } else {
                 TimelinePlayback::Once
@@ -242,7 +248,7 @@ impl FigView {
             Action::PlayStateChangeRequested { playing } => { self.timeline_shell.update(cx, |clock, cx| clock.set_playing(*playing, cx)); }
             Action::LoopChangeRequested { looping } => { self.timeline_shell.update(cx, |clock, cx| clock.set_loop_playback(*looping, cx)); }
             Action::PlaybackChangeRequested { playback } => {
-                if *playback == TimelinePlayback::PingPong { notify_unavailable("Ping-pong playback", window, cx); }
+                if *playback == TimelinePlayback::PingPong { self.timeline_shell.update(cx, |clock, cx| clock.set_ping_pong_playback(cx)); }
                 else { self.timeline_shell.update(cx, |clock, cx| clock.set_loop_playback(*playback == TimelinePlayback::Loop, cx)); }
             }
             Action::SeekRequested { time_ms } => { self.timeline_shell.update(cx, |clock, cx| clock.set_playhead(i64::from(*time_ms) * 1000, cx)); }
@@ -279,16 +285,38 @@ impl FigView {
             Action::PropertyKeyframeRequested { property_id, time_ms, .. } => {
                 let operation = self.active_motion_clip.and_then(|clip_id| {
                     let doc = &self.item.read(cx).document()?.doc;
-                    let track = doc.motion.clip(clip_id)?.tracks.values().find(|track| track.id.to_string() == property_id.as_ref())?;
-                    let value = track.evaluate(*time_ms)?;
-                    let keyframe = Keyframe::new(KeyframeId::new(), *time_ms, value);
+                    let clip = doc.motion.clip(clip_id)?;
+                    let track = clip.tracks.values().find(|track| track.id.to_string() == property_id.as_ref())?;
+                    let time_ms = (*time_ms).min(clip.duration_ms);
+                    if track.keyframes.values().any(|keyframe| keyframe.time_ms == time_ms) {
+                        return None;
+                    }
+                    let value = track.evaluate(time_ms)?;
+                    let keyframe = Keyframe::new(KeyframeId::new(), time_ms, value);
                     Some(Operation::SetKeyframe { clip: clip_id, track: track.id, target: track.target, keyframe: keyframe.id, old: None, new: Some(keyframe) })
                 });
                 self.apply_inspector_operations(operation.into_iter().collect(), "Add keyframe", window, cx);
             }
             Action::AddKeyframeRequested { time_ms } => {
                 self.timeline_shell.update(cx, |clock, cx| clock.set_playhead(i64::from(*time_ms) * 1000, cx));
-                self.add_motion_keyframe(TimelineProperty::Opacity, cx);
+                let operations = self.active_motion_clip.and_then(|clip_id| {
+                    let doc = &self.item.read(cx).document()?.doc;
+                    let clip = doc.motion.clip(clip_id)?;
+                    let time_ms = (*time_ms).min(clip.duration_ms);
+                    Some(clip.tracks.values().filter(|track| doc.selection.contains(track.target.node)).filter_map(|track| {
+                        if track.keyframes.values().any(|keyframe| keyframe.time_ms == time_ms) {
+                            return None;
+                        }
+                        let value = track.evaluate(time_ms)?;
+                        let keyframe = Keyframe::new(KeyframeId::new(), time_ms, value);
+                        Some(Operation::SetKeyframe { clip: clip_id, track: track.id, target: track.target, keyframe: keyframe.id, old: None, new: Some(keyframe) })
+                    }).collect::<Vec<_>>())
+                }).unwrap_or_default();
+                if operations.is_empty() {
+                    show_canvas_notice("No new keyframes can be added at this time".into(), window, cx);
+                } else {
+                    self.apply_inspector_operations(operations, "Add keyframes", window, cx);
+                }
             }
             Action::KeyframesMoveRequested { .. } | Action::KeyframesDeleteRequested { .. } | Action::KeyframesDuplicateRequested { .. } | Action::EasingChangeRequested { .. } | Action::TrackTimingChangeRequested { .. } => {
                 let operations = self.timeline_edit_operations(action, cx);

@@ -17,10 +17,10 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::layout::{
-    ACTIVE_MODES_JSON, ASSETS_DIR, COMPONENTS_DIR, DEF_JSON, DOC_DIR, FLOW_START_JSON, LOOSE_DIR,
-    MASTER_FNX, MASTER_IDS, METADATA_JSON, MOTION_JSON, NODES_DIR, PAGE_FNX, PAGE_IDS, PAGE_JSON,
-    PAGES_DIR, SETS_JSON, VARIABLES_JSON, id_from_key, is_project_dir, json_key, read_json_file,
-    read_json_or, read_manifest, sorted_entries,
+    ACTIVE_MODES_JSON, ASSETS_DIR, COMPONENTS_DIR, DEF_JSON, DOC_DIR, FLOW_START_JSON, FLOWS_JSON,
+    LOOSE_DIR, MASTER_FNX, MASTER_IDS, METADATA_JSON, MOTION_JSON, NODES_DIR, PAGE_FNX, PAGE_IDS,
+    PAGE_JSON, PAGES_DIR, PRESENTATION_JSON, SETS_JSON, VARIABLES_JSON, id_from_key,
+    is_project_dir, json_key, read_json_file, read_json_or, read_manifest, sorted_entries,
 };
 
 /// Load a project directory back into a [`Doc`] plus its asset blobs.
@@ -92,6 +92,14 @@ fn read_project_tree_with_source_override_locked(
     let flow_start = read_json_or(&doc_dir.join(FLOW_START_JSON), Value::Null)?;
     if !flow_start.is_null() {
         root.insert("flow_start".to_owned(), flow_start);
+    }
+    root.insert(
+        "flows".to_owned(),
+        read_json_or(&doc_dir.join(FLOWS_JSON), json!([]))?,
+    );
+    let presentation = read_json_or(&doc_dir.join(PRESENTATION_JSON), Value::Null)?;
+    if !presentation.is_null() {
+        root.insert("presentation".to_owned(), presentation);
     }
 
     // Index component defs (and the variables read above) BEFORE decoding any

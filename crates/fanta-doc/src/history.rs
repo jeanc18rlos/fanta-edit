@@ -197,6 +197,8 @@ impl History {
         let mut active_modes = std::collections::BTreeMap::new();
         let mut motion = crate::motion::MotionLibrary::new();
         let mut flow_start = None;
+        let mut flows = Vec::new();
+        let mut presentation = None;
         let mut pages = Vec::new();
         let mut active_page = None;
         let mut ctx = OpCtx {
@@ -208,6 +210,8 @@ impl History {
             active_modes: &mut active_modes,
             motion: &mut motion,
             flow_start: &mut flow_start,
+            flows: &mut flows,
+            presentation: &mut presentation,
         };
         self.abort_with(&mut ctx)
     }
@@ -367,6 +371,8 @@ mod tests {
         active_modes: BTreeMap<VariableCollectionId, ModeId>,
         motion: crate::motion::MotionLibrary,
         flow_start: Option<NodeId>,
+        flows: Vec<crate::doc::Flow>,
+        presentation: Option<crate::doc::PresentationConfig>,
     }
     impl TestDoc {
         fn new() -> Self {
@@ -379,6 +385,8 @@ mod tests {
                 active_modes: BTreeMap::new(),
                 motion: crate::motion::MotionLibrary::new(),
                 flow_start: None,
+                flows: Vec::new(),
+                presentation: None,
             }
         }
         fn ctx(&mut self) -> OpCtx<'_> {
@@ -391,6 +399,8 @@ mod tests {
                 active_modes: &mut self.active_modes,
                 motion: &mut self.motion,
                 flow_start: &mut self.flow_start,
+                flows: &mut self.flows,
+                presentation: &mut self.presentation,
             }
         }
     }

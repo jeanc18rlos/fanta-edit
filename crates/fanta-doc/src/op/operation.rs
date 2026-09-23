@@ -4,6 +4,7 @@
 
 use crate::binding::BoundProp;
 use crate::component::{ComponentDef, ComponentPropDef, ComponentSet, ComponentSetMembership};
+use crate::doc::{Flow, PresentationConfig};
 use crate::id::{
     AnimationClipId, AnimationTrackId, ComponentId, ComponentPropId, KeyframeId, ModeId, NodeId,
     VariableCollectionId, VariableId,
@@ -391,6 +392,15 @@ pub enum Operation {
         old: Option<NodeId>,
         new: Option<NodeId>,
     },
+
+    /// Replace named prototype flows as one undoable change.
+    SetFlows { old: Vec<Flow>, new: Vec<Flow> },
+
+    /// Change the prototype's device and presentation surround.
+    SetPresentation {
+        old: Option<PresentationConfig>,
+        new: Option<PresentationConfig>,
+    },
 }
 
 impl Operation {
@@ -501,6 +511,8 @@ impl Operation {
             Self::RemoveReaction { .. } => "Remove Interaction",
             Self::SetReaction { .. } => "Edit Interaction",
             Self::SetFlowStart { .. } => "Set Flow Start",
+            Self::SetFlows { .. } => "Edit Prototype Flows",
+            Self::SetPresentation { .. } => "Set Presentation",
         }
     }
 }

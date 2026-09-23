@@ -2040,7 +2040,7 @@ pub fn artifact_op_impact(op: &Operation) -> ArtifactOpImpact {
         | SetAnimationTrack { .. }
         | SetKeyframe { .. } => Impact::Motion,
 
-        SetFlowStart { .. } => Impact::Flow,
+        SetFlowStart { .. } | SetFlows { .. } | SetPresentation { .. } => Impact::Flow,
     }
 }
 

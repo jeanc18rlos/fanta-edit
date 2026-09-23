@@ -20,12 +20,8 @@ use fanta_doc::{CanvasNode, Fill, NodeData, Operation, PathData, Stroke, Transfo
 use glam::DVec2;
 use smallvec::SmallVec;
 
-/// Stroke width baked into a committed freehand path.
-const PENCIL_STROKE_WIDTH: f64 = 2.0;
 /// Minimum screen-space travel between captured samples.
 const SAMPLE_PX: f64 = 3.0;
-/// RDP simplification tolerance, in world units.
-const SIMPLIFY_EPSILON: f64 = 1.2;
 
 /// State machine for the pencil tool.
 #[derive(Debug, Default)]
@@ -154,7 +150,7 @@ impl PencilTool {
     /// Simplify the captured points and commit an open stroked path. No-op for
     /// fewer than two distinct points.
     fn commit(&mut self, ctx: &mut ToolContext) {
-        let simplified = rdp(&self.points, SIMPLIFY_EPSILON);
+        let simplified = rdp(&self.points, ctx.stroke_smoothing);
         if simplified.len() < 2 {
             return;
         }
@@ -174,7 +170,7 @@ impl PencilTool {
         let mut strokes: SmallVec<[Stroke; 1]> = SmallVec::new();
         strokes.push(Stroke {
             paint: Fill::solid(ctx.new_shape_fill),
-            width: PENCIL_STROKE_WIDTH,
+            width: ctx.new_stroke_width,
             cap: Default::default(),
             join: Default::default(),
             miter_limit: 4.0,
@@ -192,6 +188,7 @@ impl PencilTool {
             local_size: None,
             parametric: None,
         }));
+        node.blend_mode = ctx.new_blend_mode;
         node.transform = Transform2D::translation(p0.x, p0.y);
         ctx.place_new_node_on_active_page(&mut node);
         let id = node.id;
@@ -347,6 +344,39 @@ mod tests {
             _ => panic!("expected vector"),
         }
         assert!(!tool.is_drafting(), "sticky tool resets after a stroke");
+    }
+
+    #[test]
+    fn stroke_uses_active_draw_settings_and_survives_undo() {
+        let (mut doc, mut viewport, snap, size) = ctx_pieces();
+        let mut ctx = ToolContext::new(&mut doc, &mut viewport, snap, size);
+        ctx.new_shape_fill = fanta_doc::Color::rgba(0x12, 0x34, 0x56, 0x80);
+        ctx.new_stroke_width = 18.0;
+        ctx.stroke_smoothing = 0.2;
+        ctx.new_blend_mode = fanta_doc::BlendMode::Multiply;
+        let mut tool = PencilTool::new();
+        tool.handle_event(&mut ctx, press([100.0, 100.0]));
+        tool.handle_event(&mut ctx, mv([150.0, 105.0]));
+        tool.handle_event(&mut ctx, release([200.0, 110.0]));
+
+        let id = doc.scene.roots()[0];
+        let node = doc.scene.get(id).expect("drawn node");
+        assert_eq!(node.blend_mode, fanta_doc::BlendMode::Multiply);
+        let NodeData::Vector(vector) = &node.data else {
+            panic!("drawn node should be vector");
+        };
+        assert_eq!(vector.strokes[0].width, 18.0);
+        assert_eq!(
+            vector.strokes[0].paint,
+            Fill::solid(fanta_doc::Color::rgba(0x12, 0x34, 0x56, 0x80))
+        );
+        assert!(doc.undo().expect("undo stroke"));
+        assert_eq!(doc.scene.len(), 0);
+        assert!(doc.redo().expect("redo stroke"));
+        assert_eq!(
+            doc.scene.get(id).expect("redone stroke").blend_mode,
+            fanta_doc::BlendMode::Multiply
+        );
     }
 
     #[test]

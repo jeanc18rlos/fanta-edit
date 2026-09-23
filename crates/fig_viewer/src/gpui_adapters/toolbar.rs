@@ -2,9 +2,11 @@
 //! intents onto FigView's existing tool, mode, zoom, and edit entry points,
 //! and echoes FigView state back into the toolbar entity.
 
+use fanta_doc::{Color as FantaColor, Doc, Fill, NodeData, NodeId};
 use fanta_gpui::toolbar::{
-    DevToolbarOptions, DrawToolbarOptions, EditorToolbar, MotionToolbarOptions,
-    ToolbarChromeControl, ToolbarCommand, ToolbarMode, ToolbarTool,
+    DevToolbarOptions, DrawBrushCapabilities, DrawToolbarAction, DrawToolbarOptions, EditorToolbar,
+    MotionToolbarOptions, ToolbarChromeControl, ToolbarCommand, ToolbarMode,
+    ToolbarSecondaryControl, ToolbarTool,
 };
 use gpui::{AppContext as _, Context, Entity, SharedString, Subscription, Window};
 #[cfg(test)]
@@ -48,6 +50,10 @@ pub(crate) const IMPLEMENTED_COMMANDS: &[ToolbarCommand] = &[
     ToolbarCommand::Group,
     ToolbarCommand::Ungroup,
     ToolbarCommand::FrameSelection,
+    ToolbarCommand::AddAutoLayout,
+    ToolbarCommand::CreateComponent,
+    ToolbarCommand::DetachInstance,
+    ToolbarCommand::MakePrototype,
     ToolbarCommand::GenerateImage,
     ToolbarCommand::GenerateVideo,
     ToolbarCommand::GenerateVector,
@@ -59,6 +65,72 @@ pub(crate) const IMPLEMENTED_COMMANDS: &[ToolbarCommand] = &[
     ToolbarCommand::TranslateText,
     ToolbarCommand::RenameLayers,
 ];
+
+pub(crate) const SUPPORTED_TOOLS: &[ToolbarTool] = &[
+    ToolbarTool::Move,
+    ToolbarTool::Hand,
+    ToolbarTool::PathSelect,
+    ToolbarTool::NodeEdit,
+    ToolbarTool::Frame,
+    ToolbarTool::Section,
+    ToolbarTool::Slice,
+    ToolbarTool::Rectangle,
+    ToolbarTool::Line,
+    ToolbarTool::Ellipse,
+    ToolbarTool::Polygon,
+    ToolbarTool::Star,
+    ToolbarTool::Pen,
+    ToolbarTool::Pencil,
+    ToolbarTool::Text,
+    ToolbarTool::Comment,
+    ToolbarTool::Actions,
+    ToolbarTool::ColorPicker,
+    ToolbarTool::Code,
+    ToolbarTool::Variables,
+    ToolbarTool::Inspect,
+    ToolbarTool::MotionSelect,
+    ToolbarTool::AddKeyframe,
+    ToolbarTool::PlayPreview,
+];
+
+pub(crate) const SUPPORTED_SECONDARY_CONTROLS: &[ToolbarSecondaryControl] = &[
+    ToolbarSecondaryControl::MotionPlayPause,
+    ToolbarSecondaryControl::MotionLoop,
+    ToolbarSecondaryControl::MotionAddKeyframe,
+    ToolbarSecondaryControl::MotionAnimationStyle,
+];
+
+pub(crate) fn draw_sample_color(doc: &Doc, page: Option<NodeId>) -> Option<FantaColor> {
+    let mut selected = doc.selection.iter().copied();
+    match (selected.next(), selected.next()) {
+        (Some(id), None) => {
+            let node = doc.scene.get(id)?;
+            match &node.data {
+                NodeData::Vector(vector) => vector.fills.last().and_then(Fill::solid_color),
+                NodeData::Boolean(boolean) => boolean.fills.last().and_then(Fill::solid_color),
+                NodeData::Group(group) => group
+                    .background_fills
+                    .last()
+                    .or(group.background.as_ref())
+                    .and_then(Fill::solid_color),
+                NodeData::Text(text) => Some(text.style.color),
+                _ => None,
+            }
+        }
+        (None, None) => {
+            let page = page.or_else(|| doc.active_page())?;
+            let node = doc.scene.get(page)?;
+            let NodeData::Group(group) = &node.data else {
+                return None;
+            };
+            match group.background_fills.last().or(group.background.as_ref()) {
+                Some(fill) => fill.solid_color(),
+                None => Some(crate::properties_ops::DEFAULT_PAGE_BACKGROUND),
+            }
+        }
+        _ => None,
+    }
+}
 
 /// The entrance presets fig_viewer's Motion inspector can author — the same
 /// catalog as `motion_panel.rs`'s `AnimationProperty` preset labels (Position,
@@ -199,6 +271,14 @@ impl ToolbarAdapter {
                 cx,
             );
             toolbar.set_commands(IMPLEMENTED_COMMANDS.iter().copied(), cx);
+            toolbar.set_supported_tools(SUPPORTED_TOOLS.iter().copied(), cx);
+            toolbar
+                .set_supported_secondary_controls(SUPPORTED_SECONDARY_CONTROLS.iter().copied(), cx);
+            toolbar.set_draw_brush_capabilities(DrawBrushCapabilities::VECTOR_PENCIL, cx);
+            toolbar.set_supported_draw_actions(
+                [DrawToolbarAction::SelectAll, DrawToolbarAction::Deselect],
+                cx,
+            );
             toolbar
         });
         let subscription = cx.subscribe_in(&panel, window, FigView::handle_toolbar_action);
@@ -233,14 +313,15 @@ impl ToolbarAdapter {
     #[cfg(not(test))]
     fn record_option_push(&self) {}
 
-    /// Accepts a `MotionAnimationStyle` control change when the candidate is
-    /// in the host catalog. Returns whether the accepted style changed; the
-    /// echo happens on the next render-time [`Self::refresh`].
+    /// Accepts a style command from the host catalog. Selecting the active
+    /// style still applies a new preset to the current layer.
     pub(crate) fn accept_animation_style(&mut self, style: &SharedString) -> bool {
-        if self.animation_style == *style || !motion_animation_styles().contains(style) {
+        if !motion_animation_styles().contains(style) {
             return false;
         }
-        self.animation_style = style.clone();
+        if self.animation_style != *style {
+            self.animation_style = style.clone();
+        }
         true
     }
 
@@ -647,6 +728,32 @@ mod echo_tests {
         doc.selection.select_only(target_id);
         doc.history = Default::default();
         doc
+    }
+
+    #[test]
+    fn draw_color_sampler_uses_the_selected_fill_or_active_page() {
+        let mut doc = test_doc();
+        let selected = doc.selection.iter().next().copied().expect("selected text");
+        let text_color = match &doc.scene.get(selected).expect("text layer").data {
+            NodeData::Text(text) => text.style.color,
+            _ => panic!("fixture must select text"),
+        };
+        assert_eq!(draw_sample_color(&doc, None), Some(text_color));
+
+        doc.selection.clear();
+        assert_eq!(
+            draw_sample_color(&doc, None),
+            Some(crate::properties_ops::DEFAULT_PAGE_BACKGROUND)
+        );
+
+        let page = doc.active_page().expect("active page");
+        let page_node = doc.scene.get_mut(page).expect("page node");
+        let NodeData::Group(group) = &mut page_node.data else {
+            panic!("page must be a group");
+        };
+        let color = FantaColor::rgb(12, 34, 56);
+        group.background = Some(Fill::solid(color));
+        assert_eq!(draw_sample_color(&doc, Some(page)), Some(color));
     }
 
     async fn setup(
@@ -1931,6 +2038,30 @@ mod echo_tests {
             );
         });
 
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.clear();
+                ((), crate::document::DocChange::Selection)
+            });
+        });
+        toolbar.update_in(cx, |_, _, cx| {
+            cx.emit(ToolbarAction::ControlChangeRequested {
+                mode: ToolbarMode::Motion,
+                control: ToolbarSecondaryControl::MotionAnimationStyle,
+                value: ToolbarControlValue::Choice("Scale in".into()),
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            toolbar.read_with(cx, |toolbar, _| toolbar
+                .motion_options()
+                .animation_style
+                .clone()),
+            SharedString::from("Fade in"),
+            "without a selected layer, the style control must not claim it applied a preset"
+        );
+
         // A candidate outside the host catalog is refused, not echoed.
         toolbar.update_in(cx, |_, _, cx| {
             cx.emit(ToolbarAction::ControlChangeRequested {
@@ -2014,6 +2145,129 @@ mod echo_tests {
             "zoom-to-fit must center the page contents, got {:?}",
             viewport.center
         );
+    }
+
+    #[gpui::test]
+    async fn structural_toolbar_commands_create_layout_and_component(cx: &mut TestAppContext) {
+        let (view, toolbar, mut cx) = setup(cx).await;
+        let cx = &mut cx;
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        let original = item.read_with(cx, |item, _| {
+            item.doc()
+                .expect("document")
+                .selection
+                .iter()
+                .next()
+                .copied()
+                .expect("selected text")
+        });
+
+        toolbar.update_in(cx, |_, _, cx| {
+            cx.emit(ToolbarAction::CommandInvoked {
+                command: ToolbarCommand::AddAutoLayout,
+            });
+        });
+        cx.run_until_parked();
+        let frame = item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let frame = doc
+                .selection
+                .iter()
+                .next()
+                .copied()
+                .expect("selected frame");
+            assert_ne!(frame, original);
+            let NodeData::Group(group) = &doc.scene.get(frame).expect("frame").data else {
+                panic!("auto layout must wrap the text in a frame");
+            };
+            assert!(group.auto_layout.is_some());
+            assert_eq!(doc.scene.get(original).expect("text").parent, Some(frame));
+            frame
+        });
+
+        toolbar.update_in(cx, |_, _, cx| {
+            cx.emit(ToolbarAction::CommandInvoked {
+                command: ToolbarCommand::CreateComponent,
+            });
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert!(
+                doc.components
+                    .defs
+                    .values()
+                    .any(|definition| definition.root == frame)
+            );
+        });
+
+        toolbar.update_in(cx, |_, _, cx| {
+            cx.emit(ToolbarAction::CommandInvoked {
+                command: ToolbarCommand::MakePrototype,
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            view.read_with(cx, |view, cx| view.editor_mode(cx)),
+            EditorMode::Prototype
+        );
+    }
+
+    #[gpui::test]
+    async fn toolbar_color_picker_opens_for_an_empty_page(cx: &mut TestAppContext) {
+        let (view, toolbar, mut cx) = setup(cx).await;
+        let cx = &mut cx;
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.clear();
+                ((), crate::document::DocChange::Selection)
+            });
+        });
+        cx.simulate_resize(size(px(1200.), px(900.)));
+        cx.run_until_parked();
+
+        toolbar.update_in(cx, |_, _, cx| {
+            cx.emit(ToolbarAction::ToolChangeRequested {
+                mode: ToolbarMode::Design,
+                tool: ToolbarTool::ColorPicker,
+            });
+        });
+        cx.run_until_parked();
+
+        assert!(
+            cx.debug_bounds("color-picker-spectrum").is_some(),
+            "the toolbar should open the visible design inspector color picker"
+        );
+    }
+
+    #[gpui::test]
+    async fn motion_toolbar_shows_only_working_secondary_controls(cx: &mut TestAppContext) {
+        let (view, _, mut cx) = setup(cx).await;
+        let cx = &mut cx;
+        cx.simulate_resize(size(px(1200.), px(900.)));
+        view.update_in(cx, |view, _, cx| {
+            view.set_editor_mode(EditorMode::Motion, cx);
+        });
+        cx.run_until_parked();
+
+        for selector in [
+            "toolbar-secondary-motion-play",
+            "toolbar-secondary-motion-loop",
+            "toolbar-secondary-motion-keyframe",
+            "toolbar-secondary-motion-style",
+        ] {
+            assert!(cx.debug_bounds(selector).is_some(), "{selector} is missing");
+        }
+        for selector in [
+            "toolbar-secondary-motion-autokey",
+            "toolbar-secondary-motion-timeline",
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_none(),
+                "{selector} is still visible"
+            );
+        }
     }
 
     fn selection(view: &Entity<FigView>, cx: &mut VisualTestContext) -> Vec<fanta_doc::NodeId> {

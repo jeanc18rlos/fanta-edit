@@ -82,6 +82,8 @@ pub(crate) const VARIABLES_JSON: &str = "variables.json";
 pub(crate) const ACTIVE_MODES_JSON: &str = "active_modes.json";
 pub(crate) const MOTION_JSON: &str = "motion.json";
 pub(crate) const FLOW_START_JSON: &str = "flow_start.json";
+pub(crate) const FLOWS_JSON: &str = "flows.json";
+pub(crate) const PRESENTATION_JSON: &str = "presentation.json";
 
 pub(crate) const GITIGNORE_NAME: &str = ".gitignore";
 /// Derived/transient directories and OS noise stay out of history.
@@ -132,6 +134,8 @@ doc/
   active_modes.json              # which mode is active per variable collection
   motion.json                    # animation clips, tracks, and keyframes
   flow_start.json                # prototype start page (or null)
+  flows.json                     # named prototype starting points
+  presentation.json              # prototype device and surround color
 pages/<page-slug>/
   page.json                      # { "id": "n_…", "name": ..., "order": N }
   page.fnx                       # the page's node tree as readable source  <- edit this
