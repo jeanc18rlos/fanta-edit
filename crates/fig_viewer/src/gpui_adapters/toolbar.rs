@@ -84,6 +84,11 @@ pub(crate) const SUPPORTED_TOOLS: &[ToolbarTool] = &[
     ToolbarTool::Pencil,
     ToolbarTool::Eraser,
     ToolbarTool::RectangleSelect,
+    ToolbarTool::EllipseSelect,
+    ToolbarTool::Lasso,
+    ToolbarTool::PolygonalLasso,
+    ToolbarTool::MagicWand,
+    ToolbarTool::Crop,
     ToolbarTool::Text,
     ToolbarTool::Comment,
     ToolbarTool::Actions,
@@ -139,6 +144,8 @@ pub(crate) fn draw_capabilities(tool: ToolKind) -> DrawBrushCapabilities {
     match tool {
         ToolKind::Brush => DrawBrushCapabilities {
             brush_tip: true,
+            hardness: true,
+            flow: true,
             ..DrawBrushCapabilities::VECTOR_PENCIL
         },
         ToolKind::Pencil => DrawBrushCapabilities::VECTOR_PENCIL,
@@ -193,6 +200,11 @@ pub(crate) fn toolbar_tool(kind: ToolKind) -> ToolbarTool {
         ToolKind::Select => ToolbarTool::Move,
         ToolKind::PathSelect => ToolbarTool::PathSelect,
         ToolKind::RectangleSelect => ToolbarTool::RectangleSelect,
+        ToolKind::EllipseSelect => ToolbarTool::EllipseSelect,
+        ToolKind::Lasso => ToolbarTool::Lasso,
+        ToolKind::PolygonalLasso => ToolbarTool::PolygonalLasso,
+        ToolKind::MagicWand => ToolbarTool::MagicWand,
+        ToolKind::Crop => ToolbarTool::Crop,
         ToolKind::NodeEdit => ToolbarTool::NodeEdit,
         ToolKind::Hand => ToolbarTool::Hand,
         ToolKind::Scale => ToolbarTool::Scale,
@@ -224,6 +236,11 @@ pub(crate) fn tool_kind(tool: ToolbarTool) -> Option<ToolKind> {
         ToolbarTool::Move => ToolKind::Select,
         ToolbarTool::PathSelect => ToolKind::PathSelect,
         ToolbarTool::RectangleSelect => ToolKind::RectangleSelect,
+        ToolbarTool::EllipseSelect => ToolKind::EllipseSelect,
+        ToolbarTool::Lasso => ToolKind::Lasso,
+        ToolbarTool::PolygonalLasso => ToolKind::PolygonalLasso,
+        ToolbarTool::MagicWand => ToolKind::MagicWand,
+        ToolbarTool::Crop => ToolKind::Crop,
         ToolbarTool::NodeEdit => ToolKind::NodeEdit,
         ToolbarTool::Hand => ToolKind::Hand,
         ToolbarTool::Scale => ToolKind::Scale,
@@ -285,7 +302,7 @@ impl ToolbarAdapter {
     pub(crate) fn new(window: &mut Window, cx: &mut Context<FigView>) -> Self {
         let initial = (ToolbarMode::Design, ToolbarTool::Move, 100);
         let mut draw_options = DrawToolbarOptions::default();
-        draw_options.brush_tips = ["Round", "Flat", "Ink"]
+        draw_options.brush_tips = ["Round", "Soft round", "Flat", "Ink"]
             .into_iter()
             .map(Into::into)
             .collect();
@@ -307,7 +324,13 @@ impl ToolbarAdapter {
                 .set_draw_selection_capabilities(DrawSelectionCapabilities::VECTOR_RECTANGLE, cx);
             toolbar.set_draw_options(draw_options.clone(), cx);
             toolbar.set_supported_draw_actions(
-                [DrawToolbarAction::SelectAll, DrawToolbarAction::Deselect],
+                [
+                    DrawToolbarAction::SelectAll,
+                    DrawToolbarAction::Deselect,
+                    DrawToolbarAction::InvertSelection,
+                    DrawToolbarAction::ApplyCrop,
+                    DrawToolbarAction::CancelCrop,
+                ],
                 cx,
             );
             toolbar
@@ -405,7 +428,14 @@ impl ToolbarAdapter {
             });
         }
 
-        let selection_capabilities = if tool == ToolKind::RectangleSelect {
+        let selection_capabilities = if matches!(
+            tool,
+            ToolKind::RectangleSelect
+                | ToolKind::EllipseSelect
+                | ToolKind::Lasso
+                | ToolKind::PolygonalLasso
+                | ToolKind::MagicWand
+        ) {
             DrawSelectionCapabilities::VECTOR_RECTANGLE
         } else {
             DrawSelectionCapabilities::default()
@@ -479,6 +509,11 @@ mod tests {
             ToolKind::Select,
             ToolKind::PathSelect,
             ToolKind::RectangleSelect,
+            ToolKind::EllipseSelect,
+            ToolKind::Lasso,
+            ToolKind::PolygonalLasso,
+            ToolKind::MagicWand,
+            ToolKind::Crop,
             ToolKind::NodeEdit,
             ToolKind::Hand,
             ToolKind::Scale,
@@ -517,6 +552,8 @@ mod tests {
             assert_eq!(tool_kind(toolbar), Some(kind));
         }
         assert!(draw_capabilities(ToolKind::Brush).brush_tip);
+        assert!(draw_capabilities(ToolKind::Brush).hardness);
+        assert!(draw_capabilities(ToolKind::Brush).flow);
         assert!(!draw_capabilities(ToolKind::Pencil).brush_tip);
         assert!(!draw_capabilities(ToolKind::Eraser).brush_tip);
         assert!(!draw_capabilities(ToolKind::Eraser).paint);
@@ -537,11 +574,6 @@ mod tests {
         assert_eq!(
             unmapped,
             vec![
-                ToolbarTool::EllipseSelect,
-                ToolbarTool::Lasso,
-                ToolbarTool::PolygonalLasso,
-                ToolbarTool::MagicWand,
-                ToolbarTool::Crop,
                 ToolbarTool::Arrow,
                 ToolbarTool::ImageVideo,
                 ToolbarTool::Annotation,

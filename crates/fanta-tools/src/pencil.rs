@@ -22,16 +22,20 @@ use smallvec::SmallVec;
 
 /// Minimum screen-space travel between captured samples.
 const SAMPLE_PX: f64 = 3.0;
+const MAX_PREVIEW_SAMPLES: usize = 2048;
 
 /// State machine for the pencil tool.
 #[derive(Debug, Default)]
 pub struct PencilTool {
     /// Captured world-space points for the in-flight stroke.
     points: Vec<DVec2>,
+    preview_points: Vec<DVec2>,
     /// True while the pointer is down capturing a stroke.
     active: bool,
     /// Screen position of the last accepted sample (sampling throttle).
     last_sample_screen: Option<DVec2>,
+    last_preview_screen: Option<DVec2>,
+    preview_sample_px: f64,
 }
 
 impl PencilTool {
@@ -74,8 +78,34 @@ impl Tool for PencilTool {
 impl PencilTool {
     fn reset(&mut self) {
         self.points.clear();
+        self.preview_points.clear();
         self.active = false;
         self.last_sample_screen = None;
+        self.last_preview_screen = None;
+        self.preview_sample_px = SAMPLE_PX;
+    }
+
+    fn add_sample(&mut self, world: DVec2, screen: DVec2) {
+        self.points.push(world);
+        self.last_sample_screen = Some(screen);
+        if self
+            .last_preview_screen
+            .is_some_and(|last| (screen - last).length() < self.preview_sample_px)
+        {
+            return;
+        }
+        self.preview_points.push(world);
+        self.last_preview_screen = Some(screen);
+        if self.preview_points.len() >= MAX_PREVIEW_SAMPLES {
+            let last = self.preview_points.len() - 1;
+            self.preview_points = self
+                .preview_points
+                .drain(..)
+                .enumerate()
+                .filter_map(|(index, point)| (index % 2 == 0 || index == last).then_some(point))
+                .collect();
+            self.preview_sample_px *= 2.0;
+        }
     }
 
     fn handle_pointer(&mut self, ctx: &mut ToolContext, p: PointerEvent) -> ToolResponse {
@@ -86,11 +116,10 @@ impl PencilTool {
                 ..
             } => {
                 let world = ctx.screen_to_world(DVec2::from(screen));
-                self.points.clear();
-                self.points.push(world);
+                self.reset();
+                self.add_sample(world, DVec2::from(screen));
                 self.active = true;
-                self.last_sample_screen = Some(DVec2::from(screen));
-                ToolResponse::cursor(CursorHint::Crosshair)
+                self.preview(ctx, None)
             }
             PointerEvent::Move { screen, .. } => {
                 if !self.active {
@@ -102,10 +131,9 @@ impl PencilTool {
                     .map(|last| (scr - last).length() >= SAMPLE_PX)
                     .unwrap_or(true);
                 if far_enough {
-                    self.points.push(ctx.screen_to_world(scr));
-                    self.last_sample_screen = Some(scr);
+                    self.add_sample(ctx.screen_to_world(scr), scr);
                 }
-                self.preview()
+                self.preview(ctx, Some(ctx.screen_to_world(scr)))
             }
             PointerEvent::Release {
                 screen,
@@ -135,13 +163,22 @@ impl PencilTool {
         ToolResponse::empty()
     }
 
-    /// Preview the captured stroke as straight segments between samples.
-    fn preview(&self) -> ToolResponse {
+    fn preview(&self, ctx: &ToolContext, pointer: Option<DVec2>) -> ToolResponse {
         let mut response = ToolResponse::cursor(CursorHint::Crosshair);
-        for pair in self.points.windows(2) {
-            response.overlays.push(ToolOverlay::PreviewLine {
-                world_start: [pair[0].x, pair[0].y],
-                world_end: [pair[1].x, pair[1].y],
+        let mut world_points = self.preview_points.clone();
+        if let Some(pointer) = pointer
+            && world_points.last() != Some(&pointer)
+        {
+            world_points.push(pointer);
+        }
+        if world_points.len() >= 2 {
+            response.overlays.push(ToolOverlay::PreviewPencilStroke {
+                world_points: world_points
+                    .iter()
+                    .map(|point| [point.x, point.y])
+                    .collect(),
+                color: ctx.new_shape_fill,
+                width: ctx.new_stroke_width,
             });
         }
         response
@@ -318,6 +355,18 @@ mod tests {
     }
 
     #[test]
+    fn long_stroke_keeps_full_geometry_with_bounded_preview() {
+        let mut tool = PencilTool::new();
+        tool.reset();
+        for index in 0..5000 {
+            let point = DVec2::new(index as f64 * 4.0, 100.0);
+            tool.add_sample(point, point);
+        }
+        assert_eq!(tool.point_count(), 5000);
+        assert!(tool.preview_points.len() < MAX_PREVIEW_SAMPLES);
+    }
+
+    #[test]
     fn release_commits_simplified_open_path() {
         let (mut doc, mut viewport, snap, size) = ctx_pieces();
         let mut ctx = ToolContext::new(&mut doc, &mut viewport, snap, size);
@@ -356,7 +405,14 @@ mod tests {
         ctx.new_blend_mode = fanta_doc::BlendMode::Multiply;
         let mut tool = PencilTool::new();
         tool.handle_event(&mut ctx, press([100.0, 100.0]));
-        tool.handle_event(&mut ctx, mv([150.0, 105.0]));
+        let preview = tool.handle_event(&mut ctx, mv([150.0, 105.0]));
+        assert!(matches!(
+            preview.overlays.as_slice(),
+            [ToolOverlay::PreviewPencilStroke { world_points, color, width }]
+                if world_points.len() == 2
+                    && *color == ctx.new_shape_fill
+                    && *width == ctx.new_stroke_width
+        ));
         tool.handle_event(&mut ctx, release([200.0, 110.0]));
 
         let id = doc.scene.roots()[0];

@@ -45,9 +45,11 @@
 //! [`Transaction`]: fanta_doc::Transaction
 //! [`Tool`]: crate::tool::Tool
 
+mod crop;
 mod dispatch;
 mod mv;
 mod rectangle;
+mod region;
 mod reparent;
 mod resize;
 mod rotate;
@@ -56,5 +58,10 @@ mod state;
 #[cfg(test)]
 mod tests;
 
+pub use crop::CropTool;
 pub use rectangle::{RectangleSelectTool, RectangleSelectionOperation};
+pub use region::{
+    DrawSelectionRegion, DrawSelectionShape, DrawShapeOperation, RegionSelectTool,
+    RegionSelectionKind, apply_draw_region, draw_content_candidates, draw_content_target,
+};
 pub use state::SelectTool;

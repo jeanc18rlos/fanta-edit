@@ -3111,6 +3111,53 @@ impl CanvasElement {
                         let end = project(DVec2::new(world_end[0], world_end[1]));
                         paint_line(start, end, accent, window);
                     }
+                    ToolOverlay::PreviewBrushStroke {
+                        world_outline,
+                        color,
+                    } => {
+                        let mut positions = world_outline
+                            .iter()
+                            .map(|world| project(DVec2::new(world[0], world[1])));
+                        if let Some(first) = positions.next() {
+                            let mut builder = PathBuilder::fill();
+                            builder.move_to(first);
+                            for position in positions {
+                                builder.line_to(position);
+                            }
+                            builder.close();
+                            match builder.build() {
+                                Ok(path) => window.paint_path(path, overlay_paint(*color)),
+                                Err(error) => {
+                                    log::warn!("failed to build brush preview: {error:#}")
+                                }
+                            }
+                        }
+                    }
+                    ToolOverlay::PreviewPencilStroke {
+                        world_points,
+                        color,
+                        width,
+                    } => {
+                        let screen_width = width * viewport.zoom;
+                        if screen_width.is_finite() && screen_width > 0.0 {
+                            let mut positions = world_points
+                                .iter()
+                                .map(|world| project(DVec2::new(world[0], world[1])));
+                            if let Some(first) = positions.next() {
+                                let mut builder = PathBuilder::stroke(px(screen_width as f32));
+                                builder.move_to(first);
+                                for position in positions {
+                                    builder.line_to(position);
+                                }
+                                match builder.build() {
+                                    Ok(path) => window.paint_path(path, overlay_paint(*color)),
+                                    Err(error) => {
+                                        log::warn!("failed to build pencil preview: {error:#}")
+                                    }
+                                }
+                            }
+                        }
+                    }
                     ToolOverlay::PathAnchor { world, selected } => {
                         let center = project(DVec2::new(world[0], world[1]));
                         let anchor_px = px(6.);
@@ -3300,6 +3347,10 @@ fn paint_line(start: Point<Pixels>, end: Point<Pixels>, color: Hsla, window: &mu
         Ok(path) => window.paint_path(path, color),
         Err(error) => log::warn!("failed to build canvas overlay line: {error:#}"),
     }
+}
+
+fn overlay_paint(color: fanta_doc::Color) -> Hsla {
+    gpui::rgba(u32::from_be_bytes([color.r, color.g, color.b, color.a])).into()
 }
 
 fn paint_ellipse_outline(bounds: Bounds<Pixels>, color: Hsla, window: &mut Window) {

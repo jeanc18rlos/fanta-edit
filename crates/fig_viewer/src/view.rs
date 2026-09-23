@@ -8,7 +8,10 @@ mod properties_inspector;
 #[cfg(feature = "fanta-gpui-ui")]
 mod timeline_adapter;
 
-use std::collections::HashSet;
+use std::{
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    sync::Arc,
+};
 
 use anyhow::{Context as _, Result};
 use fanta_canvas::HitPrecision;
@@ -174,6 +177,16 @@ actions!(
         ActivatePathSelectTool,
         /// Select vector layers with a drawn rectangle.
         ActivateRectangleSelectTool,
+        /// Select vector and image content inside an ellipse.
+        ActivateEllipseSelectTool,
+        /// Select vector and image content with a freehand outline.
+        ActivateLassoTool,
+        /// Select vector and image content with clicked polygon corners.
+        ActivatePolygonalLassoTool,
+        /// Select matching vector paints and image assets.
+        ActivateMagicWandTool,
+        /// Crop vector and image content with a rectangular clip.
+        ActivateCropTool,
         /// Activate the text-on-path tool (placeholder).
         ActivateTextPathTool,
         /// Activate the comment tool (click the canvas to pin a comment).
@@ -197,6 +210,11 @@ fn action_for_kind(kind: ToolKind) -> Box<dyn Action> {
         ToolKind::Select => Box::new(ActivateSelectTool),
         ToolKind::PathSelect => Box::new(ActivatePathSelectTool),
         ToolKind::RectangleSelect => Box::new(ActivateRectangleSelectTool),
+        ToolKind::EllipseSelect => Box::new(ActivateEllipseSelectTool),
+        ToolKind::Lasso => Box::new(ActivateLassoTool),
+        ToolKind::PolygonalLasso => Box::new(ActivatePolygonalLassoTool),
+        ToolKind::MagicWand => Box::new(ActivateMagicWandTool),
+        ToolKind::Crop => Box::new(ActivateCropTool),
         ToolKind::NodeEdit => Box::new(ActivateNodeEditTool),
         ToolKind::Hand => Box::new(ActivateHandTool),
         ToolKind::Scale => Box::new(ActivateScaleTool),
@@ -327,6 +345,11 @@ pub struct FigView {
     #[cfg(target_os = "macos")]
     canvas_video_active: std::cell::Cell<bool>,
     pub(crate) tools: ToolShell,
+    wand_asset_map: Option<Arc<BTreeMap<AssetId, Vec<u8>>>>,
+    wand_decode_cache: HashMap<AssetId, Arc<image::RgbaImage>>,
+    wand_decode_order: VecDeque<AssetId>,
+    wand_generation: u64,
+    wand_override: Option<(NodeId, fanta_tools::select::DrawSelectionShape)>,
     pub(crate) comment_state: crate::comments_ui::CommentState,
     /// The last-used tool per toolbar group, so each group's button keeps
     /// showing the member you last picked (Figma behavior). Indexed by group.
@@ -620,6 +643,11 @@ impl FigView {
             #[cfg(target_os = "macos")]
             canvas_video_active: std::cell::Cell::new(true),
             tools: ToolShell::new(),
+            wand_asset_map: None,
+            wand_decode_cache: HashMap::new(),
+            wand_decode_order: VecDeque::new(),
+            wand_generation: 0,
+            wand_override: None,
             comment_state: crate::comments_ui::CommentState::default(),
             group_faces: crate::tools::initial_group_faces(),
             #[cfg(feature = "fanta-gpui-ui")]
@@ -1040,6 +1068,9 @@ impl FigView {
         let previous_mode = self.editor_mode(cx);
         if previous_mode == mode {
             return;
+        }
+        if previous_mode == EditorMode::Draw && mode != EditorMode::Draw {
+            self.tools.clear_draw_selection_region();
         }
         if self.prototype_player.is_some() && mode != EditorMode::Prototype {
             self.exit_prototype_session(cx);
@@ -1816,6 +1847,149 @@ impl FigView {
 
     // === Tool routing =====================================================
 
+    fn defer_bitmap_wand_press(
+        &mut self,
+        event: ToolEvent,
+        viewport: Viewport,
+        screen_size: DVec2,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.tools.kind() != ToolKind::MagicWand
+            || self.editor_mode(cx) != EditorMode::Draw
+            || self.wand_override.is_some()
+        {
+            return false;
+        }
+        let ToolEvent::Pointer(fanta_tools::PointerEvent::Press {
+            screen,
+            button: ToolButton::Primary,
+            ..
+        }) = event
+        else {
+            return false;
+        };
+        self.wand_generation = self.wand_generation.wrapping_add(1);
+        let generation = self.wand_generation;
+        let world_click =
+            fanta_canvas::screen_to_world(DVec2::from(screen), &viewport, screen_size);
+        let Some((target, bitmap, transform, revision, raw_assets)) =
+            self.item.read(cx).document().and_then(|document| {
+                let doc = &document.doc;
+                let target = fanta_canvas::hit_test_deep(
+                    &doc.scene,
+                    world_click,
+                    HitPrecision::Path,
+                    doc.active_page(),
+                )
+                .into_iter()
+                .find_map(|leaf| {
+                    fanta_tools::select::draw_content_target(&doc.scene, leaf, doc.active_page())
+                })?;
+                let node = doc.scene.get(target)?;
+                let NodeData::Bitmap(bitmap) = &node.data else {
+                    return None;
+                };
+                Some((
+                    target,
+                    bitmap.clone(),
+                    doc.scene.world_transform(target)?,
+                    doc.scene.revision(),
+                    document.raw_assets.clone(),
+                ))
+            })
+        else {
+            return false;
+        };
+
+        if self
+            .wand_asset_map
+            .as_ref()
+            .is_none_or(|previous| !Arc::ptr_eq(previous, &raw_assets))
+        {
+            self.wand_asset_map = Some(raw_assets.clone());
+            self.wand_decode_cache.clear();
+            self.wand_decode_order.clear();
+        }
+        let cached = self.wand_decode_cache.get(&bitmap.asset).cloned();
+        let asset = bitmap.asset;
+        #[cfg(feature = "fanta-gpui-ui")]
+        let (tolerance, contiguous) = self
+            .gpui_toolbar
+            .as_ref()
+            .map(|toolbar| {
+                (
+                    toolbar.draw_options.tolerance,
+                    toolbar.draw_options.contiguous,
+                )
+            })
+            .unwrap_or((32, true));
+        #[cfg(not(feature = "fanta-gpui-ui"))]
+        let (tolerance, contiguous) = (32, true);
+        let worker_assets = raw_assets.clone();
+        let work = cx.background_spawn(async move {
+            let pixels = match cached {
+                Some(pixels) => pixels,
+                None => Arc::new(crate::draw_wand::decode_wand_thumbnail(
+                    worker_assets
+                        .get(&asset)
+                        .context("The selected image data is unavailable")?,
+                )?),
+            };
+            let region = crate::draw_wand::bitmap_wand_region(
+                &pixels,
+                &bitmap,
+                transform,
+                world_click,
+                tolerance,
+                contiguous,
+            )?;
+            Ok::<_, anyhow::Error>((pixels, region))
+        });
+        cx.spawn(async move |this, cx| {
+            let computed = work.await;
+            this.update(cx, |this, cx| {
+                if this.wand_generation != generation
+                    || this.tools.kind() != ToolKind::MagicWand
+                    || this.editor_mode(cx) != EditorMode::Draw
+                    || !this.item.read(cx).document().is_some_and(|document| {
+                        Arc::ptr_eq(&document.raw_assets, &raw_assets)
+                            && document.doc.scene.revision() == revision
+                            && document.doc.scene.get(target).is_some_and(|node| {
+                                matches!(&node.data, NodeData::Bitmap(bitmap) if bitmap.asset == asset)
+                            })
+                    })
+                {
+                    return;
+                }
+                match computed {
+                    Ok((pixels, region)) => {
+                        if !this.wand_decode_cache.contains_key(&asset) {
+                            if this.wand_decode_order.len() >= 8 {
+                                if let Some(oldest) = this.wand_decode_order.pop_front() {
+                                    this.wand_decode_cache.remove(&oldest);
+                                }
+                            }
+                            this.wand_decode_order.push_back(asset);
+                            this.wand_decode_cache.insert(asset, pixels);
+                        }
+                        if let Some(region) = region {
+                            this.wand_override = Some((target, region));
+                            this.dispatch_tool_event(event, cx);
+                        }
+                    }
+                    Err(error) => {
+                        show_canvas_notice_deferred(
+                            format!("Magic Wand selection failed: {error:#}"),
+                            cx,
+                        );
+                    }
+                }
+            })
+        })
+        .detach_and_log_err(cx);
+        true
+    }
+
     /// Send one event through the active tool, tracking whether it changed
     /// document content, only the selection, or nothing.
     fn dispatch_tool_event(&mut self, event: ToolEvent, cx: &mut Context<Self>) {
@@ -1838,6 +2012,9 @@ impl FigView {
             let (width, height) = bounds_size(bounds);
             DVec2::new(width, height)
         };
+        if self.defer_bitmap_wand_press(event, viewport, screen_size, cx) {
+            return;
+        }
         let viewport_before = viewport;
         let mut viewport = viewport;
         let is_preview_move = matches!(
@@ -1877,6 +2054,8 @@ impl FigView {
                 f64::from(draw.options.size),
                 0.2 + f64::from(draw.options.smoothing) * 0.058,
                 blend,
+                draw.options.hardness,
+                draw.options.flow,
                 match draw.options.brush_tip.as_ref() {
                     "Flat" => fanta_tools::BrushStyle::Flat,
                     "Ink" => fanta_tools::BrushStyle::Ink,
@@ -1885,27 +2064,43 @@ impl FigView {
             ))
         })
         .flatten();
+        let draw_content_only = self.editor_mode(cx) == EditorMode::Draw;
         #[cfg(feature = "fanta-gpui-ui")]
-        let rectangle_selection_operation = (self.editor_mode(cx) == EditorMode::Draw
-            && active_tool == ToolKind::RectangleSelect)
-            .then(|| {
-                let operation = self.gpui_toolbar.as_ref()?.draw_options.selection_operation;
-                Some(match operation {
-                    fanta_gpui::toolbar::DrawSelectionOperation::Replace => {
-                        fanta_tools::select::RectangleSelectionOperation::Replace
-                    }
-                    fanta_gpui::toolbar::DrawSelectionOperation::Add => {
-                        fanta_tools::select::RectangleSelectionOperation::Add
-                    }
-                    fanta_gpui::toolbar::DrawSelectionOperation::Subtract => {
-                        fanta_tools::select::RectangleSelectionOperation::Subtract
-                    }
-                    fanta_gpui::toolbar::DrawSelectionOperation::Intersect => {
-                        fanta_tools::select::RectangleSelectionOperation::Intersect
-                    }
-                })
-            })
-            .flatten();
+        let draw_selection_settings = (draw_content_only
+            && matches!(
+                active_tool,
+                ToolKind::RectangleSelect
+                    | ToolKind::EllipseSelect
+                    | ToolKind::Lasso
+                    | ToolKind::PolygonalLasso
+                    | ToolKind::MagicWand
+                    | ToolKind::Crop
+            ))
+        .then(|| {
+            let options = &self.gpui_toolbar.as_ref()?.draw_options;
+            let operation = match options.selection_operation {
+                fanta_gpui::toolbar::DrawSelectionOperation::Replace => {
+                    fanta_tools::select::RectangleSelectionOperation::Replace
+                }
+                fanta_gpui::toolbar::DrawSelectionOperation::Add => {
+                    fanta_tools::select::RectangleSelectionOperation::Add
+                }
+                fanta_gpui::toolbar::DrawSelectionOperation::Subtract => {
+                    fanta_tools::select::RectangleSelectionOperation::Subtract
+                }
+                fanta_gpui::toolbar::DrawSelectionOperation::Intersect => {
+                    fanta_tools::select::RectangleSelectionOperation::Intersect
+                }
+            };
+            Some((
+                operation,
+                options.tolerance,
+                options.contiguous,
+                options.crop_ratio.to_string(),
+            ))
+        })
+        .flatten();
+        let wand_override = self.wand_override.take();
         let tools = &mut self.tools;
         let mut wants_exit = false;
         let mut content_changed = false;
@@ -1918,19 +2113,42 @@ impl FigView {
 
                 let mut ctx =
                     tool_context(&mut document.doc, &mut viewport, screen_size, active_tool);
+                ctx.draw_content_only = draw_content_only;
+                ctx.bitmap_wand_override = wand_override;
                 #[cfg(feature = "fanta-gpui-ui")]
-                if let Some((color, width, smoothing, blend, brush_style)) = draw_stroke {
+                if let Some((color, width, smoothing, blend, hardness, flow, brush_style)) =
+                    draw_stroke
+                {
                     if let Some(color) = color {
                         ctx.new_shape_fill = color;
                     }
                     ctx.new_stroke_width = width;
                     ctx.stroke_smoothing = smoothing;
                     ctx.new_blend_mode = blend;
+                    ctx.brush_hardness = hardness;
+                    ctx.brush_flow = flow;
                     ctx.brush_style = brush_style;
                 }
                 #[cfg(feature = "fanta-gpui-ui")]
-                if let Some(operation) = rectangle_selection_operation {
-                    ctx.rectangle_selection_operation = operation;
+                if let Some((operation, tolerance, contiguous, ratio)) = &draw_selection_settings {
+                    ctx.rectangle_selection_operation = *operation;
+                    ctx.selection_tolerance = *tolerance;
+                    ctx.selection_contiguous = *contiguous;
+                    ctx.crop_aspect_ratio = match ratio.as_str() {
+                        "1:1" => Some(1.0),
+                        "4:3" => Some(4.0 / 3.0),
+                        "3:2" => Some(3.0 / 2.0),
+                        "16:9" => Some(16.0 / 9.0),
+                        "Original" => ctx
+                            .doc
+                            .selection
+                            .iter()
+                            .next()
+                            .and_then(|id| ctx.doc.scene.world_bounds(*id))
+                            .filter(|bounds| bounds.height() > 0.0)
+                            .map(|bounds| bounds.width() / bounds.height()),
+                        _ => None,
+                    };
                 }
                 let response = tools.handle_event(&mut ctx, event);
                 wants_exit = response.wants_exit;
@@ -2089,6 +2307,10 @@ impl FigView {
     pub fn activate_tool(&mut self, kind: ToolKind, cx: &mut Context<Self>) {
         if kind.requires_editing() && !self.is_editable(cx) {
             return;
+        }
+        if self.tools.kind() != kind {
+            self.wand_generation = self.wand_generation.wrapping_add(1);
+            self.wand_override = None;
         }
         if kind != ToolKind::Comment {
             self.comment_state.draft = None;
@@ -2991,6 +3213,11 @@ impl FigView {
         // The inline text session owns its own selection; selecting canvas
         // nodes underneath it mid-typing is never what the user asked for.
         if self.text_edit.is_some() {
+            return;
+        }
+        #[cfg(feature = "fanta-gpui-ui")]
+        if self.editor_mode(cx) == EditorMode::Draw {
+            self.select_all_draw_content(cx);
             return;
         }
         self.item.update(cx, |item, cx| {
@@ -5546,6 +5773,21 @@ impl Render for FigView {
             .on_action(cx.listener(|this, _: &ActivateRectangleSelectTool, _, cx| {
                 this.activate_tool(ToolKind::RectangleSelect, cx)
             }))
+            .on_action(cx.listener(|this, _: &ActivateEllipseSelectTool, _, cx| {
+                this.activate_tool(ToolKind::EllipseSelect, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActivateLassoTool, _, cx| {
+                this.activate_tool(ToolKind::Lasso, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActivatePolygonalLassoTool, _, cx| {
+                this.activate_tool(ToolKind::PolygonalLasso, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActivateMagicWandTool, _, cx| {
+                this.activate_tool(ToolKind::MagicWand, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActivateCropTool, _, cx| {
+                this.activate_tool(ToolKind::Crop, cx)
+            }))
             .on_action(cx.listener(|this, _: &ActivateCommentTool, _, cx| {
                 this.activate_tool(ToolKind::Comment, cx)
             }))
@@ -6492,6 +6734,11 @@ impl Item for FigView {
                 #[cfg(target_os = "macos")]
                 canvas_video_active: std::cell::Cell::new(true),
                 tools: ToolShell::new(),
+                wand_asset_map: None,
+                wand_decode_cache: HashMap::new(),
+                wand_decode_order: VecDeque::new(),
+                wand_generation: 0,
+                wand_override: None,
                 comment_state: crate::comments_ui::CommentState::default(),
                 group_faces: crate::tools::initial_group_faces(),
                 #[cfg(feature = "fanta-gpui-ui")]
@@ -9763,8 +10010,21 @@ impl FigView {
             ToolbarAction::DrawActionInvoked { action } => {
                 use fanta_gpui::toolbar::DrawToolbarAction;
                 match action {
-                    DrawToolbarAction::SelectAll => self.select_all(&SelectAll, window, cx),
+                    DrawToolbarAction::SelectAll => self.select_all_draw_content(cx),
                     DrawToolbarAction::Deselect => self.deselect_canvas(cx),
+                    DrawToolbarAction::InvertSelection => self.invert_draw_selection(cx),
+                    DrawToolbarAction::ApplyCrop if self.tools.kind() == ToolKind::Crop => {
+                        self.dispatch_tool_event(
+                            key_event(LogicalKey::Enter, window.modifiers()),
+                            cx,
+                        );
+                    }
+                    DrawToolbarAction::CancelCrop if self.tools.kind() == ToolKind::Crop => {
+                        self.dispatch_tool_event(
+                            key_event(LogicalKey::Escape, window.modifiers()),
+                            cx,
+                        );
+                    }
                     other => notify_unavailable(&format!("{other:?}"), window, cx),
                 }
             }
@@ -9774,6 +10034,7 @@ impl FigView {
 
     #[cfg(feature = "fanta-gpui-ui")]
     fn deselect_canvas(&mut self, cx: &mut Context<Self>) {
+        self.tools.clear_draw_selection_region();
         self.item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
                 if document.doc.selection.is_empty() {
@@ -9782,6 +10043,40 @@ impl FigView {
                     document.doc.selection.clear();
                     ((), DocChange::Selection)
                 }
+            });
+        });
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn invert_draw_selection(&mut self, cx: &mut Context<Self>) {
+        self.tools.clear_draw_selection_region();
+        self.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let candidates = fanta_tools::select::draw_content_candidates(
+                    &document.doc.scene,
+                    document.doc.active_page(),
+                );
+                let inverted = candidates
+                    .into_iter()
+                    .filter(|id| !document.doc.selection.contains(*id))
+                    .collect::<Vec<_>>();
+                document.doc.selection.replace_with(inverted);
+                ((), DocChange::Selection)
+            });
+        });
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn select_all_draw_content(&mut self, cx: &mut Context<Self>) {
+        self.tools.clear_draw_selection_region();
+        self.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let candidates = fanta_tools::select::draw_content_candidates(
+                    &document.doc.scene,
+                    document.doc.active_page(),
+                );
+                document.doc.selection.replace_with(candidates);
+                ((), DocChange::Selection)
             });
         });
     }

@@ -18,7 +18,7 @@ use fanta_doc::{BlendMode, CanvasNode, Color, Doc, NodeId, Transform2D, Viewport
 use glam::DVec2;
 
 use crate::brush::BrushStyle;
-use crate::select::RectangleSelectionOperation;
+use crate::select::{DrawSelectionRegion, DrawSelectionShape, RectangleSelectionOperation};
 
 /// Neutral fill a shape-creation tool uses when the shell doesn't specify one
 /// (e.g. in unit tests that call [`ToolContext::new`] directly).
@@ -67,7 +67,15 @@ pub struct ToolContext<'a> {
     pub stroke_smoothing: f64,
     pub new_blend_mode: BlendMode,
     pub brush_style: BrushStyle,
+    pub brush_hardness: u8,
+    pub brush_flow: u8,
     pub rectangle_selection_operation: RectangleSelectionOperation,
+    pub selection_tolerance: u8,
+    pub selection_contiguous: bool,
+    pub crop_aspect_ratio: Option<f64>,
+    pub draw_content_only: bool,
+    pub draw_selection_region: Option<DrawSelectionRegion>,
+    pub bitmap_wand_override: Option<(NodeId, DrawSelectionShape)>,
 
     /// The subtree root the active editor view is scoped to (selection
     /// container-walk, deep hit-test base, and new-node parent). The shell sets
@@ -96,7 +104,15 @@ impl<'a> ToolContext<'a> {
             stroke_smoothing: 1.2,
             new_blend_mode: BlendMode::Normal,
             brush_style: BrushStyle::Round,
+            brush_hardness: 100,
+            brush_flow: 100,
             rectangle_selection_operation: RectangleSelectionOperation::Replace,
+            selection_tolerance: 32,
+            selection_contiguous: true,
+            crop_aspect_ratio: None,
+            draw_content_only: false,
+            draw_selection_region: None,
+            bitmap_wand_override: None,
             scope_root: None,
         }
     }

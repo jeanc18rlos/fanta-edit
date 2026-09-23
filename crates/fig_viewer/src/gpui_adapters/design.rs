@@ -13,7 +13,7 @@
 //! align/distribute. Gated off: layout grids, exports, style registries,
 //! aspect-ratio lock, smart selection, constraints, resize-to-fit, Tidy up,
 //! single-node align, text-path, and pattern/shader/media paint editing
-//! (gradient and image paints are displayed read-only).
+//! (image paints are displayed read-only).
 
 use std::collections::HashMap;
 
@@ -29,10 +29,11 @@ use fanta_gpui::design::{
     DesignComponentReference, DesignComponentRole, DesignCornerCapabilities, DesignEffect,
     DesignEffectKind, DesignEffectKindAvailability, DesignEffectSettings, DesignGradientStop,
     DesignLayout, DesignLayoutMode, DesignLetterSpacing, DesignLineHeight, DesignMaskType,
-    DesignPaint, DesignPaintKind, DesignPaintProperty, DesignPaintValue, DesignPanel,
-    DesignPanelAction, DesignPanelAutoLayoutDirection, DesignPanelAutoLayoutParticipation,
-    DesignPanelAutoLayoutWrap, DesignPanelCollection, DesignPanelEditPhase, DesignPanelNode,
-    DesignPanelNodeCapabilities, DesignPanelNodeKind, DesignPanelParentLayout, DesignPanelProperty,
+    DesignPaint, DesignPaintKind, DesignPaintPayload, DesignPaintProperty, DesignPaintTransform,
+    DesignPaintType, DesignPaintValue, DesignPanel, DesignPanelAction,
+    DesignPanelAutoLayoutDirection, DesignPanelAutoLayoutParticipation, DesignPanelAutoLayoutWrap,
+    DesignPanelCollection, DesignPanelEditPhase, DesignPanelNode, DesignPanelNodeCapabilities,
+    DesignPanelNodeKind, DesignPanelParentLayout, DesignPanelProperty,
     DesignPanelPropertyValueState, DesignPanelSection, DesignPanelTarget, DesignPanelValue,
     DesignSelectionHeaderCommand, DesignSelectionHeaderControl, DesignSelectionHeaderControlKind,
     DesignSelectionHeaderMenu, DesignSelectionHeaderMenuItem, DesignSelectionHeaderViewData,
@@ -302,8 +303,7 @@ pub(crate) fn selection_header_for_doc(
 
 /// One panel paint from a snapshot row. Paint ids are index-derived and
 /// re-minted on every echo — the engine has no stable paint identity.
-/// Gradients and media paints are displayed losslessly but read-only in
-/// wave 1; only solid paints accept edits.
+/// Media paints are displayed read-only; solids and gradients accept edits.
 fn design_paint(
     node_id: NodeId,
     collection: &str,
@@ -324,7 +324,14 @@ fn design_paint(
                 },
                 gradient_stops(gradient),
             );
-            paint.read_only = true;
+            if let DesignPaintPayload::Gradient(payload) = &mut paint.payload {
+                payload.transform = design_gradient_transform(gradient);
+            }
+            paint.opacity = crate::color_picker::gradient_stops(gradient)
+                .iter()
+                .map(|stop| stop.color.a)
+                .max()
+                .map_or(0.0, |alpha| f32::from(alpha) / 255.0 * 100.0);
             paint
         }
         _ => {
@@ -339,7 +346,9 @@ fn design_paint(
         }
     };
     paint.id = SharedString::from(format!("{node_id}-{collection}-{index}"));
-    if let Some(opacity) = snapshot.opacity_percent {
+    if let Some(opacity) = snapshot.opacity_percent
+        && !matches!(snapshot.kind, Some(EnginePaintKind::Gradient(_)))
+    {
         paint.opacity = opacity as f32;
     }
     paint.visible = snapshot.visible;
@@ -369,6 +378,135 @@ fn gradient_stops(gradient: &Gradient) -> Vec<DesignGradientStop> {
         .iter()
         .map(|stop| DesignGradientStop::new(stop.position, design_color(stop.color)))
         .collect()
+}
+
+fn design_gradient_transform(gradient: &Gradient) -> DesignPaintTransform {
+    let (primary, secondary, center) = match gradient {
+        Gradient::Linear { start, end, .. } => {
+            let axis = [end[0] - start[0], end[1] - start[1]];
+            let other = [axis[1], -axis[0]];
+            let center = [(start[0] + end[0]) / 2.0, (start[1] + end[1]) / 2.0];
+            (other, axis, center)
+        }
+        Gradient::Radial {
+            center,
+            radius,
+            handles,
+            ..
+        }
+        | Gradient::Diamond {
+            center,
+            radius,
+            handles,
+            ..
+        } => {
+            let handles = handles.unwrap_or([
+                [center[0] + radius, center[1]],
+                [center[0], center[1] + radius],
+            ]);
+            (
+                [
+                    2.0 * (handles[0][0] - center[0]),
+                    2.0 * (handles[0][1] - center[1]),
+                ],
+                [
+                    2.0 * (handles[1][0] - center[0]),
+                    2.0 * (handles[1][1] - center[1]),
+                ],
+                *center,
+            )
+        }
+        Gradient::Angular {
+            center,
+            start_angle,
+            ..
+        } => {
+            let (sine, cosine) = start_angle.sin_cos();
+            ([cosine, sine], [-sine, cosine], *center)
+        }
+    };
+    DesignPaintTransform {
+        m11: primary[0],
+        m12: primary[1],
+        m21: secondary[0],
+        m22: secondary[1],
+        tx: center[0] - (primary[0] + secondary[0]) * 0.5,
+        ty: center[1] - (primary[1] + secondary[1]) * 0.5,
+    }
+}
+
+fn gradient_from_design(
+    kind: DesignPaintKind,
+    stops: &[DesignGradientStop],
+    transform: DesignPaintTransform,
+) -> Option<Gradient> {
+    let components = [
+        transform.m11,
+        transform.m12,
+        transform.m21,
+        transform.m22,
+        transform.tx,
+        transform.ty,
+    ];
+    if !components.into_iter().all(f32::is_finite) || stops.len() < 2 {
+        return None;
+    }
+    let stops: Vec<fanta_doc::GradientStop> = stops
+        .iter()
+        .map(|stop| {
+            Some(fanta_doc::GradientStop {
+                position: stop
+                    .position
+                    .is_finite()
+                    .then_some(stop.position.clamp(0.0, 1.0))?,
+                color: fanta_color(stop.color),
+            })
+        })
+        .collect::<Option<_>>()?;
+    let point = |x: f32, y: f32| {
+        [
+            transform.m11 * x + transform.m21 * y + transform.tx,
+            transform.m12 * x + transform.m22 * y + transform.ty,
+        ]
+    };
+    let center = point(0.5, 0.5);
+    let primary = point(1.0, 0.5);
+    let secondary = point(0.5, 1.0);
+    let radius = (primary[0] - center[0]).hypot(primary[1] - center[1]);
+    Some(match kind {
+        DesignPaintKind::LinearGradient => Gradient::Linear {
+            start: point(0.5, 0.0),
+            end: point(0.5, 1.0),
+            stops,
+        },
+        DesignPaintKind::RadialGradient => Gradient::Radial {
+            center,
+            radius,
+            handles: Some([primary, secondary]),
+            stops,
+        },
+        DesignPaintKind::AngularGradient => {
+            let mut stops = stops;
+            if transform.m11 * transform.m22 - transform.m21 * transform.m12 < 0.0 {
+                for stop in &mut stops {
+                    stop.position = 1.0 - stop.position;
+                }
+                stops.sort_by(|left, right| left.position.total_cmp(&right.position));
+            }
+            Gradient::Angular {
+                center,
+                start_angle: transform.m12.atan2(transform.m11),
+                stops,
+            }
+        }
+        DesignPaintKind::DiamondGradient => Gradient::Diamond {
+            center,
+            radius,
+            handles: Some([primary, secondary]),
+            stops,
+        },
+        _ => return None,
+    })
 }
 
 /// The concatenated effect list: shadows first, then blurs, with ids that
@@ -743,6 +881,7 @@ pub(crate) fn design_node(
         // A text node's Fill section is its glyph color.
         let mut paint = design_solid_paint(typography.color);
         paint.id = SharedString::from(format!("{id}-fill-0"));
+        paint.blend_mode = design_blend_mode(node.blend_mode);
         out.fills = vec![paint];
     }
     if let Some(strokes) = &section.strokes {
@@ -768,6 +907,8 @@ pub(crate) fn design_node(
             }
         })
         .collect();
+    out.effect_capabilities.progressive_blur = false;
+    out.effect_capabilities.shadow_blend_mode = false;
     out.layout = design_layout(&section);
     out.typography = section.typography.as_ref().map(design_typography);
     out.is_mask = node.is_mask;
@@ -1055,6 +1196,23 @@ impl DesignAdapter {
                 cx,
             )
         });
+        panel.update(cx, |panel, cx| {
+            panel.set_supported_paint_types(
+                &[DesignPaintType::Solid, DesignPaintType::Gradient],
+                cx,
+            );
+            panel.set_paint_visibility_supported(false, cx);
+            let supported_blend_modes: Vec<_> = DesignBlendMode::ALL
+                .into_iter()
+                .filter(|mode| {
+                    !matches!(
+                        mode,
+                        DesignBlendMode::LinearBurn | DesignBlendMode::LinearDodge
+                    )
+                })
+                .collect();
+            panel.set_supported_blend_modes(&supported_blend_modes, cx);
+        });
         let subscription = cx.subscribe_in(&panel, window, FigView::handle_design_action);
         Self {
             panel,
@@ -1108,6 +1266,13 @@ impl FigView {
                 .copied()
                 .filter(|id| doc.scene.contains(*id))
                 .collect();
+            let text_selection = selection.len() == 1
+                && selection.first().is_some_and(|id| {
+                    matches!(
+                        doc.scene.get(*id).map(|node| &node.data),
+                        Some(NodeData::Text(_))
+                    )
+                });
             let key = DesignEchoKey {
                 selection: selection.clone(),
                 generation: document.render_generation(),
@@ -1131,9 +1296,9 @@ impl FigView {
                 .and_then(|adapter| adapter.panel.read(cx).page_view_data().cloned());
             let view_data =
                 build_design_view_data(document, &selection, page_index, editable, previous_page);
-            Some((key, view_data))
+            Some((key, view_data, text_selection))
         };
-        let Some((key, mut view_data)) = built else {
+        let Some((key, mut view_data, text_selection)) = built else {
             return;
         };
         // Granular, not `set_view_data` — see this method's docs. Page first,
@@ -1150,6 +1315,14 @@ impl FigView {
         };
         adapter.last_echo = Some(key);
         adapter.panel.update(cx, |panel, cx| {
+            panel.set_supported_paint_types(
+                if text_selection {
+                    &[DesignPaintType::Solid]
+                } else {
+                    &[DesignPaintType::Solid, DesignPaintType::Gradient]
+                },
+                cx,
+            );
             if let Some(page_view_data) = page_view_data {
                 panel.set_page_view_data(page_view_data, cx);
             }
@@ -1369,6 +1542,24 @@ impl FigView {
                         {
                             let fill = vector.fills.remove(from);
                             vector.fills.insert(to, fill);
+                        } else if let NodeData::Group(group) = data {
+                            let count = usize::from(group.background.is_some())
+                                + group.background_fills.len();
+                            if from < count && to < count {
+                                let has_background = group.background.is_some();
+                                let mut fills: Vec<Fill> = group
+                                    .background
+                                    .take()
+                                    .into_iter()
+                                    .chain(group.background_fills.drain(..))
+                                    .collect();
+                                let fill = fills.remove(from);
+                                fills.insert(to, fill);
+                                if has_background {
+                                    group.background = Some(fills.remove(0));
+                                }
+                                group.background_fills.extend(fills);
+                            }
                         }
                     })
                 });
@@ -1560,6 +1751,7 @@ impl FigView {
                     page_id,
                     *color,
                     DesignPanelEditPhase::Commit,
+                    window,
                     cx,
                 );
             }
@@ -1568,7 +1760,7 @@ impl FigView {
                 color,
                 phase,
             } => {
-                self.handle_design_page_background(page_id, *color, *phase, cx);
+                self.handle_design_page_background(page_id, *color, *phase, window, cx);
             }
             DesignPanelAction::PropertyVariableDetachRequested {
                 node_id: id,
@@ -2116,8 +2308,41 @@ impl FigView {
             (DesignPaintProperty::Color, DesignPaintValue::Color(color)) => {
                 PaintEditValue::Color(fanta_color(*color))
             }
-            (DesignPaintProperty::Opacity, DesignPaintValue::Number(percent)) => {
+            (DesignPaintProperty::Opacity, DesignPaintValue::Number(percent))
+                if percent.is_finite() =>
+            {
                 PaintEditValue::Opacity(f64::from(*percent))
+            }
+            (DesignPaintProperty::BlendMode, DesignPaintValue::BlendMode(mode)) => {
+                let Some(mode) = engine_blend_mode(*mode) else {
+                    return;
+                };
+                PaintEditValue::BlendMode(mode)
+            }
+            (DesignPaintProperty::Payload, DesignPaintValue::Payload(payload)) => {
+                PaintEditValue::Payload(payload.clone())
+            }
+            (DesignPaintProperty::GradientKind, DesignPaintValue::PaintKind(kind))
+                if kind.is_gradient() =>
+            {
+                PaintEditValue::GradientKind(*kind)
+            }
+            (DesignPaintProperty::GradientTransform, DesignPaintValue::Transform(transform)) => {
+                PaintEditValue::GradientTransform(*transform)
+            }
+            (
+                DesignPaintProperty::GradientStopColor { index, .. },
+                DesignPaintValue::Color(color),
+            ) => PaintEditValue::GradientStopColor(*index, fanta_color(*color)),
+            (
+                DesignPaintProperty::GradientStopPosition { index, .. },
+                DesignPaintValue::Number(position),
+            ) if position.is_finite() => PaintEditValue::GradientStopPosition(*index, *position),
+            (DesignPaintProperty::GradientStopAdd, DesignPaintValue::GradientStop(stop)) => {
+                PaintEditValue::GradientStopAdd(stop.position, fanta_color(stop.color))
+            }
+            (DesignPaintProperty::GradientStopRemove { index, .. }, DesignPaintValue::None) => {
+                PaintEditValue::GradientStopRemove(*index)
             }
             _ => {
                 log::debug!(
@@ -2214,24 +2439,52 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if phase != DesignPanelEditPhase::Commit && phase != DesignPanelEditPhase::Begin {
-            // Effect scrubs preview through the shared property session when
-            // one exists; discrete commits are the wave-1 contract otherwise.
-            if phase == DesignPanelEditPhase::Cancel {
-                self.finish_gpui_design_edits(cx);
+        match phase {
+            DesignPanelEditPhase::Begin => {
+                self.handle_design_phased_edit(
+                    id,
+                    property,
+                    value,
+                    DesignPanelEditPhase::Begin,
+                    window,
+                    cx,
+                );
+                return;
             }
-            return;
-        }
-        if phase == DesignPanelEditPhase::Begin {
-            self.handle_design_phased_edit(
-                id,
-                property,
-                value,
-                DesignPanelEditPhase::Begin,
-                window,
-                cx,
-            );
-            return;
+            DesignPanelEditPhase::Preview => {
+                let Some(snapshot) = self
+                    .gpui_design
+                    .as_ref()
+                    .and_then(|adapter| adapter.session.as_ref())
+                    .filter(|session| session.node == id)
+                    .map(|session| session.snapshot.clone())
+                else {
+                    return;
+                };
+                let item = self.item().clone();
+                item.update(cx, |item, cx| {
+                    if !item.is_editable() {
+                        return;
+                    }
+                    item.with_document(cx, |document| {
+                        restore_snapshot(&mut document.doc, &snapshot);
+                        if let Some(operations) =
+                            effect_edit_operations(&document.doc, id, reference, property, value)
+                        {
+                            for operation in &operations {
+                                apply_preview_operation(&mut document.doc, operation);
+                            }
+                        }
+                        ((), DocChange::ContentPreview)
+                    });
+                });
+                return;
+            }
+            DesignPanelEditPhase::Cancel => {
+                self.finish_gpui_design_edits(cx);
+                return;
+            }
+            DesignPanelEditPhase::Commit => {}
         }
         let session = self
             .gpui_design
@@ -2314,27 +2567,86 @@ impl FigView {
         page_id: &SharedString,
         color: DesignColor,
         phase: DesignPanelEditPhase,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if phase != DesignPanelEditPhase::Commit {
-            return;
-        }
         let Some(root) = node_id(page_id) else {
             return;
         };
+        let item = self.item().clone();
+        if item
+            .read(cx)
+            .document()
+            .is_none_or(|document| document.doc.active_page() != Some(root))
+        {
+            return;
+        }
         let color = fanta_color(color);
-        self.finish_document_edits_for_external_change(cx);
-        let ops = self.design_ops(cx, |doc| {
-            if doc.active_page() != Some(root) {
-                return Vec::new();
-            }
+        let build = |doc: &Doc| {
             replace_data_operation(doc, root, |data| {
                 if let NodeData::Group(group) = data {
                     group.background = Some(Fill::solid(color));
                 }
             })
-        });
-        self.design_apply_ops(ops, cx);
+        };
+        match phase {
+            DesignPanelEditPhase::Begin => self.handle_design_phased_edit(
+                root,
+                DesignPanelProperty::Opacity,
+                &DesignPanelValue::Number(0.0),
+                DesignPanelEditPhase::Begin,
+                window,
+                cx,
+            ),
+            DesignPanelEditPhase::Preview => {
+                let Some(snapshot) = self
+                    .gpui_design
+                    .as_ref()
+                    .and_then(|adapter| adapter.session.as_ref())
+                    .filter(|session| session.node == root)
+                    .map(|session| session.snapshot.clone())
+                else {
+                    return;
+                };
+                let item = self.item().clone();
+                item.update(cx, |item, cx| {
+                    if !item.is_editable() {
+                        return;
+                    }
+                    item.with_document(cx, |document| {
+                        restore_snapshot(&mut document.doc, &snapshot);
+                        for operation in build(&document.doc) {
+                            apply_preview_operation(&mut document.doc, &operation);
+                        }
+                        ((), DocChange::ContentPreview)
+                    });
+                });
+            }
+            DesignPanelEditPhase::Commit => {
+                let session = self
+                    .gpui_design
+                    .as_mut()
+                    .and_then(|adapter| adapter.session.take())
+                    .filter(|session| session.node == root);
+                let item = self.item().clone();
+                if let Some(session) = &session {
+                    item.update(cx, |item, cx| {
+                        item.with_document(cx, |document| {
+                            restore_snapshot(&mut document.doc, &session.snapshot);
+                            ((), DocChange::ContentPreview)
+                        });
+                    });
+                } else {
+                    self.finish_document_edits_for_external_change(cx);
+                }
+                let ops = self.design_ops(cx, build);
+                let committed = self.design_apply_ops(ops, cx);
+                if session.is_some() {
+                    item.update(cx, |item, cx| item.finish_content_preview(committed, cx));
+                }
+            }
+            DesignPanelEditPhase::Cancel => self.finish_gpui_design_edits(cx),
+        }
     }
 }
 
@@ -2549,6 +2861,14 @@ fn flip_operations(doc: &Doc, ids: &[NodeId], horizontal: bool) -> Vec<Operation
 enum PaintEditValue {
     Color(FantaColor),
     Opacity(f64),
+    BlendMode(BlendMode),
+    Payload(DesignPaintPayload),
+    GradientKind(DesignPaintKind),
+    GradientTransform(DesignPaintTransform),
+    GradientStopColor(usize, FantaColor),
+    GradientStopPosition(usize, f32),
+    GradientStopAdd(f32, FantaColor),
+    GradientStopRemove(usize),
 }
 
 fn paint_edit_operations(
@@ -2566,23 +2886,182 @@ fn paint_edit_operations(
     match value {
         PaintEditValue::Color(color) => {
             if is_text && !is_stroke {
-                return field_operations(
-                    doc,
-                    &InspectorField::TextColor(id),
-                    &design_color(*color).hex(),
-                );
+                return text_paint_color_operations(doc, id, *color);
             }
             solid_paint_color_operations(doc, id, is_stroke, index, *color)
         }
-        PaintEditValue::Opacity(percent) => field_operations(
-            doc,
-            &InspectorField::PaintOpacity {
-                id,
-                index,
-                is_stroke,
-            },
-            &format_number(*percent),
-        ),
+        PaintEditValue::Opacity(percent) => {
+            if is_text && !is_stroke {
+                let alpha = (percent.clamp(0.0, 100.0) / 100.0 * 255.0).round() as u8;
+                replace_data_operation(doc, id, |data| {
+                    if let NodeData::Text(text) = data {
+                        text.style.color.a = alpha;
+                        for run in &mut text.style_runs {
+                            run.style.color.a = alpha;
+                        }
+                    }
+                })
+            } else if paint_gradient(doc, id, is_stroke, index).is_none() {
+                field_operations(
+                    doc,
+                    &InspectorField::PaintOpacity {
+                        id,
+                        index,
+                        is_stroke,
+                    },
+                    &format_number(*percent),
+                )
+            } else {
+                gradient_paint_operations(doc, id, is_stroke, index, |gradient| {
+                    let stops = crate::color_picker::gradient_stops_mut(gradient);
+                    let old_max = stops.iter().map(|stop| stop.color.a).max().unwrap_or(0);
+                    let target_max = (percent.clamp(0.0, 100.0) / 100.0 * 255.0).round();
+                    for stop in stops {
+                        stop.color.a = if old_max == 0 {
+                            target_max as u8
+                        } else {
+                            (f64::from(stop.color.a) / f64::from(old_max) * target_max)
+                                .round()
+                                .clamp(0.0, 255.0) as u8
+                        };
+                    }
+                    Some(gradient.clone())
+                })
+            }
+        }
+        PaintEditValue::BlendMode(blend) => {
+            if is_text && !is_stroke {
+                blend_mode_operations(doc, id, design_blend_mode(*blend))
+            } else {
+                replace_data_operation(doc, id, |data| {
+                    if let Some(paint) =
+                        crate::properties_ops::paint_slot_mut(data, index, is_stroke)
+                    {
+                        match paint {
+                            Fill::Solid { blend: current, .. }
+                            | Fill::Gradient { blend: current, .. }
+                            | Fill::Image { blend: current, .. } => *current = *blend,
+                        }
+                    }
+                })
+            }
+        }
+        PaintEditValue::Payload(payload) => match payload {
+            DesignPaintPayload::Solid(solid) => {
+                let color = fanta_color(solid.color);
+                if is_text && !is_stroke {
+                    text_paint_color_operations(doc, id, color)
+                } else {
+                    solid_paint_color_operations(doc, id, is_stroke, index, color)
+                }
+            }
+            DesignPaintPayload::Gradient(gradient) if !is_text => {
+                let Some(engine_gradient) =
+                    gradient_from_design(gradient.kind, &gradient.stops, gradient.transform)
+                else {
+                    return Vec::new();
+                };
+                replace_data_operation(doc, id, |data| {
+                    crate::properties_ops::set_paint_gradient(
+                        data,
+                        index,
+                        is_stroke,
+                        engine_gradient.clone(),
+                    );
+                })
+            }
+            _ => Vec::new(),
+        },
+        PaintEditValue::GradientKind(kind) => {
+            gradient_paint_operations(doc, id, is_stroke, index, |gradient| {
+                let design_transform = design_gradient_transform(gradient);
+                gradient_from_design(*kind, &gradient_stops(gradient), design_transform)
+            })
+        }
+        PaintEditValue::GradientTransform(transform) => {
+            gradient_paint_operations(doc, id, is_stroke, index, |gradient| {
+                let kind = design_gradient_kind(gradient);
+                gradient_from_design(kind, &gradient_stops(gradient), *transform)
+            })
+        }
+        PaintEditValue::GradientStopColor(stop_index, color) => {
+            gradient_paint_operations(doc, id, is_stroke, index, |gradient| {
+                crate::color_picker::gradient_stops_mut(gradient)
+                    .get_mut(*stop_index)?
+                    .color = *color;
+                Some(gradient.clone())
+            })
+        }
+        PaintEditValue::GradientStopPosition(stop_index, position) => {
+            gradient_paint_operations(doc, id, is_stroke, index, |gradient| {
+                let stop =
+                    crate::color_picker::gradient_stops_mut(gradient).get_mut(*stop_index)?;
+                stop.position = position.clamp(0.0, 1.0);
+                crate::color_picker::gradient_stops_mut(gradient)
+                    .sort_by(|left, right| left.position.total_cmp(&right.position));
+                Some(gradient.clone())
+            })
+        }
+        PaintEditValue::GradientStopAdd(position, color) => {
+            gradient_paint_operations(doc, id, is_stroke, index, |gradient| {
+                if !position.is_finite() {
+                    return None;
+                }
+                let stops = crate::color_picker::gradient_stops_mut(gradient);
+                stops.push(fanta_doc::GradientStop {
+                    position: position.clamp(0.0, 1.0),
+                    color: *color,
+                });
+                stops.sort_by(|left, right| left.position.total_cmp(&right.position));
+                Some(gradient.clone())
+            })
+        }
+        PaintEditValue::GradientStopRemove(stop_index) => {
+            gradient_paint_operations(doc, id, is_stroke, index, |gradient| {
+                let stops = crate::color_picker::gradient_stops_mut(gradient);
+                if stops.len() <= 2 || *stop_index >= stops.len() {
+                    return None;
+                }
+                stops.remove(*stop_index);
+                Some(gradient.clone())
+            })
+        }
+    }
+}
+
+fn design_gradient_kind(gradient: &Gradient) -> DesignPaintKind {
+    match gradient {
+        Gradient::Linear { .. } => DesignPaintKind::LinearGradient,
+        Gradient::Radial { .. } => DesignPaintKind::RadialGradient,
+        Gradient::Angular { .. } => DesignPaintKind::AngularGradient,
+        Gradient::Diamond { .. } => DesignPaintKind::DiamondGradient,
+    }
+}
+
+fn gradient_paint_operations(
+    doc: &Doc,
+    id: NodeId,
+    is_stroke: bool,
+    index: usize,
+    edit: impl FnOnce(&mut Gradient) -> Option<Gradient>,
+) -> Vec<Operation> {
+    let Some(mut gradient) = paint_gradient(doc, id, is_stroke, index) else {
+        return Vec::new();
+    };
+    let Some(edited) = edit(&mut gradient) else {
+        return Vec::new();
+    };
+    replace_data_operation(doc, id, |data| {
+        crate::properties_ops::set_paint_gradient(data, index, is_stroke, edited.clone());
+    })
+}
+
+fn paint_gradient(doc: &Doc, id: NodeId, is_stroke: bool, index: usize) -> Option<Gradient> {
+    let node = doc.scene.get(id)?;
+    let mut data = node.data.clone();
+    match crate::properties_ops::paint_slot_mut(&mut data, index, is_stroke)? {
+        Fill::Gradient { gradient, .. } => Some(gradient.clone()),
+        _ => None,
     }
 }
 
@@ -2603,6 +3082,14 @@ fn solid_paint_color_operations(
             }
         } else {
             set_fill_color(data, index, color);
+        }
+    })
+}
+
+fn text_paint_color_operations(doc: &Doc, id: NodeId, color: FantaColor) -> Vec<Operation> {
+    replace_data_operation(doc, id, |data| {
+        if let NodeData::Text(text) = data {
+            text.set_glyph_color(color);
         }
     })
 }
@@ -3283,8 +3770,8 @@ mod tests {
 
     use fanta_doc::{CanvasNode, Doc, GroupNode, VectorNode};
     use fanta_gpui::design::{
-        DesignPageBackground, DesignPageViewData, DesignPanelInspectionContext,
-        DesignPanelPermissions, DesignPanelSurface,
+        DesignPageBackground, DesignPageViewData, DesignPaintEdit, DesignPaintTarget,
+        DesignPanelInspectionContext, DesignPanelPermissions, DesignPanelSurface,
     };
     use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, point, px, size};
     use project::{FakeFs, Project};
@@ -3617,6 +4104,431 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn adding_drop_shadow_is_undoable_and_echoes_to_inspector(cx: &mut TestAppContext) {
+        let (mut doc, _page, rect) = doc_with_rect();
+        doc.selection.replace_with([rect]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        cx.simulate_resize(size(px(1200.), px(900.)));
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::EffectAddRequested {
+                node_id: SharedString::from(rect.to_string()),
+                kind: DesignEffectKind::DropShadow,
+            });
+        });
+        cx.run_until_parked();
+
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            let node = doc.scene.get(rect).expect("rect exists");
+            assert_eq!(node.effects.len(), 1);
+            assert_eq!(node.effects[0].kind, ShadowKind::Drop);
+            assert!(doc.history.can_undo());
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.node().effects.len(), 1);
+        });
+
+        for phase in [
+            DesignPanelEditPhase::Begin,
+            DesignPanelEditPhase::Preview,
+            DesignPanelEditPhase::Cancel,
+        ] {
+            panel.update_in(cx, |_, _, cx| {
+                cx.emit(DesignPanelAction::EffectEditRequested {
+                    node_id: SharedString::from(rect.to_string()),
+                    effect_id: "shadow-0".into(),
+                    index: 0,
+                    property: DesignPanelProperty::EffectShadowBlur(0),
+                    shader_property_id: None,
+                    value: DesignPanelValue::Number(24.0),
+                    phase,
+                });
+            });
+            cx.run_until_parked();
+            let expected = if phase == DesignPanelEditPhase::Preview {
+                24.0
+            } else {
+                default_shadow().blur
+            };
+            item.read_with(cx, |item, _| {
+                let doc = &item.document().expect("document ready").doc;
+                assert_eq!(
+                    doc.scene.get(rect).expect("rect exists").effects[0].blur,
+                    expected
+                );
+            });
+        }
+
+        let shadow_color = DesignColor::rgb(0x36, 0x80, 0xd4);
+        for (property, value) in [
+            (
+                DesignPanelProperty::EffectShadowBlur(0),
+                DesignPanelValue::Number(18.0),
+            ),
+            (
+                DesignPanelProperty::EffectShadowColor(0),
+                DesignPanelValue::Color(shadow_color),
+            ),
+        ] {
+            panel.update_in(cx, |_, _, cx| {
+                cx.emit(DesignPanelAction::EffectEditRequested {
+                    node_id: SharedString::from(rect.to_string()),
+                    effect_id: "shadow-0".into(),
+                    index: 0,
+                    property,
+                    shader_property_id: None,
+                    value,
+                    phase: DesignPanelEditPhase::Commit,
+                });
+            });
+            cx.run_until_parked();
+        }
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let doc = &mut document.doc;
+                let shadow = &doc.scene.get(rect).expect("rect exists").effects[0];
+                assert_eq!(shadow.blur, 18.0);
+                assert_eq!(shadow.color, fanta_color(shadow_color));
+                assert!(doc.undo().expect("undo shadow color"));
+                assert_eq!(
+                    doc.scene.get(rect).expect("rect exists").effects[0].color,
+                    default_shadow().color
+                );
+                assert!(doc.undo().expect("undo shadow blur"));
+                assert_eq!(
+                    doc.scene.get(rect).expect("rect exists").effects[0].blur,
+                    default_shadow().blur
+                );
+                assert!(doc.undo().expect("undo shadow creation"));
+                assert!(doc.scene.get(rect).expect("rect exists").effects.is_empty());
+                ((), DocChange::Content)
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn gradient_picker_edits_round_trip_and_undo(cx: &mut TestAppContext) {
+        let (mut doc, _page, rect) = doc_with_rect();
+        if let Some(node) = doc.scene.get_mut(rect)
+            && let NodeData::Vector(vector) = &mut node.data
+            && let Some(Fill::Solid { blend, .. }) = vector.fills.first_mut()
+        {
+            *blend = BlendMode::Multiply;
+        }
+        doc.selection.replace_with([rect]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+
+        let source = DesignPaint::gradient(
+            DesignPaintKind::LinearGradient,
+            vec![
+                DesignGradientStop::new(0.0, DesignColor::rgb(0xe0, 0x30, 0x30)),
+                DesignGradientStop::new(1.0, DesignColor::rgb(0x30, 0x30, 0xe0)),
+            ],
+        );
+        let emit = |panel: &Entity<DesignPanel>,
+                    cx: &mut VisualTestContext,
+                    property: DesignPaintProperty,
+                    value: DesignPaintValue| {
+            panel.update_in(cx, |_, _, cx| {
+                cx.emit(DesignPanelAction::PaintEditRequested {
+                    node_id: SharedString::from(rect.to_string()),
+                    collection: DesignPanelCollection::Fill,
+                    target: DesignPaintTarget::WholeLayer,
+                    paint_id: SharedString::from(format!("{rect}-fill-0")),
+                    index: 0,
+                    edit: DesignPaintEdit { property, value },
+                    phase: DesignPanelEditPhase::Commit,
+                });
+            });
+            cx.run_until_parked();
+        };
+        emit(
+            &panel,
+            cx,
+            DesignPaintProperty::Payload,
+            DesignPaintValue::Payload(source.payload),
+        );
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            let node = doc.scene.get(rect).expect("rect exists");
+            let NodeData::Vector(vector) = &node.data else {
+                panic!("rect is a vector");
+            };
+            assert!(matches!(
+                vector.fills.first(),
+                Some(Fill::Gradient {
+                    blend: BlendMode::Multiply,
+                    ..
+                })
+            ));
+        });
+
+        let new_color = DesignColor::rgb(0x22, 0xbb, 0x77);
+        emit(
+            &panel,
+            cx,
+            DesignPaintProperty::GradientStopColor {
+                stop_id: "".into(),
+                index: 1,
+            },
+            DesignPaintValue::Color(new_color),
+        );
+        let solid = DesignPaint::solid(new_color);
+        emit(
+            &panel,
+            cx,
+            DesignPaintProperty::Payload,
+            DesignPaintValue::Payload(solid.payload),
+        );
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let doc = &mut document.doc;
+                let node = doc.scene.get(rect).expect("rect exists");
+                let NodeData::Vector(vector) = &node.data else {
+                    panic!("rect is a vector");
+                };
+                assert!(matches!(
+                    vector.fills.first(),
+                    Some(Fill::Solid {
+                        color,
+                        blend: BlendMode::Multiply
+                    }) if *color == fanta_color(new_color)
+                ));
+                assert!(doc.undo().expect("undo solid conversion"));
+                let node = doc.scene.get(rect).expect("rect exists");
+                let NodeData::Vector(vector) = &node.data else {
+                    panic!("rect is a vector");
+                };
+                let Some(Fill::Gradient { gradient, .. }) = vector.fills.first() else {
+                    panic!("undo restores the gradient");
+                };
+                assert_eq!(
+                    crate::color_picker::gradient_stops(gradient)[1].color,
+                    fanta_color(new_color)
+                );
+                assert!(doc.undo().expect("undo color edit"));
+                let node = doc.scene.get(rect).expect("rect exists");
+                let NodeData::Vector(vector) = &node.data else {
+                    panic!("rect is a vector");
+                };
+                let Some(Fill::Gradient { gradient, .. }) = vector.fills.first() else {
+                    panic!("undo restores the gradient");
+                };
+                assert_eq!(
+                    crate::color_picker::gradient_stops(gradient)[1].color,
+                    FantaColor::rgb(0x30, 0x30, 0xe0)
+                );
+                assert!(doc.undo().expect("undo gradient creation"));
+                let node = doc.scene.get(rect).expect("rect exists");
+                let NodeData::Vector(vector) = &node.data else {
+                    panic!("rect is a vector");
+                };
+                assert!(matches!(
+                    vector.fills.first(),
+                    Some(Fill::Solid {
+                        blend: BlendMode::Multiply,
+                        ..
+                    })
+                ));
+                ((), DocChange::Content)
+            });
+        });
+    }
+
+    #[gpui::test]
+    async fn group_fill_reorder_updates_the_primary_background(cx: &mut TestAppContext) {
+        let (mut doc, page, _) = doc_with_rect();
+        if let Some(node) = doc.scene.get_mut(page)
+            && let NodeData::Group(group) = &mut node.data
+        {
+            group.background = Some(Fill::solid(FantaColor::rgb(255, 0, 0)));
+            group
+                .background_fills
+                .push(Fill::solid(FantaColor::rgb(0, 0, 255)));
+        }
+        doc.selection.replace_with([page]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::PaintReorderRequested {
+                node_id: SharedString::from(page.to_string()),
+                collection: DesignPanelCollection::Fill,
+                target: DesignPaintTarget::WholeLayer,
+                paint_id: SharedString::from(format!("{page}-fill-1")),
+                from_index: 1,
+                to_index: 0,
+            });
+        });
+        cx.run_until_parked();
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            let NodeData::Group(group) = &doc.scene.get(page).expect("page exists").data else {
+                panic!("page is a group");
+            };
+            assert_eq!(
+                group.background,
+                Some(Fill::solid(FantaColor::rgb(0, 0, 255)))
+            );
+            assert_eq!(
+                group.background_fills[0],
+                Fill::solid(FantaColor::rgb(255, 0, 0))
+            );
+            assert!(doc.history.can_undo());
+        });
+    }
+
+    #[test]
+    fn gradient_transform_projection_preserves_geometry_and_angular_flip() {
+        let linear = crate::color_picker::seed_gradient_from_color(FantaColor::rgb(20, 40, 60));
+        let projected = design_gradient_transform(&linear);
+        let rebuilt = gradient_from_design(
+            DesignPaintKind::LinearGradient,
+            &gradient_stops(&linear),
+            projected,
+        )
+        .expect("linear projection is valid");
+        assert_eq!(rebuilt, linear);
+
+        let angular = Gradient::Angular {
+            center: [0.5, 0.5],
+            start_angle: 0.0,
+            stops: crate::color_picker::gradient_stops(&linear).to_vec(),
+        };
+        let flipped = gradient_from_design(
+            DesignPaintKind::AngularGradient,
+            &gradient_stops(&angular),
+            design_gradient_transform(&angular).flipped_horizontal(),
+        )
+        .expect("angular flip is valid");
+        let restored = gradient_from_design(
+            DesignPaintKind::AngularGradient,
+            &gradient_stops(&flipped),
+            design_gradient_transform(&flipped).flipped_horizontal(),
+        )
+        .expect("second angular flip is valid");
+        let Gradient::Angular {
+            start_angle, stops, ..
+        } = restored
+        else {
+            panic!("angular kind is preserved");
+        };
+        assert!(start_angle.abs() < 1e-5);
+        assert_eq!(stops, crate::color_picker::gradient_stops(&angular));
+    }
+
+    #[test]
+    fn gradient_opacity_scales_stop_alpha_in_one_undo_step() {
+        let (mut doc, _page, rect) = doc_with_rect();
+        let original_gradient = Gradient::Linear {
+            start: [0.5, 0.0],
+            end: [0.5, 1.0],
+            stops: vec![
+                fanta_doc::GradientStop {
+                    position: 0.0,
+                    color: FantaColor::rgba(20, 40, 60, 255),
+                },
+                fanta_doc::GradientStop {
+                    position: 1.0,
+                    color: FantaColor::rgba(80, 100, 120, 128),
+                },
+            ],
+        };
+        if let Some(node) = doc.scene.get_mut(rect)
+            && let NodeData::Vector(vector) = &mut node.data
+        {
+            vector.fills[0] = Fill::Gradient {
+                gradient: original_gradient.clone(),
+                blend: BlendMode::Normal,
+            };
+        }
+        let ops = paint_edit_operations(&doc, rect, false, 0, &PaintEditValue::Opacity(50.0));
+        assert_eq!(ops.len(), 1);
+        for operation in ops {
+            doc.apply(operation).expect("apply gradient opacity");
+        }
+        let node = doc.scene.get(rect).expect("rect exists");
+        let NodeData::Vector(vector) = &node.data else {
+            panic!("rect is a vector");
+        };
+        let Some(Fill::Gradient { gradient, .. }) = vector.fills.first() else {
+            panic!("fill is a gradient");
+        };
+        let stops = crate::color_picker::gradient_stops(gradient);
+        assert_eq!(stops[0].color.a, 128);
+        assert_eq!(stops[1].color.a, 64);
+        assert!(doc.undo().expect("undo opacity edit"));
+        let node = doc.scene.get(rect).expect("rect exists");
+        let NodeData::Vector(vector) = &node.data else {
+            panic!("rect is a vector");
+        };
+        assert_eq!(
+            vector.fills.first(),
+            Some(&Fill::Gradient {
+                gradient: original_gradient,
+                blend: BlendMode::Normal,
+            })
+        );
+    }
+
+    #[test]
+    fn text_fill_opacity_edits_glyph_alpha_and_undoes() {
+        let (mut doc, page, _) = doc_with_rect();
+        let mut text = CanvasNode::new(NodeData::Text(fanta_doc::TextNode::new(
+            "Hello", 100.0, 30.0,
+        )));
+        text.parent = Some(page);
+        let id = text.id;
+        doc.scene.insert(text).expect("insert text");
+        let ops = paint_edit_operations(&doc, id, false, 0, &PaintEditValue::Opacity(40.0));
+        assert_eq!(ops.len(), 1);
+        for operation in ops {
+            doc.apply(operation).expect("apply text fill opacity");
+        }
+        let node = doc.scene.get(id).expect("text exists");
+        let NodeData::Text(text) = &node.data else {
+            panic!("text node");
+        };
+        assert_eq!(text.style.color.a, 102);
+        assert!(doc.undo().expect("undo text fill opacity"));
+        let node = doc.scene.get(id).expect("text exists");
+        let NodeData::Text(text) = &node.data else {
+            panic!("text node");
+        };
+        assert_eq!(text.style.color.a, 255);
+
+        let ops = paint_edit_operations(
+            &doc,
+            id,
+            false,
+            0,
+            &PaintEditValue::BlendMode(BlendMode::Multiply),
+        );
+        assert_eq!(ops.len(), 1);
+        for operation in ops {
+            doc.apply(operation).expect("apply text fill blend");
+        }
+        assert_eq!(
+            doc.scene.get(id).expect("text exists").blend_mode,
+            BlendMode::Multiply
+        );
+        assert!(doc.undo().expect("undo text fill blend"));
+        assert_eq!(
+            doc.scene.get(id).expect("text exists").blend_mode,
+            BlendMode::Normal
+        );
+    }
+
+    #[gpui::test]
     async fn opacity_edit_lands_as_one_undoable_operation_and_echoes(cx: &mut TestAppContext) {
         let (mut doc, _page, rect) = doc_with_rect();
         doc.selection.replace_with([rect]);
@@ -3780,6 +4692,68 @@ mod tests {
             cx.debug_bounds("color-picker-spectrum").is_none(),
             "the picker close button accepts clicks"
         );
+    }
+
+    #[gpui::test]
+    async fn page_background_preview_cancels_and_commits_cleanly(cx: &mut TestAppContext) {
+        let (doc, page, _) = doc_with_rect();
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        let color = DesignColor::rgb(0x4c, 0x91, 0xdc);
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        let emit = |panel: &Entity<DesignPanel>, cx: &mut VisualTestContext, phase| {
+            panel.update_in(cx, |_, _, cx| {
+                cx.emit(DesignPanelAction::PageBackgroundEditRequested {
+                    page_id: SharedString::from(page.to_string()),
+                    color,
+                    phase,
+                });
+            });
+            cx.run_until_parked();
+        };
+        for phase in [DesignPanelEditPhase::Begin, DesignPanelEditPhase::Preview] {
+            emit(&panel, cx, phase);
+        }
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            let NodeData::Group(group) = &doc.scene.get(page).expect("page exists").data else {
+                panic!("page is a group");
+            };
+            assert_eq!(group.background, Some(Fill::solid(fanta_color(color))));
+            assert!(!doc.history.can_undo());
+        });
+        emit(&panel, cx, DesignPanelEditPhase::Cancel);
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            let NodeData::Group(group) = &doc.scene.get(page).expect("page exists").data else {
+                panic!("page is a group");
+            };
+            assert_eq!(group.background, None);
+            assert!(!doc.history.can_undo());
+        });
+
+        for phase in [
+            DesignPanelEditPhase::Begin,
+            DesignPanelEditPhase::Preview,
+            DesignPanelEditPhase::Commit,
+        ] {
+            emit(&panel, cx, phase);
+        }
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let doc = &mut document.doc;
+                let NodeData::Group(group) = &doc.scene.get(page).expect("page exists").data else {
+                    panic!("page is a group");
+                };
+                assert_eq!(group.background, Some(Fill::solid(fanta_color(color))));
+                assert!(doc.undo().expect("undo background color"));
+                let NodeData::Group(group) = &doc.scene.get(page).expect("page exists").data else {
+                    panic!("page is a group");
+                };
+                assert_eq!(group.background, None);
+                ((), DocChange::Content)
+            });
+        });
     }
 
     #[gpui::test]

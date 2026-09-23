@@ -13,6 +13,7 @@ mod comments_ui;
 mod component_properties;
 mod design_panel;
 mod document;
+mod draw_wand;
 mod editor_session;
 mod export;
 mod generation_journal;

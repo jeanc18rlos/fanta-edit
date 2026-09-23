@@ -24,7 +24,7 @@
 use crate::context::ToolContext;
 use crate::event::ToolEvent;
 use fanta_canvas::{SnapCandidates, SnapResult};
-use fanta_doc::{Bounds, Doc, NodeId};
+use fanta_doc::{Bounds, Color, Doc, NodeId};
 use glam::DVec2;
 use smallvec::SmallVec;
 
@@ -116,6 +116,20 @@ pub enum ToolOverlay {
     PreviewLine {
         world_start: [f64; 2],
         world_end: [f64; 2],
+    },
+
+    /// A filled brush outline in world space, painted with the same color as
+    /// the mark committed on release.
+    PreviewBrushStroke {
+        world_outline: Vec<[f64; 2]>,
+        color: Color,
+    },
+
+    /// An open Pencil path in world space, painted at its committed width.
+    PreviewPencilStroke {
+        world_points: Vec<[f64; 2]>,
+        color: Color,
+        width: f64,
     },
 
     /// A path anchor square (node-edit tool) at a world position, drawn at a

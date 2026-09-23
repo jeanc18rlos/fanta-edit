@@ -25,6 +25,7 @@ pub(crate) use support::*;
 
 mod clicks;
 mod container_select;
+mod draw_selection;
 mod keys;
 mod marquee;
 mod move_drag;

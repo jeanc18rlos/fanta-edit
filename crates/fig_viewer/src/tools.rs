@@ -5,7 +5,9 @@
 //! ([`ToolOverlay`]s and a [`CursorHint`]) for the canvas element to paint.
 
 use fanta_doc::{Color, Doc, Viewport};
-use fanta_tools::select::RectangleSelectTool;
+use fanta_tools::select::{
+    CropTool, DrawSelectionRegion, RectangleSelectTool, RegionSelectTool, RegionSelectionKind,
+};
 use fanta_tools::{
     BrushTool, Button, CursorHint, EllipseTool, EraserTool, FrameTool, HandTool, KeyEvent,
     LineTool, LogicalKey, ModifierKeys, NodeEditTool, PathSelectTool, PenTool, PencilTool,
@@ -37,6 +39,11 @@ pub const TOOLBAR_GROUPS: [&[ToolKind]; 6] = [
         ToolKind::Select,
         ToolKind::PathSelect,
         ToolKind::RectangleSelect,
+        ToolKind::EllipseSelect,
+        ToolKind::Lasso,
+        ToolKind::PolygonalLasso,
+        ToolKind::MagicWand,
+        ToolKind::Crop,
         ToolKind::Hand,
         ToolKind::Scale,
     ],
@@ -79,6 +86,11 @@ pub enum ToolKind {
     Select,
     PathSelect,
     RectangleSelect,
+    EllipseSelect,
+    Lasso,
+    PolygonalLasso,
+    MagicWand,
+    Crop,
     NodeEdit,
     Hand,
     Scale,
@@ -105,6 +117,11 @@ impl ToolKind {
             Self::Select => "Move",
             Self::PathSelect => "Path Selection",
             Self::RectangleSelect => "Rectangle Selection",
+            Self::EllipseSelect => "Ellipse Selection",
+            Self::Lasso => "Lasso",
+            Self::PolygonalLasso => "Polygonal Lasso",
+            Self::MagicWand => "Magic Wand",
+            Self::Crop => "Crop",
             Self::NodeEdit => "Edit Path",
             Self::Hand => "Hand",
             Self::Scale => "Scale",
@@ -131,6 +148,10 @@ impl ToolKind {
             Self::Select => IconName::ToolSelect,
             Self::PathSelect => IconName::ToolPathSelect,
             Self::RectangleSelect => IconName::ToolRect,
+            Self::EllipseSelect => IconName::ToolEllipse,
+            Self::Lasso | Self::PolygonalLasso => IconName::ToolPen,
+            Self::MagicWand => IconName::ToolSelect,
+            Self::Crop => IconName::ToolRect,
             Self::NodeEdit => IconName::ToolNodeEdit,
             Self::Hand => IconName::ToolHand,
             Self::Scale => IconName::ToolScale,
@@ -169,6 +190,13 @@ impl ToolKind {
             Self::Select => Box::new(SelectTool::new()),
             Self::PathSelect => Box::new(PathSelectTool::new()),
             Self::RectangleSelect => Box::new(RectangleSelectTool::new()),
+            Self::EllipseSelect => Box::new(RegionSelectTool::new(RegionSelectionKind::Ellipse)),
+            Self::Lasso => Box::new(RegionSelectTool::new(RegionSelectionKind::Lasso)),
+            Self::PolygonalLasso => {
+                Box::new(RegionSelectTool::new(RegionSelectionKind::PolygonalLasso))
+            }
+            Self::MagicWand => Box::new(RegionSelectTool::new(RegionSelectionKind::MagicWand)),
+            Self::Crop => Box::new(CropTool::new()),
             Self::NodeEdit => Box::new(NodeEditTool::new()),
             Self::Hand => Box::new(HandTool::new()),
             Self::Scale => Box::new(ScaleTool::new()),
@@ -200,6 +228,7 @@ pub struct ToolShell {
     tool: Box<dyn Tool>,
     pub overlays: Vec<ToolOverlay>,
     pub cursor: Option<CursorHint>,
+    draw_selection_region: Option<DrawSelectionRegion>,
 }
 
 impl ToolShell {
@@ -209,6 +238,7 @@ impl ToolShell {
             tool: ToolKind::Select.build(),
             overlays: Vec::new(),
             cursor: None,
+            draw_selection_region: None,
         }
     }
 
@@ -227,6 +257,7 @@ impl ToolShell {
         self.tool = kind.build();
         self.tool.activate(ctx);
         self.overlays.clear();
+        self.append_selection_region_overlay();
         self.cursor = None;
     }
 
@@ -242,6 +273,7 @@ impl ToolShell {
         self.kind = kind;
         self.tool = kind.build();
         self.overlays.clear();
+        self.append_selection_region_overlay();
         self.cursor = None;
     }
 
@@ -251,14 +283,18 @@ impl ToolShell {
         self.tool = kind.build();
         self.tool.activate(ctx);
         self.overlays.clear();
+        self.append_selection_region_overlay();
         self.cursor = None;
     }
 
     /// Feed one event through the active tool and record its render hints.
     /// Returns the response so the caller can react to `wants_exit`.
     pub fn handle_event(&mut self, ctx: &mut ToolContext, event: ToolEvent) -> ToolResponse {
+        ctx.draw_selection_region = self.draw_selection_region.clone();
         let response = self.tool.handle_event(ctx, event);
+        self.draw_selection_region = ctx.draw_selection_region.clone();
         self.overlays = response.overlays.to_vec();
+        self.append_selection_region_overlay();
         if response.cursor.is_some() {
             self.cursor = response.cursor;
         }
@@ -273,7 +309,19 @@ impl ToolShell {
             return false;
         }
         self.overlays = overlays;
+        self.append_selection_region_overlay();
         true
+    }
+
+    pub fn clear_draw_selection_region(&mut self) {
+        self.draw_selection_region = None;
+        self.overlays.clear();
+    }
+
+    fn append_selection_region_overlay(&mut self) {
+        if let Some(region) = &self.draw_selection_region {
+            self.overlays.extend(region.shape.overlays());
+        }
     }
 
     pub fn cursor_style(&self, dragging_canvas: bool) -> CursorStyle {
@@ -553,5 +601,74 @@ mod tests {
             }
         }
         assert_eq!(initial_group_faces().len(), TOOLBAR_GROUPS.len());
+    }
+
+    #[test]
+    fn draw_region_survives_tool_switch_and_masks_crop() {
+        use fanta_doc::{CanvasNode, NodeData, Operation, VectorNode};
+
+        let mut doc = Doc::new();
+        let node = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            -100.0,
+            -100.0,
+            200.0,
+            200.0,
+            Color::WHITE,
+        )));
+        let node_id = node.id;
+        doc.apply(Operation::create_node(node))
+            .expect("create vector");
+        let mut viewport = Viewport::default();
+        let mut context = tool_context(
+            &mut doc,
+            &mut viewport,
+            DVec2::new(800.0, 600.0),
+            ToolKind::EllipseSelect,
+        );
+        context.draw_content_only = true;
+        let mut shell = ToolShell::new();
+        shell.activate(ToolKind::EllipseSelect, &mut context);
+        shell.handle_event(
+            &mut context,
+            ToolEvent::Pointer(PointerEvent::Press {
+                screen: [350.0, 250.0],
+                button: Button::Primary,
+                modifiers: ModifierKeys::ALT,
+                count: 1,
+            }),
+        );
+        shell.handle_event(
+            &mut context,
+            ToolEvent::Pointer(PointerEvent::Release {
+                screen: [450.0, 350.0],
+                button: Button::Primary,
+                modifiers: ModifierKeys::ALT,
+            }),
+        );
+        assert!(shell.draw_selection_region.is_some());
+        shell.activate(ToolKind::Crop, &mut context);
+        assert!(
+            shell
+                .overlays
+                .iter()
+                .any(|overlay| { matches!(overlay, ToolOverlay::PreviewEllipse { .. }) })
+        );
+        shell.handle_event(
+            &mut context,
+            ToolEvent::Key(KeyEvent::press(LogicalKey::Enter)),
+        );
+        let crop_id = context.doc.selection.as_slice()[0];
+        let children = context.doc.scene.children_of(Some(crop_id));
+        assert_eq!(children.len(), 2);
+        assert!(
+            context
+                .doc
+                .scene
+                .get(children[0])
+                .expect("selection mask")
+                .is_mask
+        );
+        assert_eq!(children[1], node_id);
+        assert!(shell.draw_selection_region.is_none());
     }
 }

@@ -28,7 +28,7 @@ impl RectangleSelectTool {
         Self::default()
     }
 
-    fn apply_hits(
+    pub(super) fn apply_hits(
         operation: RectangleSelectionOperation,
         selection: &mut Selection,
         hits: impl IntoIterator<Item = NodeId>,
@@ -131,6 +131,19 @@ impl RectangleSelectTool {
             let mut seen = HashSet::new();
             let mut hits = Vec::new();
             for leaf in leaves {
+                if ctx.draw_content_only {
+                    if let Some(target) = super::region::content_target(&ctx.doc.scene, leaf, scope)
+                        && ctx
+                            .doc
+                            .scene
+                            .world_bounds(target)
+                            .is_some_and(|bounds| Self::marquee_matches(bounds, world_rect, mode))
+                        && seen.insert(target)
+                    {
+                        hits.push(target);
+                    }
+                    continue;
+                }
                 let container = SelectTool::resolve_in_scope(&ctx.doc.scene, leaf, scope);
                 let target = if ctx
                     .doc
@@ -146,29 +159,51 @@ impl RectangleSelectTool {
                     hits.push(target);
                 }
             }
-            for frame in
-                Self::frame_surface_hits(&ctx.doc.scene, scope, ctx.doc.pages(), world_rect, mode)
-            {
-                if seen.insert(frame) {
-                    hits.push(frame);
+            if !ctx.draw_content_only {
+                for frame in Self::frame_surface_hits(
+                    &ctx.doc.scene,
+                    scope,
+                    ctx.doc.pages(),
+                    world_rect,
+                    mode,
+                ) {
+                    if seen.insert(frame) {
+                        hits.push(frame);
+                    }
                 }
             }
-            Self::apply_hits(
-                ctx.rectangle_selection_operation,
-                &mut ctx.doc.selection,
-                hits,
-            );
+            if ctx.draw_content_only {
+                super::region::apply_draw_region(
+                    ctx,
+                    super::region::DrawSelectionShape::Rectangle(world_rect),
+                    hits,
+                );
+            } else {
+                Self::apply_hits(
+                    ctx.rectangle_selection_operation,
+                    &mut ctx.doc.selection,
+                    hits,
+                );
+            }
         } else {
+            if ctx.draw_content_only {
+                ctx.draw_selection_region = None;
+            }
             let hits = hit_test_deep(
                 &ctx.doc.scene,
                 ctx.screen_to_world(screen),
                 HitPrecision::Path,
                 ctx.scope(),
             );
-            let target = hits
-                .first()
-                .copied()
-                .map(|leaf| SelectTool::resolve_in_scope(&ctx.doc.scene, leaf, ctx.scope()));
+            let target = if ctx.draw_content_only {
+                hits.into_iter().find_map(|leaf| {
+                    super::region::content_target(&ctx.doc.scene, leaf, ctx.scope())
+                })
+            } else {
+                hits.first()
+                    .copied()
+                    .map(|leaf| SelectTool::resolve_in_scope(&ctx.doc.scene, leaf, ctx.scope()))
+            };
             Self::apply_hits(
                 ctx.rectangle_selection_operation,
                 &mut ctx.doc.selection,

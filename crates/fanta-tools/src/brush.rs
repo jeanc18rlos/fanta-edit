@@ -2,7 +2,9 @@ use crate::context::ToolContext;
 use crate::event::{Button, LogicalKey, PointerEvent, ToolEvent};
 use crate::ink::{InkPoint, StrokeOptions, get_stroke};
 use crate::tool::{CursorHint, Tool, ToolOverlay, ToolResponse};
-use fanta_doc::{CanvasNode, Fill, NodeData, Operation, PathData, Transform2D, VectorNode};
+use fanta_doc::{
+    Blur, CanvasNode, Color, Fill, NodeData, Operation, PathData, Transform2D, VectorNode,
+};
 use glam::DVec2;
 use smallvec::SmallVec;
 
@@ -72,22 +74,7 @@ impl BrushTool {
         }
     }
 
-    fn preview(&self) -> ToolResponse {
-        let mut response = ToolResponse::cursor(CursorHint::Crosshair);
-        for pair in self.preview_points.windows(2) {
-            response.overlays.push(ToolOverlay::PreviewLine {
-                world_start: [pair[0].pt.x, pair[0].pt.y],
-                world_end: [pair[1].pt.x, pair[1].pt.y],
-            });
-        }
-        response
-    }
-
-    fn commit(&mut self, ctx: &mut ToolContext) {
-        let Some(first) = self.points.first() else {
-            return;
-        };
-        let first = first.pt;
+    fn stroke_options(ctx: &ToolContext) -> StrokeOptions {
         let mut options = StrokeOptions {
             size: ctx.new_stroke_width.clamp(1.0, 5000.0),
             smoothing: 0.2,
@@ -108,7 +95,71 @@ impl BrushTool {
                 options.smoothing = 0.45;
             }
         }
-        let outline = get_stroke(&self.points, &options);
+        options
+    }
+
+    fn stroke_color(ctx: &ToolContext) -> Color {
+        let color = ctx.new_shape_fill;
+        let alpha = u16::from(color.a) * u16::from(ctx.brush_flow.min(100)) / 100;
+        Color::rgba(color.r, color.g, color.b, alpha as u8)
+    }
+
+    fn softness_radius(ctx: &ToolContext) -> f64 {
+        ctx.new_stroke_width.clamp(1.0, 5000.0) * (100.0 - f64::from(ctx.brush_hardness.min(100)))
+            / 100.0
+            * 0.65
+    }
+
+    fn preview(&self, ctx: &ToolContext) -> ToolResponse {
+        let mut response = ToolResponse::cursor(CursorHint::Crosshair);
+        if self.preview_points.is_empty() {
+            return response;
+        }
+        let mut preview_points = self.preview_points.clone();
+        if let Some(latest) = self.points.last().copied()
+            && preview_points.last() != Some(&latest)
+        {
+            preview_points.push(latest);
+        }
+        let options = Self::stroke_options(ctx);
+        let outline = get_stroke(&preview_points, &options);
+        if !outline.is_empty() {
+            let color = Self::stroke_color(ctx);
+            let softness_radius = Self::softness_radius(ctx);
+            if softness_radius > 0.0 {
+                let mut halo_options = options;
+                halo_options.size = (halo_options.size + softness_radius * 2.0).min(5000.0);
+                let halo = get_stroke(&preview_points, &halo_options);
+                if !halo.is_empty() {
+                    response.overlays.push(ToolOverlay::PreviewBrushStroke {
+                        world_outline: halo,
+                        color: Color::rgba(color.r, color.g, color.b, color.a / 4),
+                    });
+                }
+            }
+            response.overlays.push(ToolOverlay::PreviewBrushStroke {
+                world_outline: outline,
+                color: if softness_radius > 0.0 {
+                    Color::rgba(
+                        color.r,
+                        color.g,
+                        color.b,
+                        (u16::from(color.a) * 3 / 4) as u8,
+                    )
+                } else {
+                    color
+                },
+            });
+        }
+        response
+    }
+
+    fn commit(&mut self, ctx: &mut ToolContext) {
+        let Some(first) = self.points.first() else {
+            return;
+        };
+        let first = first.pt;
+        let outline = get_stroke(&self.points, &Self::stroke_options(ctx));
         let Some(start) = outline.first() else {
             return;
         };
@@ -119,7 +170,7 @@ impl BrushTool {
         }
         path.close();
         let mut fills = SmallVec::new();
-        fills.push(Fill::solid(ctx.new_shape_fill));
+        fills.push(Fill::solid(Self::stroke_color(ctx)));
         let mut node = CanvasNode::new(NodeData::Vector(VectorNode {
             path,
             fills,
@@ -133,6 +184,10 @@ impl BrushTool {
         node.name = "Brush stroke".into();
         node.meta = serde_json::json!({ "fanta_draw_mark": "brush" });
         node.blend_mode = ctx.new_blend_mode;
+        let softness_radius = Self::softness_radius(ctx);
+        if softness_radius > 0.0 {
+            node.blurs.push(Blur::layer(softness_radius));
+        }
         node.transform = Transform2D::translation(first.x, first.y);
         ctx.place_new_node_on_active_page(&mut node);
         let id = node.id;
@@ -159,11 +214,11 @@ impl Tool for BrushTool {
                 self.reset();
                 self.active = true;
                 self.add_sample(ctx, DVec2::from(screen));
-                ToolResponse::cursor(CursorHint::Crosshair)
+                self.preview(ctx)
             }
             ToolEvent::Pointer(PointerEvent::Move { screen, .. }) if self.active => {
                 self.add_sample(ctx, DVec2::from(screen));
-                self.preview()
+                self.preview(ctx)
             }
             ToolEvent::Pointer(PointerEvent::Release {
                 screen,
@@ -241,7 +296,13 @@ mod tests {
             ctx.new_blend_mode = BlendMode::Multiply;
             ctx.brush_style = style;
             tool.handle_event(&mut ctx, pointer([400.0, 300.0], "press"));
-            tool.handle_event(&mut ctx, pointer([430.0, 300.0], "move"));
+            let preview = tool.handle_event(&mut ctx, pointer([430.0, 300.0], "move"));
+            let expected_outline = get_stroke(&tool.points, &BrushTool::stroke_options(&ctx));
+            assert!(matches!(
+                preview.overlays.as_slice(),
+                [ToolOverlay::PreviewBrushStroke { world_outline, color }]
+                    if *world_outline == expected_outline && *color == ctx.new_shape_fill
+            ));
             tool.handle_event(&mut ctx, pointer([460.0, 310.0], "release"));
             let node = doc
                 .scene
@@ -286,5 +347,44 @@ mod tests {
         }
         assert_eq!(tool.points.len(), 5000);
         assert!(tool.preview_points.len() < MAX_SAMPLES);
+    }
+
+    #[test]
+    fn brush_flow_and_hardness_affect_preview_and_committed_mark() {
+        let mut doc = Doc::new();
+        let mut viewport = Viewport::default();
+        let mut context = ToolContext::new(
+            &mut doc,
+            &mut viewport,
+            SnapEngine::default(),
+            DVec2::new(800.0, 600.0),
+        );
+        context.new_shape_fill = Color::rgba(10, 20, 30, 200);
+        context.new_stroke_width = 40.0;
+        context.brush_flow = 50;
+        context.brush_hardness = 0;
+        let mut brush = BrushTool::new();
+        brush.handle_event(&mut context, pointer([300.0, 300.0], "press"));
+        let preview = brush.handle_event(&mut context, pointer([350.0, 300.0], "move"));
+        assert!(matches!(
+            preview.overlays.as_slice(),
+            [ToolOverlay::PreviewBrushStroke { color: halo_color, .. },
+             ToolOverlay::PreviewBrushStroke { color: core_color, .. }]
+                if *halo_color == Color::rgba(10, 20, 30, 25)
+                    && *core_color == Color::rgba(10, 20, 30, 75)
+        ));
+        brush.handle_event(&mut context, pointer([400.0, 300.0], "release"));
+        let node = doc
+            .scene
+            .get(*doc.scene.roots().last().expect("brush mark"))
+            .expect("brush node");
+        let NodeData::Vector(vector) = &node.data else {
+            panic!("brush mark must be a vector");
+        };
+        assert_eq!(
+            vector.fills[0].solid_color(),
+            Some(Color::rgba(10, 20, 30, 100))
+        );
+        assert_eq!(node.blurs.as_slice(), &[Blur::layer(26.0)]);
     }
 }

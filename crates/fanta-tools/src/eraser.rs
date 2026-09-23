@@ -2,8 +2,12 @@ use crate::context::ToolContext;
 use crate::event::{Button, LogicalKey, PointerEvent, ToolEvent};
 use crate::tool::{CursorHint, Tool, ToolResponse};
 use fanta_canvas::{BEZIER_FLATTEN_STEPS, hit_test::on_active_page};
-use fanta_doc::{Bounds, NodeData, NodeFlags, NodeId, Operation, PathSegment, Scene};
+use fanta_doc::{
+    BooleanNode, BooleanOp, Bounds, CanvasNode, NodeData, NodeFlags, NodeId, Operation, PathData,
+    PathSegment, Scene, SceneError, Transform2D,
+};
 use glam::DVec2;
+use std::collections::HashMap;
 
 #[derive(Default)]
 pub struct EraserTool {
@@ -11,6 +15,7 @@ pub struct EraserTool {
     max_stroke_radius: f64,
     cached_scene: Option<(u64, u64, Option<NodeId>)>,
     deleted_widest_stroke: bool,
+    active_subtractions: HashMap<NodeId, NodeId>,
 }
 
 impl EraserTool {
@@ -33,6 +38,9 @@ impl EraserTool {
     fn erase_segment(&mut self, ctx: &mut ToolContext, end: DVec2) {
         self.refresh_stroke_radius(ctx);
         let start = self.last_world.unwrap_or(end);
+        if self.last_world == Some(end) {
+            return;
+        }
         self.last_world = Some(end);
         let radius = (ctx.new_stroke_width * 0.5).clamp(0.5, 2500.0);
         // Vector bounds cover their paths but not the paint around those paths.
@@ -52,23 +60,82 @@ impl EraserTool {
             let removed_widest_stroke = self.max_stroke_radius > 0.0
                 && stroke_radius(&ctx.doc.scene, id)
                     .is_some_and(|mark_radius| mark_radius >= self.max_stroke_radius);
-            let snapshot = ctx
-                .doc
-                .scene
-                .descendants_of(id)
-                .filter_map(|descendant| ctx.doc.scene.get(descendant).cloned())
-                .collect::<Vec<_>>();
-            if snapshot.is_empty() {
-                continue;
-            }
-            if let Err(error) = ctx.doc.apply(Operation::DeleteSubtree { snapshot }) {
+            if let Err(error) = self.subtract_sweep(ctx, id, start, end, radius) {
                 tracing::warn!(target: "fanta-tools.eraser", "erase failed: {error}");
-            } else {
-                ctx.doc.selection.remove(id);
-                self.deleted_widest_stroke |= removed_widest_stroke;
+                if let Err(error) = ctx.doc.abort_transaction() {
+                    tracing::warn!(target: "fanta-tools.eraser", "rollback failed: {error}");
+                }
+                self.last_world = None;
+                self.cached_scene = None;
+                self.active_subtractions.clear();
+                return;
             }
+            ctx.doc.selection.remove(id);
+            self.deleted_widest_stroke |= removed_widest_stroke;
         }
         self.cached_scene = Some((ctx.doc.scene.instance_id(), ctx.doc.scene.revision(), scope));
+    }
+
+    fn subtract_sweep(
+        &mut self,
+        ctx: &mut ToolContext,
+        id: NodeId,
+        start: DVec2,
+        end: DVec2,
+        radius: f64,
+    ) -> Result<(), SceneError> {
+        let Some(original_world) = ctx.doc.scene.world_transform(id) else {
+            return Ok(());
+        };
+        let original_determinant = original_world.0.matrix2.determinant();
+        if !original_determinant.is_finite() || original_determinant.abs() < 1e-12 {
+            return Ok(());
+        }
+        let boolean_id = if is_erased_mark(&ctx.doc.scene, id) {
+            id
+        } else {
+            wrap_mark(ctx, id)?
+        };
+        let Some(world_transform) = ctx.doc.scene.world_transform(boolean_id) else {
+            return Ok(());
+        };
+        let determinant = world_transform.0.matrix2.determinant();
+        if !determinant.is_finite() || determinant.abs() < 1e-12 {
+            return Ok(());
+        }
+        let inverse = world_transform.inverse();
+        let mut swept_area = capsule(start, end, radius);
+        swept_area.map_points_mut(|point| {
+            let local = inverse.transform_point(DVec2::from(point));
+            [local.x, local.y]
+        });
+
+        if let Some(&operand_id) = self.active_subtractions.get(&boolean_id) {
+            if let Some(node) = ctx.doc.scene.get(operand_id)
+                && let NodeData::Vector(vector) = &node.data
+            {
+                let old = node.data.clone();
+                let mut updated = vector.clone();
+                updated.path.segments.extend(swept_area.segments);
+                ctx.doc.apply(Operation::ReplaceData {
+                    id: operand_id,
+                    old: Box::new(old),
+                    new: Box::new(NodeData::Vector(updated)),
+                })?;
+                return Ok(());
+            }
+        }
+
+        let mut operand = CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode {
+            path: swept_area,
+            ..Default::default()
+        }));
+        operand.parent = Some(boolean_id);
+        operand.index = ctx.doc.scene.next_child_index(Some(boolean_id));
+        let operand_id = operand.id;
+        ctx.doc.apply(Operation::create_node(operand))?;
+        self.active_subtractions.insert(boolean_id, operand_id);
+        Ok(())
     }
 
     fn finish(&mut self, ctx: &mut ToolContext) {
@@ -79,6 +146,7 @@ impl EraserTool {
             self.cached_scene = None;
             self.deleted_widest_stroke = false;
         }
+        self.active_subtractions.clear();
     }
 }
 
@@ -95,6 +163,7 @@ impl Tool for EraserTool {
                 ..
             }) => {
                 self.finish(ctx);
+                self.active_subtractions.clear();
                 ctx.doc.history.begin("Erase strokes", &mut ctx.doc.scene);
                 self.erase_segment(ctx, ctx.screen_to_world(DVec2::from(screen)));
                 ToolResponse::cursor(CursorHint::Crosshair)
@@ -119,6 +188,7 @@ impl Tool for EraserTool {
                     }
                     self.cached_scene = None;
                     self.deleted_widest_stroke = false;
+                    self.active_subtractions.clear();
                     ToolResponse::cursor(CursorHint::Crosshair)
                 } else {
                     ToolResponse::exit()
@@ -135,6 +205,123 @@ impl Tool for EraserTool {
     fn deactivate(&mut self, ctx: &mut ToolContext) {
         self.finish(ctx);
     }
+}
+
+fn wrap_mark(ctx: &mut ToolContext, id: NodeId) -> Result<NodeId, SceneError> {
+    let source = ctx
+        .doc
+        .scene
+        .get(id)
+        .cloned()
+        .ok_or(SceneError::NotFound(id))?;
+    let NodeData::Vector(vector) = &source.data else {
+        return Err(SceneError::InvariantViolated(
+            "eraser source is not a vector".into(),
+        ));
+    };
+    let fills = if vector.fills.is_empty() {
+        let Some(stroke) = vector.strokes.first() else {
+            return Err(SceneError::InvariantViolated(
+                "eraser source has no paint".into(),
+            ));
+        };
+        let mut outlined = vector.clone();
+        outlined.path = vector
+            .path
+            .stroke_to_fill(stroke.width, stroke.cap, stroke.join);
+        outlined.fills.push(stroke.paint.clone());
+        outlined.strokes.clear();
+        outlined.parametric = None;
+        ctx.doc.apply(Operation::ReplaceData {
+            id,
+            old: Box::new(source.data.clone()),
+            new: Box::new(NodeData::Vector(outlined)),
+        })?;
+        std::iter::once(stroke.paint.clone()).collect()
+    } else {
+        vector.fills.clone()
+    };
+
+    let mut wrapper = CanvasNode::new(NodeData::Boolean(BooleanNode {
+        op: BooleanOp::Subtract,
+        fills,
+        strokes: Default::default(),
+    }));
+    wrapper.parent = source.parent;
+    wrapper.index = source.index;
+    wrapper.name = source.name;
+    wrapper.transform = source.transform;
+    wrapper.constraints = source.constraints;
+    wrapper.opacity = source.opacity;
+    wrapper.blend_mode = source.blend_mode;
+    wrapper.effects = source.effects;
+    wrapper.blurs = source.blurs;
+    wrapper.flags = source.flags;
+    wrapper.is_mask = source.is_mask;
+    wrapper.mask_type = source.mask_type;
+    wrapper.scroll_behavior = source.scroll_behavior;
+    wrapper.layout_child = source.layout_child;
+    wrapper.bindings = source.bindings;
+    wrapper.reactions = source.reactions;
+    wrapper.meta = source.meta;
+    if let Some(meta) = wrapper.meta.as_object_mut() {
+        meta.insert("fanta_eraser_result".into(), true.into());
+    } else {
+        wrapper.meta = serde_json::json!({ "fanta_eraser_result": true });
+    }
+    let wrapper_id = wrapper.id;
+    ctx.doc.apply(Operation::create_node(wrapper))?;
+    ctx.doc.apply(Operation::Reparent {
+        id,
+        old_parent: source.parent,
+        old_index: source.index,
+        new_parent: Some(wrapper_id),
+        new_index: ctx.doc.scene.next_child_index(Some(wrapper_id)),
+    })?;
+    if source.transform != Transform2D::IDENTITY {
+        ctx.doc.apply(Operation::SetTransform {
+            id,
+            old: source.transform,
+            new: Transform2D::IDENTITY,
+        })?;
+    }
+    Ok(wrapper_id)
+}
+
+fn capsule(start: DVec2, end: DVec2, radius: f64) -> PathData {
+    if (end - start).length_squared() <= f64::EPSILON {
+        return PathData::ellipse(start.x, start.y, radius, radius);
+    }
+    let tangent = (end - start).normalize();
+    let normal = DVec2::new(-tangent.y, tangent.x);
+    let n = normal * radius;
+    let t = tangent * radius;
+    let k = 0.552_284_749_830_793_3;
+    let mut path = PathData::new();
+    let point = start + n;
+    path.move_to(point.x, point.y);
+    let point = end + n;
+    path.line_to(point.x, point.y);
+    let (control1, control2, point) = (end + n + t * k, end + t + n * k, end + t);
+    path.cubic_to(
+        control1.x, control1.y, control2.x, control2.y, point.x, point.y,
+    );
+    let (control1, control2, point) = (end + t - n * k, end - n + t * k, end - n);
+    path.cubic_to(
+        control1.x, control1.y, control2.x, control2.y, point.x, point.y,
+    );
+    let point = start - n;
+    path.line_to(point.x, point.y);
+    let (control1, control2, point) = (start - n - t * k, start - t - n * k, start - t);
+    path.cubic_to(
+        control1.x, control1.y, control2.x, control2.y, point.x, point.y,
+    );
+    let (control1, control2, point) = (start - t + n * k, start + n - t * k, start + n);
+    path.cubic_to(
+        control1.x, control1.y, control2.x, control2.y, point.x, point.y,
+    );
+    path.close();
+    path
 }
 
 fn max_stroke_radius(scene: &Scene, scope: Option<NodeId>) -> f64 {
@@ -177,37 +364,66 @@ fn editable_mark(scene: &Scene, id: NodeId) -> bool {
             ancestor
                 .flags
                 .intersects(NodeFlags::HIDDEN | NodeFlags::LOCKED)
+                || matches!(ancestor.data, NodeData::Boolean(_))
         })
     {
         return false;
     }
+    if is_erased_mark(scene, id) {
+        return true;
+    }
     let NodeData::Vector(vector) = &node.data else {
         return false;
     };
-    node.meta
-        .get("fanta_draw_mark")
-        .is_some_and(|value| value == "brush")
-        || (vector.fills.is_empty() && !vector.strokes.is_empty())
+    node.meta.get("fanta_draw_mark") == Some(&serde_json::json!("brush"))
+        || (vector.fills.is_empty()
+            && vector.strokes.len() == 1
+            && vector.strokes.first().is_some_and(|stroke| {
+                stroke.width.is_finite() && stroke.width > 0.0 && stroke.dash.is_empty()
+            }))
+}
+
+fn is_erased_mark(scene: &Scene, id: NodeId) -> bool {
+    scene.get(id).is_some_and(|node| {
+        matches!(node.data, NodeData::Boolean(_))
+            && node.meta.get("fanta_eraser_result") == Some(&serde_json::Value::Bool(true))
+    })
 }
 
 fn mark_intersects_sweep(scene: &Scene, id: NodeId, start: DVec2, end: DVec2, radius: f64) -> bool {
     let Some(node) = scene.get(id) else {
         return false;
     };
+    if is_erased_mark(scene, id) {
+        return scene
+            .children_of(Some(id))
+            .first()
+            .is_some_and(|source| mark_intersects_sweep(scene, *source, start, end, radius));
+    }
     let NodeData::Vector(vector) = &node.data else {
         return false;
     };
     let Some(transform) = scene.world_transform(id) else {
         return false;
     };
+    let filled = !vector.fills.is_empty()
+        || scene
+            .ancestors_of(id)
+            .any(|ancestor| matches!(ancestor.data, NodeData::Boolean(_)));
     let mark_radius = stroke_radius(scene, id).unwrap_or(0.0);
     let threshold = radius + mark_radius;
     let mut first = None;
     let mut previous = None;
     let mut outline = Vec::new();
+    let mut inside_fill = false;
     for segment in &vector.path.segments {
         match segment {
             PathSegment::Move { to } => {
+                if filled && outline.len() >= 3 {
+                    inside_fill |=
+                        point_in_polygon(&outline, start) || point_in_polygon(&outline, end);
+                }
+                outline.clear();
                 let point = transform.transform_point(DVec2::from(*to));
                 first = Some(point);
                 previous = Some(point);
@@ -264,10 +480,10 @@ fn mark_intersects_sweep(scene: &Scene, id: NodeId, start: DVec2, end: DVec2, ra
             }
         }
     }
-    if vector.fills.is_empty() || outline.len() < 3 {
-        return false;
+    if !filled || outline.len() < 3 {
+        return inside_fill;
     }
-    point_in_polygon(&outline, start) || point_in_polygon(&outline, end)
+    inside_fill || point_in_polygon(&outline, start) || point_in_polygon(&outline, end)
 }
 
 fn trace_point(
@@ -360,8 +576,134 @@ mod tests {
         })
     }
 
+    fn painted_at(scene: &Scene, wrapper: NodeId, point: DVec2) -> bool {
+        let Some((&source, subtractors)) = scene.children_of(Some(wrapper)).split_first() else {
+            return false;
+        };
+        mark_intersects_sweep(scene, source, point, point, 0.0)
+            && subtractors
+                .iter()
+                .all(|id| !mark_intersects_sweep(scene, *id, point, point, 0.0))
+    }
+
     #[test]
-    fn eraser_removes_pencil_and_brush_marks_as_one_undo_step() {
+    fn eraser_cuts_only_the_middle_of_a_pencil_line() {
+        let mut doc = Doc::new();
+        let mut path = PathData::new();
+        path.move_to(-60.0, 0.0).line_to(60.0, 0.0);
+        let original = CanvasNode::new(NodeData::Vector(VectorNode {
+            path,
+            strokes: [Stroke::solid(Color::BLACK, 12.0)].into_iter().collect(),
+            ..VectorNode::default()
+        }));
+        let original_id = original.id;
+        doc.apply(Operation::create_node(original))
+            .expect("create pencil line");
+        let mut viewport = Viewport::default();
+        let mut ctx = ToolContext::new(
+            &mut doc,
+            &mut viewport,
+            SnapEngine::default(),
+            DVec2::new(800.0, 600.0),
+        );
+        ctx.new_stroke_width = 20.0;
+        let mut eraser = EraserTool::new();
+        eraser.handle_event(&mut ctx, pointer([400.0, 300.0], "press"));
+        eraser.handle_event(&mut ctx, pointer([400.0, 300.0], "release"));
+
+        let wrapper = ctx.doc.scene.roots()[0];
+        assert!(is_erased_mark(&ctx.doc.scene, wrapper));
+        assert_eq!(ctx.doc.scene.children_of(Some(wrapper)).len(), 2);
+        assert!(painted_at(&ctx.doc.scene, wrapper, DVec2::new(-40.0, 0.0)));
+        assert!(!painted_at(&ctx.doc.scene, wrapper, DVec2::ZERO));
+        assert!(painted_at(&ctx.doc.scene, wrapper, DVec2::new(40.0, 0.0)));
+        assert!(ctx.doc.undo().expect("undo eraser"));
+        assert_eq!(ctx.doc.scene.roots(), &[original_id]);
+        assert_eq!(ctx.doc.scene.len(), 1);
+        assert!(ctx.doc.redo().expect("redo eraser"));
+        assert!(!painted_at(&ctx.doc.scene, wrapper, DVec2::ZERO));
+    }
+
+    #[test]
+    fn eraser_drag_keeps_one_subtraction_operand_and_covers_the_sweep() {
+        let mut doc = Doc::new();
+        let mut path = PathData::new();
+        path.move_to(-80.0, 0.0).line_to(80.0, 0.0);
+        let original = CanvasNode::new(NodeData::Vector(VectorNode {
+            path,
+            strokes: [Stroke::solid(Color::BLACK, 12.0)].into_iter().collect(),
+            ..VectorNode::default()
+        }));
+        doc.apply(Operation::create_node(original))
+            .expect("create pencil line");
+        let mut viewport = Viewport::default();
+        let mut ctx = ToolContext::new(
+            &mut doc,
+            &mut viewport,
+            SnapEngine::default(),
+            DVec2::new(800.0, 600.0),
+        );
+        ctx.new_stroke_width = 20.0;
+        let mut eraser = EraserTool::new();
+        eraser.handle_event(&mut ctx, pointer([400.0, 300.0], "press"));
+        eraser.handle_event(&mut ctx, pointer([425.0, 300.0], "move"));
+        eraser.handle_event(&mut ctx, pointer([450.0, 300.0], "release"));
+
+        let wrapper = ctx.doc.scene.roots()[0];
+        let children = ctx.doc.scene.children_of(Some(wrapper));
+        assert_eq!(children.len(), 2);
+        let subtraction = ctx.doc.scene.get(children[1]).expect("subtraction operand");
+        let NodeData::Vector(vector) = &subtraction.data else {
+            panic!("subtraction must contain vector geometry");
+        };
+        assert_eq!(
+            vector
+                .path
+                .segments
+                .iter()
+                .filter(|segment| matches!(segment, PathSegment::Move { .. }))
+                .count(),
+            3
+        );
+        assert!(painted_at(&ctx.doc.scene, wrapper, DVec2::new(-40.0, 0.0)));
+        for x in [0.0, 20.0, 40.0] {
+            assert!(!painted_at(&ctx.doc.scene, wrapper, DVec2::new(x, 0.0)));
+        }
+        assert!(painted_at(&ctx.doc.scene, wrapper, DVec2::new(70.0, 0.0)));
+    }
+
+    #[test]
+    fn eraser_cuts_brush_outline_without_deleting_its_ends() {
+        let mut doc = Doc::new();
+        let mut viewport = Viewport::default();
+        let mut ctx = ToolContext::new(
+            &mut doc,
+            &mut viewport,
+            SnapEngine::default(),
+            DVec2::new(800.0, 600.0),
+        );
+        ctx.new_stroke_width = 20.0;
+        let mut brush = BrushTool::new();
+        brush.handle_event(&mut ctx, pointer([340.0, 300.0], "press"));
+        brush.handle_event(&mut ctx, pointer([460.0, 300.0], "release"));
+        let brush_id = ctx.doc.scene.roots()[0];
+        let mut eraser = EraserTool::new();
+        eraser.handle_event(&mut ctx, pointer([400.0, 300.0], "press"));
+        eraser.handle_event(&mut ctx, pointer([400.0, 300.0], "release"));
+
+        let wrapper = ctx.doc.scene.roots()[0];
+        assert!(is_erased_mark(&ctx.doc.scene, wrapper));
+        assert_eq!(
+            ctx.doc.scene.get(brush_id).and_then(|node| node.parent),
+            Some(wrapper)
+        );
+        assert!(painted_at(&ctx.doc.scene, wrapper, DVec2::new(-40.0, 0.0)));
+        assert!(!painted_at(&ctx.doc.scene, wrapper, DVec2::ZERO));
+        assert!(painted_at(&ctx.doc.scene, wrapper, DVec2::new(40.0, 0.0)));
+    }
+
+    #[test]
+    fn eraser_partially_subtracts_pencil_and_brush_as_one_undo_step() {
         let mut doc = Doc::new();
         let mut viewport = Viewport::default();
         let size = DVec2::new(800.0, 600.0);
@@ -375,20 +717,29 @@ mod tests {
             brush.handle_event(&mut ctx, pointer([500.0, 300.0], "release"));
         }
         assert_eq!(doc.scene.len(), 2);
+        let original_ids = doc.scene.roots().to_vec();
         {
             let mut ctx = ToolContext::new(&mut doc, &mut viewport, SnapEngine::default(), size);
             ctx.new_stroke_width = 24.0;
             let mut eraser = EraserTool::new();
             eraser.handle_event(&mut ctx, pointer([420.0, 300.0], "press"));
-            assert_eq!(ctx.doc.scene.len(), 1);
+            assert_eq!(ctx.doc.scene.len(), 4);
             eraser.handle_event(&mut ctx, pointer([480.0, 300.0], "move"));
             eraser.handle_event(&mut ctx, pointer([480.0, 300.0], "release"));
         }
-        assert_eq!(doc.scene.len(), 0);
+        assert_eq!(doc.scene.roots().len(), 2);
+        for id in &original_ids {
+            let wrapper = doc.scene.get(*id).and_then(|node| node.parent);
+            assert!(wrapper.is_some_and(|wrapper| is_erased_mark(&doc.scene, wrapper)));
+        }
+        assert_eq!(doc.scene.len(), 6);
         assert!(doc.undo().expect("undo eraser gesture"));
         assert_eq!(doc.scene.len(), 2);
+        for id in &original_ids {
+            assert!(doc.scene.get(*id).is_some_and(|node| node.parent.is_none()));
+        }
         assert!(doc.redo().expect("redo eraser gesture"));
-        assert_eq!(doc.scene.len(), 0);
+        assert_eq!(doc.scene.len(), 6);
     }
 
     #[test]
@@ -411,7 +762,11 @@ mod tests {
         let mut eraser = EraserTool::new();
         eraser.handle_event(&mut ctx, pointer([420.0, 330.0], "press"));
         eraser.handle_event(&mut ctx, pointer([420.0, 330.0], "release"));
-        assert_eq!(ctx.doc.scene.len(), 0);
+        assert_eq!(ctx.doc.scene.len(), 3);
+        let wrapper = ctx.doc.scene.roots()[0];
+        assert!(is_erased_mark(&ctx.doc.scene, wrapper));
+        assert!(painted_at(&ctx.doc.scene, wrapper, DVec2::new(20.0, 0.0)));
+        assert!(!painted_at(&ctx.doc.scene, wrapper, DVec2::new(20.0, 30.0)));
         eraser.handle_event(&mut ctx, pointer([600.0, 450.0], "press"));
         assert_eq!(eraser.max_stroke_radius, 0.0);
         eraser.handle_event(&mut ctx, pointer([600.0, 450.0], "release"));
@@ -420,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn eraser_removes_quadratic_and_cubic_stroked_vectors() {
+    fn eraser_partially_subtracts_quadratic_and_cubic_stroked_vectors() {
         for cubic in [false, true] {
             let mut doc = Doc::new();
             let mut path = PathData::new();
@@ -449,7 +804,8 @@ mod tests {
             let mut eraser = EraserTool::new();
             eraser.handle_event(&mut ctx, pointer([400.0, 250.0], "press"));
             eraser.handle_event(&mut ctx, pointer([400.0, 250.0], "release"));
-            assert_eq!(ctx.doc.scene.len(), 0, "cubic={cubic}");
+            assert_eq!(ctx.doc.scene.len(), 3, "cubic={cubic}");
+            assert!(is_erased_mark(&ctx.doc.scene, ctx.doc.scene.roots()[0]));
             assert!(ctx.doc.undo().expect("undo curved mark erasure"));
             assert_eq!(ctx.doc.scene.len(), 1, "cubic={cubic}");
         }
@@ -466,7 +822,7 @@ mod tests {
         brush.handle_event(&mut ctx, pointer([450.0, 300.0], "release"));
         let mut eraser = EraserTool::new();
         eraser.handle_event(&mut ctx, pointer([425.0, 300.0], "press"));
-        assert_eq!(ctx.doc.scene.len(), 0);
+        assert_eq!(ctx.doc.scene.len(), 3);
         eraser.handle_event(
             &mut ctx,
             ToolEvent::Key(KeyEvent::press(LogicalKey::Escape)),
@@ -503,7 +859,16 @@ mod tests {
         eraser.handle_event(&mut ctx, pointer([425.0, 300.0], "press"));
         eraser.handle_event(&mut ctx, pointer([425.0, 300.0], "release"));
         assert!(ctx.doc.scene.get(mark_ids[0]).is_some());
-        assert!(ctx.doc.scene.get(mark_ids[1]).is_none());
+        assert_eq!(
+            ctx.doc.scene.get(mark_ids[0]).and_then(|node| node.parent),
+            Some(first_page_id)
+        );
+        let erased_parent = ctx.doc.scene.get(mark_ids[1]).and_then(|node| node.parent);
+        assert!(erased_parent.is_some_and(|parent| is_erased_mark(&ctx.doc.scene, parent)));
+        assert_eq!(
+            erased_parent.and_then(|parent| ctx.doc.scene.get(parent).and_then(|node| node.parent)),
+            Some(second_page_id)
+        );
     }
 
     #[test]
