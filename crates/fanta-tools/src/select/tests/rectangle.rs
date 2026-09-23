@@ -41,6 +41,145 @@ fn rectangle_drag_selects_without_moving_a_node_under_the_press() {
 }
 
 #[test]
+fn rectangle_marquee_selects_the_visible_frame_containing_a_child() {
+    let size = DVec2::new(800.0, 600.0);
+    let mut doc = Doc::new();
+    let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    let page_id = page.id;
+    doc.apply(Operation::create_node(page))
+        .expect("create page");
+    doc.add_page(page_id);
+    doc.set_active_page(Some(page_id));
+
+    let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+        clip_size: Some([341.0, 153.0]),
+        ..GroupNode::default()
+    }));
+    frame.parent = Some(page_id);
+    frame.transform = Transform2D::translation(-168.0, 143.0);
+    let frame_id = frame.id;
+    doc.apply(Operation::create_node(frame))
+        .expect("create frame");
+
+    let mut child = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+        100.0,
+        40.0,
+        80.0,
+        60.0,
+        Color::rgba(255, 0, 0, 255),
+    )));
+    child.parent = Some(frame_id);
+    let child_id = child.id;
+    doc.apply(Operation::create_node(child))
+        .expect("create frame child");
+
+    let mut viewport = Viewport::default();
+    let mut ctx = ToolContext::new(&mut doc, &mut viewport, SnapEngine::default(), size);
+    let mut tool = RectangleSelectTool::new();
+    select_rectangle(
+        &mut tool,
+        &mut ctx,
+        [360.0, 500.0],
+        [360.0, 500.0],
+        ModifierKeys::empty(),
+    );
+    assert_eq!(ctx.doc.selection.as_slice(), &[frame_id]);
+
+    select_rectangle(
+        &mut tool,
+        &mut ctx,
+        [225.0, 430.0],
+        [578.0, 610.0],
+        ModifierKeys::empty(),
+    );
+    assert_eq!(ctx.doc.selection.as_slice(), &[frame_id]);
+    assert!(!ctx.doc.selection.contains(child_id));
+
+    select_rectangle(
+        &mut tool,
+        &mut ctx,
+        [325.0, 475.0],
+        [420.0, 550.0],
+        ModifierKeys::empty(),
+    );
+    assert_eq!(ctx.doc.selection.as_slice(), &[child_id]);
+}
+
+#[test]
+fn rectangle_marquee_selects_an_empty_frame_surface() {
+    let size = DVec2::new(800.0, 600.0);
+    let mut doc = Doc::new();
+    let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    let page_id = page.id;
+    doc.apply(Operation::create_node(page))
+        .expect("create page");
+    doc.add_page(page_id);
+    doc.set_active_page(Some(page_id));
+
+    let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+        clip_size: Some([341.0, 153.0]),
+        ..GroupNode::default()
+    }));
+    frame.parent = Some(page_id);
+    frame.transform = Transform2D::translation(-168.0, 143.0);
+    let frame_id = frame.id;
+    doc.apply(Operation::create_node(frame))
+        .expect("create empty frame");
+
+    let mut viewport = Viewport::default();
+    let mut ctx = ToolContext::new(&mut doc, &mut viewport, SnapEngine::default(), size);
+    let mut tool = RectangleSelectTool::new();
+    select_rectangle(
+        &mut tool,
+        &mut ctx,
+        [225.0, 430.0],
+        [578.0, 610.0],
+        ModifierKeys::empty(),
+    );
+    assert_eq!(ctx.doc.selection.as_slice(), &[frame_id]);
+}
+
+#[test]
+fn rectangle_marquee_does_not_select_a_page_backdrop_without_active_scope() {
+    let size = DVec2::new(800.0, 600.0);
+    let mut doc = Doc::new();
+    let page = CanvasNode::new(NodeData::Group(GroupNode {
+        clip_size: Some([300.0, 200.0]),
+        ..GroupNode::default()
+    }));
+    let page_id = page.id;
+    doc.apply(Operation::create_node(page))
+        .expect("create page");
+    doc.add_page(page_id);
+    assert!(doc.set_active_page(None));
+
+    let mut child = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+        50.0,
+        50.0,
+        50.0,
+        50.0,
+        Color::WHITE,
+    )));
+    child.parent = Some(page_id);
+    let child_id = child.id;
+    doc.apply(Operation::create_node(child))
+        .expect("create page child");
+
+    let mut viewport = Viewport::default();
+    let mut ctx = ToolContext::new(&mut doc, &mut viewport, SnapEngine::default(), size);
+    let mut tool = RectangleSelectTool::new();
+    select_rectangle(
+        &mut tool,
+        &mut ctx,
+        [390.0, 290.0],
+        [710.0, 510.0],
+        ModifierKeys::empty(),
+    );
+    assert_eq!(ctx.doc.selection.as_slice(), &[child_id]);
+    assert!(!ctx.doc.selection.contains(page_id));
+}
+
+#[test]
 fn rectangle_selection_operations_apply_to_current_vector_selection() {
     let size = DVec2::new(800.0, 600.0);
     let mut doc = Doc::new();

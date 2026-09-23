@@ -3,7 +3,7 @@ use crate::context::ToolContext;
 use crate::event::{Button, LogicalKey, ModifierKeys, PointerEvent, ToolEvent};
 use crate::tool::{CursorHint, Tool, ToolOverlay, ToolResponse, bounds_from_corners};
 use fanta_canvas::{HitPrecision, MarqueeMode, hit_test_deep, hit_test_within_screen};
-use fanta_doc::{NodeId, Selection};
+use fanta_doc::{Bounds, NodeData, NodeFlags, NodeId, Scene, Selection};
 use glam::DVec2;
 use std::collections::HashSet;
 
@@ -53,6 +53,52 @@ impl RectangleSelectTool {
         }
     }
 
+    fn marquee_matches(bounds: Bounds, marquee: Bounds, mode: MarqueeMode) -> bool {
+        match mode {
+            MarqueeMode::Contains => {
+                bounds.min_x >= marquee.min_x
+                    && bounds.min_y >= marquee.min_y
+                    && bounds.max_x <= marquee.max_x
+                    && bounds.max_y <= marquee.max_y
+            }
+            MarqueeMode::Intersects => bounds.intersects(&marquee),
+        }
+    }
+
+    fn frame_surface_hits<'a>(
+        scene: &'a Scene,
+        scope: Option<NodeId>,
+        pages: &'a [NodeId],
+        marquee: Bounds,
+        mode: MarqueeMode,
+    ) -> impl Iterator<Item = NodeId> + 'a {
+        let candidates = match scope {
+            Some(root) => scene.children_of(Some(root)),
+            None => scene.roots(),
+        };
+        candidates.iter().copied().filter(move |&id| {
+            if pages.contains(&id) {
+                return false;
+            }
+            let Some(node) = scene.get(id) else {
+                return false;
+            };
+            let NodeData::Group(group) = &node.data else {
+                return false;
+            };
+            group.is_frame_surface()
+                && !node.flags.intersects(NodeFlags::HIDDEN | NodeFlags::LOCKED)
+                && !scene.ancestors_of(id).any(|ancestor| {
+                    ancestor
+                        .flags
+                        .intersects(NodeFlags::HIDDEN | NodeFlags::LOCKED)
+                })
+                && scene
+                    .world_bounds(id)
+                    .is_some_and(|bounds| Self::marquee_matches(bounds, marquee, mode))
+        })
+    }
+
     fn release(
         &mut self,
         ctx: &mut ToolContext,
@@ -68,14 +114,45 @@ impl RectangleSelectTool {
             } else {
                 MarqueeMode::Contains
             };
-            let hits = hit_test_within_screen(
+            let screen_rect = bounds_from_corners(screen_press, screen);
+            let world_press = ctx.screen_to_world(screen_press);
+            let world_end = ctx.screen_to_world(screen);
+            let world_rect =
+                Bounds::from_min_max(world_press.min(world_end), world_press.max(world_end));
+            let scope = ctx.scope();
+            let leaves = hit_test_within_screen(
                 &ctx.doc.scene,
                 ctx.viewport,
                 ctx.screen_size,
-                bounds_from_corners(screen_press, screen),
+                screen_rect,
                 mode,
-                ctx.scope(),
+                scope,
             );
+            let mut seen = HashSet::new();
+            let mut hits = Vec::new();
+            for leaf in leaves {
+                let container = SelectTool::resolve_in_scope(&ctx.doc.scene, leaf, scope);
+                let target = if ctx
+                    .doc
+                    .scene
+                    .world_bounds(container)
+                    .is_some_and(|bounds| Self::marquee_matches(bounds, world_rect, mode))
+                {
+                    container
+                } else {
+                    leaf
+                };
+                if seen.insert(target) {
+                    hits.push(target);
+                }
+            }
+            for frame in
+                Self::frame_surface_hits(&ctx.doc.scene, scope, ctx.doc.pages(), world_rect, mode)
+            {
+                if seen.insert(frame) {
+                    hits.push(frame);
+                }
+            }
             Self::apply_hits(
                 ctx.rectangle_selection_operation,
                 &mut ctx.doc.selection,
