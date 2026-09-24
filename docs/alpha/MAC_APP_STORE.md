@@ -2,8 +2,12 @@
 
 Status on 24 September 2026: the App Store build path and RevenueCat integration
 are implemented locally. The Apple app record and purchase products are created.
-RevenueCat store credentials, signing, production backend deployment, purchase
-verification, and App Review remain.
+The Paid Apps Agreement, bank account, and tax forms show Active in App Store
+Connect. The EU trader submission shows In Review. Apple Developer Finance has
+received a request to correct the submitted W-8BEN. RevenueCat now has the
+Apple app with valid credentials, both products, a `pro` entitlement for the
+subscription, and the default offering. Signing, production backend deployment,
+purchase verification, and App Review remain.
 Submitting to review on 24–25 September is the target; approval and publication
 depend on Apple.
 
@@ -12,6 +16,10 @@ depend on Apple.
 1. In Apple Developer and App Store Connect, use an Account Holder/Admin account
    with an active Developer Program membership. The Account Holder must accept
    the current Paid Apps Agreement and complete banking and tax information.
+   These show Active, but the submitted W-8BEN lists Spain as citizenship;
+   request a replacement with Venezuela as citizenship while retaining Spain
+   as the user's ordinary IRPF tax residence. Ask Apple to confirm how to align
+   the beneficial-owner and signer names with the legal identity document.
 2. The explicit macOS bundle ID `dev.fanta.Fanta` and App Store Connect record
    **Fanta — Design Editor** (Apple app ID `6815642103`, SKU `FANTA-MAC-2026`)
    are created. Use this bundle ID in the provisioning profile and RevenueCat.
@@ -34,19 +42,23 @@ depend on Apple.
    Review its legal text before publishing; the original site checkout has
    unrelated uncommitted work and must not be deployed wholesale.
 5. In RevenueCat project `fantaisa` (`9eb97ebe`), connect the Apple app with
-   its In-App Purchase key and shared
-   secret, configure the products and a current offering, and copy its **public
-   Apple SDK key** to `FANTA_REVENUECAT_PUBLIC_API_KEY` for the App Store build.
+   its In-App Purchase key, configure the products and a current offering, and
+   set its **public Apple SDK key** as `FANTA_REVENUECAT_PUBLIC_API_KEY` for the
+   App Store build. Add an app-specific shared secret only if a StoreKit 1
+   purchase path needs legacy receipt validation.
    Use the backend Fanta user UUID as RevenueCat App User ID. Keep a purchase
    with its original App User ID on account transfer and disable Family Sharing
    for this subscription.
-   RevenueCat currently shows the default **Transfer to new App User ID**
-   behavior; change it to **Keep with original App User ID** before testing
-   account switching, so one person's purchase cannot move to another Fanta
-   account on the same Mac.
-   The RevenueCat email address still needs confirmation. The Apple app cannot
-   be saved in RevenueCat until the Apple In-App Purchase `.p8` key, Key ID,
-   and Issuer ID are provided.
+   RevenueCat's project-wide restore behavior is **Keep with original App User
+   ID** so one person's purchase cannot move to another Fanta account on the
+   same Mac. A customer using a second Fanta account with the same Apple ID
+   may need to return to the original account to restore or buy.
+   The Apple In-App Purchase key named **Fanta RevenueCat** was uploaded to
+   RevenueCat, and the app shows **Valid credentials**. The `Fanta Pro Monthly`
+   and `500 Fanta Credits` products match the Apple product IDs. The
+   subscription is attached to the `pro` entitlement; the consumable is not.
+   The `default` offering contains `$rc_monthly` and `credits_500` packages.
+   The app's public Apple SDK key is `appl_rpAPkYVLOHhdDSzQMkOxeYBbBew`.
    RevenueCat Billing shows that this account is already on the **Pro** plan,
    which supports the webhook needed for server-side credit fulfillment.
    Its Sandbox testing access is currently **Anybody**, the default for early
@@ -61,8 +73,9 @@ depend on Apple.
   release assets and is written to `target/<host-target>/release/app-store-dev/Fanta.app`.
   The Mac App Store build must report marketing version `1.0` and a numeric
   build number so App Store Connect can attach it to the version 1.0 record.
-  The final ad hoc build reports `1.0`/`1`, passes strict code signature
-  verification, opens a valid external design after relaunch, and shows a
+  The final ad hoc build reports `1.0`/`1`, embeds the RevenueCat public SDK
+  key, passes strict code signature verification, launches through macOS
+  LaunchServices, opens a valid external design after relaunch, and shows a
   visible error for a loose `.fnx` outside a Fanta project. It is not a
   distribution-signed package.
   The distributable command is `./script/bundle-mac -s`. Release signing requires
