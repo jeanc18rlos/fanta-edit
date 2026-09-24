@@ -15,6 +15,19 @@ app_store_ad_hoc=false
 IDENTITY="${MACOS_SIGNING_IDENTITY:-}"
 INSTALLER_IDENTITY="${MACOS_APP_STORE_INSTALLER_IDENTITY:-}"
 
+decode_app_store_provisioning_profile() {
+    local profile_path="$1"
+    local output_path="$2"
+
+    if security cms -D -i "$profile_path" -o "$output_path" 2>/dev/null &&
+        plutil -lint -s "$output_path"; then
+        return 0
+    fi
+
+    openssl cms -verify -inform DER -noverify -in "$profile_path" -out "$output_path" 2>/dev/null &&
+        plutil -lint -s "$output_path"
+}
+
 # Function for displaying help info
 help_info() {
   echo "
@@ -96,10 +109,13 @@ if [[ "$app_store" = true ]]; then
             echo "A release Mac App Store build requires MACOS_APP_STORE_PROVISIONING_PROFILE to name an existing .provisionprofile file."
             exit 1
         fi
-        if ! security cms -D -i "$MACOS_APP_STORE_PROVISIONING_PROFILE" > /dev/null; then
+        profile_validation_plist=$(mktemp)
+        if ! decode_app_store_provisioning_profile "$MACOS_APP_STORE_PROVISIONING_PROFILE" "$profile_validation_plist"; then
+            rm -f "$profile_validation_plist"
             echo "MACOS_APP_STORE_PROVISIONING_PROFILE is not a valid signed provisioning profile."
             exit 1
         fi
+        rm -f "$profile_validation_plist"
         if [[ -n "${MACOS_INSTALLER_CERTIFICATE:-}" && -z "${MACOS_INSTALLER_CERTIFICATE_PASSWORD:-}" ]] || \
            [[ -z "${MACOS_INSTALLER_CERTIFICATE:-}" && -n "${MACOS_INSTALLER_CERTIFICATE_PASSWORD:-}" ]]; then
             echo "MACOS_INSTALLER_CERTIFICATE and MACOS_INSTALLER_CERTIFICATE_PASSWORD must be provided together."
@@ -433,7 +449,7 @@ function sign_app_store_bundle() {
 
     if [[ "$app_store_ad_hoc" != true ]]; then
         profile_plist=$(mktemp)
-        security cms -D -i "$MACOS_APP_STORE_PROVISIONING_PROFILE" -o "$profile_plist"
+        decode_app_store_provisioning_profile "$MACOS_APP_STORE_PROVISIONING_PROFILE" "$profile_plist"
         profile_app_identifier=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.application-identifier' "$profile_plist")
         profile_team_identifier=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.team-identifier' "$profile_plist")
         if [[ "$profile_app_identifier" != "${profile_team_identifier}.dev.fanta.Fanta" ]]; then
