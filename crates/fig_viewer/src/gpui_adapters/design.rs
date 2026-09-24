@@ -2358,7 +2358,13 @@ impl FigView {
                         async { Ok(chooser.await??.and_then(|paths| paths.into_iter().next())) }
                             .await;
                     match selected {
-                        Ok(Some(directory)) => Some(directory),
+                        Ok(Some(directory)) => {
+                            #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+                            workspace::remember_user_selected_paths(std::slice::from_ref(
+                                &directory,
+                            ))?;
+                            Some(directory)
+                        }
                         Ok(None) => return Ok::<(), anyhow::Error>(()),
                         Err(error) => {
                             this.update_in(cx, |_, window, cx| {
@@ -3935,6 +3941,8 @@ impl FigView {
                         else {
                             return Ok(());
                         };
+                        #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+                        workspace::remember_user_selected_paths(std::slice::from_ref(&path))?;
                         path
                     }
                     (None, None) => return Ok(()),
@@ -4037,6 +4045,8 @@ impl FigView {
                         else {
                             return Ok(());
                         };
+                        #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+                        workspace::remember_user_selected_paths(std::slice::from_ref(&path))?;
                         path
                     }
                     (None, None) => return Ok(()),

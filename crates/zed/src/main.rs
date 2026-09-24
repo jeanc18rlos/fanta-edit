@@ -34,6 +34,7 @@ use gpui_platform;
 
 use gpui_tokio::Tokio;
 use language::LanguageRegistry;
+#[cfg(not(feature = "mac_app_store"))]
 use prompt_store::PromptBuilder;
 use remote::RemoteConnectionOptions;
 use reqwest_client::ReqwestClient;
@@ -365,7 +366,8 @@ fn main() {
 
     let (open_listener, mut open_rx) = OpenListener::new();
 
-    let failed_single_instance_check = if *zed_env_vars::ZED_STATELESS
+    let failed_single_instance_check = if cfg!(feature = "mac_app_store")
+        || *zed_env_vars::ZED_STATELESS
         || *release_channel::RELEASE_CHANNEL == ReleaseChannel::Dev
     {
         false
@@ -432,14 +434,16 @@ fn main() {
     };
 
     let git_hosting_provider_registry = Arc::new(GitHostingProviderRegistry::new());
-    let git_binary_path =
-        if cfg!(target_os = "macos") && option_env!("ZED_BUNDLE").as_deref() == Some("true") {
-            app.path_for_auxiliary_executable("git")
-                .context("could not find git binary path")
-                .log_err()
-        } else {
-            None
-        };
+    let git_binary_path = if !cfg!(feature = "mac_app_store")
+        && cfg!(target_os = "macos")
+        && option_env!("ZED_BUNDLE").as_deref() == Some("true")
+    {
+        app.path_for_auxiliary_executable("git")
+            .context("could not find git binary path")
+            .log_err()
+    } else {
+        None
+    };
     if let Some(git_binary_path) = &git_binary_path {
         log::info!("Using git binary path: {:?}", git_binary_path);
     }
@@ -452,7 +456,11 @@ fn main() {
     );
 
     let (shell_env_loaded_tx, shell_env_loaded_rx) = oneshot::channel();
-    if !stdout_is_a_pty() {
+    if cfg!(feature = "mac_app_store") {
+        if shell_env_loaded_tx.send(()).is_err() {
+            log::debug!("Shell environment readiness receiver was dropped");
+        }
+    } else if !stdout_is_a_pty() {
         app.background_executor()
             .spawn(async {
                 #[cfg(unix)]
@@ -574,7 +582,7 @@ fn main() {
         Client::set_global(client.clone(), cx);
 
         zed::init(cx);
-        #[cfg(target_os = "macos")]
+        #[cfg(all(target_os = "macos", not(feature = "mac_app_store")))]
         zed::move_to_applications::init(cx);
         project::Project::init(&client, cx);
         client::init(&client, cx);
@@ -610,6 +618,7 @@ fn main() {
         })
         .detach();
 
+        #[cfg(not(feature = "mac_app_store"))]
         let is_new_install = matches!(&installation_id, Some(IdType::New(_)));
 
         // We should rename these in the future to `first app open`, `first app open for release channel`, and `app open`
@@ -641,6 +650,7 @@ fn main() {
         });
         AppState::set_global(app_state.clone(), cx);
 
+        #[cfg(not(feature = "mac_app_store"))]
         auto_update::init(client.clone(), cx);
         reliability::init(client.clone(), cx);
 
@@ -654,27 +664,32 @@ fn main() {
             cx,
         );
         language_models::init(app_state.user_store.clone(), app_state.client.clone(), cx);
+        #[cfg(not(feature = "mac_app_store"))]
         acp_tools::init(cx);
         zed::telemetry_log::init(cx);
         zed::remote_debug::init(cx);
         web_search::init(cx);
         web_search_providers::init(app_state.client.clone(), app_state.user_store.clone(), cx);
         snippet_provider::init(cx);
+        #[cfg(not(feature = "mac_app_store"))]
         let prompt_builder = PromptBuilder::load(app_state.fs.clone(), stdout_is_a_pty(), cx);
-        project::AgentRegistryStore::init_global(
-            cx,
-            app_state.fs.clone(),
-            app_state.client.http_client(),
-        );
-        agent_ui::init(
-            app_state.fs.clone(),
-            prompt_builder,
-            app_state.languages.clone(),
-            is_new_install,
-            false,
-            cx,
-        );
-        zed::watch_user_agents_md(app_state.fs.clone(), cx);
+        #[cfg(not(feature = "mac_app_store"))]
+        {
+            project::AgentRegistryStore::init_global(
+                cx,
+                app_state.fs.clone(),
+                app_state.client.http_client(),
+            );
+            agent_ui::init(
+                app_state.fs.clone(),
+                prompt_builder,
+                app_state.languages.clone(),
+                is_new_install,
+                false,
+                cx,
+            );
+            zed::watch_user_agents_md(app_state.fs.clone(), cx);
+        }
 
         recent_projects::init(cx);
 
@@ -700,10 +715,12 @@ fn main() {
             },
             wrap_div_with_search_actions: search::buffer_search::register_pane_search_actions,
         });
+        #[cfg(not(feature = "mac_app_store"))]
         terminal_view::init(cx);
         theme_selector::init(cx);
         notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
         title_bar::init(cx);
+        #[cfg(not(feature = "mac_app_store"))]
         git_ui::init(cx);
         #[cfg(target_os = "windows")]
         etw_tracing::init(cx);
@@ -1486,6 +1503,10 @@ fn hide_unshipped_actions_from_command_palette(cx: &mut App) {
         for namespace in HIDDEN_NAMESPACES {
             filter.hide_namespace(namespace);
         }
+        #[cfg(feature = "mac_app_store")]
+        for namespace in ["agent", "assistant", "acp", "git", "git_ui", "extensions"] {
+            filter.hide_namespace(namespace);
+        }
         // Leftovers in namespaces that must stay visible.
         filter.hide_action_types(&[
             TypeId::of::<zed::OpenTasks>(),
@@ -1522,7 +1543,8 @@ fn hide_unshipped_actions_from_command_palette(cx: &mut App) {
             TypeId::of::<zed_actions::OpenTelemetryLog>(),
             TypeId::of::<zed_actions::OpenPerformanceProfiler>(),
             TypeId::of::<zed_actions::ShowUpdateNotification>(),
-            // These open Zed's own account, server or extension surfaces.
+            // These open inherited server or extension surfaces.
+            #[cfg(not(feature = "mac_app_store"))]
             TypeId::of::<zed_actions::OpenAccountSettings>(),
             TypeId::of::<zed_actions::OpenServerSettings>(),
             TypeId::of::<zed_actions::OpenZedUrl>(),

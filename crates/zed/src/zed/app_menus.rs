@@ -15,8 +15,11 @@ pub fn app_menus() -> Vec<Menu> {
         MenuItem::action("Layers Sidebar", fig_viewer::ToggleLayersSidebar),
         MenuItem::action("Inspector Sidebar", fig_viewer::ToggleInspectorSidebar),
         MenuItem::separator(),
+        #[cfg(not(feature = "mac_app_store"))]
         MenuItem::action("Toggle Agent Panel", zed_actions::assistant::Toggle),
+        #[cfg(not(feature = "mac_app_store"))]
         MenuItem::action("Toggle Threads Rail", workspace::ToggleWorkspaceSidebar),
+        #[cfg(not(feature = "mac_app_store"))]
         MenuItem::separator(),
         MenuItem::action("Command Palette...", zed_actions::command_palette::Toggle),
     ];
@@ -27,6 +30,8 @@ pub fn app_menus() -> Vec<Menu> {
             disabled: false,
             items: vec![
                 MenuItem::action("About Fanta", zed_actions::About),
+                #[cfg(feature = "mac_app_store")]
+                MenuItem::action("Credits & Billing…", zed_actions::OpenAccountSettings),
                 MenuItem::separator(),
                 MenuItem::submenu(Menu::new("Settings").items([
                     MenuItem::action("Open Settings File", super::OpenSettingsFile),
@@ -77,8 +82,11 @@ pub fn app_menus() -> Vec<Menu> {
                 MenuItem::separator(),
                 // Declared in git_ui's `actions!(git, [Diff, ..])`, not in the
                 // git crate, and registered on every workspace by git_ui::init.
+                #[cfg(not(feature = "mac_app_store"))]
                 MenuItem::action("Review Changes", git_ui::project_diff::Diff),
+                #[cfg(not(feature = "mac_app_store"))]
                 MenuItem::action("Commit…", git::Commit),
+                #[cfg(not(feature = "mac_app_store"))]
                 MenuItem::separator(),
                 MenuItem::action(
                     "Close Tab",
@@ -134,7 +142,9 @@ pub fn app_menus() -> Vec<Menu> {
                         url: "https://fantaisa.net/docs".into(),
                     },
                 ),
+                #[cfg(not(feature = "mac_app_store"))]
                 MenuItem::separator(),
+                #[cfg(not(feature = "mac_app_store"))]
                 MenuItem::action(
                     "Connect Claude Code / Codex…",
                     zed_actions::fanta::ConnectExternalAgent,

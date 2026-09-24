@@ -13,6 +13,7 @@ path = "src/fig_viewer.rs"
 doctest = false
 
 [features]
+mac_app_store = ["workspace/mac_app_store"]
 # The fanta-gpui LayersPanel is the only layers UI, so the runtime is on by
 # default; `--no-default-features` builds a diagnostic host without it.
 default = ["fanta-gpui-ui"]

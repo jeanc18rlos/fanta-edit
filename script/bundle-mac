@@ -9,8 +9,11 @@ open_result=false
 local_install=false
 can_code_sign=false
 can_notarize=false
+app_store=false
+app_store_ad_hoc=false
 
 IDENTITY="${MACOS_SIGNING_IDENTITY:-}"
+INSTALLER_IDENTITY="${MACOS_APP_STORE_INSTALLER_IDENTITY:-}"
 
 # Function for displaying help info
 help_info() {
@@ -19,17 +22,20 @@ Usage: ${0##*/} [options] [architecture=host]
 Build the application bundle for macOS.
 
 Options:
-  -d    Compile in debug mode
-  -o    Open dir with the resulting DMG or launch the app itself in local mode.
+  -d    Compile in debug mode; with -s, use a release-profile ad-hoc test app.
+  -o    Open the resulting package directory or launch the app in debug mode.
   -i    Install the resulting DMG into /Applications.
+  -s    Build a sandboxed Mac App Store app and, for release builds, a signed PKG.
+        Use -s -d for an ad-hoc signed app to test locally.
   -h    Display this help and exit.
   "
 }
 
-while getopts 'dloih' flag
+while getopts 'dloish' flag
 do
     case "${flag}" in
         o) open_result=true;;
+        s) app_store=true;;
         d)
             export CARGO_INCREMENTAL=true
             export CARGO_BUNDLE_SKIP_BUILD=true
@@ -46,6 +52,13 @@ done
 
 shift $((OPTIND-1))
 
+if [[ "$app_store" = true && "$target_dir" = debug ]]; then
+    app_store_ad_hoc=true
+    build_flag="--release"
+    target_dir="release"
+    unset CARGO_INCREMENTAL CARGO_BUNDLE_SKIP_BUILD
+fi
+
 case "${FANTA_REQUIRE_NOTARIZATION:-false}" in
     true|1) require_notarization=true;;
     false|0) require_notarization=false;;
@@ -55,10 +68,53 @@ case "${FANTA_REQUIRE_NOTARIZATION:-false}" in
         ;;
 esac
 
-if [[ -n "${MACOS_CERTIFICATE:-}" && -z "${MACOS_CERTIFICATE_PASSWORD:-}" ]] || \
-   [[ -z "${MACOS_CERTIFICATE:-}" && -n "${MACOS_CERTIFICATE_PASSWORD:-}" ]]; then
-    echo "MACOS_CERTIFICATE and MACOS_CERTIFICATE_PASSWORD must be provided together."
-    exit 1
+if [[ "$app_store" = true ]]; then
+    if [[ "$require_notarization" = true ]]; then
+        echo "Mac App Store packages are submitted to App Store Connect; unset FANTA_REQUIRE_NOTARIZATION."
+        exit 1
+    fi
+    if [[ "$local_install" = true ]]; then
+        echo "-i is only available for the Developer ID DMG build."
+        exit 1
+    fi
+    store_version="${FANTA_APP_STORE_VERSION:-1.0}"
+    if [[ ! "$store_version" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "FANTA_APP_STORE_VERSION must contain two or three period-separated integers."
+        exit 1
+    fi
+    store_build="${FANTA_APP_STORE_BUILD_NUMBER:-1}"
+    if [[ ! "$store_build" =~ ^[0-9]{1,4}(\.[0-9]{1,2}){0,2}$ ]]; then
+        echo "FANTA_APP_STORE_BUILD_NUMBER must use up to four digits, optionally followed by two components of up to two digits each."
+        exit 1
+    fi
+    if [[ "$app_store_ad_hoc" != true ]]; then
+        if [[ -z "${FANTA_REVENUECAT_PUBLIC_API_KEY:-}" ]]; then
+            echo "A release Mac App Store build requires FANTA_REVENUECAT_PUBLIC_API_KEY."
+            exit 1
+        fi
+        if [[ -z "${MACOS_APP_STORE_PROVISIONING_PROFILE:-}" || ! -f "${MACOS_APP_STORE_PROVISIONING_PROFILE:-}" ]]; then
+            echo "A release Mac App Store build requires MACOS_APP_STORE_PROVISIONING_PROFILE to name an existing .provisionprofile file."
+            exit 1
+        fi
+        if ! security cms -D -i "$MACOS_APP_STORE_PROVISIONING_PROFILE" > /dev/null; then
+            echo "MACOS_APP_STORE_PROVISIONING_PROFILE is not a valid signed provisioning profile."
+            exit 1
+        fi
+        if [[ -n "${MACOS_INSTALLER_CERTIFICATE:-}" && -z "${MACOS_INSTALLER_CERTIFICATE_PASSWORD:-}" ]] || \
+           [[ -z "${MACOS_INSTALLER_CERTIFICATE:-}" && -n "${MACOS_INSTALLER_CERTIFICATE_PASSWORD:-}" ]]; then
+            echo "MACOS_INSTALLER_CERTIFICATE and MACOS_INSTALLER_CERTIFICATE_PASSWORD must be provided together."
+            exit 1
+        fi
+    fi
+    IDENTITY="${MACOS_APP_STORE_SIGNING_IDENTITY:-}"
+fi
+
+if [[ "$app_store" != true || "$app_store_ad_hoc" != true ]]; then
+    if [[ -n "${MACOS_CERTIFICATE:-}" && -z "${MACOS_CERTIFICATE_PASSWORD:-}" ]] || \
+       [[ -z "${MACOS_CERTIFICATE:-}" && -n "${MACOS_CERTIFICATE_PASSWORD:-}" ]]; then
+        echo "MACOS_CERTIFICATE and MACOS_CERTIFICATE_PASSWORD must be provided together."
+        exit 1
+    fi
 fi
 
 if [[ "$require_notarization" = true ]]; then
@@ -85,13 +141,21 @@ case "$channel" in
         exit 1
         ;;
 esac
+if [[ "$app_store" = true && "$channel" != stable ]]; then
+    echo "Mac App Store builds require FANTA_RELEASE_CHANNEL=stable (dev.fanta.Fanta)."
+    exit 1
+fi
 
 export ZED_BUNDLE=true
 
 # Compiled into the binary by auto_update's `option_env!`: it suppresses the
 # hourly poll of the Zed release endpoint (which this fork does not serve) and
 # turns "Check for Updates" into an info prompt instead of an error.
-export ZED_UPDATE_EXPLANATION='Alpha builds are updated by downloading a new DMG from Fanta.'
+if [[ "$app_store" = true ]]; then
+    export ZED_UPDATE_EXPLANATION='Fanta is updated through the Mac App Store.'
+else
+    export ZED_UPDATE_EXPLANATION='Alpha builds are updated by downloading a new DMG from Fanta.'
+fi
 
 # cargo bundle honours CARGO_TARGET_DIR, but the copy steps below read from the
 # repo-relative target/. With the variable set, the app is bundled from one tree
@@ -113,9 +177,14 @@ export CXXFLAGS="-stdlib=libc++"
 
 version_info=$(rustc --version --verbose)
 host_line=$(echo "$version_info" | grep host)
-target_triple=${host_line#*: }
+host_target_triple=${host_line#*: }
+target_triple=$host_target_triple
 if [[ $# -gt 0 && -n "$1" ]]; then
     target_triple="$1"
+fi
+if [[ "$app_store" = true && "$target_triple" != "$host_target_triple" ]]; then
+    echo "Mac App Store builds require a native host target because the RevenueCat bridge is built with SwiftPM."
+    exit 1
 fi
 arch_suffix=""
 
@@ -129,12 +198,24 @@ else
 fi
 
 # Generate the licenses first, so they can be baked into the binaries
-script/generate-licenses
+if [[ "$app_store_ad_hoc" = true && "${FANTA_SKIP_LICENSE_GENERATION:-false}" = true ]]; then
+    if [[ ! -s assets/licenses.md ]]; then
+        echo "Skipping license generation requires an existing assets/licenses.md file."
+        exit 1
+    fi
+    echo "Local ad-hoc Mac App Store build: using existing generated licenses."
+else
+    script/generate-licenses
+fi
 
 rustup target add $target_triple
 
 echo "Compiling zed binaries"
-cargo build ${build_flag} --locked --package zed --package cli --target $target_triple
+if [[ "$app_store" = true ]]; then
+    cargo build ${build_flag} --locked --package zed --features zed/mac_app_store --target "$target_triple"
+else
+    cargo build ${build_flag} --locked --package zed --package cli --target "$target_triple"
+fi
 
 echo "Creating application bundle"
 pushd crates/zed
@@ -148,13 +229,43 @@ sed \
     "s/package.metadata.bundle-${channel}/package.metadata.bundle/" \
     Cargo.toml
 
-app_path=$(TERM=xterm-256color cargo bundle ${build_flag} --target $target_triple --select-workspace-root | xargs)
+if [[ "$app_store" = true ]]; then
+    app_path=$(TERM=xterm-256color cargo bundle ${build_flag} --features mac_app_store --target "$target_triple" --select-workspace-root | xargs)
+else
+    app_path=$(TERM=xterm-256color cargo bundle ${build_flag} --target "$target_triple" --select-workspace-root | xargs)
+fi
 
 restore_bundle_manifest
 trap - EXIT
 unset -f restore_bundle_manifest
 popd
 echo "Bundled ${app_path}"
+
+if [[ "$app_store" = true ]]; then
+    if [[ "$app_store_ad_hoc" = true ]]; then
+        app_store_directory="target/${target_triple}/${target_dir}/app-store-dev"
+    else
+        app_store_directory="target/${target_triple}/${target_dir}/app-store"
+    fi
+    mkdir -p "$app_store_directory"
+    rm -rf "${app_store_directory}/Fanta.app"
+    mv "$app_path" "${app_store_directory}/Fanta.app"
+    app_path="${app_store_directory}/Fanta.app"
+
+    info_plist="${app_path}/Contents/Info.plist"
+    bundle_identifier=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$info_plist")
+    if [[ "$bundle_identifier" != dev.fanta.Fanta ]]; then
+        echo "Expected Mac App Store bundle identifier dev.fanta.Fanta; got $bundle_identifier."
+        exit 1
+    fi
+    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${store_version}" "$info_plist"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${store_build}" "$info_plist"
+    if /usr/libexec/PlistBuddy -c 'Print :ITSAppUsesNonExemptEncryption' "$info_plist" > /dev/null 2>&1; then
+        /usr/libexec/PlistBuddy -c 'Set :ITSAppUsesNonExemptEncryption false' "$info_plist"
+    else
+        /usr/libexec/PlistBuddy -c 'Add :ITSAppUsesNonExemptEncryption bool false' "$info_plist"
+    fi
+fi
 
 # DocumentTypes.plist references CFBundleTypeIconFile "Document", so the bundle must contain Document.icns.
 # We use the app icon as a placeholder document icon for now.
@@ -167,11 +278,24 @@ else
     echo "cargo::warning=Missing ${document_icon_source}; macOS document icons may not appear in Finder."
 fi
 
+if [[ "$app_store" = true ]]; then
+    ./crates/fanta_revenuecat/bundle-native.sh "$app_path"
+    revenuecat_license="target/revenuecat-swift/checkouts/purchases-ios-spm/LICENSE"
+    if [[ ! -s "$revenuecat_license" ]]; then
+        echo "The RevenueCat SDK license was not found in the resolved SwiftPM checkout: $revenuecat_license"
+        exit 1
+    fi
+    cp "$revenuecat_license" "${app_path}/Contents/Resources/RevenueCat-LICENSE.txt"
+fi
+
 signing_keychain_directory=""
 signing_keychain=""
 certificate_file=""
 notarization_key_file=""
 original_default_keychain=""
+app_store_entitlements_file=""
+verification_entitlements_file=""
+profile_plist=""
 
 function cleanup() {
     local result=$?
@@ -180,6 +304,15 @@ function cleanup() {
     fi
     if [[ -n "$notarization_key_file" ]]; then
         rm -f "$notarization_key_file"
+    fi
+    if [[ -n "$app_store_entitlements_file" ]]; then
+        rm -f "$app_store_entitlements_file"
+    fi
+    if [[ -n "$verification_entitlements_file" ]]; then
+        rm -f "$verification_entitlements_file"
+    fi
+    if [[ -n "$profile_plist" ]]; then
+        rm -f "$profile_plist"
     fi
     if [[ -n "$signing_keychain" ]]; then
         echo "Cleaning up keychain"
@@ -194,49 +327,170 @@ function cleanup() {
 
 trap cleanup EXIT
 
-if [[ -n "${MACOS_CERTIFICATE:-}" && -n "${MACOS_CERTIFICATE_PASSWORD:-}" ]]; then
+use_temp_keychain=false
+if [[ "$app_store" != true || "$app_store_ad_hoc" != true ]]; then
+    if [[ -n "${MACOS_CERTIFICATE:-}" && -n "${MACOS_CERTIFICATE_PASSWORD:-}" ]] || \
+       [[ "$app_store" = true && -n "${MACOS_INSTALLER_CERTIFICATE:-}" ]]; then
+        use_temp_keychain=true
+    fi
+fi
+if [[ "$use_temp_keychain" = true ]]; then
     echo "Setting up keychain for code signing..."
+    keychain_password="${MACOS_CERTIFICATE_PASSWORD:-${MACOS_INSTALLER_CERTIFICATE_PASSWORD:-}}"
     original_default_keychain=$(security default-keychain -d user | sed -E 's/^[[:space:]]*"//; s/"[[:space:]]*$//')
     signing_keychain_directory=$(mktemp -d)
     signing_keychain="${signing_keychain_directory}/fanta.keychain-db"
-    certificate_file=$(mktemp)
 
-    security create-keychain -p "$MACOS_CERTIFICATE_PASSWORD" "$signing_keychain"
+    security create-keychain -p "$keychain_password" "$signing_keychain"
     security default-keychain -d user -s "$signing_keychain"
-    security unlock-keychain -p "$MACOS_CERTIFICATE_PASSWORD" "$signing_keychain"
+    security unlock-keychain -p "$keychain_password" "$signing_keychain"
     # Calling set-keychain-settings without `-t` disables the auto-lock timeout
     security set-keychain-settings "$signing_keychain"
-    echo "$MACOS_CERTIFICATE" | base64 --decode > "$certificate_file"
-    security import "$certificate_file" -k "$signing_keychain" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-    rm "$certificate_file"
-    security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$MACOS_CERTIFICATE_PASSWORD" "$signing_keychain"
+    if [[ -n "${MACOS_CERTIFICATE:-}" ]]; then
+        certificate_file=$(mktemp)
+        printf '%s' "$MACOS_CERTIFICATE" | base64 --decode > "$certificate_file"
+        security import "$certificate_file" -k "$signing_keychain" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+        rm "$certificate_file"
+        certificate_file=""
+    fi
+    if [[ "$app_store" = true && "$app_store_ad_hoc" != true && -n "${MACOS_INSTALLER_CERTIFICATE:-}" ]]; then
+        certificate_file=$(mktemp)
+        printf '%s' "$MACOS_INSTALLER_CERTIFICATE" | base64 --decode > "$certificate_file"
+        security import "$certificate_file" -k "$signing_keychain" -P "$MACOS_INSTALLER_CERTIFICATE_PASSWORD" -T /usr/bin/productbuild
+        rm "$certificate_file"
+        certificate_file=""
+    fi
+    security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$signing_keychain"
 fi
 
 available_identities=$(security find-identity -v -p codesigning)
-if [[ -z "$IDENTITY" ]]; then
-    developer_identities=$(sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' <<< "$available_identities")
-    IDENTITY=${developer_identities%%$'\n'*}
-fi
-if [[ -n "$IDENTITY" ]]; then
-    if [[ "$IDENTITY" != "Developer ID Application: "* ]]; then
-        echo "MACOS_SIGNING_IDENTITY must name a Developer ID Application certificate."
+if [[ "$app_store" = true ]]; then
+    if [[ "$app_store_ad_hoc" != true ]]; then
+        if [[ -z "$IDENTITY" ]]; then
+            app_store_identities=$(sed -n -E 's/.*"((Apple Distribution|3rd Party Mac Developer Application): [^"]*)".*/\1/p' <<< "$available_identities")
+            IDENTITY=${app_store_identities%%$'\n'*}
+        fi
+        if [[ "$IDENTITY" != "Apple Distribution: "* && "$IDENTITY" != "3rd Party Mac Developer Application: "* ]] || \
+           ! grep -Fq "\"${IDENTITY}\"" <<< "$available_identities"; then
+            echo "A Mac App Store app signing identity is required (Apple Distribution or 3rd Party Mac Developer Application)."
+            exit 1
+        fi
+        available_installer_identities=$(security find-identity -v)
+        if [[ -z "$INSTALLER_IDENTITY" ]]; then
+            installer_identities=$(sed -n 's/.*"\(3rd Party Mac Developer Installer: [^"]*\)".*/\1/p' <<< "$available_installer_identities")
+            INSTALLER_IDENTITY=${installer_identities%%$'\n'*}
+        fi
+        if [[ "$INSTALLER_IDENTITY" != "3rd Party Mac Developer Installer: "* ]] || \
+           ! grep -Fq "\"${INSTALLER_IDENTITY}\"" <<< "$available_installer_identities"; then
+            echo "A Mac Installer Distribution signing identity is required (3rd Party Mac Developer Installer)."
+            exit 1
+        fi
+        can_code_sign=true
+    fi
+else
+    if [[ -z "$IDENTITY" ]]; then
+        developer_identities=$(sed -n 's/.*"\(Developer ID Application: [^"]*\)".*/\1/p' <<< "$available_identities")
+        IDENTITY=${developer_identities%%$'\n'*}
+    fi
+    if [[ -n "$IDENTITY" ]]; then
+        if [[ "$IDENTITY" != "Developer ID Application: "* ]]; then
+            echo "MACOS_SIGNING_IDENTITY must name a Developer ID Application certificate."
+            exit 1
+        fi
+        if ! grep -Fq "\"${IDENTITY}\"" <<< "$available_identities"; then
+            echo "The Developer ID Application identity '${IDENTITY}' is not available in the keychain."
+            exit 1
+        fi
+        can_code_sign=true
+    fi
+    if [[ $can_code_sign = true && -n "${APPLE_NOTARIZATION_KEYCHAIN_PROFILE:-}" ]]; then
+        can_notarize=true
+    elif [[ $can_code_sign = true && -n "${APPLE_NOTARIZATION_KEY:-}" && -n "${APPLE_NOTARIZATION_KEY_ID:-}" && -n "${APPLE_NOTARIZATION_ISSUER_ID:-}" ]]; then
+        can_notarize=true
+    fi
+    if [[ "$require_notarization" = true && "$can_notarize" != true ]]; then
+        echo "Distribution requires a Developer ID Application signing identity and Apple notarization credentials."
         exit 1
     fi
-    if ! grep -Fq "\"${IDENTITY}\"" <<< "$available_identities"; then
-        echo "The Developer ID Application identity '${IDENTITY}' is not available in the keychain."
+fi
+
+function sign_app_store_bundle() {
+    local entitlements="crates/zed/resources/fanta-app-store.entitlements"
+    local signing_options=(--force --sign -)
+    local framework
+    local profile_app_identifier
+    local profile_team_identifier
+    local signature_info
+
+    if [[ -e "${app_path}/Contents/MacOS/cli" || -e "${app_path}/Contents/MacOS/git" || -e "${app_path}/Contents/Resources/git" ]]; then
+        echo "Mac App Store bundles must not contain the CLI or bundled Git runtime."
         exit 1
     fi
-    can_code_sign=true
-fi
-if [[ $can_code_sign = true && -n "${APPLE_NOTARIZATION_KEYCHAIN_PROFILE:-}" ]]; then
-    can_notarize=true
-elif [[ $can_code_sign = true && -n "${APPLE_NOTARIZATION_KEY:-}" && -n "${APPLE_NOTARIZATION_KEY_ID:-}" && -n "${APPLE_NOTARIZATION_ISSUER_ID:-}" ]]; then
-    can_notarize=true
-fi
-if [[ "$require_notarization" = true && "$can_notarize" != true ]]; then
-    echo "Distribution requires a Developer ID Application signing identity and Apple notarization credentials."
-    exit 1
-fi
+    if [[ ! -x "${app_path}/Contents/MacOS/fanta" ]]; then
+        echo "The Mac App Store app bundle is missing its fanta executable."
+        exit 1
+    fi
+
+    if [[ "$app_store_ad_hoc" != true ]]; then
+        profile_plist=$(mktemp)
+        security cms -D -i "$MACOS_APP_STORE_PROVISIONING_PROFILE" -o "$profile_plist"
+        profile_app_identifier=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.application-identifier' "$profile_plist")
+        profile_team_identifier=$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.team-identifier' "$profile_plist")
+        if [[ "$profile_app_identifier" != "${profile_team_identifier}.dev.fanta.Fanta" ]]; then
+            echo "The Mac App Store provisioning profile does not match dev.fanta.Fanta."
+            exit 1
+        fi
+
+        app_store_entitlements_file=$(mktemp)
+        cp "$entitlements" "$app_store_entitlements_file"
+        /usr/libexec/PlistBuddy -c "Add :com.apple.application-identifier string $profile_app_identifier" "$app_store_entitlements_file"
+        /usr/libexec/PlistBuddy -c "Add :com.apple.developer.team-identifier string $profile_team_identifier" "$app_store_entitlements_file"
+        entitlements="$app_store_entitlements_file"
+        cp "$MACOS_APP_STORE_PROVISIONING_PROFILE" "${app_path}/Contents/embedded.provisionprofile"
+        signing_options=(--force --timestamp --options runtime --sign "$IDENTITY")
+    fi
+
+    if [[ -d "${app_path}/Contents/Frameworks" ]]; then
+        while IFS= read -r -d '' framework; do
+            /usr/bin/codesign "${signing_options[@]}" "$framework"
+        done < <(find "${app_path}/Contents/Frameworks" -depth \( -name '*.dylib' -o -name '*.framework' \) -print0)
+    fi
+
+    /usr/bin/codesign "${signing_options[@]}" --entitlements "$entitlements" "${app_path}/Contents/MacOS/fanta"
+    /usr/bin/codesign "${signing_options[@]}" --entitlements "$entitlements" "$app_path"
+    /usr/bin/codesign --verify --deep --strict --verbose=2 "$app_path"
+    verification_entitlements_file=$(mktemp)
+    /usr/bin/codesign --display --entitlements "$verification_entitlements_file" --xml "$app_path"
+    if [[ "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.app-sandbox' "$verification_entitlements_file")" != true ]]; then
+        echo "The Mac App Store app signature is missing App Sandbox."
+        exit 1
+    fi
+
+    if [[ "$app_store_ad_hoc" != true ]]; then
+        if [[ "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.application-identifier' "$verification_entitlements_file")" != "$profile_app_identifier" ]]; then
+            echo "The app signature's application identifier does not match its provisioning profile."
+            exit 1
+        fi
+        signature_info=$(/usr/bin/codesign -dv --verbose=4 "$app_path" 2>&1)
+        if ! grep -Fxq "TeamIdentifier=$profile_team_identifier" <<< "$signature_info"; then
+            echo "The app signature's team identifier does not match its provisioning profile."
+            exit 1
+        fi
+        local package_path="${app_store_directory}/Fanta-${arch_suffix}.pkg"
+        rm -f "$package_path"
+        /usr/bin/productbuild --sign "$INSTALLER_IDENTITY" --component "$app_path" /Applications "$package_path"
+        /usr/sbin/pkgutil --check-signature "$package_path"
+        echo "Mac App Store package: $package_path"
+        if [[ "$open_result" = true ]]; then
+            open "$app_store_directory"
+        fi
+    else
+        echo "Ad-hoc signed sandbox app: $app_path"
+        if [[ "$open_result" = true ]]; then
+            open "$app_path"
+        fi
+    fi
+}
 
 function sign_app_binaries() {
     rm -rf "${app_path}/Contents/Frameworks"
@@ -340,8 +594,8 @@ function sign_binary() {
 # dsymutil writes target/<triple>/<profile>/fanta.dwarf, which is the directory
 # holding the DMG but not the `dmg/` staging dir, so it never gets packaged.
 function generate_debug_symbols() {
-    if [[ "$target_dir" != "release" ]]; then
-        echo "debug build; skipping dsymutil."
+    if [[ "$target_dir" != "release" || "$app_store_ad_hoc" = true ]]; then
+        echo "Local test build; skipping dsymutil."
         return
     fi
 
@@ -354,7 +608,9 @@ function generate_debug_symbols() {
 }
 
 function upload_debug_symbols() {
-    if [ "$local_install" = true ]; then
+    if [[ "$app_store_ad_hoc" = true ]]; then
+        echo "Local test build; skipping Sentry upload."
+    elif [ "$local_install" = true ]; then
         echo "local install; skipping sentry upload."
     elif [[ ! -f "target/${target_triple}/${target_dir}/fanta.dwarf" ]]; then
         echo "no debug symbols were generated; skipping sentry upload."
@@ -387,7 +643,9 @@ upload_debug_symbols
 # Use the same profile dir the build above produced; hardcoding `release`
 # broke `-d` (debug) bundles, which never create the release binary.
 cp target/${target_triple}/${target_dir}/fanta "${app_path}/Contents/MacOS/fanta"
-cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
+if [[ "$app_store" != true ]]; then
+    cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
+fi
 
 # Ordering is load-bearing: dsymutil above needs the unstripped binaries in
 # target/, and the codesign calls in sign_app_binaries (invoked just below) must
@@ -397,10 +655,16 @@ cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
 # Cost: panic backtraces in ~/Library/Logs/Fanta/Fanta.log become bare
 # addresses, symbolicated with `atos -o fanta.dwarf -arch arm64 -l <load address>`.
 /usr/bin/strip "${app_path}/Contents/MacOS/fanta"
-/usr/bin/strip "${app_path}/Contents/MacOS/cli"
+if [[ "$app_store" != true ]]; then
+    /usr/bin/strip "${app_path}/Contents/MacOS/cli"
+fi
 
-sign_app_binaries
+if [[ "$app_store" = true ]]; then
+    sign_app_store_bundle
+else
+    sign_app_binaries
+fi
 
-if [[ "$target_dir" = "release" ]]; then
+if [[ "$target_dir" = "release" && "$app_store_ad_hoc" != true ]]; then
     echo "Debug symbols: target/${target_triple}/${target_dir}/fanta.dwarf"
 fi

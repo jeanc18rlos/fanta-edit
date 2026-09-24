@@ -1,15 +1,20 @@
+#[cfg(not(feature = "mac_app_store"))]
+use crate::ToggleWorkspaceSidebar;
 use crate::{
     Open, OpenMode, PathList, RecentWorkspace, RecentWorkspaceStatus, SerializedWorkspaceLocation,
-    ToggleWorkspaceSidebar, Workspace, WorkspaceSettings,
+    Workspace, WorkspaceSettings,
     item::{Item, ItemEvent},
     persistence::WorkspaceDb,
 };
+#[cfg(not(feature = "mac_app_store"))]
 use agent_settings::AgentSettings;
+use gpui::WeakEntity;
 use gpui::{
     Action, App, Context, Entity, EventEmitter, FocusHandle, Focusable, InteractiveElement,
     ParentElement, PathPromptOptions, Render, Styled, Task, TaskExt, Window, actions,
 };
-use gpui::{ClipboardItem, WeakEntity, linear_color_stop, linear_gradient};
+#[cfg(not(feature = "mac_app_store"))]
+use gpui::{ClipboardItem, linear_color_stop, linear_gradient};
 use menu::{SelectNext, SelectPrevious};
 use project::DirectoryLister;
 
@@ -18,7 +23,9 @@ use serde::{Deserialize, Serialize};
 use settings::{DefaultOpenBehavior, Settings};
 use ui::{ButtonLike, Divider, DividerColor, KeyBinding, Vector, VectorName, prelude::*};
 use util::ResultExt;
-use zed_actions::{OpenSettings, assistant::ToggleFocus};
+use zed_actions::OpenSettings;
+#[cfg(not(feature = "mac_app_store"))]
+use zed_actions::assistant::ToggleFocus;
 
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize, JsonSchema, Action)]
 #[action(namespace = welcome)]
@@ -37,17 +44,25 @@ actions!(
 
 /// The one-line statement of what Fanta is. Kept public so the docs and the
 /// release notes quote exactly what the first screen says.
+#[cfg(not(feature = "mac_app_store"))]
 pub const HERO_HEADLINE: &str = "Your design is code.";
+#[cfg(feature = "mac_app_store")]
+pub const HERO_HEADLINE: &str = "Design on your Mac.";
 
 /// The paragraph under [`HERO_HEADLINE`], also quoted verbatim by the docs.
+#[cfg(not(feature = "mac_app_store"))]
 pub const HERO_SUBTITLE: &str = "A Fanta project is a git-tracked folder of .fnx source. Every canvas edit is a reviewable change; every source edit reloads the canvas.";
+#[cfg(feature = "mac_app_store")]
+pub const HERO_SUBTITLE: &str = "Create and edit designs in a folder you choose. Open .fig files or Fanta projects, refine the canvas, and save your work locally.";
 
 /// The command that registers this app as an MCP server for Claude Code, shown
 /// on the welcome page and copied by its "Copy command" button.
+#[cfg(not(feature = "mac_app_store"))]
 pub const CONNECT_CLAUDE_CODE_COMMAND: &str =
     "claude mcp add -s user fanta -- /Applications/Fanta.app/Contents/MacOS/fanta --mcp-stdio";
 
 /// The equivalent entry for `~/.codex/config.toml`.
+#[cfg(not(feature = "mac_app_store"))]
 pub const CONNECT_CODEX_CONFIG: &str = "[mcp_servers.fanta]\ncommand = \"/Applications/Fanta.app/Contents/MacOS/fanta\"\nargs = [\"--mcp-stdio\"]\n";
 
 #[derive(IntoElement)]
@@ -198,6 +213,7 @@ impl SectionEntry {
     }
 }
 
+#[cfg(not(feature = "mac_app_store"))]
 const CONTENT: (Section<3>, Section<1>) = (
     Section {
         title: "Get Started",
@@ -218,6 +234,42 @@ const CONTENT: (Section<3>, Section<1>) = (
                 icon: IconName::AiClaude,
                 title: "Connect Claude Code / Codex",
                 action: &zed_actions::fanta::ConnectExternalAgent,
+                visibility_guard: SectionVisibility::Always,
+            },
+        ],
+    },
+    Section {
+        title: "Configure",
+        entries: [SectionEntry {
+            icon: IconName::Settings,
+            title: "Open Settings",
+            action: &OpenSettings,
+            visibility_guard: SectionVisibility::Always,
+        }],
+    },
+);
+
+#[cfg(feature = "mac_app_store")]
+const CONTENT: (Section<3>, Section<1>) = (
+    Section {
+        title: "Get Started",
+        entries: [
+            SectionEntry {
+                icon: IconName::Plus,
+                title: "New Design...",
+                action: &zed_actions::fanta::NewDesign,
+                visibility_guard: SectionVisibility::Always,
+            },
+            SectionEntry {
+                icon: IconName::FolderOpen,
+                title: "Open .fig or Fanta project...",
+                action: &Open::DEFAULT,
+                visibility_guard: SectionVisibility::Always,
+            },
+            SectionEntry {
+                icon: IconName::BoltOutlined,
+                title: "Credits & Billing",
+                action: &zed_actions::OpenAccountSettings,
                 visibility_guard: SectionVisibility::Always,
             },
         ],
@@ -432,6 +484,7 @@ impl WelcomePage {
         .detach();
     }
 
+    #[cfg(not(feature = "mac_app_store"))]
     fn render_agent_card(&self, tab_index: usize, cx: &mut Context<Self>) -> impl IntoElement {
         let focus = self.focus_handle.clone();
         let color = cx.theme().colors();
@@ -482,6 +535,7 @@ impl WelcomePage {
             )
     }
 
+    #[cfg(not(feature = "mac_app_store"))]
     fn render_bring_your_own_agent(
         &self,
         tab_index: usize,
@@ -567,6 +621,37 @@ impl WelcomePage {
             )
     }
 
+    #[cfg(feature = "mac_app_store")]
+    fn render_local_design_card(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let color = cx.theme().colors();
+        v_flex()
+            .w_full()
+            .min_w_0()
+            .p_2()
+            .gap_2()
+            .rounded_md()
+            .border_1()
+            .border_color(color.border_variant)
+            .bg(color.panel_background)
+            .child(
+                h_flex()
+                    .gap_1p5()
+                    .child(
+                        Icon::new(IconName::FolderOpen)
+                            .color(Color::Muted)
+                            .size(IconSize::Small),
+                    )
+                    .child(Label::new("Local design workspace")),
+            )
+            .child(
+                Label::new(
+                    "Create and save designs locally. AI generation is optional; sign in from the Create panel and use Credits & Billing for in-app purchases.",
+                )
+                .size(LabelSize::Small)
+                .color(Color::Muted),
+            )
+    }
+
     fn render_recent_project_section(
         &self,
         recent_projects: Vec<impl IntoElement>,
@@ -632,8 +717,10 @@ impl Render for WelcomePage {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (first_section, second_section) = CONTENT;
         let first_section_entries = first_section.entries.len();
+        #[cfg(not(feature = "mac_app_store"))]
         let next_tab_index = first_section_entries + second_section.entries.len();
 
+        #[cfg(not(feature = "mac_app_store"))]
         let ai_enabled = AgentSettings::get_global(cx).enabled(cx);
 
         let recent_projects = self
@@ -659,6 +746,46 @@ impl Render for WelcomePage {
                 .into_any_element()
         };
 
+        let content = v_flex()
+            .id("welcome-content")
+            .p_8()
+            .max_w_128()
+            .size_full()
+            .min_w_0()
+            .gap_6()
+            .justify_start()
+            .overflow_y_scroll()
+            .child(
+                v_flex()
+                    .w_full()
+                    .mb_4()
+                    .gap_2()
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .flex_wrap()
+                            .justify_center()
+                            .gap_4()
+                            .child(Vector::square(VectorName::FantaLogo, rems_from_px(45.)))
+                            .child(Headline::new(HERO_HEADLINE)),
+                    )
+                    .child(
+                        Label::new(HERO_SUBTITLE)
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    ),
+            )
+            .child(first_section.render(Default::default(), &self.focus_handle))
+            .child(second_section);
+        #[cfg(feature = "mac_app_store")]
+        let content = content.child(self.render_local_design_card(cx));
+        #[cfg(not(feature = "mac_app_store"))]
+        let content = content
+            .when(ai_enabled && !showing_recent_projects, |this| {
+                this.child(self.render_agent_card(next_tab_index, cx))
+            })
+            .child(self.render_bring_your_own_agent(next_tab_index + 1, cx));
         h_flex()
             .key_context("Welcome")
             .track_focus(&self.focus_handle(cx))
@@ -668,44 +795,7 @@ impl Render for WelcomePage {
             .size_full()
             .bg(cx.theme().colors().editor_background)
             .justify_center()
-            .child(
-                v_flex()
-                    .id("welcome-content")
-                    .p_8()
-                    .max_w_128()
-                    .size_full()
-                    .min_w_0()
-                    .gap_6()
-                    .justify_start()
-                    .overflow_y_scroll()
-                    .child(
-                        v_flex()
-                            .w_full()
-                            .mb_4()
-                            .gap_2()
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .min_w_0()
-                                    .flex_wrap()
-                                    .justify_center()
-                                    .gap_4()
-                                    .child(Vector::square(VectorName::FantaLogo, rems_from_px(45.)))
-                                    .child(Headline::new(HERO_HEADLINE)),
-                            )
-                            .child(
-                                Label::new(HERO_SUBTITLE)
-                                    .size(LabelSize::Small)
-                                    .color(Color::Muted),
-                            ),
-                    )
-                    .child(first_section.render(Default::default(), &self.focus_handle))
-                    .child(second_section)
-                    .when(ai_enabled && !showing_recent_projects, |this| {
-                        this.child(self.render_agent_card(next_tab_index, cx))
-                    })
-                    .child(self.render_bring_your_own_agent(next_tab_index + 1, cx)),
-            )
+            .child(content)
     }
 }
 

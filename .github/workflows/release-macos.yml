@@ -15,8 +15,16 @@ on:
       - 'script/**'
   workflow_dispatch:
     inputs:
+      distribution:
+        description: Build a Developer ID DMG or a Mac App Store installer package
+        required: true
+        default: developer-id
+        type: choice
+        options:
+          - developer-id
+          - app-store
       signed:
-        description: Sign and notarize for customer distribution (requires Apple secrets)
+        description: Sign and notarize the Developer ID DMG (requires Apple secrets)
         required: true
         default: false
         type: boolean
@@ -32,11 +40,12 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: '0'
   FANTA_RELEASE_CHANNEL: stable
-  FANTA_REQUIRE_NOTARIZATION: ${{ startsWith(github.ref, 'refs/tags/') || inputs.signed || false }}
+  FANTA_APP_STORE: ${{ inputs.distribution == 'app-store' }}
+  FANTA_REQUIRE_NOTARIZATION: ${{ inputs.distribution != 'app-store' && (startsWith(github.ref, 'refs/tags/') || inputs.signed || false) }}
 
 jobs:
   build:
-    name: Build Apple Silicon DMG
+    name: Build Apple Silicon installer
     runs-on: macos-26
     timeout-minutes: 180
     steps:
@@ -69,6 +78,23 @@ jobs:
             fi
           done
 
+      - name: Check Mac App Store credentials
+        if: env.FANTA_APP_STORE == 'true'
+        env:
+          MACOS_APP_STORE_CERTIFICATE: ${{ secrets.MACOS_APP_STORE_CERTIFICATE }}
+          MACOS_APP_STORE_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_APP_STORE_CERTIFICATE_PASSWORD }}
+          MACOS_APP_STORE_INSTALLER_CERTIFICATE: ${{ secrets.MACOS_APP_STORE_INSTALLER_CERTIFICATE }}
+          MACOS_APP_STORE_INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_APP_STORE_INSTALLER_CERTIFICATE_PASSWORD }}
+          MACOS_APP_STORE_PROFILE: ${{ secrets.MACOS_APP_STORE_PROFILE }}
+          FANTA_REVENUECAT_PUBLIC_API_KEY: ${{ secrets.FANTA_REVENUECAT_PUBLIC_API_KEY }}
+        run: |
+          for name in MACOS_APP_STORE_CERTIFICATE MACOS_APP_STORE_CERTIFICATE_PASSWORD MACOS_APP_STORE_INSTALLER_CERTIFICATE MACOS_APP_STORE_INSTALLER_CERTIFICATE_PASSWORD MACOS_APP_STORE_PROFILE FANTA_REVENUECAT_PUBLIC_API_KEY; do
+            if [[ -z "${!name}" ]]; then
+              echo "::error::Configure the ${name} repository secret before building a Mac App Store package."
+              exit 1
+            fi
+          done
+
       - name: Install the repository Rust toolchain
         run: |
           test "$(uname -m)" = arm64
@@ -94,13 +120,33 @@ jobs:
           APPLE_NOTARIZATION_KEY: ${{ env.FANTA_REQUIRE_NOTARIZATION == 'true' && secrets.APPLE_NOTARIZATION_KEY || '' }}
           APPLE_NOTARIZATION_KEY_ID: ${{ env.FANTA_REQUIRE_NOTARIZATION == 'true' && secrets.APPLE_NOTARIZATION_KEY_ID || '' }}
           APPLE_NOTARIZATION_ISSUER_ID: ${{ env.FANTA_REQUIRE_NOTARIZATION == 'true' && secrets.APPLE_NOTARIZATION_ISSUER_ID || '' }}
+          MACOS_APP_STORE_CERTIFICATE: ${{ env.FANTA_APP_STORE == 'true' && secrets.MACOS_APP_STORE_CERTIFICATE || '' }}
+          MACOS_APP_STORE_CERTIFICATE_PASSWORD: ${{ env.FANTA_APP_STORE == 'true' && secrets.MACOS_APP_STORE_CERTIFICATE_PASSWORD || '' }}
+          MACOS_INSTALLER_CERTIFICATE: ${{ env.FANTA_APP_STORE == 'true' && secrets.MACOS_APP_STORE_INSTALLER_CERTIFICATE || '' }}
+          MACOS_INSTALLER_CERTIFICATE_PASSWORD: ${{ env.FANTA_APP_STORE == 'true' && secrets.MACOS_APP_STORE_INSTALLER_CERTIFICATE_PASSWORD || '' }}
+          MACOS_APP_STORE_PROFILE: ${{ env.FANTA_APP_STORE == 'true' && secrets.MACOS_APP_STORE_PROFILE || '' }}
+          FANTA_REVENUECAT_PUBLIC_API_KEY: ${{ env.FANTA_APP_STORE == 'true' && secrets.FANTA_REVENUECAT_PUBLIC_API_KEY || '' }}
+          MACOS_APP_STORE_SIGNING_IDENTITY: ${{ secrets.MACOS_APP_STORE_SIGNING_IDENTITY }}
+          MACOS_APP_STORE_INSTALLER_IDENTITY: ${{ secrets.MACOS_APP_STORE_INSTALLER_IDENTITY }}
+          FANTA_APP_STORE_VERSION: '1.0'
+          FANTA_APP_STORE_BUILD_NUMBER: ${{ github.run_number }}
         run: |
           if [[ -n "$FANTA_CLIENT_CHECKSUM_SEED" ]]; then
             export ZED_CLIENT_CHECKSUM_SEED="$FANTA_CLIENT_CHECKSUM_SEED"
           fi
-          ./script/bundle-mac aarch64-apple-darwin
+          if [[ "$FANTA_APP_STORE" == true ]]; then
+            export MACOS_CERTIFICATE="$MACOS_APP_STORE_CERTIFICATE"
+            export MACOS_CERTIFICATE_PASSWORD="$MACOS_APP_STORE_CERTIFICATE_PASSWORD"
+            export MACOS_APP_STORE_PROVISIONING_PROFILE="$RUNNER_TEMP/Fanta.provisionprofile"
+            printf '%s' "$MACOS_APP_STORE_PROFILE" | base64 --decode > "$MACOS_APP_STORE_PROVISIONING_PROFILE"
+            trap 'rm -f "$MACOS_APP_STORE_PROVISIONING_PROFILE"' EXIT
+            ./script/bundle-mac -s aarch64-apple-darwin
+          else
+            ./script/bundle-mac aarch64-apple-darwin
+          fi
 
       - name: Verify app bundle and record checksums
+        if: env.FANTA_APP_STORE != 'true'
         run: |
           app_path=target/aarch64-apple-darwin/release/dmg/Fanta.app
           ./script/verify-macos-document-icon "$app_path"
@@ -110,17 +156,54 @@ jobs:
           cd target/aarch64-apple-darwin/release
           shasum -a 256 Fanta-aarch64.dmg > SHA256SUMS.txt
 
+      - name: Verify Mac App Store package and record checksums
+        if: env.FANTA_APP_STORE == 'true'
+        env:
+          EXPECTED_BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          app_path=target/aarch64-apple-darwin/release/app-store/Fanta.app
+          package_path=target/aarch64-apple-darwin/release/app-store/Fanta-aarch64.pkg
+          ./script/verify-macos-document-icon "$app_path"
+          test -f "$app_path/Contents/embedded.provisionprofile"
+          test ! -e "$app_path/Contents/MacOS/cli"
+          test ! -e "$app_path/Contents/MacOS/git"
+          test ! -e "$app_path/Contents/Resources/git"
+          test -s "$app_path/Contents/Resources/RevenueCat-LICENSE.txt"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_path/Contents/Info.plist")" = dev.fanta.Fanta
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_path/Contents/Info.plist")" = 1.0
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_path/Contents/Info.plist")" = "$EXPECTED_BUILD_NUMBER"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :ITSAppUsesNonExemptEncryption' "$app_path/Contents/Info.plist")" = false
+          /usr/bin/codesign --verify --deep --strict --verbose=2 "$app_path"
+          /usr/bin/codesign --display --entitlements "$RUNNER_TEMP/Fanta.entitlements" --xml "$app_path"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.app-sandbox' "$RUNNER_TEMP/Fanta.entitlements")" = true
+          /usr/sbin/pkgutil --check-signature "$package_path"
+          cd target/aarch64-apple-darwin/release/app-store
+          shasum -a 256 Fanta-aarch64.pkg > SHA256SUMS.txt
+
       - name: Verify Apple notarization
         if: env.FANTA_REQUIRE_NOTARIZATION == 'true'
         run: xcrun stapler validate target/aarch64-apple-darwin/release/Fanta-aarch64.dmg
 
       - name: Upload installer
+        if: env.FANTA_APP_STORE != 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: fanta-macos-aarch64-${{ env.FANTA_REQUIRE_NOTARIZATION == 'true' && 'notarized' || 'test-only' }}
           path: |
             target/aarch64-apple-darwin/release/Fanta-aarch64.dmg
             target/aarch64-apple-darwin/release/SHA256SUMS.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload Mac App Store package
+        if: env.FANTA_APP_STORE == 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fanta-macos-aarch64-app-store
+          path: |
+            target/aarch64-apple-darwin/release/app-store/Fanta-aarch64.pkg
+            target/aarch64-apple-darwin/release/app-store/SHA256SUMS.txt
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
@@ -134,14 +217,20 @@ jobs:
           retention-days: 90
 
       - name: Summarize build
+        if: env.FANTA_APP_STORE != 'true'
         env:
           SIGNING_STATUS: ${{ env.FANTA_REQUIRE_NOTARIZATION == 'true' && 'Signed and notarized for distribution.' || 'Ad-hoc signed test build. macOS will block first launch; build with signing enabled before distributing to customers.' }}
         run: |
           printf '### Fanta for Apple Silicon\n\n%s\n\nCommit: `%s`\n\nDownload the DMG and checksum from this run’s installer artifact. Crash symbols are stored separately.\n' "$SIGNING_STATUS" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Summarize Mac App Store build
+        if: env.FANTA_APP_STORE == 'true'
+        run: |
+          printf '### Fanta for the Mac App Store\n\nSigned package and checksum are in this run’s installer artifact. It has not been uploaded to App Store Connect.\n\nCommit: `%s`\n' "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
   draft-release:
     name: Prepare draft release
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') && inputs.distribution != 'app-store'
     needs: build
     runs-on: ubuntu-latest
     permissions:

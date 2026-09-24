@@ -9,6 +9,7 @@ license = "GPL-3.0-or-later"
 workspace = true
 
 [features]
+mac_app_store = []
 test-support = []
 
 [lib]

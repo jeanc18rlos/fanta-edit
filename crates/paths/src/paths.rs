@@ -65,6 +65,16 @@ static CURRENT_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 /// On Windows, this is `%APPDATA%\Zed`.
 static CONFIG_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+#[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+fn app_store_container_dir() -> PathBuf {
+    let home = home_dir();
+    if home.ends_with("Library/Containers/dev.fanta.Fanta/Data") {
+        home.clone()
+    } else {
+        home.join("Library/Containers/dev.fanta.Fanta/Data")
+    }
+}
+
 /// Returns the relative path to the zed_server directory on the ssh host.
 pub fn remote_server_dir_relative() -> &'static RelPath {
     static CACHED: LazyLock<&'static RelPath> =
@@ -121,6 +131,12 @@ pub fn set_custom_data_dir(dir: &str) -> &'static PathBuf {
 /// Returns the path to the configuration directory used by Zed.
 pub fn config_dir() -> &'static PathBuf {
     CONFIG_DIR.get_or_init(|| {
+        #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+        if CUSTOM_DATA_DIR.get().is_none() {
+            return app_store_container_dir()
+                .join(".config")
+                .join(APP_NAME_LOWERCASE);
+        }
         if let Some(custom_dir) = CUSTOM_DATA_DIR.get() {
             custom_dir.join("config")
         } else if cfg!(target_os = "windows") {
@@ -143,6 +159,12 @@ pub fn config_dir() -> &'static PathBuf {
 /// Returns the path to the data directory used by Zed.
 pub fn data_dir() -> &'static PathBuf {
     CURRENT_DATA_DIR.get_or_init(|| {
+        #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+        if CUSTOM_DATA_DIR.get().is_none() {
+            return app_store_container_dir()
+                .join("Library/Application Support")
+                .join(APP_NAME);
+        }
         if let Some(custom_dir) = CUSTOM_DATA_DIR.get() {
             custom_dir.clone()
         } else if cfg!(target_os = "macos") {
@@ -169,22 +191,31 @@ pub fn data_dir() -> &'static PathBuf {
 pub fn state_dir() -> &'static PathBuf {
     static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
     STATE_DIR.get_or_init(|| {
-        if cfg!(target_os = "macos") {
-            return home_dir().join(".local").join("state").join(APP_NAME);
+        #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+        {
+            app_store_container_dir()
+                .join(".local/state")
+                .join(APP_NAME)
         }
 
-        if cfg!(any(target_os = "linux", target_os = "freebsd")) {
-            return if let Ok(flatpak_xdg_state) = std::env::var("FLATPAK_XDG_STATE_HOME") {
-                flatpak_xdg_state.into()
-            } else {
-                dirs::state_dir().expect("failed to determine XDG_STATE_HOME directory")
+        #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+        {
+            if cfg!(target_os = "macos") {
+                return home_dir().join(".local").join("state").join(APP_NAME);
             }
-            .join(APP_NAME_LOWERCASE);
-        } else {
-            // Windows
-            return dirs::data_local_dir()
-                .expect("failed to determine LocalAppData directory")
-                .join(APP_NAME);
+
+            if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+                if let Ok(flatpak_xdg_state) = std::env::var("FLATPAK_XDG_STATE_HOME") {
+                    flatpak_xdg_state.into()
+                } else {
+                    dirs::state_dir().expect("failed to determine XDG_STATE_HOME directory")
+                }
+                .join(APP_NAME_LOWERCASE)
+            } else {
+                dirs::data_local_dir()
+                    .expect("failed to determine LocalAppData directory")
+                    .join(APP_NAME)
+            }
         }
     })
 }
@@ -193,28 +224,38 @@ pub fn state_dir() -> &'static PathBuf {
 pub fn temp_dir() -> &'static PathBuf {
     static TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
     TEMP_DIR.get_or_init(|| {
-        if cfg!(target_os = "macos") {
-            return dirs::cache_dir()
-                .expect("failed to determine cachesDirectory directory")
-                .join(APP_NAME);
+        #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+        {
+            app_store_container_dir()
+                .join("Library/Caches")
+                .join(APP_NAME)
         }
 
-        if cfg!(target_os = "windows") {
-            return dirs::cache_dir()
-                .expect("failed to determine LocalAppData directory")
-                .join(APP_NAME);
-        }
-
-        if cfg!(any(target_os = "linux", target_os = "freebsd")) {
-            return if let Ok(flatpak_xdg_cache) = std::env::var("FLATPAK_XDG_CACHE_HOME") {
-                flatpak_xdg_cache.into()
-            } else {
-                dirs::cache_dir().expect("failed to determine XDG_CACHE_HOME directory")
+        #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+        {
+            if cfg!(target_os = "macos") {
+                return dirs::cache_dir()
+                    .expect("failed to determine cachesDirectory directory")
+                    .join(APP_NAME);
             }
-            .join(APP_NAME_LOWERCASE);
-        }
 
-        home_dir().join(".cache").join(APP_NAME_LOWERCASE)
+            if cfg!(target_os = "windows") {
+                return dirs::cache_dir()
+                    .expect("failed to determine LocalAppData directory")
+                    .join(APP_NAME);
+            }
+
+            if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+                return if let Ok(flatpak_xdg_cache) = std::env::var("FLATPAK_XDG_CACHE_HOME") {
+                    flatpak_xdg_cache.into()
+                } else {
+                    dirs::cache_dir().expect("failed to determine XDG_CACHE_HOME directory")
+                }
+                .join(APP_NAME_LOWERCASE);
+            }
+
+            home_dir().join(".cache").join(APP_NAME_LOWERCASE)
+        }
     })
 }
 
@@ -228,10 +269,20 @@ pub fn hang_traces_dir() -> &'static PathBuf {
 pub fn logs_dir() -> &'static PathBuf {
     static LOGS_DIR: OnceLock<PathBuf> = OnceLock::new();
     LOGS_DIR.get_or_init(|| {
-        if cfg!(target_os = "macos") {
-            home_dir().join("Library/Logs").join(APP_NAME)
-        } else {
-            data_dir().join("logs")
+        #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+        {
+            app_store_container_dir()
+                .join("Library/Logs")
+                .join(APP_NAME)
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+        {
+            if cfg!(target_os = "macos") {
+                home_dir().join("Library/Logs").join(APP_NAME)
+            } else {
+                data_dir().join("logs")
+            }
         }
     })
 }
@@ -264,7 +315,15 @@ pub fn database_dir() -> &'static PathBuf {
 pub fn crashes_dir() -> &'static Option<PathBuf> {
     static CRASHES_DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
     CRASHES_DIR.get_or_init(|| {
-        cfg!(target_os = "macos").then_some(home_dir().join("Library/Logs/DiagnosticReports"))
+        #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+        {
+            None
+        }
+
+        #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+        {
+            cfg!(target_os = "macos").then_some(home_dir().join("Library/Logs/DiagnosticReports"))
+        }
     })
 }
 

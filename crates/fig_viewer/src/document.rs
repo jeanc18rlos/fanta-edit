@@ -2485,6 +2485,11 @@ impl FigItem {
                         }
                     })
                     .await?;
+                #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+                let bookmark_error = workspace::remember_user_selected_paths(
+                    std::slice::from_ref(&root),
+                )
+                .err();
                 let projects = this.update(cx, |this, cx| {
                     this.entry_id = project
                         .read(cx)
@@ -2539,6 +2544,21 @@ impl FigItem {
                             root.display()
                         );
                     }
+                }
+                #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+                if let Some(error) = bookmark_error {
+                    log::error!(
+                        "remembering access to saved design {} failed: {error:#}",
+                        root.display()
+                    );
+                    cx.update(|cx| {
+                        crate::view::show_canvas_notice_deferred(
+                            format!(
+                                "The design was saved, but Fanta could not remember access to it: {error:#}. Reopen it with File > Open Folder next time."
+                            ),
+                            cx,
+                        )
+                    });
                 }
                 Ok(())
             }
@@ -2712,18 +2732,29 @@ fn write_project_copy(
 ) -> Result<(PathBuf, fanta_format::ProjectWriteCache)> {
     let requested_target = target.to_path_buf();
     let target = validate_project_copy_destination(target, source)?;
+    #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
     let parent = target
         .parent()
         .context("Choose a destination folder with a parent directory.")?;
-    // Publish only a complete project. A failed/cancelled background write
-    // must not leave a half-written fanta.json that future opens would adopt.
-    let staging = tempfile::Builder::new()
-        .prefix(".fanta-save-as-")
-        .tempdir_in(parent)?;
     let mut cache = fanta_format::ProjectWriteCache::default();
-    write_project_cached(staging.path(), document, assets, &mut cache)?;
-    std::fs::rename(staging.path(), &target)
-        .with_context(|| format!("saving the copied design at {}", target.display()))?;
+    #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+    {
+        // The Save panel grants the destination, not a sibling staging folder.
+        std::fs::create_dir_all(&target)
+            .with_context(|| format!("creating the copied design at {}", target.display()))?;
+        write_project_cached(&target, document, assets, &mut cache)?;
+    }
+    #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+    {
+        // Publish only a complete project. A failed/cancelled background write
+        // must not leave a half-written fanta.json that future opens would adopt.
+        let staging = tempfile::Builder::new()
+            .prefix(".fanta-save-as-")
+            .tempdir_in(parent)?;
+        write_project_cached(staging.path(), document, assets, &mut cache)?;
+        std::fs::rename(staging.path(), &target)
+            .with_context(|| format!("saving the copied design at {}", target.display()))?;
+    }
     Ok((requested_target, cache))
 }
 
@@ -2909,6 +2940,7 @@ fn write_project_cached_report_with_sources(
             Err(error) => return Err(error).context("Removing the old project thumbnail"),
         }
     }
+    #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
     git_init_if_needed(root);
     Ok(report)
 }
@@ -2922,6 +2954,7 @@ fn write_project_cached_report_with_sources(
 ///
 /// A missing `git`, or a `git init` that fails, is logged and swallowed: a save
 /// must never fail because version control is unavailable.
+#[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
 fn git_init_if_needed(root: &Path) {
     if root.ancestors().any(|dir| dir.join(".git").exists()) {
         return;
@@ -2949,6 +2982,7 @@ fn git_init_if_needed(root: &Path) {
     }
 }
 
+#[cfg(any(test, not(all(target_os = "macos", feature = "mac_app_store"))))]
 fn project_git_binary(executable: Option<&Path>) -> PathBuf {
     executable
         .and_then(Path::parent)

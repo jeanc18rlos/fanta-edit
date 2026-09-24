@@ -8,6 +8,8 @@ step: read the files here, or on GitHub.
   and [`KNOWN_ISSUES.md`](./alpha/KNOWN_ISSUES.md).
 - [`alpha/LAUNCH.md`](./alpha/LAUNCH.md) — backend, billing, analytics, and
   GitHub installer requirements for the first customer release.
+- [`alpha/MAC_APP_STORE.md`](./alpha/MAC_APP_STORE.md) — Apple signing, RevenueCat,
+  App Review, and Shipaton release checklist.
 - [`alpha/RELEASE_VALIDATION.md`](./alpha/RELEASE_VALIDATION.md) — measured
   performance, completed checks, and remaining release verification.
 - [`alpha/RELEASE_STATUS_2026-09-12.md`](./alpha/RELEASE_STATUS_2026-09-12.md) —

@@ -2,7 +2,7 @@
 description = "Fanta - an agent-native design app"
 edition.workspace = true
 name = "zed"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 publish.workspace = true
 license = "GPL-3.0-or-later"
 authors = ["Fanta"]
@@ -13,6 +13,7 @@ workspace = true
 
 [features]
 fanta-gpui-ui = ["fig_viewer/fanta-gpui-ui"]
+mac_app_store = ["paths/mac_app_store", "workspace/mac_app_store", "fig_viewer/mac_app_store", "title_bar/mac_app_store", "dep:fanta_revenuecat"]
 tracy = ["ztracing/tracy"]
 # LEAK_BACKTRACE=1 cargo run --features zed/track-project-leak --profile release-fast
 track-project-leak = ["gpui/leak-detection"]
@@ -46,6 +47,7 @@ db.workspace = true
 editor.workspace = true
 feature_flags.workspace = true
 fig_viewer.workspace = true
+fanta_revenuecat = { workspace = true, optional = true }
 fs.workspace = true
 futures.workspace = true
 git.workspace = true

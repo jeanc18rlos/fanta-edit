@@ -23,7 +23,9 @@ use crate::application_menu::{
 };
 
 use auto_update::AutoUpdateStatus;
-use client::{Client, UserStore, zed_urls};
+#[cfg(not(feature = "mac_app_store"))]
+use client::zed_urls;
+use client::{Client, UserStore};
 use command_palette_hooks::CommandPaletteFilter;
 
 use gpui::{
@@ -1314,7 +1316,13 @@ impl TitleBar {
                                     .child(Label::new(username))
                                     .into_any_element()
                             },
-                            move |_, cx| {
+                            move |_window, cx| {
+                                #[cfg(feature = "mac_app_store")]
+                                _window.dispatch_action(
+                                    zed_actions::OpenAccountSettings.boxed_clone(),
+                                    cx,
+                                );
+                                #[cfg(not(feature = "mac_app_store"))]
                                 cx.open_url(&zed_urls::account_url(cx));
                             },
                         )

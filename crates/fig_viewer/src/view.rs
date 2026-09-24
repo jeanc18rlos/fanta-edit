@@ -10961,7 +10961,7 @@ pub(crate) fn show_canvas_notice(message: String, window: &mut Window, cx: &mut 
 /// Show a canvas notice from a place that holds no `Window` — an item event
 /// subscription. The notice lands on the active window at the next effect
 /// flush, which is also when the reload it announces has finished applying.
-fn show_canvas_notice_deferred(message: String, cx: &mut App) {
+pub(crate) fn show_canvas_notice_deferred(message: String, cx: &mut App) {
     cx.defer(move |cx| {
         let Some(window) = cx.active_window() else {
             log::warn!("fanta: no active window to show a canvas notice in: {message}");
