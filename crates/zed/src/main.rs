@@ -686,6 +686,7 @@ fn main() {
 
         audio::init(cx);
         workspace::init(app_state.clone(), cx);
+        project_panel::init(cx);
         ui_prompt::init(cx);
 
         channel::init(&app_state.client.clone(), app_state.user_store.clone(), cx);

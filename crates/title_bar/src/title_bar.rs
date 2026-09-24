@@ -539,6 +539,8 @@ impl TitleBar {
                 cx.notify()
             }),
         );
+        subscriptions.push(cx.observe(workspace.left_dock(), |_, _, cx| cx.notify()));
+        subscriptions.push(cx.observe(workspace.right_dock(), |_, _, cx| cx.notify()));
 
         subscriptions.push(cx.observe_window_activation(window, Self::window_activation_changed));
         subscriptions.push(

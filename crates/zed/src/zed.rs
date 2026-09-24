@@ -945,6 +945,14 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
             .await
             .log_err();
 
+        let project_panel =
+            project_panel::ProjectPanel::load(workspace_handle.clone(), cx.clone()).await?;
+        workspace_handle.update_in(cx, |workspace, window, cx| {
+            if workspace.panel::<project_panel::ProjectPanel>(cx).is_none() {
+                workspace.add_panel(project_panel, window, cx);
+            }
+        })?;
+
         // Commit, staging, and push actions depend on a mounted GitPanel even
         // when its dock is closed. Registering their actions alone is not enough.
         let git_panel =

@@ -17719,6 +17719,7 @@ dependencies = [
  "pkg-config",
  "profiling",
  "project",
+ "project_panel",
  "prompt_store",
  "proto",
  "rayon",
