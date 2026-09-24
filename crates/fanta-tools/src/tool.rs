@@ -132,6 +132,13 @@ pub enum ToolOverlay {
         width: f64,
     },
 
+    /// The current brush footprint in world space, including the soft edge.
+    BrushCursor {
+        world_center: [f64; 2],
+        diameter: f64,
+        softness_radius: f64,
+    },
+
     /// A path anchor square (node-edit tool) at a world position, drawn at a
     /// fixed screen size. `selected` anchors render filled with the accent;
     /// unselected ones hollow (white fill + accent border), matching the

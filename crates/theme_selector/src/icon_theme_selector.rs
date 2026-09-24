@@ -12,7 +12,6 @@ use theme_settings::{IconThemeName, IconThemeSelection, ThemeSettings};
 use ui::{ListItem, ListItemSpacing, prelude::*, v_flex};
 use util::ResultExt;
 use workspace::{ModalView, ui::HighlightedLabel};
-use zed_actions::{ExtensionCategoryFilter, Extensions};
 
 pub(crate) struct IconThemeSelector {
     picker: Entity<Picker<IconThemeSelectorDelegate>>,
@@ -329,7 +328,6 @@ impl PickerDelegate for IconThemeSelectorDelegate {
             h_flex()
                 .p_2()
                 .w_full()
-                .justify_between()
                 .gap_2()
                 .border_t_1()
                 .border_color(cx.theme().colors().border_variant)
@@ -343,19 +341,6 @@ impl PickerDelegate for IconThemeSelectorDelegate {
                         .on_click(|_event, _window, cx| {
                             cx.open_url("https://zed.dev/docs/icon-themes");
                         }),
-                )
-                .child(
-                    Button::new("more-icon-themes", "Install Icon Themes").on_click(
-                        move |_event, window, cx| {
-                            window.dispatch_action(
-                                Box::new(Extensions {
-                                    category_filter: Some(ExtensionCategoryFilter::IconThemes),
-                                    id: None,
-                                }),
-                                cx,
-                            );
-                        },
-                    ),
                 )
                 .into_any_element(),
         )

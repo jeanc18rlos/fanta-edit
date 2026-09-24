@@ -231,7 +231,7 @@ impl PencilTool {
         let id = node.id;
         if let Err(e) = ctx.doc.apply(Operation::create_node(node)) {
             tracing::warn!(target: "fanta-tools.pencil", "create failed: {e}");
-        } else {
+        } else if !ctx.draw_content_only {
             ctx.doc.selection.select_only(id);
         }
     }

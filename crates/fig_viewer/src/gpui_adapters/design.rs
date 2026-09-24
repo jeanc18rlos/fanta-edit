@@ -20,11 +20,12 @@ use fanta_gpui::design::{
     DesignComponentProperty, DesignComponentPropertyValue, DesignComponentReference,
     DesignComponentRole, DesignCornerCapabilities, DesignCounterAxisAlignContent, DesignEffect,
     DesignEffectKind, DesignEffectKindAvailability, DesignEffectSettings,
-    DesignEffectStyleViewData, DesignEffectVector, DesignFontFamily, DesignFontSource,
-    DesignFontStyle, DesignFontViewData, DesignGradientStop, DesignImageFilters,
-    DesignItemSpacingMode, DesignLayout, DesignLayoutAlignSelf, DesignLayoutMode,
-    DesignLayoutPositioning, DesignLetterSpacing, DesignLineHeight, DesignMaskType,
-    DesignMediaCropAction, DesignMediaCropToolState, DesignMediaPaintCapabilities,
+    DesignEffectStyleViewData, DesignEffectVector, DesignExportConfiguration, DesignExportFormat,
+    DesignExportMode, DesignExportSizing as DesignPanelExportSizing, DesignExportViewData,
+    DesignFontFamily, DesignFontSource, DesignFontStyle, DesignFontViewData, DesignGradientStop,
+    DesignImageFilters, DesignItemSpacingMode, DesignLayout, DesignLayoutAlignSelf,
+    DesignLayoutMode, DesignLayoutPositioning, DesignLetterSpacing, DesignLineHeight,
+    DesignMaskType, DesignMediaCropAction, DesignMediaCropToolState, DesignMediaPaintCapabilities,
     DesignMediaPaintPlacement, DesignMediaPaintView, DesignMediaPaintViewData,
     DesignMediaQuarterTurn, DesignPaint, DesignPaintKind, DesignPaintPayload, DesignPaintProperty,
     DesignPaintSource, DesignPaintStyleViewData, DesignPaintTransform, DesignPaintType,
@@ -51,6 +52,9 @@ use gpui::{AppContext as _, Context, Entity, SharedString, Subscription, TaskExt
 use super::design_snapshot::build_design_view_data;
 use crate::color_picker::GradientKind;
 use crate::document::{AssetStores, DocChange, FigDocument, MAX_IMAGE_SOURCE_BYTES, PreparedImage};
+use crate::export::{
+    ExportFormat, ExportRequest, ExportSizing, prepare_export_requests, run_export_jobs,
+};
 use crate::properties_ops::{
     apply_preview_operation, blurs_operations, default_blur, default_shadow,
     detach_instance_operations, effects_operations, field_operations, finite_transform_operations,
@@ -1356,9 +1360,7 @@ fn gate_capabilities(
     capabilities.sections.retain(|section| {
         !matches!(
             section,
-            DesignPanelSection::LayoutGrid
-                | DesignPanelSection::Export
-                | DesignPanelSection::Selection
+            DesignPanelSection::LayoutGrid | DesignPanelSection::Selection
         )
     });
     if is_mask && !capabilities.sections.contains(&DesignPanelSection::Mask) {
@@ -1889,6 +1891,9 @@ pub(crate) struct DesignAdapter {
     crop_session: Option<DesignCropSession>,
     font_catalog: DesignFontViewData,
     font_catalog_dirty: bool,
+    export_configurations: Vec<DesignExportConfiguration>,
+    export_edit_snapshot: Option<Vec<DesignExportConfiguration>>,
+    next_export_id: u64,
     _subscription: Subscription,
 }
 
@@ -1932,6 +1937,7 @@ impl DesignAdapter {
         });
         panel.update(cx, |panel, cx| {
             panel.set_supported_paint_types(supported_paint_types(false), cx);
+            panel.set_export_advanced_settings_enabled(false, cx);
             panel.set_paint_visibility_supported(false, cx);
             panel.set_shader_view_data(bundled_shader_catalog(), cx);
             panel.set_shader_variable_binding_enabled(false, cx);
@@ -1964,6 +1970,12 @@ impl DesignAdapter {
             crop_session: None,
             font_catalog,
             font_catalog_dirty: true,
+            export_configurations: vec![DesignExportConfiguration::new(
+                "fanta-export-0",
+                DesignExportFormat::Png,
+            )],
+            export_edit_snapshot: None,
+            next_export_id: 1,
             _subscription: subscription,
         }
     }
@@ -2013,17 +2025,8 @@ impl FigView {
     /// The snapshot is *applied* through the granular setters rather than
     /// `DesignPanel::set_view_data`, because the complete-snapshot path is not
     /// yet echo-safe for this host: it routes every `None` projection through
-    /// the matching `apply_clear_*`, and `apply_clear_export_view_data` is the
-    /// one sibling without an idempotence guard. This adapter gates exports
-    /// off, so its export projection is permanently `None` and that unguarded
-    /// clear would run on *every* echo — including one where only the render
-    /// generation moved — tearing down and rebuilding each per-property
-    /// `Entity<SelectState>` dropdown (`clear_option_interactions`) and losing
-    /// the transient state of an open popup. The granular setters touch only
-    /// what this adapter actually owns. Switch to `set_view_data` (and restore
-    /// the panel-owned-state retention it needs) once the library's
-    /// `apply_clear_export_view_data` early-returns when there is nothing to
-    /// clear.
+    /// the matching `apply_clear_*`, which can discard transient dropdown
+    /// state. The granular setters touch only what this adapter owns.
     pub(crate) fn refresh_gpui_design(&mut self, cx: &mut Context<Self>) {
         if self.gpui_design.is_none() {
             return;
@@ -2106,9 +2109,9 @@ impl FigView {
                         .collect()
                 })
                 .unwrap_or_default();
-            Some((key, view_data, text_selection, pattern_sources))
+            Some((key, view_data, selection, text_selection, pattern_sources))
         };
-        let Some((key, mut view_data, text_selection, pattern_sources)) = built else {
+        let Some((key, mut view_data, selection, text_selection, pattern_sources)) = built else {
             return;
         };
         // Granular, not `set_view_data` — see this method's docs. Page first,
@@ -2117,6 +2120,18 @@ impl FigView {
         // unchanged Page projection is a no-op inside `apply_page_view_data`,
         // so carrying the retained value forward costs nothing.
         let page_view_data = view_data.projections.page.take();
+        let export_target = if selection.is_empty() {
+            DesignPanelTarget::Page {
+                page_id: page_view_data
+                    .as_ref()
+                    .map(|page| page.page_id.clone())
+                    .unwrap_or_else(|| format!("page-{}", page_index.unwrap_or(0)).into()),
+            }
+        } else {
+            DesignPanelTarget::Nodes {
+                node_ids: selection.iter().map(|id| id.to_string().into()).collect(),
+            }
+        };
         let add_auto_layout = view_data.projections.add_auto_layout.take();
         let selection_header = view_data.projections.selection_header.take();
         let media_paints = media_paint_view_data(
@@ -2131,6 +2146,14 @@ impl FigView {
         let property_states = view_data.property_states;
         let Some(adapter) = self.gpui_design.as_mut() else {
             return;
+        };
+        let export_view_data = DesignExportViewData {
+            target: export_target,
+            configurations: adapter.export_configurations.clone(),
+            mode: DesignExportMode::Static,
+            static_capabilities: Default::default(),
+            preview: None,
+            animated: None,
         };
         let font_catalog = adapter
             .font_catalog_dirty
@@ -2151,6 +2174,7 @@ impl FigView {
                 panel.set_page_view_data(page_view_data, cx);
             }
             panel.set_inspection_context(inspection_context, cx);
+            panel.set_export_view_data(export_view_data, cx);
             panel.set_media_paint_view_data(media_paints, cx);
             if let Some(add_auto_layout) = add_auto_layout {
                 panel.set_add_auto_layout_view_data(add_auto_layout, cx);
@@ -2179,6 +2203,9 @@ impl FigView {
         };
         adapter.crop_session = None;
         adapter.last_echo = None;
+        if let Some(configurations) = adapter.export_edit_snapshot.take() {
+            adapter.export_configurations = configurations;
+        }
         let Some(session) = adapter.session.take() else {
             return;
         };
@@ -2237,6 +2264,158 @@ impl FigView {
         })
     }
 
+    fn design_export_target_matches(&self, target: &DesignPanelTarget, cx: &Context<Self>) -> bool {
+        match target {
+            DesignPanelTarget::Nodes { .. } => self.design_target_matches_selection(target, cx),
+            DesignPanelTarget::Page { page_id } => {
+                let item = self.item().read(cx);
+                let Some(document) = item.document() else {
+                    return false;
+                };
+                if !document.doc.selection.is_empty() {
+                    return false;
+                }
+                let page =
+                    crate::properties_snapshot::page_section(document, self.selected_page_index());
+                let current_page_id = page
+                    .id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| format!("page-{}", self.selected_page_index().unwrap_or(0)));
+                page_id.as_ref() == current_page_id
+            }
+        }
+    }
+
+    pub(crate) fn export_design_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(adapter) = self.gpui_design.as_ref() else {
+            crate::view::show_canvas_notice(
+                "The design exporter is unavailable.".into(),
+                window,
+                cx,
+            );
+            return;
+        };
+        let requests = adapter
+            .export_configurations
+            .iter()
+            .map(|configuration| ExportRequest {
+                format: match configuration.format() {
+                    DesignExportFormat::Png => ExportFormat::Png,
+                    DesignExportFormat::Jpg => ExportFormat::Jpeg,
+                    DesignExportFormat::Svg => ExportFormat::Svg,
+                    DesignExportFormat::Pdf => ExportFormat::Pdf,
+                },
+                sizing: match configuration.sizing {
+                    DesignPanelExportSizing::Scale(value) => ExportSizing::Scale(f64::from(value)),
+                    DesignPanelExportSizing::Width(value) => ExportSizing::Width(f64::from(value)),
+                    DesignPanelExportSizing::Height(value) => {
+                        ExportSizing::Height(f64::from(value))
+                    }
+                },
+                suffix: configuration.common.suffix.to_string(),
+            })
+            .collect::<Vec<_>>();
+        let item = self.item().read(cx);
+        let Some(document) = item.document() else {
+            crate::view::show_canvas_notice(
+                "The document is not ready to export.".into(),
+                window,
+                cx,
+            );
+            return;
+        };
+        let project_root = item.project_root().map(std::path::Path::to_path_buf);
+        let output_directory = project_root
+            .as_ref()
+            .map(|root| root.join("exports"))
+            .unwrap_or_default();
+        let jobs = prepare_export_requests(
+            &document.doc,
+            document.asset_resolver.clone(),
+            document.page(self.selected_page_index()),
+            output_directory,
+            &requests,
+        );
+        let jobs = match jobs {
+            Ok(jobs) => jobs,
+            Err(error) => {
+                crate::view::show_canvas_notice(format!("Export failed: {error:#}"), window, cx);
+                return;
+            }
+        };
+        let chooser = project_root.is_none().then(|| {
+            cx.prompt_for_paths(gpui::PathPromptOptions {
+                files: false,
+                directories: true,
+                multiple: false,
+                prompt: Some("Choose export folder".into()),
+            })
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let output_directory = match chooser {
+                Some(chooser) => {
+                    let selected: anyhow::Result<Option<std::path::PathBuf>> =
+                        async { Ok(chooser.await??.and_then(|paths| paths.into_iter().next())) }
+                            .await;
+                    match selected {
+                        Ok(Some(directory)) => Some(directory),
+                        Ok(None) => return Ok::<(), anyhow::Error>(()),
+                        Err(error) => {
+                            this.update_in(cx, |_, window, cx| {
+                                crate::view::show_canvas_notice(
+                                    format!("Export folder could not be chosen: {error:#}"),
+                                    window,
+                                    cx,
+                                );
+                            })?;
+                            return Ok(());
+                        }
+                    }
+                }
+                None => None,
+            };
+            this.update_in(cx, |_, window, cx| {
+                crate::view::show_canvas_notice("Exporting…".into(), window, cx);
+            })?;
+            let jobs = if let Some(directory) = output_directory {
+                jobs.with_output_directory(directory)
+            } else {
+                jobs
+            };
+            let result = cx
+                .background_spawn(async move { run_export_jobs(jobs) })
+                .await;
+            this.update_in(cx, |_, window, cx| {
+                let message = match result {
+                    Ok(paths) => {
+                        for path in &paths {
+                            log::info!("Fanta export written to {}", path.display());
+                        }
+                        match paths.as_slice() {
+                            [path] => format!("Exported {}", path.display()),
+                            [first, ..] => format!(
+                                "Exported {} files to {}",
+                                paths.len(),
+                                first.parent().map_or_else(
+                                    || "export folder".to_string(),
+                                    |path| path.display().to_string()
+                                )
+                            ),
+                            [] => "Nothing was exported.".to_string(),
+                        }
+                    }
+                    Err(error) => {
+                        log::error!("Fanta export failed: {error:#}");
+                        format!("Export failed: {error:#}")
+                    }
+                };
+                crate::view::show_canvas_notice(message, window, cx);
+            })?;
+            Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     /// Builds committed operations against the current document.
     fn design_ops(
         &mut self,
@@ -2264,6 +2443,84 @@ impl FigView {
         cx: &mut Context<Self>,
     ) {
         match action {
+            DesignPanelAction::ExportConfigurationAddRequested { target } => {
+                if !self.design_export_target_matches(target, cx) {
+                    return;
+                }
+                if let Some(adapter) = self.gpui_design.as_mut() {
+                    let id = adapter.next_export_id;
+                    adapter.next_export_id = adapter.next_export_id.wrapping_add(1);
+                    adapter
+                        .export_configurations
+                        .push(DesignExportConfiguration::new(
+                            format!("fanta-export-{id}"),
+                            DesignExportFormat::Png,
+                        ));
+                    adapter.last_echo = None;
+                }
+                self.refresh_gpui_design(cx);
+            }
+            DesignPanelAction::ExportConfigurationRemoveRequested {
+                target,
+                configuration_id,
+            } => {
+                if !self.design_export_target_matches(target, cx) {
+                    return;
+                }
+                if let Some(adapter) = self.gpui_design.as_mut() {
+                    adapter
+                        .export_configurations
+                        .retain(|configuration| configuration.id != *configuration_id);
+                    adapter.last_echo = None;
+                }
+                self.refresh_gpui_design(cx);
+            }
+            DesignPanelAction::ExportConfigurationChangeRequested {
+                target,
+                configuration_id,
+                change,
+                phase,
+            } => {
+                if !self.design_export_target_matches(target, cx) {
+                    return;
+                }
+                let Some(adapter) = self.gpui_design.as_mut() else {
+                    return;
+                };
+                match phase {
+                    DesignPanelEditPhase::Begin => {
+                        adapter.export_edit_snapshot = Some(adapter.export_configurations.clone());
+                    }
+                    DesignPanelEditPhase::Cancel => {
+                        if let Some(snapshot) = adapter.export_edit_snapshot.take() {
+                            adapter.export_configurations = snapshot;
+                        }
+                    }
+                    DesignPanelEditPhase::Preview | DesignPanelEditPhase::Commit => {
+                        if let Some(configuration) = adapter
+                            .export_configurations
+                            .iter_mut()
+                            .find(|configuration| configuration.id == *configuration_id)
+                        {
+                            configuration.apply_change(change.clone());
+                            configuration.apply_target_defaults(Default::default());
+                        }
+                        if *phase == DesignPanelEditPhase::Commit {
+                            adapter.export_edit_snapshot = None;
+                        }
+                    }
+                }
+                adapter.last_echo = None;
+                self.refresh_gpui_design(cx);
+            }
+            DesignPanelAction::ExportAllRequested { target } => {
+                if self.design_export_target_matches(target, cx) {
+                    self.export_design_selection(window, cx);
+                }
+            }
+            DesignPanelAction::ExportRequested { .. } => {
+                self.export_design_selection(window, cx);
+            }
             DesignPanelAction::PropertyChangeRequested {
                 node_id: id,
                 property,
@@ -6509,6 +6766,7 @@ mod tests {
         DesignPanelSurface, DesignTypographyTarget,
     };
     use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, point, px, size};
+    use image::GenericImageView as _;
     use project::{FakeFs, Project};
 
     use super::*;
@@ -7441,12 +7699,193 @@ mod tests {
                 "layout grids are gated off"
             );
             assert!(
-                !capabilities.sections.contains(&DesignPanelSection::Export),
-                "exports are gated off"
+                capabilities.sections.contains(&DesignPanelSection::Export),
+                "the selected rectangle can export"
             );
+            let export = panel
+                .view_data()
+                .projections
+                .export
+                .expect("the active inspector has export settings");
+            assert_eq!(export.configurations.len(), 1);
+            assert_eq!(export.configurations[0].format(), DesignExportFormat::Png);
             assert!(!capabilities.aspect_ratio_lock);
             assert!(!panel.paint_style_view_data().enabled);
         });
+    }
+
+    #[gpui::test]
+    async fn design_export_rows_echo_add_change_suffix_and_remove(cx: &mut TestAppContext) {
+        let (mut doc, _page, rect) = doc_with_rect();
+        doc.selection.replace_with([rect]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+        let target = DesignPanelTarget::Nodes {
+            node_ids: vec![rect.to_string().into()],
+        };
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::ExportConfigurationAddRequested {
+                target: target.clone(),
+            });
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel
+                    .view_data()
+                    .projections
+                    .export
+                    .expect("export projection")
+                    .configurations
+                    .len(),
+                2
+            );
+        });
+        for change in [
+            fanta_gpui::design::DesignExportConfigurationChange::Format(DesignExportFormat::Jpg),
+            fanta_gpui::design::DesignExportConfigurationChange::Sizing(
+                DesignPanelExportSizing::Width(480.0),
+            ),
+            fanta_gpui::design::DesignExportConfigurationChange::Suffix("-large".into()),
+        ] {
+            panel.update_in(cx, |_, _, cx| {
+                cx.emit(DesignPanelAction::ExportConfigurationChangeRequested {
+                    target: target.clone(),
+                    configuration_id: "fanta-export-1".into(),
+                    change,
+                    phase: DesignPanelEditPhase::Commit,
+                });
+            });
+            cx.run_until_parked();
+        }
+        panel.read_with(cx, |panel, _| {
+            let export = panel
+                .view_data()
+                .projections
+                .export
+                .expect("export projection");
+            let changed = &export.configurations[1];
+            assert_eq!(changed.format(), DesignExportFormat::Jpg);
+            assert_eq!(changed.sizing, DesignPanelExportSizing::Width(480.0));
+            assert_eq!(changed.common.suffix.as_ref(), "-large");
+        });
+        for phase in [
+            DesignPanelEditPhase::Begin,
+            DesignPanelEditPhase::Preview,
+            DesignPanelEditPhase::Cancel,
+        ] {
+            panel.update_in(cx, |_, _, cx| {
+                cx.emit(DesignPanelAction::ExportConfigurationChangeRequested {
+                    target: target.clone(),
+                    configuration_id: "fanta-export-1".into(),
+                    change: fanta_gpui::design::DesignExportConfigurationChange::Suffix(
+                        "-temporary".into(),
+                    ),
+                    phase,
+                });
+            });
+            cx.run_until_parked();
+        }
+        panel.read_with(cx, |panel, _| {
+            let export = panel
+                .view_data()
+                .projections
+                .export
+                .expect("export projection");
+            assert_eq!(export.configurations[1].common.suffix.as_ref(), "-large");
+        });
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::ExportConfigurationRemoveRequested {
+                target,
+                configuration_id: "fanta-export-1".into(),
+            });
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel
+                    .view_data()
+                    .projections
+                    .export
+                    .expect("export projection")
+                    .configurations
+                    .len(),
+                1
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn design_export_action_writes_png_from_an_unsaved_design(cx: &mut TestAppContext) {
+        let (mut doc, _page, rect) = doc_with_rect();
+        doc.selection.replace_with([rect]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::ExportAllRequested {
+                target: DesignPanelTarget::Nodes {
+                    node_ids: vec![rect.to_string().into()],
+                },
+            });
+        });
+        assert!(
+            cx.did_prompt_for_paths(),
+            "unsaved designs ask for an export folder"
+        );
+        let output = tempfile::tempdir().expect("export destination");
+        let directory = output.path().to_path_buf();
+        cx.simulate_path_prompt_response(move |options| {
+            assert!(options.directories);
+            assert!(!options.files);
+            Some(vec![directory])
+        });
+        cx.run_until_parked();
+        let exported = output.path().join("Hero.png");
+        assert!(exported.exists(), "the export action writes a real PNG");
+        let image = image::open(exported).expect("exported PNG can be decoded");
+        assert_eq!(image.dimensions(), (200, 100));
+        let center = image.get_pixel(100, 50);
+        assert!(
+            center[0] > center[1] && center[3] > 0,
+            "the red layer rendered"
+        );
+    }
+
+    #[gpui::test]
+    async fn design_export_action_writes_the_current_page(cx: &mut TestAppContext) {
+        let (doc, page, _rect) = doc_with_rect();
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::ExportAllRequested {
+                target: DesignPanelTarget::Page {
+                    page_id: page.to_string().into(),
+                },
+            });
+        });
+        assert!(
+            cx.did_prompt_for_paths(),
+            "page export chooses a destination"
+        );
+        let output = tempfile::tempdir().expect("export destination");
+        let directory = output.path().to_path_buf();
+        cx.simulate_path_prompt_response(move |_| Some(vec![directory]));
+        cx.run_until_parked();
+        let exported = output.path().join("Page 1.png");
+        assert!(exported.exists());
+        let image = image::open(exported).expect("page PNG can be decoded");
+        assert_eq!(image.dimensions(), (200, 100));
+        let center = image.get_pixel(100, 50);
+        assert!(
+            center[0] > center[1] && center[3] > 0,
+            "the red page content rendered"
+        );
     }
 
     #[gpui::test]

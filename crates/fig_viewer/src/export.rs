@@ -113,8 +113,50 @@ pub(crate) struct ExportBatch {
     doc: Doc,
     asset_resolver: Option<Arc<dyn AssetResolver>>,
     targets: Vec<ExportTarget>,
-    presets: Vec<ExportPreset>,
-    project_root: PathBuf,
+    requests: Vec<ExportRequest>,
+    output_directory: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum ExportSizing {
+    Scale(f64),
+    Width(f64),
+    Height(f64),
+}
+
+impl From<ExportScale> for ExportSizing {
+    fn from(scale: ExportScale) -> Self {
+        Self::Scale(scale.multiplier())
+    }
+}
+
+impl ExportSizing {
+    fn zoom(self, bounds: Bounds) -> Result<f64> {
+        let zoom = match self {
+            Self::Scale(scale) => scale,
+            Self::Width(width) => width / bounds.width(),
+            Self::Height(height) => height / bounds.height(),
+        };
+        if !zoom.is_finite() || zoom <= 0.0 {
+            bail!("export size must be a finite positive value");
+        }
+        Ok(zoom)
+    }
+
+    fn label(self) -> String {
+        match self {
+            Self::Scale(scale) => format!("{scale}x"),
+            Self::Width(width) => format!("{width}w"),
+            Self::Height(height) => format!("{height}h"),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ExportRequest {
+    pub(crate) format: ExportFormat,
+    pub(crate) sizing: ExportSizing,
+    pub(crate) suffix: String,
 }
 
 struct ExportTarget {
@@ -130,7 +172,35 @@ pub(crate) fn prepare_export_jobs(
     project_root: PathBuf,
     presets: &[ExportPreset],
 ) -> Result<ExportBatch> {
-    if presets.is_empty() {
+    let requests = presets
+        .iter()
+        .map(|preset| ExportRequest {
+            format: preset.format,
+            sizing: preset.scale.into(),
+            suffix: if preset.format.is_raster() {
+                preset.scale.file_suffix().to_string()
+            } else {
+                String::new()
+            },
+        })
+        .collect::<Vec<_>>();
+    prepare_export_requests(
+        doc,
+        asset_resolver,
+        page,
+        project_root.join("exports"),
+        &requests,
+    )
+}
+
+pub(crate) fn prepare_export_requests(
+    doc: &Doc,
+    asset_resolver: Option<Arc<dyn AssetResolver>>,
+    page: Option<&FigPage>,
+    output_directory: PathBuf,
+    requests: &[ExportRequest],
+) -> Result<ExportBatch> {
+    if requests.is_empty() {
         bail!("add at least one export setting");
     }
 
@@ -180,14 +250,14 @@ pub(crate) fn prepare_export_jobs(
             .collect()
     };
 
-    validate_export_requests(&targets, presets)?;
+    validate_export_requests(&targets, requests)?;
 
     Ok(ExportBatch {
         doc: doc.clone(),
         asset_resolver,
         targets,
-        presets: presets.to_vec(),
-        project_root,
+        requests: requests.to_vec(),
+        output_directory,
     })
 }
 
@@ -232,17 +302,22 @@ fn resolve_export_bindings(document: &Doc) -> Cow<'_, Doc> {
 }
 
 impl ExportBatch {
+    pub(crate) fn with_output_directory(mut self, output_directory: PathBuf) -> Self {
+        self.output_directory = output_directory;
+        self
+    }
+
     pub(crate) fn len(&self) -> usize {
-        self.targets.len().saturating_mul(self.presets.len())
+        self.targets.len().saturating_mul(self.requests.len())
     }
 
     pub(crate) fn format_summary(&self) -> String {
         let mut labels = Vec::new();
-        for preset in &self.presets {
-            let label = if preset.format.is_raster() {
-                format!("{} {}", preset.format.label(), preset.scale.label())
+        for request in &self.requests {
+            let label = if request.format.is_raster() {
+                format!("{} {}", request.format.label(), request.sizing.label())
             } else {
-                preset.format.label().to_string()
+                request.format.label().to_string()
             };
             if !labels.contains(&label) {
                 labels.push(label);
@@ -253,27 +328,27 @@ impl ExportBatch {
 }
 
 pub(crate) fn run_export_jobs(batch: ExportBatch) -> Result<Vec<PathBuf>> {
-    if batch.targets.is_empty() || batch.presets.is_empty() {
+    if batch.targets.is_empty() || batch.requests.is_empty() {
         bail!("there is nothing to export");
     }
 
-    let exports_dir = batch.project_root.join("exports");
+    let exports_dir = &batch.output_directory;
     std::fs::create_dir_all(&exports_dir)
         .with_context(|| format!("creating {}", exports_dir.display()))?;
-    let file_names = output_file_names(&batch.targets, &batch.presets);
+    let file_names = output_file_names(&batch.targets, &batch.requests);
     let mut file_names = file_names.into_iter();
     let mut paths = Vec::with_capacity(batch.len());
 
     for target in &batch.targets {
         let document = render_document_for_target(&batch.doc, target)?;
-        for preset in &batch.presets {
+        for request in &batch.requests {
             let file_name = file_names
                 .next()
                 .context("export filename generation was incomplete")?;
-            let bytes = render_export(&batch, &document, target, *preset).with_context(|| {
-                format!("exporting {} as {}", target.name, preset.format.label())
+            let bytes = render_export(&batch, &document, target, request).with_context(|| {
+                format!("exporting {} as {}", target.name, request.format.label())
             })?;
-            let path = write_export_atomically(&exports_dir, &file_name, &bytes)
+            let path = write_export_atomically(exports_dir, &file_name, &bytes)
                 .with_context(|| format!("writing {file_name}"))?;
             paths.push(path);
         }
@@ -285,11 +360,11 @@ fn render_export(
     batch: &ExportBatch,
     document: &Doc,
     target: &ExportTarget,
-    preset: ExportPreset,
+    request: &ExportRequest,
 ) -> Result<Vec<u8>> {
-    match preset.format {
-        ExportFormat::Png => render_png(batch, document, target, preset.scale),
-        ExportFormat::Jpeg => render_jpeg(batch, document, target, preset.scale),
+    match request.format {
+        ExportFormat::Png => render_png(batch, document, target, request.sizing),
+        ExportFormat::Jpeg => render_jpeg(batch, document, target, request.sizing),
         ExportFormat::Svg => render_svg(batch, document, target),
         ExportFormat::Pdf => render_pdf(batch, document, target),
     }
@@ -299,9 +374,9 @@ fn render_png(
     batch: &ExportBatch,
     document: &Doc,
     target: &ExportTarget,
-    scale: ExportScale,
+    sizing: ExportSizing,
 ) -> Result<Vec<u8>> {
-    let mut renderer = render_raster(batch, document, target, scale)?;
+    let mut renderer = render_raster(batch, document, target, sizing)?;
     renderer
         .encode_png()
         .map_err(|error| anyhow::anyhow!("encoding export PNG: {error}"))
@@ -311,10 +386,10 @@ fn render_jpeg(
     batch: &ExportBatch,
     document: &Doc,
     target: &ExportTarget,
-    scale: ExportScale,
+    sizing: ExportSizing,
 ) -> Result<Vec<u8>> {
-    let mut renderer = render_raster(batch, document, target, scale)?;
-    let (width, height) = raster_dimensions(target.bounds, scale, &target.name)?;
+    let mut renderer = render_raster(batch, document, target, sizing)?;
+    let (width, height) = raster_dimensions(target.bounds, sizing, &target.name)?;
     let rgba = renderer.copy_rgba();
     let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
     for pixel in rgba.chunks_exact(4) {
@@ -336,10 +411,10 @@ fn render_raster(
     batch: &ExportBatch,
     document: &Doc,
     target: &ExportTarget,
-    scale: ExportScale,
+    sizing: ExportSizing,
 ) -> Result<RasterRenderer> {
-    let (width, height) = raster_dimensions(target.bounds, scale, &target.name)?;
-    let zoom = scale.multiplier();
+    let (width, height) = raster_dimensions(target.bounds, sizing, &target.name)?;
+    let zoom = sizing.zoom(target.bounds)?;
     let mut renderer = RasterRenderer::new(width, height)
         .map_err(|error| anyhow::anyhow!("creating {width}x{height} export surface: {error}"))?;
     if let Some(asset_resolver) = batch.asset_resolver.clone() {
@@ -485,11 +560,11 @@ fn page_visual_bounds(document: &Doc, root: Option<NodeId>) -> Option<Bounds> {
     }
 }
 
-fn validate_export_requests(targets: &[ExportTarget], presets: &[ExportPreset]) -> Result<()> {
+fn validate_export_requests(targets: &[ExportTarget], requests: &[ExportRequest]) -> Result<()> {
     for target in targets {
-        for preset in presets {
-            if preset.format.is_raster() {
-                raster_dimensions(target.bounds, preset.scale, &target.name)?;
+        for request in requests {
+            if request.format.is_raster() {
+                raster_dimensions(target.bounds, request.sizing, &target.name)?;
             } else {
                 checked_vector_dimension(target.bounds.width(), "vector width")?;
                 checked_vector_dimension(target.bounds.height(), "vector height")?;
@@ -499,14 +574,27 @@ fn validate_export_requests(targets: &[ExportTarget], presets: &[ExportPreset]) 
     Ok(())
 }
 
-fn raster_dimensions(bounds: Bounds, scale: ExportScale, name: &str) -> Result<(u32, u32)> {
-    let multiplier = scale.multiplier();
-    let width = (bounds.width() * multiplier).ceil().max(1.0);
-    let height = (bounds.height() * multiplier).ceil().max(1.0);
+fn raster_dimensions(
+    bounds: Bounds,
+    sizing: impl Into<ExportSizing>,
+    name: &str,
+) -> Result<(u32, u32)> {
+    let sizing = sizing.into();
+    let multiplier = sizing.zoom(bounds)?;
+    let (width, height) = match sizing {
+        ExportSizing::Scale(_) => (
+            (bounds.width() * multiplier).ceil(),
+            (bounds.height() * multiplier).ceil(),
+        ),
+        ExportSizing::Width(width) => (width.ceil(), (bounds.height() * multiplier).ceil()),
+        ExportSizing::Height(height) => ((bounds.width() * multiplier).ceil(), height.ceil()),
+    };
+    let width = width.max(1.0);
+    let height = height.max(1.0);
     if width > f64::from(MAX_EXPORT_PIXELS) || height > f64::from(MAX_EXPORT_PIXELS) {
         bail!(
             "{name} at {} would be {width:.0}×{height:.0} pixels; the per-side limit is {MAX_EXPORT_PIXELS}. Choose a smaller scale",
-            scale.label()
+            sizing.label()
         );
     }
     let pixels = (width as u64)
@@ -515,7 +603,7 @@ fn raster_dimensions(bounds: Bounds, scale: ExportScale, name: &str) -> Result<(
     if pixels > MAX_EXPORT_TOTAL_PIXELS {
         bail!(
             "{name} at {} would contain {pixels} pixels; the safe limit is {MAX_EXPORT_TOTAL_PIXELS}. Choose a smaller scale",
-            scale.label()
+            sizing.label()
         );
     }
     Ok((width as u32, height as u32))
@@ -605,17 +693,17 @@ fn ensure_exportable_bounds(name: &str, bounds: Bounds) -> Result<()> {
     Ok(())
 }
 
-fn output_file_names(targets: &[ExportTarget], presets: &[ExportPreset]) -> Vec<String> {
+fn output_file_names(targets: &[ExportTarget], requests: &[ExportRequest]) -> Vec<String> {
     targets
         .iter()
         .flat_map(|target| {
-            presets.iter().map(move |preset| {
-                let suffix = if preset.format.is_raster() {
-                    preset.scale.file_suffix()
+            requests.iter().map(move |request| {
+                let suffix = if request.suffix.is_empty() {
+                    String::new()
                 } else {
-                    ""
+                    sanitize_file_name(&request.suffix)
                 };
-                format!("{}{suffix}.{}", target.name, preset.format.extension())
+                format!("{}{suffix}.{}", target.name, request.format.extension())
             })
         })
         .collect()
@@ -787,6 +875,89 @@ mod tests {
         assert_eq!(
             image::open(&paths[1]).expect("JPEG is decodable").color(),
             image::ColorType::Rgb8
+        );
+    }
+
+    #[test]
+    fn inspector_requests_export_custom_sizes_and_suffixes_into_chosen_directory() {
+        let directory = tempfile::tempdir().expect("temporary export directory");
+        let output_directory = directory.path().join("chosen");
+        let mut doc = Doc::new();
+        let frame = insert(&mut doc, exportable_frame("Badge", 0.0));
+        doc.selection.select_only(frame);
+        let requests = [
+            ExportRequest {
+                format: ExportFormat::Png,
+                sizing: ExportSizing::Width(40.0),
+                suffix: "-wide".into(),
+            },
+            ExportRequest {
+                format: ExportFormat::Jpeg,
+                sizing: ExportSizing::Height(30.0),
+                suffix: "-tall".into(),
+            },
+            ExportRequest {
+                format: ExportFormat::Svg,
+                sizing: ExportSizing::Scale(1.0),
+                suffix: "-vector".into(),
+            },
+            ExportRequest {
+                format: ExportFormat::Pdf,
+                sizing: ExportSizing::Scale(1.0),
+                suffix: String::new(),
+            },
+        ];
+        let batch = prepare_export_requests(&doc, None, None, output_directory.clone(), &requests)
+            .expect("inspector requests are valid");
+        let paths = run_export_jobs(batch).expect("each requested file is written");
+        assert_eq!(
+            paths,
+            [
+                output_directory.join("Badge-wide.png"),
+                output_directory.join("Badge-tall.jpg"),
+                output_directory.join("Badge-vector.svg"),
+                output_directory.join("Badge.pdf"),
+            ]
+        );
+        assert_eq!(
+            image::open(&paths[0])
+                .expect("PNG is decodable")
+                .dimensions(),
+            (40, 20)
+        );
+        assert_eq!(
+            image::open(&paths[1])
+                .expect("JPEG is decodable")
+                .dimensions(),
+            (60, 30)
+        );
+        assert!(
+            std::fs::read_to_string(&paths[2])
+                .expect("SVG is readable")
+                .contains("<svg")
+        );
+        assert!(
+            std::fs::read(&paths[3])
+                .expect("PDF is readable")
+                .starts_with(b"%PDF-")
+        );
+    }
+
+    #[test]
+    fn inspector_export_rejects_invalid_and_oversized_sizing() {
+        let bounds = Bounds::from_xywh(0.0, 0.0, 20.0, 10.0);
+        for sizing in [
+            ExportSizing::Scale(0.0),
+            ExportSizing::Width(f64::NAN),
+            ExportSizing::Height(-1.0),
+        ] {
+            assert!(raster_dimensions(bounds, sizing, "Badge").is_err());
+        }
+        assert!(
+            raster_dimensions(bounds, ExportSizing::Width(100_000.0), "Badge")
+                .expect_err("large exports are rejected")
+                .to_string()
+                .contains("per-side limit")
         );
     }
 
@@ -1104,7 +1275,11 @@ pub(crate) fn render_layer(
         .first()
         .context("The layer has no export target")?;
     let resolved = resolve_export_bindings(&batch.doc);
-    render_export(&batch, resolved.as_ref(), target, preset)
+    let request = batch
+        .requests
+        .first()
+        .context("The layer has no export request")?;
+    render_export(&batch, resolved.as_ref(), target, request)
 }
 
 #[cfg(feature = "fanta-gpui-ui")]

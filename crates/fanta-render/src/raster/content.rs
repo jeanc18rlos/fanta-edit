@@ -84,15 +84,23 @@ pub(crate) fn paint_node_content(
         }
         NodeData::Group(g) => paint_group(canvas, node, g, scene_id, ctx),
         NodeData::Vector(v) => {
-            // SVG viewport: clip the vector to its authored box so geometry that
-            // spills past it — chiefly a stroke thickened beyond the box — is
-            // cropped instead of growing the shape. The canvas already carries the
-            // node's transform, so `[0,0,w,h]` is the box in local coordinates.
-            let viewport = if node.flags.contains(fanta_doc::NodeFlags::UNCLIPPED_VECTOR) {
-                None
-            } else {
-                v.local_size
-            };
+            // A viewport crops geometry outside its authored box. For a path
+            // contained by that box, the centered/outside border must be able
+            // to extend beyond it; otherwise the viewport's square corners
+            // visibly cut off a rounded border.
+            let viewport = crate::bounds::vector_viewport_clip(v, node.flags, || {
+                path_cache_id
+                    .and_then(|id| {
+                        let stamp = ctx.scene.node_stamp(id);
+                        ctx.path_cache
+                            .entries
+                            .get(&id)
+                            .and_then(|(cached_stamp, paths)| {
+                                (*cached_stamp == stamp).then_some(paths.rough_bounds)
+                            })
+                    })
+                    .or_else(|| v.path.rough_bounds())
+            });
             if let Some([w, h]) = viewport {
                 canvas.save();
                 canvas.clip_rect(Rect::from_xywh(0.0, 0.0, w as f32, h as f32), None, true);

@@ -8,12 +8,14 @@ use crate::application_menu::{ApplicationMenu, show_menus};
 use crate::plan_chip::PlanChip;
 use agent_settings::{AgentSettings, WindowLayout};
 use arrayvec::ArrayVec;
-use git_ui::worktree_picker::WorktreePicker;
+use fanta_gpui::atoms::{LucideIcon, SegmentIconOption, SegmentedControl};
+use git_ui::{git_panel::GitPanel, worktree_picker::WorktreePicker};
 pub use platform_title_bar::{
     self, DraggedWindowTab, MergeAllWindows, MoveTabToNewWindow, PlatformTitleBar,
     ShowNextWindowTab, ShowPreviousWindowTab,
 };
 use project::{linked_worktree_short_name, repo_identity_path};
+use project_panel::ProjectPanel;
 
 #[cfg(not(target_os = "macos"))]
 use crate::application_menu::{
@@ -51,6 +53,7 @@ use update_version::UpdateVersion;
 use util::ResultExt;
 use workspace::{
     MultiWorkspace, ToggleWorktreeSecurity, Workspace,
+    dock::DockPosition,
     notifications::{NotifyResultExt, NotifyTaskExt as _},
 };
 
@@ -61,6 +64,28 @@ pub use onboarding_banner::restore_banner;
 const MAX_PROJECT_NAME_LENGTH: usize = 40;
 const MAX_BRANCH_NAME_LENGTH: usize = 40;
 const MAX_SHORT_SHA_LENGTH: usize = 8;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PrimaryPanel {
+    Files,
+    Git,
+}
+
+fn visible_primary_panel(workspace: &Workspace, cx: &App) -> Option<PrimaryPanel> {
+    [DockPosition::Right, DockPosition::Left]
+        .into_iter()
+        .filter_map(|position| {
+            let dock = workspace.dock_at_position(position).read(cx);
+            dock.is_open()
+                .then(|| dock.visible_panel().map(|panel| panel.persistent_name()))
+                .flatten()
+        })
+        .find_map(|name| match name {
+            "Project Panel" => Some(PrimaryPanel::Files),
+            "GitPanel" => Some(PrimaryPanel::Git),
+            _ => None,
+        })
+}
 
 actions!(
     collab,
@@ -349,6 +374,8 @@ impl Render for TitleBar {
                 client::Status::SignedOut | client::Status::AuthenticationError
             );
 
+        let panel_switcher = self.render_panel_switcher(cx);
+
         children.push(
             h_flex()
                 .map(|this| {
@@ -362,6 +389,7 @@ impl Render for TitleBar {
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .children(self.render_connection_status(status, cx))
                 .child(self.update_version.clone())
+                .when_some(panel_switcher, |this, switcher| this.child(switcher))
                 .when(
                     user.is_none()
                         && is_signed_out_or_auth_error
@@ -427,6 +455,58 @@ impl Render for TitleBar {
 }
 
 impl TitleBar {
+    fn render_panel_switcher(&self, cx: &mut Context<Self>) -> Option<SegmentedControl> {
+        let workspace = self.workspace.upgrade()?;
+        let active = {
+            let workspace = workspace.read(cx);
+            if workspace.panel::<ProjectPanel>(cx).is_none()
+                || workspace.panel::<GitPanel>(cx).is_none()
+            {
+                return None;
+            }
+            visible_primary_panel(workspace, cx)
+        };
+        let switcher = SegmentedControl::icons(
+            "fanta-primary-panels",
+            vec![
+                SegmentIconOption::new(LucideIcon::FolderTree, "Files"),
+                SegmentIconOption::new(LucideIcon::GitBranch, "Git"),
+            ],
+        )
+        .compact();
+        let switcher = match active {
+            Some(PrimaryPanel::Files) => switcher.selected_index(0),
+            Some(PrimaryPanel::Git) => switcher.selected_index(1),
+            None => switcher.unselected(),
+        };
+        Some(switcher.on_change(move |selection, window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                match selection.index {
+                    0 if active == Some(PrimaryPanel::Files) => {
+                        workspace.close_panel::<ProjectPanel>(window, cx);
+                    }
+                    0 => {
+                        if active == Some(PrimaryPanel::Git) {
+                            workspace.close_panel::<GitPanel>(window, cx);
+                        }
+                        workspace.reveal_panel::<ProjectPanel>(window, cx);
+                    }
+                    1 if active == Some(PrimaryPanel::Git) => {
+                        workspace.close_panel::<GitPanel>(window, cx);
+                    }
+                    1 => {
+                        if active == Some(PrimaryPanel::Files) {
+                            workspace.close_panel::<ProjectPanel>(window, cx);
+                        }
+                        workspace.reveal_panel::<GitPanel>(window, cx);
+                    }
+                    _ => return,
+                }
+                cx.notify();
+            });
+        }))
+    }
+
     pub fn new(
         id: impl Into<ElementId>,
         workspace: &Workspace,

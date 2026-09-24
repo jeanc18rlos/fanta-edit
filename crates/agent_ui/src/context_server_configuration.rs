@@ -12,8 +12,38 @@ use workspace::Workspace;
 
 use crate::agent_configuration::ConfigureContextServerModal;
 
+gpui::actions!(agent, [AddLocalContextServer, AddRemoteContextServer]);
+
 pub(crate) fn init(language_registry: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, cx: &mut App) {
-    cx.observe_new(move |_: &mut Workspace, window, cx| {
+    cx.observe_new(move |workspace: &mut Workspace, window, cx| {
+        workspace
+            .register_action({
+                let language_registry = language_registry.clone();
+                move |_workspace, _: &AddLocalContextServer, window, cx| {
+                    ConfigureContextServerModal::show_modal_for_new_server(
+                        false,
+                        language_registry.clone(),
+                        cx.weak_entity(),
+                        window,
+                        cx,
+                    )
+                    .detach_and_log_err(cx);
+                }
+            })
+            .register_action({
+                let language_registry = language_registry.clone();
+                move |_workspace, _: &AddRemoteContextServer, window, cx| {
+                    ConfigureContextServerModal::show_modal_for_new_server(
+                        true,
+                        language_registry.clone(),
+                        cx.weak_entity(),
+                        window,
+                        cx,
+                    )
+                    .detach_and_log_err(cx);
+                }
+            });
+
         let Some(window) = window else {
             return;
         };

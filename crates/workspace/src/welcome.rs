@@ -125,29 +125,38 @@ impl RenderOnce for SectionButton {
             .child(
                 h_flex()
                     .w_full()
+                    .min_w_0()
                     .justify_between()
                     .child(
                         h_flex()
+                            .min_w_0()
+                            .flex_1()
                             .gap_2()
                             .child(
                                 Icon::new(self.icon)
                                     .color(Color::Muted)
                                     .size(IconSize::Small),
                             )
-                            .child(v_flex().child(Label::new(self.label)).when_some(
-                                self.detail,
-                                |this, detail| {
-                                    this.child(
-                                        Label::new(detail)
-                                            .size(LabelSize::XSmall)
-                                            .color(Color::Warning),
-                                    )
-                                },
-                            )),
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .child(Label::new(self.label).truncate())
+                                    .when_some(self.detail, |this, detail| {
+                                        this.child(
+                                            Label::new(detail)
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Warning)
+                                                .truncate(),
+                                        )
+                                    }),
+                            ),
                     )
                     .child(
-                        KeyBinding::for_action_in(action_ref, &self.focus_handle, cx)
-                            .size(rems_from_px(12.)),
+                        div().flex_shrink_0().ml_2().child(
+                            KeyBinding::for_action_in(action_ref, &self.focus_handle, cx)
+                                .size(rems_from_px(12.)),
+                        ),
                     ),
             )
             .on_click(move |_, window, cx| {
@@ -431,6 +440,7 @@ impl WelcomePage {
 
         v_flex()
             .w_full()
+            .min_w_0()
             .p_2()
             .rounded_md()
             .border_1()
@@ -483,6 +493,7 @@ impl WelcomePage {
 
         v_flex()
             .w_full()
+            .min_w_0()
             .p_2()
             .gap_2()
             .rounded_md()
@@ -507,6 +518,8 @@ impl WelcomePage {
             .child(
                 div()
                     .w_full()
+                    .min_w_0()
+                    .overflow_hidden()
                     .p_1p5()
                     .rounded_sm()
                     .bg(color.editor_background)
@@ -516,11 +529,12 @@ impl WelcomePage {
                         Label::new(CONNECT_CLAUDE_CODE_COMMAND)
                             .buffer_font(cx)
                             .size(LabelSize::XSmall)
-                            .color(Color::Default),
+                            .color(Color::Default)
+                            .line_clamp(3),
                     ),
             )
             .child(
-                h_flex()
+                v_flex()
                     .w_full()
                     .gap_2()
                     .child(
@@ -660,8 +674,9 @@ impl Render for WelcomePage {
                     .p_8()
                     .max_w_128()
                     .size_full()
+                    .min_w_0()
                     .gap_6()
-                    .justify_center()
+                    .justify_start()
                     .overflow_y_scroll()
                     .child(
                         v_flex()
@@ -671,6 +686,8 @@ impl Render for WelcomePage {
                             .child(
                                 h_flex()
                                     .w_full()
+                                    .min_w_0()
+                                    .flex_wrap()
                                     .justify_center()
                                     .gap_4()
                                     .child(Vector::square(VectorName::FantaLogo, rems_from_px(45.)))

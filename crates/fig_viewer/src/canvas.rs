@@ -3302,6 +3302,39 @@ impl CanvasElement {
                             }
                         }
                     }
+                    ToolOverlay::BrushCursor {
+                        world_center,
+                        diameter,
+                        softness_radius,
+                    } => {
+                        let center = project(DVec2::from(*world_center));
+                        let screen_diameter = diameter * viewport.zoom;
+                        if screen_diameter.is_finite() && screen_diameter > 0.0 {
+                            let core_radius = px((screen_diameter as f32 / 2.0).max(2.0));
+                            let cursor_bounds = |radius: Pixels| Bounds {
+                                origin: point(center.x - radius, center.y - radius),
+                                size: size(radius * 2.0, radius * 2.0),
+                            };
+                            let soft_radius = *softness_radius * viewport.zoom;
+                            if soft_radius.is_finite() && soft_radius > 0.0 {
+                                paint_ellipse_outline(
+                                    cursor_bounds(core_radius + px(soft_radius as f32)),
+                                    gpui::white().opacity(0.55),
+                                    window,
+                                );
+                            }
+                            paint_ellipse_outline(
+                                cursor_bounds(core_radius + px(1.0)),
+                                gpui::black().opacity(0.85),
+                                window,
+                            );
+                            paint_ellipse_outline(
+                                cursor_bounds(core_radius),
+                                gpui::white(),
+                                window,
+                            );
+                        }
+                    }
                     ToolOverlay::PathAnchor { world, selected } => {
                         let center = project(DVec2::new(world[0], world[1]));
                         let anchor_px = px(6.);

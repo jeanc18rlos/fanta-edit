@@ -193,7 +193,7 @@ impl BrushTool {
         let id = node.id;
         if let Err(error) = ctx.doc.apply(Operation::create_node(node)) {
             tracing::warn!(target: "fanta-tools.brush", "create failed: {error}");
-        } else {
+        } else if !ctx.draw_content_only {
             ctx.doc.selection.select_only(id);
         }
     }
@@ -347,6 +347,35 @@ mod tests {
         }
         assert_eq!(tool.points.len(), 5000);
         assert!(tool.preview_points.len() < MAX_SAMPLES);
+    }
+
+    #[test]
+    fn draw_mode_brush_mark_keeps_selection_and_extends_past_pointer_path() {
+        let mut doc = Doc::new();
+        let mut viewport = Viewport::default();
+        let mut context = ToolContext::new(
+            &mut doc,
+            &mut viewport,
+            SnapEngine::default(),
+            DVec2::new(800.0, 600.0),
+        );
+        context.draw_content_only = true;
+        context.new_stroke_width = 40.0;
+        let mut brush = BrushTool::new();
+        brush.handle_event(&mut context, pointer([400.0, 300.0], "press"));
+        brush.handle_event(&mut context, pointer([450.0, 300.0], "release"));
+        assert!(context.doc.selection.is_empty());
+        let node = context
+            .doc
+            .scene
+            .get(context.doc.scene.roots()[0])
+            .expect("brush mark");
+        let NodeData::Vector(vector) = &node.data else {
+            panic!("brush mark must be a vector");
+        };
+        assert!(vector.local_size.is_none());
+        let bounds = vector.path.rough_bounds().expect("brush path bounds");
+        assert!(bounds.min_y < 0.0 && bounds.max_y > 0.0, "{bounds:?}");
     }
 
     #[test]

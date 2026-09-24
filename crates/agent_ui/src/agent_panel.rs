@@ -38,6 +38,7 @@ use crate::ExpandMessageEditor;
 use crate::ManageProfiles;
 use crate::agent_connection_store::AgentConnectionStore;
 use crate::completion_provider::{AgentContextSelection, AgentContextSource};
+use crate::context_server_configuration::{AddLocalContextServer, AddRemoteContextServer};
 use crate::terminal_thread_metadata_store::{
     TerminalThreadMetadata, TerminalThreadMetadataStore, compose_terminal_thread_title,
     terminal_title_without_prefix,
@@ -3485,16 +3486,32 @@ impl AgentPanel {
     fn manage_skills(
         &mut self,
         _action: &ManageSkills,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.dispatch_action(
-            Box::new(zed_actions::OpenSettingsAt {
-                path: zed_actions::AGENT_SKILLS_SETTINGS_PATH.to_string(),
-                target: None,
-            }),
-            cx,
-        );
+        cx.stop_propagation();
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let app_state = workspace.read(cx).app_state().clone();
+        let skills_path = agent_skills::global_skills_dir();
+        cx.spawn(async move |_, cx| {
+            app_state.fs.create_dir(&skills_path).await?;
+            cx.update(|cx| {
+                workspace::open_paths(
+                    &[skills_path],
+                    app_state,
+                    workspace::OpenOptions {
+                        open_mode: workspace::OpenMode::NewWindow,
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            })
+            .await?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     /// Refresh the native agent's view of available skills
@@ -3656,14 +3673,26 @@ impl AgentPanel {
         }
     }
 
-    pub(crate) fn open_configuration(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        window.dispatch_action(
-            Box::new(zed_actions::OpenSettingsPage {
-                page: "AI".to_string(),
-                target: None,
-            }),
+    pub(crate) fn open_configuration(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        let app_state = workspace.read(cx).app_state().clone();
+        workspace::open_new(
+            workspace::OpenOptions {
+                open_mode: workspace::OpenMode::NewWindow,
+                ..Default::default()
+            },
+            app_state,
             cx,
-        );
+            |_workspace, window, cx| {
+                workspace::create_and_open_local_file(paths::settings_file(), window, cx, || {
+                    settings::initial_user_settings_content().as_ref().into()
+                })
+                .detach_and_log_err(cx);
+            },
+        )
+        .detach_and_log_err(cx);
     }
 
     pub(crate) fn open_active_thread_as_markdown(
@@ -5628,21 +5657,11 @@ impl AgentPanel {
                         if !showing_terminal {
                             menu = menu
                                 .header("MCP Servers")
+                                .action("Add Local Server…", Box::new(AddLocalContextServer))
+                                .action("Add Remote Server…", Box::new(AddRemoteContextServer))
                                 .action(
-                                    "Add Server…",
-                                    Box::new(zed_actions::OpenSettingsAt {
-                                        path: "context_servers".to_string(),
-                                        target: None,
-                                    }),
-                                )
-                                .action(
-                                    "Install New Servers…",
-                                    Box::new(zed_actions::Extensions {
-                                        category_filter: Some(
-                                            zed_actions::ExtensionCategoryFilter::ContextServers,
-                                        ),
-                                        id: None,
-                                    }),
+                                    "Edit Server Settings",
+                                    Box::new(zed_actions::OpenSettingsFile),
                                 )
                                 .separator()
                                 .header("Context")
@@ -5702,24 +5721,6 @@ impl AgentPanel {
                             }
 
                             menu = menu
-                                .separator()
-                                .header("MCP Servers")
-                                .action(
-                                    "Add Server…",
-                                    Box::new(zed_actions::OpenSettingsAt {
-                                        path: "context_servers".to_string(),
-                                        target: None,
-                                    }),
-                                )
-                                .action(
-                                    "Install New Servers…",
-                                    Box::new(zed_actions::Extensions {
-                                        category_filter: Some(
-                                            zed_actions::ExtensionCategoryFilter::ContextServers,
-                                        ),
-                                        id: None,
-                                    }),
-                                )
                                 .separator()
                                 .action("Profiles", Box::new(ManageProfiles::default()));
                         }
@@ -6425,6 +6426,7 @@ impl Render for AgentPanel {
                 this.new_terminal(None, AgentThreadSource::AgentPanel, window, cx);
             }))
             .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                cx.stop_propagation();
                 this.open_configuration(window, cx);
             }))
             .on_action(cx.listener(Self::open_active_thread_as_markdown))
@@ -9445,6 +9447,12 @@ mod tests {
             cx.debug_bounds("KEY_BINDING-l").is_some(),
             "Skills menu item should show the ManageSkills shortcut"
         );
+        assert!(cx.debug_bounds("MENU_ITEM-Add Local Server…").is_some());
+        assert!(cx.debug_bounds("MENU_ITEM-Add Remote Server…").is_some());
+        assert!(cx.debug_bounds("MENU_ITEM-Edit Server Settings").is_some());
+        assert!(cx.debug_bounds("MENU_ITEM-Profiles").is_some());
+        assert!(cx.debug_bounds("MENU_ITEM-Settings").is_some());
+        assert!(cx.debug_bounds("MENU_ITEM-Install New Servers…").is_none());
     }
 
     #[gpui::test]

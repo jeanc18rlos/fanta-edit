@@ -10662,16 +10662,14 @@ impl FigView {
         }
     }
 
-    /// The toolbar's Export command runs the inspector's export flow — the
-    /// same presets, the same `exports/` destination, the same in-panel
-    /// feedback — rather than a second, divergent export path. Deferred
-    /// because that flow reads this view, which is leased for the duration of
-    /// the toolbar event.
+    /// The toolbar uses the active Design export settings when the new
+    /// inspector is mounted, including the same destination and format rows.
     #[cfg(feature = "fanta-gpui-ui")]
     fn export_from_toolbar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // The flow reports progress, the written paths, and every failure
-        // (unsaved project, unexportable bounds) as inspector feedback, so the
-        // panel has to be on screen or the command looks like it did nothing.
+        if self.gpui_design.is_some() {
+            self.export_design_selection(window, cx);
+            return;
+        }
         if !self.inspector_sidebar_visible {
             self.toggle_inspector_sidebar(&ToggleInspectorSidebar, window, cx);
         }

@@ -295,6 +295,25 @@ impl ToolShell {
         self.draw_selection_region = ctx.draw_selection_region.clone();
         self.overlays = response.overlays.to_vec();
         self.append_selection_region_overlay();
+        if matches!(
+            self.kind,
+            ToolKind::Brush | ToolKind::Pencil | ToolKind::Eraser
+        ) && let ToolEvent::Pointer(pointer) = event
+            && !matches!(pointer, PointerEvent::Scroll { .. })
+        {
+            let world = ctx.screen_to_world(pointer.screen());
+            let diameter = ctx.new_stroke_width.clamp(1.0, 5000.0);
+            let softness_radius = if self.kind == ToolKind::Brush {
+                diameter * (100.0 - f64::from(ctx.brush_hardness.min(100))) / 100.0 * 0.65
+            } else {
+                0.0
+            };
+            self.overlays.push(ToolOverlay::BrushCursor {
+                world_center: [world.x, world.y],
+                diameter,
+                softness_radius,
+            });
+        }
         if response.cursor.is_some() {
             self.cursor = response.cursor;
         }
@@ -535,6 +554,68 @@ mod tests {
             modifier_keys(all),
             ModifierKeys::SHIFT | ModifierKeys::ALT | ModifierKeys::CTRL | ModifierKeys::META
         );
+    }
+
+    #[test]
+    fn draw_tools_show_brush_footprint_before_and_during_a_stroke() {
+        let mut document = Doc::new();
+        let mut viewport = Viewport::default();
+        let mut context = tool_context(
+            &mut document,
+            &mut viewport,
+            DVec2::new(800.0, 600.0),
+            ToolKind::Brush,
+        );
+        context.new_stroke_width = 40.0;
+        context.brush_hardness = 50;
+        let mut shell = ToolShell::new();
+        for tool in [ToolKind::Brush, ToolKind::Pencil, ToolKind::Eraser] {
+            shell.activate(tool, &mut context);
+            shell.handle_event(
+                &mut context,
+                ToolEvent::Pointer(PointerEvent::Move {
+                    screen: [410.0, 320.0],
+                    modifiers: ModifierKeys::empty(),
+                }),
+            );
+            let expected_softness = if tool == ToolKind::Brush { 13.0 } else { 0.0 };
+            assert!(
+                matches!(
+                    shell.overlays.last(),
+                    Some(ToolOverlay::BrushCursor {
+                        world_center: [10.0, 20.0],
+                        diameter: 40.0,
+                        softness_radius,
+                    }) if (*softness_radius - expected_softness).abs() < 1e-9
+                ),
+                "{tool:?} should preview its footprint on hover"
+            );
+
+            shell.handle_event(
+                &mut context,
+                ToolEvent::Pointer(PointerEvent::Press {
+                    screen: [420.0, 330.0],
+                    button: Button::Primary,
+                    modifiers: ModifierKeys::empty(),
+                    count: 1,
+                }),
+            );
+            assert!(matches!(
+                shell.overlays.last(),
+                Some(ToolOverlay::BrushCursor {
+                    world_center: [20.0, 30.0],
+                    ..
+                })
+            ));
+            shell.handle_event(
+                &mut context,
+                ToolEvent::Pointer(PointerEvent::Release {
+                    screen: [420.0, 330.0],
+                    button: Button::Primary,
+                    modifiers: ModifierKeys::empty(),
+                }),
+            );
+        }
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use fanta_doc::{Bounds, NodeData, NodeFlags, NodeId, Scene, StrokeAlign, StrokeJoin};
+use fanta_doc::{Bounds, NodeData, NodeFlags, NodeId, Scene, StrokeAlign, StrokeJoin, VectorNode};
 
 use crate::raster::shadow_expanded_local_bounds;
 
@@ -47,11 +47,7 @@ fn local_visual_bounds(scene: &Scene, id: NodeId, effective_scale: f32) -> Optio
                 .data
                 .local_bounds()
                 .map(|bounds| expand_for_strokes(bounds, &vector.strokes, vector.path.is_rect()));
-            let viewport = if node.flags.contains(NodeFlags::UNCLIPPED_VECTOR) {
-                None
-            } else {
-                vector.local_size
-            };
+            let viewport = vector_viewport_clip(vector, node.flags, || vector.path.rough_bounds());
             let own = match (own, viewport) {
                 (Some(bounds), Some([width, height])) => {
                     intersect_bounds(bounds, Bounds::from_xywh(0.0, 0.0, width, height))
@@ -86,6 +82,39 @@ fn local_visual_bounds(scene: &Scene, id: NodeId, effective_scale: f32) -> Optio
     result.map(|bounds| {
         shadow_expanded_local_bounds(bounds, &node.effects, &node.blurs, effective_scale)
     })
+}
+
+/// Imported vector boxes crop geometry that exceeds the authored viewport, but
+/// a path contained by that box needs its center/outside stroke beyond the box.
+/// Clipping that stroke to a square viewport cuts off rounded outer corners.
+pub(crate) fn vector_viewport_clip(
+    vector: &VectorNode,
+    flags: NodeFlags,
+    path_bounds: impl FnOnce() -> Option<Bounds>,
+) -> Option<[f64; 2]> {
+    let viewport = vector.local_size?;
+    if flags.contains(NodeFlags::UNCLIPPED_VECTOR) {
+        return None;
+    }
+    let [width, height] = viewport;
+    // Raster supplies its cached path bounds here, avoiding another path scan
+    // for every visible vector on every frame.
+    let Some(bounds) = path_bounds() else {
+        return Some(viewport);
+    };
+    const TOLERANCE: f64 = 0.001;
+    if !bounds.is_finite()
+        || !width.is_finite()
+        || !height.is_finite()
+        || bounds.min_x < -TOLERANCE
+        || bounds.min_y < -TOLERANCE
+        || bounds.max_x > width + TOLERANCE
+        || bounds.max_y > height + TOLERANCE
+    {
+        Some(viewport)
+    } else {
+        None
+    }
 }
 
 fn intersect_bounds(left: Bounds, right: Bounds) -> Option<Bounds> {
@@ -181,6 +210,38 @@ mod tests {
             visual_world_bounds(&doc.scene, id, 0.0),
             Some(Bounds::from_xywh(-4.0, -4.0, 18.0, 18.0))
         );
+    }
+
+    #[test]
+    fn authored_box_keeps_visual_bounds_of_center_and_outside_borders() {
+        for align in [StrokeAlign::Center, StrokeAlign::Outside] {
+            let mut doc = Doc::new();
+            let mut node = rectangle();
+            let NodeData::Vector(vector) = &mut node.data else {
+                unreachable!();
+            };
+            vector.local_size = Some([10.0, 10.0]);
+            vector.corner_radius = Some(4.0);
+            let mut stroke = Stroke::solid(Color::BLACK, 4.0);
+            stroke.align = align;
+            vector.strokes.push(stroke);
+            let id = insert(&mut doc, node);
+            let extent = if align == StrokeAlign::Center {
+                2.0
+            } else {
+                4.0
+            };
+            assert_eq!(
+                visual_world_bounds(&doc.scene, id, 0.0),
+                Some(Bounds::from_xywh(
+                    -extent,
+                    -extent,
+                    10.0 + 2.0 * extent,
+                    10.0 + 2.0 * extent
+                )),
+                "{align:?} border must not be culled at the authored box"
+            );
+        }
     }
 
     #[test]

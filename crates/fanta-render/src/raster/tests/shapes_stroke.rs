@@ -292,9 +292,8 @@ fn thick_inside_stroke_keeps_the_rounded_outer_corner() {
     );
 }
 
-/// A 20×20 rect authored at the LOCAL origin `[0,0]` (so a `[0,0,w,h]` viewport
-/// clip aligns with it) with a wide centered stroke that spills 8px past every
-/// edge. `local_size` sets the SVG viewport used to clip that overflow.
+/// A 20×20 rect authored at the LOCAL origin `[0,0]` with a wide centered
+/// stroke that spills 8px past every edge. `local_size` is the authored box.
 ///
 /// Geometry (64×64, origin-centred viewport, zoom 1): world (x,y) → screen
 /// (x+32, y+32). The rect spans world (0,0)..(20,20) → screen (32,32)..(52,52).
@@ -336,26 +335,25 @@ fn without_a_viewport_a_thick_stroke_bleeds_past_the_box() {
 }
 
 #[test]
-fn a_viewport_clips_a_stroke_thickened_past_the_box() {
-    // With `local_size = [20,20]` the vector is clipped to its authored box, so
-    // the same over-thick stroke is cropped at the edge (SVG viewport
-    // semantics) — while content INSIDE the box is untouched.
+fn a_viewport_keeps_an_aligned_stroke_on_a_contained_shape() {
+    // The path itself fits in its authored box, so the center stroke's outer
+    // half remains visible outside that box.
     let doc = viewport_stroked_rect_doc(Some([20.0, 20.0]));
     let mut r = RasterRenderer::new(64, 64).unwrap();
     r.render(&doc.scene, &doc.viewport);
     let buf = r.copy_rgba();
-    // Same pixel as the baseline, now OUTSIDE the viewport → cropped away.
+    // Same pixel as the baseline, outside the authored box but under the stroke.
     let outside = rgba_at(&buf, 64, 56, 42);
     assert!(
-        outside[3] < 40,
-        "a viewport must crop the stroke past the box edge, got {outside:?}"
+        outside[2] > 200 && outside[3] > 200,
+        "a viewport must preserve an aligned stroke beyond the box, got {outside:?}"
     );
     // The stroke's inner half, just inside the right edge (screen x = 50 < 52),
-    // stays painted — the clip only removes what spills past the box.
+    // stays painted too.
     let inside_band = rgba_at(&buf, 64, 50, 42);
     assert!(
         inside_band[2] > 200 && inside_band[3] > 200,
-        "the viewport must keep the stroke inside the box, got {inside_band:?}"
+        "the inside half of the stroke must stay visible, got {inside_band:?}"
     );
     // Interior fill (screen (42,42) → world (10,10)) is well inside the box.
     let interior = rgba_at(&buf, 64, 42, 42);
@@ -363,4 +361,69 @@ fn a_viewport_clips_a_stroke_thickened_past_the_box() {
         interior[1] > 180 && interior[2] < 40,
         "the viewport must leave the interior fill green, got {interior:?}"
     );
+}
+
+#[test]
+fn a_viewport_still_clips_geometry_that_exceeds_the_box() {
+    let mut doc = viewport_stroked_rect_doc(Some([20.0, 20.0]));
+    let node_id = doc.scene.roots()[0];
+    let Some(node) = doc.scene.get_mut(node_id) else {
+        panic!("fixture node");
+    };
+    let NodeData::Vector(vector) = &mut node.data else {
+        panic!("fixture vector");
+    };
+    vector.path = fanta_doc::PathData::rect(-4.0, -4.0, 28.0, 28.0);
+
+    let mut renderer = RasterRenderer::new(64, 64).unwrap();
+    renderer.render(&doc.scene, &doc.viewport);
+    let pixels = renderer.copy_rgba();
+    let outside = rgba_at(&pixels, 64, 56, 42);
+    assert!(
+        outside[3] < 40,
+        "authored viewport must crop genuinely overflowing geometry, got {outside:?}"
+    );
+    let inside = rgba_at(&pixels, 64, 50, 42);
+    assert!(
+        inside[2] > 200 && inside[3] > 200,
+        "stroke within the authored viewport must remain visible, got {inside:?}"
+    );
+}
+
+#[test]
+fn rounded_outside_border_is_not_squared_off_by_its_authored_box() {
+    for align in [
+        fanta_doc::StrokeAlign::Center,
+        fanta_doc::StrokeAlign::Outside,
+    ] {
+        let mut stroke = fanta_doc::Stroke::solid(Color::BLACK, 8.0);
+        stroke.align = align;
+        let mut doc = Doc::new();
+        let mut vector = CanvasNode::new(NodeData::Vector(VectorNode {
+            path: fanta_doc::PathData::rect(0.0, 0.0, 40.0, 40.0),
+            fills: smallvec_of(Fill::solid(Color::WHITE)),
+            strokes: smallvec::smallvec![stroke],
+            corner_radius: Some(16.0),
+            corner_radii: None,
+            corner_smoothing: 0.0,
+            local_size: Some([40.0, 40.0]),
+            parametric: None,
+        }));
+        vector.transform = Transform2D::translation(-20.0, -20.0);
+        doc.apply(Operation::create_node(vector)).unwrap();
+
+        let mut renderer = RasterRenderer::new(64, 64).unwrap();
+        renderer.render(&doc.scene, &doc.viewport);
+        let pixels = renderer.copy_rgba();
+        let top_outside = rgba_at(&pixels, 64, 32, 10);
+        assert!(
+            top_outside[3] > 200,
+            "{align:?} border must paint past the square top of the authored box: {top_outside:?}"
+        );
+        let outer_corner = rgba_at(&pixels, 64, 8, 8);
+        assert!(
+            outer_corner[3] < 40,
+            "{align:?} border must retain its rounded outer corner: {outer_corner:?}"
+        );
+    }
 }

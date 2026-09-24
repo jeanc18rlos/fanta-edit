@@ -31,6 +31,9 @@ use util::ResultExt as _;
 use workspace::{ModalView, Workspace};
 
 enum ConfigurationTarget {
+    New {
+        server_type: ExistingServerType,
+    },
     Existing {
         id: ContextServerId,
         command: ContextServerCommand,
@@ -48,6 +51,7 @@ enum ConfigurationTarget {
     },
 }
 
+#[derive(Clone, Copy)]
 enum ExistingServerType {
     Local,
     Remote,
@@ -97,6 +101,18 @@ impl ConfigurationSource {
         }
 
         match target {
+            ConfigurationTarget::New { server_type } => ConfigurationSource::Existing {
+                editor: create_editor(
+                    match server_type {
+                        ExistingServerType::Local => context_server_input(None),
+                        ExistingServerType::Remote => context_server_http_input(None),
+                    },
+                    jsonc_language,
+                    window,
+                    cx,
+                ),
+                server_type,
+            },
             ConfigurationTarget::Existing { id, command } => ConfigurationSource::Existing {
                 editor: create_editor(
                     context_server_input(Some((id, command))),
@@ -222,7 +238,7 @@ fn context_server_input(existing: Option<(ContextServerId, ContextServerCommand)
         }
         None => (
             "some-mcp-server".to_string(),
-            "".to_string(),
+            "\"\"".to_string(),
             "[]".to_string(),
             "{}".to_string(),
         ),
@@ -416,6 +432,7 @@ impl ConfigureContextServerModal {
         cx: &App,
     ) -> State {
         let server_id = match target {
+            ConfigurationTarget::New { .. } => return State::Idle,
             ConfigurationTarget::Existing { id, .. }
             | ConfigurationTarget::ExistingHttp { id, .. }
             | ConfigurationTarget::Extension { id, .. } => id,
@@ -441,6 +458,29 @@ impl ConfigureContextServerModal {
             | Some(ContextServerStatus::Stopped)
             | None => State::Idle,
         }
+    }
+
+    pub fn show_modal_for_new_server(
+        remote: bool,
+        language_registry: Arc<LanguageRegistry>,
+        workspace: WeakEntity<Workspace>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Task<Result<()>> {
+        let server_type = if remote {
+            ExistingServerType::Remote
+        } else {
+            ExistingServerType::Local
+        };
+        window.spawn(cx, async move |cx| {
+            Self::show_modal(
+                ConfigurationTarget::New { server_type },
+                language_registry,
+                workspace,
+                cx,
+            )
+            .await
+        })
     }
 
     pub fn show_modal_for_existing_server(
@@ -527,11 +567,12 @@ impl ConfigureContextServerModal {
                     workspace: workspace_handle,
                     state: Self::initial_state(&context_server_store, &target, cx),
 
-                    original_server_id: Some(match &target {
+                    original_server_id: match &target {
+                        ConfigurationTarget::New { .. } => None,
                         ConfigurationTarget::Existing { id, .. }
                         | ConfigurationTarget::ExistingHttp { id, .. }
-                        | ConfigurationTarget::Extension { id, .. } => id.clone(),
-                    }),
+                        | ConfigurationTarget::Extension { id, .. } => Some(id.clone()),
+                    },
                     source: ConfigurationSource::from_target(
                         target,
                         language_registry,
@@ -753,6 +794,10 @@ fn parse_input(text: &str) -> Result<(ContextServerId, ContextServerCommand)> {
     anyhow::ensure!(object.len() == 1, "Expected exactly one key-value pair");
     let (context_server_name, value) = object.into_iter().next().unwrap();
     let command: ContextServerCommand = serde_json::from_value(value.clone())?;
+    anyhow::ensure!(
+        !command.path.as_os_str().is_empty(),
+        "Enter a command for this MCP server"
+    );
     Ok((ContextServerId(context_server_name.clone().into()), command))
 }
 
@@ -1213,6 +1258,13 @@ pub(crate) fn default_markdown_style(window: &Window, cx: &App) -> MarkdownStyle
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_local_server_template_requires_a_command() {
+        let template = context_server_input(None);
+        let error = parse_input(&template).expect_err("empty command should not start a server");
+        assert!(error.to_string().contains("Enter a command"));
+    }
 
     #[test]
     fn parse_http_input_reads_oauth_settings() {
