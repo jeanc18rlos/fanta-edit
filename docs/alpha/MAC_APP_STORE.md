@@ -6,8 +6,11 @@ The Paid Apps Agreement, bank account, and tax forms show Active in App Store
 Connect. The EU trader submission shows In Review. Apple Developer Finance has
 received a request to correct the submitted W-8BEN. RevenueCat now has the
 Apple app with valid credentials, both products, a `pro` entitlement for the
-subscription, and the default offering. Signing, production backend deployment,
-purchase verification, and App Review remain.
+subscription, and the default offering. Apple issued the Mac App Distribution
+and Mac Installer Distribution certificates and Fanta's Mac App Store
+provisioning profile, which Xcode has synced to this Mac. Installing the issued
+certificates, production authentication and backend deployment, purchase
+verification, and App Review remain.
 Submitting to review on 24–25 September is the target; approval and publication
 depend on Apple.
 
@@ -23,10 +26,18 @@ depend on Apple.
 2. The explicit macOS bundle ID `dev.fanta.Fanta` and App Store Connect record
    **Fanta — Design Editor** (Apple app ID `6815642103`, SKU `FANTA-MAC-2026`)
    are created. Use this bundle ID in the provisioning profile and RevenueCat.
-3. Create an Apple Distribution application certificate, a Mac Installer
-   Distribution certificate, and an App Store provisioning profile. The local
-   keychain currently has no valid signing identity, so import them or configure
-   the GitHub Actions secrets listed in the release workflow.
+3. Apple issued a **Mac App Distribution** certificate (`R3ZLJB5Z33`), a
+   **Mac Installer Distribution** certificate (`H976XV3585`), and the
+   **Fanta Mac App Store 2026** provisioning profile (`FAQK699VP4`) for
+   `SP6J7Q6M3J.dev.fanta.Fanta`. Both certificates expire 24 September 2027.
+   The verified CSR is at
+   `/private/tmp/fanta-mas-signing-20260924/FantaMacApp.certSigningRequest`;
+   its private key was created in the login Keychain. Chrome blocked the
+   automated certificate downloads. After the Apple team was added to Xcode,
+   **Download Manual Profiles** synced the profile to
+   `/Users/jeanrojas/Library/Developer/Xcode/UserData/Provisioning Profiles/48232fbe-6b4a-4ceb-84b0-1b50e3fff671.provisionprofile`.
+   The two `.cer` files still need to be installed. Verify both resulting
+   signing identities before building the distribution package.
 4. The **Fanta Pro** subscription group (`22410157`) contains a monthly
    auto-renewable subscription `dev.fanta.Fanta.pro.monthly` (`6815642543`),
    priced at Apple's US tier of **$44.99/month** for 3,000 credits. The
@@ -38,9 +49,12 @@ depend on Apple.
    provider; update them to cover Apple in-app purchases before submission.
    A tested, isolated site candidate with the exact Apple prices, updated
    Terms, and Apple/RevenueCat privacy disclosures is at
-   `/private/tmp/fanta-site-appstore-eEECAZ` (commit `cb8343c`).
-   Review its legal text before publishing; the original site checkout has
-   unrelated uncommitted work and must not be deployed wholesale.
+   `/private/tmp/fanta-site-appstore-eEECAZ` (commit `f12707b`).
+   The owner approved publishing it after a staged deployment. Preview and
+   production builds of commit `f12707b` were verified, then promoted to
+   `fantaisa.net` and `www.fantaisa.net` on 24 September. The live pricing,
+   Terms, and Privacy pages return HTTP 200 with those changes. The original
+   site checkout has unrelated uncommitted work and was not deployed.
 5. In RevenueCat project `fantaisa` (`9eb97ebe`), connect the Apple app with
    its In-App Purchase key, configure the products and a current offering, and
    set its **public Apple SDK key** as `FANTA_REVENUECAT_PUBLIC_API_KEY` for the
@@ -85,16 +99,20 @@ depend on Apple.
   workflow's manual `app-store` distribution builds and stores a signed `.pkg`;
   it does not upload it to Apple.
 - Deploy the backend RevenueCat webhook only after verifying the current
-  production database target, backing it up, applying pending Drizzle
-  migrations `0020`–`0023` in order, and setting
+  production database target, making a recovery snapshot in the existing
+  Neon project with the owner's approval, applying pending Drizzle migration
+  `0023`, and setting
   `REVENUECAT_APP_ID` and `REVENUECAT_WEBHOOK_AUTHORIZATION`. The backend
   handoff is in the isolated backend candidate at
   `/private/tmp/fanta-backend-revenuecat-20260924/docs/apple-revenuecat.md`.
   Do not deploy from the original dirty backend checkout: its local `0019`
-  migration conflicts with upstream history. A read-only check of the local
-  production connection found migrations `0000`–`0019` match the candidate,
-  and a Vercel Production environment pull confirmed the database URL matches
-  that inspected target. Back up the database before any migration.
+  migration conflicts with upstream history. A read-only check of the
+  production connection found migrations `0000`–`0022` match the candidate;
+  `0023_revenuecat_billing` is pending. Claude is concurrently changing the
+  original backend checkout, so reconcile that work before migration or
+  deployment. The attempted local production export was blocked by automatic
+  approval review because it could copy customer data; no backup or database
+  mutation has occurred.
   Point RevenueCat's
   production webhook to `https://api.fantaisa.net/webhooks/revenuecat`.
 - Test a real Apple sandbox purchase for each product, subscription renewal,
@@ -114,14 +132,37 @@ depend on Apple.
    and screenshot before submission.
    The current draft has the description, keywords, subtitle, support and
    privacy URLs, Graphics & Design category, 13+ age rating, free price, and
-   US-only availability. Screenshots, build, review sign-in, privacy details,
-   and other review fields remain.
-   A genuine current-build Mac screenshot (2880 × 1800 PNG) is saved at
+   US-only availability. A genuine current-build Mac screenshot (2880 × 1800
+   PNG) has been uploaded to the version 1.0 record. The App Privacy draft
+   discloses Product Interaction and Other Usage Data as account-linked,
+   for analytics and app functionality, with no tracking. Before publishing
+   it, add Diagnostics → Performance Data for the app's optional hang and
+   latency telemetry, used for app functionality, linked to the user/device,
+   with no tracking. The private App Review contact, testing notes, and
+   explanations for user-selected file access and outbound networking are
+   saved. The review account, build, and other review fields remain.
+   The uploaded screenshot is saved at
    `docs/alpha/assets/fanta-mac-app-store-2880x1800.png`; the existing
    `crates/zed/resources/app-icon@2x.png` is 1024 × 1024. The screenshot
    is a sparse smoke-test design and should be replaced with a stronger real
-   design if time allows. The older website beta screenshot shows features
+   design if time allows. A populated original dashboard design is ready at
+   `/private/tmp/fanta-mas-smoke-qa/MAS Smoke Design Copy`; its canvas render
+   is `/private/tmp/fanta-mas-smoke-qa/fanta-showcase-canvas.png`.
+   The older website beta screenshot shows features
    absent from this Mac App Store build and should not be submitted.
+   The live Fanta sign-in currently redirects to a Clerk **Development**
+   instance (`accounts.dev`). Move the backend, dashboard, and admin app to a
+   production Clerk instance before inviting App Review. Development users
+   cannot be moved automatically; map existing Clerk IDs to Fanta accounts,
+   credits, and admin access before cutover. Create the dedicated reviewer
+   account only after the production sign-in is verified. The current Google
+   login also needs an Apple Guideline 4.8 review: add an equivalent private
+   login such as Sign in with Apple, or remove Google after providing existing
+   users another working sign-in path.
+   Both initial in-app purchases need **Review Information screenshots**;
+   App Store Connect rejects Add for Review until each screenshot is present.
+   Product-specific review notes are saved. The 500-credit consumable's
+   availability has been corrected to United States only and saved.
 3. Submit to App Review. Once approved, publish the first public version and
    confirm it can be downloaded in the US. A TestFlight build does not satisfy
    the standard Shipaton eligibility rules.
