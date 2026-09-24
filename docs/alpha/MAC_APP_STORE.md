@@ -8,9 +8,11 @@ received a request to correct the submitted W-8BEN. RevenueCat now has the
 Apple app with valid credentials, both products, a `pro` entitlement for the
 subscription, and the default offering. Apple issued the Mac App Distribution
 and Mac Installer Distribution certificates and Fanta's Mac App Store
-provisioning profile, which Xcode has synced to this Mac. Installing the issued
-certificates, production authentication and backend deployment, purchase
-verification, and App Review remain.
+provisioning profile, which Xcode has synced to this Mac. Both issued
+certificates are installed in the login Keychain. The distribution-signed
+version 1.0 app and installer package pass Apple's signature checks.
+Production authentication and backend deployment, purchase verification,
+upload, and App Review remain.
 Submitting to review on 24–25 September is the target; approval and publication
 depend on Apple.
 
@@ -36,8 +38,8 @@ depend on Apple.
    automated certificate downloads. After the Apple team was added to Xcode,
    **Download Manual Profiles** synced the profile to
    `/Users/jeanrojas/Library/Developer/Xcode/UserData/Provisioning Profiles/48232fbe-6b4a-4ceb-84b0-1b50e3fff671.provisionprofile`.
-   The two `.cer` files still need to be installed. Verify both resulting
-   signing identities before building the distribution package.
+   Both `.cer` files are installed in the login Keychain. The app and installer
+   signing identities were verified before the distribution build.
 4. The **Fanta Pro** subscription group (`22410157`) contains a monthly
    auto-renewable subscription `dev.fanta.Fanta.pro.monthly` (`6815642543`),
    priced at Apple's US tier of **$44.99/month** for 3,000 credits. The
@@ -97,7 +99,12 @@ depend on Apple.
   `MACOS_APP_STORE_SIGNING_IDENTITY`,
   `MACOS_APP_STORE_INSTALLER_IDENTITY`, and the public RevenueCat key. The
   workflow's manual `app-store` distribution builds and stores a signed `.pkg`;
-  it does not upload it to Apple.
+  it does not upload it to Apple. The signed 1.0/1 package is at
+  `target/aarch64-apple-darwin/release/app-store/Fanta-aarch64.pkg`.
+  `codesign --verify --deep --strict` and `pkgutil --check-signature` passed
+  against the installed Apple certificates. Upload is pending. Xcode's
+  `altool` requires an App Store Connect API key or app-specific password;
+  Apple's Transporter app is not installed on this Mac.
 - Deploy the backend RevenueCat webhook only after verifying the current
   production database target, making a recovery snapshot in the existing
   Neon project with the owner's approval, applying pending Drizzle migration
@@ -144,8 +151,10 @@ depend on Apple.
    The uploaded screenshot is saved at
    `docs/alpha/assets/fanta-mac-app-store-2880x1800.png`; the existing
    `crates/zed/resources/app-icon@2x.png` is 1024 × 1024. The screenshot
-   is a sparse smoke-test design and should be replaced with a stronger real
-   design if time allows. A populated original dashboard design is ready at
+   is a sparse smoke-test design. A stronger real app capture is ready at
+   `/private/tmp/fanta-release-assets/fanta-mac-app-store-showcase-2880x1800.png`
+   but has not yet replaced it in App Store Connect. A populated original
+   dashboard design is ready at
    `/private/tmp/fanta-mas-smoke-qa/MAS Smoke Design Copy`; its canvas render
    is `/private/tmp/fanta-mas-smoke-qa/fanta-showcase-canvas.png`.
    The older website beta screenshot shows features
@@ -178,6 +187,14 @@ depend on Apple.
    before real offer codes can be generated. Verify a code from a fresh account
    and include judge redemption instructions in Devpost.
    Submit by **30 September 2026, 11:45 PM PDT**.
+   The existing Fanta Shipaton draft (project `1192066`) now has its project
+   story, technology tags, website, RevenueCat project ID, and monetization
+   and design answers saved. Devpost still shows 2 of 5 steps complete. The
+   1024 × 1024 icon is `crates/zed/resources/app-icon@2x.png`; a real app
+   portrait screenshot is ready at
+   `/private/tmp/fanta-release-assets/fanta-shipaton-showcase-1179x2556.png`.
+   Neither asset is attached yet. The public demo, store link, and judge
+   access instructions are still needed before final submission.
 
 References: [Apple app records](https://developer.apple.com/help/app-store-connect/create-an-app-record/add-a-new-app), [RevenueCat Apple credentials](https://www.revenuecat.com/docs/store-configuration/app-store/service-credentials-index), [Shipaton submission guide](https://www.revenuecat.com/blog/engineering/how-to-submit-your-app-for-shipaton).
 The [official Shipaton rules](https://revenuecat-shipaton-2026.devpost.com/rules)
