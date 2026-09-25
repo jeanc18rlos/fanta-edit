@@ -4,7 +4,7 @@ use anyhow::Result;
 use client::{Client, ClientSettings};
 use credentials_provider::CredentialsProvider;
 use futures::{FutureExt, StreamExt, future::BoxFuture, stream::BoxStream};
-use gpui::{App, AppContext, AsyncApp, Context, Entity, SharedString, Task, Window};
+use gpui::{Action as _, App, AppContext, AsyncApp, Context, Entity, SharedString, Task, Window};
 use http_client::{CustomHeaders, HttpClient};
 use language_model::{
     AuthenticateError, IconOrSvg, LanguageModel, LanguageModelCompletionError,
@@ -393,8 +393,11 @@ impl Render for AccountConfigurationView {
                 this.child(Label::new(error).color(Color::Error))
             })
             .child(
-                Button::new("fanta-manage-account", "Manage account and billing")
-                    .on_click(|_, _, cx| cx.open_url(&client::zed_urls::account_url(cx))),
+                Button::new("fanta-manage-account", "Manage account and billing").on_click(
+                    |_, window, cx| {
+                        window.dispatch_action(zed_actions::OpenAccountSettings.boxed_clone(), cx);
+                    },
+                ),
             )
     }
 }
