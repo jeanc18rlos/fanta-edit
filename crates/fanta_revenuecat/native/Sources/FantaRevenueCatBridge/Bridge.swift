@@ -1,5 +1,7 @@
 import Foundation
+import AppKit
 import RevenueCat
+import StoreKit
 
 public typealias Completion = @convention(c) (
     UnsafeMutableRawPointer?,
@@ -10,6 +12,49 @@ public typealias Completion = @convention(c) (
 private enum State {
     static var publicAPIKey: String?
     static var appUserID: String?
+    static var redeemingForUserID: String?
+}
+
+private enum RedemptionError: LocalizedError {
+    case noWindow
+    case noContentView
+    case accountChanged
+
+    var errorDescription: String? {
+        switch self {
+        case .noWindow:
+            return "Open a Fanta window before redeeming an offer code."
+        case .noContentView:
+            return "Fanta could not display Apple's offer code sheet in this window."
+        case .accountChanged:
+            return "Your Fanta account changed while redeeming. Sign in to the original account and sync purchases."
+        }
+    }
+}
+
+@available(macOS 15.0, *)
+@MainActor
+private func presentOfferCodeSheet() async throws {
+    guard let window = NSApplication.shared.keyWindow ?? NSApplication.shared.mainWindow else {
+        throw RedemptionError.noWindow
+    }
+
+    guard let contentView = window.contentView else {
+        throw RedemptionError.noContentView
+    }
+    let controller: NSViewController
+    let temporaryView: NSView?
+    if let existingController = window.contentViewController {
+        controller = existingController
+        temporaryView = nil
+    } else {
+        controller = NSViewController()
+        controller.view = NSView(frame: .zero)
+        contentView.addSubview(controller.view)
+        temporaryView = controller.view
+    }
+    defer { temporaryView?.removeFromSuperview() }
+    try await AppStore.presentOfferCodeRedeemSheet(from: controller)
 }
 
 private struct SendableContext: @unchecked Sendable {
@@ -125,6 +170,10 @@ public func fanta_rc_request(
 
         switch name {
         case "log_in":
+            guard State.redeemingForUserID == nil else {
+                complete(callback, context: context, status: 2, text: "Finish redeeming the offer code before switching Fanta accounts")
+                return
+            }
             guard let userID = value, !userID.isEmpty else {
                 complete(callback, context: context, status: 2, text: "Missing app user ID")
                 return
@@ -136,6 +185,10 @@ public func fanta_rc_request(
                 completeCustomer(callback, context: context, info: info, error: error)
             }
         case "log_out":
+            guard State.redeemingForUserID == nil else {
+                complete(callback, context: context, status: 2, text: "Finish redeeming the offer code before signing out")
+                return
+            }
             Purchases.shared.logOut { info, error in
                 if error == nil, info != nil {
                     State.appUserID = nil
@@ -211,6 +264,50 @@ public func fanta_rc_request(
         case "restore":
             Purchases.shared.restorePurchases { info, error in
                 completeCustomer(callback, context: context, info: info, error: error)
+            }
+        case "sync_purchases":
+            guard State.appUserID != nil else {
+                complete(callback, context: context, status: 2, text: "Sign in to Fanta before syncing Apple purchases")
+                return
+            }
+            Purchases.shared.syncPurchases { info, error in
+                completeCustomer(callback, context: context, info: info, error: error)
+            }
+        case "redeem_offer_code":
+            guard #available(macOS 15.0, *) else {
+                complete(callback, context: context, status: 2, text: "Redeeming offer codes in Fanta requires macOS 15 or later")
+                return
+            }
+            guard let userID = State.appUserID else {
+                complete(callback, context: context, status: 2, text: "Sign in to Fanta before redeeming an offer code")
+                return
+            }
+            guard State.redeemingForUserID == nil else {
+                complete(callback, context: context, status: 2, text: "An offer code sheet is already open")
+                return
+            }
+            State.redeemingForUserID = userID
+            let callbackContext = SendableContext(pointer: context)
+            Task { @MainActor in
+                do {
+                    try await presentOfferCodeSheet()
+                    guard State.appUserID == userID else {
+                        throw RedemptionError.accountChanged
+                    }
+                    Purchases.shared.syncPurchases { info, error in
+                        Task { @MainActor in
+                            State.redeemingForUserID = nil
+                            completeCustomer(callback, context: callbackContext.pointer, info: info, error: error)
+                        }
+                    }
+                } catch {
+                    State.redeemingForUserID = nil
+                    if let storeError = error as? StoreKitError, case .userCancelled = storeError {
+                        complete(callback, context: callbackContext.pointer, status: 1, text: "Offer code entry was cancelled")
+                    } else {
+                        complete(callback, context: callbackContext.pointer, status: 2, text: error.localizedDescription)
+                    }
+                }
             }
         case "customer_info":
             Purchases.shared.getCustomerInfo { info, error in
