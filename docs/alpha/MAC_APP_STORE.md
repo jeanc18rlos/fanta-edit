@@ -147,8 +147,11 @@ still gate submission. Approval and publication depend on Apple.
 
 ## Submit and publish
 
-1. Upload the signed `.pkg` using Apple's Transporter or App Store Connect
-   upload workflow. Select the build and the two in-app purchases for review.
+1. Install Apple's Transporter Mac app, sign in with the existing App Store
+   Connect Apple ID, add the signed `.pkg`, and click Deliver. Alternatively,
+   use `xcrun altool` with an App Store Connect API key or Apple ID app-specific
+   password. After Apple processes the upload, select build 1.0/2 and both
+   in-app purchases for review.
 2. Complete the macOS listing: icon, screenshots, description, category,
    privacy policy (`https://www.fantaisa.net/privacy`), Terms of Use
    (`https://www.fantaisa.net/terms`), age rating, export compliance, support
