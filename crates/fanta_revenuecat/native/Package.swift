@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "FantaRevenueCatBridge",
-    platforms: [.macOS(.v10_15)],
+    platforms: [.macOS(.v12)],
     products: [
         .library(name: "FantaRevenueCatBridge", type: .dynamic, targets: ["FantaRevenueCatBridge"])
     ],

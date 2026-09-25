@@ -24,7 +24,10 @@ fn main() {
     }
 
     if cfg!(target_os = "macos") {
-        println!("cargo:rustc-env=MACOSX_DEPLOYMENT_TARGET=10.15.7");
+        println!("cargo:rerun-if-env-changed=MACOSX_DEPLOYMENT_TARGET");
+        let deployment_target = std::env::var("MACOSX_DEPLOYMENT_TARGET")
+            .unwrap_or_else(|_| "10.15.7".to_string());
+        println!("cargo:rustc-env=MACOSX_DEPLOYMENT_TARGET={deployment_target}");
 
         // Weakly link ReplayKit to ensure Zed can be used on macOS 10.15+.
         println!("cargo:rustc-link-arg=-Wl,-weak_framework,ReplayKit");

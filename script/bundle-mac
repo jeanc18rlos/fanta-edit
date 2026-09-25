@@ -123,6 +123,7 @@ if [[ "$app_store" = true ]]; then
         fi
     fi
     IDENTITY="${MACOS_APP_STORE_SIGNING_IDENTITY:-}"
+    export MACOSX_DEPLOYMENT_TARGET=12.0
 fi
 
 if [[ "$app_store" != true || "$app_store_ad_hoc" != true ]]; then
@@ -276,6 +277,7 @@ if [[ "$app_store" = true ]]; then
     fi
     /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${store_version}" "$info_plist"
     /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${store_build}" "$info_plist"
+    /usr/libexec/PlistBuddy -c 'Set :LSMinimumSystemVersion 12.0' "$info_plist"
     if /usr/libexec/PlistBuddy -c 'Print :ITSAppUsesNonExemptEncryption' "$info_plist" > /dev/null 2>&1; then
         /usr/libexec/PlistBuddy -c 'Set :ITSAppUsesNonExemptEncryption false' "$info_plist"
     else
@@ -433,7 +435,9 @@ fi
 function sign_app_store_bundle() {
     local entitlements="crates/zed/resources/fanta-app-store.entitlements"
     local signing_options=(--force --sign -)
+    local bundled_file
     local framework
+    local minimum_system_version
     local profile_app_identifier
     local profile_team_identifier
     local signature_info
@@ -446,6 +450,19 @@ function sign_app_store_bundle() {
         echo "The Mac App Store app bundle is missing its fanta executable."
         exit 1
     fi
+    if [[ "$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$info_plist")" != 12.0 ]]; then
+        echo "The Mac App Store app must require macOS 12.0."
+        exit 1
+    fi
+    while IFS= read -r -d '' bundled_file; do
+        if /usr/bin/file -b "$bundled_file" | grep -q 'Mach-O'; then
+            minimum_system_version=$(xcrun vtool -show-build "$bundled_file" | awk '$1 == "minos" { print $2 }')
+            if [[ "$minimum_system_version" != 12.0 ]]; then
+                echo "Expected macOS 12.0 in ${bundled_file}; found ${minimum_system_version:-none}."
+                exit 1
+            fi
+        fi
+    done < <(find "${app_path}/Contents" -type f -print0)
 
     if [[ "$app_store_ad_hoc" != true ]]; then
         profile_plist=$(mktemp)
