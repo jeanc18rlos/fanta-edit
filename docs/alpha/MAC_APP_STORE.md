@@ -11,10 +11,12 @@ subscription, and the default offering. Apple issued the Mac App Distribution
 and Mac Installer Distribution certificates and Fanta's Mac App Store
 provisioning profile, which Xcode has synced to this Mac. Both issued
 certificates are installed in the login Keychain. The distribution-signed
-version 1.0 (build 4) app and installer package include the restored UI and
+version 1.0 (build 5) app and installer package include the restored UI and
 account-deletion entry point. Both pass Apple's signature checks. Transporter
-delivered the package on 25 September and App Store Connect is processing it.
-Production authentication and backend deployment, purchase verification, and
+delivered the package at 18:57 Madrid time on 25 September. Transporter now
+reports that Apple finished processing it. Build 5 still needs to be selected
+on the App Store Connect version page.
+Production authentication, purchase verification, and
 App Review remain. Approval and publication depend on Apple.
 
 ## Account setup
@@ -100,11 +102,11 @@ App Review remain. Approval and publication depend on Apple.
   Apple distribution identities in Keychain (or explicit signing identity
   environment variables). The
   workflow's manual `app-store` distribution builds and stores a signed `.pkg`;
-  it does not upload it to Apple. The signed 1.0/4 package is at
+  it does not upload it to Apple. The signed 1.0/5 package is at
   `target/aarch64-apple-darwin/release/app-store/Fanta-aarch64.pkg`.
   `codesign --verify --deep --strict` and `pkgutil --check-signature` passed
   against the installed Apple certificates on 25 September. Its SHA-256 is
-  `719fa6e834edc9709405db2dba464d87b27c10efab91afe851091f480ad45aba`.
+  `75a6b2dbba9f15d6d65898e9221c635b9f73665a26327fe8bf391f54412effda`.
   Its Info.plist, main binary, and bundled RevenueCat library require macOS 12.0.
   Apple's Transporter app is installed, its license is accepted, and it is
   signed in as `jrojastechnology@gmail.com`. Delivery of build 2 failed Apple
@@ -112,12 +114,17 @@ App Review remain. Approval and publication depend on Apple.
   target below 12.0. Corrected build 3 was delivered at 18:25 Madrid time on
   25 September and is Ready for Internal Testing. Build 4 also directs the AI
   provider's account button to the in-app RevenueCat purchase flow; Transporter
-  delivered it at 18:39 and App Store Connect is processing it.
+  delivered it at 18:39 and it is Ready for Internal Testing. Build 5 fixes the
+  design Agent prompt to name the available `design_state`, `design_edit`, and
+  `design_screenshot` tools. Its executable contains source commit `78bb1ac0c5`;
+  Transporter delivered it at 18:57 and Apple finished processing it. Confirm its
+  status on the App Store Connect build page before selecting it for review.
   Xcode's `altool` remains a fallback, but it requires an App Store Connect
   API key or an Apple ID app-specific password.
-- Deploy the backend RevenueCat webhook only after verifying the current
-  production database target, applying pending Drizzle migration `0023`, and setting
-  `REVENUECAT_APP_ID` and `REVENUECAT_WEBHOOK_AUTHORIZATION`. The backend
+- The backend RevenueCat handler is deployed after verification of the current
+  production database target, application of Drizzle migration `0023`, and
+  configuration of `REVENUECAT_APP_ID` and
+  `REVENUECAT_WEBHOOK_AUTHORIZATION`. The backend
   handoff is in the isolated backend candidate at
   `/private/tmp/fanta-backend-revenuecat-20260924/docs/apple-revenuecat.md` and
   [draft PR #9](https://github.com/jeanc18rlos/fanta-backend/pull/9).
@@ -134,27 +141,31 @@ App Review remain. Approval and publication depend on Apple.
   ledger, so the exact `0000`–`0022` hashes and timestamps were added to the
   sandbox ledger in a guarded transaction. A second guarded transaction applied
   `0023`; SQL Editor verified zero users, 24 ledger rows, and all three
-  RevenueCat tables. The backend candidate includes the three commits already
+  RevenueCat tables. The backend candidate includes the three commits previously
   live in production; the merge had no conflicts, type checking passed, and
   639 active tests passed. Its isolated Vercel preview is Ready at
   `https://fanta-backend-qjqv5i0nx-squidreds-projects.vercel.app`; its status
   endpoint returned HTTP 200 and its sandbox webhook rejected an unauthenticated
   probe with HTTP 401. The sandbox catalog was seeded once with three plans,
   11 endpoints, 75 models, 32 aliases, and 70 pricing rows. Preview variables
-  use the sandbox URL and development Clerk keys; no production env variables
-  were changed. The RevenueCat sandbox webhook form is prepared but not saved.
+  use the sandbox URL and development Clerk keys. The RevenueCat sandbox webhook
+  form is prepared but not saved.
   Do not deploy from the original dirty backend checkout: it is 26 commits
   behind the available `origin/main`, and its local `0019`
-  migration conflicts with upstream history. A read-only check of the
-  production connection found migrations `0000`–`0022` match the candidate;
-  `0023_revenuecat_billing` is pending. Claude is concurrently changing the
-  original backend checkout, so reconcile that work before migration or
-  deployment. The attempted local production export was blocked by automatic
-  approval review because it could copy customer data. The recovery branch
-  stays inside the same Neon project; migration `0023` has not run and the
-  production database has not been changed.
-  Point RevenueCat's
-  production webhook to `https://api.fantaisa.net/webhooks/revenuecat`.
+  migration conflicts with upstream history. The verified production Neon
+  connection matched migration hashes and timestamps `0000`–`0022`; the clean
+  candidate applied only additive `0023_revenuecat_billing` on 25 September.
+  The production ledger now has 24 matching rows and the three RevenueCat
+  tables are empty. Vercel Production has a separate RevenueCat app ID and
+  authorization secret, and `api.fantaisa.net` now points to Ready deployment
+  `dpl_FWwNwkLuRr471JK8ynetem6Hja5d` from candidate `0636395`. Live status
+  is HTTP 200; the webhook rejects missing authorization with HTTP 401 and
+  authenticated malformed payload with HTTP 400. No RevenueCat production
+  webhook has been created, and the Clerk keys have not changed. The attempted
+  local production export was blocked by automatic approval review because it
+  could copy customer data; the recovery branch remains inside Neon. After
+  sandbox QA, point RevenueCat's production-only webhook to
+  `https://api.fantaisa.net/webhooks/revenuecat`.
 - Test a real Apple sandbox purchase for each product, subscription renewal,
   cancellation, refund, and restore. Check that the backend credits exactly
   once for each transaction and that generation spends those credits. Also
@@ -176,10 +187,10 @@ App Review remain. Approval and publication depend on Apple.
 
 ## Submit and publish
 
-1. Apple Transporter delivered build 1.0/4 on 25 September. After App Store
-   Connect processes the upload, select build 4 and both in-app purchases for
-   review. Build 3 is Ready for Internal Testing but lacks the provider billing
-   navigation fix.
+1. Apple Transporter delivered build 1.0/5 on 25 September. After App Store
+   Connect processes the upload, select build 5 and both in-app purchases for
+   review. Builds 3 and 4 are Ready for Internal Testing; build 5 also fixes
+   the Agent design-generation prompt.
 2. Complete the macOS listing: icon, screenshots, description, category,
    privacy policy (`https://www.fantaisa.net/privacy`), Terms of Use
    (`https://www.fantaisa.net/terms`), age rating, export compliance, support
@@ -249,7 +260,8 @@ App Review remain. Approval and publication depend on Apple.
    Submit by **30 September 2026, 11:45 PM PDT**.
    The existing Fanta Shipaton draft (project `1192066`) now has its project
    story, technology tags, website, RevenueCat project ID, and monetization
-   and design answers saved. Devpost still shows 2 of 5 steps complete. The
+   and design answers saved. The icon and frameless screenshot confirmations
+   were saved on 25 September, bringing the draft to 3 of 5 steps complete. The
    1024 × 1024 icon is `crates/zed/resources/app-icon@2x.png`; a real app
    portrait screenshot candidate is at
    `/private/tmp/fanta-release-assets/fanta-shipaton-showcase-1179x2556.png`.
