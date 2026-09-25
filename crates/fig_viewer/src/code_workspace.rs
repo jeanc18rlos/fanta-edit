@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use collections::HashSet;
 use editor::{Editor, MultiBufferOffset, SelectionEffects, scroll::Autoscroll};
 use fanta_doc::NodeId;
@@ -9,7 +9,7 @@ use gpui::{
     AnyElement, App, ClipboardItem, Context, Entity, FocusHandle, Focusable, IntoElement, Render,
     SharedString, Subscription, Task, Window, div, px,
 };
-use language::Buffer;
+use language::{Buffer, Capability};
 use project::Project;
 use serde::Deserialize;
 use ui::Tooltip;
@@ -17,7 +17,7 @@ use ui::prelude::*;
 
 use crate::document::{FigItem, FigItemEvent};
 
-const READ_ONLY_STATUS: &str = "Formatted preview · source unchanged";
+const EDITABLE_STATUS: &str = "Edit FNX source · save to update the canvas";
 
 /// Every JSX tag the FNX printer can emit: the canonical node tags plus the
 /// two authoring-sugar shape tags. Restricting the opening-tag scan to these
@@ -108,8 +108,8 @@ pub struct FantaCodeWorkspace {
     json_source_buffer: Option<Entity<Buffer>>,
     fnx_source_observation: Option<Subscription>,
     json_source_observation: Option<Subscription>,
-    fnx_source_version: Option<clock::Global>,
     json_source_version: Option<clock::Global>,
+    source_save_in_progress: bool,
     loading_fnx: bool,
     loading_json: bool,
     error_message: Option<SharedString>,
@@ -151,6 +151,7 @@ impl FantaCodeWorkspace {
                     } else {
                         this.reload_saved_sources(window, cx);
                     }
+                    this.update_fnx_editability(cx);
                     this.last_synced_selection = None;
                     this.sync_selection_to_source(window, cx);
                 }
@@ -174,8 +175,8 @@ impl FantaCodeWorkspace {
             json_source_buffer: None,
             fnx_source_observation: None,
             json_source_observation: None,
-            fnx_source_version: None,
             json_source_version: None,
+            source_save_in_progress: false,
             loading_fnx: false,
             loading_json: false,
             error_message: None,
@@ -193,6 +194,12 @@ impl FantaCodeWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if page != self.requested_page && self.source_is_dirty(cx) {
+            self.error_message =
+                Some("Save or discard the FNX edit before switching pages.".into());
+            cx.notify();
+            return;
+        }
         self.requested_page = page;
         self.refresh_from_item(window, cx);
     }
@@ -205,28 +212,140 @@ impl FantaCodeWorkspace {
         self.error_message.as_deref()
     }
 
-    /// A read-only pane never authors an unsaved source edit, so the view's
-    /// dirty state belongs entirely to the canvas document.
-    pub(crate) fn source_is_dirty(&self, _cx: &App) -> bool {
-        false
+    pub(crate) fn source_is_dirty(&self, cx: &App) -> bool {
+        self.source_save_in_progress
+            || self.fnx_source_buffer.as_ref().is_some_and(|buffer| {
+                let buffer = buffer.read(cx);
+                buffer.is_dirty() || buffer.has_unsaved_edits()
+            })
     }
 
-    /// External on-disk edits that could not be merged into unsaved canvas
-    /// work are still a real conflict; the item owns that flag.
     pub(crate) fn has_source_conflict(&self, cx: &App) -> bool {
-        self.item.read(cx).has_conflict()
+        let item = self.item.read(cx);
+        item.has_conflict() || (item.is_dirty() && self.source_is_dirty(cx))
     }
 
-    /// Nothing to persist: the pane never holds a source edit, so a save is
-    /// entirely the canvas document's business.
-    pub(crate) fn save_source_edit(&mut self, _cx: &mut Context<Self>) -> Option<Task<Result<()>>> {
-        None
+    pub(crate) fn save_source_edit(&mut self, cx: &mut Context<Self>) -> Option<Task<Result<()>>> {
+        let buffer = self.fnx_source_buffer.clone()?;
+        if self.source_save_in_progress {
+            return Some(Task::ready(Err(anyhow!(
+                "an FNX save is already in progress"
+            ))));
+        }
+        if !buffer.read(cx).is_dirty() {
+            return None;
+        }
+        if buffer.read(cx).has_conflict() {
+            return Some(Task::ready(Err(anyhow!(
+                "FNX changed on disk; resolve the file conflict before saving"
+            ))));
+        }
+        if self.item.read(cx).is_dirty() {
+            return Some(Task::ready(Err(anyhow!(
+                "save or discard canvas changes before saving FNX source"
+            ))));
+        }
+        let Some(project_root) = self.item.read(cx).project_root().map(Path::to_path_buf) else {
+            return Some(Task::ready(Err(anyhow!(
+                "save the design before editing FNX source"
+            ))));
+        };
+        let Some(source_path) = self.fnx_path.clone() else {
+            return Some(Task::ready(Err(anyhow!(
+                "the FNX source path is unavailable"
+            ))));
+        };
+        let (source, version, capability) = buffer.read_with(cx, |buffer, _| {
+            (buffer.text(), buffer.version(), buffer.capability())
+        });
+        buffer.update(cx, |buffer, cx| buffer.set_capability(Capability::Read, cx));
+        self.source_save_in_progress = true;
+        self.error_message = None;
+        self.update_fnx_editability(cx);
+        cx.notify();
+        let project = self.project.clone();
+        let item = self.item.clone();
+        Some(cx.spawn(async move |this, cx| {
+            let save_result: Result<()> = async {
+                let (_, diagnostics) = cx
+                    .background_spawn(async move {
+                        fanta_format::apply_project_source_edit_with_diagnostics(
+                            &project_root,
+                            &source_path,
+                            &source,
+                        )
+                    })
+                    .await?;
+                anyhow::ensure!(
+                    buffer.read_with(cx, |buffer, _| buffer.version() == version),
+                    "FNX changed while saving; resolve the newer edit before retrying"
+                );
+                let reload_buffer = project.update(cx, |project, cx| {
+                    project.reload_buffers(std::iter::once(buffer.clone()).collect(), false, cx)
+                });
+                reload_buffer.await?;
+                anyhow::ensure!(
+                    buffer.read_with(cx, |buffer, _| !buffer.has_unsaved_edits()),
+                    "FNX changed while refreshing the editor; resolve its file conflict"
+                );
+                let reload_canvas = item.update(cx, |item, cx| {
+                    item.discard_canvas_edits_for_source_resolution(cx)
+                });
+                reload_canvas.await?;
+                if !diagnostics.is_empty() {
+                    log::warn!("FNX saved with {} source diagnostics", diagnostics.len());
+                }
+                Ok(())
+            }
+            .await;
+            buffer.update(cx, |buffer, cx| buffer.set_capability(capability, cx));
+            let buffer_dirty = buffer.read_with(cx, |buffer, _| {
+                buffer.is_dirty() || buffer.has_unsaved_edits()
+            });
+            item.update(cx, |item, cx| item.set_source_edit_locked(buffer_dirty, cx));
+            this.update(cx, |this, cx| {
+                this.source_save_in_progress = false;
+                this.error_message = save_result
+                    .as_ref()
+                    .err()
+                    .map(|error| format!("Could not save FNX: {error:#}").into());
+                this.update_fnx_editability(cx);
+                cx.notify();
+            })?;
+            save_result
+        }))
     }
 
-    /// Nothing to discard, for the same reason `save_source_edit` has nothing
-    /// to save. Reload paths await this before reloading the canvas.
-    pub(crate) fn discard_source_edit(&mut self, _cx: &mut Context<Self>) -> Task<Result<()>> {
-        Task::ready(Ok(()))
+    pub(crate) fn discard_source_edit(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        if self.source_save_in_progress {
+            return Task::ready(Err(anyhow!(
+                "wait for the FNX save to finish before discarding changes"
+            )));
+        }
+        let Some(buffer) = self.fnx_source_buffer.clone() else {
+            return Task::ready(Ok(()));
+        };
+        if !buffer.read(cx).is_dirty() {
+            return Task::ready(Ok(()));
+        }
+        let reload = self.project.update(cx, |project, cx| {
+            project.reload_buffers(std::iter::once(buffer.clone()).collect(), false, cx)
+        });
+        let item = self.item.clone();
+        cx.spawn(async move |this, cx| {
+            reload.await?;
+            let still_dirty = buffer.read_with(cx, |buffer, _| buffer.is_dirty());
+            item.update(cx, |item, cx| item.set_source_edit_locked(still_dirty, cx));
+            this.update(cx, |this, cx| {
+                this.error_message = None;
+                cx.notify();
+            })?;
+            if still_dirty {
+                Err(anyhow!("FNX changed again while discarding its edits"))
+            } else {
+                Ok(())
+            }
+        })
     }
 
     fn saved_source_paths_changed(&self, cx: &App) -> bool {
@@ -370,7 +489,6 @@ impl FantaCodeWorkspace {
         self.json_source_buffer = None;
         self.fnx_source_observation = None;
         self.json_source_observation = None;
-        self.fnx_source_version = None;
         self.json_source_version = None;
         self.loading_fnx = false;
         self.loading_json = false;
@@ -379,21 +497,17 @@ impl FantaCodeWorkspace {
         self.last_synced_selection = None;
     }
 
-    /// Open the page source for *reading*. Opening a design must never write
-    /// to the project: no format pass, no save, no legacy-source rewrite —
-    /// the file belongs to whoever is authoring it.
+    /// Opening the editor must not format or write the source. Saving validates
+    /// the user's edit before the canvas adopts the changed file.
     fn open_fnx(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
         if self.fnx_path.as_ref() == Some(&path) && self.fnx_editor.is_some() {
-            if let Some(buffer) = self.fnx_source_buffer.clone() {
-                self.show_fnx_preview(buffer, window, cx);
-            }
+            self.update_fnx_editability(cx);
             return;
         }
         self.fnx_path = Some(path.clone());
         self.fnx_editor = None;
         self.fnx_source_buffer = None;
         self.fnx_source_observation = None;
-        self.fnx_source_version = None;
         self.loading_fnx = true;
         self.error_message = None;
         let open_task = self
@@ -410,10 +524,11 @@ impl FantaCodeWorkspace {
                     Ok(buffer) => {
                         this.fnx_source_observation =
                             Some(cx.observe_in(&buffer, window, |this, buffer, window, cx| {
-                                this.show_fnx_preview(buffer.clone(), window, cx);
+                                this.source_buffer_changed(buffer.clone(), window, cx);
                             }));
                         this.fnx_source_buffer = Some(buffer.clone());
-                        this.show_fnx_preview(buffer, window, cx);
+                        this.show_fnx_editor(buffer.clone(), window, cx);
+                        this.source_buffer_changed(buffer, window, cx);
                         // The buffer arrives long after the selection that
                         // should be revealed in it, so catch up once here.
                         this.last_synced_selection = None;
@@ -475,33 +590,52 @@ impl FantaCodeWorkspace {
         }));
     }
 
-    fn show_fnx_preview(
+    fn show_fnx_editor(
         &mut self,
         source_buffer: Entity<Buffer>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let version = source_buffer.read(cx).version();
-        if self.fnx_source_version.as_ref() == Some(&version) && self.fnx_editor.is_some() {
-            return;
-        }
-        let source = source_buffer.read(cx).text();
-        let language = source_buffer.read(cx).language().cloned();
-        let formatted = format_fnx_preview(&source);
         let project = self.project.clone();
-        let preview = project.update(cx, |project, cx| {
-            project.create_local_buffer(&formatted, language, false, cx)
-        });
+        let read_only = self.item.read(cx).is_dirty();
         let editor = cx.new(|cx| {
-            let mut editor = Editor::for_buffer(preview, Some(project), window, cx);
-            editor.set_read_only(true);
+            let mut editor = Editor::for_buffer(source_buffer, Some(project), window, cx);
+            editor.set_read_only(read_only);
             editor
         });
         self.fnx_editor = Some(editor);
-        self.fnx_source_version = Some(version);
         self.last_synced_selection = None;
         self.sync_selection_to_source(window, cx);
         cx.notify();
+    }
+
+    fn source_buffer_changed(
+        &mut self,
+        buffer: Entity<Buffer>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dirty = self.source_save_in_progress
+            || buffer.read_with(cx, |buffer, _| {
+                buffer.is_dirty() || buffer.has_unsaved_edits()
+            });
+        self.item
+            .update(cx, |item, cx| item.set_source_edit_locked(dirty, cx));
+        if dirty {
+            self.error_message = None;
+        }
+        self.update_fnx_editability(cx);
+        cx.notify();
+    }
+
+    fn update_fnx_editability(&mut self, cx: &mut Context<Self>) {
+        let Some(editor) = &self.fnx_editor else {
+            return;
+        };
+        let read_only = self.item.read(cx).is_dirty() || self.source_save_in_progress;
+        if editor.read(cx).read_only(cx) != read_only {
+            editor.update(cx, |editor, _| editor.set_read_only(read_only));
+        }
     }
 
     fn show_json_preview(
@@ -885,120 +1019,6 @@ fn identifier_end(bytes: &[u8], start: usize) -> usize {
     index
 }
 
-/// Reflow only FNX opening tags for the read-only Code view. Keeping the
-/// authoritative buffer untouched avoids saving a whitespace-only edit when
-/// someone merely switches tabs, while the sidecar still maps by tag order.
-fn format_fnx_preview(source: &str) -> String {
-    let mut formatted = String::with_capacity(source.len());
-    let mut copied_through = 0;
-    let mut scanned_through = 0;
-    let mut line_start = 0;
-    for tag in opening_tags(source) {
-        let name_end = identifier_end(source.as_bytes(), tag.offset + 1);
-        let (end, _) = scan_tag(source, name_end);
-        if end <= copied_through || end > source.len() {
-            continue;
-        }
-        if let Some(newline) = source[scanned_through..tag.offset].rfind('\n') {
-            line_start = scanned_through + newline + 1;
-        }
-        scanned_through = tag.offset;
-        formatted.push_str(&source[copied_through..tag.offset]);
-        let leading = &source[line_start..tag.offset];
-        let indent = if leading.bytes().all(|byte| byte == b' ' || byte == b'\t') {
-            leading
-        } else {
-            ""
-        };
-        formatted.push_str(&format_opening_tag_preview(
-            &source[tag.offset..end],
-            indent,
-        ));
-        copied_through = end;
-    }
-    formatted.push_str(&source[copied_through..]);
-    formatted
-}
-
-fn format_opening_tag_preview(tag: &str, indent: &str) -> String {
-    let bytes = tag.as_bytes();
-    let name_end = identifier_end(bytes, 1);
-    if name_end <= 1 || !tag.ends_with('>') || tag.len() <= 100 && !tag.contains('\n') {
-        return tag.to_owned();
-    }
-    let mut attributes = Vec::new();
-    let mut index = name_end;
-    while index < bytes.len() {
-        while bytes.get(index).is_some_and(u8::is_ascii_whitespace) {
-            index += 1;
-        }
-        if matches!(bytes.get(index), None | Some(b'>' | b'/')) {
-            break;
-        }
-        let start = index;
-        let mut brace_depth = 0usize;
-        while index < bytes.len() {
-            match bytes[index] {
-                b'"' | b'\'' => index = quoted_end(bytes, index),
-                b'{' => {
-                    brace_depth += 1;
-                    index += 1;
-                }
-                b'}' => {
-                    brace_depth = brace_depth.saturating_sub(1);
-                    index += 1;
-                }
-                byte if brace_depth == 0 && byte.is_ascii_whitespace() => break,
-                b'>' if brace_depth == 0 => break,
-                b'/' if brace_depth == 0 && bytes.get(index + 1) == Some(&b'>') => break,
-                _ => index += 1,
-            }
-        }
-        if index == start {
-            break;
-        }
-        attributes.push(&tag[start..index]);
-    }
-    if attributes.is_empty() {
-        return tag.to_owned();
-    }
-    let mut result = tag[..name_end].to_owned();
-    for attribute in attributes {
-        result.push('\n');
-        result.push_str(indent);
-        result.push_str("  ");
-        let expression = attribute
-            .split_once("={")
-            .filter(|(_, value)| value.ends_with('}'));
-        if let Some((name, value)) = expression
-            && let Ok(json) = serde_json::from_str::<serde_json::Value>(&value[..value.len() - 1])
-            && let Ok(pretty) = serde_json::to_string_pretty(&json)
-        {
-            result.push_str(name);
-            result.push_str("={");
-            for (line_index, line) in pretty.lines().enumerate() {
-                if line_index > 0 {
-                    result.push('\n');
-                    result.push_str(indent);
-                    result.push_str("    ");
-                }
-                result.push_str(line);
-            }
-            result.push('}');
-        } else {
-            result.push_str(attribute);
-        }
-    }
-    result.push('\n');
-    result.push_str(indent);
-    if tag.trim_end().ends_with("/>") {
-        result.push_str("/>");
-    } else {
-        result.push('>');
-    }
-    result
-}
-
 impl Focusable for FantaCodeWorkspace {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.active_editor()
@@ -1015,7 +1035,19 @@ impl Render for FantaCodeWorkspace {
         } else {
             Color::Muted
         };
-        let status = error_message.unwrap_or_else(|| READ_ONLY_STATUS.into());
+        let status = error_message.unwrap_or_else(|| {
+            if self.source_save_in_progress {
+                "Saving FNX…".into()
+            } else if self.selected_file == CodeWorkspaceFile::Json {
+                "JSON preview · edit the FNX source to change the canvas".into()
+            } else if self.item.read(cx).is_dirty() {
+                "Save canvas changes before editing FNX source".into()
+            } else if self.source_is_dirty(cx) {
+                "Unsaved FNX edits · save to update the canvas".into()
+            } else {
+                EDITABLE_STATUS.into()
+            }
+        });
         v_flex()
             .track_focus(&self.focus_handle)
             .size_full()
@@ -1054,25 +1086,6 @@ mod tests {
     use fanta_doc::{CanvasNode, Doc, GroupNode, IndexKey, NodeData};
     use gpui::TestAppContext;
     use project::{ProjectItem as _, ProjectPath};
-
-    #[test]
-    fn fnx_preview_wraps_attributes_without_changing_tag_mapping() {
-        let source = "  <Frame name=\"A <Frame> B\" meta={{\"a\":1,\"b\":[2,3]}} explicit_modes={{\"very-long-variable-collection\":\"some-mode\"}} width={120} height={90}>\n    <Rect name=\"Child\" />\n  </Frame>\n";
-        let formatted = format_fnx_preview(source);
-        assert!(formatted.contains("\n    meta={{\n"));
-        assert!(formatted.contains("\n    width={120}\n"));
-        assert!(formatted.contains("A <Frame> B"));
-        assert_eq!(
-            opening_tags(source)
-                .iter()
-                .map(|tag| tag.name.as_deref())
-                .collect::<Vec<_>>(),
-            opening_tags(&formatted)
-                .iter()
-                .map(|tag| tag.name.as_deref())
-                .collect::<Vec<_>>()
-        );
-    }
 
     fn init_test(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
@@ -1147,11 +1160,9 @@ mod tests {
             .expect("read code workspace")
     }
 
-    /// The row of the opening tag carrying `name` in the formatted preview
-    /// shown by the pane. Formatting can wrap attributes across many lines.
+    /// The row of the opening tag carrying `name` in the source editor.
     fn source_row_of(source_path: &Path, name: &str) -> u32 {
         let source = std::fs::read_to_string(source_path).expect("read FNX source");
-        let source = format_fnx_preview(&source);
         let needle = format!("name=\"{name}\"");
         let attribute_offset = source
             .find(&needle)
@@ -1597,7 +1608,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn saved_canvas_edits_update_the_formatted_preview(cx: &mut TestAppContext) {
+    async fn saved_canvas_edits_update_the_source_editor(cx: &mut TestAppContext) {
         init_test(cx);
         let temporary = tempfile::tempdir().expect("temporary project");
         let (_page, child) = write_project_with_children(temporary.path());
@@ -1689,10 +1700,8 @@ mod tests {
         );
     }
 
-    /// Both panes are viewers. Anything the user typed here could only
-    /// diverge from the file the canvas actually follows.
     #[gpui::test]
-    async fn both_code_editors_are_read_only(cx: &mut TestAppContext) {
+    async fn fnx_source_is_editable_and_json_is_a_preview(cx: &mut TestAppContext) {
         init_test(cx);
         let temporary = tempfile::tempdir().expect("temporary project");
         write_project(temporary.path());
@@ -1702,13 +1711,156 @@ mod tests {
             .read_with(cx, |workspace, cx| {
                 let fnx_editor = workspace.fnx_editor.as_ref().expect("FNX editor");
                 let json_editor = workspace.json_editor.as_ref().expect("JSON editor");
-                assert!(
-                    fnx_editor.read(cx).read_only(cx),
-                    "the FNX pane is a viewer"
-                );
+                assert!(!fnx_editor.read(cx).read_only(cx), "FNX source is editable");
                 assert!(
                     json_editor.read(cx).read_only(cx),
-                    "the JSON pane is a viewer"
+                    "generated JSON remains a preview"
+                );
+            })
+            .expect("read code workspace");
+    }
+
+    #[gpui::test]
+    async fn saving_fnx_source_updates_the_file_and_canvas(cx: &mut TestAppContext) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("temporary project");
+        let page = write_project(temporary.path());
+        let source_path = page_source_path(temporary.path(), page);
+        let original = std::fs::read_to_string(&source_path).expect("read FNX");
+        let changed = original.replace("name=\"Original\"", "name=\"Saved edit\"");
+        assert_ne!(changed, original);
+        let (_project, item, workspace) = open_code_workspace(temporary.path(), cx).await;
+
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace
+                    .fnx_editor
+                    .as_ref()
+                    .expect("FNX editor")
+                    .update(cx, |editor, cx| {
+                        editor.set_text(changed.clone(), window, cx)
+                    });
+            })
+            .expect("edit FNX");
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| assert!(item.source_edit_locked()));
+
+        let save = workspace
+            .update(cx, |workspace, _, cx| {
+                workspace.save_source_edit(cx).expect("dirty FNX source")
+            })
+            .expect("start FNX save");
+        workspace
+            .read_with(cx, |workspace, cx| {
+                assert!(workspace.source_save_in_progress);
+                assert!(workspace.source_is_dirty(cx));
+                assert!(
+                    workspace
+                        .fnx_editor
+                        .as_ref()
+                        .expect("FNX editor")
+                        .read(cx)
+                        .read_only(cx)
+                );
+                assert_eq!(
+                    workspace
+                        .fnx_source_buffer
+                        .as_ref()
+                        .expect("FNX buffer")
+                        .read(cx)
+                        .capability(),
+                    Capability::Read
+                );
+            })
+            .expect("read frozen FNX editor");
+        save.await.expect("save validated FNX");
+        cx.run_until_parked();
+
+        assert_eq!(
+            std::fs::read_to_string(&source_path).expect("read saved FNX"),
+            changed
+        );
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.doc()
+                    .and_then(|doc| doc.scene.get(page))
+                    .map(|node| node.name.as_str()),
+                Some("Saved edit")
+            );
+            assert!(!item.source_edit_locked());
+            assert!(item.is_editable());
+        });
+        workspace
+            .read_with(cx, |workspace, cx| {
+                assert!(!workspace.source_is_dirty(cx));
+                assert_eq!(
+                    workspace
+                        .fnx_source_buffer
+                        .as_ref()
+                        .expect("FNX buffer")
+                        .read(cx)
+                        .capability(),
+                    Capability::ReadWrite
+                );
+            })
+            .expect("read code workspace");
+    }
+
+    #[gpui::test]
+    async fn invalid_fnx_edit_keeps_last_saved_file_and_canvas(cx: &mut TestAppContext) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("temporary project");
+        let page = write_project(temporary.path());
+        let source_path = page_source_path(temporary.path(), page);
+        let original = std::fs::read_to_string(&source_path).expect("read FNX");
+        let (_project, item, workspace) = open_code_workspace(temporary.path(), cx).await;
+
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace
+                    .fnx_editor
+                    .as_ref()
+                    .expect("FNX editor")
+                    .update(cx, |editor, cx| {
+                        editor.set_text("<Frame name={ />".to_owned(), window, cx)
+                    });
+            })
+            .expect("edit FNX");
+        cx.run_until_parked();
+
+        let save = workspace
+            .update(cx, |workspace, _, cx| {
+                workspace.save_source_edit(cx).expect("dirty FNX source")
+            })
+            .expect("start FNX save");
+        assert!(save.await.is_err());
+        cx.run_until_parked();
+
+        assert_eq!(
+            std::fs::read_to_string(&source_path).expect("read saved FNX"),
+            original
+        );
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.doc()
+                    .and_then(|doc| doc.scene.get(page))
+                    .map(|node| node.name.as_str()),
+                Some("Original")
+            );
+            assert!(item.source_edit_locked());
+        });
+        workspace
+            .read_with(cx, |workspace, cx| {
+                assert!(workspace.source_is_dirty(cx));
+                assert!(!workspace.source_save_in_progress);
+                assert_eq!(
+                    workspace
+                        .fnx_source_buffer
+                        .as_ref()
+                        .expect("FNX buffer")
+                        .read(cx)
+                        .capability(),
+                    Capability::ReadWrite
                 );
             })
             .expect("read code workspace");
@@ -1763,9 +1915,8 @@ mod tests {
         );
     }
 
-    /// The alpha's code→canvas loop runs through the FILE: an agent (or an
-    /// ordinary editor) writes `.fnx`, and the canvas picks the change up on
-    /// reload. The code pane never locks the canvas while that happens.
+    /// An external agent edit still reaches the canvas when no local source
+    /// edit is pending.
     #[gpui::test]
     async fn agent_written_fnx_on_disk_still_reaches_the_canvas(cx: &mut TestAppContext) {
         init_test(cx);

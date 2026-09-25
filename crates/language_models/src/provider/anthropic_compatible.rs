@@ -427,16 +427,24 @@ impl AnthropicCompatibleLanguageModel {
         let http_client = self.http_client.clone();
         let provider_name = self.provider_name.clone();
 
-        let (api_key, api_url, extra_headers) = self.state.read_with(cx, |state, cx| {
-            let api_url = state.settings.api_url.clone();
-            // An explicit API key wins; the signed-in account token covers the
-            // managed (account-server) provider so sign-in alone grants AI.
-            let api_key = state
-                .api_key_state
-                .key(&api_url)
-                .or_else(|| account_token_for(&self.client, &api_url, cx));
-            (api_key, api_url, state.settings.custom_headers.clone())
-        });
+        let (api_key, api_url, extra_headers, managed_account) =
+            self.state.read_with(cx, |state, cx| {
+                let api_url = state.settings.api_url.clone();
+                // An explicit API key wins; the signed-in account token covers the
+                // managed (account-server) provider so sign-in alone grants AI.
+                let api_key = state
+                    .api_key_state
+                    .key(&api_url)
+                    .or_else(|| account_token_for(&self.client, &api_url, cx));
+                let managed_account =
+                    is_account_provider(&api_url, &ClientSettings::get_global(cx).server_url);
+                (
+                    api_key,
+                    api_url,
+                    state.settings.custom_headers.clone(),
+                    managed_account,
+                )
+            });
 
         let beta_headers = self.model.beta_headers();
 
@@ -456,9 +464,18 @@ impl AnthropicCompatibleLanguageModel {
                 &extra_headers,
             );
 
-            request
-                .await
-                .map_err(|error| anthropic::completion_error_from_anthropic(error, provider_name))
+            request.await.map_err(|error| match error {
+                AnthropicError::ApiError(api_error)
+                    if managed_account
+                        && api_error.error_type == "invalid_request_error"
+                        && api_error
+                            .message
+                            .contains("Fanta credit balance is too low") =>
+                {
+                    LanguageModelCompletionError::PaymentRequired
+                }
+                error => anthropic::completion_error_from_anthropic(error, provider_name),
+            })
         }
         .boxed()
     }

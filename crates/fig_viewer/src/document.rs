@@ -1309,11 +1309,6 @@ impl FigItem {
         self.source_edit_locked
     }
 
-    /// Test-only. Nothing in the app locks the canvas any more: the source view
-    /// is read-only, so there is no unsaved buffer to protect the document from.
-    /// The guards that read the flag are still live code, and these tests are
-    /// what keeps them honest if source editing ever comes back.
-    #[cfg(test)]
     pub(crate) fn set_source_edit_locked(
         &mut self,
         source_edit_locked: bool,
@@ -1906,6 +1901,13 @@ impl FigItem {
         requester: ScopeRequester,
         cx: &mut Context<Self>,
     ) {
+        if self.source_edit_locked
+            && let FigDocumentState::Ready(document) = &self.document
+            && let Some(root) = scope_target_root(document, scope)
+            && document.doc.active_page() != Some(root)
+        {
+            return;
+        }
         match &mut self.document {
             FigDocumentState::Ready(document) => {
                 // Focused tabs re-assert their scope on every tab switch; when

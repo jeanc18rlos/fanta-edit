@@ -1,6 +1,6 @@
 # Fanta Mac App Store and Shipaton release
 
-Status on 24 September 2026: the App Store build path and RevenueCat integration
+Status on 25 September 2026: the App Store build path and RevenueCat integration
 are implemented locally. The Apple app record and purchase products are created.
 The Paid Apps Agreement, bank account, and tax forms show Active in App Store
 Connect. The EU trader submission shows In Review. Apple Developer Finance has
@@ -10,11 +10,12 @@ subscription, and the default offering. Apple issued the Mac App Distribution
 and Mac Installer Distribution certificates and Fanta's Mac App Store
 provisioning profile, which Xcode has synced to this Mac. Both issued
 certificates are installed in the login Keychain. The distribution-signed
-version 1.0 app and installer package pass Apple's signature checks.
+version 1.0 (build 2) app and installer package include the restored UI and
+pass Apple's signature checks.
 Production authentication and backend deployment, purchase verification,
 upload, and App Review remain.
-Submitting to review on 24–25 September is the target; approval and publication
-depend on Apple.
+The package is ready for upload; the production and review prerequisites below
+still gate submission. Approval and publication depend on Apple.
 
 ## Account setup
 
@@ -89,20 +90,22 @@ depend on Apple.
   release assets and is written to `target/<host-target>/release/app-store-dev/Fanta.app`.
   The Mac App Store build must report marketing version `1.0` and a numeric
   build number so App Store Connect can attach it to the version 1.0 record.
-  The final ad hoc build reports `1.0`/`1`, embeds the RevenueCat public SDK
+  The current ad hoc build reports `1.0`/`1`, embeds the RevenueCat public SDK
   key, passes strict code signature verification, launches through macOS
   LaunchServices, opens a valid external design after relaunch, and shows a
   visible error for a loose `.fnx` outside a Fanta project. It is not a
   distribution-signed package.
   The distributable command is `./script/bundle-mac -s`. Release signing requires
-  `MACOS_APP_STORE_PROVISIONING_PROFILE`,
-  `MACOS_APP_STORE_SIGNING_IDENTITY`,
-  `MACOS_APP_STORE_INSTALLER_IDENTITY`, and the public RevenueCat key. The
+  `MACOS_APP_STORE_PROVISIONING_PROFILE`, the public RevenueCat key, and both
+  Apple distribution identities in Keychain (or explicit signing identity
+  environment variables). The
   workflow's manual `app-store` distribution builds and stores a signed `.pkg`;
-  it does not upload it to Apple. The signed 1.0/1 package is at
+  it does not upload it to Apple. The signed 1.0/2 package is at
   `target/aarch64-apple-darwin/release/app-store/Fanta-aarch64.pkg`.
   `codesign --verify --deep --strict` and `pkgutil --check-signature` passed
-  against the installed Apple certificates. Upload is pending. Xcode's
+  against the installed Apple certificates on 25 September. Its SHA-256 is
+  `d73a7b20a052ed3ba5d3e8a43d21d3e3bcab96e8fc1f4ffd0081b0453b1d9c79`.
+  Upload is pending. Xcode's
   `altool` requires an App Store Connect API key or app-specific password;
   Apple's Transporter app is not installed on this Mac.
 - Deploy the backend RevenueCat webhook only after verifying the current
@@ -127,6 +130,12 @@ depend on Apple.
   once for each transaction and that generation spends those credits. Also
   verify sign-out/account switching and opening, saving, and reopening a local
   design in the sandboxed app.
+- The 25 September UI update restores the Agent panel, Threads rail, project
+  file tree, Git panel, bottom panel toggles, and a focused settings modal.
+  FNX source is editable and validates before updating the canvas. The
+  Mac App Store feature build and 18 focused FNX tests pass. The signed ad hoc
+  app shows the restored panels and settings; live Fanta account, RevenueCat
+  purchase, and backend tool flows still need signed-in sandbox QA.
 
 ## Submit and publish
 
@@ -139,8 +148,9 @@ depend on Apple.
    and screenshot before submission.
    The current draft has the description, keywords, subtitle, support and
    privacy URLs, Graphics & Design category, 13+ age rating, free price, and
-   US-only availability. A genuine current-build Mac screenshot (2880 × 1800
-   PNG) has been uploaded to the version 1.0 record. The App Privacy draft
+   US-only availability. A genuine Mac screenshot (2880 × 1800 PNG) has been
+   uploaded to the version 1.0 record, but it predates the 25 September UI
+   update and should be replaced with a capture of build 2. The App Privacy draft
    discloses Product Interaction and Other Usage Data as account-linked,
    for analytics and app functionality, with no tracking. Before publishing
    it, add Diagnostics → Performance Data for the app's optional hang and

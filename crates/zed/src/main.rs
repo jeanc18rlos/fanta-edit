@@ -34,7 +34,6 @@ use gpui_platform;
 
 use gpui_tokio::Tokio;
 use language::LanguageRegistry;
-#[cfg(not(feature = "mac_app_store"))]
 use prompt_store::PromptBuilder;
 use remote::RemoteConnectionOptions;
 use reqwest_client::ReqwestClient;
@@ -618,7 +617,6 @@ fn main() {
         })
         .detach();
 
-        #[cfg(not(feature = "mac_app_store"))]
         let is_new_install = matches!(&installation_id, Some(IdType::New(_)));
 
         // We should rename these in the future to `first app open`, `first app open for release channel`, and `app open`
@@ -671,9 +669,7 @@ fn main() {
         web_search::init(cx);
         web_search_providers::init(app_state.client.clone(), app_state.user_store.clone(), cx);
         snippet_provider::init(cx);
-        #[cfg(not(feature = "mac_app_store"))]
         let prompt_builder = PromptBuilder::load(app_state.fs.clone(), stdout_is_a_pty(), cx);
-        #[cfg(not(feature = "mac_app_store"))]
         {
             project::AgentRegistryStore::init_global(
                 cx,
@@ -720,7 +716,6 @@ fn main() {
         theme_selector::init(cx);
         notifications::init(app_state.client.clone(), app_state.user_store.clone(), cx);
         title_bar::init(cx);
-        #[cfg(not(feature = "mac_app_store"))]
         git_ui::init(cx);
         #[cfg(target_os = "windows")]
         etw_tracing::init(cx);
@@ -1471,7 +1466,6 @@ fn hide_unshipped_actions_from_command_palette(cx: &mut App) {
         // Zed's bug-report form and support address.
         "feedback",
         "file_finder",
-        "git_panel",
         "journal",
         "keymap_editor",
         "language_selector",
@@ -1482,7 +1476,6 @@ fn hide_unshipped_actions_from_command_palette(cx: &mut App) {
         "onboarding",
         "outline",
         "outline_panel",
-        "project_panel",
         "projects",
         "remote_debug",
         "repl",
@@ -1504,7 +1497,7 @@ fn hide_unshipped_actions_from_command_palette(cx: &mut App) {
             filter.hide_namespace(namespace);
         }
         #[cfg(feature = "mac_app_store")]
-        for namespace in ["agent", "assistant", "acp", "git", "git_ui", "extensions"] {
+        for namespace in ["extensions"] {
             filter.hide_namespace(namespace);
         }
         // Leftovers in namespaces that must stay visible.
@@ -1525,8 +1518,6 @@ fn hide_unshipped_actions_from_command_palette(cx: &mut App) {
             TypeId::of::<workspace::pane::RevealInProjectPanel>(),
             TypeId::of::<workspace::NewTerminal>(),
             TypeId::of::<workspace::NewCenterTerminal>(),
-            TypeId::of::<workspace::ToggleLeftDock>(),
-            TypeId::of::<workspace::ToggleRightDock>(),
             // Both of these write a `.zed/settings.json` into the open project,
             // which permanently disqualifies it from the design-project auto-trust
             // in `zed::trust_worktree_if_design_project` and leaves the user facing

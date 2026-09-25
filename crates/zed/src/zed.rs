@@ -11,11 +11,11 @@ pub(crate) mod move_to_applications;
 mod open_listener;
 mod open_url_modal;
 pub mod remote_debug;
+mod settings_modal;
 pub mod telemetry_log;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows_only_instance;
 
-#[cfg(not(feature = "mac_app_store"))]
 use agent_settings::{UserAgentsMdState, init_user_agents_md};
 use agent_ui::AgentDiffToolbar;
 use anyhow::Context as _;
@@ -64,7 +64,6 @@ use settings::{
     SettingsFile, SettingsStore, VIM_KEYMAP_PATH, initial_local_debug_tasks_content,
     initial_project_settings_content, initial_tasks_content, update_settings_file,
 };
-#[cfg(not(feature = "mac_app_store"))]
 use sidebar::Sidebar;
 #[cfg(debug_assertions)]
 use workspace::workspace_error::{ErrorAction, ErrorSeverity, WorkspaceError};
@@ -268,16 +267,26 @@ pub fn init(cx: &mut App) {
             );
         });
     })
-    // Fanta has no settings UI, so the generic `OpenSettings` dispatched by
-    // the welcome page, the user menu and `zed://settings` opens the file.
     .on_action(|_: &zed_actions::OpenSettings, cx| {
-        with_active_or_new_workspace(cx, |_, window, cx| {
-            open_settings_file(
-                paths::settings_file(),
-                || settings::initial_user_settings_content().as_ref().into(),
+        with_active_or_new_workspace(cx, |workspace, window, cx| {
+            settings_modal::SettingsModal::open(
+                workspace,
+                settings_modal::SettingsPage::General,
                 window,
                 cx,
             );
+        });
+    })
+    .on_action(|action: &zed_actions::OpenSettingsAt, cx| {
+        let page = settings_modal::SettingsPage::from_path(&action.path);
+        with_active_or_new_workspace(cx, move |workspace, window, cx| {
+            settings_modal::SettingsModal::open(workspace, page, window, cx);
+        });
+    })
+    .on_action(|action: &zed_actions::OpenSettingsPage, cx| {
+        let page = settings_modal::SettingsPage::from_path(&action.page);
+        with_active_or_new_workspace(cx, move |workspace, window, cx| {
+            settings_modal::SettingsModal::open(workspace, page, window, cx);
         });
     })
     .on_action(|_: &OpenAccountSettings, cx| {
@@ -727,11 +736,8 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
                 .unwrap_or(true)
         });
 
-        #[cfg(not(feature = "mac_app_store"))]
         let window_handle = window.window_handle();
-        #[cfg(not(feature = "mac_app_store"))]
         let multi_workspace_handle = cx.entity();
-        #[cfg(not(feature = "mac_app_store"))]
         cx.subscribe_in(
             &multi_workspace_handle,
             window,
@@ -764,7 +770,6 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         )
         .detach();
 
-        #[cfg(not(feature = "mac_app_store"))]
         cx.defer(move |cx| {
             window_handle
                 .update(cx, |_, window, cx| {
@@ -958,7 +963,6 @@ fn show_software_emulation_warning_if_needed(
 
 fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<anyhow::Result<()>> {
     cx.spawn_in(window, async move |workspace_handle, cx| {
-        #[cfg(not(feature = "mac_app_store"))]
         initialize_agent_panel(workspace_handle.clone(), cx.clone())
             .await
             .log_err();
@@ -973,22 +977,18 @@ fn initialize_panels(window: &mut Window, cx: &mut Context<Workspace>) -> Task<a
 
         // Commit, staging, and push actions depend on a mounted GitPanel even
         // when its dock is closed. Registering their actions alone is not enough.
-        #[cfg(not(feature = "mac_app_store"))]
-        {
-            let git_panel =
-                git_ui::git_panel::GitPanel::load(workspace_handle.clone(), cx.clone()).await?;
-            workspace_handle.update_in(cx, |workspace, window, cx| {
-                if workspace.panel::<git_ui::git_panel::GitPanel>(cx).is_none() {
-                    workspace.add_panel(git_panel, window, cx);
-                }
-            })?;
-        }
+        let git_panel =
+            git_ui::git_panel::GitPanel::load(workspace_handle.clone(), cx.clone()).await?;
+        workspace_handle.update_in(cx, |workspace, window, cx| {
+            if workspace.panel::<git_ui::git_panel::GitPanel>(cx).is_none() {
+                workspace.add_panel(git_panel, window, cx);
+            }
+        })?;
 
         anyhow::Ok(())
     })
 }
 
-#[cfg(not(feature = "mac_app_store"))]
 fn setup_or_teardown_ai_panel<P: Panel>(
     workspace: &mut Workspace,
     window: &mut Window,
@@ -1025,7 +1025,6 @@ fn setup_or_teardown_ai_panel<P: Panel>(
     }
 }
 
-#[cfg(not(feature = "mac_app_store"))]
 fn ensure_agent_panel_for_workspace(
     workspace: &mut Workspace,
     source_workspace: Option<WeakEntity<Workspace>>,
@@ -1050,7 +1049,6 @@ fn ensure_agent_panel_for_workspace(
     })
 }
 
-#[cfg(not(feature = "mac_app_store"))]
 async fn initialize_agent_panel(
     workspace_handle: WeakEntity<Workspace>,
     mut cx: AsyncWindowContext,
@@ -2096,7 +2094,6 @@ fn init_cursor_hide_mode(cx: &mut App) {
 ///
 /// The file itself is loaded into [`agent_settings::UserAgentsMd`] for inclusion
 /// in prompts.
-#[cfg(not(feature = "mac_app_store"))]
 pub fn watch_user_agents_md(fs: Arc<dyn fs::Fs>, cx: &mut App) {
     struct UserAgentsMdParseError;
     let notification_id = NotificationId::unique::<UserAgentsMdParseError>();

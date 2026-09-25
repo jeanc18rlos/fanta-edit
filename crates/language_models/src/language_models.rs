@@ -373,6 +373,18 @@ mod tests {
             Some(Ok(LanguageModelCompletionEvent::Text(text))) if text == "Connected"
         ));
 
+        client.http_client().as_fake().replace_handler(|_, _| async move {
+            Ok(http_client::Response::builder().status(400).body(
+                "{\"type\":\"error\",\"error\":{\"type\":\"invalid_request_error\",\"message\":\"Your Fanta credit balance is too low to run this request.\"}}".into(),
+            )?)
+        });
+        assert!(matches!(
+            model
+                .stream_completion(LanguageModelRequest::default(), &cx.to_async())
+                .await,
+            Err(language_model::LanguageModelCompletionError::PaymentRequired)
+        ));
+
         client.sign_out(&cx.to_async()).await;
         assert!(!cx.update(|cx| provider.is_authenticated(cx)));
         assert!(matches!(

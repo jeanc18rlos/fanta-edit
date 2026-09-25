@@ -16051,10 +16051,10 @@ mod tests {
         let (workspace, _cx) =
             cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
 
-        // Fanta ships with the status bar off, so the default is hidden.
+        // The dock toggles are in the status bar, so keep it visible by default.
         workspace.read_with(cx, |workspace, cx| {
             let visible = workspace.status_bar_visible(cx);
-            assert!(!visible, "Status bar should be hidden by default");
+            assert!(visible, "Status bar should be visible by default");
         });
 
         // Test with status bar hidden

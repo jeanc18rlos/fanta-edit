@@ -782,7 +782,7 @@
     // Default width of the project panel.
     "default_width": 240,
     // Where to dock the project panel. Can be 'left' or 'right'.
-    "dock": "right",
+    "dock": "left",
     // Spacing between worktree entries in the project panel. Can be 'comfortable' or 'standard'.
     "entry_spacing": "comfortable",
     // Whether to show file icons in the project panel.
@@ -798,7 +798,7 @@
     // Gitignored entries are never auto revealed.
     "auto_reveal_entries": true,
     // Whether the project panel should open on startup.
-    "starts_open": false,
+    "starts_open": true,
     // Whether to fold directories automatically and show compact folders
     // (e.g. "a/b/c" ) when a directory has only one subdirectory inside.
     "auto_fold_dirs": true,
@@ -1833,7 +1833,7 @@
   // Status bar-related settings.
   "status_bar": {
     // Whether to show the status bar.
-    "experimental.show": false,
+    "experimental.show": true,
     // Whether to show the name of the active file in the status bar.
     "show_active_file": false,
     // Whether to show the active language button in the status bar.

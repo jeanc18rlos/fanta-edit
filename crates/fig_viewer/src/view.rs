@@ -3863,12 +3863,14 @@ impl FigView {
     // === Pages ============================================================
 
     pub fn select_page(&mut self, index: usize, cx: &mut Context<Self>) {
-        if self
-            .item
-            .read(cx)
-            .document()
-            .is_none_or(|document| index >= document.pages.len())
-        {
+        let item = self.item.read(cx);
+        let Some(document) = item.document() else {
+            return;
+        };
+        let Some(page) = document.pages.get(index) else {
+            return;
+        };
+        if item.source_edit_locked() && document.doc.active_page() != page.root {
             return;
         }
         // The edited node stays behind on the old page; end the session
@@ -3995,7 +3997,7 @@ impl FigView {
             .update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
     }
 
-    fn toggle_layers_sidebar(
+    pub fn toggle_layers_sidebar(
         &mut self,
         _: &ToggleLayersSidebar,
         _window: &mut Window,
@@ -4006,7 +4008,7 @@ impl FigView {
         cx.notify();
     }
 
-    fn toggle_inspector_sidebar(
+    pub fn toggle_inspector_sidebar(
         &mut self,
         _: &ToggleInspectorSidebar,
         _window: &mut Window,
@@ -9060,6 +9062,59 @@ mod tests {
             view.select_page(1, cx);
         });
         view.read_with(cx, |view, _| assert_eq!(view.viewport, Some(zoomed)));
+    }
+
+    #[gpui::test]
+    async fn source_edit_lock_keeps_page_navigation_on_the_edited_page(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, first_page, second_page) = doc_with_two_pages();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Design.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("view");
+
+        item.update(cx, |item, cx| item.set_source_edit_locked(true, cx));
+        view.update(cx, |view, cx| {
+            view.select_page(0, cx);
+            view.select_page(1, cx);
+        });
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.doc().and_then(|doc| doc.active_page()),
+                Some(first_page)
+            );
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.selected_page_root, Some(first_page));
+        });
+
+        item.update(cx, |item, cx| {
+            item.request_scope(FigScope::Page(second_page), ScopeRequester::Open, cx);
+        });
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.doc().and_then(|doc| doc.active_page()),
+                Some(first_page)
+            );
+        });
+
+        item.update(cx, |item, cx| item.set_source_edit_locked(false, cx));
+        view.update(cx, |view, cx| view.select_page(1, cx));
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.doc().and_then(|doc| doc.active_page()),
+                Some(second_page)
+            );
+        });
     }
 
     #[test]
