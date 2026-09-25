@@ -3,7 +3,8 @@
 Status on 25 September 2026: the App Store build path and RevenueCat integration
 are implemented locally. The Apple app record and purchase products are created.
 The Paid Apps Agreement, bank account, and tax forms show Active in App Store
-Connect. The EU trader submission shows In Review. Apple Developer Finance has
+Connect. The EU trader submission shows In Review. The nine-type App Privacy
+label is published. Apple Developer Finance has
 received a request to correct the submitted W-8BEN. RevenueCat now has the
 Apple app with valid credentials, both products, a `pro` entitlement for the
 subscription, and the default offering. Apple issued the Mac App Distribution
@@ -11,7 +12,7 @@ and Mac Installer Distribution certificates and Fanta's Mac App Store
 provisioning profile, which Xcode has synced to this Mac. Both issued
 certificates are installed in the login Keychain. The distribution-signed
 version 1.0 (build 2) app and installer package include the restored UI and
-pass Apple's signature checks.
+account-deletion entry point. Both pass Apple's signature checks.
 Production authentication and backend deployment, purchase verification,
 upload, and App Review remain.
 The package is ready for upload; the production and review prerequisites below
@@ -104,8 +105,8 @@ still gate submission. Approval and publication depend on Apple.
   `target/aarch64-apple-darwin/release/app-store/Fanta-aarch64.pkg`.
   `codesign --verify --deep --strict` and `pkgutil --check-signature` passed
   against the installed Apple certificates on 25 September. Its SHA-256 is
-  `03be0dc0267a67f2fd8e5375c24d0c2a8d9448b122a8702fddee90cfc4b1e30c`.
-  The bundled binary identifies source commit `5ac4798f4b`.
+  `e8f7f9f9cc2de158fa84d57b87c408ec4ac11f76150f2a1fe6fdf374f4cf723b`.
+  The bundled binary identifies source commit `cc6501acf6`.
   Upload is pending. Xcode's
   `altool` requires an App Store Connect API key or app-specific password;
   Apple's Transporter app is not installed on this Mac.
@@ -116,7 +117,8 @@ still gate submission. Approval and publication depend on Apple.
   `REVENUECAT_APP_ID` and `REVENUECAT_WEBHOOK_AUTHORIZATION`. The backend
   handoff is in the isolated backend candidate at
   `/private/tmp/fanta-backend-revenuecat-20260924/docs/apple-revenuecat.md`.
-  Do not deploy from the original dirty backend checkout: its local `0019`
+  Do not deploy from the original dirty backend checkout: it is 26 commits
+  behind the available `origin/main`, and its local `0019`
   migration conflicts with upstream history. A read-only check of the
   production connection found migrations `0000`–`0022` match the candidate;
   `0023_revenuecat_billing` is pending. Claude is concurrently changing the
@@ -136,7 +138,12 @@ still gate submission. Approval and publication depend on Apple.
   FNX source is editable and validates before updating the canvas. The
   Mac App Store feature build and 18 focused FNX tests pass. The signed ad hoc
   app shows the restored panels and settings; live Fanta account, RevenueCat
-  purchase, and backend tool flows still need signed-in sandbox QA.
+  purchase, and backend tool flows still need signed-in sandbox QA. Settings →
+  AI & Billing now offers account deletion with a confirmation and a warning
+  that an Apple subscription must be canceled separately. The backend's
+  `DELETE /v1/me` route needs production verification after the Clerk cutover;
+  the isolated candidate now stops and keeps local data when Clerk deletion
+  fails (commit `0dfcf13`). Deletion does not cancel Apple billing.
 
 ## Submit and publish
 
@@ -151,30 +158,36 @@ still gate submission. Approval and publication depend on Apple.
    privacy URLs, Graphics & Design category, 13+ age rating, free price, and
    US-only availability. A genuine Mac screenshot (2880 × 1800 PNG) has been
    uploaded to the version 1.0 record, but it predates the 25 September UI
-   update and should be replaced with a capture of build 2. The App Privacy draft
-   discloses Product Interaction and Other Usage Data as account-linked,
-   for analytics and app functionality, with no tracking. Before publishing
-   it, add Diagnostics → Performance Data for the app's optional hang and
-   latency telemetry, used for app functionality, linked to the user/device,
-   with no tracking. The private App Review contact, testing notes, and
+   update. A stronger real app showcase capture replaced it in the draft on
+   25 September. Recapture the final build with the restored workspace before
+   submission. The App Privacy
+   label was published on 25 September with nine data types, including
+   Product Interaction, Other Usage Data, and Diagnostics → Performance Data.
+   Performance Data is disclosed for app functionality, linked to identity,
+   and not used for tracking. The private App Review contact (Jean Rojas, the
+   supplied phone and email), testing notes, and
    explanations for user-selected file access and outbound networking are
    saved. The review account, build, and other review fields remain.
-   The uploaded screenshot is saved at
-   `docs/alpha/assets/fanta-mac-app-store-2880x1800.png`; the existing
-   `crates/zed/resources/app-icon@2x.png` is 1024 × 1024. The screenshot
-   is a sparse smoke-test design. A stronger real app capture is ready at
-   `/private/tmp/fanta-release-assets/fanta-mac-app-store-showcase-2880x1800.png`
-   but has not yet replaced it in App Store Connect. A populated original
+   The current uploaded capture is
+   `/private/tmp/fanta-release-assets/fanta-mac-app-store-showcase-2880x1800.png`;
+   the existing `crates/zed/resources/app-icon@2x.png` is 1024 × 1024.
+   A populated original
    dashboard design is ready at
    `/private/tmp/fanta-mas-smoke-qa/MAS Smoke Design Copy`; its canvas render
    is `/private/tmp/fanta-mas-smoke-qa/fanta-showcase-canvas.png`.
    The older website beta screenshot shows features
    absent from this Mac App Store build and should not be submitted.
    The live Fanta sign-in currently redirects to a Clerk **Development**
-   instance (`accounts.dev`). Move the backend, dashboard, and admin app to a
-   production Clerk instance before inviting App Review. Development users
+   instance (`accounts.dev`). The Vercel `fanta-auth` Clerk integration has a
+   Production instance, but its domain is an unverified placeholder and it has
+   no users. Set its production domain to `fantaisa.net`, add the exact Clerk
+   CNAMEs in Vercel DNS, and verify them before moving the backend, dashboard,
+   and admin app to production Clerk keys. Development users
    cannot be moved automatically; map existing Clerk IDs to Fanta accounts,
-   credits, and admin access before cutover. Create the dedicated reviewer
+   credits, and admin access before cutover. The isolated backend candidate
+   has a guarded, dry-run-first mapping script and runbook in
+   `docs/clerk-production-identity-cutover.md` (commit `d00a187`); no
+   production mapping has run. Create the dedicated reviewer
    account only after the production sign-in is verified. The current Google
    login also needs an Apple Guideline 4.8 review: add an equivalent private
    login such as Sign in with Apple, or remove Google after providing existing
@@ -202,10 +215,13 @@ still gate submission. Approval and publication depend on Apple.
    story, technology tags, website, RevenueCat project ID, and monetization
    and design answers saved. Devpost still shows 2 of 5 steps complete. The
    1024 × 1024 icon is `crates/zed/resources/app-icon@2x.png`; a real app
-   portrait screenshot is ready at
+   portrait screenshot candidate is at
    `/private/tmp/fanta-release-assets/fanta-shipaton-showcase-1179x2556.png`.
-   Neither asset is attached yet. The public demo, store link, and judge
-   access instructions are still needed before final submission.
+   The icon and genuine Mac app screenshot were attached to the Devpost image
+   gallery and remained after reloading the draft on 25 September. The
+   portrait candidate is not attached because it has large blank or clipped
+   areas; recapture from the final build. The public demo, store link, and
+   judge access instructions are still needed before final submission.
 
 References: [Apple app records](https://developer.apple.com/help/app-store-connect/create-an-app-record/add-a-new-app), [RevenueCat Apple credentials](https://www.revenuecat.com/docs/store-configuration/app-store/service-credentials-index), [Shipaton submission guide](https://www.revenuecat.com/blog/engineering/how-to-submit-your-app-for-shipaton).
 The [official Shipaton rules](https://revenuecat-shipaton-2026.devpost.com/rules)
