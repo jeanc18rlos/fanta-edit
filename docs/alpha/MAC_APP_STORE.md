@@ -104,7 +104,8 @@ still gate submission. Approval and publication depend on Apple.
   `target/aarch64-apple-darwin/release/app-store/Fanta-aarch64.pkg`.
   `codesign --verify --deep --strict` and `pkgutil --check-signature` passed
   against the installed Apple certificates on 25 September. Its SHA-256 is
-  `d73a7b20a052ed3ba5d3e8a43d21d3e3bcab96e8fc1f4ffd0081b0453b1d9c79`.
+  `03be0dc0267a67f2fd8e5375c24d0c2a8d9448b122a8702fddee90cfc4b1e30c`.
+  The bundled binary identifies source commit `5ac4798f4b`.
   Upload is pending. Xcode's
   `altool` requires an App Store Connect API key or app-specific password;
   Apple's Transporter app is not installed on this Mac.
