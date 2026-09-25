@@ -431,13 +431,26 @@ impl SettingsModal {
                 ));
                 #[cfg(feature = "mac_app_store")]
                 {
-                    contents = contents.child(Self::action_row(
-                        "Credits & billing",
-                        "Manage Fanta credits and restore Apple purchases.",
-                        "Open…",
-                        zed_actions::OpenAccountSettings,
-                        cx,
-                    ));
+                    contents = contents
+                        .child(Self::action_row(
+                            "Credits & billing",
+                            "Manage Fanta credits and restore Apple purchases.",
+                            "Open…",
+                            zed_actions::OpenAccountSettings,
+                            cx,
+                        ))
+                        .child(Self::setting_row(
+                            "Delete Fanta account",
+                            "Permanently delete your account and personal cloud data.",
+                            Button::new("delete-fanta-account", "Delete…").on_click(cx.listener(
+                                |_, _, window, cx| {
+                                    cx.emit(DismissEvent);
+                                    window.defer(cx, |_, cx| {
+                                        super::app_store_billing::request_account_deletion(cx);
+                                    });
+                                },
+                            )),
+                        ));
                 }
                 #[cfg(not(feature = "mac_app_store"))]
                 {
