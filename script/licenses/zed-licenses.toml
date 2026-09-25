@@ -27,6 +27,9 @@ accepted = [
     # Clause License: public-domain-equivalent, no attribution requirement, and
     # more permissive than MIT.
     "0BSD",
+    # The fanta-ui fork supplies GPL-licensed GPUI, logging, and tracing crates.
+    "GPL-3.0",
+    "GPL-3.0-or-later",
 ]
 
 [procinfo.clarify]

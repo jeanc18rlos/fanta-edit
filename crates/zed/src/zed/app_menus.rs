@@ -15,6 +15,9 @@ pub fn app_menus() -> Vec<Menu> {
         MenuItem::action("Layers Sidebar", fig_viewer::ToggleLayersSidebar),
         MenuItem::action("Inspector Sidebar", fig_viewer::ToggleInspectorSidebar),
         MenuItem::separator(),
+        MenuItem::action("File Tree", zed_actions::project_panel::ToggleFocus),
+        MenuItem::action("Git Changes", git_ui::git_panel::ToggleFocus),
+        MenuItem::separator(),
         MenuItem::action("Toggle Agent Panel", zed_actions::assistant::Toggle),
         MenuItem::action("Toggle Threads Rail", workspace::ToggleWorkspaceSidebar),
         MenuItem::separator(),
@@ -27,8 +30,12 @@ pub fn app_menus() -> Vec<Menu> {
             disabled: false,
             items: vec![
                 MenuItem::action("About Fanta", zed_actions::About),
+                #[cfg(feature = "mac_app_store")]
+                MenuItem::action("Credits & Billing…", zed_actions::OpenAccountSettings),
                 MenuItem::separator(),
                 MenuItem::submenu(Menu::new("Settings").items([
+                    MenuItem::action("Open Settings…", zed_actions::OpenSettings),
+                    MenuItem::separator(),
                     MenuItem::action("Open Settings File", super::OpenSettingsFile),
                     MenuItem::action("Open Keymap File", zed_actions::OpenKeymapFile),
                     MenuItem::separator(),
@@ -134,7 +141,9 @@ pub fn app_menus() -> Vec<Menu> {
                         url: "https://fantaisa.net/docs".into(),
                     },
                 ),
+                #[cfg(not(feature = "mac_app_store"))]
                 MenuItem::separator(),
+                #[cfg(not(feature = "mac_app_store"))]
                 MenuItem::action(
                     "Connect Claude Code / Codex…",
                     zed_actions::fanta::ConnectExternalAgent,

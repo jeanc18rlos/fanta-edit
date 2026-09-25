@@ -10722,17 +10722,44 @@ impl ThreadView {
     }
 
     fn render_payment_required_error(&self, cx: &mut Context<Self>) -> Callout {
-        const ERROR_MESSAGE: &str = "You reached your free usage limit.";
+        let fanta_account = self.as_native_thread(cx).is_some_and(|thread| {
+            thread
+                .read(cx)
+                .model()
+                .is_some_and(|model| model.provider_id().0.as_ref() == "Fanta")
+        });
+        let message = if fanta_account {
+            "Your Fanta credits are exhausted. Add credits or subscribe to keep using the agent."
+        } else {
+            "You reached your free usage limit."
+        };
 
         Callout::new()
             .severity(Severity::Error)
             .icon(IconName::XCircle)
-            .title("Free Usage Exceeded")
-            .description(ERROR_MESSAGE)
+            .title(if fanta_account {
+                "Fanta credits exhausted"
+            } else {
+                "Free Usage Exceeded"
+            })
+            .description(message)
             .actions_slot(
                 h_flex()
                     .gap_0p5()
-                    .child(self.create_copy_button(ERROR_MESSAGE)),
+                    .when(fanta_account, |this| {
+                        this.child(
+                            Button::new("fanta-agent-billing", "Credits & Billing")
+                                .label_size(LabelSize::Small)
+                                .style(ButtonStyle::Filled)
+                                .on_click(|_, window, cx| {
+                                    window.dispatch_action(
+                                        zed_actions::OpenAccountSettings.boxed_clone(),
+                                        cx,
+                                    );
+                                }),
+                        )
+                    })
+                    .child(self.create_copy_button(message)),
             )
             .dismiss_action(self.dismiss_error_button(cx))
     }

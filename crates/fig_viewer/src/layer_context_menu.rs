@@ -515,6 +515,8 @@ impl FantaDesignPanel {
                 let Some(path) = paths.await??.and_then(|paths| paths.into_iter().next()) else {
                     return Ok(());
                 };
+                #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+                workspace::remember_user_selected_paths(std::slice::from_ref(&path))?;
                 let bytes = cx
                     .background_spawn(async move {
                         ensure!(

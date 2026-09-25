@@ -1,14 +1,17 @@
 mod app_menus;
+#[cfg(feature = "mac_app_store")]
+mod app_store_billing;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac_only_instance;
 #[cfg(unix)]
 pub mod mcp_stdio;
 mod migrate;
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(feature = "mac_app_store")))]
 pub(crate) mod move_to_applications;
 mod open_listener;
 mod open_url_modal;
 pub mod remote_debug;
+mod settings_modal;
 pub mod telemetry_log;
 #[cfg(target_os = "windows")]
 pub(crate) mod windows_only_instance;
@@ -20,6 +23,7 @@ pub use app_menus::*;
 use assets::Assets;
 
 use breadcrumbs::Breadcrumbs;
+#[cfg(not(feature = "mac_app_store"))]
 use client::zed_urls;
 use collections::{HashSet, VecDeque};
 use editor::{Editor, MultiBuffer};
@@ -263,19 +267,32 @@ pub fn init(cx: &mut App) {
             );
         });
     })
-    // Fanta has no settings UI, so the generic `OpenSettings` dispatched by
-    // the welcome page, the user menu and `zed://settings` opens the file.
     .on_action(|_: &zed_actions::OpenSettings, cx| {
-        with_active_or_new_workspace(cx, |_, window, cx| {
-            open_settings_file(
-                paths::settings_file(),
-                || settings::initial_user_settings_content().as_ref().into(),
+        with_active_or_new_workspace(cx, |workspace, window, cx| {
+            settings_modal::SettingsModal::open(
+                workspace,
+                settings_modal::SettingsPage::General,
                 window,
                 cx,
             );
         });
     })
+    .on_action(|action: &zed_actions::OpenSettingsAt, cx| {
+        let page = settings_modal::SettingsPage::from_path(&action.path);
+        with_active_or_new_workspace(cx, move |workspace, window, cx| {
+            settings_modal::SettingsModal::open(workspace, page, window, cx);
+        });
+    })
+    .on_action(|action: &zed_actions::OpenSettingsPage, cx| {
+        let page = settings_modal::SettingsPage::from_path(&action.page);
+        with_active_or_new_workspace(cx, move |workspace, window, cx| {
+            settings_modal::SettingsModal::open(workspace, page, window, cx);
+        });
+    })
     .on_action(|_: &OpenAccountSettings, cx| {
+        #[cfg(feature = "mac_app_store")]
+        app_store_billing::open(cx);
+        #[cfg(not(feature = "mac_app_store"))]
         with_active_or_new_workspace(cx, |_, _, cx| {
             cx.open_url(&zed_urls::account_url(cx));
         });
@@ -805,14 +822,19 @@ pub fn initialize_workspace(app_state: Arc<AppState>, cx: &mut App) {
         let search_button = cx.new(|_| search::search_status_button::SearchButton::new());
         let active_file_name = cx.new(|_| workspace::active_file_name::ActiveFileName::new());
         let image_info = cx.new(|_cx| ImageInfo::new(workspace));
+        #[cfg(not(feature = "mac_app_store"))]
         let git_blame_status = cx.new(|_| git_ui::GitBlameStatus::default());
+        #[cfg(not(feature = "mac_app_store"))]
         let merge_conflict_indicator =
             cx.new(|cx| git_ui::MergeConflictIndicator::new(workspace, cx));
         workspace.status_bar().update(cx, |status_bar, cx| {
             status_bar.add_left_item(search_button, window, cx);
             status_bar.add_left_item(active_file_name, window, cx);
-            status_bar.add_left_item(git_blame_status, window, cx);
-            status_bar.add_left_item(merge_conflict_indicator, window, cx);
+            #[cfg(not(feature = "mac_app_store"))]
+            {
+                status_bar.add_left_item(git_blame_status, window, cx);
+                status_bar.add_left_item(merge_conflict_indicator, window, cx);
+            }
             status_bar.add_right_item(image_info, window, cx);
         });
 

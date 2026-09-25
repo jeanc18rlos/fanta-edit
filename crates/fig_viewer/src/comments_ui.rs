@@ -801,6 +801,10 @@ impl FigView {
                 Ok(Ok(Some(paths))) => paths,
                 _ => return Ok::<(), anyhow::Error>(()),
             };
+            #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+            if let Err(error) = workspace::remember_user_selected_paths(&selected) {
+                log::warn!("Could not retain access to comment attachments: {error:#}");
+            }
             this.update(cx, |this, cx| {
                 if this.attachment_picker_origin(origin.target()).as_ref() != Some(&origin) {
                     return;

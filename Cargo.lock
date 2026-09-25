@@ -5011,6 +5011,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanta_revenuecat"
+version = "0.1.0"
+dependencies = [
+ "futures 0.3.32",
+ "libloading",
+ "log",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.17",
+]
+
+[[package]]
 name = "fanta_ui"
 version = "0.1.0"
 dependencies = [
@@ -7537,6 +7549,7 @@ dependencies = [
  "strum 0.27.2",
  "ui",
  "ui_input",
+ "zed_actions",
 ]
 
 [[package]]
@@ -17208,6 +17221,7 @@ dependencies = [
  "component",
  "db",
  "dirs 6.0.0",
+ "fanta-format",
  "fanta-gpui-collections",
  "fanta-gpui-core",
  "fanta-gpui-http-client",
@@ -17223,7 +17237,10 @@ dependencies = [
  "markdown 0.1.0",
  "menu",
  "node_runtime",
+ "objc2 0.6.3",
+ "objc2-foundation 0.3.2",
  "parking_lot",
+ "paths",
  "postage",
  "pretty_assertions",
  "project",
@@ -17654,7 +17671,7 @@ dependencies = [
 
 [[package]]
 name = "zed"
-version = "0.1.0-alpha.1"
+version = "0.1.0"
 dependencies = [
  "acp_tools",
  "agent",
@@ -17690,6 +17707,7 @@ dependencies = [
  "fanta-gpui-zlog",
  "fanta-gpui-ztracing",
  "fanta_languages",
+ "fanta_revenuecat",
  "feature_flags",
  "fig_viewer",
  "fs",

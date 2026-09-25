@@ -1,0 +1,20 @@
+[package]
+name = "fanta_revenuecat"
+description = "RevenueCat bridge for Fanta's macOS App Store build"
+edition.workspace = true
+version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lib]
+path = "fanta_revenuecat.rs"
+
+[dependencies]
+futures.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libloading = "0.8.9"

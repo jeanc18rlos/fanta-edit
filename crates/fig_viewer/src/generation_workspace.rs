@@ -5,6 +5,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use client::{Client, ClientSettings};
 use design_surface::{DesignOp, ScreenshotTarget};
 use futures::{AsyncReadExt as _, StreamExt as _};
+#[cfg(feature = "mac_app_store")]
+use gpui::Action as _;
 use gpui::{
     App, AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, Image,
     ImageFormat, MouseButton, ObjectFit, PathPromptOptions, Pixels, Render, SharedString, Task,
@@ -1705,6 +1707,8 @@ impl GenerationWorkspace {
                 let Some(path) = paths.await??.and_then(|paths| paths.into_iter().next()) else {
                     return Ok(None);
                 };
+                #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+                workspace::remember_user_selected_paths(std::slice::from_ref(&path))?;
                 let (bytes, name, mime, preview) = cx
                     .background_spawn(async move {
                         ensure!(
@@ -2020,8 +2024,16 @@ impl GenerationWorkspace {
                     client.account_access_token() == account,
                     "Your Fanta account changed. Choose the result again before saving it."
                 );
+                #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+                let saved_path = path.clone();
                 cx.background_spawn(async move { generation_media::write_output(&path, &bytes) })
                     .await?;
+                #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+                if let Err(error) =
+                    workspace::remember_user_selected_paths(std::slice::from_ref(&saved_path))
+                {
+                    log::warn!("Could not retain access to the saved generation: {error:#}");
+                }
                 Ok(true)
             }
             .await;
@@ -2212,7 +2224,7 @@ impl GenerationWorkspace {
                 .upgrade()
                 .context("This workspace was closed.")?;
             let prompt = format!(
-                "Create this design in the active Fanta canvas using editable native layers: {}\n\nUse design_state and design_get_guidelines first, then design_batch with frames, text, shapes, and auto layout. Keep existing work and create in empty space. Finish by checking design_screenshot.",
+                "Create this design in the active Fanta canvas using editable native layers: {}\n\nUse design_state to inspect the current page and find empty_space for a new top-level frame. Keep existing work. Use design_edit to create frames, text, and shapes, applying auto layout where useful. Finish by checking design_screenshot.",
                 prompt.trim()
             );
             agent_ui::open_external_prompt_for_review(workspace, &prompt, window, cx)
@@ -2656,7 +2668,10 @@ impl Render for GenerationWorkspace {
                     .child(Label::new(if signed_in { "Fanta account connected" } else { "Connect your account to generate" }).color(Color::Muted))
                     .when(!signed_in || self.error.is_some(), |element| element.child(Button::new("generation-sign-in", "Sign in")
                         .disabled(self.task.is_some()).on_click(cx.listener(|this, _, _, cx| this.sign_in(cx)))))
-                    .child(Button::new("generation-billing", "Credits & billing").on_click(|_, _, cx| {
+                    .child(Button::new("generation-billing", "Credits & billing").on_click(|_, window, cx| {
+                        #[cfg(feature = "mac_app_store")]
+                        window.dispatch_action(zed_actions::OpenAccountSettings.boxed_clone(), cx);
+                        #[cfg(not(feature = "mac_app_store"))]
                         cx.open_url(&client::zed_urls::account_url(cx));
                     }))))
             .child(h_flex().flex_shrink_0().gap_1().flex_wrap().children(GenerationMode::ALL.into_iter().map(|mode| {

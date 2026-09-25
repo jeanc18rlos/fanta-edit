@@ -1,4 +1,6 @@
 pub mod active_file_name;
+#[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+mod app_store_sandbox;
 pub mod dock;
 pub mod history_manager;
 pub mod invalid_item_view;
@@ -29,6 +31,8 @@ pub mod welcome;
 pub mod workspace_error;
 mod workspace_settings;
 
+#[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+pub use app_store_sandbox::remember_user_selected_paths;
 pub use dock::Panel;
 pub use multi_workspace::{
     CloseWorkspaceSidebar, DraggedSidebar, FocusWorkspaceSidebar, MoveProjectToNewWindow,
@@ -744,6 +748,15 @@ pub fn prompt_for_open_path_and_open(
         let Some(paths) = paths.await.log_err().flatten() else {
             return;
         };
+        #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+        if let Err(error) = validate_app_store_open_paths(&paths) {
+            if let Err(update_error) = this.update(cx, |workspace, cx| {
+                workspace.show_error(error, cx);
+            }) {
+                log::error!("Could not show invalid Open selection: {update_error:#}");
+            }
+            return;
+        }
         if !create_new_window {
             if let Some(handle) = multi_workspace_handle {
                 if let Some(task) = handle
@@ -769,7 +782,55 @@ pub fn prompt_for_open_path_and_open(
     .detach();
 }
 
+#[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+fn validate_app_store_open_paths(paths: &[PathBuf]) -> Result<()> {
+    for path in paths {
+        if path.is_dir() {
+            if !fanta_format::is_project_dir(path) {
+                anyhow::bail!(
+                    "Cannot open {}: choose a Fanta project folder containing a valid fanta.json.",
+                    path.display()
+                );
+            }
+        } else if path.file_name().and_then(|name| name.to_str()) == Some("fanta.json") {
+            anyhow::bail!(
+                "Cannot open {} directly: choose its containing Fanta project folder so the app can access the whole design.",
+                path.display()
+            );
+        } else if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("fig"))
+        {
+            if !path.is_file() {
+                anyhow::bail!("Cannot open {}: the .fig file is missing.", path.display());
+            }
+        } else if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("fnx"))
+        {
+            if fanta_format::page_scope_of_source(path).is_none() {
+                anyhow::bail!(
+                    "Cannot open {} directly: choose its containing Fanta project folder so the app can access the whole design.",
+                    path.display()
+                );
+            }
+        } else {
+            anyhow::bail!(
+                "Cannot open {}: choose a Fanta project folder or a .fig file.",
+                path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 pub fn init(app_state: Arc<AppState>, cx: &mut App) {
+    #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+    if let Err(error) = app_store_sandbox::restore_access() {
+        log::error!("Could not restore access to previously selected files: {error:#}");
+    }
     component::init();
     theme_preview::init(cx);
     toast_layer::init(cx);
@@ -3012,7 +3073,10 @@ impl Workspace {
         // TODO: If `on_prompt_for_open_path` is set, we should always use it
         // rather than gating on `use_system_path_prompts`. This would let tests
         // inject a mock without also having to disable the setting.
-        if !lister.is_local(cx) || !WorkspaceSettings::get_global(cx).use_system_path_prompts {
+        if !lister.is_local(cx)
+            || (!cfg!(all(target_os = "macos", feature = "mac_app_store"))
+                && !WorkspaceSettings::get_global(cx).use_system_path_prompts)
+        {
             let prompt = self.on_prompt_for_open_path.take().unwrap();
             let rx = prompt(self, lister, window, cx);
             self.on_prompt_for_open_path = Some(prompt);
@@ -3028,19 +3092,48 @@ impl Workspace {
 
                 match result {
                     Ok(result) => {
+                        #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+                        if let Some(paths) = result.as_ref()
+                            && let Err(error) =
+                                app_store_sandbox::remember_user_selected_paths(paths)
+                        {
+                            workspace.update(cx, |workspace, cx| {
+                                workspace.show_error(
+                                    format!(
+                                        "Could not remember access to selected files: {error:#}"
+                                    ),
+                                    cx,
+                                );
+                            })?;
+                        }
                         tx.send(result).ok();
                     }
                     Err(err) => {
-                        let rx = workspace.update_in(cx, |workspace, window, cx| {
-                            workspace
-                                .show_error(workspace_error::PortalError::new(err.to_string()), cx);
-                            let prompt = workspace.on_prompt_for_open_path.take().unwrap();
-                            let rx = prompt(workspace, lister, window, cx);
-                            workspace.on_prompt_for_open_path = Some(prompt);
-                            rx
-                        })?;
-                        if let Ok(path) = rx.await {
-                            tx.send(path).ok();
+                        #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+                        {
+                            workspace.update(cx, |workspace, cx| {
+                                workspace.show_error(
+                                    workspace_error::PortalError::new(err.to_string()),
+                                    cx,
+                                );
+                            })?;
+                            return anyhow::Ok(());
+                        }
+                        #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+                        {
+                            let rx = workspace.update_in(cx, |workspace, window, cx| {
+                                workspace.show_error(
+                                    workspace_error::PortalError::new(err.to_string()),
+                                    cx,
+                                );
+                                let prompt = workspace.on_prompt_for_open_path.take().unwrap();
+                                let rx = prompt(workspace, lister, window, cx);
+                                workspace.on_prompt_for_open_path = Some(prompt);
+                                rx
+                            })?;
+                            if let Ok(path) = rx.await {
+                                tx.send(path).ok();
+                            }
                         }
                     }
                 };
@@ -3072,7 +3165,8 @@ impl Workspace {
     ) -> oneshot::Receiver<Option<Vec<PathBuf>>> {
         if self.project.read(cx).is_via_collab()
             || self.project.read(cx).is_via_remote_server()
-            || !WorkspaceSettings::get_global(cx).use_system_path_prompts
+            || (!cfg!(all(target_os = "macos", feature = "mac_app_store"))
+                && !WorkspaceSettings::get_global(cx).use_system_path_prompts)
         {
             let prompt = self.on_prompt_for_new_path.take().unwrap();
             let rx = prompt(self, lister, suggested_name, initial_directory, window, cx);
@@ -3103,28 +3197,63 @@ impl Workspace {
             let abs_path = match abs_path.await? {
                 Ok(path) => path,
                 Err(err) => {
-                    let rx = workspace.update_in(cx, |workspace, window, cx| {
-                        workspace
-                            .show_error(workspace_error::PortalError::new(err.to_string()), cx);
-
-                        let prompt = workspace.on_prompt_for_new_path.take().unwrap();
-                        let rx = prompt(
-                            workspace,
-                            lister,
-                            suggested_name,
-                            initial_directory,
-                            window,
-                            cx,
-                        );
-                        workspace.on_prompt_for_new_path = Some(prompt);
-                        rx
-                    })?;
-                    if let Ok(path) = rx.await {
-                        tx.send(path).ok();
+                    #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+                    {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace
+                                .show_error(workspace_error::PortalError::new(err.to_string()), cx);
+                        })?;
+                        return anyhow::Ok(());
                     }
-                    return anyhow::Ok(());
+                    #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+                    {
+                        let rx = workspace.update_in(cx, |workspace, window, cx| {
+                            workspace
+                                .show_error(workspace_error::PortalError::new(err.to_string()), cx);
+
+                            let prompt = workspace.on_prompt_for_new_path.take().unwrap();
+                            let rx = prompt(
+                                workspace,
+                                lister,
+                                suggested_name,
+                                initial_directory,
+                                window,
+                                cx,
+                            );
+                            workspace.on_prompt_for_new_path = Some(prompt);
+                            rx
+                        })?;
+                        if let Ok(path) = rx.await {
+                            tx.send(path).ok();
+                        }
+                        return anyhow::Ok(());
+                    }
                 }
             };
+
+            #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+            if let Some(path) = abs_path.as_ref() {
+                if path.exists() {
+                    if let Err(error) =
+                        app_store_sandbox::remember_user_selected_paths(std::slice::from_ref(path))
+                    {
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.show_error(
+                                format!("Could not remember access to saved file: {error:#}"),
+                                cx,
+                            );
+                        })?;
+                    }
+                } else if let Some(parent) = path.parent()
+                    && let Err(error) =
+                        app_store_sandbox::remember_user_selected_paths(&[parent.to_path_buf()])
+                {
+                    log::warn!(
+                        "Could not remember access to save destination {}: {error:#}",
+                        path.display()
+                    );
+                }
+            }
 
             tx.send(abs_path.map(|path| vec![path])).ok();
             anyhow::Ok(())
@@ -15922,10 +16051,10 @@ mod tests {
         let (workspace, _cx) =
             cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
 
-        // Fanta ships with the status bar off, so the default is hidden.
+        // The dock toggles are in the status bar, so keep it visible by default.
         workspace.read_with(cx, |workspace, cx| {
             let visible = workspace.status_bar_visible(cx);
-            assert!(!visible, "Status bar should be hidden by default");
+            assert!(visible, "Status bar should be visible by default");
         });
 
         // Test with status bar hidden

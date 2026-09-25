@@ -5730,6 +5730,11 @@ impl AgentPanel {
                             .separator()
                             .action("Toggle Threads Sidebar", Box::new(ToggleWorkspaceSidebar));
 
+                        menu = menu.action(
+                            "Credits & Billing",
+                            Box::new(zed_actions::OpenAccountSettings),
+                        );
+
                         if has_auth_methods || supports_logout {
                             menu = menu.separator()
                         }

@@ -76,21 +76,46 @@ fn prompt_and_create(workspace: &mut Workspace, window: &mut Window, cx: &mut Co
             return anyhow::Ok(());
         }
 
+        #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+        let bookmark_error = workspace::remember_user_selected_paths(std::slice::from_ref(&root))
+            .err()
+            .map(|error| {
+                log::error!(
+                    "remembering access to new design {} failed: {error:#}",
+                    root.display()
+                );
+                format!(
+                    "The design was created, but Fanta could not remember access to it: {error:#}. Reopen it with File > Open Folder next time."
+                )
+            });
+
         if let Some(multi_workspace) = multi_workspace {
             multi_workspace
                 .update(cx, |multi_workspace, window, cx| {
                     multi_workspace.open_project(vec![root], OpenMode::Activate, window, cx)
                 })?
                 .await?;
+            #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+            if let Some(error) = bookmark_error {
+                let current_workspace = multi_workspace
+                    .update(cx, |multi_workspace, _, _| multi_workspace.workspace().clone())?;
+                current_workspace.update(cx, |workspace, cx| workspace.show_error(error, cx));
+            }
             return anyhow::Ok(());
         }
         // A window whose root is not a `MultiWorkspace` (tests, and the
         // single-workspace shell) still has to land somewhere.
-        workspace
+        let opened_workspace = workspace
             .update_in(cx, |workspace, window, cx| {
                 workspace.open_workspace_for_paths(OpenMode::NewWindow, vec![root], window, cx)
             })?
             .await?;
+        #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+        if let Some(error) = bookmark_error {
+            opened_workspace.update(cx, |workspace, cx| workspace.show_error(error, cx));
+        }
+        #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+        drop(opened_workspace);
         anyhow::Ok(())
     })
     .detach_and_log_err(cx);
@@ -127,21 +152,35 @@ fn create_project(root: &Path) -> Result<()> {
         }
     }
 
+    #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
     let parent = root
         .parent()
         .context("The new design folder needs a parent directory")?;
-    let staging = tempfile::Builder::new()
-        .prefix(".fanta-new-design-")
-        .tempdir_in(parent)
-        .with_context(|| format!("staging the new design near {}", root.display()))?;
-    let doc = new_document(root)?;
-    crate::document::write_project(staging.path(), &doc, &BTreeMap::new())?;
-    if root.exists() {
-        std::fs::remove_dir(root)
-            .with_context(|| format!("publishing the new design at {}", root.display()))?;
+    #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+    {
+        // The Save panel grants the chosen destination, not a sibling staging
+        // directory in its parent, so the sandboxed build writes within it.
+        std::fs::create_dir_all(root)
+            .with_context(|| format!("creating the new design at {}", root.display()))?;
+        let doc = new_document(root)?;
+        return crate::document::write_project(root, &doc, &BTreeMap::new())
+            .with_context(|| format!("writing the new design at {}", root.display()));
     }
-    std::fs::rename(staging.path(), root)
-        .with_context(|| format!("publishing the new design at {}", root.display()))
+    #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+    {
+        let staging = tempfile::Builder::new()
+            .prefix(".fanta-new-design-")
+            .tempdir_in(parent)
+            .with_context(|| format!("staging the new design near {}", root.display()))?;
+        let doc = new_document(root)?;
+        crate::document::write_project(staging.path(), &doc, &BTreeMap::new())?;
+        if root.exists() {
+            std::fs::remove_dir(root)
+                .with_context(|| format!("publishing the new design at {}", root.display()))?;
+        }
+        std::fs::rename(staging.path(), root)
+            .with_context(|| format!("publishing the new design at {}", root.display()))
+    }
 }
 
 /// A document with exactly one empty page.

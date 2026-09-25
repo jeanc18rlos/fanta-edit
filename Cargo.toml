@@ -47,6 +47,7 @@ members = [
     "crates/fanta-fnx",
     "crates/fanta-format",
     "crates/fanta-present",
+    "crates/fanta_revenuecat",
     "crates/fanta-render",
     "crates/fanta-text",
     "crates/fanta-tools",
@@ -214,6 +215,7 @@ extension = { path = "crates/extension" }
 feature_flags = { path = "crates/feature_flags" }
 feature_flags_macros = { path = "crates/feature_flags_macros" }
 fanta_languages = { path = "crates/fanta_languages" }
+fanta_revenuecat = { path = "crates/fanta_revenuecat" }
 fanta_ui = { path = "crates/fanta_ui" }
 fig_viewer = { path = "crates/fig_viewer" }
 file_icons = { path = "crates/file_icons" }
