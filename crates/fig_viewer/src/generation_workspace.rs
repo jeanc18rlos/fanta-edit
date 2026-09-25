@@ -2224,7 +2224,7 @@ impl GenerationWorkspace {
                 .upgrade()
                 .context("This workspace was closed.")?;
             let prompt = format!(
-                "Create this design in the active Fanta canvas using editable native layers: {}\n\nUse design_state and design_get_guidelines first, then design_batch with frames, text, shapes, and auto layout. Keep existing work and create in empty space. Finish by checking design_screenshot.",
+                "Create this design in the active Fanta canvas using editable native layers: {}\n\nUse design_state to inspect the current page and find empty_space for a new top-level frame. Keep existing work. Use design_edit to create frames, text, and shapes, applying auto layout where useful. Finish by checking design_screenshot.",
                 prompt.trim()
             );
             agent_ui::open_external_prompt_for_review(workspace, &prompt, window, cx)
