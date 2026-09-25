@@ -241,7 +241,7 @@ fn purchase_description(pro: Option<&Product>, credits: Option<&Product>) -> Str
     if let Some(product) = pro {
         if let Some(trial) = &product.eligible_introductory_trial {
             lines.push(format!(
-                "Pro: 3,000 AI credits every month. Your free trial lasts {} from the time you subscribe. After the trial, Apple charges {} per month. It automatically renews monthly until canceled in your Apple Account. Cancel before the trial ends to avoid the first charge.",
+                "Pro: Access Pro features during your free trial of {}. The trial adds no subscription credits; you can use credits already in your account. After the trial, Apple charges {} per month and you receive 3,000 AI credits for each paid month. The subscription renews monthly until canceled in your Apple Account. Cancel before the trial ends to avoid the first charge.",
                 trial.duration_label(),
                 product.localized_price
             ));
@@ -332,8 +332,10 @@ mod tests {
         }));
         assert!(pro_action_label(&pro).contains("3 days free, then $44.99/month"));
         let description = purchase_description(Some(&pro), None);
-        assert!(description.contains("free trial lasts 3 days"));
+        assert!(description.contains("Access Pro features during your free trial of 3 days"));
+        assert!(description.contains("The trial adds no subscription credits"));
         assert!(description.contains("Apple charges $44.99 per month"));
+        assert!(description.contains("3,000 AI credits for each paid month"));
         assert!(description.contains("Cancel before the trial ends"));
     }
 
