@@ -11,12 +11,11 @@ subscription, and the default offering. Apple issued the Mac App Distribution
 and Mac Installer Distribution certificates and Fanta's Mac App Store
 provisioning profile, which Xcode has synced to this Mac. Both issued
 certificates are installed in the login Keychain. The distribution-signed
-version 1.0 (build 2) app and installer package include the restored UI and
-account-deletion entry point. Both pass Apple's signature checks.
-Production authentication and backend deployment, purchase verification,
-upload, and App Review remain.
-The package is ready for upload; the production and review prerequisites below
-still gate submission. Approval and publication depend on Apple.
+version 1.0 (build 4) app and installer package include the restored UI and
+account-deletion entry point. Both pass Apple's signature checks. Transporter
+delivered the package on 25 September and App Store Connect is processing it.
+Production authentication and backend deployment, purchase verification, and
+App Review remain. Approval and publication depend on Apple.
 
 ## Account setup
 
@@ -101,17 +100,21 @@ still gate submission. Approval and publication depend on Apple.
   Apple distribution identities in Keychain (or explicit signing identity
   environment variables). The
   workflow's manual `app-store` distribution builds and stores a signed `.pkg`;
-  it does not upload it to Apple. The signed 1.0/2 package is at
+  it does not upload it to Apple. The signed 1.0/4 package is at
   `target/aarch64-apple-darwin/release/app-store/Fanta-aarch64.pkg`.
   `codesign --verify --deep --strict` and `pkgutil --check-signature` passed
   against the installed Apple certificates on 25 September. Its SHA-256 is
-  `e8f7f9f9cc2de158fa84d57b87c408ec4ac11f76150f2a1fe6fdf374f4cf723b`.
-  The bundled binary identifies source commit `cc6501acf6`.
-  Upload is pending. Apple's Transporter app is installed on this Mac, and its
-  license has been accepted. It is waiting for the owner to complete sign-in
-  with the App Store Connect Apple ID `jrojastechnology@gmail.com`. Xcode's
-  `altool` remains a fallback, but it requires an App Store Connect API key or
-  an Apple ID app-specific password.
+  `719fa6e834edc9709405db2dba464d87b27c10efab91afe851091f480ad45aba`.
+  Its Info.plist, main binary, and bundled RevenueCat library require macOS 12.0.
+  Apple's Transporter app is installed, its license is accepted, and it is
+  signed in as `jrojastechnology@gmail.com`. Delivery of build 2 failed Apple
+  validation with ITMS-90869: the arm64-only app declared a macOS deployment
+  target below 12.0. Corrected build 3 was delivered at 18:25 Madrid time on
+  25 September and is Ready for Internal Testing. Build 4 also directs the AI
+  provider's account button to the in-app RevenueCat purchase flow; Transporter
+  delivered it at 18:39 and App Store Connect is processing it.
+  Xcode's `altool` remains a fallback, but it requires an App Store Connect
+  API key or an Apple ID app-specific password.
 - Deploy the backend RevenueCat webhook only after verifying the current
   production database target, applying pending Drizzle migration `0023`, and setting
   `REVENUECAT_APP_ID` and `REVENUECAT_WEBHOOK_AUTHORIZATION`. The backend
@@ -124,6 +127,22 @@ still gate submission. Approval and publication depend on Apple.
   `fanta-recovery-before-revenuecat-2026-09-25`
   (`br-young-dust-ah9at528`) was created from `main` at
   2026-09-25 04:36 Madrid time with no expiration. No app is connected to it.
+  The separate schema-only sandbox branch
+  `fanta-revenuecat-sandbox-2026-09-25` (`br-proud-breeze-ahg1wv82`) was
+  created from `main` on 25 September and expires on 2 October. It is not
+  connected to Vercel. Its zero-user schema had an empty Drizzle migration
+  ledger, so the exact `0000`–`0022` hashes and timestamps were added to the
+  sandbox ledger in a guarded transaction. A second guarded transaction applied
+  `0023`; SQL Editor verified zero users, 24 ledger rows, and all three
+  RevenueCat tables. The backend candidate includes the three commits already
+  live in production; the merge had no conflicts, type checking passed, and
+  639 active tests passed. Its isolated Vercel preview is Ready at
+  `https://fanta-backend-qjqv5i0nx-squidreds-projects.vercel.app`; its status
+  endpoint returned HTTP 200 and its sandbox webhook rejected an unauthenticated
+  probe with HTTP 401. The sandbox catalog was seeded once with three plans,
+  11 endpoints, 75 models, 32 aliases, and 70 pricing rows. Preview variables
+  use the sandbox URL and development Clerk keys; no production env variables
+  were changed. The RevenueCat sandbox webhook form is prepared but not saved.
   Do not deploy from the original dirty backend checkout: it is 26 commits
   behind the available `origin/main`, and its local `0019`
   migration conflicts with upstream history. A read-only check of the
@@ -157,11 +176,10 @@ still gate submission. Approval and publication depend on Apple.
 
 ## Submit and publish
 
-1. Sign in to the installed Apple Transporter app with the existing App Store
-   Connect Apple ID, add the signed `.pkg`, and click Deliver. Alternatively,
-   use `xcrun altool` with an App Store Connect API key or Apple ID app-specific
-   password. After Apple processes the upload, select build 1.0/2 and both
-   in-app purchases for review.
+1. Apple Transporter delivered build 1.0/4 on 25 September. After App Store
+   Connect processes the upload, select build 4 and both in-app purchases for
+   review. Build 3 is Ready for Internal Testing but lacks the provider billing
+   navigation fix.
 2. Complete the macOS listing: icon, screenshots, description, category,
    privacy policy (`https://www.fantaisa.net/privacy`), Terms of Use
    (`https://www.fantaisa.net/terms`), age rating, export compliance, support
