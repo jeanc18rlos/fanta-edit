@@ -135,20 +135,19 @@ async fn show_store(
     let revenuecat = RevenueCat::get_or_configure(REVENUECAT_PUBLIC_API_KEY, &user.id)
         .await
         .context("Could not connect to the App Store")?;
-    let products = revenuecat
-        .products(&[PRO_MONTHLY, CREDITS_500])
-        .await
-        .context("Could not load App Store products")?;
+    let products = match revenuecat.products(&[PRO_MONTHLY, CREDITS_500]).await {
+        Ok(products) => products,
+        Err(error) => {
+            log::warn!("Could not load App Store products: {error}");
+            Vec::new()
+        }
+    };
     let pro = products
         .iter()
         .find(|product| product.identifier == PRO_MONTHLY);
     let credits = products
         .iter()
         .find(|product| product.identifier == CREDITS_500);
-    if pro.is_none() && credits.is_none() {
-        bail!("The App Store products are not available yet. Please try again later.");
-    }
-
     let mut actions = Vec::new();
     if let Some(product) = pro {
         actions.push((
@@ -162,6 +161,8 @@ async fn show_store(
             Some(CREDITS_500),
         ));
     }
+    actions.push(("Redeem offer code (macOS 15+)".to_string(), None));
+    actions.push(("Sync Apple purchases".to_string(), None));
     actions.push(("Restore purchases".to_string(), None));
     actions.push(("Terms of Use".to_string(), None));
     actions.push(("Privacy Policy".to_string(), None));
@@ -198,6 +199,47 @@ async fn show_store(
         bail!("Your Fanta account changed. Reopen this screen and try again.");
     }
 
+    if label == "Redeem offer code (macOS 15+)" {
+        match revenuecat.redeem_offer_code().await {
+            Ok(_) => {
+                let current_token = cx.update(|_, cx| Client::global(cx).account_access_token())?;
+                if current_token.as_deref() != Some(token.as_ref()) {
+                    bail!(
+                        "Your Fanta account changed while Apple's offer code sheet was open. Sign in to the original account to check any purchase."
+                    );
+                }
+                show_message(
+                    cx,
+                    "Apple purchases checked",
+                    "If you redeemed a code, your Fanta balance will update after Apple and Fanta process the purchase. Reopen Credits & billing to sync again if needed.",
+                )
+                .await?;
+            }
+            Err(fanta_revenuecat::RevenueCatError::Cancelled) => {}
+            Err(error) => return Err(error).context("Could not redeem or sync the offer code"),
+        }
+        return Ok(());
+    }
+    if label == "Sync Apple purchases" {
+        revenuecat
+            .sync_purchases()
+            .await
+            .context("Could not sync Apple purchases")?;
+        let current_token = cx.update(|_, cx| Client::global(cx).account_access_token())?;
+        if current_token.as_deref() != Some(token.as_ref()) {
+            bail!(
+                "Your Fanta account changed while Apple purchases were being checked. Sign in to the original account to see its credits."
+            );
+        }
+        show_message(
+            cx,
+            "Apple purchases checked",
+            "If you redeemed a code in the App Store, your Fanta balance will update after the purchase is processed.",
+        )
+        .await?;
+        return Ok(());
+    }
+
     if let Some(product_id) = product_id {
         match revenuecat.purchase(product_id).await {
             Ok(_) => {
@@ -229,6 +271,9 @@ async fn show_store(
 
 fn purchase_description(pro: Option<&Product>, credits: Option<&Product>) -> String {
     let mut lines = Vec::new();
+    if pro.is_none() && credits.is_none() {
+        lines.push("The App Store products are unavailable right now. You can still redeem an offer code or sync an earlier purchase.".into());
+    }
     if let Some(product) = pro {
         lines.push(format!(
             "Pro: 3,000 AI credits every month for {}. Automatically renews monthly until canceled in your Apple account.",
@@ -243,6 +288,10 @@ fn purchase_description(pro: Option<&Product>, credits: Option<&Product>) -> Str
     }
     lines.push(
         "Payment is handled by Apple. Purchases are linked to your signed-in Fanta account.".into(),
+    );
+    lines.push(
+        "Redeem offer codes inside Fanta while signed in to the account that should receive them. If you redeemed in the App Store, choose Sync Apple purchases."
+            .into(),
     );
     lines.join("\n\n")
 }

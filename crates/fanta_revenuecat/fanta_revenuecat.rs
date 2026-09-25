@@ -124,6 +124,14 @@ impl RevenueCat {
         platform::request("restore", None).await
     }
 
+    pub async fn sync_purchases(&self) -> Result<CustomerInfo, RevenueCatError> {
+        platform::request("sync_purchases", None).await
+    }
+
+    pub async fn redeem_offer_code(&self) -> Result<CustomerInfo, RevenueCatError> {
+        platform::request("redeem_offer_code", None).await
+    }
+
     pub async fn customer_info(&self) -> Result<CustomerInfo, RevenueCatError> {
         platform::request("customer_info", None).await
     }
