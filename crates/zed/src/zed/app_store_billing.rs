@@ -151,10 +151,7 @@ async fn show_store(
 
     let mut actions = Vec::new();
     if let Some(product) = pro {
-        actions.push((
-            format!("Pro monthly — {}", product.localized_price),
-            Some(PRO_MONTHLY),
-        ));
+        actions.push((pro_action_label(product), Some(PRO_MONTHLY)));
     }
     if let Some(product) = credits {
         actions.push((
@@ -227,13 +224,33 @@ async fn show_store(
     Ok(())
 }
 
+fn pro_action_label(product: &Product) -> String {
+    if let Some(trial) = &product.eligible_introductory_trial {
+        format!(
+            "Pro — {} free, then {}/month",
+            trial.duration_label(),
+            product.localized_price
+        )
+    } else {
+        format!("Pro monthly — {}", product.localized_price)
+    }
+}
+
 fn purchase_description(pro: Option<&Product>, credits: Option<&Product>) -> String {
     let mut lines = Vec::new();
     if let Some(product) = pro {
-        lines.push(format!(
-            "Pro: 3,000 AI credits every month for {}. Automatically renews monthly until canceled in your Apple account.",
-            product.localized_price
-        ));
+        if let Some(trial) = &product.eligible_introductory_trial {
+            lines.push(format!(
+                "Pro: 3,000 AI credits every month. Your free trial lasts {} from the time you subscribe. After the trial, Apple charges {} per month. It automatically renews monthly until canceled in your Apple Account. Cancel before the trial ends to avoid the first charge.",
+                trial.duration_label(),
+                product.localized_price
+            ));
+        } else {
+            lines.push(format!(
+                "Pro: 3,000 AI credits every month for {} per month. Automatically renews monthly until canceled in your Apple Account.",
+                product.localized_price
+            ));
+        }
     }
     if let Some(product) = credits {
         lines.push(format!(
@@ -289,4 +306,43 @@ async fn show_message(cx: &mut AsyncWindowContext, title: &str, message: &str) -
         .update(|window, cx| window.prompt(PromptLevel::Info, title, Some(message), &["OK"], cx))?;
     response.await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pro_action_label, purchase_description};
+    use fanta_revenuecat::{IntroductoryTrial, Product, TrialUnit};
+
+    fn pro_product(trial: Option<IntroductoryTrial>) -> Product {
+        Product {
+            identifier: "dev.fanta.Fanta.pro.monthly".into(),
+            title: "Fanta Pro".into(),
+            description: String::new(),
+            localized_price: "$44.99".into(),
+            currency_code: "USD".into(),
+            eligible_introductory_trial: trial,
+        }
+    }
+
+    #[test]
+    fn eligible_trial_shows_duration_and_renewal_price() {
+        let pro = pro_product(Some(IntroductoryTrial {
+            duration: 3,
+            unit: TrialUnit::Day,
+        }));
+        assert!(pro_action_label(&pro).contains("3 days free, then $44.99/month"));
+        let description = purchase_description(Some(&pro), None);
+        assert!(description.contains("free trial lasts 3 days"));
+        assert!(description.contains("Apple charges $44.99 per month"));
+        assert!(description.contains("Cancel before the trial ends"));
+    }
+
+    #[test]
+    fn unavailable_trial_shows_standard_subscription_price() {
+        let pro = pro_product(None);
+        assert_eq!(pro_action_label(&pro), "Pro monthly — $44.99");
+        let description = purchase_description(Some(&pro), None);
+        assert!(description.contains("$44.99 per month"));
+        assert!(!description.contains("free trial"));
+    }
 }

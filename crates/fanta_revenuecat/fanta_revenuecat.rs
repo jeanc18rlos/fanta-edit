@@ -30,6 +30,39 @@ pub struct Product {
     pub description: String,
     pub localized_price: String,
     pub currency_code: String,
+    #[serde(default)]
+    pub eligible_introductory_trial: Option<IntroductoryTrial>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IntroductoryTrial {
+    pub duration: u32,
+    pub unit: TrialUnit,
+}
+
+impl IntroductoryTrial {
+    pub fn duration_label(&self) -> String {
+        let unit = match self.unit {
+            TrialUnit::Day => "day",
+            TrialUnit::Week => "week",
+            TrialUnit::Month => "month",
+            TrialUnit::Year => "year",
+        };
+        if self.duration == 1 {
+            format!("1 {unit}")
+        } else {
+            format!("{} {unit}s", self.duration)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrialUnit {
+    Day,
+    Week,
+    Month,
+    Year,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -143,6 +176,29 @@ mod platform {
         _argument: Option<&str>,
     ) -> Result<T, RevenueCatError> {
         Err(RevenueCatError::UnsupportedPlatform)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Product;
+
+    #[test]
+    fn product_trial_metadata_is_optional() -> Result<(), serde_json::Error> {
+        let standard: Product = serde_json::from_str(
+            r#"{"identifier":"pro","title":"Pro","description":"","localized_price":"$44.99","currency_code":"USD"}"#,
+        )?;
+        assert!(standard.eligible_introductory_trial.is_none());
+
+        let eligible: Product = serde_json::from_str(
+            r#"{"identifier":"pro","title":"Pro","description":"","localized_price":"$44.99","currency_code":"USD","eligible_introductory_trial":{"duration":7,"unit":"day"}}"#,
+        )?;
+        let trial = eligible.eligible_introductory_trial.as_ref();
+        assert_eq!(
+            trial.map(|trial| trial.duration_label()).as_deref(),
+            Some("7 days")
+        );
+        Ok(())
     }
 }
 
