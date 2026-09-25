@@ -107,12 +107,11 @@ still gate submission. Approval and publication depend on Apple.
   against the installed Apple certificates on 25 September. Its SHA-256 is
   `e8f7f9f9cc2de158fa84d57b87c408ec4ac11f76150f2a1fe6fdf374f4cf723b`.
   The bundled binary identifies source commit `cc6501acf6`.
-  Upload is pending. Xcode's
-  `altool` requires an App Store Connect API key or app-specific password;
-  Apple's Transporter app is not installed on this Mac. Repeated attempts to
-  install it from the official Mac App Store listing reached a blank Apple
-  authorization sheet; the owner needs to complete that install or provide an
-  approved `altool` authentication path.
+  Upload is pending. Apple's Transporter app is installed on this Mac, and its
+  license has been accepted. It is waiting for the owner to complete sign-in
+  with the App Store Connect Apple ID `jrojastechnology@gmail.com`. Xcode's
+  `altool` remains a fallback, but it requires an App Store Connect API key or
+  an Apple ID app-specific password.
 - Deploy the backend RevenueCat webhook only after verifying the current
   production database target, applying pending Drizzle migration `0023`, and setting
   `REVENUECAT_APP_ID` and `REVENUECAT_WEBHOOK_AUTHORIZATION`. The backend
@@ -158,7 +157,7 @@ still gate submission. Approval and publication depend on Apple.
 
 ## Submit and publish
 
-1. Install Apple's Transporter Mac app, sign in with the existing App Store
+1. Sign in to the installed Apple Transporter app with the existing App Store
    Connect Apple ID, add the signed `.pkg`, and click Deliver. Alternatively,
    use `xcrun altool` with an App Store Connect API key or Apple ID app-specific
    password. After Apple processes the upload, select build 1.0/2 and both
@@ -178,10 +177,11 @@ still gate submission. Approval and publication depend on Apple.
    label was published on 25 September with nine data types, including
    Product Interaction, Other Usage Data, and Diagnostics → Performance Data.
    Performance Data is disclosed for app functionality, linked to identity,
-   and not used for tracking. The private App Review contact (Jean Rojas, the
-   supplied phone and email), testing notes, and
-   explanations for user-selected file access and outbound networking are
-   saved. The review account, build, and other review fields remain.
+   and not used for tracking. Testing notes and explanations for user-selected
+   file access and outbound networking are saved. The private App Review
+   contact's first and last name are saved, but the supplied phone and email
+   were blank on the version 1.0 page when last inspected; fill and save them
+   before submission. The review account, build, and other review fields remain.
    The current uploaded capture is
    `/private/tmp/fanta-release-assets/fanta-mac-app-store-showcase-2880x1800.png`;
    the existing `crates/zed/resources/app-icon@2x.png` is 1024 × 1024.
