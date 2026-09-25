@@ -109,14 +109,21 @@ still gate submission. Approval and publication depend on Apple.
   The bundled binary identifies source commit `cc6501acf6`.
   Upload is pending. Xcode's
   `altool` requires an App Store Connect API key or app-specific password;
-  Apple's Transporter app is not installed on this Mac.
+  Apple's Transporter app is not installed on this Mac. Repeated attempts to
+  install it from the official Mac App Store listing reached a blank Apple
+  authorization sheet; the owner needs to complete that install or provide an
+  approved `altool` authentication path.
 - Deploy the backend RevenueCat webhook only after verifying the current
   production database target, making a recovery snapshot in the existing
   Neon project with the owner's approval, applying pending Drizzle migration
   `0023`, and setting
   `REVENUECAT_APP_ID` and `REVENUECAT_WEBHOOK_AUTHORIZATION`. The backend
   handoff is in the isolated backend candidate at
-  `/private/tmp/fanta-backend-revenuecat-20260924/docs/apple-revenuecat.md`.
+  `/private/tmp/fanta-backend-revenuecat-20260924/docs/apple-revenuecat.md` and
+  [draft PR #9](https://github.com/jeanc18rlos/fanta-backend/pull/9).
+  Vercel's `fanta-db` opens Neon project `small-hill-03400665`; its production
+  branch is `main` (`br-snowy-cake-ahzz1slc`) with four Fanta users. A named
+  recovery child branch is prepared in the UI but has not been created.
   Do not deploy from the original dirty backend checkout: it is 26 commits
   behind the available `origin/main`, and its local `0019`
   migration conflicts with upstream history. A read-only check of the
