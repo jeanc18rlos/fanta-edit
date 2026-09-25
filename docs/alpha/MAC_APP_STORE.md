@@ -114,16 +114,17 @@ still gate submission. Approval and publication depend on Apple.
   authorization sheet; the owner needs to complete that install or provide an
   approved `altool` authentication path.
 - Deploy the backend RevenueCat webhook only after verifying the current
-  production database target, making a recovery snapshot in the existing
-  Neon project with the owner's approval, applying pending Drizzle migration
-  `0023`, and setting
+  production database target, applying pending Drizzle migration `0023`, and setting
   `REVENUECAT_APP_ID` and `REVENUECAT_WEBHOOK_AUTHORIZATION`. The backend
   handoff is in the isolated backend candidate at
   `/private/tmp/fanta-backend-revenuecat-20260924/docs/apple-revenuecat.md` and
   [draft PR #9](https://github.com/jeanc18rlos/fanta-backend/pull/9).
   Vercel's `fanta-db` opens Neon project `small-hill-03400665`; its production
   branch is `main` (`br-snowy-cake-ahzz1slc`) with four Fanta users. A named
-  recovery child branch is prepared in the UI but has not been created.
+  data-and-schema recovery child branch
+  `fanta-recovery-before-revenuecat-2026-09-25`
+  (`br-young-dust-ah9at528`) was created from `main` at
+  2026-09-25 04:36 Madrid time with no expiration. No app is connected to it.
   Do not deploy from the original dirty backend checkout: it is 26 commits
   behind the available `origin/main`, and its local `0019`
   migration conflicts with upstream history. A read-only check of the
@@ -131,8 +132,9 @@ still gate submission. Approval and publication depend on Apple.
   `0023_revenuecat_billing` is pending. Claude is concurrently changing the
   original backend checkout, so reconcile that work before migration or
   deployment. The attempted local production export was blocked by automatic
-  approval review because it could copy customer data; no backup or database
-  mutation has occurred.
+  approval review because it could copy customer data. The recovery branch
+  stays inside the same Neon project; migration `0023` has not run and the
+  production database has not been changed.
   Point RevenueCat's
   production webhook to `https://api.fantaisa.net/webhooks/revenuecat`.
 - Test a real Apple sandbox purchase for each product, subscription renewal,
@@ -151,6 +153,8 @@ still gate submission. Approval and publication depend on Apple.
   `DELETE /v1/me` route needs production verification after the Clerk cutover;
   the isolated candidate now stops and keeps local data when Clerk deletion
   fails (commit `0dfcf13`). Deletion does not cancel Apple billing.
+  The app changes are in
+  [draft PR #10](https://github.com/jeanc18rlos/fanta-edit/pull/10).
 
 ## Submit and publish
 
