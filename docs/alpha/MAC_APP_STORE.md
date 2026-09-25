@@ -182,16 +182,20 @@ still gate submission. Approval and publication depend on Apple.
    absent from this Mac App Store build and should not be submitted.
    The live Fanta sign-in currently redirects to a Clerk **Development**
    instance (`accounts.dev`). The Vercel `fanta-auth` Clerk integration has a
-   Production instance, but its domain is an unverified placeholder and it has
-   no users. Set its production domain to `fantaisa.net`, add the exact Clerk
-   CNAMEs in Vercel DNS, and verify them before moving the backend, dashboard,
-   and admin app to production Clerk keys. Development users
+   Production instance with no users. Its domain was changed to `fantaisa.net`
+   on 25 September; all five Clerk CNAMEs are present in Vercel DNS, Clerk
+   verified frontend, account-portal, and email records, and both SSL
+   certificates were issued. Do not move the backend, dashboard, and admin app
+   to production Clerk keys until the user-ID mapping is applied. Development users
    cannot be moved automatically; map existing Clerk IDs to Fanta accounts,
    credits, and admin access before cutover. The isolated backend candidate
    has a guarded, dry-run-first mapping script and runbook in
    `docs/clerk-production-identity-cutover.md` (commit `d00a187`); no
    production mapping has run. Create the dedicated reviewer
-   account only after the production sign-in is verified. The current Google
+   account only after the production sign-in is verified. Production Clerk has
+   email/password sign-up enabled, so the reviewer needs a Fanta account, not
+   an Apple ID. Device Trust currently asks for extra verification on a new
+   device, which must be addressed for App Review. The current Google
    login also needs an Apple Guideline 4.8 review: add an equivalent private
    login such as Sign in with Apple, or remove Google after providing existing
    users another working sign-in path.
