@@ -172,7 +172,7 @@ pub fn init(client: &Arc<Client>, cx: &mut App) {
         let client = client.clone();
         move |_: &SignIn, cx| {
             if let Some(client) = client.upgrade() {
-                cx.spawn(async move |cx| client.sign_in_with_optional_connect(true, cx).await)
+                cx.spawn(async move |cx| client.sign_in_with_optional_connect(false, cx).await)
                     .detach_and_log_err(cx);
             }
         }
@@ -335,6 +335,7 @@ impl Status {
 
 struct ClientState {
     credentials: Option<Credentials>,
+    stored_credentials: Option<Credentials>,
     status: (watch::Sender<Status>, watch::Receiver<Status>),
     /// Bumped each time the cloud websocket finishes its handshake. Starts at `0` so
     /// subscribers can distinguish "no connection yet" from a real reconnect.
@@ -440,6 +441,7 @@ impl Default for ClientState {
     fn default() -> Self {
         Self {
             credentials: None,
+            stored_credentials: None,
             status: watch::channel_with(Status::SignedOut),
             cloud_connection_id: watch::channel_with(0),
             _reconnect_task: None,
@@ -880,10 +882,10 @@ impl Client {
     }
 
     pub async fn has_credentials(&self, cx: &AsyncApp) -> bool {
-        self.credentials_provider
-            .read_credentials(cx)
-            .await
-            .is_some()
+        let credentials = self.credentials_provider.read_credentials(cx).await;
+        let has_credentials = credentials.is_some();
+        self.state.write().stored_credentials = credentials;
+        has_credentials
     }
 
     pub fn account_access_token(&self) -> Option<Arc<str>> {
@@ -916,10 +918,15 @@ impl Client {
             credentials = Some(old_credentials);
         }
 
-        if credentials.is_none()
-            && try_provider
-            && let Some(stored_credentials) = self.credentials_provider.read_credentials(cx).await
-        {
+        let stored_credentials = if try_provider && credentials.is_none() {
+            match self.state.write().stored_credentials.take() {
+                Some(credentials) => Some(credentials),
+                None => self.credentials_provider.read_credentials(cx).await,
+            }
+        } else {
+            None
+        };
+        if let Some(stored_credentials) = stored_credentials {
             if self.validate_credentials(&stored_credentials, cx).await? {
                 credentials = Some(stored_credentials);
             } else {
@@ -1525,6 +1532,7 @@ impl Client {
                         native_app_port: u16,
                         native_app_public_key: String,
                         system_id: Option<Arc<str>>,
+                        choose_account: u8,
                     }
 
                     // Open the Zed sign-in page in the user's browser, with query parameters that indicate
@@ -1535,6 +1543,7 @@ impl Client {
                             native_app_port: port,
                             native_app_public_key: public_key,
                             system_id: this.telemetry.system_id(),
+                            choose_account: 1,
                         })?
                     ));
 
@@ -1725,11 +1734,15 @@ impl Client {
     }
 
     pub async fn sign_out(self: &Arc<Self>, cx: &AsyncApp) {
-        self.state.write().credentials = None;
+        let had_credentials = {
+            let mut state = self.state.write();
+            state.stored_credentials = None;
+            state.credentials.take().is_some()
+        };
         self.cloud_client.clear_credentials();
         self.disconnect(cx);
 
-        if self.has_credentials(cx).await {
+        if had_credentials {
             self.credentials_provider
                 .delete_credentials(cx)
                 .await
@@ -2045,6 +2058,101 @@ mod tests {
     use proto::TypedEnvelope;
     use settings::SettingsStore;
     use std::future;
+
+    #[derive(Default)]
+    struct CountingCredentialsProvider {
+        credentials: Mutex<Option<(String, Vec<u8>)>>,
+        reads: Mutex<usize>,
+        writes: Mutex<usize>,
+        deletes: Mutex<usize>,
+    }
+
+    impl CredentialsProvider for CountingCredentialsProvider {
+        fn read_credentials<'a>(
+            &'a self,
+            _url: &'a str,
+            _cx: &'a AsyncApp,
+        ) -> Pin<Box<dyn Future<Output = Result<Option<(String, Vec<u8>)>>> + 'a>> {
+            async move {
+                *self.reads.lock() += 1;
+                Ok(self.credentials.lock().clone())
+            }
+            .boxed_local()
+        }
+
+        fn write_credentials<'a>(
+            &'a self,
+            _url: &'a str,
+            username: &'a str,
+            password: &'a [u8],
+            _cx: &'a AsyncApp,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+            async move {
+                *self.writes.lock() += 1;
+                *self.credentials.lock() = Some((username.to_string(), password.to_vec()));
+                Ok(())
+            }
+            .boxed_local()
+        }
+
+        fn delete_credentials<'a>(
+            &'a self,
+            _url: &'a str,
+            _cx: &'a AsyncApp,
+        ) -> Pin<Box<dyn Future<Output = Result<()>> + 'a>> {
+            async move {
+                *self.deletes.lock() += 1;
+                *self.credentials.lock() = None;
+                Ok(())
+            }
+            .boxed_local()
+        }
+    }
+
+    #[gpui::test]
+    async fn test_sign_out_clears_saved_credentials_without_reading_them_again(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let provider = Arc::new(CountingCredentialsProvider::default());
+        *provider.credentials.lock() = Some(("1".into(), b"old-token".to_vec()));
+        let http_client = FakeHttpClient::create(|_request| async move {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body("".into())
+                .unwrap())
+        });
+        let client = cx.update(|cx| {
+            cx.set_global(zed_credentials_provider::ZedCredentialsProvider(
+                provider.clone(),
+            ));
+            Client::new(Arc::new(FakeSystemClock::new()), http_client, cx)
+        });
+        client.override_authenticate(|cx| {
+            cx.background_spawn(async {
+                Ok(Credentials {
+                    user_id: 2,
+                    access_token: "new-token".into(),
+                })
+            })
+        });
+
+        assert!(client.has_credentials(&cx.to_async()).await);
+        assert_eq!(*provider.reads.lock(), 1);
+
+        client.sign_in(true, &cx.to_async()).await.unwrap();
+        assert_eq!(*provider.reads.lock(), 1);
+
+        client.sign_out(&cx.to_async()).await;
+        assert_eq!(*provider.reads.lock(), 1);
+        assert_eq!(*provider.deletes.lock(), 1);
+        assert!(provider.credentials.lock().is_none());
+
+        let credentials = client.sign_in(false, &cx.to_async()).await.unwrap();
+        assert_eq!(credentials.user_id, 2);
+        assert_eq!(*provider.reads.lock(), 1);
+        assert_eq!(*provider.writes.lock(), 1);
+    }
 
     #[test]
     fn test_browser_sign_in_callback_ignores_invalid_requests() -> Result<()> {
