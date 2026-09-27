@@ -498,6 +498,10 @@ function sign_app_store_bundle() {
         echo "The Mac App Store app signature is missing App Sandbox."
         exit 1
     fi
+    if [[ "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.security.network.server' "$verification_entitlements_file")" != true ]]; then
+        echo "The Mac App Store app signature is missing the local sign-in callback entitlement."
+        exit 1
+    fi
 
     if [[ "$app_store_ad_hoc" != true ]]; then
         if [[ "$(/usr/libexec/PlistBuddy -c 'Print :com.apple.application-identifier' "$verification_entitlements_file")" != "$profile_app_identifier" ]]; then

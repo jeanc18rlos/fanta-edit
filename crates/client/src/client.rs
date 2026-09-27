@@ -929,7 +929,8 @@ impl Client {
         }
 
         let stored_credentials = if try_provider && credentials.is_none() {
-            match self.state.write().stored_credentials.take() {
+            let preloaded_credentials = { self.state.write().stored_credentials.take() };
+            match preloaded_credentials {
                 Some(credentials) => Some(credentials),
                 None => self.credentials_provider.read_credentials(cx).await,
             }
@@ -2072,6 +2073,7 @@ mod tests {
     #[derive(Default)]
     struct CountingCredentialsProvider {
         credentials: Mutex<Option<(String, Vec<u8>)>>,
+        client_for_read: Mutex<Option<std::sync::Weak<Client>>>,
         reads: Mutex<usize>,
         writes: Mutex<usize>,
         deletes: Mutex<usize>,
@@ -2084,6 +2086,17 @@ mod tests {
             _cx: &'a AsyncApp,
         ) -> Pin<Box<dyn Future<Output = Result<Option<(String, Vec<u8>)>>> + 'a>> {
             async move {
+                if let Some(client) = self
+                    .client_for_read
+                    .lock()
+                    .as_ref()
+                    .and_then(|client| client.upgrade())
+                {
+                    assert!(
+                        client.state.try_read().is_some(),
+                        "client state must be unlocked during credential reads"
+                    );
+                }
                 *self.reads.lock() += 1;
                 Ok(self.credentials.lock().clone())
             }
@@ -2117,6 +2130,39 @@ mod tests {
             }
             .boxed_local()
         }
+    }
+
+    #[gpui::test]
+    async fn test_sign_in_without_preloaded_credentials_releases_client_state_before_keychain_read(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let provider = Arc::new(CountingCredentialsProvider::default());
+        let http_client = FakeHttpClient::create(|_request| async move {
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body("".into())
+                .unwrap())
+        });
+        let client = cx.update(|cx| {
+            cx.set_global(zed_credentials_provider::ZedCredentialsProvider(
+                provider.clone(),
+            ));
+            Client::new(Arc::new(FakeSystemClock::new()), http_client, cx)
+        });
+        *provider.client_for_read.lock() = Some(Arc::downgrade(&client));
+        client.override_authenticate(|cx| {
+            cx.background_spawn(async {
+                Ok(Credentials {
+                    user_id: 2,
+                    access_token: "new-token".into(),
+                })
+            })
+        });
+
+        let credentials = client.sign_in(true, &cx.to_async()).await.unwrap();
+        assert_eq!(credentials.user_id, 2);
+        assert_eq!(*provider.reads.lock(), 1);
     }
 
     #[gpui::test]
