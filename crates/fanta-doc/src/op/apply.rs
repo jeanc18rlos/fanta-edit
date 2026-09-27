@@ -303,6 +303,9 @@ impl Operation {
             Self::AddMode { collection, mode } => match dir {
                 Dir::Apply => {
                     if let Some(c) = ctx.variables.collections.get_mut(collection) {
+                        if c.modes.is_empty() {
+                            c.default_mode = mode.id;
+                        }
                         c.modes.push(mode.clone());
                     }
                     Ok(())
@@ -310,6 +313,9 @@ impl Operation {
                 Dir::Revert => {
                     if let Some(c) = ctx.variables.collections.get_mut(collection) {
                         c.modes.pop();
+                        if c.modes.is_empty() {
+                            c.default_mode = crate::id::ModeId::from_u128(0);
+                        }
                     }
                     Ok(())
                 }
@@ -335,6 +341,19 @@ impl Operation {
                     Ok(())
                 }
             },
+            Self::SetCollectionDefaultMode {
+                collection,
+                old,
+                new,
+            } => {
+                let collection = ctx
+                    .variables
+                    .collections
+                    .get_mut(collection)
+                    .ok_or_else(|| SceneError::InvariantViolated("collection is missing".into()))?;
+                collection.default_mode = *dir.pick(old, new);
+                Ok(())
+            }
             Self::CreateVariable { variable } => match dir {
                 Dir::Apply => {
                     ctx.variables
@@ -358,13 +377,33 @@ impl Operation {
                     Ok(())
                 }
             },
-            Self::DeleteVariable { id, variable } => match dir {
+            Self::DeleteVariable {
+                id,
+                variable,
+                order_index,
+            } => match dir {
                 Dir::Apply => {
                     ctx.variables.variables.remove(id);
+                    if let Some(collection) =
+                        ctx.variables.collections.get_mut(&variable.collection)
+                    {
+                        collection
+                            .variable_order
+                            .retain(|candidate| candidate != id);
+                    }
                     Ok(())
                 }
                 Dir::Revert => {
                     ctx.variables.variables.insert(*id, (**variable).clone());
+                    if let Some(index) = order_index
+                        && let Some(collection) =
+                            ctx.variables.collections.get_mut(&variable.collection)
+                        && !collection.variable_order.contains(id)
+                    {
+                        collection
+                            .variable_order
+                            .insert((*index).min(collection.variable_order.len()), *id);
+                    }
                     Ok(())
                 }
             },

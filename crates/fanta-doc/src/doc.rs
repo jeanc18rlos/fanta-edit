@@ -5,13 +5,15 @@
 //! write directly (see ARCHITECTURE.md §6 and §8).
 
 use crate::component::ComponentLibrary;
-use crate::history::History;
-use crate::id::{DocId, ModeId, NodeId, VariableCollectionId};
+use crate::history::{History, Transaction};
+use crate::id::{DocId, ModeId, NodeId, VariableCollectionId, VariableId};
 use crate::motion::MotionLibrary;
-use crate::op::{OpCtx, Operation};
+use crate::node::{Action, NodeData};
+use crate::op::{ModeScope, OpCtx, Operation};
 use crate::scene::{Scene, SceneError};
 use crate::selection::Selection;
-use crate::variables::VariableRegistry;
+use crate::value::{VarValue, VariableType};
+use crate::variables::{Mode, VariableRegistry};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -321,6 +323,259 @@ impl Doc {
         Ok(())
     }
 
+    /// Add a mode with usable values for every existing variable in its
+    /// collection. Each value is captured separately for exact undo.
+    pub fn add_mode_transaction(
+        &self,
+        collection_id: VariableCollectionId,
+        mode: Mode,
+    ) -> Result<Transaction, SceneError> {
+        let collection = self
+            .variables
+            .collections
+            .get(&collection_id)
+            .ok_or_else(|| SceneError::InvariantViolated("collection is missing".into()))?;
+        if collection.has_mode(mode.id) {
+            return Err(SceneError::InvariantViolated("mode already exists".into()));
+        }
+        let mut transaction = Transaction::new("Add Mode");
+        if collection.modes.is_empty() && collection.default_mode != ModeId::from_u128(0) {
+            transaction.push(Operation::SetCollectionDefaultMode {
+                collection: collection_id,
+                old: collection.default_mode,
+                new: ModeId::from_u128(0),
+            });
+        }
+        transaction.push(Operation::AddMode {
+            collection: collection_id,
+            mode: mode.clone(),
+        });
+        for variable in self
+            .variables
+            .variables
+            .values()
+            .filter(|variable| variable.collection == collection_id)
+        {
+            let old = variable.values_by_mode.get(&mode.id).cloned();
+            let new = variable
+                .values_by_mode
+                .get(&collection.default_mode)
+                .cloned()
+                .unwrap_or_else(|| default_variable_value(variable.ty));
+            transaction.push(Operation::SetVariableValue {
+                variable: variable.id,
+                mode: mode.id,
+                old,
+                new: Some(new),
+            });
+        }
+        Ok(transaction)
+    }
+
+    /// Build one undoable edit that removes a variable, its direct bindings,
+    /// aliases, and prototype actions. Bound properties keep their currently
+    /// resolved literal value.
+    pub fn delete_variable_transaction(&self, id: VariableId) -> Result<Transaction, SceneError> {
+        let variable = self
+            .variables
+            .variables
+            .get(&id)
+            .ok_or_else(|| SceneError::InvariantViolated("variable is missing".into()))?;
+        let order_index = self
+            .variables
+            .collections
+            .get(&variable.collection)
+            .and_then(|collection| {
+                collection
+                    .variable_order
+                    .iter()
+                    .position(|entry| *entry == id)
+            });
+        let mut transaction = Transaction::new("Delete Variable");
+
+        for source in self
+            .variables
+            .variables
+            .values()
+            .filter(|source| source.id != id)
+        {
+            for (mode, value) in &source.values_by_mode {
+                if !matches!(value, VarValue::Alias { variable } if *variable == id) {
+                    continue;
+                }
+                let mut active_modes = self.active_modes.clone();
+                active_modes.insert(source.collection, *mode);
+                let literal = crate::resolve::resolve_bound_value(
+                    &self.variables,
+                    &self.scene,
+                    NodeId::from_u128(0),
+                    &active_modes,
+                    source.id,
+                )
+                .map(|resolved| resolved.to_var_value());
+                transaction.push(Operation::SetVariableValue {
+                    variable: source.id,
+                    mode: *mode,
+                    old: Some(value.clone()),
+                    new: literal,
+                });
+            }
+        }
+
+        for root in self.scene.roots() {
+            for node_id in self.scene.descendants_of(*root) {
+                let Some(node) = self.scene.get(node_id) else {
+                    continue;
+                };
+                let mut baked = node.clone();
+                for (prop, bound) in &node.bindings {
+                    if *bound != id {
+                        continue;
+                    }
+                    let old_data = Box::new(baked.data.clone());
+                    let old_opacity = baked.opacity;
+                    let old_flags = baked.flags;
+                    if let Some(value) = crate::resolve::resolve_bound_value(
+                        &self.variables,
+                        &self.scene,
+                        node_id,
+                        &self.active_modes,
+                        id,
+                    ) {
+                        prop.apply_resolved(&mut baked, value);
+                    }
+                    baked.bindings.remove(prop);
+                    transaction.push(Operation::UnbindProperty {
+                        node: node_id,
+                        prop: *prop,
+                        variable: id,
+                        old_data,
+                        new_data: Box::new(baked.data.clone()),
+                        old_opacity,
+                        new_opacity: baked.opacity,
+                        old_flags,
+                        new_flags: baked.flags,
+                    });
+                }
+                for (index, reaction) in node.reactions.iter().enumerate().rev() {
+                    let mut remaining: Vec<Action> = reaction
+                        .actions()
+                        .filter(|action| {
+                            !matches!(action, Action::SetVariable { variable, .. } if *variable == id)
+                        })
+                        .cloned()
+                        .collect();
+                    if remaining.len() == reaction.extra_actions.len() + 1 {
+                        continue;
+                    }
+                    if remaining.is_empty() {
+                        transaction.push(Operation::RemoveReaction {
+                            node: node_id,
+                            index,
+                            reaction: reaction.clone(),
+                        });
+                    } else {
+                        let mut replacement = reaction.clone();
+                        replacement.action = remaining.remove(0);
+                        replacement.extra_actions = remaining;
+                        transaction.push(Operation::SetReaction {
+                            node: node_id,
+                            index,
+                            old: reaction.clone(),
+                            new: replacement,
+                        });
+                    }
+                }
+            }
+        }
+
+        transaction.push(Operation::DeleteVariable {
+            id,
+            variable: Box::new(variable.clone()),
+            order_index,
+        });
+        Ok(transaction)
+    }
+
+    /// Build one undoable edit that removes a mode, its values, and explicit
+    /// document or frame selections. An empty collection has a zero default id
+    /// until its next `AddMode` operation.
+    pub fn remove_mode_transaction(
+        &self,
+        collection_id: VariableCollectionId,
+        mode_id: ModeId,
+    ) -> Result<Transaction, SceneError> {
+        let collection = self
+            .variables
+            .collections
+            .get(&collection_id)
+            .ok_or_else(|| SceneError::InvariantViolated("collection is missing".into()))?;
+        let (index, mode) = collection
+            .modes
+            .iter()
+            .enumerate()
+            .find(|(_, mode)| mode.id == mode_id)
+            .ok_or_else(|| SceneError::InvariantViolated("mode is missing".into()))?;
+        let mut transaction = Transaction::new("Delete Mode");
+        for variable in self
+            .variables
+            .variables
+            .values()
+            .filter(|variable| variable.collection == collection_id)
+        {
+            if let Some(value) = variable.values_by_mode.get(&mode_id) {
+                transaction.push(Operation::SetVariableValue {
+                    variable: variable.id,
+                    mode: mode_id,
+                    old: Some(value.clone()),
+                    new: None,
+                });
+            }
+        }
+        if self.active_modes.get(&collection_id) == Some(&mode_id) {
+            transaction.push(Operation::SetActiveMode {
+                scope: ModeScope::Doc,
+                collection: collection_id,
+                old: Some(mode_id),
+                new: None,
+            });
+        }
+        for root in self.scene.roots() {
+            for node_id in self.scene.descendants_of(*root) {
+                if let Some(node) = self.scene.get(node_id)
+                    && let NodeData::Group(group) = &node.data
+                    && group.explicit_modes.get(&collection_id) == Some(&mode_id)
+                {
+                    transaction.push(Operation::SetActiveMode {
+                        scope: ModeScope::Frame { node: node_id },
+                        collection: collection_id,
+                        old: Some(mode_id),
+                        new: None,
+                    });
+                }
+            }
+        }
+        if collection.default_mode == mode_id {
+            let new_default = collection
+                .modes
+                .iter()
+                .find(|candidate| candidate.id != mode_id)
+                .map(|candidate| candidate.id)
+                .unwrap_or(ModeId::from_u128(0));
+            transaction.push(Operation::SetCollectionDefaultMode {
+                collection: collection_id,
+                old: mode_id,
+                new: new_default,
+            });
+        }
+        transaction.push(Operation::RemoveMode {
+            collection: collection_id,
+            index,
+            mode: mode.clone(),
+        });
+        Ok(transaction)
+    }
+
     /// Discard the open transaction, reverting the ops it has applied so far
     /// against the whole document — the same [`OpCtx`] as [`Self::apply`], so
     /// a `DefineComponent` or motion-track op inside the transaction is undone
@@ -608,11 +863,363 @@ fn unix_seconds_now() -> i64 {
         .unwrap_or(0)
 }
 
+fn default_variable_value(variable_type: VariableType) -> VarValue {
+    match variable_type {
+        VariableType::Color => VarValue::Color {
+            value: crate::color::Color::BLACK,
+        },
+        VariableType::Float => VarValue::Float { value: 0.0 },
+        VariableType::String => VarValue::String {
+            value: String::new(),
+        },
+        VariableType::Boolean => VarValue::Boolean { value: false },
+        VariableType::Typography => VarValue::TextStyle {
+            value: crate::node::TextStyle::default(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::node::{CanvasNode, GroupNode, NodeData, VectorNode};
-    use crate::{NodeId, color::Color};
+    use crate::node::{CanvasNode, GroupNode, NodeData, Reaction, Trigger, VectorNode};
+    use crate::variables::{Variable, VariableCollection};
+    use crate::{BoundProp, NodeId, ReactionId, Stroke, color::Color};
+
+    #[test]
+    fn deleting_variable_bakes_bindings_replaces_aliases_and_undoes_exactly() {
+        let mut doc = Doc::new();
+        let collection_id = VariableCollectionId::from_u128(1);
+        let light = ModeId::from_u128(2);
+        let dark = ModeId::from_u128(3);
+        let alias_id = VariableId::from_u128(4);
+        let target_id = VariableId::from_u128(5);
+        doc.variables.collections.insert(
+            collection_id,
+            VariableCollection {
+                id: collection_id,
+                name: "Theme".into(),
+                modes: vec![
+                    Mode {
+                        id: light,
+                        name: "Light".into(),
+                    },
+                    Mode {
+                        id: dark,
+                        name: "Dark".into(),
+                    },
+                ],
+                default_mode: light,
+                variable_order: vec![alias_id, target_id],
+            },
+        );
+        doc.variables.variables.insert(
+            target_id,
+            Variable {
+                id: target_id,
+                collection: collection_id,
+                name: "Background".into(),
+                ty: VariableType::Color,
+                values_by_mode: BTreeMap::from([
+                    (
+                        light,
+                        VarValue::Color {
+                            value: Color::WHITE,
+                        },
+                    ),
+                    (
+                        dark,
+                        VarValue::Color {
+                            value: Color::BLACK,
+                        },
+                    ),
+                ]),
+                scopes: Vec::new(),
+            },
+        );
+        doc.variables.variables.insert(
+            alias_id,
+            Variable {
+                id: alias_id,
+                collection: collection_id,
+                name: "Surface".into(),
+                ty: VariableType::Color,
+                values_by_mode: BTreeMap::from([
+                    (
+                        light,
+                        VarValue::Alias {
+                            variable: target_id,
+                        },
+                    ),
+                    (
+                        dark,
+                        VarValue::Alias {
+                            variable: target_id,
+                        },
+                    ),
+                ]),
+                scopes: Vec::new(),
+            },
+        );
+        let mut node = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            10.0,
+            10.0,
+            Color::BLACK,
+        )));
+        if let NodeData::Vector(vector) = &mut node.data {
+            vector.strokes.push(Stroke::solid(Color::BLACK, 1.0));
+        }
+        let node_id = node.id;
+        node.bindings
+            .insert(BoundProp::FillColor { index: 0 }, target_id);
+        node.bindings
+            .insert(BoundProp::StrokeColor { index: 0 }, target_id);
+        node.reactions.push(Reaction {
+            id: ReactionId::from_u128(6),
+            trigger: Trigger::Click,
+            action: Action::SetVariable {
+                variable: target_id,
+                value: VarValue::Color {
+                    value: Color::BLACK,
+                },
+            },
+            extra_actions: vec![Action::Back],
+            transition: None,
+            animation: None,
+        });
+        doc.scene.insert(node).unwrap();
+        let original_variables = serde_json::to_value(&doc.variables).unwrap();
+        let original_scene = serde_json::to_value(&doc.scene).unwrap();
+
+        doc.apply_transaction(doc.delete_variable_transaction(target_id).unwrap())
+            .unwrap();
+        assert!(!doc.variables.variables.contains_key(&target_id));
+        assert_eq!(
+            doc.variables.collections[&collection_id].variable_order,
+            vec![alias_id]
+        );
+        assert_eq!(
+            doc.variables.variables[&alias_id].values_by_mode[&light],
+            VarValue::Color {
+                value: Color::WHITE
+            }
+        );
+        assert_eq!(
+            doc.variables.variables[&alias_id].values_by_mode[&dark],
+            VarValue::Color {
+                value: Color::BLACK
+            }
+        );
+        let node = doc.scene.get(node_id).unwrap();
+        assert!(node.bindings.is_empty());
+        assert!(matches!(node.reactions[0].action, Action::Back));
+        assert!(node.reactions[0].extra_actions.is_empty());
+        if let NodeData::Vector(vector) = &node.data {
+            assert_eq!(vector.fills[0].solid_color(), Some(Color::WHITE));
+            assert_eq!(vector.strokes[0].paint.solid_color(), Some(Color::WHITE));
+        } else {
+            panic!("expected vector node");
+        }
+
+        assert!(doc.undo().unwrap());
+        assert_eq!(
+            serde_json::to_value(&doc.variables).unwrap(),
+            original_variables
+        );
+        assert_eq!(serde_json::to_value(&doc.scene).unwrap(), original_scene);
+        assert!(doc.redo().unwrap());
+        assert!(!doc.variables.variables.contains_key(&target_id));
+    }
+
+    #[test]
+    fn deleting_final_mode_and_adding_another_recovers_values_and_undoes() {
+        let mut doc = Doc::new();
+        let collection_id = VariableCollectionId::from_u128(11);
+        let original_mode = ModeId::from_u128(12);
+        let variable_id = VariableId::from_u128(13);
+        doc.variables.collections.insert(
+            collection_id,
+            VariableCollection {
+                id: collection_id,
+                name: "Theme".into(),
+                modes: vec![Mode {
+                    id: original_mode,
+                    name: "Original".into(),
+                }],
+                default_mode: original_mode,
+                variable_order: vec![variable_id],
+            },
+        );
+        doc.variables.variables.insert(
+            variable_id,
+            Variable {
+                id: variable_id,
+                collection: collection_id,
+                name: "Background".into(),
+                ty: VariableType::Color,
+                values_by_mode: BTreeMap::from([(
+                    original_mode,
+                    VarValue::Color {
+                        value: Color::WHITE,
+                    },
+                )]),
+                scopes: Vec::new(),
+            },
+        );
+        doc.active_modes.insert(collection_id, original_mode);
+        let mut frame = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        if let NodeData::Group(group) = &mut frame.data {
+            group.explicit_modes.insert(collection_id, original_mode);
+        }
+        let frame_id = frame.id;
+        doc.scene.insert(frame).unwrap();
+        let original_variables = serde_json::to_value(&doc.variables).unwrap();
+        let original_scene = serde_json::to_value(&doc.scene).unwrap();
+        let original_active_modes = doc.active_modes.clone();
+
+        doc.apply_transaction(
+            doc.remove_mode_transaction(collection_id, original_mode)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(doc.variables.collections[&collection_id].modes.is_empty());
+        assert_eq!(
+            doc.variables.collections[&collection_id].default_mode,
+            ModeId::from_u128(0)
+        );
+        assert!(
+            doc.variables.variables[&variable_id]
+                .values_by_mode
+                .is_empty()
+        );
+        assert!(!doc.active_modes.contains_key(&collection_id));
+        if let NodeData::Group(group) = &doc.scene.get(frame_id).unwrap().data {
+            assert!(!group.explicit_modes.contains_key(&collection_id));
+        }
+        assert!(
+            crate::resolve::resolve_bound_value(
+                &doc.variables,
+                &doc.scene,
+                frame_id,
+                &doc.active_modes,
+                variable_id,
+            )
+            .is_none()
+        );
+
+        let new_mode = Mode {
+            id: ModeId::from_u128(14),
+            name: "Fresh".into(),
+        };
+        doc.apply_transaction(
+            doc.add_mode_transaction(collection_id, new_mode.clone())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            doc.variables.collections[&collection_id].default_mode,
+            new_mode.id
+        );
+        assert_eq!(
+            doc.variables.variables[&variable_id].values_by_mode[&new_mode.id],
+            VarValue::Color {
+                value: Color::BLACK
+            }
+        );
+        assert!(doc.undo().unwrap());
+        assert!(doc.variables.collections[&collection_id].modes.is_empty());
+        assert_eq!(
+            doc.variables.collections[&collection_id].default_mode,
+            ModeId::from_u128(0)
+        );
+        assert!(doc.undo().unwrap());
+        assert_eq!(
+            serde_json::to_value(&doc.variables).unwrap(),
+            original_variables
+        );
+        assert_eq!(serde_json::to_value(&doc.scene).unwrap(), original_scene);
+        assert_eq!(doc.active_modes, original_active_modes);
+        assert!(doc.redo().unwrap());
+        assert!(doc.variables.collections[&collection_id].modes.is_empty());
+    }
+
+    #[test]
+    fn deleting_default_mode_selects_surviving_mode_and_restores_on_undo() {
+        let mut doc = Doc::new();
+        let collection_id = VariableCollectionId::from_u128(21);
+        let first = ModeId::from_u128(22);
+        let second = ModeId::from_u128(23);
+        doc.variables.collections.insert(
+            collection_id,
+            VariableCollection {
+                id: collection_id,
+                name: "Theme".into(),
+                modes: vec![
+                    Mode {
+                        id: first,
+                        name: "First".into(),
+                    },
+                    Mode {
+                        id: second,
+                        name: "Second".into(),
+                    },
+                ],
+                default_mode: first,
+                variable_order: Vec::new(),
+            },
+        );
+        doc.apply_transaction(doc.remove_mode_transaction(collection_id, first).unwrap())
+            .unwrap();
+        assert_eq!(
+            doc.variables.collections[&collection_id].default_mode,
+            second
+        );
+        assert_eq!(doc.variables.collections[&collection_id].modes.len(), 1);
+        assert!(doc.undo().unwrap());
+        assert_eq!(
+            doc.variables.collections[&collection_id].default_mode,
+            first
+        );
+        assert_eq!(doc.variables.collections[&collection_id].modes.len(), 2);
+    }
+
+    #[test]
+    fn adding_mode_to_noncanonical_empty_collection_restores_default_on_undo() {
+        let mut doc = Doc::new();
+        let collection_id = VariableCollectionId::from_u128(31);
+        let stale_default = ModeId::from_u128(32);
+        let new_mode = Mode {
+            id: ModeId::from_u128(33),
+            name: "Fresh".into(),
+        };
+        doc.variables.collections.insert(
+            collection_id,
+            VariableCollection {
+                id: collection_id,
+                name: "Empty".into(),
+                modes: Vec::new(),
+                default_mode: stale_default,
+                variable_order: Vec::new(),
+            },
+        );
+        doc.apply_transaction(
+            doc.add_mode_transaction(collection_id, new_mode.clone())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            doc.variables.collections[&collection_id].default_mode,
+            new_mode.id
+        );
+        assert!(doc.undo().unwrap());
+        assert!(doc.variables.collections[&collection_id].modes.is_empty());
+        assert_eq!(
+            doc.variables.collections[&collection_id].default_mode,
+            stale_default
+        );
+    }
 
     #[test]
     fn empty_doc_round_trips_through_json() {

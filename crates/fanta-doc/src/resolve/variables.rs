@@ -100,6 +100,9 @@ fn resolve_var(
 
     let var = registry.variable(var_id)?;
     let collection = registry.collections.get(&var.collection)?;
+    if collection.modes.is_empty() {
+        return None;
+    }
     let mode = resolve_effective_mode(scene, node_id, collection, doc_active_modes);
     // The value for the effective mode, falling back to the default mode's value
     // if this variable has no entry for the effective mode.
@@ -210,6 +213,27 @@ mod tests {
             Some(ResolvedVarValue::Color {
                 value: Color::BLACK
             })
+        );
+    }
+
+    #[test]
+    fn empty_collection_cannot_resolve_stale_values() {
+        let (mut registry, collection, _light, _dark, variable) = theme_registry();
+        registry
+            .collections
+            .get_mut(&collection)
+            .unwrap()
+            .modes
+            .clear();
+        assert_eq!(
+            resolve_bound_value(
+                &registry,
+                &Scene::new(),
+                NodeId::new(),
+                &BTreeMap::new(),
+                variable,
+            ),
+            None
         );
     }
 

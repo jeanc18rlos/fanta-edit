@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use crate::document::{FigItem, FigItemEvent};
+use crate::document::{DocChange, FigItem, FigItemEvent};
 use crate::mode_overrides::mode_override_operation;
 use crate::variable_binding::{
     bindable_properties, variable_binding_model, variable_binding_operation,
@@ -9,7 +9,8 @@ use crate::variable_binding::{
 };
 use fanta_doc::{
     BoundProp, Color as FantaColor, Doc, Mode, ModeId, ModeScope, NodeData, NodeId, Operation,
-    VarValue, Variable, VariableCollection, VariableCollectionId, VariableId, VariableType,
+    Transaction, VarValue, Variable, VariableCollection, VariableCollectionId, VariableId,
+    VariableType,
 };
 use fanta_gpui::variables::{
     VariableKind, VariableModeValue, VariableRow, VariablesAction, VariablesBindingProperty,
@@ -197,6 +198,8 @@ impl FantaVariablesWorkspace {
                 self.create_variable(cx);
             }
             VariablesAction::AddModeRequested => self.add_mode(cx),
+            VariablesAction::VariableDeleteRequested { .. }
+            | VariablesAction::ModeDeleteRequested { .. } => self.delete_action(action, cx),
             VariablesAction::SearchQueryChanged { .. }
             | VariablesAction::SearchOptionsRequested
             | VariablesAction::ValueEditRequested { .. }
@@ -287,6 +290,82 @@ impl FantaVariablesWorkspace {
         }
     }
 
+    fn delete_action(&mut self, action: &VariablesAction, cx: &mut Context<Self>) {
+        let transaction: anyhow::Result<Transaction> = (|| {
+            let item = self.item.read(cx);
+            let doc = item
+                .doc()
+                .ok_or_else(|| anyhow::anyhow!("The document is not ready"))?;
+            match action {
+                VariablesAction::VariableDeleteRequested { variable_id } => {
+                    let id: VariableId = variable_id
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("Invalid variable identifier"))?;
+                    let variable = doc
+                        .variables
+                        .variables
+                        .get(&id)
+                        .ok_or_else(|| anyhow::anyhow!("The variable no longer exists"))?;
+                    if Some(variable.collection) != self.selected_collection {
+                        anyhow::bail!("The selected collection has changed");
+                    }
+                    Ok(doc.delete_variable_transaction(id)?)
+                }
+                VariablesAction::ModeDeleteRequested { mode_id } => {
+                    let collection = self
+                        .selected_collection
+                        .ok_or_else(|| anyhow::anyhow!("Select a collection first"))?;
+                    let mode: ModeId = mode_id
+                        .parse()
+                        .map_err(|_| anyhow::anyhow!("Invalid mode identifier"))?;
+                    Ok(doc.remove_mode_transaction(collection, mode)?)
+                }
+                _ => anyhow::bail!("Unsupported delete action"),
+            }
+        })();
+        let transaction = match transaction {
+            Ok(transaction) => transaction,
+            Err(error) => {
+                self.error_message = Some(error.to_string().into());
+                cx.notify();
+                return;
+            }
+        };
+        self.apply_transaction(transaction, cx);
+    }
+
+    fn apply_transaction(&mut self, transaction: Transaction, cx: &mut Context<Self>) {
+        let label = transaction.label.clone();
+        let result: Option<anyhow::Result<bool>> = self.item.update(cx, |item, cx| {
+            if !item.is_editable() {
+                return None;
+            }
+            item.with_document(cx, |document| {
+                match crate::clipboard::apply_transaction(
+                    &mut document.doc,
+                    &label,
+                    transaction.ops,
+                ) {
+                    Ok(true) => (Ok(true), DocChange::Content),
+                    Ok(false) => (Ok(false), DocChange::None),
+                    Err(error) => (Err(error), DocChange::None),
+                }
+            })
+        });
+        self.invalidate_snapshot();
+        self.projected_snapshot = None;
+        match result {
+            Some(Ok(true)) => self.error_message = None,
+            Some(Ok(false)) => self.error_message = None,
+            Some(Err(error)) => {
+                log::error!("Fanta variables workspace transaction failed: {error:#}");
+                self.error_message = Some(error.to_string().into());
+            }
+            None => self.error_message = Some("The document is not editable".into()),
+        }
+        cx.notify();
+    }
+
     fn create_collection(&mut self, cx: &mut Context<Self>) {
         let operation = {
             let item = self.item.read(cx);
@@ -347,19 +426,19 @@ impl FantaVariablesWorkspace {
         let Some(collection) = self.selected_collection else {
             return;
         };
-        let operation = {
+        let transaction = {
             let item = self.item.read(cx);
             let Some(doc) = item.doc() else {
                 return;
             };
-            add_mode_operation(doc, collection)
+            add_mode_transaction(doc, collection)
         };
-        match operation {
-            Ok(operation) => {
-                self.apply_operation(operation, cx);
+        match transaction {
+            Ok(transaction) => {
+                self.apply_transaction(transaction, cx);
             }
             Err(error) => {
-                self.error_message = Some(error.into());
+                self.error_message = Some(error.to_string().into());
                 cx.notify();
             }
         }
@@ -795,7 +874,7 @@ fn create_variable_operation(
         .collections
         .get(&collection_id)
         .ok_or("The selected collection no longer exists")?;
-    if collection.modes.is_empty() || !collection.has_mode(collection.default_mode) {
+    if !collection.modes.is_empty() && !collection.has_mode(collection.default_mode) {
         return Err("The collection does not have a valid default mode");
     }
     let value = default_variable_value(variable_type);
@@ -816,22 +895,22 @@ fn create_variable_operation(
     })
 }
 
-fn add_mode_operation(
+fn add_mode_transaction(
     doc: &Doc,
     collection_id: VariableCollectionId,
-) -> Result<Operation, &'static str> {
+) -> anyhow::Result<Transaction> {
     let collection = doc
         .variables
         .collections
         .get(&collection_id)
-        .ok_or("The selected collection no longer exists")?;
-    Ok(Operation::AddMode {
-        collection: collection_id,
-        mode: Mode {
+        .ok_or_else(|| anyhow::anyhow!("The selected collection no longer exists"))?;
+    Ok(doc.add_mode_transaction(
+        collection_id,
+        Mode {
             id: ModeId::new(),
             name: unique_mode_name(collection),
         },
-    })
+    )?)
 }
 
 fn set_variable_value_operation(
@@ -1749,6 +1828,99 @@ mod tests {
         });
         assert!(workspace.read_with(cx, |workspace, _| workspace.error_message.is_none()));
     }
+
+    #[gpui::test]
+    async fn delete_variable_intent_updates_document_and_undo_restores_it(cx: &mut TestAppContext) {
+        let (doc, collection, _) = doc_with_many_variables(3);
+        let variable = VariableId::from_u128(1);
+        let (workspace, item, mut cx) = workspace_for_doc(doc, cx).await;
+        let screen = workspace.read_with(&cx, |workspace, _| {
+            workspace.screen.clone().expect("shared screen mounted")
+        });
+        screen.update(&mut cx, |_, cx| {
+            cx.emit(VariablesAction::VariableDeleteRequested {
+                variable_id: variable.to_string().into(),
+            })
+        });
+        cx.run_until_parked();
+        item.read_with(&cx, |item, _| {
+            let doc = item.doc().expect("document ready");
+            assert!(!doc.variables.variables.contains_key(&variable));
+            assert!(
+                !doc.variables.collections[&collection]
+                    .variable_order
+                    .contains(&variable)
+            );
+        });
+        assert!(workspace.read_with(&cx, |workspace, _| workspace.error_message.is_none()));
+        assert!(
+            item.update(&mut cx, |item, cx| item.undo(cx))
+                .expect("undo variable delete")
+        );
+        item.read_with(&cx, |item, _| {
+            let doc = item.doc().expect("document ready");
+            assert!(doc.variables.variables.contains_key(&variable));
+            assert_eq!(
+                doc.variables.collections[&collection].variable_order[0],
+                variable
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn delete_last_mode_intent_allows_recovery_and_undo(cx: &mut TestAppContext) {
+        let (doc, collection, original_mode) = doc_with_many_variables(1);
+        let variable = VariableId::from_u128(1);
+        let (workspace, item, mut cx) = workspace_for_doc(doc, cx).await;
+        let screen = workspace.read_with(&cx, |workspace, _| {
+            workspace.screen.clone().expect("shared screen mounted")
+        });
+        screen.update(&mut cx, |_, cx| {
+            cx.emit(VariablesAction::ModeDeleteRequested {
+                mode_id: original_mode.to_string().into(),
+            })
+        });
+        cx.run_until_parked();
+        item.read_with(&cx, |item, _| {
+            let doc = item.doc().expect("document ready");
+            assert!(doc.variables.collections[&collection].modes.is_empty());
+            assert!(doc.variables.variables[&variable].values_by_mode.is_empty());
+        });
+        screen.update(&mut cx, |_, cx| cx.emit(VariablesAction::AddModeRequested));
+        cx.run_until_parked();
+        item.read_with(&cx, |item, _| {
+            let doc = item.doc().expect("document ready");
+            let collection = &doc.variables.collections[&collection];
+            assert_eq!(collection.modes.len(), 1);
+            assert_eq!(collection.default_mode, collection.modes[0].id);
+            assert!(
+                doc.variables.variables[&variable]
+                    .values_by_mode
+                    .contains_key(&collection.default_mode)
+            );
+        });
+        assert!(workspace.read_with(&cx, |workspace, _| workspace.error_message.is_none()));
+        assert!(
+            item.update(&mut cx, |item, cx| item.undo(cx))
+                .expect("undo mode addition")
+        );
+        assert!(
+            item.update(&mut cx, |item, cx| item.undo(cx))
+                .expect("undo mode deletion")
+        );
+        item.read_with(&cx, |item, _| {
+            let doc = item.doc().expect("document ready");
+            let collection = &doc.variables.collections[&collection];
+            assert_eq!(collection.modes[0].id, original_mode);
+            assert_eq!(collection.default_mode, original_mode);
+            assert!(
+                doc.variables.variables[&variable]
+                    .values_by_mode
+                    .contains_key(&original_mode)
+            );
+        });
+    }
+
     #[gpui::test]
     async fn first_variable_creates_a_collection_and_mode(cx: &mut TestAppContext) {
         let (workspace, item, mut cx) = workspace_for_doc(Doc::new(), cx).await;

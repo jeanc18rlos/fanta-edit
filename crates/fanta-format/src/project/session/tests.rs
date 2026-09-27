@@ -311,6 +311,16 @@ fn apply_refuses_variable_ops() {
         },
     );
     assert!(matches!(err, Err(SessionError::UseWorkspaceArtifact)));
+
+    let err = ws.apply(
+        &id,
+        Operation::SetCollectionDefaultMode {
+            collection: fanta_doc::VariableCollectionId::new(),
+            old: mid,
+            new: fanta_doc::ModeId::new(),
+        },
+    );
+    assert!(matches!(err, Err(SessionError::UseWorkspaceArtifact)));
 }
 
 #[test]
