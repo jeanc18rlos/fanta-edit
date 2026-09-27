@@ -10391,18 +10391,13 @@ impl FigView {
             ToolbarAction::CommandInvoked { command } => match command {
                 ToolbarCommand::GenerateImage
                 | ToolbarCommand::GenerateVideo
-                | ToolbarCommand::GenerateVector
-                | ToolbarCommand::GenerateMasks
-                | ToolbarCommand::RemoveBackground
-                | ToolbarCommand::GenerateDesign => {
+                | ToolbarCommand::GenerateAudio
+                | ToolbarCommand::GenerateVector => {
                     use crate::generation_workspace::GenerationMode;
                     let mode = match command {
                         ToolbarCommand::GenerateVideo => GenerationMode::Video,
+                        ToolbarCommand::GenerateAudio => GenerationMode::Audio,
                         ToolbarCommand::GenerateVector => GenerationMode::Vector,
-                        ToolbarCommand::GenerateMasks | ToolbarCommand::RemoveBackground => {
-                            GenerationMode::Masks
-                        }
-                        ToolbarCommand::GenerateDesign => GenerationMode::Design,
                         _ => GenerationMode::Image,
                     };
                     crate::generation_workspace::open_from_canvas(
@@ -10957,20 +10952,14 @@ const CANVAS_NOTICE_ID: &str = "fanta-canvas-notice";
 #[cfg(feature = "fanta-gpui-ui")]
 const AGENT_PROMPT_CONTEXT_LAYERS: usize = 8;
 
-/// The draft prompt a toolbar AI command opens in the Agent Panel for the
-/// user to complete and review. Media commands stay `None`: there is no image
-/// backend to hand them to, so they are declined by name instead.
+/// The draft prompt a text-editing toolbar command opens in the Agent Panel.
+/// Generation commands open the dedicated generation workspace.
 #[cfg(feature = "fanta-gpui-ui")]
 fn toolbar_agent_prompt_template(
     command: fanta_gpui::toolbar::ToolbarCommand,
 ) -> Option<&'static str> {
     use fanta_gpui::toolbar::ToolbarCommand;
     match command {
-        ToolbarCommand::GenerateDesign => Some(
-            "Design <describe the screen> as a new frame on this page, using auto layout, \
-             a consistent type scale and the page's existing colours; verify with \
-             design_screenshot.",
-        ),
         ToolbarCommand::ReplaceContent => Some(
             "Replace the placeholder content in the selection with realistic content for \
              <describe the product>.",

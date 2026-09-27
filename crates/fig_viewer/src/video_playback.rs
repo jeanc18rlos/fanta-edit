@@ -185,6 +185,12 @@ impl VideoPlaybackView {
                 });
                 match setup {
                     Ok(()) => {
+                        if self.wants_play {
+                            if let Err(error) = session.play() {
+                                self.fail(error, cx);
+                                return;
+                            }
+                        }
                         self.session = Some(session);
                         self.awaiting_frame = true;
                         self.arm_deadline(
@@ -242,14 +248,16 @@ impl VideoPlaybackView {
         if self.closed || !self.active || !self.window_active {
             return;
         }
+        self.wants_play = true;
         if let Some(session) = self.session.as_mut() {
             match session.play() {
                 Ok(()) => {
-                    self.wants_play = true;
                     cx.notify();
                 }
                 Err(error) => self.fail(error, cx),
             }
+        } else {
+            cx.notify();
         }
     }
 

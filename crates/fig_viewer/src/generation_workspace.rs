@@ -1,18 +1,26 @@
-use std::{cell::Cell, io::Cursor, path::PathBuf, sync::Arc, time::Duration};
+use std::{cell::Cell, collections::HashMap, io::Cursor, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context as _, Result, anyhow, bail, ensure};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use client::{Client, ClientSettings};
 use design_surface::{DesignOp, ScreenshotTarget};
+use fanta_gpui::generation::{
+    GenerationAction, GenerationChoice, GenerationDraft, GenerationKind,
+    GenerationModel as ScreenModel, GenerationOptionGroup, GenerationOutput,
+    GenerationOutputStatus, GenerationRecipe, GenerationScreen, GenerationSource,
+    GenerationSubmission, GenerationTemplate, GenerationViewData, GenerationVoiceReference,
+};
 use futures::{AsyncReadExt as _, StreamExt as _};
 #[cfg(feature = "mac_app_store")]
 use gpui::Action as _;
 use gpui::{
     App, AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, Image,
-    ImageFormat, MouseButton, ObjectFit, PathPromptOptions, Pixels, Render, SharedString, Task,
-    WeakEntity, Window, actions, canvas, img,
+    ImageFormat, MouseButton, ObjectFit, PathPromptOptions, Pixels, Render, SharedString,
+    Subscription, Task, WeakEntity, Window, actions, canvas, img,
 };
 use http_client::{AsyncBody, HttpClient as _, Method, Request};
+#[cfg(target_os = "macos")]
+use rodio::Source as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use settings::Settings as _;
@@ -31,7 +39,8 @@ use crate::{
     generation_media,
 };
 
-const MAX_MEDIA_BYTES: usize = 100 * 1024 * 1024;
+const MAX_SOURCE_BYTES: usize = 100 * 1024 * 1024;
+const MAX_MEDIA_BYTES: usize = 128 * 1024 * 1024;
 const MAX_JSON_BYTES: usize = 32 * 1024 * 1024;
 const MAX_VECTOR_RESPONSE_BYTES: usize = 256 * 1024;
 const MAX_VECTOR_SVG_BYTES: usize = 128 * 1024;
@@ -42,31 +51,45 @@ const HISTORY_LIMIT: usize = 12;
 const API_TIMEOUT: Duration = Duration::from_secs(125);
 const MEDIA_TRANSFER_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const VIDEO_PREVIEW_TIMEOUT: Duration = Duration::from_secs(20);
+const QWEN_LOGO: &[u8] = include_bytes!("../assets/generation/logos/qwen.png");
+const TONGYI_LOGO: &[u8] = include_bytes!("../assets/generation/logos/tongyi-mai.jpg");
+const BFL_LOGO: &[u8] = include_bytes!("../assets/generation/logos/black-forest-labs-white.png");
+const LTX_LOGO: &[u8] = include_bytes!("../assets/generation/logos/ltx.svg");
+const WAN_LOGO: &[u8] = include_bytes!("../assets/generation/logos/wan.png");
+const RESEMBLE_LOGO: &[u8] = include_bytes!("../assets/generation/logos/resemble-ai.png");
+const HEXGRAD_LOGO: &[u8] = include_bytes!("../assets/generation/logos/hexgrad.png");
+const ACE_LOGO: &[u8] = include_bytes!("../assets/generation/logos/ace-step.jpg");
+const STARVECTOR_LOGO: &[u8] = include_bytes!("../assets/generation/logos/starvector.jpg");
+const CLAUDE_LOGO: &[u8] = include_bytes!("../assets/generation/logos/claude.png");
+const RECRAFT_LOGO: &[u8] = include_bytes!("../assets/generation/logos/recraft.png");
+const MINIMAX_LOGO: &[u8] = include_bytes!("../assets/generation/logos/minimax.png");
+const BYTEDANCE_LOGO: &[u8] = include_bytes!("../assets/generation/logos/bytedance-seed.png");
+const ELEVENLABS_LOGO: &[u8] = include_bytes!("../assets/generation/logos/elevenlabs.png");
+const GOOGLE_LOGO: &[u8] = include_bytes!("../assets/generation/logos/google.png");
+const META_LOGO: &[u8] = include_bytes!("../assets/generation/logos/meta.png");
+const XAI_LOGO: &[u8] = include_bytes!("../assets/generation/logos/xai.png");
+const KLING_LOGO: &[u8] = include_bytes!("../assets/generation/logos/kling.png");
 
 actions!(
     fanta,
-    [
-        GenerateImage,
-        GenerateVideo,
-        GenerateVector,
-        GenerateDesign,
-        GenerateMasks
-    ]
+    [GenerateImage, GenerateVideo, GenerateAudio, GenerateVector]
 );
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum GenerationMode {
     Image,
     Video,
+    Audio,
     Vector,
     Design,
     Masks,
 }
 
 impl GenerationMode {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::Image,
         Self::Video,
+        Self::Audio,
         Self::Vector,
         Self::Design,
         Self::Masks,
@@ -76,6 +99,7 @@ impl GenerationMode {
         match self {
             Self::Image => "Image",
             Self::Video => "Video",
+            Self::Audio => "Audio",
             Self::Vector => "Vector",
             Self::Design => "Design",
             Self::Masks => "Masks",
@@ -93,9 +117,29 @@ impl GenerationMode {
         match self {
             Self::Image => model.kind == "image",
             Self::Video => model.kind == "video",
+            Self::Audio => model.kind == "audio",
             Self::Vector => matches!(model.kind.as_str(), "chat" | "svg" | "vectorize"),
             Self::Masks => model.kind == "segment",
             Self::Design => false,
+        }
+    }
+
+    fn generation_kind(self) -> Option<GenerationKind> {
+        match self {
+            Self::Image => Some(GenerationKind::Image),
+            Self::Video => Some(GenerationKind::Video),
+            Self::Audio => Some(GenerationKind::Audio),
+            Self::Vector => Some(GenerationKind::Svg),
+            Self::Design | Self::Masks => None,
+        }
+    }
+
+    fn default_recipe(self) -> GenerationRecipe {
+        match self {
+            Self::Image | Self::Design | Self::Masks => GenerationRecipe::TextImage,
+            Self::Video => GenerationRecipe::TextVideo,
+            Self::Audio => GenerationRecipe::Speech,
+            Self::Vector => GenerationRecipe::PromptSvg,
         }
     }
 }
@@ -132,6 +176,8 @@ struct GenerationModel {
     max_output_tokens: Option<u32>,
     #[serde(default)]
     capabilities: Value,
+    #[serde(default)]
+    pricing: Value,
 }
 
 impl GenerationModel {
@@ -160,6 +206,66 @@ impl GenerationModel {
         self.capabilities["operations"]
             .as_array()
             .is_some_and(|operations| operations.iter().any(|operation| operation == "inpaint"))
+    }
+
+    fn recipes(&self) -> Vec<GenerationRecipe> {
+        let declared = self.capabilities["operations"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter_map(|operation| match operation {
+                "text_to_image" => Some(GenerationRecipe::TextImage),
+                "text_to_video" => Some(GenerationRecipe::TextVideo),
+                "image_to_video" => Some(GenerationRecipe::ImageVideo),
+                "speech" => Some(GenerationRecipe::Speech),
+                "music" => Some(GenerationRecipe::Music),
+                "prompt_to_svg" => Some(GenerationRecipe::PromptSvg),
+                "image_to_svg" => Some(GenerationRecipe::ImageSvg),
+                "vectorize" => Some(GenerationRecipe::Vectorize),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if !declared.is_empty()
+            || self.capabilities["operations"]
+                .as_array()
+                .is_some_and(|operations| !operations.is_empty())
+        {
+            return declared;
+        }
+        match self.kind.as_str() {
+            "image" if !self.id.contains("edit") => vec![GenerationRecipe::TextImage],
+            "video" if self.id.contains("i2v") || self.id.contains("animate") => {
+                vec![GenerationRecipe::ImageVideo]
+            }
+            "video" => vec![GenerationRecipe::TextVideo],
+            "audio" if self.id.contains("music") || self.id.contains("ace-step") => {
+                vec![GenerationRecipe::Music]
+            }
+            "audio" => vec![GenerationRecipe::Speech],
+            "chat" if self.id.starts_with("claude-") => vec![GenerationRecipe::PromptSvg],
+            "svg" => vec![GenerationRecipe::ImageSvg],
+            "vectorize" => vec![GenerationRecipe::Vectorize],
+            _ => Vec::new(),
+        }
+    }
+
+    fn hosted_creation(&self) -> bool {
+        !self.id.starts_with("fanta-")
+            && !self.recipes().is_empty()
+            && (self.capabilities["hosted"] == true
+                || self.capabilities["gateway"].is_object()
+                || (self.kind == "image" && self.id == "flux-schnell")
+                || (self.kind == "chat"
+                    && matches!(
+                        self.id.as_str(),
+                        "claude-fable-5-1"
+                            | "claude-opus-5-5"
+                            | "claude-fable-5"
+                            | "claude-sonnet-5"
+                            | "claude-opus-4-8"
+                            | "claude-haiku-4-5"
+                    )))
     }
 }
 
@@ -284,6 +390,16 @@ struct MediaOutput {
 }
 
 #[derive(Clone)]
+struct GalleryRecord {
+    id: String,
+    kind: GenerationKind,
+    model: String,
+    status: GenerationOutputStatus,
+    created_at: String,
+    outputs: Vec<MediaOutput>,
+}
+
+#[derive(Clone)]
 enum MediaLocation {
     Inline(Arc<[u8]>),
     Url(String),
@@ -301,6 +417,157 @@ struct SourceImage {
     reference: Value,
     name: String,
     preview: Preview,
+}
+
+#[derive(Clone)]
+struct VoiceSource {
+    name: String,
+    bytes: Arc<[u8]>,
+}
+
+#[cfg(target_os = "macos")]
+struct AudioPlaybackView {
+    bytes: Arc<[u8]>,
+    output: Option<rodio::MixerDeviceSink>,
+    player: Option<rodio::Player>,
+    duration: Option<Duration>,
+    playing: bool,
+    error: Option<SharedString>,
+    progress_task: Option<Task<()>>,
+}
+
+#[cfg(target_os = "macos")]
+impl AudioPlaybackView {
+    fn new(bytes: Arc<[u8]>) -> Self {
+        Self {
+            bytes,
+            output: None,
+            player: None,
+            duration: None,
+            playing: false,
+            error: None,
+            progress_task: None,
+        }
+    }
+
+    fn play(&mut self, cx: &mut Context<Self>) {
+        let result = (|| -> Result<()> {
+            if self.player.as_ref().is_none_or(rodio::Player::empty) {
+                self.player = None;
+                self.output = None;
+                let decoder = rodio::Decoder::new(Cursor::new(self.bytes.to_vec()))
+                    .context("The generated audio could not be decoded.")?;
+                self.duration = decoder.total_duration();
+                let output = rodio::DeviceSinkBuilder::open_default_sink()
+                    .context("No audio output device is available.")?;
+                let player = rodio::Player::connect_new(output.mixer());
+                player.append(decoder);
+                self.output = Some(output);
+                self.player = Some(player);
+            } else if let Some(player) = self.player.as_ref() {
+                player.play();
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                self.playing = true;
+                self.error = None;
+                if self.progress_task.is_none() {
+                    self.progress_task = Some(cx.spawn(async move |this, cx| {
+                        loop {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(250))
+                                .await;
+                            let Ok(finished) = this.update(cx, |this, cx| {
+                                let finished =
+                                    this.player.as_ref().is_none_or(rodio::Player::empty);
+                                if finished {
+                                    this.playing = false;
+                                    this.progress_task = None;
+                                }
+                                cx.notify();
+                                finished
+                            }) else {
+                                break;
+                            };
+                            if finished {
+                                break;
+                            }
+                        }
+                    }));
+                }
+            }
+            Err(error) => self.error = Some(error.to_string().into()),
+        }
+        cx.notify();
+    }
+
+    fn pause(&mut self, cx: &mut Context<Self>) {
+        if let Some(player) = self.player.as_ref() {
+            player.pause();
+        }
+        self.playing = false;
+        cx.notify();
+    }
+
+    fn close(&mut self, cx: &mut Context<Self>) {
+        self.progress_task = None;
+        if let Some(player) = self.player.take() {
+            player.stop();
+        }
+        self.output = None;
+        self.playing = false;
+        cx.notify();
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Render for AudioPlaybackView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let position = self
+            .player
+            .as_ref()
+            .map(rodio::Player::get_pos)
+            .unwrap_or_default();
+        let duration = self.duration.unwrap_or_default();
+        let label = format!(
+            "{:02}:{:02} / {:02}:{:02}",
+            position.as_secs() / 60,
+            position.as_secs() % 60,
+            duration.as_secs() / 60,
+            duration.as_secs() % 60,
+        );
+        v_flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .child(Label::new("Audio preview").size(LabelSize::Large))
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        Button::new(
+                            "audio-playback-toggle",
+                            if self.playing { "Pause" } else { "Play" },
+                        )
+                        .style(ButtonStyle::Filled)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if this.playing {
+                                this.pause(cx)
+                            } else {
+                                this.play(cx)
+                            }
+                        })),
+                    )
+                    .child(Label::new(label).color(Color::Muted)),
+            )
+            .when_some(self.error.clone(), |element, error| {
+                element.child(Label::new(error).color(Color::Error))
+            })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -518,6 +785,19 @@ struct GenerationWorkspace {
     client: Arc<Client>,
     base_url: String,
     mode: GenerationMode,
+    recipe: GenerationRecipe,
+    generation_screen: Option<Entity<GenerationScreen>>,
+    _generation_screen_subscription: Option<Subscription>,
+    screen_options: HashMap<(String, String), String>,
+    screen_drafts: HashMap<GenerationKind, GenerationDraft>,
+    selected_template: Option<SharedString>,
+    member_id: Option<String>,
+    gallery: Vec<GalleryRecord>,
+    gallery_before: Option<String>,
+    gallery_task: Option<Task<()>>,
+    gallery_previews: HashMap<String, Arc<Image>>,
+    gallery_preview_task: Option<Task<()>>,
+    play_after_preview: bool,
     vector_operation: VectorOperation,
     models: Vec<GenerationModel>,
     selected_model: Option<String>,
@@ -531,6 +811,9 @@ struct GenerationWorkspace {
     duration: Entity<InputField>,
     strength: Entity<InputField>,
     source: Option<SourceImage>,
+    end_frame: Option<SourceImage>,
+    voice_reference: Option<VoiceSource>,
+    voice_consent_granted: bool,
     mask: Option<Arc<[u8]>>,
     points: Vec<MaskPoint>,
     exclude_points: bool,
@@ -541,6 +824,8 @@ struct GenerationWorkspace {
     prepared_video: Option<Arc<generation_media::PreparedVideo>>,
     #[cfg(target_os = "macos")]
     playback: Option<Entity<crate::video_playback::VideoPlaybackView>>,
+    #[cfg(target_os = "macos")]
+    audio_playback: Option<Entity<AudioPlaybackView>>,
     #[cfg(all(test, target_os = "macos"))]
     playback_factory: Option<
         Box<dyn Fn(Arc<[u8]>, &mut App) -> Entity<crate::video_playback::VideoPlaybackView>>,
@@ -572,14 +857,11 @@ pub(crate) fn register(workspace: &mut Workspace) {
     workspace.register_action(|workspace, _: &GenerateVideo, window, cx| {
         open(workspace, GenerationMode::Video, None, window, cx);
     });
+    workspace.register_action(|workspace, _: &GenerateAudio, window, cx| {
+        open(workspace, GenerationMode::Audio, None, window, cx);
+    });
     workspace.register_action(|workspace, _: &GenerateVector, window, cx| {
         open(workspace, GenerationMode::Vector, None, window, cx);
-    });
-    workspace.register_action(|workspace, _: &GenerateDesign, window, cx| {
-        open(workspace, GenerationMode::Design, None, window, cx);
-    });
-    workspace.register_action(|workspace, _: &GenerateMasks, window, cx| {
-        open(workspace, GenerationMode::Masks, None, window, cx);
     });
 }
 
@@ -620,6 +902,933 @@ pub(crate) fn open_from_canvas(
 }
 
 impl GenerationWorkspace {
+    fn mount_generation_screen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(old) = self.generation_screen.take() {
+            let kind = old.read(cx).kind();
+            self.screen_drafts.insert(kind, old.read(cx).draft(cx));
+        }
+        self._generation_screen_subscription = None;
+        let Some(kind) = self.mode.generation_kind() else {
+            return;
+        };
+        let data = self.generation_view_data(cx);
+        let screen = cx.new(|cx| GenerationScreen::new("fanta-generation", kind, data, window, cx));
+        if let Some(draft) = self.screen_drafts.get(&kind).cloned() {
+            screen.update(cx, |screen, cx| screen.set_draft(draft, window, cx));
+        }
+        let subscription = cx.subscribe_in(
+            &screen,
+            window,
+            |this, _, action: &GenerationAction, window, cx| {
+                this.handle_generation_action(action.clone(), window, cx);
+            },
+        );
+        self.generation_screen = Some(screen);
+        self._generation_screen_subscription = Some(subscription);
+    }
+
+    fn screen_model(
+        &self,
+        model: &GenerationModel,
+        recipe: GenerationRecipe,
+        prompt_units: usize,
+    ) -> ScreenModel {
+        let gateway = &model.capabilities["gateway"];
+        let description = if gateway.is_object()
+            && matches!(
+                recipe,
+                GenerationRecipe::TextVideo | GenerationRecipe::ImageVideo
+            ) {
+            let duration = gateway["duration"].as_u64().unwrap_or(0);
+            let resolution = gateway["resolution"]
+                .as_str()
+                .or_else(|| gateway["aspectRatio"].as_str())
+                .unwrap_or("model resolution");
+            format!("{duration}s · {resolution} · silent output")
+        } else {
+            match recipe {
+                GenerationRecipe::TextImage => "Create an image from text",
+                GenerationRecipe::TextVideo => "Generate a scene from text",
+                GenerationRecipe::ImageVideo => "Animate a start frame",
+                GenerationRecipe::Speech => "Generate spoken audio",
+                GenerationRecipe::Music => "Compose music from a prompt",
+                GenerationRecipe::PromptSvg => "Create editable SVG artwork",
+                GenerationRecipe::ImageSvg => "Trace an image to SVG",
+                GenerationRecipe::Vectorize => "Convert an image to vectors",
+            }
+            .to_owned()
+        };
+        let mut screen = ScreenModel::new(&model.id, model.label(), recipe)
+            .max_prompt_chars(Some(
+                model.capabilities["prompt_limit"]
+                    .as_u64()
+                    .and_then(|limit| usize::try_from(limit).ok())
+                    .unwrap_or(if model.capabilities["hosted"] == true {
+                        10_000
+                    } else {
+                        1_200
+                    }),
+            ))
+            .description(description)
+            .supports_prompt(recipe != GenerationRecipe::ImageSvg)
+            .supports_negative(model.capabilities["negative_prompt"]["supported"] == true)
+            .supports_seed(
+                model.capabilities["seed"]["supported"] == true
+                    || model.capabilities["seed"]["optional"] == true,
+            )
+            .supports_voice_reference(matches!(
+                model.id.as_str(),
+                "fanta-voice-1" | "fanta-voice-turbo-1" | "chatterbox-tts" | "chatterbox-tts-turbo"
+            ))
+            .supports_end_frame(
+                recipe == GenerationRecipe::ImageVideo
+                    && model.capabilities["inputs"]["end_frame"]["request_field"]
+                        .as_str()
+                        .is_some_and(|field| !field.is_empty()),
+            )
+            .option_groups(self.screen_option_groups(model, recipe));
+        let provider = model.capabilities["provider"]
+            .as_str()
+            .filter(|provider| !matches!(*provider, "Replicate" | "AI Gateway"))
+            .map(str::to_owned)
+            .unwrap_or_else(|| provider_mark(&model.id).0.to_owned());
+        screen = screen.provider(provider);
+        let (_, logo) = provider_mark(&model.id);
+        if let Some((key, format, bytes)) = logo {
+            screen = screen.logo(key, Arc::new(Image::from_bytes(format, bytes.to_vec())));
+        }
+        let unit = model.pricing["unit"].as_str().unwrap_or("output");
+        if unit == "output" {
+            if let Some(credits) = model.credits_per_output {
+                let outputs = self
+                    .screen_options
+                    .get(&(model.id.clone(), "num_outputs".into()))
+                    .and_then(|value| value.parse::<usize>().ok())
+                    .unwrap_or(1);
+                if outputs > 1 {
+                    screen = screen.credit_hint(format!(
+                        "Est. {:.0} credits · {outputs} outputs",
+                        (credits * outputs as f64).ceil()
+                    ));
+                } else if credits.fract() == 0. && credits >= 0. && credits <= u32::MAX as f64 {
+                    screen = screen.credits_per_output(credits as u32);
+                } else {
+                    screen = screen.credit_hint(format!("{credits:.2} credits / output"));
+                }
+            }
+        } else if let Some(rate) = model.pricing["credits_per_unit"].as_f64() {
+            match unit {
+                "second" => {
+                    let selected = |key: &str| {
+                        self.screen_options
+                            .get(&(model.id.clone(), key.into()))
+                            .and_then(|value| value.parse::<f64>().ok())
+                            .or_else(|| model.capabilities["controls"][key]["default"].as_f64())
+                    };
+                    let seconds = selected("duration")
+                        .or_else(|| selected("duration_s"))
+                        .or_else(|| {
+                            selected("music_length_ms").map(|milliseconds| milliseconds / 1000.)
+                        })
+                        .or_else(|| model.pricing["default_units"].as_f64());
+                    if let Some(seconds) =
+                        seconds.filter(|seconds| seconds.is_finite() && *seconds > 0.)
+                    {
+                        screen = screen.credit_hint(format!(
+                            "Est. {:.0} credits · {seconds}s",
+                            (rate * seconds).ceil()
+                        ));
+                    } else {
+                        screen = screen.credit_hint(format!("{rate:.3} credits / second"));
+                    }
+                }
+                "character" => {
+                    if prompt_units > 0 {
+                        screen = screen.credit_hint(format!(
+                            "Est. {:.0} credits · {prompt_units} chars",
+                            (rate * prompt_units as f64).ceil()
+                        ));
+                    } else {
+                        screen = screen.credit_hint(format!("{rate:.3} credits / character"));
+                    }
+                }
+                _ => {}
+            }
+        } else if let Some(estimate) = model.pricing["estimated_credits"].as_f64() {
+            screen = screen.credit_hint(format!("Est. {estimate:.0} credits · default settings"));
+        } else if let Some(credits) = model.credits_per_output {
+            screen = screen.credit_hint(format!("Est. {credits:.0} credits · default settings"));
+        } else if model.kind == "chat" {
+            screen = screen.credit_hint("Usage-based");
+        }
+        screen
+    }
+
+    fn screen_option_groups(
+        &self,
+        model: &GenerationModel,
+        recipe: GenerationRecipe,
+    ) -> Vec<GenerationOptionGroup> {
+        let mut groups = Vec::new();
+        if let Some(controls) = model.capabilities["controls"].as_object() {
+            for (key, control) in controls {
+                let constrained_value = (self.end_frame.is_some()
+                    && recipe == GenerationRecipe::ImageVideo)
+                    .then(|| model.capabilities["constraints"]["end_frame"][key].as_str())
+                    .flatten();
+                let choices = control["values"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|value| {
+                        let value = option_value(value)?;
+                        if constrained_value.is_some_and(|required| value != required) {
+                            return None;
+                        }
+                        Some(GenerationChoice::new(value.clone(), value))
+                    })
+                    .collect::<Vec<_>>();
+                if choices.is_empty() {
+                    continue;
+                }
+                let selected = constrained_value
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        self.screen_options
+                            .get(&(model.id.clone(), key.clone()))
+                            .cloned()
+                            .or_else(|| option_value(&control["default"]))
+                    })
+                    .unwrap_or_else(|| choices[0].value.to_string());
+                let group =
+                    GenerationOptionGroup::new(key.as_str(), option_label(key), choices, selected);
+                groups.push(group.advanced(matches!(key.as_str(), "fps" | "seed" | "speed")));
+            }
+            return groups;
+        }
+        if model.capabilities["gateway"].is_object() {
+            if recipe == GenerationRecipe::TextImage {
+                let sizes = model.sizes();
+                if !sizes.is_empty() {
+                    let selected = self
+                        .screen_options
+                        .get(&(model.id.clone(), "canvas".into()))
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            model.capabilities["size"]["default"]
+                                .as_str()
+                                .unwrap_or(&sizes[0])
+                                .to_owned()
+                        });
+                    groups.push(GenerationOptionGroup::new(
+                        "canvas",
+                        "Canvas size",
+                        sizes
+                            .iter()
+                            .map(|size| GenerationChoice::new(size.as_str(), size.as_str())),
+                        selected,
+                    ));
+                }
+                let max = model.capabilities["num_outputs"]["max"]
+                    .as_u64()
+                    .unwrap_or(1)
+                    .min(4);
+                if max > 1 {
+                    let selected = self
+                        .screen_options
+                        .get(&(model.id.clone(), "num_outputs".into()))
+                        .cloned()
+                        .unwrap_or_else(|| "1".into());
+                    groups.push(GenerationOptionGroup::new(
+                        "num_outputs",
+                        "Outputs",
+                        (1..=max).map(|n| GenerationChoice::new(n.to_string(), n.to_string())),
+                        selected,
+                    ));
+                }
+            }
+            return groups;
+        }
+        if recipe == GenerationRecipe::TextImage {
+            let sizes = model.sizes();
+            if !sizes.is_empty() {
+                let selected = self
+                    .screen_options
+                    .get(&(model.id.clone(), "canvas".into()))
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        model.capabilities["size"]["default"]
+                            .as_str()
+                            .unwrap_or(&sizes[0])
+                            .to_owned()
+                    });
+                groups.push(GenerationOptionGroup::new(
+                    "canvas",
+                    "Canvas size",
+                    sizes
+                        .iter()
+                        .map(|size| GenerationChoice::new(size.as_str(), size.as_str())),
+                    selected,
+                ));
+            }
+            for (key, label, values) in [
+                ("steps", "Steps", &[10, 20, 30, 40, 50][..]),
+                ("guidance", "Prompt guidance", &[1, 2, 4, 6, 8, 10][..]),
+            ] {
+                if model.capabilities[key].is_object() {
+                    let selected = self
+                        .screen_options
+                        .get(&(model.id.clone(), key.into()))
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            option_value(&model.capabilities[key]["default"])
+                                .unwrap_or_else(|| values[0].to_string())
+                        });
+                    groups.push(
+                        GenerationOptionGroup::new(
+                            key,
+                            label,
+                            values.iter().map(|value| {
+                                let value = value.to_string();
+                                GenerationChoice::new(value.clone(), value)
+                            }),
+                            selected,
+                        )
+                        .advanced(true),
+                    );
+                }
+            }
+        }
+        if matches!(
+            recipe,
+            GenerationRecipe::TextVideo | GenerationRecipe::ImageVideo
+        ) {
+            let hd = !model.id.contains("ltx");
+            let canvas = if hd {
+                ["1280x720", "720x1280", "768x768"]
+            } else {
+                ["768x512", "512x768", "768x768"]
+            };
+            for (key, label, choices, default, advanced) in [
+                (
+                    "frames",
+                    "Duration",
+                    vec![
+                        ("17", "1 second"),
+                        ("33", "2 seconds"),
+                        ("49", "3 seconds"),
+                        ("65", "4 seconds"),
+                        ("81", "5 seconds"),
+                    ],
+                    "49",
+                    false,
+                ),
+                (
+                    "canvas",
+                    "Frame size",
+                    canvas.iter().map(|size| (*size, *size)).collect(),
+                    canvas[0],
+                    false,
+                ),
+                (
+                    "fps",
+                    "Frame rate",
+                    vec![("16", "16 fps"), ("24", "24 fps")],
+                    "16",
+                    true,
+                ),
+            ] {
+                let selected = self
+                    .screen_options
+                    .get(&(model.id.clone(), key.into()))
+                    .cloned()
+                    .unwrap_or_else(|| default.to_owned());
+                groups.push(
+                    GenerationOptionGroup::new(
+                        key,
+                        label,
+                        choices
+                            .into_iter()
+                            .map(|(value, label)| GenerationChoice::new(value, label)),
+                        selected,
+                    )
+                    .advanced(advanced),
+                );
+            }
+        }
+        if recipe == GenerationRecipe::Vectorize {
+            for (key, label, choices, default) in [
+                (
+                    "mode",
+                    "Style",
+                    vec![
+                        ("line_art", "Line art"),
+                        ("flat_color", "Flat color"),
+                        ("trace", "Trace"),
+                    ],
+                    "line_art",
+                ),
+                (
+                    "detail",
+                    "Detail",
+                    vec![("low", "Low"), ("medium", "Medium"), ("high", "High")],
+                    "medium",
+                ),
+            ] {
+                let selected = self
+                    .screen_options
+                    .get(&(model.id.clone(), key.into()))
+                    .cloned()
+                    .unwrap_or_else(|| default.into());
+                groups.push(GenerationOptionGroup::new(
+                    key,
+                    label,
+                    choices
+                        .into_iter()
+                        .map(|(value, label)| GenerationChoice::new(value, label)),
+                    selected,
+                ));
+            }
+        }
+        if recipe == GenerationRecipe::Speech && model.id.contains("kokoro") {
+            let selected = self
+                .screen_options
+                .get(&(model.id.clone(), "speed".into()))
+                .cloned()
+                .unwrap_or_else(|| "1.0".into());
+            groups.push(GenerationOptionGroup::new(
+                "speed",
+                "Pace",
+                [
+                    GenerationChoice::new("0.8", "Relaxed"),
+                    GenerationChoice::new("1.0", "Natural"),
+                    GenerationChoice::new("1.2", "Brisk"),
+                ],
+                selected,
+            ));
+        }
+        groups
+    }
+
+    fn generation_view_data(&self, cx: &App) -> GenerationViewData {
+        let prompt_units = self
+            .generation_screen
+            .as_ref()
+            .filter(|screen| Some(screen.read(cx).kind()) == self.mode.generation_kind())
+            .map(|screen| screen.read(cx).draft(cx).prompt.encode_utf16().count())
+            .or_else(|| {
+                self.mode
+                    .generation_kind()
+                    .and_then(|kind| self.screen_drafts.get(&kind))
+                    .map(|draft| draft.prompt.encode_utf16().count())
+            })
+            .unwrap_or(0);
+        let models = self
+            .models
+            .iter()
+            .filter(|model| model.hosted_creation())
+            .flat_map(|model| {
+                model
+                    .recipes()
+                    .into_iter()
+                    .map(|recipe| self.screen_model(model, recipe, prompt_units))
+            })
+            .collect::<Vec<_>>();
+        let selected_model_id = self.selected_model.as_ref().and_then(|id| {
+            models
+                .iter()
+                .any(|model| model.id.as_ref() == id && model.recipe == self.recipe)
+                .then(|| SharedString::from(id.clone()))
+        });
+        let source = self.source.as_ref().map(|source| {
+            GenerationSource::new(source.reference.to_string(), source.name.clone())
+                .preview(source.preview.image.clone())
+        });
+        let end_frame = self.end_frame.as_ref().map(|source| {
+            GenerationSource::new(source.reference.to_string(), source.name.clone())
+                .preview(source.preview.image.clone())
+        });
+        let voice_reference = self
+            .voice_reference
+            .as_ref()
+            .map(|source| GenerationVoiceReference::new(source.name.clone(), source.name.clone()));
+        let mut outputs = Vec::new();
+        let active_id = self.active_run.as_ref().and_then(RunSummary::generation_id);
+        if let Some(run) = self.active_run.as_ref() {
+            let kind = self
+                .models
+                .iter()
+                .find(|model| model.id == run.model)
+                .and_then(|model| model.recipes().first().copied())
+                .map(GenerationRecipe::kind)
+                .unwrap_or_else(|| self.mode.generation_kind().unwrap_or(GenerationKind::Image));
+            if self.outputs.is_empty() && (self.pending || self.task.is_some()) {
+                outputs.push(
+                    GenerationOutput::new(
+                        format!("gen:{}:0", run.generation_id().unwrap_or("vector")),
+                        kind,
+                        "Generating…",
+                        run.model.clone(),
+                        GenerationOutputStatus::Running,
+                    )
+                    .prompt(run.prompt.clone()),
+                );
+            }
+            for (index, output) in self.outputs.iter().enumerate() {
+                let id = format!("gen:{}:{index}", run.generation_id().unwrap_or("vector"));
+                let mut entry = GenerationOutput::new(
+                    id.clone(),
+                    kind,
+                    output.label.clone(),
+                    run.model.clone(),
+                    GenerationOutputStatus::Succeeded,
+                )
+                .detail(output.mime.clone());
+                if !run.prompt.is_empty() {
+                    entry = entry.prompt(run.prompt.clone());
+                }
+                if let Some(preview) = self.gallery_previews.get(&id) {
+                    entry = entry.preview(preview.clone());
+                }
+                if index == self.selected_output {
+                    if let Some(preview) = self.preview.as_ref() {
+                        entry = entry.preview(preview.image.clone());
+                    }
+                    #[cfg(target_os = "macos")]
+                    if let Some(playback) = self.playback.as_ref() {
+                        entry = entry.playback_view(playback.clone());
+                    }
+                    #[cfg(target_os = "macos")]
+                    if let Some(playback) = self.audio_playback.as_ref() {
+                        entry = entry.playback_view(playback.clone());
+                    }
+                }
+                outputs.push(entry);
+            }
+        }
+        for record in &self.gallery {
+            if Some(record.id.as_str()) == active_id {
+                continue;
+            }
+            let count = record.outputs.len().max(1);
+            for index in 0..count {
+                let id = format!("gen:{}:{index}", record.id);
+                let mut entry = GenerationOutput::new(
+                    id.clone(),
+                    record.kind,
+                    format!("{} · {}", record.model, record.created_at),
+                    record.model.clone(),
+                    record.status,
+                )
+                .created_at(record.created_at.clone());
+                if let Some(output) = record.outputs.get(index) {
+                    entry = entry.detail(output.mime.clone());
+                }
+                if let Some(run) = self
+                    .history
+                    .iter()
+                    .find(|run| run.generation_id() == Some(record.id.as_str()))
+                {
+                    entry = entry.prompt(run.prompt.clone());
+                }
+                if let Some(preview) = self.gallery_previews.get(&id) {
+                    entry = entry.preview(preview.clone());
+                }
+                outputs.push(entry);
+            }
+        }
+        for run in &self.history {
+            let Some(id) = run.generation_id() else {
+                continue;
+            };
+            if Some(id) == active_id || self.gallery.iter().any(|record| record.id == id) {
+                continue;
+            }
+            let kind = self
+                .models
+                .iter()
+                .find(|model| model.id == run.model)
+                .and_then(|model| model.recipes().first().copied())
+                .map(GenerationRecipe::kind)
+                .unwrap_or(GenerationKind::Image);
+            outputs.push(
+                GenerationOutput::new(
+                    format!("gen:{id}:0"),
+                    kind,
+                    run.prompt.chars().take(48).collect::<String>(),
+                    run.model.clone(),
+                    GenerationOutputStatus::Succeeded,
+                )
+                .prompt(run.prompt.clone())
+                .detail("Saved experiment"),
+            );
+        }
+        GenerationViewData {
+            models,
+            selected_recipe: Some(self.recipe),
+            templates: generation_templates(),
+            outputs,
+            selected_model_id,
+            selected_template_id: self.selected_template.clone(),
+            selected_output_id: (!self.outputs.is_empty()).then(|| {
+                format!(
+                    "gen:{}:{}",
+                    active_id.unwrap_or("vector"),
+                    self.selected_output
+                )
+                .into()
+            }),
+            source,
+            end_frame,
+            voice_reference,
+            voice_consent_granted: self.voice_consent_granted,
+            busy: self.task.is_some() || self.unresolved_submission.is_some(),
+            error: self.error.clone(),
+            has_more: self.gallery_before.is_some(),
+        }
+    }
+
+    fn handle_generation_action(
+        &mut self,
+        action: GenerationAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            GenerationAction::KindSelected(kind) => {
+                let mode = match kind {
+                    GenerationKind::Image => GenerationMode::Image,
+                    GenerationKind::Video => GenerationMode::Video,
+                    GenerationKind::Audio => GenerationMode::Audio,
+                    GenerationKind::Svg => GenerationMode::Vector,
+                };
+                self.set_mode(mode, window, cx);
+            }
+            GenerationAction::RecipeSelected(recipe) => {
+                self.recipe = recipe;
+                self.vector_operation = if recipe == GenerationRecipe::PromptSvg {
+                    VectorOperation::Create
+                } else {
+                    VectorOperation::Trace
+                };
+                self.selected_model = self
+                    .models
+                    .iter()
+                    .find(|model| model.hosted_creation() && model.recipes().contains(&recipe))
+                    .map(|model| model.id.clone());
+                self.selected_template = None;
+                cx.notify();
+            }
+            GenerationAction::ModelSelected { id } => {
+                let id = id.to_string();
+                if let Some(model) = self
+                    .models
+                    .iter()
+                    .find(|model| model.id == id && model.hosted_creation())
+                {
+                    if let Some(recipe) = model
+                        .recipes()
+                        .into_iter()
+                        .find(|recipe| *recipe == self.recipe)
+                    {
+                        self.recipe = recipe;
+                        self.selected_model = Some(id);
+                        self.selected_template = None;
+                        cx.notify();
+                    }
+                }
+            }
+            GenerationAction::OptionSelected {
+                model_id,
+                key,
+                value,
+            } => {
+                self.screen_options
+                    .insert((model_id.to_string(), key.to_string()), value.to_string());
+                cx.notify();
+            }
+            GenerationAction::DraftChanged => cx.notify(),
+            GenerationAction::SourceRequested => self.choose_source(cx),
+            GenerationAction::SourceCleared => {
+                self.source = None;
+                self.end_frame = None;
+                cx.notify();
+            }
+            GenerationAction::EndFrameRequested => self.choose_end_frame(cx),
+            GenerationAction::EndFrameCleared => {
+                self.end_frame = None;
+                cx.notify();
+            }
+            GenerationAction::VoiceReferenceRequested => self.choose_voice_reference(cx),
+            GenerationAction::VoiceReferenceCleared => {
+                self.voice_reference = None;
+                self.voice_consent_granted = false;
+                cx.notify();
+            }
+            GenerationAction::VoiceConsentChanged(granted) => {
+                self.voice_consent_granted = granted;
+                cx.notify();
+            }
+            GenerationAction::TemplateSelected { id } => {
+                self.selected_template = Some(id.clone());
+                let recipe = match id.as_ref() {
+                    "audio-music" => Some(GenerationRecipe::Music),
+                    "audio-narration" => Some(GenerationRecipe::Speech),
+                    "svg-symbol" | "svg-monogram" => Some(GenerationRecipe::PromptSvg),
+                    "video-orbit" | "video-atmosphere" => Some(GenerationRecipe::TextVideo),
+                    "image-editorial" | "image-product" => Some(GenerationRecipe::TextImage),
+                    _ => None,
+                };
+                if let Some(recipe) = recipe {
+                    self.recipe = recipe;
+                    self.selected_model = self
+                        .models
+                        .iter()
+                        .find(|model| model.hosted_creation() && model.recipes().contains(&recipe))
+                        .map(|model| model.id.clone());
+                }
+                if let Some(model_id) = generation_templates()
+                    .into_iter()
+                    .find(|template| template.id == id)
+                    .and_then(|template| template.model_id)
+                {
+                    self.selected_model = Some(model_id.to_string());
+                }
+                cx.notify();
+            }
+            GenerationAction::GenerateRequested(submission) => {
+                self.generate_screen_submission(submission, cx);
+            }
+            GenerationAction::OutputSelected { id } => {
+                self.select_output_id(&id, cx);
+                cx.notify();
+            }
+            GenerationAction::PreviewClosed { .. } => {
+                self.play_after_preview = false;
+                #[cfg(target_os = "macos")]
+                if let Some(playback) = self.playback.as_ref() {
+                    playback.update(cx, |playback, cx| playback.pause(cx));
+                }
+                #[cfg(target_os = "macos")]
+                if let Some(playback) = self.audio_playback.as_ref() {
+                    playback.update(cx, |playback, cx| playback.pause(cx));
+                }
+            }
+            GenerationAction::DownloadRequested { id } => {
+                if self.select_output_id(&id, cx) {
+                    self.save_output(cx);
+                }
+            }
+            GenerationAction::PlayRequested { id } => {
+                if !self.select_output_id(&id, cx) {
+                    return;
+                }
+                self.play_after_preview = self.preview_task.is_some();
+                #[cfg(target_os = "macos")]
+                if let Some(playback) = self.playback.as_ref() {
+                    playback.update(cx, |playback, cx| playback.play(cx));
+                }
+                #[cfg(target_os = "macos")]
+                if let Some(playback) = self.audio_playback.as_ref() {
+                    playback.update(cx, |playback, cx| playback.play(cx));
+                }
+                #[cfg(not(target_os = "macos"))]
+                self.play_output(cx);
+            }
+            GenerationAction::ReusePromptRequested { id } => {
+                let prompt = self
+                    .generation_view_data(cx)
+                    .outputs
+                    .into_iter()
+                    .find(|output| output.id == id)
+                    .and_then(|output| output.prompt);
+                if let (Some(screen), Some(prompt)) = (self.generation_screen.as_ref(), prompt) {
+                    let kind = screen.read(cx).kind();
+                    let mut draft = screen.read(cx).draft(cx);
+                    draft.prompt = prompt;
+                    screen.update(cx, |screen, cx| screen.set_draft(draft.clone(), window, cx));
+                    self.screen_drafts.insert(kind, draft);
+                }
+                self.selected_template = None;
+                cx.notify();
+            }
+            GenerationAction::RefreshRequested => {
+                self.refresh_catalog(cx);
+                self.refresh_gallery(false, cx);
+            }
+            GenerationAction::LoadMoreRequested => self.refresh_gallery(true, cx),
+        }
+    }
+
+    fn generate_screen_submission(
+        &mut self,
+        submission: GenerationSubmission,
+        cx: &mut Context<Self>,
+    ) {
+        self.sync_account(cx);
+        if self.task.is_some() {
+            return;
+        }
+        if self.unresolved_submission.is_some() {
+            self.fail(
+                anyhow!("Recover the saved request before starting a new generation."),
+                cx,
+            );
+            return;
+        }
+        let result: Result<(GenerationModel, Value)> = (|| {
+            let model = self
+                .models
+                .iter()
+                .find(|model| model.id == submission.model_id && model.hosted_creation())
+                .cloned()
+                .context("The selected model is no longer available. Refresh models.")?;
+            ensure!(
+                model.recipes().contains(&submission.recipe),
+                "The selected model does not support this operation."
+            );
+            ensure!(
+                self.recipe == submission.recipe,
+                "The operation changed. Review the model and try again."
+            );
+            submission.validate_against(&self.screen_model(
+                &model,
+                submission.recipe,
+                submission.prompt.encode_utf16().count(),
+            ))?;
+            if let Some(source_id) = submission.source_id.as_ref() {
+                let selected_source: Value = serde_json::from_str(source_id.as_ref())?;
+                ensure!(
+                    self.source
+                        .as_ref()
+                        .is_some_and(|source| source.reference == selected_source),
+                    "The source image changed. Review the start frame and try again."
+                );
+            }
+            if let Some(end_frame_id) = submission.end_frame_id.as_ref() {
+                let selected_end_frame: Value = serde_json::from_str(end_frame_id.as_ref())?;
+                ensure!(
+                    self.end_frame
+                        .as_ref()
+                        .is_some_and(|source| source.reference == selected_end_frame),
+                    "The end frame changed. Review it and try again."
+                );
+            }
+            if let Some(reference_id) = submission.voice_reference_id.as_ref() {
+                ensure!(
+                    self.voice_reference
+                        .as_ref()
+                        .is_some_and(|source| source.name == reference_id.as_ref()),
+                    "The reference voice changed. Choose it again."
+                );
+            }
+            let request = build_screen_request(
+                &model,
+                &submission,
+                self.source.as_ref(),
+                self.end_frame.as_ref(),
+                self.voice_reference.as_ref(),
+            )?;
+            Ok((model, request))
+        })();
+        let (model, request) = match result {
+            Ok(result) => result,
+            Err(error) => {
+                self.fail(error, cx);
+                return;
+            }
+        };
+        if submission.recipe == GenerationRecipe::PromptSvg && model.kind == "chat" {
+            let size = submission
+                .options
+                .iter()
+                .find(|option| option.key == "canvas")
+                .map(|option| option.value.to_string())
+                .unwrap_or_else(|| "1024x1024".into());
+            self.generate_vectors_with(model, submission.prompt.to_string(), size, cx);
+            return;
+        }
+        self.submit(
+            Submission {
+                key: uuid::Uuid::new_v4().to_string(),
+                request,
+                model: model.id,
+                prompt: submission.prompt.to_string(),
+                source: self.source.clone(),
+                account: self.client.account_access_token(),
+                mode: self.mode,
+            },
+            cx,
+        );
+    }
+
+    fn select_output_id(&mut self, id: &str, cx: &mut Context<Self>) -> bool {
+        let Some((generation_id, index)) = parse_generation_output_id(id) else {
+            return false;
+        };
+        if self
+            .active_run
+            .as_ref()
+            .is_some_and(|run| run.generation_id().unwrap_or("vector") == generation_id)
+        {
+            if index < self.outputs.len() {
+                if index != self.selected_output {
+                    self.selected_output = index;
+                    self.load_preview(cx);
+                }
+                return true;
+            }
+            return false;
+        }
+        if let Some(record) = self
+            .gallery
+            .iter()
+            .find(|record| record.id == generation_id)
+            .cloned()
+        {
+            let prompt = self
+                .history
+                .iter()
+                .find(|run| run.generation_id() == Some(generation_id))
+                .map(|run| run.prompt.clone())
+                .unwrap_or_default();
+            let run = RunSummary {
+                result: RunResult::Generation {
+                    id: record.id.clone(),
+                },
+                model: record.model,
+                prompt,
+                source: None,
+            };
+            if record.outputs.is_empty() {
+                self.refresh_gallery(false, cx);
+                return false;
+            }
+            if index >= record.outputs.len() {
+                return false;
+            }
+            self.active_run = Some(run);
+            self.outputs = record.outputs;
+            self.selected_output = index;
+            self.pending = matches!(
+                record.status,
+                GenerationOutputStatus::Queued | GenerationOutputStatus::Running
+            );
+            self.load_preview(cx);
+            cx.notify();
+            return true;
+        }
+        if let Some(run) = self
+            .history
+            .iter()
+            .find(|run| run.generation_id() == Some(generation_id))
+            .cloned()
+        {
+            self.check_status(run, cx);
+            return true;
+        }
+        false
+    }
     fn new(
         workspace: WeakEntity<Workspace>,
         canvas_item: Option<WeakEntity<FigItem>>,
@@ -657,6 +1866,19 @@ impl GenerationWorkspace {
                 .trim_end_matches('/')
                 .to_owned(),
             mode,
+            recipe: mode.default_recipe(),
+            generation_screen: None,
+            _generation_screen_subscription: None,
+            screen_options: HashMap::new(),
+            screen_drafts: HashMap::new(),
+            selected_template: None,
+            member_id: None,
+            gallery: Vec::new(),
+            gallery_before: None,
+            gallery_task: None,
+            gallery_previews: HashMap::new(),
+            gallery_preview_task: None,
+            play_after_preview: false,
             vector_operation: VectorOperation::Create,
             models: Vec::new(),
             selected_model: None,
@@ -670,6 +1892,9 @@ impl GenerationWorkspace {
             duration: cx.new(|cx| InputField::new(window, cx, "5")),
             strength: cx.new(|cx| InputField::new(window, cx, "0.8")),
             source: None,
+            end_frame: None,
+            voice_reference: None,
+            voice_consent_granted: false,
             mask: None,
             points: Vec::new(),
             exclude_points: false,
@@ -680,6 +1905,8 @@ impl GenerationWorkspace {
             prepared_video: None,
             #[cfg(target_os = "macos")]
             playback: None,
+            #[cfg(target_os = "macos")]
+            audio_playback: None,
             #[cfg(all(test, target_os = "macos"))]
             playback_factory: None,
             playback_active: true,
@@ -702,6 +1929,7 @@ impl GenerationWorkspace {
             preview_task: None,
         };
         this.refresh_catalog(cx);
+        this.mount_generation_screen(window, cx);
         this
     }
 
@@ -715,6 +1943,14 @@ impl GenerationWorkspace {
         self.catalog_request = None;
         self.models.clear();
         self.selected_model = None;
+        self.screen_drafts.clear();
+        self.member_id = None;
+        self.gallery.clear();
+        self.gallery_before = None;
+        self.gallery_task = None;
+        self.gallery_previews.clear();
+        self.gallery_preview_task = None;
+        self.play_after_preview = false;
         self.task = None;
         self.preview_task = None;
         self.prepared_video = None;
@@ -724,6 +1960,9 @@ impl GenerationWorkspace {
         self.recovered_submissions.clear();
         self.journal = None;
         self.source = None;
+        self.end_frame = None;
+        self.voice_reference = None;
+        self.voice_consent_granted = false;
         self.mask = None;
         self.points.clear();
         self.outputs.clear();
@@ -791,6 +2030,10 @@ impl GenerationWorkspace {
                         .as_str()
                         .context("Your account organization is unavailable.")?,
                 )?;
+                let member_id = profile["user"]["id"]
+                    .as_str()
+                    .context("Your account identity is unavailable.")?
+                    .to_owned();
                 let journal = GenerationJournal::new(store, scope)?;
                 let snapshot = journal.load().await?;
                 let restored = cx
@@ -799,7 +2042,7 @@ impl GenerationWorkspace {
                         async move { restore_journal(snapshot, account) }
                     })
                     .await?;
-                anyhow::Ok((models, journal, restored))
+                anyhow::Ok((models, journal, restored, member_id))
             }
             .await;
             this.update(cx, |this, cx| {
@@ -813,18 +2056,185 @@ impl GenerationWorkspace {
                 this.catalog_task = None;
                 this.catalog_request = None;
                 match result {
-                    Ok((models, journal, (submissions, history))) => {
+                    Ok((models, journal, (submissions, history), member_id)) => {
                         this.models = models;
                         this.journal = Some(journal);
+                        this.member_id = Some(member_id);
                         this.restore_history(submissions, history);
                         this.choose_default_model();
+                        if this.mode.generation_kind().is_some()
+                            && !this.models.iter().any(|model| {
+                                Some(model.id.as_str()) == this.selected_model.as_deref()
+                                    && model.hosted_creation()
+                                    && model.recipes().contains(&this.recipe)
+                            })
+                        {
+                            this.selected_model = this
+                                .models
+                                .iter()
+                                .find(|model| {
+                                    model.hosted_creation()
+                                        && model.recipes().contains(&this.recipe)
+                                })
+                                .map(|model| model.id.clone());
+                        }
                         this.error = None;
+                        // Legacy recovery fixtures provide strict HTTP scripts. Gallery
+                        // requests are exercised separately from those submission flows.
+                        #[cfg(not(test))]
+                        this.refresh_gallery(false, cx);
                     }
                     Err(error) => this.error = Some(error.to_string().into()),
                 }
                 cx.notify();
             })
             .log_err();
+        }));
+    }
+
+    fn refresh_gallery(&mut self, load_more: bool, cx: &mut Context<Self>) {
+        if self.gallery_task.is_some() {
+            return;
+        }
+        let Some(member_id) = self.member_id.clone() else {
+            return;
+        };
+        let before = if load_more {
+            self.gallery_before.clone()
+        } else {
+            None
+        };
+        if load_more && before.is_none() {
+            return;
+        }
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("limit", "24")
+            .append_pair("member", &member_id)
+            .finish();
+        let query = if let Some(before) = before.as_deref() {
+            format!(
+                "{query}&{}",
+                url::form_urlencoded::Serializer::new(String::new())
+                    .append_pair("before", before)
+                    .finish()
+            )
+        } else {
+            query
+        };
+        let path = format!("/v1/generations?{query}");
+        let client = self.client.clone();
+        let base_url = self.base_url.clone();
+        let account = client.account_access_token();
+        self.gallery_task = Some(cx.spawn(async move |this, cx| {
+            let result = api_json(
+                &client,
+                &base_url,
+                Method::GET,
+                &path,
+                None,
+                None,
+                account.as_deref(),
+                cx.background_executor(),
+            )
+            .await
+            .and_then(parse_gallery_response);
+            this.update(cx, |this, cx| {
+                this.gallery_task = None;
+                if this.client.account_access_token() != account {
+                    return;
+                }
+                match result {
+                    Ok((records, next_before)) => {
+                        if load_more {
+                            for record in records {
+                                if !this.gallery.iter().any(|existing| existing.id == record.id) {
+                                    this.gallery.push(record);
+                                }
+                            }
+                        } else {
+                            this.gallery = records;
+                        }
+                        if let Some(active_id) =
+                            this.active_run.as_ref().and_then(RunSummary::generation_id)
+                        {
+                            if let Some(active_record) =
+                                this.gallery.iter().find(|record| record.id == active_id)
+                            {
+                                if !active_record.outputs.is_empty() {
+                                    this.outputs = active_record.outputs.clone();
+                                    this.pending = matches!(
+                                        active_record.status,
+                                        GenerationOutputStatus::Queued
+                                            | GenerationOutputStatus::Running
+                                    );
+                                }
+                            }
+                        }
+                        this.gallery_before = next_before;
+                        this.load_gallery_previews(cx);
+                    }
+                    Err(error) => {
+                        log::warn!("Fanta generation gallery: {error:#}");
+                        this.error = Some(format!("Gallery unavailable: {error}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .log_err();
+        }));
+    }
+
+    fn load_gallery_previews(&mut self, cx: &mut Context<Self>) {
+        self.gallery_preview_task = None;
+        let previews = self
+            .gallery
+            .iter()
+            .flat_map(|record| {
+                record
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, output)| {
+                        (format!("gen:{}:{index}", record.id), output.clone())
+                    })
+            })
+            .filter(|(id, output)| {
+                output.mime.starts_with("image/") && !self.gallery_previews.contains_key(id)
+            })
+            .take(24)
+            .collect::<Vec<_>>();
+        if previews.is_empty() {
+            return;
+        }
+        let client = self.client.clone();
+        let account = client.account_access_token();
+        self.gallery_preview_task = Some(cx.spawn(async move |this, cx| {
+            for (id, output) in previews {
+                let result = async {
+                    let bytes =
+                        media_bytes(&client, &output.location, cx.background_executor()).await?;
+                    cx.background_spawn(async move { make_preview(&bytes, &output.mime) })
+                        .await
+                }
+                .await;
+                if this
+                    .update(cx, |this, cx| {
+                        if this.client.account_access_token() != account {
+                            return false;
+                        }
+                        if let Ok(preview) = result {
+                            this.gallery_previews.insert(id, preview.image);
+                            cx.notify();
+                        }
+                        true
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            this.update(cx, |this, _| this.gallery_preview_task = None)
+                .log_err();
         }));
     }
 
@@ -843,8 +2253,14 @@ impl GenerationWorkspace {
     }
 
     fn accepts_model(&self, model: &GenerationModel) -> bool {
-        self.mode.accepts(model)
-            && (self.mode != GenerationMode::Vector || self.vector_operation.accepts(model))
+        if self.mode.generation_kind().is_some() {
+            model.hosted_creation()
+                && self.mode.accepts(model)
+                && model.recipes().contains(&self.recipe)
+        } else {
+            self.mode.accepts(model)
+                && (self.mode != GenerationMode::Vector || self.vector_operation.accepts(model))
+        }
     }
 
     fn choose_default_model(&mut self) {
@@ -869,7 +2285,7 @@ impl GenerationWorkspace {
                         } else {
                             0
                         },
-                        !model.id.starts_with("fanta-"),
+                        model.id.starts_with("fanta-"),
                         model.supports_inpaint(),
                     )
                 })
@@ -915,15 +2331,23 @@ impl GenerationWorkspace {
             prompt
         };
         self.mode = mode;
+        self.recipe = mode.default_recipe();
         if mode != GenerationMode::Image {
             self.mask = None;
         }
+        self.end_frame = None;
         self.choose_default_model();
+        self.selected_model = self
+            .models
+            .iter()
+            .find(|model| model.hosted_creation() && model.recipes().contains(&self.recipe))
+            .map(|model| model.id.clone());
         self.error = None;
         if self.task.is_none() {
             self.status = match mode {
                 GenerationMode::Image => "Describe your image, then choose Generate.",
                 GenerationMode::Video => "Describe a video, or choose an image to animate.",
+                GenerationMode::Audio => "Write speech or describe music to generate audio.",
                 GenerationMode::Vector => {
                     "Create editable vectors from a prompt or trace an image."
                 }
@@ -937,6 +2361,7 @@ impl GenerationWorkspace {
             .into();
         }
         self.prompt.read(cx).focus_handle(cx).focus(window, cx);
+        self.mount_generation_screen(window, cx);
         cx.emit(ItemEvent::UpdateTab);
         cx.notify();
     }
@@ -1031,6 +2456,24 @@ impl GenerationWorkspace {
     }
 
     fn generate_vectors(&mut self, cx: &mut Context<Self>) {
+        let Some(model) = self.model().cloned() else {
+            self.fail(
+                anyhow!("No vector creation model is available. Refresh the model list."),
+                cx,
+            );
+            return;
+        };
+        let prompt = self.prompt.read(cx).text(cx);
+        self.generate_vectors_with(model, prompt, self.size.clone(), cx);
+    }
+
+    fn generate_vectors_with(
+        &mut self,
+        model: GenerationModel,
+        prompt: String,
+        size: String,
+        cx: &mut Context<Self>,
+    ) {
         if self.task.is_some() {
             return;
         }
@@ -1041,15 +2484,7 @@ impl GenerationWorkspace {
             );
             return;
         };
-        let Some(model) = self.model().cloned() else {
-            self.fail(
-                anyhow!("No vector creation model is available. Refresh the model list."),
-                cx,
-            );
-            return;
-        };
-        let prompt = self.prompt.read(cx).text(cx);
-        let request = match build_vector_message_request(&model, &prompt, &self.size) {
+        let request = match build_vector_message_request(&model, &prompt, &size) {
             Ok(request) => request,
             Err(error) => {
                 self.fail(error, cx);
@@ -1585,15 +3020,19 @@ impl GenerationWorkspace {
             };
             let bytes = video.bytes.clone();
             #[cfg(test)]
-            let injected = self
+            let playback = self
                 .playback_factory
                 .as_ref()
-                .map(|factory| factory(bytes.clone(), _cx));
+                .map(|factory| factory(bytes.clone(), _cx))
+                .unwrap_or_else(|| {
+                    _cx.new(|cx| {
+                        crate::video_playback::VideoPlaybackView::new(bytes, PREVIEW_SIZE, cx)
+                    })
+                });
             #[cfg(not(test))]
-            let injected: Option<Entity<crate::video_playback::VideoPlaybackView>> = None;
-            let playback = injected.unwrap_or_else(|| {
+            let playback = {
                 _cx.new(|cx| crate::video_playback::VideoPlaybackView::new(bytes, PREVIEW_SIZE, cx))
-            });
+            };
             playback.update(_cx, |playback, cx| {
                 playback.set_active(self.playback_active, cx)
             });
@@ -1606,6 +3045,10 @@ impl GenerationWorkspace {
         if let Some(playback) = self.playback.take() {
             playback.update(_cx, |playback, cx| playback.close(cx));
         }
+        #[cfg(target_os = "macos")]
+        if let Some(playback) = self.audio_playback.take() {
+            playback.update(_cx, |playback, cx| playback.close(cx));
+        }
     }
 
     fn set_playback_active(&mut self, active: bool, _cx: &mut Context<Self>) {
@@ -1614,9 +3057,16 @@ impl GenerationWorkspace {
         if let Some(playback) = self.playback.as_ref() {
             playback.update(_cx, |playback, cx| playback.set_active(active, cx));
         }
+        #[cfg(target_os = "macos")]
+        if !active {
+            if let Some(playback) = self.audio_playback.as_ref() {
+                playback.update(_cx, |playback, cx| playback.pause(cx));
+            }
+        }
     }
 
     fn load_preview(&mut self, cx: &mut Context<Self>) {
+        self.play_after_preview = false;
         self.preview = None;
         self.preview_task = None;
         self.prepared_video = None;
@@ -1625,7 +3075,10 @@ impl GenerationWorkspace {
         let Some(output) = self.outputs.get(self.selected_output).cloned() else {
             return;
         };
-        if !output.mime.starts_with("image/") && !output.mime.starts_with("video/") {
+        if !output.mime.starts_with("image/")
+            && !output.mime.starts_with("video/")
+            && !output.mime.starts_with("audio/")
+        {
             return;
         }
         let client = self.client.clone();
@@ -1636,7 +3089,9 @@ impl GenerationWorkspace {
             let result = async {
                 let bytes =
                     media_bytes(&client, &output.location, cx.background_executor()).await?;
-                if output.mime.starts_with("video/") {
+                if output.mime.starts_with("audio/") {
+                    Ok::<_, anyhow::Error>((None, None, Some(bytes)))
+                } else if output.mime.starts_with("video/") {
                     network_deadline(
                         cx.background_executor(),
                         VIDEO_PREVIEW_TIMEOUT,
@@ -1648,7 +3103,7 @@ impl GenerationWorkspace {
                                 .as_ref()
                                 .map(|poster| make_preview(&poster.png, "image/png"))
                                 .transpose()?;
-                            Ok((preview, Some(Arc::new(prepared))))
+                            Ok((preview, Some(Arc::new(prepared)), None))
                         }),
                     )
                     .await
@@ -1656,7 +3111,7 @@ impl GenerationWorkspace {
                     let preview = cx
                         .background_spawn(async move { make_preview(&bytes, &output.mime) })
                         .await?;
-                    Ok::<_, anyhow::Error>((Some(preview), None))
+                    Ok::<_, anyhow::Error>((Some(preview), None, None))
                 }
             }
             .await;
@@ -1671,10 +3126,27 @@ impl GenerationWorkspace {
                 this.preview_task = None;
                 this.preview_request = None;
                 match result {
-                    Ok((preview, video)) => {
+                    Ok((preview, video, audio)) => {
                         this.preview = preview;
                         this.prepared_video = video;
                         this.restore_video_playback(cx);
+                        #[cfg(target_os = "macos")]
+                        if let Some(bytes) = audio {
+                            this.audio_playback = Some(cx.new(|_| AudioPlaybackView::new(bytes)));
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        drop(audio);
+                        if this.play_after_preview {
+                            this.play_after_preview = false;
+                            #[cfg(target_os = "macos")]
+                            if let Some(playback) = this.playback.as_ref() {
+                                playback.update(cx, |playback, cx| playback.play(cx));
+                            }
+                            #[cfg(target_os = "macos")]
+                            if let Some(playback) = this.audio_playback.as_ref() {
+                                playback.update(cx, |playback, cx| playback.play(cx));
+                            }
+                        }
                     }
                     Err(error) => {
                         this.error = Some(
@@ -1690,6 +3162,14 @@ impl GenerationWorkspace {
     }
 
     fn choose_source(&mut self, cx: &mut Context<Self>) {
+        self.choose_image_source(false, cx);
+    }
+
+    fn choose_end_frame(&mut self, cx: &mut Context<Self>) {
+        self.choose_image_source(true, cx);
+    }
+
+    fn choose_voice_reference(&mut self, cx: &mut Context<Self>) {
         self.sync_account(cx);
         if self.task.is_some() {
             return;
@@ -1698,7 +3178,78 @@ impl GenerationWorkspace {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Choose source image".into()),
+            prompt: Some("Choose a reference voice WAV".into()),
+        });
+        self.task = Some(cx.spawn(async move |this, cx| {
+            let result: Result<Option<VoiceSource>> = async {
+                let Some(path) = paths.await??.and_then(|paths| paths.into_iter().next()) else {
+                    return Ok(None);
+                };
+                #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+                workspace::remember_user_selected_paths(std::slice::from_ref(&path))?;
+                cx.background_spawn(async move {
+                    ensure!(
+                        std::fs::metadata(&path)?.len() <= 8 * 1024 * 1024,
+                        "Choose a reference voice smaller than 8 MB."
+                    );
+                    let bytes = std::fs::read(&path)?;
+                    ensure!(
+                        bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WAVE"),
+                        "Choose a WAV reference voice."
+                    );
+                    let name = path
+                        .file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| "Reference voice.wav".into());
+                    Ok(Some(VoiceSource {
+                        name,
+                        bytes: bytes.into(),
+                    }))
+                })
+                .await
+            }
+            .await;
+            this.update(cx, |this, cx| {
+                this.task = None;
+                match result {
+                    Ok(Some(reference)) => {
+                        this.voice_reference = Some(reference);
+                        this.voice_consent_granted = false;
+                        this.error = None;
+                    }
+                    Ok(None) => {}
+                    Err(error) => this.fail(error, cx),
+                }
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
+    fn choose_image_source(&mut self, end_frame: bool, cx: &mut Context<Self>) {
+        self.sync_account(cx);
+        if self.task.is_some() {
+            return;
+        }
+        let hosted_frame = self.mode.generation_kind().is_some();
+        let max_source_bytes = if hosted_frame {
+            20 * 1024 * 1024
+        } else {
+            MAX_SOURCE_BYTES
+        };
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(
+                if end_frame {
+                    "Choose end frame"
+                } else {
+                    "Choose start image"
+                }
+                .into(),
+            ),
         });
         let client = self.client.clone();
         let base_url = self.base_url.clone();
@@ -1712,8 +3263,9 @@ impl GenerationWorkspace {
                 let (bytes, name, mime, preview) = cx
                     .background_spawn(async move {
                         ensure!(
-                            std::fs::metadata(&path)?.len() <= MAX_MEDIA_BYTES as u64,
-                            "Choose an image smaller than 100 MB."
+                            std::fs::metadata(&path)?.len() <= max_source_bytes as u64,
+                            "Choose an image smaller than {} MB.",
+                            if hosted_frame { 20 } else { 100 }
                         );
                         let bytes = std::fs::read(&path)?;
                         let format = image::guess_format(&bytes)
@@ -1756,6 +3308,11 @@ impl GenerationWorkspace {
             this.update(cx, |this, cx| {
                 this.task = None;
                 match result {
+                    Ok(Some(source)) if end_frame => {
+                        this.end_frame = Some(source);
+                        this.error = None;
+                        cx.notify();
+                    }
                     Ok(Some(source)) => this.set_source(source, cx),
                     Ok(None) => {}
                     Err(error) => this.fail(error, cx),
@@ -1998,6 +3555,9 @@ impl GenerationWorkspace {
         let extension = match output.mime.as_str() {
             "image/svg+xml" => "svg",
             "video/mp4" => "mp4",
+            "audio/wav" | "audio/x-wav" => "wav",
+            "audio/mpeg" | "audio/mp3" => "mp3",
+            "audio/flac" => "flac",
             "image/jpeg" => "jpg",
             "image/webp" => "webp",
             _ => "png",
@@ -2642,6 +4202,60 @@ impl Render for GenerationWorkspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_account(cx);
         self.set_playback_active(true, cx);
+        if let Some(screen) = self.generation_screen.clone() {
+            let data = self.generation_view_data(cx);
+            screen.update(cx, |screen, cx| screen.set_view_data(data, window, cx));
+            return v_flex()
+                .id("fanta-generation-workspace")
+                .size_full()
+                .min_h_0()
+                .bg(cx.theme().colors().editor_background)
+                .when(self.client.account_access_token().is_none(), |element| {
+                    element.child(
+                        h_flex()
+                            .p_2()
+                            .gap_2()
+                            .child(
+                                Label::new("Sign in to use Fanta generation.").color(Color::Muted),
+                            )
+                            .child(
+                                Button::new("generation-sign-in", "Sign in")
+                                    .on_click(cx.listener(|this, _, _, cx| this.sign_in(cx))),
+                            ),
+                    )
+                })
+                .child(div().flex_1().min_h_0().child(screen))
+                .when(
+                    self.unresolved_submission.is_some() && self.task.is_none(),
+                    |element| {
+                        element.child(
+                            h_flex()
+                                .p_2()
+                                .gap_2()
+                                .child(
+                                    Label::new("A saved request needs recovery.")
+                                        .color(Color::Muted),
+                                )
+                                .child(
+                                    Button::new(
+                                        "retry-generation-submission",
+                                        "Retry saved request",
+                                    )
+                                    .on_click(cx.listener(
+                                        |this, _, _, cx| {
+                                            if let Some(submission) =
+                                                this.unresolved_submission.clone()
+                                            {
+                                                this.submit(submission, cx);
+                                            }
+                                        },
+                                    )),
+                                ),
+                        )
+                    },
+                )
+                .into_any_element();
+        }
         let signed_in = self.client.account_access_token().is_some();
         let is_design = self.mode == GenerationMode::Design;
         let prompt_vectors =
@@ -2668,9 +4282,9 @@ impl Render for GenerationWorkspace {
                     .child(Label::new(if signed_in { "Fanta account connected" } else { "Connect your account to generate" }).color(Color::Muted))
                     .when(!signed_in || self.error.is_some(), |element| element.child(Button::new("generation-sign-in", "Sign in")
                         .disabled(self.task.is_some()).on_click(cx.listener(|this, _, _, cx| this.sign_in(cx)))))
-                    .child(Button::new("generation-billing", "Credits & billing").on_click(|_, window, cx| {
+                    .child(Button::new("generation-billing", "Credits & billing").on_click(|_, _window, cx| {
                         #[cfg(feature = "mac_app_store")]
-                        window.dispatch_action(zed_actions::OpenAccountSettings.boxed_clone(), cx);
+                        _window.dispatch_action(zed_actions::OpenAccountSettings.boxed_clone(), cx);
                         #[cfg(not(feature = "mac_app_store"))]
                         cx.open_url(&client::zed_urls::account_url(cx));
                     }))))
@@ -2762,13 +4376,17 @@ impl Render for GenerationWorkspace {
                     .child(Label::new(self.status.clone()).color(Color::Muted))
                     .when_some(self.error.clone(), |element, error| element.child(Label::new(error).color(Color::Error))))
                 .when(!is_design, |element| element.child(results)))
+            .into_any_element()
     }
 }
 
 impl EventEmitter<ItemEvent> for GenerationWorkspace {}
 impl Focusable for GenerationWorkspace {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
-        self.prompt.read(cx).focus_handle(cx)
+        self.generation_screen
+            .as_ref()
+            .map(|screen| screen.read(cx).focus_handle(cx))
+            .unwrap_or_else(|| self.prompt.read(cx).focus_handle(cx))
     }
 }
 impl Item for GenerationWorkspace {
@@ -2788,6 +4406,10 @@ impl Item for GenerationWorkspace {
         self.playback_removed.set(true);
         #[cfg(target_os = "macos")]
         if let Some(playback) = self.playback.as_ref() {
+            playback.update(_cx, |playback, cx| playback.close(cx));
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(playback) = self.audio_playback.as_ref() {
             playback.update(_cx, |playback, cx| playback.close(cx));
         }
     }
@@ -3168,6 +4790,218 @@ fn parse_size(size: &str) -> Result<(u32, u32)> {
     Ok((width, height))
 }
 
+type ProviderMark = (
+    &'static str,
+    Option<(&'static str, ImageFormat, &'static [u8])>,
+);
+
+fn provider_mark(id: &str) -> ProviderMark {
+    if id.contains("recraft") {
+        ("Recraft", Some(("recraft", ImageFormat::Png, RECRAFT_LOGO)))
+    } else if id.contains("seedream") || id.contains("seedance") {
+        (
+            "ByteDance Seed",
+            Some(("bytedance-seed", ImageFormat::Png, BYTEDANCE_LOGO)),
+        )
+    } else if id.contains("minimax") || id.contains("speech-2.8") {
+        (
+            "MiniMax",
+            Some(("minimax", ImageFormat::Jpeg, MINIMAX_LOGO)),
+        )
+    } else if id.contains("eleven") {
+        (
+            "ElevenLabs",
+            Some(("elevenlabs", ImageFormat::Png, ELEVENLABS_LOGO)),
+        )
+    } else if id.contains("veo") {
+        ("Google", Some(("google", ImageFormat::Png, GOOGLE_LOGO)))
+    } else if id.contains("kling") {
+        ("Kling AI", Some(("kling", ImageFormat::Jpeg, KLING_LOGO)))
+    } else if id.contains("muse") {
+        ("Meta", Some(("meta", ImageFormat::Png, META_LOGO)))
+    } else if id.contains("grok") {
+        ("xAI", Some(("xai", ImageFormat::Png, XAI_LOGO)))
+    } else if id.contains("qwen") || id == "fanta-image-1" {
+        ("Qwen", Some(("qwen", ImageFormat::Png, QWEN_LOGO)))
+    } else if id.contains("z-image") || id == "fanta-image-fast-1" {
+        (
+            "Tongyi-MAI",
+            Some(("tongyi", ImageFormat::Jpeg, TONGYI_LOGO)),
+        )
+    } else if id.contains("flux") || id.contains("black-forest") || id == "fanta-vectorize-1" {
+        (
+            "Black Forest Labs",
+            Some(("bfl", ImageFormat::Png, BFL_LOGO)),
+        )
+    } else if id.contains("ltx") || id == "fanta-video-1" {
+        ("Lightricks", Some(("ltx", ImageFormat::Svg, LTX_LOGO)))
+    } else if id.contains("wan") || id == "fanta-video-hd-1" || id == "fanta-animate-1" {
+        ("Wan", Some(("wan", ImageFormat::Png, WAN_LOGO)))
+    } else if id.contains("chatterbox") || id.contains("fanta-voice-") && !id.contains("fast") {
+        (
+            "Resemble AI",
+            Some(("resemble", ImageFormat::Png, RESEMBLE_LOGO)),
+        )
+    } else if id.contains("kokoro") || id == "fanta-voice-fast-1" {
+        ("Hexgrad", Some(("hexgrad", ImageFormat::Png, HEXGRAD_LOGO)))
+    } else if id.contains("ace-step") || id == "fanta-music-1" {
+        ("ACE-Step", Some(("ace", ImageFormat::Jpeg, ACE_LOGO)))
+    } else if id.contains("starvector") || id == "fanta-svg-1" {
+        (
+            "StarVector",
+            Some(("starvector", ImageFormat::Jpeg, STARVECTOR_LOGO)),
+        )
+    } else if id.starts_with("claude-") {
+        ("Anthropic", Some(("claude", ImageFormat::Png, CLAUDE_LOGO)))
+    } else {
+        ("AI provider", None)
+    }
+}
+
+fn option_value(value: &Value) -> Option<String> {
+    value
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| value.as_bool().map(|value| value.to_string()))
+        .or_else(|| value.as_number().map(ToString::to_string))
+}
+
+fn option_label(key: &str) -> String {
+    let mut words = key.split('_');
+    let first = words.next().unwrap_or(key);
+    let mut label = String::new();
+    let mut chars = first.chars();
+    if let Some(first) = chars.next() {
+        label.extend(first.to_uppercase());
+        label.extend(chars);
+    }
+    for word in words {
+        label.push(' ');
+        label.push_str(word);
+    }
+    label
+}
+
+fn generation_templates() -> Vec<GenerationTemplate> {
+    [
+        ("image-editorial", "Editorial portrait", GenerationKind::Image, "An editorial portrait in soft window light, refined composition and natural skin texture"),
+        ("image-product", "Product study", GenerationKind::Image, "A sculptural product photograph on a dark stone plinth with a single directional key light"),
+        ("video-orbit", "Cinematic orbit", GenerationKind::Video, "A slow cinematic orbit around the subject, subtle depth of field and smooth natural motion"),
+        ("video-atmosphere", "Atmospheric scene", GenerationKind::Video, "A quiet atmospheric scene with drifting mist, restrained camera movement and rich detail"),
+        ("audio-narration", "Narration", GenerationKind::Audio, "Welcome to a new way of creating. Every detail begins with an idea."),
+        ("audio-music", "Ambient score", GenerationKind::Audio, "A warm ambient score with soft synthesizers, subtle piano, and a gradual emotional rise"),
+        ("svg-symbol", "Geometric symbol", GenerationKind::Svg, "Create a precise geometric compass symbol with clean paths and balanced negative space"),
+        ("svg-monogram", "Monogram", GenerationKind::Svg, "Create a refined geometric monogram with consistent stroke weight and simple vector shapes"),
+    ]
+    .into_iter()
+    .map(|(id, title, kind, prompt)| GenerationTemplate::new(id, title, kind, prompt))
+    .collect()
+}
+
+fn build_screen_request(
+    model: &GenerationModel,
+    submission: &GenerationSubmission,
+    source: Option<&SourceImage>,
+    end_frame: Option<&SourceImage>,
+    voice_reference: Option<&VoiceSource>,
+) -> Result<Value> {
+    let prompt_limit = model.capabilities["prompt_limit"]
+        .as_u64()
+        .and_then(|limit| usize::try_from(limit).ok())
+        .unwrap_or(if model.capabilities["hosted"] == true {
+            10_000
+        } else {
+            1_200
+        });
+    ensure!(
+        submission.prompt.encode_utf16().count() <= prompt_limit,
+        "Keep the prompt under {prompt_limit} characters."
+    );
+    let mut request = json!({ "model": model.id });
+    if !submission.prompt.trim().is_empty() {
+        request["prompt"] = json!(if submission.recipe == GenerationRecipe::Speech {
+            submission.prompt.as_ref()
+        } else {
+            submission.prompt.trim()
+        });
+    }
+    if let Some(negative) = submission.negative.as_ref() {
+        request["negative"] = json!(negative.as_ref());
+    }
+    if let Some(seed) = submission.seed {
+        request["seed"] = json!(seed);
+    }
+    let mut input = json!({});
+    for option in &submission.options {
+        let key = option.key.as_ref();
+        let value = option.value.as_ref();
+        if key == "canvas" || key == "size" && value.contains('x') {
+            let (width, height) = parse_size(value)?;
+            request["width"] = json!(width);
+            request["height"] = json!(height);
+            continue;
+        }
+        let control = &model.capabilities["controls"][key];
+        let field = control["request_field"].as_str().unwrap_or(key);
+        let encoded = if value == "true" {
+            json!(true)
+        } else if value == "false" {
+            json!(false)
+        } else if matches!(
+            key,
+            "frames"
+                | "fps"
+                | "steps"
+                | "guidance"
+                | "duration"
+                | "speed"
+                | "music_length_ms"
+                | "num_outputs"
+        ) {
+            json!(
+                value
+                    .parse::<f64>()
+                    .with_context(|| format!("Choose a valid {key}."))?
+            )
+        } else {
+            json!(value)
+        };
+        if control["location"] == "top" {
+            request[field] = encoded;
+        } else {
+            input[field] = encoded;
+        }
+    }
+    if let Some(source) = source.filter(|_| submission.source_id.is_some()) {
+        input["source"] = source.reference.clone();
+    }
+    if let Some(end_frame) = end_frame.filter(|_| submission.end_frame_id.is_some()) {
+        input["end_frame"] = end_frame.reference.clone();
+    }
+    if let Some(reference) = voice_reference.filter(|_| submission.voice_reference_id.is_some()) {
+        ensure!(
+            submission.voice_consent_granted,
+            "Confirm permission to use the reference voice."
+        );
+        input["voice_ref_b64"] = json!(STANDARD.encode(&reference.bytes));
+        input["consent"] = json!(true);
+    }
+    if model.capabilities["operations"]
+        .as_array()
+        .is_some_and(|operations| operations.len() > 1)
+    {
+        input["operation"] = json!(match submission.recipe {
+            GenerationRecipe::TextVideo => "text_to_video",
+            GenerationRecipe::ImageVideo => "image_to_video",
+            _ => bail!("This model does not support the selected operation."),
+        });
+    }
+    if input.as_object().is_some_and(|input| !input.is_empty()) {
+        request["input"] = input;
+    }
+    Ok(request)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_request(
     model: &GenerationModel,
@@ -3381,6 +5215,61 @@ fn normalize_outputs(outputs: &[Value]) -> Result<Vec<MediaOutput>> {
     Ok(result)
 }
 
+fn parse_gallery_response(value: Value) -> Result<(Vec<GalleryRecord>, Option<String>)> {
+    let rows = value["generations"]
+        .as_array()
+        .context("The generation gallery returned no list.")?;
+    let mut records = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(id) = row["id"].as_str() else {
+            continue;
+        };
+        let Some(kind) = row["kind"].as_str().and_then(|kind| match kind {
+            "image" => Some(GenerationKind::Image),
+            "video" => Some(GenerationKind::Video),
+            "audio" => Some(GenerationKind::Audio),
+            "svg" | "vectorize" => Some(GenerationKind::Svg),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let status = match row["status"].as_str() {
+            Some("queued") => GenerationOutputStatus::Queued,
+            Some("warming" | "processing") => GenerationOutputStatus::Running,
+            Some("succeeded") => GenerationOutputStatus::Succeeded,
+            Some("failed") => GenerationOutputStatus::Failed,
+            Some("canceled") => GenerationOutputStatus::Canceled,
+            _ => continue,
+        };
+        let outputs = row["output"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let outputs = match normalize_outputs(outputs) {
+            Ok(outputs) => outputs,
+            Err(error) => {
+                log::warn!("Skipping unreadable gallery output {id}: {error:#}");
+                Vec::new()
+            }
+        };
+        records.push(GalleryRecord {
+            id: id.to_owned(),
+            kind,
+            model: row["model"].as_str().unwrap_or("Unknown model").to_owned(),
+            status,
+            created_at: row["created_at"].as_str().unwrap_or_default().to_owned(),
+            outputs,
+        });
+    }
+    Ok((records, value["next_before"].as_str().map(str::to_owned)))
+}
+
+fn parse_generation_output_id(id: &str) -> Option<(&str, usize)> {
+    let id = id.strip_prefix("gen:")?;
+    let (generation_id, index) = id.rsplit_once(':')?;
+    Some((generation_id, index.parse().ok()?))
+}
+
 fn decode_data_url(data: &str) -> Result<(String, Vec<u8>)> {
     let (header, encoded) = data
         .split_once(',')
@@ -3553,6 +5442,8 @@ mod tests {
             initialize_recovery_database(cx);
             assets::Assets.load_test_fonts(cx);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
+            gpui_component::init(cx);
+            crate::theme_bridge::init(cx);
             editor::init(cx);
             Client::set_global(client, cx);
         });
@@ -3567,36 +5458,68 @@ mod tests {
     #[gpui::test]
     fn generation_prompt_is_visible_and_modes_keep_separate_drafts(cx: &mut gpui::TestAppContext) {
         let (view, cx) = visual_workspace(GenerationMode::Image, cx);
-        let prompt = view.read_with(cx, |view, _| view.prompt.clone());
-        let bounds = prompt.read_with(cx, |prompt, cx| {
-            *prompt
-                .editor()
-                .as_any()
-                .downcast_ref::<Entity<editor::Editor>>()
-                .expect("prompt editor")
-                .read(cx)
-                .last_bounds()
-                .expect("rendered prompt")
-        });
-        assert!(
-            bounds.size.width > px(250.),
-            "prompt text must have visible width: {bounds:?}"
-        );
-        cx.simulate_click(bounds.center(), gpui::Modifiers::none());
-        cx.simulate_input("a green landscape");
         view.update_in(cx, |view, window, cx| {
-            view.set_mode(GenerationMode::Masks, window, cx)
+            let mut image = model("image");
+            image.id = "replicate-image".into();
+            image.capabilities = json!({"hosted":true,"operations":["text_to_image"]});
+            let mut video = model("video");
+            video.id = "replicate-video".into();
+            video.capabilities = json!({"hosted":true,"operations":["text_to_video"]});
+            view.models = vec![image, video];
+            view.selected_model = Some("replicate-image".into());
+            let screen = view.generation_screen.as_ref().expect("image screen");
+            screen.update(cx, |screen, cx| {
+                screen.set_draft(
+                    GenerationDraft {
+                        prompt: "a green landscape".into(),
+                        ..GenerationDraft::default()
+                    },
+                    window,
+                    cx,
+                )
+            });
         });
-        let mask_prompt = view.read_with(cx, |view, _| view.prompt.clone());
-        assert!(mask_prompt.read_with(cx, |prompt, cx| prompt.text(cx).is_empty()));
-        mask_prompt.update_in(cx, |prompt, window, cx| {
-            prompt.set_text("orange circle", window, cx)
+        view.update_in(cx, |view, window, cx| {
+            view.set_mode(GenerationMode::Video, window, cx)
+        });
+        view.read_with(cx, |view, cx| {
+            assert!(
+                view.generation_screen
+                    .as_ref()
+                    .expect("video screen")
+                    .read(cx)
+                    .draft(cx)
+                    .prompt
+                    .is_empty()
+            );
+        });
+        view.update_in(cx, |view, window, cx| {
+            view.generation_screen
+                .as_ref()
+                .expect("video screen")
+                .update(cx, |screen, cx| {
+                    screen.set_draft(
+                        GenerationDraft {
+                            prompt: "orange circle".into(),
+                            ..GenerationDraft::default()
+                        },
+                        window,
+                        cx,
+                    )
+                });
         });
         view.update_in(cx, |view, window, cx| {
             view.set_mode(GenerationMode::Image, window, cx)
         });
         assert_eq!(
-            view.read_with(cx, |view, cx| view.prompt.read(cx).text(cx)),
+            view.read_with(cx, |view, cx| view
+                .generation_screen
+                .as_ref()
+                .expect("image screen")
+                .read(cx)
+                .draft(cx)
+                .prompt
+                .to_string()),
             "a green landscape"
         );
     }
@@ -3606,48 +5529,39 @@ mod tests {
         let (view, cx) = visual_workspace(GenerationMode::Image, cx);
         view.update_in(cx, |view, window, cx| {
             let mut supported = model("image");
-            supported.capabilities = json!({"negative_prompt":{"supported":true}});
+            supported.id = "replicate-supported".into();
+            supported.capabilities = json!({"hosted":true,"operations":["text_to_image"],"negative_prompt":{"supported":true}});
             let mut unsupported = supported.clone();
-            unsupported.id = "fanta-image-no-negative".into();
-            unsupported.capabilities = json!({"negative_prompt":{"supported":false}});
+            unsupported.id = "replicate-no-negative".into();
+            unsupported.capabilities = json!({"hosted":true,"operations":["text_to_image"],"negative_prompt":{"supported":false}});
             let mut video = model("video");
-            video.capabilities = json!({});
+            video.id = "replicate-video".into();
+            video.capabilities = json!({"hosted":true,"operations":["text_to_video"]});
             view.selected_model = Some(supported.id.clone());
             view.models = vec![supported, unsupported, video];
-            view.prompt.update(cx, |prompt, cx| {
-                prompt.set_text("a landscape", window, cx);
+            view.generation_screen.as_ref().expect("image screen").update(cx, |screen, cx| {
+                screen.set_draft(GenerationDraft {
+                    prompt: "a landscape".into(),
+                    negative: "blur and watermarks".into(),
+                    ..GenerationDraft::default()
+                }, window, cx)
             });
-            view.negative.update(cx, |negative, cx| {
-                negative.set_text("  blur and watermarks  ", window, cx);
-            });
-            assert_eq!(
-                view.request(cx).expect("supported image request")["negative"],
-                "blur and watermarks"
-            );
+            let supported = view.models.iter().find(|model| model.id == "replicate-supported").expect("supported model");
+            assert!(view.screen_model(supported, GenerationRecipe::TextImage, 0).supports_negative);
 
-            view.selected_model = Some("fanta-image-no-negative".into());
+            view.selected_model = Some("replicate-no-negative".into());
             view.choose_default_model();
-            let unsupported_request = view.request(cx).expect("unsupported image request");
-            assert_eq!(unsupported_request["model"], "fanta-image-no-negative");
-            assert_eq!(view.negative.read(cx).text(cx), "  blur and watermarks  ");
+            assert_eq!(view.selected_model.as_deref(), Some("replicate-no-negative"));
+            let unsupported = view.models.iter().find(|model| model.id == "replicate-no-negative").expect("unsupported model");
+            assert!(!view.screen_model(unsupported, GenerationRecipe::TextImage, 0).supports_negative);
 
             view.set_mode(GenerationMode::Video, window, cx);
-            view.prompt.update(cx, |prompt, cx| {
-                prompt.set_text("a moving landscape", window, cx);
-            });
-            let video_request = view.request(cx).expect("video request");
-            assert_eq!(video_request["model"], "fanta-video-1");
-            assert_eq!(view.negative.read(cx).text(cx), "  blur and watermarks  ");
+            assert_eq!(view.selected_model.as_deref(), Some("replicate-video"));
 
             view.set_mode(GenerationMode::Image, window, cx);
-            view.selected_model = Some("fanta-image-1".into());
-            view.choose_default_model();
-            let restored_request = view.request(cx).expect("restored image request");
-            assert_eq!(restored_request["prompt"], "a landscape");
-            assert_eq!(restored_request["negative"], "blur and watermarks");
-            assert_eq!(view.negative.read(cx).text(cx), "  blur and watermarks  ");
-            assert!(unsupported_request.get("negative").is_none());
-            assert!(video_request.get("negative").is_none());
+            let restored = view.generation_screen.as_ref().expect("restored image screen").read(cx).draft(cx);
+            assert_eq!(restored.prompt.as_ref(), "a landscape");
+            assert_eq!(restored.negative.as_ref(), "blur and watermarks");
         });
     }
 
@@ -4927,6 +6841,7 @@ mod tests {
                 player
             });
             cx.run_until_parked();
+            player.update_in(cx, |player, window, cx| player.tick(window, cx));
             let revision = player.read_with(cx, |player, _| player.frame_revision());
             assert!(player.read_with(cx, |player, _| player.frame().is_some()));
             view.update(cx, |view, cx| {
@@ -4990,6 +6905,7 @@ mod tests {
         });
         cx.run_until_parked();
         let original = view.read_with(cx, |view, _| view.playback.clone().expect("first player"));
+        original.update_in(cx, |player, window, cx| player.tick(window, cx));
         assert!(original.read_with(cx, |player, _| player.frame().is_some()));
         view.update_in(cx, |view, window, cx| {
             Item::deactivated(view, window, cx);
@@ -5057,6 +6973,7 @@ mod tests {
             player
         });
         cx.run_until_parked();
+        player.update_in(cx, |player, window, cx| player.tick(window, cx));
         assert!(player.read_with(cx, |player, _| player.frame().is_some()));
         client.sign_out(&cx.to_async()).await;
         cx.run_until_parked();
@@ -5486,7 +7403,109 @@ mod tests {
             credits_per_output: None,
             max_output_tokens: None,
             capabilities: json!({"operations":["inpaint"],"steps":{"min":10,"max":50}}),
+            pricing: Value::Null,
         }
+    }
+
+    fn screen_submission(
+        model: &GenerationModel,
+        recipe: GenerationRecipe,
+        prompt: &str,
+    ) -> GenerationSubmission {
+        GenerationSubmission {
+            kind: recipe.kind(),
+            recipe,
+            model_id: model.id.clone().into(),
+            prompt: prompt.to_owned().into(),
+            negative: None,
+            seed: None,
+            source_id: None,
+            end_frame_id: None,
+            voice_reference_id: None,
+            voice_consent_granted: false,
+            options: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn generation_catalog_shows_verified_hosted_models_only() {
+        let mut model = model("image");
+        assert!(!model.hosted_creation());
+        model.capabilities = json!({});
+        model.id = "flux-schnell".into();
+        assert!(model.hosted_creation());
+        model.kind = "chat".into();
+        model.id = "claude-sonnet-5".into();
+        assert!(model.hosted_creation());
+        model.kind = "image".into();
+        model.id = "replicate-seedream-5-lite".into();
+        model.capabilities = json!({"hosted":true});
+        assert!(model.hosted_creation());
+        model.id = "seedream-5-lite".into();
+        model.capabilities =
+            json!({"hosted":true,"operations":["text_to_image"],"provider":"AI Gateway"});
+        assert!(model.hosted_creation());
+        model.id = "flux-fill".into();
+        model.capabilities = json!({"hosted":true,"operations":["inpaint"]});
+        assert!(!model.hosted_creation());
+        model.id = "fanta-image-1".into();
+        model.capabilities = json!({"gateway":{"duration":4}});
+        assert!(!model.hosted_creation());
+    }
+
+    #[test]
+    fn hosted_speech_preserves_script_and_uses_model_prompt_limit() {
+        let mut model = model("audio");
+        model.id = "replicate-speech-2.8-hd".into();
+        model.capabilities = json!({"hosted":true,"prompt_limit":10000,"operations":["speech"]});
+        let script = "  Pause after this sentence.\nThen continue.  ";
+        let request = build_screen_request(
+            &model,
+            &screen_submission(&model, GenerationRecipe::Speech, script),
+            None,
+            None,
+            None,
+        )
+        .expect("valid speech request");
+        assert_eq!(request["prompt"], script);
+        assert!(
+            build_screen_request(
+                &model,
+                &screen_submission(&model, GenerationRecipe::Speech, &"word ".repeat(2_001)),
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn hosted_video_operation_and_controls_map_to_backend_input() {
+        let mut model = model("video");
+        model.id = "replicate-ltx-2.3-pro".into();
+        model.capabilities = json!({
+            "hosted":true,
+            "operations":["text_to_video","image_to_video"],
+            "controls":{"duration":{"request_field":"duration","location":"input"}}
+        });
+        let mut submission = screen_submission(
+            &model,
+            GenerationRecipe::TextVideo,
+            "A slow orbit around a sculpture",
+        );
+        submission
+            .options
+            .push(fanta_gpui::generation::GenerationOptionSelection {
+                key: "duration".into(),
+                value: "6".into(),
+            });
+        let request = build_screen_request(&model, &submission, None, None, None)
+            .expect("valid hosted video request");
+        assert_eq!(request["input"]["operation"], "text_to_video");
+        assert_eq!(request["input"]["duration"], 6.0);
+        assert!(request["input"].get("frames").is_none());
+        assert!(request["input"].get("fps").is_none());
     }
 
     #[test]

@@ -56,10 +56,8 @@ pub(crate) const IMPLEMENTED_COMMANDS: &[ToolbarCommand] = &[
     ToolbarCommand::MakePrototype,
     ToolbarCommand::GenerateImage,
     ToolbarCommand::GenerateVideo,
+    ToolbarCommand::GenerateAudio,
     ToolbarCommand::GenerateVector,
-    ToolbarCommand::GenerateDesign,
-    ToolbarCommand::GenerateMasks,
-    ToolbarCommand::RemoveBackground,
     ToolbarCommand::ReplaceContent,
     ToolbarCommand::RewriteText,
     ToolbarCommand::TranslateText,
@@ -1974,28 +1972,16 @@ mod echo_tests {
                 "AI · Video",
             ),
             (
+                "generate audio",
+                ToolbarCommand::GenerateAudio,
+                "toolbar-command-generate-audio",
+                "AI · Audio",
+            ),
+            (
                 "generate vector",
                 ToolbarCommand::GenerateVector,
                 "toolbar-command-generate-vectors",
                 "AI · Create from prompt",
-            ),
-            (
-                "generate design",
-                ToolbarCommand::GenerateDesign,
-                "toolbar-command-generate-a-design",
-                "AI · Design",
-            ),
-            (
-                "generate masks",
-                ToolbarCommand::GenerateMasks,
-                "toolbar-command-generate-masks",
-                "AI · Masks",
-            ),
-            (
-                "remove background",
-                ToolbarCommand::RemoveBackground,
-                "toolbar-command-remove-background",
-                "AI · Masks",
             ),
         ] {
             cx.update(|window, cx| {
