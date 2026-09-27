@@ -277,6 +277,16 @@ pub fn init(cx: &mut App) {
             );
         });
     })
+    .on_action(|_: &zed_actions::OpenAppAccess, cx| {
+        with_active_or_new_workspace(cx, |workspace, window, cx| {
+            settings_modal::SettingsModal::open(
+                workspace,
+                settings_modal::SettingsPage::AppAccess,
+                window,
+                cx,
+            );
+        });
+    })
     .on_action(|action: &zed_actions::OpenSettingsAt, cx| {
         let page = settings_modal::SettingsPage::from_path(&action.path);
         with_active_or_new_workspace(cx, move |workspace, window, cx| {

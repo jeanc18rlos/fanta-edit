@@ -250,7 +250,7 @@ const CONTENT: (Section<3>, Section<1>) = (
 );
 
 #[cfg(feature = "mac_app_store")]
-const CONTENT: (Section<3>, Section<1>) = (
+const CONTENT: (Section<3>, Section<2>) = (
     Section {
         title: "Get Started",
         entries: [
@@ -276,12 +276,20 @@ const CONTENT: (Section<3>, Section<1>) = (
     },
     Section {
         title: "Configure",
-        entries: [SectionEntry {
-            icon: IconName::Settings,
-            title: "Open Settings",
-            action: &OpenSettings,
-            visibility_guard: SectionVisibility::Always,
-        }],
+        entries: [
+            SectionEntry {
+                icon: IconName::Settings,
+                title: "Open Settings",
+                action: &OpenSettings,
+                visibility_guard: SectionVisibility::Always,
+            },
+            SectionEntry {
+                icon: IconName::Lock,
+                title: "Review App Access",
+                action: &zed_actions::OpenAppAccess,
+                visibility_guard: SectionVisibility::Always,
+            },
+        ],
     },
 );
 

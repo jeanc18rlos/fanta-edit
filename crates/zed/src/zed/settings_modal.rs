@@ -15,15 +15,17 @@ pub(super) enum SettingsPage {
     Appearance,
     Editor,
     Panels,
+    AppAccess,
     Account,
 }
 
 impl SettingsPage {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 6] = [
         Self::General,
         Self::Appearance,
         Self::Editor,
         Self::Panels,
+        Self::AppAccess,
         Self::Account,
     ];
 
@@ -33,6 +35,7 @@ impl SettingsPage {
             Self::Appearance => "Appearance",
             Self::Editor => "Code Editor",
             Self::Panels => "Panels",
+            Self::AppAccess => "App Access",
             Self::Account => "AI & Billing",
         }
     }
@@ -45,6 +48,8 @@ impl SettingsPage {
             Self::Editor
         } else if path.contains("panel") || path.contains("dock") || path.contains("sidebar") {
             Self::Panels
+        } else if path.contains("app access") || path.contains("macos permissions") {
+            Self::AppAccess
         } else if path.contains("agent")
             || path.contains("ai")
             || path.contains("account")
@@ -419,6 +424,32 @@ impl SettingsModal {
                         "Toggle",
                         workspace::ToggleWorkspaceSidebar,
                         cx,
+                    ));
+            }
+            SettingsPage::AppAccess => {
+                contents = contents
+                    .child(Self::setting_row(
+                        "Project files",
+                        "Fanta can edit files and folders you select in macOS Open and Save dialogs. Check Files & Folders if macOS blocked a protected location.",
+                        Button::new("open-files-and-folders", "System Settings…")
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.open_url("x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_FilesAndFolders");
+                            })),
+                    ))
+                    .child(Self::setting_row(
+                        "Sign-in Keychain",
+                        "macOS may ask before Fanta reads its saved sign-in. Sign Out removes that saved session; there is no global permission to enable.",
+                        Label::new("Managed by macOS").color(Color::Muted),
+                    ))
+                    .child(Self::setting_row(
+                        "Network",
+                        "Fanta uses network access for sign-in, AI features, and billing. The App Store build includes this sandbox capability; macOS has no per-app switch for it.",
+                        Label::new("Included in app").color(Color::Muted),
+                    ))
+                    .child(Self::setting_row(
+                        "Screen recording",
+                        "Fanta does not capture your screen or need Screen Recording permission. You can record a demo with your Mac's own screen recorder.",
+                        Label::new("Not requested").color(Color::Muted),
                     ));
             }
             SettingsPage::Account => {

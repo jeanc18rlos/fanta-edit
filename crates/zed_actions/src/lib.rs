@@ -57,6 +57,8 @@ actions!(
         OpenKeymap,
         /// Opens account settings.
         OpenAccountSettings,
+        /// Opens Fanta's macOS access guide.
+        OpenAppAccess,
         /// Opens server settings.
         OpenServerSettings,
         /// Quits the application.
