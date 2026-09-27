@@ -104,12 +104,10 @@
             "TARGET_DIR"
           ])
           // {
-            # note: different than `$FONTCONFIG_FILE` in `build.nix` – this refers to relative paths
-            # outside the nix store instead of to `$src`
             FONTCONFIG_FILE = pkgs.makeFontsConf {
               fontDirectories = [
-                "./assets/fonts/lilex"
-                "./assets/fonts/ibm-plex-sans"
+                pkgs.lilex
+                pkgs.ibm-plex
               ];
             };
             PROTOC = "${pkgs.protobuf}/bin/protoc";

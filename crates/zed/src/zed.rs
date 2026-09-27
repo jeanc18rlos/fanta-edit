@@ -20,7 +20,6 @@ use agent_settings::{UserAgentsMdState, init_user_agents_md};
 use agent_ui::AgentDiffToolbar;
 use anyhow::Context as _;
 pub use app_menus::*;
-use assets::Assets;
 
 use breadcrumbs::Breadcrumbs;
 #[cfg(not(feature = "mac_app_store"))]
@@ -79,7 +78,7 @@ use theme_settings::ThemeSettings;
 use ui::{Navigable, NavigableEntry, TintColor, prelude::*};
 use util::markdown::MarkdownString;
 use util::rel_path::RelPath;
-use util::{ResultExt, asset_str, maybe};
+use util::{ResultExt, maybe};
 use uuid::Uuid;
 use vim_mode_setting::VimModeSetting;
 use workspace::notifications::{NotificationId, dismiss_app_notification, show_app_notification};
@@ -236,15 +235,18 @@ pub fn init(cx: &mut App) {
     }
 
     cx.on_action(|_: &zed_actions::OpenLicenses, cx| {
-        with_active_or_new_workspace(cx, |workspace, window, cx| {
-            open_bundled_file(
+        with_active_or_new_workspace(cx, |workspace, window, cx| match bundled_licenses(cx) {
+            Ok(text) => open_bundled_file(
                 workspace,
-                asset_str::<Assets>("licenses.md"),
+                text,
                 "Open Source License Attribution",
                 "Markdown",
                 window,
                 cx,
-            );
+            ),
+            Err(error) => {
+                workspace.show_error(format!("Could not load dependency licenses: {error:#}"), cx)
+            }
         });
     })
     .on_action(|&zed_actions::OpenKeymapFile, cx| {
@@ -2582,6 +2584,17 @@ fn open_local_file(
         workspace.show_notification(NotificationId::unique::<NoOpenFolders>(), cx, |cx| {
             cx.new(|cx| MessageNotification::new("This project has no folders open.", cx))
         })
+    }
+}
+
+fn bundled_licenses(cx: &App) -> anyhow::Result<Cow<'static, str>> {
+    let bytes = cx
+        .asset_source()
+        .load("licenses.md")?
+        .context("license asset is missing")?;
+    match bytes {
+        Cow::Borrowed(bytes) => Ok(Cow::Borrowed(std::str::from_utf8(bytes)?)),
+        Cow::Owned(bytes) => Ok(Cow::Owned(String::from_utf8(bytes)?)),
     }
 }
 

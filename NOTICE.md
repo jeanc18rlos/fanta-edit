@@ -8,9 +8,11 @@ Industries.
   See `LICENSE-GPL`.
 - Portions of the upstream project are Apache-2.0; see `LICENSE-APACHE`, which
   retains Zed Industries' copyright notice.
-- The Fanta design engine and UI kit under `crates/fanta-*` are (c) Fanta and are
-  licensed GPL-3.0. See `crates/VENDORED.md` for their upstream provenance.
+- The Fanta design engine under `crates/fanta-*` is (c) Fanta and licensed
+  GPL-3.0. See `crates/VENDORED.md` for its upstream provenance. The reusable
+  UI packages are published from [fanta-ui](https://github.com/squidred-dev/fanta-ui).
 
-Third-party dependency licenses are generated at build time into
-`assets/licenses.md` and are readable in the app under
-**Help > View Dependency Licenses**.
+Third-party dependency licenses are generated for each editor bundle into
+`assets/licenses.md`, alongside the shared icon and theme notices, and are
+readable in the app under **Help > View Dependency Licenses**. Without a
+generated editor file, the shared UI asset package supplies its bundled notices.

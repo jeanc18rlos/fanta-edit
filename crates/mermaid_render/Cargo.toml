@@ -26,3 +26,4 @@ serde_json.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 mermaid_render = { path = ".", features = ["test-support"] }
 usvg.workspace = true
+zed_ui_assets.workspace = true

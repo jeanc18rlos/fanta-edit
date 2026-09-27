@@ -1,8 +1,8 @@
 # Vendored Fanta crates
 
-The Fanta engine crates below are vendored into this repository so
-the tree builds standalone and the GPL-3.0 corresponding-source offer for the
-shipped binary is satisfied by this repository alone.
+The Fanta engine crates below are vendored into this repository. The GPUI and
+reusable UI source lives separately in
+[fanta-ui](https://github.com/squidred-dev/fanta-ui).
 
 | Crate(s) | Upstream | Commit |
 |---|---|---|
@@ -106,18 +106,25 @@ Divergences from upstream made *after* vendoring, to be re-applied on a resync:
   module this copy carried. `[package]` still omits `repository` and the
   `[lints]` block still allows `redundant_clone`, per the rules above.
 
-All other source is byte-identical to upstream. Edits belong here now; the
-sibling checkouts are no longer part of the build.
+All other vendored engine source is byte-identical to upstream. Engine edits
+belong here; GPUI and reusable UI changes belong in fanta-ui.
 
 ## External GPUI dependencies
 
 The workspace consumes the GPUI framework, supporting libraries, and reusable
-Fanta components externally. The workspace uses the coordinated crates.io release `=0.3.0`. Dependency aliases preserve existing Rust imports, and `Cargo.lock`
-records the exact source. The shared Variables screen includes project titles, mode selectors,
-layer bindings, and input handling that survives editor keymap reloads.
+Fanta components and the Zed UI foundation externally. The workspace uses the
+coordinated crates.io release `=0.5.0`. Dependency aliases preserve existing
+Rust imports, and `Cargo.lock` records the exact source. The shared Variables
+screen includes project titles, mode selectors, layer bindings, and input
+handling that survives editor keymap reloads.
 
-The migrated local source copies have been removed. The `fanta-gpui` entries
-above record historical provenance and migration work, not the active source.
+The migrated local source copies have been removed. The `fanta-gpui` entry
+above records historical provenance and migration work, not the active source.
+`component`, `file_icons`, `icons`, `menu`, `syntax_theme`, `theme`, `ui`,
+`ui_input`, and `ui_macros` are now separate fanta-ui packages. UI icons, file
+icons, fonts, themes, and vector assets are provided by its shared asset
+package. Editor settings, input-editor integration, and generated dependency
+licenses remain in this repository.
 Framework changes and native framework tests belong in
 https://github.com/squidred-dev/fanta-ui. Editor CI tests the host integration,
 including canvas rendering and editor video playback, against the pinned
@@ -133,4 +140,4 @@ The shared FileInspectorSidebar composes the Pages and Layers entities supplied
 by the editor. The old native Pages fallback, section divider, and sidebar
 layout have been removed. The editor owns document actions and persisted
 visibility; the shared sidebar owns header, theme, and floating-card rendering.
-All GPUI aliases resolve to crates.io `=0.3.0` with a single GPUI type identity.
+All GPUI aliases resolve to crates.io `=0.5.0` with a single GPUI type identity.

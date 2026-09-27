@@ -105,9 +105,10 @@ dependencies = [
  "env_logger 0.11.8",
  "fanta-gpui-collections",
  "fanta-gpui-core",
+ "fanta-gpui-file-icons",
+ "fanta-gpui-ui",
  "fanta-gpui-util",
  "feature_flags",
- "file_icons",
  "futures 0.3.32",
  "http_proxy",
  "image",
@@ -132,7 +133,6 @@ dependencies = [
  "tempfile",
  "terminal",
  "text",
- "ui",
  "url",
  "urlencoding",
  "uuid",
@@ -148,6 +148,7 @@ dependencies = [
  "agent_ui",
  "fanta-gpui-collections",
  "fanta-gpui-core",
+ "fanta-gpui-ui",
  "fanta-gpui-util",
  "language",
  "markdown 0.1.0",
@@ -156,7 +157,6 @@ dependencies = [
  "serde_json",
  "settings",
  "theme_settings",
- "ui",
  "workspace",
 ]
 
@@ -248,6 +248,8 @@ dependencies = [
  "fanta-gpui-http-client",
  "fanta-gpui-proptest",
  "fanta-gpui-reqwest-client",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
  "fanta-gpui-util",
  "fanta-gpui-zlog",
  "feature_flags",
@@ -289,10 +291,8 @@ dependencies = [
  "telemetry",
  "tempfile",
  "text",
- "theme",
  "theme_settings",
  "thiserror 2.0.17",
- "ui",
  "unindent",
  "url",
  "uuid",
@@ -367,6 +367,7 @@ dependencies = [
  "fanta-gpui-gpui-tokio",
  "fanta-gpui-http-client",
  "fanta-gpui-reqwest-client",
+ "fanta-gpui-ui",
  "fanta-gpui-util",
  "feature_flags",
  "fs",
@@ -387,7 +388,6 @@ dependencies = [
  "tempfile",
  "terminal",
  "thiserror 2.0.17",
- "ui",
  "uuid",
  "watch",
  "zed_credentials_provider",
@@ -456,20 +456,24 @@ dependencies = [
  "clock",
  "cloud_api_types",
  "command_palette_hooks",
- "component",
  "context_server",
  "db",
  "editor",
  "eval_utils",
  "extension",
  "fanta-gpui-collections",
+ "fanta-gpui-component",
  "fanta-gpui-core",
+ "fanta-gpui-file-icons",
  "fanta-gpui-gpui-tokio",
  "fanta-gpui-http-client",
+ "fanta-gpui-menu",
  "fanta-gpui-reqwest-client",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
+ "fanta-gpui-ui-input",
  "fanta-gpui-util",
  "feature_flags",
- "file_icons",
  "fs",
  "futures 0.3.32",
  "fuzzy",
@@ -489,7 +493,6 @@ dependencies = [
  "lru",
  "lsp",
  "markdown 0.1.0",
- "menu",
  "multi_buffer",
  "node_runtime",
  "notifications",
@@ -524,12 +527,9 @@ dependencies = [
  "terminal",
  "terminal_view",
  "text",
- "theme",
  "theme_settings",
  "time",
  "tree-sitter-md",
- "ui",
- "ui_input",
  "unicode-segmentation",
  "unindent",
  "url",
@@ -570,13 +570,13 @@ version = "0.1.0"
 dependencies = [
  "client",
  "cloud_api_types",
- "component",
+ "fanta-gpui-component",
  "fanta-gpui-core",
+ "fanta-gpui-ui",
  "language_model",
  "serde",
  "smallvec",
  "telemetry",
- "ui",
  "zed_actions",
 ]
 
@@ -898,6 +898,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "fanta-gpui-core",
+ "fanta-gpui-zed-ui-assets",
  "rust-embed",
 ]
 
@@ -1602,7 +1603,7 @@ name = "breadcrumbs"
 version = "0.1.0"
 dependencies = [
  "fanta-gpui-core",
- "ui",
+ "fanta-gpui-ui",
  "workspace",
 ]
 
@@ -2364,22 +2365,22 @@ dependencies = [
  "editor",
  "fanta-gpui-collections",
  "fanta-gpui-core",
+ "fanta-gpui-menu",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
  "fanta-gpui-util",
  "fuzzy_nucleo",
  "go_to_line",
  "language",
  "log",
- "menu",
  "picker",
  "postage",
  "project",
  "serde",
  "settings",
  "telemetry",
- "theme",
  "theme_settings",
  "time",
- "ui",
  "workspace",
  "zed_actions",
 ]
@@ -2392,19 +2393,6 @@ dependencies = [
  "fanta-gpui-collections",
  "fanta-gpui-core",
  "workspace",
-]
-
-[[package]]
-name = "component"
-version = "0.1.0"
-dependencies = [
- "documented",
- "fanta-gpui-collections",
- "fanta-gpui-core",
- "inventory",
- "parking_lot",
- "strum 0.27.2",
- "theme",
 ]
 
 [[package]]
@@ -3724,7 +3712,7 @@ version = "0.1.0"
 dependencies = [
  "client",
  "fanta-gpui-core",
- "icons",
+ "fanta-gpui-icons",
  "language",
  "text",
 ]
@@ -3749,13 +3737,17 @@ dependencies = [
  "emojis",
  "fanta-gpui-collections",
  "fanta-gpui-core",
+ "fanta-gpui-file-icons",
+ "fanta-gpui-menu",
  "fanta-gpui-proptest",
  "fanta-gpui-sum-tree",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
+ "fanta-gpui-ui-input",
  "fanta-gpui-util",
  "fanta-gpui-zlog",
  "fanta-gpui-ztracing",
  "feature_flags",
- "file_icons",
  "fs",
  "futures 0.3.32",
  "futures-lite 1.13.0",
@@ -3769,7 +3761,6 @@ dependencies = [
  "log",
  "lsp",
  "markdown 0.1.0",
- "menu",
  "multi_buffer",
  "ordered-float 2.10.1",
  "parking_lot",
@@ -3791,7 +3782,6 @@ dependencies = [
  "task",
  "telemetry",
  "text",
- "theme",
  "theme_settings",
  "time",
  "tracing",
@@ -3804,8 +3794,6 @@ dependencies = [
  "tree-sitter-rust",
  "tree-sitter-typescript",
  "tree-sitter-yaml",
- "ui",
- "ui_input",
  "unicode-script",
  "unicode-segmentation",
  "unicode-width",
@@ -4297,8 +4285,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1237b459f4c144c071910ffb11ad60fe7b4c1256be9cfc86399aa64616372073"
 dependencies = [
  "fanta-gpui-components",
  "fanta-gpui-core",
@@ -4310,8 +4299,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-async-process"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "930a736af6878daf8f8497c0d3d663972374877dca16f9dcc9c2fce08404f105"
 dependencies = [
  "async-channel 2.5.0",
  "async-io",
@@ -4327,8 +4317,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-collections"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ffbc51d38d0bb1f75a3ee416418de5ffa5188f36b07e4b8b6de415c1c3af2467"
 dependencies = [
  "fanta-gpui-gpui-util",
  "indexmap 2.14.0",
@@ -4336,9 +4327,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanta-gpui-component"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "18d675e1fb0913af4737b40df685a23f2957207668a6eadb3a872ee6ceac9d0d"
+dependencies = [
+ "fanta-gpui-collections",
+ "fanta-gpui-core",
+ "fanta-gpui-theme",
+ "inventory",
+ "parking_lot",
+ "strum 0.27.2",
+]
+
+[[package]]
 name = "fanta-gpui-components"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5da23e16430276319fa28b19918512d7d9125daf3a11d9c3dd21fb90c35eb50"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -4376,8 +4382,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-core"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbf0b991f2eea49c19d24c582e4afd2782491e8ea1889b722de4e1e0adaace06"
 dependencies = [
  "accesskit",
  "anyhow",
@@ -4461,8 +4468,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-derive-refineable"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "311ccdd73a5d665fb7a08f31c2aff8ff5c80410358c58508468dff18b5000ac4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4470,9 +4478,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanta-gpui-file-icons"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b16aca3e9054e8f76b95fd3b459d72a0680119fad7d608877040be89b242c86b"
+dependencies = [
+ "fanta-gpui-core",
+ "fanta-gpui-theme",
+ "fanta-gpui-util",
+ "serde",
+]
+
+[[package]]
 name = "fanta-gpui-gpui-linux"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eacbee8c87ef3c78ea0acb2ef72535a463221a0f65ed248b0df80a7891201c2a"
 dependencies = [
  "accesskit",
  "accesskit_unix",
@@ -4522,8 +4543,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-gpui-macos"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3971d843e2f48b273fb2fb1d662235e26b18d8deb89eed627cf316aa5d067005"
 dependencies = [
  "accesskit",
  "accesskit_macos",
@@ -4569,8 +4591,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-gpui-macros"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93aa0aeb1ffea81471e5961a0b2b8478bb3777cae8d151aecbd983ae6b882793"
 dependencies = [
  "heck 0.5.0",
  "proc-macro2",
@@ -4580,8 +4603,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-gpui-platform"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6b17aa233e7aa43bbb5f941905107bad48c4636f38ba264ccc6bfce26146338b"
 dependencies = [
  "console_error_panic_hook",
  "fanta-gpui-core",
@@ -4593,8 +4617,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-gpui-shared-string"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ece29813dc44db44585cd4fe14b033bac65c99e0919d46336910b76b14fdd329"
 dependencies = [
  "schemars 1.0.4",
  "serde",
@@ -4603,8 +4628,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-gpui-tokio"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "76bf84232afb2e64cf1cdd10f81f3c24cf5b92a01720853f0e3f7deff37453a2"
 dependencies = [
  "anyhow",
  "fanta-gpui-core",
@@ -4614,8 +4640,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-gpui-util"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8887e6567c69e4093827d822306639b8480d3c800a6f54dca16b4dde6190170d"
 dependencies = [
  "anyhow",
  "log",
@@ -4624,8 +4651,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-gpui-web"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "837f43f642d86a62c43057a234633a55b7011d2ba58afaf131c1889ebe1c0d25"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",
@@ -4648,8 +4676,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-gpui-wgpu"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16782eefa38f920c48bcc9afdadb2cea31de63922aaa4c8377ee4c7420e56431"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -4677,8 +4706,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-gpui-windows"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "01d8481286112e59164aebf5fe35fec5aba304fb63707d1b662ea771db4f157f"
 dependencies = [
  "accesskit",
  "accesskit_windows",
@@ -4706,8 +4736,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-http-client"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8624c7313a76eec6cdc6368e70939699a80f425a7ffc0c3fb8bb38380ea5773f"
 dependencies = [
  "anyhow",
  "async-compression",
@@ -4731,17 +4762,29 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-http-client-tls"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "73eaf52d4cf92ee2222a897a236df171756558db69634f6fa3ddeda4fe85f1c8"
 dependencies = [
  "rustls",
  "rustls-platform-verifier",
 ]
 
 [[package]]
+name = "fanta-gpui-icons"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16681ef89511c0e988b36df09967c5da8625af5143053764a738180f486a7dbf"
+dependencies = [
+ "serde",
+ "strum 0.27.2",
+]
+
+[[package]]
 name = "fanta-gpui-media"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ca7beaa643748a4fcea851be4cb18471fae2cc979c8f77d1a02528fad1c173c"
 dependencies = [
  "anyhow",
  "bindgen",
@@ -4757,9 +4800,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanta-gpui-menu"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9f70004a5054d62a50c5a563ea99b9b87ac1eccecb4c96b6e3c86af29141c063"
+dependencies = [
+ "fanta-gpui-core",
+]
+
+[[package]]
 name = "fanta-gpui-perf"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b0f8355231e6bd856d49b1dc28a09a10c314d27e824656242c457d01edb74958"
 dependencies = [
  "fanta-gpui-collections",
  "serde",
@@ -4768,8 +4821,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-proptest"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52064c864142aab0922cc9dfed4c6f30ad762f871c277affffe8e3a193fcf489"
 dependencies = [
  "bit-set 0.8.0",
  "bit-vec 0.8.0",
@@ -4787,8 +4841,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-proptest-macro"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "364ca9208a1be0dc55738e0d7338f1bb6a58eea7d1d4f933faa526ec2e35516d"
 dependencies = [
  "convert_case 0.11.0",
  "proc-macro2",
@@ -4798,16 +4853,18 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-refineable"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cc4e15c0b0b9cc03505900abd2af980bb8ce92aaeb3190b25857d2b1db55c32"
 dependencies = [
  "fanta-gpui-derive-refineable",
 ]
 
 [[package]]
 name = "fanta-gpui-reqwest-client"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d38afddabe32bdda88958e109a2ba74cee437f6d520bffd3151c39a9e7dd372c"
 dependencies = [
  "anyhow",
  "bytes 1.11.1",
@@ -4824,8 +4881,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-scheduler"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc580cb8d8e0ed63acfcc17bb4e6c47b40da2e27d402a802f365fe1889d74db5"
 dependencies = [
  "async-task",
  "backtrace",
@@ -4839,8 +4897,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-smol"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "724cfeed7b796fa9855b8c370acbb0e9686c54cd4b1e21545baa8fc93130cd56"
 dependencies = [
  "async-channel 2.5.0",
  "async-executor",
@@ -4855,8 +4914,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-sum-tree"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "688fe66a1a91ba4b88202677f9fa974fb47322b82532a491b1281de3b3094681"
 dependencies = [
  "fanta-gpui-ztracing",
  "heapless",
@@ -4866,9 +4926,88 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanta-gpui-syntax-theme"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9d256ecfb61a39953dc313415b53f11593d34c317f9cbe23dd590e97462afa15"
+dependencies = [
+ "fanta-gpui-core",
+]
+
+[[package]]
+name = "fanta-gpui-theme"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34717796d7a97166b65f1d2e91722e2cf1391e9dbe1e0242e826ca9900df96df"
+dependencies = [
+ "anyhow",
+ "fanta-gpui-collections",
+ "fanta-gpui-core",
+ "fanta-gpui-refineable",
+ "fanta-gpui-syntax-theme",
+ "palette",
+ "parking_lot",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+ "serde_json_lenient",
+ "strum 0.27.2",
+ "thiserror 2.0.17",
+ "uuid",
+]
+
+[[package]]
+name = "fanta-gpui-ui"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "517ae7c5c4e9e610f3da9e6e7dbc026617834fdfe7bf8d042e1b6f5bbf97b6bf"
+dependencies = [
+ "chrono",
+ "documented",
+ "fanta-gpui-component",
+ "fanta-gpui-core",
+ "fanta-gpui-gpui-macros",
+ "fanta-gpui-gpui-util",
+ "fanta-gpui-icons",
+ "fanta-gpui-menu",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui-macros",
+ "itertools 0.14.0",
+ "log",
+ "num-format",
+ "schemars 1.0.4",
+ "serde",
+ "smallvec",
+ "strum 0.27.2",
+ "windows 0.61.3",
+]
+
+[[package]]
+name = "fanta-gpui-ui-input"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8295973fe5bd16bb7d12ca96c1b8328d89fe0e857fbfa0f146be4c339906384"
+dependencies = [
+ "fanta-gpui-component",
+ "fanta-gpui-core",
+ "fanta-gpui-ui",
+]
+
+[[package]]
+name = "fanta-gpui-ui-macros"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6e97684f07d5cc2c859f2dd353fab433fc81203dc643fdfae377cabba5154c2"
+dependencies = [
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
 name = "fanta-gpui-util"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d78f4729cd599a0c49af3ab5cef1314a05762d337456d4df346411ab780e750"
 dependencies = [
  "anyhow",
  "async-fs",
@@ -4909,8 +5048,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-util-macros"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6cf6076ae70f7f3a5f474be2864039d45c349e8050865805f99137473cae6513"
 dependencies = [
  "fanta-gpui-perf",
  "quote",
@@ -4918,9 +5058,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanta-gpui-zed-ui-assets"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e89cb31a570149fa9a1b3302f7dd8733eb97e863b6bc723acc90b61ee939e94d"
+dependencies = [
+ "fanta-gpui-core",
+ "rust-embed",
+]
+
+[[package]]
 name = "fanta-gpui-zlog"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89ce80e1ab94e4771ccb7dded53e818ec3c1277a80a48b13911dd5f9992d9d1b"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4930,8 +5081,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-ztracing"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f340930ff3754a73501ab3a7be49f17c5ae2879690ab84d2293f25e03332f3aa"
 dependencies = [
  "fanta-gpui-zlog",
  "fanta-gpui-ztracing-macro",
@@ -4943,8 +5095,9 @@ dependencies = [
 
 [[package]]
 name = "fanta-gpui-ztracing-macro"
-version = "0.4.1"
-source = "git+https://github.com/squidred-dev/fanta-ui?rev=de274b385ab9a9fc153c562dc6953618c3179c33#de274b385ab9a9fc153c562dc6953618c3179c33"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f0977d1b634ae781583fd32289a8084e60373055e209debabcf320adfeaa234"
 
 [[package]]
 name = "fanta-present"
@@ -5031,12 +5184,12 @@ dependencies = [
  "env_logger 0.11.8",
  "fanta-gpui-core",
  "fanta-gpui-gpui-platform",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
  "image",
  "picker",
  "settings",
- "theme",
  "theme_settings",
- "ui",
 ]
 
 [[package]]
@@ -5136,9 +5289,13 @@ dependencies = [
  "fanta-gpui-collections",
  "fanta-gpui-components",
  "fanta-gpui-core",
+ "fanta-gpui-file-icons",
  "fanta-gpui-gpui-platform",
  "fanta-gpui-http-client",
  "fanta-gpui-media",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
+ "fanta-gpui-ui-input",
  "fanta-gpui-util",
  "fanta-gpui-zlog",
  "fanta-present",
@@ -5146,7 +5303,6 @@ dependencies = [
  "fanta-text",
  "fanta-tools",
  "fanta_ui",
- "file_icons",
  "foreign-types 0.5.0",
  "fs",
  "futures 0.3.32",
@@ -5168,26 +5324,13 @@ dependencies = [
  "skia-safe",
  "smallvec",
  "tempfile",
- "theme",
  "theme_settings",
- "ui",
- "ui_input",
  "url",
  "usvg",
  "uuid",
  "workspace",
  "worktree",
  "zed_actions",
-]
-
-[[package]]
-name = "file_icons"
-version = "0.1.0"
-dependencies = [
- "fanta-gpui-core",
- "fanta-gpui-util",
- "serde",
- "theme",
 ]
 
 [[package]]
@@ -5826,16 +5969,20 @@ dependencies = [
  "async-channel 2.5.0",
  "buffer_diff",
  "client",
- "component",
  "ctor",
  "db",
  "editor",
  "fanta-gpui-collections",
+ "fanta-gpui-component",
  "fanta-gpui-core",
+ "fanta-gpui-file-icons",
+ "fanta-gpui-menu",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
+ "fanta-gpui-ui-input",
  "fanta-gpui-util",
  "fanta-gpui-zlog",
  "fanta-gpui-ztracing",
- "file_icons",
  "fs",
  "futures 0.3.32",
  "futures-lite 1.13.0",
@@ -5848,7 +5995,6 @@ dependencies = [
  "language_model",
  "log",
  "markdown 0.1.0",
- "menu",
  "multi_buffer",
  "notifications",
  "panel",
@@ -5872,13 +6018,10 @@ dependencies = [
  "task",
  "telemetry",
  "terminal",
- "theme",
  "theme_settings",
  "time",
  "time_format",
  "tracing",
- "ui",
- "ui_input",
  "unindent",
  "watch",
  "windows 0.61.3",
@@ -6079,10 +6222,12 @@ version = "0.1.0"
 dependencies = [
  "editor",
  "fanta-gpui-core",
+ "fanta-gpui-menu",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
  "fanta-gpui-util",
  "indoc",
  "language",
- "menu",
  "multi_buffer",
  "project",
  "rope",
@@ -6090,8 +6235,6 @@ dependencies = [
  "serde_json",
  "settings",
  "text",
- "theme",
- "ui",
  "workspace",
 ]
 
@@ -6662,14 +6805,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "icons"
-version = "0.1.0"
-dependencies = [
- "serde",
- "strum 0.27.2",
-]
-
-[[package]]
 name = "icu_collections"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6846,15 +6981,15 @@ dependencies = [
  "db",
  "editor",
  "fanta-gpui-core",
+ "fanta-gpui-file-icons",
+ "fanta-gpui-ui",
  "fanta-gpui-util",
- "file_icons",
  "language",
  "log",
  "project",
  "serde",
  "settings",
  "theme_settings",
- "ui",
  "workspace",
 ]
 
@@ -7240,6 +7375,7 @@ dependencies = [
  "extension",
  "fanta-gpui-collections",
  "fanta-gpui-core",
+ "fanta-gpui-theme",
  "fanta-gpui-util",
  "feature_flags",
  "language",
@@ -7252,7 +7388,6 @@ dependencies = [
  "settings",
  "snippet_provider",
  "task",
- "theme",
 ]
 
 [[package]]
@@ -7408,6 +7543,7 @@ dependencies = [
  "fanta-gpui-core",
  "fanta-gpui-http-client",
  "fanta-gpui-sum-tree",
+ "fanta-gpui-theme",
  "fanta-gpui-util",
  "fanta-gpui-zlog",
  "fanta-gpui-ztracing",
@@ -7438,7 +7574,6 @@ dependencies = [
  "strsim 0.11.1",
  "task",
  "text",
- "theme",
  "theme_settings",
  "toml 0.8.23",
  "tracing",
@@ -7489,9 +7624,9 @@ dependencies = [
  "fanta-gpui-collections",
  "fanta-gpui-core",
  "fanta-gpui-http-client",
+ "fanta-gpui-icons",
  "fanta-gpui-util",
  "futures 0.3.32",
- "icons",
  "image",
  "language_model_core",
  "log",
@@ -7535,20 +7670,20 @@ dependencies = [
  "fanta-gpui-core",
  "fanta-gpui-gpui-tokio",
  "fanta-gpui-http-client",
+ "fanta-gpui-menu",
+ "fanta-gpui-ui",
+ "fanta-gpui-ui-input",
  "fanta-gpui-util",
  "feature_flags",
  "fs",
  "futures 0.3.32",
  "language_model",
  "log",
- "menu",
  "open_ai",
  "release_channel",
  "serde_json",
  "settings",
  "strum 0.27.2",
- "ui",
- "ui_input",
  "zed_actions",
 ]
 
@@ -7566,6 +7701,7 @@ dependencies = [
  "fanta-gpui-core",
  "fanta-gpui-http-client",
  "fanta-gpui-smol",
+ "fanta-gpui-theme",
  "fanta-gpui-util",
  "fs",
  "futures 0.3.32",
@@ -7599,7 +7735,6 @@ dependencies = [
  "task",
  "tempfile",
  "terminal",
- "theme",
  "tree-sitter",
  "tree-sitter-bash",
  "tree-sitter-c",
@@ -8074,6 +8209,8 @@ dependencies = [
  "fanta-gpui-core",
  "fanta-gpui-gpui-platform",
  "fanta-gpui-sum-tree",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
  "fanta-gpui-util",
  "fs",
  "futures 0.3.32",
@@ -8090,9 +8227,7 @@ dependencies = [
  "settings",
  "smallvec",
  "stacksafe",
- "theme",
  "theme_settings",
- "ui",
 ]
 
 [[package]]
@@ -8113,6 +8248,8 @@ dependencies = [
  "db",
  "editor",
  "fanta-gpui-core",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
  "fanta-gpui-util",
  "fs",
  "language",
@@ -8122,9 +8259,7 @@ dependencies = [
  "serde_json",
  "settings",
  "tempfile",
- "theme",
  "theme_settings",
- "ui",
  "urlencoding",
  "workspace",
  "zed_actions",
@@ -8229,18 +8364,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "menu"
-version = "0.1.0"
-dependencies = [
- "fanta-gpui-core",
-]
-
-[[package]]
 name = "mermaid_render"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "fanta-gpui-core",
+ "fanta-gpui-zed-ui-assets",
  "mermaid_render",
  "merman",
  "quick-xml 0.38.3",
@@ -8495,6 +8624,7 @@ dependencies = [
  "fanta-gpui-collections",
  "fanta-gpui-core",
  "fanta-gpui-sum-tree",
+ "fanta-gpui-theme",
  "fanta-gpui-util",
  "fanta-gpui-zlog",
  "fanta-gpui-ztracing",
@@ -8511,7 +8641,6 @@ dependencies = [
  "settings",
  "smallvec",
  "text",
- "theme",
  "tracing",
  "tree-sitter",
  "unicode-segmentation",
@@ -8755,14 +8884,14 @@ dependencies = [
  "anyhow",
  "channel",
  "client",
- "component",
+ "fanta-gpui-component",
  "fanta-gpui-core",
  "fanta-gpui-sum-tree",
+ "fanta-gpui-ui",
  "fanta-gpui-util",
  "futures-lite 1.13.0",
  "rpc",
  "time",
- "ui",
  "workspace",
  "zed_actions",
 ]
@@ -9446,8 +9575,10 @@ version = "0.1.0"
 dependencies = [
  "editor",
  "fanta-gpui-core",
+ "fanta-gpui-file-icons",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
  "fanta-gpui-util",
- "file_icons",
  "futures 0.3.32",
  "fuzzy",
  "picker",
@@ -9456,9 +9587,7 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
- "theme",
  "theme_settings",
- "ui",
  "workspace",
 ]
 
@@ -9556,21 +9685,21 @@ version = "0.1.0"
 dependencies = [
  "editor",
  "fanta-gpui-core",
+ "fanta-gpui-menu",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
  "fanta-gpui-util",
  "futures 0.3.32",
  "fuzzy_nucleo",
  "indoc",
  "language",
  "lsp",
- "menu",
  "picker",
  "project",
  "rope",
  "serde_json",
  "settings",
- "theme",
  "theme_settings",
- "ui",
  "workspace",
  "zed_actions",
 ]
@@ -9585,15 +9714,17 @@ dependencies = [
  "editor",
  "fanta-gpui-collections",
  "fanta-gpui-core",
+ "fanta-gpui-file-icons",
+ "fanta-gpui-menu",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
  "fanta-gpui-util",
- "file_icons",
  "futures 0.3.32",
  "fuzzy",
  "itertools 0.14.0",
  "language",
  "log",
  "lsp",
- "menu",
  "outline",
  "pretty_assertions",
  "project",
@@ -9602,9 +9733,7 @@ dependencies = [
  "serde_json",
  "settings",
  "smallvec",
- "theme",
  "theme_settings",
- "ui",
  "workspace",
  "worktree",
  "zed_actions",
@@ -9655,7 +9784,7 @@ name = "panel"
 version = "0.1.0"
 dependencies = [
  "fanta-gpui-core",
- "ui",
+ "fanta-gpui-ui",
  "workspace",
 ]
 
@@ -10417,18 +10546,18 @@ dependencies = [
  "db",
  "editor",
  "fanta-gpui-core",
+ "fanta-gpui-menu",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
+ "fanta-gpui-ui-input",
  "fanta-gpui-util",
  "language",
- "menu",
  "project",
  "schemars 1.0.4",
  "serde",
  "serde_json",
  "settings",
- "theme",
  "theme_settings",
- "ui",
- "ui_input",
  "workspace",
  "zed_actions",
 ]
@@ -10439,6 +10568,7 @@ version = "0.1.0"
 dependencies = [
  "editor",
  "fanta-gpui-core",
+ "fanta-gpui-ui",
  "fanta-gpui-util",
  "language",
  "multi_buffer",
@@ -10446,7 +10576,6 @@ dependencies = [
  "project",
  "rope",
  "settings",
- "ui",
 ]
 
 [[package]]
@@ -10536,12 +10665,12 @@ name = "platform_title_bar"
 version = "0.1.0"
 dependencies = [
  "fanta-gpui-core",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
  "project",
  "settings",
  "smallvec",
- "theme",
  "theme_settings",
- "ui",
  "windows 0.61.3",
  "workspace",
  "zed_actions",
@@ -10970,9 +11099,12 @@ dependencies = [
  "editor",
  "fanta-gpui-collections",
  "fanta-gpui-core",
+ "fanta-gpui-file-icons",
+ "fanta-gpui-menu",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
  "fanta-gpui-util",
  "feature_flags",
- "file_icons",
  "fs",
  "futures 0.3.32",
  "git",
@@ -10981,7 +11113,6 @@ dependencies = [
  "language",
  "log",
  "markdown_preview",
- "menu",
  "notifications",
  "pretty_assertions",
  "project",
@@ -10995,9 +11126,7 @@ dependencies = [
  "smallvec",
  "telemetry",
  "tempfile",
- "theme",
  "theme_settings",
- "ui",
  "workspace",
  "worktree",
  "zed_actions",
@@ -11538,13 +11667,15 @@ dependencies = [
  "chrono",
  "editor",
  "fanta-gpui-core",
+ "fanta-gpui-menu",
+ "fanta-gpui-ui",
+ "fanta-gpui-ui-input",
  "fanta-gpui-util",
  "fs",
  "futures 0.3.32",
  "fuzzy_nucleo",
  "indoc",
  "log",
- "menu",
  "open_path_prompt",
  "ordered-float 2.10.1",
  "paths",
@@ -11557,8 +11688,6 @@ dependencies = [
  "settings",
  "task",
  "telemetry",
- "ui",
- "ui_input",
  "windows-registry 0.6.1",
  "workspace",
  "zed_actions",
@@ -11730,17 +11859,17 @@ dependencies = [
  "askpass",
  "auto_update",
  "fanta-gpui-core",
+ "fanta-gpui-menu",
+ "fanta-gpui-ui",
+ "fanta-gpui-ui-input",
  "futures 0.3.32",
  "log",
  "markdown 0.1.0",
- "menu",
  "release_channel",
  "remote",
  "semver",
  "settings",
  "theme_settings",
- "ui",
- "ui_input",
  "workspace",
 ]
 
@@ -12409,17 +12538,19 @@ dependencies = [
  "editor",
  "fanta-gpui-collections",
  "fanta-gpui-core",
+ "fanta-gpui-file-icons",
+ "fanta-gpui-menu",
  "fanta-gpui-smol",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
  "fanta-gpui-util",
  "fanta-gpui-util-macros",
  "fanta-gpui-ztracing",
- "file_icons",
  "fs",
  "futures 0.3.32",
  "itertools 0.14.0",
  "language",
  "lsp",
- "menu",
  "multi_buffer",
  "picker",
  "picker_preview",
@@ -12429,10 +12560,8 @@ dependencies = [
  "serde_json",
  "settings",
  "text",
- "theme",
  "theme_settings",
  "tracing",
- "ui",
  "unindent",
  "workspace",
  "zed_actions",
@@ -12895,6 +13024,9 @@ dependencies = [
  "extension",
  "fanta-gpui-core",
  "fanta-gpui-http-client",
+ "fanta-gpui-menu",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
  "fanta-gpui-util",
  "feature_flags",
  "fs",
@@ -12904,7 +13036,6 @@ dependencies = [
  "language",
  "language_model",
  "log",
- "menu",
  "node_runtime",
  "notifications",
  "platform_title_bar",
@@ -12920,9 +13051,7 @@ dependencies = [
  "serde_json",
  "settings",
  "telemetry",
- "theme",
  "theme_settings",
- "ui",
  "unicode-segmentation",
  "workspace",
  "zed_actions",
@@ -13699,15 +13828,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "syntax_theme"
-version = "0.1.0"
-dependencies = [
- "fanta-gpui-core",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "sys-locale"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13921,6 +14041,7 @@ dependencies = [
  "async-channel 2.5.0",
  "fanta-gpui-collections",
  "fanta-gpui-core",
+ "fanta-gpui-theme",
  "fanta-gpui-util",
  "fanta-gpui-util-macros",
  "futures 0.3.32",
@@ -13938,7 +14059,6 @@ dependencies = [
  "settings",
  "sysinfo 0.37.2",
  "task",
- "theme",
  "theme_settings",
  "thiserror 2.0.17",
  "url",
@@ -13969,12 +14089,14 @@ dependencies = [
  "editor",
  "fanta-gpui-collections",
  "fanta-gpui-core",
+ "fanta-gpui-menu",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
  "fanta-gpui-util",
  "futures 0.3.32",
  "itertools 0.14.0",
  "language",
  "log",
- "menu",
  "pretty_assertions",
  "project",
  "regex",
@@ -13990,9 +14112,7 @@ dependencies = [
  "shlex",
  "task",
  "terminal",
- "theme",
  "theme_settings",
- "ui",
  "workspace",
  "zed_actions",
 ]
@@ -14019,31 +14139,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "theme"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "fanta-gpui-collections",
- "fanta-gpui-core",
- "fanta-gpui-refineable",
- "palette",
- "parking_lot",
- "schemars 1.0.4",
- "serde",
- "serde_json",
- "serde_json_lenient",
- "strum 0.27.2",
- "syntax_theme",
- "thiserror 2.0.17",
- "uuid",
-]
-
-[[package]]
 name = "theme_selector"
 version = "0.1.0"
 dependencies = [
  "editor",
  "fanta-gpui-core",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
  "fanta-gpui-util",
  "fs",
  "fuzzy",
@@ -14054,9 +14156,7 @@ dependencies = [
  "serde_json",
  "settings",
  "telemetry",
- "theme",
  "theme_settings",
- "ui",
  "workspace",
  "zed_actions",
 ]
@@ -14070,14 +14170,14 @@ dependencies = [
  "fanta-gpui-core",
  "fanta-gpui-gpui-util",
  "fanta-gpui-refineable",
+ "fanta-gpui-theme",
+ "fanta-gpui-zed-ui-assets",
  "log",
  "palette",
  "schemars 1.0.4",
  "serde",
- "serde_json",
  "serde_json_lenient",
  "settings",
- "theme",
  "uuid",
 ]
 
@@ -14285,6 +14385,8 @@ dependencies = [
  "db",
  "fanta-gpui",
  "fanta-gpui-core",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
  "fanta-gpui-util",
  "fs",
  "git_ui",
@@ -14301,8 +14403,6 @@ dependencies = [
  "settings",
  "smallvec",
  "telemetry",
- "theme",
- "ui",
  "windows 0.61.3",
  "workspace",
  "zed_actions",
@@ -14973,59 +15073,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "ui"
-version = "0.1.0"
-dependencies = [
- "chrono",
- "component",
- "documented",
- "fanta-gpui-core",
- "fanta-gpui-gpui-macros",
- "fanta-gpui-gpui-util",
- "icons",
- "itertools 0.14.0",
- "log",
- "menu",
- "num-format",
- "schemars 1.0.4",
- "serde",
- "smallvec",
- "strum 0.27.2",
- "theme",
- "ui_macros",
- "windows 0.61.3",
-]
-
-[[package]]
-name = "ui_input"
-version = "0.1.0"
-dependencies = [
- "component",
- "fanta-gpui-core",
- "ui",
-]
-
-[[package]]
-name = "ui_macros"
-version = "0.1.0"
-dependencies = [
- "component",
- "quote",
- "syn 2.0.117",
- "ui",
-]
-
-[[package]]
 name = "ui_prompt"
 version = "0.1.0"
 dependencies = [
  "fanta-gpui-core",
+ "fanta-gpui-menu",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
  "markdown 0.1.0",
- "menu",
  "settings",
- "theme",
  "theme_settings",
- "ui",
  "workspace",
 ]
 
@@ -15371,7 +15428,10 @@ dependencies = [
  "env_logger 0.11.8",
  "fanta-gpui-collections",
  "fanta-gpui-core",
+ "fanta-gpui-menu",
  "fanta-gpui-perf",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
  "fanta-gpui-util",
  "fanta-gpui-util-macros",
  "futures 0.3.32",
@@ -15383,7 +15443,6 @@ dependencies = [
  "log",
  "lsp",
  "markdown_preview",
- "menu",
  "multi_buffer",
  "nvim-rs",
  "outline_panel",
@@ -15401,10 +15460,8 @@ dependencies = [
  "settings",
  "task",
  "text",
- "theme",
  "theme_settings",
  "tokio",
- "ui",
  "vim_mode_setting",
  "workspace",
  "zed_actions",
@@ -17218,14 +17275,18 @@ dependencies = [
  "chrono",
  "client",
  "clock",
- "component",
  "db",
  "dirs 6.0.0",
  "fanta-format",
  "fanta-gpui-collections",
+ "fanta-gpui-component",
  "fanta-gpui-core",
  "fanta-gpui-http-client",
+ "fanta-gpui-menu",
  "fanta-gpui-proptest",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
+ "fanta-gpui-ui-input",
  "fanta-gpui-util",
  "fanta-gpui-zlog",
  "fs",
@@ -17235,7 +17296,6 @@ dependencies = [
  "language",
  "log",
  "markdown 0.1.0",
- "menu",
  "node_runtime",
  "objc2 0.6.3",
  "objc2-foundation 0.3.2",
@@ -17257,10 +17317,7 @@ dependencies = [
  "task",
  "telemetry",
  "tempfile",
- "theme",
  "theme_settings",
- "ui",
- "ui_input",
  "url",
  "uuid",
  "windows 0.61.3",
@@ -17691,18 +17748,21 @@ dependencies = [
  "client",
  "command_palette",
  "command_palette_hooks",
- "component",
  "crashes",
  "db",
  "editor",
  "etw_tracing",
  "fanta-gpui-collections",
+ "fanta-gpui-component",
  "fanta-gpui-core",
  "fanta-gpui-gpui-platform",
  "fanta-gpui-gpui-tokio",
  "fanta-gpui-http-client",
+ "fanta-gpui-menu",
  "fanta-gpui-reqwest-client",
  "fanta-gpui-smol",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
  "fanta-gpui-util",
  "fanta-gpui-zlog",
  "fanta-gpui-ztracing",
@@ -17727,7 +17787,6 @@ dependencies = [
  "libc",
  "log",
  "markdown 0.1.0",
- "menu",
  "migrator",
  "mimalloc",
  "node_runtime",
@@ -17761,14 +17820,12 @@ dependencies = [
  "telemetry",
  "telemetry_events",
  "terminal_view",
- "theme",
  "theme_selector",
  "theme_settings",
  "time",
  "time_format",
  "title_bar",
  "tracing",
- "ui",
  "ui_prompt",
  "url",
  "urlencoding",
