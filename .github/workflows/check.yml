@@ -87,6 +87,28 @@ jobs:
       - name: Test sidebar behavior and project ownership
         run: cargo test --locked -p sidebar --lib
 
+  account-center:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.native_video_only }}
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install the repository Rust toolchain
+        run: rustup show active-toolchain
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: macos-account-center
+      - name: Check direct and Mac App Store account builds
+        run: |
+          cargo check --locked -p zed --bin fanta
+          cargo check --locked -p zed --bin fanta --features mac_app_store
+      - name: Test account contract and usage in both builds
+        run: |
+          cargo test --locked -p zed --bin fanta fanta_account::tests
+          cargo test --locked -p zed --bin fanta fanta_account::tests --features mac_app_store
+
   native-video:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.native_video_only }}
     runs-on: macos-26
