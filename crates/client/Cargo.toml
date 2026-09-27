@@ -13,6 +13,7 @@ path = "src/client.rs"
 doctest = false
 
 [features]
+mac_app_store = []
 test-support = ["clock/test-support", "collections/test-support", "gpui/test-support", "rpc/test-support"]
 
 [dependencies]
