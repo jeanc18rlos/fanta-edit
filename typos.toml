@@ -7,9 +7,6 @@ extend-exclude = [
     # Contributor names aren't typos.
     ".mailmap",
 
-    # File suffixes aren't typos.
-    "crates/theme/src/icon_theme.rs",
-
     # Vendored JSON schemas from SchemaStore.
     "crates/json_schema_store/src/schemas/",
 

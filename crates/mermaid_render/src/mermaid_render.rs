@@ -184,30 +184,33 @@ pub fn render_to_svg(source: &str, theme: &MermaidTheme) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use anyhow::Context as _;
+    use gpui::AssetSource as _;
 
     #[test]
-    fn mermaid_diagram_with_mixed_weight_combining_marks_does_not_panic() {
-        const IBM_PLEX_REGULAR: &[u8] =
-            include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf");
-        const IBM_PLEX_SEMIBOLD: &[u8] =
-            include_bytes!("../../../assets/fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf");
+    fn mermaid_diagram_with_mixed_weight_combining_marks_does_not_panic() -> Result<()> {
+        let regular = zed_ui_assets::Assets
+            .load("fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf")?
+            .context("bundled IBM Plex Sans regular font is missing")?;
+        let semibold = zed_ui_assets::Assets
+            .load("fonts/ibm-plex-sans/IBMPlexSans-SemiBold.ttf")?
+            .context("bundled IBM Plex Sans semibold font is missing")?;
 
         let zalgo = "Ne\u{0301}\u{0302}\u{0303}\u{0304}\u{0306}\u{0307}\u{0308}\u{030a}d";
         let source = format!("flowchart TD\n  A[\"**{zalgo}** {zalgo}\"]");
-        let svg = render_to_svg(&source, &MermaidTheme::default())
-            .expect("mermaid diagram should render to SVG");
+        let svg = render_to_svg(&source, &MermaidTheme::default())?;
 
         let mut db = usvg::fontdb::Database::new();
-        db.load_font_data(IBM_PLEX_REGULAR.to_vec());
-        db.load_font_data(IBM_PLEX_SEMIBOLD.to_vec());
+        db.load_font_data(regular.into_owned());
+        db.load_font_data(semibold.into_owned());
         db.set_sans_serif_family("IBM Plex Sans");
         let options = usvg::Options {
             fontdb: std::sync::Arc::new(db),
             ..Default::default()
         };
 
-        usvg::Tree::from_data(svg.as_bytes(), &options)
-            .expect("rasterizing mermaid text should not panic");
+        usvg::Tree::from_data(svg.as_bytes(), &options)?;
+        Ok(())
     }
 
     /// An ER diagram whose attribute-block tokens begin with a multibyte

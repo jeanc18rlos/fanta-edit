@@ -4,14 +4,19 @@ $PSNativeCommandUseErrorActionPreference = $true
 $CARGO_ABOUT_VERSION="0.8.2"
 $outputFile=$args[0] ? $args[0] : "$(Get-Location)/assets/licenses.md"
 $templateFile="script/licenses/template.md.hbs"
+$metadata = cargo metadata --format-version 1 --locked | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) { throw "Cargo metadata failed" }
+$assetPackage = $metadata.packages | Where-Object { $_.name -eq 'fanta-gpui-zed-ui-assets' } | Select-Object -First 1
+if (-not $assetPackage) { throw "fanta-gpui-zed-ui-assets is missing from Cargo metadata" }
+$assetDirectory = Join-Path (Split-Path $assetPackage.manifest_path) 'assets'
 
 New-Item -Path "$outputFile" -ItemType File -Value "" -Force
 
 @(
     "# ###### THEME LICENSES ######\n"
-    Get-Content assets/themes/LICENSES
+    Get-Content (Join-Path $assetDirectory 'themes/LICENSES')
     "\n# ###### ICON LICENSES ######\n"
-    Get-Content assets/icons/LICENSES
+    Get-Content (Join-Path $assetDirectory 'icons/LICENSES')
     "\n# ###### CODE LICENSES ######\n"
 ) | Add-Content -Path $outputFile
 

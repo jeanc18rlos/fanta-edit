@@ -106,13 +106,9 @@ The binary is named `fanta`. Useful entry points:
   canvas-to-agent-to-git loop against a running app and asserts 18 things about
   it. The fastest way to know a build works.
 
-The design engine lives in the vendored `crates/fanta-*` crates; the app shell
-is a fork of Zed with the IDE removed — 179 workspace members remain, of which
-164 link into the app binary, inside a 904-crate dependency graph
-(`cargo tree -p zed --edges normal`). The debugger, vim, edit prediction,
-Copilot, collab, livekit, dev containers, the file finder, the project panel,
-the outline panel, onboarding, the extension host, wasmtime and the AWS SDK are
-no longer linked.
+The design engine lives in the vendored `crates/fanta-*` crates; reusable GPUI
+and Zed UI packages come from [fanta-ui](https://github.com/squidred-dev/fanta-ui).
+The app shell is a fork of Zed with its design workflows layered on top.
 
 ## Getting started in the app
 
@@ -186,5 +182,7 @@ symbolicate with `atos -o fanta.dwarf -arch arm64 -l <load address> <address>`.
 ## License
 
 GPL-3.0-or-later. Fanta is a fork of Zed; see `NOTICE.md` and `LICENSE-GPL`.
-Source for every binary we ship is this repository, including the vendored
-engine crates under `crates/fanta-*`.
+The editor and vendored engine source are in this repository. The GPUI fork,
+reusable components, and Zed UI baseline are published from
+[fanta-ui](https://github.com/squidred-dev/fanta-ui); `Cargo.lock` records the
+exact package versions used by this build.

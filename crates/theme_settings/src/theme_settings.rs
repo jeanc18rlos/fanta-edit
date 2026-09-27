@@ -228,15 +228,14 @@ pub fn load_bundled_themes(registry: &ThemeRegistry) {
             continue;
         };
 
-        let Some(theme_family) = serde_json::from_slice(&theme)
+        let Some(theme_family) = theme::decode_bundled_theme(&theme)
             .with_context(|| format!("failed to parse theme at path \"{path}\""))
             .log_err()
         else {
             continue;
         };
 
-        let refined = refine_theme_family(theme_family);
-        registry.insert_theme_families([refined]);
+        registry.insert_theme_families([theme_family]);
     }
 }
 
@@ -444,4 +443,34 @@ pub fn increase_buffer_font_size(cx: &mut App) {
 /// This will be effective until the app is restarted.
 pub fn decrease_buffer_font_size(cx: &mut App) {
     adjust_buffer_font_size(cx, |size| size - px(1.0));
+}
+
+#[cfg(test)]
+mod bundled_theme_tests {
+    use super::*;
+    use gpui::AssetSource as _;
+
+    #[test]
+    fn standalone_decoder_matches_editor_refinement() -> Result<()> {
+        for path in zed_ui_assets::Assets.list("themes/")? {
+            if !path.ends_with(".json") {
+                continue;
+            }
+            let bytes = zed_ui_assets::Assets
+                .load(&path)?
+                .with_context(|| format!("missing bundled theme {path}"))?;
+            let editor = refine_theme_family(deserialize_user_theme(&bytes)?);
+            let standalone = theme::decode_bundled_theme(&bytes)?;
+            assert_eq!(editor.themes.len(), standalone.themes.len(), "{path}");
+            for (editor_theme, standalone_theme) in editor.themes.iter().zip(&standalone.themes) {
+                assert_eq!(editor_theme.name, standalone_theme.name, "{path}");
+                assert_eq!(
+                    editor_theme.appearance, standalone_theme.appearance,
+                    "{path}"
+                );
+                assert_eq!(editor_theme.styles, standalone_theme.styles, "{path}");
+            }
+        }
+        Ok(())
+    }
 }

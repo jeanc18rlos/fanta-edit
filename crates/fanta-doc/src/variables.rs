@@ -61,11 +61,12 @@ impl VariableRegistry {
 pub struct VariableCollection {
     pub id: VariableCollectionId,
     pub name: String,
-    /// The modes (columns). Always non-empty in a well-formed collection;
-    /// `default_mode` must be one of these.
+    /// The modes (columns). A collection may be empty after its final mode is
+    /// deleted; `default_mode` is then the zero-id placeholder.
     pub modes: Vec<Mode>,
     /// The mode used when nothing pins one (no frame `explicit_modes`, no
-    /// `Doc.active_modes` entry). The ultimate fallback in mode resolution.
+    /// `Doc.active_modes` entry). It names a declared mode unless `modes` is
+    /// empty, in which case values cannot resolve until another mode is added.
     pub default_mode: ModeId,
     /// Display order of the collection's variables in the panel. UI-only;
     /// resolution never consults it. Variables not listed sort after, by id.

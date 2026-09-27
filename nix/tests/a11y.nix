@@ -89,8 +89,8 @@ let
           ZSTD_SYS_USE_PKG_CONFIG = true;
           FONTCONFIG_FILE = pkgs.makeFontsConf {
             fontDirectories = [
-              ../../assets/fonts/lilex
-              ../../assets/fonts/ibm-plex-sans
+              pkgs.lilex
+              pkgs.ibm-plex
             ];
           };
         };

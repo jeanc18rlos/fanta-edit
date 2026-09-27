@@ -254,6 +254,14 @@ pub enum Operation {
         mode: Mode,
     },
 
+    /// Change a collection's default mode. The zero id represents an empty
+    /// collection until a mode is added again.
+    SetCollectionDefaultMode {
+        collection: VariableCollectionId,
+        old: ModeId,
+        new: ModeId,
+    },
+
     /// Create a variable. Reverts by removing it.
     CreateVariable { variable: Box<Variable> },
 
@@ -261,6 +269,8 @@ pub enum Operation {
     DeleteVariable {
         id: VariableId,
         variable: Box<Variable>,
+        #[serde(default)]
+        order_index: Option<usize>,
     },
 
     /// Set (or clear) a variable's value for one mode.
@@ -501,6 +511,7 @@ impl Operation {
             Self::DeleteVariableCollection { .. } => "Delete Collection",
             Self::AddMode { .. } => "Add Mode",
             Self::RemoveMode { .. } => "Remove Mode",
+            Self::SetCollectionDefaultMode { .. } => "Set Default Mode",
             Self::CreateVariable { .. } => "Create Variable",
             Self::DeleteVariable { .. } => "Delete Variable",
             Self::SetVariableValue { .. } => "Set Variable",

@@ -5,6 +5,18 @@ set -euo pipefail
 CARGO_ABOUT_VERSION="0.8.2"
 OUTPUT_FILE="${1:-$(pwd)/assets/licenses.md}"
 TEMPLATE_FILE="script/licenses/template.md.hbs"
+UI_ASSET_DIRECTORY="$(cargo metadata --format-version 1 --locked | python3 -c '
+import json
+from pathlib import Path
+import sys
+
+for package in json.load(sys.stdin)["packages"]:
+    if package["name"] == "fanta-gpui-zed-ui-assets":
+        print(Path(package["manifest_path"]).parent / "assets")
+        break
+else:
+    sys.exit("fanta-gpui-zed-ui-assets is missing from Cargo metadata")
+')"
 
 fail_on_stderr() {
     local tmpfile=$(mktemp)
@@ -19,10 +31,10 @@ echo -n "" >"$OUTPUT_FILE"
 
 {
     echo -e "# ###### THEME LICENSES ######\n"
-    cat assets/themes/LICENSES
+    cat "$UI_ASSET_DIRECTORY/themes/LICENSES"
 
     echo -e "\n# ###### ICON LICENSES ######\n"
-    cat assets/icons/LICENSES
+    cat "$UI_ASSET_DIRECTORY/icons/LICENSES"
 
     echo -e "\n# ###### CODE LICENSES ######\n"
 } >>"$OUTPUT_FILE"

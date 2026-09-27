@@ -2023,6 +2023,7 @@ pub fn artifact_op_impact(op: &Operation) -> ArtifactOpImpact {
         | DeleteVariableCollection { .. }
         | AddMode { .. }
         | RemoveMode { .. }
+        | SetCollectionDefaultMode { .. }
         | CreateVariable { .. }
         | DeleteVariable { .. }
         | SetVariableValue { .. }

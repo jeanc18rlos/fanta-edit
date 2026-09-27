@@ -611,10 +611,8 @@ mod tests {
         assert!(chrome_controls(false, false, None).is_empty());
     }
 
-    /// The app's asset source is Zed's `assets::Assets` (embedded
-    /// `assets/icons/**`), not gpui-component-assets. Every Lucide icon the
-    /// toolbar can name — its own tool/mode faces and the host's chrome
-    /// controls — must resolve there or the tile renders blank in the app.
+    /// Every Lucide icon the toolbar can name must resolve through the shared
+    /// Zed asset source or the tile renders blank in the app.
     /// Enumerate the public variants from the pinned component release because
     /// the published enum does not expose an iterator.
     #[test]
@@ -730,7 +728,7 @@ mod tests {
             let bytes = assets::Assets
                 .load(path.as_ref())
                 .unwrap_or_else(|error| panic!("{path}: {error:#}"))
-                .unwrap_or_else(|| panic!("{path} is missing from assets/icons"));
+                .unwrap_or_else(|| panic!("{path} is missing from shared Zed UI assets"));
             assert!(
                 std::str::from_utf8(&bytes).is_ok_and(|svg| svg.contains("<svg")),
                 "{path} must be an SVG document"
