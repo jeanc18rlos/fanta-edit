@@ -5,8 +5,6 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use client::{Client, ClientSettings};
 use design_surface::{DesignOp, ScreenshotTarget};
 use futures::{AsyncReadExt as _, StreamExt as _};
-#[cfg(feature = "mac_app_store")]
-use gpui::Action as _;
 use gpui::{
     App, AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, Image,
     ImageFormat, MouseButton, ObjectFit, PathPromptOptions, Pixels, Render, SharedString, Task,
@@ -2669,10 +2667,7 @@ impl Render for GenerationWorkspace {
                     .when(!signed_in || self.error.is_some(), |element| element.child(Button::new("generation-sign-in", "Sign in")
                         .disabled(self.task.is_some()).on_click(cx.listener(|this, _, _, cx| this.sign_in(cx)))))
                     .child(Button::new("generation-billing", "Credits & billing").on_click(|_, window, cx| {
-                        #[cfg(feature = "mac_app_store")]
-                        window.dispatch_action(zed_actions::OpenAccountSettings.boxed_clone(), cx);
-                        #[cfg(not(feature = "mac_app_store"))]
-                        cx.open_url(&client::zed_urls::account_url(cx));
+                        window.dispatch_action(Box::new(zed_actions::OpenAccountSettings), cx);
                     }))))
             .child(h_flex().flex_shrink_0().gap_1().flex_wrap().children(GenerationMode::ALL.into_iter().map(|mode| {
                 Button::new(("generation-mode", mode as usize), mode.label()).toggle_state(self.mode == mode)

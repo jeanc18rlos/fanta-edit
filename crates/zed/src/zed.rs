@@ -1,6 +1,7 @@
 mod app_menus;
 #[cfg(feature = "mac_app_store")]
 mod app_store_billing;
+mod fanta_account;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac_only_instance;
 #[cfg(unix)]
@@ -23,8 +24,6 @@ pub use app_menus::*;
 use assets::Assets;
 
 use breadcrumbs::Breadcrumbs;
-#[cfg(not(feature = "mac_app_store"))]
-use client::zed_urls;
 use collections::{HashSet, VecDeque};
 use editor::{Editor, MultiBuffer};
 use feature_flags::{FeatureFlagAppExt as _, PanicFeatureFlag};
@@ -290,11 +289,13 @@ pub fn init(cx: &mut App) {
         });
     })
     .on_action(|_: &OpenAccountSettings, cx| {
-        #[cfg(feature = "mac_app_store")]
-        app_store_billing::open(cx);
-        #[cfg(not(feature = "mac_app_store"))]
-        with_active_or_new_workspace(cx, |_, _, cx| {
-            cx.open_url(&zed_urls::account_url(cx));
+        with_active_or_new_workspace(cx, |workspace, window, cx| {
+            settings_modal::SettingsModal::open(
+                workspace,
+                settings_modal::SettingsPage::Account,
+                window,
+                cx,
+            );
         });
     })
     .on_action(|_: &OpenTasks, cx| {

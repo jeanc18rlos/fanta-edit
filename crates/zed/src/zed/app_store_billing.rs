@@ -132,6 +132,9 @@ async fn show_store(
     }
 
     let user = fetch_backend_user(&client, &token, &server_url).await?;
+    require_personal_organization(&client, &token, &server_url).await?;
+    let polar_subscription_active =
+        has_active_polar_subscription(&client, &token, &server_url).await?;
     let revenuecat = RevenueCat::get_or_configure(REVENUECAT_PUBLIC_API_KEY, &user.id)
         .await
         .context("Could not connect to the App Store")?;
@@ -144,7 +147,7 @@ async fn show_store(
     };
     let pro = products
         .iter()
-        .find(|product| product.identifier == PRO_MONTHLY);
+        .find(|product| !polar_subscription_active && product.identifier == PRO_MONTHLY);
     let credits = products
         .iter()
         .find(|product| product.identifier == CREDITS_500);
@@ -168,7 +171,10 @@ async fn show_store(
     actions.push(("Privacy Policy".to_string(), None));
     actions.push(("Cancel".to_string(), None));
     let labels: Vec<&str> = actions.iter().map(|(label, _)| label.as_str()).collect();
-    let description = purchase_description(pro, credits);
+    let mut description = purchase_description(pro, credits);
+    if polar_subscription_active {
+        description.push_str("\n\nThis organization already has a Polar subscription. Manage it in the Fanta dashboard before buying an Apple subscription.");
+    }
     let response = cx.update(|window, cx| {
         window.prompt(
             PromptLevel::Info,
@@ -241,6 +247,13 @@ async fn show_store(
     }
 
     if let Some(product_id) = product_id {
+        if *product_id == PRO_MONTHLY
+            && has_active_polar_subscription(&client, &token, &server_url).await?
+        {
+            bail!(
+                "This organization now has a Polar subscription. Manage it in the Fanta dashboard before purchasing an Apple subscription."
+            );
+        }
         match revenuecat.purchase(product_id).await {
             Ok(_) => {
                 let current_token = cx.update(|_, cx| Client::global(cx).account_access_token())?;
@@ -267,6 +280,90 @@ async fn show_store(
         .await?;
     }
     Ok(())
+}
+
+async fn require_personal_organization(
+    client: &Client,
+    token: &str,
+    server_url: &str,
+) -> Result<()> {
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!(
+            "{}/v1/account/overview",
+            server_url.trim_end_matches('/')
+        ))
+        .header("Accept", "application/json")
+        .header("Authorization", format!("Bearer {token}"))
+        .body(AsyncBody::empty())?;
+    let mut response = client
+        .http_client()
+        .send(request)
+        .await
+        .context("Could not check your Fanta organization before purchasing")?;
+    let status = response.status();
+    let mut body = Vec::new();
+    response
+        .body_mut()
+        .take(1024 * 1024)
+        .read_to_end(&mut body)
+        .await?;
+    if !status.is_success() {
+        if status.as_u16() == 401 {
+            bail!("Your Fanta sign-in expired. Sign in again before purchasing.");
+        }
+        bail!("Could not verify your Fanta organization (HTTP {status}). Retry before purchasing.");
+    }
+    let overview: Value =
+        serde_json::from_slice(&body).context("Fanta returned an invalid account response")?;
+    match overview["organization"]["is_personal"].as_bool() {
+        Some(true) => Ok(()),
+        Some(false) => bail!(
+            "Apple purchases belong to your personal organization. Sign in with its editor key before purchasing."
+        ),
+        None => bail!(
+            "Fanta could not confirm your personal organization. Update the server before purchasing."
+        ),
+    }
+}
+
+async fn has_active_polar_subscription(
+    client: &Client,
+    token: &str,
+    server_url: &str,
+) -> Result<bool> {
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!(
+            "{}/v1/billing/subscription",
+            server_url.trim_end_matches('/')
+        ))
+        .header("Accept", "application/json")
+        .header("Authorization", format!("Bearer {token}"))
+        .body(AsyncBody::empty())?;
+    let mut response = client
+        .http_client()
+        .send(request)
+        .await
+        .context("Could not check the organization's current subscription")?;
+    let status = response.status();
+    let mut body = Vec::new();
+    response
+        .body_mut()
+        .take(1024 * 1024)
+        .read_to_end(&mut body)
+        .await?;
+    if !status.is_success() {
+        if status.as_u16() == 401 {
+            bail!("Your Fanta sign-in expired. Sign in again before purchasing.");
+        }
+        bail!(
+            "Could not verify the organization's current subscription (HTTP {status}). Retry before purchasing."
+        );
+    }
+    let billing: Value =
+        serde_json::from_slice(&body).context("Fanta returned an invalid subscription response")?;
+    Ok(billing["active"] == true && billing["subscription"]["source"] == "polar")
 }
 
 fn purchase_description(pro: Option<&Product>, credits: Option<&Product>) -> String {

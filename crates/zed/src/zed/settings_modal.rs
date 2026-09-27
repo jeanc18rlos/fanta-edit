@@ -1,6 +1,6 @@
 use fs::Fs;
 use gpui::{
-    Action, App, Context, DismissEvent, EventEmitter, FocusHandle, Focusable, Subscription,
+    Action, App, Context, DismissEvent, Entity, EventEmitter, FocusHandle, Focusable, Subscription,
     WeakEntity,
 };
 use settings::{
@@ -75,6 +75,7 @@ enum DesignPanelAction {
 pub(super) struct SettingsModal {
     focus_handle: FocusHandle,
     page: SettingsPage,
+    account: Entity<super::fanta_account::FantaAccount>,
     workspace: WeakEntity<Workspace>,
     _settings_subscription: Subscription,
 }
@@ -85,15 +86,23 @@ impl SettingsModal {
         workspace: WeakEntity<Workspace>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let account = cx.new(super::fanta_account::FantaAccount::new);
+        if page == SettingsPage::Account {
+            account.update(cx, |account, cx| account.refresh(cx));
+        }
         Self {
             focus_handle: cx.focus_handle(),
             page,
+            account,
             workspace,
             _settings_subscription: cx.observe_global::<SettingsStore>(|_, cx| cx.notify()),
         }
     }
 
     pub(super) fn select_page(&mut self, page: SettingsPage, cx: &mut Context<Self>) {
+        if page == SettingsPage::Account && self.page != SettingsPage::Account {
+            self.account.update(cx, |account, cx| account.refresh(cx));
+        }
         self.page = page;
         cx.notify();
     }
@@ -422,49 +431,32 @@ impl SettingsModal {
                     ));
             }
             SettingsPage::Account => {
+                contents = contents.child(self.account.clone());
                 contents = contents.child(Self::action_row(
-                    "Agent",
-                    "Open the agent panel for canvas edits and design generation.",
-                    "Open Panel",
+                    "Create panel",
+                    "Sign in to Fanta or open the agent panel for canvas edits.",
+                    "Open Create",
                     zed_actions::assistant::Toggle,
                     cx,
                 ));
                 #[cfg(feature = "mac_app_store")]
                 {
-                    contents = contents
-                        .child(Self::action_row(
-                            "Credits & billing",
-                            "Manage Fanta credits and restore Apple purchases.",
-                            "Open…",
-                            zed_actions::OpenAccountSettings,
-                            cx,
-                        ))
-                        .child(Self::setting_row(
-                            "Delete Fanta account",
-                            "Permanently delete your account and personal cloud data.",
-                            Button::new("delete-fanta-account", "Delete…").on_click(cx.listener(
-                                |_, _, window, cx| {
-                                    cx.emit(DismissEvent);
-                                    window.defer(cx, |_, cx| {
-                                        super::app_store_billing::request_account_deletion(cx);
-                                    });
-                                },
-                            )),
-                        ));
-                }
-                #[cfg(not(feature = "mac_app_store"))]
-                {
-                    contents = contents.child(Self::action_row(
-                        "Account",
-                        "Open Fanta account settings in your browser.",
-                        "Open…",
-                        zed_actions::OpenAccountSettings,
-                        cx,
+                    contents = contents.child(Self::setting_row(
+                        "Delete Fanta account",
+                        "Permanently delete your account and personal cloud data.",
+                        Button::new("delete-fanta-account", "Delete…").on_click(cx.listener(
+                            |_, _, window, cx| {
+                                cx.emit(DismissEvent);
+                                window.defer(cx, |_, cx| {
+                                    super::app_store_billing::request_account_deletion(cx);
+                                });
+                            },
+                        )),
                     ));
                 }
                 contents = contents.child(Self::action_row(
                     "Advanced AI settings",
-                    "Configure agent, MCP and model settings in settings.json.",
+                    "Configure agent and model settings in settings.json.",
                     "Open File",
                     zed_actions::OpenSettingsFile,
                     cx,
