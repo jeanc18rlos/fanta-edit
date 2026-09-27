@@ -374,7 +374,17 @@ impl ClientCredentialsProvider {
     /// Returns the key used for credential storage in the system keychain.
     fn credentials_url(&self, cx: &AsyncApp) -> Result<String> {
         let from_settings = cx.update(|cx| ClientSettings::get_global(cx).credentials_url.clone());
-        Ok(from_settings.unwrap_or(self.server_url(cx)?))
+        if let Some(credentials_url) = from_settings {
+            return Ok(credentials_url);
+        }
+        let server_url = self.server_url(cx)?;
+        #[cfg(feature = "mac_app_store")]
+        {
+            // App Store and local builds have different Keychain access identities.
+            return Ok(format!("{server_url}/mac-app-store"));
+        }
+        #[cfg(not(feature = "mac_app_store"))]
+        Ok(server_url)
     }
 
     /// Reads the credentials from the provider.
@@ -2128,6 +2138,14 @@ mod tests {
             ));
             Client::new(Arc::new(FakeSystemClock::new()), http_client, cx)
         });
+        #[cfg(feature = "mac_app_store")]
+        assert!(
+            client
+                .credentials_provider
+                .credentials_url(&cx.to_async())
+                .unwrap()
+                .ends_with("/mac-app-store")
+        );
         client.override_authenticate(|cx| {
             cx.background_spawn(async {
                 Ok(Credentials {
