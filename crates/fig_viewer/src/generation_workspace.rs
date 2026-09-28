@@ -1052,7 +1052,12 @@ impl GenerationWorkspace {
         let provider_hint = model.capabilities["provider"].as_str();
         let (inferred_provider, logo) = provider_mark(&model.id, provider_hint);
         let provider = provider_hint
-            .filter(|provider| !matches!(*provider, "Replicate" | "AI Gateway"))
+            .filter(|provider| {
+                !matches!(
+                    *provider,
+                    "Replicate" | "AI Gateway" | "SpaceXAI" | "Alibaba"
+                )
+            })
             .map(str::to_owned)
             .unwrap_or_else(|| inferred_provider.to_owned());
         screen = screen.provider(provider);
