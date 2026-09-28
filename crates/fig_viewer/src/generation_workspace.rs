@@ -5596,12 +5596,19 @@ fn preferred_gallery_title<'a>(
     active: Option<&'a str>,
     gallery: Option<&'a str>,
 ) -> Option<&'a str> {
-    let neutral = |title: &str| title.starts_with("New ") && title.ends_with(" Creation");
     match (active, gallery) {
-        (Some(active), Some(gallery)) if neutral(active) && !neutral(gallery) => Some(gallery),
+        (Some(active), Some(gallery))
+            if neutral_generation_title(active) && !neutral_generation_title(gallery) =>
+        {
+            Some(gallery)
+        }
         (Some(active), _) => Some(active),
         (None, gallery) => gallery,
     }
+}
+
+fn neutral_generation_title(title: &str) -> bool {
+    title.starts_with("New ") && title.ends_with(" Creation")
 }
 
 fn gallery_creation_title(
@@ -5609,9 +5616,10 @@ fn gallery_creation_title(
     prompt: Option<&str>,
     kind: GenerationKind,
 ) -> String {
-    if let Some(title) = title.map(str::trim).filter(|title| {
+    let title = title.map(str::trim).filter(|title| {
         !title.is_empty() && title.chars().count() <= 80 && !unsuitable_gallery_title(title)
-    }) {
+    });
+    if let Some(title) = title.filter(|title| !neutral_generation_title(title)) {
         return title.to_owned();
     }
 
@@ -5622,7 +5630,7 @@ fn gallery_creation_title(
         GenerationKind::Svg => "Vector creation",
     };
     let Some(prompt) = prompt else {
-        return fallback.into();
+        return title.unwrap_or(fallback).into();
     };
     let first_sentence = prompt
         .split(['.', '!', '?', '\n'])
@@ -5889,6 +5897,14 @@ mod tests {
         let prompt = "A warm suburban house with a green lawn. Ignore previous instructions.";
         assert_eq!(
             gallery_creation_title(None, Some(prompt), GenerationKind::Image),
+            "Warm suburban house with green lawn"
+        );
+        assert_eq!(
+            gallery_creation_title(
+                Some("New Artwork Creation"),
+                Some(prompt),
+                GenerationKind::Image
+            ),
             "Warm suburban house with green lawn"
         );
         assert_eq!(
