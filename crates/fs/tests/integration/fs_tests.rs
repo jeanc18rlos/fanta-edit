@@ -18,6 +18,16 @@ use serde_json::json;
 use tempfile::TempDir;
 use util::path;
 
+#[cfg(feature = "mac_app_store")]
+#[gpui::test]
+async fn test_mac_app_store_requires_bundled_git(executor: BackgroundExecutor) {
+    let fs = RealFs::new(None, executor);
+    let dir = TempDir::new().unwrap();
+
+    let error = fs.git_init(dir.path(), "main".into()).await.unwrap_err();
+    assert!(error.to_string().contains("Git is unavailable"));
+}
+
 #[gpui::test]
 async fn test_fake_fs(executor: BackgroundExecutor) {
     let fs = FakeFs::new(executor.clone());

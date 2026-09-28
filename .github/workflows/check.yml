@@ -124,6 +124,9 @@ jobs:
       - name: Test blocked remote connections
         run: cargo test --locked -p remote --lib --features mac_app_store test_mac_app_store_rejects_remote_connection
 
+      - name: Test bundled Git requirement
+        run: cargo test --locked -p fs --test integration --features mac_app_store,test-support test_mac_app_store_requires_bundled_git
+
       - name: Test blocked project execution paths
         run: cargo test --locked -p project --test integration --features mac_app_store,test-support test_mac_app_store_
 

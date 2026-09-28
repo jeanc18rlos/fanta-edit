@@ -62,4 +62,5 @@ gpui = { workspace = true, features = ["test-support"] }
 git = { workspace = true, features = ["test-support"] }
 
 [features]
+mac_app_store = []
 test-support = ["gpui/test-support", "git/test-support", "util/test-support"]
