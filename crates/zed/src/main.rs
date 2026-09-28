@@ -433,16 +433,14 @@ fn main() {
     };
 
     let git_hosting_provider_registry = Arc::new(GitHostingProviderRegistry::new());
-    let git_binary_path = if !cfg!(feature = "mac_app_store")
-        && cfg!(target_os = "macos")
-        && option_env!("ZED_BUNDLE").as_deref() == Some("true")
-    {
-        app.path_for_auxiliary_executable("git")
-            .context("could not find git binary path")
-            .log_err()
-    } else {
-        None
-    };
+    let git_binary_path =
+        if cfg!(target_os = "macos") && option_env!("ZED_BUNDLE").as_deref() == Some("true") {
+            app.path_for_auxiliary_executable("git")
+                .context("could not find git binary path")
+                .log_err()
+        } else {
+            None
+        };
     if let Some(git_binary_path) = &git_binary_path {
         log::info!("Using git binary path: {:?}", git_binary_path);
     }
