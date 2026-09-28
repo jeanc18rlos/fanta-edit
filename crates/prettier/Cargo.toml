@@ -13,6 +13,7 @@ path = "src/prettier.rs"
 doctest = false
 
 [features]
+mac_app_store = []
 test-support = []
 
 [dependencies]

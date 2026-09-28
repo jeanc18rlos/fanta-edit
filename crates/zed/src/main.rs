@@ -513,6 +513,16 @@ fn main() {
             AppCommitSha::set_global(app_commit_sha, cx);
         }
         settings::init(cx);
+        #[cfg(feature = "mac_app_store")]
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_default_settings(cx, |settings| {
+                let languages = &mut settings.project.all_languages;
+                languages.defaults.prettier.get_or_insert_default().allowed = Some(false);
+                for language in languages.languages.0.values_mut() {
+                    language.prettier.get_or_insert_default().allowed = Some(false);
+                }
+            });
+        });
         zlog_settings::init(cx);
         zed::watch_settings_files(fs.clone(), cx);
         handle_keymap_file_changes(user_keymap_file_rx, user_keymap_watcher, cx);

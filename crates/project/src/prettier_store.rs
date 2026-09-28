@@ -109,6 +109,10 @@ impl PrettierStore {
         buffer: &Entity<Buffer>,
         cx: &mut Context<Self>,
     ) -> Task<Option<(Option<PathBuf>, PrettierTask)>> {
+        if cfg!(feature = "mac_app_store") {
+            return Task::ready(None);
+        }
+
         let buffer = buffer.read(cx);
         let buffer_file = buffer.file();
         if buffer.language().is_none() {
@@ -281,6 +285,13 @@ impl PrettierStore {
         worktree_id: Option<WorktreeId>,
         cx: &mut Context<Self>,
     ) -> PrettierTask {
+        if cfg!(feature = "mac_app_store") {
+            return Task::ready(Err(Arc::new(anyhow!(
+                "Prettier is unavailable in the Mac App Store build"
+            ))))
+            .shared();
+        }
+
         let request_timeout = ProjectSettings::get_global(cx)
             .global_lsp_settings
             .get_request_timeout();
@@ -542,6 +553,10 @@ impl PrettierStore {
         plugins: impl Iterator<Item = Arc<str>>,
         cx: &mut Context<Self>,
     ) {
+        if cfg!(feature = "mac_app_store") {
+            return;
+        }
+
         if cfg!(any(test, feature = "test-support")) {
             self.default_prettier.installed_plugins.extend(plugins);
             self.default_prettier.prettier = PrettierInstallation::Installed(PrettierInstance {
@@ -702,6 +717,10 @@ impl PrettierStore {
         language_formatters_to_check: Vec<(Option<WorktreeId>, LanguageSettings)>,
         cx: &mut Context<Self>,
     ) {
+        if cfg!(feature = "mac_app_store") {
+            return;
+        }
+
         let mut prettier_plugins_by_worktree = HashMap::default();
         for (worktree, language_settings) in language_formatters_to_check {
             if language_settings.prettier.allowed
@@ -930,6 +949,10 @@ async fn install_prettier_packages(
     plugins_to_install: HashSet<Arc<str>>,
     node: NodeRuntime,
 ) -> anyhow::Result<()> {
+    if cfg!(feature = "mac_app_store") {
+        anyhow::bail!("Prettier package installation is unavailable in the Mac App Store build");
+    }
+
     let packages_to_install = plugins_to_install
         .iter()
         .map(|package_name| package_name.to_string())
