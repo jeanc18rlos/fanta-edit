@@ -14,6 +14,7 @@ doctest = false
 
 [features]
 default = []
+mac_app_store = ["remote/mac_app_store"]
 test-support = ["remote/test-support", "remote_connection/test-support", "project/test-support", "workspace/test-support"]
 
 [dependencies]

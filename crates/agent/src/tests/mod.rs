@@ -294,6 +294,59 @@ fn disable_sandboxing(cx: &mut TestAppContext) {
     });
 }
 
+#[cfg(feature = "mac_app_store")]
+#[gpui::test]
+async fn test_mac_app_store_terminal_tool_is_unavailable(cx: &mut TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    let project_context = cx.new(|_cx| ProjectContext::default());
+    let context_server_registry =
+        cx.new(|cx| ContextServerRegistry::new(project.read(cx).context_server_store(), cx));
+    let environment = Rc::new(FakeThreadEnvironment::default());
+    let thread = cx.new(|cx| {
+        let mut thread = Thread::new(
+            project.clone(),
+            project_context,
+            context_server_registry,
+            Templates::new(),
+            Some(Arc::new(FakeLanguageModel::default())),
+            cx,
+        );
+        thread.add_default_tools(environment.clone(), cx);
+        thread
+    });
+
+    thread.read_with(cx, |thread, _| {
+        assert!(!thread.has_registered_tool(TerminalTool::NAME));
+        assert!(!thread.has_registered_tool(SandboxedTerminalTool::NAME));
+    });
+
+    // A stale tool call from an existing thread must also fail before it
+    // reaches the environment that creates a terminal process.
+    #[allow(clippy::arc_with_non_send_sync)]
+    let tool = Arc::new(TerminalTool::new(project, environment.clone()));
+    let (event_stream, _rx) = ToolCallEventStream::test();
+    let task = cx.update(|cx| {
+        tool.run(
+            ToolInput::resolved(TerminalToolInput {
+                command: "touch should-not-run".into(),
+                cd: ".".into(),
+                ..Default::default()
+            }),
+            event_stream,
+            cx,
+        )
+    });
+
+    assert_eq!(
+        task.await,
+        Err("Terminal commands are unavailable in the Mac App Store build".into())
+    );
+    assert_eq!(environment.terminal_creation_count(), 0);
+}
+
 #[gpui::test]
 async fn test_echo(cx: &mut TestAppContext) {
     let ThreadTest { model, thread, .. } = setup(cx, TestModel::Fake).await;

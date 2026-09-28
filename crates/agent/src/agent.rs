@@ -3135,6 +3135,12 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         sandbox_wrap: Option<acp_thread::SandboxWrap>,
         cx: &mut AsyncApp,
     ) -> Task<Result<Rc<dyn TerminalHandle>>> {
+        if cfg!(feature = "mac_app_store") {
+            return Task::ready(Err(anyhow!(
+                "Terminal commands are unavailable in the Mac App Store build"
+            )));
+        }
+
         // On Seatbelt-style sandboxes (macOS) there's no tmpfs overlay, so to
         // give the command a writable temp area we point `$TMPDIR`/`$TMP`/
         // `$TEMP` at a per-thread directory inside the sandbox's writable

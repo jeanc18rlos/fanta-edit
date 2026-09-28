@@ -196,6 +196,12 @@ impl AgentServer for CustomAgentServer {
         project: Entity<Project>,
         cx: &mut App,
     ) -> Task<Result<Rc<dyn AgentConnection>>> {
+        if cfg!(feature = "mac_app_store") {
+            return Task::ready(Err(anyhow::anyhow!(
+                "External agent processes are unavailable in the Mac App Store build"
+            )));
+        }
+
         let agent_id = self.agent_id();
         let default_mode = self.default_mode(cx);
         let is_registry_agent = is_registry_agent(agent_id.clone(), cx);

@@ -381,6 +381,10 @@ pub async fn connect(
     delegate: Arc<dyn RemoteClientDelegate>,
     cx: &mut AsyncApp,
 ) -> Result<Arc<dyn RemoteConnection>> {
+    if cfg!(feature = "mac_app_store") {
+        anyhow::bail!("Remote connections are unavailable in the Mac App Store build");
+    }
+
     cx.update(|cx| {
         cx.update_default_global(|pool: &mut ConnectionPool, cx| {
             pool.connect(connection_options.clone(), delegate.clone(), cx)
@@ -1371,6 +1375,23 @@ mod tests {
     use super::*;
     use gpui::TestAppContext;
     use rpc::{ErrorCodeExt, proto::ErrorCode};
+
+    #[cfg(feature = "mac_app_store")]
+    #[gpui::test]
+    async fn test_mac_app_store_rejects_remote_connection(cx: &mut TestAppContext) {
+        let result = connect(
+            RemoteConnectionOptions::Ssh(SshConnectionOptions::default()),
+            Arc::new(crate::MockDelegate),
+            &mut cx.to_async(),
+        )
+        .await;
+
+        assert!(result.is_err_and(|error| {
+            error
+                .to_string()
+                .contains("unavailable in the Mac App Store build")
+        }));
+    }
 
     #[test]
     fn test_ssh_display_name_prefers_nickname() {

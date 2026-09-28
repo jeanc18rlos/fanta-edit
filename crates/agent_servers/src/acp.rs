@@ -810,6 +810,10 @@ impl AcpConnection {
         default_config_options: HashMap<String, AgentConfigOptionValue>,
         cx: &mut AsyncApp,
     ) -> Result<Self> {
+        if cfg!(feature = "mac_app_store") {
+            anyhow::bail!("External agent processes are unavailable in the Mac App Store build");
+        }
+
         let root_dir = project.read_with(cx, |project, cx| {
             project
                 .default_path_list(cx)
@@ -2700,6 +2704,46 @@ mod tests {
     use feature_flags::FeatureFlag as _;
     use gpui::UpdateGlobal as _;
     use settings::Settings as _;
+
+    #[cfg(all(feature = "mac_app_store", target_os = "macos"))]
+    #[gpui::test]
+    async fn test_mac_app_store_blocks_direct_acp_stdio_spawn(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let store = SettingsStore::test(cx);
+            cx.set_global(store);
+        });
+        cx.executor().allow_parking();
+
+        let temp_dir = tempfile::tempdir().expect("temp directory");
+        let marker = temp_dir.path().join("acp-process-started");
+        let project = project::Project::example([temp_dir.path()], &mut cx.to_async()).await;
+        let agent_server_store =
+            project.read_with(cx, |project, _| project.agent_server_store().downgrade());
+        let command = AgentServerCommand {
+            path: "/usr/bin/touch".into(),
+            args: vec![marker.to_string_lossy().into_owned()],
+            env: None,
+        };
+
+        let mut async_cx = cx.to_async();
+        let result = AcpConnection::stdio(
+            AgentId::new("test-agent"),
+            project,
+            command,
+            agent_server_store,
+            None,
+            HashMap::default(),
+            &mut async_cx,
+        )
+        .await;
+
+        assert!(result.is_err_and(|error| {
+            error
+                .to_string()
+                .contains("unavailable in the Mac App Store build")
+        }));
+        assert!(!marker.exists(), "ACP command must not run");
+    }
 
     fn init_feature_flags_test(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {

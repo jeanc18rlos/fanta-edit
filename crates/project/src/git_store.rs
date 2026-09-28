@@ -437,18 +437,22 @@ impl LocalRepositoryState {
             .background_spawn({
                 let fs = fs.clone();
                 async move {
-                    let system_git_binary_path = search_paths
-                        .and_then(|search_paths| {
-                            which::which_in("git", Some(search_paths), &work_directory_abs_path)
-                                .ok()
-                        })
-                        .or_else(|| which::which("git").ok());
+                    let system_git_binary_path = if cfg!(feature = "mac_app_store") {
+                        None
+                    } else {
+                        search_paths
+                            .and_then(|search_paths| {
+                                which::which_in("git", Some(search_paths), &work_directory_abs_path)
+                                    .ok()
+                            })
+                            .or_else(|| which::which("git").ok())
+                    };
                     fs.open_repo(&dot_git_abs_path, system_git_binary_path.as_deref())
                         .with_context(|| format!("opening repository at {dot_git_abs_path:?}"))
                 }
             })
             .await?;
-        backend.set_trusted(is_trusted);
+        backend.set_trusted(is_trusted && !cfg!(feature = "mac_app_store"));
         Ok(LocalRepositoryState {
             backend,
             environment: Arc::new(environment),
@@ -1961,7 +1965,9 @@ impl GitStore {
                     let repository_state = repo.read(cx).repository_state.clone();
                     cx.background_spawn(async move {
                         if let Ok(RepositoryState::Local(state)) = repository_state.await {
-                            state.backend.set_trusted(is_trusted);
+                            state
+                                .backend
+                                .set_trusted(is_trusted && !cfg!(feature = "mac_app_store"));
                         }
                     })
                     .detach();

@@ -13,6 +13,7 @@ path = "src/agent_ui.rs"
 doctest = false
 
 [features]
+mac_app_store = ["agent/mac_app_store", "agent_servers/mac_app_store", "project/mac_app_store"]
 test-support = [
     "acp_thread/test-support",
     "eval_utils",

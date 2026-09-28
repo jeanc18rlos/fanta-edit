@@ -515,7 +515,12 @@ impl RealFs {
         let bundled_git = self.bundled_git_binary_path.clone();
         self.executor
             .spawn(async move {
-                git::executable::select_git(git::executable::find_system_git(), bundled_git)
+                let system_git = if cfg!(feature = "mac_app_store") {
+                    None
+                } else {
+                    git::executable::find_system_git()
+                };
+                git::executable::select_git(system_git, bundled_git)
             })
             .await
     }

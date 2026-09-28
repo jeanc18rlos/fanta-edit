@@ -513,6 +513,16 @@ fn main() {
             AppCommitSha::set_global(app_commit_sha, cx);
         }
         settings::init(cx);
+        #[cfg(feature = "mac_app_store")]
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_default_settings(cx, |settings| {
+                let languages = &mut settings.project.all_languages;
+                languages.defaults.prettier.get_or_insert_default().allowed = Some(false);
+                for language in languages.languages.0.values_mut() {
+                    language.prettier.get_or_insert_default().allowed = Some(false);
+                }
+            });
+        });
         zlog_settings::init(cx);
         zed::watch_settings_files(fs.clone(), cx);
         handle_keymap_file_changes(user_keymap_file_rx, user_keymap_watcher, cx);
@@ -671,6 +681,7 @@ fn main() {
         snippet_provider::init(cx);
         let prompt_builder = PromptBuilder::load(app_state.fs.clone(), stdout_is_a_pty(), cx);
         {
+            #[cfg(not(feature = "mac_app_store"))]
             project::AgentRegistryStore::init_global(
                 cx,
                 app_state.fs.clone(),
@@ -688,6 +699,10 @@ fn main() {
         }
 
         recent_projects::init(cx);
+        #[cfg(feature = "mac_app_store")]
+        CommandPaletteFilter::update_global(cx, |filter, _| {
+            filter.hide_action_types(&[TypeId::of::<zed_actions::OpenRemote>()]);
+        });
 
         load_embedded_fonts(cx);
 
@@ -1191,6 +1206,7 @@ pub(crate) async fn restore_or_create_workspace(
                         .await
                         .map(|_| ())
                 }
+                SerializedWorkspaceLocation::Remote(_) if cfg!(feature = "mac_app_store") => Ok(()),
                 SerializedWorkspaceLocation::Remote(connection_options) => {
                     let mut connection_options = connection_options.clone();
                     if let RemoteConnectionOptions::Ssh(options) = &mut connection_options {
@@ -1534,6 +1550,10 @@ fn hide_unshipped_actions_from_command_palette(cx: &mut App) {
             TypeId::of::<zed_actions::OpenTelemetryLog>(),
             TypeId::of::<zed_actions::OpenPerformanceProfiler>(),
             TypeId::of::<zed_actions::ShowUpdateNotification>(),
+            #[cfg(feature = "mac_app_store")]
+            TypeId::of::<zed_actions::AcpRegistry>(),
+            #[cfg(feature = "mac_app_store")]
+            TypeId::of::<agent_ui::NewExternalAgentThread>(),
             // These open inherited server or extension surfaces.
             #[cfg(not(feature = "mac_app_store"))]
             TypeId::of::<zed_actions::OpenAccountSettings>(),

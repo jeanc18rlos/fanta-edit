@@ -279,6 +279,10 @@ impl Prettier {
         _: Duration,
         _: AsyncApp,
     ) -> anyhow::Result<Self> {
+        if cfg!(feature = "mac_app_store") {
+            anyhow::bail!("Prettier is unavailable in the Mac App Store build");
+        }
+
         Ok(Self::Test(TestPrettier {
             default: prettier_dir == default_prettier_dir().as_path(),
             prettier_dir,
@@ -293,6 +297,10 @@ impl Prettier {
         request_timeout: Duration,
         mut cx: AsyncApp,
     ) -> anyhow::Result<Self> {
+        if cfg!(feature = "mac_app_store") {
+            anyhow::bail!("Prettier is unavailable in the Mac App Store build");
+        }
+
         use lsp::{LanguageServerBinary, LanguageServerName};
 
         let executor = cx.background_executor().clone();
@@ -706,6 +714,25 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[cfg(feature = "mac_app_store")]
+    #[gpui::test]
+    async fn test_mac_app_store_rejects_prettier_launch(cx: &mut gpui::TestAppContext) {
+        let result = Prettier::start(
+            LanguageServerId(0),
+            PathBuf::from("/tmp/prettier-should-not-run"),
+            NodeRuntime::unavailable(),
+            Duration::from_secs(1),
+            cx.to_async(),
+        )
+        .await;
+
+        assert!(result.is_err_and(|error| {
+            error
+                .to_string()
+                .contains("unavailable in the Mac App Store build")
+        }));
+    }
 
     #[gpui::test]
     async fn test_prettier_lookup_finds_nothing(cx: &mut gpui::TestAppContext) {

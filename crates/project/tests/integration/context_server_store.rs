@@ -18,6 +18,170 @@ use std::sync::Arc;
 use std::{cell::RefCell, path::PathBuf, rc::Rc};
 use util::path;
 
+#[cfg(feature = "mac_app_store")]
+#[gpui::test]
+async fn test_mac_app_store_hides_saved_external_agents(cx: &mut TestAppContext) {
+    use project::agent_registry_store::{RegistryAgentMetadata, RegistryNpxAgent};
+    use project::agent_server_store::{AllAgentServersSettings, CustomAgentServerSettings};
+    use project::{AgentId, AgentRegistryStore, RegistryAgent};
+
+    let (_fs, project) = setup_context_server_test(cx, json!({"code.rs": ""}), vec![]).await;
+    let agent_id = AgentId::from("saved-registry");
+    cx.update(|cx| {
+        AgentRegistryStore::init_test_global(
+            cx,
+            vec![RegistryAgent::Npx(RegistryNpxAgent {
+                metadata: RegistryAgentMetadata {
+                    id: agent_id.clone(),
+                    name: "Saved registry agent".into(),
+                    description: "".into(),
+                    version: "1.0.0".into(),
+                    repository: None,
+                    website: None,
+                    icon_path: None,
+                },
+                package: "saved-registry".into(),
+                args: Vec::new(),
+                env: Default::default(),
+            })],
+        );
+        let mut settings = AllAgentServersSettings::default();
+        settings.insert(
+            "saved-registry".into(),
+            CustomAgentServerSettings::Registry {
+                env: Default::default(),
+                default_mode: None,
+                default_config_options: Default::default(),
+                favorite_config_option_values: Default::default(),
+            },
+        );
+        settings.insert(
+            "saved-custom".into(),
+            CustomAgentServerSettings::Custom {
+                command: project::agent_server_store::AgentServerCommand {
+                    path: "/usr/bin/touch".into(),
+                    args: Vec::new(),
+                    env: None,
+                },
+                default_mode: None,
+                default_config_options: Default::default(),
+                favorite_config_option_values: Default::default(),
+            },
+        );
+        AllAgentServersSettings::override_global(settings, cx);
+    });
+    cx.run_until_parked();
+
+    cx.read(|cx| {
+        assert!(
+            !project
+                .read(cx)
+                .agent_server_store()
+                .read(cx)
+                .has_external_agents()
+        );
+    });
+}
+
+#[cfg(feature = "mac_app_store")]
+#[gpui::test]
+async fn test_mac_app_store_rejects_saved_local_mcp_servers(cx: &mut TestAppContext) {
+    let (_fs, project) = setup_context_server_test(cx, json!({"code.rs": ""}), vec![]).await;
+    let store = project.read_with(cx, |project, _| project.context_server_store());
+    let stdio_id = ContextServerId("saved-stdio".into());
+    let extension_id = ContextServerId("saved-extension".into());
+
+    set_context_server_configuration(
+        vec![
+            (
+                stdio_id.0.clone(),
+                settings::ContextServerSettingsContent::Stdio {
+                    enabled: true,
+                    remote: false,
+                    command: ContextServerCommand {
+                        path: "/usr/bin/touch".into(),
+                        args: vec![],
+                        env: None,
+                        timeout: None,
+                    },
+                },
+            ),
+            (
+                extension_id.0.clone(),
+                settings::ContextServerSettingsContent::Extension {
+                    enabled: true,
+                    remote: false,
+                    settings: json!({}),
+                },
+            ),
+        ],
+        cx,
+    );
+    cx.run_until_parked();
+
+    cx.read(|cx| {
+        for id in [&stdio_id, &extension_id] {
+            assert!(matches!(
+                store.read(cx).status_for_server(id),
+                Some(ContextServerStatus::Error(error))
+                    if error.contains("unavailable in the Mac App Store build")
+            ));
+        }
+    });
+
+    // A direct start request must also fail before reaching the process factory.
+    let mut async_cx = cx.to_async();
+    let result = ContextServerStore::create_context_server(
+        store.downgrade(),
+        stdio_id,
+        Arc::new(ContextServerConfiguration::Custom {
+            command: ContextServerCommand {
+                path: "/usr/bin/touch".into(),
+                args: vec![],
+                env: None,
+                timeout: None,
+            },
+            remote: false,
+        }),
+        &mut async_cx,
+    )
+    .await;
+    assert!(result.is_err_and(|error| {
+        error
+            .to_string()
+            .contains("unavailable in the Mac App Store build")
+    }));
+}
+
+#[cfg(feature = "mac_app_store")]
+#[gpui::test]
+async fn test_mac_app_store_keeps_http_mcp_configuration(cx: &mut TestAppContext) {
+    let (_fs, project) = setup_context_server_test(cx, json!({"code.rs": ""}), vec![]).await;
+    let registry = cx.new(|_| ContextServerDescriptorRegistry::new());
+    let worktree_store = project.read_with(cx, |project, _| project.worktree_store());
+    let async_cx = cx.to_async();
+
+    let configuration = ContextServerConfiguration::from_settings(
+        ContextServerSettings::Http {
+            enabled: true,
+            url: "https://example.test/mcp".into(),
+            headers: Default::default(),
+            timeout: None,
+            oauth: None,
+        },
+        ContextServerId("remote-http".into()),
+        registry,
+        worktree_store,
+        &async_cx,
+    )
+    .await;
+
+    assert!(matches!(
+        configuration,
+        Ok(ContextServerConfiguration::Http { .. })
+    ));
+}
+
 #[gpui::test]
 async fn test_context_server_status(cx: &mut TestAppContext) {
     const SERVER_1_ID: &str = "mcp-1";

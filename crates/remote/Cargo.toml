@@ -15,6 +15,7 @@ doctest = false
 
 [features]
 default = []
+mac_app_store = []
 build-remote-server-binary = []
 test-support = ["fs/test-support"]
 

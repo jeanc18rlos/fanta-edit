@@ -2508,6 +2508,10 @@ impl LocalLspStore {
         arguments: Option<&[String]>,
         cx: &mut AsyncApp,
     ) -> Result<Option<Diff>> {
+        if cfg!(feature = "mac_app_store") {
+            anyhow::bail!("External formatters are unavailable in the Mac App Store build");
+        }
+
         let working_dir_path = buffer.handle.update(cx, |buffer, cx| {
             let file = File::from_dyn(buffer.file())?;
             let worktree = file.worktree.read(cx);

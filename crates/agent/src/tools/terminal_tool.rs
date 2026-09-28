@@ -413,6 +413,10 @@ async fn run_terminal_tool(
     event_stream: ToolCallEventStream,
     cx: &mut AsyncApp,
 ) -> Result<String, String> {
+    if cfg!(feature = "mac_app_store") {
+        return Err("Terminal commands are unavailable in the Mac App Store build".into());
+    }
+
     let selection = input.selection;
     let sandbox_input = input.sandbox.clone().unwrap_or_default();
 

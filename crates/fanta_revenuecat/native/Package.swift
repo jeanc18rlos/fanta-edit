@@ -8,7 +8,7 @@ let package = Package(
         .library(name: "FantaRevenueCatBridge", type: .dynamic, targets: ["FantaRevenueCatBridge"])
     ],
     dependencies: [
-        .package(url: "https://github.com/RevenueCat/purchases-ios-spm.git", exact: "5.82.0")
+        .package(url: "https://github.com/RevenueCat/purchases-ios-spm.git", exact: "5.91.0")
     ],
     targets: [
         .target(

@@ -3,6 +3,7 @@ pub mod agent_connection_store;
 mod agent_diff;
 mod agent_model_selector;
 mod agent_panel;
+#[cfg(not(feature = "mac_app_store"))]
 mod agent_registry_ui;
 mod buffer_codegen;
 mod completion_provider;
@@ -74,6 +75,7 @@ pub use crate::agent_panel::{
     AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo, MaxIdleRetainedThreads, TerminalId,
     ThreadTitleRegenerationResult,
 };
+#[cfg(not(feature = "mac_app_store"))]
 use crate::agent_registry_ui::AgentRegistryPage;
 pub use crate::inline_assistant::InlineAssistant;
 pub use crate::message_editor::MessageEditorEvent;
@@ -667,6 +669,7 @@ pub fn init(
 
     inline_assistant::init(fs.clone(), prompt_builder.clone(), cx);
     terminal_inline_assistant::init(fs.clone(), prompt_builder, cx);
+    #[cfg(not(feature = "mac_app_store"))]
     cx.observe_new(|workspace: &mut Workspace, _window, _cx| {
         workspace.register_action(
             move |workspace: &mut Workspace,
@@ -923,6 +926,10 @@ fn update_command_palette_filter(cx: &mut App) {
             filter.show_action_types(manage_skills_action.iter());
             filter.hide_action_types(&skill_creator_actions);
         }
+
+        if cfg!(feature = "mac_app_store") {
+            filter.hide_action_types(&[TypeId::of::<NewTerminalThread>()]);
+        }
     });
 }
 
@@ -1075,9 +1082,10 @@ mod tests {
                 !filter.is_hidden(&NewThread),
                 "NewThread should be visible by default"
             );
-            assert!(
-                !filter.is_hidden(&NewTerminalThread),
-                "NewTerminalThread should be visible by default"
+            assert_eq!(
+                filter.is_hidden(&NewTerminalThread),
+                cfg!(feature = "mac_app_store"),
+                "NewTerminalThread visibility should match Store policy"
             );
             assert!(
                 !filter.is_hidden(&zed_actions::assistant::OpenSkillCreator),

@@ -1,4 +1,6 @@
 use client::{Client, ClientSettings, TelemetrySettings};
+#[cfg(feature = "mac_app_store")]
+use fanta_gpui::settings::SettingsTone;
 use fanta_gpui::{
     billing::{
         BillingAction, BillingActionState, BillingActions, BillingLoadState, BillingUsageRange,
@@ -32,6 +34,8 @@ use super::{settings_billing, settings_mcp};
 
 const PRIVACY_POLICY_URL: &str = "https://www.fantaisa.net/privacy";
 const TERMS_OF_USE_URL: &str = "https://www.fantaisa.net/terms";
+#[cfg(feature = "mac_app_store")]
+const FILES_AND_FOLDERS_SETTINGS_URL: &str = "x-apple.systempreferences:com.apple.settings.PrivacySecurity.extension?Privacy_FilesAndFolders";
 
 fn legal_document_url(id: &str) -> Option<&'static str> {
     match id {
@@ -130,6 +134,58 @@ fn action(
     )
 }
 
+#[cfg(feature = "mac_app_store")]
+fn app_access_status(
+    id: &'static str,
+    title: &'static str,
+    description: &'static str,
+    label: &'static str,
+) -> SettingsItem {
+    item(
+        id,
+        title,
+        description,
+        SettingsControl::Status {
+            label: label.into(),
+            tone: SettingsTone::Neutral,
+        },
+    )
+}
+
+#[cfg(feature = "mac_app_store")]
+fn app_access_settings_group() -> SettingsGroup {
+    SettingsGroup::new(
+        "App Access",
+        vec![
+            action(
+                "app_access_project_files",
+                "Project files",
+                "Fanta can edit files and folders you select in macOS Open and Save dialogs. If macOS blocks a protected location, review Files & Folders.",
+                "System Settings…",
+            ),
+            app_access_status(
+                "app_access_keychain",
+                "Sign-in Keychain",
+                "macOS may ask before Fanta reads its saved sign-in. Sign Out removes that saved session; there is no global permission to enable.",
+                "Managed by macOS",
+            ),
+            app_access_status(
+                "app_access_network",
+                "Network",
+                "Fanta uses network access for sign-in, AI features, and billing. The App Store build includes this sandbox capability; macOS has no per-app switch for it.",
+                "Included in app",
+            ),
+            app_access_status(
+                "app_access_screen_recording",
+                "Screen recording",
+                "Fanta does not capture your screen or request Screen Recording access. You can record a demo with your Mac's own screen recorder.",
+                "Not requested",
+            ),
+        ],
+    )
+    .description("How macOS controls Fanta's access to files, saved sign-in, and the network.")
+}
+
 fn preference_pages(cx: &App, host_workspace: Option<&Entity<Workspace>>) -> Vec<SettingsPageData> {
     let workspace = WorkspaceSettings::get_global(cx);
     let editor = editor::EditorSettings::get_global(cx);
@@ -144,6 +200,38 @@ fn preference_pages(cx: &App, host_workspace: Option<&Entity<Workspace>>) -> Vec
     };
     let ui_size = format!("{}", f32::from(theme.ui_font_size(cx)).round() as i32);
     let buffer_size = format!("{}", f32::from(theme.buffer_font_size(cx)).round() as i32);
+    let mut privacy_groups = Vec::new();
+    #[cfg(feature = "mac_app_store")]
+    privacy_groups.push(app_access_settings_group());
+    privacy_groups.push(SettingsGroup::new(
+        "Diagnostics & data",
+        vec![
+            toggle(
+                "diagnostics",
+                "Share crash diagnostics",
+                "Send crash information to improve stability.",
+                telemetry.diagnostics,
+            ),
+            toggle(
+                "metrics",
+                "Share anonymous usage metrics",
+                "Send usage measurements without document contents.",
+                telemetry.metrics,
+            ),
+            action(
+                "privacy_policy",
+                "Privacy Policy",
+                "Read how Fanta handles account and application data.",
+                "Open",
+            ),
+            action(
+                "terms_of_use",
+                "Terms of Use",
+                "Read the terms for Fanta subscriptions and services.",
+                "Open",
+            ),
+        ],
+    ));
 
     vec![
         SettingsPageData::new(
@@ -392,38 +480,7 @@ fn preference_pages(cx: &App, host_workspace: Option<&Entity<Workspace>>) -> Vec
                 legal_settings_group(),
             ],
         ),
-        SettingsPageData::new(
-            SettingsPage::Privacy,
-            vec![SettingsGroup::new(
-                "Diagnostics & data",
-                vec![
-                    toggle(
-                        "diagnostics",
-                        "Share crash diagnostics",
-                        "Send crash information to improve stability.",
-                        telemetry.diagnostics,
-                    ),
-                    toggle(
-                        "metrics",
-                        "Share anonymous usage metrics",
-                        "Send usage measurements without document contents.",
-                        telemetry.metrics,
-                    ),
-                    action(
-                        "privacy_policy",
-                        "Privacy Policy",
-                        "Read how Fanta handles account and application data.",
-                        "Open",
-                    ),
-                    action(
-                        "terms_of_use",
-                        "Terms of Use",
-                        "Read the terms for Fanta subscriptions and services.",
-                        "Open",
-                    ),
-                ],
-            )],
-        ),
+        SettingsPageData::new(SettingsPage::Privacy, privacy_groups),
     ]
 }
 
@@ -512,7 +569,13 @@ fn apply_toggle_setting(settings: &mut SettingsContent, id: &str, value: bool) -
 
 pub(super) fn page_from_path(path: &str) -> SettingsPage {
     let path = path.to_ascii_lowercase();
-    if path.contains("mcp") || path.contains("context_server") || path.contains("tool") {
+    if cfg!(feature = "mac_app_store")
+        && (path.contains("app access")
+            || path.contains("app_access")
+            || path.contains("macos permissions"))
+    {
+        SettingsPage::Privacy
+    } else if path.contains("mcp") || path.contains("context_server") || path.contains("tool") {
         SettingsPage::McpTools
     } else if path.contains("billing") || path.contains("credit") || path.contains("plan") {
         SettingsPage::Billing
@@ -1022,6 +1085,8 @@ impl SettingsWindow {
             "api_keys" => cx.open_url("https://app.fantaisa.net/keys"),
             "account_security" => cx.open_url("https://app.fantaisa.net/settings"),
             #[cfg(feature = "mac_app_store")]
+            "app_access_project_files" => cx.open_url(FILES_AND_FOLDERS_SETTINGS_URL),
+            #[cfg(feature = "mac_app_store")]
             "delete_account" => super::app_store_billing::request_account_deletion(cx),
             _ => self.notice("This settings action is unavailable.", cx),
         }
@@ -1205,6 +1270,38 @@ mod tests {
         assert_eq!(page_from_path("account.billing"), SettingsPage::Billing);
         assert_eq!(page_from_path("ai.usage"), SettingsPage::Usage);
         assert_eq!(page_from_path("agent.model"), SettingsPage::AiModels);
+        #[cfg(feature = "mac_app_store")]
+        assert_eq!(
+            page_from_path("macos permissions.app_access"),
+            SettingsPage::Privacy
+        );
+    }
+
+    #[cfg(feature = "mac_app_store")]
+    #[test]
+    fn store_app_access_guide_has_one_system_action_and_three_explanations() {
+        let group = app_access_settings_group();
+        assert_eq!(group.title.as_ref(), "App Access");
+        assert_eq!(group.items.len(), 4);
+        assert_eq!(group.items[0].title.as_ref(), "Project files");
+        assert_eq!(group.items[0].id.as_ref(), "app_access_project_files");
+        assert!(matches!(
+            &group.items[0].control,
+            SettingsControl::Action { label } if label.as_ref() == "System Settings…"
+        ));
+        assert_eq!(
+            group.items[1..]
+                .iter()
+                .map(|item| item.title.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["Sign-in Keychain", "Network", "Screen recording"]
+        );
+        assert!(
+            group.items[1..]
+                .iter()
+                .all(|item| matches!(&item.control, SettingsControl::Status { .. }))
+        );
+        assert!(FILES_AND_FOLDERS_SETTINGS_URL.starts_with("x-apple.systempreferences:"));
     }
 
     #[test]

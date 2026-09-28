@@ -2132,11 +2132,14 @@ impl Thread {
         ));
         // Register terminal tool variants; `enabled_tools` exposes the one
         // matching the current sandbox state to the model as `terminal`.
-        self.add_tool(TerminalTool::new(self.project.clone(), environment.clone()));
-        self.add_tool(SandboxedTerminalTool::new(
-            self.project.clone(),
-            environment.clone(),
-        ));
+        #[cfg(not(feature = "mac_app_store"))]
+        {
+            self.add_tool(TerminalTool::new(self.project.clone(), environment.clone()));
+            self.add_tool(SandboxedTerminalTool::new(
+                self.project.clone(),
+                environment.clone(),
+            ));
+        }
         self.add_tool(WebSearchTool);
 
         // Design-canvas tools; they resolve the active surface from the

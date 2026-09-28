@@ -5996,18 +5996,21 @@ impl AgentPanel {
 
                             menu
                         })
-                        .separator()
-                        .item(
-                            ContextMenuEntry::new("Add More Agents")
-                                .icon(IconName::Plus)
-                                .icon_color(Color::Muted)
-                                .handler({
-                                    move |window, cx| {
-                                        window
-                                            .dispatch_action(Box::new(zed_actions::AcpRegistry), cx)
-                                    }
-                                }),
-                        )
+                        .when(!cfg!(feature = "mac_app_store"), |menu| {
+                            menu.separator().item(
+                                ContextMenuEntry::new("Add More Agents")
+                                    .icon(IconName::Plus)
+                                    .icon_color(Color::Muted)
+                                    .handler({
+                                        move |window, cx| {
+                                            window.dispatch_action(
+                                                Box::new(zed_actions::AcpRegistry),
+                                                cx,
+                                            )
+                                        }
+                                    }),
+                            )
+                        })
                 }))
             })
         };

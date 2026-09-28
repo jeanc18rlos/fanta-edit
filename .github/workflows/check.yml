@@ -87,6 +87,55 @@ jobs:
       - name: Test sidebar behavior and project ownership
         run: cargo test --locked -p sidebar --lib
 
+  mac-app-store-runtime:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.native_video_only }}
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install the repository Rust toolchain
+        run: rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: macos-check
+
+      - name: Check the Mac App Store feature build
+        run: cargo check --locked -p zed --features mac_app_store
+
+      - name: Test Store App Access settings guide
+        run: cargo test --locked -p zed --bin fanta --features mac_app_store store_app_access_guide_has_one_system_action_and_three_explanations
+
+      - name: Test Store Welcome App Access entry
+        run: cargo test --locked -p workspace --lib --features mac_app_store store_welcome_links_to_app_access_guide
+
+      - name: Test blocked local MCP process spawn
+        run: cargo test --locked -p context_server --lib --features mac_app_store rejects_stdio_before_process_spawn
+
+      - name: Test blocked native agent terminal commands
+        run: cargo test --locked -p agent --lib --features mac_app_store test_mac_app_store_terminal_tool
+
+      - name: Test terminal action is hidden in Store builds
+        run: cargo test --locked -p agent_ui --lib --features mac_app_store test_agent_command_palette_visibility
+
+      - name: Test blocked direct ACP process spawn
+        run: cargo test --locked -p agent_servers --lib --features mac_app_store test_mac_app_store_blocks_direct_acp_stdio_spawn
+
+      - name: Test blocked Prettier JavaScript server
+        run: cargo test --locked -p prettier --lib --features mac_app_store test_mac_app_store_rejects_prettier_launch
+
+      - name: Test blocked remote connections
+        run: cargo test --locked -p remote --lib --features mac_app_store test_mac_app_store_rejects_remote_connection
+
+      - name: Test bundled Git requirement
+        run: cargo test --locked -p fs --test integration --features mac_app_store,test-support test_mac_app_store_requires_bundled_git
+
+      - name: Test blocked project execution paths
+        run: cargo test --locked -p project --test integration --features mac_app_store,test-support test_mac_app_store_
+
   native-video:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.native_video_only }}
     runs-on: macos-26

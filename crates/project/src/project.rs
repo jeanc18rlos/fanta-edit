@@ -2286,6 +2286,10 @@ impl Project {
 
     #[inline]
     pub fn supports_terminal(&self, _cx: &App) -> bool {
+        if cfg!(feature = "mac_app_store") {
+            return false;
+        }
+
         self.is_local() || self.is_via_remote_server()
     }
 

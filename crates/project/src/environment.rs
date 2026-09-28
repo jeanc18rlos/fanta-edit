@@ -249,6 +249,14 @@ impl ProjectEnvironment {
             .clone()
     }
 
+    #[cfg(feature = "test-support")]
+    pub async fn load_directory_shell_environment_for_test(
+        abs_path: Arc<Path>,
+    ) -> anyhow::Result<HashMap<String, String>> {
+        let (tx, _rx) = mpsc::unbounded();
+        load_directory_shell_environment(Shell::System, abs_path, DirenvSettings::Direct, tx).await
+    }
+
     pub fn remote_directory_environment(
         &mut self,
         shell: &Shell,
@@ -316,6 +324,10 @@ async fn load_directory_shell_environment(
     load_direnv: DirenvSettings,
     tx: mpsc::UnboundedSender<String>,
 ) -> anyhow::Result<HashMap<String, String>> {
+    if cfg!(feature = "mac_app_store") {
+        return Ok(HashMap::default());
+    }
+
     if let DirenvSettings::Disabled = load_direnv {
         return Ok(HashMap::default());
     }

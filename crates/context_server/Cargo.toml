@@ -12,6 +12,7 @@ workspace = true
 path = "src/context_server.rs"
 
 [features]
+mac_app_store = []
 test-support = ["gpui/test-support"]
 
 [dependencies]

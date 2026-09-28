@@ -312,6 +312,21 @@ impl AgentServerStore {
             .get::<AllAgentServersSettings>(None)
             .clone();
 
+        if cfg!(feature = "mac_app_store") {
+            self.external_agents.clear();
+            *old_settings = Some(new_settings);
+            if let Some((project_id, downstream_client)) = downstream_client {
+                downstream_client
+                    .send(proto::ExternalAgentsUpdated {
+                        project_id: *project_id,
+                        names: Vec::new(),
+                    })
+                    .log_err();
+            }
+            cx.emit(AgentServersUpdated);
+            return;
+        }
+
         // If we don't have agents from the registry loaded yet, trigger a
         // refresh, which will cause this function to be called again
         let registry_store = AgentRegistryStore::try_global(cx);
@@ -1147,6 +1162,12 @@ impl ExternalAgentServer for LocalRegistryArchiveAgent {
         extra_env: HashMap<String, String>,
         cx: &mut AsyncApp,
     ) -> Task<Result<AgentServerCommand>> {
+        if cfg!(feature = "mac_app_store") {
+            return Task::ready(Err(anyhow::anyhow!(
+                "External agent processes are unavailable in the Mac App Store build"
+            )));
+        }
+
         let fs = self.fs.clone();
         let http_client = self.http_client.clone();
         let node_runtime = self.node_runtime.clone();
@@ -1358,6 +1379,12 @@ impl ExternalAgentServer for LocalRegistryNpxAgent {
         extra_env: HashMap<String, String>,
         cx: &mut AsyncApp,
     ) -> Task<Result<AgentServerCommand>> {
+        if cfg!(feature = "mac_app_store") {
+            return Task::ready(Err(anyhow::anyhow!(
+                "External agent processes are unavailable in the Mac App Store build"
+            )));
+        }
+
         let fs = self.fs.clone();
         let node_runtime = self.node_runtime.clone();
         let project_environment = self.project_environment.downgrade();
@@ -1462,6 +1489,12 @@ impl ExternalAgentServer for LocalCustomAgent {
         extra_env: HashMap<String, String>,
         cx: &mut AsyncApp,
     ) -> Task<Result<AgentServerCommand>> {
+        if cfg!(feature = "mac_app_store") {
+            return Task::ready(Err(anyhow::anyhow!(
+                "External agent processes are unavailable in the Mac App Store build"
+            )));
+        }
+
         let mut command = self.command.clone();
         let project_environment = self.project_environment.downgrade();
         cx.spawn(async move |cx| {

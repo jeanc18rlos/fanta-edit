@@ -19,6 +19,7 @@ required-features = ["test-support"]
 path = "tests/integration/project_tests.rs"
 
 [features]
+mac_app_store = ["context_server/mac_app_store", "fs/mac_app_store", "prettier/mac_app_store"]
 test-support = [
     "buffer_diff/test-support",
     "client/test-support",
