@@ -13,10 +13,10 @@ use fanta_gpui::{
 use fs::Fs;
 use futures::StreamExt as _;
 use gpui::{
-    Action, App, AppContext as _, Context, Entity, FocusHandle, Focusable, IntoElement,
-    ParentElement as _, Render, SharedString, Size, Styled as _, Subscription, Task,
-    TitlebarOptions, WeakEntity, Window, WindowBounds, WindowHandle, WindowKind, WindowOptions,
-    div, point, px,
+    Action, App, AppContext as _, Context, Entity, FocusHandle, Focusable, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, SharedString, Size, StatefulInteractiveElement as _,
+    Styled as _, Subscription, Task, TitlebarOptions, WeakEntity, Window, WindowBounds,
+    WindowHandle, WindowKind, WindowOptions, div, point, px,
 };
 use project::context_server_store::ServerStatusChangedEvent;
 use settings::{
@@ -29,6 +29,37 @@ use util::ResultExt as _;
 use workspace::{MultiWorkspace, Workspace, WorkspaceSettings};
 
 use super::{settings_billing, settings_mcp};
+
+const PRIVACY_POLICY_URL: &str = "https://www.fantaisa.net/privacy";
+const TERMS_OF_USE_URL: &str = "https://www.fantaisa.net/terms";
+
+fn legal_document_url(id: &str) -> Option<&'static str> {
+    match id {
+        "privacy_policy" => Some(PRIVACY_POLICY_URL),
+        "terms_of_use" => Some(TERMS_OF_USE_URL),
+        _ => None,
+    }
+}
+
+fn legal_settings_group() -> SettingsGroup {
+    SettingsGroup::new(
+        "Legal",
+        vec![
+            action(
+                "terms_of_use",
+                "Terms of Use",
+                "Read the terms for Fanta subscriptions and services.",
+                "Open",
+            ),
+            action(
+                "privacy_policy",
+                "Privacy Policy",
+                "Read how Fanta handles account and application data.",
+                "Open",
+            ),
+        ],
+    )
+}
 
 pub(super) struct SettingsWindow {
     screen: Entity<SettingsScreen>,
@@ -327,36 +358,39 @@ fn preference_pages(cx: &App, host_workspace: Option<&Entity<Workspace>>) -> Vec
         ),
         SettingsPageData::new(
             SettingsPage::Account,
-            vec![SettingsGroup::new(
-                "Fanta account",
-                vec![
-                    action(
-                        "workspace_details",
-                        "Workspace",
-                        "Manage members and workspace preferences in the dashboard.",
-                        "Manage",
-                    ),
-                    action(
-                        "api_keys",
-                        "API keys",
-                        "Create and manage keys for Fanta API access.",
-                        "Open keys",
-                    ),
-                    action(
-                        "account_security",
-                        "Account security",
-                        "Review your sign-in and account access.",
-                        "Manage",
-                    ),
-                    #[cfg(feature = "mac_app_store")]
-                    action(
-                        "delete_account",
-                        "Delete Fanta account",
-                        "Permanently delete your account and personal cloud data.",
-                        "Delete…",
-                    ),
-                ],
-            )],
+            vec![
+                SettingsGroup::new(
+                    "Fanta account",
+                    vec![
+                        action(
+                            "workspace_details",
+                            "Workspace",
+                            "Manage members and workspace preferences in the dashboard.",
+                            "Manage",
+                        ),
+                        action(
+                            "api_keys",
+                            "API keys",
+                            "Create and manage keys for Fanta API access.",
+                            "Open keys",
+                        ),
+                        action(
+                            "account_security",
+                            "Account security",
+                            "Review your sign-in and account access.",
+                            "Manage",
+                        ),
+                        #[cfg(feature = "mac_app_store")]
+                        action(
+                            "delete_account",
+                            "Delete Fanta account",
+                            "Permanently delete your account and personal cloud data.",
+                            "Delete…",
+                        ),
+                    ],
+                ),
+                legal_settings_group(),
+            ],
         ),
         SettingsPageData::new(
             SettingsPage::Privacy,
@@ -377,8 +411,14 @@ fn preference_pages(cx: &App, host_workspace: Option<&Entity<Workspace>>) -> Vec
                     ),
                     action(
                         "privacy_policy",
-                        "Privacy policy",
+                        "Privacy Policy",
                         "Read how Fanta handles account and application data.",
+                        "Open",
+                    ),
+                    action(
+                        "terms_of_use",
+                        "Terms of Use",
+                        "Read the terms for Fanta subscriptions and services.",
                         "Open",
                     ),
                 ],
@@ -949,6 +989,10 @@ impl SettingsWindow {
     }
 
     fn handle_action_request(&mut self, id: &str, cx: &mut Context<Self>) {
+        if let Some(url) = legal_document_url(id) {
+            cx.open_url(url);
+            return;
+        }
         match id {
             "settings_json" | "configure_providers" => {
                 self.dispatch_to_workspace(Box::new(zed_actions::OpenSettingsFile), cx)
@@ -977,7 +1021,6 @@ impl SettingsWindow {
             "workspace_details" => cx.open_url("https://app.fantaisa.net/organization"),
             "api_keys" => cx.open_url("https://app.fantaisa.net/keys"),
             "account_security" => cx.open_url("https://app.fantaisa.net/settings"),
-            "privacy_policy" => cx.open_url("https://www.fantaisa.net/privacy"),
             #[cfg(feature = "mac_app_store")]
             "delete_account" => super::app_store_billing::request_account_deletion(cx),
             _ => self.notice("This settings action is unavailable.", cx),
@@ -1081,14 +1124,78 @@ impl Focusable for SettingsWindow {
 }
 
 impl Render for SettingsWindow {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().child(self.screen.clone())
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        let legal_prompt = if matches!(
+            self.data.selected_page,
+            SettingsPage::Billing | SettingsPage::Plans
+        ) {
+            "Before subscribing, review"
+        } else {
+            "Fanta legal"
+        };
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(colors.background)
+            .child(div().flex_1().min_h_0().child(self.screen.clone()))
+            .child(
+                div()
+                    .id("fanta-settings-legal-footer")
+                    .h(px(52.))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_end()
+                    .gap(px(16.))
+                    .px(px(24.))
+                    .border_t_1()
+                    .border_color(colors.border_variant)
+                    .text_size(px(14.))
+                    .child(div().text_color(colors.text_muted).child(legal_prompt))
+                    .child(
+                        div()
+                            .id("fanta-settings-terms-link")
+                            .cursor_pointer()
+                            .text_color(colors.text_accent)
+                            .hover(|link| link.text_color(colors.text))
+                            .on_click(cx.listener(|_, _, _, cx| cx.open_url(TERMS_OF_USE_URL)))
+                            .child("Terms of Use"),
+                    )
+                    .child(
+                        div()
+                            .id("fanta-settings-privacy-link")
+                            .cursor_pointer()
+                            .text_color(colors.text_accent)
+                            .hover(|link| link.text_color(colors.text))
+                            .on_click(cx.listener(|_, _, _, cx| cx.open_url(PRIVACY_POLICY_URL)))
+                            .child("Privacy Policy"),
+                    ),
+            )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_legal_actions_open_the_public_subscription_documents() {
+        let legal = legal_settings_group();
+        let links: Vec<_> = legal
+            .items
+            .iter()
+            .map(|item| (item.title.as_ref(), legal_document_url(item.id.as_ref())))
+            .collect();
+        assert_eq!(
+            links,
+            vec![
+                ("Terms of Use", Some(TERMS_OF_USE_URL)),
+                ("Privacy Policy", Some(PRIVACY_POLICY_URL)),
+            ]
+        );
+    }
 
     #[test]
     fn settings_paths_open_the_relevant_native_destination() {
