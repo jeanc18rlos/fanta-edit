@@ -178,8 +178,7 @@ pub(crate) async fn prepare_canvas_asset(
         ProjectAssetKind::Video => Ok(PreparedCanvasAsset::Video(prepare_video(bytes).await?)),
         ProjectAssetKind::Audio => {
             use rodio::Source as _;
-            let decoder = rodio::Decoder::new(std::io::Cursor::new(bytes))
-                .context("This audio file could not be decoded.")?;
+            let decoder = audio_decoder(bytes).context("This audio file could not be decoded.")?;
             let duration = decoder
                 .total_duration()
                 .context("The audio file has no usable duration.")?;
@@ -189,6 +188,17 @@ pub(crate) async fn prepare_canvas_asset(
             Ok(PreparedCanvasAsset::Audio { duration_us })
         }
     }
+}
+
+pub(crate) fn audio_decoder(
+    bytes: Arc<[u8]>,
+) -> Result<rodio::Decoder<std::io::Cursor<Arc<[u8]>>>> {
+    let byte_len = u64::try_from(bytes.len()).context("The audio file is too large.")?;
+    rodio::Decoder::builder()
+        .with_data(std::io::Cursor::new(bytes))
+        .with_byte_len(byte_len)
+        .build()
+        .map_err(Into::into)
 }
 
 pub(crate) fn place_audio(
@@ -227,9 +237,24 @@ pub(crate) fn place_audio(
 }
 
 pub(crate) fn write_output(path: &Path, bytes: &[u8]) -> Result<()> {
+    #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+    {
+        let mut file = File::options()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .context("The selected file could not be opened")?;
+        file.write_all(bytes)
+            .context("The result could not be written")?;
+        file.sync_all().context("The result could not be saved")?;
+        Ok(())
+    }
+    #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
     write_output_with(path, |file| file.write_all(bytes)).context("The result could not be saved")
 }
 
+#[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
 fn write_output_with(
     path: &Path,
     write: impl FnOnce(&mut File) -> std::io::Result<()>,
@@ -260,6 +285,7 @@ fn write_output_with(
     }
 }
 
+#[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
 fn discard_output_temporary(
     temporary: tempfile::NamedTempFile,
     primary: std::io::Error,
@@ -1052,6 +1078,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mp3_decoder_exposes_duration_and_supports_placement() {
+        use rodio::Source as _;
+
+        let bytes: Arc<[u8]> =
+            Arc::from(&include_bytes!("../tests/fixtures/one_second_tone.mp3")[..]);
+        let mut decoder = audio_decoder(bytes.clone()).expect("decode MP3 with its byte length");
+        let duration = decoder.total_duration().expect("known MP3 duration");
+        assert!(duration.as_millis() >= 900 && duration.as_millis() <= 1_200);
+        decoder
+            .try_seek(std::time::Duration::from_millis(500))
+            .expect("seek MP3 preview");
+
+        let prepared =
+            futures::executor::block_on(prepare_canvas_asset(ProjectAssetKind::Audio, bytes))
+                .expect("place MP3 asset");
+        assert!(matches!(
+            prepared,
+            PreparedCanvasAsset::Audio { duration_us } if (900_000..=1_200_000).contains(&duration_us)
+        ));
+    }
+
+    #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+    #[test]
     fn output_partial_write_failure_preserves_existing_file() {
         let directory = tempfile::tempdir().expect("output directory");
         let destination = directory.path().join("result.mp4");
@@ -1074,6 +1123,28 @@ mod tests {
                 .count(),
             1,
             "failed writes must not leave temporary files"
+        );
+    }
+
+    #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+    #[test]
+    fn store_output_writes_selected_file_without_sibling_access() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("output directory");
+        let destination = directory.path().join("result.mp3");
+        std::fs::write(&destination, b"old audio").expect("selected file");
+        let original = std::fs::metadata(directory.path())
+            .expect("directory metadata")
+            .permissions();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o500))
+            .expect("restrict sibling creation");
+        let result = write_output(&destination, b"new audio");
+        std::fs::set_permissions(directory.path(), original).expect("restore directory access");
+        result.expect("save selected file");
+        assert_eq!(
+            std::fs::read(&destination).expect("saved audio"),
+            b"new audio"
         );
     }
 
