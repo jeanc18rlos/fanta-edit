@@ -210,6 +210,7 @@ pub(crate) fn place_audio(
     name: &str,
     x: f64,
     y: f64,
+    size: [f64; 2],
 ) -> (Result<()>, DocChange) {
     if !document.raw_assets.contains_key(&asset) {
         return (
@@ -221,7 +222,7 @@ pub(crate) fn place_audio(
     }
     let mut node = CanvasNode::new(NodeData::Audio(AudioNode {
         asset,
-        local_size: [360.0, 80.0],
+        local_size: size,
         time_range_us: [0, duration_us],
         volume: 1.0,
         muted: false,

@@ -3652,6 +3652,7 @@ impl FigView {
                                         &name,
                                         x,
                                         y,
+                                        size,
                                     )
                                 }
                             };
