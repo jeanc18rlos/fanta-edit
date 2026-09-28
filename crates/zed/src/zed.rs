@@ -360,6 +360,18 @@ pub fn init(cx: &mut App) {
     .on_action(|_: &About, cx| {
         open_about_window(cx);
     });
+
+    #[cfg(feature = "mac_app_store")]
+    cx.on_action(|_: &workspace::welcome::OpenAppAccess, cx| {
+        with_active_or_new_workspace(cx, |workspace, window, cx| {
+            settings_modal::SettingsWindow::open(
+                fanta_gpui::settings::SettingsPage::Privacy,
+                workspace,
+                window,
+                cx,
+            );
+        });
+    });
 }
 
 fn bind_on_window_closed(cx: &mut App) -> Option<gpui::Subscription> {

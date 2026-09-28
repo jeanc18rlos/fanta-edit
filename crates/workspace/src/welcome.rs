@@ -42,6 +42,15 @@ actions!(
     ]
 );
 
+#[cfg(feature = "mac_app_store")]
+actions!(
+    zed,
+    [
+        /// Open the macOS App Access guide in Fanta settings.
+        OpenAppAccess
+    ]
+);
+
 /// The one-line statement of what Fanta is. Kept public so the docs and the
 /// release notes quote exactly what the first screen says.
 #[cfg(not(feature = "mac_app_store"))]
@@ -250,7 +259,7 @@ const CONTENT: (Section<3>, Section<1>) = (
 );
 
 #[cfg(feature = "mac_app_store")]
-const CONTENT: (Section<3>, Section<1>) = (
+const CONTENT: (Section<3>, Section<2>) = (
     Section {
         title: "Get Started",
         entries: [
@@ -276,12 +285,20 @@ const CONTENT: (Section<3>, Section<1>) = (
     },
     Section {
         title: "Configure",
-        entries: [SectionEntry {
-            icon: IconName::Settings,
-            title: "Open Settings",
-            action: &OpenSettings,
-            visibility_guard: SectionVisibility::Always,
-        }],
+        entries: [
+            SectionEntry {
+                icon: IconName::Settings,
+                title: "Open Settings",
+                action: &OpenSettings,
+                visibility_guard: SectionVisibility::Always,
+            },
+            SectionEntry {
+                icon: IconName::Lock,
+                title: "Review App Access",
+                action: &OpenAppAccess,
+                visibility_guard: SectionVisibility::Always,
+            },
+        ],
     },
 );
 
@@ -958,6 +975,14 @@ fn project_name(paths: &PathList) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "mac_app_store")]
+    #[test]
+    fn store_welcome_links_to_app_access_guide() {
+        let entry = &CONTENT.1.entries[1];
+        assert_eq!(entry.title, "Review App Access");
+        assert_eq!(entry.action.name(), OpenAppAccess.name());
+    }
 
     #[test]
     fn test_project_name_empty() {

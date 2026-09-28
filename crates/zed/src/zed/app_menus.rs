@@ -35,6 +35,8 @@ pub fn app_menus() -> Vec<Menu> {
                 MenuItem::separator(),
                 MenuItem::submenu(Menu::new("Settings").items([
                     MenuItem::action("Open Settings…", zed_actions::OpenSettings),
+                    #[cfg(feature = "mac_app_store")]
+                    MenuItem::action("App Access…", workspace::welcome::OpenAppAccess),
                     MenuItem::separator(),
                     MenuItem::action("Open Settings File", super::OpenSettingsFile),
                     MenuItem::action("Open Keymap File", zed_actions::OpenKeymapFile),
