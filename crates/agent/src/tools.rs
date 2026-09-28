@@ -18,6 +18,7 @@ mod find_references_tool;
 mod get_code_actions_tool;
 mod go_to_definition_tool;
 mod grep_tool;
+mod jev_evaluate_tool;
 mod list_agents_and_models_tool;
 mod list_directory_tool;
 mod move_path_tool;
@@ -83,6 +84,7 @@ pub use find_references_tool::*;
 pub use get_code_actions_tool::*;
 pub use go_to_definition_tool::*;
 pub use grep_tool::*;
+pub use jev_evaluate_tool::*;
 pub use list_agents_and_models_tool::*;
 pub use list_directory_tool::*;
 pub use move_path_tool::*;
@@ -210,6 +212,7 @@ tools! {
     GetCodeActionsTool,
     GoToDefinitionTool,
     GrepTool,
+    JevEvaluateTool,
     ListAgentsAndModelsTool,
     ListDirectoryTool,
     MovePathTool,
@@ -253,12 +256,14 @@ mod tests {
         assert!(!tool_allowed_in_restricted_mode(FetchTool::NAME));
         assert!(!tool_allowed_in_restricted_mode(TerminalTool::NAME));
         assert!(!tool_allowed_in_restricted_mode(PlaceGenerationTool::NAME));
+        assert!(!tool_allowed_in_restricted_mode(JevEvaluateTool::NAME));
 
         // Every other built-in tool, and unknown (e.g. MCP) tools, are allowed.
         for name in ALL_TOOL_NAMES {
             let expected = *name != FetchTool::NAME
                 && *name != TerminalTool::NAME
-                && *name != PlaceGenerationTool::NAME;
+                && *name != PlaceGenerationTool::NAME
+                && *name != JevEvaluateTool::NAME;
             assert_eq!(
                 tool_allowed_in_restricted_mode(name),
                 expected,

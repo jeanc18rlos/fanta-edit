@@ -2,10 +2,10 @@ use crate::{
     ApplyCodeActionTool, CodeActionStore, ContextServerRegistry, CopyPathTool, CreateDirectoryTool,
     CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool, DesignEditTool,
     DesignScreenshotTool, DesignStateTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool,
-    FindReferencesTool, GetCodeActionsTool, GoToDefinitionTool, GrepTool, ListAgentsAndModelsTool,
-    ListDirectoryTool, MovePathTool, PlaceGenerationTool, ProjectSnapshot, ReadFileTool,
-    RenameTool, SandboxedTerminalTool, SpawnAgentTool, SystemPromptTemplate, Template, Templates,
-    TerminalTool, ToolPermissionDecision, WebSearchTool, WriteFileTool,
+    FindReferencesTool, GetCodeActionsTool, GoToDefinitionTool, GrepTool, JevEvaluateTool,
+    ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool, PlaceGenerationTool, ProjectSnapshot,
+    ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool, SystemPromptTemplate,
+    Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool, WriteFileTool,
     decide_permission_from_settings,
 };
 use acp_thread::{ClientUserMessageId, MentionUri};
@@ -2147,6 +2147,7 @@ impl Thread {
         self.add_tool(PlaceGenerationTool::new(
             self.project.read(cx).client().http_client(),
         ));
+        self.add_tool(JevEvaluateTool::new(self.project.read(cx).client().clone()));
 
         self.add_tool(DiagnosticsTool::new(self.project.clone()));
 

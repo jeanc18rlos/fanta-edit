@@ -467,6 +467,11 @@ pub enum LanguageModelCostInfo {
     },
     /// Cost per request
     RequestCost { cost_per_request: f64 },
+    /// Fanta's retail credits per million input and output tokens.
+    CreditTokenCost {
+        input_credits_per_1m: u64,
+        output_credits_per_1m: u64,
+    },
 }
 
 impl LanguageModelCostInfo {
@@ -484,6 +489,12 @@ impl LanguageModelCostInfo {
                 let output_cost = Self::cost_value_to_string(output_token_cost_per_1m);
                 SharedString::from(format!("{}$/{}$", input_cost, output_cost))
             }
+            LanguageModelCostInfo::CreditTokenCost {
+                input_credits_per_1m,
+                output_credits_per_1m,
+            } => SharedString::from(format!(
+                "{input_credits_per_1m}/{output_credits_per_1m} credits/M"
+            )),
         }
     }
 
