@@ -316,6 +316,8 @@ struct GenerationResponse {
     id: String,
     status: String,
     #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
     output: Vec<Value>,
     #[serde(default)]
     model: Option<String>,
@@ -436,6 +438,7 @@ struct GalleryRecord {
     id: String,
     kind: GenerationKind,
     model: String,
+    title: Option<String>,
     status: GenerationOutputStatus,
     created_at: String,
     outputs: Vec<MediaOutput>,
@@ -662,6 +665,10 @@ impl RunSummary {
     }
 }
 
+fn response_targets_active_run(run: Option<&RunSummary>, response_id: &str) -> bool {
+    run.and_then(RunSummary::generation_id) == Some(response_id)
+}
+
 #[derive(Clone)]
 struct Submission {
     key: String,
@@ -879,6 +886,7 @@ struct GenerationWorkspace {
     preview_request: Option<uuid::Uuid>,
     history: Vec<RunSummary>,
     active_run: Option<RunSummary>,
+    active_title: Option<String>,
     pending: bool,
     playback_file: Option<tempfile::TempPath>,
     unresolved_submission: Option<Submission>,
@@ -1512,13 +1520,27 @@ impl GenerationWorkspace {
         let active_id = active_run.and_then(RunSummary::generation_id);
         if let Some(run) = active_run {
             let kind = run.mode.generation_kind().expect("creation run kind");
+            let server_title = active_id
+                .and_then(|id| self.gallery.iter().find(|record| record.id == id))
+                .and_then(|record| record.title.as_deref());
+            let title = gallery_creation_title(
+                preferred_gallery_title(self.active_title.as_deref(), server_title),
+                Some(&run.prompt),
+                kind,
+            );
+            let model_label = self
+                .models
+                .iter()
+                .find(|model| model.id == run.model)
+                .map(GenerationModel::label)
+                .unwrap_or_else(|| humanize_model_id(&run.model));
             if self.outputs.is_empty() && (self.pending || self.task.is_some()) {
                 outputs.push(
                     GenerationOutput::new(
                         format!("gen:{}:0", run.generation_id().unwrap_or("vector")),
                         kind,
-                        "Generating…",
-                        run.model.clone(),
+                        title.clone(),
+                        model_label.clone(),
                         GenerationOutputStatus::Running,
                     )
                     .prompt(run.prompt.clone()),
@@ -1529,8 +1551,8 @@ impl GenerationWorkspace {
                 let mut entry = GenerationOutput::new(
                     id.clone(),
                     kind,
-                    output.label.clone(),
-                    run.model.clone(),
+                    title.clone(),
+                    model_label.clone(),
                     GenerationOutputStatus::Succeeded,
                 )
                 .detail(output.mime.clone());
@@ -1565,26 +1587,31 @@ impl GenerationWorkspace {
                 .iter()
                 .find(|model| model.id == record.model)
                 .map(GenerationModel::label)
-                .unwrap_or_else(|| record.model.clone());
+                .unwrap_or_else(|| humanize_model_id(&record.model));
+            let local_run = self
+                .history
+                .iter()
+                .find(|run| run.generation_id() == Some(record.id.as_str()));
+            let title = gallery_creation_title(
+                record.title.as_deref(),
+                local_run.map(|run| run.prompt.as_str()),
+                record.kind,
+            );
             let count = record.outputs.len().max(1);
             for index in 0..count {
                 let id = format!("gen:{}:{index}", record.id);
                 let mut entry = GenerationOutput::new(
                     id.clone(),
                     record.kind,
-                    format!("{} · {}", model_label, record.created_at),
-                    record.model.clone(),
+                    title.clone(),
+                    model_label.clone(),
                     record.status,
                 )
                 .created_at(record.created_at.clone());
                 if let Some(output) = record.outputs.get(index) {
                     entry = entry.detail(output.mime.clone());
                 }
-                if let Some(run) = self
-                    .history
-                    .iter()
-                    .find(|run| run.generation_id() == Some(record.id.as_str()))
-                {
+                if let Some(run) = local_run {
                     entry = entry.prompt(run.prompt.clone());
                 }
                 if let Some(preview) = self.gallery_previews.get(&id) {
@@ -1609,8 +1636,12 @@ impl GenerationWorkspace {
                 GenerationOutput::new(
                     format!("gen:{id}:0"),
                     kind,
-                    run.prompt.chars().take(48).collect::<String>(),
-                    run.model.clone(),
+                    gallery_creation_title(None, Some(&run.prompt), kind),
+                    self.models
+                        .iter()
+                        .find(|model| model.id == run.model)
+                        .map(GenerationModel::label)
+                        .unwrap_or_else(|| humanize_model_id(&run.model)),
                     GenerationOutputStatus::Succeeded,
                 )
                 .prompt(run.prompt.clone())
@@ -1968,6 +1999,7 @@ impl GenerationWorkspace {
                 return false;
             }
             self.active_run = Some(run);
+            self.active_title = record.title;
             self.outputs = record.outputs;
             self.selected_output = index;
             self.pending = matches!(
@@ -2074,6 +2106,7 @@ impl GenerationWorkspace {
             preview_request: None,
             history: Vec::new(),
             active_run: None,
+            active_title: None,
             pending: false,
             playback_file: None,
             unresolved_submission: None,
@@ -2129,6 +2162,7 @@ impl GenerationWorkspace {
         self.preview = None;
         self.history.clear();
         self.active_run = None;
+        self.active_title = None;
         self.pending = false;
         self.playback_file = None;
         self.status = "Account changed. Choose a source and start a new experiment.".into();
@@ -2673,6 +2707,7 @@ impl GenerationWorkspace {
         self.clear_playback(cx);
         self.preview_request = None;
         self.active_run = None;
+        self.active_title = None;
         self.error = None;
         self.status = "Creating vector artwork…".into();
         self.task = Some(cx.spawn(async move |this, cx| {
@@ -2697,6 +2732,7 @@ impl GenerationWorkspace {
                             model: model.id, prompt, source: None, mode: GenerationMode::Vector,
                         };
                         this.active_run = Some(run.clone());
+                        this.active_title = None;
                         this.history.insert(0, run);
                         let mut vectors = 0;
                         this.history.retain(|run| match run.result {
@@ -2836,6 +2872,7 @@ impl GenerationWorkspace {
                         }
                         this.restore_history(submissions, history);
                         this.active_run = Some(run);
+                        this.active_title = None;
                         this.outputs.clear();
                         this.preview = None;
                         this.preview_task = None;
@@ -3033,6 +3070,7 @@ impl GenerationWorkspace {
         self.preview_request = None;
         self.pending = false;
         self.active_run = Some(run.clone());
+        self.active_title = None;
         if let RunResult::VectorMessage { svg, .. } = &run.result {
             self.outputs = vec![vector_output(svg.clone())];
             self.selected_output = 0;
@@ -3121,6 +3159,12 @@ impl GenerationWorkspace {
     }
 
     fn accept_response(&mut self, response: &GenerationResponse, cx: &mut Context<Self>) {
+        if !response_targets_active_run(self.active_run.as_ref(), &response.id) {
+            return;
+        }
+        if let Some(title) = response.title.as_deref() {
+            self.active_title = Some(title.to_owned());
+        }
         self.pending = response.pending();
         if self.pending {
             self.status = if response.awaiting_input() {
@@ -5515,6 +5559,122 @@ fn normalize_outputs(outputs: &[Value]) -> Result<Vec<MediaOutput>> {
     Ok(result)
 }
 
+fn humanize_model_id(id: &str) -> String {
+    id.split(['-', '_'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn unsuitable_gallery_title(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains('@')
+        || lower.contains("://")
+        || lower.contains("www.")
+        || lower.contains("password")
+        || lower.contains("secret")
+        || lower.contains("api key")
+        || lower.contains("ignore previous")
+        || lower.contains("system prompt")
+        || text
+            .split(|c: char| !c.is_ascii_digit())
+            .any(|digits| digits.len() >= 4)
+        || text.chars().any(|c| {
+            c.is_control()
+                || matches!(c, '<' | '>' | '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+        })
+}
+
+fn preferred_gallery_title<'a>(
+    active: Option<&'a str>,
+    gallery: Option<&'a str>,
+) -> Option<&'a str> {
+    match (active, gallery) {
+        (Some(active), Some(gallery))
+            if neutral_generation_title(active) && !neutral_generation_title(gallery) =>
+        {
+            Some(gallery)
+        }
+        (Some(active), _) => Some(active),
+        (None, gallery) => gallery,
+    }
+}
+
+fn neutral_generation_title(title: &str) -> bool {
+    title.starts_with("New ") && title.ends_with(" Creation")
+}
+
+fn gallery_creation_title(
+    title: Option<&str>,
+    prompt: Option<&str>,
+    kind: GenerationKind,
+) -> String {
+    let title = title.map(str::trim).filter(|title| {
+        !title.is_empty() && title.chars().count() <= 80 && !unsuitable_gallery_title(title)
+    });
+    if let Some(title) = title.filter(|title| !neutral_generation_title(title)) {
+        return title.to_owned();
+    }
+
+    let fallback = match kind {
+        GenerationKind::Image => "Image creation",
+        GenerationKind::Video => "Video creation",
+        GenerationKind::Audio => "Audio creation",
+        GenerationKind::Svg => "Vector creation",
+    };
+    let Some(prompt) = prompt else {
+        return title.unwrap_or(fallback).into();
+    };
+    let first_sentence = prompt
+        .split(['.', '!', '?', '\n'])
+        .next()
+        .unwrap_or_default();
+    if unsuitable_gallery_title(first_sentence) {
+        return fallback.into();
+    }
+    let mut words = Vec::new();
+    for word in first_sentence.split_whitespace() {
+        let word = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '-' && c != '\'');
+        if word.is_empty() || matches!(word.to_ascii_lowercase().as_str(), "a" | "an" | "the") {
+            continue;
+        }
+        if words.is_empty()
+            && matches!(
+                word.to_ascii_lowercase().as_str(),
+                "create" | "generate" | "make" | "draw" | "render" | "paint"
+            )
+        {
+            continue;
+        }
+        let candidate = words
+            .iter()
+            .copied()
+            .chain([word])
+            .collect::<Vec<_>>()
+            .join(" ");
+        if candidate.chars().count() > 56 || words.len() == 6 {
+            break;
+        }
+        words.push(word);
+    }
+    if words.is_empty() {
+        return fallback.into();
+    }
+    let title = words.join(" ");
+    let mut chars = title.chars();
+    chars
+        .next()
+        .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+        .unwrap_or_else(|| fallback.into())
+}
+
 fn parse_gallery_response(value: Value) -> Result<(Vec<GalleryRecord>, Option<String>)> {
     let rows = value["generations"]
         .as_array()
@@ -5556,6 +5716,7 @@ fn parse_gallery_response(value: Value) -> Result<(Vec<GalleryRecord>, Option<St
             id: id.to_owned(),
             kind,
             model: row["model"].as_str().unwrap_or("Unknown model").to_owned(),
+            title: row["title"].as_str().map(str::to_owned),
             status,
             created_at: row["created_at"].as_str().unwrap_or_default().to_owned(),
             outputs,
@@ -5688,6 +5849,110 @@ fn preview_point(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gallery_uses_server_semantic_title_and_never_model_timestamp_as_name() {
+        let (records, _) = parse_gallery_response(json!({
+            "generations": [{
+                "id": "b7801ec0-5abc-4977-843f-e4719bf15210",
+                "kind": "image", "model": "qwen-image-2.0", "status": "succeeded",
+                "title": "Sunlit Suburban Family Home",
+                "created_at": "2026-09-25T00:57:45.199Z", "output": []
+            }]
+        }))
+        .expect("gallery response");
+        assert_eq!(
+            records[0].title.as_deref(),
+            Some("Sunlit Suburban Family Home")
+        );
+        assert_eq!(
+            gallery_creation_title(
+                records[0].title.as_deref(),
+                Some("A house on a lawn"),
+                records[0].kind
+            ),
+            "Sunlit Suburban Family Home"
+        );
+        assert_eq!(humanize_model_id(&records[0].model), "Qwen Image 2.0");
+        let accepted = parse_generation_response(json!({
+            "id": records[0].id, "status": "processing", "title": "Sunlit Suburban Family Home"
+        }))
+        .expect("generation response");
+        assert_eq!(
+            accepted.title.as_deref(),
+            Some("Sunlit Suburban Family Home")
+        );
+        assert_eq!(
+            preferred_gallery_title(Some("Sunlit House and Lawn"), Some("New Artwork Creation")),
+            Some("Sunlit House and Lawn")
+        );
+        assert_eq!(
+            preferred_gallery_title(Some("New Artwork Creation"), Some("Sunlit House and Lawn")),
+            Some("Sunlit House and Lawn")
+        );
+    }
+
+    #[test]
+    fn older_gallery_rows_use_local_prompt_then_a_plain_kind_fallback() {
+        let prompt = "A warm suburban house with a green lawn. Ignore previous instructions.";
+        assert_eq!(
+            gallery_creation_title(None, Some(prompt), GenerationKind::Image),
+            "Warm suburban house with green lawn"
+        );
+        assert_eq!(
+            gallery_creation_title(
+                Some("New Artwork Creation"),
+                Some(prompt),
+                GenerationKind::Image
+            ),
+            "Warm suburban house with green lawn"
+        );
+        assert_eq!(
+            gallery_creation_title(None, None, GenerationKind::Image),
+            "Image creation"
+        );
+        assert_eq!(
+            gallery_creation_title(Some("<script>bad</script>"), None, GenerationKind::Video),
+            "Video creation"
+        );
+        assert_eq!(
+            gallery_creation_title(None, Some("My SSN is 123-45-6789"), GenerationKind::Image),
+            "Image creation"
+        );
+        assert_eq!(
+            gallery_creation_title(
+                Some("Safe \u{202e} Hidden Label"),
+                None,
+                GenerationKind::Image
+            ),
+            "Image creation"
+        );
+    }
+
+    #[test]
+    fn stale_generation_response_cannot_replace_another_active_preview() {
+        let run = RunSummary {
+            result: RunResult::Generation {
+                id: "current".into(),
+            },
+            model: "qwen-image-2.0".into(),
+            prompt: "A house".into(),
+            source: None,
+            mode: GenerationMode::Image,
+        };
+        assert!(response_targets_active_run(Some(&run), "current"));
+        assert!(!response_targets_active_run(Some(&run), "older"));
+        assert!(!response_targets_active_run(None, "older"));
+        let vector = RunSummary {
+            result: RunResult::VectorMessage {
+                message_id: None,
+                svg: Arc::from(&b"<svg/>"[..]),
+            },
+            mode: GenerationMode::Vector,
+            ..run
+        };
+        assert!(!response_targets_active_run(Some(&vector), "older"));
+    }
 
     struct RecoveryTestDirectory {
         _directory: tempfile::TempDir,
