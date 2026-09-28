@@ -6,6 +6,7 @@ publish.workspace = true
 license = "GPL-3.0-or-later"
 
 [features]
+mac_app_store = ["project/mac_app_store"]
 test-support = [
     "acp_thread/test-support",
     "gpui/test-support",

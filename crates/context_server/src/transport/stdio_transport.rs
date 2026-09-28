@@ -30,6 +30,10 @@ impl StdioTransport {
         working_directory: &Option<PathBuf>,
         cx: &AsyncApp,
     ) -> Result<Self> {
+        if cfg!(feature = "mac_app_store") {
+            anyhow::bail!("Local MCP processes are unavailable in the Mac App Store build");
+        }
+
         let builder = ShellBuilder::new(&Shell::System, cfg!(windows)).non_interactive();
         let mut command =
             builder.build_std_command(Some(binary.executable.display().to_string()), &binary.args);
@@ -144,5 +148,32 @@ impl Transport for StdioTransport {
 impl Drop for StdioTransport {
     fn drop(&mut self) {
         let _ = self.server.kill();
+    }
+}
+
+#[cfg(all(test, feature = "mac_app_store", target_os = "macos"))]
+mod mac_app_store_tests {
+    use super::*;
+    use gpui::{AppContext as _, TestAppContext};
+
+    #[gpui::test]
+    async fn rejects_stdio_before_process_spawn(cx: &mut TestAppContext) {
+        let dir = tempfile::tempdir().expect("temp directory");
+        let marker = dir.path().join("stdio-process-started");
+        let binary = ModelContextServerBinary {
+            executable: "/usr/bin/touch".into(),
+            args: vec![marker.to_string_lossy().into_owned()],
+            env: None,
+            timeout: None,
+        };
+
+        let result = StdioTransport::new(binary, &None, &cx.to_async());
+
+        assert!(result.is_err_and(|error| {
+            error
+                .to_string()
+                .contains("unavailable in the Mac App Store build")
+        }));
+        assert!(!marker.exists(), "stdio command must not run");
     }
 }

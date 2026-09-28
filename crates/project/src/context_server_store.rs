@@ -253,6 +253,15 @@ impl ContextServerConfiguration {
     ) -> Result<Self> {
         const EXTENSION_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
+        if cfg!(feature = "mac_app_store")
+            && matches!(
+                &settings,
+                ContextServerSettings::Stdio { .. } | ContextServerSettings::Extension { .. }
+            )
+        {
+            anyhow::bail!("Local MCP processes are unavailable in the Mac App Store build");
+        }
+
         match settings {
             ContextServerSettings::Stdio {
                 enabled: _,
@@ -987,6 +996,10 @@ impl ContextServerStore {
         configuration: Arc<ContextServerConfiguration>,
         cx: &mut AsyncApp,
     ) -> Result<(Arc<ContextServer>, Arc<ContextServerConfiguration>)> {
+        if cfg!(feature = "mac_app_store") && configuration.command().is_some() {
+            anyhow::bail!("Local MCP processes are unavailable in the Mac App Store build");
+        }
+
         let remote = configuration.remote();
         let needs_remote_command = match configuration.as_ref() {
             ContextServerConfiguration::Custom { .. }

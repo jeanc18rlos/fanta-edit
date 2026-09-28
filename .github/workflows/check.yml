@@ -87,6 +87,31 @@ jobs:
       - name: Test sidebar behavior and project ownership
         run: cargo test --locked -p sidebar --lib
 
+  mac-app-store-runtime:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.native_video_only }}
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install the repository Rust toolchain
+        run: rustup show active-toolchain
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: macos-check
+
+      - name: Check the Mac App Store feature build
+        run: cargo check --locked -p zed --features mac_app_store
+
+      - name: Test blocked local MCP process spawn
+        run: cargo test --locked -p context_server --lib --features mac_app_store rejects_stdio_before_process_spawn
+
+      - name: Test saved local agents and MCP servers
+        run: cargo test --locked -p project --test integration --features mac_app_store,test-support test_mac_app_store_
+
   native-video:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.native_video_only }}
     runs-on: macos-26

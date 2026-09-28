@@ -671,6 +671,7 @@ fn main() {
         snippet_provider::init(cx);
         let prompt_builder = PromptBuilder::load(app_state.fs.clone(), stdout_is_a_pty(), cx);
         {
+            #[cfg(not(feature = "mac_app_store"))]
             project::AgentRegistryStore::init_global(
                 cx,
                 app_state.fs.clone(),
@@ -1534,6 +1535,10 @@ fn hide_unshipped_actions_from_command_palette(cx: &mut App) {
             TypeId::of::<zed_actions::OpenTelemetryLog>(),
             TypeId::of::<zed_actions::OpenPerformanceProfiler>(),
             TypeId::of::<zed_actions::ShowUpdateNotification>(),
+            #[cfg(feature = "mac_app_store")]
+            TypeId::of::<zed_actions::AcpRegistry>(),
+            #[cfg(feature = "mac_app_store")]
+            TypeId::of::<agent_ui::NewExternalAgentThread>(),
             // These open inherited server or extension surfaces.
             #[cfg(not(feature = "mac_app_store"))]
             TypeId::of::<zed_actions::OpenAccountSettings>(),
