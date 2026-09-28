@@ -9,6 +9,7 @@ license = "GPL-3.0-or-later"
 path = "src/agent.rs"
 
 [features]
+mac_app_store = ["agent_servers/mac_app_store", "project/mac_app_store"]
 test-support = ["db/test-support"]
 unit-eval = []
 e2e = []
