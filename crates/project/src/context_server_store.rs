@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, ensure};
 use client::{Client, ClientSettings};
 use collections::{HashMap, HashSet};
 use context_server::oauth::{self, McpOAuthTokenProvider, OAuthDiscovery, OAuthSession};
@@ -250,7 +250,7 @@ impl ContextServerConfiguration {
         registry: Entity<ContextServerDescriptorRegistry>,
         worktree_store: Entity<WorktreeStore>,
         cx: &AsyncApp,
-    ) -> Option<Self> {
+    ) -> Result<Self> {
         const EXTENSION_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
         match settings {
@@ -258,35 +258,30 @@ impl ContextServerConfiguration {
                 enabled: _,
                 command,
                 remote,
-            } => Some(ContextServerConfiguration::Custom { command, remote }),
+            } => Ok(ContextServerConfiguration::Custom { command, remote }),
             ContextServerSettings::Extension {
                 enabled: _,
                 settings,
                 remote,
             } => {
-                let descriptor =
-                    cx.update(|cx| registry.read(cx).context_server_descriptor(&id.0))?;
+                let descriptor = cx
+                    .update(|cx| registry.read(cx).context_server_descriptor(&id.0))
+                    .with_context(|| format!("No extension MCP server descriptor for {id}"))?;
 
                 let command_future = descriptor.command(worktree_store, cx);
                 let timeout_future = cx.background_executor().timer(EXTENSION_COMMAND_TIMEOUT);
 
                 match futures::future::select(command_future, timeout_future).await {
-                    Either::Left((Ok(command), _)) => Some(ContextServerConfiguration::Extension {
+                    Either::Left((Ok(command), _)) => Ok(ContextServerConfiguration::Extension {
                         command,
                         settings,
                         remote,
                     }),
-                    Either::Left((Err(e), _)) => {
-                        log::error!(
-                            "Failed to create context server configuration from settings: {e:#}"
-                        );
-                        None
-                    }
+                    Either::Left((Err(error), _)) => Err(error).with_context(|| {
+                        format!("Failed to resolve command for extension MCP server {id}")
+                    }),
                     Either::Right(_) => {
-                        log::error!(
-                            "Timed out resolving command for extension context server {id}"
-                        );
-                        None
+                        anyhow::bail!("Timed out resolving command for extension MCP server {id}")
                     }
                 }
             }
@@ -297,8 +292,9 @@ impl ContextServerConfiguration {
                 timeout,
                 oauth,
             } => {
-                let url = url::Url::parse(&url).log_err()?;
-                Some(ContextServerConfiguration::Http {
+                let url = url::Url::parse(&url)
+                    .with_context(|| format!("Invalid URL for MCP server {id}"))?;
+                Ok(ContextServerConfiguration::Http {
                     url,
                     headers: auth,
                     timeout,
@@ -327,6 +323,7 @@ pub struct ContextServerStore {
     state: ContextServerStoreState,
     context_server_settings: HashMap<Arc<str>, ContextServerSettings>,
     servers: HashMap<ContextServerId, ContextServerState>,
+    configuration_errors: HashMap<ContextServerId, Arc<str>>,
     server_ids: Vec<ContextServerId>,
     worktree_store: Entity<WorktreeStore>,
     project: Option<WeakEntity<Project>>,
@@ -585,6 +582,7 @@ impl ContextServerStore {
             needs_server_update: false,
             ai_disabled,
             servers: HashMap::default(),
+            configuration_errors: HashMap::default(),
             server_ids: Default::default(),
             update_servers_task: None,
             context_server_factory,
@@ -609,7 +607,16 @@ impl ContextServerStore {
     }
 
     pub fn status_for_server(&self, id: &ContextServerId) -> Option<ContextServerStatus> {
-        self.servers.get(id).map(ContextServerStatus::from_state)
+        self.servers
+            .get(id)
+            .map(ContextServerStatus::from_state)
+            .or_else(|| {
+                self.context_server_settings
+                    .get(&id.0)
+                    .filter(|settings| settings.enabled())
+                    .and_then(|_| self.configuration_errors.get(id))
+                    .map(|error| ContextServerStatus::Error(error.clone()))
+            })
     }
 
     pub fn configuration_for_server(
@@ -766,6 +773,23 @@ impl ContextServerStore {
         result
     }
 
+    pub fn retry_server(&mut self, id: &ContextServerId, cx: &mut Context<Self>) -> Result<()> {
+        ensure!(
+            self.context_server_settings
+                .get(&id.0)
+                .is_some_and(ContextServerSettings::enabled),
+            "MCP server is not enabled"
+        );
+        if let Some(server) = self.get_server(id) {
+            self.stop_server(id, cx)?;
+            self.start_server(server, cx);
+        } else {
+            self.configuration_errors.remove(id);
+            self.available_context_servers_changed(cx);
+        }
+        Ok(())
+    }
+
     fn run_server(
         &mut self,
         server: Arc<ContextServer>,
@@ -920,14 +944,33 @@ impl ContextServerStore {
         if let ContextServerConfiguration::Http { url, .. } = state.configuration().as_ref() {
             let server_url = url.clone();
             let id = id.clone();
-            cx.spawn(async move |_this, cx| {
-                let credentials_provider = cx.update(|cx| zed_credentials_provider::global(cx));
-                if let Err(err) = Self::clear_session(&credentials_provider, &server_url, &cx).await
-                {
-                    log::warn!("{} failed to clear OAuth session on removal: {}", id, err);
-                }
-            })
-            .detach();
+            let resource = oauth::canonical_server_uri(&server_url);
+            let shared = self
+                .context_server_settings
+                .iter()
+                .any(|(other_id, settings)| {
+                    if other_id.as_ref() == id.0.as_ref() {
+                        return false;
+                    }
+                    match settings {
+                        ContextServerSettings::Http { url, .. } => url::Url::parse(url)
+                            .ok()
+                            .is_some_and(|url| oauth::canonical_server_uri(&url) == resource),
+                        _ => false,
+                    }
+                });
+            if !shared {
+                cx.spawn(async move |_this, cx| {
+                    if let Err(error) = Self::clear_http_credentials(&server_url, &cx).await {
+                        log::warn!(
+                            "{} failed to clear OAuth credentials on removal: {}",
+                            id,
+                            error
+                        );
+                    }
+                })
+                .detach();
+            }
         }
 
         drop(state);
@@ -1674,6 +1717,23 @@ impl ContextServerStore {
         credentials_provider.delete_credentials(&key, cx).await
     }
 
+    pub async fn clear_http_credentials(server_url: &url::Url, cx: &AsyncApp) -> Result<()> {
+        let credentials_provider = cx.update(|cx| zed_credentials_provider::global(cx));
+        for key in [
+            Self::keychain_key(server_url),
+            Self::client_secret_keychain_key(server_url),
+        ] {
+            if credentials_provider
+                .read_credentials(&key, cx)
+                .await?
+                .is_some()
+            {
+                credentials_provider.delete_credentials(&key, cx).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Log out of an OAuth-authenticated MCP server: clear the stored OAuth
     /// session from the keychain and stop the server.
     pub fn logout_server(&mut self, id: &ContextServerId, cx: &mut Context<Self>) -> Result<()> {
@@ -1717,6 +1777,7 @@ impl ContextServerStore {
         cx: &mut Context<Self>,
     ) {
         let status = ContextServerStatus::from_state(&state);
+        self.configuration_errors.remove(&id);
         self.servers.insert(id.clone(), state);
         cx.emit(ServerStatusChangedEvent {
             server_id: id,
@@ -1795,7 +1856,7 @@ impl ContextServerStore {
                         ))
             });
 
-        let configured_servers = join_all(enabled_servers.into_iter().map(|(id, settings)| {
+        let resolved_servers = join_all(enabled_servers.into_iter().map(|(id, settings)| {
             let id = ContextServerId(id);
             ContextServerConfiguration::from_settings(
                 settings,
@@ -1807,9 +1868,20 @@ impl ContextServerStore {
             .map(move |config| (id, config))
         }))
         .await
-        .into_iter()
-        .filter_map(|(id, config)| config.map(|config| (id, config)))
-        .collect::<HashMap<_, _>>();
+        .into_iter();
+        let mut configured_servers = HashMap::default();
+        let mut configuration_errors = Vec::new();
+        for (id, configuration) in resolved_servers {
+            match configuration {
+                Ok(configuration) => {
+                    configured_servers.insert(id, configuration);
+                }
+                Err(error) => {
+                    log::error!("{id} MCP server configuration failed: {error:#}");
+                    configuration_errors.push((id, Arc::<str>::from(format!("{error:#}"))));
+                }
+            }
+        }
 
         let mut servers_to_start = Vec::new();
         let mut servers_to_remove = HashSet::default();
@@ -1854,6 +1926,17 @@ impl ContextServerStore {
             anyhow::Ok(())
         })??;
 
+        this.update(cx, |this, cx| {
+            for (id, error) in configuration_errors {
+                this.configuration_errors.insert(id.clone(), error.clone());
+                cx.emit(ServerStatusChangedEvent {
+                    server_id: id,
+                    status: ContextServerStatus::Error(error),
+                });
+            }
+            cx.notify();
+        })?;
+
         for (id, config) in servers_to_start {
             match Self::create_context_server(this.clone(), id.clone(), config, cx).await {
                 Ok((server, config)) => {
@@ -1863,10 +1946,12 @@ impl ContextServerStore {
                 }
                 Err(err) => {
                     log::error!("{id} context server failed to create: {err:#}");
-                    this.update(cx, |_this, cx| {
+                    this.update(cx, |this, cx| {
+                        let error: Arc<str> = format!("{err:#}").into();
+                        this.configuration_errors.insert(id.clone(), error.clone());
                         cx.emit(ServerStatusChangedEvent {
                             server_id: id,
-                            status: ContextServerStatus::Error(err.to_string().into()),
+                            status: ContextServerStatus::Error(error),
                         });
                         cx.notify();
                     })?;

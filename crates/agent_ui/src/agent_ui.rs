@@ -43,6 +43,7 @@ use ::ui::IconName;
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::{AgentProfileId, AgentSettings};
 use command_palette_hooks::CommandPaletteFilter;
+use context_server::ContextServerId;
 use editor::{Editor, SelectionEffects, scroll::Autoscroll};
 use feature_flags::FeatureFlagAppExt as _;
 use fs::Fs;
@@ -67,7 +68,7 @@ use std::any::TypeId;
 use std::path::{Path, PathBuf};
 use workspace::{OpenOptions, Workspace};
 
-use crate::agent_configuration::ManageProfilesModal;
+use crate::agent_configuration::{ConfigureContextServerModal, ManageProfilesModal};
 pub use crate::agent_connection_store::{ActiveAcpConnection, AgentConnectionStore};
 pub use crate::agent_panel::{
     AgentPanel, AgentPanelEvent, AgentPanelTerminalInfo, MaxIdleRetainedThreads, TerminalId,
@@ -90,6 +91,22 @@ pub use thread_import::{
 };
 use zed_actions;
 pub use zed_actions::{CreateWorktree, NewWorktreeBranchTarget, SwitchWorktree};
+
+pub fn configure_existing_context_server(
+    workspace: Entity<Workspace>,
+    server_id: String,
+    window: &mut Window,
+    cx: &mut App,
+) -> gpui::Task<anyhow::Result<()>> {
+    let language_registry = workspace.read(cx).app_state().languages.clone();
+    ConfigureContextServerModal::show_modal_for_existing_server(
+        ContextServerId(server_id.into()),
+        language_registry,
+        workspace.downgrade(),
+        window,
+        cx,
+    )
+}
 
 /// Opens text supplied by another UI surface in a fresh Agent Panel draft.
 /// External prompts deliberately require a manual send so the originating

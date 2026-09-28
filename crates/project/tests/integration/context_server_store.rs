@@ -93,6 +93,49 @@ async fn test_context_server_status(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_invalid_http_configuration_error_survives_snapshot_and_retry(
+    cx: &mut TestAppContext,
+) {
+    let (_fs, project) = setup_context_server_test(cx, json!({"code.rs": ""}), vec![]).await;
+    let store = project.read_with(cx, |project, _| project.context_server_store());
+    let server_id = ContextServerId("broken-http".into());
+
+    set_context_server_configuration(
+        vec![(
+            server_id.0.clone(),
+            settings::ContextServerSettingsContent::Http {
+                enabled: true,
+                url: "not-a-url".to_string(),
+                headers: Default::default(),
+                timeout: None,
+                oauth: None,
+            },
+        )],
+        cx,
+    );
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        assert!(matches!(
+            store.read(cx).status_for_server(&server_id),
+            Some(ContextServerStatus::Error(error)) if error.contains("Invalid URL")
+        ));
+    });
+
+    store
+        .update(cx, |store, cx| store.retry_server(&server_id, cx))
+        .unwrap();
+    cx.update(|cx| assert_eq!(store.read(cx).status_for_server(&server_id), None));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert!(matches!(
+            store.read(cx).status_for_server(&server_id),
+            Some(ContextServerStatus::Error(error)) if error.contains("Invalid URL")
+        ));
+    });
+}
+
+#[gpui::test]
 async fn test_context_server_status_events(cx: &mut TestAppContext) {
     const SERVER_1_ID: &str = "mcp-1";
     const SERVER_2_ID: &str = "mcp-2";
@@ -445,6 +488,20 @@ async fn test_context_server_maintain_servers_loop(cx: &mut TestAppContext) {
             assert_eq!(store.read(cx).status_for_server(&server_2_id), None);
         });
     }
+
+    let _server_events = assert_server_events(
+        &store,
+        vec![
+            (server_1_id.clone(), ContextServerStatus::Stopped),
+            (server_1_id.clone(), ContextServerStatus::Starting),
+            (server_1_id.clone(), ContextServerStatus::Running),
+        ],
+        cx,
+    );
+    store
+        .update(cx, |store, cx| store.retry_server(&server_1_id, cx))
+        .unwrap();
+    cx.run_until_parked();
 }
 
 #[gpui::test]
