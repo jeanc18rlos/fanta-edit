@@ -448,7 +448,7 @@ impl LocalRepositoryState {
                 }
             })
             .await?;
-        backend.set_trusted(is_trusted);
+        backend.set_trusted(is_trusted && !cfg!(feature = "mac_app_store"));
         Ok(LocalRepositoryState {
             backend,
             environment: Arc::new(environment),
@@ -1961,7 +1961,9 @@ impl GitStore {
                     let repository_state = repo.read(cx).repository_state.clone();
                     cx.background_spawn(async move {
                         if let Ok(RepositoryState::Local(state)) = repository_state.await {
-                            state.backend.set_trusted(is_trusted);
+                            state
+                                .backend
+                                .set_trusted(is_trusted && !cfg!(feature = "mac_app_store"));
                         }
                     })
                     .detach();

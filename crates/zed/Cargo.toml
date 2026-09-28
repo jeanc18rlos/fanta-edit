@@ -13,7 +13,7 @@ workspace = true
 
 [features]
 fanta-gpui-ui = ["fig_viewer/fanta-gpui-ui"]
-mac_app_store = ["agent_ui/mac_app_store", "client/mac_app_store", "context_server/mac_app_store", "paths/mac_app_store", "workspace/mac_app_store", "fig_viewer/mac_app_store", "title_bar/mac_app_store", "dep:fanta_revenuecat"]
+mac_app_store = ["agent_ui/mac_app_store", "client/mac_app_store", "context_server/mac_app_store", "paths/mac_app_store", "recent_projects/mac_app_store", "remote/mac_app_store", "workspace/mac_app_store", "fig_viewer/mac_app_store", "title_bar/mac_app_store", "dep:fanta_revenuecat"]
 tracy = ["ztracing/tracy"]
 # LEAK_BACKTRACE=1 cargo run --features zed/track-project-leak --profile release-fast
 track-project-leak = ["gpui/leak-detection"]

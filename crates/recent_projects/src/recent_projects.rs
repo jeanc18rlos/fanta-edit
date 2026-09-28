@@ -483,6 +483,10 @@ pub fn init(cx: &mut App) {
         }
     });
     cx.on_action(|open_remote: &OpenRemote, cx| {
+        if cfg!(feature = "mac_app_store") {
+            return;
+        }
+
         let from_existing_connection = open_remote.from_existing_connection;
         let create_new_window = open_remote
             .create_new_window
@@ -832,7 +836,13 @@ impl RecentProjectsDelegate {
     }
 
     pub fn set_workspaces(&mut self, workspaces: Vec<RecentWorkspace>) {
-        self.workspaces = workspaces;
+        self.workspaces = workspaces
+            .into_iter()
+            .filter(|workspace| {
+                !cfg!(feature = "mac_app_store")
+                    || matches!(&workspace.location, SerializedWorkspaceLocation::Local)
+            })
+            .collect();
     }
 
     fn filtered_entries_include_remote_project(&self) -> bool {
@@ -1722,36 +1732,38 @@ impl PickerDelegate for RecentProjectsDelegate {
                                 }
                             })
                     })
-                    .child(
-                        ButtonLike::new("open_remote_folder")
-                            .child(
-                                h_flex()
-                                    .w_full()
-                                    .gap_1()
-                                    .justify_between()
-                                    .child(Label::new("Open Remote Folder"))
-                                    .child(KeyBinding::for_action(
-                                        &OpenRemote {
-                                            from_existing_connection: false,
-                                            create_new_window: Some(self.create_new_window),
-                                        },
-                                        cx,
-                                    )),
-                            )
-                            .on_click({
-                                let create_new_window = self.create_new_window;
-                                move |_, window, cx| {
-                                    window.dispatch_action(
-                                        OpenRemote {
-                                            from_existing_connection: false,
-                                            create_new_window: Some(create_new_window),
-                                        }
-                                        .boxed_clone(),
-                                        cx,
-                                    )
-                                }
-                            }),
-                    )
+                    .when(!cfg!(feature = "mac_app_store"), |this| {
+                        this.child(
+                            ButtonLike::new("open_remote_folder")
+                                .child(
+                                    h_flex()
+                                        .w_full()
+                                        .gap_1()
+                                        .justify_between()
+                                        .child(Label::new("Open Remote Folder"))
+                                        .child(KeyBinding::for_action(
+                                            &OpenRemote {
+                                                from_existing_connection: false,
+                                                create_new_window: Some(self.create_new_window),
+                                            },
+                                            cx,
+                                        )),
+                                )
+                                .on_click({
+                                    let create_new_window = self.create_new_window;
+                                    move |_, window, cx| {
+                                        window.dispatch_action(
+                                            OpenRemote {
+                                                from_existing_connection: false,
+                                                create_new_window: Some(create_new_window),
+                                            }
+                                            .boxed_clone(),
+                                            cx,
+                                        )
+                                    }
+                                }),
+                        )
+                    })
                     .into_any(),
             );
         }
@@ -1971,14 +1983,16 @@ impl PickerDelegate for RecentProjectsDelegate {
                                                     }
                                                 },
                                             )
-                                            .action(
-                                                "Open Remote Folder",
-                                                OpenRemote {
-                                                    from_existing_connection: false,
-                                                    create_new_window: Some(create_new_window),
-                                                }
-                                                .boxed_clone(),
-                                            )
+                                            .when(!cfg!(feature = "mac_app_store"), |menu| {
+                                                menu.action(
+                                                    "Open Remote Folder",
+                                                    OpenRemote {
+                                                        from_existing_connection: false,
+                                                        create_new_window: Some(create_new_window),
+                                                    }
+                                                    .boxed_clone(),
+                                                )
+                                            })
                                     }
                                 }))
                             }

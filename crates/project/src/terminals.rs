@@ -66,6 +66,12 @@ impl Project {
         spawn_task: SpawnInTerminal,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
+        if cfg!(feature = "mac_app_store") {
+            return Task::ready(Err(anyhow::anyhow!(
+                "Terminal tasks are unavailable in the Mac App Store build"
+            )));
+        }
+
         let is_via_remote = self.remote_client.is_some();
 
         let path: Option<Arc<Path>> = if let Some(cwd) = &spawn_task.cwd {
@@ -321,6 +327,12 @@ impl Project {
         force_local: bool,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
+        if cfg!(feature = "mac_app_store") {
+            return Task::ready(Err(anyhow::anyhow!(
+                "Terminal shells are unavailable in the Mac App Store build"
+            )));
+        }
+
         let path = cwd.map(|p| Arc::from(&*p));
         let is_via_remote = !force_local && self.remote_client.is_some();
 

@@ -1187,6 +1187,10 @@ fn register_actions(
             );
         })
         .register_action(|workspace, action: &zed_actions::OpenRemote, window, cx| {
+            if cfg!(feature = "mac_app_store") {
+                return;
+            }
+
             if !action.from_existing_connection {
                 cx.propagate();
                 return;

@@ -112,13 +112,19 @@ jobs:
       - name: Test blocked native agent terminal commands
         run: cargo test --locked -p agent --lib --features mac_app_store test_mac_app_store_terminal_tool
 
+      - name: Test terminal action is hidden in Store builds
+        run: cargo test --locked -p agent_ui --lib --features mac_app_store test_agent_command_palette_visibility
+
       - name: Test blocked direct ACP process spawn
         run: cargo test --locked -p agent_servers --lib --features mac_app_store test_mac_app_store_blocks_direct_acp_stdio_spawn
 
       - name: Test blocked Prettier JavaScript server
         run: cargo test --locked -p prettier --lib --features mac_app_store test_mac_app_store_rejects_prettier_launch
 
-      - name: Test saved local agents and MCP servers
+      - name: Test blocked remote connections
+        run: cargo test --locked -p remote --lib --features mac_app_store test_mac_app_store_rejects_remote_connection
+
+      - name: Test blocked project execution paths
         run: cargo test --locked -p project --test integration --features mac_app_store,test-support test_mac_app_store_
 
   native-video:

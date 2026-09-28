@@ -132,6 +132,10 @@ pub async fn open_remote_project(
     open_options: workspace::OpenOptions,
     cx: &mut AsyncApp,
 ) -> Result<WindowHandle<MultiWorkspace>> {
+    if cfg!(feature = "mac_app_store") {
+        anyhow::bail!("Remote projects are unavailable in the Mac App Store build");
+    }
+
     let created_new_window = open_options.requesting_window.is_none();
 
     let (existing, open_visible) = find_existing_workspace(

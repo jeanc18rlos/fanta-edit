@@ -7136,6 +7136,103 @@ async fn assert_line_endings_after_format(
     }
 }
 
+#[cfg(all(feature = "mac_app_store", target_os = "macos"))]
+#[gpui::test]
+async fn test_mac_app_store_external_formatter_does_not_spawn(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("external-formatter-ran");
+    cx.update(|cx| {
+        SettingsStore::update_global(cx, |store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.project.all_languages.defaults.formatter =
+                    Some(FormatterList::Single(Formatter::External {
+                        command: "/usr/bin/touch".into(),
+                        arguments: Some(vec![marker.to_string_lossy().into_owned()]),
+                    }));
+            });
+        });
+    });
+
+    let fs = FakeFs::new(cx.executor());
+    let file_path = dir.path().join("file.rs");
+    fs.insert_tree(dir.path(), json!({ "file.rs": "" })).await;
+    let project = Project::test(fs, [dir.path()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| project.open_local_buffer(&file_path, cx))
+        .await
+        .unwrap();
+
+    let mut buffers = HashSet::default();
+    buffers.insert(buffer);
+    project
+        .update(cx, |project, cx| {
+            project.format(
+                buffers,
+                project::lsp_store::LspFormatTarget::Buffers,
+                false,
+                project::lsp_store::FormatTrigger::Manual,
+                cx,
+            )
+        })
+        .await
+        .unwrap();
+
+    assert!(!marker.exists(), "Store build ran an external formatter");
+}
+
+#[cfg(all(feature = "mac_app_store", target_os = "macos"))]
+#[gpui::test]
+async fn test_mac_app_store_terminal_creation_is_rejected(cx: &mut gpui::TestAppContext) {
+    init_test(cx);
+
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    assert!(!project.read_with(cx, |project, cx| project.supports_terminal(cx)));
+
+    let shell = project
+        .update(cx, |project, cx| project.create_terminal_shell(None, cx))
+        .await;
+    assert!(shell.is_err_and(|error| {
+        error
+            .to_string()
+            .contains("unavailable in the Mac App Store build")
+    }));
+
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("terminal-task-ran");
+    let terminal_task = task::SpawnInTerminal {
+        command: Some("/usr/bin/touch".into()),
+        args: vec![marker.to_string_lossy().into_owned()],
+        cwd: Some(dir.path().to_path_buf()),
+        ..Default::default()
+    };
+    let task = project
+        .update(cx, |project, cx| {
+            project.create_terminal_task(terminal_task, cx)
+        })
+        .await;
+    assert!(task.is_err_and(|error| {
+        error
+            .to_string()
+            .contains("unavailable in the Mac App Store build")
+    }));
+    assert!(!marker.exists(), "Store build ran a terminal task");
+}
+
+#[cfg(feature = "mac_app_store")]
+#[gpui::test]
+async fn test_mac_app_store_skips_directory_shell_environment(_cx: &mut gpui::TestAppContext) {
+    let environment = ProjectEnvironment::load_directory_shell_environment_for_test(Arc::from(
+        Path::new("/store-environment-must-not-be-read"),
+    ))
+    .await
+    .unwrap();
+
+    assert!(environment.is_empty());
+}
+
 #[gpui::test]
 async fn test_grouped_diagnostics(cx: &mut gpui::TestAppContext) {
     init_test(cx);

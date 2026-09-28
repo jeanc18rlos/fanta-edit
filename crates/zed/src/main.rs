@@ -699,6 +699,10 @@ fn main() {
         }
 
         recent_projects::init(cx);
+        #[cfg(feature = "mac_app_store")]
+        CommandPaletteFilter::update_global(cx, |filter, _| {
+            filter.hide_action_types(&[TypeId::of::<zed_actions::OpenRemote>()]);
+        });
 
         load_embedded_fonts(cx);
 
@@ -1202,6 +1206,7 @@ pub(crate) async fn restore_or_create_workspace(
                         .await
                         .map(|_| ())
                 }
+                SerializedWorkspaceLocation::Remote(_) if cfg!(feature = "mac_app_store") => Ok(()),
                 SerializedWorkspaceLocation::Remote(connection_options) => {
                     let mut connection_options = connection_options.clone();
                     if let RemoteConnectionOptions::Ssh(options) = &mut connection_options {

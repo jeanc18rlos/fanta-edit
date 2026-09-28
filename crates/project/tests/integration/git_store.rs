@@ -1446,6 +1446,48 @@ mod trust_tests {
         });
     }
 
+    #[cfg(feature = "mac_app_store")]
+    #[gpui::test]
+    async fn test_mac_app_store_git_backend_stays_untrusted(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.background_executor.clone());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "a.txt": "hello",
+            }),
+        )
+        .await;
+
+        cx.update(|cx| project::trusted_worktrees::init(DbTrustedPaths::default(), cx));
+        let project = Project::test_with_worktree_trust(fs, [path!("/project").as_ref()], cx).await;
+        cx.executor().run_until_parked();
+
+        let worktree_store = project.read_with(cx, |project, _| project.worktree_store());
+        let worktree_id = worktree_store.read_with(cx, |store, cx| {
+            store.worktrees().next().unwrap().read(cx).id()
+        });
+        let repository = project.read_with(cx, |project, cx| {
+            project.repositories(cx).values().next().unwrap().clone()
+        });
+
+        let trusted_worktrees = cx
+            .update(|cx| TrustedWorktrees::try_get_global(cx).expect("trust global should exist"));
+        trusted_worktrees.update(cx, |store, cx| {
+            store.trust(
+                &worktree_store,
+                HashSet::from_iter([PathTrust::Worktree(worktree_id)]),
+                cx,
+            );
+        });
+        cx.executor().run_until_parked();
+
+        repository.read_with(cx, |repo, _| {
+            assert!(!repo.is_trusted(), "Store Git backend must not run hooks");
+        });
+    }
+
     #[gpui::test]
     async fn test_repository_defaults_to_untrusted_without_trust_system(cx: &mut TestAppContext) {
         init_test(cx);

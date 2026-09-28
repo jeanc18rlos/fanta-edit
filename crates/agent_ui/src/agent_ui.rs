@@ -926,6 +926,10 @@ fn update_command_palette_filter(cx: &mut App) {
             filter.show_action_types(manage_skills_action.iter());
             filter.hide_action_types(&skill_creator_actions);
         }
+
+        if cfg!(feature = "mac_app_store") {
+            filter.hide_action_types(&[TypeId::of::<NewTerminalThread>()]);
+        }
     });
 }
 
@@ -1078,9 +1082,10 @@ mod tests {
                 !filter.is_hidden(&NewThread),
                 "NewThread should be visible by default"
             );
-            assert!(
-                !filter.is_hidden(&NewTerminalThread),
-                "NewTerminalThread should be visible by default"
+            assert_eq!(
+                filter.is_hidden(&NewTerminalThread),
+                cfg!(feature = "mac_app_store"),
+                "NewTerminalThread visibility should match Store policy"
             );
             assert!(
                 !filter.is_hidden(&zed_actions::assistant::OpenSkillCreator),

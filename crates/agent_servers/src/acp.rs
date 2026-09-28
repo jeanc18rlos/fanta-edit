@@ -2712,6 +2712,7 @@ mod tests {
             let store = SettingsStore::test(cx);
             cx.set_global(store);
         });
+        cx.executor().allow_parking();
 
         let temp_dir = tempfile::tempdir().expect("temp directory");
         let marker = temp_dir.path().join("acp-process-started");
