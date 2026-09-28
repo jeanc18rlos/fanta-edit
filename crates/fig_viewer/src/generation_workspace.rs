@@ -968,6 +968,7 @@ impl GenerationWorkspace {
         recipe: GenerationRecipe,
         prompt_units: usize,
     ) -> ScreenModel {
+        let option_groups = self.screen_option_groups(model, recipe);
         let mut description = match recipe {
             GenerationRecipe::TextImage => "Create an image from text",
             GenerationRecipe::TextVideo => "Generate a scene from text",
@@ -986,9 +987,10 @@ impl GenerationWorkspace {
             )
         {
             let selected = |key: &str| {
-                self.screen_options
-                    .get(&(model.id.clone(), key.into()))
-                    .cloned()
+                option_groups
+                    .iter()
+                    .find(|group| group.key.as_ref() == key)
+                    .map(|group| group.selected.to_string())
                     .or_else(|| option_value(&model.capabilities["controls"][key]["default"]))
             };
             let mut details = Vec::new();
@@ -1046,7 +1048,7 @@ impl GenerationWorkspace {
                         .as_str()
                         .is_some_and(|field| !field.is_empty()),
             )
-            .option_groups(self.screen_option_groups(model, recipe));
+            .option_groups(option_groups);
         let provider_hint = model.capabilities["provider"].as_str();
         let (inferred_provider, logo) = provider_mark(&model.id, provider_hint);
         let provider = provider_hint
@@ -1182,6 +1184,19 @@ impl GenerationWorkspace {
                     && recipe == GenerationRecipe::ImageVideo)
                     .then(|| model.capabilities["constraints"]["end_frame"][key].as_str())
                     .flatten();
+                let mode_resolutions = (key.as_str() == "resolution")
+                    .then(|| {
+                        self.screen_options
+                            .get(&(model.id.clone(), "mode".into()))
+                            .cloned()
+                            .or_else(|| {
+                                option_value(&model.capabilities["controls"]["mode"]["default"])
+                            })
+                    })
+                    .flatten()
+                    .and_then(|mode| {
+                        model.capabilities["constraints"]["mode_resolution"][mode].as_array()
+                    });
                 let choices = control["values"]
                     .as_array()
                     .into_iter()
@@ -1189,6 +1204,13 @@ impl GenerationWorkspace {
                     .filter_map(|value| {
                         let value = option_value(value)?;
                         if constrained_value.is_some_and(|required| value != required) {
+                            return None;
+                        }
+                        if mode_resolutions.is_some_and(|allowed| {
+                            !allowed
+                                .iter()
+                                .any(|candidate| candidate.as_str() == Some(value.as_str()))
+                        }) {
                             return None;
                         }
                         Some(GenerationChoice::new(
@@ -3355,11 +3377,37 @@ impl GenerationWorkspace {
             return;
         }
         let hosted_frame = self.mode.generation_kind().is_some();
-        let max_source_bytes = if hosted_frame {
+        let default_max_source_bytes = if hosted_frame {
             20 * 1024 * 1024
         } else {
             MAX_SOURCE_BYTES
         };
+        let frame_input = self
+            .selected_model
+            .as_ref()
+            .and_then(|selected| self.models.iter().find(|model| &model.id == selected))
+            .map(|model| {
+                &model.capabilities["inputs"][if end_frame {
+                    "end_frame"
+                } else {
+                    "start_frame"
+                }]
+            });
+        let max_source_bytes = frame_input
+            .and_then(|input| input["max_bytes"].as_u64())
+            .and_then(|limit| usize::try_from(limit).ok())
+            .unwrap_or(default_max_source_bytes)
+            .min(default_max_source_bytes);
+        let accepted_mime_types = frame_input
+            .and_then(|input| input["mime_types"].as_array())
+            .map(|types| {
+                types
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -3386,8 +3434,8 @@ impl GenerationWorkspace {
                     .background_spawn(async move {
                         ensure!(
                             std::fs::metadata(&path)?.len() <= max_source_bytes as u64,
-                            "Choose an image smaller than {} MB.",
-                            if hosted_frame { 20 } else { 100 }
+                            "Choose an image no larger than {} MB for this model.",
+                            max_source_bytes.div_ceil(1024 * 1024)
                         );
                         let bytes = std::fs::read(&path)?;
                         let format = image::guess_format(&bytes)
@@ -3398,6 +3446,11 @@ impl GenerationWorkspace {
                             image::ImageFormat::WebP => "image/webp",
                             _ => bail!("Choose a PNG, JPEG, or WebP image."),
                         };
+                        ensure!(
+                            accepted_mime_types.is_empty()
+                                || accepted_mime_types.iter().any(|accepted| accepted == mime),
+                            "Choose an image format supported by this model."
+                        );
                         let preview = make_preview(&bytes, mime)?;
                         let name = path
                             .file_name()
@@ -5174,6 +5227,27 @@ fn build_screen_request(
             request[field] = encoded;
         } else {
             input[field] = encoded;
+        }
+    }
+    let selected_control = |key: &str| {
+        submission
+            .options
+            .iter()
+            .find(|option| option.key.as_ref() == key)
+            .map(|option| option.value.to_string())
+            .or_else(|| option_value(&model.capabilities["controls"][key]["default"]))
+    };
+    if let (Some(mode), Some(resolution)) =
+        (selected_control("mode"), selected_control("resolution"))
+    {
+        if let Some(allowed) = model.capabilities["constraints"]["mode_resolution"][mode].as_array()
+        {
+            ensure!(
+                allowed
+                    .iter()
+                    .any(|candidate| candidate.as_str() == Some(resolution.as_str())),
+                "Choose a resolution available in this mode."
+            );
         }
     }
     if let Some(source) = source.filter(|_| submission.source_id.is_some()) {
@@ -7774,6 +7848,60 @@ mod tests {
             let screen = view.screen_model(&model, GenerationRecipe::TextVideo, 0);
             assert_eq!(screen.credit_hint.as_deref(), Some("Est. 236 credits · 5s"));
         });
+    }
+
+    #[gpui::test]
+    fn gateway_resolution_choices_follow_selected_mode(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = visual_workspace(GenerationMode::Video, cx);
+        let mut model = model("video");
+        model.id = "gateway-kling-3-t2v".into();
+        model.capabilities = json!({
+            "gateway": {"model": "kling/video"},
+            "operations": ["text_to_video"],
+            "controls": {
+                "mode": {"values": ["std", "pro"], "default": "std", "request_field": "mode", "location": "input"},
+                "resolution": {"values": ["1280x720", "1920x1080"], "default": "1280x720", "request_field": "resolution", "location": "input"}
+            },
+            "constraints": {
+                "mode_resolution": {
+                    "std": ["1280x720"],
+                    "pro": ["1280x720", "1920x1080"]
+                }
+            }
+        });
+        view.update_in(cx, |view, _, _| {
+            let standard = view.screen_option_groups(&model, GenerationRecipe::TextVideo);
+            let resolution = standard
+                .iter()
+                .find(|group| group.key == "resolution")
+                .expect("resolution group");
+            assert_eq!(resolution.choices.len(), 1);
+            assert_eq!(resolution.selected.as_ref(), "1280x720");
+
+            view.screen_options
+                .insert((model.id.clone(), "mode".into()), "pro".into());
+            let pro = view.screen_option_groups(&model, GenerationRecipe::TextVideo);
+            let resolution = pro
+                .iter()
+                .find(|group| group.key == "resolution")
+                .expect("resolution group");
+            assert_eq!(resolution.choices.len(), 2);
+        });
+
+        let mut submission = screen_submission(&model, GenerationRecipe::TextVideo, "Ocean mist");
+        submission.options = vec![
+            fanta_gpui::generation::GenerationOptionSelection {
+                key: "mode".into(),
+                value: "std".into(),
+            },
+            fanta_gpui::generation::GenerationOptionSelection {
+                key: "resolution".into(),
+                value: "1920x1080".into(),
+            },
+        ];
+        assert!(build_screen_request(&model, &submission, None, None, None).is_err());
+        submission.options[0].value = "pro".into();
+        assert!(build_screen_request(&model, &submission, None, None, None).is_ok());
     }
 
     #[test]
