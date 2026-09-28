@@ -100,15 +100,10 @@ pub(crate) fn add_project_asset(
             (asset, ProjectAssetKind::Image)
         }
         PreparedProjectAsset::Binary { bytes, kind } => {
-            let asset = fanta_format::asset_id_for_bytes(&bytes);
-            if let Some(existing) = document.raw_assets.get(&asset) {
-                ensure!(
-                    existing.as_slice() == bytes.as_ref(),
-                    "The project contains a different asset with the same ID."
-                );
-            } else {
-                Arc::make_mut(&mut document.raw_assets).insert(asset, bytes.to_vec());
-            }
+            let (asset, _) = document
+                .doc_and_assets()
+                .1
+                .add_raw_bytes_tracked(bytes.to_vec())?;
             if kind == ProjectAssetKind::Svg {
                 document.gpui_images.entry(asset).or_insert_with(|| {
                     Arc::new(gpui::Image::from_bytes(
