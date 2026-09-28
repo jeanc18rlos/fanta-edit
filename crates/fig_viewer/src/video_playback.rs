@@ -302,6 +302,17 @@ impl VideoPlaybackView {
         }
     }
 
+    fn skip(&mut self, seconds: i64, cx: &mut Context<Self>) {
+        let current = self.status.current_time_us;
+        let offset = seconds.unsigned_abs().saturating_mul(1_000_000);
+        let target = if seconds < 0 {
+            current.saturating_sub(offset)
+        } else {
+            current.saturating_add(offset)
+        };
+        self.seek(target, cx);
+    }
+
     pub(crate) fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
         if self.active == active || self.closed {
             return;
@@ -563,11 +574,10 @@ impl VideoPlaybackView {
                                     });
                                 }
                             });
-                            let view = weak.clone();
                             window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
                                 if phase == DispatchPhase::Bubble
                                     && event.button == MouseButton::Left
-                                    && let Some(view) = view.upgrade()
+                                    && let Some(view) = weak.upgrade()
                                 {
                                     view.update(cx, |this, cx| {
                                         if this.scrubbing {
@@ -585,17 +595,48 @@ impl VideoPlaybackView {
             );
         v_flex()
             .w_full()
-            .gap_1()
+            .gap_2()
+            .p_3()
+            .rounded_lg()
+            .bg(cx.theme().colors().editor_background)
+            .border_1()
+            .border_color(cx.theme().colors().border)
+            .child(
+                h_flex()
+                    .justify_between()
+                    .items_center()
+                    .child(
+                        Label::new("VIDEO PREVIEW")
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(
+                        Label::new(format!(
+                            "{} / {}",
+                            time_label(self.status.current_time_us),
+                            time_label(self.status.duration_us)
+                        ))
+                        .size(LabelSize::Small),
+                    ),
+            )
+            .child(seek_bar)
             .child(
                 h_flex()
                     .w_full()
                     .flex_wrap()
                     .gap_2()
+                    .items_center()
+                    .child(
+                        Button::new("video-back-five", "−5s")
+                            .disabled(disabled)
+                            .on_click(cx.listener(|this, _, _, cx| this.skip(-5, cx))),
+                    )
                     .child(
                         Button::new(
                             "video-toggle-play",
                             if self.wants_play { "Pause" } else { "Play" },
                         )
+                        .style(ButtonStyle::Filled)
                         .disabled(disabled)
                         .on_click(cx.listener(|this, _, _, cx| {
                             if this.wants_play {
@@ -606,13 +647,11 @@ impl VideoPlaybackView {
                         })),
                     )
                     .child(
-                        Label::new(format!(
-                            "{} / {}",
-                            time_label(self.status.current_time_us),
-                            time_label(self.status.duration_us)
-                        ))
-                        .size(LabelSize::Small),
+                        Button::new("video-forward-five", "+5s")
+                            .disabled(disabled)
+                            .on_click(cx.listener(|this, _, _, cx| this.skip(5, cx))),
                     )
+                    .child(div().flex_1())
                     .child(
                         Button::new(
                             "video-toggle-mute",
@@ -622,9 +661,34 @@ impl VideoPlaybackView {
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.set_audio(!this.muted, this.volume, cx);
                         })),
+                    )
+                    .child(
+                        Button::new("video-volume-down", "−")
+                            .disabled(disabled)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_audio(false, (this.volume - 0.2).max(0.0), cx);
+                            })),
+                    )
+                    .child(
+                        Button::new("video-volume-up", "+")
+                            .disabled(disabled)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_audio(false, (this.volume + 0.2).min(1.0), cx);
+                            })),
+                    )
+                    .child(
+                        Label::new(format!(
+                            "{}%",
+                            if self.muted {
+                                0
+                            } else {
+                                (self.volume * 100.0).round() as i32
+                            }
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
                     ),
             )
-            .child(seek_bar)
             .when_some(self.error.clone(), |element, error| {
                 element.child(Label::new(error).color(Color::Error))
             })

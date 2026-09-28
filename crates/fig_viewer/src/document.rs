@@ -852,6 +852,7 @@ impl FigDocument {
 pub(crate) struct OverlayAssetResolver {
     base: Option<Arc<dyn AssetResolver>>,
     added: std::sync::RwLock<HashMap<AssetId, DecodedImage>>,
+    added_bytes: std::sync::RwLock<HashMap<AssetId, Arc<Vec<u8>>>>,
 }
 
 impl AssetResolver for OverlayAssetResolver {
@@ -863,6 +864,9 @@ impl AssetResolver for OverlayAssetResolver {
     }
 
     fn resolve_bytes(&self, id: AssetId) -> Option<Arc<Vec<u8>>> {
+        if let Some(bytes) = self.added_bytes.read().unwrap().get(&id) {
+            return Some(bytes.clone());
+        }
         self.base.as_ref()?.resolve_bytes(id)
     }
 }
@@ -939,6 +943,32 @@ impl TestAssetStores {
 }
 
 impl AssetStores<'_> {
+    pub(crate) fn add_raw_bytes_tracked(&mut self, bytes: Vec<u8>) -> Result<(AssetId, bool)> {
+        let id = fanta_format::asset_id_for_bytes(&bytes);
+        if let Some(existing) = self.raw_assets.get(&id) {
+            anyhow::ensure!(
+                existing == &bytes,
+                "asset {id} has a content hash collision"
+            );
+            return Ok((id, false));
+        }
+        Arc::make_mut(self.raw_assets).insert(id, bytes.clone());
+        let overlay = self.overlay.get_or_insert_with(|| {
+            Arc::new(OverlayAssetResolver {
+                base: self.asset_resolver.clone(),
+                added: std::sync::RwLock::new(HashMap::default()),
+                added_bytes: std::sync::RwLock::new(HashMap::default()),
+            })
+        });
+        overlay
+            .added_bytes
+            .write()
+            .unwrap()
+            .insert(id, Arc::new(bytes));
+        *self.asset_resolver = Some(overlay.clone() as Arc<dyn AssetResolver>);
+        Ok((id, true))
+    }
+
     /// Ingest encoded image bytes as a project asset and return its natural size.
     #[cfg(test)]
     pub(crate) fn add_image(&mut self, bytes: Vec<u8>) -> Result<(AssetId, [u32; 2])> {
@@ -974,19 +1004,11 @@ impl AssetStores<'_> {
             return Ok((id, [width, height], false));
         }
 
-        // `raw_assets` is shared behind an `Arc` with the load-time asset
-        // resolver, so ingesting usually clones the byte map (the resolver
-        // keeps serving the map it was built over; the new image reaches it
-        // through the overlay below). Fine for occasional agent placements;
-        // batch imports should get a shared-bytes representation first.
-        Arc::make_mut(self.raw_assets).insert(id, bytes.clone());
-
-        let overlay = self.overlay.get_or_insert_with(|| {
-            Arc::new(OverlayAssetResolver {
-                base: self.asset_resolver.clone(),
-                added: std::sync::RwLock::new(HashMap::default()),
-            })
-        });
+        self.add_raw_bytes_tracked(bytes.clone())?;
+        let overlay = self
+            .overlay
+            .as_ref()
+            .context("ingested image has no resolver")?;
         overlay
             .added
             .write()
@@ -1009,6 +1031,7 @@ impl AssetStores<'_> {
         }
         if let Some(overlay) = self.overlay.as_ref() {
             overlay.added.write().unwrap().remove(&id);
+            overlay.added_bytes.write().unwrap().remove(&id);
         }
         self.gpui_images.remove(&id);
     }
@@ -3610,7 +3633,15 @@ fn decode_gpui_images(assets: &BTreeMap<AssetId, Vec<u8>>) -> HashMap<AssetId, A
     assets
         .iter()
         .filter_map(|(asset_id, bytes)| {
-            let format = gpui_image_format(image::guess_format(bytes).ok()?)?;
+            let format = image::guess_format(bytes)
+                .ok()
+                .and_then(gpui_image_format)
+                .or_else(|| {
+                    fanta_format::MediaRegistry::with_builtins()
+                        .sniff(bytes)
+                        .filter(|format| format.id == "svg")
+                        .map(|_| ImageFormat::Svg)
+                })?;
             // The ENCODED bytes go to GPUI (not `decode_embedded_image`'s straight-alpha
             // RGBA8, which the canvas renderer wants): handing over the source
             // bytes lets GPUI decode, swap channels to BGRA, and cache the
@@ -4485,6 +4516,36 @@ mod tests {
         assert!(
             stores.resolver().is_none(),
             "no overlay resolver is installed for a refused image"
+        );
+    }
+
+    #[test]
+    fn newly_added_media_bytes_reach_the_live_render_resolver() {
+        let mut stores = TestAssetStores::default();
+        let bytes = b"generated audio bytes".to_vec();
+        let (asset, inserted) = stores
+            .stores()
+            .add_raw_bytes_tracked(bytes.clone())
+            .expect("add project media");
+        assert!(inserted);
+        assert_eq!(
+            stores
+                .resolver()
+                .and_then(|resolver| resolver.resolve_bytes(asset)),
+            Some(Arc::new(bytes.clone()))
+        );
+
+        let (_, inserted) = stores
+            .stores()
+            .add_raw_bytes_tracked(bytes)
+            .expect("deduplicate project media");
+        assert!(!inserted);
+        stores.stores().remove(asset);
+        assert!(
+            stores
+                .resolver()
+                .and_then(|resolver| resolver.resolve_bytes(asset))
+                .is_none()
         );
     }
 

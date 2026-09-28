@@ -10,8 +10,15 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
+#[cfg(feature = "fanta-gpui-ui")]
+use fanta_doc::{AssetId, DocId, ProjectAssetKind};
 use fanta_doc::{
     CanvasNode, Doc, GroupNode, IndexKey, NodeData, NodeFlags, NodeId, Operation, Scene,
+};
+#[cfg(feature = "fanta-gpui-ui")]
+use fanta_gpui::assets::{
+    AssetKind, AssetPageTarget, AssetRow, AssetThumbnail, AssetsPanel, AssetsPanelAction,
+    AssetsViewData,
 };
 use fs::Fs;
 #[cfg(test)]
@@ -28,6 +35,8 @@ use workspace::{
 };
 
 use crate::document::{DocChange, FigDocument};
+#[cfg(feature = "fanta-gpui-ui")]
+use crate::editor_session::{EditorMode, EditorSessionEvent};
 use crate::panel_settings::FantaDesignPanelSettings;
 use crate::view::{
     CopySelection, CutSelection, DeleteSelection, DuplicateSelection, FigView, FrameSelection,
@@ -312,6 +321,10 @@ pub struct FantaDesignPanel {
     #[cfg(feature = "fanta-gpui-ui")]
     gpui_layers: Option<crate::gpui_adapters::layers::LayersAdapter>,
     #[cfg(feature = "fanta-gpui-ui")]
+    gpui_assets: Option<Entity<AssetsPanel>>,
+    #[cfg(feature = "fanta-gpui-ui")]
+    asset_echo_key: Option<(DocId, u64, EditorMode, Option<NodeId>, bool)>,
+    #[cfg(feature = "fanta-gpui-ui")]
     file_inspector: Option<Entity<fanta_gpui::file_inspector::FileInspectorSidebar>>,
     #[cfg(feature = "fanta-gpui-ui")]
     context_picker: Option<context_menu::ContextPicker>,
@@ -328,6 +341,8 @@ pub struct FantaDesignPanel {
     pending_reveal: Option<NodeId>,
     _subscriptions: Vec<Subscription>,
     _active_view_subscription: Option<Subscription>,
+    #[cfg(feature = "fanta-gpui-ui")]
+    _editor_session_subscription: Option<Subscription>,
 }
 
 impl FantaDesignPanel {
@@ -350,13 +365,16 @@ impl FantaDesignPanel {
             };
             let pages = pages.panel.clone();
             let layers = layers.panel.clone();
+            let assets = self.gpui_assets.clone();
             let inspector = cx.new(|cx| {
-                fanta_gpui::file_inspector::FileInspectorSidebar::new(
+                let mut inspector = fanta_gpui::file_inspector::FileInspectorSidebar::new(
                     "fanta-file-inspector",
                     pages,
                     layers,
                     cx,
-                )
+                );
+                inspector.set_assets_panel(assets, cx);
+                inspector
             });
             self._subscriptions.push(
                 cx.subscribe(&inspector, |this, _, event, cx| {
@@ -455,6 +473,10 @@ impl FantaDesignPanel {
             #[cfg(feature = "fanta-gpui-ui")]
             gpui_layers: None,
             #[cfg(feature = "fanta-gpui-ui")]
+            gpui_assets: None,
+            #[cfg(feature = "fanta-gpui-ui")]
+            asset_echo_key: None,
+            #[cfg(feature = "fanta-gpui-ui")]
             file_inspector: None,
             #[cfg(feature = "fanta-gpui-ui")]
             context_picker: None,
@@ -464,6 +486,8 @@ impl FantaDesignPanel {
             pending_reveal: None,
             _subscriptions: subscriptions,
             _active_view_subscription: None,
+            #[cfg(feature = "fanta-gpui-ui")]
+            _editor_session_subscription: None,
         };
         this.set_active_view(initial_view, cx);
         this
@@ -500,6 +524,20 @@ impl FantaDesignPanel {
                     // document events, never in render — preview frames can't
                     // change tree structure, so they're skipped too.
                     let item = view.read(cx).item().clone();
+                    #[cfg(feature = "fanta-gpui-ui")]
+                    {
+                        let session = view.read(cx).editor_session().clone();
+                        self._editor_session_subscription = Some(cx.subscribe(
+                            &session,
+                            |this, _, event: &EditorSessionEvent, cx| {
+                                if matches!(event, EditorSessionEvent::ModeChanged(_)) {
+                                    this.asset_echo_key = None;
+                                    cx.notify();
+                                }
+                            },
+                        ));
+                        self.asset_echo_key = None;
+                    }
                     self._active_view_subscription = Some(cx.subscribe(
                         &item,
                         |this, _, event: &crate::document::FigItemEvent, cx| {
@@ -509,6 +547,10 @@ impl FantaDesignPanel {
                                     | crate::document::FigItemEvent::TextSelectionChanged
                             ) {
                                 this.rebuild_caches(cx);
+                                #[cfg(feature = "fanta-gpui-ui")]
+                                {
+                                    this.asset_echo_key = None;
+                                }
                                 #[cfg(feature = "fanta-gpui-ui")]
                                 this.refresh_gpui_pages(cx);
                                 #[cfg(feature = "fanta-gpui-ui")]
@@ -1024,6 +1066,8 @@ impl Render for FantaDesignPanel {
         #[cfg(feature = "fanta-gpui-ui")]
         self.ensure_gpui_layers(_window, cx);
         #[cfg(feature = "fanta-gpui-ui")]
+        self.ensure_gpui_assets(_window, cx);
+        #[cfg(feature = "fanta-gpui-ui")]
         self.ensure_file_inspector(cx);
         let body = match self.active_view(cx) {
             None => centered_message("Open a Figma document to browse its layers"),
@@ -1108,6 +1152,244 @@ impl Render for FantaDesignPanel {
             })
             .child(body)
             .children(picker)
+    }
+}
+
+#[cfg(feature = "fanta-gpui-ui")]
+fn project_assets_view_data(document: &FigDocument, editable: bool) -> AssetsViewData {
+    let pages = document
+        .pages
+        .iter()
+        .filter(|page| !page.hidden)
+        .filter_map(|page| {
+            let root = page.root?;
+            let label = document
+                .doc
+                .scene
+                .get(root)
+                .map(|node| node.name.clone())
+                .unwrap_or_else(|| page.name.to_string());
+            Some(AssetPageTarget::new(root.to_string(), label))
+        })
+        .collect::<Vec<_>>();
+    let selected_page_id = document
+        .doc
+        .active_page()
+        .map(|page| SharedString::from(page.to_string()))
+        .filter(|id| pages.iter().any(|page| &page.id == id))
+        .or_else(|| pages.first().map(|page| page.id.clone()));
+
+    let mut scene_names = std::collections::HashMap::<AssetId, String>::new();
+    let mut video_posters = HashSet::<AssetId>::new();
+    let mut video_previews = std::collections::HashMap::<AssetId, AssetId>::new();
+    if document
+        .raw_assets
+        .keys()
+        .any(|asset| !document.doc.asset_library.contains_key(asset))
+    {
+        for root in document.doc.scene.roots() {
+            for node_id in std::iter::once(*root).chain(document.doc.scene.descendants_of(*root)) {
+                let Some(node) = document.doc.scene.get(node_id) else {
+                    continue;
+                };
+                let asset = match &node.data {
+                    NodeData::Bitmap(bitmap) => Some(bitmap.asset),
+                    NodeData::Video(video) => {
+                        if let Some(poster) = video.poster {
+                            video_posters.insert(poster);
+                            video_previews.insert(video.asset, poster);
+                        }
+                        Some(video.asset)
+                    }
+                    NodeData::Audio(audio) => Some(audio.asset),
+                    _ => None,
+                };
+                if let Some(asset) = asset {
+                    scene_names
+                        .entry(asset)
+                        .or_insert_with(|| node.name.clone());
+                }
+            }
+        }
+    }
+
+    let asset_ids = document
+        .raw_assets
+        .keys()
+        .chain(document.doc.asset_library.keys())
+        .copied()
+        .filter(|asset| {
+            !video_posters.contains(asset)
+                || document.doc.asset_library.contains_key(asset)
+                || scene_names.contains_key(asset)
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut assets = Vec::with_capacity(asset_ids.len());
+    for (index, asset_id) in asset_ids.into_iter().enumerate() {
+        let bytes = document.raw_assets.get(&asset_id);
+        let metadata = document.doc.asset_library.get(&asset_id);
+        let kind = metadata
+            .map(|entry| entry.kind)
+            .or_else(|| bytes.and_then(|bytes| crate::generation_media::project_asset_kind(bytes)));
+        let asset_kind = match kind {
+            Some(ProjectAssetKind::Image) => AssetKind::Image,
+            Some(ProjectAssetKind::Svg) => AssetKind::Svg,
+            Some(ProjectAssetKind::Video) => AssetKind::Video,
+            Some(ProjectAssetKind::Audio) => AssetKind::Audio,
+            None => AssetKind::Other,
+        };
+        let label = metadata
+            .map(|entry| entry.name.as_str())
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| scene_names.get(&asset_id).map(String::as_str))
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("{} {}", asset_kind.label(), index + 1));
+        let mut row = AssetRow::new(asset_id.to_string(), label, asset_kind);
+        row.thumbnail = document
+            .gpui_images
+            .get(&asset_id)
+            .or_else(|| {
+                video_previews
+                    .get(&asset_id)
+                    .and_then(|poster| document.gpui_images.get(poster))
+            })
+            .cloned()
+            .map(|image| AssetThumbnail::new(asset_id.to_string(), image));
+        row.detail = bytes
+            .map(|bytes| {
+                let kib = bytes.len() as f64 / 1024.0;
+                if kib < 1024.0 {
+                    format!("{kib:.0} KB").into()
+                } else {
+                    format!("{:.1} MB", kib / 1024.0).into()
+                }
+            })
+            .unwrap_or_else(|| "Missing file".into());
+        let reason = if bytes.is_none() {
+            Some("The media file is missing from this project.")
+        } else if kind.is_none_or(|kind| {
+            bytes.is_none_or(|bytes| !crate::generation_media::project_asset_can_place(bytes, kind))
+        }) {
+            Some("This media format cannot be placed on the canvas.")
+        } else if selected_page_id.is_none() {
+            Some("Create a page before placing assets.")
+        } else if !editable {
+            Some("Save or discard source edits before placing assets.")
+        } else {
+            None
+        };
+        row.can_place = reason.is_none();
+        row.disabled_reason = reason.map(SharedString::from);
+        assets.push(row);
+    }
+    assets.sort_by(|left, right| left.label.as_ref().cmp(right.label.as_ref()));
+    AssetsViewData {
+        assets,
+        pages,
+        selected_page_id,
+    }
+}
+
+#[cfg(feature = "fanta-gpui-ui")]
+impl FantaDesignPanel {
+    fn ensure_gpui_assets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !crate::gpui_adapters::runtime_enabled(cx) {
+            return;
+        }
+        if self.gpui_assets.is_none() {
+            let panel = cx.new(|cx| {
+                AssetsPanel::new(
+                    "fanta-project-assets",
+                    AssetsViewData::default(),
+                    window,
+                    cx,
+                )
+            });
+            self._subscriptions
+                .push(cx.subscribe_in(&panel, window, Self::handle_assets_action));
+            if let Some(inspector) = &self.file_inspector {
+                inspector.update(cx, |inspector, cx| {
+                    inspector.set_assets_panel(Some(panel.clone()), cx)
+                });
+            }
+            self.gpui_assets = Some(panel);
+        }
+        self.refresh_gpui_assets(window, cx);
+    }
+
+    fn refresh_gpui_assets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.active_view(cx) else {
+            return;
+        };
+        let Some(panel) = &self.gpui_assets else {
+            return;
+        };
+        let (key, data) = {
+            let view = view.read(cx);
+            let item = view.item().read(cx);
+            let Some(document) = item.document() else {
+                return;
+            };
+            let mode = view.editor_mode(cx);
+            let key = (
+                document.doc.id,
+                document.render_generation(),
+                mode,
+                document.doc.active_page(),
+                item.is_editable(),
+            );
+            if self.asset_echo_key == Some(key) {
+                return;
+            }
+            (key, project_assets_view_data(document, item.is_editable()))
+        };
+        panel.update(cx, |panel, cx| panel.set_view_data(data, window, cx));
+        self.asset_echo_key = Some(key);
+    }
+
+    fn handle_assets_action(
+        &mut self,
+        _panel: &Entity<AssetsPanel>,
+        action: &AssetsPanelAction,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            AssetsPanelAction::TargetPageSelected { page_id } => {
+                let index = self.active_view(cx).and_then(|view| {
+                    let view = view.read(cx);
+                    let item = view.item().read(cx);
+                    let document = item.document()?;
+                    document.pages.iter().position(|page| {
+                        !page.hidden
+                            && page
+                                .root
+                                .is_some_and(|root| root.to_string() == page_id.as_ref())
+                    })
+                });
+                if let Some(index) = index {
+                    self.select_page(index, cx);
+                    self.asset_echo_key = None;
+                    cx.notify();
+                }
+            }
+            AssetsPanelAction::PlaceRequested { asset_id, page_id } => {
+                let result = (|| -> Result<()> {
+                    let asset = asset_id.as_ref().parse::<AssetId>()?;
+                    let page = page_id.as_ref().parse::<NodeId>()?;
+                    let view = self.active_view(cx).ok_or_else(|| {
+                        anyhow::anyhow!("Open a project canvas before placing an asset.")
+                    })?;
+                    view.update(cx, |view, cx| view.place_project_asset(asset, page, cx))
+                })();
+                if let Err(error) = result {
+                    crate::view::show_canvas_notice_deferred(
+                        format!("Could not place asset: {error:#}"),
+                        cx,
+                    );
+                }
+            }
+        }
     }
 }
 

@@ -17,10 +17,11 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use super::layout::{
-    ACTIVE_MODES_JSON, ASSETS_DIR, COMPONENTS_DIR, DEF_JSON, DOC_DIR, FLOW_START_JSON, FLOWS_JSON,
-    LOOSE_DIR, MASTER_FNX, MASTER_IDS, METADATA_JSON, MOTION_JSON, NODES_DIR, PAGE_FNX, PAGE_IDS,
-    PAGE_JSON, PAGES_DIR, PRESENTATION_JSON, SETS_JSON, VARIABLES_JSON, id_from_key,
-    is_project_dir, json_key, read_json_file, read_json_or, read_manifest, sorted_entries,
+    ACTIVE_MODES_JSON, ASSET_LIBRARY_JSON, ASSETS_DIR, COMPONENTS_DIR, DEF_JSON, DOC_DIR,
+    FLOW_START_JSON, FLOWS_JSON, LOOSE_DIR, MASTER_FNX, MASTER_IDS, METADATA_JSON, MOTION_JSON,
+    NODES_DIR, PAGE_FNX, PAGE_IDS, PAGE_JSON, PAGES_DIR, PRESENTATION_JSON, SETS_JSON,
+    VARIABLES_JSON, id_from_key, is_project_dir, json_key, read_json_file, read_json_or,
+    read_manifest, sorted_entries,
 };
 
 /// Load a project directory back into a [`Doc`] plus its asset blobs.
@@ -78,6 +79,10 @@ fn read_project_tree_with_source_override_locked(
     root.insert(
         "metadata".to_owned(),
         read_json_file(&doc_dir.join(METADATA_JSON))?,
+    );
+    root.insert(
+        "asset_library".to_owned(),
+        read_json_or(&doc_dir.join(ASSET_LIBRARY_JSON), json!({}))?,
     );
     let variables = read_json_or(&doc_dir.join(VARIABLES_JSON), json!({}))?;
     root.insert("variables".to_owned(), variables.clone());

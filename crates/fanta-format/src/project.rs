@@ -494,6 +494,27 @@ mod tests {
     }
 
     #[test]
+    fn unplaced_project_asset_keeps_its_name_and_bytes() {
+        let directory = tempfile::tempdir().expect("project directory");
+        let bytes = b"<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 8 8\"><path d=\"M0 0h8v8z\"/></svg>".to_vec();
+        let asset = crate::asset_id_for_bytes(&bytes);
+        let mut doc = fanta_doc::Doc::new();
+        doc.asset_library.insert(
+            asset,
+            fanta_doc::ProjectAsset {
+                name: "Compass mark".into(),
+                kind: fanta_doc::ProjectAssetKind::Svg,
+            },
+        );
+        let assets = BTreeMap::from([(asset, bytes.clone())]);
+        write_project_tree(directory.path(), &doc, &assets).expect("write project");
+        let (reloaded, reloaded_assets) =
+            read_project_tree(directory.path()).expect("reopen project");
+        assert_eq!(reloaded.asset_library, doc.asset_library);
+        assert_eq!(reloaded_assets.get(&asset), Some(&bytes));
+    }
+
+    #[test]
     fn round_trip_preserves_persisted_projection_and_assets() {
         let f = fixture();
         let (assets, _) = fixture_assets();
