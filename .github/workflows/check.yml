@@ -112,6 +112,9 @@ jobs:
       - name: Test blocked native agent terminal commands
         run: cargo test --locked -p agent --lib --features mac_app_store test_mac_app_store_terminal_tool
 
+      - name: Test blocked direct ACP process spawn
+        run: cargo test --locked -p agent_servers --lib --features mac_app_store test_mac_app_store_blocks_direct_acp_stdio_spawn
+
       - name: Test saved local agents and MCP servers
         run: cargo test --locked -p project --test integration --features mac_app_store,test-support test_mac_app_store_
 
