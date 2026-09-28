@@ -1,18 +1,19 @@
 use anthropic::completion::{AnthropicEventMapper, AnthropicPromptCacheMode, into_anthropic};
 use anthropic::{AnthropicError, AnthropicModelMode};
-use anyhow::Result;
+use anyhow::{Context as _, Result, ensure};
 use client::{Client, ClientSettings};
 use credentials_provider::CredentialsProvider;
-use futures::{FutureExt, StreamExt, future::BoxFuture, stream::BoxStream};
+use futures::{AsyncReadExt as _, FutureExt, StreamExt, future::BoxFuture, stream::BoxStream};
 use gpui::{Action as _, App, AppContext, AsyncApp, Context, Entity, SharedString, Task, Window};
-use http_client::{CustomHeaders, HttpClient};
+use http_client::{AsyncBody, CustomHeaders, HttpClient, Method, Request};
 use language_model::{
     AuthenticateError, IconOrSvg, LanguageModel, LanguageModelCompletionError,
-    LanguageModelCompletionEvent, LanguageModelId, LanguageModelName, LanguageModelProvider,
-    LanguageModelProviderId, LanguageModelProviderName, LanguageModelProviderState,
-    LanguageModelRequest, LanguageModelToolChoice, ProviderSettingsView, RateLimiter,
-    SubPageProviderSettings,
+    LanguageModelCompletionEvent, LanguageModelCostInfo, LanguageModelId, LanguageModelName,
+    LanguageModelProvider, LanguageModelProviderId, LanguageModelProviderName,
+    LanguageModelProviderState, LanguageModelRequest, LanguageModelToolChoice,
+    ProviderSettingsView, RateLimiter, SubPageProviderSettings,
 };
+use serde_json::Value;
 use settings::Settings;
 use std::future::Future;
 use std::pin::Pin;
@@ -43,6 +44,33 @@ pub struct AnthropicCompatibleLanguageModelProvider {
     http_client: Arc<dyn HttpClient>,
     client: Arc<Client>,
     state: Entity<State>,
+    catalog: Entity<CatalogState>,
+}
+
+#[derive(Clone)]
+struct CatalogModel {
+    available: AvailableModel,
+    cost: Option<LanguageModelCostInfo>,
+    adaptive_thinking: bool,
+    forced_tool_choice: bool,
+}
+
+impl From<AvailableModel> for CatalogModel {
+    fn from(available: AvailableModel) -> Self {
+        Self {
+            available,
+            cost: None,
+            adaptive_thinking: false,
+            forced_tool_choice: true,
+        }
+    }
+}
+
+#[derive(Default)]
+struct CatalogState {
+    models: Option<Vec<CatalogModel>>,
+    revision: u64,
+    fetch_task: Option<Task<()>>,
 }
 
 /// The signed-in account's access token, iff this provider targets the
@@ -123,14 +151,20 @@ impl ApiCompatibleProviderSettings for AnthropicCompatibleSettings {
 
 pub type State = ApiCompatibleProviderState<AnthropicCompatibleSettings>;
 
-fn available_model_to_anthropic_model(available: &AvailableModel) -> anthropic::Model {
-    let mode = match available.mode.unwrap_or_default() {
-        settings::ModelMode::Default => AnthropicModelMode::Default,
-        settings::ModelMode::Thinking { budget_tokens } => {
-            AnthropicModelMode::Thinking { budget_tokens }
+fn available_model_to_anthropic_model(record: &CatalogModel) -> anthropic::Model {
+    let available = &record.available;
+    let mode = if record.adaptive_thinking {
+        AnthropicModelMode::AdaptiveThinking
+    } else {
+        match available.mode.unwrap_or_default() {
+            settings::ModelMode::Default => AnthropicModelMode::Default,
+            settings::ModelMode::Thinking { budget_tokens } => {
+                AnthropicModelMode::Thinking { budget_tokens }
+            }
         }
     };
-    let supports_thinking = matches!(mode, AnthropicModelMode::Thinking { .. });
+    let supports_thinking = !matches!(mode, AnthropicModelMode::Default);
+    let supports_adaptive_thinking = matches!(mode, AnthropicModelMode::AdaptiveThinking);
 
     anthropic::Model {
         display_name: available
@@ -143,14 +177,179 @@ fn available_model_to_anthropic_model(available: &AvailableModel) -> anthropic::
         default_temperature: available.default_temperature.unwrap_or(1.0),
         mode,
         supports_thinking,
-        supports_adaptive_thinking: false,
+        supports_adaptive_thinking,
         supports_images: available.capabilities.images,
         supports_speed: false,
         supports_compaction: false,
-        supported_effort_levels: Vec::new(),
+        supported_effort_levels: if supports_adaptive_thinking {
+            vec![
+                anthropic::Effort::Low,
+                anthropic::Effort::Medium,
+                anthropic::Effort::High,
+                anthropic::Effort::XHigh,
+            ]
+        } else {
+            Vec::new()
+        },
         tool_override: available.tool_override.clone(),
         extra_beta_headers: available.extra_beta_headers.clone(),
     }
+}
+
+fn parse_catalog(value: &Value) -> Result<Vec<CatalogModel>> {
+    let rows = value["models"]
+        .as_array()
+        .context("Fanta's model catalog has no models array")?;
+    let mut models = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for row in rows {
+        if row["kind"].as_str() != Some("chat") {
+            continue;
+        }
+        let Some(id) = row["id"]
+            .as_str()
+            .filter(|id| !id.is_empty() && id.len() <= 128)
+        else {
+            continue;
+        };
+        if !seen.insert(id) {
+            continue;
+        }
+        let capabilities = &row["capabilities"];
+        let context_window = capabilities["context_window"]
+            .as_u64()
+            .filter(|tokens| (4_096..=2_000_000).contains(tokens))
+            .unwrap_or(200_000);
+        let max_output_tokens = row["max_output_tokens"]
+            .as_u64()
+            .filter(|tokens| (1..=128_000).contains(tokens))
+            .unwrap_or(4_096);
+        let display_name = capabilities["display_name"]
+            .as_str()
+            .filter(|name| !name.is_empty() && name.len() <= 120)
+            .unwrap_or(id);
+        let available = AvailableModel {
+            name: id.to_owned(),
+            display_name: Some(display_name.to_owned()),
+            max_tokens: context_window,
+            tool_override: None,
+            max_output_tokens: Some(max_output_tokens),
+            default_temperature: None,
+            extra_beta_headers: Vec::new(),
+            mode: None,
+            capabilities: ModelCapabilities {
+                tools: capabilities["tools"].as_bool().unwrap_or(true),
+                images: capabilities["images"].as_bool().unwrap_or(false),
+                prompt_caching: capabilities["prompt_caching"].as_bool().unwrap_or(false),
+            },
+        };
+        let cost = row["credits_per_mtok_input"]
+            .as_u64()
+            .zip(row["credits_per_mtok_output"].as_u64())
+            .map(|(input_credits_per_1m, output_credits_per_1m)| {
+                LanguageModelCostInfo::CreditTokenCost {
+                    input_credits_per_1m,
+                    output_credits_per_1m,
+                }
+            });
+        models.push(CatalogModel {
+            available,
+            cost,
+            adaptive_thinking: capabilities["reasoning_mode"].as_str() == Some("adaptive"),
+            forced_tool_choice: capabilities["forced_tool_choice"].as_bool().unwrap_or(true),
+        });
+    }
+    Ok(models)
+}
+
+async fn fetch_catalog(
+    http_client: &dyn HttpClient,
+    api_url: &str,
+    token: &str,
+) -> Result<Vec<CatalogModel>> {
+    const MAX_CATALOG_BYTES: u64 = 512 * 1024;
+    let request = Request::builder()
+        .method(Method::GET)
+        .uri(format!("{}/v1/models", api_url.trim_end_matches('/')))
+        .header("Accept", "application/json")
+        .header("Authorization", format!("Bearer {token}"))
+        .body(AsyncBody::empty())?;
+    let response = http_client.send(request).await?;
+    ensure!(
+        response.status().is_success(),
+        "Fanta catalog returned {}",
+        response.status()
+    );
+    let mut bytes = Vec::new();
+    response
+        .into_body()
+        .take(MAX_CATALOG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    ensure!(
+        bytes.len() as u64 <= MAX_CATALOG_BYTES,
+        "Fanta catalog is too large"
+    );
+    parse_catalog(&serde_json::from_slice(&bytes)?)
+}
+
+fn refresh_catalog(
+    state: &Entity<State>,
+    catalog: &Entity<CatalogState>,
+    client: &Arc<Client>,
+    http_client: &Arc<dyn HttpClient>,
+    cx: &mut App,
+) {
+    let (api_url, key, managed_account) = state.read_with(cx, |state, cx| {
+        let api_url = state.settings.api_url.clone();
+        let managed_account =
+            is_account_provider(&api_url, &ClientSettings::get_global(cx).server_url);
+        let key = state
+            .api_key_state
+            .key(&api_url)
+            .or_else(|| account_token_for(client, &api_url, cx));
+        (api_url, key, managed_account)
+    });
+    let revision = catalog.update(cx, |catalog, _| {
+        catalog.revision = catalog.revision.wrapping_add(1);
+        catalog.models = None;
+        catalog.fetch_task = None;
+        catalog.revision
+    });
+    state.update(cx, |_, cx| cx.notify());
+    if !managed_account {
+        return;
+    }
+    let Some(key) = key else {
+        return;
+    };
+    let catalog_for_task = catalog.downgrade();
+    let state_for_task = state.downgrade();
+    let http_client = http_client.clone();
+    let task = cx.spawn(async move |cx| {
+        let result = fetch_catalog(http_client.as_ref(), &api_url, &key).await;
+        let (Some(catalog_for_task), Some(state_for_task)) =
+            (catalog_for_task.upgrade(), state_for_task.upgrade())
+        else {
+            return;
+        };
+        match result {
+            Ok(models) => {
+                let changed = catalog_for_task.update(cx, |catalog, _| {
+                    if catalog.revision != revision {
+                        return false;
+                    }
+                    catalog.models = Some(models);
+                    true
+                });
+                if changed {
+                    state_for_task.update(cx, |_, cx| cx.notify());
+                }
+            }
+            Err(error) => log::warn!("Fanta model catalog unavailable: {error:#}"),
+        }
+    });
+    catalog.update(cx, |catalog, _| catalog.fetch_task = Some(task));
 }
 
 impl AnthropicCompatibleLanguageModelProvider {
@@ -171,33 +370,68 @@ impl AnthropicCompatibleLanguageModelProvider {
             cx,
         );
 
+        let catalog = cx.new(|_| CatalogState::default());
+
         // Sign-in/out changes whether the account token authenticates the
         // managed provider; poke the observable state so the registry and the
         // agent panel re-evaluate authentication without an app restart.
         let mut status = client.status();
         cx.spawn({
             let state = state.downgrade();
+            let catalog = catalog.downgrade();
+            let client = client.clone();
+            let http_client = client.http_client();
             async move |cx| {
                 while status.next().await.is_some() {
-                    if state.update(cx, |_, cx| cx.notify()).is_err() {
+                    let (Some(state), Some(catalog)) = (state.upgrade(), catalog.upgrade()) else {
                         break;
-                    }
+                    };
+                    cx.update(|cx| {
+                        state.update(cx, |_, cx| cx.notify());
+                        refresh_catalog(&state, &catalog, &client, &http_client, cx);
+                    });
                 }
             }
         })
         .detach();
 
-        Self {
+        let provider = Self {
             id: id.clone().into(),
             name: id.into(),
             http_client: client.http_client(),
             client,
             state,
-        }
+            catalog,
+        };
+        provider.refresh_catalog(cx);
+        provider
     }
 
-    fn create_language_model(&self, model: AvailableModel) -> Arc<dyn LanguageModel> {
-        let capabilities = model.capabilities.clone();
+    fn refresh_catalog(&self, cx: &mut App) {
+        refresh_catalog(
+            &self.state,
+            &self.catalog,
+            &self.client,
+            &self.http_client,
+            cx,
+        );
+    }
+
+    fn models(&self, cx: &App) -> Vec<CatalogModel> {
+        self.catalog.read(cx).models.clone().unwrap_or_else(|| {
+            self.state
+                .read(cx)
+                .settings
+                .available_models
+                .iter()
+                .cloned()
+                .map(CatalogModel::from)
+                .collect()
+        })
+    }
+
+    fn create_language_model(&self, record: CatalogModel) -> Arc<dyn LanguageModel> {
+        let capabilities = record.available.capabilities.clone();
         // Compatible providers may not support Anthropic's automatic prompt
         // caching; only request explicit (legacy) cache breakpoints when the
         // user has opted in via the `prompt_caching` capability.
@@ -206,7 +440,7 @@ impl AnthropicCompatibleLanguageModelProvider {
         } else {
             AnthropicPromptCacheMode::Disabled
         };
-        let model = available_model_to_anthropic_model(&model);
+        let model = available_model_to_anthropic_model(&record);
 
         Arc::new(AnthropicCompatibleLanguageModel {
             id: LanguageModelId::from(model.id.clone()),
@@ -214,6 +448,8 @@ impl AnthropicCompatibleLanguageModelProvider {
             provider_name: self.name.clone(),
             model,
             capabilities,
+            cost: record.cost,
+            forced_tool_choice: record.forced_tool_choice,
             cache_mode,
             state: self.state.clone(),
             http_client: self.http_client.clone(),
@@ -245,25 +481,33 @@ impl LanguageModelProvider for AnthropicCompatibleLanguageModelProvider {
     }
 
     fn default_model(&self, cx: &App) -> Option<Arc<dyn LanguageModel>> {
-        self.state
-            .read(cx)
-            .settings
-            .available_models
-            .first()
-            .map(|model| self.create_language_model(model.clone()))
+        let models = self.models(cx);
+        models
+            .iter()
+            .find(|record| record.available.name == "claude-sonnet-5")
+            .or_else(|| models.first())
+            .cloned()
+            .map(|record| self.create_language_model(record))
     }
 
-    fn default_fast_model(&self, _cx: &App) -> Option<Arc<dyn LanguageModel>> {
-        None
+    fn default_fast_model(&self, cx: &App) -> Option<Arc<dyn LanguageModel>> {
+        let models = self.models(cx);
+        models
+            .iter()
+            .find(|record| record.available.name == "gpt-6-luna")
+            .or_else(|| {
+                models
+                    .iter()
+                    .find(|record| record.available.name == "claude-haiku-4-5")
+            })
+            .cloned()
+            .map(|record| self.create_language_model(record))
     }
 
     fn provided_models(&self, cx: &App) -> Vec<Arc<dyn LanguageModel>> {
-        self.state
-            .read(cx)
-            .settings
-            .available_models
-            .iter()
-            .map(|model| self.create_language_model(model.clone()))
+        self.models(cx)
+            .into_iter()
+            .map(|model| self.create_language_model(model))
             .collect()
     }
 
@@ -283,12 +527,19 @@ impl LanguageModelProvider for AnthropicCompatibleLanguageModelProvider {
         // account token only masks missing credentials, never storage errors.
         let inner = self.state.update(cx, |state, cx| state.authenticate(cx));
         let api_url = self.state.read(cx).settings.api_url.clone();
-        if account_token_for(&self.client, &api_url, cx).is_none() {
-            return inner;
-        }
-        cx.spawn(async move |_cx| match inner.await {
-            Ok(()) | Err(AuthenticateError::CredentialsNotFound) => Ok(()),
-            Err(error) => Err(error),
+        let has_account_token = account_token_for(&self.client, &api_url, cx).is_some();
+        let state = self.state.clone();
+        let catalog = self.catalog.clone();
+        let client = self.client.clone();
+        let http_client = self.http_client.clone();
+        cx.spawn(async move |cx| {
+            let result = inner.await;
+            cx.update(|cx| refresh_catalog(&state, &catalog, &client, &http_client, cx));
+            match result {
+                Ok(()) => Ok(()),
+                Err(AuthenticateError::CredentialsNotFound) if has_account_token => Ok(()),
+                Err(error) => Err(error),
+            }
         })
     }
 
@@ -323,8 +574,18 @@ impl LanguageModelProvider for AnthropicCompatibleLanguageModelProvider {
     }
 
     fn set_api_key(&self, api_key: Option<String>, cx: &mut App) -> Task<Result<()>> {
-        self.state
-            .update(cx, |state, cx| state.set_api_key(api_key, cx))
+        let inner = self
+            .state
+            .update(cx, |state, cx| state.set_api_key(api_key, cx));
+        let state = self.state.clone();
+        let catalog = self.catalog.clone();
+        let client = self.client.clone();
+        let http_client = self.http_client.clone();
+        cx.spawn(async move |cx| {
+            let result = inner.await;
+            cx.update(|cx| refresh_catalog(&state, &catalog, &client, &http_client, cx));
+            result
+        })
     }
 }
 
@@ -408,6 +669,8 @@ pub struct AnthropicCompatibleLanguageModel {
     provider_name: LanguageModelProviderName,
     model: anthropic::Model,
     capabilities: ModelCapabilities,
+    cost: Option<LanguageModelCostInfo>,
+    forced_tool_choice: bool,
     cache_mode: AnthropicPromptCacheMode,
     state: Entity<State>,
     http_client: Arc<dyn HttpClient>,
@@ -515,7 +778,8 @@ impl LanguageModel for AnthropicCompatibleLanguageModel {
 
     fn supports_tool_choice(&self, choice: LanguageModelToolChoice) -> bool {
         match choice {
-            LanguageModelToolChoice::Auto | LanguageModelToolChoice::Any => self.capabilities.tools,
+            LanguageModelToolChoice::Auto => self.capabilities.tools,
+            LanguageModelToolChoice::Any => self.capabilities.tools && self.forced_tool_choice,
             LanguageModelToolChoice::None => true,
         }
     }
@@ -524,8 +788,37 @@ impl LanguageModel for AnthropicCompatibleLanguageModel {
         self.model.supports_thinking
     }
 
+    fn supports_disabling_thinking(&self) -> bool {
+        !self.model.supports_adaptive_thinking
+    }
+
+    fn supported_effort_levels(&self) -> Vec<language_model::LanguageModelEffortLevel> {
+        self.model
+            .supported_effort_levels
+            .iter()
+            .map(|effort| {
+                let (name, value) = match effort {
+                    anthropic::Effort::Low => ("Low", "low"),
+                    anthropic::Effort::Medium => ("Medium", "medium"),
+                    anthropic::Effort::High => ("High", "high"),
+                    anthropic::Effort::XHigh => ("XHigh", "xhigh"),
+                    anthropic::Effort::Max => ("Max", "max"),
+                };
+                language_model::LanguageModelEffortLevel {
+                    name: name.into(),
+                    value: value.into(),
+                    is_default: matches!(effort, anthropic::Effort::High),
+                }
+            })
+            .collect()
+    }
+
+    fn model_cost_info(&self) -> Option<LanguageModelCostInfo> {
+        self.cost.clone()
+    }
+
     fn telemetry_id(&self) -> String {
-        format!("anthropic/{}", self.model.id)
+        format!("{}/{}", self.provider_id.0, self.model.id)
     }
 
     fn max_token_count(&self) -> u64 {
@@ -538,7 +831,7 @@ impl LanguageModel for AnthropicCompatibleLanguageModel {
 
     fn stream_completion(
         &self,
-        request: LanguageModelRequest,
+        mut request: LanguageModelRequest,
         cx: &AsyncApp,
     ) -> BoxFuture<
         'static,
@@ -547,6 +840,12 @@ impl LanguageModel for AnthropicCompatibleLanguageModel {
             LanguageModelCompletionError,
         >,
     > {
+        if self.model.supports_adaptive_thinking {
+            request.thinking_allowed = true;
+        }
+        if !self.forced_tool_choice && request.tool_choice == Some(LanguageModelToolChoice::Any) {
+            request.tool_choice = Some(LanguageModelToolChoice::Auto);
+        }
         let has_tools = !request.tools.is_empty();
         let request_id = self.model.request_id(has_tools).to_string();
         let mut request = into_anthropic(
@@ -567,5 +866,75 @@ impl LanguageModel for AnthropicCompatibleLanguageModel {
             Ok(AnthropicEventMapper::new(provider_name).map_stream(response))
         });
         async move { Ok(future.await?.boxed()) }.boxed()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn catalog_exposes_only_chat_models_with_server_authored_capabilities_and_prices() {
+        let catalog = parse_catalog(&json!({
+            "models": [
+                {
+                    "id": "claude-opus-5-5",
+                    "kind": "chat",
+                    "max_output_tokens": 64000,
+                    "credits_per_mtok_input": 5600,
+                    "credits_per_mtok_output": 28000,
+                    "capabilities": {
+                        "display_name": "Claude Opus 5.5",
+                        "context_window": 1000000,
+                        "tools": true,
+                        "images": true,
+                        "prompt_caching": true,
+                        "reasoning_mode": "adaptive",
+                        "forced_tool_choice": false
+                    }
+                },
+                { "id": "claude-opus-5-5", "kind": "chat" },
+                { "id": "typesafe-ai/jev", "kind": "evaluation" },
+                { "id": "flux-2", "kind": "image" }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(catalog.len(), 1);
+        let opus = &catalog[0];
+        assert_eq!(opus.available.name, "claude-opus-5-5");
+        assert_eq!(opus.available.max_tokens, 1_000_000);
+        assert_eq!(opus.available.max_output_tokens, Some(64_000));
+        assert!(opus.available.capabilities.images);
+        assert!(opus.available.capabilities.prompt_caching);
+        assert!(!opus.forced_tool_choice);
+        assert_eq!(
+            opus.cost,
+            Some(LanguageModelCostInfo::CreditTokenCost {
+                input_credits_per_1m: 5_600,
+                output_credits_per_1m: 28_000,
+            })
+        );
+        assert!(matches!(
+            available_model_to_anthropic_model(opus).mode,
+            AnthropicModelMode::AdaptiveThinking
+        ));
+    }
+
+    #[test]
+    fn malformed_catalog_is_rejected_and_invalid_rows_are_skipped() {
+        assert!(parse_catalog(&json!({})).is_err());
+        let catalog = parse_catalog(&json!({
+            "models": [
+                { "kind": "chat" },
+                { "id": "", "kind": "chat" },
+                { "id": "gpt-6-sol", "kind": "chat", "capabilities": {} }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].available.max_tokens, 200_000);
+        assert!(catalog[0].available.capabilities.tools);
+        assert_eq!(catalog[0].cost, None);
     }
 }

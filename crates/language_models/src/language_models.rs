@@ -306,6 +306,59 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_managed_provider_uses_live_enabled_catalog(cx: &mut TestAppContext) {
+        let (client, credentials_provider) = cx.update(init_test);
+        client.http_client().as_fake().replace_handler(|_, request| async move {
+            assert_eq!(request.uri().to_string(), "https://api.fantaisa.net/v1/models");
+            assert_eq!(
+                request
+                    .headers()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok()),
+                Some("Bearer fnt_live_account_token")
+            );
+            Ok(http_client::Response::builder().status(200).body(
+                serde_json::json!({ "models": [
+                    { "id": "claude-sonnet-5", "kind": "chat", "capabilities": { "display_name": "Claude Sonnet 5", "tools": true } },
+                    { "id": "gpt-6-sol", "kind": "chat", "credits_per_mtok_input": 280, "credits_per_mtok_output": 1400,
+                      "capabilities": { "display_name": "GPT-6 Sol", "context_window": 1050000, "tools": true, "images": true } },
+                    { "id": "jev-evaluate", "kind": "evaluate" },
+                    { "id": "flux", "kind": "image" }
+                ] }).to_string().into(),
+            )?)
+        });
+        let provider = cx.update(|cx| {
+            AnthropicCompatibleLanguageModelProvider::new(
+                "Fanta".into(),
+                client.clone(),
+                credentials_provider,
+                cx,
+            )
+        });
+        client.override_authenticate(|_| {
+            gpui::Task::ready(Ok(client::Credentials {
+                user_id: 1,
+                access_token: "fnt_live_account_token".into(),
+            }))
+        });
+        client.sign_in(false, &cx.to_async()).await.unwrap();
+        cx.update(|cx| provider.authenticate(cx)).await.unwrap();
+        cx.run_until_parked();
+        let models = cx.update(|cx| provider.provided_models(cx));
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id().0.to_string())
+                .collect::<Vec<_>>(),
+            ["claude-sonnet-5", "gpt-6-sol"]
+        );
+        assert_eq!(models[1].name().0.as_ref(), "GPT-6 Sol");
+        assert_eq!(models[1].max_token_count(), 1_050_000);
+        assert!(models[1].supports_images());
+        assert!(models[1].model_cost_info().is_some());
+    }
+
+    #[gpui::test]
     async fn test_managed_provider_uses_account_token_for_streaming(cx: &mut TestAppContext) {
         let (client, credentials_provider) = cx.update(init_test);
         let provider = cx.update(|cx| {
