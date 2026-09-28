@@ -37,3 +37,5 @@ for a particular model version. They remain trademarks of their owners.
 | `meta.png` | [Meta GitHub organization](https://github.com/facebook) avatar |
 | `xai.png` | [xAI GitHub organization](https://github.com/xai-org) avatar |
 | `kling.png` | [Kling AI Research GitHub organization](https://github.com/KlingAIResearch) avatar (JPEG content) |
+| `openai.svg` | OpenAI provider glyph from the vendored Zed UI asset bundle (`ai_open_ai.svg`), licensed with Fanta GPUI |
+| `quiverai.png` | [QuiverAI verified GitHub organization](https://github.com/quiverai) avatar, identifying the creator of Arrow SVG models |

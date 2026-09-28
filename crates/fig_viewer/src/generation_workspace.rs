@@ -69,6 +69,8 @@ const GOOGLE_LOGO: &[u8] = include_bytes!("../assets/generation/logos/google.png
 const META_LOGO: &[u8] = include_bytes!("../assets/generation/logos/meta.png");
 const XAI_LOGO: &[u8] = include_bytes!("../assets/generation/logos/xai.png");
 const KLING_LOGO: &[u8] = include_bytes!("../assets/generation/logos/kling.png");
+const OPENAI_LOGO: &[u8] = include_bytes!("../assets/generation/logos/openai.svg");
+const QUIVER_LOGO: &[u8] = include_bytes!("../assets/generation/logos/quiverai.png");
 
 actions!(
     fanta,
@@ -94,6 +96,7 @@ impl GenerationMode {
         Self::Design,
         Self::Masks,
     ];
+    const CREATION_MODES: [Self; 4] = [Self::Image, Self::Video, Self::Audio, Self::Vector];
 
     fn label(self) -> &'static str {
         match self {
@@ -171,6 +174,8 @@ struct GenerationModel {
     id: String,
     kind: String,
     #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
     credits_per_output: Option<f64>,
     #[serde(default)]
     max_output_tokens: Option<u32>,
@@ -182,13 +187,43 @@ struct GenerationModel {
 
 impl GenerationModel {
     fn label(&self) -> String {
+        if let Some(name) = self
+            .display_name
+            .as_deref()
+            .or_else(|| self.capabilities["display_name"].as_str())
+            .filter(|name| !name.trim().is_empty())
+        {
+            return name.to_owned();
+        }
         match self.id.as_str() {
             "claude-sonnet-5" => "Claude Sonnet 5".into(),
             "claude-haiku-4-5" => "Claude Haiku 4.5".into(),
             "claude-opus-4-8" => "Claude Opus 4.8".into(),
             "claude-fable-5" => "Claude Fable 5".into(),
-            _ => self.id.clone(),
+            _ => self
+                .id
+                .split('-')
+                .map(|part| match part {
+                    "svg" => "SVG".to_owned(),
+                    "gpt" => "GPT".to_owned(),
+                    "i2v" => "I2V".to_owned(),
+                    "t2v" => "T2V".to_owned(),
+                    "ai" => "AI".to_owned(),
+                    _ => {
+                        let mut chars = part.chars();
+                        chars
+                            .next()
+                            .map(|first| first.to_uppercase().collect::<String>() + chars.as_str())
+                            .unwrap_or_default()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
         }
+    }
+
+    fn gateway(&self) -> bool {
+        self.capabilities["gateway"].is_object()
     }
 
     fn sizes(&self) -> Vec<String> {
@@ -254,7 +289,7 @@ impl GenerationModel {
         !self.id.starts_with("fanta-")
             && !self.recipes().is_empty()
             && (self.capabilities["hosted"] == true
-                || self.capabilities["gateway"].is_object()
+                || self.gateway()
                 || (self.kind == "image" && self.id == "flux-schnell")
                 || (self.kind == "chat"
                     && matches!(
@@ -933,41 +968,66 @@ impl GenerationWorkspace {
         recipe: GenerationRecipe,
         prompt_units: usize,
     ) -> ScreenModel {
-        let gateway = &model.capabilities["gateway"];
-        let description = if gateway.is_object()
+        let mut description = match recipe {
+            GenerationRecipe::TextImage => "Create an image from text",
+            GenerationRecipe::TextVideo => "Generate a scene from text",
+            GenerationRecipe::ImageVideo => "Animate a start frame",
+            GenerationRecipe::Speech => "Generate spoken audio",
+            GenerationRecipe::Music => "Compose music from a prompt",
+            GenerationRecipe::PromptSvg => "Create editable SVG artwork",
+            GenerationRecipe::ImageSvg => "Trace an image to SVG",
+            GenerationRecipe::Vectorize => "Convert an image to vectors",
+        }
+        .to_owned();
+        if model.gateway()
             && matches!(
                 recipe,
                 GenerationRecipe::TextVideo | GenerationRecipe::ImageVideo
-            ) {
-            let duration = gateway["duration"].as_u64().unwrap_or(0);
-            let resolution = gateway["resolution"]
-                .as_str()
-                .or_else(|| gateway["aspectRatio"].as_str())
-                .unwrap_or("model resolution");
-            format!("{duration}s · {resolution} · silent output")
-        } else {
-            match recipe {
-                GenerationRecipe::TextImage => "Create an image from text",
-                GenerationRecipe::TextVideo => "Generate a scene from text",
-                GenerationRecipe::ImageVideo => "Animate a start frame",
-                GenerationRecipe::Speech => "Generate spoken audio",
-                GenerationRecipe::Music => "Compose music from a prompt",
-                GenerationRecipe::PromptSvg => "Create editable SVG artwork",
-                GenerationRecipe::ImageSvg => "Trace an image to SVG",
-                GenerationRecipe::Vectorize => "Convert an image to vectors",
+            )
+        {
+            let selected = |key: &str| {
+                self.screen_options
+                    .get(&(model.id.clone(), key.into()))
+                    .cloned()
+                    .or_else(|| option_value(&model.capabilities["controls"][key]["default"]))
+            };
+            let mut details = Vec::new();
+            if let Some(duration) = selected("duration")
+                .or_else(|| option_value(&model.capabilities["gateway"]["duration"]))
+            {
+                details.push(format!("{duration}s"));
             }
-            .to_owned()
-        };
+            if let Some(resolution) = selected("resolution")
+                .or_else(|| selected("aspect_ratio"))
+                .or_else(|| {
+                    model.capabilities["gateway"]["resolution"]
+                        .as_str()
+                        .map(str::to_owned)
+                })
+            {
+                details.push(resolution);
+            }
+            if let Some(audio) = selected("generate_audio") {
+                details.push(
+                    if audio == "true" {
+                        "With audio"
+                    } else {
+                        "Silent"
+                    }
+                    .into(),
+                );
+            }
+            if !details.is_empty() {
+                description.push_str(" · ");
+                description.push_str(&details.join(" · "));
+            }
+        }
         let mut screen = ScreenModel::new(&model.id, model.label(), recipe)
             .max_prompt_chars(Some(
                 model.capabilities["prompt_limit"]
                     .as_u64()
                     .and_then(|limit| usize::try_from(limit).ok())
-                    .unwrap_or(if model.capabilities["hosted"] == true {
-                        10_000
-                    } else {
-                        1_200
-                    }),
+                    .unwrap_or(1_200),
             ))
             .description(description)
             .supports_prompt(recipe != GenerationRecipe::ImageSvg)
@@ -987,19 +1047,23 @@ impl GenerationWorkspace {
                         .is_some_and(|field| !field.is_empty()),
             )
             .option_groups(self.screen_option_groups(model, recipe));
-        let provider = model.capabilities["provider"]
-            .as_str()
+        let provider_hint = model.capabilities["provider"].as_str();
+        let (inferred_provider, logo) = provider_mark(&model.id, provider_hint);
+        let provider = provider_hint
             .filter(|provider| !matches!(*provider, "Replicate" | "AI Gateway"))
             .map(str::to_owned)
-            .unwrap_or_else(|| provider_mark(&model.id).0.to_owned());
+            .unwrap_or_else(|| inferred_provider.to_owned());
         screen = screen.provider(provider);
-        let (_, logo) = provider_mark(&model.id);
         if let Some((key, format, bytes)) = logo {
             screen = screen.logo(key, Arc::new(Image::from_bytes(format, bytes.to_vec())));
         }
         let unit = model.pricing["unit"].as_str().unwrap_or("output");
         if unit == "output" {
-            if let Some(credits) = model.credits_per_output {
+            if let Some(credits) = model
+                .credits_per_output
+                .or_else(|| model.pricing["estimated_credits"].as_f64())
+            {
+                let credits = self.selected_credit_rate(model, credits);
                 let outputs = self
                     .screen_options
                     .get(&(model.id.clone(), "num_outputs".into()))
@@ -1017,6 +1081,7 @@ impl GenerationWorkspace {
                 }
             }
         } else if let Some(rate) = model.pricing["credits_per_unit"].as_f64() {
+            let rate = self.selected_credit_rate(model, rate);
             match unit {
                 "second" => {
                     let selected = |key: &str| {
@@ -1064,6 +1129,45 @@ impl GenerationWorkspace {
         screen
     }
 
+    fn selected_credit_rate(&self, model: &GenerationModel, default_rate: f64) -> f64 {
+        let Some(fields) = model.pricing["variant_fields"].as_array() else {
+            return default_rate;
+        };
+        let Some(rates) = model.pricing["variant_credits_per_unit"].as_object() else {
+            return default_rate;
+        };
+        let mut values = Vec::with_capacity(fields.len());
+        for field in fields {
+            let Some(field) = field.as_str() else {
+                return default_rate;
+            };
+            let control = model.capabilities["controls"]
+                .as_object()
+                .and_then(|controls| {
+                    controls.iter().find(|(key, control)| {
+                        key.as_str() == field || control["request_field"].as_str() == Some(field)
+                    })
+                });
+            let selected = control.and_then(|(key, control)| {
+                self.screen_options
+                    .get(&(model.id.clone(), key.clone()))
+                    .cloned()
+                    .or_else(|| option_value(&control["default"]))
+            });
+            let selected =
+                selected.or_else(|| option_value(&model.capabilities["fixed_input"][field]));
+            let Some(selected) = selected else {
+                return default_rate;
+            };
+            values.push(selected);
+        }
+        rates
+            .get(&values.join("|"))
+            .and_then(Value::as_f64)
+            .filter(|rate| rate.is_finite() && *rate >= 0.)
+            .unwrap_or(default_rate)
+    }
+
     fn screen_option_groups(
         &self,
         model: &GenerationModel,
@@ -1071,6 +1175,8 @@ impl GenerationWorkspace {
     ) -> Vec<GenerationOptionGroup> {
         let mut groups = Vec::new();
         if let Some(controls) = model.capabilities["controls"].as_object() {
+            let mut controls = controls.iter().collect::<Vec<_>>();
+            controls.sort_by_key(|(key, _)| (control_priority(key), *key));
             for (key, control) in controls {
                 let constrained_value = (self.end_frame.is_some()
                     && recipe == GenerationRecipe::ImageVideo)
@@ -1085,7 +1191,10 @@ impl GenerationWorkspace {
                         if constrained_value.is_some_and(|required| value != required) {
                             return None;
                         }
-                        Some(GenerationChoice::new(value.clone(), value))
+                        Some(GenerationChoice::new(
+                            value.clone(),
+                            option_choice_label(key, &value),
+                        ))
                     })
                     .collect::<Vec<_>>();
                 if choices.is_empty() {
@@ -1099,12 +1208,19 @@ impl GenerationWorkspace {
                             .cloned()
                             .or_else(|| option_value(&control["default"]))
                     })
+                    .filter(|selected| {
+                        choices
+                            .iter()
+                            .any(|choice| choice.value.as_ref() == selected.as_str())
+                    })
                     .unwrap_or_else(|| choices[0].value.to_string());
                 let group =
                     GenerationOptionGroup::new(key.as_str(), option_label(key), choices, selected);
-                groups.push(group.advanced(matches!(key.as_str(), "fps" | "seed" | "speed")));
+                groups.push(group.advanced(control_priority(key) > 0));
             }
-            return groups;
+            if !groups.is_empty() {
+                return groups;
+            }
         }
         if model.capabilities["gateway"].is_object() {
             if recipe == GenerationRecipe::TextImage {
@@ -1410,13 +1526,19 @@ impl GenerationWorkspace {
             if Some(record.id.as_str()) == active_id {
                 continue;
             }
+            let model_label = self
+                .models
+                .iter()
+                .find(|model| model.id == record.model)
+                .map(GenerationModel::label)
+                .unwrap_or_else(|| record.model.clone());
             let count = record.outputs.len().max(1);
             for index in 0..count {
                 let id = format!("gen:{}:{index}", record.id);
                 let mut entry = GenerationOutput::new(
                     id.clone(),
                     record.kind,
-                    format!("{} · {}", record.model, record.created_at),
+                    format!("{} · {}", model_label, record.created_at),
                     record.model.clone(),
                     record.status,
                 )
@@ -4288,7 +4410,7 @@ impl Render for GenerationWorkspace {
                         #[cfg(not(feature = "mac_app_store"))]
                         cx.open_url(&client::zed_urls::account_url(cx));
                     }))))
-            .child(h_flex().flex_shrink_0().gap_1().flex_wrap().children(GenerationMode::ALL.into_iter().map(|mode| {
+            .child(h_flex().flex_shrink_0().gap_1().flex_wrap().children(GenerationMode::CREATION_MODES.into_iter().map(|mode| {
                 Button::new(("generation-mode", mode as usize), mode.label()).toggle_state(self.mode == mode)
                     .on_click(cx.listener(move |this, _, window, cx| this.set_mode(mode, window, cx)))
             })))
@@ -4548,7 +4670,16 @@ async fn fetch_catalog(
         executor,
     )
     .await?;
-    serde_json::from_value(value["models"].clone()).context("The model catalog could not be read")
+    let mut models: Vec<GenerationModel> = serde_json::from_value(value["models"].clone())
+        .context("The model catalog could not be read")?;
+    models.sort_by_key(|model| {
+        (
+            !model.gateway(),
+            model.capabilities["hosted"] != true,
+            model.label().to_lowercase(),
+        )
+    });
+    Ok(models)
 }
 
 async fn api_json(
@@ -4795,63 +4926,83 @@ type ProviderMark = (
     Option<(&'static str, ImageFormat, &'static [u8])>,
 );
 
-fn provider_mark(id: &str) -> ProviderMark {
-    if id.contains("recraft") {
+fn provider_mark(id: &str, provider: Option<&str>) -> ProviderMark {
+    let provider_is =
+        |name: &str| provider.is_some_and(|provider| provider.eq_ignore_ascii_case(name));
+    if id.contains("recraft") || provider_is("Recraft") {
         ("Recraft", Some(("recraft", ImageFormat::Png, RECRAFT_LOGO)))
-    } else if id.contains("seedream") || id.contains("seedance") {
+    } else if id.contains("arrow") || id.contains("quiver") || provider_is("QuiverAI") {
+        (
+            "QuiverAI",
+            Some(("quiverai", ImageFormat::Png, QUIVER_LOGO)),
+        )
+    } else if id.contains("seedream") || id.contains("seedance") || provider_is("ByteDance") {
         (
             "ByteDance Seed",
             Some(("bytedance-seed", ImageFormat::Png, BYTEDANCE_LOGO)),
         )
-    } else if id.contains("minimax") || id.contains("speech-2.8") {
+    } else if id.contains("minimax") || id.contains("speech-2.8") || provider_is("MiniMax") {
         (
             "MiniMax",
             Some(("minimax", ImageFormat::Jpeg, MINIMAX_LOGO)),
         )
-    } else if id.contains("eleven") {
+    } else if id.contains("eleven") || provider_is("ElevenLabs") {
         (
             "ElevenLabs",
             Some(("elevenlabs", ImageFormat::Png, ELEVENLABS_LOGO)),
         )
-    } else if id.contains("veo") {
+    } else if id.contains("veo") || provider_is("Google") {
         ("Google", Some(("google", ImageFormat::Png, GOOGLE_LOGO)))
-    } else if id.contains("kling") {
+    } else if id.contains("kling") || provider_is("Kling") || provider_is("Kling AI") {
         ("Kling AI", Some(("kling", ImageFormat::Jpeg, KLING_LOGO)))
-    } else if id.contains("muse") {
+    } else if id.contains("muse") || provider_is("Meta") {
         ("Meta", Some(("meta", ImageFormat::Png, META_LOGO)))
-    } else if id.contains("grok") {
+    } else if id.contains("grok") || provider_is("xAI") {
         ("xAI", Some(("xai", ImageFormat::Png, XAI_LOGO)))
-    } else if id.contains("qwen") || id == "fanta-image-1" {
+    } else if id.starts_with("gpt-") || id.starts_with("sora-") || provider_is("OpenAI") {
+        ("OpenAI", Some(("openai", ImageFormat::Svg, OPENAI_LOGO)))
+    } else if id.contains("qwen") || id == "fanta-image-1" || provider_is("Qwen") {
         ("Qwen", Some(("qwen", ImageFormat::Png, QWEN_LOGO)))
-    } else if id.contains("z-image") || id == "fanta-image-fast-1" {
+    } else if id.contains("z-image") || id == "fanta-image-fast-1" || provider_is("Tongyi-MAI") {
         (
             "Tongyi-MAI",
             Some(("tongyi", ImageFormat::Jpeg, TONGYI_LOGO)),
         )
-    } else if id.contains("flux") || id.contains("black-forest") || id == "fanta-vectorize-1" {
+    } else if id.contains("flux")
+        || id.contains("black-forest")
+        || id == "fanta-vectorize-1"
+        || provider_is("Black Forest Labs")
+    {
         (
             "Black Forest Labs",
             Some(("bfl", ImageFormat::Png, BFL_LOGO)),
         )
-    } else if id.contains("ltx") || id == "fanta-video-1" {
+    } else if id.contains("ltx") || id == "fanta-video-1" || provider_is("Lightricks") {
         ("Lightricks", Some(("ltx", ImageFormat::Svg, LTX_LOGO)))
-    } else if id.contains("wan") || id == "fanta-video-hd-1" || id == "fanta-animate-1" {
+    } else if id.contains("wan")
+        || id == "fanta-video-hd-1"
+        || id == "fanta-animate-1"
+        || provider_is("Wan")
+    {
         ("Wan", Some(("wan", ImageFormat::Png, WAN_LOGO)))
-    } else if id.contains("chatterbox") || id.contains("fanta-voice-") && !id.contains("fast") {
+    } else if id.contains("chatterbox")
+        || id.contains("fanta-voice-") && !id.contains("fast")
+        || provider_is("Resemble AI")
+    {
         (
             "Resemble AI",
             Some(("resemble", ImageFormat::Png, RESEMBLE_LOGO)),
         )
-    } else if id.contains("kokoro") || id == "fanta-voice-fast-1" {
+    } else if id.contains("kokoro") || id == "fanta-voice-fast-1" || provider_is("Hexgrad") {
         ("Hexgrad", Some(("hexgrad", ImageFormat::Png, HEXGRAD_LOGO)))
-    } else if id.contains("ace-step") || id == "fanta-music-1" {
+    } else if id.contains("ace-step") || id == "fanta-music-1" || provider_is("ACE-Step") {
         ("ACE-Step", Some(("ace", ImageFormat::Jpeg, ACE_LOGO)))
-    } else if id.contains("starvector") || id == "fanta-svg-1" {
+    } else if id.contains("starvector") || id == "fanta-svg-1" || provider_is("StarVector") {
         (
             "StarVector",
             Some(("starvector", ImageFormat::Jpeg, STARVECTOR_LOGO)),
         )
-    } else if id.starts_with("claude-") {
+    } else if id.starts_with("claude-") || provider_is("Anthropic") {
         ("Anthropic", Some(("claude", ImageFormat::Png, CLAUDE_LOGO)))
     } else {
         ("AI provider", None)
@@ -4867,6 +5018,20 @@ fn option_value(value: &Value) -> Option<String> {
 }
 
 fn option_label(key: &str) -> String {
+    match key {
+        "aspect_ratio" => return "Aspect ratio".into(),
+        "audio_format" | "output_format" => return "Output format".into(),
+        "camera_motion" => return "Camera motion".into(),
+        "duration" | "duration_s" | "music_length_ms" => return "Duration".into(),
+        "fps" => return "Frame rate".into(),
+        "size" | "canvas" => return "Canvas size".into(),
+        "voice" | "voice_id" => return "Voice".into(),
+        "speed" => return "Pace".into(),
+        "generate_audio" => return "Generate audio".into(),
+        "force_instrumental" => return "Instrumental".into(),
+        "enable_prompt_expansion" => return "Prompt expansion".into(),
+        _ => {}
+    }
     let mut words = key.split('_');
     let first = words.next().unwrap_or(key);
     let mut label = String::new();
@@ -4880,6 +5045,40 @@ fn option_label(key: &str) -> String {
         label.push_str(word);
     }
     label
+}
+
+fn control_priority(key: &str) -> u8 {
+    match key {
+        "size" | "canvas" | "aspect_ratio" | "resolution" | "duration" | "duration_s"
+        | "music_length_ms" | "voice" | "voice_id" => 0,
+        _ => 1,
+    }
+}
+
+fn option_choice_label(key: &str, value: &str) -> String {
+    if matches!(value, "true" | "false") {
+        return if value == "true" { "On" } else { "Off" }.into();
+    }
+    if matches!(key, "duration" | "duration_s") {
+        return format!("{value} s");
+    }
+    if key == "music_length_ms" {
+        if let Ok(milliseconds) = value.parse::<u64>() {
+            return format!("{} s", milliseconds / 1000);
+        }
+    }
+    if key == "aspect_ratio" {
+        return match value {
+            "16:9" => "Landscape · 16:9".into(),
+            "9:16" => "Portrait · 9:16".into(),
+            "1:1" => "Square · 1:1".into(),
+            _ => value.to_owned(),
+        };
+    }
+    if value.contains('_') {
+        return value.replace('_', " ");
+    }
+    value.to_owned()
 }
 
 fn generation_templates() -> Vec<GenerationTemplate> {
@@ -4908,16 +5107,12 @@ fn build_screen_request(
     let prompt_limit = model.capabilities["prompt_limit"]
         .as_u64()
         .and_then(|limit| usize::try_from(limit).ok())
-        .unwrap_or(if model.capabilities["hosted"] == true {
-            10_000
-        } else {
-            1_200
-        });
+        .unwrap_or(1_200);
     ensure!(
         submission.prompt.encode_utf16().count() <= prompt_limit,
         "Keep the prompt under {prompt_limit} characters."
     );
-    let mut request = json!({ "model": model.id });
+    let mut request = json!({ "model": model.id, "kind": model.kind });
     if !submission.prompt.trim().is_empty() {
         request["prompt"] = json!(if submission.recipe == GenerationRecipe::Speech {
             submission.prompt.as_ref()
@@ -4935,34 +5130,43 @@ fn build_screen_request(
     for option in &submission.options {
         let key = option.key.as_ref();
         let value = option.value.as_ref();
-        if key == "canvas" || key == "size" && value.contains('x') {
+        let control = &model.capabilities["controls"][key];
+        if !control.is_object() && (key == "canvas" || key == "size" && value.contains('x')) {
             let (width, height) = parse_size(value)?;
             request["width"] = json!(width);
             request["height"] = json!(height);
             continue;
         }
-        let control = &model.capabilities["controls"][key];
+        if let Some(values) = control["values"].as_array() {
+            ensure!(
+                values
+                    .iter()
+                    .any(|candidate| option_value(candidate).as_deref() == Some(value)),
+                "Choose a valid {}.",
+                option_label(key),
+            );
+        }
         let field = control["request_field"].as_str().unwrap_or(key);
-        let encoded = if value == "true" {
-            json!(true)
-        } else if value == "false" {
-            json!(false)
-        } else if matches!(
-            key,
-            "frames"
-                | "fps"
-                | "steps"
-                | "guidance"
-                | "duration"
-                | "speed"
-                | "music_length_ms"
-                | "num_outputs"
-        ) {
-            json!(
-                value
-                    .parse::<f64>()
-                    .with_context(|| format!("Choose a valid {key}."))?
+        let encoded = if control["default"].is_boolean() || value == "true" || value == "false" {
+            ensure!(matches!(value, "true" | "false"), "Choose a valid {key}.");
+            json!(value == "true")
+        } else if control["default"].is_number()
+            || matches!(
+                key,
+                "frames"
+                    | "fps"
+                    | "steps"
+                    | "guidance"
+                    | "duration"
+                    | "speed"
+                    | "music_length_ms"
+                    | "num_outputs"
             )
+        {
+            let number: Value =
+                serde_json::from_str(value).with_context(|| format!("Choose a valid {key}."))?;
+            ensure!(number.is_number(), "Choose a valid {key}.");
+            number
         } else {
             json!(value)
         };
@@ -7400,6 +7604,7 @@ mod tests {
         GenerationModel {
             id: format!("fanta-{kind}-1"),
             kind: kind.into(),
+            display_name: None,
             credits_per_output: None,
             max_output_tokens: None,
             capabilities: json!({"operations":["inpaint"],"steps":{"min":10,"max":50}}),
@@ -7451,6 +7656,124 @@ mod tests {
         model.id = "fanta-image-1".into();
         model.capabilities = json!({"gateway":{"duration":4}});
         assert!(!model.hosted_creation());
+    }
+
+    #[gpui::test]
+    fn generation_controls_follow_model_capabilities(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = visual_workspace(GenerationMode::Video, cx);
+        let mut model = model("video");
+        model.id = "wan-3-video".into();
+        model.display_name = Some("Wan 3 Video".into());
+        model.capabilities = json!({
+            "gateway": {"model": "wan/wan-3"},
+            "operations": ["text_to_video", "image_to_video"],
+            "controls": {
+                "duration": {"values": [4, 8], "default": 4, "request_field": "duration", "location": "input"},
+                "resolution": {"values": ["720p", "1080p"], "default": "720p", "request_field": "resolution", "location": "input"},
+                "generate_audio": {"values": [true, false], "default": true, "request_field": "generate_audio", "location": "input"},
+                "camera_motion": {"values": ["static", "dolly_in"], "default": "static", "request_field": "camera_motion", "location": "input"}
+            }
+        });
+        let groups = view.read_with(cx, |view, _| {
+            view.screen_option_groups(&model, GenerationRecipe::ImageVideo)
+        });
+        assert_eq!(model.label(), "Wan 3 Video");
+        assert!(model.hosted_creation());
+        assert_eq!(groups.len(), 4);
+        assert_eq!(groups[0].key.as_ref(), "duration");
+        assert_eq!(groups[0].choices[0].label.as_ref(), "4 s");
+        assert!(!groups[0].advanced);
+        assert_eq!(groups[1].key.as_ref(), "resolution");
+        assert!(!groups[1].advanced);
+        assert!(
+            groups
+                .iter()
+                .find(|group| group.key == "camera_motion")
+                .expect("camera motion")
+                .advanced
+        );
+        assert!(
+            groups
+                .iter()
+                .find(|group| group.key == "generate_audio")
+                .expect("audio switch")
+                .advanced
+        );
+    }
+
+    #[test]
+    fn gateway_control_values_preserve_provider_input_types() {
+        let mut model = model("image");
+        model.id = "gateway-image".into();
+        model.capabilities = json!({
+            "gateway": {"model": "example/image"},
+            "operations": ["text_to_image"],
+            "controls": {
+                "size": {"values": ["1024x1024", "1536x1024"], "default": "1024x1024", "request_field": "size", "location": "input"},
+                "quality": {"values": [1, 2], "default": 1, "request_field": "quality", "location": "input"},
+                "transparent": {"values": [true, false], "default": false, "request_field": "transparent", "location": "input"}
+            }
+        });
+        let mut submission = screen_submission(&model, GenerationRecipe::TextImage, "A fox icon");
+        for (key, value) in [
+            ("size", "1536x1024"),
+            ("quality", "2"),
+            ("transparent", "true"),
+        ] {
+            submission
+                .options
+                .push(fanta_gpui::generation::GenerationOptionSelection {
+                    key: key.into(),
+                    value: value.into(),
+                });
+        }
+        let request = build_screen_request(&model, &submission, None, None, None)
+            .expect("valid catalog controls");
+        assert_eq!(request["kind"], "image");
+        assert_eq!(request["input"]["size"], "1536x1024");
+        assert_eq!(request["input"]["quality"], 2);
+        assert_eq!(request["input"]["transparent"], true);
+        assert!(request.get("width").is_none());
+
+        submission.options[1].value = "3".into();
+        assert!(build_screen_request(&model, &submission, None, None, None).is_err());
+    }
+
+    #[gpui::test]
+    fn generation_cost_hint_tracks_gateway_paid_variants(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = visual_workspace(GenerationMode::Video, cx);
+        let mut model = model("video");
+        model.id = "gateway-kling-video".into();
+        model.capabilities = json!({
+            "gateway": {"model": "kling/video"},
+            "operations": ["text_to_video"],
+            "controls": {
+                "duration": {"values": [5, 10], "default": 5, "request_field": "duration", "location": "input"},
+                "mode": {"values": ["std", "pro"], "default": "std", "request_field": "mode", "location": "input"},
+                "generate_audio": {"values": [true, false], "default": false, "request_field": "generateAudio", "location": "input"}
+            }
+        });
+        model.pricing = json!({
+            "unit": "second",
+            "credits_per_unit": 23.52,
+            "variant_fields": ["mode", "generateAudio"],
+            "variant_credits_per_unit": {
+                "std|false": 23.52,
+                "std|true": 35.28,
+                "pro|false": 31.36,
+                "pro|true": 47.04
+            }
+        });
+        view.update_in(cx, |view, _, _| {
+            assert_eq!(view.selected_credit_rate(&model, 23.52), 23.52);
+            view.screen_options
+                .insert((model.id.clone(), "mode".into()), "pro".into());
+            view.screen_options
+                .insert((model.id.clone(), "generate_audio".into()), "true".into());
+            assert_eq!(view.selected_credit_rate(&model, 23.52), 47.04);
+            let screen = view.screen_model(&model, GenerationRecipe::TextVideo, 0);
+            assert_eq!(screen.credit_hint.as_deref(), Some("Est. 236 credits · 5s"));
+        });
     }
 
     #[test]
