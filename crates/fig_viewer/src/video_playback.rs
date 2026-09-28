@@ -574,11 +574,10 @@ impl VideoPlaybackView {
                                     });
                                 }
                             });
-                            let view = weak.clone();
                             window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
                                 if phase == DispatchPhase::Bubble
                                     && event.button == MouseButton::Left
-                                    && let Some(view) = view.upgrade()
+                                    && let Some(view) = weak.upgrade()
                                 {
                                     view.update(cx, |this, cx| {
                                         if this.scrubbing {

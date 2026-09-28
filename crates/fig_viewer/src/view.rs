@@ -3491,6 +3491,10 @@ impl FigView {
             self.is_editable(cx),
             "Save or discard source edits before placing an asset."
         );
+        anyhow::ensure!(
+            self.editor_workspace(cx) == EditorWorkspace::Canvas,
+            "Open the canvas before placing a project asset."
+        );
         let (page_index, bytes, kind, name) = {
             let item = self.item.read(cx);
             let document = item.document().context("The project is still loading.")?;
@@ -3563,6 +3567,10 @@ impl FigView {
                             .and_then(|document| document.doc.active_page())
                             == Some(page),
                         "The target page changed while preparing the asset. Choose it again."
+                    );
+                    anyhow::ensure!(
+                        this.editor_workspace(cx) == EditorWorkspace::Canvas,
+                        "Open the canvas before placing a project asset."
                     );
                     let natural = media.dimensions();
                     let mut scale = 1.0_f64;
