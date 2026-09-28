@@ -18,8 +18,8 @@ use fanta_canvas::HitPrecision;
 use fanta_doc::{
     AnimationClip, AnimationClipId, AnimationTrack, AnimationTrackId, AssetId, BoundProp,
     CanvasNode, Doc, Easing, Fill, IndexKey, Interpolation, Keyframe, KeyframeId, MotionEvaluation,
-    MotionProperty, MotionTarget, MotionTransform, NodeData, NodeId, Operation, ResolvedVarValue,
-    Transaction, Viewport,
+    MotionProperty, MotionTarget, MotionTransform, NodeData, NodeId, Operation, ProjectAssetKind,
+    ResolvedVarValue, Transaction, Viewport,
 };
 use fanta_tools::{Button as ToolButton, LogicalKey, ToolEvent};
 use file_icons::FileIcons;
@@ -60,6 +60,7 @@ use crate::document::{
 use crate::editor_session::{
     EditorMode, EditorModeTabs, EditorSession, EditorWorkspace, EditorWorkspaceTabs,
 };
+use crate::generation_media::{self, PreparedCanvasAsset};
 use crate::motion_edit::{
     MotionKeyframeDragSession, delete_keyframe_operation, rename_clip_operation,
     set_clip_duration_operation, set_keyframe_easing_operation,
@@ -83,6 +84,8 @@ use crate::variables_workspace::FantaVariablesWorkspace;
 
 #[cfg(target_os = "macos")]
 use crate::canvas::{CanvasVideoFillFrame, CanvasVideoFrame, GpuCanvas};
+#[cfg(target_os = "macos")]
+use crate::generation_workspace::AudioPlaybackView;
 #[cfg(target_os = "macos")]
 use crate::video_playback::VideoPlaybackView;
 
@@ -339,6 +342,8 @@ pub struct FigView {
     #[cfg(target_os = "macos")]
     canvas_video: Option<CanvasVideoSession>,
     #[cfg(target_os = "macos")]
+    canvas_audio: Option<CanvasAudioSession>,
+    #[cfg(target_os = "macos")]
     canvas_video_fills: HashMap<AssetId, CanvasVideoFillSession>,
     #[cfg(target_os = "macos")]
     canvas_video_generation: u64,
@@ -422,6 +427,24 @@ struct CanvasVideoSession {
     audio: (bool, u32),
     bytes: Option<std::sync::Arc<[u8]>>,
     trim: Option<CanvasVideoTrim>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CanvasAudioSource {
+    scene: u64,
+    node: NodeId,
+    asset: AssetId,
+    bytes_identity: Option<(usize, usize)>,
+    time_range_us: [i64; 2],
+    muted: bool,
+    volume_bits: u32,
+}
+
+#[cfg(target_os = "macos")]
+struct CanvasAudioSession {
+    source: CanvasAudioSource,
+    playback: Entity<AudioPlaybackView>,
 }
 
 #[cfg(target_os = "macos")]
@@ -691,6 +714,8 @@ impl FigView {
             gpu_canvas: None,
             #[cfg(target_os = "macos")]
             canvas_video: None,
+            #[cfg(target_os = "macos")]
+            canvas_audio: None,
             #[cfg(target_os = "macos")]
             canvas_video_fills: HashMap::new(),
             #[cfg(target_os = "macos")]
@@ -3456,6 +3481,195 @@ impl FigView {
         .detach_and_log_err(cx);
     }
 
+    pub(crate) fn place_project_asset(
+        &mut self,
+        asset: AssetId,
+        page: NodeId,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            self.is_editable(cx),
+            "Save or discard source edits before placing an asset."
+        );
+        let (page_index, bytes, kind, name) = {
+            let item = self.item.read(cx);
+            let document = item.document().context("The project is still loading.")?;
+            let page_index = document
+                .pages
+                .iter()
+                .position(|candidate| candidate.root == Some(page) && !candidate.hidden)
+                .context("Choose an available page for this asset.")?;
+            let bytes = document
+                .raw_assets
+                .get(&asset)
+                .context("This project asset is no longer available.")?;
+            let kind = document
+                .doc
+                .asset_library
+                .get(&asset)
+                .map(|entry| entry.kind)
+                .or_else(|| generation_media::project_asset_kind(bytes))
+                .context("This asset type cannot be placed on the canvas.")?;
+            anyhow::ensure!(
+                generation_media::project_asset_can_place(bytes, kind),
+                "This asset format cannot be placed on the canvas."
+            );
+            let name = document
+                .doc
+                .asset_library
+                .get(&asset)
+                .map(|entry| entry.name.clone())
+                .unwrap_or_else(|| {
+                    match kind {
+                        ProjectAssetKind::Image => "Project image",
+                        ProjectAssetKind::Svg => "Project vector",
+                        ProjectAssetKind::Video => "Project video",
+                        ProjectAssetKind::Audio => "Project audio",
+                    }
+                    .to_owned()
+                });
+            (page_index, Arc::<[u8]>::from(bytes.as_slice()), kind, name)
+        };
+        self.select_page(page_index, cx);
+        anyhow::ensure!(
+            self.item
+                .read(cx)
+                .document()
+                .and_then(|document| document.doc.active_page())
+                == Some(page),
+            "The selected page is unavailable while editing its source."
+        );
+        let viewport = self.viewport.unwrap_or(Viewport {
+            center: [0.0, 0.0],
+            zoom: 1.0,
+        });
+        let visible = self
+            .container_bounds
+            .map(bounds_size)
+            .map(|(width, height)| [width / viewport.zoom, height / viewport.zoom])
+            .unwrap_or([1024.0, 768.0]);
+        let preparation = cx.background_spawn(async move {
+            generation_media::prepare_canvas_asset(kind, bytes).await
+        });
+        cx.spawn(async move |this, cx| {
+            let prepared = preparation.await;
+            this.update(cx, |this, cx| {
+                let result: Result<()> = (|| {
+                    let media = prepared?;
+                    anyhow::ensure!(
+                        this.item
+                            .read(cx)
+                            .document()
+                            .and_then(|document| document.doc.active_page())
+                            == Some(page),
+                        "The target page changed while preparing the asset. Choose it again."
+                    );
+                    let natural = media.dimensions();
+                    let mut scale = 1.0_f64;
+                    for axis in 0..2 {
+                        if visible[axis].is_finite() && visible[axis] > 0.0 {
+                            scale = scale.min(visible[axis] * 0.8 / natural[axis]);
+                        }
+                    }
+                    let size = [natural[0] * scale, natural[1] * scale];
+                    let x = viewport.center[0] - size[0] * 0.5;
+                    let y = viewport.center[1] - size[1] * 0.5;
+                    this.item.update(cx, |item, cx| {
+                        anyhow::ensure!(
+                            item.is_editable(),
+                            "Save or discard source edits before placing an asset."
+                        );
+                        item.with_document(cx, |document| {
+                            if !document.raw_assets.contains_key(&asset) {
+                                return (
+                                    Err(anyhow::anyhow!(
+                                        "This project asset was removed while it was loading."
+                                    )),
+                                    DocChange::None,
+                                );
+                            }
+                            let (result, change) = match media {
+                                PreparedCanvasAsset::Image { width, height } => {
+                                    let result = (|| {
+                                        let mut node = crate::structure::image_layer_node(
+                                            &document.doc,
+                                            asset,
+                                            [width, height],
+                                            size,
+                                            None,
+                                            x,
+                                            y,
+                                            None,
+                                        )?;
+                                        node.name = name.clone();
+                                        let id = node.id;
+                                        document.doc.apply(Operation::create_node(node))?;
+                                        document.doc.selection.select_only(id);
+                                        Ok(())
+                                    })();
+                                    let change = if result.is_ok() {
+                                        DocChange::Content
+                                    } else {
+                                        DocChange::None
+                                    };
+                                    (result, change)
+                                }
+                                PreparedCanvasAsset::Svg(artwork) => {
+                                    generation_media::place_svg_named(
+                                        document,
+                                        artwork,
+                                        x,
+                                        y,
+                                        None,
+                                        Some(&name),
+                                        scale,
+                                    )
+                                }
+                                PreparedCanvasAsset::Video(video) => {
+                                    generation_media::place_video_named(
+                                        document,
+                                        video,
+                                        x,
+                                        y,
+                                        None,
+                                        Some(&name),
+                                        Some(size),
+                                    )
+                                }
+                                PreparedCanvasAsset::Audio { duration_us } => {
+                                    generation_media::place_audio(
+                                        document,
+                                        asset,
+                                        duration_us,
+                                        &name,
+                                        x,
+                                        y,
+                                    )
+                                }
+                            };
+                            if result.is_ok() && kind != ProjectAssetKind::Image {
+                                if let Some(id) =
+                                    document.doc.scene.children_of(Some(page)).last().copied()
+                                {
+                                    document.doc.selection.select_only(id);
+                                }
+                            }
+                            (result, change)
+                        })
+                        .context("The project is still loading.")?
+                    })
+                })();
+                if let Err(error) = result {
+                    log::warn!("Placing project asset failed: {error:#}");
+                    show_canvas_notice_deferred(format!("Could not place asset: {error:#}"), cx);
+                }
+            })
+            .log_err();
+        })
+        .detach();
+        Ok(())
+    }
+
     fn place_prepared_images(
         &mut self,
         images: Vec<Result<PreparedImage>>,
@@ -4934,6 +5148,99 @@ impl FigView {
 
 #[cfg(target_os = "macos")]
 impl FigView {
+    fn selected_canvas_audio_source(&self, cx: &App) -> Option<CanvasAudioSource> {
+        let document = self.item.read(cx).document()?;
+        let node = single_selection(&document.doc)?;
+        if !crate::clipboard::node_is_on_active_page(&document.doc, node) {
+            return None;
+        }
+        let NodeData::Audio(audio) = &document.doc.scene.get(node)?.data else {
+            return None;
+        };
+        Some(CanvasAudioSource {
+            scene: document.doc.scene.instance_id(),
+            node,
+            asset: audio.asset,
+            bytes_identity: document
+                .raw_assets
+                .get(&audio.asset)
+                .map(|bytes| (bytes.as_ptr() as usize, bytes.len())),
+            time_range_us: audio.time_range_us,
+            muted: audio.muted,
+            volume_bits: audio.volume.to_bits(),
+        })
+    }
+
+    fn clear_canvas_audio(&mut self, cx: &mut Context<Self>) {
+        if let Some(session) = self.canvas_audio.take() {
+            session
+                .playback
+                .update(cx, |playback, cx| playback.close(cx));
+            cx.notify();
+        }
+    }
+
+    fn sync_canvas_audio(&mut self, window_active: bool, cx: &mut Context<Self>) {
+        if self.canvas_video_removed.get()
+            || self.prototype_player.is_some()
+            || self.editor_workspace(cx) != EditorWorkspace::Canvas
+            || !window_active
+            || !matches!(
+                self.editor_mode(cx),
+                EditorMode::Motion | EditorMode::Prototype
+            )
+        {
+            self.clear_canvas_audio(cx);
+            return;
+        }
+        let source = self.selected_canvas_audio_source(cx);
+        if self.canvas_audio.as_ref().map(|session| session.source) == source {
+            return;
+        }
+        self.clear_canvas_audio(cx);
+        let Some(source) = source else {
+            return;
+        };
+        let (bytes, title) = {
+            let item = self.item.read(cx);
+            let Some(document) = item.document() else {
+                return;
+            };
+            let Some(bytes) = document.raw_assets.get(&source.asset) else {
+                return;
+            };
+            let Some(node) = document.doc.scene.get(source.node) else {
+                return;
+            };
+            (
+                Arc::<[u8]>::from(bytes.as_slice()),
+                SharedString::from(node.name.clone()),
+            )
+        };
+        let playback = cx.new(|_| {
+            AudioPlaybackView::new(bytes, title)
+                .with_levels(f32::from_bits(source.volume_bits), source.muted)
+        });
+        self.canvas_audio = Some(CanvasAudioSession { source, playback });
+        cx.notify();
+    }
+
+    fn render_canvas_audio_controls(&self, cx: &App) -> Option<AnyElement> {
+        let session = self.canvas_audio.as_ref()?;
+        Some(
+            div()
+                .id("canvas-audio-controls")
+                .debug_selector(|| "canvas-audio-controls".to_owned())
+                .w_full()
+                .h(px(190.))
+                .flex_none()
+                .border_t_1()
+                .border_color(cx.theme().colors().border)
+                .child(session.playback.clone())
+                .into_any_element(),
+        )
+    }
+
     fn selected_canvas_video_source(&self, cx: &App) -> Option<(CanvasVideoSource, bool, f32)> {
         let document = self.item.read(cx).document()?;
         let node = single_selection(&document.doc)?;
@@ -5107,6 +5414,10 @@ impl FigView {
         if self.canvas_video_removed.get()
             || self.prototype_player.is_some()
             || self.editor_workspace(cx) != EditorWorkspace::Canvas
+            || !matches!(
+                self.editor_mode(cx),
+                EditorMode::Motion | EditorMode::Prototype
+            )
         {
             self.clear_canvas_video_fills(cx);
             return;
@@ -5143,6 +5454,12 @@ impl FigView {
     }
 
     pub(crate) fn ensure_video_fill_playback(&mut self, asset: AssetId, cx: &mut Context<Self>) {
+        if !matches!(
+            self.editor_mode(cx),
+            EditorMode::Motion | EditorMode::Prototype
+        ) {
+            return;
+        }
         if self.canvas_video_fills.contains_key(&asset) {
             return;
         }
@@ -5232,8 +5549,13 @@ impl FigView {
         if self.canvas_video_removed.get()
             || self.prototype_player.is_some()
             || self.editor_workspace(cx) != EditorWorkspace::Canvas
+            || !matches!(
+                self.editor_mode(cx),
+                EditorMode::Motion | EditorMode::Prototype
+            )
         {
-            self.set_canvas_video_active(false, cx);
+            self.clear_canvas_video(cx);
+            self.clear_canvas_video_fills(cx);
             return;
         }
         let source = self.selected_canvas_video_source(cx);
@@ -5754,6 +6076,12 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
+        if !matches!(
+            self.editor_mode(cx),
+            EditorMode::Motion | EditorMode::Prototype
+        ) {
+            return None;
+        }
         let session = self.canvas_video.as_ref()?;
         let playback = session.playback.clone();
         let mut error = session.error.clone();
@@ -5868,6 +6196,8 @@ impl Render for FigView {
         let editor_mode = self.editor_mode(cx);
         #[cfg(target_os = "macos")]
         self.sync_canvas_video(window.is_window_active(), cx);
+        #[cfg(target_os = "macos")]
+        self.sync_canvas_audio(window.is_window_active(), cx);
         #[cfg(target_os = "macos")]
         self.sync_canvas_video_fills(window, cx);
         #[cfg(feature = "fanta-gpui-ui")]
@@ -6277,6 +6607,16 @@ impl Render for FigView {
                                                     {
                                                         None::<AnyElement>
                                                     }
+                                                })
+                                                .children({
+                                                    #[cfg(target_os = "macos")]
+                                                    {
+                                                        self.render_canvas_audio_controls(cx)
+                                                    }
+                                                    #[cfg(not(target_os = "macos"))]
+                                                    {
+                                                        None::<AnyElement>
+                                                    }
                                                 }),
                                         )
                                         .children(
@@ -6659,11 +6999,23 @@ impl Item for FigView {
     fn deactivated(&mut self, _: &mut Window, _cx: &mut Context<Self>) {
         #[cfg(target_os = "macos")]
         self.set_canvas_video_active(false, _cx);
+        #[cfg(target_os = "macos")]
+        if let Some(session) = self.canvas_audio.as_ref() {
+            session
+                .playback
+                .update(_cx, |playback, cx| playback.pause(cx));
+        }
     }
 
     fn workspace_deactivated(&mut self, _: &mut Window, _cx: &mut Context<Self>) {
         #[cfg(target_os = "macos")]
         self.set_canvas_video_active(false, _cx);
+        #[cfg(target_os = "macos")]
+        if let Some(session) = self.canvas_audio.as_ref() {
+            session
+                .playback
+                .update(_cx, |playback, cx| playback.pause(cx));
+        }
     }
 
     fn on_removed(&self, _cx: &mut Context<Self>) {
@@ -6682,6 +7034,11 @@ impl Item for FigView {
                 if let Some(playback) = &session.playback {
                     playback.update(_cx, |playback, cx| playback.close(cx));
                 }
+            }
+            if let Some(session) = &self.canvas_audio {
+                session
+                    .playback
+                    .update(_cx, |playback, cx| playback.close(cx));
             }
         }
     }
@@ -7039,6 +7396,8 @@ impl Item for FigView {
                 #[cfg(target_os = "macos")]
                 canvas_video: None,
                 #[cfg(target_os = "macos")]
+                canvas_audio: None,
+                #[cfg(target_os = "macos")]
                 canvas_video_fills: HashMap::new(),
                 #[cfg(target_os = "macos")]
                 canvas_video_generation: 0,
@@ -7313,6 +7672,7 @@ mod tests {
                 ((), DocChange::Selection)
             });
         });
+        view.update(cx, |view, cx| view.set_editor_mode(EditorMode::Motion, cx));
         (directory, item, view)
     }
 
@@ -7329,6 +7689,11 @@ mod tests {
         let playback = cx.update(crate::video_playback::fake_playback);
         cx.run_until_parked();
         let window = cx.add_window(|window, cx| FigView::new(item.clone(), project, window, cx));
+        window
+            .update(cx, |view, _, cx| {
+                view.set_editor_mode(EditorMode::Motion, cx)
+            })
+            .expect("set motion mode");
         window
             .update(cx, |_, window, _| window.activate_window())
             .expect("activate trim window");
@@ -7718,7 +8083,9 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[gpui::test]
-    async fn canvas_video_controls_remain_below_the_design_toolbar(cx: &mut TestAppContext) {
+    async fn canvas_video_controls_only_show_in_motion_and_stay_below_toolbar(
+        cx: &mut TestAppContext,
+    ) {
         init_visual_test(cx);
         #[cfg(feature = "fanta-gpui-ui")]
         cx.update(|cx| {
@@ -7771,6 +8138,12 @@ mod tests {
                 trim: None,
             });
         });
+        window
+            .update(cx, |view, window, cx| {
+                assert!(view.render_canvas_video_controls(window, cx).is_none());
+                view.set_editor_mode(EditorMode::Motion, cx);
+            })
+            .expect("show motion controls");
         let mut visual_context = gpui::VisualTestContext::from_window(window.into(), cx);
         for width in [1_000., 1_400.] {
             visual_context.simulate_resize(size(px(width), px(800.)));

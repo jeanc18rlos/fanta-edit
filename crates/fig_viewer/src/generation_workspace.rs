@@ -14,9 +14,10 @@ use futures::{AsyncReadExt as _, StreamExt as _};
 #[cfg(feature = "mac_app_store")]
 use gpui::Action as _;
 use gpui::{
-    App, AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, Image,
-    ImageFormat, MouseButton, ObjectFit, PathPromptOptions, Pixels, Render, SharedString,
-    Subscription, Task, WeakEntity, Window, actions, canvas, img,
+    App, AppContext as _, Bounds, Context, DispatchPhase, Entity, EventEmitter, FocusHandle,
+    Focusable, Image, ImageFormat, MouseButton, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    PathPromptOptions, Pixels, Render, SharedString, Subscription, Task, WeakEntity, Window,
+    actions, canvas, img, px,
 };
 use http_client::{AsyncBody, HttpClient as _, Method, Request};
 #[cfg(target_os = "macos")]
@@ -433,6 +434,32 @@ struct MediaOutput {
     mask: bool,
 }
 
+impl MediaOutput {
+    fn can_add_to_project(&self) -> bool {
+        if self.mask
+            || !matches!(
+                self.mime.as_str(),
+                "image/png"
+                    | "image/jpeg"
+                    | "image/webp"
+                    | "image/svg+xml"
+                    | "video/mp4"
+                    | "audio/wav"
+                    | "audio/x-wav"
+                    | "audio/mpeg"
+                    | "audio/mp3"
+                    | "audio/flac"
+            )
+        {
+            return false;
+        }
+        match &self.location {
+            MediaLocation::Inline(bytes) => !bytes.is_empty(),
+            MediaLocation::Url(url) => !url.is_empty(),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct GalleryRecord {
     id: String,
@@ -471,28 +498,46 @@ struct VoiceSource {
 }
 
 #[cfg(target_os = "macos")]
-struct AudioPlaybackView {
+pub(crate) struct AudioPlaybackView {
     bytes: Arc<[u8]>,
+    title: SharedString,
     output: Option<rodio::MixerDeviceSink>,
     player: Option<rodio::Player>,
     duration: Option<Duration>,
     playing: bool,
+    muted: bool,
+    volume: f32,
+    speed: f32,
+    seek_bounds: Option<Bounds<Pixels>>,
+    scrubbing: bool,
     error: Option<SharedString>,
     progress_task: Option<Task<()>>,
 }
 
 #[cfg(target_os = "macos")]
 impl AudioPlaybackView {
-    fn new(bytes: Arc<[u8]>) -> Self {
+    pub(crate) fn new(bytes: Arc<[u8]>, title: SharedString) -> Self {
         Self {
             bytes,
+            title,
             output: None,
             player: None,
             duration: None,
             playing: false,
+            muted: false,
+            volume: 0.85,
+            speed: 1.0,
+            seek_bounds: None,
+            scrubbing: false,
             error: None,
             progress_task: None,
         }
+    }
+
+    pub(crate) fn with_levels(mut self, volume: f32, muted: bool) -> Self {
+        self.volume = volume.clamp(0.0, 1.0);
+        self.muted = muted;
+        self
     }
 
     fn play(&mut self, cx: &mut Context<Self>) {
@@ -500,13 +545,15 @@ impl AudioPlaybackView {
             if self.player.as_ref().is_none_or(rodio::Player::empty) {
                 self.player = None;
                 self.output = None;
-                let decoder = rodio::Decoder::new(Cursor::new(self.bytes.to_vec()))
+                let decoder = rodio::Decoder::new(Cursor::new(self.bytes.clone()))
                     .context("The generated audio could not be decoded.")?;
                 self.duration = decoder.total_duration();
                 let output = rodio::DeviceSinkBuilder::open_default_sink()
                     .context("No audio output device is available.")?;
                 let player = rodio::Player::connect_new(output.mixer());
                 player.append(decoder);
+                player.set_volume(if self.muted { 0.0 } else { self.volume });
+                player.set_speed(self.speed);
                 self.output = Some(output);
                 self.player = Some(player);
             } else if let Some(player) = self.player.as_ref() {
@@ -548,7 +595,7 @@ impl AudioPlaybackView {
         cx.notify();
     }
 
-    fn pause(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn pause(&mut self, cx: &mut Context<Self>) {
         if let Some(player) = self.player.as_ref() {
             player.pause();
         }
@@ -556,13 +603,84 @@ impl AudioPlaybackView {
         cx.notify();
     }
 
-    fn close(&mut self, cx: &mut Context<Self>) {
+    fn seek(&mut self, position: Duration, cx: &mut Context<Self>) {
+        let Some(player) = self.player.as_ref() else {
+            return;
+        };
+        let duration = self.duration.unwrap_or_default();
+        if let Err(error) = player.try_seek(position.min(duration)) {
+            self.error = Some(format!("Could not seek audio: {error}").into());
+        } else {
+            self.error = None;
+        }
+        cx.notify();
+    }
+
+    fn seek_at(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let (Some(bounds), Some(duration)) = (self.seek_bounds, self.duration) else {
+            return;
+        };
+        let width = f32::from(bounds.size.width);
+        if width <= 0.0 {
+            return;
+        }
+        let ratio = (f32::from(position.x - bounds.origin.x) / width).clamp(0.0, 1.0);
+        self.seek(duration.mul_f32(ratio), cx);
+    }
+
+    fn skip(&mut self, seconds: i64, cx: &mut Context<Self>) {
+        let current = self
+            .player
+            .as_ref()
+            .map(rodio::Player::get_pos)
+            .unwrap_or_default();
+        let next = if seconds >= 0 {
+            current.saturating_add(Duration::from_secs(seconds as u64))
+        } else {
+            current.saturating_sub(Duration::from_secs(seconds.unsigned_abs()))
+        };
+        self.seek(next, cx);
+    }
+
+    fn toggle_mute(&mut self, cx: &mut Context<Self>) {
+        self.muted = !self.muted;
+        if let Some(player) = self.player.as_ref() {
+            player.set_volume(if self.muted { 0.0 } else { self.volume });
+        }
+        cx.notify();
+    }
+
+    fn set_volume(&mut self, volume: f32, cx: &mut Context<Self>) {
+        self.volume = volume.clamp(0.0, 1.0);
+        self.muted = false;
+        if let Some(player) = self.player.as_ref() {
+            player.set_volume(self.volume);
+        }
+        cx.notify();
+    }
+
+    fn cycle_speed(&mut self, cx: &mut Context<Self>) {
+        self.speed = if self.speed < 1.0 {
+            1.0
+        } else if self.speed < 1.25 {
+            1.25
+        } else {
+            0.75
+        };
+        if let Some(player) = self.player.as_ref() {
+            player.set_speed(self.speed);
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn close(&mut self, cx: &mut Context<Self>) {
         self.progress_task = None;
         if let Some(player) = self.player.take() {
             player.stop();
         }
         self.output = None;
         self.playing = false;
+        self.scrubbing = false;
         cx.notify();
     }
 }
@@ -576,23 +694,143 @@ impl Render for AudioPlaybackView {
             .map(rodio::Player::get_pos)
             .unwrap_or_default();
         let duration = self.duration.unwrap_or_default();
-        let label = format!(
-            "{:02}:{:02} / {:02}:{:02}",
-            position.as_secs() / 60,
-            position.as_secs() % 60,
-            duration.as_secs() / 60,
-            duration.as_secs() % 60,
-        );
+        let ratio = if duration.is_zero() {
+            0.0
+        } else {
+            (position.as_secs_f32() / duration.as_secs_f32()).clamp(0.0, 1.0)
+        };
+        let weak = cx.entity().downgrade();
+        let seek_bar = div()
+            .id("audio-seek-bar")
+            .relative()
+            .w_full()
+            .h(px(28.))
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
+                    if this.player.is_some() && this.duration.is_some() {
+                        this.scrubbing = true;
+                        this.seek_at(event.position, cx);
+                        cx.stop_propagation();
+                    }
+                }),
+            )
+            .child(
+                canvas(
+                    move |bounds, _, cx| {
+                        if let Some(view) = weak.upgrade() {
+                            view.update(cx, |this, _| this.seek_bounds = Some(bounds));
+                        }
+                    },
+                    {
+                        let weak = cx.entity().downgrade();
+                        move |bounds, _, window, cx| {
+                            let track = Bounds {
+                                origin: gpui::point(bounds.origin.x, bounds.center().y - px(2.)),
+                                size: gpui::size(bounds.size.width, px(4.)),
+                            };
+                            window.paint_quad(
+                                gpui::fill(track, cx.theme().colors().border).corner_radii(px(2.)),
+                            );
+                            let progress = Bounds {
+                                size: gpui::size(track.size.width * ratio, track.size.height),
+                                ..track
+                            };
+                            window.paint_quad(
+                                gpui::fill(progress, cx.theme().colors().text_accent)
+                                    .corner_radii(px(2.)),
+                            );
+                            let thumb = Bounds {
+                                origin: gpui::point(
+                                    progress.right() - px(5.),
+                                    bounds.center().y - px(5.),
+                                ),
+                                size: gpui::size(px(10.), px(10.)),
+                            };
+                            window.paint_quad(
+                                gpui::fill(thumb, cx.theme().colors().text_accent)
+                                    .corner_radii(px(5.)),
+                            );
+                            let view = weak.clone();
+                            window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                                if phase == DispatchPhase::Bubble
+                                    && let Some(view) = view.upgrade()
+                                {
+                                    view.update(cx, |this, cx| {
+                                        if this.scrubbing {
+                                            this.seek_at(event.position, cx);
+                                            cx.stop_propagation();
+                                        }
+                                    });
+                                }
+                            });
+                            let view = weak.clone();
+                            window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                                if phase == DispatchPhase::Bubble
+                                    && event.button == MouseButton::Left
+                                    && let Some(view) = view.upgrade()
+                                {
+                                    view.update(cx, |this, cx| {
+                                        if this.scrubbing {
+                                            this.seek_at(event.position, cx);
+                                            this.scrubbing = false;
+                                            cx.stop_propagation();
+                                        }
+                                    });
+                                }
+                            });
+                        }
+                    },
+                )
+                .size_full(),
+            );
+        let clock = |time: Duration| format!("{}:{:02}", time.as_secs() / 60, time.as_secs() % 60);
         v_flex()
             .size_full()
-            .items_center()
             .justify_center()
-            .gap_3()
-            .child(Label::new("Audio preview").size(LabelSize::Large))
+            .gap_4()
+            .p_5()
+            .bg(cx.theme().colors().editor_background)
+            .child(
+                h_flex()
+                    .gap_3()
+                    .items_center()
+                    .child(
+                        div()
+                            .size(px(48.))
+                            .rounded_lg()
+                            .bg(cx.theme().colors().element_hover)
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(Label::new("♫").size(LabelSize::Large)),
+                    )
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .child(
+                                Label::new(self.title.clone())
+                                    .size(LabelSize::Large)
+                                    .weight(gpui::FontWeight::SEMIBOLD),
+                            )
+                            .child(
+                                Label::new("Audio preview")
+                                    .size(LabelSize::Small)
+                                    .color(Color::Muted),
+                            ),
+                    ),
+            )
+            .child(seek_bar)
             .child(
                 h_flex()
                     .items_center()
-                    .gap_3()
+                    .flex_wrap()
+                    .gap_2()
+                    .child(
+                        Button::new("audio-back-ten", "−10s")
+                            .on_click(cx.listener(|this, _, _, cx| this.skip(-10, cx))),
+                    )
                     .child(
                         Button::new(
                             "audio-playback-toggle",
@@ -607,7 +845,42 @@ impl Render for AudioPlaybackView {
                             }
                         })),
                     )
-                    .child(Label::new(label).color(Color::Muted)),
+                    .child(
+                        Button::new("audio-forward-ten", "+10s")
+                            .on_click(cx.listener(|this, _, _, cx| this.skip(10, cx))),
+                    )
+                    .child(
+                        Label::new(format!("{} / {}", clock(position), clock(duration)))
+                            .size(LabelSize::Small)
+                            .color(Color::Muted),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("audio-speed", format!("{:.2}×", self.speed))
+                            .on_click(cx.listener(|this, _, _, cx| this.cycle_speed(cx))),
+                    )
+                    .child(Button::new("audio-volume-down", "−").on_click(
+                        cx.listener(|this, _, _, cx| this.set_volume(this.volume - 0.2, cx)),
+                    ))
+                    .child(
+                        Button::new("audio-mute", if self.muted { "Unmute" } else { "Mute" })
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_mute(cx))),
+                    )
+                    .child(Button::new("audio-volume-up", "+").on_click(
+                        cx.listener(|this, _, _, cx| this.set_volume(this.volume + 0.2, cx)),
+                    ))
+                    .child(
+                        Label::new(format!(
+                            "{}%",
+                            if self.muted {
+                                0
+                            } else {
+                                (self.volume * 100.0).round() as i32
+                            }
+                        ))
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                    ),
             )
             .when_some(self.error.clone(), |element, error| {
                 element.child(Label::new(error).color(Color::Error))
@@ -997,6 +1270,26 @@ impl GenerationWorkspace {
             GenerationRecipe::Vectorize => "Convert an image to vectors",
         }
         .to_owned();
+        if matches!(
+            recipe,
+            GenerationRecipe::ImageSvg | GenerationRecipe::Vectorize
+        ) {
+            let source = &model.capabilities["inputs"]["start_frame"];
+            let mut limits = Vec::new();
+            if let Some(bytes) = source["max_bytes"].as_u64() {
+                limits.push(format!("Source up to {} MB", bytes.div_ceil(1024 * 1024)));
+            }
+            if let (Some(minimum), Some(maximum)) = (
+                source["min_dimension"].as_u64(),
+                source["max_dimension"].as_u64(),
+            ) {
+                limits.push(format!("{minimum}–{maximum} px per side"));
+            }
+            if !limits.is_empty() {
+                description.push_str(" · ");
+                description.push_str(&limits.join(" · "));
+            }
+        }
         if model.gateway()
             && matches!(
                 recipe,
@@ -1093,7 +1386,17 @@ impl GenerationWorkspace {
                     .get(&(model.id.clone(), "num_outputs".into()))
                     .and_then(|value| value.parse::<usize>().ok())
                     .unwrap_or(1);
-                if outputs > 1 {
+                if model.capabilities["billing"]["quote_is_maximum"] == true {
+                    if outputs > 1 {
+                        screen = screen.credit_hint(format!(
+                            "Up to {:.0} credits · {outputs} outputs",
+                            (credits * outputs as f64).ceil()
+                        ));
+                    } else {
+                        screen = screen
+                            .credit_hint(format!("Up to {:.0} credits / output", credits.ceil()));
+                    }
+                } else if outputs > 1 {
                     screen = screen.credit_hint(format!(
                         "Est. {:.0} credits · {outputs} outputs",
                         (credits * outputs as f64).ceil()
@@ -1486,7 +1789,7 @@ impl GenerationWorkspace {
         let models = self
             .models
             .iter()
-            .filter(|model| model.hosted_creation())
+            .filter(|model| model.hosted_creation() && model.kind != "chat")
             .flat_map(|model| {
                 model
                     .recipes()
@@ -1555,7 +1858,8 @@ impl GenerationWorkspace {
                     model_label.clone(),
                     GenerationOutputStatus::Succeeded,
                 )
-                .detail(output.mime.clone());
+                .detail(output.mime.clone())
+                .can_add_to_project(self.canvas_item.is_some() && output.can_add_to_project());
                 if !run.prompt.is_empty() {
                     entry = entry.prompt(run.prompt.clone());
                 }
@@ -1609,7 +1913,11 @@ impl GenerationWorkspace {
                 )
                 .created_at(record.created_at.clone());
                 if let Some(output) = record.outputs.get(index) {
-                    entry = entry.detail(output.mime.clone());
+                    entry = entry.detail(output.mime.clone()).can_add_to_project(
+                        self.canvas_item.is_some()
+                            && record.status == GenerationOutputStatus::Succeeded
+                            && output.can_add_to_project(),
+                    );
                 }
                 if let Some(run) = local_run {
                     entry = entry.prompt(run.prompt.clone());
@@ -1802,6 +2110,11 @@ impl GenerationWorkspace {
             GenerationAction::DownloadRequested { id } => {
                 if self.select_output_id(&id, cx) {
                     self.save_output(cx);
+                }
+            }
+            GenerationAction::AddToProjectRequested { id } => {
+                if self.select_output_id(&id, cx) {
+                    self.add_output_to_project(cx);
                 }
             }
             GenerationAction::PlayRequested { id } => {
@@ -2467,6 +2780,7 @@ impl GenerationWorkspace {
                 .filter(|model| self.accepts_model(model))
                 .min_by_key(|model| {
                     (
+                        model.kind == "chat",
                         if self.mode == GenerationMode::Vector
                             && self.vector_operation == VectorOperation::Create
                         {
@@ -3340,7 +3654,11 @@ impl GenerationWorkspace {
                         this.restore_video_playback(cx);
                         #[cfg(target_os = "macos")]
                         if let Some(bytes) = audio {
-                            this.audio_playback = Some(cx.new(|_| AudioPlaybackView::new(bytes)));
+                            let title = this.active_title.as_deref().unwrap_or("Audio preview");
+                            this.audio_playback =
+                                Some(cx.new(|_| {
+                                    AudioPlaybackView::new(bytes, title.to_owned().into())
+                                }));
                         }
                         #[cfg(not(target_os = "macos"))]
                         drop(audio);
@@ -3472,6 +3790,9 @@ impl GenerationWorkspace {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let min_dimension = frame_input.and_then(|input| input["min_dimension"].as_u64());
+        let max_dimension = frame_input.and_then(|input| input["max_dimension"].as_u64());
+        let max_pixels = frame_input.and_then(|input| input["max_pixels"].as_u64());
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -3488,13 +3809,15 @@ impl GenerationWorkspace {
         let client = self.client.clone();
         let base_url = self.base_url.clone();
         self.task = Some(cx.spawn(async move |this, cx| {
-            let result: Result<Option<SourceImage>> = async {
-                let Some(path) = paths.await??.and_then(|paths| paths.into_iter().next()) else {
-                    return Ok(None);
-                };
-                #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
-                workspace::remember_user_selected_paths(std::slice::from_ref(&path))?;
-                let (bytes, name, mime, preview) = cx
+            let result: Result<Option<SourceImage>> =
+                async {
+                    let Some(path) = paths.await??.and_then(|paths| paths.into_iter().next())
+                    else {
+                        return Ok(None);
+                    };
+                    #[cfg(all(target_os = "macos", feature = "mac_app_store"))]
+                    workspace::remember_user_selected_paths(std::slice::from_ref(&path))?;
+                    let (bytes, name, mime, preview) = cx
                     .background_spawn(async move {
                         ensure!(
                             std::fs::metadata(&path)?.len() <= max_source_bytes as u64,
@@ -3516,6 +3839,19 @@ impl GenerationWorkspace {
                             "Choose an image format supported by this model."
                         );
                         let preview = make_preview(&bytes, mime)?;
+                        let [width, height] = [u64::from(preview.width), u64::from(preview.height)];
+                        if let Some(minimum) = min_dimension {
+                            ensure!(width >= minimum && height >= minimum,
+                                "Choose an image with both sides at least {minimum} pixels.");
+                        }
+                        if let Some(maximum) = max_dimension {
+                            ensure!(width <= maximum && height <= maximum,
+                                "Choose an image with both sides no larger than {maximum} pixels.");
+                        }
+                        if let Some(maximum) = max_pixels {
+                            ensure!(width.saturating_mul(height) <= maximum,
+                                "Choose an image with no more than {maximum} pixels.");
+                        }
                         let name = path
                             .file_name()
                             .map(|name| name.to_string_lossy().into_owned())
@@ -3523,27 +3859,27 @@ impl GenerationWorkspace {
                         Ok::<_, anyhow::Error>((bytes, name, mime, preview))
                     })
                     .await?;
-                this.update(cx, |this, cx| {
-                    this.status = "Uploading source image…".into();
-                    cx.notify();
-                })?;
-                let asset = upload_image(
-                    &client,
-                    &base_url,
-                    bytes,
-                    &name,
-                    mime,
-                    &preview,
-                    cx.background_executor(),
-                )
-                .await?;
-                Ok(Some(SourceImage {
-                    reference: json!({"asset_id": asset}),
-                    name,
-                    preview,
-                }))
-            }
-            .await;
+                    this.update(cx, |this, cx| {
+                        this.status = "Uploading source image…".into();
+                        cx.notify();
+                    })?;
+                    let asset = upload_image(
+                        &client,
+                        &base_url,
+                        bytes,
+                        &name,
+                        mime,
+                        &preview,
+                        cx.background_executor(),
+                    )
+                    .await?;
+                    Ok(Some(SourceImage {
+                        reference: json!({"asset_id": asset}),
+                        name,
+                        preview,
+                    }))
+                }
+                .await;
             this.update(cx, |this, cx| {
                 this.task = None;
                 match result {
@@ -3854,6 +4190,79 @@ impl GenerationWorkspace {
             })
             .log_err();
         }));
+    }
+
+    fn add_output_to_project(&mut self, cx: &mut Context<Self>) {
+        self.sync_account(cx);
+        if self.task.is_some() {
+            return;
+        }
+        let Some(output) = self.outputs.get(self.selected_output).cloned() else {
+            return;
+        };
+        if output.mask {
+            self.fail(anyhow!("Masks cannot be added to project assets."), cx);
+            return;
+        }
+        let Some(item) = self.canvas_item.clone() else {
+            self.fail(anyhow!("Open a project canvas before adding an asset."), cx);
+            return;
+        };
+        let kind = self
+            .active_run
+            .as_ref()
+            .and_then(|run| run.mode.generation_kind())
+            .unwrap_or(GenerationKind::Image);
+        let title = gallery_creation_title(
+            self.active_title.as_deref(),
+            self.active_run.as_ref().map(|run| run.prompt.as_str()),
+            kind,
+        );
+        let client = self.client.clone();
+        let account = client.account_access_token();
+        self.task = Some(cx.spawn(async move |this, cx| {
+            let result: Result<_> = async {
+                let bytes = media_bytes(&client, &output.location, cx.background_executor()).await?;
+                let mime = output.mime.clone();
+                let prepared = cx.background_spawn(async move {
+                    generation_media::prepare_project_asset(bytes, &mime)
+                }).await?;
+                cx.update(|cx| {
+                    ensure!(client.account_access_token() == account,
+                        "Your Fanta account changed. Choose the result again before adding it.");
+                    let item = item.upgrade().context("The source project was closed.")?;
+                    item.update(cx, |item, cx| {
+                        ensure!(item.is_editable(),
+                            "Save or discard source edits before adding project assets.");
+                        item.with_document(cx, |document| {
+                            let result = generation_media::add_project_asset(document, prepared, &title);
+                            let change = if result.is_ok() {
+                                crate::document::DocChange::Content
+                            } else {
+                                crate::document::DocChange::None
+                            };
+                            (result, change)
+                        }).context("The project is still loading.")?
+                    })
+                })
+            }.await;
+            this.update(cx, |this, cx| {
+                if this.client.account_access_token() != account {
+                    this.sync_account(cx);
+                    return;
+                }
+                this.task = None;
+                match result {
+                    Ok(_) => {
+                        this.error = None;
+                        this.status = "Added to project assets. Expand Assets in the file inspector to place it.".into();
+                    }
+                    Err(error) => this.fail(error, cx),
+                }
+                cx.notify();
+            }).log_err();
+        }));
+        cx.notify();
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -5330,7 +5739,20 @@ fn build_screen_request(
         input["voice_ref_b64"] = json!(STANDARD.encode(&reference.bytes));
         input["consent"] = json!(true);
     }
-    if model.capabilities["operations"]
+    if matches!(
+        submission.recipe,
+        GenerationRecipe::ImageSvg | GenerationRecipe::Vectorize
+    ) {
+        input["operation"] = json!(if submission.recipe == GenerationRecipe::ImageSvg {
+            "image_to_svg"
+        } else {
+            "vectorize"
+        });
+    } else if submission.recipe == GenerationRecipe::PromptSvg
+        && model.capabilities["gateway"]["svg_text"] == true
+    {
+        input["operation"] = json!("prompt_to_svg");
+    } else if model.capabilities["operations"]
         .as_array()
         .is_some_and(|operations| operations.len() > 1)
     {
@@ -8446,6 +8868,102 @@ mod tests {
         vectorize.capabilities = json!({"hosted":true,"operations":["vectorize"]});
         assert!(VectorOperation::Trace.accepts(&vectorize));
         assert!(!VectorOperation::Create.accepts(&vectorize));
+    }
+
+    #[test]
+    fn hosted_claude_svg_and_recraft_vectorize_use_generation_outputs() {
+        let mut claude = model("svg");
+        claude.id = "svg-claude-sonnet-5".into();
+        claude.credits_per_output = Some(9.0);
+        claude.capabilities = json!({
+            "hosted": true,
+            "provider": "Anthropic",
+            "operations": ["prompt_to_svg"],
+            "gateway": {"svg_text": true}
+        });
+        assert!(claude.hosted_creation());
+        assert_eq!(claude.recipes(), vec![GenerationRecipe::PromptSvg]);
+        let request = build_screen_request(
+            &claude,
+            &screen_submission(&claude, GenerationRecipe::PromptSvg, "A geometric fox"),
+            None,
+            None,
+            None,
+        )
+        .expect("Claude SVG request");
+        assert_eq!(request["kind"], "svg");
+        assert_eq!(request["input"]["operation"], "prompt_to_svg");
+        assert_eq!(request["prompt"], "A geometric fox");
+
+        let mut recraft = model("svg");
+        recraft.id = "replicate-recraft-vectorize".into();
+        recraft.credits_per_output = Some(2.0);
+        recraft.capabilities = json!({
+            "hosted": true,
+            "provider": "Recraft",
+            "operations": ["image_to_svg"],
+            "prompt_limit": 0
+        });
+        assert!(recraft.hosted_creation());
+        assert_eq!(recraft.recipes(), vec![GenerationRecipe::ImageSvg]);
+        let source = SourceImage {
+            reference: json!({"asset_id":"asset-1"}),
+            name: "Reference".into(),
+            preview: Preview {
+                image: Arc::new(Image::from_bytes(ImageFormat::Png, Vec::new())),
+                width: 1,
+                height: 1,
+            },
+        };
+        let mut submission = screen_submission(&recraft, GenerationRecipe::ImageSvg, "");
+        submission.source_id = Some(source.reference.to_string().into());
+        let request = build_screen_request(&recraft, &submission, Some(&source), None, None)
+            .expect("Recraft image to SVG request");
+        assert_eq!(request["kind"], "svg");
+        assert_eq!(request["input"]["operation"], "image_to_svg");
+        assert_eq!(request["input"]["source"]["asset_id"], "asset-1");
+        assert!(request.get("prompt").is_none());
+
+        let outputs = normalize_outputs(&[json!({
+            "r2_key": "generated/vector.svg",
+            "mime": "image/svg+xml",
+            "url": "https://media.example/generated/vector.svg"
+        })])
+        .expect("SVG output");
+        assert_eq!(outputs[0].mime, "image/svg+xml");
+        assert!(outputs[0].can_add_to_project());
+    }
+
+    #[test]
+    fn project_import_is_offered_only_for_supported_ready_media() {
+        let output = MediaOutput {
+            label: "Result".into(),
+            mime: "image/png".into(),
+            location: MediaLocation::Url("https://media.example/image.png".into()),
+            mask: false,
+        };
+        assert!(output.can_add_to_project());
+        assert!(
+            !MediaOutput {
+                location: MediaLocation::Url(String::new()),
+                ..output.clone()
+            }
+            .can_add_to_project()
+        );
+        assert!(
+            !MediaOutput {
+                mime: "application/octet-stream".into(),
+                ..output.clone()
+            }
+            .can_add_to_project()
+        );
+        assert!(
+            !MediaOutput {
+                mask: true,
+                ..output
+            }
+            .can_add_to_project()
+        );
     }
 
     #[test]

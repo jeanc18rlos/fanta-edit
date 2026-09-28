@@ -3610,7 +3610,15 @@ fn decode_gpui_images(assets: &BTreeMap<AssetId, Vec<u8>>) -> HashMap<AssetId, A
     assets
         .iter()
         .filter_map(|(asset_id, bytes)| {
-            let format = gpui_image_format(image::guess_format(bytes).ok()?)?;
+            let format = image::guess_format(bytes)
+                .ok()
+                .and_then(gpui_image_format)
+                .or_else(|| {
+                    fanta_format::MediaRegistry::with_builtins()
+                        .sniff(bytes)
+                        .filter(|format| format.id == "svg")
+                        .map(|_| ImageFormat::Svg)
+                })?;
             // The ENCODED bytes go to GPUI (not `decode_embedded_image`'s straight-alpha
             // RGBA8, which the canvas renderer wants): handing over the source
             // bytes lets GPUI decode, swap channels to BGRA, and cache the

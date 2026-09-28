@@ -6,7 +6,7 @@
 
 use crate::component::ComponentLibrary;
 use crate::history::{History, Transaction};
-use crate::id::{DocId, ModeId, NodeId, VariableCollectionId, VariableId};
+use crate::id::{AssetId, DocId, ModeId, NodeId, VariableCollectionId, VariableId};
 use crate::motion::MotionLibrary;
 use crate::node::{Action, NodeData};
 use crate::op::{ModeScope, OpCtx, Operation};
@@ -39,6 +39,11 @@ pub struct Doc {
 
     #[serde(default)]
     pub metadata: DocMetadata,
+
+    /// Display names for project assets. Binary bytes live in the asset store;
+    /// keeping names here lets unplaced media remain browsable after reopening.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub asset_library: BTreeMap<AssetId, ProjectAsset>,
 
     pub scene: Scene,
 
@@ -164,6 +169,7 @@ impl Doc {
                 modified_at: now,
                 author: None,
             },
+            asset_library: BTreeMap::new(),
             scene: Scene::new(),
             selection: Selection::new(),
             history: History::new(),
@@ -704,6 +710,7 @@ impl Doc {
             id: self.id,
             schema_version: self.schema_version,
             metadata: self.metadata.clone(),
+            asset_library: self.asset_library.clone(),
             scene: self.scene.clone(),
             selection: Selection::new(),
             history: History::new(),
@@ -803,6 +810,21 @@ impl Default for Doc {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectAsset {
+    pub name: String,
+    pub kind: ProjectAssetKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectAssetKind {
+    Image,
+    Svg,
+    Video,
+    Audio,
 }
 
 /// Lightweight metadata shown in file pickers and recent-files lists.

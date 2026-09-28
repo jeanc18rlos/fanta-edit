@@ -1,13 +1,241 @@
 use anyhow::{Context as _, Result, bail, ensure};
 use fanta_doc::{
-    AssetId, BlendMode, CanvasNode, Color, Fill, FillRule, Gradient, GradientStop, GroupNode,
-    ImageFitMode, IndexKey, NodeData, NodeId, Operation, PathData, Stroke, StrokeCap, StrokeJoin,
-    Transaction, Transform2D, UnitInterval, VectorNode, VideoNode,
+    AssetId, AudioNode, BlendMode, CanvasNode, Color, Fill, FillRule, Gradient, GradientStop,
+    GroupNode, ImageFitMode, IndexKey, NodeData, NodeId, Operation, PathData, ProjectAsset,
+    ProjectAssetKind, Stroke, StrokeCap, StrokeJoin, Transaction, Transform2D, UnitInterval,
+    VectorNode, VideoNode,
 };
 use serde_json::Value;
 use std::{fs::File, io::Write as _, path::Path, sync::Arc};
 
-use crate::document::{DocChange, FigDocument};
+use crate::document::{DocChange, FigDocument, PreparedImage};
+
+pub(crate) enum PreparedProjectAsset {
+    Image(PreparedImage),
+    Binary {
+        bytes: Arc<[u8]>,
+        kind: ProjectAssetKind,
+    },
+}
+
+pub(crate) fn project_asset_kind(bytes: &[u8]) -> Option<ProjectAssetKind> {
+    let format = fanta_format::MediaRegistry::with_builtins().sniff(bytes)?;
+    match format.family {
+        "images" => Some(ProjectAssetKind::Image),
+        "svg" => Some(ProjectAssetKind::Svg),
+        "video" => Some(ProjectAssetKind::Video),
+        "audio" => Some(ProjectAssetKind::Audio),
+        _ => None,
+    }
+}
+
+pub(crate) fn project_asset_can_place(bytes: &[u8], kind: ProjectAssetKind) -> bool {
+    let Some(format) = fanta_format::MediaRegistry::with_builtins().sniff(bytes) else {
+        return false;
+    };
+    matches!(
+        (kind, format.id),
+        (ProjectAssetKind::Image, "png" | "jpeg" | "gif" | "webp")
+            | (ProjectAssetKind::Svg, "svg")
+            | (ProjectAssetKind::Video, "mp4")
+            | (
+                ProjectAssetKind::Audio,
+                "wav" | "mp3-id3" | "mp3-raw" | "flac"
+            )
+    )
+}
+
+pub(crate) fn prepare_project_asset(bytes: Arc<[u8]>, mime: &str) -> Result<PreparedProjectAsset> {
+    ensure!(
+        !bytes.is_empty() && bytes.len() <= 128 * 1024 * 1024,
+        "The media file is empty or exceeds the project asset limit."
+    );
+    match mime {
+        "image/png" | "image/jpeg" | "image/webp" => Ok(PreparedProjectAsset::Image(
+            PreparedImage::new(bytes.to_vec())?,
+        )),
+        "image/svg+xml" => {
+            parse_svg(&bytes).context("This SVG cannot be placed as editable vectors.")?;
+            Ok(PreparedProjectAsset::Binary {
+                bytes,
+                kind: ProjectAssetKind::Svg,
+            })
+        }
+        "video/mp4" => {
+            mp4_metadata(&bytes)?;
+            Ok(PreparedProjectAsset::Binary {
+                bytes,
+                kind: ProjectAssetKind::Video,
+            })
+        }
+        "audio/wav" | "audio/x-wav" | "audio/mpeg" | "audio/mp3" | "audio/flac" => {
+            let format = fanta_format::MediaRegistry::with_builtins()
+                .sniff(&bytes)
+                .context("The audio file has an unsupported format.")?;
+            ensure!(
+                format.family == "audio",
+                "The result is not a supported audio file."
+            );
+            Ok(PreparedProjectAsset::Binary {
+                bytes,
+                kind: ProjectAssetKind::Audio,
+            })
+        }
+        _ => bail!("This media format cannot be added to a Fanta project."),
+    }
+}
+
+pub(crate) fn add_project_asset(
+    document: &mut FigDocument,
+    prepared: PreparedProjectAsset,
+    name: &str,
+) -> Result<AssetId> {
+    let name = name.trim().chars().take(80).collect::<String>();
+    let (asset, kind) = match prepared {
+        PreparedProjectAsset::Image(image) => {
+            let (asset, _, _) = document
+                .doc_and_assets()
+                .1
+                .add_prepared_image_tracked(image)?;
+            (asset, ProjectAssetKind::Image)
+        }
+        PreparedProjectAsset::Binary { bytes, kind } => {
+            let asset = fanta_format::asset_id_for_bytes(&bytes);
+            if let Some(existing) = document.raw_assets.get(&asset) {
+                ensure!(
+                    existing.as_slice() == bytes.as_ref(),
+                    "The project contains a different asset with the same ID."
+                );
+            } else {
+                Arc::make_mut(&mut document.raw_assets).insert(asset, bytes.to_vec());
+            }
+            if kind == ProjectAssetKind::Svg {
+                document.gpui_images.entry(asset).or_insert_with(|| {
+                    Arc::new(gpui::Image::from_bytes(
+                        gpui::ImageFormat::Svg,
+                        bytes.to_vec(),
+                    ))
+                });
+            }
+            (asset, kind)
+        }
+    };
+    document
+        .doc
+        .asset_library
+        .entry(asset)
+        .or_insert_with(|| ProjectAsset {
+            name: if name.is_empty() {
+                format!(
+                    "Generated {}",
+                    match kind {
+                        ProjectAssetKind::Image => "image",
+                        ProjectAssetKind::Svg => "vector",
+                        ProjectAssetKind::Video => "video",
+                        ProjectAssetKind::Audio => "audio",
+                    }
+                )
+            } else {
+                name
+            },
+            kind,
+        });
+    Ok(asset)
+}
+
+pub(crate) enum PreparedCanvasAsset {
+    Image { width: u32, height: u32 },
+    Svg(VectorArtwork),
+    Video(PreparedVideo),
+    Audio { duration_us: i64 },
+}
+
+impl PreparedCanvasAsset {
+    pub(crate) fn dimensions(&self) -> [f64; 2] {
+        match self {
+            Self::Image { width, height } => [f64::from(*width), f64::from(*height)],
+            Self::Svg(artwork) => [artwork.width, artwork.height],
+            Self::Video(video) => [
+                f64::from(video.metadata.width),
+                f64::from(video.metadata.height),
+            ],
+            Self::Audio { .. } => [360.0, 80.0],
+        }
+    }
+}
+
+pub(crate) async fn prepare_canvas_asset(
+    kind: ProjectAssetKind,
+    bytes: Arc<[u8]>,
+) -> Result<PreparedCanvasAsset> {
+    match kind {
+        ProjectAssetKind::Image => {
+            let image = image::load_from_memory(&bytes)
+                .context("This image could not be decoded for the canvas.")?;
+            let (width, height) = (image.width(), image.height());
+            ensure!(
+                width > 0 && height > 0 && u64::from(width) * u64::from(height) <= 32 * 1024 * 1024,
+                "This image is too large to place on the canvas."
+            );
+            Ok(PreparedCanvasAsset::Image { width, height })
+        }
+        ProjectAssetKind::Svg => Ok(PreparedCanvasAsset::Svg(parse_svg(&bytes)?)),
+        ProjectAssetKind::Video => Ok(PreparedCanvasAsset::Video(prepare_video(bytes).await?)),
+        ProjectAssetKind::Audio => {
+            #[cfg(target_os = "macos")]
+            {
+                use rodio::Source as _;
+                let decoder = rodio::Decoder::new(std::io::Cursor::new(bytes.to_vec()))
+                    .context("This audio file could not be decoded.")?;
+                let duration = decoder
+                    .total_duration()
+                    .context("The audio file has no usable duration.")?;
+                let duration_us =
+                    i64::try_from(duration.as_micros()).context("The audio file is too long.")?;
+                ensure!(duration_us > 0, "The audio file has no playable samples.");
+                Ok(PreparedCanvasAsset::Audio { duration_us })
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                bail!("Audio canvas placement is unavailable on this platform.")
+            }
+        }
+    }
+}
+
+pub(crate) fn place_audio(
+    document: &mut FigDocument,
+    asset: AssetId,
+    duration_us: i64,
+    name: &str,
+    x: f64,
+    y: f64,
+) -> (Result<()>, DocChange) {
+    if !document.raw_assets.contains_key(&asset) {
+        return (
+            Err(anyhow::anyhow!(
+                "The audio asset is missing from the project."
+            )),
+            DocChange::None,
+        );
+    }
+    let mut node = CanvasNode::new(NodeData::Audio(AudioNode {
+        asset,
+        local_size: [360.0, 80.0],
+        time_range_us: [0, duration_us],
+        volume: 1.0,
+        muted: false,
+        waveform_color: Color::rgb(0x7C, 0xB8, 0xF5),
+    }));
+    node.name = name.to_owned();
+    node.parent = document.doc.active_page();
+    node.index = document.doc.scene.next_child_index(node.parent);
+    node.transform = Transform2D::translation(x, y);
+    match document.doc.apply(Operation::create_node(node)) {
+        Ok(()) => (Ok(()), DocChange::Content),
+        Err(error) => (Err(error.into()), DocChange::None),
+    }
+}
 
 pub(crate) fn write_output(path: &Path, bytes: &[u8]) -> Result<()> {
     write_output_with(path, |file| file.write_all(bytes)).context("The result could not be saved")
@@ -360,18 +588,33 @@ fn svg_paint(paint: &usvg::Paint, opacity: f32, bounds: usvg::Rect) -> Result<Fi
 
 pub(crate) fn place_svg(
     document: &mut FigDocument,
+    artwork: VectorArtwork,
+    x: f64,
+    y: f64,
+    provenance: Option<Value>,
+) -> (Result<()>, DocChange) {
+    place_svg_named(document, artwork, x, y, provenance, None, 1.0)
+}
+
+pub(crate) fn place_svg_named(
+    document: &mut FigDocument,
     mut artwork: VectorArtwork,
     x: f64,
     y: f64,
     provenance: Option<Value>,
+    name: Option<&str>,
+    scale: f64,
 ) -> (Result<()>, DocChange) {
     let parent = document.doc.active_page();
     let mut transaction = Transaction::new("Place generated vectors");
     for mut node in artwork.nodes.drain(..) {
         if node.id == artwork.root {
+            if let Some(name) = name {
+                node.name = name.to_owned();
+            }
             node.parent = parent;
             node.index = document.doc.scene.next_child_index(parent);
-            node.transform = Transform2D::translation(x, y);
+            node.transform = Transform2D::scale(scale).then(&Transform2D::translation(x, y));
             if let Some(provenance) = provenance.clone() {
                 node.meta = provenance;
             }
@@ -733,6 +976,18 @@ pub(crate) fn place_video(
     y: f64,
     provenance: Option<Value>,
 ) -> (Result<()>, DocChange) {
+    place_video_named(document, video, x, y, provenance, None, None)
+}
+
+pub(crate) fn place_video_named(
+    document: &mut FigDocument,
+    video: PreparedVideo,
+    x: f64,
+    y: f64,
+    provenance: Option<Value>,
+    name: Option<&str>,
+    size: Option<[f64; 2]>,
+) -> (Result<()>, DocChange) {
     let PreparedVideo {
         bytes,
         asset,
@@ -771,7 +1026,7 @@ pub(crate) fn place_video(
     let mut node = CanvasNode::new(NodeData::Video(VideoNode {
         asset,
         natural_size: [metadata.width, metadata.height],
-        local_size: [metadata.width as f64, metadata.height as f64],
+        local_size: size.unwrap_or([metadata.width as f64, metadata.height as f64]),
         time_range_us: [0, metadata.duration_us],
         speed: 1.,
         muted: false,
@@ -780,7 +1035,7 @@ pub(crate) fn place_video(
         poster: poster_asset.map(|(asset, _)| asset),
         fit: ImageFitMode::Fit,
     }));
-    node.name = "Generated video".into();
+    node.name = name.unwrap_or("Generated video").into();
     node.parent = document.doc.active_page();
     node.index = document.doc.scene.next_child_index(node.parent);
     node.transform = Transform2D::translation(x, y);

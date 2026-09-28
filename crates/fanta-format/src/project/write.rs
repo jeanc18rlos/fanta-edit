@@ -43,11 +43,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use super::layout::{
-    ACTIVE_MODES_JSON, ASSETS_DIR, COMPONENTS_DIR, DEF_JSON, DOC_DIR, EXPORTS_DIR, FANTA_JSON,
-    FLOW_START_JSON, FLOWS_JSON, LOOSE_DIR, MASTER_FNX, MASTER_IDS, METADATA_JSON, MOTION_JSON,
-    NODES_DIR, PAGE_FNX, PAGE_IDS, PAGE_JSON, PAGES_DIR, PRESENTATION_JSON, PREVIEWS_DIR,
-    PROJECT_VERSION, ProjectManifest, SETS_JSON, VARIABLES_JSON, WORKSPACE_FNX, id_from_key,
-    json_bytes, json_key, slugify, sorted_entries,
+    ACTIVE_MODES_JSON, ASSET_LIBRARY_JSON, ASSETS_DIR, COMPONENTS_DIR, DEF_JSON, DOC_DIR,
+    EXPORTS_DIR, FANTA_JSON, FLOW_START_JSON, FLOWS_JSON, LOOSE_DIR, MASTER_FNX, MASTER_IDS,
+    METADATA_JSON, MOTION_JSON, NODES_DIR, PAGE_FNX, PAGE_IDS, PAGE_JSON, PAGES_DIR,
+    PRESENTATION_JSON, PREVIEWS_DIR, PROJECT_VERSION, ProjectManifest, SETS_JSON, VARIABLES_JSON,
+    WORKSPACE_FNX, id_from_key, json_bytes, json_key, slugify, sorted_entries,
 };
 use super::media::{ASSET_INDEX_FILE, MediaRegistry, asset_index_bytes, sniff_media};
 
@@ -547,6 +547,10 @@ fn project_doc_singletons(files: &mut ProjectedFiles, doc: &Doc) -> Result<()> {
     };
     let singletons = [
         (METADATA_JSON, serde_json::to_value(&doc.metadata)?),
+        (
+            ASSET_LIBRARY_JSON,
+            serde_json::to_value(&doc.asset_library)?,
+        ),
         (VARIABLES_JSON, variables),
         (ACTIVE_MODES_JSON, serde_json::to_value(&doc.active_modes)?),
         (MOTION_JSON, motion),
@@ -1225,6 +1229,7 @@ fn is_generated_artifact(relative: &Path) -> bool {
     match parts.as_slice() {
         [DOC_DIR, name] => [
             METADATA_JSON,
+            ASSET_LIBRARY_JSON,
             VARIABLES_JSON,
             ACTIVE_MODES_JSON,
             MOTION_JSON,

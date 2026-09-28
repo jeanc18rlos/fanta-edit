@@ -60,8 +60,8 @@ pub use component::{
     ComponentSet, ComponentSetMembership, PropBindingTarget, VariantAxis,
 };
 pub use doc::{
-    Doc, DocLoadError, DocMetadata, Flow, PresentationConfig, SCHEMA_VERSION, Viewport,
-    migrate_doc_json,
+    Doc, DocLoadError, DocMetadata, Flow, PresentationConfig, ProjectAsset, ProjectAssetKind,
+    SCHEMA_VERSION, Viewport, migrate_doc_json,
 };
 pub use history::{History, Transaction};
 pub use id::{
