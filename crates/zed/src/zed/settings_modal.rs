@@ -653,6 +653,14 @@ impl SettingsWindow {
 
     fn sync_screen(&mut self, cx: &mut Context<Self>) {
         let mut data = self.data.clone();
+        #[cfg(feature = "mac_app_store")]
+        if data.selected_page == SettingsPage::McpTools {
+            const LOCAL_MCP_NOTICE: &str = "This Mac App Store build cannot run local MCP commands. Use a remote HTTP server here, or use a non-Store build for local commands.";
+            data.notice = Some(match data.notice.take() {
+                Some(notice) => format!("{LOCAL_MCP_NOTICE}\n\n{notice}").into(),
+                None => LOCAL_MCP_NOTICE.into(),
+            });
+        }
         if self.billing_action_pending {
             if let Some(billing) = &mut data.billing {
                 disable_busy_billing_actions(billing);

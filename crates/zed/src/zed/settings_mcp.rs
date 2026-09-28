@@ -72,6 +72,44 @@ fn display_url(url: &str) -> SharedString {
     }
 }
 
+fn safe_connection_error(error: &str, is_local: bool) -> &'static str {
+    if cfg!(feature = "mac_app_store") && is_local {
+        return "Local MCP commands require a non-Store build of Fanta. Remove this server or use remote HTTP.";
+    }
+    let error = error.to_ascii_lowercase();
+    if error.contains("operation not permitted") || error.contains("permission denied") {
+        return if is_local {
+            "macOS blocked the command. Check that Fanta can access and execute it."
+        } else {
+            "The server denied access. Check its permissions and authentication."
+        };
+    }
+    if error.contains("no such file or directory") || error.contains("not found") {
+        return if is_local {
+            "Executable not found. Check the command path."
+        } else {
+            "Server address not found. Check the endpoint URL."
+        };
+    }
+    if error.contains("timed out") || error.contains("timeout") {
+        return "The server timed out. Check that it is running, then retry.";
+    }
+    if error.contains("401") || error.contains("unauthorized") {
+        return "The server rejected authentication. Check its sign-in configuration.";
+    }
+    if error.contains("403") || error.contains("forbidden") {
+        return "The server denied access. Check account permissions.";
+    }
+    if error.contains("connection refused") {
+        return "Connection refused. Check that the server is running and the endpoint is correct.";
+    }
+    if is_local {
+        "The command did not complete the MCP connection. Check its configuration and retry."
+    } else {
+        "The server could not connect. Check its URL and authentication, then retry."
+    }
+}
+
 pub(super) fn mcp_server_views(
     workspace: &Entity<Workspace>,
     cx: &App,
@@ -86,7 +124,7 @@ pub(super) fn mcp_server_views(
                 return None;
             }
             let settings = store.settings_for_server(id)?;
-            let (connection, enabled) = match settings {
+            let (connection, enabled, is_local) = match settings {
                 ContextServerSettings::Stdio {
                     command, enabled, ..
                 } => (
@@ -99,12 +137,14 @@ pub(super) fn mcp_server_views(
                         },
                     },
                     *enabled,
+                    true,
                 ),
                 ContextServerSettings::Http { url, enabled, .. } => (
                     SettingsMcpConnection::Http {
                         url: display_url(url),
                     },
                     *enabled,
+                    false,
                 ),
                 ContextServerSettings::Extension { .. } => return None,
             };
@@ -124,9 +164,9 @@ pub(super) fn mcp_server_views(
                             .into(),
                     ),
                 ),
-                Some(ContextServerStatus::Error(_)) => (
+                Some(ContextServerStatus::Error(error)) => (
                     SettingsMcpStatus::Error,
-                    Some("The server could not connect. Retry or inspect the app log.".into()),
+                    Some(safe_connection_error(&error, is_local).into()),
                 ),
                 Some(ContextServerStatus::Stopped) | None => (SettingsMcpStatus::Stopped, None),
             };
@@ -403,6 +443,11 @@ pub(super) fn save_mcp_server(
             !matches!(original, Some(ContextServerSettings::Extension { .. })),
             "Extension servers are managed in the Agent panel"
         );
+        ensure!(
+            !cfg!(feature = "mac_app_store")
+                || !matches!(&draft.connection, SettingsMcpConnection::Local { .. }),
+            "Local MCP commands require a non-Store build of Fanta. Use a remote HTTP server."
+        );
         let entry = connection_settings(&draft, original.as_ref())?;
         let project_path = project_path.transpose()?;
         match draft.scope {
@@ -551,4 +596,41 @@ pub(super) fn handle_mcp_action(
         }
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mcp_connection_errors_do_not_expose_endpoint_secrets() {
+        let detail = safe_connection_error(
+            "https://user:private-token@example.com/mcp?key=another-secret returned HTTP 401",
+            false,
+        );
+        assert_eq!(
+            detail,
+            "The server rejected authentication. Check its sign-in configuration."
+        );
+        assert!(!detail.contains("private-token"));
+        assert!(!detail.contains("another-secret"));
+    }
+
+    #[test]
+    fn mcp_connection_errors_point_to_the_failed_step() {
+        assert_eq!(
+            safe_connection_error("Connection refused", false),
+            "Connection refused. Check that the server is running and the endpoint is correct."
+        );
+        #[cfg(feature = "mac_app_store")]
+        assert_eq!(
+            safe_connection_error("Operation not permitted", true),
+            "Local MCP commands require a non-Store build of Fanta. Remove this server or use remote HTTP."
+        );
+        #[cfg(not(feature = "mac_app_store"))]
+        assert_eq!(
+            safe_connection_error("No such file or directory", true),
+            "Executable not found. Check the command path."
+        );
+    }
 }
