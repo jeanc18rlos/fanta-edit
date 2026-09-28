@@ -182,23 +182,16 @@ pub(crate) async fn prepare_canvas_asset(
         ProjectAssetKind::Svg => Ok(PreparedCanvasAsset::Svg(parse_svg(&bytes)?)),
         ProjectAssetKind::Video => Ok(PreparedCanvasAsset::Video(prepare_video(bytes).await?)),
         ProjectAssetKind::Audio => {
-            #[cfg(target_os = "macos")]
-            {
-                use rodio::Source as _;
-                let decoder = rodio::Decoder::new(std::io::Cursor::new(bytes.to_vec()))
-                    .context("This audio file could not be decoded.")?;
-                let duration = decoder
-                    .total_duration()
-                    .context("The audio file has no usable duration.")?;
-                let duration_us =
-                    i64::try_from(duration.as_micros()).context("The audio file is too long.")?;
-                ensure!(duration_us > 0, "The audio file has no playable samples.");
-                Ok(PreparedCanvasAsset::Audio { duration_us })
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                bail!("Audio canvas placement is unavailable on this platform.")
-            }
+            use rodio::Source as _;
+            let decoder = rodio::Decoder::new(std::io::Cursor::new(bytes))
+                .context("This audio file could not be decoded.")?;
+            let duration = decoder
+                .total_duration()
+                .context("The audio file has no usable duration.")?;
+            let duration_us =
+                i64::try_from(duration.as_micros()).context("The audio file is too long.")?;
+            ensure!(duration_us > 0, "The audio file has no playable samples.");
+            Ok(PreparedCanvasAsset::Audio { duration_us })
         }
     }
 }
