@@ -7627,6 +7627,13 @@ mod tests {
             });
         });
         view.update(cx, |view, cx| {
+            for asset in assets {
+                view.ensure_video_fill_playback(asset, cx);
+            }
+            assert!(view.canvas_video_fills.is_empty());
+            view.set_editor_mode(EditorMode::Motion, cx);
+        });
+        view.update(cx, |view, cx| {
             let sources = view.selected_canvas_video_fill_sources(cx);
             assert_eq!(sources.len(), 2);
             for source in sources {
