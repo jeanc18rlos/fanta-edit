@@ -504,59 +504,65 @@ impl SettingsWindow {
     ) {
         let workspace = cx.entity().downgrade();
         let source_window = window.window_handle().downcast::<MultiWorkspace>();
-        if let Some(existing) = cx
-            .windows()
-            .into_iter()
-            .find_map(|handle| handle.downcast::<Self>())
-        {
-            existing
-                .update(cx, |settings, window, cx| {
-                    settings.workspace = workspace;
-                    settings.source_window = source_window;
-                    settings.rebind_server_subscription(cx);
-                    settings.refresh_local(cx);
-                    settings.select_page(page, window, cx);
-                    window.activate_window();
-                    settings.focus_handle(cx).focus(window, cx);
-                })
-                .log_err();
-            return;
-        }
+        // This action runs inside `Workspace::update`. Constructing the settings
+        // window immediately would read that same workspace while it is still
+        // mutably borrowed, which panics in the native menu callback.
+        cx.defer(move |cx| {
+            if let Some(existing) = cx
+                .windows()
+                .into_iter()
+                .find_map(|handle| handle.downcast::<Self>())
+            {
+                existing
+                    .update(cx, |settings, window, cx| {
+                        settings.workspace = workspace;
+                        settings.source_window = source_window;
+                        settings.rebind_server_subscription(cx);
+                        settings.refresh_local(cx);
+                        settings.select_page(page, window, cx);
+                        window.activate_window();
+                        settings.focus_handle(cx).focus(window, cx);
+                    })
+                    .log_err();
+                return;
+            }
 
-        let window_size = Size {
-            width: px(1120.),
-            height: px(780.),
-        };
-        let window_bounds = WindowBounds::centered(window_size, cx);
-        let window_background = cx.theme().window_background_appearance();
-        cx.open_window(
-            WindowOptions {
-                titlebar: Some(TitlebarOptions {
-                    title: Some("Fanta Settings".into()),
-                    appears_transparent: true,
-                    traffic_light_position: Some(point(px(9.), px(9.))),
-                }),
-                window_bounds: Some(window_bounds),
-                window_min_size: Some(Size {
-                    width: px(SETTINGS_SCREEN_MIN_WIDTH),
-                    height: px(SETTINGS_SCREEN_MIN_HEIGHT.max(640.)),
-                }),
-                kind: WindowKind::Normal,
-                is_movable: true,
-                window_background,
-                ..Default::default()
-            },
-            move |window, cx| {
-                let settings = cx.new(|cx| Self::new(page, workspace, source_window, window, cx));
-                window.activate_window();
-                settings.read(cx).focus_handle(cx).focus(window, cx);
-                settings.update(cx, |settings, cx| {
-                    settings.load_billing(window, cx);
-                });
-                settings
-            },
-        )
-        .log_err();
+            let window_size = Size {
+                width: px(1120.),
+                height: px(780.),
+            };
+            let window_bounds = WindowBounds::centered(window_size, cx);
+            let window_background = cx.theme().window_background_appearance();
+            cx.open_window(
+                WindowOptions {
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("Fanta Settings".into()),
+                        appears_transparent: true,
+                        traffic_light_position: Some(point(px(9.), px(9.))),
+                    }),
+                    window_bounds: Some(window_bounds),
+                    window_min_size: Some(Size {
+                        width: px(SETTINGS_SCREEN_MIN_WIDTH),
+                        height: px(SETTINGS_SCREEN_MIN_HEIGHT.max(640.)),
+                    }),
+                    kind: WindowKind::Normal,
+                    is_movable: true,
+                    window_background,
+                    ..Default::default()
+                },
+                move |window, cx| {
+                    let settings =
+                        cx.new(|cx| Self::new(page, workspace, source_window, window, cx));
+                    window.activate_window();
+                    settings.read(cx).focus_handle(cx).focus(window, cx);
+                    settings.update(cx, |settings, cx| {
+                        settings.load_billing(window, cx);
+                    });
+                    settings
+                },
+            )
+            .log_err();
+        });
     }
 
     fn new(
