@@ -162,9 +162,16 @@ impl VectorOperation {
     }
 
     fn accepts(self, model: &GenerationModel) -> bool {
+        let recipes = model.recipes();
         match self {
-            Self::Create => model.kind == "chat" && model.id.starts_with("claude-"),
-            Self::Trace => matches!(model.kind.as_str(), "svg" | "vectorize"),
+            Self::Create => {
+                recipes.contains(&GenerationRecipe::PromptSvg)
+                    || model.kind == "chat" && model.id.starts_with("claude-")
+            }
+            Self::Trace => {
+                recipes.contains(&GenerationRecipe::ImageSvg)
+                    || recipes.contains(&GenerationRecipe::Vectorize)
+            }
         }
     }
 }
@@ -2579,7 +2586,10 @@ impl GenerationWorkspace {
             self.generate_design(window, cx);
             return;
         }
-        if self.mode == GenerationMode::Vector && self.vector_operation == VectorOperation::Create {
+        if self.mode == GenerationMode::Vector
+            && self.vector_operation == VectorOperation::Create
+            && self.model().is_some_and(|model| model.kind == "chat")
+        {
             self.generate_vectors(cx);
             return;
         }
@@ -4620,7 +4630,9 @@ fn build_vector_message_request(
     size: &str,
 ) -> Result<Value> {
     ensure!(
-        VectorOperation::Create.accepts(model),
+        model.kind == "chat"
+            && model.id.starts_with("claude-")
+            && VectorOperation::Create.accepts(model),
         "Choose a Fanta Claude model to create vectors from a prompt."
     );
     ensure!(
@@ -8133,14 +8145,42 @@ mod tests {
     }
 
     #[test]
-    fn vector_operations_offer_chat_for_creation_and_image_workers_for_tracing() {
+    fn vector_operations_route_prompt_svg_and_image_tracing_to_their_recipes() {
         let mut chat = model("chat");
         chat.id = "claude-sonnet-5".into();
         assert!(VectorOperation::Create.accepts(&chat));
         assert!(!VectorOperation::Trace.accepts(&chat));
-        assert!(!VectorOperation::Create.accepts(&model("svg")));
-        assert!(VectorOperation::Trace.accepts(&model("svg")));
-        assert!(VectorOperation::Trace.accepts(&model("vectorize")));
+
+        let mut arrow = model("svg");
+        arrow.id = "gateway-arrow-1.1-svg".into();
+        arrow.capabilities = json!({"hosted":true,"operations":["prompt_to_svg"]});
+        assert!(arrow.hosted_creation());
+        assert_eq!(arrow.recipes(), vec![GenerationRecipe::PromptSvg]);
+        assert!(VectorOperation::Create.accepts(&arrow));
+        assert!(!VectorOperation::Trace.accepts(&arrow));
+        let request = build_screen_request(
+            &arrow,
+            &screen_submission(&arrow, GenerationRecipe::PromptSvg, "A clean fox icon"),
+            None,
+            None,
+            None,
+        )
+        .expect("Arrow prompt creation uses the hosted generations request");
+        assert_eq!(request["model"], "gateway-arrow-1.1-svg");
+        assert_eq!(request["kind"], "svg");
+        assert_eq!(request["prompt"], "A clean fox icon");
+        assert!(request.get("messages").is_none());
+        assert!(request.get("input").is_none());
+
+        let mut trace = model("svg");
+        trace.id = "replicate-recraft-v4.1-svg".into();
+        trace.capabilities = json!({"hosted":true,"operations":["image_to_svg"]});
+        assert!(VectorOperation::Trace.accepts(&trace));
+        assert!(!VectorOperation::Create.accepts(&trace));
+        let mut vectorize = model("vectorize");
+        vectorize.capabilities = json!({"hosted":true,"operations":["vectorize"]});
+        assert!(VectorOperation::Trace.accepts(&vectorize));
+        assert!(!VectorOperation::Create.accepts(&vectorize));
     }
 
     #[test]
