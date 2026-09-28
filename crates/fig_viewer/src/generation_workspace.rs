@@ -618,6 +618,7 @@ struct RunSummary {
     model: String,
     prompt: String,
     source: Option<SourceImage>,
+    mode: GenerationMode,
 }
 
 #[derive(Clone)]
@@ -719,7 +720,7 @@ fn restore_source(source: &SavedSource) -> Result<SourceImage> {
     })
 }
 
-fn run_from_record(record: &JournalRecord) -> Result<RunSummary> {
+fn run_from_record(record: &JournalRecord, mode: GenerationMode) -> Result<RunSummary> {
     let result = match record
         .result
         .as_ref()
@@ -742,6 +743,7 @@ fn run_from_record(record: &JournalRecord) -> Result<RunSummary> {
         model: record.model.clone(),
         prompt: record.prompt.clone(),
         source: record.source.as_ref().map(restore_source).transpose()?,
+        mode,
     })
 }
 
@@ -754,7 +756,7 @@ fn restore_journal(
     for record in snapshot.records {
         let mode = GenerationMode::from_label(&record.mode)?;
         if record.result.is_some() {
-            history.push(run_from_record(&record)?);
+            history.push(run_from_record(&record, mode)?);
         }
         if record.result.is_none()
             || (record.request.is_some()
@@ -1496,15 +1498,13 @@ impl GenerationWorkspace {
             .as_ref()
             .map(|source| GenerationVoiceReference::new(source.name.clone(), source.name.clone()));
         let mut outputs = Vec::new();
-        let active_id = self.active_run.as_ref().and_then(RunSummary::generation_id);
-        if let Some(run) = self.active_run.as_ref() {
-            let kind = self
-                .models
-                .iter()
-                .find(|model| model.id == run.model)
-                .and_then(|model| model.recipes().first().copied())
-                .map(GenerationRecipe::kind)
-                .unwrap_or_else(|| self.mode.generation_kind().unwrap_or(GenerationKind::Image));
+        let active_run = self
+            .active_run
+            .as_ref()
+            .filter(|run| run.mode.generation_kind().is_some());
+        let active_id = active_run.and_then(RunSummary::generation_id);
+        if let Some(run) = active_run {
+            let kind = run.mode.generation_kind().expect("creation run kind");
             if self.outputs.is_empty() && (self.pending || self.task.is_some()) {
                 outputs.push(
                     GenerationOutput::new(
@@ -1586,20 +1586,18 @@ impl GenerationWorkspace {
                 outputs.push(entry);
             }
         }
-        for run in &self.history {
+        for run in self
+            .history
+            .iter()
+            .filter(|run| run.mode.generation_kind().is_some())
+        {
             let Some(id) = run.generation_id() else {
                 continue;
             };
             if Some(id) == active_id || self.gallery.iter().any(|record| record.id == id) {
                 continue;
             }
-            let kind = self
-                .models
-                .iter()
-                .find(|model| model.id == run.model)
-                .and_then(|model| model.recipes().first().copied())
-                .map(GenerationRecipe::kind)
-                .unwrap_or(GenerationKind::Image);
+            let kind = run.mode.generation_kind().expect("creation run kind");
             outputs.push(
                 GenerationOutput::new(
                     format!("gen:{id}:0"),
@@ -1619,7 +1617,7 @@ impl GenerationWorkspace {
             outputs,
             selected_model_id,
             selected_template_id: self.selected_template.clone(),
-            selected_output_id: (!self.outputs.is_empty()).then(|| {
+            selected_output_id: (active_run.is_some() && !self.outputs.is_empty()).then(|| {
                 format!(
                     "gen:{}:{}",
                     active_id.unwrap_or("vector"),
@@ -1948,6 +1946,12 @@ impl GenerationWorkspace {
                 model: record.model,
                 prompt,
                 source: None,
+                mode: match record.kind {
+                    GenerationKind::Image => GenerationMode::Image,
+                    GenerationKind::Video => GenerationMode::Video,
+                    GenerationKind::Audio => GenerationMode::Audio,
+                    GenerationKind::Svg => GenerationMode::Vector,
+                },
             };
             if record.outputs.is_empty() {
                 self.refresh_gallery(false, cx);
@@ -2680,7 +2684,7 @@ impl GenerationWorkspace {
                     Ok((message_id, svg)) => {
                         let run = RunSummary {
                             result: RunResult::VectorMessage { message_id, svg: svg.clone() },
-                            model: model.id, prompt, source: None,
+                            model: model.id, prompt, source: None, mode: GenerationMode::Vector,
                         };
                         this.active_run = Some(run.clone());
                         this.history.insert(0, run);
@@ -2751,6 +2755,7 @@ impl GenerationWorkspace {
             prompt,
             source,
             account,
+            mode,
             ..
         } = submission;
         let client = self.client.clone();
@@ -2812,7 +2817,7 @@ impl GenerationWorkspace {
                 Ok((response, (submissions, history))) => {
                     let run = RunSummary {
                         result: RunResult::Generation { id: response.id.clone() },
-                        model, prompt, source,
+                        model, prompt, source, mode,
                     };
                     let applied = this.update(cx, |this, cx| {
                         if this.client.account_access_token() != account {
@@ -7553,6 +7558,7 @@ mod tests {
                 model: "fanta-video-1".into(),
                 prompt: "A sunrise".into(),
                 source: None,
+                mode: GenerationMode::Video,
             };
             view.active_run = Some(run.clone());
             view.history = vec![run];
@@ -7735,6 +7741,106 @@ mod tests {
         model.id = "fanta-image-1".into();
         model.capabilities = json!({"gateway":{"duration":4}});
         assert!(!model.hosted_creation());
+    }
+
+    #[gpui::test]
+    fn existing_gateway_images_and_videos_remain_available(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = visual_workspace(GenerationMode::Image, cx);
+        let mut image = model("image");
+        image.id = "recraft-v4.1-flash".into();
+        image.capabilities = json!({
+            "hosted": true,
+            "provider": "AI Gateway",
+            "operations": [],
+            "gateway": {},
+            "size": {"values": ["1024x1024", "1280x768", "768x1280"], "default": "1024x1024"},
+            "num_outputs": {"min": 1, "max": 4, "default": 1}
+        });
+        assert!(image.hosted_creation());
+        assert_eq!(image.recipes(), vec![GenerationRecipe::TextImage]);
+        let groups = view.read_with(cx, |view, _| {
+            view.screen_option_groups(&image, GenerationRecipe::TextImage)
+        });
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].key.as_ref(), "canvas");
+        assert_eq!(groups[0].choices.len(), 3);
+        assert_eq!(groups[1].key.as_ref(), "num_outputs");
+        assert_eq!(groups[1].choices.len(), 4);
+        let mut submission = screen_submission(&image, GenerationRecipe::TextImage, "A fern");
+        submission.options = vec![
+            fanta_gpui::generation::GenerationOptionSelection {
+                key: "canvas".into(),
+                value: "1280x768".into(),
+            },
+            fanta_gpui::generation::GenerationOptionSelection {
+                key: "num_outputs".into(),
+                value: "2".into(),
+            },
+        ];
+        let request = build_screen_request(&image, &submission, None, None, None)
+            .expect("legacy Gateway image request");
+        assert_eq!(request["width"], 1280);
+        assert_eq!(request["height"], 768);
+        assert_eq!(request["input"]["num_outputs"], 2);
+
+        let mut video = model("video");
+        video.id = "veo-3.1-fast".into();
+        video.capabilities = json!({
+            "operations": [],
+            "gateway": {"duration": 4, "resolution": "1280x720", "generateAudio": false}
+        });
+        assert!(video.hosted_creation());
+        assert_eq!(video.recipes(), vec![GenerationRecipe::TextVideo]);
+        let screen = view.read_with(cx, |view, _| {
+            view.screen_model(&video, GenerationRecipe::TextVideo, 0)
+        });
+        assert!(screen.description.contains("4s"));
+        assert!(screen.option_groups.is_empty());
+
+        video.id = "kling-2.6-i2v".into();
+        video.capabilities = json!({
+            "operations": [],
+            "gateway": {"duration": 5, "generateAudio": false, "requires_image": true}
+        });
+        assert!(video.hosted_creation());
+        assert_eq!(video.recipes(), vec![GenerationRecipe::ImageVideo]);
+    }
+
+    #[gpui::test]
+    fn creation_gallery_excludes_historical_mask_runs(cx: &mut gpui::TestAppContext) {
+        let (view, cx) = visual_workspace(GenerationMode::Image, cx);
+        view.update_in(cx, |view, _, cx| {
+            let mask_run = RunSummary {
+                result: RunResult::Generation {
+                    id: "old-mask".into(),
+                },
+                model: "fanta-segment-1".into(),
+                prompt: "Select the subject".into(),
+                source: None,
+                mode: GenerationMode::Masks,
+            };
+            let image_run = RunSummary {
+                result: RunResult::Generation {
+                    id: "saved-image".into(),
+                },
+                model: "recraft-v4.1-flash".into(),
+                prompt: "A fern".into(),
+                source: None,
+                mode: GenerationMode::Image,
+            };
+            view.history = vec![mask_run.clone(), image_run];
+            view.active_run = Some(mask_run);
+            view.outputs = vec![MediaOutput {
+                label: "Mask".into(),
+                mime: "image/png".into(),
+                location: MediaLocation::Inline(Arc::from(&b"mask"[..])),
+                mask: true,
+            }];
+            let data = view.generation_view_data(cx);
+            assert_eq!(data.outputs.len(), 1);
+            assert_eq!(data.outputs[0].id.as_ref(), "gen:saved-image:0");
+            assert!(data.selected_output_id.is_none());
+        });
     }
 
     #[gpui::test]
@@ -8052,6 +8158,7 @@ mod tests {
             model: "claude-sonnet-5".into(),
             prompt: "triangle".into(),
             source: None,
+            mode: GenerationMode::Vector,
         };
         assert!(run.generation_id().is_none());
         assert_eq!(run.provenance()["message_id"], "msg_vector");
