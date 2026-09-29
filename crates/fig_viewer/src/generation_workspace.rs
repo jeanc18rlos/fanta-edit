@@ -517,19 +517,23 @@ pub(crate) struct AudioPlaybackView {
 #[cfg(target_os = "macos")]
 impl AudioPlaybackView {
     pub(crate) fn new(bytes: Arc<[u8]>, title: SharedString) -> Self {
+        let (duration, error) = match generation_media::audio_decoder(bytes.clone()) {
+            Ok(decoder) => (decoder.total_duration(), None),
+            Err(error) => (None, Some(error.to_string().into())),
+        };
         Self {
             bytes,
             title,
             output: None,
             player: None,
-            duration: None,
+            duration,
             playing: false,
             muted: false,
             volume: 0.85,
             speed: 1.0,
             seek_bounds: None,
             scrubbing: false,
-            error: None,
+            error,
             progress_task: None,
         }
     }
@@ -540,29 +544,34 @@ impl AudioPlaybackView {
         self
     }
 
+    fn ensure_player(&mut self) -> Result<()> {
+        if self.player.as_ref().is_some_and(|player| !player.empty()) {
+            return Ok(());
+        }
+        self.player = None;
+        self.output = None;
+        let decoder = generation_media::audio_decoder(self.bytes.clone())
+            .context("The generated audio could not be decoded.")?;
+        self.duration = decoder.total_duration();
+        let output = rodio::DeviceSinkBuilder::open_default_sink()
+            .context("No audio output device is available.")?;
+        let player = rodio::Player::connect_new(output.mixer());
+        player.pause();
+        player.append(decoder);
+        player.set_volume(if self.muted { 0.0 } else { self.volume });
+        player.set_speed(self.speed);
+        self.output = Some(output);
+        self.player = Some(player);
+        Ok(())
+    }
+
     fn play(&mut self, cx: &mut Context<Self>) {
-        let result = (|| -> Result<()> {
-            if self.player.as_ref().is_none_or(rodio::Player::empty) {
-                self.player = None;
-                self.output = None;
-                let decoder = rodio::Decoder::new(Cursor::new(self.bytes.clone()))
-                    .context("The generated audio could not be decoded.")?;
-                self.duration = decoder.total_duration();
-                let output = rodio::DeviceSinkBuilder::open_default_sink()
-                    .context("No audio output device is available.")?;
-                let player = rodio::Player::connect_new(output.mixer());
-                player.append(decoder);
-                player.set_volume(if self.muted { 0.0 } else { self.volume });
-                player.set_speed(self.speed);
-                self.output = Some(output);
-                self.player = Some(player);
-            } else if let Some(player) = self.player.as_ref() {
-                player.play();
-            }
-            Ok(())
-        })();
+        let result = self.ensure_player();
         match result {
             Ok(()) => {
+                if let Some(player) = self.player.as_ref() {
+                    player.play();
+                }
                 self.playing = true;
                 self.error = None;
                 if self.progress_task.is_none() {
@@ -604,6 +613,11 @@ impl AudioPlaybackView {
     }
 
     fn seek(&mut self, position: Duration, cx: &mut Context<Self>) {
+        if let Err(error) = self.ensure_player() {
+            self.error = Some(error.to_string().into());
+            cx.notify();
+            return;
+        }
         let Some(player) = self.player.as_ref() else {
             return;
         };
@@ -709,7 +723,7 @@ impl Render for AudioPlaybackView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &gpui::MouseDownEvent, _, cx| {
-                    if this.player.is_some() && this.duration.is_some() {
+                    if this.duration.is_some() {
                         this.scrubbing = true;
                         this.seek_at(event.position, cx);
                         cx.stop_propagation();
@@ -785,6 +799,10 @@ impl Render for AudioPlaybackView {
                 .size_full(),
             );
         let clock = |time: Duration| format!("{}:{:02}", time.as_secs() / 60, time.as_secs() % 60);
+        let duration_label = self
+            .duration
+            .map(|duration| clock(duration))
+            .unwrap_or_else(|| "--:--".into());
         v_flex()
             .size_full()
             .justify_center()
@@ -849,7 +867,7 @@ impl Render for AudioPlaybackView {
                             .on_click(cx.listener(|this, _, _, cx| this.skip(10, cx))),
                     )
                     .child(
-                        Label::new(format!("{} / {}", clock(position), clock(duration)))
+                        Label::new(format!("{} / {}", clock(position), duration_label))
                             .size(LabelSize::Small)
                             .color(Color::Muted),
                     )
@@ -1825,10 +1843,12 @@ impl GenerationWorkspace {
             let server_title = active_id
                 .and_then(|id| self.gallery.iter().find(|record| record.id == id))
                 .and_then(|record| record.title.as_deref());
-            let title = gallery_creation_title(
+            let title = creation_title_for_model(
                 preferred_gallery_title(self.active_title.as_deref(), server_title),
                 Some(&run.prompt),
                 kind,
+                Some(run.model.as_str()),
+                &self.models,
             );
             let model_label = self
                 .models
@@ -1895,10 +1915,12 @@ impl GenerationWorkspace {
                 .history
                 .iter()
                 .find(|run| run.generation_id() == Some(record.id.as_str()));
-            let title = gallery_creation_title(
+            let title = creation_title_for_model(
                 record.title.as_deref(),
                 local_run.map(|run| run.prompt.as_str()),
                 record.kind,
+                Some(record.model.as_str()),
+                &self.models,
             );
             let count = record.outputs.len().max(1);
             for index in 0..count {
@@ -3653,11 +3675,15 @@ impl GenerationWorkspace {
                         this.restore_video_playback(cx);
                         #[cfg(target_os = "macos")]
                         if let Some(bytes) = audio {
-                            let title = this.active_title.as_deref().unwrap_or("Audio preview");
+                            let title = creation_title_for_model(
+                                this.active_title.as_deref(),
+                                this.active_run.as_ref().map(|run| run.prompt.as_str()),
+                                GenerationKind::Audio,
+                                this.active_run.as_ref().map(|run| run.model.as_str()),
+                                &this.models,
+                            );
                             this.audio_playback =
-                                Some(cx.new(|_| {
-                                    AudioPlaybackView::new(bytes, title.to_owned().into())
-                                }));
+                                Some(cx.new(|_| AudioPlaybackView::new(bytes, title.into())));
                         }
                         #[cfg(not(target_os = "macos"))]
                         drop(audio);
@@ -4140,7 +4166,24 @@ impl GenerationWorkspace {
         let path = cx.prompt_for_new_path(&PathBuf::from(paths::home_dir().as_path()), Some(&name));
         let client = self.client.clone();
         let account = client.account_access_token();
-        let cached_video = self.prepared_video.clone();
+        let cached_media = if output.mime.starts_with("video/") {
+            self.prepared_video
+                .as_ref()
+                .map(|video| video.bytes.clone())
+        } else if output.mime.starts_with("audio/") {
+            #[cfg(target_os = "macos")]
+            {
+                self.audio_playback
+                    .as_ref()
+                    .map(|playback| playback.read(cx).bytes.clone())
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                None
+            }
+        } else {
+            None
+        };
         self.task = Some(cx.spawn(async move |this, cx| {
             let result: Result<bool> = async {
                 let Some(path) = path.await?? else {
@@ -4150,9 +4193,11 @@ impl GenerationWorkspace {
                     client.account_access_token() == account,
                     "Your Fanta account changed. Choose the result again before saving it."
                 );
-                let bytes = match cached_video {
-                    Some(video) if output.mime.starts_with("video/") => video.bytes.clone(),
-                    _ => media_bytes(&client, &output.location, cx.background_executor()).await?,
+                let bytes = match cached_media {
+                    Some(bytes) => bytes,
+                    None => {
+                        media_bytes(&client, &output.location, cx.background_executor()).await?
+                    }
                 };
                 ensure!(
                     client.account_access_token() == account,
@@ -4212,10 +4257,12 @@ impl GenerationWorkspace {
             .as_ref()
             .and_then(|run| run.mode.generation_kind())
             .unwrap_or(GenerationKind::Image);
-        let title = gallery_creation_title(
+        let title = creation_title_for_model(
             self.active_title.as_deref(),
             self.active_run.as_ref().map(|run| run.prompt.as_str()),
             kind,
+            self.active_run.as_ref().map(|run| run.model.as_str()),
+            &self.models,
         );
         let client = self.client.clone();
         let account = client.account_access_token();
@@ -6032,6 +6079,25 @@ fn neutral_generation_title(title: &str) -> bool {
     title.starts_with("New ") && title.ends_with(" Creation")
 }
 
+fn creation_title_for_model(
+    server_title: Option<&str>,
+    prompt: Option<&str>,
+    kind: GenerationKind,
+    model_id: Option<&str>,
+    models: &[GenerationModel],
+) -> String {
+    let narration = kind == GenerationKind::Audio
+        && prompt.is_some_and(|prompt| !prompt.trim().is_empty())
+        && model_id.is_some_and(|id| {
+            models
+                .iter()
+                .find(|model| model.id == id)
+                .is_some_and(|model| model.recipes().as_slice() == [GenerationRecipe::Speech])
+                || id.to_ascii_lowercase().contains("tts")
+        });
+    gallery_creation_title(if narration { None } else { server_title }, prompt, kind)
+}
+
 fn gallery_creation_title(
     title: Option<&str>,
     prompt: Option<&str>,
@@ -6348,6 +6414,75 @@ mod tests {
             ),
             "Image creation"
         );
+    }
+
+    #[test]
+    fn narration_uses_spoken_text_instead_of_an_unrelated_server_title() {
+        let mut narration = model("audio");
+        narration.id = "grok-tts".into();
+        narration.capabilities = json!({"operations":["speech"]});
+        let mut music = model("audio");
+        music.id = "music-model".into();
+        music.capabilities = json!({"operations":["music"]});
+        let models = [narration, music];
+        let server_title = Some("Vibrant Soda Brand Imagination Jingle");
+        let spoken_text = Some("Welcome to Fanta. Create what you imagine.");
+
+        assert_eq!(
+            creation_title_for_model(
+                server_title,
+                spoken_text,
+                GenerationKind::Audio,
+                Some("grok-tts"),
+                &models,
+            ),
+            "Welcome to Fanta"
+        );
+        assert_eq!(
+            creation_title_for_model(
+                server_title,
+                spoken_text,
+                GenerationKind::Audio,
+                Some("GROK-TTS"),
+                &models,
+            ),
+            "Welcome to Fanta"
+        );
+        assert_eq!(
+            creation_title_for_model(
+                server_title,
+                spoken_text,
+                GenerationKind::Audio,
+                Some("music-model"),
+                &models,
+            ),
+            "Vibrant Soda Brand Imagination Jingle"
+        );
+        assert_eq!(
+            creation_title_for_model(
+                server_title,
+                None,
+                GenerationKind::Audio,
+                Some("grok-tts"),
+                &models,
+            ),
+            "Vibrant Soda Brand Imagination Jingle"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn audio_preview_knows_mp3_duration_before_playing() {
+        let bytes: Arc<[u8]> =
+            Arc::from(&include_bytes!("../tests/fixtures/one_second_tone.mp3")[..]);
+        let preview = AudioPlaybackView::new(bytes, "Audio preview".into());
+        assert!(
+            preview
+                .duration
+                .is_some_and(|duration| { (900..=1_200).contains(&duration.as_millis()) })
+        );
+        assert!(preview.error.is_none());
+        assert!(preview.player.is_none());
     }
 
     #[test]
@@ -8204,6 +8339,47 @@ mod tests {
         cx.simulate_new_path_selection(|_| Some(path.clone()));
         cx.run_until_parked();
         assert_eq!(std::fs::read(path).expect("saved video"), expected.as_ref());
+        view.read_with(cx, |view, _| {
+            assert!(view.task.is_none());
+            assert!(view.error.is_none());
+            assert_eq!(view.status.as_ref(), "Result saved.");
+        });
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn generation_audio_save_reuses_preview_bytes(cx: &mut gpui::TestAppContext) {
+        let http = http_client::FakeHttpClient::create(|request| async move {
+            let body = match request.uri().path() {
+                "/v1/models" => json!({"models":[]}),
+                "/v1/me" => recovery_account_fixture(),
+                route => panic!("cached audio must not be downloaded again: {route}"),
+            };
+            Ok(http_client::Response::builder()
+                .status(200)
+                .body(body.to_string().into())?)
+        });
+        let client = catalog_client(cx, http);
+        sign_in_catalog_client(&client, cx).await;
+        let (view, cx) = visual_workspace_with_client(GenerationMode::Audio, client, cx);
+        let directory = tempfile::tempdir().expect("save directory");
+        let path = directory.path().join("cached.mp3");
+        let expected: Arc<[u8]> =
+            Arc::from(&include_bytes!("../tests/fixtures/one_second_tone.mp3")[..]);
+        view.update(cx, |view, cx| {
+            view.outputs = vec![MediaOutput {
+                label: "Audio".into(),
+                mime: "audio/mpeg".into(),
+                mask: false,
+                location: MediaLocation::Url("https://media.example/expired.mp3".into()),
+            }];
+            view.audio_playback =
+                Some(cx.new(|_| AudioPlaybackView::new(expected.clone(), "Audio preview".into())));
+            view.save_output(cx);
+        });
+        cx.simulate_new_path_selection(|_| Some(path.clone()));
+        cx.run_until_parked();
+        assert_eq!(std::fs::read(path).expect("saved audio"), expected.as_ref());
         view.read_with(cx, |view, _| {
             assert!(view.task.is_none());
             assert!(view.error.is_none());
