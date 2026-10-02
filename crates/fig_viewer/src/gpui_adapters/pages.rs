@@ -100,7 +100,7 @@ pub(crate) fn element_kind(
     component_roots: &std::collections::HashSet<NodeId>,
 ) -> PagesPanelElementKind {
     match data {
-        NodeData::Text(_) => PagesPanelElementKind::Text,
+        NodeData::Text(_) | NodeData::TextPath(_) => PagesPanelElementKind::Text,
         NodeData::Instance(_) => PagesPanelElementKind::Instance,
         NodeData::Group(_) if component_roots.contains(&id) => PagesPanelElementKind::Component,
         NodeData::Group(_) => PagesPanelElementKind::FrameGroup,

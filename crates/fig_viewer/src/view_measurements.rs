@@ -602,3 +602,718 @@ impl FigView {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fanta_doc::{CanvasNode, Color, GroupNode, NodeData, Operation, VectorNode};
+    use gpui::{TestAppContext, point, size};
+    use project::FakeFs;
+    use settings::SettingsStore;
+
+    fn init_visual_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            zlog::init_test();
+            assets::Assets.load_test_fonts(cx);
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+            #[cfg(feature = "fanta-gpui-ui")]
+            {
+                gpui_component::init(cx);
+                fanta_gpui::init(cx);
+                crate::theme_bridge::init(cx);
+            }
+        });
+    }
+
+    fn doc_with_one_page() -> fanta_doc::Doc {
+        let mut doc = fanta_doc::Doc::new();
+        let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page.name = "Page 1".to_owned();
+        let root = page.id;
+        doc.apply(Operation::create_node(page))
+            .expect("create page root node");
+        doc.add_page(root);
+        doc.set_active_page(Some(root));
+        doc
+    }
+
+    async fn autosave_fixture(
+        cx: &mut TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        Entity<FigItem>,
+        Entity<FigView>,
+    ) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("Design");
+        let initial = doc_with_one_page();
+        crate::document::write_project(&root, &initial, &BTreeMap::new())
+            .expect("materialize project fixture");
+        let item = crate::document::ready_item_with_root_for_test(
+            &project,
+            dir.path().join("Design.fig"),
+            Some(root.clone()),
+            initial,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("create fig view");
+        (dir, root, item, view)
+    }
+
+    async fn measurement_view_fixture(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<FigItem>,
+        Entity<FigView>,
+        gpui::WindowHandle<gpui::Empty>,
+        NodeId,
+    ) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let page = doc.active_page().expect("page");
+        let mut rectangle = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            100.0,
+            100.0,
+            Color::BLACK,
+        )));
+        rectangle.parent = Some(page);
+        let node = rectangle.id;
+        doc.apply(Operation::create_node(rectangle))
+            .expect("art layer");
+        doc.selection.select_only(node);
+        doc.history = Default::default();
+        let item =
+            crate::document::ready_item_for_test(&project, "/tmp/Measurement.fig".into(), doc, cx);
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("measurement view");
+        cx.run_until_parked();
+        view.update(cx, |view, cx| {
+            view.select_page(0, cx);
+            view.container_bounds = Some(Bounds::new(
+                point(px(100.), px(50.)),
+                size(px(800.), px(600.)),
+            ));
+            view.viewport = Some(Viewport::default());
+        });
+        (item, view, scratch, node)
+    }
+
+    fn measurement_pointer_down(
+        view: &mut FigView,
+        screen: [f64; 2],
+        window: &mut Window,
+        cx: &mut Context<FigView>,
+    ) {
+        view.handle_mouse_down(
+            &MouseDownEvent {
+                button: MouseButton::Left,
+                position: point(px(screen[0] as f32 + 100.), px(screen[1] as f32 + 50.)),
+                modifiers: gpui::Modifiers::none(),
+                click_count: 1,
+                first_mouse: false,
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn measurement_pointer_up(
+        view: &mut FigView,
+        screen: [f64; 2],
+        window: &mut Window,
+        cx: &mut Context<FigView>,
+    ) {
+        view.handle_mouse_up(
+            &MouseUpEvent {
+                button: MouseButton::Left,
+                position: point(px(screen[0] as f32 + 100.), px(screen[1] as f32 + 50.)),
+                modifiers: gpui::Modifiers::none(),
+                click_count: 1,
+            },
+            window,
+            cx,
+        );
+    }
+
+    #[gpui::test]
+    async fn measurement_native_pointer_routes_create_edit_move_copy_delete_and_undo(
+        cx: &mut TestAppContext,
+    ) {
+        let (item, view, scratch, node) = measurement_view_fixture(cx).await;
+        let original_node = item.read_with(cx, |item, _| {
+            item.doc()
+                .expect("doc")
+                .scene
+                .get(node)
+                .expect("art")
+                .clone()
+        });
+        scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.activate_tool(ToolKind::Measure, cx);
+                    assert_eq!(view.tools.kind(), ToolKind::Measure);
+                    assert!(!view.is_editable(cx));
+                    assert!(view.can_edit_measurements(cx));
+                    measurement_pointer_down(view, [400., 300.], window, cx);
+                    view.handle_window_mouse_move(
+                        &MouseMoveEvent {
+                            position: point(px(540.), px(380.)),
+                            pressed_button: Some(MouseButton::Left),
+                            modifiers: gpui::Modifiers::none(),
+                        },
+                        cx,
+                    );
+                    assert!(
+                        view.page_measurements(cx).is_empty(),
+                        "preview is not persisted"
+                    );
+                    assert_eq!(
+                        view.item.read(cx).doc().expect("doc").history.undo_depth(),
+                        0
+                    );
+                    let preview = view.measurement_overlays(Viewport::default(), [800., 600.], cx);
+                    assert_eq!(preview.len(), 1);
+                    assert_eq!(preview.first().expect("preview").label, "50 px");
+                    measurement_pointer_up(view, [440., 330.], window, cx);
+                    measurement_pointer_up(view, [440., 330.], window, cx);
+                    let created = view
+                        .selected_measurement(cx)
+                        .expect("new selected measurement");
+                    assert_eq!(created.measurement().start, [0., 0.]);
+                    assert_eq!(created.measurement().end, [40., 30.]);
+                    assert!(view.item.read(cx).doc().expect("doc").selection.is_empty());
+                    assert_eq!(
+                        view.item.read(cx).doc().expect("doc").history.undo_depth(),
+                        1
+                    );
+                    measurement_pointer_down(view, [440., 330.], window, cx);
+                    measurement_pointer_up(view, [450., 350.], window, cx);
+                    let edited = view.selected_measurement(cx).expect("edited measurement");
+                    assert_eq!(edited.measurement().id, created.measurement().id);
+                    assert_eq!(edited.measurement().start, [0., 0.]);
+                    assert_eq!(edited.measurement().end, [50., 50.]);
+                    assert_eq!(
+                        view.item.read(cx).doc().expect("doc").history.undo_depth(),
+                        2
+                    );
+                    view.undo(&Undo, window, cx);
+                    assert_eq!(
+                        view.selected_measurement(cx)
+                            .expect("undo endpoint")
+                            .measurement()
+                            .end,
+                        [40., 30.]
+                    );
+                    view.redo(&Redo, window, cx);
+                    measurement_pointer_down(view, [425., 325.], window, cx);
+                    measurement_pointer_up(view, [445., 335.], window, cx);
+                    let moved = view.selected_measurement(cx).expect("moved measurement");
+                    assert_eq!(moved.measurement().start, [20., 10.]);
+                    assert_eq!(moved.measurement().end, [70., 60.]);
+                    assert_eq!(
+                        view.item.read(cx).doc().expect("doc").history.undo_depth(),
+                        3
+                    );
+                    view.copy_selected_nodes(cx);
+                    assert_eq!(
+                        cx.read_from_clipboard()
+                            .and_then(|clipboard| clipboard.text()),
+                        Some(moved.measurement().label().expect("label"))
+                    );
+                    view.cut_selected_nodes(cx);
+                    view.duplicate_selected_nodes(cx);
+                    view.nudge(LogicalKey::ArrowRight, window, cx);
+                    view.group_selection(&GroupSelection, window, cx);
+                    assert_eq!(
+                        view.item.read(cx).doc().expect("doc").scene.get(node),
+                        Some(&original_node)
+                    );
+                    assert_eq!(
+                        view.item.read(cx).doc().expect("doc").history.undo_depth(),
+                        3
+                    );
+                    view.delete_selection(&DeleteSelection, window, cx);
+                    assert!(view.page_measurements(cx).is_empty());
+                    assert_eq!(
+                        view.item.read(cx).doc().expect("doc").history.undo_depth(),
+                        4
+                    );
+                    view.undo(&Undo, window, cx);
+                    let restored = view.page_measurements(cx).pop().expect("undo deletion");
+                    assert_eq!(restored.measurement(), moved.measurement());
+                })
+            })
+            .expect("full measurement lifecycle");
+    }
+
+    #[gpui::test]
+    async fn measurement_drafts_block_boundaries_and_escape_consumes_a_late_release(
+        cx: &mut TestAppContext,
+    ) {
+        let (item, view, scratch, _) = measurement_view_fixture(cx).await;
+        let before = item.read_with(cx, |item, _| {
+            (
+                item.doc()
+                    .expect("doc")
+                    .scene
+                    .get(item.doc().expect("doc").active_page().expect("page"))
+                    .expect("page")
+                    .meta
+                    .clone(),
+                item.doc().expect("doc").history.undo_depth(),
+                item.is_dirty(),
+            )
+        });
+        let save = scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.activate_tool(ToolKind::Measure, cx);
+                    measurement_pointer_down(view, [400., 300.], window, cx);
+                    view.handle_window_mouse_move(
+                        &MouseMoveEvent {
+                            position: point(px(550.), px(380.)),
+                            pressed_button: Some(MouseButton::Left),
+                            modifiers: gpui::Modifiers::none(),
+                        },
+                        cx,
+                    );
+                    let draft = view.measurement_controller.clone();
+                    view.activate_tool(ToolKind::Inspect, cx);
+                    view.set_editor_mode(EditorMode::Motion, cx);
+                    view.set_editor_workspace(EditorWorkspace::Code, cx);
+                    view.select_page(99, cx);
+                    assert_eq!(view.measurement_controller, draft);
+                    assert_eq!(view.tools.kind(), ToolKind::Measure);
+                    assert_eq!(view.editor_mode(cx), EditorMode::Design);
+                    assert_eq!(view.editor_workspace(cx), EditorWorkspace::Canvas);
+                    let save = view.save_document(cx);
+                    view.cancel(&Cancel, window, cx);
+                    assert!(!view.measurement_controller.has_pending_authoring());
+                    measurement_pointer_up(view, [450., 330.], window, cx);
+                    assert!(view.page_measurements(cx).is_empty());
+                    view.activate_tool(ToolKind::Inspect, cx);
+                    assert!(view.is_inspecting());
+                    save
+                })
+            })
+            .expect("draft boundaries");
+        assert!(save.await.is_err());
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("doc");
+            assert_eq!(
+                doc.scene
+                    .get(doc.active_page().expect("page"))
+                    .expect("page")
+                    .meta,
+                before.0
+            );
+            assert_eq!(doc.history.undo_depth(), before.1);
+            assert_eq!(item.is_dirty(), before.2);
+        });
+    }
+
+    #[gpui::test]
+    async fn measurement_changed_projection_rejects_release_and_enter_keeps_preview(
+        cx: &mut TestAppContext,
+    ) {
+        let (item, view, scratch, _) = measurement_view_fixture(cx).await;
+        scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.activate_tool(ToolKind::Measure, cx);
+                    measurement_pointer_down(view, [400., 300.], window, cx);
+                    view.handle_window_mouse_move(
+                        &MouseMoveEvent {
+                            position: point(px(540.), px(380.)),
+                            pressed_button: Some(MouseButton::Left),
+                            modifiers: gpui::Modifiers::none(),
+                        },
+                        cx,
+                    );
+                    let accepted = view
+                        .measurement_controller
+                        .draft()
+                        .expect("draft")
+                        .preview();
+                    view.viewport = Some(Viewport {
+                        center: [0., 0.],
+                        zoom: 2.,
+                    });
+                    measurement_pointer_up(view, [440., 330.], window, cx);
+                    assert_eq!(
+                        view.measurement_controller
+                            .draft()
+                            .expect("kept draft")
+                            .preview(),
+                        accepted
+                    );
+                    assert!(!view.measurement_controller.is_dragging());
+                    view.viewport = Some(Viewport::default());
+                    view.confirm(&Confirm, window, cx);
+                    assert!(view.page_measurements(cx).is_empty());
+                    assert!(view.measurement_controller.has_pending_authoring());
+                    view.cancel(&Cancel, window, cx);
+                })
+            })
+            .expect("rejected release stays rejected");
+        assert_eq!(
+            item.read_with(cx, |item, _| item.doc().expect("doc").history.undo_depth()),
+            0
+        );
+    }
+
+    #[gpui::test]
+    async fn measurement_focus_loss_freezes_preview_and_ignores_hover_and_late_release(
+        cx: &mut TestAppContext,
+    ) {
+        let (item, view, scratch, _) = measurement_view_fixture(cx).await;
+        scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    for boundary in ["item", "workspace", "missed-release"] {
+                        view.activate_tool(ToolKind::Measure, cx);
+                        measurement_pointer_down(view, [400., 300.], window, cx);
+                        view.handle_window_mouse_move(
+                            &MouseMoveEvent {
+                                position: point(px(540.), px(380.)),
+                                pressed_button: Some(MouseButton::Left),
+                                modifiers: gpui::Modifiers::none(),
+                            },
+                            cx,
+                        );
+                        let before = view
+                            .measurement_controller
+                            .draft()
+                            .expect("draft")
+                            .preview();
+                        match boundary {
+                            "item" => Item::deactivated(view, window, cx),
+                            "workspace" => Item::workspace_deactivated(view, window, cx),
+                            _ => {}
+                        }
+                        view.handle_window_mouse_move(
+                            &MouseMoveEvent {
+                                position: point(px(590.), px(420.)),
+                                pressed_button: None,
+                                modifiers: gpui::Modifiers::none(),
+                            },
+                            cx,
+                        );
+                        assert!(!view.primary_pressed, "{boundary}");
+                        assert!(!view.canvas_pointer_down, "{boundary}");
+                        assert!(!view.measurement_controller.is_dragging(), "{boundary}");
+                        measurement_pointer_up(view, [490., 370.], window, cx);
+                        view.confirm(&Confirm, window, cx);
+                        assert_eq!(
+                            view.measurement_controller
+                                .draft()
+                                .expect("kept draft")
+                                .preview(),
+                            before,
+                            "{boundary}"
+                        );
+                        assert!(view.page_measurements(cx).is_empty(), "{boundary}");
+                        view.cancel(&Cancel, window, cx);
+                    }
+                })
+            })
+            .expect("focus and lost-release recovery");
+        assert_eq!(
+            item.read_with(cx, |item, _| item.doc().expect("doc").history.undo_depth()),
+            0
+        );
+    }
+
+    #[gpui::test]
+    async fn measurement_inspect_selection_copies_but_never_mutates_and_exit_restores_art(
+        cx: &mut TestAppContext,
+    ) {
+        let (item, view, scratch, node) = measurement_view_fixture(cx).await;
+        scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.activate_tool(ToolKind::Measure, cx);
+                    measurement_pointer_down(view, [400., 300.], window, cx);
+                    measurement_pointer_up(view, [440., 330.], window, cx);
+                    let expected = view.selected_measurement(cx).expect("measurement");
+                    let before = view
+                        .item
+                        .read(cx)
+                        .doc()
+                        .expect("doc")
+                        .to_json_string()
+                        .expect("snapshot");
+                    view.activate_tool(ToolKind::Inspect, cx);
+                    measurement_pointer_down(view, [420., 315.], window, cx);
+                    measurement_pointer_up(view, [470., 365.], window, cx);
+                    assert_eq!(view.selected_measurement(cx).as_ref(), Some(&expected));
+                    view.copy_measurement(&expected, cx);
+                    assert_eq!(
+                        cx.read_from_clipboard()
+                            .and_then(|clipboard| clipboard.text()),
+                        Some("50 px".into())
+                    );
+                    view.delete_measurement(&expected, cx);
+                    view.delete_selected_nodes(cx);
+                    view.undo(&Undo, window, cx);
+                    view.redo(&Redo, window, cx);
+                    assert_eq!(
+                        view.item
+                            .read(cx)
+                            .doc()
+                            .expect("doc")
+                            .to_json_string()
+                            .expect("snapshot"),
+                        before
+                    );
+                    view.activate_tool(ToolKind::Select, cx);
+                    assert!(view.selected_measurement(cx).is_none());
+                    assert!(view.is_editable(cx));
+                    view.item.update(cx, |item, cx| {
+                        item.with_document(cx, |document| {
+                            document.doc.selection.select_only(node);
+                            ((), DocChange::Selection)
+                        });
+                    });
+                    view.nudge(LogicalKey::ArrowRight, window, cx);
+                    assert_eq!(
+                        view.page_measurements(cx)
+                            .first()
+                            .expect("measurement unchanged")
+                            .measurement(),
+                        expected.measurement()
+                    );
+                })
+            })
+            .expect("readonly inspection and exit");
+        assert!(item.read_with(cx, |item, _| item.is_dirty()));
+    }
+
+    #[gpui::test]
+    async fn measurement_cancel_rearms_autosave_for_preexisting_committed_edits(
+        cx: &mut TestAppContext,
+    ) {
+        let (_directory, root, item, view) = autosave_fixture(cx).await;
+        item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect("write baseline");
+        let page = item.read_with(cx, |item, _| {
+            item.doc().expect("doc").active_page().expect("page")
+        });
+        item.update(cx, |item, cx| {
+            item.apply(
+                Operation::SetName {
+                    id: page,
+                    old: "Page 1".into(),
+                    new: "Committed before measuring".into(),
+                },
+                cx,
+            )
+            .expect("committed edit")
+        });
+        cx.run_until_parked();
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.container_bounds = Some(Bounds::new(
+                        point(px(100.), px(50.)),
+                        size(px(800.), px(600.)),
+                    ));
+                    view.viewport = Some(Viewport::default());
+                    view.activate_tool(ToolKind::Measure, cx);
+                    measurement_pointer_down(view, [400., 300.], window, cx);
+                    view.handle_window_mouse_move(
+                        &MouseMoveEvent {
+                            position: point(px(540.), px(380.)),
+                            pressed_button: Some(MouseButton::Left),
+                            modifiers: gpui::Modifiers::none(),
+                        },
+                        cx,
+                    );
+                })
+            })
+            .expect("start uncommitted measurement");
+        cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.autosave_task.is_none(),
+                "debounce expired while measurement blocked save"
+            )
+        });
+        let (during, _) = fanta_format::read_project_tree(&root).expect("baseline still on disk");
+        assert_eq!(during.scene.get(page).expect("page").name, "Page 1");
+        scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.cancel(&Cancel, window, cx);
+                    assert!(
+                        view.autosave_task.is_some(),
+                        "Escape rearms prior committed work"
+                    );
+                })
+            })
+            .expect("cancel draft");
+        cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+        cx.run_until_parked();
+        let (saved, _) = fanta_format::read_project_tree(&root).expect("previous edit autosaved");
+        assert_eq!(
+            saved.scene.get(page).expect("page").name,
+            "Committed before measuring"
+        );
+        assert!(
+            read_measurements(&saved, page)
+                .expect("read saved marks")
+                .is_empty()
+        );
+        assert!(!item.read_with(cx, |item, _| item.is_dirty()));
+    }
+
+    #[gpui::test]
+    async fn measurement_view_local_close_blocker_keeps_owner_and_allows_sibling_close(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut document = doc_with_one_page();
+        document.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            "/tmp/MeasurementClose.fig".into(),
+            document,
+            cx,
+        );
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::Workspace::test_new(project.clone(), window, cx)
+        });
+        let (owner, sibling) = cx.update(|window, cx| {
+            window.activate_window();
+            let owner = cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx));
+            let sibling = cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx));
+            owner.update(cx, |view, _| {
+                view.opened_entry_id = Some(ProjectEntryId::from_proto(1))
+            });
+            sibling.update(cx, |view, _| {
+                view.opened_entry_id = Some(ProjectEntryId::from_proto(2))
+            });
+            (owner, sibling)
+        });
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        pane.update_in(cx, |pane, window, cx| {
+            pane.add_item(Box::new(sibling.clone()), false, true, None, window, cx);
+            pane.add_item(Box::new(owner.clone()), false, true, None, window, cx);
+        });
+        cx.run_until_parked();
+        owner.update_in(cx, |view, window, cx| {
+            view.select_page(0, cx);
+            view.container_bounds = Some(Bounds::new(
+                point(px(100.), px(50.)),
+                size(px(800.), px(600.)),
+            ));
+            view.viewport = Some(Viewport::default());
+            view.activate_tool(ToolKind::Measure, cx);
+            measurement_pointer_down(view, [400., 300.], window, cx);
+            view.handle_window_mouse_move(
+                &MouseMoveEvent {
+                    position: point(px(540.), px(380.)),
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: gpui::Modifiers::none(),
+                },
+                cx,
+            );
+            view.freeze_measurement_drag(cx);
+        });
+        let draft = owner.read_with(cx, |view, cx| {
+            assert!(view.close_blocker(cx).is_some());
+            view.measurement_controller
+                .draft()
+                .cloned()
+                .expect("recoverable preview")
+        });
+        let before = item.read_with(cx, |item, _| {
+            assert!(
+                !item.is_dirty(),
+                "local preview does not spoof shared document dirtiness"
+            );
+            serde_json::to_value(item.doc().expect("document")).expect("snapshot")
+        });
+        for intent in [workspace::SaveIntent::Close, workspace::SaveIntent::Skip] {
+            pane.update_in(cx, |pane, window, cx| {
+                pane.close_item_by_id(owner.entity_id(), intent, window, cx)
+            })
+            .await
+            .expect("blocked owner close");
+            pane.read_with(cx, |pane, _| {
+                assert_eq!(pane.items_len(), 2);
+                assert_eq!(
+                    pane.active_item()
+                        .expect("owner remains reachable")
+                        .item_id(),
+                    owner.entity_id()
+                );
+            });
+            owner.read_with(cx, |view, _| {
+                assert_eq!(view.measurement_controller.draft(), Some(&draft));
+            });
+        }
+        assert!(
+            !workspace
+                .update_in(cx, |workspace, window, cx| {
+                    workspace.prepare_to_close(workspace::CloseIntent::Quit, window, cx)
+                })
+                .await
+                .expect("quit preflight")
+        );
+        pane.update_in(cx, |pane, window, cx| {
+            pane.close_item_by_id(
+                sibling.entity_id(),
+                workspace::SaveIntent::Close,
+                window,
+                cx,
+            )
+        })
+        .await
+        .expect("sibling close");
+        pane.read_with(cx, |pane, _| assert_eq!(pane.items_len(), 1));
+        owner.read_with(cx, |view, _| {
+            assert_eq!(view.measurement_controller.draft(), Some(&draft));
+        });
+        item.read_with(cx, |item, _| {
+            assert!(!item.is_dirty());
+            assert_eq!(
+                serde_json::to_value(item.doc().expect("document")).expect("snapshot"),
+                before
+            );
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0);
+        });
+        assert!(!cx.has_pending_prompt());
+        owner.update(cx, |view, cx| assert!(view.cancel_measurement_drag(cx)));
+        pane.update_in(cx, |pane, window, cx| {
+            pane.close_item_by_id(owner.entity_id(), workspace::SaveIntent::Close, window, cx)
+        })
+        .await
+        .expect("close after explicit draft cancellation");
+        pane.read_with(cx, |pane, _| assert_eq!(pane.items_len(), 0));
+    }
+}

@@ -926,118 +926,54 @@ impl FantaDesignPanel {
     }
 
     fn add_page(&mut self, cx: &mut Context<Self>) {
-        let Some(view) = self.active_view(cx) else {
-            return;
-        };
-        if self.inspecting || !view.read(cx).is_editable(cx) {
-            return;
-        }
-        let item = view.read(cx).item().clone();
-        if !item.read(cx).is_editable() {
-            return;
-        }
-        view.update(cx, |view, cx| {
-            view.finish_document_edits_for_external_change(cx);
-        });
-        let Some(page_node) = ({
-            let fig_item = item.read(cx);
-            fig_item.document().and_then(|document| {
-                // A doc without explicit page roots renders every root as one
-                // implicit page; adding a real page there would hide all of
-                // that content behind the new empty active page.
-                if !document.pages.iter().all(|page| page.root.is_some()) {
-                    return None;
-                }
-                let mut page_node = CanvasNode::new(NodeData::Group(GroupNode::default()));
-                let visible_count = document.pages.iter().filter(|page| !page.hidden).count();
-                page_node.name = format!("Page {}", visible_count + 1);
-                page_node.index = document.doc.scene.next_root_index();
-                Some(page_node)
-            })
-        }) else {
-            return;
-        };
-        let root = page_node.id;
-
-        self.apply_document_ops(
-            "Add page",
-            |doc| {
-                let old = doc.pages().to_vec();
-                let mut new = old.clone();
-                new.push(root);
-                vec![
-                    Operation::create_node(page_node),
-                    Operation::SetPages { old, new },
-                ]
-            },
-            cx,
-        );
-        let new_page_index = item.read(cx).document().and_then(|document| {
-            document
-                .pages
-                .iter()
-                .position(|page| page.root == Some(root))
-        });
-        if let Some(index) = new_page_index {
-            view.update(cx, |view, cx| view.select_page(index, cx));
-        }
+        self.edit_pages(None, cx);
     }
 
     fn delete_page(&mut self, page_index: usize, cx: &mut Context<Self>) {
+        self.edit_pages(Some(page_index), cx);
+    }
+
+    fn edit_pages(&mut self, deleted_page: Option<usize>, cx: &mut Context<Self>) {
+        if self.inspecting {
+            return;
+        }
         let Some(view) = self.active_view(cx) else {
             return;
         };
-        if self.inspecting || !view.read(cx).is_editable(cx) {
+        if !view.read(cx).is_editable(cx) {
             return;
         }
         let item = view.read(cx).item().clone();
-        if !item.read(cx).is_editable() {
+        let owner = view.entity_id();
+        if !item.read(cx).is_editable() || !item.read(cx).can_preview_for_owner(owner) {
             return;
         }
         view.update(cx, |view, cx| {
-            view.finish_document_edits_for_external_change(cx);
+            view.finish_document_edits_for_external_change(cx)
         });
-        let Some((root, snapshot)) = ({
-            let fig_item = item.read(cx);
-            fig_item.document().and_then(|document| {
-                if document.pages.iter().filter(|page| !page.hidden).count() <= 1 {
-                    return None;
-                }
-                let root = document.pages.get(page_index)?.root?;
-                // `descendants_of` yields the page root first, which is what
-                // `DeleteSubtree` expects its snapshot to start with.
-                let snapshot: Vec<CanvasNode> = document
-                    .doc
-                    .scene
-                    .descendants_of(root)
-                    .filter_map(|node_id| document.doc.scene.get(node_id).cloned())
-                    .collect();
-                (!snapshot.is_empty()).then_some((root, snapshot))
+        let result = item.update(cx, |item, cx| {
+            if !item.is_editable() || !item.can_preview_for_owner(owner) {
+                return None;
+            }
+            item.with_document_for_preview_owner(owner, cx, |document| {
+                let result = match deleted_page {
+                    Some(index) => document.delete_page(index),
+                    None => document.add_page(),
+                };
+                let change = if matches!(result, Ok(Some(_))) {
+                    DocChange::Content
+                } else {
+                    DocChange::None
+                };
+                (result, change)
             })
-        }) else {
-            return;
-        };
-
-        self.apply_document_ops(
-            "Delete page",
-            |doc| {
-                let old = doc.pages().to_vec();
-                let new = old.iter().copied().filter(|id| *id != root).collect();
-                vec![
-                    Operation::SetPages { old, new },
-                    Operation::DeleteSubtree { snapshot },
-                ]
-            },
-            cx,
-        );
-        let next_page_index = item.read(cx).document().and_then(|document| {
-            document
-                .pages
-                .iter()
-                .position(|page| page.root == document.doc.active_page())
         });
-        if let Some(index) = next_page_index {
-            view.update(cx, |view, cx| view.select_page(index, cx));
+        match result {
+            Some(Ok(Some(index))) if deleted_page.is_none() => {
+                view.update(cx, |view, cx| view.select_page(index, cx));
+            }
+            Some(Err(error)) => log::error!("fanta design panel: failed to edit pages: {error:#}"),
+            _ => {}
         }
     }
 
@@ -3057,7 +2993,12 @@ impl FantaDesignPanel {
                                     }
                                 })
                                 .collect();
-                            vec![Operation::SetPages { old, new }]
+                            vec![Operation::SetPageRegistry {
+                                old_pages: old,
+                                new_pages: new,
+                                old_active_page: doc.active_page(),
+                                new_active_page: doc.active_page(),
+                            }]
                         },
                         cx,
                     );

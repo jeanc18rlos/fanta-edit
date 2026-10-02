@@ -396,7 +396,7 @@ impl DesignSurface for FigDesignSurface {
             .collect::<Vec<_>>();
         Ok(json!({
             "document_id": document_id,
-            "project": item.title().as_ref(),
+            "project": truncate_summary_string(item.title().as_ref(), SUMMARY_LABEL_CHARS),
             "project_root": project_root.map(|root| root.display().to_string()),
             "design_spec": project_root.filter(|root| root.join("fanta.md").is_file()).map(|root| root.join("fanta.md").display().to_string()),
             "is_editable": item.is_editable(),
@@ -492,7 +492,7 @@ impl DesignSurface for FigDesignSurface {
         let root = page.root.context("the page has no root node")?;
         Ok(json!({
             "page": page_index,
-            "name": page.name.as_ref(),
+            "name": truncate_summary_string(page.name.as_ref(), SUMMARY_LABEL_CHARS),
             "root": paginated_node_summary(
                 doc,
                 root,
@@ -803,7 +803,7 @@ fn pages_json(pages: &[FigPage], doc: &Doc, project_root: Option<&Path>) -> Vec<
                 });
             json!({
                 "index": index,
-                "name": page.name.as_ref(),
+                "name": truncate_summary_string(page.name.as_ref(), SUMMARY_LABEL_CHARS),
                 "root": page.root.map(|id| id.to_string()),
                 "hidden": page.hidden,
                 "active": page.root.is_some() && page.root == active_page,
@@ -828,7 +828,7 @@ fn components_json(doc: &Doc, project_root: Option<&Path>) -> Vec<Value> {
                 .and_then(|project_root| fanta_format::locate_master_source(project_root, def.id));
             json!({
                 "id": def.id.to_string(),
-                "name": def.name,
+                "name": truncate_summary_string(&def.name, SUMMARY_LABEL_CHARS),
                 "root": def.root.to_string(),
                 "source": relative_source(project_root, source),
                 "properties": def.props,
@@ -1237,14 +1237,22 @@ fn paginated_node_summary(
 /// A compact node-tree projection for page listings: enough for the model to
 /// navigate and target nodes without the full serde payload (fetch specific
 /// ids for that).
-fn node_summary(doc: &Doc, id: NodeId, depth: Option<u32>, include_geometry: bool) -> Value {
+pub(crate) fn node_summary(
+    doc: &Doc,
+    id: NodeId,
+    depth: Option<u32>,
+    include_geometry: bool,
+) -> Value {
     let Some(node) = doc.scene.get(id) else {
         return Value::Null;
     };
     let mut object = serde_json::Map::new();
     object.insert("id".into(), json!(id.to_string()));
     object.insert("kind".into(), json!(node.data.kind_tag()));
-    object.insert("name".into(), json!(node.name));
+    object.insert(
+        "name".into(),
+        json!(truncate_summary_string(&node.name, SUMMARY_LABEL_CHARS)),
+    );
     if node.flags.contains(NodeFlags::HIDDEN) {
         object.insert("hidden".into(), json!(true));
     }
@@ -1279,6 +1287,16 @@ fn node_summary(doc: &Doc, id: NodeId, depth: Option<u32>, include_geometry: boo
 /// content is cut there and reported with its full `text_length`, so a page
 /// listing stays bounded per node (fetch the node by id for the whole text).
 const SUMMARY_TEXT_CHARS: usize = 120;
+pub(crate) const SUMMARY_LABEL_CHARS: usize = 160;
+
+pub(crate) fn truncate_summary_string(value: &str, max_chars: usize) -> String {
+    let mut characters = value.chars();
+    let mut truncated = characters.by_ref().take(max_chars).collect::<String>();
+    if characters.next().is_some() {
+        truncated.push('…');
+    }
+    truncated
+}
 
 /// Kind-specific facts a model needs to reason about a node without fetching
 /// it in full: a frame's size and layout mode, a text's font and (truncated)
@@ -1302,27 +1320,10 @@ fn summarize_kind(doc: &Doc, node: &CanvasNode, object: &mut serde_json::Map<Str
             }
         }
         NodeData::Text(text) => {
-            let text_length = text.content.chars().count();
-            if text_length > SUMMARY_TEXT_CHARS {
-                let preview: String = text
-                    .content
-                    .chars()
-                    .take(SUMMARY_TEXT_CHARS)
-                    .chain(std::iter::once('…'))
-                    .collect();
-                object.insert("text".into(), json!(preview));
-                object.insert("text_length".into(), json!(text_length));
-            } else {
-                object.insert("text".into(), json!(text.content));
-            }
-            object.insert(
-                "font".into(),
-                json!({
-                    "family": text.style.font_family,
-                    "size": text.style.size_px,
-                    "weight": text.style.weight,
-                }),
-            );
+            summarize_text(&text.content, &text.style, object);
+        }
+        NodeData::TextPath(text_path) => {
+            summarize_text(&text_path.content, &text_path.style, object);
         }
         NodeData::Vector(vector) => {
             if let Some(color) = vector.fills.first().and_then(Fill::solid_color) {
@@ -1353,6 +1354,33 @@ fn summarize_kind(doc: &Doc, node: &CanvasNode, object: &mut serde_json::Map<Str
         | NodeData::AiArtifact(_)
         | NodeData::Embed(_) => {}
     }
+}
+
+fn summarize_text(
+    content: &str,
+    style: &fanta_doc::TextStyle,
+    object: &mut serde_json::Map<String, Value>,
+) {
+    let text_length = content.chars().count();
+    if text_length > SUMMARY_TEXT_CHARS {
+        let preview: String = content
+            .chars()
+            .take(SUMMARY_TEXT_CHARS)
+            .chain(std::iter::once('…'))
+            .collect();
+        object.insert("text".into(), json!(preview));
+        object.insert("text_length".into(), json!(text_length));
+    } else {
+        object.insert("text".into(), json!(content));
+    }
+    object.insert(
+        "font".into(),
+        json!({
+            "family": style.font_family,
+            "size": style.size_px,
+            "weight": style.weight,
+        }),
+    );
 }
 
 fn render_surface_screenshot(

@@ -521,36 +521,13 @@ pub(crate) fn stroke_box_path(
             continue;
         }
 
-        let (offset, radius_delta) = match stroke.align {
-            fanta_doc::StrokeAlign::Center => (0.0, 0.0),
-            fanta_doc::StrokeAlign::Inside => (stroke_width * 0.5, -stroke_width * 0.5),
-            fanta_doc::StrokeAlign::Outside => (-stroke_width * 0.5, stroke_width * 0.5),
-        };
-
-        // An Inside stroke wider than twice a corner's radius cannot be drawn as
-        // an inset offset path: the inset radius clamps to 0 and stroking that
-        // square path at full width squares off the OUTER corner too. Figma
-        // keeps the stroke's outer edge on the shape's rounded outline (only the
-        // inner edge goes square), which is exactly what the clip-based
-        // `stroke_sk_path` Inside branch produces (double-width stroke of the
-        // TRUE outline, clipped to its interior) — so route those through it.
-        if stroke.align == fanta_doc::StrokeAlign::Inside {
-            let half = f64::from(stroke_width) * 0.5;
-            let radii = corner_radii.unwrap_or([corner_radius.unwrap_or(0.0); 4]);
-            if radii.iter().any(|&r| r > 0.0 && r < half) {
-                let box_path = original_path();
-                stroke_sk_path(
-                    canvas,
-                    &box_path,
-                    std::slice::from_ref(stroke),
-                    local_bounds_f32,
-                    ctx,
-                );
-                continue;
-            }
-        }
-
-        let Some(stroke_bounds) = offset_box_bounds(local_bounds_f32, offset) else {
+        let Some(stroke_path) = box_stroke_path(
+            local_bounds_f32,
+            corner_radius,
+            corner_radii,
+            corner_smoothing,
+            stroke,
+        ) else {
             let box_path = original_path();
             stroke_sk_path(
                 canvas,
@@ -562,17 +539,41 @@ pub(crate) fn stroke_box_path(
             continue;
         };
 
-        let stroke_path = rounded_rect_path(
-            stroke_bounds,
-            offset_corner_radius(corner_radius, radius_delta),
-            offset_corner_radii(corner_radii, radius_delta),
-            corner_smoothing,
-        );
         let mut paint = stroke_to_paint(stroke, local_bounds_f32);
         scale_paint_alpha(&mut paint, ctx.paint_alpha);
         canvas.draw_path(&stroke_path, &paint);
         ctx.metrics.nodes_drawn += 1;
     }
+}
+
+fn box_stroke_path(
+    bounds: [f32; 4],
+    corner_radius: Option<f64>,
+    corner_radii: Option<[f64; 4]>,
+    corner_smoothing: f32,
+    stroke: &fanta_doc::Stroke,
+) -> Option<skia_safe::Path> {
+    let width = stroke.width as f32;
+    let (offset, radius_delta) = match stroke.align {
+        fanta_doc::StrokeAlign::Center => (0.0, 0.0),
+        fanta_doc::StrokeAlign::Inside => (width * 0.5, -width * 0.5),
+        fanta_doc::StrokeAlign::Outside => (-width * 0.5, width * 0.5),
+    };
+    // Insetting a radius below zero squares its outer edge. Keep the original
+    // rounded silhouette and clip a doubled stroke in that case instead.
+    if stroke.align == fanta_doc::StrokeAlign::Inside {
+        let half = f64::from(width) * 0.5;
+        let radii = corner_radii.unwrap_or([corner_radius.unwrap_or(0.0); 4]);
+        if radii.iter().any(|&radius| radius > 0.0 && radius < half) {
+            return None;
+        }
+    }
+    Some(rounded_rect_path(
+        offset_box_bounds(bounds, offset)?,
+        offset_corner_radius(corner_radius, radius_delta),
+        offset_corner_radii(corner_radii, radius_delta),
+        corner_smoothing,
+    ))
 }
 
 fn offset_box_bounds(bounds: [f32; 4], inset: f32) -> Option<[f32; 4]> {
@@ -730,6 +731,50 @@ pub(crate) fn draw_per_side_border(
         }
     }
 
+    let (rectangles, clip_path) =
+        per_side_border_rectangles(shape_path, stroke, sides, local_bounds_f32);
+    let clip_to_shape = clip_path.is_some();
+    if let Some(path) = &clip_path {
+        canvas.save();
+        canvas.clip_path(path, skia_safe::ClipOp::Intersect, true);
+    }
+    let mut drew = false;
+    let mut video_bands = video_bounds.map(|_| skia_safe::Path::new());
+    for rectangle in rectangles.into_iter().flatten() {
+        if let Some(path) = &mut video_bands {
+            path.add_rect(rectangle, None);
+        } else {
+            canvas.draw_rect(rectangle, &paint);
+        }
+        drew = true;
+    }
+    if let (
+        Some(path),
+        Some(bounds),
+        Fill::Video {
+            video,
+            opacity,
+            blend,
+        },
+    ) = (video_bands, video_bounds, &stroke.paint)
+    {
+        if !draw_video_fill(canvas, &path, bounds, video, *opacity, *blend, ctx) {
+            canvas.draw_path(&path, &paint);
+        }
+    }
+    if clip_to_shape {
+        canvas.restore();
+    }
+    drew
+}
+
+fn per_side_border_rectangles(
+    shape_path: &skia_safe::Path,
+    stroke: &fanta_doc::Stroke,
+    sides: [f64; 4],
+    local_bounds_f32: [f32; 4],
+) -> ([Option<Rect>; 4], Option<skia_safe::Path>) {
+    let [x, y, w, h] = local_bounds_f32;
     // For each side, `(outer_off, inner_off)` are how far the band extends past
     // the box edge outward and inward, by alignment.
     let (out_frac, in_frac) = match stroke.align {
@@ -758,99 +803,41 @@ pub(crate) fn draw_per_side_border(
             outset_silhouette(shape_path, max_width * out_frac)
         }
     };
-    // The clip is anti-aliased to match the soft fill/stroke edges the rest of the
-    // renderer draws. Scoped by the save/restore pair around all four bands so it
-    // never leaks to siblings.
-    let clip_to_shape = clip_path.is_some();
-    if let Some(ref cp) = clip_path {
-        canvas.save();
-        canvas.clip_path(cp, skia_safe::ClipOp::Intersect, true);
-    }
-    let x0 = x;
-    let y0 = y;
-    let x1 = x + w;
-    let y1 = y + h;
-
-    // Top edge: a horizontal band along y0, spanning the full (outer) width so it
-    // covers the corners with the adjacent vertical edges (last-drawn wins, which
-    // is fine for a single-color border; for differing widths the corner is owned
-    // by whichever edge is wider, matching Figma's overlap).
-    let mut drew = false;
-    let mut video_bands = video_bounds.map(|_| skia_safe::Path::new());
-    if t > 0.0 {
-        let rect = Rect::from_ltrb(
-            x0 - l * out_frac,
-            y0 - t * out_frac,
-            x1 + r * out_frac,
-            y0 + t * in_frac,
-        );
-        if let Some(path) = &mut video_bands {
-            path.add_rect(rect, None);
-        } else {
-            canvas.draw_rect(rect, &paint);
-        }
-        drew = true;
-    }
-    if b > 0.0 {
-        let rect = Rect::from_ltrb(
-            x0 - l * out_frac,
-            y1 - b * in_frac,
-            x1 + r * out_frac,
-            y1 + b * out_frac,
-        );
-        if let Some(path) = &mut video_bands {
-            path.add_rect(rect, None);
-        } else {
-            canvas.draw_rect(rect, &paint);
-        }
-        drew = true;
-    }
-    if l > 0.0 {
-        let rect = Rect::from_ltrb(
-            x0 - l * out_frac,
-            y0 - t * out_frac,
-            x0 + l * in_frac,
-            y1 + b * out_frac,
-        );
-        if let Some(path) = &mut video_bands {
-            path.add_rect(rect, None);
-        } else {
-            canvas.draw_rect(rect, &paint);
-        }
-        drew = true;
-    }
-    if r > 0.0 {
-        let rect = Rect::from_ltrb(
-            x1 - r * in_frac,
-            y0 - t * out_frac,
-            x1 + r * out_frac,
-            y1 + b * out_frac,
-        );
-        if let Some(path) = &mut video_bands {
-            path.add_rect(rect, None);
-        } else {
-            canvas.draw_rect(rect, &paint);
-        }
-        drew = true;
-    }
-    if let (
-        Some(path),
-        Some(bounds),
-        Fill::Video {
-            video,
-            opacity,
-            blend,
-        },
-    ) = (video_bands, video_bounds, &stroke.paint)
-    {
-        if !draw_video_fill(canvas, &path, bounds, video, *opacity, *blend, ctx) {
-            canvas.draw_path(&path, &paint);
-        }
-    }
-    if clip_to_shape {
-        canvas.restore();
-    }
-    drew
+    let rectangles = [
+        (t > 0.0).then(|| {
+            Rect::from_ltrb(
+                x - l * out_frac,
+                y - t * out_frac,
+                x + w + r * out_frac,
+                y + t * in_frac,
+            )
+        }),
+        (b > 0.0).then(|| {
+            Rect::from_ltrb(
+                x - l * out_frac,
+                y + h - b * in_frac,
+                x + w + r * out_frac,
+                y + h + b * out_frac,
+            )
+        }),
+        (l > 0.0).then(|| {
+            Rect::from_ltrb(
+                x - l * out_frac,
+                y - t * out_frac,
+                x + l * in_frac,
+                y + h + b * out_frac,
+            )
+        }),
+        (r > 0.0).then(|| {
+            Rect::from_ltrb(
+                x + w - r * in_frac,
+                y - t * out_frac,
+                x + w + r * out_frac,
+                y + h + b * out_frac,
+            )
+        }),
+    ];
+    (rectangles, clip_path)
 }
 
 /// Per-side border bands for a ROUNDED (non-rect) outline: each side's band is
@@ -1213,6 +1200,109 @@ fn build_vector_paths(
     }
 }
 
+pub fn rounded_rect_contains_point(
+    bounds: [f64; 4],
+    corner_radius: Option<f64>,
+    corner_radii: Option<[f64; 4]>,
+    smoothing: f32,
+    point: [f64; 2],
+) -> bool {
+    let bounds = bounds.map(|value| value as f32);
+    let point = point.map(|value| value as f32);
+    if !bounds.into_iter().chain(point).all(f32::is_finite) || bounds[2] <= 0.0 || bounds[3] <= 0.0
+    {
+        return false;
+    }
+    rounded_rect_path(bounds, corner_radius, corner_radii, smoothing)
+        .contains(skia_safe::Point::new(point[0], point[1]))
+}
+
+/// Tests local fill and stroke geometry using the same paths as rendering.
+/// Paint opacity and effects do not change geometric selection coverage.
+pub fn vector_contains_point(vector: &fanta_doc::VectorNode, point: [f64; 2]) -> bool {
+    let point = skia_safe::Point::new(point[0] as f32, point[1] as f32);
+    if !point.x.is_finite() || !point.y.is_finite() {
+        return false;
+    }
+    let paths = build_vector_paths(
+        &vector.path,
+        vector.corner_radius,
+        vector.corner_radii,
+        vector.corner_smoothing,
+    );
+    let fill_path = paths.fill.as_ref().unwrap_or(&paths.outline);
+    if !vector.fills.is_empty() && fill_path.contains(point) {
+        return true;
+    }
+    let bounds = bounds_to_f32(&paths.rough_bounds);
+    vector.strokes.iter().any(|stroke| {
+        if let Some(sides) = stroke.per_side
+            && bounds[2] > 0.0
+            && bounds[3] > 0.0
+        {
+            if paths.outline.is_rect().is_none()
+                && let Some(bands) = per_side_border_rounded_paths(&paths.outline, stroke, sides)
+            {
+                return bands.iter().any(|band| band.contains(point));
+            }
+            let (rectangles, clip_path) =
+                per_side_border_rectangles(&paths.outline, stroke, sides, bounds);
+            if rectangles.iter().any(Option::is_some) {
+                return clip_path.as_ref().is_none_or(|path| path.contains(point))
+                    && rectangles.iter().flatten().any(|rectangle| {
+                        point.x >= rectangle.left
+                            && point.x <= rectangle.right
+                            && point.y >= rectangle.top
+                            && point.y <= rectangle.bottom
+                    });
+            }
+        }
+        let width = stroke.width as f32;
+        if !width.is_finite() || width <= 0.0 {
+            return false;
+        }
+        let mut paint = stroke_to_paint(stroke, bounds);
+        if paths.is_rect
+            && !matches!(
+                stroke.paint,
+                Fill::Image { .. }
+                    | Fill::Video { .. }
+                    | Fill::Pattern { .. }
+                    | Fill::Shader { .. }
+            )
+            && let Some(path) = box_stroke_path(
+                bounds,
+                vector.corner_radius,
+                vector.corner_radii,
+                vector.corner_smoothing,
+                stroke,
+            )
+        {
+            return stroke_outline_contains_point(&path, &paint, point);
+        }
+        let inside = paths.outline.contains(point);
+        match stroke.align {
+            fanta_doc::StrokeAlign::Inside if !inside => return false,
+            fanta_doc::StrokeAlign::Outside if inside => return false,
+            fanta_doc::StrokeAlign::Inside | fanta_doc::StrokeAlign::Outside => {
+                paint.set_stroke_width(width * 2.0);
+            }
+            fanta_doc::StrokeAlign::Center => {}
+        }
+        stroke_outline_contains_point(&paths.outline, &paint, point)
+    })
+}
+
+fn stroke_outline_contains_point(
+    path: &skia_safe::Path,
+    paint: &Paint,
+    point: skia_safe::Point,
+) -> bool {
+    let mut outline = skia_safe::Path::new();
+    skia_safe::path_utils::fill_path_with_paint(path, paint, &mut outline, None, None)
+        && outline.contains(point)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_vector(
     canvas: &Canvas,
@@ -1323,6 +1413,218 @@ pub(crate) fn bounds_to_f32(b: &Bounds) -> [f32; 4] {
         b.width() as f32,
         b.height() as f32,
     ]
+}
+
+#[cfg(test)]
+mod vector_hit_tests {
+    use super::*;
+    use fanta_doc::{FillRule, PathData, Stroke, StrokeAlign, StrokeCap, StrokeJoin, VectorNode};
+
+    #[test]
+    fn rounded_frame_hits_follow_scaled_and_smoothed_clip_geometry() {
+        let bounds = [0.0, 0.0, 100.0, 100.0];
+        for smoothing in [0.0, 0.7] {
+            assert!(rounded_rect_contains_point(
+                bounds,
+                Some(50.0),
+                None,
+                smoothing,
+                [50.0, 50.0]
+            ));
+            assert!(!rounded_rect_contains_point(
+                bounds,
+                Some(50.0),
+                None,
+                smoothing,
+                [1.0, 1.0]
+            ));
+        }
+        assert!(!rounded_rect_contains_point(
+            bounds,
+            None,
+            Some([200.0, 0.0, 0.0, 0.0]),
+            0.0,
+            [1.0, 1.0]
+        ));
+        assert!(rounded_rect_contains_point(
+            bounds,
+            None,
+            Some([200.0, 0.0, 0.0, 0.0]),
+            0.0,
+            [99.0, 99.0]
+        ));
+        assert!(!rounded_rect_contains_point(
+            bounds,
+            None,
+            None,
+            0.0,
+            [f64::NAN, 0.0]
+        ));
+    }
+
+    fn stroked(path: PathData, stroke: Stroke) -> VectorNode {
+        VectorNode {
+            path,
+            strokes: [stroke].into_iter().collect(),
+            ..VectorNode::default()
+        }
+    }
+
+    #[test]
+    fn open_line_and_arrow_have_stroke_coverage_without_a_local_size() {
+        let mut path = PathData::new();
+        path.move_to(0.0, 0.0).line_to(100.0, 0.0);
+        let line = stroked(path, Stroke::solid(Color::BLACK, 2.0));
+        assert_eq!(line.local_size, None);
+        assert!(vector_contains_point(&line, [50.0, 0.0]));
+        assert!(vector_contains_point(&line, [50.0, 0.75]));
+        assert!(!vector_contains_point(&line, [50.0, 2.0]));
+
+        let mut arrow = line;
+        arrow
+            .path
+            .move_to(90.0, -10.0)
+            .line_to(100.0, 0.0)
+            .line_to(90.0, 10.0);
+        for point in [[50.0, 0.0], [95.0, -5.0], [95.0, 5.0]] {
+            assert!(
+                vector_contains_point(&arrow, point),
+                "arrow segment at {point:?}"
+            );
+        }
+        assert!(!vector_contains_point(&arrow, [91.0, 4.0]));
+    }
+
+    #[test]
+    fn hollow_rectangle_hits_only_strokes_and_filled_rectangle_hits_its_interior() {
+        let mut vector = stroked(
+            PathData::rect(0.0, 0.0, 100.0, 100.0),
+            Stroke::solid(Color::BLACK, 4.0),
+        );
+        assert!(vector_contains_point(&vector, [50.0, 1.0]));
+        assert!(!vector_contains_point(&vector, [50.0, 50.0]));
+        vector.fills.push(Fill::solid(Color::BLACK));
+        assert!(vector_contains_point(&vector, [50.0, 50.0]));
+        assert!(!vector_contains_point(&vector, [150.0, 50.0]));
+    }
+
+    #[test]
+    fn stroke_caps_dashes_and_joins_use_rendered_outlines() {
+        let mut path = PathData::new();
+        path.move_to(0.0, 0.0).line_to(100.0, 0.0);
+        let mut stroke = Stroke::solid(Color::BLACK, 4.0);
+        assert!(!vector_contains_point(
+            &stroked(path.clone(), stroke.clone()),
+            [-1.0, 0.0]
+        ));
+        stroke.cap = StrokeCap::Round;
+        assert!(vector_contains_point(
+            &stroked(path.clone(), stroke.clone()),
+            [-1.0, 0.0]
+        ));
+        assert!(!vector_contains_point(
+            &stroked(path.clone(), stroke.clone()),
+            [-1.5, 1.5]
+        ));
+        stroke.cap = StrokeCap::Square;
+        assert!(vector_contains_point(
+            &stroked(path.clone(), stroke.clone()),
+            [-1.5, 1.5]
+        ));
+        stroke.cap = StrokeCap::Butt;
+        stroke.dash = vec![10.0, 10.0];
+        let dashed = stroked(path, stroke.clone());
+        assert!(vector_contains_point(&dashed, [5.0, 0.0]));
+        assert!(!vector_contains_point(&dashed, [15.0, 0.0]));
+
+        let mut corner = PathData::new();
+        corner
+            .move_to(0.0, 50.0)
+            .line_to(50.0, 50.0)
+            .line_to(50.0, 0.0);
+        stroke.dash.clear();
+        stroke.join = StrokeJoin::Miter;
+        assert!(vector_contains_point(
+            &stroked(corner.clone(), stroke.clone()),
+            [51.5, 51.5]
+        ));
+        stroke.join = StrokeJoin::Round;
+        assert!(!vector_contains_point(
+            &stroked(corner.clone(), stroke.clone()),
+            [51.5, 51.5]
+        ));
+        stroke.join = StrokeJoin::Bevel;
+        assert!(!vector_contains_point(
+            &stroked(corner, stroke),
+            [51.5, 51.5]
+        ));
+    }
+
+    #[test]
+    fn uniform_and_per_side_strokes_honor_alignment_and_rounded_corners() {
+        for per_side in [None, Some([4.0, 0.0, 0.0, 0.0])] {
+            for radius in [None, Some(20.0)] {
+                for (align, hit, miss) in [
+                    (StrokeAlign::Inside, [50.0, 3.0], [50.0, -1.0]),
+                    (StrokeAlign::Center, [50.0, -1.0], [50.0, 3.0]),
+                    (StrokeAlign::Outside, [50.0, -3.0], [50.0, 1.0]),
+                ] {
+                    let mut stroke = Stroke::solid(Color::BLACK, 4.0);
+                    stroke.align = align;
+                    stroke.per_side = per_side;
+                    let mut vector = stroked(PathData::rect(0.0, 0.0, 100.0, 100.0), stroke);
+                    vector.corner_radius = radius;
+                    assert!(
+                        vector_contains_point(&vector, hit),
+                        "{align:?}, {per_side:?}, {radius:?}"
+                    );
+                    assert!(
+                        !vector_contains_point(&vector, miss),
+                        "{align:?}, {per_side:?}, {radius:?}"
+                    );
+                    if per_side.is_some() {
+                        assert!(!vector_contains_point(&vector, [1.0, 50.0]));
+                    }
+                }
+            }
+        }
+        let mut rounded = VectorNode::rect_solid(0.0, 0.0, 100.0, 100.0, Color::BLACK);
+        rounded.corner_radius = Some(20.0);
+        assert!(vector_contains_point(&rounded, [50.0, 50.0]));
+        assert!(!vector_contains_point(&rounded, [1.0, 1.0]));
+    }
+
+    #[test]
+    fn fill_coverage_honors_path_and_mixed_subpath_winding_rules() {
+        let path = PathData::from_svg_d(
+            "M 0 0 H 100 V 100 H 0 Z M 20 20 H 80 V 80 H 20 Z M 40 40 H 60 V 60 H 40 Z",
+        )
+        .expect("nested rectangles");
+        let mut vector = VectorNode {
+            path,
+            fills: [Fill::solid(Color::BLACK)].into_iter().collect(),
+            ..VectorNode::default()
+        };
+        assert!(vector_contains_point(&vector, [30.0, 50.0]));
+        vector.path.fill_rule = FillRule::EvenOdd;
+        assert!(!vector_contains_point(&vector, [30.0, 50.0]));
+        assert!(vector_contains_point(&vector, [50.0, 50.0]));
+        vector.path.fill_rule = FillRule::NonZero;
+        vector.path.subpath_rules = vec![FillRule::EvenOdd, FillRule::EvenOdd, FillRule::NonZero];
+        assert!(vector_contains_point(&vector, [10.0, 50.0]));
+        assert!(!vector_contains_point(&vector, [30.0, 50.0]));
+        assert!(vector_contains_point(&vector, [50.0, 50.0]));
+    }
+
+    #[test]
+    fn zero_width_and_nonfinite_points_have_no_stroke_coverage() {
+        let mut path = PathData::new();
+        path.move_to(0.0, 0.0).line_to(100.0, 0.0);
+        let vector = stroked(path, Stroke::solid(Color::BLACK, 0.0));
+        assert!(!vector_contains_point(&vector, [50.0, 0.0]));
+        assert!(!vector_contains_point(&vector, [f64::NAN, 0.0]));
+        assert!(!vector_contains_point(&vector, [f64::INFINITY, 0.0]));
+    }
 }
 
 #[cfg(test)]

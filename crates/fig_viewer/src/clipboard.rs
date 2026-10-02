@@ -407,7 +407,12 @@ pub(crate) fn duplicate_page_operations(doc: &Doc, root: NodeId) -> Result<Vec<O
     let old = doc.pages().to_vec();
     let mut new = old.clone();
     new.insert(index + 1, copy);
-    operations.push(Operation::SetPages { old, new });
+    operations.push(Operation::SetPageRegistry {
+        old_pages: old,
+        new_pages: new,
+        old_active_page: doc.active_page(),
+        new_active_page: doc.active_page(),
+    });
     Ok(operations)
 }
 

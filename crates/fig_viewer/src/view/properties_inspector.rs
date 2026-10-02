@@ -25,7 +25,7 @@ fn inspector_tab(mode: EditorMode) -> PropertiesInspectorTab {
         EditorMode::Design => PropertiesInspectorTab::Design,
         EditorMode::Motion => PropertiesInspectorTab::Motion,
         EditorMode::Draw => PropertiesInspectorTab::Draw,
-        EditorMode::Code => PropertiesInspectorTab::Code,
+        EditorMode::Code | EditorMode::Dev => PropertiesInspectorTab::Code,
         EditorMode::Prototype => PropertiesInspectorTab::Prototype,
         EditorMode::Comments => PropertiesInspectorTab::Comments,
     }
@@ -86,12 +86,12 @@ impl FigView {
             let motion = cx.new(|cx| {
                 let mut inspector =
                     MotionInspector::new("editor-motion-inspector", Default::default(), cx);
-                inspector.set_auto_keyframe_available(false, cx);
+                inspector.set_auto_keyframe_available(true, cx);
                 inspector
             });
             let children = PropertiesInspectorChildren {
                 design: design.clone().into(),
-                motion: motion.clone().into(),
+                motion: self.motion_sidebar.clone().into(),
                 draw: draw.clone().into(),
                 code: code.clone().into(),
                 prototype: self.prototype_sidebar.clone().into(),
@@ -157,6 +157,8 @@ impl FigView {
         let mode = inspector_tab(self.editor_mode(cx));
         let zoom = self.current_zoom_percent(cx);
         let editable = self.is_editable(cx);
+        let auto_keyframe = self.motion_auto_keyframe;
+        let auto_keyframe_available = editable && self.active_motion_clip.is_some();
         let collapsed = !self.inspector_sidebar_visible;
         let can_present = self.item.read(cx).document().is_some_and(|document| {
             crate::prototype_player::prototype_entry_frame(&document.doc).is_some()
@@ -221,7 +223,11 @@ impl FigView {
                     self.item.read(cx),
                     self.active_motion_clip,
                     self.timeline_shell.read(cx),
+                    auto_keyframe,
                 );
+                adapter.motion.update(cx, |panel, cx| {
+                    panel.set_auto_keyframe_available(auto_keyframe_available, cx);
+                });
                 if adapter.motion.read(cx).view_data() != &motion {
                     adapter
                         .motion
@@ -531,6 +537,7 @@ fn motion_view_data(
     item: &FigItem,
     active_clip: Option<AnimationClipId>,
     clock: &TimelineShell,
+    auto_keyframe: bool,
 ) -> MotionInspectorViewData {
     let mut data = MotionInspectorViewData {
         playing: clock.is_playing(),
@@ -542,6 +549,7 @@ fn motion_view_data(
             fanta_gpui::timeline::TimelinePlayback::Once
         },
         read_only: !item.is_editable(),
+        auto_keyframe,
         timeline_open_available: false,
         ..Default::default()
     };
@@ -680,8 +688,10 @@ impl FigView {
             MotionInspectorAction::TimelineOpenRequested => {
                 self.set_editor_mode(EditorMode::Motion, cx)
             }
-            MotionInspectorAction::AutoKeyframeChangeRequested { .. } => {
-                notify_unavailable("Auto keyframe recording", window, cx)
+            MotionInspectorAction::AutoKeyframeChangeRequested { enabled } => {
+                if let Err(error) = self.set_motion_auto_keyframe(*enabled, cx) {
+                    show_canvas_notice(error.to_string(), window, cx);
+                }
             }
             MotionInspectorAction::PresetApplyRequested { id } => {
                 self.motion_sidebar

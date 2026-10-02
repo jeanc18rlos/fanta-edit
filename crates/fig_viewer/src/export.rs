@@ -1062,6 +1062,427 @@ mod tests {
     }
 
     #[test]
+    fn drawn_arrow_survives_project_reopen_and_exports_every_segment() {
+        use fanta_tools::{
+            Button, LineTool, ModifierKeys, PointerEvent, Tool, ToolContext, ToolEvent,
+        };
+        use glam::DVec2;
+
+        let directory = tempfile::tempdir().expect("arrow project");
+        let mut document = Doc::new();
+        let page = insert(
+            &mut document,
+            CanvasNode::new(NodeData::Group(GroupNode::default())),
+        );
+        document.add_page(page);
+        document.set_active_page(Some(page));
+        let mut viewport = Viewport::default();
+        let mut context = ToolContext::new(
+            &mut document,
+            &mut viewport,
+            fanta_canvas::SnapEngine {
+                targets: fanta_canvas::SnapTargets::empty(),
+                ..Default::default()
+            },
+            DVec2::new(800.0, 600.0),
+        );
+        let mut arrow = LineTool::arrow();
+        arrow.handle_event(
+            &mut context,
+            ToolEvent::Pointer(PointerEvent::Press {
+                screen: [550.0, 420.0],
+                button: Button::Primary,
+                modifiers: ModifierKeys::empty(),
+                count: 1,
+            }),
+        );
+        arrow.handle_event(
+            &mut context,
+            ToolEvent::Pointer(PointerEvent::Release {
+                screen: [250.0, 180.0],
+                button: Button::Primary,
+                modifiers: ModifierKeys::empty(),
+            }),
+        );
+        let arrow_id = *document.selection.iter().next().expect("selected arrow");
+        let original = document.scene.get(arrow_id).expect("drawn arrow").clone();
+        fanta_format::write_project_tree(directory.path(), &document, &BTreeMap::new())
+            .expect("save arrow project");
+        let (mut reopened, _) =
+            fanta_format::read_project_tree(directory.path()).expect("read saved arrow project");
+        let restored = reopened.scene.get(arrow_id).expect("reopened arrow");
+        assert_eq!(restored.data, original.data);
+        assert_eq!(restored.transform, original.transform);
+        assert_eq!(restored.name, "Arrow");
+        reopened.selection.select_only(arrow_id);
+
+        let batch = prepare_export_jobs(
+            &reopened,
+            None,
+            None,
+            directory.path().to_path_buf(),
+            &[
+                ExportPreset {
+                    format: ExportFormat::Png,
+                    scale: ExportScale::Two,
+                },
+                ExportPreset {
+                    format: ExportFormat::Svg,
+                    scale: ExportScale::One,
+                },
+            ],
+        )
+        .expect("arrow has exportable bounds");
+        let target = batch.targets.first().expect("arrow export target");
+        let export_viewport = target_viewport(target, 2.0);
+        let paths = run_export_jobs(batch).expect("export arrow");
+        let raster = image::open(paths.first().expect("PNG output"))
+            .expect("decode exported arrow")
+            .to_rgba8();
+        let NodeData::Vector(vector) = &original.data else {
+            panic!("arrow is a vector");
+        };
+        let mut current = DVec2::ZERO;
+        let mut lines = 0;
+        for segment in &vector.path.segments {
+            match segment {
+                fanta_doc::PathSegment::Move { to } => current = DVec2::from(*to),
+                fanta_doc::PathSegment::Line { to } => {
+                    let end = DVec2::from(*to);
+                    let midpoint = original.transform.transform_point((current + end) / 2.0);
+                    let pixel = fanta_canvas::world_to_screen(
+                        midpoint,
+                        &export_viewport,
+                        DVec2::new(raster.width() as f64, raster.height() as f64),
+                    );
+                    let painted = (-2..=2).any(|offset_x| {
+                        (-2..=2).any(|offset_y| {
+                            let x = pixel.x.round() as i64 + offset_x;
+                            let y = pixel.y.round() as i64 + offset_y;
+                            x >= 0
+                                && y >= 0
+                                && raster.get_pixel_checked(x as u32, y as u32).is_some_and(
+                                    |pixel| {
+                                        pixel[3] > 64
+                                            && pixel[0] < 50
+                                            && pixel[1] < 50
+                                            && pixel[2] < 50
+                                    },
+                                )
+                        })
+                    });
+                    assert!(painted, "arrow segment {lines} is absent from PNG export");
+                    lines += 1;
+                    current = end;
+                }
+                _ => panic!("arrow consists of open straight segments"),
+            }
+        }
+        assert_eq!(lines, 3);
+        let svg =
+            std::fs::read_to_string(paths.get(1).expect("SVG output")).expect("read vector arrow");
+        assert!(svg.contains("<path"));
+        assert!(!svg.contains("<image"));
+    }
+
+    #[test]
+    fn persistent_measurements_leave_png_pixels_svg_paint_and_export_bounds_unchanged() {
+        use crate::measurements::{Measurement, create_measurement_op, read_measurements};
+
+        let directory = tempfile::tempdir().expect("measurement export fixture");
+        let mut document = Doc::new();
+        let mut page_node = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page_node.name = "Measured page".into();
+        page_node.transform = Transform2D::translation(120.0, -70.0);
+        let page = insert(&mut document, page_node);
+        document.add_page(page);
+        document.set_active_page(Some(page));
+        let mut art = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            48.0,
+            24.0,
+            Color::rgb(24, 96, 200),
+        )));
+        art.parent = Some(page);
+        art.transform = Transform2D::translation(8.0, 12.0);
+        if let NodeData::Vector(vector) = &mut art.data {
+            let mut stroke = Stroke::solid(Color::BLACK, 4.0);
+            stroke.align = StrokeAlign::Outside;
+            vector.strokes.push(stroke);
+        }
+        insert(&mut document, art);
+        let art_count = document.scene.len();
+        let export = |document: &Doc, name: &str| {
+            let page = FigPage {
+                root: Some(page),
+                name: "Measured page".into(),
+                bounds: Bounds::ZERO,
+                hidden: false,
+            };
+            let batch = prepare_export_jobs(
+                document,
+                None,
+                Some(&page),
+                directory.path().join(name),
+                &[
+                    ExportPreset {
+                        format: ExportFormat::Png,
+                        scale: ExportScale::Two,
+                    },
+                    ExportPreset {
+                        format: ExportFormat::Svg,
+                        scale: ExportScale::One,
+                    },
+                ],
+            )
+            .expect("prepare actual page export");
+            let bounds = batch.targets.first().expect("page export target").bounds;
+            let files = run_export_jobs(batch).expect("write PNG and SVG");
+            let raster = image::open(files.first().expect("PNG file"))
+                .expect("decode exported PNG")
+                .to_rgba8();
+            let svg = std::fs::read_to_string(files.get(1).expect("SVG file"))
+                .expect("read exported SVG");
+            (bounds, raster, svg)
+        };
+        let before = export(&document, "before");
+        assert_eq!(
+            before.1.dimensions(),
+            (112, 64),
+            "baseline includes the outside stroke"
+        );
+        assert!(
+            before
+                .1
+                .pixels()
+                .any(|pixel| pixel[3] == 255 && pixel[2] > pixel[0]),
+            "fixture paints blue artwork"
+        );
+        assert!(
+            before.2.contains("<path") || before.2.contains("<rect"),
+            "SVG fixture includes vector paint"
+        );
+        assert!(!before.2.contains("<image"));
+
+        let inside = Measurement::new([12.0, 16.0], [48.0, 28.0], "Designer".into(), 42)
+            .expect("overlapping measurement");
+        let outside = Measurement::new(
+            [-1_000_000.0, 1_000_000.0],
+            [1_000_000.0, -1_000_000.0],
+            "Designer".into(),
+            43,
+        )
+        .expect("measurement far outside art bounds");
+        for measurement in [&inside, &outside] {
+            document
+                .apply(
+                    create_measurement_op(&document, page, measurement)
+                        .expect("create measurement"),
+                )
+                .expect("apply metadata");
+        }
+        assert_eq!(
+            document.scene.len(),
+            art_count,
+            "measurement IDs do not become scene nodes"
+        );
+        assert_eq!(
+            read_measurements(&document, page)
+                .expect("read marks")
+                .len(),
+            2
+        );
+        let after = export(&document, "after");
+        assert_eq!(
+            after.0, before.0,
+            "far-away measurement cannot inflate export bounds"
+        );
+        assert_eq!(after.1.dimensions(), before.1.dimensions());
+        assert_eq!(
+            after.1.as_raw(),
+            before.1.as_raw(),
+            "marks never enter art PNG pixels"
+        );
+        assert_eq!(after.2, before.2, "SVG paint stays exactly the same");
+        assert!(!after.2.contains(&inside.id));
+        assert!(!after.2.contains(&outside.id));
+
+        let project = directory.path().join("saved-project");
+        fanta_format::write_project_tree(&project, &document, &BTreeMap::new())
+            .expect("save measured project");
+        let (reopened, _) =
+            fanta_format::read_project_tree(&project).expect("reopen measured page FNX");
+        assert_eq!(
+            read_measurements(&reopened, page)
+                .expect("restored records")
+                .len(),
+            2
+        );
+        let restored = export(&reopened, "after-reopen");
+        assert_eq!(restored.0, before.0);
+        assert_eq!(
+            restored.1.as_raw(),
+            before.1.as_raw(),
+            "reopened measurements remain excluded from PNG"
+        );
+        assert_eq!(
+            restored.2, before.2,
+            "reopened measurements remain excluded from SVG"
+        );
+    }
+
+    #[test]
+    fn persistent_annotations_preserve_export_pixels_bounds_and_metadata_after_reopen() {
+        use crate::annotations::{DeveloperAnnotation, create_annotation_op, read_annotations};
+
+        let directory = tempfile::tempdir().expect("annotation export fixture");
+        let mut document = Doc::new();
+        let mut page_node = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page_node.name = "Annotated page".into();
+        page_node.transform = Transform2D::translation(120.0, -70.0);
+        page_node.meta = serde_json::json!({
+            "annotations": [{"version": 2, "id": "future-note", "opaque": [1, "keep"]}],
+            "integration": {"keep": true}
+        });
+        let page = insert(&mut document, page_node);
+        document.add_page(page);
+        document.set_active_page(Some(page));
+        let mut art = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            48.0,
+            24.0,
+            Color::rgb(24, 96, 200),
+        )));
+        art.parent = Some(page);
+        art.transform = Transform2D::translation(8.0, 12.0);
+        if let NodeData::Vector(vector) = &mut art.data {
+            let mut stroke = Stroke::solid(Color::BLACK, 4.0);
+            stroke.align = StrokeAlign::Outside;
+            vector.strokes.push(stroke);
+        }
+        let art = insert(&mut document, art);
+        let art_snapshot = document.scene.get(art).cloned().expect("painted artwork");
+        let scene_count = document.scene.len();
+        let export = |document: &Doc, name: &str| {
+            let page = FigPage {
+                root: Some(page),
+                name: "Annotated page".into(),
+                bounds: Bounds::ZERO,
+                hidden: false,
+            };
+            let batch = prepare_export_jobs(
+                document,
+                None,
+                Some(&page),
+                directory.path().join(name),
+                &[
+                    ExportPreset {
+                        format: ExportFormat::Png,
+                        scale: ExportScale::Two,
+                    },
+                    ExportPreset {
+                        format: ExportFormat::Svg,
+                        scale: ExportScale::One,
+                    },
+                ],
+            )
+            .expect("prepare actual page export");
+            let bounds = batch.targets.first().expect("page export target").bounds;
+            let files = run_export_jobs(batch).expect("write annotated PNG and SVG");
+            let raster = image::open(files.first().expect("PNG file"))
+                .expect("decode exported PNG")
+                .to_rgba8();
+            let svg = std::fs::read_to_string(files.get(1).expect("SVG file"))
+                .expect("read exported SVG");
+            (bounds, raster, svg)
+        };
+        let before = export(&document, "before");
+        assert_eq!(before.1.dimensions(), (112, 64));
+        assert!(
+            before
+                .1
+                .pixels()
+                .any(|pixel| pixel[3] == 255 && pixel[2] > pixel[0]),
+            "baseline export must contain opaque blue artwork"
+        );
+        assert!(before.2.contains("<path") || before.2.contains("<rect"));
+        assert!(!before.2.contains("<image"));
+
+        let inside = DeveloperAnnotation::new(
+            [12.0, 16.0],
+            "Use 24 px spacing.\nKeep the résumé label.".into(),
+            "Designer".into(),
+            42,
+        )
+        .expect("note over artwork");
+        let outside = DeveloperAnnotation::new(
+            [-1_000_000.0, 1_000_000.0],
+            "Far outside the exported page".into(),
+            "Reviewer".into(),
+            43,
+        )
+        .expect("note far outside art bounds");
+        for annotation in [&inside, &outside] {
+            let operation = create_annotation_op(&document, page, annotation)
+                .expect("create annotation metadata");
+            document.apply(operation).expect("apply annotation");
+        }
+        let metadata = document.scene.get(page).expect("page").meta.clone();
+        assert_eq!(
+            metadata["annotations"]
+                .as_array()
+                .expect("all raw notes")
+                .len(),
+            3
+        );
+        assert_eq!(
+            metadata["annotations"][0]["opaque"],
+            serde_json::json!([1, "keep"])
+        );
+        assert_eq!(metadata["integration"], serde_json::json!({"keep": true}));
+        assert_eq!(document.scene.len(), scene_count);
+        assert_eq!(document.scene.get(art), Some(&art_snapshot));
+        let after = export(&document, "after");
+        assert_eq!(after.0, before.0, "off-art notes must not inflate bounds");
+        assert_eq!(after.1.dimensions(), before.1.dimensions());
+        assert_eq!(
+            after.1.as_raw(),
+            before.1.as_raw(),
+            "notes cannot paint PNG pixels"
+        );
+        assert_eq!(after.2, before.2, "notes cannot enter vector SVG paint");
+        for annotation in [&inside, &outside] {
+            assert!(!after.2.contains(&annotation.id));
+            assert!(!after.2.contains(&annotation.text));
+        }
+
+        let project = directory.path().join("saved-project");
+        fanta_format::write_project_tree(&project, &document, &BTreeMap::new())
+            .expect("save annotated project");
+        let (reopened, _) = fanta_format::read_project_tree(&project).expect("reopen page FNX");
+        assert_eq!(
+            reopened.scene.get(page).expect("reopened page").meta,
+            metadata
+        );
+        assert_eq!(reopened.scene.get(art), Some(&art_snapshot));
+        assert_eq!(reopened.scene.len(), scene_count);
+        let restored = read_annotations(&reopened, page).expect("restored annotations");
+        assert_eq!(restored.len(), 2, "future-version metadata stays opaque");
+        assert_eq!(restored.first().expect("inside note").annotation(), &inside);
+        assert_eq!(
+            restored.get(1).expect("outside note").annotation(),
+            &outside
+        );
+        let restored = export(&reopened, "after-reopen");
+        assert_eq!(restored.0, before.0);
+        assert_eq!(restored.1.dimensions(), before.1.dimensions());
+        assert_eq!(restored.1.as_raw(), before.1.as_raw());
+        assert_eq!(restored.2, before.2);
+    }
+
+    #[test]
     fn empty_bounds_and_empty_presets_are_reported_before_background_export() {
         let mut doc = Doc::new();
         let empty = insert(

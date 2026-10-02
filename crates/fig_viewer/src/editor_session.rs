@@ -166,14 +166,17 @@ impl RenderOnce for EditorModeTabs {
         let mut tabs = CollapsibleIconTabBar::new("fanta-editor-mode-tabs");
         for (index, mode) in EditorMode::ALL.into_iter().enumerate() {
             let on_select = self.on_select.clone();
-            tabs = tabs.tab(CollapsibleIconTab::new(
-                "fanta-editor-mode",
-                index,
-                mode.icon(),
-                mode.label(),
-                mode == self.selected,
-                move |window, cx| on_select(mode, window, cx),
-            ));
+            tabs = tabs.tab(
+                CollapsibleIconTab::new(
+                    "fanta-editor-mode",
+                    index,
+                    mode.icon(),
+                    mode.label(),
+                    mode == self.selected,
+                    move |window, cx| on_select(mode, window, cx),
+                )
+                .preserve_focus(),
+            );
         }
         tabs
     }
@@ -183,6 +186,7 @@ impl RenderOnce for EditorModeTabs {
 pub struct EditorWorkspaceTabs {
     selected: EditorWorkspace,
     code_source: Option<SharedString>,
+    variables_visible: bool,
     on_select: WorkspaceHandler,
 }
 
@@ -194,8 +198,14 @@ impl EditorWorkspaceTabs {
         Self {
             selected,
             code_source: None,
+            variables_visible: true,
             on_select: Rc::new(on_select),
         }
+    }
+
+    pub fn variables_visible(mut self, visible: bool) -> Self {
+        self.variables_visible = visible;
+        self
     }
 
     /// Name the file the Code tab opens on its own pill — "the design is
@@ -212,6 +222,9 @@ impl RenderOnce for EditorWorkspaceTabs {
     fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
         let mut tabs = CollapsibleIconTabBar::new("fanta-editor-workspace-tabs");
         for (index, workspace) in EditorWorkspace::ALL.into_iter().enumerate() {
+            if workspace == EditorWorkspace::Variables && !self.variables_visible {
+                continue;
+            }
             let on_select = self.on_select.clone();
             let label: SharedString = match (workspace, self.code_source.as_ref()) {
                 (EditorWorkspace::Code, Some(source)) => {
@@ -244,7 +257,15 @@ mod tests {
     fn mode_order_and_labels_are_stable() {
         assert_eq!(
             EditorMode::ALL.map(EditorMode::label),
-            ["Design", "Motion", "Draw", "Code", "Prototype", "Comments"]
+            [
+                "Design",
+                "Motion",
+                "Draw",
+                "Code",
+                "Prototype",
+                "Comments",
+                "Dev"
+            ]
         );
         assert_eq!(EditorMode::default(), EditorMode::Design);
         assert_eq!(

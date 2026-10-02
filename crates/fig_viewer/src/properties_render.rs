@@ -2412,6 +2412,7 @@ impl FantaPropertiesPanel {
     ) -> AnyElement {
         let mut identity = h_flex()
             .id("fanta-main-component")
+            .debug_selector(|| "native-main-component".to_owned())
             .px_4()
             .gap_1p5()
             .items_center()
@@ -3718,6 +3719,9 @@ impl FantaPropertiesPanel {
             let resolve_id = comment.id.clone();
             let delete_id = comment.id.clone();
             let mut details = Vec::new();
+            if let Some(label) = &comment.motion_label {
+                details.push(label.to_string());
+            }
             if comment.replies > 0 {
                 details.push(format!(
                     "{} repl{}",
@@ -3808,12 +3812,20 @@ impl FantaPropertiesPanel {
                             .justify_end()
                             .gap_1()
                             .child(
-                                Button::new(("fanta-comment-open", row), "Open thread")
-                                    .size(ButtonSize::Compact)
-                                    .label_size(LabelSize::XSmall)
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.open_comment_thread(open_id.clone(), window, cx);
-                                    })),
+                                div()
+                                    .debug_selector(move || format!("fanta-comment-open-{row}"))
+                                    .child(
+                                        Button::new(("fanta-comment-open", row), "Open thread")
+                                            .size(ButtonSize::Compact)
+                                            .label_size(LabelSize::XSmall)
+                                            .on_click(cx.listener(move |this, _, window, cx| {
+                                                this.open_comment_thread(
+                                                    open_id.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            })),
+                                    ),
                             )
                             .child(
                                 IconButton::new(

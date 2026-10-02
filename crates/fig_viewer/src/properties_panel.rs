@@ -2148,7 +2148,12 @@ impl FantaPropertiesPanel {
     ) -> AnyElement {
         let feedback = self.export_feedback.clone();
         v_flex()
-            .child(self.render_export_section(can_export && self.export_task.is_none(), window, cx))
+            .child(self.render_export_section(
+                can_export && self.export_task.is_none(),
+                None,
+                window,
+                cx,
+            ))
             .when_some(feedback, |section, feedback| {
                 let (icon, color) = match feedback.kind {
                     ExportFeedbackKind::Running => (IconName::ArrowCircle, Color::Info),

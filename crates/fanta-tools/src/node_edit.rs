@@ -31,7 +31,7 @@ use crate::node_math::{
     self, AnchorId, AnchorInfo, HandleSide, closest_point_on_path, enumerate_anchors,
 };
 use crate::tool::{CursorHint, Tool, ToolOverlay, ToolResponse, bounds_from_corners};
-use fanta_doc::{Doc, NodeData, NodeFlags, NodeId, Operation, PathData, Transform2D};
+use fanta_doc::{Doc, NodeData, NodeFlags, NodeId, Operation, PathData, Transform2D, Viewport};
 use glam::DVec2;
 use std::collections::BTreeSet;
 
@@ -91,6 +91,7 @@ pub struct NodeEditTool {
     select_segments: bool,
     /// The vector node whose path is being edited.
     target: Option<NodeId>,
+    scope_root: Option<NodeId>,
     /// Selected anchors of the target's path.
     selected: BTreeSet<AnchorId>,
     phase: Phase,
@@ -109,6 +110,7 @@ impl NodeEditTool {
         Self {
             select_segments: false,
             target: None,
+            scope_root: None,
             selected: BTreeSet::new(),
             phase: Phase::Idle,
             insert_hover: None,
@@ -139,6 +141,13 @@ impl NodeEditTool {
             Phase::DraggingAnchor { .. } | Phase::DraggingHandle { .. }
         )
     }
+
+    pub fn selected_editable_vector(doc: &Doc) -> Option<NodeId> {
+        let [id] = doc.selection.as_slice() else {
+            return None;
+        };
+        eligible_selection_target(doc, doc.active_page(), *id).then_some(*id)
+    }
 }
 
 impl Tool for NodeEditTool {
@@ -147,19 +156,14 @@ impl Tool for NodeEditTool {
     }
 
     fn handle_event(&mut self, ctx: &mut ToolContext, event: ToolEvent) -> ToolResponse {
-        if self.select_segments
-            && self.target.is_some_and(|id| {
-                !eligible_selection_target(ctx, id) || !ctx.doc.selection.contains(id)
-            })
-        {
+        if self.target.is_some_and(|id| {
+            !eligible_selection_target(ctx.doc, ctx.scope(), id) || !ctx.doc.selection.contains(id)
+        }) {
             self.abort_drag(ctx);
             self.target = None;
             self.selected.clear();
             self.insert_hover = None;
         }
-        // The shell swaps tools without calling `activate`, so the edit
-        // target is (re-)derived lazily from the doc selection — this is what
-        // makes "double-click a vector with Select" land here already armed.
         self.ensure_target(ctx);
         match event {
             ToolEvent::Pointer(p) => self.handle_pointer(ctx, p),
@@ -196,8 +200,8 @@ fn is_vector(ctx: &ToolContext, id: NodeId) -> bool {
         .is_some_and(|n| n.data.as_vector().is_some())
 }
 
-fn eligible_selection_target(ctx: &ToolContext, id: NodeId) -> bool {
-    let scene = &ctx.doc.scene;
+fn eligible_selection_target(doc: &Doc, scope: Option<NodeId>, id: NodeId) -> bool {
+    let scene = &doc.scene;
     let Some(node) = scene.get(id) else {
         return false;
     };
@@ -209,7 +213,7 @@ fn eligible_selection_target(ctx: &ToolContext, id: NodeId) -> bool {
                 .intersects(NodeFlags::LOCKED | NodeFlags::HIDDEN)
                 || matches!(ancestor.data, NodeData::Boolean(_))
         })
-        || ctx.scope().is_some_and(|root| {
+        || scope.is_some_and(|root| {
             id != root && !scene.ancestors_of(id).any(|ancestor| ancestor.id == root)
         })
     {
@@ -238,18 +242,35 @@ impl NodeEditTool {
                 return;
             }
         }
-        let world = ctx.screen_to_world(screen);
+        if let Some(id) =
+            Self::vector_at_screen(ctx.doc, ctx.viewport, ctx.screen_size, ctx.scope(), screen)
+        {
+            if self.target != Some(id) {
+                self.selected.clear();
+            }
+            self.target = Some(id);
+            ctx.doc.selection.select_only(id);
+        }
+    }
+
+    pub fn vector_at_screen(
+        doc: &Doc,
+        viewport: &Viewport,
+        screen_size: DVec2,
+        scope: Option<NodeId>,
+        screen: DVec2,
+    ) -> Option<NodeId> {
+        let to_world = |point| fanta_canvas::screen_to_world(point, viewport, screen_size);
+        let world = to_world(screen);
         let radius = DVec2::splat(SEGMENT_HIT_PX);
-        let hit_bounds = fanta_doc::Bounds::from_min_max(
-            ctx.screen_to_world(screen - radius),
-            ctx.screen_to_world(screen + radius),
-        );
+        let hit_bounds =
+            fanta_doc::Bounds::from_min_max(to_world(screen - radius), to_world(screen + radius));
         // Query the full screen-space tolerance before refining geometry, so thin
         // paths and paths behind another vector's empty bounds remain reachable.
-        let candidates = ctx.doc.scene.rect_query_where(hit_bounds, |id, bounds| {
+        let candidates = doc.scene.rect_query_where(hit_bounds, |id, bounds| {
             bounds.intersects(&hit_bounds)
-                && eligible_selection_target(ctx, id)
-                && ctx.doc.scene.ancestors_of(id).all(|ancestor| {
+                && eligible_selection_target(doc, scope, id)
+                && doc.scene.ancestors_of(id).all(|ancestor| {
                     let NodeData::Group(group) = &ancestor.data else {
                         return true;
                     };
@@ -264,8 +285,7 @@ impl NodeEditTool {
                     {
                         return true;
                     }
-                    ctx.doc
-                        .scene
+                    doc.scene
                         .world_transform(ancestor.id)
                         .is_some_and(|transform| {
                             if !transform.is_finite()
@@ -278,25 +298,33 @@ impl NodeEditTool {
                         })
                 })
         });
-        let previous_target = self.target;
-        for id in candidates.into_iter().rev() {
-            self.target = Some(id);
-            let on_path = self.target_path(ctx).is_some_and(|path| {
-                let world = self.target_world(ctx);
-                self.anchor_at(ctx, &enumerate_anchors(&path), &world, screen)
-                    .is_some()
-                    || self.segment_at(ctx, &path, &world, screen).is_some()
-                    || self.in_filled_path(ctx, screen)
+        candidates.into_iter().rev().find(|&id| {
+            let Some(vector) = doc.scene.get(id).and_then(|node| node.data.as_vector()) else {
+                return false;
+            };
+            let Some(transform) = doc.scene.world_transform(id) else {
+                return false;
+            };
+            let mut screen_path = vector.path.clone();
+            screen_path.map_points_mut(|point| {
+                fanta_canvas::world_to_screen(
+                    transform.transform_point(DVec2::from(point)),
+                    viewport,
+                    screen_size,
+                )
+                .to_array()
             });
-            if on_path {
-                if previous_target != self.target {
-                    self.selected.clear();
-                }
-                ctx.doc.selection.select_only(id);
-                return;
-            }
-        }
-        self.target = previous_target;
+            enumerate_anchors(&screen_path)
+                .iter()
+                .any(|anchor| (anchor.pos - screen).length() <= ANCHOR_HIT_PX)
+                || closest_point_on_path(&screen_path, screen)
+                    .is_some_and(|hit| hit.dist <= SEGMENT_HIT_PX)
+                || (!vector.fills.is_empty()
+                    && fanta_canvas::point_in_path(
+                        &vector.path,
+                        transform.inverse().transform_point(world),
+                    ))
+        })
     }
 
     fn in_filled_path(&self, ctx: &ToolContext, screen: DVec2) -> bool {
@@ -316,13 +344,8 @@ impl NodeEditTool {
     /// node vanished / changed kind), adopt the first selected vector from the
     /// doc. Dropping the target also drops the per-path anchor selection.
     fn ensure_target(&mut self, ctx: &ToolContext) {
-        let eligible = |id| {
-            if self.select_segments {
-                eligible_selection_target(ctx, id)
-            } else {
-                is_vector(ctx, id)
-            }
-        };
+        self.scope_root = ctx.scope_root;
+        let eligible = |id| eligible_selection_target(ctx.doc, ctx.scope(), id);
         if self.target.is_some_and(eligible) {
             return;
         }
@@ -404,9 +427,7 @@ impl NodeEditTool {
         old_data.path = original.path;
         old_data.local_size = original.local_size;
         let mut new_data = vector.clone();
-        if self.select_segments {
-            new_data.parametric = None;
-        }
+        new_data.parametric = None;
         let new_flags = node.flags;
         let mut old_flags = new_flags;
         old_flags.set(NodeFlags::UNCLIPPED_VECTOR, original.unclipped);
@@ -490,7 +511,7 @@ impl NodeEditTool {
         world_t: &Transform2D,
         screen: DVec2,
     ) -> Option<(AnchorId, HandleSide)> {
-        let visible = self.handle_visible_set(anchors);
+        let visible = Self::handle_visible_set(anchors, &self.selected);
         let mut best: Option<(AnchorId, HandleSide, f64)> = None;
         for a in anchors {
             if !visible.contains(&a.id) {
@@ -511,7 +532,10 @@ impl NodeEditTool {
     /// Anchors whose handles are visible: the selected anchors plus each
     /// selected anchor's subpath neighbors (wrapping when closed) — the
     /// Illustrator visibility rule.
-    fn handle_visible_set(&self, anchors: &[AnchorInfo]) -> BTreeSet<AnchorId> {
+    fn handle_visible_set(
+        anchors: &[AnchorInfo],
+        selected: &BTreeSet<AnchorId>,
+    ) -> BTreeSet<AnchorId> {
         let mut out = BTreeSet::new();
         // Per-subpath anchor counts for neighbor wraparound.
         let mut counts: Vec<usize> = Vec::new();
@@ -528,7 +552,7 @@ impl NodeEditTool {
             }
             v
         };
-        for &id in &self.selected {
+        for &id in selected {
             out.insert(id);
             let Some(&n) = counts.get(id.subpath) else {
                 continue;
@@ -573,45 +597,48 @@ impl NodeEditTool {
         world_t: &Transform2D,
         screen: DVec2,
     ) -> Option<(usize, f64, DVec2)> {
-        if self.select_segments {
-            // Local-space proximity is distorted by non-uniform scale and skew.
-            let mut screen_path = path.clone();
-            screen_path.map_points_mut(|point| {
-                self.local_to_screen(ctx, world_t, DVec2::from(point))
-                    .to_array()
-            });
-            let hit = closest_point_on_path(&screen_path, screen)?;
-            return (hit.dist <= SEGMENT_HIT_PX)
-                .then(|| {
-                    node_math::eval_segment(path, hit.seg_index, hit.t)
-                        .map(|point| (hit.seg_index, hit.t, point))
-                })
-                .flatten();
-        }
-        let local = self.screen_to_local(ctx, world_t, screen);
-        let hit = closest_point_on_path(path, local)?;
-        let on_screen = self.local_to_screen(ctx, world_t, hit.pos);
-        ((on_screen - screen).length() <= SEGMENT_HIT_PX).then_some((hit.seg_index, hit.t, hit.pos))
+        // Local-space proximity is distorted by non-uniform scale and skew.
+        let mut screen_path = path.clone();
+        screen_path.map_points_mut(|point| {
+            self.local_to_screen(ctx, world_t, DVec2::from(point))
+                .to_array()
+        });
+        let hit = closest_point_on_path(&screen_path, screen)?;
+        (hit.dist <= SEGMENT_HIT_PX)
+            .then(|| {
+                node_math::eval_segment(path, hit.seg_index, hit.t)
+                    .map(|point| (hit.seg_index, hit.t, point))
+            })
+            .flatten()
     }
 
     // -- overlays ---------------------------------------------------------------
 
     fn path_overlays(&self, doc: &Doc) -> Vec<ToolOverlay> {
-        let Some(id) = self.target else {
+        let scope = self.scope_root.or_else(|| doc.active_page());
+        let eligible = |id| doc.selection.contains(id) && eligible_selection_target(doc, scope, id);
+        let Some(id) = self
+            .target
+            .filter(|&id| eligible(id))
+            .or_else(|| doc.selection.iter().copied().find(|&id| eligible(id)))
+        else {
             return Vec::new();
         };
         let Some(vector) = doc.scene.get(id).and_then(|node| node.data.as_vector()) else {
             return Vec::new();
         };
-        if self.select_segments && !doc.selection.contains(id) {
-            return Vec::new();
-        }
         let world_t = doc
             .scene
             .world_transform(id)
             .unwrap_or(Transform2D::IDENTITY);
         let anchors = enumerate_anchors(&vector.path);
-        let visible = self.handle_visible_set(&anchors);
+        let no_selection = BTreeSet::new();
+        let selected = if Some(id) == self.target {
+            &self.selected
+        } else {
+            &no_selection
+        };
+        let visible = Self::handle_visible_set(&anchors, selected);
         let mut overlays = Vec::new();
         for a in &anchors {
             if visible.contains(&a.id) {
@@ -629,7 +656,7 @@ impl NodeEditTool {
             let w = world_t.transform_point(a.pos);
             overlays.push(ToolOverlay::PathAnchor {
                 world: [w.x, w.y],
-                selected: self.selected.contains(&a.id),
+                selected: selected.contains(&a.id),
             });
         }
         overlays
@@ -684,25 +711,7 @@ impl NodeEditTool {
         count: u8,
     ) -> ToolResponse {
         self.insert_hover = None;
-        if self.select_segments {
-            self.retarget_selection(ctx, screen);
-        }
-        // No target yet: adopt the vector under the cursor.
-        if !self.select_segments
-            && (self.target.is_none() || !self.target.is_some_and(|id| is_vector(ctx, id)))
-        {
-            let world = ctx.screen_to_world(screen);
-            let hit = ctx
-                .hit_test(world, fanta_canvas::HitPrecision::Bounds)
-                .filter(|&id| is_vector(ctx, id));
-            if let Some(id) = hit {
-                self.target = Some(id);
-                self.selected.clear();
-                ctx.doc.selection.select_only(id);
-            } else {
-                return ToolResponse::cursor(CursorHint::Default);
-            }
-        }
+        self.retarget_selection(ctx, screen);
         let Some(original) = self.target_snapshot(ctx) else {
             return ToolResponse::cursor(CursorHint::Default);
         };
@@ -1153,6 +1162,155 @@ mod tests {
     }
 
     #[test]
+    fn path_edit_retargets_after_layer_selection_without_editing_the_previous_vector() {
+        for select_segments in [false, true] {
+            let (mut doc, mut viewport, snap, size) = ctx_pieces();
+            let first = add_polyline(&mut doc);
+            let second = add_polyline(&mut doc);
+            doc.scene.get_mut(second).expect("second vector").transform =
+                Transform2D::translation(200., 0.);
+            let first_original = node_path(&doc, first);
+            let second_original = node_path(&doc, second);
+            doc.selection.select_only(first);
+            doc.history = Default::default();
+            let mut ctx = ToolContext::new(&mut doc, &mut viewport, snap, size);
+            let mut tool = viewport_edit_tool(select_segments);
+            tool.activate(&mut ctx);
+            tool.handle_event(&mut ctx, press(w2s([0., 0.])));
+            tool.handle_event(&mut ctx, release(w2s([0., 0.])));
+            ctx.doc.selection.select_only(second);
+            let response = tool.handle_event(&mut ctx, mv(w2s([200., 0.])));
+            assert_eq!(tool.target(), Some(second));
+            assert_eq!(tool.selected_count(), 0);
+            assert!(response.overlays.iter().any(|overlay| matches!(
+                overlay,
+                ToolOverlay::PathAnchor {
+                    world: [200., 0.],
+                    ..
+                }
+            )));
+            tool.handle_event(&mut ctx, press(w2s([200., 0.])));
+            tool.handle_event(&mut ctx, mv(w2s([220., 30.])));
+            tool.handle_event(&mut ctx, release(w2s([220., 30.])));
+            assert_eq!(node_path(ctx.doc, first), first_original);
+            assert_ne!(node_path(ctx.doc, second), second_original);
+            assert_eq!(ctx.doc.history.undo_depth(), 1);
+            assert!(ctx.doc.undo().expect("undo current vector edit"));
+            assert_eq!(node_path(ctx.doc, second), second_original);
+        }
+    }
+
+    #[test]
+    fn path_edit_acquires_thin_strokes_and_inserts_with_screen_space_tolerance() {
+        for zoom in [0.5, 1., 4.] {
+            for transform in [Transform2D::IDENTITY, Transform2D::scale_xy(10., 0.1)] {
+                let (mut doc, mut viewport, snap, size) = ctx_pieces();
+                viewport.zoom = zoom;
+                let mut path = PathData::new();
+                path.move_to(0., 0.).line_to(100., 100.);
+                let mut vector = CanvasNode::new(NodeData::Vector(VectorNode {
+                    path: path.clone(),
+                    strokes: [fanta_doc::Stroke::solid(fanta_doc::Color::BLACK, 1.)]
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                }));
+                vector.transform = transform;
+                let id = vector.id;
+                doc.apply(Operation::create_node(vector))
+                    .expect("thin path");
+                doc.history = Default::default();
+                let mut ctx = ToolContext::new(&mut doc, &mut viewport, snap, size);
+                let mut tool = NodeEditTool::new();
+                let tangent = transform.transform_point(DVec2::new(100., 100.));
+                let normal = DVec2::new(-tangent.y, tangent.x).normalize();
+                let screen = ctx.world_to_screen(tangent * 0.5) + normal * 4.;
+                tool.handle_event(&mut ctx, press(screen.to_array()));
+                tool.handle_event(&mut ctx, release(screen.to_array()));
+                assert_eq!(
+                    tool.target(),
+                    Some(id),
+                    "zoom {zoom}, transform {transform:?}"
+                );
+                assert!(ctx.doc.selection.contains(id));
+                let anchors = enumerate_anchors(&node_path(ctx.doc, id));
+                assert_eq!(anchors.len(), 3);
+                let inserted_world =
+                    transform.transform_point(anchors.get(1).expect("inserted anchor").pos);
+                assert!(
+                    (ctx.world_to_screen(inserted_world) - ctx.world_to_screen(tangent * 0.5))
+                        .length()
+                        < 0.01,
+                    "zoom {zoom}, transform {transform:?}, inserted {:?}",
+                    anchors.get(1).expect("inserted anchor").pos
+                );
+                assert_eq!(ctx.doc.history.undo_depth(), 1);
+                assert!(ctx.doc.undo().expect("undo inserted anchor"));
+                assert_eq!(node_path(ctx.doc, id), path);
+            }
+        }
+    }
+
+    #[test]
+    fn path_edit_drops_hidden_and_locked_targets() {
+        for flags in [NodeFlags::HIDDEN, NodeFlags::LOCKED] {
+            let (mut doc, mut viewport, snap, size) = ctx_pieces();
+            let id = add_polyline(&mut doc);
+            let original = node_path(&doc, id);
+            let mut tool = tool_on(&mut doc, id);
+            doc.scene.get_mut(id).expect("vector").flags.insert(flags);
+            doc.history = Default::default();
+            let mut ctx = ToolContext::new(&mut doc, &mut viewport, snap, size);
+            tool.activate(&mut ctx);
+            tool.handle_event(&mut ctx, press(w2s([0., 0.])));
+            tool.handle_event(&mut ctx, mv(w2s([20., 30.])));
+            tool.handle_event(&mut ctx, release(w2s([20., 30.])));
+            assert_eq!(tool.target(), None);
+            assert_eq!(node_path(ctx.doc, id), original);
+            assert_eq!(ctx.doc.history.undo_depth(), 0);
+        }
+    }
+
+    #[test]
+    fn path_edit_detaches_parametric_shape_and_undo_restores_descriptor() {
+        let (mut doc, mut viewport, snap, size) = ctx_pieces();
+        let descriptor = fanta_doc::ParametricShape::Polygon { points: 4 };
+        let path = descriptor.to_path(100., 100.);
+        let first = enumerate_anchors(&path)
+            .first()
+            .expect("polygon anchor")
+            .pos;
+        let vector = CanvasNode::new(NodeData::Vector(VectorNode {
+            path,
+            parametric: Some(descriptor),
+            ..Default::default()
+        }));
+        let id = vector.id;
+        let original = vector.data.clone();
+        doc.apply(Operation::create_node(vector)).expect("polygon");
+        let mut tool = tool_on(&mut doc, id);
+        doc.history = Default::default();
+        let mut ctx = ToolContext::new(&mut doc, &mut viewport, snap, size);
+        tool.handle_event(&mut ctx, press(w2s(first.to_array())));
+        let end = first + DVec2::new(20., 30.);
+        tool.handle_event(&mut ctx, mv(w2s(end.to_array())));
+        tool.handle_event(&mut ctx, release(w2s(end.to_array())));
+        assert_eq!(
+            ctx.doc
+                .scene
+                .get(id)
+                .expect("polygon")
+                .data
+                .as_vector()
+                .expect("vector")
+                .parametric,
+            None
+        );
+        assert!(ctx.doc.undo().expect("undo anchor edit"));
+        assert_eq!(ctx.doc.scene.get(id).expect("polygon").data, original);
+    }
+
+    #[test]
     fn click_anchor_selects_it_and_emits_filled_overlay() {
         let (mut doc, mut viewport, snap, size) = ctx_pieces();
         let id = add_polyline(&mut doc);
@@ -1414,18 +1572,36 @@ mod tests {
     }
 
     #[test]
-    fn press_adopts_vector_under_cursor_when_unselected() {
+    fn press_adopts_unselected_path_geometry_without_capturing_empty_bounds() {
         let (mut doc, mut viewport, snap, size) = ctx_pieces();
         let id = add_polyline(&mut doc);
+        doc.scene
+            .get_mut(id)
+            .expect("vector")
+            .data
+            .as_vector_mut()
+            .expect("path")
+            .strokes
+            .push(fanta_doc::Stroke::solid(fanta_doc::Color::BLACK, 1.));
+        let original = node_path(&doc, id);
         doc.selection.clear();
+        doc.history = Default::default();
         let mut tool = NodeEditTool::new();
         let mut ctx = ToolContext::new(&mut doc, &mut viewport, snap, size);
         tool.activate(&mut ctx);
         assert_eq!(tool.target(), None);
         tool.handle_event(&mut ctx, press(w2s([50.0, 50.0])));
         tool.handle_event(&mut ctx, release(w2s([50.0, 50.0])));
+        assert_eq!(tool.target(), None);
+        assert!(ctx.doc.selection.is_empty());
+        assert_eq!(node_path(ctx.doc, id), original);
+        assert_eq!(ctx.doc.history.undo_depth(), 0);
+        tool.handle_event(&mut ctx, press(w2s([100.0, 0.0])));
+        tool.handle_event(&mut ctx, release(w2s([100.0, 0.0])));
         assert_eq!(tool.target(), Some(id));
         assert!(doc.selection.contains(id));
+        assert_eq!(node_path(&doc, id), original);
+        assert_eq!(doc.history.undo_depth(), 0);
     }
 
     #[test]

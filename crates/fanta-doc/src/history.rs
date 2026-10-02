@@ -151,7 +151,12 @@ impl History {
     }
 
     pub fn next_undo_transaction(&self) -> Option<&Transaction> {
-        self.undo.last()
+        // Undo commits an open gesture first, so inspecting only the stack
+        // could authorize a different transaction from the one it reverts.
+        self.open
+            .as_ref()
+            .filter(|transaction| !transaction.is_empty())
+            .or_else(|| self.undo.last())
     }
 
     pub fn next_redo_transaction(&self) -> Option<&Transaction> {
@@ -537,5 +542,61 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(history.undo_depth(), 3);
+    }
+
+    #[test]
+    fn undo_peek_accounts_for_implicit_open_transaction_commit() {
+        let mut document = TestDoc::new();
+        let mut history = History::new();
+        let node = rect_node();
+        let id = node.id;
+        history
+            .apply(Operation::create_node(node), &mut document.ctx())
+            .expect("create node");
+        history.begin("Unchanged gesture", &mut document.scene);
+        assert!(matches!(
+            history
+                .next_undo_transaction()
+                .expect("previous undo transaction")
+                .ops
+                .first(),
+            Some(Operation::CreateNode { .. })
+        ));
+
+        history.begin("Pending move", &mut document.scene);
+        history
+            .apply(
+                Operation::SetTransform {
+                    id,
+                    old: Transform2D::IDENTITY,
+                    new: Transform2D::translation(25.0, 0.0),
+                },
+                &mut document.ctx(),
+            )
+            .expect("pending move");
+        assert_eq!(history.undo_depth(), 1);
+        assert_eq!(
+            history.next_undo_transaction().expect("pending undo").label,
+            "Pending move"
+        );
+        assert_eq!(history.undo_depth(), 1);
+        assert!(history.next_redo_transaction().is_none());
+        assert!(
+            history
+                .undo(&mut document.ctx())
+                .expect("undo pending move")
+        );
+        assert_eq!(
+            history
+                .next_redo_transaction()
+                .expect("redo pending move")
+                .label,
+            "Pending move"
+        );
+        assert_eq!(
+            document.scene.get(id).expect("node remains").transform,
+            Transform2D::IDENTITY
+        );
+        assert_eq!(history.undo_depth(), 1);
     }
 }

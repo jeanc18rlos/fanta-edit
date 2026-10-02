@@ -6,14 +6,14 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 
+use fanta_doc::MeasuredPath;
 use fanta_doc::{
     AssetId, BlendMode, Blur, BlurKind, BooleanOp, BoundProp, Color as FantaColor, ComponentId,
     ComponentPropKind, CounterAlign, Doc, Fill, Gradient, ImageFitMode, LayoutChild, LayoutMode,
     MaskType, NodeData, NodeFlags, NodeId, Operation, ParametricShape, PatternFill,
     PatternHorizontalAlignment, PatternSpacing, PatternTileType, PrimaryAlign, Shadow, ShadowKind,
     StrokeAlign, StrokeCap, StrokeJoin, TextAlign, TextAutoResize, TextPathAlignment,
-    TextPathDirection, TextPathSide, TextPathStart, Transform2D,
-    VAlign as TextVAlign, VarValue,
+    TextPathDirection, TextPathSide, TextPathStart, Transform2D, VAlign as TextVAlign, VarValue,
 };
 use fanta_gpui::design::{
     DesignArcData, DesignArrangeOperation, DesignAutoLayoutItem, DesignBaselineAlignment,
@@ -29,13 +29,14 @@ use fanta_gpui::design::{
     DesignMaskType, DesignMediaCropAction, DesignMediaCropToolState, DesignMediaKind,
     DesignMediaPaintAsset, DesignMediaPaintCapabilities, DesignMediaPaintPlacement,
     DesignMediaPaintView, DesignMediaPaintViewData, DesignMediaQuarterTurn, DesignPaint,
-    DesignPaintKind, DesignPaintPayload, DesignPaintProperty, DesignPaintSource,
-    DesignPaintStyleViewData, DesignPaintTransform, DesignPaintType, DesignPaintValue, DesignPanel,
-    DesignPanelAction, DesignPanelAutoLayoutDirection, DesignPanelAutoLayoutParticipation,
-    DesignPanelAutoLayoutWrap, DesignPanelCollection, DesignPanelEditPhase, DesignPanelNode,
-    DesignPanelNodeCapabilities, DesignPanelNodeKind, DesignPanelParentLayout, DesignPanelProperty,
-    DesignPanelPropertyValueState, DesignPanelSection, DesignPanelSelection, DesignPanelTarget,
-    DesignPanelValue, DesignPatternHorizontalAlignment, DesignPatternPaint, DesignPatternSource,
+    DesignPaintCollectionEditMode, DesignPaintKind, DesignPaintPayload, DesignPaintProperty,
+    DesignPaintSource, DesignPaintStyleViewData, DesignPaintTransform, DesignPaintType,
+    DesignPaintValue, DesignPanel, DesignPanelAction, DesignPanelAutoLayoutDirection,
+    DesignPanelAutoLayoutParticipation, DesignPanelAutoLayoutWrap, DesignPanelCollection,
+    DesignPanelEditPhase, DesignPanelNode, DesignPanelNodeCapabilities, DesignPanelNodeKind,
+    DesignPanelParentLayout, DesignPanelProperty, DesignPanelPropertyValueState,
+    DesignPanelSection, DesignPanelSelection, DesignPanelTarget, DesignPanelValue,
+    DesignPatternHorizontalAlignment, DesignPatternPaint, DesignPatternSource,
     DesignPatternTileType, DesignPolygonGeometry, DesignSelectionHeaderCommand,
     DesignSelectionHeaderControl, DesignSelectionHeaderControlKind, DesignSelectionHeaderMenu,
     DesignSelectionHeaderMenuItem, DesignSelectionHeaderViewData, DesignShaderDefinition,
@@ -44,14 +45,17 @@ use fanta_gpui::design::{
     DesignShaderViewData, DesignShapeGeometry, DesignSizingMode, DesignStackingOrder,
     DesignStarGeometry, DesignStroke, DesignStrokeAlign, DesignStrokeCap, DesignStrokeDashMode,
     DesignStrokeDashes, DesignStrokeEditContext, DesignStrokeJoin, DesignStrokeWeightMode,
-    DesignStrokeWeights, DesignTextDecoration, DesignTextHorizontalAlignment, DesignTextResize,
+    DesignStrokeWeights, DesignTextDecoration, DesignTextHorizontalAlignment,
     DesignTextPathDirection, DesignTextPathOrientation, DesignTextPathPlacement,
-    DesignTextPathStartData, DesignTextPathViewData, DesignTextVerticalAlignment,
-    DesignTransformOperation, DesignTypography, DesignTypographyTarget, DesignPaintCollectionEditMode,
-    DesignVideoPreviewAction, DesignVideoPreviewState,
+    DesignTextPathStartData, DesignTextPathViewData, DesignTextResize, DesignTextVerticalAlignment,
+    DesignTransformOperation, DesignTypography, DesignTypographyTarget, DesignVideoPreviewAction,
+    DesignVideoPreviewState, DesignViewerPropertiesViewData, DesignViewerPropertyRow,
+    DesignViewerPropertySection,
 };
-use gpui::{AppContext as _, Context, Entity, SharedString, Subscription, TaskExt as _, Window};
-use fanta_doc::MeasuredPath;
+use gpui::{
+    AppContext as _, ClipboardItem, Context, Entity, SharedString, Subscription, TaskExt as _,
+    Window,
+};
 
 use super::design_snapshot::build_design_view_data;
 use crate::color_picker::GradientKind;
@@ -69,8 +73,9 @@ use crate::properties_ops::{
 };
 use crate::properties_snapshot::PaintKind as EnginePaintKind;
 use crate::properties_snapshot::{
-    CornerRadiusValue, InspectorField, NodeSection, NodeSnapshot, PaintSnapshot, PropValueSnapshot,
-    TypographySnapshot, multi_section, node_section,
+    CornerRadiusValue, HiddenPaintAlpha, InspectorField, NodeSection, NodeSnapshot, PaintKey,
+    PaintSnapshot, PropValueSnapshot, TypographySnapshot, multi_section, node_section,
+    opaque_paint_alpha, paint_alpha, paint_alpha_is_visible, set_paint_alpha, zeroed_paint_alpha,
 };
 use crate::view::FigView;
 
@@ -1742,6 +1747,10 @@ pub(crate) fn design_node(
         smoothing: section.corner_smoothing.is_some(),
     };
 
+    let text_path = match &node.data {
+        NodeData::TextPath(text_path) => Some(text_path),
+        _ => None,
+    };
     if let Some(fills) = &section.fills {
         out.fills = fills
             .iter()
@@ -1762,6 +1771,11 @@ pub(crate) fn design_node(
     } else if let Some(typography) = &section.typography {
         // A text node's Fill section is its glyph color.
         let mut paint = design_solid_paint(typography.color);
+        paint.id = SharedString::from(format!("{id}-fill-0"));
+        paint.blend_mode = design_blend_mode(node.blend_mode);
+        out.fills = vec![paint];
+    } else if let Some(text_path) = text_path {
+        let mut paint = design_solid_paint(text_path.style.color);
         paint.id = SharedString::from(format!("{id}-fill-0"));
         paint.blend_mode = design_blend_mode(node.blend_mode);
         out.fills = vec![paint];
@@ -1792,7 +1806,28 @@ pub(crate) fn design_node(
     out.effect_capabilities.progressive_blur = false;
     out.effect_capabilities.shadow_blend_mode = false;
     out.layout = design_layout(doc, node, &section);
-    out.typography = section.typography.as_ref().map(design_typography);
+    out.typography = section
+        .typography
+        .as_ref()
+        .map(design_typography)
+        .or_else(|| text_path.map(design_text_path_typography));
+    if let Some(text_path) = text_path {
+        out.text_path = Some(
+            DesignTextPathViewData::new(match text_path.side {
+                TextPathSide::Default => DesignTextPathOrientation::Default,
+                TextPathSide::Flipped => DesignTextPathOrientation::Flipped,
+            })
+            .with_direction(match text_path.direction {
+                TextPathDirection::Forward => DesignTextPathDirection::Forward,
+                TextPathDirection::Reverse => DesignTextPathDirection::Reverse,
+            }),
+        );
+        out.text_path_start_data = Some(DesignTextPathStartData {
+            segment: text_path.start.segment(),
+            position: text_path.start.position() as f32,
+        });
+        out.text_path_placement = design_text_path_placement(text_path);
+    }
     out.is_mask = node.is_mask;
     out.mask_mode = match node.mask_type {
         MaskType::Alpha => DesignMaskType::Alpha,
@@ -2054,6 +2089,38 @@ pub(crate) fn bound_states(doc: &Doc, id: NodeId) -> PropertyStates {
             ),
         ));
     }
+    if matches!(&node.data, NodeData::TextPath(_)) {
+        states.extend(
+            [
+                DesignPanelProperty::TypographyStyle,
+                DesignPanelProperty::TextLeadingTrim,
+                DesignPanelProperty::ParagraphSpacing,
+                DesignPanelProperty::ParagraphIndent,
+                DesignPanelProperty::ListSpacing,
+                DesignPanelProperty::TextHangingPunctuation,
+                DesignPanelProperty::TextHangingLists,
+                DesignPanelProperty::VerticalTextAlignment,
+                DesignPanelProperty::TextResize,
+                DesignPanelProperty::TextTruncate,
+                DesignPanelProperty::TextMaxLines,
+                DesignPanelProperty::TextDecorationStyle,
+                DesignPanelProperty::TextDecorationOffset,
+                DesignPanelProperty::TextDecorationThickness,
+                DesignPanelProperty::TextDecorationColor,
+                DesignPanelProperty::TextDecorationSkipInk,
+                DesignPanelProperty::TextCase,
+                DesignPanelProperty::TextList,
+            ]
+            .into_iter()
+            .map(|property| {
+                (
+                    property,
+                    DesignPanelPropertyValueState::Unset
+                        .read_only_with_reason("This property does not exist on text paths"),
+                )
+            }),
+        );
+    }
     states
 }
 
@@ -2097,6 +2164,7 @@ pub(crate) struct DesignAdapter {
     pub panel: Entity<DesignPanel>,
     pub(crate) last_echo: Option<DesignEchoKey>,
     pub(crate) session: Option<DesignEditSession>,
+    hidden_paint_alpha: HashMap<PaintKey, HiddenPaintAlpha>,
     crop_session: Option<DesignCropSession>,
     media_draft: Option<DesignMediaDraft>,
     media_draft_epoch: u64,
@@ -2148,7 +2216,7 @@ impl DesignAdapter {
         panel.update(cx, |panel, cx| {
             panel.set_supported_paint_types(supported_paint_types(false), cx);
             panel.set_export_advanced_settings_enabled(false, cx);
-            panel.set_paint_visibility_supported(false, cx);
+            panel.set_paint_visibility_supported(true, cx);
             panel.set_shader_view_data(bundled_shader_catalog(), cx);
             panel.set_shader_variable_binding_enabled(false, cx);
             panel.set_eyedropper_enabled(false, cx);
@@ -2177,6 +2245,7 @@ impl DesignAdapter {
             panel,
             last_echo: None,
             session: None,
+            hidden_paint_alpha: HashMap::new(),
             crop_session: None,
             media_draft: None,
             media_draft_epoch: 0,
@@ -2243,6 +2312,29 @@ impl FigView {
         if self.gpui_design.is_none() {
             return;
         }
+        let draft_scope = Some(self.draft_preserving_toolbar_focus_scope(cx));
+        if let Some(adapter) = &self.gpui_design {
+            adapter.panel.update(cx, |panel, _| {
+                panel.set_draft_preserving_focus_scope(draft_scope)
+            });
+        }
+        let viewer_properties = if self.is_art_read_only(cx) {
+            let target = self
+                .item()
+                .read(cx)
+                .document()
+                .map(|document| DesignPanelTarget::Nodes {
+                    node_ids: document
+                        .doc
+                        .selection
+                        .iter()
+                        .map(|id| id.to_string().into())
+                        .collect(),
+                });
+            target.and_then(|target| self.current_viewer_properties_for_target(&target, cx))
+        } else {
+            None
+        };
         let mut video_previews = HashMap::new();
         #[cfg(target_os = "macos")]
         for asset in self.selected_canvas_video_fill_assets(cx) {
@@ -2272,7 +2364,7 @@ impl FigView {
             let Some(document) = fig_item.document() else {
                 return;
             };
-            let editable = fig_item.is_editable();
+            let editable = self.is_editable(cx);
             let doc = &document.doc;
             let selection: Vec<NodeId> = doc
                 .selection
@@ -2284,7 +2376,7 @@ impl FigView {
                 && selection.first().is_some_and(|id| {
                     matches!(
                         doc.scene.get(*id).map(|node| &node.data),
-                        Some(NodeData::Text(_))
+                        Some(NodeData::Text(_) | NodeData::TextPath(_))
                     )
                 });
             let key = DesignEchoKey {
@@ -2429,6 +2521,11 @@ impl FigView {
                 panel.clear_selection_header_view_data(cx);
             }
             panel.set_property_value_states(property_states, cx);
+            if let Some(viewer_properties) = viewer_properties {
+                panel.set_viewer_properties_view_data(viewer_properties, cx);
+            } else {
+                panel.clear_viewer_properties_view_data(cx);
+            }
         });
     }
 
@@ -2451,8 +2548,15 @@ impl FigView {
         let item = self.item().clone();
         item.update(cx, |item, cx| {
             item.with_document_for_preview_owner(preview_owner, cx, |document| {
-                restore_snapshot(&mut document.doc, &session.snapshot);
-                ((), DocChange::ContentPreview)
+                let restored = restore_design_edit_session(&mut document.doc, &session);
+                (
+                    (),
+                    if restored {
+                        DocChange::ContentPreview
+                    } else {
+                        DocChange::None
+                    },
+                )
             });
             item.finish_content_preview(preview_owner, false, cx);
         });
@@ -2463,6 +2567,7 @@ impl FigView {
     pub(crate) fn discard_gpui_design_edits(&mut self) {
         if let Some(adapter) = self.gpui_design.as_mut() {
             adapter.session = None;
+            adapter.hidden_paint_alpha.clear();
         }
     }
 
@@ -2818,6 +2923,28 @@ impl FigView {
         }
     }
 
+    fn current_viewer_properties_for_target(
+        &self,
+        target: &DesignPanelTarget,
+        cx: &Context<Self>,
+    ) -> Option<DesignViewerPropertiesViewData> {
+        let DesignPanelTarget::Nodes { node_ids } = target else {
+            return None;
+        };
+        let [target_id] = node_ids.as_slice() else {
+            return None;
+        };
+        let target_id = node_id(target_id)?;
+        let item = self.item().read(cx);
+        let document = item.document()?;
+        if !document.doc.selection.iter().copied().eq([target_id]) {
+            return None;
+        }
+        let masters = crate::properties_snapshot::master_roots(&document.doc.components);
+        let (node, _) = design_node(document, target_id, &masters)?;
+        viewer_properties_view_data(&document.doc, target_id, &node)
+    }
+
     fn design_apply_ops(&mut self, operations: Vec<Operation>, cx: &mut Context<Self>) -> bool {
         let preview_owner = cx.entity_id();
         let operations = finite_transform_operations(operations);
@@ -3041,12 +3168,97 @@ impl FigView {
     #[allow(deprecated)]
     pub(crate) fn handle_design_action(
         &mut self,
-        _panel: &Entity<DesignPanel>,
+        panel: &Entity<DesignPanel>,
         action: &DesignPanelAction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_editable(cx)
+            && !matches!(
+                action,
+                DesignPanelAction::PropertyCopyRequested { .. }
+                    | DesignPanelAction::ViewerSectionCopyRequested { .. }
+                    | DesignPanelAction::ViewerSectionRepresentationChangeRequested { .. }
+                    | DesignPanelAction::GoToMainComponentRequested { .. }
+                    | DesignPanelAction::SurfaceChangeRequested { .. }
+                    | DesignPanelAction::ExportConfigurationAddRequested { .. }
+                    | DesignPanelAction::ExportConfigurationRemoveRequested { .. }
+                    | DesignPanelAction::ExportConfigurationChangeRequested { .. }
+                    | DesignPanelAction::ExportAllRequested { .. }
+                    | DesignPanelAction::ExportRequested { .. }
+            )
+        {
+            return;
+        }
         match action {
+            DesignPanelAction::PropertyCopyRequested {
+                target,
+                property,
+                displayed_value,
+            } => {
+                let permissions = panel.read(cx).inspection_context().permissions();
+                if permissions.can_edit() || !permissions.can_copy() {
+                    log::warn!("fig design adapter: rejecting unavailable property copy");
+                    return;
+                }
+                let Some(view_data) = self.current_viewer_properties_for_target(target, cx) else {
+                    log::warn!("fig design adapter: rejecting stale property copy target");
+                    return;
+                };
+                let Some(payload) =
+                    viewer_property_copy_payload(&view_data, target, *property, displayed_value)
+                else {
+                    log::warn!("fig design adapter: rejecting stale property copy payload");
+                    return;
+                };
+                cx.write_to_clipboard(ClipboardItem::new_string(payload.to_string()));
+            }
+            DesignPanelAction::ViewerSectionCopyRequested {
+                target,
+                section_id,
+                copy_value,
+            } => {
+                let permissions = panel.read(cx).inspection_context().permissions();
+                if permissions.can_edit() || !permissions.can_copy() {
+                    log::warn!("fig design adapter: rejecting unavailable viewer section copy");
+                    return;
+                }
+                let Some(view_data) = self.current_viewer_properties_for_target(target, cx) else {
+                    log::warn!("fig design adapter: rejecting stale viewer section copy target");
+                    return;
+                };
+                let Some(payload) =
+                    viewer_section_copy_payload(&view_data, target, section_id, copy_value)
+                else {
+                    log::warn!("fig design adapter: rejecting stale viewer section copy payload");
+                    return;
+                };
+                cx.write_to_clipboard(ClipboardItem::new_string(payload.to_string()));
+            }
+            DesignPanelAction::ViewerSectionRepresentationChangeRequested {
+                target,
+                section_id,
+                ..
+            } => {
+                let permissions = panel.read(cx).inspection_context().permissions();
+                if permissions.can_edit() || !permissions.can_copy() {
+                    log::warn!("fig design adapter: rejecting unavailable viewer representation");
+                    return;
+                }
+                let Some(view_data) = self.current_viewer_properties_for_target(target, cx) else {
+                    log::warn!("fig design adapter: rejecting stale viewer representation target");
+                    return;
+                };
+                if !viewer_section_is_current(&view_data, target, section_id) {
+                    log::warn!("fig design adapter: rejecting stale viewer representation section");
+                    return;
+                }
+                crate::view::notify_unavailable(
+                    "Developer property representation changes",
+                    window,
+                    cx,
+                );
+            }
             DesignPanelAction::ExportConfigurationAddRequested { target } => {
                 if !self.design_export_target_matches(target, cx) {
                     return;
@@ -3125,6 +3337,69 @@ impl FigView {
             DesignPanelAction::ExportRequested { .. } => {
                 self.export_design_selection(window, cx);
             }
+            DesignPanelAction::TextPathFlipOrientationRequested { node_id: id } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                if !self.design_text_path_action_is_current(panel, id, cx) {
+                    log::warn!("fig design adapter: rejecting stale text-path flip target");
+                    return;
+                }
+                self.finish_document_edits_for_external_change(cx);
+                let operations = self.design_ops(cx, |doc| {
+                    text_path_flip_operations(doc, id).unwrap_or_default()
+                });
+                self.design_apply_ops(operations, cx);
+            }
+            DesignPanelAction::TextPathStartChangeRequested {
+                node_id: id,
+                data,
+                phase,
+            } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                self.handle_design_text_path_start(
+                    panel,
+                    id,
+                    TextPathStartEdit::Segment(*data),
+                    *phase,
+                    cx,
+                );
+            }
+            DesignPanelAction::TextPathPlacementChangeRequested {
+                node_id: id,
+                placement,
+                phase,
+            } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                self.handle_design_text_path_start(
+                    panel,
+                    id,
+                    TextPathStartEdit::Placement(*placement),
+                    *phase,
+                    cx,
+                );
+            }
+            DesignPanelAction::TextPathDirectionChangeRequested {
+                node_id: id,
+                direction,
+            } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                if !self.design_text_path_action_is_current(panel, id, cx) {
+                    log::warn!("fig design adapter: rejecting stale text-path direction target");
+                    return;
+                }
+                self.finish_document_edits_for_external_change(cx);
+                let operations = self.design_ops(cx, |doc| {
+                    text_path_direction_operations(doc, id, *direction)
+                });
+                self.design_apply_ops(operations, cx);
+            }
             DesignPanelAction::PropertyChangeRequested {
                 node_id: id,
                 property,
@@ -3133,6 +3408,13 @@ impl FigView {
                 let Some(id) = node_id(id) else {
                     return;
                 };
+                if !self.design_node_action_is_current(panel, id, cx)
+                    || (self.design_action_targets_text_path(panel, id, cx)
+                        && !self.design_text_path_action_is_current(panel, id, cx))
+                {
+                    log::warn!("fig design adapter: rejecting stale property target");
+                    return;
+                }
                 self.finish_document_edits_for_external_change(cx);
                 let mut unhandled = false;
                 let ops = self.design_ops(cx, |doc| {
@@ -3157,18 +3439,14 @@ impl FigView {
                 let Some(id) = node_id(id) else {
                     return;
                 };
-                self.handle_design_phased_edit(id, *property, value, *phase, window, cx);
-            }
-            DesignPanelAction::PropertyCopyRequested {
-                target,
-                displayed_value,
-                ..
-            } => {
-                if self.design_target_matches_selection(target, cx) {
-                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                        displayed_value.to_string(),
-                    ));
+                if !self.design_node_action_is_current(panel, id, cx)
+                    || (self.design_action_targets_text_path(panel, id, cx)
+                        && !self.design_text_path_action_is_current(panel, id, cx))
+                {
+                    log::warn!("fig design adapter: rejecting stale property target");
+                    return;
                 }
+                self.handle_design_phased_edit(id, *property, value, *phase, window, cx);
             }
             DesignPanelAction::TargetedNodeActionRequested { target, action } => {
                 self.handle_design_targeted_action(target, action, window, cx);
@@ -3188,7 +3466,8 @@ impl FigView {
             DesignPanelAction::PaintEditRequested {
                 node_id: id,
                 collection,
-                paint_id: _,
+                paint_id,
+                target,
                 index,
                 edit,
                 phase,
@@ -3197,6 +3476,23 @@ impl FigView {
                 let Some(id) = node_id(id) else {
                     return;
                 };
+                if self.design_action_targets_text_path(panel, id, cx) {
+                    if !self.design_text_path_action_is_current(panel, id, cx)
+                        || *collection != DesignPanelCollection::Fill
+                        || !matches!(target, fanta_gpui::design::DesignPaintTarget::WholeLayer)
+                        || *index != 0
+                        || paint_id.as_ref() != format!("{id}-fill-0")
+                        || (*phase != DesignPanelEditPhase::Cancel
+                            && !matches!(
+                                (&edit.property, &edit.value),
+                                (DesignPaintProperty::Color, DesignPaintValue::Color(_))
+                                    | (DesignPaintProperty::Opacity, DesignPaintValue::Number(_))
+                            ))
+                    {
+                        log::warn!("fig design adapter: rejecting stale text-path paint target");
+                        return;
+                    }
+                }
                 self.handle_design_paint_edit(id, *collection, *index, edit, *phase, window, cx);
             }
             DesignPanelAction::PaintMediaSourceActionRequested {
@@ -3446,6 +3742,7 @@ impl FigView {
                 let is_stroke = *collection == DesignPanelCollection::Stroke;
                 let (from, to) = (*from_index, *to_index);
                 self.finish_document_edits_for_external_change(cx);
+                self.forget_hidden_paint_alpha(id, is_stroke);
                 let ops = self.design_ops(cx, |doc| {
                     replace_data_operation(doc, id, |data| {
                         if is_stroke {
@@ -3498,6 +3795,7 @@ impl FigView {
                     return;
                 }
                 self.finish_document_edits_for_external_change(cx);
+                self.forget_hidden_paint_alpha(id, is_stroke);
                 let ops = self.design_ops(cx, |doc| {
                     replace_data_operation(doc, id, |data| {
                         if is_stroke {
@@ -3526,6 +3824,7 @@ impl FigView {
                 }
                 let index = *index;
                 self.finish_document_edits_for_external_change(cx);
+                self.forget_hidden_paint_alpha(id, is_stroke);
                 let ops = self.design_ops(cx, |doc| {
                     replace_data_operation(doc, id, |data| {
                         if is_stroke {
@@ -3615,6 +3914,14 @@ impl FigView {
                 property,
                 value,
             } => {
+                if let Some(id) = node_id(id)
+                    && self.design_action_targets_text_path(panel, id, cx)
+                {
+                    self.handle_design_text_path_typography(
+                        panel, id, *target, *property, value, None, window, cx,
+                    );
+                    return;
+                }
                 if target.is_selected_text_range() {
                     crate::view::notify_unavailable("Selected text formatting", window, cx);
                     return;
@@ -3644,6 +3951,21 @@ impl FigView {
                 value,
                 phase,
             } => {
+                if let Some(id) = node_id(id)
+                    && self.design_action_targets_text_path(panel, id, cx)
+                {
+                    self.handle_design_text_path_typography(
+                        panel,
+                        id,
+                        *target,
+                        *property,
+                        value,
+                        Some(*phase),
+                        window,
+                        cx,
+                    );
+                    return;
+                }
                 if target.is_selected_text_range() {
                     if *phase == DesignPanelEditPhase::Commit {
                         crate::view::notify_unavailable("Selected text formatting", window, cx);
@@ -3660,6 +3982,12 @@ impl FigView {
                 target,
                 font,
             } => {
+                if let Some(id) = node_id(id)
+                    && self.design_action_targets_text_path(panel, id, cx)
+                {
+                    self.handle_design_text_path_font_apply(panel, id, *target, font, cx);
+                    return;
+                }
                 let Some(id) = node_id(id) else {
                     return;
                 };
@@ -4903,6 +5231,12 @@ impl FigView {
         {
             return;
         }
+        if let (DesignPaintProperty::Visible, DesignPaintValue::Bool(visible)) =
+            (&edit.property, &edit.value)
+        {
+            self.handle_design_paint_visibility(id, is_stroke, index, *visible, phase, window, cx);
+            return;
+        }
         let pending_payload = match (&edit.property, &edit.value, phase) {
             (
                 DesignPaintProperty::Payload,
@@ -5131,13 +5465,7 @@ impl FigView {
                 // Begin captured the snapshot; nothing document-facing yet.
             }
             DesignPanelEditPhase::Preview => {
-                let Some(snapshot) = self
-                    .gpui_design
-                    .as_ref()
-                    .and_then(|adapter| adapter.session.as_ref())
-                    .filter(|session| session.node == id)
-                    .map(|session| session.snapshot.clone())
-                else {
+                let Some(session) = self.design_edit_session_for_preview(id, cx) else {
                     return;
                 };
                 let item = self.item().clone();
@@ -5146,7 +5474,9 @@ impl FigView {
                         return;
                     }
                     item.with_document_for_preview_owner(preview_owner, cx, |document| {
-                        restore_snapshot(&mut document.doc, &snapshot);
+                        if !restore_design_edit_session(&mut document.doc, &session) {
+                            return ((), DocChange::None);
+                        }
                         let operations = build(&document.doc);
                         for operation in &operations {
                             apply_preview_operation(&mut document.doc, operation);
@@ -5162,20 +5492,40 @@ impl FigView {
                     .and_then(|adapter| adapter.session.take())
                     .filter(|session| session.node == id);
                 let item = self.item().clone();
-                if let Some(session) = &session {
+                let session_is_current = if let Some(session) = &session {
                     item.update(cx, |item, cx| {
                         item.with_document_for_preview_owner(preview_owner, cx, |document| {
-                            restore_snapshot(&mut document.doc, &session.snapshot);
-                            ((), DocChange::ContentPreview)
-                        });
-                    });
+                            let restored = restore_design_edit_session(&mut document.doc, session);
+                            (
+                                restored,
+                                if restored {
+                                    DocChange::ContentPreview
+                                } else {
+                                    DocChange::None
+                                },
+                            )
+                        })
+                        .unwrap_or(false)
+                    })
                 } else {
                     self.finish_document_edits_for_external_change(cx);
+                    true
+                };
+                if !session_is_current {
+                    item.update(cx, |item, cx| {
+                        item.finish_content_preview(preview_owner, false, cx)
+                    });
+                    return;
                 }
                 let ops = self.design_ops(cx, build);
                 let committed = self.design_apply_ops(ops, cx);
+                if committed && matches!(edit.property, DesignPaintProperty::Payload) {
+                    self.forget_hidden_paint_alpha(id, is_stroke);
+                }
                 if session.is_some() {
-                    item.update(cx, |item, cx| item.finish_content_preview(preview_owner, committed, cx));
+                    item.update(cx, |item, cx| {
+                        item.finish_content_preview(preview_owner, committed, cx)
+                    });
                 }
             }
             DesignPanelEditPhase::Cancel => {
@@ -5188,6 +5538,77 @@ impl FigView {
                     cx,
                 );
             }
+        }
+    }
+
+    fn handle_design_paint_visibility(
+        &mut self,
+        id: NodeId,
+        is_stroke: bool,
+        index: usize,
+        visible: bool,
+        phase: DesignPanelEditPhase,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if phase != DesignPanelEditPhase::Commit {
+            return;
+        }
+        self.finish_document_edits_for_external_change(cx);
+        let key = PaintKey {
+            id,
+            index,
+            is_stroke,
+        };
+        let remembered = self
+            .gpui_design
+            .as_ref()
+            .and_then(|adapter| adapter.hidden_paint_alpha.get(&key))
+            .cloned();
+        let item = self.item().clone();
+        let plan = {
+            let item = item.read(cx);
+            if !item.is_editable() {
+                return;
+            }
+            item.document().and_then(|document| {
+                paint_visibility_operations(
+                    &document.doc,
+                    id,
+                    is_stroke,
+                    index,
+                    visible,
+                    remembered.as_ref(),
+                )
+            })
+        };
+        let Some(plan) = plan else {
+            log::debug!("fig design adapter: unavailable paint visibility edit");
+            crate::view::notify_unavailable(UNWIRED_CONTROL, window, cx);
+            return;
+        };
+        if !self.design_apply_ops(plan.operations, cx) {
+            return;
+        }
+        let Some(adapter) = self.gpui_design.as_mut() else {
+            return;
+        };
+        match plan.memory_update {
+            PaintVisibilityMemoryUpdate::Preserve => {}
+            PaintVisibilityMemoryUpdate::Store(alpha) => {
+                adapter.hidden_paint_alpha.insert(key, alpha);
+            }
+            PaintVisibilityMemoryUpdate::Remove => {
+                adapter.hidden_paint_alpha.remove(&key);
+            }
+        }
+    }
+
+    fn forget_hidden_paint_alpha(&mut self, id: NodeId, is_stroke: bool) {
+        if let Some(adapter) = self.gpui_design.as_mut() {
+            adapter
+                .hidden_paint_alpha
+                .retain(|key, _| key.id != id || key.is_stroke != is_stroke);
         }
     }
 
@@ -5215,13 +5636,7 @@ impl FigView {
                 return;
             }
             DesignPanelEditPhase::Preview => {
-                let Some(snapshot) = self
-                    .gpui_design
-                    .as_ref()
-                    .and_then(|adapter| adapter.session.as_ref())
-                    .filter(|session| session.node == id)
-                    .map(|session| session.snapshot.clone())
-                else {
+                let Some(session) = self.design_edit_session_for_preview(id, cx) else {
                     return;
                 };
                 let item = self.item().clone();
@@ -5230,7 +5645,9 @@ impl FigView {
                         return;
                     }
                     item.with_document_for_preview_owner(preview_owner, cx, |document| {
-                        restore_snapshot(&mut document.doc, &snapshot);
+                        if !restore_design_edit_session(&mut document.doc, &session) {
+                            return ((), DocChange::None);
+                        }
                         if let Some(operations) =
                             effect_edit_operations(&document.doc, id, reference, property, value)
                         {
@@ -5255,15 +5672,30 @@ impl FigView {
             .and_then(|adapter| adapter.session.take())
             .filter(|session| session.node == id);
         let item = self.item().clone();
-        if let Some(session) = &session {
+        let session_is_current = if let Some(session) = &session {
             item.update(cx, |item, cx| {
                 item.with_document_for_preview_owner(preview_owner, cx, |document| {
-                    restore_snapshot(&mut document.doc, &session.snapshot);
-                    ((), DocChange::ContentPreview)
-                });
-            });
+                    let restored = restore_design_edit_session(&mut document.doc, session);
+                    (
+                        restored,
+                        if restored {
+                            DocChange::ContentPreview
+                        } else {
+                            DocChange::None
+                        },
+                    )
+                })
+                .unwrap_or(false)
+            })
         } else {
             self.finish_document_edits_for_external_change(cx);
+            true
+        };
+        if !session_is_current {
+            item.update(cx, |item, cx| {
+                item.finish_content_preview(preview_owner, false, cx)
+            });
+            return;
         }
         let ops = self.design_ops(cx, |doc| {
             effect_edit_operations(doc, id, reference, property, value).unwrap_or_else(|| {
@@ -5273,7 +5705,9 @@ impl FigView {
         });
         let committed = self.design_apply_ops(ops, cx);
         if session.is_some() {
-            item.update(cx, |item, cx| item.finish_content_preview(preview_owner, committed, cx));
+            item.update(cx, |item, cx| {
+                item.finish_content_preview(preview_owner, committed, cx)
+            });
         }
     }
 
@@ -5375,13 +5809,7 @@ impl FigView {
                 cx,
             ),
             DesignPanelEditPhase::Preview => {
-                let Some(snapshot) = self
-                    .gpui_design
-                    .as_ref()
-                    .and_then(|adapter| adapter.session.as_ref())
-                    .filter(|session| session.node == root)
-                    .map(|session| session.snapshot.clone())
-                else {
+                let Some(session) = self.design_edit_session_for_preview(root, cx) else {
                     return;
                 };
                 let item = self.item().clone();
@@ -5390,7 +5818,9 @@ impl FigView {
                         return;
                     }
                     item.with_document_for_preview_owner(preview_owner, cx, |document| {
-                        restore_snapshot(&mut document.doc, &snapshot);
+                        if !restore_design_edit_session(&mut document.doc, &session) {
+                            return ((), DocChange::None);
+                        }
                         for operation in build(&document.doc) {
                             apply_preview_operation(&mut document.doc, &operation);
                         }
@@ -5405,20 +5835,37 @@ impl FigView {
                     .and_then(|adapter| adapter.session.take())
                     .filter(|session| session.node == root);
                 let item = self.item().clone();
-                if let Some(session) = &session {
+                let session_is_current = if let Some(session) = &session {
                     item.update(cx, |item, cx| {
                         item.with_document_for_preview_owner(preview_owner, cx, |document| {
-                            restore_snapshot(&mut document.doc, &session.snapshot);
-                            ((), DocChange::ContentPreview)
-                        });
-                    });
+                            let restored = restore_design_edit_session(&mut document.doc, session);
+                            (
+                                restored,
+                                if restored {
+                                    DocChange::ContentPreview
+                                } else {
+                                    DocChange::None
+                                },
+                            )
+                        })
+                        .unwrap_or(false)
+                    })
                 } else {
                     self.finish_document_edits_for_external_change(cx);
+                    true
+                };
+                if !session_is_current {
+                    item.update(cx, |item, cx| {
+                        item.finish_content_preview(preview_owner, false, cx)
+                    });
+                    return;
                 }
                 let ops = self.design_ops(cx, build);
                 let committed = self.design_apply_ops(ops, cx);
                 if session.is_some() {
-                    item.update(cx, |item, cx| item.finish_content_preview(preview_owner, committed, cx));
+                    item.update(cx, |item, cx| {
+                        item.finish_content_preview(preview_owner, committed, cx)
+                    });
                 }
             }
             DesignPanelEditPhase::Cancel => self.finish_gpui_design_edits(cx),
@@ -5755,6 +6202,147 @@ fn text_path_typography_operations(
         }));
     }
     property_operations(doc, id, property, value)
+}
+
+fn viewer_number(value: f32) -> String {
+    if value == 0.0 {
+        "0".to_owned()
+    } else {
+        value.to_string()
+    }
+}
+
+fn viewer_property_section(
+    id: &'static str,
+    title: &'static str,
+    rows: Vec<DesignViewerPropertyRow>,
+) -> DesignViewerPropertySection {
+    let copy_value = rows
+        .iter()
+        .map(|row| format!("{}: {}", row.label, row.displayed_value))
+        .collect::<Vec<_>>()
+        .join("\n");
+    DesignViewerPropertySection::new(id, title, rows)
+        .with_copy_value(copy_value)
+        .with_copy_all()
+}
+
+fn viewer_properties_view_data(
+    doc: &Doc,
+    id: NodeId,
+    node: &DesignPanelNode,
+) -> Option<DesignViewerPropertiesViewData> {
+    let document_node = doc.scene.get(id)?;
+    let target = DesignPanelTarget::Nodes {
+        node_ids: vec![SharedString::from(id.to_string())],
+    };
+    let mut sections = Vec::new();
+
+    let content = match &document_node.data {
+        NodeData::Text(text) => Some(text.content.as_str()),
+        NodeData::TextPath(text_path) => Some(text_path.content.as_str()),
+        _ => None,
+    };
+    if let Some(content) = content {
+        sections.push(DesignViewerPropertySection::text_content(
+            "content", content,
+        ));
+    }
+
+    sections.push(viewer_property_section(
+        "identity",
+        "Identity",
+        vec![
+            DesignViewerPropertyRow::new("name", "Name", node.name.clone()),
+            DesignViewerPropertyRow::new("type", "Type", node.kind.label()),
+            DesignViewerPropertyRow::new("id", "ID", node.id.clone()),
+        ],
+    ));
+    let has_geometry = node_section(
+        doc,
+        id,
+        &crate::properties_snapshot::master_roots(&doc.components),
+    )
+    .is_some_and(|section| section.geometry.is_some());
+    if has_geometry {
+        sections.push(viewer_property_section(
+            "geometry",
+            "Geometry",
+            vec![
+                DesignViewerPropertyRow::new("x", "X", viewer_number(node.x))
+                    .with_property(DesignPanelProperty::X),
+                DesignViewerPropertyRow::new("y", "Y", viewer_number(node.y))
+                    .with_property(DesignPanelProperty::Y),
+                DesignViewerPropertyRow::new("width", "Width", viewer_number(node.width))
+                    .with_property(DesignPanelProperty::Width),
+                DesignViewerPropertyRow::new("height", "Height", viewer_number(node.height))
+                    .with_property(DesignPanelProperty::Height),
+                DesignViewerPropertyRow::new(
+                    "rotation",
+                    "Rotation",
+                    format!("{}°", viewer_number(node.rotation)),
+                )
+                .with_property(DesignPanelProperty::Rotation),
+            ],
+        ));
+    }
+    sections.push(viewer_property_section(
+        "appearance",
+        "Appearance",
+        vec![
+            DesignViewerPropertyRow::new(
+                "opacity",
+                "Opacity",
+                format!("{}%", viewer_number(node.opacity)),
+            )
+            .with_property(DesignPanelProperty::Opacity),
+        ],
+    ));
+
+    Some(DesignViewerPropertiesViewData::new(target, sections))
+}
+
+fn viewer_property_copy_payload(
+    view_data: &DesignViewerPropertiesViewData,
+    target: &DesignPanelTarget,
+    property: DesignPanelProperty,
+    displayed_value: &SharedString,
+) -> Option<SharedString> {
+    if !view_data.is_valid() || &view_data.target != target {
+        return None;
+    }
+    view_data
+        .sections
+        .iter()
+        .flat_map(|section| section.rows.iter())
+        .find(|row| row.property == Some(property) && &row.displayed_value == displayed_value)
+        .map(|row| row.displayed_value.clone())
+}
+
+fn viewer_section_copy_payload(
+    view_data: &DesignViewerPropertiesViewData,
+    target: &DesignPanelTarget,
+    section_id: &SharedString,
+    copy_value: &SharedString,
+) -> Option<SharedString> {
+    if !view_data.is_valid() || &view_data.target != target {
+        return None;
+    }
+    view_data
+        .section(section_id.as_ref())
+        .and_then(|section| section.copy_value.as_ref())
+        .filter(|host_value| *host_value == copy_value)
+        .cloned()
+}
+
+fn viewer_section_is_current(
+    view_data: &DesignViewerPropertiesViewData,
+    target: &DesignPanelTarget,
+    section_id: &SharedString,
+) -> bool {
+    view_data.is_valid()
+        && &view_data.target == target
+        && view_data.section(section_id.as_ref()).is_some()
 }
 
 fn targeted_property_operations(
@@ -6551,6 +7139,26 @@ fn paint_edit_operations(
     index: usize,
     value: &PaintEditValue,
 ) -> Vec<Operation> {
+    if matches!(
+        doc.scene.get(id).map(|node| &node.data),
+        Some(NodeData::TextPath(_))
+    ) {
+        if is_stroke || index != 0 {
+            return Vec::new();
+        }
+        return match value {
+            PaintEditValue::Color(color) => replace_data_operation(doc, id, |data| {
+                visit_text_styles_mut(data, |style| set_text_style_rgb(style, *color));
+            }),
+            PaintEditValue::Opacity(percent) if percent.is_finite() => {
+                let alpha = (percent.clamp(0.0, 100.0) / 100.0 * 255.0).round() as u8;
+                replace_data_operation(doc, id, |data| {
+                    visit_text_styles_mut(data, |style| style.color.a = alpha);
+                })
+            }
+            _ => Vec::new(),
+        };
+    }
     // A text node's single Fill row edits the glyph color.
     let is_text = matches!(
         doc.scene.get(id).map(|node| &node.data),
@@ -6866,6 +7474,61 @@ fn paint_gradient(doc: &Doc, id: NodeId, is_stroke: bool, index: usize) -> Optio
         Fill::Gradient { gradient, .. } => Some(gradient.clone()),
         _ => None,
     }
+}
+
+#[derive(Debug, PartialEq)]
+enum PaintVisibilityMemoryUpdate {
+    Preserve,
+    Store(HiddenPaintAlpha),
+    Remove,
+}
+
+struct PaintVisibilityPlan {
+    operations: Vec<Operation>,
+    memory_update: PaintVisibilityMemoryUpdate,
+}
+
+fn paint_visibility_operations(
+    doc: &Doc,
+    id: NodeId,
+    is_stroke: bool,
+    index: usize,
+    visible: bool,
+    remembered: Option<&HiddenPaintAlpha>,
+) -> Option<PaintVisibilityPlan> {
+    let node = doc.scene.get(id)?;
+    let mut data = node.data.clone();
+    let paint = crate::properties_ops::paint_slot_mut(&mut data, index, is_stroke)?;
+    let current = paint_alpha(paint);
+    if paint_alpha_is_visible(&current) == visible {
+        return Some(PaintVisibilityPlan {
+            operations: Vec::new(),
+            memory_update: PaintVisibilityMemoryUpdate::Preserve,
+        });
+    }
+    let (target, memory_update) = if visible {
+        let target = remembered
+            .filter(|remembered| {
+                std::mem::discriminant(*remembered) == std::mem::discriminant(&current)
+            })
+            .cloned()
+            .unwrap_or_else(|| opaque_paint_alpha(&current));
+        (target, PaintVisibilityMemoryUpdate::Remove)
+    } else {
+        (
+            zeroed_paint_alpha(paint),
+            PaintVisibilityMemoryUpdate::Store(current),
+        )
+    };
+    let operations = replace_data_operation(doc, id, |data| {
+        if let Some(paint) = crate::properties_ops::paint_slot_mut(data, index, is_stroke) {
+            set_paint_alpha(paint, &target);
+        }
+    });
+    Some(PaintVisibilityPlan {
+        operations,
+        memory_update,
+    })
 }
 
 fn solid_paint_color_operations(
@@ -7680,14 +8343,23 @@ fn property_operations(
             let minimum = matches!(property, P::MinWidth | P::MinHeight);
             Some(layout_limit_operations(doc, id, &text, horizontal, minimum))
         }
-        (P::FontFamily, V::Text(family)) if !family.is_empty() => {
+        (P::FontFamily, V::Text(family)) => {
+            if family.is_empty() {
+                return None;
+            }
+            let family = family.to_string();
             Some(replace_data_operation(doc, id, |data| {
-                if let NodeData::Text(text) = data {
-                    text.style.font_family = family.to_string();
-                    for run in &mut text.style_runs {
-                        run.style.font_family = family.to_string();
-                    }
-                }
+                visit_text_styles_mut(data, |style| style.font_family.clone_from(&family));
+            }))
+        }
+        (P::FontStyle, V::Text(style_name)) => {
+            let italic = match style_name.as_ref() {
+                "Regular" => false,
+                "Italic" => true,
+                _ => return None,
+            };
+            Some(replace_data_operation(doc, id, |data| {
+                visit_text_styles_mut(data, |style| style.italic = italic);
             }))
         }
         (P::FontSize, _) => {
@@ -7696,68 +8368,93 @@ fn property_operations(
                 return None;
             }
             Some(replace_data_operation(doc, id, |data| {
-                if let NodeData::Text(text) = data {
-                    text.style.size_px = size;
-                    for run in &mut text.style_runs {
-                        run.style.size_px = size;
-                    }
-                }
+                visit_text_styles_mut(data, |style| style.size_px = size);
             }))
         }
         (P::FontWeight, _) => {
             let weight = number(value)?.clamp(1.0, 1000.0) as u16;
             Some(replace_data_operation(doc, id, |data| {
-                if let NodeData::Text(text) = data {
-                    text.style.weight = weight;
-                    for run in &mut text.style_runs {
-                        run.style.weight = weight;
-                    }
-                }
+                visit_text_styles_mut(data, |style| style.weight = weight);
             }))
         }
-        (P::LineHeight, V::LineHeight(DesignLineHeight::Percent(percent))) => {
-            let line_height = f64::from(*percent) / 100.0;
-            if !line_height.is_finite() || line_height <= 0.0 {
-                return None;
+        (P::TextDecoration, V::TextDecoration(decoration)) => {
+            let (underline, strikethrough) = match decoration {
+                DesignTextDecoration::None => (false, false),
+                DesignTextDecoration::Underline => (true, false),
+                DesignTextDecoration::Strikethrough => (false, true),
+            };
+            Some(replace_data_operation(doc, id, |data| {
+                visit_text_styles_mut(data, |style| {
+                    style.underline = underline;
+                    style.strikethrough = strikethrough;
+                });
+            }))
+        }
+        (P::LineHeight, V::LineHeight(line_height)) => {
+            let line_height = *line_height;
+            match line_height {
+                DesignLineHeight::Pixels(pixels) | DesignLineHeight::Percent(pixels)
+                    if !pixels.is_finite() || pixels <= 0.0 =>
+                {
+                    return None;
+                }
+                _ => {}
             }
             Some(replace_data_operation(doc, id, |data| {
-                if let NodeData::Text(text) = data {
-                    text.style.line_height = line_height;
-                    text.style.line_height_auto_percent = None;
-                    for run in &mut text.style_runs {
-                        run.style.line_height = line_height;
-                        run.style.line_height_auto_percent = None;
+                visit_text_styles_mut(data, |style| match line_height {
+                    DesignLineHeight::Auto => style.line_height_auto_percent = Some(100.0),
+                    DesignLineHeight::Pixels(pixels) => {
+                        if style.size_px.is_finite() && style.size_px > 0.0 {
+                            style.line_height = f64::from(pixels) / style.size_px;
+                            style.line_height_auto_percent = None;
+                        }
                     }
-                }
+                    DesignLineHeight::Percent(percent) => {
+                        style.line_height = f64::from(percent) / 100.0;
+                        style.line_height_auto_percent = None;
+                    }
+                });
             }))
         }
         (P::LineHeight, _) => None,
         (P::LetterSpacing, V::LetterSpacing(DesignLetterSpacing::Pixels(pixels))) => {
-            let spacing = f64::from(*pixels);
-            if !spacing.is_finite() {
+            let pixels = f64::from(*pixels);
+            if !pixels.is_finite() {
                 return None;
             }
             Some(replace_data_operation(doc, id, |data| {
-                if let NodeData::Text(text) = data {
-                    text.style.letter_spacing = spacing;
-                    for run in &mut text.style_runs {
-                        run.style.letter_spacing = spacing;
-                    }
-                }
+                visit_text_styles_mut(data, |style| style.letter_spacing = pixels);
             }))
         }
         (P::LetterSpacing, _) => None,
         (P::HorizontalTextAlignment, V::TextHorizontalAlignment(align)) => {
-            let align = match align {
+            let text_align = match align {
                 DesignTextHorizontalAlignment::Left => TextAlign::Left,
                 DesignTextHorizontalAlignment::Center => TextAlign::Center,
                 DesignTextHorizontalAlignment::Right => TextAlign::Right,
                 DesignTextHorizontalAlignment::Justified => TextAlign::Justify,
             };
-            Some(replace_data_operation(doc, id, |data| {
-                if let NodeData::Text(text) = data {
-                    text.align = align;
+            let text_path_alignment = match align {
+                DesignTextHorizontalAlignment::Left => Some(TextPathAlignment::Start),
+                DesignTextHorizontalAlignment::Center => Some(TextPathAlignment::Center),
+                DesignTextHorizontalAlignment::Right => Some(TextPathAlignment::End),
+                DesignTextHorizontalAlignment::Justified => None,
+            };
+            if matches!(
+                doc.scene.get(id).map(|node| &node.data),
+                Some(NodeData::TextPath(_))
+            ) && text_path_alignment.is_none()
+            {
+                return None;
+            }
+            Some(replace_data_operation(doc, id, |data| match data {
+                NodeData::Text(text) => text.align = text_align,
+                NodeData::TextPath(text_path) => {
+                    if let Some(alignment) = text_path_alignment {
+                        text_path.alignment = alignment;
+                    }
                 }
+                _ => {}
             }))
         }
         (P::VerticalTextAlignment, V::TextVerticalAlignment(align)) => {
@@ -7769,20 +8466,6 @@ fn property_operations(
             Some(replace_data_operation(doc, id, |data| {
                 if let NodeData::Text(text) = data {
                     text.vertical_align = align;
-                }
-            }))
-        }
-        (P::TextDecoration, V::TextDecoration(decoration)) => {
-            let underline = *decoration == DesignTextDecoration::Underline;
-            let strikethrough = *decoration == DesignTextDecoration::Strikethrough;
-            Some(replace_data_operation(doc, id, |data| {
-                if let NodeData::Text(text) = data {
-                    text.style.underline = underline;
-                    text.style.strikethrough = strikethrough;
-                    for run in &mut text.style_runs {
-                        run.style.underline = underline;
-                        run.style.strikethrough = strikethrough;
-                    }
                 }
             }))
         }
@@ -8056,7 +8739,7 @@ mod tests {
 
     use fanta_doc::{
         BooleanNode, CanvasNode, ComponentDef, ComponentPropDef, ComponentPropId, Doc, GroupNode,
-        InstanceNode, VectorNode,
+        InstanceNode, PathData, TextPathNode, TextStyleRun, VectorNode,
     };
     use fanta_gpui::design::{
         DesignFontCatalogState, DesignFontSelection, DesignPageBackground, DesignPageViewData,
@@ -8535,6 +9218,494 @@ mod tests {
             .expect("viewers can inspect the selection");
         assert_eq!(viewer.primary_controls.len(), 1);
         assert_eq!(viewer.primary_controls[0].kind, Kind::SelectMatchingLayers);
+    }
+
+    fn doc_with_text_path() -> (Doc, NodeId, NodeId) {
+        let mut doc = Doc::new();
+        let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page.name = "Page 1".to_owned();
+        let page_id = page.id;
+        doc.scene.insert(page).expect("insert page");
+        doc.add_page(page_id);
+        doc.set_active_page(Some(page_id));
+
+        let mut path = PathData::new();
+        path.move_to(0.0, 0.0)
+            .line_to(80.0, 0.0)
+            .line_to(120.0, 40.0);
+        let mut text_path = TextPathNode::new(path, "Text on a path");
+        text_path.style.font_family = "Source Serif 4".to_owned();
+        text_path.style.size_px = 24.0;
+        text_path.style.weight = 650;
+        text_path.style.italic = true;
+        text_path.style.underline = true;
+        text_path.style.color = FantaColor::rgba(0x12, 0x34, 0x56, 0xc0);
+        text_path.style.letter_spacing = 1.5;
+        text_path.style.line_height = 1.4;
+        text_path.style_runs.push(TextStyleRun {
+            start: 0,
+            end: 4,
+            style: text_path.style.clone(),
+        });
+        text_path.start = TextPathStart::new(1, 0.25).expect("valid path start");
+        text_path.alignment = TextPathAlignment::End;
+        text_path.direction = TextPathDirection::Reverse;
+        text_path.side = TextPathSide::Flipped;
+
+        let mut node = CanvasNode::new(NodeData::TextPath(text_path));
+        node.name = "Circular title".to_owned();
+        node.parent = Some(page_id);
+        let id = node.id;
+        doc.scene.insert(node).expect("insert text path");
+        (doc, page_id, id)
+    }
+
+    fn text_path(doc: &Doc, id: NodeId) -> &TextPathNode {
+        match &doc.scene.get(id).expect("text path exists").data {
+            NodeData::TextPath(text_path) => text_path,
+            _ => panic!("expected a text path"),
+        }
+    }
+
+    fn apply_operations(doc: &mut Doc, operations: Vec<Operation>) {
+        for operation in operations {
+            doc.apply(operation).expect("apply inspector operation");
+        }
+    }
+
+    #[test]
+    fn text_path_projection_and_operations_preserve_path_specific_state() {
+        let (mut doc, _page, id) = doc_with_text_path();
+        let original = text_path(&doc, id).clone();
+        assert_eq!(
+            design_kind(
+                id,
+                &doc.scene.get(id).expect("node exists").data,
+                &HashMap::new()
+            ),
+            DesignPanelNodeKind::TextPath
+        );
+
+        let typography = design_text_path_typography(&original);
+        assert_eq!(typography.family.as_ref(), "Source Serif 4");
+        assert_eq!(typography.style.as_ref(), "Italic");
+        assert_eq!(typography.weight, 650.0);
+        assert_eq!(typography.size, 24.0);
+        assert_eq!(
+            typography.horizontal_alignment,
+            DesignTextHorizontalAlignment::Right
+        );
+        assert_eq!(typography.decoration, DesignTextDecoration::Underline);
+
+        let states = bound_states(&doc, id);
+        for property in [
+            DesignPanelProperty::VerticalTextAlignment,
+            DesignPanelProperty::TextResize,
+            DesignPanelProperty::TextTruncate,
+            DesignPanelProperty::TextCase,
+        ] {
+            let state = states
+                .iter()
+                .find_map(|(candidate, state)| (*candidate == property).then_some(state))
+                .expect("unsupported TextPath property has an explicit state");
+            assert!(state.is_read_only());
+            assert!(state.is_unset());
+        }
+
+        let operations = text_path_start_operations(
+            &doc,
+            id,
+            DesignTextPathStartData {
+                segment: 0,
+                position: 0.75,
+            },
+        )
+        .expect("the first drawable segment is valid");
+        assert_eq!(operations.len(), 1);
+        apply_operations(&mut doc, operations);
+        let changed = text_path(&doc, id);
+        assert_eq!(
+            changed.start,
+            TextPathStart::new(0, 0.75).expect("valid start")
+        );
+        assert_eq!(changed.path, original.path);
+        assert_eq!(changed.content, original.content);
+        assert_eq!(changed.style, original.style);
+        assert_eq!(changed.style_runs, original.style_runs);
+        assert_eq!(changed.alignment, original.alignment);
+        assert_eq!(changed.direction, original.direction);
+        assert_eq!(changed.side, original.side);
+        assert!(
+            text_path_start_operations(
+                &doc,
+                id,
+                DesignTextPathStartData {
+                    segment: 99,
+                    position: 0.5,
+                },
+            )
+            .is_none(),
+            "a segment not present in the owned path must be rejected"
+        );
+
+        let operations = text_path_flip_operations(&doc, id).expect("flip is supported");
+        apply_operations(&mut doc, operations);
+        let flipped = text_path(&doc, id);
+        assert_eq!(flipped.side, TextPathSide::Default);
+        assert_eq!(flipped.direction, TextPathDirection::Reverse);
+    }
+
+    #[test]
+    fn text_path_typography_edits_apply_to_base_and_style_runs() {
+        let (mut doc, _page, id) = doc_with_text_path();
+        for (property, value) in [
+            (
+                DesignPanelProperty::FontWeight,
+                DesignPanelValue::Number(725.0),
+            ),
+            (
+                DesignPanelProperty::HorizontalTextAlignment,
+                DesignPanelValue::TextHorizontalAlignment(DesignTextHorizontalAlignment::Center),
+            ),
+            (
+                DesignPanelProperty::TextDecoration,
+                DesignPanelValue::TextDecoration(DesignTextDecoration::Strikethrough),
+            ),
+        ] {
+            let operations = text_path_typography_operations(&doc, id, property, &value)
+                .expect("supported TextPath typography property");
+            apply_operations(&mut doc, operations);
+        }
+        let text_path = text_path(&doc, id);
+        assert_eq!(text_path.style.weight, 725);
+        assert_eq!(text_path.style_runs[0].style.weight, 725);
+        assert_eq!(text_path.alignment, TextPathAlignment::Center);
+        assert!(text_path.style.strikethrough);
+        assert!(!text_path.style.underline);
+        assert!(text_path.style_runs[0].style.strikethrough);
+        assert!(!text_path.style_runs[0].style.underline);
+        assert!(
+            text_path_typography_operations(
+                &doc,
+                id,
+                DesignPanelProperty::HorizontalTextAlignment,
+                &DesignPanelValue::TextHorizontalAlignment(
+                    DesignTextHorizontalAlignment::Justified,
+                ),
+            )
+            .is_none(),
+            "TextPath has no justified alignment"
+        );
+        assert!(
+            text_path_typography_operations(
+                &doc,
+                id,
+                DesignPanelProperty::VerticalTextAlignment,
+                &DesignPanelValue::TextVerticalAlignment(DesignTextVerticalAlignment::Bottom),
+            )
+            .is_none(),
+            "TextNode-only vertical alignment must remain unavailable"
+        );
+    }
+
+    #[test]
+    fn text_path_offset_measures_the_whole_contour_and_rejects_invalid_targets() {
+        let (mut doc, _, id) = doc_with_text_path();
+        let original = text_path(&doc, id).clone();
+        let current = design_text_path_placement(&original).expect("valid placement");
+        let total_length = 80.0 + 40.0_f64.hypot(40.0);
+        assert!(
+            (f64::from(current.offset) - (80.0 + 0.25 * 40.0_f64.hypot(40.0)) / total_length).abs()
+                < 1.0e-6
+        );
+        assert!(
+            text_path_start_edit_operations(&doc, id, TextPathStartEdit::Placement(current))
+                .expect("no-op")
+                .is_empty()
+        );
+        for placement in [
+            DesignTextPathPlacement {
+                contour: 99,
+                offset: 0.5,
+            },
+            DesignTextPathPlacement {
+                contour: 0,
+                offset: f32::NAN,
+            },
+            DesignTextPathPlacement {
+                contour: 0,
+                offset: 1.1,
+            },
+            DesignTextPathPlacement {
+                contour: 0,
+                offset: -0.1,
+            },
+        ] {
+            assert!(
+                text_path_start_edit_operations(&doc, id, TextPathStartEdit::Placement(placement))
+                    .is_none()
+            );
+        }
+        for offset in [0.0, 0.5, 1.0] {
+            let operations = text_path_start_edit_operations(
+                &doc,
+                id,
+                TextPathStartEdit::Placement(DesignTextPathPlacement { contour: 0, offset }),
+            )
+            .expect("valid offset");
+            apply_operations(&mut doc, operations);
+            let changed = text_path(&doc, id);
+            let measured = MeasuredPath::new(&changed.path);
+            let distance = measured
+                .distance_at_segment_position(
+                    changed.start.segment() as usize,
+                    changed.start.position(),
+                )
+                .expect("valid start");
+            assert!((distance - f64::from(offset) * total_length).abs() < 1.0e-9);
+            let mut expected = original.clone();
+            expected.start = changed.start;
+            assert_eq!(changed, &expected);
+        }
+    }
+
+    #[test]
+    fn text_path_rgb_and_opacity_edits_keep_color_channels_independent() {
+        let (mut doc, _page, id) = doc_with_text_path();
+        let node = doc.scene.get_mut(id).expect("text path exists");
+        let NodeData::TextPath(text_path_node) = &mut node.data else {
+            panic!("expected a text path");
+        };
+        text_path_node.style_runs[0].style.color.a = 0x40;
+
+        let operations = paint_edit_operations(
+            &doc,
+            id,
+            false,
+            0,
+            &PaintEditValue::Color(FantaColor::rgba(0xaa, 0xbb, 0xcc, 0x11)),
+        );
+        apply_operations(&mut doc, operations);
+        let updated_text_path = text_path(&doc, id);
+        assert_eq!(
+            updated_text_path.style.color,
+            FantaColor::rgba(0xaa, 0xbb, 0xcc, 0xc0)
+        );
+        assert_eq!(
+            updated_text_path.style_runs[0].style.color,
+            FantaColor::rgba(0xaa, 0xbb, 0xcc, 0x40)
+        );
+
+        let operations = paint_edit_operations(
+            &doc,
+            id,
+            false,
+            0,
+            &PaintEditValue::Payload(DesignPaintPayload::Solid(design_color(FantaColor::rgba(
+                0x22, 0x44, 0x66, 0x01,
+            )))),
+        );
+        assert!(
+            operations.is_empty(),
+            "payload replacement is not a glyph-color edit"
+        );
+
+        let operations = paint_edit_operations(&doc, id, false, 0, &PaintEditValue::Opacity(25.0));
+        apply_operations(&mut doc, operations);
+        let updated_text_path = text_path(&doc, id);
+        assert_eq!(
+            updated_text_path.style.color,
+            FantaColor::rgba(0xaa, 0xbb, 0xcc, 0x40)
+        );
+        assert_eq!(
+            updated_text_path.style_runs[0].style.color,
+            FantaColor::rgba(0xaa, 0xbb, 0xcc, 0x40)
+        );
+    }
+
+    #[test]
+    fn text_path_metric_relative_line_height_round_trips_in_its_original_unit() {
+        let (mut doc, _page, id) = doc_with_text_path();
+        let node = doc.scene.get_mut(id).expect("text path exists");
+        let NodeData::TextPath(text_path_node) = &mut node.data else {
+            panic!("expected a text path");
+        };
+        text_path_node.style.line_height = 1.8;
+        text_path_node.style.line_height_auto_percent = Some(150.0);
+        text_path_node.style_runs[0].style.line_height = 1.8;
+        text_path_node.style_runs[0].style.line_height_auto_percent = Some(150.0);
+
+        assert_eq!(
+            design_text_path_typography(text_path_node).line_height,
+            DesignLineHeight::Percent(150.0)
+        );
+        let operations = text_path_typography_operations(
+            &doc,
+            id,
+            DesignPanelProperty::LineHeight,
+            &DesignPanelValue::LineHeight(DesignLineHeight::Percent(150.0)),
+        )
+        .expect("metric-relative percent is supported");
+        assert!(
+            operations.is_empty(),
+            "an unchanged value round-trips exactly"
+        );
+
+        let operations = text_path_typography_operations(
+            &doc,
+            id,
+            DesignPanelProperty::LineHeight,
+            &DesignPanelValue::LineHeight(DesignLineHeight::Percent(125.0)),
+        )
+        .expect("metric-relative percent edit is supported");
+        apply_operations(&mut doc, operations);
+        let text_path = text_path(&doc, id);
+        for style in std::iter::once(&text_path.style)
+            .chain(text_path.style_runs.iter().map(|run| &run.style))
+        {
+            assert_eq!(style.line_height_auto_percent, Some(125.0));
+            assert!((style.line_height - 1.5).abs() < 1.0e-12);
+        }
+    }
+
+    #[test]
+    fn text_path_start_rejects_an_empty_contour_even_when_another_contour_is_usable() {
+        let (mut doc, _page, id) = doc_with_text_path();
+        let mut path = PathData::new();
+        path.move_to(0.0, 0.0).line_to(0.0, 0.0);
+        path.move_to(10.0, 20.0).line_to(110.0, 20.0);
+        let node = doc.scene.get_mut(id).expect("text path exists");
+        let NodeData::TextPath(text_path_node) = &mut node.data else {
+            panic!("expected a text path");
+        };
+        text_path_node.path = path;
+        text_path_node.start = TextPathStart::new(1, 0.25).expect("usable second contour");
+
+        assert!(
+            text_path_start_operations(
+                &doc,
+                id,
+                DesignTextPathStartData {
+                    segment: 0,
+                    position: 0.5,
+                },
+            )
+            .is_none(),
+            "the selected contour cannot produce a finite placement tangent"
+        );
+        let operations = text_path_start_operations(
+            &doc,
+            id,
+            DesignTextPathStartData {
+                segment: 1,
+                position: 0.75,
+            },
+        )
+        .expect("the usable contour remains editable");
+        apply_operations(&mut doc, operations);
+        assert_eq!(
+            text_path(&doc, id).start,
+            TextPathStart::new(1, 0.75).expect("valid edited start")
+        );
+    }
+
+    #[test]
+    fn design_edit_snapshots_restore_only_into_their_originating_scene() {
+        let (mut doc, _page, id) = doc_with_rect();
+        let (scene_instance, expected_transform, snapshot) = {
+            let node = doc.scene.get(id).expect("node exists");
+            (
+                doc.scene.instance_id(),
+                node.transform,
+                NodeSnapshot {
+                    id,
+                    transform: node.transform,
+                    opacity: node.opacity,
+                    data: Box::new(node.data.clone()),
+                    effects: node.effects.clone(),
+                    blurs: node.blurs.clone(),
+                },
+            )
+        };
+        let session = DesignEditSession {
+            scene_instance,
+            node: id,
+            snapshot,
+        };
+
+        doc.scene.get_mut(id).expect("node exists").transform =
+            Transform2D::translation(80.0, 90.0);
+        assert!(restore_design_edit_session(&mut doc, &session));
+        assert_eq!(
+            doc.scene.get(id).expect("node exists").transform,
+            expected_transform
+        );
+
+        let mut replacement = doc.clone();
+        assert_ne!(replacement.scene.instance_id(), session.scene_instance);
+        let replacement_transform = Transform2D::translation(-30.0, -40.0);
+        replacement
+            .scene
+            .get_mut(id)
+            .expect("same node id exists in replacement scene")
+            .transform = replacement_transform;
+        assert!(!restore_design_edit_session(&mut replacement, &session));
+        assert_eq!(
+            replacement.scene.get(id).expect("node exists").transform,
+            replacement_transform
+        );
+    }
+
+    fn paint_at(doc: &Doc, id: NodeId, is_stroke: bool, index: usize) -> Fill {
+        let mut data = doc.scene.get(id).expect("node exists").data.clone();
+        crate::properties_ops::paint_slot_mut(&mut data, index, is_stroke)
+            .cloned()
+            .expect("paint exists")
+    }
+
+    #[test]
+    fn paint_visibility_mutates_fills_and_strokes_and_restores_their_alpha() {
+        let (mut doc, _page, rect) = doc_with_rect();
+        let node = doc.scene.get_mut(rect).expect("rect exists");
+        let NodeData::Vector(vector) = &mut node.data else {
+            panic!("test rect should be a vector");
+        };
+        vector.strokes.push(fanta_doc::Stroke::solid(
+            FantaColor::rgba(0x10, 0x20, 0x30, 0x80),
+            2.0,
+        ));
+
+        for is_stroke in [false, true] {
+            let original = paint_alpha(&paint_at(&doc, rect, is_stroke, 0));
+            let PaintVisibilityPlan {
+                operations,
+                memory_update,
+            } = paint_visibility_operations(&doc, rect, is_stroke, 0, false, None)
+                .expect("paint visibility is wired");
+            assert_eq!(
+                memory_update,
+                PaintVisibilityMemoryUpdate::Store(original.clone())
+            );
+            assert_eq!(operations.len(), 1, "hiding writes the paint once");
+            apply_operations(&mut doc, operations);
+            assert!(!crate::properties_snapshot::paint_is_visible(&paint_at(
+                &doc, rect, is_stroke, 0
+            )));
+
+            let PaintVisibilityPlan {
+                operations,
+                memory_update,
+            } = paint_visibility_operations(&doc, rect, is_stroke, 0, true, Some(&original))
+                .expect("paint visibility is wired");
+            assert_eq!(memory_update, PaintVisibilityMemoryUpdate::Remove);
+            assert_eq!(operations.len(), 1, "showing writes the paint once");
+            apply_operations(&mut doc, operations);
+            assert_eq!(
+                paint_alpha(&paint_at(&doc, rect, is_stroke, 0)),
+                original,
+                "showing restores the pre-hide alpha"
+            );
+        }
     }
 
     fn min_x(doc: &Doc, id: NodeId) -> f64 {
@@ -9103,6 +10274,73 @@ mod tests {
             "unnamed images use a readable numbered label"
         );
         assert!(!fallback.name.contains(&unnamed_asset.to_string()));
+    }
+
+    #[gpui::test]
+    async fn paint_visibility_after_reorder_does_not_restore_another_paints_alpha(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut doc, _, rect) = doc_with_rect();
+        let NodeData::Vector(vector) = &mut doc.scene.get_mut(rect).expect("rectangle").data else {
+            panic!("rectangle is a vector");
+        };
+        vector.fills = vec![
+            Fill::Solid {
+                color: FantaColor::rgba(0xe0, 0x30, 0x30, 0x80),
+                blend: BlendMode::Normal,
+            },
+            Fill::Solid {
+                color: FantaColor::rgba(0x10, 0x80, 0xe0, 0),
+                blend: BlendMode::Normal,
+            },
+        ];
+        doc.selection.replace_with([rect]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        emit_inspector_paint(
+            &panel,
+            &mut cx,
+            rect,
+            DesignPaintProperty::Visible,
+            DesignPaintValue::Bool(false),
+            DesignPanelEditPhase::Commit,
+        );
+        panel.update_in(&mut cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::PaintReorderRequested {
+                node_id: rect.to_string().into(),
+                collection: DesignPanelCollection::Fill,
+                target: DesignPaintTarget::WholeLayer,
+                paint_id: format!("{rect}-fill-0").into(),
+                from_index: 0,
+                to_index: 1,
+            });
+        });
+        cx.run_until_parked();
+        emit_inspector_paint(
+            &panel,
+            &mut cx,
+            rect,
+            DesignPaintProperty::Visible,
+            DesignPaintValue::Bool(true),
+            DesignPanelEditPhase::Commit,
+        );
+        item.read_with(&cx, |item, _| {
+            let doc = &item.document().expect("ready document").doc;
+            let reordered = paint_at(doc, rect, false, 0);
+            assert_eq!(
+                reordered,
+                Fill::Solid {
+                    color: FantaColor::rgba(0x10, 0x80, 0xe0, 255),
+                    blend: BlendMode::Normal,
+                },
+                "a different paint shown at the old index uses its own opaque fallback"
+            );
+            assert_eq!(
+                paint_alpha(&paint_at(doc, rect, false, 1)),
+                HiddenPaintAlpha::Solid(0),
+                "the previously hidden paint stays hidden after moving"
+            );
+        });
     }
 
     #[gpui::test]

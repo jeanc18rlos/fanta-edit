@@ -9,7 +9,6 @@ use fanta_gpui::toolbar::{
     ToolbarMode, ToolbarSecondaryControl, ToolbarTool,
 };
 use gpui::{AppContext as _, Context, Entity, SharedString, Subscription, Window};
-#[cfg(test)]
 use gpui_component::IconName;
 
 use crate::editor_session::EditorMode;
@@ -19,6 +18,7 @@ use crate::view::FigView;
 /// Chrome control ids the host pushes through `set_chrome_controls`; the
 /// toolbar echoes them verbatim in `ToolbarAction::ChromeControlInvoked`.
 pub(crate) const CHROME_FIT_TO_VIEW: &str = "fit-to-view";
+pub(crate) const CHROME_ADD_CANVAS_CONTEXT: &str = "add-canvas-context";
 pub(crate) const CHROME_TOGGLE_LAYERS_SIDEBAR: &str = "toggle-layers-sidebar";
 pub(crate) const CHROME_TOGGLE_INSPECTOR_SIDEBAR: &str = "toggle-inspector-sidebar";
 
@@ -41,6 +41,7 @@ pub(crate) const IMPLEMENTED_COMMANDS: &[ToolbarCommand] = &[
     ToolbarCommand::ZoomToFit,
     ToolbarCommand::ZoomToSelection,
     ToolbarCommand::Export,
+    ToolbarCommand::PlaceImageVideo,
     ToolbarCommand::Present,
     ToolbarCommand::OpenVariables,
     ToolbarCommand::OpenDesignMode,
@@ -74,6 +75,7 @@ pub(crate) const SUPPORTED_TOOLS: &[ToolbarTool] = &[
     ToolbarTool::Slice,
     ToolbarTool::Rectangle,
     ToolbarTool::Line,
+    ToolbarTool::Arrow,
     ToolbarTool::Ellipse,
     ToolbarTool::Polygon,
     ToolbarTool::Star,
@@ -88,6 +90,10 @@ pub(crate) const SUPPORTED_TOOLS: &[ToolbarTool] = &[
     ToolbarTool::MagicWand,
     ToolbarTool::Crop,
     ToolbarTool::Text,
+    ToolbarTool::ImageVideo,
+    ToolbarTool::TextPath,
+    ToolbarTool::Measure,
+    ToolbarTool::Annotation,
     ToolbarTool::Comment,
     ToolbarTool::Actions,
     ToolbarTool::ColorPicker,
@@ -104,6 +110,11 @@ pub(crate) const SUPPORTED_SECONDARY_CONTROLS: &[ToolbarSecondaryControl] = &[
     ToolbarSecondaryControl::MotionLoop,
     ToolbarSecondaryControl::MotionAddKeyframe,
     ToolbarSecondaryControl::MotionAnimationStyle,
+    ToolbarSecondaryControl::MotionAutoKeyframe,
+    ToolbarSecondaryControl::MotionTimeComment,
+    ToolbarSecondaryControl::DevInspect,
+    ToolbarSecondaryControl::DevMeasure,
+    ToolbarSecondaryControl::DevAnnotate,
 ];
 
 pub(crate) fn draw_sample_color(doc: &Doc, page: Option<NodeId>) -> Option<FantaColor> {
@@ -152,6 +163,19 @@ pub(crate) fn draw_capabilities(tool: ToolKind) -> DrawBrushCapabilities {
     }
 }
 
+pub(crate) const DEV_COMMANDS: &[ToolbarCommand] = &[
+    ToolbarCommand::Undo,
+    ToolbarCommand::Redo,
+    ToolbarCommand::Copy,
+    ToolbarCommand::SelectAll,
+    ToolbarCommand::ZoomToFit,
+    ToolbarCommand::ZoomToSelection,
+    ToolbarCommand::Export,
+    ToolbarCommand::OpenDesignMode,
+    ToolbarCommand::OpenMotionMode,
+    ToolbarCommand::OpenDevMode,
+];
+
 /// The entrance presets fig_viewer's Motion inspector can author — the same
 /// catalog as `motion_panel.rs`'s `AnimationProperty` preset labels (Position,
 /// Scale, Rotation, Size, Opacity). The document has no per-clip style field
@@ -170,6 +194,7 @@ pub(crate) fn motion_animation_styles() -> Vec<SharedString> {
 pub(crate) struct ToolbarOptionInputs {
     pub playing: bool,
     pub auto_keyframe: bool,
+    pub time_comment_armed: bool,
     pub looping: bool,
     pub current_time_ms: u32,
     /// Duration of the active motion clip; `None` when the document has none.
@@ -184,13 +209,17 @@ pub(crate) struct ToolbarOptionInputs {
     pub fit_to_view_shortcut: Option<SharedString>,
 }
 
-/// Sidebar toggles and zoom now belong to their respective headers.
+/// Sidebar toggles and zoom belong to their respective headers; canvas context uses the host chrome intent.
 pub(crate) fn chrome_controls(
     _layers_sidebar_visible: bool,
     _inspector_sidebar_visible: bool,
     _fit_to_view_shortcut: Option<SharedString>,
 ) -> Vec<ToolbarChromeControl> {
-    Vec::new()
+    vec![ToolbarChromeControl::new(
+        CHROME_ADD_CANVAS_CONTEXT,
+        IconName::Plus,
+        "Add canvas context",
+    )]
 }
 
 /// Total: every canvas tool has a toolbar face.
@@ -229,7 +258,7 @@ pub(crate) fn toolbar_tool(kind: ToolKind) -> ToolbarTool {
     }
 }
 
-/// Partial: toolbar faces without a canvas tool (Measure, Dev and
+/// Partial: toolbar faces without a canvas tool (Resources, Dev and
 /// Motion faces, …) are roadmap items and intentionally return `None`.
 /// `Resources` also has no canvas tool — `FigView::handle_toolbar_action`
 /// intercepts it as host chrome (reveal and focus the left sidebar) before
@@ -416,6 +445,16 @@ impl ToolbarAdapter {
             self.panel.update(cx, |toolbar, cx| {
                 if next.0 != last.0 {
                     toolbar.set_mode(next.0, cx);
+                    toolbar.set_commands(
+                        if next.0 == ToolbarMode::Dev {
+                            DEV_COMMANDS
+                        } else {
+                            IMPLEMENTED_COMMANDS
+                        }
+                        .iter()
+                        .copied(),
+                        cx,
+                    );
                 }
                 if next.1 != last.1 {
                     toolbar.set_active_tool(next.1, cx);
@@ -457,6 +496,11 @@ impl ToolbarAdapter {
             playing: options.playing,
             looping: options.looping,
             auto_keyframe: options.auto_keyframe,
+            time_comment_armed: options.time_comment_armed,
+            available_keyframe_properties: crate::timeline::TimelineProperty::ALL
+                .iter()
+                .map(|property| SharedString::from(property.label()))
+                .collect(),
             current_time_ms: options.current_time_ms,
             // No clip means nothing can play: report a zero-length transport
             // instead of inventing a duration.
@@ -472,9 +516,8 @@ impl ToolbarAdapter {
             self.last_pushed_motion = Some(motion);
         }
 
-        // Truthful static: fig_viewer has no ready-for-development model (and
-        // no reachable Dev mode), so the readiness chip stays unset.
         let dev = DevToolbarOptions {
+            readiness_available: false,
             ready_for_development: false,
         };
         if self.last_pushed_dev != Some(dev) {
@@ -511,6 +554,10 @@ mod tests {
     fn every_tool_kind_round_trips_through_the_toolbar() {
         for kind in [
             ToolKind::Select,
+            ToolKind::Inspect,
+            ToolKind::Arrow,
+            ToolKind::Measure,
+            ToolKind::Annotation,
             ToolKind::PathSelect,
             ToolKind::RectangleSelect,
             ToolKind::EllipseSelect,
@@ -578,12 +625,8 @@ mod tests {
         assert_eq!(
             unmapped,
             vec![
-                ToolbarTool::Arrow,
                 ToolbarTool::ImageVideo,
-                ToolbarTool::Annotation,
-                ToolbarTool::Measure,
                 ToolbarTool::Actions,
-                ToolbarTool::Inspect,
                 ToolbarTool::ColorPicker,
                 ToolbarTool::Code,
                 ToolbarTool::Variables,
@@ -605,14 +648,17 @@ mod tests {
         assert_eq!(toolbar_mode(EditorMode::Motion), ToolbarMode::Motion);
         assert_eq!(toolbar_mode(EditorMode::Draw), ToolbarMode::Draw);
         assert_eq!(toolbar_mode(EditorMode::Code), ToolbarMode::Dev);
+        assert_eq!(toolbar_mode(EditorMode::Dev), ToolbarMode::Dev);
         assert_eq!(toolbar_mode(EditorMode::Prototype), ToolbarMode::Design);
         assert_eq!(toolbar_mode(EditorMode::Comments), ToolbarMode::Design);
     }
 
     #[test]
     fn toolbar_does_not_duplicate_sidebar_or_zoom_controls() {
-        assert!(chrome_controls(true, true, Some("⇧1".into())).is_empty());
-        assert!(chrome_controls(false, false, None).is_empty());
+        let controls = chrome_controls(true, true, Some("⇧1".into()));
+        assert_eq!(controls.len(), 1);
+        assert_eq!(controls[0].id, CHROME_ADD_CANVAS_CONTEXT);
+        assert_eq!(controls, chrome_controls(false, false, None));
     }
 
     /// Every Lucide icon the toolbar can name must resolve through the shared
@@ -2498,7 +2544,14 @@ mod echo_tests {
                 > expanded_canvas.size.width
         );
         toolbar.read_with(&cx, |toolbar, _| {
-            assert!(toolbar.chrome_controls().is_empty())
+            assert_eq!(
+                toolbar
+                    .chrome_controls()
+                    .iter()
+                    .map(|control| control.id.as_ref())
+                    .collect::<Vec<_>>(),
+                [CHROME_ADD_CANVAS_CONTEXT]
+            )
         });
         let toggle = cx
             .debug_bounds("file-inspector-toggle")
@@ -2512,7 +2565,14 @@ mod echo_tests {
             expanded_canvas.size.width
         );
         toolbar.read_with(&cx, |toolbar, _| {
-            assert!(toolbar.chrome_controls().is_empty())
+            assert_eq!(
+                toolbar
+                    .chrome_controls()
+                    .iter()
+                    .map(|control| control.id.as_ref())
+                    .collect::<Vec<_>>(),
+                [CHROME_ADD_CANVAS_CONTEXT]
+            )
         });
     }
 
@@ -2550,7 +2610,14 @@ mod echo_tests {
             expanded.size.width
         );
         toolbar.read_with(&cx, |toolbar, _| {
-            assert!(toolbar.chrome_controls().is_empty())
+            assert_eq!(
+                toolbar
+                    .chrome_controls()
+                    .iter()
+                    .map(|control| control.id.as_ref())
+                    .collect::<Vec<_>>(),
+                [CHROME_ADD_CANVAS_CONTEXT]
+            )
         });
     }
 }

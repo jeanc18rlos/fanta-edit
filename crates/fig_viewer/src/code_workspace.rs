@@ -113,6 +113,7 @@ pub struct FantaCodeWorkspace {
     json_source_observation: Option<Subscription>,
     json_source_version: Option<clock::Global>,
     source_save_in_progress: bool,
+    development_read_only: bool,
     source_writer: Option<design_surface::AgentActivity>,
     follow_source_writer: bool,
     loading_fnx: bool,
@@ -192,6 +193,7 @@ impl FantaCodeWorkspace {
             json_source_observation: None,
             json_source_version: None,
             source_save_in_progress: false,
+            development_read_only: false,
             source_writer: None,
             follow_source_writer: false,
             loading_fnx: false,
@@ -276,6 +278,14 @@ impl FantaCodeWorkspace {
 
     pub fn validation_error(&self) -> Option<&str> {
         self.error_message.as_deref()
+    }
+
+    pub(crate) fn set_development_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
+        if self.development_read_only != read_only {
+            self.development_read_only = read_only;
+            self.update_fnx_editability(cx);
+            cx.notify();
+        }
     }
 
     pub(crate) fn source_is_dirty(&self, cx: &App) -> bool {
@@ -664,7 +674,7 @@ impl FantaCodeWorkspace {
         cx: &mut Context<Self>,
     ) {
         let project = self.project.clone();
-        let read_only = self.item.read(cx).is_dirty();
+        let read_only = self.development_read_only || self.item.read(cx).is_dirty();
         let editor = cx.new(|cx| {
             let mut editor = Editor::for_buffer(source_buffer, Some(project), window, cx);
             editor.set_read_only(read_only);
@@ -700,7 +710,9 @@ impl FantaCodeWorkspace {
         let Some(editor) = &self.fnx_editor else {
             return;
         };
-        let read_only = self.item.read(cx).is_dirty() || self.source_save_in_progress;
+        let read_only = self.development_read_only
+            || self.item.read(cx).is_dirty()
+            || self.source_save_in_progress;
         if editor.read(cx).read_only(cx) != read_only {
             editor.update(cx, |editor, _| editor.set_read_only(read_only));
         }
