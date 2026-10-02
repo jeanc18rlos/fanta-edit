@@ -3,10 +3,11 @@
 //! as an unwrapped `fanta-project` directory.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashSet, hash_map::DefaultHasher},
+    hash::{Hash, Hasher},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use anyhow::{Context as _, Result};
@@ -21,12 +22,6 @@ use worktree::{PathChange, ProjectEntryId, UpdatedEntriesSet, WorktreeId};
 /// project files) settle before reloading from disk.
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
 
-/// How long after our own project writes to keep ignoring watcher events:
-/// long enough to cover the file-system watcher's delivery latency, short
-/// enough that a genuinely external edit right after a save is only briefly
-/// missed (the next edit's events will still arrive).
-const SELF_WRITE_SUPPRESS_WINDOW: Duration = Duration::from_secs(1);
-
 pub struct FigItem {
     pub(crate) path: ProjectPath,
     pub(crate) abs_path: PathBuf,
@@ -36,9 +31,19 @@ pub struct FigItem {
     dirty: bool,
     /// The project changed on disk while the canvas had unsaved edits.
     conflict: bool,
-    /// Ignore worktree events until this instant; set around our own project
-    /// writes so saving from the canvas does not trigger a self-reload.
-    suppress_watcher_until: Option<Instant>,
+    /// Content hash of the on-disk project tree as of the last point the canvas
+    /// was in sync with it (a load, reload, or save). A watcher event whose
+    /// resulting on-disk tree still hashes to this value is our own write
+    /// echoing back and is ignored; any other value is a genuine external edit
+    /// that must reload or flag a conflict. This is what distinguishes a
+    /// self-write from an external edit by *origin* (byte content) rather than
+    /// by a time window, so an agent edit landing moments after a save is not
+    /// silently dropped.
+    saved_tree_hash: Option<u64>,
+    /// True while our own `save` is writing the project tree. Its watcher echo
+    /// carries no new information and the save's completion records the new
+    /// [`Self::saved_tree_hash`], so reconciliation is skipped for the duration.
+    saving: bool,
     reload_task: Option<Task<()>>,
     _load_task: Option<Task<()>>,
     _project_subscription: Subscription,
@@ -281,17 +286,24 @@ impl project::ProjectItem for FigItem {
                         return;
                     }
 
-                    let document = cx
+                    let (document, tree_hash) = cx
                         .background_spawn(async move {
                             match load_project_root {
-                                Some(root) => load_project_document(&root),
-                                None => load_fig_document(&load_path),
+                                // Record the baseline hash before loading so a
+                                // watcher event that fires before any edit is
+                                // recognized as a no-op rather than a change.
+                                Some(root) => {
+                                    let hash = hash_project_tree(&root);
+                                    (load_project_document(&root), hash)
+                                }
+                                None => (load_fig_document(&load_path), None),
                             }
                         })
                         .await;
 
                     if let Err(error) = this.update(cx, |this: &mut FigItem, cx| {
                         this.document = FigDocumentState::from_result(document);
+                        this.saved_tree_hash = tree_hash;
                         cx.emit(FigItemEvent::StateChanged);
                         cx.notify();
                     }) {
@@ -317,7 +329,8 @@ impl project::ProjectItem for FigItem {
                     project_root,
                     dirty: false,
                     conflict: false,
-                    suppress_watcher_until: None,
+                    saved_tree_hash: None,
+                    saving: false,
                     reload_task: None,
                     _load_task: Some(load_task),
                     _project_subscription: project_subscription,
@@ -396,10 +409,9 @@ impl FigItem {
         let Some(project_root) = self.project_root.clone() else {
             return;
         };
-        if self
-            .suppress_watcher_until
-            .is_some_and(|until| Instant::now() < until)
-        {
+        // Our own save is writing the tree right now; its echo carries no new
+        // information and the save's completion records the new baseline hash.
+        if self.saving {
             return;
         }
         let Some(worktree) = project.read(cx).worktree_for_id(worktree_id, cx) else {
@@ -415,37 +427,57 @@ impl FigItem {
         if !relevant {
             return;
         }
-        if self.dirty {
-            // Unsaved canvas edits win over disk; surface the divergence as
-            // a conflict instead of clobbering them.
-            self.set_conflict(true, cx);
-        } else {
-            self.schedule_reload(cx);
-        }
+        // Whether this is our own write echoing back or a genuine external edit
+        // is decided by *content*, not timing: the reconcile below hashes the
+        // on-disk tree and compares it against the recorded baseline.
+        self.schedule_reconcile(cx);
     }
 
-    /// Debounce disk changes, then reload the project in the background.
+    /// Debounce disk changes, then reconcile the canvas with the project on
+    /// disk in the background. An on-disk tree that still hashes to
+    /// [`Self::saved_tree_hash`] is our own write echoing back (or a no-op
+    /// touch) and is ignored so the selection survives; any other tree is a
+    /// genuine external edit that is loaded (when clean) or flagged as a
+    /// conflict (when the canvas has unsaved edits).
+    ///
     /// Content gestures dirty the item on their first preview frame, so a
     /// mid-gesture reload can only interrupt selection-style gestures, which
     /// tolerate having their selection reset.
-    fn schedule_reload(&mut self, cx: &mut Context<Self>) {
+    fn schedule_reconcile(&mut self, cx: &mut Context<Self>) {
         let Some(root) = self.project_root.clone() else {
             return;
         };
         self.reload_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(RELOAD_DEBOUNCE).await;
-            let loaded = cx
-                .background_spawn(async move { load_project_document(&root) })
+            let (loaded, on_disk_hash) = cx
+                .background_spawn(async move {
+                    let hash = hash_project_tree(&root);
+                    (load_project_document(&root), hash)
+                })
                 .await;
             if let Err(error) = this.update(cx, |this, cx| {
+                // A save started after this reconcile was scheduled; let its
+                // completion establish the authoritative state rather than
+                // reacting to our own half-written tree.
+                if this.saving {
+                    return;
+                }
+                // The on-disk tree is byte-identical to what we last wrote or
+                // loaded: this event is our own write echoing back. Skip the
+                // reload entirely so a save does not reset the selection.
+                if let (Some(saved), Some(on_disk)) = (this.saved_tree_hash, on_disk_hash)
+                    && saved == on_disk
+                {
+                    return;
+                }
                 if this.dirty {
-                    // Canvas edits landed while the reload was in flight;
-                    // keep them and flag the divergence.
+                    // Unsaved canvas edits win over disk; surface the
+                    // divergence as a conflict instead of clobbering them.
                     this.set_conflict(true, cx);
                     return;
                 }
                 match loaded {
-                    Ok(document) => this.apply_reloaded_document(document, cx),
+                    Ok(document) => this.apply_reloaded_document(document, on_disk_hash, cx),
                     Err(error) => {
                         log::error!(
                             "reloading Fanta project after a disk change failed: {error:#}"
@@ -469,8 +501,14 @@ impl FigItem {
     /// Swap in a document reloaded from disk, preserving the active page (by
     /// its root node id) when it still exists. The viewport lives on the
     /// view and survives untouched; the selection resets with the new
-    /// document.
-    fn apply_reloaded_document(&mut self, mut document: FigDocument, cx: &mut Context<Self>) {
+    /// document. `tree_hash` is the on-disk hash of the tree just loaded, which
+    /// becomes the new sync baseline.
+    fn apply_reloaded_document(
+        &mut self,
+        mut document: FigDocument,
+        tree_hash: Option<u64>,
+        cx: &mut Context<Self>,
+    ) {
         let previous_page_root = self
             .document
             .ready()
@@ -487,6 +525,7 @@ impl FigItem {
         }
         self.document = FigDocumentState::Ready(document);
         self.dirty = false;
+        self.saved_tree_hash = tree_hash;
         self.set_conflict(false, cx);
         cx.emit(FigItemEvent::StateChanged);
         cx.notify();
@@ -501,10 +540,16 @@ impl FigItem {
         };
         self.reload_task = None;
         cx.spawn(async move |this, cx| {
-            let document = cx
-                .background_spawn(async move { load_project_document(&root) })
-                .await?;
-            this.update(cx, |this, cx| this.apply_reloaded_document(document, cx))?;
+            let (document, hash) = cx
+                .background_spawn(async move {
+                    let hash = hash_project_tree(&root);
+                    (load_project_document(&root), hash)
+                })
+                .await;
+            let document = document?;
+            this.update(cx, |this, cx| {
+                this.apply_reloaded_document(document, hash, cx)
+            })?;
             Ok(())
         })
     }
@@ -646,27 +691,39 @@ impl FigItem {
                 self.abs_path.display()
             )));
         }
-        // Our own writes echo back through the worktree watcher; suppress it
-        // both from save start (covers sub-second saves entirely) and again at
-        // completion (covers watcher latency after longer saves). On the
-        // materializing save this window also spans the moment the directory is
-        // adopted as a worktree, so its initial scan does not bounce back as a
-        // reload.
-        self.suppress_watcher_until = Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
+        // Our own writes echo back through the worktree watcher. Rather than
+        // blindly ignore events for a time window (which would also drop a
+        // genuine external edit that lands right after the save), we mark the
+        // save in flight and record the exact bytes we wrote as the new
+        // baseline hash on completion; the echo then matches that hash and is
+        // recognized as a self-write while any real divergence still reloads.
+        // The `saving` flag also spans the moment a materialized directory is
+        // adopted as a worktree, so its initial scan does not bounce back.
+        self.saving = true;
         cx.spawn(async move |this, cx| {
-            let result = cx
+            let (result, tree_hash) = cx
                 .background_spawn({
                     let target = target.clone();
-                    async move { write_project(&target, &doc, &raw_assets) }
+                    async move {
+                        let result = write_project(&target, &doc, &raw_assets);
+                        // Hash what we just wrote so its echo is recognized as
+                        // ours; only meaningful when the write succeeded.
+                        let hash = result
+                            .as_ref()
+                            .ok()
+                            .and_then(|()| hash_project_tree(&target));
+                        (result, hash)
+                    }
                 })
                 .await;
             this.update(cx, |this, cx| {
-                this.suppress_watcher_until = Some(Instant::now() + SELF_WRITE_SUPPRESS_WINDOW);
+                this.saving = false;
                 if result.is_ok() {
                     if materializing {
                         this.project_root = Some(target.clone());
                     }
                     this.dirty = false;
+                    this.saved_tree_hash = tree_hash;
                     this.set_conflict(false, cx);
                     cx.emit(FigItemEvent::StateChanged);
                     cx.notify();
@@ -778,6 +835,54 @@ fn load_project_document(root: &Path) -> Result<FigDocument> {
     let (doc, assets) = fanta_format::read_project_tree(root)
         .with_context(|| format!("reading Fanta project at {}", root.display()))?;
     Ok(FigDocument::from_doc(doc, assets, None))
+}
+
+/// A content hash over every design-relevant file under `root` — exactly the
+/// files [`is_relevant_project_change`] reacts to, read in sorted order. Two
+/// trees with byte-identical relevant files hash equally, which is how a save's
+/// own watcher echo is told apart from a genuine external edit: the bytes we
+/// wrote hash to the value we recorded, so the echo matches and no reload
+/// fires; any real divergence hashes differently and is reacted to, regardless
+/// of how soon after our save it lands.
+///
+/// Returns `None` if the tree can't be walked or read. Callers treat `None` as
+/// "not a match" (i.e. changed), so an external edit is never silently ignored
+/// because of a transient I/O error — the bias is always toward reacting.
+///
+/// The hash is only ever compared against another hash produced by this same
+/// function within the same process, so a non-portable [`DefaultHasher`] is
+/// sufficient; it is never persisted.
+fn hash_project_tree(root: &Path) -> Option<u64> {
+    let mut files = Vec::new();
+    collect_relevant_files(root, root, &mut files)?;
+    files.sort();
+    let mut hasher = DefaultHasher::new();
+    for path in &files {
+        let relative = path.strip_prefix(root).ok()?;
+        relative.to_string_lossy().hash(&mut hasher);
+        std::fs::read(path).ok()?.hash(&mut hasher);
+    }
+    Some(hasher.finish())
+}
+
+/// Recursively collect design-relevant files under `dir`, pruning subtrees the
+/// canvas never reads (`previews/`, `exports/`, `.git/`) so a large ignored
+/// tree does not dominate the hash. Symlinked entries report neither
+/// `is_file()` nor `is_dir()` and are skipped, avoiding link cycles.
+fn collect_relevant_files(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Option<()> {
+    for entry in std::fs::read_dir(dir).ok()? {
+        let path = entry.ok()?.path();
+        let file_type = std::fs::symlink_metadata(&path).ok()?.file_type();
+        if file_type.is_dir() {
+            let is_git = path.file_name().and_then(|name| name.to_str()) == Some(".git");
+            if !is_git && is_relevant_project_change(root, &path) {
+                collect_relevant_files(root, &path, out)?;
+            }
+        } else if file_type.is_file() && is_relevant_project_change(root, &path) {
+            out.push(path);
+        }
+    }
+    Some(())
 }
 
 fn scene_uses_auto_layout(scene: &fanta_doc::Scene) -> bool {
@@ -1013,7 +1118,7 @@ mod tests {
     }
 
     use gpui::TestAppContext;
-    use project::FakeFs;
+    use project::{FakeFs, ProjectItem as _};
     use settings::SettingsStore;
     use util::rel_path::RelPath;
 
@@ -1075,7 +1180,8 @@ mod tests {
                 project_root,
                 dirty: false,
                 conflict: false,
-                suppress_watcher_until: None,
+                saved_tree_hash: None,
+                saving: false,
                 reload_task: None,
                 _load_task: None,
                 _project_subscription: subscription,
@@ -1174,6 +1280,185 @@ mod tests {
                 item.project_root().is_none(),
                 "a refused materialization must not adopt the project it declined to overwrite"
             );
+        });
+    }
+
+    /// A single-page document whose page carries `name`, so a reload can be
+    /// observed as a change to `document().pages[0].name`.
+    fn doc_with_page_named(name: &str) -> Doc {
+        use fanta_doc::{CanvasNode, GroupNode, NodeData};
+        let mut doc = Doc::new();
+        let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page.name = name.to_owned();
+        let root = page.id;
+        doc.apply(Operation::create_node(page))
+            .expect("create page root node");
+        doc.add_page(root);
+        doc
+    }
+
+    /// Open a `FigItem` backed by a Fanta project whose content lives on real
+    /// disk (the canvas load/reload path in `fanta_format` uses `std::fs`, not
+    /// the project's `Fs`) while the worktree is a `FakeFs` rooted at the same
+    /// path. The `FakeFs` keeps its watcher on the deterministic test scheduler
+    /// — a `RealFs` watcher runs on its own thread and trips the scheduler's
+    /// nondeterminism guard the instant the tree is written — and its root path
+    /// matches `project_root`, so `absolutize` in the relevance check lines up.
+    /// Watcher events are delivered explicitly via [`deliver_worktree_change`].
+    /// Returns the item, project, worktree id, the resolved project root, and
+    /// the temp dir guard.
+    async fn open_disk_item(
+        initial: Doc,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<FigItem>,
+        Entity<Project>,
+        WorktreeId,
+        PathBuf,
+        tempfile::TempDir,
+    ) {
+        init_test(cx);
+        let temp = tempfile::tempdir().unwrap();
+        write_project(temp.path(), &initial, &BTreeMap::new()).expect("write the initial project");
+
+        let fake_fs = FakeFs::new(cx.executor());
+        // Only the directory needs to exist in `FakeFs` (`create_dir` creates
+        // every parent level) so the worktree — and hence `absolutize` — is
+        // rooted at the real project path; the files themselves are read from
+        // real disk.
+        fs::Fs::create_dir(fake_fs.as_ref(), temp.path())
+            .await
+            .expect("root the FakeFs worktree at the project path");
+        let project = Project::test(fake_fs, [temp.path()], cx).await;
+        let worktree_id =
+            project.update(cx, |project, cx| project.worktrees(cx).next().unwrap().read(cx).id());
+        let path = ProjectPath {
+            worktree_id,
+            path: util::rel_path::rel_path("fanta.json").into(),
+        };
+        let item = cx
+            .update(|cx| FigItem::try_open(&project, &path, cx))
+            .expect("fanta.json opens as a FigItem")
+            .await
+            .expect("loading the FigItem");
+        cx.run_until_parked();
+        let root = item.read_with(cx, |item, _| {
+            item.project_root()
+                .expect("an on-disk project has a root")
+                .to_path_buf()
+        });
+        (item, project, worktree_id, root, temp)
+    }
+
+    /// Deliver a worktree change event for `rel` (a project-relative file) and
+    /// pump the reconcile debounce, mimicking the watcher echo of a disk write.
+    fn deliver_worktree_change(
+        project: &Entity<Project>,
+        worktree_id: WorktreeId,
+        rel: &str,
+        cx: &mut TestAppContext,
+    ) {
+        let rel_path: Arc<RelPath> = util::rel_path::rel_path(rel).into();
+        let changes: UpdatedEntriesSet =
+            Arc::from(vec![(rel_path, ProjectEntryId::from_usize(1), PathChange::Updated)]);
+        project.update(cx, |_, cx| {
+            cx.emit(project::Event::WorktreeUpdatedEntries(worktree_id, changes));
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(RELOAD_DEBOUNCE);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn external_edit_right_after_save_reloads_via_content_not_time(cx: &mut TestAppContext) {
+        // The bug: a genuine external write (Zed's agent rewriting the `.fnx`
+        // sources — the product's core loop) landing within ~1s of a user
+        // Cmd-S was dropped by a blanket time gate. Origin-based suppression
+        // must reload it: the on-disk bytes differ from what we saved.
+        let (item, project, worktree_id, root, _temp) =
+            open_disk_item(doc_with_one_page(), cx).await;
+
+        // User saves; this records the baseline hash of exactly what we wrote.
+        item.update(cx, |item, cx| item.save(cx))
+            .await
+            .expect("saving the canvas");
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.document().unwrap().pages[0].name.as_ref(), "Page 1");
+            assert!(!item.is_dirty());
+        });
+
+        // Immediately after, an external actor writes a genuinely new revision.
+        write_project(&root, &doc_with_page_named("Edited By Agent"), &BTreeMap::new())
+            .expect("external write of a new revision");
+        deliver_worktree_change(&project, worktree_id, "fanta.json", cx);
+
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.document().unwrap().pages[0].name.as_ref(),
+                "Edited By Agent",
+                "an external edit right after a save must reload, not be silently dropped"
+            );
+            assert!(!item.has_conflict(), "a clean canvas reloads without a conflict");
+            assert!(!item.is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    async fn external_edit_while_dirty_flags_conflict_instead_of_clobbering(
+        cx: &mut TestAppContext,
+    ) {
+        let (item, project, worktree_id, root, _temp) =
+            open_disk_item(doc_with_one_page(), cx).await;
+
+        // Unsaved canvas edits present when the project diverges on disk.
+        item.update(cx, |item, _| item.dirty = true);
+        write_project(&root, &doc_with_page_named("Edited By Agent"), &BTreeMap::new())
+            .expect("external write of a new revision");
+        deliver_worktree_change(&project, worktree_id, "fanta.json", cx);
+
+        item.read_with(cx, |item, _| {
+            assert!(
+                item.has_conflict(),
+                "a divergent disk change while dirty must surface a conflict"
+            );
+            assert_eq!(
+                item.document().unwrap().pages[0].name.as_ref(),
+                "Page 1",
+                "unsaved edits are preserved, not clobbered by the disk reload"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn self_write_echo_does_not_reload_or_reset_selection(cx: &mut TestAppContext) {
+        let (item, project, worktree_id, _root, _temp) =
+            open_disk_item(doc_with_one_page(), cx).await;
+
+        // Select the page node, save, then keep the disk untouched: the watcher
+        // echo of our own write must be recognized by content and ignored, so
+        // the selection survives (no reload, no conflict).
+        let selected = item.update(cx, |item, cx| {
+            let root = item.document().unwrap().pages[0].root.unwrap();
+            item.with_document(cx, |document| {
+                document.doc.selection.select_only(root);
+                ((), DocChange::Selection)
+            });
+            root
+        });
+        item.update(cx, |item, cx| item.save(cx))
+            .await
+            .expect("saving the canvas");
+
+        deliver_worktree_change(&project, worktree_id, "fanta.json", cx);
+
+        item.read_with(cx, |item, _| {
+            assert!(
+                item.document().unwrap().doc.selection.contains(selected),
+                "a pure self-write echo must not reload and reset the selection"
+            );
+            assert_eq!(item.document().unwrap().pages[0].name.as_ref(), "Page 1");
+            assert!(!item.has_conflict());
+            assert!(!item.is_dirty());
         });
     }
 }
