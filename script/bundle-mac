@@ -479,9 +479,12 @@ function sign_app_store_bundle() {
         /usr/libexec/PlistBuddy -c "Add :com.apple.application-identifier string $profile_app_identifier" "$app_store_entitlements_file"
         /usr/libexec/PlistBuddy -c "Add :com.apple.developer.team-identifier string $profile_team_identifier" "$app_store_entitlements_file"
         entitlements="$app_store_entitlements_file"
-        cp "$MACOS_APP_STORE_PROVISIONING_PROFILE" "${app_path}/Contents/embedded.provisionprofile"
+        cp -X "$MACOS_APP_STORE_PROVISIONING_PROFILE" "${app_path}/Contents/embedded.provisionprofile"
         signing_options=(--force --timestamp --options runtime --sign "$IDENTITY")
     fi
+
+    # Downloaded profiles and bundled resources can carry quarantine into the signed package.
+    /usr/bin/xattr -dr com.apple.quarantine "$app_path"
 
     if [[ -d "${app_path}/Contents/Frameworks" ]]; then
         while IFS= read -r -d '' framework; do
@@ -511,6 +514,12 @@ function sign_app_store_bundle() {
         signature_info=$(/usr/bin/codesign -dv --verbose=4 "$app_path" 2>&1)
         if ! grep -Fxq "TeamIdentifier=$profile_team_identifier" <<< "$signature_info"; then
             echo "The app signature's team identifier does not match its provisioning profile."
+            exit 1
+        fi
+        local remaining_attributes
+        remaining_attributes=$(/usr/bin/xattr -r "$app_path")
+        if [[ "$remaining_attributes" == *com.apple.quarantine* ]]; then
+            echo "The Mac App Store app still contains quarantined files."
             exit 1
         fi
         local package_path="${app_store_directory}/Fanta-${arch_suffix}.pkg"
