@@ -4765,27 +4765,6 @@ fn clamp_sidebar_width(width: Pixels, sidebar: SidebarKind) -> Pixels {
 }
 
 impl FigView {
-    fn render_prototype_play_button(&self, cx: &mut Context<Self>) -> AnyElement {
-        let view = cx.weak_entity();
-        div()
-            .absolute()
-            .top_3()
-            .right_3()
-            .child(
-                Button::new("fanta-prototype-present", "Present")
-                    .start_icon(Icon::new(IconName::PlayFilled).size(IconSize::Small))
-                    .style(ButtonStyle::Filled)
-                    .tooltip(Tooltip::text("Present prototype (⌥⌘↵)"))
-                    .on_click(move |_, window, cx| {
-                        view.update(cx, |view, cx| {
-                            view.play_prototype(&PlayPrototype, window, cx)
-                        })
-                        .log_err();
-                    }),
-            )
-            .into_any_element()
-    }
-
     fn render_prototype_presentation(
         &self,
         window: &mut Window,
@@ -6577,14 +6556,6 @@ impl Render for FigView {
                                                                 self.render_comment_overlay(cx)
                                                             {
                                                                 c.push(comments);
-                                                            }
-                                                            if editor_mode == EditorMode::Prototype
-                                                            {
-                                                                let play_button = self
-                                                                    .render_prototype_play_button(
-                                                                        cx,
-                                                                    );
-                                                                c.push(play_button);
                                                             }
                                                             // A loading or
                                                             // failed document

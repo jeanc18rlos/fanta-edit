@@ -205,7 +205,12 @@ fn main() {
     #[cfg(unix)]
     util::prevent_root_execution();
 
-    let args = Args::parse();
+    let mut args = Args::parse();
+    args.user_data_dir =
+        launch_user_data_dir(args.user_data_dir, env::var("FANTA_USER_DATA_DIR").ok());
+    if let Some(dir) = &args.user_data_dir {
+        paths::set_custom_data_dir(dir);
+    }
 
     // `zed --askpass` Makes zed operate in nc/netcat mode for use with askpass
     #[cfg(not(target_os = "windows"))]
@@ -219,11 +224,6 @@ fn main() {
     // which would otherwise refuse to start a second process.
     #[cfg(not(target_os = "windows"))]
     if args.mcp_stdio {
-        // The discovery file lives under the data dir, so the override has to
-        // be applied before it is read.
-        if let Some(dir) = &args.user_data_dir {
-            paths::set_custom_data_dir(dir);
-        }
         process::exit(zed::mcp_stdio::run());
     }
 
@@ -275,11 +275,6 @@ fn main() {
     if args.dump_all_actions {
         dump_all_gpui_actions();
         return;
-    }
-
-    // Set custom data directory.
-    if let Some(dir) = &args.user_data_dir {
-        paths::set_custom_data_dir(dir);
     }
 
     #[cfg(target_os = "windows")]
@@ -1584,6 +1579,7 @@ struct Args {
     /// Sets a custom directory for all user data (e.g., database, extensions, logs).
     ///
     /// This overrides the default platform-specific data directory location.
+    /// If omitted, a nonblank `FANTA_USER_DATA_DIR` environment variable is used.
     /// On macOS, the default is `~/Library/Application Support/Fanta`.
     /// On Linux/FreeBSD, the default is `$XDG_DATA_HOME/fanta`.
     /// On Windows, the default is `%LOCALAPPDATA%\Fanta`.
@@ -1676,6 +1672,46 @@ struct Args {
     #[cfg(target_os = "windows")]
     #[arg(long, hide = true)]
     etw_socket: Option<String>,
+}
+
+fn launch_user_data_dir(
+    command_line: Option<String>,
+    environment: Option<String>,
+) -> Option<String> {
+    command_line.or_else(|| environment.filter(|directory| !directory.trim().is_empty()))
+}
+
+#[cfg(test)]
+mod user_data_dir_tests {
+    use super::{Args, launch_user_data_dir};
+    use clap::Parser as _;
+
+    #[test]
+    fn explicit_user_data_directory_overrides_environment() {
+        let args = Args::try_parse_from(["fanta", "--user-data-dir", "/tmp/command line profile"])
+            .expect("parse custom data directory");
+        assert_eq!(
+            launch_user_data_dir(args.user_data_dir, Some("/tmp/environment profile".into())),
+            Some("/tmp/command line profile".into())
+        );
+    }
+
+    #[test]
+    fn native_launch_uses_environment_directory_without_command_line_override() {
+        let args = Args::try_parse_from(["fanta"]).expect("parse native launch");
+        assert_eq!(
+            launch_user_data_dir(args.user_data_dir, Some("/tmp/native profile".into())),
+            Some("/tmp/native profile".into())
+        );
+    }
+
+    #[test]
+    fn blank_environment_directory_keeps_platform_default() {
+        for environment in [None, Some("".into()), Some(" \t\n".into())] {
+            let args = Args::try_parse_from(["fanta"]).expect("parse native launch");
+            assert_eq!(launch_user_data_dir(args.user_data_dir, environment), None);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

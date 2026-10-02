@@ -32,6 +32,13 @@ fn inspector_tab(mode: EditorMode) -> PropertiesInspectorTab {
 }
 
 impl FigView {
+    #[cfg(test)]
+    pub(crate) fn properties_inspector_for_test(&self) -> Option<Entity<PropertiesInspector>> {
+        self.gpui_properties
+            .as_ref()
+            .map(|adapter| adapter.layout.clone())
+    }
+
     pub(super) fn refresh_properties_inspector(
         &mut self,
         window: &mut Window,
@@ -151,9 +158,18 @@ impl FigView {
         let zoom = self.current_zoom_percent(cx);
         let editable = self.is_editable(cx);
         let collapsed = !self.inspector_sidebar_visible;
+        let can_present = self.item.read(cx).document().is_some_and(|document| {
+            crate::prototype_player::prototype_entry_frame(&document.doc).is_some()
+        });
         let Some(adapter) = self.gpui_properties.as_mut() else {
             return;
         };
+        adapter
+            .layout
+            .update(cx, |layout, cx| layout.set_can_present(can_present, cx));
+        self.prototype_sidebar.update(cx, |panel, cx| {
+            panel.set_show_presentation_action(false, cx);
+        });
         let previous_tab = adapter.layout.read(cx).active_tab();
         if (previous_tab != mode || (collapsed && !adapter.layout.read(cx).is_collapsed()))
             && previous_tab == PropertiesInspectorTab::Design
@@ -331,6 +347,11 @@ impl FigView {
         cx: &mut Context<Self>,
     ) {
         match action {
+            PropertiesInspectorAction::PresentRequested => {
+                if self.editor_mode(cx) == EditorMode::Prototype {
+                    self.play_prototype(&PlayPrototype, window, cx);
+                }
+            }
             PropertiesInspectorAction::TabChanged { tab } => {
                 if let Some(adapter) = &self.gpui_properties {
                     adapter

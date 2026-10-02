@@ -808,47 +808,48 @@ features = [
 ]
 
 [patch.crates-io]
-fanta-gpui = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-async-process = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-collections = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-component = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-components = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-core = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-derive-refineable = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-file-icons = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-gpui-linux = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-gpui-macos = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-gpui-macros = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-gpui-platform = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-gpui-shared-string = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-gpui-tokio = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-gpui-util = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-gpui-web = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-gpui-wgpu = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-gpui-windows = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-http-client = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-http-client-tls = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-icons = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-media = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-menu = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-perf = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-proptest = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-refineable = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-reqwest-client = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-scheduler = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-smol = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-sum-tree = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-syntax-theme = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-theme = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-ui = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-ui-input = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-ui-macros = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-util = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-util-macros = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-zed-ui-assets = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-zlog = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-ztracing = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
-fanta-gpui-ztracing-macro = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "237904942f046a780986768b5bd0f7c12081ef5d" }
+# Keep framework types and inspector components on the same local source.
+fanta-gpui = { path = "../fanta-gpui/crates/fanta-gpui" }
+fanta-gpui-async-process = { path = "../fanta-gpui/crates/async_process" }
+fanta-gpui-collections = { path = "../fanta-gpui/crates/collections" }
+fanta-gpui-component = { path = "../fanta-gpui/crates/component" }
+fanta-gpui-components = { path = "../fanta-gpui/crates/gpui_component" }
+fanta-gpui-core = { path = "../fanta-gpui/crates/gpui" }
+fanta-gpui-derive-refineable = { path = "../fanta-gpui/crates/refineable/derive_refineable" }
+fanta-gpui-file-icons = { path = "../fanta-gpui/crates/file_icons" }
+fanta-gpui-gpui-linux = { path = "../fanta-gpui/crates/gpui_linux" }
+fanta-gpui-gpui-macos = { path = "../fanta-gpui/crates/gpui_macos" }
+fanta-gpui-gpui-macros = { path = "../fanta-gpui/crates/gpui_macros" }
+fanta-gpui-gpui-platform = { path = "../fanta-gpui/crates/gpui_platform" }
+fanta-gpui-gpui-shared-string = { path = "../fanta-gpui/crates/gpui_shared_string" }
+fanta-gpui-gpui-tokio = { path = "../fanta-gpui/crates/gpui_tokio" }
+fanta-gpui-gpui-util = { path = "../fanta-gpui/crates/gpui_util" }
+fanta-gpui-gpui-web = { path = "../fanta-gpui/crates/gpui_web" }
+fanta-gpui-gpui-wgpu = { path = "../fanta-gpui/crates/gpui_wgpu" }
+fanta-gpui-gpui-windows = { path = "../fanta-gpui/crates/gpui_windows" }
+fanta-gpui-http-client = { path = "../fanta-gpui/crates/http_client" }
+fanta-gpui-http-client-tls = { path = "../fanta-gpui/crates/http_client_tls" }
+fanta-gpui-icons = { path = "../fanta-gpui/crates/icons" }
+fanta-gpui-media = { path = "../fanta-gpui/crates/media" }
+fanta-gpui-menu = { path = "../fanta-gpui/crates/menu" }
+fanta-gpui-perf = { path = "../fanta-gpui/tooling/perf" }
+fanta-gpui-proptest = { path = "../fanta-gpui/crates/proptest" }
+fanta-gpui-refineable = { path = "../fanta-gpui/crates/refineable" }
+fanta-gpui-reqwest-client = { path = "../fanta-gpui/crates/reqwest_client" }
+fanta-gpui-scheduler = { path = "../fanta-gpui/crates/scheduler" }
+fanta-gpui-smol = { path = "../fanta-gpui/crates/smol" }
+fanta-gpui-sum-tree = { path = "../fanta-gpui/crates/sum_tree" }
+fanta-gpui-syntax-theme = { path = "../fanta-gpui/crates/syntax_theme" }
+fanta-gpui-theme = { path = "../fanta-gpui/crates/theme" }
+fanta-gpui-ui = { path = "../fanta-gpui/crates/ui" }
+fanta-gpui-ui-input = { path = "../fanta-gpui/crates/ui_input" }
+fanta-gpui-ui-macros = { path = "../fanta-gpui/crates/ui_macros" }
+fanta-gpui-util = { path = "../fanta-gpui/crates/util" }
+fanta-gpui-util-macros = { path = "../fanta-gpui/crates/util_macros" }
+fanta-gpui-zed-ui-assets = { path = "../fanta-gpui/crates/zed_ui_assets" }
+fanta-gpui-zlog = { path = "../fanta-gpui/crates/zlog" }
+fanta-gpui-ztracing = { path = "../fanta-gpui/crates/ztracing" }
+fanta-gpui-ztracing-macro = { path = "../fanta-gpui/crates/ztracing_macro" }
 async-task = { git = "https://github.com/smol-rs/async-task.git", rev = "b4486cd71e4e94fbda54ce6302444de14f4d190e" }
 windows-capture = { git = "https://github.com/zed-industries/windows-capture.git", rev = "f0d6c1b6691db75461b732f6d5ff56eed002eeb9" }
 calloop = { git = "https://github.com/zed-industries/calloop" }

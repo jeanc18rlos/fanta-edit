@@ -25,16 +25,16 @@ use fanta_gpui::design::{
     DesignFontFamily, DesignFontSource, DesignFontStyle, DesignFontViewData, DesignGradientStop,
     DesignImageFilters, DesignItemSpacingMode, DesignLayout, DesignLayoutAlignSelf,
     DesignLayoutMode, DesignLayoutPositioning, DesignLetterSpacing, DesignLineHeight,
-    DesignMaskType, DesignMediaCropAction, DesignMediaCropToolState, DesignMediaPaintCapabilities,
-    DesignMediaPaintPlacement, DesignMediaPaintView, DesignMediaPaintViewData,
-    DesignMediaQuarterTurn, DesignPaint, DesignPaintKind, DesignPaintPayload, DesignPaintProperty,
-    DesignPaintSource, DesignPaintStyleViewData, DesignPaintTransform, DesignPaintType,
-    DesignPaintValue, DesignPanel, DesignPanelAction, DesignPanelAutoLayoutDirection,
-    DesignPanelAutoLayoutParticipation, DesignPanelAutoLayoutWrap, DesignPanelCollection,
-    DesignPanelEditPhase, DesignPanelNode, DesignPanelNodeCapabilities, DesignPanelNodeKind,
-    DesignPanelParentLayout, DesignPanelProperty, DesignPanelPropertyValueState,
-    DesignPanelSection, DesignPanelSelection, DesignPanelTarget, DesignPanelValue,
-    DesignPatternHorizontalAlignment, DesignPatternPaint, DesignPatternSource,
+    DesignMaskType, DesignMediaCropAction, DesignMediaCropToolState, DesignMediaKind,
+    DesignMediaPaintAsset, DesignMediaPaintCapabilities, DesignMediaPaintPlacement,
+    DesignMediaPaintView, DesignMediaPaintViewData, DesignMediaQuarterTurn, DesignPaint,
+    DesignPaintKind, DesignPaintPayload, DesignPaintProperty, DesignPaintSource,
+    DesignPaintStyleViewData, DesignPaintTransform, DesignPaintType, DesignPaintValue, DesignPanel,
+    DesignPanelAction, DesignPanelAutoLayoutDirection, DesignPanelAutoLayoutParticipation,
+    DesignPanelAutoLayoutWrap, DesignPanelCollection, DesignPanelEditPhase, DesignPanelNode,
+    DesignPanelNodeCapabilities, DesignPanelNodeKind, DesignPanelParentLayout, DesignPanelProperty,
+    DesignPanelPropertyValueState, DesignPanelSection, DesignPanelSelection, DesignPanelTarget,
+    DesignPanelValue, DesignPatternHorizontalAlignment, DesignPatternPaint, DesignPatternSource,
     DesignPatternTileType, DesignPolygonGeometry, DesignSelectionHeaderCommand,
     DesignSelectionHeaderControl, DesignSelectionHeaderControlKind, DesignSelectionHeaderMenu,
     DesignSelectionHeaderMenuItem, DesignSelectionHeaderViewData, DesignShaderDefinition,
@@ -307,16 +307,16 @@ pub(crate) fn selection_header_for_doc(
     if can_edit && selection.len() == 1 && matches!(node.data, NodeData::Group(_)) {
         let actions = crate::gpui_adapters::layers::context_actions(doc, first);
         let menu_items = [
-            ("frame", "Frame", LayerAction::ConvertToFrame),
-            ("section", "Section", LayerAction::ConvertToSection),
+            (DesignPanelNodeKind::Frame, LayerAction::ConvertToFrame),
+            (DesignPanelNodeKind::Section, LayerAction::ConvertToSection),
         ]
         .into_iter()
-        .filter(|(_, _, action)| actions.contains(action))
-        .map(|(id, label, _)| {
+        .filter(|(_, action)| actions.contains(action))
+        .map(|(kind, _)| {
             DesignSelectionHeaderMenuItem::new(
-                id,
-                label,
-                DesignSelectionHeaderCommand::TitleMenuItem { item_id: id.into() },
+                kind.label().to_ascii_lowercase(),
+                kind.label(),
+                DesignSelectionHeaderCommand::ChangeLayerType { kind },
             )
         })
         .collect::<Vec<_>>();
@@ -736,6 +736,201 @@ fn bundled_shader_catalog() -> DesignShaderViewData {
     )
 }
 
+fn media_assets_for_document(document: &FigDocument) -> Vec<DesignMediaPaintAsset> {
+    let mut scene_names = HashMap::<AssetId, String>::new();
+    if document.raw_assets.keys().any(|asset| {
+        document
+            .doc
+            .asset_library
+            .get(asset)
+            .is_none_or(|metadata| metadata.name.trim().is_empty())
+    }) {
+        for root in document.doc.scene.roots() {
+            for node_id in std::iter::once(*root).chain(document.doc.scene.descendants_of(*root)) {
+                let Some(node) = document.doc.scene.get(node_id) else {
+                    continue;
+                };
+                let asset = match &node.data {
+                    NodeData::Bitmap(image) => Some(image.asset),
+                    NodeData::Video(video) => Some(video.asset),
+                    _ => None,
+                };
+                if let Some(asset) = asset
+                    && !node.name.trim().is_empty()
+                {
+                    scene_names
+                        .entry(asset)
+                        .or_insert_with(|| node.name.trim().to_owned());
+                }
+            }
+        }
+    }
+    let mut image_number = 0;
+    let mut video_number = 0;
+    let mut assets = document
+        .raw_assets
+        .iter()
+        .filter_map(|(id, bytes)| {
+            let metadata = document.doc.asset_library.get(id);
+            let kind = metadata
+                .map(|asset| asset.kind)
+                .or_else(|| crate::generation_media::project_asset_kind(bytes))?;
+            if !crate::generation_media::project_asset_can_place(bytes, kind) {
+                return None;
+            }
+            let kind = match kind {
+                fanta_doc::ProjectAssetKind::Image => DesignMediaKind::Image,
+                fanta_doc::ProjectAssetKind::Video if cfg!(target_os = "macos") => {
+                    DesignMediaKind::Video
+                }
+                _ => return None,
+            };
+            let number = match kind {
+                DesignMediaKind::Image => {
+                    image_number += 1;
+                    image_number
+                }
+                DesignMediaKind::Video => {
+                    video_number += 1;
+                    video_number
+                }
+            };
+            let label = metadata
+                .map(|asset| asset.name.trim())
+                .filter(|name| !name.is_empty())
+                .or_else(|| scene_names.get(id).map(String::as_str))
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("{} {number}", kind.label()));
+            let mut source = DesignPaintSource::new(id.to_string(), label);
+            source.reference = Some(id.to_string().into());
+            Some(DesignMediaPaintAsset::new(source, kind))
+        })
+        .collect::<Vec<_>>();
+    assets.sort_by(|left, right| left.source.name.as_ref().cmp(right.source.name.as_ref()));
+    assets
+}
+
+fn media_payload_kind(payload: &DesignPaintPayload) -> Option<DesignMediaKind> {
+    match payload {
+        DesignPaintPayload::Image(_) => Some(DesignMediaKind::Image),
+        DesignPaintPayload::Video(_) => Some(DesignMediaKind::Video),
+        _ => None,
+    }
+}
+
+/// Choosing a media kind precedes choosing its source. Keep that choice in
+/// the host until there is a real asset; the document never gets an invalid
+/// Image/Video fill, and the picker can offer both Upload and Assets.
+#[derive(Clone)]
+struct DesignMediaDraft {
+    document_id: fanta_doc::DocId,
+    node: NodeId,
+    is_stroke: bool,
+    index: usize,
+    baseline: Fill,
+    paint: DesignPaint,
+    edit_snapshot: Option<DesignPaint>,
+}
+
+impl DesignMediaDraft {
+    fn new(
+        doc: &Doc,
+        node: NodeId,
+        is_stroke: bool,
+        index: usize,
+        payload: DesignPaintPayload,
+    ) -> Option<Self> {
+        media_payload_kind(&payload)?;
+        let baseline = current_paint(doc, node, is_stroke, index)?.clone();
+        let snapshot = crate::properties_snapshot::paint_snapshot(&baseline, None);
+        let mut paint = design_paint(
+            node,
+            if is_stroke { "stroke" } else { "fill" },
+            index,
+            &snapshot,
+            Some(&baseline),
+        );
+        if !paint.apply_edit(&fanta_gpui::design::DesignPaintEdit {
+            property: DesignPaintProperty::Payload,
+            value: DesignPaintValue::Payload(payload),
+        }) {
+            return None;
+        }
+        Some(Self {
+            document_id: doc.id,
+            node,
+            is_stroke,
+            index,
+            baseline,
+            paint,
+            edit_snapshot: None,
+        })
+    }
+
+    fn matches(&self, doc: &Doc, node: NodeId, is_stroke: bool, index: usize) -> bool {
+        self.document_id == doc.id
+            && self.node == node
+            && self.is_stroke == is_stroke
+            && self.index == index
+            && current_paint(doc, node, is_stroke, index) == Some(&self.baseline)
+    }
+
+    fn inspection_context(
+        &self,
+        context: &fanta_gpui::design::DesignPanelInspectionContext,
+    ) -> Option<fanta_gpui::design::DesignPanelInspectionContext> {
+        let DesignPanelSelection::Single(node) = context.selection() else {
+            return None;
+        };
+        if node_id(&node.id) != Some(self.node) {
+            return None;
+        }
+        let mut node = node.clone();
+        let paint = if self.is_stroke {
+            node.stroke.as_mut()?.paints.get_mut(self.index)?
+        } else {
+            node.fills.get_mut(self.index)?
+        };
+        *paint = self.paint.clone();
+        fanta_gpui::design::DesignPanelInspectionContext::try_new(
+            DesignPanelSelection::Single(node),
+            context.parent_layout(),
+            context.permissions(),
+            context.edit_mode(),
+        )
+        .ok()
+    }
+
+    fn edit(&mut self, edit: &fanta_gpui::design::DesignPaintEdit, phase: DesignPanelEditPhase) {
+        match phase {
+            DesignPanelEditPhase::Begin => self.edit_snapshot = Some(self.paint.clone()),
+            DesignPanelEditPhase::Preview | DesignPanelEditPhase::Commit => {
+                self.paint.apply_edit(edit);
+                if phase == DesignPanelEditPhase::Commit {
+                    self.edit_snapshot = None;
+                }
+            }
+            DesignPanelEditPhase::Cancel => {
+                if let Some(paint) = self.edit_snapshot.take() {
+                    self.paint = paint;
+                }
+            }
+        }
+    }
+}
+
+fn media_paint_capabilities(paint: &DesignPaint) -> DesignMediaPaintCapabilities {
+    let mut capabilities = DesignMediaPaintCapabilities::editor()
+        .with_source_actions(true, false, false)
+        .with_crop_rotation(false);
+    capabilities.can_edit_properties = match &paint.payload {
+        DesignPaintPayload::Image(image) => !image.source.id.is_empty(),
+        DesignPaintPayload::Video(video) => !video.source.id.is_empty(),
+        _ => false,
+    };
+    capabilities
+}
+
 fn media_paint_view_data(
     context: &fanta_gpui::design::DesignPanelInspectionContext,
     crop_session: Option<&DesignCropSession>,
@@ -745,9 +940,6 @@ fn media_paint_view_data(
     let DesignPanelSelection::Single(node) = context.selection() else {
         return DesignMediaPaintViewData::default();
     };
-    let capabilities = DesignMediaPaintCapabilities::editor()
-        .with_source_actions(true, false, false)
-        .with_crop_rotation(false);
     let fills = node.fills.iter().enumerate().filter_map(|(index, paint)| {
         matches!(
             paint.payload,
@@ -756,8 +948,10 @@ fn media_paint_view_data(
         .then(|| {
             let mut view =
                 DesignMediaPaintView::new(DesignPanelCollection::Fill, paint.id.clone(), index)
-                    .with_capabilities(capabilities);
-            if let DesignPaintPayload::Video(video) = &paint.payload {
+                    .with_capabilities(media_paint_capabilities(paint));
+            if let DesignPaintPayload::Video(video) = &paint.payload
+                && !video.source.id.is_empty()
+            {
                 view = view.with_video_preview(
                     video_previews
                         .get(video.source.id.as_ref())
@@ -791,8 +985,10 @@ fn media_paint_view_data(
                     paint.id.clone(),
                     index,
                 )
-                .with_capabilities(capabilities);
-                if let DesignPaintPayload::Video(video) = &paint.payload {
+                .with_capabilities(media_paint_capabilities(paint));
+                if let DesignPaintPayload::Video(video) = &paint.payload
+                    && !video.source.id.is_empty()
+                {
                     view = view.with_video_preview(
                         video_previews
                             .get(video.source.id.as_ref())
@@ -1889,6 +2085,8 @@ pub(crate) struct DesignAdapter {
     pub(crate) last_echo: Option<DesignEchoKey>,
     pub(crate) session: Option<DesignEditSession>,
     crop_session: Option<DesignCropSession>,
+    media_draft: Option<DesignMediaDraft>,
+    media_draft_epoch: u64,
     font_catalog: DesignFontViewData,
     font_catalog_dirty: bool,
     export_configurations: Vec<DesignExportConfiguration>,
@@ -1968,6 +2166,8 @@ impl DesignAdapter {
             last_echo: None,
             session: None,
             crop_session: None,
+            media_draft: None,
+            media_draft_epoch: 0,
             font_catalog,
             font_catalog_dirty: true,
             export_configurations: vec![DesignExportConfiguration::new(
@@ -2097,8 +2297,24 @@ impl FigView {
                 .gpui_design
                 .as_ref()
                 .and_then(|adapter| adapter.panel.read(cx).page_view_data().cloned());
-            let view_data =
+            let mut view_data =
                 build_design_view_data(document, &selection, page_index, editable, previous_page);
+            if let Some(adapter) = self.gpui_design.as_mut()
+                && let Some(draft) = &adapter.media_draft
+            {
+                if editable
+                    && selection.as_slice() == [draft.node]
+                    && draft.matches(doc, draft.node, draft.is_stroke, draft.index)
+                {
+                    if let Some(context) = draft.inspection_context(&view_data.inspection_context) {
+                        view_data.inspection_context = context;
+                    }
+                } else {
+                    adapter.media_draft = None;
+                    adapter.media_draft_epoch = adapter.media_draft_epoch.wrapping_add(1);
+                }
+            }
+            let media_assets = media_assets_for_document(document);
             let pattern_sources = selection
                 .first()
                 .filter(|_| selection.len() == 1)
@@ -2109,9 +2325,18 @@ impl FigView {
                         .collect()
                 })
                 .unwrap_or_default();
-            Some((key, view_data, selection, text_selection, pattern_sources))
+            Some((
+                key,
+                view_data,
+                selection,
+                text_selection,
+                pattern_sources,
+                media_assets,
+            ))
         };
-        let Some((key, mut view_data, selection, text_selection, pattern_sources)) = built else {
+        let Some((key, mut view_data, selection, text_selection, pattern_sources, media_assets)) =
+            built
+        else {
             return;
         };
         // Granular, not `set_view_data` — see this method's docs. Page first,
@@ -2141,7 +2366,8 @@ impl FigView {
                 .and_then(|adapter| adapter.crop_session.as_ref()),
             pattern_sources,
             &video_previews,
-        );
+        )
+        .with_assets(media_assets);
         let inspection_context = view_data.inspection_context;
         let property_states = view_data.property_states;
         let Some(adapter) = self.gpui_design.as_mut() else {
@@ -2620,12 +2846,25 @@ impl FigView {
                     DesignPanelCollection::Stroke => true,
                     _ => return,
                 };
-                let is_video = self.item().read(cx).document().is_some_and(|document| {
-                    matches!(
-                        current_paint(&document.doc, id, is_stroke, *index),
-                        Some(Fill::Video { .. })
-                    )
-                });
+                let draft_kind = self
+                    .gpui_design
+                    .as_ref()
+                    .and_then(|adapter| adapter.media_draft.as_ref())
+                    .filter(|draft| {
+                        self.item().read(cx).document().is_some_and(|document| {
+                            draft.matches(&document.doc, id, is_stroke, *index)
+                        })
+                    })
+                    .and_then(|draft| media_payload_kind(&draft.paint.payload));
+                let is_video = match draft_kind {
+                    Some(kind) => kind == DesignMediaKind::Video,
+                    None => self.item().read(cx).document().is_some_and(|document| {
+                        matches!(
+                            current_paint(&document.doc, id, is_stroke, *index),
+                            Some(Fill::Video { .. })
+                        )
+                    }),
+                };
                 if is_video {
                     self.handle_design_video_upload(
                         id,
@@ -3426,16 +3665,18 @@ impl FigView {
                     .iter()
                     .chain(header.overflow_controls.iter())
                     .any(|control| {
-                        control.command().as_ref() == Some(command)
-                            || control
-                                .menu_items
-                                .iter()
-                                .any(|item| &item.command == command)
+                        control.enabled
+                            && (control.command().as_ref() == Some(command)
+                                || control
+                                    .menu_items
+                                    .iter()
+                                    .any(|item| item.enabled && &item.command == command))
                     })
-                    || header
-                        .title_menu
-                        .as_ref()
-                        .is_some_and(|menu| menu.items.iter().any(|item| &item.command == command))
+                    || header.title_menu.as_ref().is_some_and(|menu| {
+                        menu.items
+                            .iter()
+                            .any(|item| item.enabled && &item.command == command)
+                    })
             })
         });
         if !supported {
@@ -3503,10 +3744,17 @@ impl FigView {
             }
             DesignSelectionHeaderCommand::UseAsMask
             | DesignSelectionHeaderCommand::Flatten
-            | DesignSelectionHeaderCommand::TitleMenuItem { .. } => {
+            | DesignSelectionHeaderCommand::TitleMenuItem { .. }
+            | DesignSelectionHeaderCommand::ChangeLayerType { .. } => {
                 let action = match command {
                     DesignSelectionHeaderCommand::UseAsMask => LayerAction::UseAsMask,
                     DesignSelectionHeaderCommand::Flatten => LayerAction::Flatten,
+                    DesignSelectionHeaderCommand::ChangeLayerType {
+                        kind: DesignPanelNodeKind::Frame,
+                    } => LayerAction::ConvertToFrame,
+                    DesignSelectionHeaderCommand::ChangeLayerType {
+                        kind: DesignPanelNodeKind::Section,
+                    } => LayerAction::ConvertToSection,
                     DesignSelectionHeaderCommand::TitleMenuItem { item_id }
                         if item_id.as_ref() == "frame" =>
                     {
@@ -3898,6 +4146,66 @@ impl FigView {
         }
     }
 
+    fn live_media_upload_draft(
+        &self,
+        id: NodeId,
+        is_stroke: bool,
+        index: usize,
+        epoch: u64,
+        cx: &gpui::App,
+    ) -> anyhow::Result<Option<DesignPaint>> {
+        let adapter = self
+            .gpui_design
+            .as_ref()
+            .context("The media inspector is no longer available")?;
+        anyhow::ensure!(
+            adapter.media_draft_epoch == epoch,
+            "The media source choice changed while uploading"
+        );
+        let document = self
+            .item()
+            .read(cx)
+            .document()
+            .context("The document is no longer available")?;
+        anyhow::ensure!(
+            self.is_editable(cx)
+                && document.doc.selection.iter().copied().eq([id])
+                && crate::layer_context_ops::editable(&document.doc, id),
+            "The media selection is no longer editable"
+        );
+        match &adapter.media_draft {
+            Some(draft) => {
+                anyhow::ensure!(
+                    draft.matches(&document.doc, id, is_stroke, index),
+                    "The media paint changed while uploading"
+                );
+                Ok(Some(draft.paint.clone()))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn finish_media_upload_draft(
+        &mut self,
+        id: NodeId,
+        is_stroke: bool,
+        index: usize,
+        epoch: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(adapter) = self.gpui_design.as_mut()
+            && adapter.media_draft_epoch == epoch
+            && adapter.media_draft.as_ref().is_some_and(|draft| {
+                draft.node == id && draft.is_stroke == is_stroke && draft.index == index
+            })
+        {
+            adapter.media_draft = None;
+            adapter.media_draft_epoch = adapter.media_draft_epoch.wrapping_add(1);
+            adapter.last_echo = None;
+            self.refresh_gpui_design(cx);
+        }
+    }
+
     fn handle_design_image_upload(
         &mut self,
         id: NodeId,
@@ -3908,6 +4216,21 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_editable(cx)
+            || !self.item().read(cx).document().is_some_and(|document| {
+                document.doc.selection.iter().copied().eq([id])
+                    && crate::layer_context_ops::editable(&document.doc, id)
+            })
+        {
+            return;
+        }
+        let Some(epoch) = self
+            .gpui_design
+            .as_ref()
+            .map(|adapter| adapter.media_draft_epoch)
+        else {
+            return;
+        };
         self.finish_document_edits_for_external_change(cx);
         let item = self.item().clone();
         let expected = item.read(cx).document().and_then(|document| {
@@ -3919,8 +4242,22 @@ impl FigView {
         let Some((document_id, expected_fill)) = expected else {
             return;
         };
+        let pending_paint = self
+            .gpui_design
+            .as_ref()
+            .and_then(|adapter| adapter.media_draft.as_ref())
+            .filter(|draft| {
+                draft.document_id == document_id
+                    && draft.node == id
+                    && draft.is_stroke == is_stroke
+                    && draft.index == index
+                    && draft.baseline == expected_fill
+                    && media_payload_kind(&draft.paint.payload) == Some(DesignMediaKind::Image)
+            })
+            .map(|draft| draft.paint.clone());
         if let Some(source_id) = expected_source_id
             && !matches!(&expected_fill, Fill::Image { asset, .. } if asset.to_string() == source_id.as_ref())
+            && !(source_id.is_empty() && pending_paint.is_some())
         {
             return;
         }
@@ -3963,6 +4300,9 @@ impl FigView {
                         PreparedImage::new(bytes)
                     })
                     .await?;
+                let pending_paint = this.update(cx, |view, cx| {
+                    view.live_media_upload_draft(id, is_stroke, index, epoch, cx)
+                })??;
                 item.update(cx, |item, cx| {
                     anyhow::ensure!(item.is_editable(), "this document is read-only");
                     item.with_document(cx, |document| {
@@ -3976,6 +4316,7 @@ impl FigView {
                                 is_stroke,
                                 index,
                                 &expected_fill,
+                                pending_paint.as_ref(),
                                 prepared,
                             )
                         })();
@@ -3987,7 +4328,12 @@ impl FigView {
                         (result, change)
                     })
                     .context("the document is closed")??;
-                    Ok(())
+                    Ok::<(), anyhow::Error>(())
+                })?;
+                // Refresh only after the document entity update has returned.
+                // A successful identical upload accepts its source too.
+                this.update(cx, |view, cx| {
+                    view.finish_media_upload_draft(id, is_stroke, index, epoch, cx)
                 })?;
                 Ok(())
             }
@@ -4012,6 +4358,21 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.is_editable(cx)
+            || !self.item().read(cx).document().is_some_and(|document| {
+                document.doc.selection.iter().copied().eq([id])
+                    && crate::layer_context_ops::editable(&document.doc, id)
+            })
+        {
+            return;
+        }
+        let Some(epoch) = self
+            .gpui_design
+            .as_ref()
+            .map(|adapter| adapter.media_draft_epoch)
+        else {
+            return;
+        };
         self.finish_document_edits_for_external_change(cx);
         let item = self.item().clone();
         let expected = item.read(cx).document().and_then(|document| {
@@ -4023,8 +4384,22 @@ impl FigView {
         let Some((document_id, expected_fill)) = expected else {
             return;
         };
+        let pending_paint = self
+            .gpui_design
+            .as_ref()
+            .and_then(|adapter| adapter.media_draft.as_ref())
+            .filter(|draft| {
+                draft.document_id == document_id
+                    && draft.node == id
+                    && draft.is_stroke == is_stroke
+                    && draft.index == index
+                    && draft.baseline == expected_fill
+                    && media_payload_kind(&draft.paint.payload) == Some(DesignMediaKind::Video)
+            })
+            .map(|draft| draft.paint.clone());
         if let Some(source_id) = expected_source_id
             && !matches!(&expected_fill, Fill::Video { video, .. } if video.asset.to_string() == source_id.as_ref())
+            && !(source_id.is_empty() && pending_paint.is_some())
         {
             return;
         }
@@ -4065,6 +4440,9 @@ impl FigView {
                         crate::generation_media::prepare_video(Arc::from(bytes)).await
                     })
                     .await?;
+                let pending_paint = this.update(cx, |view, cx| {
+                    view.live_media_upload_draft(id, is_stroke, index, epoch, cx)
+                })??;
                 item.update(cx, |item, cx| {
                     anyhow::ensure!(item.is_editable(), "this document is read-only");
                     item.with_document(cx, |document| {
@@ -4075,6 +4453,7 @@ impl FigView {
                             index,
                             document_id,
                             &expected_fill,
+                            pending_paint.as_ref(),
                             prepared,
                         );
                         let change = if result.as_ref().is_ok_and(|changed| *changed) {
@@ -4085,7 +4464,12 @@ impl FigView {
                         (result, change)
                     })
                     .context("the document is closed")??;
-                    Ok(())
+                    Ok::<(), anyhow::Error>(())
+                })?;
+                // Refresh only after the document entity update has returned.
+                // A successful identical upload accepts its source too.
+                this.update(cx, |view, cx| {
+                    view.finish_media_upload_draft(id, is_stroke, index, epoch, cx)
                 })?;
                 Ok(())
             }
@@ -4115,25 +4499,139 @@ impl FigView {
             DesignPanelCollection::Stroke => true,
             _ => return,
         };
-        if phase == DesignPanelEditPhase::Commit
-            && let (
-                DesignPaintProperty::Payload,
-                DesignPaintValue::Payload(DesignPaintPayload::Image(image)),
-            ) = (&edit.property, &edit.value)
-            && image.source.id.is_empty()
+        if !self.is_editable(cx)
+            || !self.item().read(cx).document().is_some_and(|document| {
+                document.doc.selection.iter().copied().eq([id])
+                    && crate::layer_context_ops::editable(&document.doc, id)
+            })
         {
-            self.handle_design_image_upload(id, is_stroke, index, None, None, window, cx);
             return;
         }
-        if phase == DesignPanelEditPhase::Commit
-            && let (
+        let pending_payload = match (&edit.property, &edit.value, phase) {
+            (
                 DesignPaintProperty::Payload,
-                DesignPaintValue::Payload(DesignPaintPayload::Video(video)),
-            ) = (&edit.property, &edit.value)
-            && video.source.id.is_empty()
-        {
-            self.handle_design_video_upload(id, is_stroke, index, None, None, window, cx);
+                DesignPaintValue::Payload(payload),
+                DesignPanelEditPhase::Commit,
+            ) if matches!(payload, DesignPaintPayload::Image(image) if image.source.id.is_empty())
+                || matches!(payload, DesignPaintPayload::Video(video) if video.source.id.is_empty()) =>
+            {
+                Some(payload.clone())
+            }
+            _ => None,
+        };
+        if let Some(payload) = pending_payload {
+            self.finish_document_edits_for_external_change(cx);
+            let mut draft = self.item().read(cx).document().and_then(|document| {
+                DesignMediaDraft::new(&document.doc, id, is_stroke, index, payload)
+            });
+            if let Some(previous) = self
+                .gpui_design
+                .as_ref()
+                .and_then(|adapter| adapter.media_draft.as_ref())
+                && let Some(draft) = &mut draft
+                && previous.document_id == draft.document_id
+                && previous.node == draft.node
+                && previous.is_stroke == draft.is_stroke
+                && previous.index == draft.index
+                && previous.baseline == draft.baseline
+            {
+                draft.paint.opacity = previous.paint.opacity;
+                draft.paint.blend_mode = previous.paint.blend_mode;
+            }
+            if let Some(adapter) = self.gpui_design.as_mut() {
+                adapter.media_draft_epoch = adapter.media_draft_epoch.wrapping_add(1);
+                adapter.media_draft = draft;
+                adapter.last_echo = None;
+            }
+            self.refresh_gpui_design(cx);
             return;
+        }
+        let pending = self
+            .gpui_design
+            .as_ref()
+            .and_then(|adapter| adapter.media_draft.as_ref())
+            .filter(|draft| {
+                self.item()
+                    .read(cx)
+                    .document()
+                    .is_some_and(|document| draft.matches(&document.doc, id, is_stroke, index))
+            })
+            .cloned();
+        if let Some(mut draft) = pending {
+            if let (DesignPaintProperty::Source, DesignPaintValue::Source(source)) =
+                (&edit.property, &edit.value)
+            {
+                if phase != DesignPanelEditPhase::Commit {
+                    return;
+                }
+                let canonical = self.item().read(cx).document().and_then(|document| {
+                    media_assets_for_document(document)
+                        .into_iter()
+                        .find(|asset| {
+                            asset.source.id == source.id
+                                && Some(asset.kind) == media_payload_kind(&draft.paint.payload)
+                        })
+                });
+                let Some(asset) = canonical else {
+                    return;
+                };
+                draft
+                    .paint
+                    .apply_edit(&fanta_gpui::design::DesignPaintEdit {
+                        property: DesignPaintProperty::Source,
+                        value: DesignPaintValue::Source(asset.source),
+                    });
+                self.finish_document_edits_for_external_change(cx);
+                let operations = self.design_ops(cx, |doc| {
+                    paint_edit_operations(
+                        doc,
+                        id,
+                        is_stroke,
+                        index,
+                        &PaintEditValue::MediaPaint(draft.paint),
+                    )
+                });
+                if operations.is_empty() || self.design_apply_ops(operations, cx) {
+                    if let Some(adapter) = self.gpui_design.as_mut() {
+                        adapter.media_draft = None;
+                        adapter.media_draft_epoch = adapter.media_draft_epoch.wrapping_add(1);
+                        adapter.last_echo = None;
+                    }
+                    self.refresh_gpui_design(cx);
+                }
+                return;
+            } else if edit.property != DesignPaintProperty::Payload {
+                draft.edit(edit, phase);
+                if let Some(adapter) = self.gpui_design.as_mut() {
+                    adapter.media_draft = Some(draft);
+                    adapter.last_echo = None;
+                }
+                self.refresh_gpui_design(cx);
+                return;
+            } else if let Some(adapter) = self.gpui_design.as_mut() {
+                adapter.media_draft = None;
+                adapter.media_draft_epoch = adapter.media_draft_epoch.wrapping_add(1);
+                adapter.last_echo = None;
+            }
+        }
+        if let (DesignPaintProperty::Source, DesignPaintValue::Source(source)) =
+            (&edit.property, &edit.value)
+        {
+            let supported = self.item().read(cx).document().is_some_and(|document| {
+                let expected_kind = current_paint(&document.doc, id, is_stroke, index).and_then(
+                    |fill| match fill {
+                        Fill::Image { .. } => Some(DesignMediaKind::Image),
+                        Fill::Video { .. } => Some(DesignMediaKind::Video),
+                        _ => None,
+                    },
+                );
+                media_assets_for_document(document)
+                    .iter()
+                    .any(|asset| asset.source.id == source.id && Some(asset.kind) == expected_kind)
+            });
+            if !supported {
+                return;
+            }
         }
         let mut value = match (&edit.property, &edit.value) {
             (DesignPaintProperty::Color, DesignPaintValue::Color(color)) => {
@@ -4179,7 +4677,8 @@ impl FigView {
                 PaintEditValue::GradientStopRemove(*index)
             }
             (
-                DesignPaintProperty::PatternSourceNode
+                DesignPaintProperty::Source
+                | DesignPaintProperty::PatternSourceNode
                 | DesignPaintProperty::PatternTileType
                 | DesignPaintProperty::PatternScalingFactor
                 | DesignPaintProperty::PatternSpacing
@@ -4774,6 +5273,7 @@ enum PaintEditValue {
     BlendMode(BlendMode),
     Payload(DesignPaintPayload),
     ModelEdit(fanta_gpui::design::DesignPaintEdit),
+    MediaPaint(DesignPaint),
     GradientKind(DesignPaintKind),
     GradientTransform(DesignPaintTransform),
     GradientStopColor(usize, FantaColor),
@@ -5062,6 +5562,7 @@ fn replace_image_paint_with_asset(
     is_stroke: bool,
     index: usize,
     expected_fill: &Fill,
+    pending_paint: Option<&DesignPaint>,
     prepared: PreparedImage,
 ) -> anyhow::Result<bool> {
     anyhow::ensure!(
@@ -5084,6 +5585,17 @@ fn replace_image_paint_with_asset(
     };
     if let Fill::Image { asset: source, .. } = &mut new_fill {
         *source = asset;
+    }
+    if let Some(paint) = pending_paint {
+        match uploaded_media_fill(paint, &new_fill) {
+            Ok(fill) => new_fill = fill,
+            Err(error) => {
+                if inserted {
+                    assets.remove(asset);
+                }
+                return Err(error);
+            }
+        }
     }
     let operations = replace_data_operation(doc, id, |data| {
         if let Some(paint) = crate::properties_ops::paint_slot_mut(data, index, is_stroke) {
@@ -5113,6 +5625,7 @@ fn replace_video_paint_with_asset(
     index: usize,
     document_id: fanta_doc::DocId,
     expected_fill: &Fill,
+    pending_paint: Option<&DesignPaint>,
     prepared: crate::generation_media::PreparedVideo,
 ) -> anyhow::Result<bool> {
     anyhow::ensure!(document.doc.id == document_id, "the document changed");
@@ -5132,15 +5645,6 @@ fn replace_video_paint_with_asset(
             "video asset hash collision"
         );
     }
-    let poster_asset = match poster {
-        Some(poster) => Some(
-            document
-                .doc_and_assets()
-                .1
-                .add_image_tracked(poster.png.to_vec())?,
-        ),
-        None => None,
-    };
     let mut new_fill = match expected_fill {
         Fill::Video { .. } => expected_fill.clone(),
         other => Fill::Video {
@@ -5156,6 +5660,21 @@ fn replace_video_paint_with_asset(
             opacity: paint_opacity_fraction(other),
             blend: crate::properties_ops::paint_blend(other),
         },
+    };
+    if let Fill::Video { video, .. } = &mut new_fill {
+        video.asset = asset;
+    }
+    if let Some(paint) = pending_paint {
+        new_fill = uploaded_media_fill(paint, &new_fill)?;
+    }
+    let poster_asset = match poster {
+        Some(poster) => Some(
+            document
+                .doc_and_assets()
+                .1
+                .add_image_tracked(poster.png.to_vec())?,
+        ),
+        None => None,
     };
     if let Fill::Video { video, .. } = &mut new_fill {
         video.asset = asset;
@@ -5265,6 +5784,39 @@ fn crop_transform_for_state(
     transform.tx = (center_x - transform.m11 * 0.5).clamp(0.0, 1.0 - transform.m11);
     transform.ty = (center_y - transform.m22 * 0.5).clamp(0.0, 1.0 - transform.m22);
     Some(transform)
+}
+
+fn uploaded_media_fill(draft: &DesignPaint, uploaded: &Fill) -> anyhow::Result<Fill> {
+    let asset = match uploaded {
+        Fill::Image { asset, .. } => *asset,
+        Fill::Video { video, .. } => video.asset,
+        _ => anyhow::bail!("The uploaded media fill is no longer available"),
+    };
+    let mut paint = draft.clone();
+    paint.apply_edit(&fanta_gpui::design::DesignPaintEdit {
+        property: DesignPaintProperty::Source,
+        value: DesignPaintValue::Source(DesignPaintSource::new(
+            asset.to_string(),
+            "Uploaded media",
+        )),
+    });
+    media_fill_from_paint(&paint, Some(uploaded)).context("The pending media settings are invalid")
+}
+
+fn media_fill_from_paint(paint: &DesignPaint, previous: Option<&Fill>) -> Option<Fill> {
+    let blend = engine_blend_mode(paint.blend_mode)?;
+    let opacity = (paint.opacity / 100.).clamp(0., 1.);
+    match &paint.payload {
+        DesignPaintPayload::Image(image) => image_fill_from_design(image, opacity, blend),
+        DesignPaintPayload::Video(video) => {
+            let previous = previous.and_then(|fill| match fill {
+                Fill::Video { video, .. } => Some(video.as_ref()),
+                _ => None,
+            });
+            video_fill_from_design(video, previous, opacity, blend)
+        }
+        _ => None,
+    }
 }
 
 fn paint_edit_operations(
@@ -5464,6 +6016,17 @@ fn paint_edit_operations(
             }
             _ => Vec::new(),
         },
+        PaintEditValue::MediaPaint(paint) => {
+            let Some(fill) = media_fill_from_paint(paint, current_paint(doc, id, is_stroke, index))
+            else {
+                return Vec::new();
+            };
+            replace_data_operation(doc, id, |data| {
+                if let Some(paint) = crate::properties_ops::paint_slot_mut(data, index, is_stroke) {
+                    *paint = fill.clone();
+                }
+            })
+        }
         PaintEditValue::ModelEdit(edit) => {
             let Some(fill) = current_paint(doc, id, is_stroke, index) else {
                 return Vec::new();
@@ -6947,6 +7510,7 @@ mod tests {
                 false,
                 0,
                 &before,
+                None,
                 prepared,
             )
             .expect("apply image fill")
@@ -7021,6 +7585,7 @@ mod tests {
                 0,
                 document_id,
                 &before,
+                None,
                 prepared,
             )
             .expect("apply video fill")
@@ -7676,6 +8241,671 @@ mod tests {
         });
         let cx = cx.clone();
         (view, panel, cx)
+    }
+
+    fn inspector_test_png() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([10, 20, 30, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .expect("encode image");
+        bytes
+    }
+
+    fn emit_inspector_paint(
+        panel: &Entity<DesignPanel>,
+        cx: &mut VisualTestContext,
+        node: NodeId,
+        property: DesignPaintProperty,
+        value: DesignPaintValue,
+        phase: DesignPanelEditPhase,
+    ) {
+        emit_inspector_paint_in_collection(
+            panel,
+            cx,
+            node,
+            DesignPanelCollection::Fill,
+            property,
+            value,
+            phase,
+        );
+    }
+
+    fn emit_inspector_paint_in_collection(
+        panel: &Entity<DesignPanel>,
+        cx: &mut VisualTestContext,
+        node: NodeId,
+        collection: DesignPanelCollection,
+        property: DesignPaintProperty,
+        value: DesignPaintValue,
+        phase: DesignPanelEditPhase,
+    ) {
+        let collection_id = match collection {
+            DesignPanelCollection::Fill => "fill",
+            DesignPanelCollection::Stroke => "stroke",
+            _ => panic!("paint tests require Fill or Stroke"),
+        };
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::PaintEditRequested {
+                node_id: node.to_string().into(),
+                collection,
+                target: DesignPaintTarget::WholeLayer,
+                paint_id: format!("{node}-{collection_id}-0").into(),
+                index: 0,
+                edit: DesignPaintEdit { property, value },
+                phase,
+            })
+        });
+        cx.run_until_parked();
+    }
+
+    #[test]
+    fn inspector_media_catalog_uses_metadata_scene_names_and_readable_fallbacks() {
+        let (mut doc, page, _) = doc_with_rect();
+        let metadata_asset = AssetId::new();
+        let scene_asset = AssetId::new();
+        let unnamed_asset = AssetId::new();
+        doc.asset_library.insert(
+            metadata_asset,
+            fanta_doc::ProjectAsset {
+                name: "  cover.png  ".into(),
+                kind: fanta_doc::ProjectAssetKind::Image,
+            },
+        );
+        doc.asset_library.insert(
+            unnamed_asset,
+            fanta_doc::ProjectAsset {
+                name: " ".into(),
+                kind: fanta_doc::ProjectAssetKind::Image,
+            },
+        );
+        for (asset, name) in [
+            (metadata_asset, "Different scene name"),
+            (scene_asset, "hero-photo.png"),
+        ] {
+            let mut node = CanvasNode::new(NodeData::Bitmap(fanta_doc::BitmapNode {
+                asset,
+                natural_size: [2, 2],
+                local_size: [2., 2.],
+                crop: None,
+                fit: fanta_doc::ImageFitMode::Fill,
+                tint: None,
+            }));
+            node.name = name.to_owned();
+            node.parent = Some(page);
+            doc.scene.insert(node).expect("insert image");
+        }
+        let document = FigDocument::from_doc(
+            doc,
+            [metadata_asset, scene_asset, unnamed_asset]
+                .into_iter()
+                .map(|asset| (asset, inspector_test_png()))
+                .collect(),
+        );
+        let catalog = media_assets_for_document(&document);
+        assert_eq!(catalog.len(), 3);
+        for (asset, name) in [
+            (metadata_asset, "cover.png"),
+            (scene_asset, "hero-photo.png"),
+        ] {
+            let source = &catalog
+                .iter()
+                .find(|entry| entry.source.id == asset.to_string())
+                .expect("named asset remains reusable")
+                .source;
+            assert_eq!(source.name, name);
+            assert_eq!(
+                source.reference.as_deref(),
+                Some(asset.to_string().as_str())
+            );
+        }
+        let fallback = &catalog
+            .iter()
+            .find(|entry| entry.source.id == unnamed_asset.to_string())
+            .expect("unnamed asset remains reusable")
+            .source;
+        assert!(
+            fallback
+                .name
+                .strip_prefix("Image ")
+                .is_some_and(|number| number.parse::<usize>().is_ok()),
+            "unnamed images use a readable numbered label"
+        );
+        assert!(!fallback.name.contains(&unnamed_asset.to_string()));
+    }
+
+    #[gpui::test]
+    async fn inspector_pending_image_source_reuse_supports_stroke_and_single_undo(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut doc, _, rect) = doc_with_rect();
+        let NodeData::Vector(vector) = &mut doc.scene.get_mut(rect).expect("rectangle").data else {
+            panic!("rectangle is a vector")
+        };
+        vector
+            .strokes
+            .push(fanta_doc::Stroke::solid(FantaColor::BLACK, 2.));
+        let baseline_stroke = current_paint(&doc, rect, true, 0).expect("stroke").clone();
+        let baseline_fill = current_paint(&doc, rect, false, 0).expect("fill").clone();
+        doc.selection.replace_with([rect]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        let asset = item.update(&mut cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let asset = document
+                    .doc_and_assets()
+                    .1
+                    .add_image_tracked(inspector_test_png())
+                    .expect("embed image")
+                    .0;
+                (asset, DocChange::Content)
+            })
+            .expect("ready document")
+        });
+        let cx = &mut cx;
+        emit_inspector_paint_in_collection(
+            &panel,
+            cx,
+            rect,
+            DesignPanelCollection::Stroke,
+            DesignPaintProperty::Payload,
+            DesignPaintValue::Payload(DesignPaint::image(Default::default()).payload),
+            DesignPanelEditPhase::Commit,
+        );
+        assert!(!cx.did_prompt_for_paths());
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("ready document").doc;
+            assert_eq!(current_paint(doc, rect, true, 0), Some(&baseline_stroke));
+            assert!(!doc.history.can_undo());
+        });
+        panel.read_with(cx, |panel, _| {
+            assert!(matches!(&panel.node().stroke.as_ref().expect("stroke").paints[0].payload, DesignPaintPayload::Image(image) if image.source.id.is_empty()));
+            assert!(panel.media_paint_view_data().assets.iter().any(|entry| entry.source.id == asset.to_string()));
+            assert!(panel.media_paint_view_data().paints.iter().any(|paint| paint.collection == DesignPanelCollection::Stroke && paint.capabilities.can_upload_source));
+        });
+        emit_inspector_paint_in_collection(
+            &panel,
+            cx,
+            rect,
+            DesignPanelCollection::Stroke,
+            DesignPaintProperty::Source,
+            DesignPaintValue::Source(DesignPaintSource::new(asset.to_string(), "Image 1")),
+            DesignPanelEditPhase::Commit,
+        );
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("ready document").doc;
+            assert!(matches!(current_paint(doc, rect, true, 0), Some(Fill::Image { asset: actual, .. }) if *actual == asset));
+            assert_eq!(current_paint(doc, rect, false, 0), Some(&baseline_fill));
+        });
+        assert!(
+            item.update(cx, |item, cx| item.undo(cx))
+                .expect("undo stroke source")
+        );
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("ready document").doc;
+            assert_eq!(current_paint(doc, rect, true, 0), Some(&baseline_stroke));
+            assert_eq!(current_paint(doc, rect, false, 0), Some(&baseline_fill));
+            assert!(!doc.history.can_undo());
+        });
+    }
+
+    #[gpui::test]
+    async fn inspector_media_choice_waits_for_source_and_reuse_is_one_undo_step(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut doc, _page, rect) = doc_with_rect();
+        let baseline = current_paint(&doc, rect, false, 0)
+            .expect("original fill")
+            .clone();
+        doc.selection.replace_with([rect]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        let asset = item.update(&mut cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let asset = document
+                    .doc_and_assets()
+                    .1
+                    .add_image_tracked(inspector_test_png())
+                    .expect("embed image")
+                    .0;
+                document.doc.asset_library.insert(
+                    asset,
+                    fanta_doc::ProjectAsset {
+                        name: "Existing photo".into(),
+                        kind: fanta_doc::ProjectAssetKind::Image,
+                    },
+                );
+                (asset, DocChange::Content)
+            })
+            .expect("ready document")
+        });
+        let cx = &mut cx;
+        emit_inspector_paint(
+            &panel,
+            cx,
+            rect,
+            DesignPaintProperty::Payload,
+            DesignPaintValue::Payload(DesignPaint::image(Default::default()).payload),
+            DesignPanelEditPhase::Commit,
+        );
+        assert!(
+            !cx.did_prompt_for_paths(),
+            "Choosing Image opens source tabs before asking for a file"
+        );
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("ready document").doc;
+            assert_eq!(current_paint(doc, rect, false, 0), Some(&baseline));
+            assert!(!doc.history.can_undo());
+        });
+        panel.read_with(cx, |panel, _| {
+            assert!(matches!(&panel.node().fills[0].payload, DesignPaintPayload::Image(image) if image.source.id.is_empty()));
+            assert!(panel.media_paint_view_data().assets.iter().any(|entry| entry.source.id == asset.to_string() && entry.source.name == "Existing photo"));
+            assert!(!panel.media_paint_view_data().paints[0].capabilities.can_edit_properties);
+        });
+        emit_inspector_paint(
+            &panel,
+            cx,
+            rect,
+            DesignPaintProperty::Opacity,
+            DesignPaintValue::Number(40.),
+            DesignPanelEditPhase::Begin,
+        );
+        emit_inspector_paint(
+            &panel,
+            cx,
+            rect,
+            DesignPaintProperty::Opacity,
+            DesignPaintValue::Number(40.),
+            DesignPanelEditPhase::Preview,
+        );
+        emit_inspector_paint(
+            &panel,
+            cx,
+            rect,
+            DesignPaintProperty::Opacity,
+            DesignPaintValue::Number(40.),
+            DesignPanelEditPhase::Cancel,
+        );
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.node().fills[0].opacity, 100.)
+        });
+        emit_inspector_paint(
+            &panel,
+            cx,
+            rect,
+            DesignPaintProperty::Opacity,
+            DesignPaintValue::Number(65.),
+            DesignPanelEditPhase::Commit,
+        );
+        emit_inspector_paint(
+            &panel,
+            cx,
+            rect,
+            DesignPaintProperty::Source,
+            DesignPaintValue::Source(DesignPaintSource::new(
+                AssetId::new().to_string(),
+                "Unknown",
+            )),
+            DesignPanelEditPhase::Commit,
+        );
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                current_paint(
+                    &item.document().expect("ready document").doc,
+                    rect,
+                    false,
+                    0
+                ),
+                Some(&baseline)
+            )
+        });
+        emit_inspector_paint(
+            &panel,
+            cx,
+            rect,
+            DesignPaintProperty::Source,
+            DesignPaintValue::Source(DesignPaintSource::new(asset.to_string(), "Existing photo")),
+            DesignPanelEditPhase::Commit,
+        );
+        item.read_with(cx, |item, _| assert!(matches!(current_paint(&item.document().expect("ready document").doc, rect, false, 0), Some(Fill::Image { asset: actual, opacity, .. }) if *actual == asset && (*opacity - 0.65).abs() < 1e-6)));
+        assert!(
+            item.update(cx, |item, cx| item.undo(cx))
+                .expect("undo reuse")
+        );
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("ready document").doc;
+            assert_eq!(current_paint(doc, rect, false, 0), Some(&baseline));
+            assert!(
+                !doc.history.can_undo(),
+                "Choosing the asset commits one final fill replacement"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn inspector_media_kind_switch_and_cancel_reject_stale_upload_choices(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut doc, _page, rect) = doc_with_rect();
+        doc.selection.replace_with([rect]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        emit_inspector_paint(
+            &panel,
+            cx,
+            rect,
+            DesignPaintProperty::Payload,
+            DesignPaintValue::Payload(DesignPaint::video(Default::default()).payload),
+            DesignPanelEditPhase::Commit,
+        );
+        let epoch = view.read_with(cx, |view, _| {
+            view.gpui_design
+                .as_ref()
+                .expect("adapter")
+                .media_draft_epoch
+        });
+        assert!(
+            !cx.did_prompt_for_paths(),
+            "Choosing Video must not open a file chooser"
+        );
+        panel.read_with(cx, |panel, _| {
+            assert!(
+                panel.media_paint_view_data().paints[0]
+                    .video_preview
+                    .is_none()
+            )
+        });
+        emit_inspector_paint(
+            &panel,
+            cx,
+            rect,
+            DesignPaintProperty::Opacity,
+            DesignPaintValue::Number(65.),
+            DesignPanelEditPhase::Commit,
+        );
+        emit_inspector_paint(
+            &panel,
+            cx,
+            rect,
+            DesignPaintProperty::Payload,
+            DesignPaintValue::Payload(DesignPaint::image(Default::default()).payload),
+            DesignPanelEditPhase::Commit,
+        );
+        view.read_with(cx, |view, cx| {
+            assert!(
+                view.live_media_upload_draft(rect, false, 0, epoch, cx)
+                    .is_err()
+            )
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.node().fills[0].opacity, 65.)
+        });
+        view.update_in(cx, |view, window, cx| {
+            view.handle_design_image_upload(rect, false, 0, Some("".into()), None, window, cx)
+        });
+        assert!(
+            cx.did_prompt_for_paths(),
+            "Only explicit Upload asks for a file"
+        );
+        cx.simulate_path_prompt_response(|_| None);
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| assert!(matches!(&panel.node().fills[0].payload, DesignPaintPayload::Image(image) if image.source.id.is_empty())));
+        let epoch = view.read_with(cx, |view, _| {
+            view.gpui_design
+                .as_ref()
+                .expect("adapter")
+                .media_draft_epoch
+        });
+        emit_inspector_paint(
+            &panel,
+            cx,
+            rect,
+            DesignPaintProperty::Payload,
+            DesignPaintValue::Payload(
+                DesignPaint::solid(DesignColor::rgb(0xe0, 0x30, 0x30)).payload,
+            ),
+            DesignPanelEditPhase::Commit,
+        );
+        view.read_with(cx, |view, cx| {
+            assert!(
+                view.live_media_upload_draft(rect, false, 0, epoch, cx)
+                    .is_err(),
+                "Abandoning the draft invalidates its upload"
+            )
+        });
+    }
+
+    #[gpui::test]
+    async fn inspector_identical_upload_accepts_pending_source_without_history(
+        cx: &mut TestAppContext,
+    ) {
+        let png = inspector_test_png();
+        let asset = fanta_format::asset_id_for_bytes(&png);
+        let (mut doc, _page, rect) = doc_with_rect();
+        let fill = image_fill_from_design(
+            &fanta_gpui::design::DesignImagePaint {
+                source: DesignPaintSource::new(asset.to_string(), "Existing image"),
+                placement: Default::default(),
+                filters: Default::default(),
+            },
+            1.,
+            BlendMode::Normal,
+        )
+        .expect("image fill");
+        let NodeData::Vector(vector) = &mut doc.scene.get_mut(rect).expect("rectangle").data else {
+            panic!("vector");
+        };
+        vector.fills[0] = fill.clone();
+        doc.selection.replace_with([rect]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        item.update(&mut cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document
+                    .doc_and_assets()
+                    .1
+                    .add_image_tracked(png.clone())
+                    .expect("embed image");
+                ((), DocChange::Content)
+            })
+        });
+        let directory = tempfile::tempdir().expect("image directory");
+        let path = directory.path().join("existing.png");
+        std::fs::write(&path, png).expect("write upload image");
+        let cx = &mut cx;
+        emit_inspector_paint(
+            &panel,
+            cx,
+            rect,
+            DesignPaintProperty::Payload,
+            DesignPaintValue::Payload(DesignPaint::video(Default::default()).payload),
+            DesignPanelEditPhase::Commit,
+        );
+        emit_inspector_paint(
+            &panel,
+            cx,
+            rect,
+            DesignPaintProperty::Payload,
+            DesignPaintValue::Payload(DesignPaint::image(Default::default()).payload),
+            DesignPanelEditPhase::Commit,
+        );
+        view.update_in(cx, |view, window, cx| {
+            view.handle_design_image_upload(rect, false, 0, Some("".into()), None, window, cx)
+        });
+        assert!(cx.did_prompt_for_paths());
+        cx.simulate_path_prompt_response(move |_| Some(vec![path]));
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.gpui_design
+                    .as_ref()
+                    .expect("adapter")
+                    .media_draft
+                    .is_none()
+            )
+        });
+        panel.read_with(cx, |panel, _| assert!(matches!(&panel.node().fills[0].payload, DesignPaintPayload::Image(image) if image.source.id == asset.to_string())));
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("ready document").doc;
+            assert_eq!(current_paint(doc, rect, false, 0), Some(&fill));
+            assert!(
+                !doc.history.can_undo(),
+                "A validated identical upload is a source acceptance, with no document edit"
+            );
+        });
+    }
+
+    #[test]
+    fn inspector_pending_image_upload_commits_settings_in_one_replacement() {
+        let (mut doc, _page, rect) = doc_with_rect();
+        let baseline = current_paint(&doc, rect, false, 0)
+            .expect("original fill")
+            .clone();
+        let mut draft = DesignMediaDraft::new(
+            &doc,
+            rect,
+            false,
+            0,
+            DesignPaint::image(Default::default()).payload,
+        )
+        .expect("pending image");
+        draft.paint.opacity = 65.;
+        draft.paint.blend_mode = DesignBlendMode::Multiply;
+        let DesignPaintPayload::Image(image) = &mut draft.paint.payload else {
+            panic!("image draft");
+        };
+        image.filters.contrast = 0.4;
+        let mut stores = crate::document::TestAssetStores::default();
+        assert!(
+            replace_image_paint_with_asset(
+                &mut doc,
+                &mut stores.stores(),
+                rect,
+                false,
+                0,
+                &baseline,
+                Some(&draft.paint),
+                PreparedImage::new(inspector_test_png()).expect("prepare upload")
+            )
+            .expect("apply upload")
+        );
+        assert!(
+            matches!(current_paint(&doc, rect, false, 0), Some(Fill::Image { opacity, blend: BlendMode::Multiply, adjust, .. }) if (*opacity - 0.65).abs() < 1e-6 && (adjust.contrast - 0.4).abs() < 1e-6)
+        );
+        assert!(doc.undo().expect("undo upload"));
+        assert_eq!(current_paint(&doc, rect, false, 0), Some(&baseline));
+        assert!(!doc.history.can_undo());
+    }
+
+    #[gpui::test]
+    async fn inspector_typed_layer_conversion_validates_current_target_and_undo(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut doc, page, _) = doc_with_rect();
+        let mut group = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        group.parent = Some(page);
+        let group_id = group.id;
+        doc.scene.insert(group).expect("insert group");
+        doc.selection.replace_with([group_id]);
+        let header =
+            selection_header_for_doc(&doc, &[group_id], Some(page), true).expect("group header");
+        assert!(
+            header
+                .title_menu
+                .expect("type menu")
+                .items
+                .iter()
+                .any(|item| item.command
+                    == DesignSelectionHeaderCommand::ChangeLayerType {
+                        kind: DesignPanelNodeKind::Frame
+                    })
+        );
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::SelectionHeaderCommandRequested {
+                target: DesignPanelTarget::Nodes {
+                    node_ids: vec![AssetId::new().to_string().into()],
+                },
+                command: DesignSelectionHeaderCommand::ChangeLayerType {
+                    kind: DesignPanelNodeKind::Frame,
+                },
+            })
+        });
+        cx.run_until_parked();
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        item.read_with(cx, |item, _| {
+            assert!(
+                !item
+                    .document()
+                    .expect("ready document")
+                    .doc
+                    .history
+                    .can_undo()
+            )
+        });
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::SelectionHeaderCommandRequested {
+                target: DesignPanelTarget::Nodes {
+                    node_ids: vec![group_id.to_string().into()],
+                },
+                command: DesignSelectionHeaderCommand::ChangeLayerType {
+                    kind: DesignPanelNodeKind::Frame,
+                },
+            })
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| assert!(matches!(&item.document().expect("ready document").doc.scene.get(group_id).expect("group").data, NodeData::Group(group) if group.clip_size.is_some())));
+        assert!(
+            item.update(cx, |item, cx| item.undo(cx))
+                .expect("undo conversion")
+        );
+        item.read_with(cx, |item, _| assert!(matches!(&item.document().expect("ready document").doc.scene.get(group_id).expect("group").data, NodeData::Group(group) if group.clip_size.is_none())));
+    }
+
+    #[gpui::test]
+    async fn inspector_header_play_only_starts_in_prototype_and_works_collapsed(
+        cx: &mut TestAppContext,
+    ) {
+        use fanta_gpui::properties_inspector::{PropertiesInspectorAction, PropertiesInspectorTab};
+        let (mut doc, page, _) = doc_with_rect();
+        let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([320., 200.]),
+            ..Default::default()
+        }));
+        frame.parent = Some(page);
+        doc.scene.insert(frame).expect("insert prototype frame");
+        let (view, _, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        let layout = view.read_with(cx, |view, _| {
+            view.properties_inspector_for_test().expect("inspector")
+        });
+        layout.update_in(cx, |_, _, cx| {
+            cx.emit(PropertiesInspectorAction::PresentRequested)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(!view.is_presenting_prototype()));
+        layout.update_in(cx, |_, _, cx| {
+            cx.emit(PropertiesInspectorAction::TabChanged {
+                tab: PropertiesInspectorTab::Prototype,
+            })
+        });
+        cx.run_until_parked();
+        layout.update_in(cx, |_, _, cx| {
+            cx.emit(PropertiesInspectorAction::CollapsedChanged { collapsed: true })
+        });
+        cx.run_until_parked();
+        layout.update_in(cx, |_, _, cx| {
+            cx.emit(PropertiesInspectorAction::PresentRequested)
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.is_presenting_prototype()));
     }
 
     #[gpui::test]
