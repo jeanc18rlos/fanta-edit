@@ -3613,14 +3613,16 @@ mod panel_integration_tests {
             assert!(!panel.finishing_from_view);
         });
         let item = harness._view.read_with(cx, |view, _| view.item().clone());
-        let (saved, _) = fanta_format::read_project_tree(harness._temp.path())
+        let (saved, saved_assets) = fanta_format::read_project_tree(harness._temp.path())
             .expect("reopen saved project bytes");
+        // Reopening in the editor restores inferred vector viewports and layout.
+        let saved = crate::document::FigDocument::from_doc(saved, saved_assets);
         item.read_with(cx, |item, _| {
             assert!(!item.content_preview_active());
             assert!(!item.is_dirty());
             let doc = item.doc().expect("document");
             for node in [harness.vector_id, harness.text_id] {
-                assert_eq!(saved.scene.get(node), doc.scene.get(node));
+                assert_eq!(saved.doc.scene.get(node), doc.scene.get(node));
             }
         });
     }

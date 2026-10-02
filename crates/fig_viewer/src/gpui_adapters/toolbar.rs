@@ -2382,7 +2382,7 @@ mod echo_tests {
 
     #[gpui::test]
     async fn motion_toolbar_shows_only_working_secondary_controls(cx: &mut TestAppContext) {
-        let (view, _, mut cx) = setup(cx).await;
+        let (view, toolbar, mut cx) = setup(cx).await;
         let cx = &mut cx;
         cx.simulate_resize(size(px(1200.), px(900.)));
         view.update_in(cx, |view, _, cx| {
@@ -2395,18 +2395,24 @@ mod echo_tests {
             "toolbar-secondary-motion-loop",
             "toolbar-secondary-motion-keyframe",
             "toolbar-secondary-motion-style",
+            "toolbar-secondary-motion-autokey",
+            "toolbar-secondary-motion-time-comment",
         ] {
             assert!(cx.debug_bounds(selector).is_some(), "{selector} is missing");
         }
-        for selector in [
-            "toolbar-secondary-motion-autokey",
-            "toolbar-secondary-motion-timeline",
-        ] {
-            assert!(
-                cx.debug_bounds(selector).is_none(),
-                "{selector} is still visible"
-            );
-        }
+        assert!(
+            cx.debug_bounds("toolbar-secondary-motion-timeline")
+                .is_none()
+        );
+        let auto_key = cx
+            .debug_bounds("toolbar-secondary-motion-autokey")
+            .expect("Auto key control");
+        cx.simulate_click(auto_key.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(toolbar.read_with(cx, |toolbar, _| toolbar.motion_options().auto_keyframe));
+        cx.simulate_click(auto_key.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(!toolbar.read_with(cx, |toolbar, _| toolbar.motion_options().auto_keyframe));
     }
 
     fn selection(view: &Entity<FigView>, cx: &mut VisualTestContext) -> Vec<fanta_doc::NodeId> {

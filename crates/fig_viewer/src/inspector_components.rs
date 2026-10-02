@@ -85,6 +85,7 @@ impl RenderOnce for CollapsibleIconTab {
             .id((self.scope, self.index))
             .h(rems(1.75))
             .flex_none()
+            .min_w(collapsed_width)
             .items_center()
             .gap_1()
             .px_2()
@@ -92,7 +93,8 @@ impl RenderOnce for CollapsibleIconTab {
             .overflow_hidden()
             .cursor_pointer()
             .when(selected, |tab| {
-                tab.bg(cx.theme().colors().element_selected)
+                tab.flex_shrink_1()
+                    .bg(cx.theme().colors().element_selected)
                     .text_color(cx.theme().colors().text)
             })
             .when(!selected, |tab| {
@@ -122,7 +124,9 @@ impl RenderOnce for CollapsibleIconTab {
                 let width = if selected {
                     collapsed_width + (expanded_width - collapsed_width) * delta
                 } else {
-                    expanded_width + (collapsed_width - expanded_width) * delta
+                    // Inactive tabs can mount together, so reserving each
+                    // label's width would push controls outside the sidebar.
+                    collapsed_width
                 };
                 tab.w(width)
             },
@@ -210,6 +214,8 @@ impl RenderOnce for CollapsibleIconTabBar {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
         h_flex()
             .id(self.id)
+            .max_w_full()
+            .min_w_0()
             .h(rems(2.125))
             .p_0p5()
             .gap_0p5()

@@ -5924,7 +5924,12 @@ fn restore_design_edit_session(doc: &mut Doc, session: &DesignEditSession) -> bo
 
 fn visit_text_styles_mut(data: &mut NodeData, mut visit: impl FnMut(&mut fanta_doc::TextStyle)) {
     match data {
-        NodeData::Text(text) => visit(&mut text.style),
+        NodeData::Text(text) => {
+            visit(&mut text.style);
+            for run in &mut text.style_runs {
+                visit(&mut run.style);
+            }
+        }
         NodeData::TextPath(text_path) => {
             visit(&mut text_path.style);
             for run in &mut text_path.style_runs {
@@ -11398,7 +11403,7 @@ mod tests {
     async fn property_copy_action_writes_the_displayed_value(cx: &mut TestAppContext) {
         let (mut doc, _page, rect) = doc_with_rect();
         doc.selection.replace_with([rect]);
-        let (_view, panel, mut cx) = setup_view(doc, cx).await;
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
         let cx = &mut cx;
         panel.update_in(cx, |_, _, cx| {
             cx.emit(DesignPanelAction::PropertyCopyRequested {
@@ -11410,9 +11415,53 @@ mod tests {
             });
         });
         cx.run_until_parked();
+        assert!(cx.read_from_clipboard().is_none());
+
+        view.update_in(cx, |view, _, cx| {
+            view.activate_tool(crate::tools::ToolKind::Inspect, cx);
+            view.refresh_gpui_design(cx);
+        });
+        cx.run_until_parked();
+        let (target, displayed_value) = panel.read_with(cx, |panel, _| {
+            let permissions = panel.inspection_context().permissions();
+            assert!(!permissions.can_edit());
+            assert!(permissions.can_copy());
+            let view_data = panel
+                .viewer_properties_view_data()
+                .expect("Inspect projects copyable property rows");
+            let width = view_data
+                .sections
+                .iter()
+                .flat_map(|section| &section.rows)
+                .find(|row| row.property == Some(DesignPanelProperty::Width))
+                .expect("rectangle width is displayed");
+            (view_data.target.clone(), width.displayed_value.clone())
+        });
+        assert_eq!(displayed_value.as_ref(), "200");
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::PropertyCopyRequested {
+                target: target.clone(),
+                property: DesignPanelProperty::Width,
+                displayed_value: displayed_value.clone(),
+            });
+        });
+        cx.run_until_parked();
         assert_eq!(
             cx.read_from_clipboard().and_then(|item| item.text()),
-            Some("200 px".to_string())
+            Some(displayed_value.to_string())
+        );
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::PropertyCopyRequested {
+                target,
+                property: DesignPanelProperty::Width,
+                displayed_value: "999 px".into(),
+            });
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            cx.read_from_clipboard().and_then(|item| item.text()),
+            Some(displayed_value.to_string()),
+            "a forged display value cannot replace the verified clipboard payload"
         );
     }
 

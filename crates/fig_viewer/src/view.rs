@@ -2478,7 +2478,11 @@ impl FigView {
     }
 
     pub(crate) fn set_viewport_silent(&mut self, viewport: Viewport) {
-        if self.annotation_state.controller.is_moving() || self.measurement_controller.is_dragging()
+        // Canvas prepaint repeats this setter on every frame; only a changed
+        // projection invalidates an active drag.
+        if self.viewport != Some(viewport)
+            && (self.annotation_state.controller.is_moving()
+                || self.measurement_controller.is_dragging())
         {
             self.annotation_state.controller.freeze_move();
             self.measurement_controller.freeze_after_release_error();
@@ -8522,6 +8526,16 @@ impl Item for FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        if self.annotation_state.controller.has_pending_authoring() {
+            return Task::ready(Err(anyhow::anyhow!(
+                "Add, save or cancel the annotation first. Its draft was kept."
+            )));
+        }
+        if self.measurement_controller.has_pending_authoring() {
+            return Task::ready(Err(anyhow::anyhow!(
+                "Finish or cancel the measurement drag first. Its preview was kept."
+            )));
+        }
         if self.prototype_player.is_some() {
             self.exit_prototype_session(cx);
         }
@@ -11406,7 +11420,7 @@ mod tests {
             .debug_bounds("timeline")
             .expect("motion timeline");
         let motion_panel = visual_context
-            .debug_bounds("properties-inspector-content")
+            .debug_bounds("fanta-motion-panel")
             .expect("motion inspector panel");
         let close = |left: Pixels, right: Pixels| (left - right).abs() <= px(1.);
 

@@ -248,16 +248,20 @@ mod tests {
         cx.run_until_parked();
     }
 
+    const MODE_TAB_SELECTORS: [&str; 7] = [
+        "fanta-collapsible-tab-fanta-editor-mode-0",
+        "fanta-collapsible-tab-fanta-editor-mode-1",
+        "fanta-collapsible-tab-fanta-editor-mode-2",
+        "fanta-collapsible-tab-fanta-editor-mode-3",
+        "fanta-collapsible-tab-fanta-editor-mode-4",
+        "fanta-collapsible-tab-fanta-editor-mode-5",
+        "fanta-collapsible-tab-fanta-editor-mode-6",
+    ];
+
     fn visible_native_mode_tab(
         cx: &mut gpui::VisualTestContext,
         selector: &'static str,
     ) -> Bounds<Pixels> {
-        // Newly mounted tabs reserve their expanded widths during the 150 ms
-        // collapse animation, so a debug bound can temporarily lie outside
-        // the clipped inspector after returning from Code.
-        cx.executor()
-            .advance_clock(std::time::Duration::from_millis(150));
-        cx.run_until_parked();
         cx.update(|window, cx| {
             window.refresh();
             window.draw(cx).clear();
@@ -290,6 +294,15 @@ mod tests {
         let (view, cx) = cx
             .add_window_view(|window, cx| FigView::new(item.clone(), project.clone(), window, cx));
         activate_canvas(&view, cx);
+        view.update_in(cx, |view, _, cx| {
+            view.inspector_sidebar_width = px(MIN_INSPECTOR_SIDEBAR_WIDTH);
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert_eq!(MODE_TAB_SELECTORS.len(), EditorMode::ALL.len());
+        for selector in MODE_TAB_SELECTORS {
+            visible_native_mode_tab(cx, selector);
+        }
         let baseline = snapshot(&item, cx);
         cx.simulate_keystrokes("shift-d");
         cx.run_until_parked();
@@ -360,6 +373,9 @@ mod tests {
         view.read_with(cx, |view, cx| {
             assert_eq!(view.editor_workspace(cx), EditorWorkspace::Canvas)
         });
+        for selector in MODE_TAB_SELECTORS {
+            visible_native_mode_tab(cx, selector);
+        }
         let design = visible_native_mode_tab(cx, "fanta-collapsible-tab-fanta-editor-mode-0");
         cx.simulate_click(design.center(), gpui::Modifiers::none());
         cx.run_until_parked();
@@ -368,7 +384,7 @@ mod tests {
             assert_eq!(view.tools.kind(), ToolKind::Select);
             assert!(view.is_editable(cx));
         });
-        let dev = visible_native_mode_tab(cx, "fanta-collapsible-tab-fanta-editor-mode-6");
+        let dev = visible_native_mode_tab(cx, "fanta-collapsible-tab-fanta-editor-mode-3");
         cx.simulate_click(dev.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         assert_eq!(snapshot(&item, cx), baseline);
@@ -413,7 +429,7 @@ mod tests {
                 assert!(panel.editing_field.is_some());
                 panel.field_editor.read(cx).text(cx)
             });
-            let dev = visible_native_mode_tab(cx, "fanta-collapsible-tab-fanta-editor-mode-6");
+            let dev = visible_native_mode_tab(cx, "fanta-collapsible-tab-fanta-editor-mode-3");
             cx.simulate_mouse_down(dev.center(), MouseButton::Left, gpui::Modifiers::none());
             cx.run_until_parked();
             inspector.read_with(cx, |panel, cx| {

@@ -261,10 +261,10 @@ mod tests {
                 "Design",
                 "Motion",
                 "Draw",
+                "Dev",
                 "Code",
                 "Prototype",
-                "Comments",
-                "Dev"
+                "Comments"
             ]
         );
         assert_eq!(EditorMode::default(), EditorMode::Design);
