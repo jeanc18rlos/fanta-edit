@@ -1508,9 +1508,7 @@ fn hide_unshipped_actions_from_command_palette(cx: &mut App) {
             filter.hide_namespace(namespace);
         }
         #[cfg(feature = "mac_app_store")]
-        for namespace in ["extensions"] {
-            filter.hide_namespace(namespace);
-        }
+        filter.hide_namespace("extensions");
         // Leftovers in namespaces that must stay visible.
         filter.hide_action_types(&[
             TypeId::of::<zed::OpenTasks>(),

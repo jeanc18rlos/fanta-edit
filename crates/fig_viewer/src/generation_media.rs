@@ -237,6 +237,13 @@ fn place_local_media_inner(
             }
         }
         LocalMediaContent::Video(video) => {
+            let asset = video.asset;
+            if let Some(existing) = document.raw_assets.get(&asset) {
+                ensure!(
+                    existing.as_slice() == video.bytes.as_ref(),
+                    "Video asset {asset} has a content hash collision"
+                );
+            }
             let poster_asset = match &video.poster {
                 Some(poster) => {
                     let (asset, _, inserted) = document
@@ -250,7 +257,6 @@ fn place_local_media_inner(
                 }
                 None => None,
             };
-            let asset = AssetId::new();
             let mut data = video_node_data(&video, asset, poster_asset);
             data.local_size = size;
             node.data = NodeData::Video(data);
@@ -267,7 +273,9 @@ fn place_local_media_inner(
         return Err(error.into());
     }
     if let Some((asset, bytes)) = video_bytes {
-        Arc::make_mut(&mut document.raw_assets).insert(asset, bytes.to_vec());
+        if !document.raw_assets.contains_key(&asset) {
+            Arc::make_mut(&mut document.raw_assets).insert(asset, bytes.to_vec());
+        }
     }
     document.doc.selection.select_only(id);
     Ok(id)
@@ -926,13 +934,29 @@ pub(crate) struct PreparedVideo {
     pub poster: Option<VideoPoster>,
 }
 
-pub(crate) async fn prepare_video(bytes: Arc<[u8]>) -> Result<PreparedVideo> {
-    let asset = fanta_format::asset_id_for_bytes(&bytes);
-    let metadata = mp4_metadata(&bytes)?;
+async fn video_metadata_for_preparation(bytes: &Arc<[u8]>) -> Result<VideoMetadata> {
+    let metadata = mp4_metadata(bytes)?;
     ensure!(
         u64::from(metadata.width) * u64::from(metadata.height) <= 32 * 1024 * 1024,
         "The video resolution is too large to preview. Save it to open it in a video player."
     );
+    #[cfg(target_os = "macos")]
+    let metadata = {
+        // Track durations can include samples excluded by an MP4 edit list.
+        // Placement and trimming must use the same timeline as the player.
+        let playback = media::video::prepare_video_playback(bytes.clone(), 1200)?.await?;
+        VideoMetadata {
+            duration_us: i64::try_from(playback.info().duration_us)
+                .context("The video playback duration is invalid.")?,
+            ..metadata
+        }
+    };
+    Ok(metadata)
+}
+
+pub(crate) async fn prepare_video(bytes: Arc<[u8]>) -> Result<PreparedVideo> {
+    let asset = fanta_format::asset_id_for_bytes(&bytes);
+    let metadata = video_metadata_for_preparation(&bytes).await?;
     #[cfg(target_os = "macos")]
     let poster = {
         let frame = media::video::video_frame(bytes.clone(), 1200)?.await?;
@@ -988,7 +1012,7 @@ pub(crate) async fn prepare_video_trim(
     bytes: Arc<[u8]>,
     range_us: [i64; 2],
 ) -> Result<PreparedVideoTrim> {
-    let metadata = mp4_metadata(&bytes)?;
+    let metadata = video_metadata_for_preparation(&bytes).await?;
     validate_video_trim(range_us, metadata.duration_us)?;
     let frame = media::video::video_frame_at(bytes, 1200, u64::try_from(range_us[0])?)?.await?;
     let difference = (i64::from(frame.width) * i64::from(metadata.height)
@@ -1430,7 +1454,7 @@ mod tests {
     fn local_media_preparation_decodes_real_mp4_and_rejects_corrupt_video() {
         let directory = tempfile::tempdir().expect("directory");
         let path = directory.path().join("Camera take.MP4");
-        let bytes = include_bytes!("../../media/test_fixtures/quadrants.mp4");
+        let bytes = include_bytes!("../tests/fixtures/quadrants.mp4");
         std::fs::write(&path, bytes).expect("video fixture");
         let prepared = futures::executor::block_on(prepare_local_media(&path))
             .expect("native MP4 preparation");
@@ -1471,7 +1495,7 @@ mod tests {
         );
         std::fs::write(
             &path,
-            include_bytes!("../../media/test_fixtures/quadrants-corrupt.mp4"),
+            include_bytes!("../tests/fixtures/quadrants-corrupt.mp4"),
         )
         .expect("corrupt video fixture");
         assert!(futures::executor::block_on(prepare_local_media(&path)).is_err());
@@ -1492,6 +1516,7 @@ mod tests {
             name: "Camera take.mp4".to_owned(),
             content: LocalMediaContent::Video(PreparedVideo {
                 bytes: video_bytes.clone(),
+                asset: fanta_format::asset_id_for_bytes(&video_bytes),
                 metadata: VideoMetadata {
                     width: 100,
                     height: 50,
@@ -1629,6 +1654,7 @@ mod tests {
                         "corrupt-poster" => {
                             prepared.content = LocalMediaContent::Video(PreparedVideo {
                                 bytes: Arc::from(&b"source"[..]),
+                                asset: fanta_format::asset_id_for_bytes(b"source"),
                                 metadata: VideoMetadata {
                                     width: 2,
                                     height: 2,

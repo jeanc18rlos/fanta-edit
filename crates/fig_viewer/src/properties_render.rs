@@ -1052,6 +1052,7 @@ impl FantaPropertiesPanel {
     pub(crate) fn render_header(
         &self,
         type_name: SharedString,
+        type_icon: Option<IconName>,
         name: String,
         rename: Option<InspectorField>,
         editable: bool,
@@ -1060,9 +1061,20 @@ impl FantaPropertiesPanel {
         let rename = if editable { rename } else { None };
         let editing = rename.is_some() && self.editing_field == rename;
         let mut header = v_flex().px_4().py_2().gap_0p5().child(
-            Label::new(type_name)
-                .size(LabelSize::XSmall)
-                .color(Color::Muted),
+            h_flex()
+                .gap_1p5()
+                .when_some(type_icon, |row, type_icon| {
+                    row.child(
+                        Icon::new(type_icon)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                })
+                .child(
+                    Label::new(type_name)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                ),
         );
         if editing {
             header = header.child(div().w_full().child(self.field_editor.clone()));

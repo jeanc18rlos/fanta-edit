@@ -8753,7 +8753,10 @@ mod tests {
         // budget: 40 + 50 fit, 60 would exceed 100.
         assert_eq!(parts_of(&messages[5]), &[tool_image(40)]);
         assert_eq!(parts_of(&messages[4]), &[tool_image(50)]);
-        assert_eq!(parts_of(&messages[3]), &[tool_placeholder.clone()]);
+        assert_eq!(
+            parts_of(&messages[3]),
+            std::slice::from_ref(&tool_placeholder)
+        );
         // The prompt text itself is untouched.
         assert_eq!(
             messages[0].content[0],
@@ -8768,7 +8771,10 @@ mod tests {
             ))]),
         ];
         elide_stale_images(&mut messages, 100);
-        assert_eq!(parts_of(&messages[0]), &[tool_placeholder.clone()]);
+        assert_eq!(
+            parts_of(&messages[0]),
+            std::slice::from_ref(&tool_placeholder)
+        );
         assert_eq!(
             messages[1].content[0],
             language_model::MessageContent::Image(image_of_len(30))

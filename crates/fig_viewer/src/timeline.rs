@@ -726,15 +726,6 @@ impl TimelineShell {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn pending_clip_edit_text_for_test(&self, cx: &App) -> Option<String> {
-        let editor = match self.editing_clip_field? {
-            TimelineClipField::Name => self.clip_name_editor.as_ref()?,
-            TimelineClipField::Duration => self.clip_duration_editor.as_ref()?,
-        };
-        Some(editor.read(cx).text(cx))
-    }
-
     fn commit_clip_edit(&mut self, cx: &mut Context<Self>) -> bool {
         if !self.authoring_enabled {
             self.cancel_clip_edit(cx);

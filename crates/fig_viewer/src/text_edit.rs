@@ -893,6 +893,7 @@ fn buffer_from_doc_text(
     (buffer, invalid_style_run)
 }
 
+#[cfg(test)]
 pub(crate) fn replace_styled_text_ranges(
     content: &str,
     base_style: &fanta_doc::TextStyle,

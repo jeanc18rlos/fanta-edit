@@ -341,36 +341,6 @@ pub struct FantaPropertiesPanel {
     pub(crate) _active_view_subscription: Option<Subscription>,
 }
 
-#[cfg(feature = "fanta-gpui-ui")]
-pub(crate) struct FantaExportSection {
-    inspector: Entity<FantaPropertiesPanel>,
-    _subscription: Subscription,
-}
-
-#[cfg(feature = "fanta-gpui-ui")]
-impl FantaExportSection {
-    pub(crate) fn new(inspector: Entity<FantaPropertiesPanel>, cx: &mut Context<Self>) -> Self {
-        let subscription = cx.observe(&inspector, |_, _, cx| cx.notify());
-        Self {
-            inspector,
-            _subscription: subscription,
-        }
-    }
-}
-
-#[cfg(feature = "fanta-gpui-ui")]
-impl Render for FantaExportSection {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.inspector.update(cx, |inspector, cx| {
-            let can_export = inspector.active_item(cx).is_some_and(|item| {
-                let item = item.read(cx);
-                item.project_root().is_some() && item.document().is_some()
-            });
-            inspector.render_export_block(can_export, window, cx)
-        })
-    }
-}
-
 impl FantaPropertiesPanel {
     pub async fn load(
         workspace: WeakEntity<Workspace>,
@@ -3146,6 +3116,7 @@ impl Render for FantaPropertiesPanel {
                     InspectorBody::Page(page) => {
                         content = content.child(self.render_header(
                             "Page".into(),
+                            None,
                             page.name.clone(),
                             page.id.map(InspectorField::Name),
                             editable,
@@ -3173,6 +3144,7 @@ impl Render for FantaPropertiesPanel {
                         use NodeKind::*;
                         content = content.child(self.render_header(
                             node.type_name.clone(),
+                            Some(node.type_icon),
                             node.name.clone(),
                             Some(InspectorField::Name(node.id)),
                             editable,
@@ -3326,6 +3298,7 @@ impl Render for FantaPropertiesPanel {
                     InspectorBody::Multi(multi) => {
                         content = content.child(self.render_header(
                             "Selection".into(),
+                            None,
                             format!("{} selected", multi.count),
                             None,
                             editable,

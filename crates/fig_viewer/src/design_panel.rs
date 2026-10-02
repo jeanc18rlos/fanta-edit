@@ -10,11 +10,11 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::Result;
+#[cfg(test)]
+use fanta_doc::GroupNode;
 #[cfg(feature = "fanta-gpui-ui")]
 use fanta_doc::{AssetId, DocId, ProjectAssetKind};
-use fanta_doc::{
-    CanvasNode, Doc, GroupNode, IndexKey, NodeData, NodeFlags, NodeId, Operation, Scene,
-};
+use fanta_doc::{CanvasNode, Doc, IndexKey, NodeData, NodeFlags, NodeId, Operation, Scene};
 #[cfg(feature = "fanta-gpui-ui")]
 use fanta_gpui::assets::{
     AssetKind, AssetPageTarget, AssetRow, AssetThumbnail, AssetsPanel, AssetsPanelAction,
@@ -29,6 +29,7 @@ use gpui::{
 };
 use settings::{Settings as _, update_settings_file};
 use ui::prelude::*;
+use util::ResultExt as _;
 use workspace::{
     Workspace,
     dock::{DockPosition, Panel, PanelEvent},

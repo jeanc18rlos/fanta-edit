@@ -9501,9 +9501,12 @@ mod tests {
             id,
             false,
             0,
-            &PaintEditValue::Payload(DesignPaintPayload::Solid(design_color(FantaColor::rgba(
-                0x22, 0x44, 0x66, 0x01,
-            )))),
+            &PaintEditValue::Payload(DesignPaintPayload::Solid(
+                fanta_gpui::design::DesignSolidPaint {
+                    color: design_color(FantaColor::rgba(0x22, 0x44, 0x66, 0x01)),
+                    binding: None,
+                },
+            )),
         );
         assert!(
             operations.is_empty(),
@@ -10293,7 +10296,8 @@ mod tests {
                 color: FantaColor::rgba(0x10, 0x80, 0xe0, 0),
                 blend: BlendMode::Normal,
             },
-        ];
+        ]
+        .into();
         doc.selection.replace_with([rect]);
         let (view, panel, mut cx) = setup_view(doc, cx).await;
         let item = view.read_with(&cx, |view, _| view.item().clone());

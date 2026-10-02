@@ -25,10 +25,9 @@ use std::{
 use anyhow::{Context as _, Result};
 use fanta_canvas::HitPrecision;
 use fanta_doc::{
-    AnimationClip, AnimationClipId, AnimationTrack, AnimationTrackId, AssetId, BoundProp,
-    CanvasNode, Doc, Easing, Fill, IndexKey, Interpolation, Keyframe, KeyframeId, MotionEvaluation,
-    MotionProperty, MotionTarget, MotionTransform, NodeData, NodeId, Operation, ProjectAssetKind,
-    ResolvedVarValue, Transaction, Viewport,
+    AnimationClip, AnimationClipId, AssetId, BoundProp, CanvasNode, Doc, Easing, Fill, IndexKey,
+    Interpolation, Keyframe, KeyframeId, MotionEvaluation, MotionProperty, NodeData, NodeId,
+    Operation, ProjectAssetKind, ResolvedVarValue, Transaction, Viewport,
 };
 use fanta_tools::{Button as ToolButton, LogicalKey, ToolEvent};
 use file_icons::FileIcons;
@@ -2166,6 +2165,7 @@ impl FigView {
             .map(|_| clip)
     }
 
+    #[cfg(test)]
     pub(crate) fn active_motion_clip_id(&self) -> Option<AnimationClipId> {
         self.active_motion_clip
     }
@@ -8221,43 +8221,7 @@ fn place_ingested_images(
     Ok(placed)
 }
 
-fn motion_property(property: TimelineProperty) -> MotionProperty {
-    match property {
-        TimelineProperty::PositionX => MotionProperty::PositionX,
-        TimelineProperty::PositionY => MotionProperty::PositionY,
-        TimelineProperty::Rotation => MotionProperty::Rotation,
-        TimelineProperty::ScaleX => MotionProperty::ScaleX,
-        TimelineProperty::ScaleY => MotionProperty::ScaleY,
-        TimelineProperty::Opacity => MotionProperty::bound(BoundProp::Opacity),
-        TimelineProperty::FillColor => MotionProperty::bound(BoundProp::FillColor { index: 0 }),
-    }
-}
-
-fn motion_value(
-    node: &fanta_doc::CanvasNode,
-    property: MotionProperty,
-) -> Option<ResolvedVarValue> {
-    match property {
-        MotionProperty::Bound { prop } => prop.read_resolved(node),
-        MotionProperty::PositionX
-        | MotionProperty::PositionY
-        | MotionProperty::Rotation
-        | MotionProperty::ScaleX
-        | MotionProperty::ScaleY => {
-            let transform = MotionTransform::decompose(node.transform)?;
-            let value = match property {
-                MotionProperty::PositionX => transform.position[0],
-                MotionProperty::PositionY => transform.position[1],
-                MotionProperty::Rotation => transform.rotation_radians,
-                MotionProperty::ScaleX => transform.scale[0],
-                MotionProperty::ScaleY => transform.scale[1],
-                MotionProperty::Bound { .. } => return None,
-            };
-            Some(ResolvedVarValue::Float { value })
-        }
-    }
-}
-
+#[cfg(test)]
 fn motion_source_node(doc: &fanta_doc::Doc, node_id: NodeId) -> Option<fanta_doc::CanvasNode> {
     let mut node = doc.scene.get(node_id)?.clone();
     for (property, variable) in node.bindings.clone() {
@@ -8956,12 +8920,13 @@ fn zoom_viewport_at(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::motion_edit::{motion_property, motion_value};
     use std::collections::BTreeMap;
 
     use fanta_doc::{
-        CanvasNode, Color, GroupNode, Mode, ModeId, NodeData, Operation, TextNode, Transform2D,
-        VarValue, Variable, VariableCollection, VariableCollectionId, VariableId, VariableType,
-        VectorNode,
+        AnimationTrack, AnimationTrackId, CanvasNode, Color, GroupNode, Mode, ModeId, MotionTarget,
+        NodeData, Operation, TextNode, Transform2D, VarValue, Variable, VariableCollection,
+        VariableCollectionId, VariableId, VariableType, VectorNode,
     };
     use gpui::{TestAppContext, point, size};
     use project::FakeFs;

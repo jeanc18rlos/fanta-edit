@@ -2043,6 +2043,7 @@ impl FigItem {
     /// Content gestures dirty the item on their first preview frame, so a
     /// mid-gesture reload can only interrupt selection-style gestures, which
     /// tolerate having their selection reset.
+    #[cfg(test)]
     fn schedule_reload(&mut self, cx: &mut Context<Self>) {
         self.schedule_reload_with_full(false, cx);
     }

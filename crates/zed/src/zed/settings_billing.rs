@@ -258,7 +258,7 @@ fn comma(value: i64) -> String {
         result.push('-');
     }
     for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             result.push(',');
         }
         result.push(digit);
