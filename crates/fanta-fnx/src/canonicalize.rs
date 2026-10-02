@@ -4,7 +4,7 @@ use crate::model::is_known_tag;
 
 pub(crate) const JSX_RUNTIME_PRAGMA: &str = "/** @jsxRuntime classic */";
 pub(crate) const JSX_FACTORY_PRAGMA: &str = "/** @jsx fnxElement */";
-pub(crate) const FNX_TAG_IMPORT: &str = "import { AiArtifact, Audio, Boolean, Ellipse, Embed, Frame, Image, Instance, Model3D, NodeGraph, Rect, Text, Vector, Video } from \"../../fnx\";";
+pub(crate) const FNX_TAG_IMPORT: &str = "import { AiArtifact, Audio, Boolean, Ellipse, Embed, Frame, Image, Instance, Model3D, NodeGraph, Rect, Text, TextPath, Vector, Video } from \"../../fnx\";";
 
 /// Import lines emitted by PREVIOUS printer versions, byte-exact. A file whose
 /// import line still equals one of these upgrades to the current
@@ -13,6 +13,7 @@ pub(crate) const FNX_TAG_IMPORT: &str = "import { AiArtifact, Audio, Boolean, El
 /// as an unimported identifier. Byte equality is the deliberate gate: an import
 /// the user reshaped (reordered, split, aliased) is theirs and stays untouched.
 const LEGACY_TAG_IMPORTS: &[&str] = &[
+    "import { AiArtifact, Audio, Boolean, Ellipse, Embed, Frame, Image, Instance, Model3D, NodeGraph, Rect, Text, Vector, Video } from \"../../fnx\";",
     "import { AiArtifact, Audio, Boolean, Embed, Frame, Image, Instance, Model3D, NodeGraph, Text, Vector, Video } from \"../../fnx\";",
 ];
 

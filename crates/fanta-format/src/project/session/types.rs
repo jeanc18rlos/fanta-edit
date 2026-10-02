@@ -222,6 +222,8 @@ pub enum ArtifactOpImpact {
     NodeAttributes,
     Structure,
     ComponentHeader,
+    /// Changes the set/order of project artifacts and requires a full-project save.
+    ProjectStructure,
     Workspace,
     Motion,
     Flow,

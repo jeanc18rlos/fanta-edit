@@ -10,8 +10,7 @@
 //! - New containers are never produced at an old version, which protects
 //!   downstream tools from accidentally writing forward-incompatible files.
 //!
-//! Today only schema version 1 exists; the function below is the seam future
-//! versions extend by appending steps to the `match` ladder.
+//! Each schema transition is an adjacent step in the ladder below.
 
 use crate::error::{FormatError, Result};
 
@@ -43,16 +42,7 @@ pub fn migrate(mut value: serde_json::Value, from: u32, to: u32) -> Result<serde
 
 /// Apply a single migration step from `current` to `next`.
 ///
-/// The first real migration will land here when schema version 2 ships. Until
-/// then this is intentionally a panic-on-missing-arm so we get a compile-time-
-/// adjacent reminder ("hey, you bumped the version but didn't write a step")
-/// the first time we forget.
-// The match below is deliberately a single-arm seam — future schema bumps
-// add `(N, N+1)` arms here without restructuring the function. Allow clippy's
-// "match_single_binding" rather than collapsing to a bare expression, because
-// the structure is the documentation.
-#[allow(clippy::match_single_binding)]
-fn step(_value: serde_json::Value, current: u32, next: u32) -> Result<serde_json::Value> {
+fn step(value: serde_json::Value, current: u32, next: u32) -> Result<serde_json::Value> {
     tracing::debug!(current, next, "migrating doc payload one step");
     match (current, next) {
         // v1 → v2: `PathData` became an object `{ "segments": [...] }` (was a
@@ -60,9 +50,19 @@ fn step(_value: serde_json::Value, current: u32, next: u32) -> Result<serde_json
         // single-sourced with `Doc::from_json_str` and walks history snapshots
         // too. (Idempotent; also stamps `schema_version`.)
         (1, 2) => {
-            let mut v = _value;
-            fanta_doc::migrate_doc_json(&mut v, 1);
-            Ok(v)
+            let mut value = value;
+            fanta_doc::migrate_doc_json_to(&mut value, 1, 2)
+                .map_err(|error| FormatError::InvalidManifest(error.to_string()))?;
+            Ok(value)
+        }
+        // v2 → v3: no existing field changes shape. The version gate reserves
+        // the new `text_path` node tag so v2 readers reject it instead of
+        // partially loading a document they cannot represent.
+        (2, 3) => {
+            let mut value = value;
+            fanta_doc::migrate_doc_json_to(&mut value, 2, 3)
+                .map_err(|error| FormatError::InvalidManifest(error.to_string()))?;
+            Ok(value)
         }
         _ => Err(FormatError::InvalidManifest(format!(
             "no migration registered from schema {current} to {next}"
@@ -97,8 +97,7 @@ mod tests {
     #[test]
     fn unknown_step_is_invalid_manifest() {
         let v = serde_json::json!({});
-        // (1,2) is registered now; an unregistered future step still errors.
-        let err = migrate(v, 2, 3).unwrap_err();
+        let err = migrate(v, 3, 4).unwrap_err();
         assert!(matches!(err, FormatError::InvalidManifest(_)));
     }
 
@@ -124,5 +123,18 @@ mod tests {
         assert!(path.is_object(), "path should be wrapped into an object");
         assert!(path["segments"].is_array(), "segments holds the old array");
         assert_eq!(out["schema_version"], 2, "version stamped to 2");
+    }
+
+    #[test]
+    fn v2_to_v3_only_stamps_the_schema_version() {
+        let v2 = serde_json::json!({
+            "schema_version": 2,
+            "scene": { "nodes": {} },
+            "opaque": { "preserved": [1, 2, 3] }
+        });
+        let mut expected = v2.clone();
+        expected["schema_version"] = serde_json::Value::from(3);
+
+        assert_eq!(migrate(v2, 2, 3).unwrap(), expected);
     }
 }

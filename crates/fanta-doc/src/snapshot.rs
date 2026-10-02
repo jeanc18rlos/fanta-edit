@@ -563,6 +563,7 @@ fn node_snapshot(node: &CanvasNode, abs: Option<Bounds>) -> NodeSnapshot {
         stroke_rgba: effective_stroke(node).map(rgba),
         text: match &node.data {
             NodeData::Text(t) => Some(t.content.clone()),
+            NodeData::TextPath(text) => Some(text.content.clone()),
             _ => None,
         },
         corner_radius: match &node.data {
@@ -587,6 +588,7 @@ fn effective_fill(node: &CanvasNode) -> Option<Color> {
         NodeData::Group(g) => solid_of(g.background.as_ref()),
         NodeData::Vector(v) => v.fills.iter().find_map(|f| solid_of(Some(f))),
         NodeData::Text(t) => Some(t.style.color),
+        NodeData::TextPath(text) => Some(text.style.color),
         _ => None,
     }
 }

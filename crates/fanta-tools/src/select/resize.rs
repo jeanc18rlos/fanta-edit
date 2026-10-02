@@ -11,21 +11,21 @@ use crate::context::ToolContext;
 use crate::event::ModifierKeys;
 use crate::tool::{CursorHint, ToolResponse};
 use fanta_canvas::{ResizeHandle, SnapResult};
-use fanta_doc::{Bounds, NodeData, NodeId, Operation, Scene, TextAutoResize};
+use fanta_doc::{Bounds, NodeData, NodeId, Operation, TextAutoResize};
 use glam::DVec2;
 
 /// The authored box used by resize handles. Non-clipping groups may have
 /// descendants outside that box; their visual/culling bounds intentionally
 /// union the overflow, while authoring handles remain attached to the box.
-pub(super) fn authored_resize_bounds(scene: &Scene, id: NodeId) -> Option<Bounds> {
-    let node = scene.get(id)?;
+pub(super) fn authored_resize_bounds(ctx: &ToolContext, id: NodeId) -> Option<Bounds> {
+    let node = ctx.doc.scene.get(id)?;
     match &node.data {
         NodeData::Group(group) => group
             .clip_size
             .or(group.local_size)
             .map(|[width, height]| Bounds::from_xywh(0.0, 0.0, width, height))
-            .or_else(|| scene.local_bounds(id)),
-        _ => scene.local_bounds(id),
+            .or_else(|| ctx.interaction_bounds(id)),
+        _ => ctx.interaction_bounds(id),
     }
 }
 
@@ -69,7 +69,7 @@ impl SelectTool {
         let original_local = if legacy_group_origin.is_some() {
             Bounds::from_xywh(0.0, 0.0, scene_local.width(), scene_local.height())
         } else {
-            authored_resize_bounds(&ctx.doc.scene, node_id).unwrap_or(scene_local)
+            authored_resize_bounds(ctx, node_id).unwrap_or(scene_local)
         };
         let original_world_transform =
             legacy_group_origin.map_or(scene_world_transform, |origin| {

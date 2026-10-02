@@ -9,7 +9,7 @@ use crate::inspector_components::{InspectorMessage, InspectorSectionHeader};
 
 #[derive(Debug, Clone)]
 pub(crate) struct DocumentCommentRow {
-    page_index: usize,
+    page_root: fanta_doc::NodeId,
     page_name: SharedString,
     id: String,
     author: SharedString,
@@ -19,6 +19,7 @@ pub(crate) struct DocumentCommentRow {
     mentions: usize,
     skill: Option<SharedString>,
     resolved: bool,
+    motion_label: Option<SharedString>,
 }
 
 pub(crate) fn document_comment_rows(
@@ -26,7 +27,7 @@ pub(crate) fn document_comment_rows(
     pages: &[FigPage],
 ) -> Vec<DocumentCommentRow> {
     let mut rows = Vec::new();
-    for (page_index, page) in pages.iter().enumerate() {
+    for page in pages {
         let Some(page_root) = page.root else {
             continue;
         };
@@ -44,7 +45,7 @@ pub(crate) fn document_comment_rows(
                 .skill
                 .or_else(|| comment.replies.iter().rev().find_map(|reply| reply.skill));
             rows.push(DocumentCommentRow {
-                page_index,
+                page_root,
                 page_name: page.name.clone(),
                 id: comment.id,
                 author: if comment.author.trim().is_empty() {
@@ -62,13 +63,16 @@ pub(crate) fn document_comment_rows(
                 mentions: comment.mentions.len() + reply_mentions,
                 skill: skill.map(|skill| skill.label().into()),
                 resolved: comment.resolved,
+                motion_label: comment
+                    .motion_anchor
+                    .map(|anchor| comments::motion_comment_label(doc, anchor).into()),
             });
         }
     }
     rows
 }
 
-type OpenHandler = Rc<dyn Fn(usize, String, &mut Window, &mut App)>;
+type OpenHandler = Rc<dyn Fn(fanta_doc::NodeId, String, &mut Window, &mut App)>;
 
 #[derive(IntoElement)]
 pub(crate) struct FantaCommentsPanel {
@@ -79,7 +83,7 @@ pub(crate) struct FantaCommentsPanel {
 impl FantaCommentsPanel {
     pub(crate) fn new(
         rows: Vec<DocumentCommentRow>,
-        on_open: impl Fn(usize, String, &mut Window, &mut App) + 'static,
+        on_open: impl Fn(fanta_doc::NodeId, String, &mut Window, &mut App) + 'static,
     ) -> Self {
         Self {
             rows,
@@ -125,7 +129,8 @@ impl RenderOnce for FantaCommentsPanel {
         for (index, row) in self.rows.into_iter().enumerate() {
             let on_open = self.on_open.clone();
             let comment_id = row.id.clone();
-            let page_index = row.page_index;
+            let page_root = row.page_root;
+            let motion_label = row.motion_label.clone();
             list = list.child(
                 v_flex()
                     .id(("fanta-document-comment", index))
@@ -139,7 +144,7 @@ impl RenderOnce for FantaCommentsPanel {
                     .border_color(cx.theme().colors().border_variant)
                     .hover(|row| row.bg(cx.theme().colors().element_hover))
                     .on_click(move |_, window, cx| {
-                        on_open(page_index, comment_id.clone(), window, cx)
+                        on_open(page_root, comment_id.clone(), window, cx)
                     })
                     .child(
                         h_flex()
@@ -169,7 +174,14 @@ impl RenderOnce for FantaCommentsPanel {
                                             .size(LabelSize::XSmall)
                                             .color(Color::Muted)
                                             .single_line(),
-                                    ),
+                                    )
+                                    .when_some(motion_label, |this, label| {
+                                        this.child(
+                                            Label::new(label)
+                                                .size(LabelSize::XSmall)
+                                                .color(Color::Accent),
+                                        )
+                                    }),
                             )
                             .child(
                                 Label::new(if row.resolved { "Resolved" } else { "Open" })
@@ -263,8 +275,21 @@ mod tests {
         doc.apply(Operation::create_node(first))
             .expect("first page");
         doc.add_page(first_id);
-        let (first_comment_id, add) =
-            comments::add_comment_op(&doc, first_id, [1.0, 2.0], "Open").expect("open comment");
+        let motion_anchor = comments::MotionCommentAnchor {
+            clip: fanta_doc::AnimationClipId::from_u128(7),
+            time_ms: 1_250,
+        };
+        let (first_comment_id, add) = comments::add_comment_full_op(
+            &doc,
+            first_id,
+            [1.0, 2.0],
+            "Open",
+            Vec::new(),
+            Vec::new(),
+            None,
+            Some(motion_anchor),
+        )
+        .expect("open comment");
         doc.apply(add).expect("add open comment");
         doc.apply(
             comments::reply_comment_full_op(
@@ -318,6 +343,12 @@ mod tests {
         assert_eq!(rows[0].attachments.len(), 1);
         assert_eq!(rows[0].mentions, 1);
         assert_eq!(rows[0].page_name.as_ref(), "First");
+        assert_eq!(rows[0].page_root, first_id);
+        assert_eq!(
+            rows[0].motion_label.as_deref(),
+            Some("Animation unavailable · 00:01.250")
+        );
         assert_eq!(rows[1].page_name.as_ref(), "Second");
+        assert_eq!(rows[1].page_root, second_id);
     }
 }

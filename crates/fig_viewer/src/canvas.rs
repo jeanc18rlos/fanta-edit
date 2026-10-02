@@ -73,9 +73,11 @@ use ui::prelude::*;
 
 use crate::document::FigDocument;
 use crate::editor_session::EditorMode;
+use crate::measurements::{MeasurementOverlay, ScreenMeasurement};
 use crate::view::FigView;
 
 const HANDLE_SIZE: f32 = 7.0;
+const MEASUREMENT_HANDLE_DIAMETER: f32 = 8.0;
 
 /// Above this many selected nodes the overlay outlines the selection's union
 /// box instead of every node (the size badge and handles already work off the
@@ -2566,6 +2568,11 @@ pub(crate) fn evaluated_world_bounds(
     let node = scene.get(id)?;
     if let Some(motion) = motion {
         let evaluated = motion.apply_to_node(node);
+        if let fanta_doc::NodeData::TextPath(text_path) = &evaluated.data
+            && let Some(local) = fanta_render::text_path_visual_bounds(text_path)
+        {
+            return local.try_transformed(&evaluated_world_transform(scene, id, Some(motion))?);
+        }
         if let Some(local) = evaluated.data.local_bounds() {
             return local.try_transformed(&evaluated_world_transform(scene, id, Some(motion))?);
         }
@@ -2589,6 +2596,14 @@ pub(crate) fn evaluated_world_bounds(
             // LOCAL space, which differs from the world-space union below
             // under rotation. Keep the world-space union for parity.
             fanta_doc::NodeData::Boolean(_) => {}
+            fanta_doc::NodeData::TextPath(text_path) => {
+                if let Some(local) = fanta_render::text_path_visual_bounds(text_path) {
+                    return local.try_transformed(&scene.world_transform(id)?);
+                }
+                if let Some(local) = scene.local_bounds(id) {
+                    return local.try_transformed(&scene.world_transform(id)?);
+                }
+            }
             // For every other kind the scene's local bounds ARE
             // `data.local_bounds()` — memoized, so a vector's path walk runs
             // once per edit instead of once per call.
@@ -2624,6 +2639,253 @@ pub(crate) fn evaluated_hit_test_screen(
 ) -> Option<NodeId> {
     let world_point = fanta_canvas::screen_to_world(screen_point, viewport, screen_size);
     evaluated_hit_test(scene, motion, world_point, precision, active_page)
+}
+
+pub(crate) fn precise_hit_test_screen(
+    scene: &fanta_doc::Scene,
+    viewport: &Viewport,
+    screen_size: DVec2,
+    screen_point: DVec2,
+    precision: fanta_canvas::HitPrecision,
+    active_page: Option<NodeId>,
+) -> Option<NodeId> {
+    let world_point = fanta_canvas::screen_to_world(screen_point, viewport, screen_size);
+    precise_hit_test(scene, world_point, precision, active_page)
+}
+
+pub(crate) fn inspect_hit_test_screen(
+    scene: &fanta_doc::Scene,
+    viewport: &Viewport,
+    screen_size: DVec2,
+    screen_point: DVec2,
+    active_page: Option<NodeId>,
+) -> Option<NodeId> {
+    let world_point = fanta_canvas::screen_to_world(screen_point, viewport, screen_size);
+    if !world_point.is_finite() {
+        return None;
+    }
+    // The scene index contains path bounds, which exclude stroke widths, caps,
+    // and joins. Walk paint order so painted overflow reaches the precise test.
+    let mut pending = Vec::new();
+    if let Some(root) = active_page {
+        scene.get(root)?;
+        if scene.ancestors_of(root).any(|ancestor| {
+            ancestor
+                .flags
+                .intersects(fanta_doc::NodeFlags::HIDDEN | fanta_doc::NodeFlags::LOCKED)
+                || matches!(ancestor.data, fanta_doc::NodeData::Boolean(_))
+                || !inspect_descendants_visible_at(scene, ancestor, world_point)
+        }) {
+            return None;
+        }
+        pending.push((root, false));
+    } else {
+        pending.extend(scene.roots().iter().map(|&id| (id, false)));
+    }
+    while let Some((id, test_body)) = pending.pop() {
+        let Some(node) = scene.get(id) else {
+            continue;
+        };
+        if test_body {
+            if !(active_page == Some(id) && node.parent.is_none())
+                && inspect_node_contains_point(scene, node, world_point)
+            {
+                return Some(id);
+            }
+            continue;
+        }
+        if node
+            .flags
+            .intersects(fanta_doc::NodeFlags::HIDDEN | fanta_doc::NodeFlags::LOCKED)
+        {
+            continue;
+        }
+        pending.push((id, true));
+        if !matches!(node.data, fanta_doc::NodeData::Boolean(_))
+            && inspect_descendants_visible_at(scene, node, world_point)
+        {
+            pending.extend(scene.children_of(Some(id)).iter().map(|&id| (id, false)));
+        }
+    }
+    None
+}
+
+fn inspect_local_point(scene: &fanta_doc::Scene, id: NodeId, world_point: DVec2) -> Option<DVec2> {
+    let transform = scene.world_transform(id)?;
+    let [a, b, c, d, _, _] = transform.to_components();
+    let determinant = a * d - b * c;
+    if !transform.is_finite() || !determinant.is_finite() || determinant == 0. {
+        return None;
+    }
+    let local = transform.inverse().transform_point(world_point);
+    local.is_finite().then_some(local)
+}
+
+fn inspect_descendants_visible_at(
+    scene: &fanta_doc::Scene,
+    node: &fanta_doc::CanvasNode,
+    world_point: DVec2,
+) -> bool {
+    let fanta_doc::NodeData::Group(group) = &node.data else {
+        return true;
+    };
+    let Some([width, height]) = group.clip_size else {
+        return true;
+    };
+    if node
+        .meta
+        .get("clip_content")
+        .and_then(serde_json::Value::as_bool)
+        == Some(false)
+    {
+        return true;
+    }
+    inspect_local_point(scene, node.id, world_point).is_some_and(|local| {
+        fanta_render::rounded_rect_contains_point(
+            [0., 0., width, height],
+            group.corner_radius,
+            group.corner_radii,
+            group.corner_smoothing,
+            local.to_array(),
+        )
+    })
+}
+
+fn inspect_node_contains_point(
+    scene: &fanta_doc::Scene,
+    node: &fanta_doc::CanvasNode,
+    world_point: DVec2,
+) -> bool {
+    let Some(local) = inspect_local_point(scene, node.id, world_point) else {
+        return false;
+    };
+    match &node.data {
+        fanta_doc::NodeData::Vector(vector) => {
+            if !node.flags.contains(fanta_doc::NodeFlags::UNCLIPPED_VECTOR)
+                && let Some([width, height]) = vector.local_size
+                && !fanta_doc::Bounds::from_xywh(0., 0., width, height).contains_point(local)
+            {
+                return false;
+            }
+            if let Some(bounds) = scene.local_bounds(node.id)
+                && let Some(padding) = vector.strokes.iter().try_fold(0.0_f64, |padding, stroke| {
+                    if !stroke.width.is_finite() || !stroke.miter_limit.is_finite() {
+                        return None;
+                    }
+                    let mut width = stroke.width.max(0.);
+                    if let Some(sides) = stroke.per_side {
+                        for side in sides {
+                            if !side.is_finite() {
+                                return None;
+                            }
+                            width = width.max(side);
+                        }
+                    }
+                    // Aligned strokes can use doubled width; square caps and
+                    // miter joins must fit even outside the original path box.
+                    let reach = width * 2. * stroke.miter_limit.max(1.);
+                    reach.is_finite().then_some(padding.max(reach))
+                })
+            {
+                let bounds = fanta_doc::Bounds {
+                    min_x: ((bounds.min_x - padding) as f32).next_down() as f64,
+                    min_y: ((bounds.min_y - padding) as f32).next_down() as f64,
+                    max_x: ((bounds.max_x + padding) as f32).next_up() as f64,
+                    max_y: ((bounds.max_y + padding) as f32).next_up() as f64,
+                };
+                if bounds.is_finite() && !bounds.contains_point(local) {
+                    return false;
+                }
+            }
+            fanta_render::vector_contains_point(vector, local.to_array())
+        }
+        fanta_doc::NodeData::Group(group) => {
+            if !group.is_frame_surface() {
+                return false;
+            }
+            let bounds = group
+                .clip_size
+                .or(group.local_size)
+                .map(|[width, height]| fanta_doc::Bounds::from_xywh(0., 0., width, height))
+                .or_else(|| scene.local_bounds(node.id));
+            bounds.is_some_and(|bounds| {
+                fanta_render::rounded_rect_contains_point(
+                    [bounds.min_x, bounds.min_y, bounds.width(), bounds.height()],
+                    group.corner_radius,
+                    group.corner_radii,
+                    group.corner_smoothing,
+                    local.to_array(),
+                )
+            })
+        }
+        fanta_doc::NodeData::TextPath(_) => accepts_precise_hit(scene, node.id, world_point),
+        _ => scene
+            .local_bounds(node.id)
+            .is_some_and(|bounds| bounds.contains_point(local)),
+    }
+}
+
+fn precise_hit_test(
+    scene: &fanta_doc::Scene,
+    world_point: DVec2,
+    precision: fanta_canvas::HitPrecision,
+    active_page: Option<NodeId>,
+) -> Option<NodeId> {
+    fanta_canvas::hit_test_deep(scene, world_point, precision, active_page)
+        .into_iter()
+        .find(|&id| accepts_precise_hit(scene, id, world_point))
+}
+
+pub(crate) fn accepts_precise_hit(
+    scene: &fanta_doc::Scene,
+    id: NodeId,
+    world_point: DVec2,
+) -> bool {
+    let Some(node) = scene.get(id) else {
+        return false;
+    };
+    let fanta_doc::NodeData::TextPath(text_path) = &node.data else {
+        return true;
+    };
+    scene
+        .world_transform(id)
+        .is_some_and(|transform| text_path_contains_world_point(text_path, transform, world_point))
+}
+
+fn text_path_contains_world_point(
+    text_path: &fanta_doc::TextPathNode,
+    transform: fanta_doc::Transform2D,
+    world_point: DVec2,
+) -> bool {
+    let [a, b, c, d, _, _] = transform.to_components();
+    let determinant = a * d - b * c;
+    if !transform.is_finite()
+        || !world_point.x.is_finite()
+        || !world_point.y.is_finite()
+        || !determinant.is_finite()
+        || determinant.abs() <= f64::EPSILON
+    {
+        return false;
+    }
+    let local_point = transform.inverse().transform_point(world_point);
+    if text_path.content.is_empty() {
+        let Some(caret) = fanta_render::text_path_caret_segment(text_path, 0) else {
+            return false;
+        };
+        let start = DVec2::from(caret.start);
+        let end = DVec2::from(caret.end);
+        let segment = end - start;
+        let segment_length_squared = segment.length_squared();
+        if !segment_length_squared.is_finite() || segment_length_squared <= f64::EPSILON {
+            return false;
+        }
+        let position =
+            ((local_point - start).dot(segment) / segment_length_squared).clamp(0.0, 1.0);
+        let closest = start + segment * position;
+        let tolerance = (text_path.style.size_px * 0.15).clamp(3.0, 12.0);
+        return local_point.distance(closest) <= tolerance;
+    }
+    fanta_render::text_path_contains_point(text_path, local_point.to_array())
 }
 
 fn evaluated_hit_test(
@@ -2751,6 +3013,8 @@ struct OverlayData {
     /// Measurement gap segments between the single selection and the hovered
     /// node, when the alt-hover-style measure condition holds.
     measure_segments: Vec<GapSegment>,
+    measurements: Vec<MeasurementOverlay>,
+    annotations: Vec<crate::view::annotations_host::AnnotationOverlay>,
     /// Comment pins on the active page, in stored (oldest-first) order.
     comment_pins: Vec<CommentPin>,
     prototype_connections: Vec<(DVec2, DVec2)>,
@@ -2779,16 +3043,26 @@ fn oriented_selection(
     OrientedSelection { corners, handles }
 }
 
-fn authored_selection_bounds(doc: &fanta_doc::Doc, id: NodeId) -> Option<fanta_doc::Bounds> {
-    let node = doc.scene.get(id)?;
+pub(crate) fn authored_local_bounds(
+    scene: &fanta_doc::Scene,
+    id: NodeId,
+) -> Option<fanta_doc::Bounds> {
+    let node = scene.get(id)?;
     match &node.data {
         fanta_doc::NodeData::Group(group) => group
             .clip_size
             .or(group.local_size)
             .map(|[width, height]| fanta_doc::Bounds::from_xywh(0.0, 0.0, width, height))
-            .or_else(|| doc.scene.local_bounds(id)),
-        _ => doc.scene.local_bounds(id),
+            .or_else(|| scene.local_bounds(id)),
+        fanta_doc::NodeData::TextPath(text_path) => {
+            fanta_render::text_path_visual_bounds(text_path).or_else(|| scene.local_bounds(id))
+        }
+        _ => scene.local_bounds(id),
     }
+}
+
+fn authored_selection_bounds(doc: &fanta_doc::Doc, id: NodeId) -> Option<fanta_doc::Bounds> {
+    authored_local_bounds(&doc.scene, id)
 }
 
 /// Prepaint snapshot of one comment pin (owned, so paint holds no doc borrow).
@@ -2805,7 +3079,7 @@ impl CanvasElement {
     /// the document into owned values. Done up front so the borrow of `cx` (via
     /// the view/document) is released before the paint pass, which needs a
     /// mutable `cx` to shape and paint text.
-    fn collect_overlay_data(&self, cx: &App) -> OverlayData {
+    fn collect_overlay_data(&self, bounds: Bounds<Pixels>, cx: &App) -> OverlayData {
         let collect_started = std::time::Instant::now();
         let mut data = OverlayData {
             frame_labels: Rc::new(Vec::new()),
@@ -2816,12 +3090,19 @@ impl CanvasElement {
             selection_union: None,
             selection_size: None,
             measure_segments: Vec::new(),
+            measurements: Vec::new(),
+            annotations: Vec::new(),
             comment_pins: Vec::new(),
             prototype_connections: Vec::new(),
             prototype_handle: None,
             prototype_start: None,
         };
         let view = self.view.read(cx);
+        if let Some(viewport) = view.viewport() {
+            let (width, height) = bounds_size(bounds);
+            data.measurements = view.measurement_overlays(viewport, [width, height], cx);
+            data.annotations = view.annotation_overlays(viewport, [width, height], cx);
+        }
         let item = view.item().read(cx);
         let Some(document) = item.document() else {
             return data;
@@ -2969,8 +3250,10 @@ impl CanvasElement {
         // Comment pins for the active page (annotation overlay, not scene
         // content, so they paint above the rendered canvas like the badges).
         if let Some(page) = doc.active_page() {
+            let active_motion_clip = view.active_motion_comment_clip(cx);
             data.comment_pins = crate::comments::read_comments(doc, page)
                 .into_iter()
+                .filter(|comment| crate::comments::comment_is_visible(comment, active_motion_clip))
                 .map(|comment| CommentPin {
                     world: DVec2::new(comment.world[0], comment.world[1]),
                     author: comment.author.clone(),
@@ -3047,7 +3330,7 @@ impl CanvasElement {
         if self.view.read(cx).is_presenting_prototype() {
             return;
         }
-        let overlay_data = self.collect_overlay_data(cx);
+        let overlay_data = self.collect_overlay_data(bounds, cx);
 
         let view = self.view.read(cx);
         let Some(viewport) = view.viewport() else {
@@ -3506,7 +3789,300 @@ impl CanvasElement {
                     cx,
                 );
             }
+            if !data.measurements.is_empty() {
+                // Labels contain only the derived numeric distance and "px".
+                // A whole repertoire width per character conservatively culls
+                // distant badges before shaping each individual label.
+                let character_width = f64::from(f32::from(
+                    shape_label("0123456789.< px", gpui::white(), &ui_font, window).width(),
+                ));
+                let (width, height) = bounds_size(bounds);
+                for measurement in &data.measurements {
+                    if !measurement_might_be_visible(measurement, [width, height], character_width)
+                    {
+                        continue;
+                    }
+                    paint_measurement(
+                        measurement,
+                        bounds.origin,
+                        [width, height],
+                        accent,
+                        &ui_font,
+                        window,
+                        cx,
+                    );
+                }
+            }
+            let (width, height) = bounds_size(bounds);
+            for annotation in &data.annotations {
+                let [x, y] = annotation.screen;
+                if !x.is_finite()
+                    || !y.is_finite()
+                    || x < -12.0
+                    || y < -12.0
+                    || x > width + 12.0
+                    || y > height + 12.0
+                {
+                    continue;
+                }
+                let center = bounds.origin + point(px(x as f32), px(y as f32));
+                let background = if annotation.selected {
+                    accent
+                } else {
+                    gpui::rgb(0xB96C14).into()
+                };
+                let background = if annotation.preview {
+                    background.opacity(0.75)
+                } else {
+                    background
+                };
+                window.paint_quad(gpui::quad(
+                    Bounds::new(center - point(px(12.0), px(12.0)), size(px(24.0), px(24.0))),
+                    px(12.0),
+                    background,
+                    px(1.0),
+                    gpui::white(),
+                    BorderStyle::Solid,
+                ));
+                let line = shape_label(&annotation.label, gpui::white(), &ui_font, window);
+                if let Err(error) = line.paint(
+                    point(center.x - line.width() / 2.0, center.y - PILL_HEIGHT / 2.0),
+                    PILL_HEIGHT,
+                    TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                ) {
+                    log::warn!("Could not paint annotation pin: {error:#}");
+                }
+            }
         });
+    }
+}
+
+pub(crate) fn measurement_label_bounds(
+    screen: &ScreenMeasurement,
+    label: &str,
+    window: &Window,
+) -> fanta_doc::Bounds {
+    let line = shape_label(label, gpui::white(), &font(".SystemUIFont"), window);
+    measurement_label_bounds_for_width(screen, f64::from(f32::from(line.width())))
+}
+
+fn measurement_label_bounds_for_width(
+    screen: &ScreenMeasurement,
+    text_width: f64,
+) -> fanta_doc::Bounds {
+    let width = text_width + 12.;
+    let height = f64::from(f32::from(PILL_HEIGHT));
+    fanta_doc::Bounds::from_xywh(
+        screen.label_anchor[0] - width / 2.,
+        screen.label_anchor[1] - height - MEASUREMENT_LABEL_GAP,
+        width,
+        height,
+    )
+}
+
+fn measurement_might_be_visible(
+    measurement: &MeasurementOverlay,
+    screen_size: [f64; 2],
+    character_width: f64,
+) -> bool {
+    let screen = &measurement.screen;
+    if !screen
+        .start
+        .into_iter()
+        .chain(screen.end)
+        .chain(screen.label_anchor)
+        .all(f64::is_finite)
+    {
+        return false;
+    }
+    let radius = f64::from(MEASUREMENT_HANDLE_DIAMETER) / 2.;
+    let segment_bounds = fanta_doc::Bounds {
+        min_x: screen.start[0].min(screen.end[0]) - radius,
+        min_y: screen.start[1].min(screen.end[1]) - radius,
+        max_x: screen.start[0].max(screen.end[0]) + radius,
+        max_y: screen.start[1].max(screen.end[1]) + radius,
+    };
+    let label_bounds = measurement_label_bounds_for_width(
+        screen,
+        measurement.label.chars().count() as f64 * character_width,
+    );
+    let visible = |bounds: fanta_doc::Bounds| {
+        bounds.max_x >= 0.
+            && bounds.max_y >= 0.
+            && bounds.min_x <= screen_size[0]
+            && bounds.min_y <= screen_size[1]
+    };
+    visible(segment_bounds) || visible(label_bounds)
+}
+
+fn clip_measurement_segment(
+    start: [f64; 2],
+    end: [f64; 2],
+    screen_size: [f64; 2],
+) -> Option<[[f64; 2]; 2]> {
+    if !start.into_iter().chain(end).all(f64::is_finite)
+        || !screen_size
+            .into_iter()
+            .all(|size| size.is_finite() && size > 0.0 && size <= f64::from(f32::MAX))
+    {
+        return None;
+    }
+    let outside = |point: [f64; 2]| {
+        u8::from(point[0] < 0.0)
+            | (u8::from(point[0] > screen_size[0]) << 1)
+            | (u8::from(point[1] < 0.0) << 2)
+            | (u8::from(point[1] > screen_size[1]) << 3)
+    };
+    let scale = start
+        .into_iter()
+        .chain(end)
+        .map(f64::abs)
+        .fold(1.0_f64, f64::max);
+    let scaled_start = DVec2::from(start) / scale;
+    let scaled_end = DVec2::from(end) / scale;
+    let delta = scaled_end - scaled_start;
+    let cross = scaled_start.x * scaled_end.y - scaled_end.x * scaled_start.y;
+    let mut start = start;
+    let mut end = end;
+    // Normalized line coefficients avoid overflowing endpoint subtraction or
+    // losing both visible intersections to the same rounded interpolation t.
+    for _ in 0..8 {
+        let start_outside = outside(start);
+        let end_outside = outside(end);
+        if (start_outside | end_outside) == 0 {
+            return Some([start, end]);
+        }
+        if start_outside & end_outside != 0 {
+            return None;
+        }
+        let side = if start_outside != 0 {
+            start_outside
+        } else {
+            end_outside
+        };
+        let intersection = if side & 12 != 0 {
+            if delta.y == 0.0 {
+                return None;
+            }
+            let y = if side & 4 != 0 { 0.0 } else { screen_size[1] };
+            [delta.x.mul_add(y / scale, cross) / delta.y * scale, y]
+        } else {
+            if delta.x == 0.0 {
+                return None;
+            }
+            let x = if side & 1 != 0 { 0.0 } else { screen_size[0] };
+            [x, delta.y.mul_add(x / scale, -cross) / delta.x * scale]
+        };
+        if !intersection.into_iter().all(f64::is_finite) {
+            return None;
+        }
+        if start_outside != 0 {
+            start = intersection;
+        } else {
+            end = intersection;
+        }
+    }
+    None
+}
+
+fn measurement_endpoint_visible(endpoint: [f64; 2], screen_size: [f64; 2]) -> bool {
+    endpoint.into_iter().all(f64::is_finite)
+        && endpoint[0] >= 0.0
+        && endpoint[1] >= 0.0
+        && endpoint[0] <= screen_size[0]
+        && endpoint[1] <= screen_size[1]
+}
+
+fn measurement_label_visible(bounds: fanta_doc::Bounds, screen_size: [f64; 2]) -> bool {
+    bounds.is_finite()
+        && bounds.max_x >= 0.0
+        && bounds.max_y >= 0.0
+        && bounds.min_x <= screen_size[0]
+        && bounds.min_y <= screen_size[1]
+}
+
+fn paint_measurement(
+    measurement: &MeasurementOverlay,
+    origin: Point<Pixels>,
+    screen_size: [f64; 2],
+    accent: Hsla,
+    ui_font: &Font,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let color = if measurement.selected || measurement.preview {
+        accent
+    } else {
+        accent.opacity(0.7)
+    };
+    let project = |screen: [f64; 2]| {
+        let x = f32::from(origin.x) + screen[0] as f32;
+        let y = f32::from(origin.y) + screen[1] as f32;
+        (x.is_finite() && y.is_finite()).then(|| point(px(x), px(y)))
+    };
+    let segment = clip_measurement_segment(
+        measurement.screen.start,
+        measurement.screen.end,
+        screen_size,
+    );
+    if let Some([start, end]) = segment
+        && let Some(start) = project(start)
+        && let Some(end) = project(end)
+    {
+        paint_line(start, end, color, window);
+    }
+    let delta = segment
+        .map(|[start, end]| DVec2::from(end) - DVec2::from(start))
+        .unwrap_or(DVec2::ZERO);
+    let length = delta.x.hypot(delta.y);
+    let normal = if length > 0.0 {
+        DVec2::new(-delta.y / length, delta.x / length) * 4.0
+    } else {
+        DVec2::new(0.0, 4.0)
+    };
+    for endpoint in [measurement.screen.start, measurement.screen.end] {
+        if !measurement_endpoint_visible(endpoint, screen_size) {
+            continue;
+        }
+        let endpoint = DVec2::from(endpoint);
+        if let Some(start) = project((endpoint - normal).to_array())
+            && let Some(end) = project((endpoint + normal).to_array())
+        {
+            paint_line(start, end, color, window);
+        }
+    }
+    let line = shape_label(&measurement.label, gpui::white(), ui_font, window);
+    let label_bounds =
+        measurement_label_bounds_for_width(&measurement.screen, f64::from(f32::from(line.width())));
+    if measurement_label_visible(label_bounds, screen_size)
+        && let Some(anchor) = project([label_bounds.center().x, label_bounds.min_y])
+    {
+        paint_pill(anchor, &line, color, window, cx);
+    }
+    if measurement.show_handles {
+        let diameter = px(MEASUREMENT_HANDLE_DIAMETER);
+        for endpoint in [measurement.screen.start, measurement.screen.end] {
+            if !measurement_endpoint_visible(endpoint, screen_size) {
+                continue;
+            }
+            let Some(center) = project(endpoint) else {
+                continue;
+            };
+            window.paint_quad(gpui::quad(
+                Bounds {
+                    origin: point(center.x - diameter / 2., center.y - diameter / 2.),
+                    size: size(diameter, diameter),
+                },
+                diameter / 2.,
+                gpui::white(),
+                px(1.),
+                color,
+                BorderStyle::Solid,
+            ));
+        }
     }
 }
 

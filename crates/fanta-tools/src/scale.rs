@@ -1,6 +1,6 @@
 //! Proportional scaling of selected layers and their contents.
 
-use crate::context::ToolContext;
+use crate::context::{InteractionBoundsResolver, ToolContext};
 use crate::event::{Button, LogicalKey, ModifierKeys, PointerEvent, ToolEvent};
 use crate::tool::{CursorHint, Tool, ToolResponse};
 use fanta_canvas::{HitPrecision, ResizeHandle};
@@ -73,21 +73,36 @@ impl ScaleTool {
     }
 
     pub fn selection_frame(doc: &Doc, scope: Option<NodeId>) -> Option<(Bounds, Transform2D)> {
+        Self::selection_frame_with_resolver(doc, scope, None)
+    }
+
+    pub fn selection_frame_with_resolver(
+        doc: &Doc,
+        scope: Option<NodeId>,
+        bounds_resolver: Option<InteractionBoundsResolver>,
+    ) -> Option<(Bounds, Transform2D)> {
         let roots = selection_roots(doc, scope);
         if let [id] = roots.as_slice() {
-            return Some((selection_bounds(doc, *id)?, doc.scene.world_transform(*id)?));
+            return Some((
+                selection_bounds(doc, *id, bounds_resolver)?,
+                doc.scene.world_transform(*id)?,
+            ));
         }
         let mut bounds: Option<Bounds> = None;
         for id in roots {
-            let next =
-                selection_bounds(doc, id)?.try_transformed(&doc.scene.world_transform(id)?)?;
+            let next = selection_bounds(doc, id, bounds_resolver)?
+                .try_transformed(&doc.scene.world_transform(id)?)?;
             bounds = Some(bounds.map_or(next, |bounds| bounds.union(&next)));
         }
         bounds.map(|bounds| (bounds, Transform2D::IDENTITY))
     }
 
     fn handle_at(&self, ctx: &ToolContext, screen: DVec2) -> Option<ResizeHandle> {
-        let (local, world) = Self::selection_frame(ctx.doc, ctx.scope())?;
+        let (local, world) = Self::selection_frame_with_resolver(
+            ctx.doc,
+            ctx.scope(),
+            ctx.interaction_bounds_resolver,
+        )?;
         fanta_canvas::handles::hit_test_resize_handle_oriented(
             local,
             &world,
@@ -99,7 +114,11 @@ impl ScaleTool {
     }
 
     fn begin(&mut self, ctx: &ToolContext, handle: ResizeHandle, screen: DVec2) {
-        let Some(frame) = Self::selection_frame(ctx.doc, ctx.scope()) else {
+        let Some(frame) = Self::selection_frame_with_resolver(
+            ctx.doc,
+            ctx.scope(),
+            ctx.interaction_bounds_resolver,
+        ) else {
             return;
         };
         let roots = selection_roots(ctx.doc, ctx.scope());
@@ -310,14 +329,10 @@ impl Tool for ScaleTool {
                 if let Some(handle) = self.handle_at(ctx, screen) {
                     self.begin(ctx, handle, screen);
                 } else {
-                    let hit = fanta_canvas::hit_test(
-                        &ctx.doc.scene,
-                        ctx.screen_to_world(screen),
-                        HitPrecision::Bounds,
-                        ctx.scope(),
-                    )
-                    .map(|id| selection_target(ctx.doc, ctx.scope(), id, modifiers))
-                    .filter(|&id| eligible_root(ctx.doc, ctx.scope(), id));
+                    let hit = ctx
+                        .hit_test(ctx.screen_to_world(screen), HitPrecision::Bounds)
+                        .map(|id| selection_target(ctx.doc, ctx.scope(), id, modifiers))
+                        .filter(|&id| eligible_root(ctx.doc, ctx.scope(), id));
                     match hit {
                         Some(id) if modifiers.extend_selection() => ctx.doc.selection.toggle(id),
                         Some(id) => ctx.doc.selection.select_only(id),
@@ -452,10 +467,17 @@ fn resolve_scale_data(doc: &Doc, node: &CanvasNode) -> Option<NodeData> {
     resolved_data
 }
 
-fn selection_bounds(doc: &Doc, id: NodeId) -> Option<Bounds> {
+fn selection_bounds(
+    doc: &Doc,
+    id: NodeId,
+    bounds_resolver: Option<InteractionBoundsResolver>,
+) -> Option<Bounds> {
     let node = doc.scene.get(id)?;
     let NodeData::Group(group) = &node.data else {
-        return doc.scene.local_bounds(id);
+        return bounds_resolver.map_or_else(
+            || doc.scene.local_bounds(id),
+            |resolver| resolver(&doc.scene, id),
+        );
     };
     // Frames render variable-bound dimensions from a scratch node, not the
     // stored literals. The handle frame and scaling pivot must use that box.
@@ -472,7 +494,7 @@ fn selection_bounds(doc: &Doc, id: NodeId) -> Option<Bounds> {
     }
     let mut bounds: Option<Bounds> = None;
     for &child in doc.scene.children_of(Some(id)) {
-        if let Some(child_bounds) = selection_bounds(doc, child)
+        if let Some(child_bounds) = selection_bounds(doc, child, bounds_resolver)
             .and_then(|bounds| bounds.try_transformed(&doc.scene.get(child)?.transform))
         {
             bounds = Some(bounds.map_or(child_bounds, |bounds| bounds.union(&child_bounds)));
@@ -663,6 +685,21 @@ fn scale_data(data: &mut NodeData, factor: f64) -> Option<()> {
             scale_number(&mut text.paragraph_spacing, factor)?;
             scale_number(&mut text.paragraph_indent, factor)?;
         }
+        NodeData::TextPath(text_path) => {
+            let mut finite = true;
+            text_path.path.map_points_mut(|point| {
+                let scaled = [point[0] * factor, point[1] * factor];
+                finite &= scaled.into_iter().all(f64::is_finite);
+                scaled
+            });
+            if !finite {
+                return None;
+            }
+            scale_text(&mut text_path.style, factor)?;
+            for run in &mut text_path.style_runs {
+                scale_text(&mut run.style, factor)?;
+            }
+        }
         NodeData::Boolean(boolean) => {
             for fill in &mut boolean.fills {
                 scale_paint(fill, factor)?;
@@ -683,7 +720,7 @@ fn scale_data(data: &mut NodeData, factor: f64) -> Option<()> {
 
 #[cfg(test)]
 mod tests {
-    use crate::scale::ScaleTool;
+    use crate::scale::{ScaleTool, scale_data};
     use crate::{
         Button, KeyEvent, LogicalKey, ModifierKeys, PointerEvent, Tool, ToolContext, ToolEvent,
     };
@@ -691,9 +728,9 @@ mod tests {
     use fanta_doc::{
         AutoLayout, Blur, BoundProp, Bounds, CanvasNode, Color, ComponentDef, ComponentId,
         ConstraintH, ConstraintV, Constraints, Doc, GroupNode, InstanceNode, Mode, ModeId,
-        NodeData, NodeFlags, NodeId, Operation, Shadow, ShadowKind, Stroke, TextNode, TextStyle,
-        TextStyleRun, Transform2D, VarValue, Variable, VariableCollection, VariableCollectionId,
-        VariableId, VariableType, VectorNode, Viewport,
+        NodeData, NodeFlags, NodeId, Operation, Shadow, ShadowKind, Stroke, TextNode, TextPathNode,
+        TextPathStart, TextStyle, TextStyleRun, Transform2D, VarValue, Variable,
+        VariableCollection, VariableCollectionId, VariableId, VariableType, VectorNode, Viewport,
     };
     use glam::DVec2;
     use std::collections::BTreeMap;
@@ -948,6 +985,43 @@ mod tests {
             assert_eq!(node(ctx.doc, child_id).data, original_child.data);
             assert_eq!(node(ctx.doc, child_id).transform, original_child.transform);
         }
+    }
+
+    #[test]
+    fn scale_text_path_scales_baseline_and_typography_without_moving_its_start() {
+        let mut path = fanta_doc::PathData::new();
+        path.move_to(1., 2.)
+            .quad_to(3., 4., 5., 6.)
+            .line_to(8., 10.);
+        let mut text_path = TextPathNode::new(path, "Curve");
+        text_path.style.size_px = 20.;
+        text_path.style.letter_spacing = 1.5;
+        text_path.style_runs.push(TextStyleRun {
+            start: 0,
+            end: 5,
+            style: TextStyle {
+                size_px: 24.,
+                letter_spacing: -0.5,
+                ..Default::default()
+            },
+        });
+        text_path.start = TextPathStart::new(1, 0.25).expect("valid path start");
+        let mut data = NodeData::TextPath(text_path);
+
+        scale_data(&mut data, 2.).expect("text path scales");
+        let text_path = data.as_text_path().expect("text path remains text path");
+        assert_eq!(
+            text_path.start,
+            TextPathStart::new(1, 0.25).expect("expected path start")
+        );
+        assert_eq!(text_path.style.size_px, 40.);
+        assert_eq!(text_path.style.letter_spacing, 3.);
+        let run = text_path.style_runs.first().expect("rich text run");
+        assert_eq!(run.style.size_px, 48.);
+        assert_eq!(run.style.letter_spacing, -1.);
+        let bounds = text_path.path.rough_bounds().expect("scaled path bounds");
+        assert_eq!([bounds.min_x, bounds.min_y], [2., 4.]);
+        assert_eq!([bounds.max_x, bounds.max_y], [16., 20.]);
     }
 
     #[test]

@@ -12,6 +12,7 @@ pub enum EditorMode {
     Prototype,
     Motion,
     Draw,
+    Dev,
     Code,
     Comments,
 }
@@ -45,10 +46,11 @@ impl EditorWorkspace {
 }
 
 impl EditorMode {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Design,
         Self::Motion,
         Self::Draw,
+        Self::Dev,
         Self::Code,
         Self::Prototype,
         Self::Comments,
@@ -60,6 +62,7 @@ impl EditorMode {
             Self::Prototype => "Prototype",
             Self::Motion => "Motion",
             Self::Draw => "Draw",
+            Self::Dev => "Dev",
             Self::Code => "Code",
             Self::Comments => "Comments",
         }
@@ -71,6 +74,7 @@ impl EditorMode {
             Self::Prototype => IconName::PlayOutlined,
             Self::Motion => IconName::FastForward,
             Self::Draw => IconName::ToolPencil,
+            Self::Dev => IconName::FileCode,
             Self::Code => IconName::FileCode,
             Self::Comments => IconName::Chat,
         }

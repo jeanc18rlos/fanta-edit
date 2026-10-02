@@ -305,6 +305,7 @@ pub struct FantaDesignPanel {
     focus_handle: FocusHandle,
     fs: Arc<dyn Fs>,
     active_view: Option<WeakEntity<FigView>>,
+    inspecting: bool,
     width: Option<Pixels>,
     /// Host-controlled expansion of the layer tree, echoed into the gpui
     /// panel on every refresh (the panel's own expansion interactions come
@@ -465,6 +466,7 @@ impl FantaDesignPanel {
             focus_handle: cx.focus_handle(),
             fs,
             active_view: None,
+            inspecting: false,
             width: None,
             expanded_nodes: HashSet::new(),
             expansion_generation: 0,
@@ -559,6 +561,7 @@ impl FantaDesignPanel {
                             }
                         },
                     ));
+                    self.inspecting = view.read(cx).is_art_read_only(cx);
                     self.active_view = Some(view.downgrade());
                     self.clear_expanded_nodes();
                     self.last_reveal_anchor = None;
@@ -609,6 +612,60 @@ impl FantaDesignPanel {
 
     fn active_view(&self, _cx: &App) -> Option<Entity<FigView>> {
         self.active_view.as_ref().and_then(|view| view.upgrade())
+    }
+
+    pub(crate) fn has_pending_authoring(&self, cx: &App) -> bool {
+        #[cfg(feature = "fanta-gpui-ui")]
+        {
+            return self
+                .gpui_layers
+                .as_ref()
+                .is_some_and(|adapter| adapter.panel.read(cx).has_pending_authoring(cx))
+                || self
+                    .gpui_pages
+                    .as_ref()
+                    .is_some_and(|adapter| adapter.panel.read(cx).has_pending_authoring(cx));
+        }
+        #[cfg(not(feature = "fanta-gpui-ui"))]
+        {
+            false
+        }
+    }
+
+    pub(crate) fn set_inspecting(&mut self, inspecting: bool, cx: &mut Context<Self>) {
+        if self.inspecting == inspecting {
+            return;
+        }
+        self.inspecting = inspecting;
+        #[cfg(feature = "fanta-gpui-ui")]
+        {
+            if let Some(adapter) = &self.gpui_pages {
+                adapter
+                    .panel
+                    .update(cx, |panel, cx| panel.set_read_only(inspecting, cx));
+            }
+            if let Some(adapter) = &self.gpui_layers {
+                adapter
+                    .panel
+                    .update(cx, |panel, cx| panel.set_read_only(inspecting, cx));
+            }
+        }
+        let panel = cx.weak_entity();
+        cx.defer(move |cx| {
+            panel
+                .update(cx, |panel, cx| {
+                    panel.rebuild_caches(cx);
+                    #[cfg(feature = "fanta-gpui-ui")]
+                    {
+                        panel.asset_echo_key = None;
+                        panel.refresh_gpui_pages(cx);
+                        panel.refresh_gpui_layers(cx);
+                    }
+                    cx.notify();
+                })
+                .log_err();
+        });
+        cx.notify();
     }
 
     // === Document mutations ================================================
@@ -662,6 +719,9 @@ impl FantaDesignPanel {
         view.update(cx, |view, cx| {
             view.finish_document_edits_for_external_change(cx);
         });
+        if self.inspecting || !view.read(cx).is_editable(cx) {
+            return;
+        }
         let item = view.read(cx).item().clone();
         let result: Result<bool> = item.update(cx, |item, cx| {
             if !item.is_editable() {
@@ -729,7 +789,8 @@ impl FantaDesignPanel {
             return false;
         };
         let item = view.read(cx).item().read(cx);
-        item.is_editable()
+        !self.inspecting
+            && view.read(cx).is_editable(cx)
             && item.document().is_some_and(|document| {
                 layer_move_operations(&document.doc, dragged, target, placement).is_ok()
             })
@@ -752,6 +813,9 @@ impl FantaDesignPanel {
         view.update(cx, |view, cx| {
             view.finish_document_edits_for_external_change(cx);
         });
+        if self.inspecting || !view.read(cx).is_editable(cx) {
+            return;
+        }
         let item = view.read(cx).item().clone();
         let result: Option<Result<bool>> = item.update(cx, |item, cx| {
             if !item.is_editable() {
@@ -816,6 +880,9 @@ impl FantaDesignPanel {
         view.update(cx, |view, cx| {
             view.finish_document_edits_for_external_change(cx);
         });
+        if self.inspecting || !view.read(cx).is_editable(cx) {
+            return;
+        }
         let item = view.read(cx).item().clone();
         item.update(cx, |item, cx| {
             if !item.is_editable() {
@@ -862,6 +929,9 @@ impl FantaDesignPanel {
         let Some(view) = self.active_view(cx) else {
             return;
         };
+        if self.inspecting || !view.read(cx).is_editable(cx) {
+            return;
+        }
         let item = view.read(cx).item().clone();
         if !item.read(cx).is_editable() {
             return;
@@ -917,6 +987,9 @@ impl FantaDesignPanel {
         let Some(view) = self.active_view(cx) else {
             return;
         };
+        if self.inspecting || !view.read(cx).is_editable(cx) {
+            return;
+        }
         let item = view.read(cx).item().clone();
         if !item.read(cx).is_editable() {
             return;
@@ -1355,7 +1428,10 @@ impl FantaDesignPanel {
             if self.asset_echo_key == Some(key) {
                 return;
             }
-            (key, project_assets_view_data(document, item.is_editable()))
+            (
+                key,
+                project_assets_view_data(document, item.is_editable() && !self.inspecting),
+            )
         };
         panel.update(cx, |panel, cx| panel.set_view_data(data, window, cx));
         self.asset_echo_key = Some(key);
@@ -2822,7 +2898,7 @@ impl FantaDesignPanel {
         };
         let (mut items, id_map) = crate::gpui_adapters::pages::pages_view_data(document);
         for page in &mut items {
-            page.editable &= fig_item.is_editable();
+            page.editable &= fig_item.is_editable() && !self.inspecting;
             page.can_copy_link = id_map
                 .get(&page.id)
                 .and_then(|page| page.root)
@@ -3158,6 +3234,9 @@ impl FantaDesignPanel {
         let Some(view) = self.active_view(cx) else {
             return;
         };
+        if self.inspecting || !view.read(cx).is_editable(cx) {
+            return;
+        }
         let item = view.read(cx).item().clone();
         if !item.read(cx).is_editable() {
             return;
@@ -3248,6 +3327,9 @@ impl FantaDesignPanel {
         let Some(view) = self.active_view(cx) else {
             return;
         };
+        if self.inspecting || !view.read(cx).is_editable(cx) {
+            return;
+        }
         let item = view.read(cx).item().clone();
         if !item.read(cx).is_editable() {
             return;
@@ -3343,7 +3425,7 @@ impl FantaDesignPanel {
             page_root,
             render_generation: document.render_generation(),
             expansion_generation: self.expansion_generation,
-            editable: fig_item.is_editable(),
+            editable: fig_item.is_editable() && !self.inspecting,
         };
         let tree = (self
             .gpui_layers
@@ -3352,7 +3434,7 @@ impl FantaDesignPanel {
         .then(|| {
             let mut tree =
                 crate::gpui_adapters::layers::layers_tree(doc, page_root, &self.expanded_nodes);
-            if !fig_item.is_editable() {
+            if !fig_item.is_editable() || self.inspecting {
                 crate::gpui_adapters::layers::restrict_read_only(&mut tree);
             }
             tree

@@ -4,6 +4,12 @@
 //! dirty tracking and save.
 
 mod agent_presence;
+#[path = "view_annotations.rs"]
+pub(crate) mod annotations_host;
+#[path = "view_dev_mode.rs"]
+mod dev_mode;
+#[path = "view_measurements.rs"]
+mod measurements_host;
 #[cfg(feature = "fanta-gpui-ui")]
 mod properties_inspector;
 #[cfg(feature = "fanta-gpui-ui")]
@@ -52,6 +58,7 @@ use crate::clipboard::{
     create_operations, delete_operations,
 };
 use crate::code_workspace::FantaCodeWorkspace;
+use crate::comments::MotionCommentAnchor;
 use crate::comments_panel::{FantaCommentsPanel, document_comment_rows};
 use crate::design_panel::{FantaDesignPanel, FileInspectorVisibilityChanged};
 use crate::document::{
@@ -62,6 +69,11 @@ use crate::editor_session::{
     EditorMode, EditorModeTabs, EditorSession, EditorWorkspace, EditorWorkspaceTabs,
 };
 use crate::generation_media::{self, PreparedCanvasAsset};
+use crate::measurements::{
+    MeasurementCommit, MeasurementController, MeasurementDragKind, MeasurementHit,
+    MeasurementOverlay, MeasurementProjection, MeasurementRecord, delete_measurement_op,
+    read_measurements,
+};
 use crate::motion_edit::{
     MotionKeyframeDragSession, delete_keyframe_operation, rename_clip_operation,
     set_clip_duration_operation, set_keyframe_easing_operation,
@@ -145,6 +157,12 @@ actions!(
         NudgeDown,
         /// Activate the move/select tool.
         ActivateSelectTool,
+        /// Inspect layers without editing artwork.
+        ActivateInspectTool,
+        /// Measure a distance on the canvas.
+        ActivateMeasureTool,
+        /// Add an annotation to the canvas.
+        ActivateAnnotationTool,
         /// Activate the hand (pan) tool.
         ActivateHandTool,
         /// Activate the rectangle tool.
@@ -153,6 +171,8 @@ actions!(
         ActivateEllipseTool,
         /// Activate the line tool.
         ActivateLineTool,
+        /// Activate the arrow tool.
+        ActivateArrowTool,
         /// Activate the polygon tool.
         ActivatePolygonTool,
         /// Activate the star tool.
@@ -191,7 +211,7 @@ actions!(
         ActivateMagicWandTool,
         /// Crop vector and image content with a rectangular clip.
         ActivateCropTool,
-        /// Activate the text-on-path tool (placeholder).
+        /// Convert the selected text and vector into text on a path.
         ActivateTextPathTool,
         /// Activate the comment tool (click the canvas to pin a comment).
         ActivateCommentTool,
@@ -212,6 +232,7 @@ actions!(
 fn action_for_kind(kind: ToolKind) -> Box<dyn Action> {
     match kind {
         ToolKind::Select => Box::new(ActivateSelectTool),
+        ToolKind::Inspect => Box::new(ActivateInspectTool),
         ToolKind::PathSelect => Box::new(ActivatePathSelectTool),
         ToolKind::RectangleSelect => Box::new(ActivateRectangleSelectTool),
         ToolKind::EllipseSelect => Box::new(ActivateEllipseSelectTool),
@@ -225,6 +246,7 @@ fn action_for_kind(kind: ToolKind) -> Box<dyn Action> {
         ToolKind::Rect => Box::new(ActivateRectangleTool),
         ToolKind::Ellipse => Box::new(ActivateEllipseTool),
         ToolKind::Line => Box::new(ActivateLineTool),
+        ToolKind::Arrow => Box::new(ActivateArrowTool),
         ToolKind::Polygon => Box::new(ActivatePolygonTool),
         ToolKind::Star => Box::new(ActivateStarTool),
         ToolKind::Pen => Box::new(ActivatePenTool),
@@ -237,6 +259,8 @@ fn action_for_kind(kind: ToolKind) -> Box<dyn Action> {
         ToolKind::Text => Box::new(ActivateTextTool),
         ToolKind::TextPath => Box::new(ActivateTextPathTool),
         ToolKind::Comment => Box::new(ActivateCommentTool),
+        ToolKind::Measure => Box::new(ActivateMeasureTool),
+        ToolKind::Annotation => Box::new(ActivateAnnotationTool),
     }
 }
 
@@ -261,6 +285,32 @@ enum SidebarKind {
     Inspector,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct LocalMediaOrigin {
+    item: gpui::EntityId,
+    scene: u64,
+    page: NodeId,
+    scope: Option<FigScope>,
+    mode: EditorMode,
+    path: std::path::PathBuf,
+    generation: u64,
+}
+
+#[derive(Clone)]
+struct MeasurementSelection {
+    document: fanta_doc::DocId,
+    scene: u64,
+    page: NodeId,
+    id: String,
+}
+
+struct MeasurementCache {
+    scene: u64,
+    revision: u64,
+    page: NodeId,
+    records: Vec<MeasurementRecord>,
+}
+
 #[derive(Clone)]
 struct SidebarResizeDrag {
     sidebar: SidebarKind,
@@ -276,6 +326,7 @@ pub struct FigView {
     pub(crate) item: Entity<FigItem>,
     project: Entity<Project>,
     pub(crate) focus_handle: FocusHandle,
+    native_toolbar_focus: FocusHandle,
     editor_session: Entity<EditorSession>,
     layers_sidebar: Entity<FantaDesignPanel>,
     _file_inspector_subscription: Subscription,
@@ -286,6 +337,7 @@ pub struct FigView {
     code_workspace: Entity<FantaCodeWorkspace>,
     timeline_shell: Entity<TimelineShell>,
     active_motion_clip: Option<AnimationClipId>,
+    motion_auto_keyframe: bool,
     motion_keyframe_drag: Option<MotionKeyframeDragSession>,
     layers_sidebar_visible: bool,
     inspector_sidebar_visible: bool,
@@ -356,6 +408,12 @@ pub struct FigView {
     #[cfg(target_os = "macos")]
     canvas_video_active: std::cell::Cell<bool>,
     pub(crate) tools: ToolShell,
+    annotation_state: annotations_host::AnnotationHostState,
+    measurement_controller: MeasurementController,
+    measurement_origin: Option<LocalMediaOrigin>,
+    measurement_selection: Option<MeasurementSelection>,
+    measurement_cache: std::cell::RefCell<Option<MeasurementCache>>,
+    media_import_generation: std::cell::Cell<u64>,
     wand_asset_map: Option<Arc<BTreeMap<AssetId, Vec<u8>>>>,
     wand_decode_cache: HashMap<AssetId, Arc<image::RgbaImage>>,
     wand_decode_order: VecDeque<AssetId>,
@@ -616,7 +674,13 @@ impl FigView {
             },
         );
         let prototype_sidebar = cx.new(|cx| FantaPrototypePanel::new(item.clone(), cx));
-        let motion_sidebar = cx.new(|cx| FantaMotionPanel::new(item.clone(), cx));
+        let timeline_shell = cx.new(|cx| {
+            let mut timeline = TimelineShell::new();
+            timeline.set_authoring_enabled(false, cx);
+            timeline
+        });
+        let motion_sidebar =
+            cx.new(|cx| FantaMotionPanel::new(item.clone(), timeline_shell.clone(), window, cx));
         let motion_sidebar_subscription =
             cx.subscribe(&motion_sidebar, |_this, _, event: &MotionPanelEvent, cx| {
                 let event = *event;
@@ -630,11 +694,6 @@ impl FigView {
             cx.new(|cx| FantaVariablesWorkspace::new(item.clone(), window, cx));
         let code_workspace =
             cx.new(|cx| FantaCodeWorkspace::new(item.clone(), project.clone(), window, cx));
-        let timeline_shell = cx.new(|cx| {
-            let mut timeline = TimelineShell::new();
-            timeline.set_authoring_enabled(false, cx);
-            timeline
-        });
         let timeline_subscription =
             cx.subscribe(&timeline_shell, |this, _, event: &TimelineEvent, cx| {
                 this.handle_timeline_event(event.clone(), cx);
@@ -682,6 +741,7 @@ impl FigView {
             item,
             project,
             focus_handle,
+            native_toolbar_focus: cx.focus_handle(),
             editor_session,
             layers_sidebar,
             _file_inspector_subscription: file_inspector_subscription,
@@ -692,6 +752,7 @@ impl FigView {
             code_workspace,
             timeline_shell,
             active_motion_clip: None,
+            motion_auto_keyframe: false,
             motion_keyframe_drag: None,
             layers_sidebar_visible,
             inspector_sidebar_visible,
@@ -731,6 +792,12 @@ impl FigView {
             #[cfg(target_os = "macos")]
             canvas_video_active: std::cell::Cell::new(true),
             tools: ToolShell::new(),
+            annotation_state: annotations_host::AnnotationHostState::default(),
+            measurement_controller: MeasurementController::default(),
+            measurement_origin: None,
+            measurement_selection: None,
+            measurement_cache: std::cell::RefCell::new(None),
+            media_import_generation: std::cell::Cell::new(0),
             wand_asset_map: None,
             wand_decode_cache: HashMap::new(),
             wand_decode_order: VecDeque::new(),
@@ -1005,6 +1072,7 @@ impl FigView {
     }
 
     fn cancel_canvas_edits_for_source_lock(&mut self, cx: &mut Context<Self>) {
+        let owner = cx.entity_id();
         if !self.item.read(cx).source_edit_locked() {
             return;
         }
@@ -1022,7 +1090,7 @@ impl FigView {
         });
         let tools = &mut self.tools;
         self.item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(owner, cx, |document| {
                 let revision_before = document.doc.scene.revision();
                 if let Some(session) = text_session.as_ref() {
                     crate::text_edit::rewind_preview(&mut document.doc, session);
@@ -1041,7 +1109,7 @@ impl FigView {
                 };
                 ((), change)
             });
-            item.finish_content_preview(false, cx);
+            item.finish_content_preview(owner, false, cx);
         });
         self.viewport = viewport;
         self.remember_tool_face(ToolKind::Select);
@@ -1135,6 +1203,13 @@ impl FigView {
     }
 
     pub fn set_editor_workspace(&mut self, workspace: EditorWorkspace, cx: &mut Context<Self>) {
+        if self.is_dev_mode(cx) {
+            self.set_dev_workspace(workspace, cx);
+            return;
+        }
+        if self.refuse_pending_annotation(cx) || self.refuse_pending_measurement(cx) {
+            return;
+        }
         if self.editor_workspace(cx) == workspace {
             return;
         }
@@ -1154,6 +1229,17 @@ impl FigView {
     }
 
     pub fn set_editor_mode(&mut self, mode: EditorMode, cx: &mut Context<Self>) {
+        if mode == EditorMode::Dev || self.is_dev_mode(cx) {
+            self.set_dev_mode_boundary(mode, cx);
+            return;
+        }
+        if self.refuse_pending_annotation(cx) || self.refuse_pending_measurement(cx) {
+            return;
+        }
+        self.comment_state.clear_pending_motion_anchor();
+        if mode != EditorMode::Motion {
+            self.set_motion_auto_keyframe_state(false, cx);
+        }
         let previous_mode = self.editor_mode(cx);
         if previous_mode == mode {
             return;
@@ -1414,6 +1500,7 @@ impl FigView {
         time_us: i64,
         cx: &mut Context<Self>,
     ) {
+        let owner = cx.entity_id();
         if !self.is_editable(cx) {
             self.cancel_motion_keyframe_drag(cx);
             return;
@@ -1427,7 +1514,7 @@ impl FigView {
             return;
         };
         item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(owner, cx, |document| {
                 let change = if session.preview(&mut document.doc, time_us) {
                     DocChange::ContentPreview
                 } else {
@@ -1444,6 +1531,7 @@ impl FigView {
         easing: Easing,
         cx: &mut Context<Self>,
     ) {
+        let owner = cx.entity_id();
         if !self.is_editable(cx) {
             self.cancel_motion_keyframe_drag(cx);
             return;
@@ -1457,7 +1545,7 @@ impl FigView {
             return;
         };
         item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(owner, cx, |document| {
                 let change = if session.preview_easing(&mut document.doc, easing) {
                     DocChange::ContentPreview
                 } else {
@@ -1474,6 +1562,7 @@ impl FigView {
         time_us: i64,
         cx: &mut Context<Self>,
     ) {
+        let owner = cx.entity_id();
         let Some(mut session) = self.motion_keyframe_drag.take() else {
             return;
         };
@@ -1482,7 +1571,7 @@ impl FigView {
             return;
         }
         self.item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(owner, cx, |document| {
                 session.preview(&mut document.doc, time_us);
                 let change = if session.restore(&mut document.doc) {
                     DocChange::ContentPreview
@@ -1492,11 +1581,11 @@ impl FigView {
                 ((), change)
             });
             let Some(operation) = session.operation() else {
-                item.finish_content_preview(false, cx);
+                item.finish_content_preview(owner, false, cx);
                 return;
             };
-            if let Err(error) = item.apply(operation, cx) {
-                item.finish_content_preview(false, cx);
+            if let Err(error) = item.apply_for_preview_owner(owner, operation, cx) {
+                item.finish_content_preview(owner, false, cx);
                 log::error!("moving motion keyframe failed: {error:#}");
             }
         });
@@ -1508,6 +1597,7 @@ impl FigView {
         easing: Easing,
         cx: &mut Context<Self>,
     ) {
+        let owner = cx.entity_id();
         let Some(mut session) = self.motion_keyframe_drag.take() else {
             return;
         };
@@ -1516,7 +1606,7 @@ impl FigView {
             return;
         }
         self.item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(owner, cx, |document| {
                 session.preview_easing(&mut document.doc, easing);
                 let change = if session.restore(&mut document.doc) {
                     DocChange::ContentPreview
@@ -1526,17 +1616,18 @@ impl FigView {
                 ((), change)
             });
             let Some(operation) = session.operation() else {
-                item.finish_content_preview(false, cx);
+                item.finish_content_preview(owner, false, cx);
                 return;
             };
-            if let Err(error) = item.apply(operation, cx) {
-                item.finish_content_preview(false, cx);
+            if let Err(error) = item.apply_for_preview_owner(owner, operation, cx) {
+                item.finish_content_preview(owner, false, cx);
                 log::error!("editing motion keyframe easing failed: {error:#}");
             }
         });
     }
 
     fn finish_motion_keyframe_drag(&mut self, cx: &mut Context<Self>) {
+        let owner = cx.entity_id();
         let Some(session) = self.motion_keyframe_drag.take() else {
             return;
         };
@@ -1545,7 +1636,7 @@ impl FigView {
             return;
         }
         self.item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(owner, cx, |document| {
                 let change = if session.restore(&mut document.doc) {
                     DocChange::ContentPreview
                 } else {
@@ -1554,11 +1645,11 @@ impl FigView {
                 ((), change)
             });
             let Some(operation) = session.operation() else {
-                item.finish_content_preview(false, cx);
+                item.finish_content_preview(owner, false, cx);
                 return;
             };
-            if let Err(error) = item.apply(operation, cx) {
-                item.finish_content_preview(false, cx);
+            if let Err(error) = item.apply_for_preview_owner(owner, operation, cx) {
+                item.finish_content_preview(owner, false, cx);
                 log::error!("finishing motion keyframe drag failed: {error:#}");
             }
         });
@@ -1576,8 +1667,9 @@ impl FigView {
         session: MotionKeyframeDragSession,
         cx: &mut Context<Self>,
     ) {
+        let owner = cx.entity_id();
         self.item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(owner, cx, |document| {
                 let change = if session.restore(&mut document.doc) {
                     DocChange::ContentPreview
                 } else {
@@ -1585,7 +1677,7 @@ impl FigView {
                 };
                 ((), change)
             });
-            item.finish_content_preview(false, cx);
+            item.finish_content_preview(owner, false, cx);
         });
     }
 
@@ -1790,6 +1882,334 @@ impl FigView {
         });
     }
 
+    fn set_motion_auto_keyframe_state(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let changed = self.motion_auto_keyframe != enabled;
+        self.motion_auto_keyframe = enabled;
+        self.motion_sidebar
+            .update(cx, |panel, cx| panel.set_auto_keyframe(enabled, cx));
+        if changed {
+            cx.notify();
+        }
+    }
+
+    fn set_motion_auto_keyframe(&mut self, enabled: bool, cx: &mut Context<Self>) -> Result<()> {
+        if !enabled {
+            self.motion_sidebar
+                .update(cx, |panel, cx| panel.finish_continuous_edits(cx));
+            self.set_motion_auto_keyframe_state(false, cx);
+            return Ok(());
+        }
+        if self.motion_auto_keyframe {
+            return Ok(());
+        }
+
+        self.finish_document_edits(cx);
+        anyhow::ensure!(
+            self.editor_workspace(cx) == EditorWorkspace::Canvas
+                && self.editor_mode(cx) == EditorMode::Motion,
+            "open the Motion canvas first"
+        );
+        let active_clip = self
+            .active_motion_clip
+            .context("create an animation clip first")?;
+        let panel_owner = self.motion_sidebar.entity_id();
+        {
+            let item = self.item.read(cx);
+            anyhow::ensure!(item.is_editable(), "the canvas is read-only");
+            anyhow::ensure!(
+                item.can_preview_for_owner(panel_owner) && !item.content_preview_active(),
+                "finish the active canvas preview first"
+            );
+            let document = item.document().context("the document is still loading")?;
+            anyhow::ensure!(
+                document.doc.motion.clip(active_clip).is_some(),
+                "the active animation no longer exists"
+            );
+            let node = single_selection(&document.doc)
+                .context("select one layer before turning on Auto key")?;
+            anyhow::ensure!(
+                document.doc.scene.get(node).is_some(),
+                "the selected layer no longer exists"
+            );
+        }
+
+        self.timeline_shell
+            .update(cx, |timeline, cx| timeline.pause(cx));
+        self.set_motion_auto_keyframe_state(true, cx);
+        self.sync_motion_timeline(cx);
+        Ok(())
+    }
+
+    pub(crate) fn active_motion_comment_clip(&self, cx: &App) -> Option<AnimationClipId> {
+        if self.editor_mode(cx) != EditorMode::Motion {
+            return None;
+        }
+        let clip = self.active_motion_clip?;
+        self.item
+            .read(cx)
+            .document()
+            .and_then(|document| document.doc.motion.clip(clip))
+            .map(|_| clip)
+    }
+
+    pub(crate) fn active_motion_clip_id(&self) -> Option<AnimationClipId> {
+        self.active_motion_clip
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn arm_motion_time_comment(&mut self, cx: &mut Context<Self>) -> Result<u32> {
+        self.finish_document_edits(cx);
+        if self.comment_state.draft.is_some() {
+            anyhow::bail!("send or cancel the current comment draft before starting another one");
+        }
+        if self.has_unsent_comment_reply(cx) {
+            anyhow::bail!("send or clear the current reply before starting a time comment");
+        }
+        if self.editor_workspace(cx) != EditorWorkspace::Canvas
+            || self.editor_mode(cx) != EditorMode::Motion
+        {
+            anyhow::bail!("open the Motion canvas before adding a time comment");
+        }
+
+        let preview_owner = cx.entity_id();
+        let (clip, time_ms) = {
+            let item = self.item.read(cx);
+            if !item.can_preview_for_owner(preview_owner) || item.content_preview_active() {
+                anyhow::bail!(
+                    "finish the current Save As operation or canvas preview before adding a time comment"
+                );
+            }
+            let document = item.document().context("the document is still loading")?;
+            let page = document
+                .doc
+                .active_page()
+                .context("open a page before adding a time comment")?;
+            if !document.doc.pages().contains(&page) {
+                anyhow::bail!("open a page before adding a time comment");
+            }
+            let clip = self
+                .active_motion_clip
+                .context("create an animation before adding a time comment")?;
+            let duration_ms = document
+                .doc
+                .motion
+                .clip(clip)
+                .context("the active animation no longer exists")?
+                .duration_ms;
+            let time_ms = self
+                .timeline_shell
+                .read(cx)
+                .playhead_us()
+                .max(0)
+                .div_euclid(1_000)
+                .min(i64::from(duration_ms)) as u32;
+            (clip, time_ms)
+        };
+
+        self.timeline_shell
+            .update(cx, |timeline, cx| timeline.pause(cx));
+        self.activate_tool(ToolKind::Comment, cx);
+        if !self.arm_motion_comment_anchor(MotionCommentAnchor { clip, time_ms }, cx) {
+            self.activate_tool(ToolKind::Select, cx);
+            anyhow::bail!("open a page before adding a time comment");
+        }
+        cx.notify();
+        Ok(time_ms)
+    }
+
+    pub(crate) fn navigate_to_motion_comment(
+        &mut self,
+        anchor: MotionCommentAnchor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_dev_mode(cx) {
+            return;
+        }
+        self.finish_document_edits(cx);
+        self.comment_state.clear_pending_motion_anchor();
+        let Some(duration_ms) = self.item.read(cx).document().and_then(|document| {
+            document
+                .doc
+                .motion
+                .clip(anchor.clip)
+                .map(|clip| clip.duration_ms)
+        }) else {
+            self.set_editor_workspace(EditorWorkspace::Canvas, cx);
+            self.hovered_node = None;
+            self.comment_state.hovered_pin = None;
+            self.invalidate_canvas_cache();
+            cx.notify();
+            show_canvas_notice(
+                "This comment's animation is no longer available.".to_string(),
+                window,
+                cx,
+            );
+            return;
+        };
+
+        self.active_motion_clip = Some(anchor.clip);
+        self.set_editor_workspace(EditorWorkspace::Canvas, cx);
+        self.set_editor_mode(EditorMode::Motion, cx);
+        self.sync_motion_timeline(cx);
+        self.timeline_shell.update(cx, |timeline, cx| {
+            timeline.seek_to(i64::from(anchor.time_ms).saturating_mul(1_000), cx)
+        });
+        self.hovered_node = None;
+        self.comment_state.hovered_pin = None;
+        self.invalidate_canvas_cache();
+        cx.notify();
+
+        if anchor.time_ms > duration_ms {
+            show_canvas_notice(
+                format!(
+                    "This comment was anchored at {}; the animation now ends at {}, so the timeline moved to its end.",
+                    crate::comments::motion_comment_time_label(anchor.time_ms),
+                    crate::comments::motion_comment_time_label(duration_ms)
+                ),
+                window,
+                cx,
+            );
+        }
+    }
+
+    pub(crate) fn is_art_read_only(&self, cx: &App) -> bool {
+        self.is_dev_mode(cx)
+            || self.is_inspecting()
+            || matches!(self.tools.kind(), ToolKind::Measure | ToolKind::Annotation)
+            || self.measurement_selection.is_some()
+            || self.annotation_state.selection.is_some()
+            || self.annotation_state.controller.has_pending_authoring()
+    }
+
+    pub(crate) fn is_inspecting(&self) -> bool {
+        self.tools.kind() == ToolKind::Inspect
+    }
+
+    pub(crate) fn draft_preserving_toolbar_focus_scope(&self, cx: &App) -> FocusHandle {
+        #[cfg(feature = "fanta-gpui-ui")]
+        if let Some(toolbar) = &self.gpui_toolbar {
+            return toolbar.panel.focus_handle(cx);
+        }
+        let _ = cx;
+        self.native_toolbar_focus.clone()
+    }
+
+    fn invalidate_local_media_origin(&self) {
+        self.media_import_generation
+            .set(self.media_import_generation.get().wrapping_add(1));
+    }
+
+    fn has_pending_authoring(&self, cx: &App) -> bool {
+        self.primary_pressed
+            || self.canvas_pointer_down
+            || self.has_pending_authoring_except_pointer(cx)
+    }
+
+    fn has_pending_authoring_except_pointer(&self, cx: &App) -> bool {
+        let inspector = self.inspector_sidebar.read(cx);
+        let pending_edit = self.annotation_state.controller.has_pending_authoring()
+            || self.measurement_controller.has_pending_authoring()
+            || self.item.read(cx).content_preview_active()
+            || self.text_edit.is_some()
+            || self.pending_text_edit.is_some()
+            || self.motion_keyframe_drag.is_some()
+            || inspector.editing_field.is_some()
+            || inspector.scrub.is_some()
+            || inspector.picker.is_some()
+            || inspector.gradient_editor.is_some()
+            || self.motion_sidebar.read(cx).has_continuous_edit()
+            || self.timeline_shell.read(cx).has_pending_authoring()
+            || self.prototype_sidebar.read(cx).has_pending_parameter_edit()
+            || self.layers_sidebar.read(cx).has_pending_authoring(cx)
+            || self.tools.overlays.iter().any(|overlay| {
+                matches!(
+                    overlay,
+                    fanta_tools::ToolOverlay::PreviewLine { .. }
+                        | fanta_tools::ToolOverlay::PreviewRect { .. }
+                        | fanta_tools::ToolOverlay::PreviewEllipse { .. }
+                )
+            });
+        #[cfg(target_os = "macos")]
+        let pending_edit = pending_edit
+            || self
+                .canvas_video
+                .as_ref()
+                .is_some_and(|session| session.trim.is_some());
+        #[cfg(feature = "fanta-gpui-ui")]
+        let pending_edit = pending_edit
+            || self
+                .gpui_design
+                .as_ref()
+                .is_some_and(|adapter| adapter.session.is_some());
+        pending_edit
+    }
+
+    fn defer_after_preserved_design_draft(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+        _resume: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> bool {
+        #[cfg(feature = "fanta-gpui-ui")]
+        if self.gpui_design.as_ref().is_some_and(|adapter| {
+            adapter.panel.update(_cx, |panel, cx| {
+                panel.finish_preserved_property_draft(_window, cx)
+            })
+        }) {
+            // The panel emits the commit; its host subscription must receive it
+            // before the next action closes the remaining document edit sessions.
+            _cx.defer_in(_window, _resume);
+            return true;
+        }
+        false
+    }
+
+    fn activate_tool_from_action(
+        &mut self,
+        kind: ToolKind,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.is_dev_mode(cx) {
+            self.activate_tool(kind, cx);
+            return;
+        }
+        if self.refuse_pending_annotation(cx) {
+            return;
+        }
+        if !matches!(
+            kind,
+            ToolKind::Inspect | ToolKind::Measure | ToolKind::Annotation
+        ) && self.defer_after_preserved_design_draft(window, cx, move |this, _, cx| {
+            this.activate_tool(kind, cx);
+        }) {
+            return;
+        }
+        self.activate_tool(kind, cx);
+    }
+
+    fn set_editor_mode_from_action(
+        &mut self,
+        mode: EditorMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if mode == EditorMode::Dev || self.is_dev_mode(cx) {
+            self.set_editor_mode(mode, cx);
+            return;
+        }
+        if self.refuse_pending_annotation(cx) {
+            return;
+        }
+        if self.defer_after_preserved_design_draft(window, cx, move |this, _, cx| {
+            this.set_editor_mode(mode, cx);
+        }) {
+            return;
+        }
+        self.set_editor_mode(mode, cx);
+    }
+
     pub fn selected_page_index(&self) -> Option<usize> {
         self.selected_page_index
     }
@@ -1848,7 +2268,7 @@ impl FigView {
     }
 
     pub(crate) fn is_editable(&self, cx: &App) -> bool {
-        self.item.read(cx).is_editable()
+        !self.is_art_read_only(cx) && self.item.read(cx).is_editable()
     }
 
     fn set_viewport(&mut self, viewport: Viewport, cx: &mut Context<Self>) {
@@ -2082,6 +2502,12 @@ impl FigView {
     /// Send one event through the active tool, tracking whether it changed
     /// document content, only the selection, or nothing.
     fn dispatch_tool_event(&mut self, event: ToolEvent, cx: &mut Context<Self>) {
+        let owner = cx.entity_id();
+        if self.handle_annotation_tool_event(event, cx)
+            || self.handle_measurement_tool_event(event, cx)
+        {
+            return;
+        }
         let Some(bounds) = self.container_bounds else {
             return;
         };
@@ -2195,7 +2621,7 @@ impl FigView {
         let mut content_changed = false;
         let item = self.item.clone();
         item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
+            item.with_document_for_preview_owner(owner, cx, |document| {
                 let revision_before = document.doc.scene.revision();
                 let selection_before: Vec<NodeId> =
                     document.doc.selection.iter().copied().collect();
@@ -2374,7 +2800,7 @@ impl FigView {
 
         self.item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
-                let hit = fanta_canvas::hit_test_screen(
+                let hit = crate::canvas::inspect_hit_test_screen(
                     &document.doc.scene,
                     &viewport,
                     screen_size,
@@ -2394,13 +2820,119 @@ impl FigView {
     }
 
     pub fn activate_tool(&mut self, kind: ToolKind, cx: &mut Context<Self>) {
-        if kind.requires_editing() && !self.is_editable(cx) {
+        if self.is_dev_mode(cx) && self.refuse_dev_transition(cx) {
             return;
         }
         if self.tools.kind() != kind {
             self.wand_generation = self.wand_generation.wrapping_add(1);
             self.wand_override = None;
         }
+        let kind = if self.is_dev_mode(cx) {
+            match kind {
+                ToolKind::Select => ToolKind::Inspect,
+                ToolKind::Inspect | ToolKind::Hand | ToolKind::Measure | ToolKind::Annotation => {
+                    kind
+                }
+                _ => {
+                    show_canvas_notice_deferred("Switch to Design to edit artwork.".into(), cx);
+                    return;
+                }
+            }
+        } else {
+            kind
+        };
+        if self.refuse_pending_annotation(cx) {
+            return;
+        }
+        if self.measurement_controller.has_pending_authoring() {
+            show_canvas_notice_deferred(
+                "Finish or cancel the measurement drag before changing tools.".into(),
+                cx,
+            );
+            return;
+        }
+        if matches!(kind, ToolKind::Measure | ToolKind::Annotation) {
+            if self.tools.kind() == kind {
+                return;
+            }
+            if self.has_pending_authoring(cx)
+                || self.comment_state.draft.is_some()
+                || self.has_unsent_comment_reply(cx)
+            {
+                show_canvas_notice_deferred(
+                    format!(
+                        "Finish or cancel the current edit before using {}.",
+                        kind.label()
+                    ),
+                    cx,
+                );
+                return;
+            }
+            if !self.item.read(cx).is_editable() || self.mark_page(cx).is_none() {
+                show_canvas_notice_deferred(
+                    "Choose a visible, editable page for measurements and annotations.".into(),
+                    cx,
+                );
+                return;
+            }
+            self.annotation_state.selection = None;
+            self.measurement_selection = None;
+            self.invalidate_local_media_origin();
+            self.comment_state.close_thread();
+            self.tools.activate_without_context(kind);
+            self.remember_tool_face(kind);
+            self.hovered_node = None;
+            self.hover_resize_handle = None;
+            self.sync_measurement_edit_barrier(cx);
+            self.inspector_sidebar_visible = true;
+            cx.notify();
+            return;
+        }
+        if kind == ToolKind::Inspect {
+            if self.is_inspecting() {
+                return;
+            }
+            if self.has_pending_authoring(cx)
+                || self.comment_state.draft.is_some()
+                || self.has_unsent_comment_reply(cx)
+            {
+                show_canvas_notice_deferred(
+                    "Finish or cancel the current edit before inspecting layers.".into(),
+                    cx,
+                );
+                return;
+            }
+            if !self.is_design_canvas_mode(cx)
+                || self.editor_workspace(cx) != EditorWorkspace::Canvas
+                || self.prototype_player.is_some()
+            {
+                show_canvas_notice_deferred(
+                    "Return to the Design canvas to inspect layers.".into(),
+                    cx,
+                );
+                return;
+            }
+            self.invalidate_local_media_origin();
+            self.comment_state.close_thread();
+            self.tools.activate_without_context(kind);
+            self.remember_tool_face(kind);
+            self.hovered_node = None;
+            self.hover_resize_handle = None;
+            self.inspector_sidebar
+                .update(cx, |panel, cx| panel.set_inspecting(true, cx));
+            self.layers_sidebar
+                .update(cx, |panel, cx| panel.set_inspecting(true, cx));
+            self.inspector_sidebar_visible = true;
+            self.invalidate_canvas_cache();
+            cx.notify();
+            return;
+        }
+        self.comment_state.clear_pending_motion_anchor();
+        if kind.requires_editing() && !self.item.read(cx).is_editable() {
+            return;
+        }
+        self.measurement_selection = None;
+        self.annotation_state.selection = None;
         if kind != ToolKind::Comment {
             self.comment_state.draft = None;
             self.comment_state.hovered_pin = None;
@@ -2408,9 +2940,24 @@ impl FigView {
         // Switching tools is a document edit boundary for every inspector and
         // inline session, not only text.
         self.finish_document_edits(cx);
+        let read_only = self.is_dev_mode(cx);
+        self.inspector_sidebar
+            .update(cx, |panel, cx| panel.set_inspecting(read_only, cx));
+        self.layers_sidebar
+            .update(cx, |panel, cx| panel.set_inspecting(read_only, cx));
+        self.hover_resize_handle = None;
+        self.hovered_node = None;
+        let activated_kind = if kind == ToolKind::TextPath {
+            ToolKind::Select
+        } else {
+            kind
+        };
         let Some((bounds, viewport)) = self.container_bounds.zip(self.viewport) else {
-            self.tools.activate_without_context(kind);
+            self.tools.activate_without_context(activated_kind);
             self.remember_tool_face(kind);
+            if kind == ToolKind::TextPath {
+                self.convert_selection_to_text_path(cx);
+            }
             cx.notify();
             return;
         };
@@ -2423,8 +2970,13 @@ impl FigView {
         item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
                 let revision_before = document.doc.scene.revision();
-                let mut ctx = tool_context(&mut document.doc, &mut viewport, screen_size, kind);
-                tools.activate(kind, &mut ctx);
+                let mut ctx = tool_context(
+                    &mut document.doc,
+                    &mut viewport,
+                    screen_size,
+                    activated_kind,
+                );
+                tools.activate(activated_kind, &mut ctx);
                 let change = if document.doc.scene.revision() != revision_before {
                     DocChange::Content
                 } else {
@@ -2435,7 +2987,45 @@ impl FigView {
         });
         self.remember_tool_face(kind);
         self.viewport = Some(viewport);
+        if kind == ToolKind::TextPath {
+            self.convert_selection_to_text_path(cx);
+        }
         cx.notify();
+    }
+
+    fn convert_selection_to_text_path(&mut self, cx: &mut Context<Self>) {
+        let conversion = self
+            .item
+            .read(cx)
+            .document()
+            .map(|document| fanta_tools::text_path_conversion(&document.doc));
+        let Some(conversion) = conversion else {
+            show_canvas_notice_deferred("The document is still loading.".to_owned(), cx);
+            return;
+        };
+        let (node_id, operation) = match conversion {
+            Ok(conversion) => conversion,
+            Err(error) => {
+                show_canvas_notice_deferred(error.to_string(), cx);
+                return;
+            }
+        };
+        let preview_owner = cx.entity_id();
+        let result = self.item.update(cx, |item, cx| {
+            item.apply_for_preview_owner(preview_owner, operation, cx)
+        });
+        match result {
+            Ok(()) => {
+                self.pending_text_edit = Some(node_id);
+                self.invalidate_canvas_cache();
+            }
+            Err(error) => {
+                show_canvas_notice_deferred(
+                    format!("Text on Path could not be created: {error:#}"),
+                    cx,
+                );
+            }
+        }
     }
 
     fn remember_tool_face(&mut self, kind: ToolKind) {
@@ -2552,6 +3142,11 @@ impl FigView {
             }
         }
 
+        if self.handle_annotation_mouse_down(event, window, cx)
+            || self.handle_measurement_mouse_down(event, window, cx)
+        {
+            return;
+        }
         self.focus_handle.focus(window, cx);
         let Some(bounds) = self.container_bounds else {
             return;
@@ -3060,6 +3655,9 @@ impl FigView {
     }
 
     fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        if self.cancel_annotation(None, cx) || self.cancel_measurement_drag(cx) {
+            return;
+        }
         #[cfg(target_os = "macos")]
         if self
             .canvas_video
@@ -3111,6 +3709,14 @@ impl FigView {
     }
 
     fn confirm(&mut self, _: &Confirm, window: &mut Window, cx: &mut Context<Self>) {
+        if self.annotation_state.controller.has_pending_authoring() {
+            let generation = self.annotation_state.controller.generation();
+            self.submit_annotation(generation, cx);
+            return;
+        }
+        if self.refuse_pending_measurement(cx) {
+            return;
+        }
         if self.prototype_player.is_some() {
             self.trigger_prototype_key("enter", cx);
             return;
@@ -4323,35 +4929,108 @@ impl FigView {
     }
 
     fn render_inspector_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
-        #[cfg(feature = "fanta-gpui-ui")]
-        if let Some(adapter) = &self.gpui_properties {
-            return div()
-                .id("fanta-inspector-sidebar")
-                .debug_selector(|| "fanta-inspector-sidebar".to_owned())
-                .relative()
-                .h_full()
-                .w(self.inspector_sidebar_width)
-                .flex_shrink_0()
-                .border_l_1()
-                .border_color(cx.theme().colors().border)
-                .child(adapter.layout.clone())
-                .child(self.render_sidebar_resize_handle(SidebarKind::Inspector))
-                .into_any_element();
-        }
         let mode = self.editor_mode(cx);
         let view = cx.weak_entity();
-        let tabs = EditorModeTabs::new(mode, move |mode, _, cx| {
-            view.update(cx, |view, cx| view.set_editor_mode(mode, cx))
-                .log_err();
+        let tabs = EditorModeTabs::new(mode, move |mode, window, cx| {
+            view.update(cx, |view, cx| {
+                view.set_editor_mode_from_action(mode, window, cx)
+            })
+            .log_err();
         });
+        if self.annotation_state.controller.has_pending_authoring()
+            || self.selected_annotation(cx).is_some()
+            || self.tools.kind() == ToolKind::Annotation
+        {
+            return self.render_inspector_body(self.render_annotation_panel(cx), tabs, cx);
+        }
         let body = match mode {
             EditorMode::Prototype => self.prototype_sidebar.clone().into_any_element(),
             EditorMode::Comments => self.render_comments_sidebar(cx),
             EditorMode::Motion => self.motion_sidebar.clone().into_any_element(),
-            EditorMode::Design | EditorMode::Draw | EditorMode::Code => {
+            EditorMode::Design | EditorMode::Draw | EditorMode::Code | EditorMode::Dev => {
+                let records = self.page_measurements(cx);
+                let selected = self.selected_measurement(cx);
+                if selected.is_some() || self.tools.kind() == ToolKind::Measure {
+                    let rows = records
+                        .iter()
+                        .enumerate()
+                        .map(|(index, record)| {
+                            let label = record
+                                .measurement()
+                                .label()
+                                .unwrap_or_else(|error| error.to_string());
+                            (
+                                SharedString::from(record.measurement().id.clone()),
+                                SharedString::from(format!("Measurement {} · {label}", index + 1)),
+                            )
+                        })
+                        .collect();
+                    let view = cx.weak_entity();
+                    let list = crate::properties_panel::MeasurementList::new(
+                        rows,
+                        selected
+                            .as_ref()
+                            .map(|record| record.measurement().id.clone().into()),
+                        move |id, _, cx| {
+                            if let Some(record) = records
+                                .iter()
+                                .find(|record| record.measurement().id.as_str() == id.as_ref())
+                                .cloned()
+                            {
+                                view.update(cx, |view, cx| view.select_measurement(record, cx))
+                                    .log_err();
+                            }
+                        },
+                    );
+                    let mut body = v_flex().size_full().overflow_hidden();
+                    if let Some(record) = selected {
+                        let view = cx.weak_entity();
+                        let copy_record = record.clone();
+                        let delete_view = view.clone();
+                        let delete_record = record.clone();
+                        let properties = crate::properties_panel::MeasurementProperties::new(
+                            record
+                                .measurement()
+                                .label()
+                                .unwrap_or_else(|error| error.to_string())
+                                .into(),
+                            record.measurement().start,
+                            record.measurement().end,
+                            self.can_edit_measurements(cx)
+                                && !self.measurement_controller.has_pending_authoring(),
+                            move |_, cx| {
+                                view.update(cx, |view, cx| view.copy_measurement(&copy_record, cx))
+                                    .log_err();
+                            },
+                            move |_, cx| {
+                                delete_view
+                                    .update(cx, |view, cx| {
+                                        view.delete_measurement(&delete_record, cx)
+                                    })
+                                    .log_err();
+                            },
+                        );
+                        body = body.child(properties);
+                    }
+                    return self.render_inspector_body(
+                        body.child(list).into_any_element(),
+                        tabs,
+                        cx,
+                    );
+                }
                 // The fanta-gpui DesignPanel replaces the legacy inspector
                 // when its adapter mounted; `FANTA_GPUI_DESIGN=0` (or the
                 // process-wide `FANTA_GPUI_UI=0`) keeps the legacy panel.
+                #[cfg(feature = "fanta-gpui-ui")]
+                if let Some(adapter) = &self.gpui_properties {
+                    if records.is_empty() && self.page_annotations(cx).is_empty() {
+                        return self.render_inspector_body(
+                            adapter.layout.clone().into_any_element(),
+                            tabs,
+                            cx,
+                        );
+                    }
+                }
                 #[cfg(feature = "fanta-gpui-ui")]
                 let body = match self.gpui_design.as_ref() {
                     Some(adapter) => adapter.panel.clone().into_any_element(),
@@ -4359,9 +5038,69 @@ impl FigView {
                 };
                 #[cfg(not(feature = "fanta-gpui-ui"))]
                 let body = self.inspector_sidebar.clone().into_any_element();
-                body
+                if records.is_empty() {
+                    body
+                } else {
+                    let rows = records
+                        .iter()
+                        .enumerate()
+                        .map(|(index, record)| {
+                            let label = record
+                                .measurement()
+                                .label()
+                                .unwrap_or_else(|error| error.to_string());
+                            (
+                                SharedString::from(record.measurement().id.clone()),
+                                SharedString::from(format!("Measurement {} · {label}", index + 1)),
+                            )
+                        })
+                        .collect();
+                    let view = cx.weak_entity();
+                    let list = crate::properties_panel::MeasurementList::new(
+                        rows,
+                        None,
+                        move |id, _, cx| {
+                            if let Some(record) = records
+                                .iter()
+                                .find(|record| record.measurement().id.as_str() == id.as_ref())
+                                .cloned()
+                            {
+                                view.update(cx, |view, cx| view.select_measurement(record, cx))
+                                    .log_err();
+                            }
+                        },
+                    );
+                    v_flex()
+                        .size_full()
+                        .child(div().flex_1().min_h_0().child(body))
+                        .child(div().h(px(180.0)).flex_shrink_0().child(list))
+                        .into_any_element()
+                }
             }
         };
+        let body = if self.is_design_canvas_mode(cx) && !self.page_annotations(cx).is_empty() {
+            v_flex()
+                .size_full()
+                .child(div().flex_1().min_h_0().child(body))
+                .child(
+                    div()
+                        .h(px(150.0))
+                        .flex_shrink_0()
+                        .child(self.render_annotation_list(cx)),
+                )
+                .into_any_element()
+        } else {
+            body
+        };
+        self.render_inspector_body(body, tabs, cx)
+    }
+
+    fn render_inspector_body(
+        &self,
+        body: AnyElement,
+        tabs: EditorModeTabs,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let sidebar = div()
             .id("fanta-inspector-sidebar")
             .relative()
@@ -4408,12 +5147,9 @@ impl FigView {
             .map(|document| document_comment_rows(&document.doc, &document.pages))
             .unwrap_or_default();
         let view = cx.weak_entity();
-        FantaCommentsPanel::new(rows, move |page_index, comment_id, window, cx| {
+        FantaCommentsPanel::new(rows, move |page_root, comment_id, window, cx| {
             view.update(cx, |view, cx| {
-                view.select_page(page_index, cx);
-                if view.comment_state.open_thread.as_deref() != Some(comment_id.as_str()) {
-                    view.toggle_comment_thread(comment_id, window, cx);
-                }
+                view.show_comment_thread_on_page(page_root, comment_id, window, cx);
             })
             .log_err();
         })
@@ -6345,6 +7081,15 @@ impl Render for FigView {
             .on_action(cx.listener(|this, _: &ActivateSelectTool, _, cx| {
                 this.activate_tool(ToolKind::Select, cx)
             }))
+            .on_action(cx.listener(|this, _: &ActivateInspectTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Inspect, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ActivateMeasureTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Measure, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ActivateAnnotationTool, window, cx| {
+                this.activate_tool_from_action(ToolKind::Annotation, window, cx);
+            }))
             .on_action(cx.listener(|this, _: &ActivateHandTool, _, cx| {
                 this.activate_tool(ToolKind::Hand, cx)
             }))
@@ -6356,6 +7101,9 @@ impl Render for FigView {
             }))
             .on_action(cx.listener(|this, _: &ActivateLineTool, _, cx| {
                 this.activate_tool(ToolKind::Line, cx)
+            }))
+            .on_action(cx.listener(|this, _: &ActivateArrowTool, _, cx| {
+                this.activate_tool(ToolKind::Arrow, cx)
             }))
             .on_action(cx.listener(|this, _: &ActivatePolygonTool, _, cx| {
                 this.activate_tool(ToolKind::Polygon, cx)
@@ -7311,7 +8059,14 @@ impl Item for FigView {
                 },
             );
             let prototype_sidebar = cx.new(|cx| FantaPrototypePanel::new(item.clone(), cx));
-            let motion_sidebar = cx.new(|cx| FantaMotionPanel::new(item.clone(), cx));
+            let timeline_shell = cx.new(|cx| {
+                let mut timeline = TimelineShell::new();
+                timeline.set_authoring_enabled(timeline_authoring_enabled, cx);
+                timeline.set_model(timeline_model, cx);
+                timeline
+            });
+            let motion_sidebar = cx
+                .new(|cx| FantaMotionPanel::new(item.clone(), timeline_shell.clone(), window, cx));
             motion_sidebar.update(cx, |panel, cx| {
                 panel.set_active_clip(active_motion_clip, cx)
             });
@@ -7328,12 +8083,6 @@ impl Item for FigView {
                 cx.new(|cx| FantaVariablesWorkspace::new(item.clone(), window, cx));
             let code_workspace =
                 cx.new(|cx| FantaCodeWorkspace::new(item.clone(), project.clone(), window, cx));
-            let timeline_shell = cx.new(|cx| {
-                let mut timeline = TimelineShell::new();
-                timeline.set_authoring_enabled(timeline_authoring_enabled, cx);
-                timeline.set_model(timeline_model, cx);
-                timeline
-            });
             let timeline_subscription =
                 cx.subscribe(&timeline_shell, |this, _, event: &TimelineEvent, cx| {
                     this.handle_timeline_event(event.clone(), cx);
@@ -7342,6 +8091,7 @@ impl Item for FigView {
                 item,
                 project,
                 focus_handle: cx.focus_handle(),
+                native_toolbar_focus: cx.focus_handle(),
                 editor_session,
                 layers_sidebar,
                 _file_inspector_subscription: file_inspector_subscription,
@@ -7352,6 +8102,7 @@ impl Item for FigView {
                 code_workspace,
                 timeline_shell,
                 active_motion_clip,
+                motion_auto_keyframe: false,
                 motion_keyframe_drag: None,
                 layers_sidebar_visible,
                 inspector_sidebar_visible,
@@ -7391,6 +8142,18 @@ impl Item for FigView {
                 #[cfg(target_os = "macos")]
                 canvas_video_active: std::cell::Cell::new(true),
                 tools: ToolShell::new(),
+                annotation_state: annotations_host::AnnotationHostState::default(),
+                measurement_controller: MeasurementController::default(),
+                measurement_origin: None,
+                measurement_selection: None,
+                measurement_cache: std::cell::RefCell::new(None),
+                media_import_generation: std::cell::Cell::new(0),
+                annotation_state: annotations_host::AnnotationHostState::default(),
+                measurement_controller: MeasurementController::default(),
+                measurement_origin: None,
+                measurement_selection: None,
+                measurement_cache: std::cell::RefCell::new(None),
+                media_import_generation: std::cell::Cell::new(0),
                 wand_asset_map: None,
                 wand_decode_cache: HashMap::new(),
                 wand_decode_order: VecDeque::new(),
@@ -7465,7 +8228,10 @@ impl Focusable for FigView {
 
 impl ToolKind {
     fn requires_editing(self) -> bool {
-        !matches!(self, Self::Select | Self::Hand)
+        !matches!(
+            self,
+            Self::Select | Self::Inspect | Self::Hand | Self::Measure | Self::Annotation
+        )
     }
 }
 
@@ -10621,6 +11387,7 @@ impl FigView {
             looping: timeline.loop_playback_enabled(),
             current_time_ms,
             duration_ms,
+            auto_keyframe: self.motion_auto_keyframe,
             layers_sidebar_visible: self.layers_sidebar_visible,
             inspector_sidebar_visible: self.inspector_sidebar_visible,
             // Live keymap text, like the tooltip the old native button had.
@@ -10685,6 +11452,9 @@ impl FigView {
     }
 
     fn render_toolbar_slot(&self, cx: &mut Context<Self>) -> AnyElement {
+        if self.is_dev_mode(cx) {
+            return self.render_native_dev_toolbar(cx);
+        }
         #[cfg(feature = "fanta-gpui-ui")]
         if self.gpui_toolbar.is_some() {
             return self.render_gpui_toolbar(cx);
@@ -10705,6 +11475,7 @@ impl FigView {
             .left_0()
             .right_0()
             .justify_center()
+            .track_focus(&self.native_toolbar_focus)
             .child(adapter.panel.clone())
             .into_any_element()
     }
@@ -10782,7 +11553,7 @@ impl FigView {
             ToolbarAction::ToolChangeRequested {
                 tool: ToolbarTool::Inspect,
                 ..
-            } => self.set_editor_mode(EditorMode::Code, cx),
+            } => self.activate_tool_from_action(ToolKind::Inspect, window, cx),
             ToolbarAction::ToolChangeRequested {
                 tool: ToolbarTool::AddKeyframe,
                 ..
@@ -10802,7 +11573,7 @@ impl FigView {
                     // vendored toolbar has no host-side API to hide a tool
                     // (see `EditorToolbar`'s setters), so say so instead.
                     Some(kind) if kind.is_stub() => notify_unavailable(tool.label(), window, cx),
-                    Some(kind) => self.activate_tool(kind, cx),
+                    Some(kind) => self.activate_tool_from_action(kind, window, cx),
                     None => notify_unavailable(tool.label(), window, cx),
                 }
             }
@@ -10812,7 +11583,7 @@ impl FigView {
             ToolbarAction::ModeChangeRequested { mode } => match mode {
                 ToolbarMode::Design => self.set_editor_mode(EditorMode::Design, cx),
                 ToolbarMode::Motion => self.set_editor_mode(EditorMode::Motion, cx),
-                ToolbarMode::Dev => self.set_editor_mode(EditorMode::Code, cx),
+                ToolbarMode::Dev => self.set_editor_mode_from_action(EditorMode::Dev, window, cx),
                 ToolbarMode::Draw => self.set_editor_mode(EditorMode::Draw, cx),
             },
             // The +/- steppers, the zoom menu's percent entries, typed
@@ -10855,7 +11626,9 @@ impl FigView {
                     self.set_editor_workspace(EditorWorkspace::Variables, cx)
                 }
                 ToolbarCommand::OpenDrawMode => self.set_editor_mode(EditorMode::Draw, cx),
-                ToolbarCommand::OpenDevMode => self.set_editor_mode(EditorMode::Code, cx),
+                ToolbarCommand::OpenDevMode => {
+                    self.set_editor_mode_from_action(EditorMode::Dev, window, cx)
+                }
                 ToolbarCommand::ZoomToFit => self.fit_to_view(&FitToView, window, cx),
                 ToolbarCommand::ZoomToSelection => self.zoom_to_selection(cx),
                 ToolbarCommand::Present => self.play_prototype(&PlayPrototype, window, cx),
@@ -11313,10 +12086,10 @@ impl FigView {
                     cx.notify();
                 }
             }
-            (ToolbarSecondaryControl::MotionAutoKeyframe, _) => {
-                // Echoing "recording" without a recorder would lie; leave the
-                // chip off until a keyframe-recording mode exists.
-                notify_unavailable("Auto keyframe recording", window, cx);
+            (ToolbarSecondaryControl::MotionAutoKeyframe, ToolbarControlValue::Toggle(enabled)) => {
+                if let Err(error) = self.set_motion_auto_keyframe(*enabled, cx) {
+                    show_canvas_notice(error.to_string(), window, cx);
+                }
             }
             (ToolbarSecondaryControl::DevReadyForDevelopment, _) => {
                 notify_unavailable("Marking a design ready for dev", window, cx);
@@ -11352,12 +12125,16 @@ impl FigView {
                 );
             }
             ToolbarSecondaryControl::MotionTimeComment => {
-                notify_unavailable("Time-anchored comments", window, cx);
+                self.arm_motion_time_comment(window, cx);
             }
-            ToolbarSecondaryControl::DevInspect
-            | ToolbarSecondaryControl::DevAnnotate
-            | ToolbarSecondaryControl::DevMeasure => {
-                notify_unavailable(control.label(), window, cx);
+            ToolbarSecondaryControl::DevInspect => {
+                self.activate_tool_from_action(ToolKind::Inspect, window, cx)
+            }
+            ToolbarSecondaryControl::DevAnnotate => {
+                self.activate_tool_from_action(ToolKind::Annotation, window, cx)
+            }
+            ToolbarSecondaryControl::DevMeasure => {
+                self.activate_tool_from_action(ToolKind::Measure, window, cx)
             }
             other => notify_unavailable(other.label(), window, cx),
         }

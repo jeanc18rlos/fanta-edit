@@ -1008,11 +1008,11 @@ pub fn def_local_path(scene: &Scene, root: NodeId, node: NodeId) -> OverridePath
 /// best-effort writes.
 fn apply_override(node: &mut CanvasNode, value: &OverrideValue) {
     match value {
-        OverrideValue::Text { value } => {
-            if let NodeData::Text(t) = &mut node.data {
-                t.content = value.clone();
-            }
-        }
+        OverrideValue::Text { value } => match &mut node.data {
+            NodeData::Text(text) => text.content = value.clone(),
+            NodeData::TextPath(text) => text.content = value.clone(),
+            _ => {}
+        },
         OverrideValue::Fills { fills } => match &mut node.data {
             NodeData::Vector(v) => {
                 v.fills = fills.clone();
@@ -1036,6 +1036,11 @@ fn apply_override(node: &mut CanvasNode, value: &OverrideValue) {
             NodeData::Text(t) => {
                 if let Some(crate::style::Fill::Solid { color, .. }) = fills.first() {
                     t.set_glyph_color(*color);
+                }
+            }
+            NodeData::TextPath(text) => {
+                if let Some(crate::style::Fill::Solid { color, .. }) = fills.first() {
+                    text.set_glyph_color(*color);
                 }
             }
             _ => {}

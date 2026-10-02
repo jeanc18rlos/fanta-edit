@@ -3,6 +3,7 @@
 //! panels and the floating canvas toolbar.
 
 mod agent_surface;
+mod annotations;
 mod canvas;
 mod clipboard;
 mod code_workspace;
@@ -12,6 +13,7 @@ mod comments_panel;
 mod comments_ui;
 mod component_properties;
 mod design_panel;
+mod dev_history;
 mod document;
 mod draw_wand;
 mod editor_session;
@@ -27,6 +29,7 @@ mod instance_text;
 #[cfg(feature = "fanta-gpui-ui")]
 mod layer_context_ops;
 mod live_mcp;
+mod measurements;
 mod mode_overrides;
 mod motion_edit;
 mod motion_panel;

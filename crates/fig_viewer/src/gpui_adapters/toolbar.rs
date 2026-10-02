@@ -169,6 +169,7 @@ pub(crate) fn motion_animation_styles() -> Vec<SharedString> {
 /// assembled by `FigView` on each render and diffed here before any push.
 pub(crate) struct ToolbarOptionInputs {
     pub playing: bool,
+    pub auto_keyframe: bool,
     pub looping: bool,
     pub current_time_ms: u32,
     /// Duration of the active motion clip; `None` when the document has none.
@@ -196,6 +197,7 @@ pub(crate) fn chrome_controls(
 pub(crate) fn toolbar_tool(kind: ToolKind) -> ToolbarTool {
     match kind {
         ToolKind::Select => ToolbarTool::Move,
+        ToolKind::Inspect => ToolbarTool::Inspect,
         ToolKind::PathSelect => ToolbarTool::PathSelect,
         ToolKind::RectangleSelect => ToolbarTool::RectangleSelect,
         ToolKind::EllipseSelect => ToolbarTool::EllipseSelect,
@@ -209,6 +211,7 @@ pub(crate) fn toolbar_tool(kind: ToolKind) -> ToolbarTool {
         ToolKind::Rect => ToolbarTool::Rectangle,
         ToolKind::Ellipse => ToolbarTool::Ellipse,
         ToolKind::Line => ToolbarTool::Line,
+        ToolKind::Arrow => ToolbarTool::Arrow,
         ToolKind::Polygon => ToolbarTool::Polygon,
         ToolKind::Star => ToolbarTool::Star,
         ToolKind::Pen => ToolbarTool::Pen,
@@ -221,10 +224,12 @@ pub(crate) fn toolbar_tool(kind: ToolKind) -> ToolbarTool {
         ToolKind::Text => ToolbarTool::Text,
         ToolKind::TextPath => ToolbarTool::TextPath,
         ToolKind::Comment => ToolbarTool::Comment,
+        ToolKind::Measure => ToolbarTool::Measure,
+        ToolKind::Annotation => ToolbarTool::Annotation,
     }
 }
 
-/// Partial: toolbar faces without a canvas tool (Arrow, Measure, Dev and
+/// Partial: toolbar faces without a canvas tool (Measure, Dev and
 /// Motion faces, …) are roadmap items and intentionally return `None`.
 /// `Resources` also has no canvas tool — `FigView::handle_toolbar_action`
 /// intercepts it as host chrome (reveal and focus the left sidebar) before
@@ -232,6 +237,7 @@ pub(crate) fn toolbar_tool(kind: ToolKind) -> ToolbarTool {
 pub(crate) fn tool_kind(tool: ToolbarTool) -> Option<ToolKind> {
     Some(match tool {
         ToolbarTool::Move => ToolKind::Select,
+        ToolbarTool::Inspect => ToolKind::Inspect,
         ToolbarTool::PathSelect => ToolKind::PathSelect,
         ToolbarTool::RectangleSelect => ToolKind::RectangleSelect,
         ToolbarTool::EllipseSelect => ToolKind::EllipseSelect,
@@ -245,6 +251,7 @@ pub(crate) fn tool_kind(tool: ToolbarTool) -> Option<ToolKind> {
         ToolbarTool::Rectangle => ToolKind::Rect,
         ToolbarTool::Ellipse => ToolKind::Ellipse,
         ToolbarTool::Line => ToolKind::Line,
+        ToolbarTool::Arrow => ToolKind::Arrow,
         ToolbarTool::Polygon => ToolKind::Polygon,
         ToolbarTool::Star => ToolKind::Star,
         ToolbarTool::Pen => ToolKind::Pen,
@@ -257,17 +264,18 @@ pub(crate) fn tool_kind(tool: ToolbarTool) -> Option<ToolKind> {
         ToolbarTool::Text => ToolKind::Text,
         ToolbarTool::TextPath => ToolKind::TextPath,
         ToolbarTool::Comment => ToolKind::Comment,
+        ToolbarTool::Measure => ToolKind::Measure,
+        ToolbarTool::Annotation => ToolKind::Annotation,
         _ => return None,
     })
 }
 
-/// The editor has no Dev mode; Prototype and Comments keep the Design strip
-/// visible.
+/// Prototype and Comments keep the Design strip visible.
 pub(crate) fn toolbar_mode(mode: EditorMode) -> ToolbarMode {
     match mode {
         EditorMode::Motion => ToolbarMode::Motion,
         EditorMode::Draw => ToolbarMode::Draw,
-        EditorMode::Code => ToolbarMode::Dev,
+        EditorMode::Code | EditorMode::Dev => ToolbarMode::Dev,
         EditorMode::Design | EditorMode::Prototype | EditorMode::Comments => ToolbarMode::Design,
     }
 }
@@ -448,9 +456,7 @@ impl ToolbarAdapter {
         let motion = MotionToolbarOptions {
             playing: options.playing,
             looping: options.looping,
-            // fig_viewer has no keyframe-recording mode; the toggle stays off
-            // and its intents are logged in `handle_toolbar_control_change`.
-            auto_keyframe: false,
+            auto_keyframe: options.auto_keyframe,
             current_time_ms: options.current_time_ms,
             // No clip means nothing can play: report a zero-length transport
             // instead of inventing a duration.

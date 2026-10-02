@@ -119,6 +119,73 @@ mod tests {
         }
     }
 
+    #[test]
+    fn page_registry_round_trip_preserves_order_and_component_scope() {
+        let mut td = TestDoc::new();
+        let first = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let second = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let mut master = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        master.parent = Some(first.id);
+        td.scene.insert(first.clone()).expect("first page");
+        td.scene.insert(second.clone()).expect("second page");
+        td.scene.insert(master.clone()).expect("component root");
+        let component = ComponentId::new();
+        td.components
+            .defs
+            .insert(component, ComponentDef::new(component, master.id, "Master"));
+        td.pages = vec![first.id, second.id];
+        td.active_page = Some(master.id);
+        let operation = Operation::SetPageRegistry {
+            old_pages: td.pages.clone(),
+            new_pages: vec![second.id, first.id],
+            old_active_page: td.active_page,
+            new_active_page: Some(second.id),
+        };
+        operation.apply(&mut td.ctx()).expect("reorder");
+        assert_eq!(td.pages, vec![second.id, first.id]);
+        assert_eq!(td.active_page, Some(second.id));
+        operation.revert(&mut td.ctx()).expect("undo reorder");
+        assert_eq!(td.pages, vec![first.id, second.id]);
+        assert_eq!(td.active_page, Some(master.id));
+        let encoded = serde_json::to_string(&operation).expect("serialize");
+        let decoded: Operation = serde_json::from_str(&encoded).expect("deserialize");
+        decoded.apply(&mut td.ctx()).expect("replay");
+        assert_eq!(td.pages, vec![second.id, first.id]);
+    }
+
+    #[test]
+    fn page_registry_rejects_invalid_roots_and_active_membership_without_mutation() {
+        let mut td = TestDoc::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let mut nested = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        nested.parent = Some(page.id);
+        let vector = rect_node();
+        for node in [page.clone(), nested.clone(), vector.clone()] {
+            td.scene.insert(node).expect("insert fixture");
+        }
+        td.pages = vec![page.id];
+        td.active_page = Some(page.id);
+        let missing = NodeId::new();
+        for (pages, active) in [
+            (vec![page.id, page.id], Some(page.id)),
+            (vec![missing], Some(missing)),
+            (vec![nested.id], Some(nested.id)),
+            (vec![vector.id], Some(vector.id)),
+            (vec![page.id], Some(nested.id)),
+            (vec![page.id], Some(missing)),
+        ] {
+            let operation = Operation::SetPageRegistry {
+                old_pages: td.pages.clone(),
+                new_pages: pages,
+                old_active_page: td.active_page,
+                new_active_page: active,
+            };
+            assert!(operation.apply(&mut td.ctx()).is_err());
+            assert_eq!(td.pages, vec![page.id]);
+            assert_eq!(td.active_page, Some(page.id));
+        }
+    }
+
     fn rect_node() -> CanvasNode {
         CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
             0.0,

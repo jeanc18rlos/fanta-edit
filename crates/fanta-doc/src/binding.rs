@@ -98,7 +98,7 @@ impl BoundProp {
             Self::FillColor { index } => match &node.data {
                 NodeData::Vector(v) => v.fills.get(*index as usize).is_some(),
                 NodeData::Group(g) => group_fill(g, *index).is_some(),
-                NodeData::Text(_) => *index == 0,
+                NodeData::Text(_) | NodeData::TextPath(_) => *index == 0,
                 _ => false,
             },
             Self::StrokeColor { index } | Self::StrokeWidth { index } => node
@@ -107,7 +107,9 @@ impl BoundProp {
                 .is_some_and(|s| s.get(*index as usize).is_some()),
             Self::CornerRadius => matches!(node.data, NodeData::Vector(_)),
             Self::Opacity | Self::Visible => true,
-            Self::TextContent | Self::TextStyle => matches!(node.data, NodeData::Text(_)),
+            Self::TextContent | Self::TextStyle => {
+                matches!(node.data, NodeData::Text(_) | NodeData::TextPath(_))
+            }
             Self::ClipWidth | Self::ClipHeight => {
                 matches!(&node.data, NodeData::Group(g) if g.clip_size.is_some())
             }
@@ -146,11 +148,15 @@ impl BoundProp {
             Self::Visible => json!(!node.flags.contains(NodeFlags::HIDDEN)),
             Self::TextContent => match &node.data {
                 NodeData::Text(t) => json!(t.content),
+                NodeData::TextPath(text) => json!(text.content),
                 _ => serde_json::Value::Null,
             },
             Self::TextStyle => match &node.data {
                 NodeData::Text(t) => {
                     serde_json::to_value(&t.style).unwrap_or(serde_json::Value::Null)
+                }
+                NodeData::TextPath(text) => {
+                    serde_json::to_value(&text.style).unwrap_or(serde_json::Value::Null)
                 }
                 _ => serde_json::Value::Null,
             },
@@ -197,10 +203,16 @@ impl BoundProp {
                 NodeData::Text(text) => Some(ResolvedVarValue::String {
                     value: text.content.clone(),
                 }),
+                NodeData::TextPath(text) => Some(ResolvedVarValue::String {
+                    value: text.content.clone(),
+                }),
                 _ => None,
             },
             Self::TextStyle => match &node.data {
                 NodeData::Text(text) => Some(ResolvedVarValue::TextStyle {
+                    value: text.style.clone(),
+                }),
+                NodeData::TextPath(text) => Some(ResolvedVarValue::TextStyle {
                     value: text.style.clone(),
                 }),
                 _ => None,
@@ -263,20 +275,22 @@ impl BoundProp {
                 true
             }
             (Self::TextContent, ResolvedVarValue::String { value }) => {
-                if let NodeData::Text(t) = &mut node.data {
-                    t.content = value;
-                    return true;
+                match &mut node.data {
+                    NodeData::Text(text) => text.content = value,
+                    NodeData::TextPath(text) => text.content = value,
+                    _ => return false,
                 }
-                false
+                true
             }
             (Self::TextStyle, ResolvedVarValue::TextStyle { value }) => {
                 // A typography token replaces the node's whole base style; the
                 // per-run overrides in `style_runs` still layer on top.
-                if let NodeData::Text(t) = &mut node.data {
-                    t.style = value;
-                    return true;
+                match &mut node.data {
+                    NodeData::Text(text) => text.style = value,
+                    NodeData::TextPath(text) => text.style = value,
+                    _ => return false,
                 }
-                false
+                true
             }
             (Self::ClipWidth, ResolvedVarValue::Float { value }) => {
                 if let Some(size) = clip_size_mut(node) {
@@ -310,6 +324,7 @@ fn node_fill_color(node: &CanvasNode, index: u16) -> Option<Color> {
         NodeData::Vector(v) => fill_color(v.fills.get(index as usize)),
         NodeData::Group(g) => fill_color(group_fill(g, index)),
         NodeData::Text(t) if index == 0 => Some(t.style.color),
+        NodeData::TextPath(text) if index == 0 => Some(text.style.color),
         _ => None,
     }
 }
@@ -332,6 +347,10 @@ fn set_node_fill_color(node: &mut CanvasNode, index: u16, color: Color) -> bool 
         }
         NodeData::Text(t) if index == 0 => {
             t.set_glyph_color(color);
+            true
+        }
+        NodeData::TextPath(text) if index == 0 => {
+            text.set_glyph_color(color);
             true
         }
         _ => false,
@@ -430,6 +449,60 @@ mod tests {
             10.0,
             Color::WHITE,
         )))
+    }
+
+    #[test]
+    fn text_path_bindings_update_content_typography_and_all_glyph_colors() {
+        use crate::node::{TextPathNode, TextStyle, TextStyleRun};
+        use crate::path::PathData;
+
+        let mut text = TextPathNode::new(PathData::rect(0.0, 0.0, 100.0, 20.0), "Original");
+        text.style_runs.push(TextStyleRun {
+            start: 0,
+            end: 4,
+            style: TextStyle::default(),
+        });
+        let mut node = CanvasNode::new(NodeData::TextPath(text));
+        let style = TextStyle {
+            size_px: 24.0,
+            ..TextStyle::default()
+        };
+        assert!(BoundProp::TextContent.applies_to(&node));
+        assert!(BoundProp::TextStyle.applies_to(&node));
+        assert!(BoundProp::FillColor { index: 0 }.applies_to(&node));
+        assert!(!BoundProp::FillColor { index: 1 }.applies_to(&node));
+        assert!(BoundProp::TextContent.apply_resolved(
+            &mut node,
+            ResolvedVarValue::String {
+                value: "Bound content".into(),
+            },
+        ));
+        assert!(BoundProp::TextStyle.apply_resolved(
+            &mut node,
+            ResolvedVarValue::TextStyle {
+                value: style.clone(),
+            },
+        ));
+        assert!(BoundProp::FillColor { index: 0 }.apply_resolved(
+            &mut node,
+            ResolvedVarValue::Color {
+                value: Color::WHITE
+            },
+        ));
+        assert_eq!(
+            BoundProp::TextContent.read_literal(&node),
+            serde_json::json!("Bound content"),
+        );
+        let NodeData::TextPath(text) = &node.data else {
+            panic!("text path kind must be preserved");
+        };
+        assert_eq!(text.style.size_px, style.size_px);
+        assert_eq!(text.style.color, Color::WHITE);
+        assert!(
+            text.style_runs
+                .iter()
+                .all(|run| run.style.color == Color::WHITE)
+        );
     }
 
     #[test]

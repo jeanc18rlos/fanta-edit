@@ -1,4 +1,4 @@
-//! Line creation tool.
+//! Line and arrow creation tool.
 //!
 //! A line is two clicks (press → release). The committed node is a
 //! [`VectorNode`] with an open path (no `Close`) and a single solid stroke.
@@ -15,6 +15,7 @@
 use crate::context::ToolContext;
 use crate::event::{Button, KeyEvent, LogicalKey, ModifierKeys, PointerEvent, ToolEvent};
 use crate::tool::{CursorHint, SnapGuide, Tool, ToolOverlay, ToolResponse};
+use fanta_canvas::SnapResult;
 use fanta_doc::{CanvasNode, Fill, NodeData, Operation, PathData, Stroke, Transform2D, VectorNode};
 use glam::DVec2;
 use smallvec::SmallVec;
@@ -23,8 +24,8 @@ use std::f64::consts::TAU;
 /// Snap a (dx, dy) vector to the nearest multiple of 45° (8 directions).
 /// Preserves the magnitude — only the angle is quantized.
 fn snap_to_45(dx: f64, dy: f64) -> (f64, f64) {
-    let mag = (dx * dx + dy * dy).sqrt();
-    if mag < f64::EPSILON {
+    let mag = dx.hypot(dy);
+    if mag == 0.0 || !mag.is_finite() {
         return (dx, dy);
     }
     let angle = dy.atan2(dx);
@@ -38,6 +39,82 @@ fn snap_to_45(dx: f64, dy: f64) -> (f64, f64) {
 struct Draft {
     start: DVec2,
     end: DVec2,
+}
+
+struct LineGeometry {
+    origin: DVec2,
+    delta: DVec2,
+    arrowhead: Option<[DVec2; 2]>,
+}
+
+impl LineGeometry {
+    fn new(start: DVec2, end: DVec2, arrow: bool) -> Option<Self> {
+        let delta = end - start;
+        let length = delta.x.hypot(delta.y);
+        if !start.is_finite() || !end.is_finite() || !length.is_finite() || length == 0.0 {
+            return None;
+        }
+        let arrowhead = if arrow {
+            let direction = delta / length;
+            let head_length = 12.0_f64.min(length * 0.5);
+            if head_length == 0.0 {
+                return None;
+            }
+            let base = delta - direction * head_length;
+            let offset = DVec2::new(-direction.y, direction.x) * (head_length * 0.5);
+            let wings = [base + offset, base - offset];
+            if wings
+                .iter()
+                .any(|wing| !wing.is_finite() || !(start + *wing).is_finite())
+            {
+                return None;
+            }
+            Some(wings)
+        } else {
+            None
+        };
+        Some(Self {
+            origin: start,
+            delta,
+            arrowhead,
+        })
+    }
+
+    fn path(&self) -> PathData {
+        let mut path = PathData::new();
+        path.move_to(0.0, 0.0).line_to(self.delta.x, self.delta.y);
+        if let Some([first, second]) = self.arrowhead {
+            path.move_to(first.x, first.y)
+                .line_to(self.delta.x, self.delta.y)
+                .line_to(second.x, second.y);
+        }
+        path
+    }
+
+    fn overlays(&self) -> impl Iterator<Item = ToolOverlay> {
+        let end = self.origin + self.delta;
+        let mut segments = SmallVec::<[(DVec2, DVec2); 3]>::new();
+        segments.push((self.origin, end));
+        if let Some([first, second]) = self.arrowhead {
+            segments.push((self.origin + first, end));
+            segments.push((end, self.origin + second));
+        }
+        segments
+            .into_iter()
+            .map(|(start, end)| ToolOverlay::PreviewLine {
+                world_start: start.to_array(),
+                world_end: end.to_array(),
+            })
+    }
+}
+
+fn snap_pointer(ctx: &ToolContext, screen: [f64; 2]) -> Option<SnapResult> {
+    let world = ctx.screen_to_world(DVec2::from(screen));
+    if !world.is_finite() {
+        return None;
+    }
+    let snapped = ctx.snap.snap_point(world, &ctx.doc.scene, &[]);
+    snapped.world.is_finite().then_some(snapped)
 }
 
 impl Draft {
@@ -57,11 +134,19 @@ impl Draft {
 #[derive(Debug, Default)]
 pub struct LineTool {
     draft: Option<Draft>,
+    arrow: bool,
 }
 
 impl LineTool {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn arrow() -> Self {
+        Self {
+            arrow: true,
+            ..Self::default()
+        }
     }
 
     pub fn is_drafting(&self) -> bool {
@@ -71,7 +156,7 @@ impl LineTool {
 
 impl Tool for LineTool {
     fn name(&self) -> &'static str {
-        "line"
+        if self.arrow { "arrow" } else { "line" }
     }
 
     fn handle_event(&mut self, ctx: &mut ToolContext, event: ToolEvent) -> ToolResponse {
@@ -98,8 +183,10 @@ impl LineTool {
                 button: Button::Primary,
                 ..
             } => {
-                let world = ctx.screen_to_world(DVec2::from(screen));
-                let snap = ctx.snap.snap_point(world, &ctx.doc.scene, &[]);
+                let Some(snap) = snap_pointer(ctx, screen) else {
+                    self.draft = None;
+                    return ToolResponse::cursor(CursorHint::Crosshair);
+                };
                 let start = snap.world;
                 self.draft = Some(Draft { start, end: start });
                 let mut response = ToolResponse::cursor(CursorHint::Crosshair);
@@ -112,17 +199,17 @@ impl LineTool {
                 let Some(mut draft) = self.draft else {
                     return ToolResponse::cursor(CursorHint::Crosshair);
                 };
-                let world = ctx.screen_to_world(DVec2::from(screen));
-                let snap = ctx.snap.snap_point(world, &ctx.doc.scene, &[]);
+                let Some(snap) = snap_pointer(ctx, screen) else {
+                    self.draft = None;
+                    return ToolResponse::cursor(CursorHint::Crosshair);
+                };
                 draft.end = snap.world;
                 self.draft = Some(draft);
                 let (a, b) = draft.endpoints(modifiers);
-                let mut response = ToolResponse::cursor(CursorHint::Crosshair).with_overlay(
-                    ToolOverlay::PreviewLine {
-                        world_start: [a.x, a.y],
-                        world_end: [b.x, b.y],
-                    },
-                );
+                let mut response = ToolResponse::cursor(CursorHint::Crosshair);
+                if let Some(geometry) = LineGeometry::new(a, b, self.arrow) {
+                    response.overlays.extend(geometry.overlays());
+                }
                 for o in SnapGuide::from_snap_result(&snap) {
                     response.overlays.push(o);
                 }
@@ -136,14 +223,12 @@ impl LineTool {
                 let Some(mut draft) = self.draft.take() else {
                     return ToolResponse::cursor(CursorHint::Default);
                 };
-                let world = ctx.screen_to_world(DVec2::from(screen));
-                let snap = ctx.snap.snap_point(world, &ctx.doc.scene, &[]);
+                let Some(snap) = snap_pointer(ctx, screen) else {
+                    return ToolResponse::exit().with_cursor(CursorHint::Default);
+                };
                 draft.end = snap.world;
                 let (a, b) = draft.endpoints(modifiers);
-                if (b - a).length() > 0.0 {
-                    // Path local (0 to delta); position via transform for place_new rebase.
-                    let mut path = PathData::new();
-                    path.move_to(0.0, 0.0).line_to((b - a).x, (b - a).y);
+                if let Some(geometry) = LineGeometry::new(a, b, self.arrow) {
                     let mut strokes: SmallVec<[Stroke; 1]> = SmallVec::new();
                     // A line is a stroke, so the active "shape fill" color drives
                     // its stroke paint — cycling the palette recolors new lines.
@@ -158,7 +243,7 @@ impl LineTool {
                         per_side: None,
                     });
                     let mut node = CanvasNode::new(NodeData::Vector(VectorNode {
-                        path,
+                        path: geometry.path(),
                         fills: SmallVec::new(),
                         strokes,
                         corner_radius: None,
@@ -167,6 +252,9 @@ impl LineTool {
                         local_size: None,
                         parametric: None,
                     }));
+                    if self.arrow {
+                        node.name = "Arrow".to_owned();
+                    }
                     node.transform = Transform2D::translation(a.x, a.y);
                     ctx.place_new_node_on_active_page(&mut node);
                     let id = node.id;
@@ -199,7 +287,7 @@ impl LineTool {
 mod tests {
     use super::*;
     use fanta_canvas::SnapEngine;
-    use fanta_doc::{Doc, Viewport};
+    use fanta_doc::{Color, Doc, GroupNode, PathSegment, Viewport};
 
     fn pe_press(screen: [f64; 2], modifiers: ModifierKeys) -> ToolEvent {
         ToolEvent::Pointer(PointerEvent::Press {
@@ -231,6 +319,274 @@ mod tests {
             },
             DVec2::new(800.0, 600.0),
         )
+    }
+
+    fn path_lines(path: &PathData, transform: Transform2D) -> Vec<(DVec2, DVec2)> {
+        let mut current = None;
+        let mut lines = Vec::new();
+        for segment in &path.segments {
+            match segment {
+                PathSegment::Move { to } => {
+                    current = Some(transform.transform_point(DVec2::from(*to)));
+                }
+                PathSegment::Line { to } => {
+                    let end = transform.transform_point(DVec2::from(*to));
+                    lines.push((current.expect("line follows a move"), end));
+                    current = Some(end);
+                }
+                _ => panic!("line and arrow paths must contain only open straight segments"),
+            }
+        }
+        lines
+    }
+
+    fn preview_lines(response: &ToolResponse) -> Vec<(DVec2, DVec2)> {
+        response
+            .overlays
+            .iter()
+            .filter_map(|overlay| match overlay {
+                ToolOverlay::PreviewLine {
+                    world_start,
+                    world_end,
+                } => Some((DVec2::from(*world_start), DVec2::from(*world_end))),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assert_lines_match(actual: &[(DVec2, DVec2)], expected: &[(DVec2, DVec2)]) {
+        assert_eq!(actual.len(), expected.len());
+        for ((start, end), (expected_start, expected_end)) in actual.iter().zip(expected) {
+            assert!(start.distance(*expected_start) < 1e-9, "{actual:?}");
+            assert!(end.distance(*expected_end) < 1e-9, "{actual:?}");
+        }
+    }
+
+    #[test]
+    fn arrow_head_follows_reverse_and_diagonal_drags_and_caps_short_lengths() {
+        for direction in [
+            DVec2::X,
+            -DVec2::X,
+            DVec2::Y,
+            -DVec2::Y,
+            DVec2::new(1.0, 1.0).normalize(),
+            DVec2::new(-1.0, 1.0).normalize(),
+        ] {
+            for length in [0.01, 1.0, 10.0, 24.0, 100.0] {
+                let origin = DVec2::new(20.0, -30.0);
+                let geometry = LineGeometry::new(origin, origin + direction * length, true)
+                    .expect("valid arrow");
+                let [first, second] = geometry.arrowhead.expect("arrowhead");
+                let head_length = 12.0_f64.min(length * 0.5);
+                for wing in [first, second] {
+                    let tip_to_wing = geometry.delta - wing;
+                    assert!((tip_to_wing.dot(direction) - head_length).abs() < 1e-9);
+                    assert!(wing.dot(direction) > 0.0);
+                    assert!(wing.is_finite());
+                }
+                let normal = DVec2::new(-direction.y, direction.x);
+                assert!(((first - geometry.delta).dot(normal) - head_length * 0.5).abs() < 1e-9);
+                assert!(((second - geometry.delta).dot(normal) + head_length * 0.5).abs() < 1e-9);
+                assert_eq!(geometry.path().segments.len(), 5);
+                let preview = ToolResponse {
+                    overlays: geometry.overlays().collect(),
+                    ..ToolResponse::empty()
+                };
+                assert_lines_match(
+                    &preview_lines(&preview),
+                    &path_lines(
+                        &geometry.path(),
+                        Transform2D::translation(origin.x, origin.y),
+                    ),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn arrow_geometry_rejects_zero_nonfinite_and_overflowing_lengths() {
+        for (start, end) in [
+            (DVec2::ZERO, DVec2::ZERO),
+            (DVec2::new(f64::NAN, 0.0), DVec2::X),
+            (DVec2::ZERO, DVec2::new(f64::INFINITY, 0.0)),
+            (DVec2::ZERO, DVec2::new(0.0, f64::NEG_INFINITY)),
+            (DVec2::new(-f64::MAX, 0.0), DVec2::new(f64::MAX, 0.0)),
+            (DVec2::ZERO, DVec2::splat(f64::MAX)),
+        ] {
+            assert!(LineGeometry::new(start, end, true).is_none());
+        }
+        let large = LineGeometry::new(DVec2::ZERO, DVec2::new(1e200, 1e200), true)
+            .expect("a finite hypotenuse must not overflow intermediate squared coordinates");
+        assert!(
+            large
+                .path()
+                .segments
+                .iter()
+                .all(|segment| segment.end_point().is_some_and(DVec2::is_finite))
+        );
+    }
+
+    #[test]
+    fn arrow_shift_constrains_all_eight_directions_with_preview_commit_parity() {
+        for direction in 0..8 {
+            let (mut doc, mut viewport, snap, size) = ctx_pieces();
+            let mut ctx = ToolContext::new(&mut doc, &mut viewport, snap, size);
+            let mut tool = LineTool::arrow();
+            let angle = f64::from(direction) * TAU / 8.0;
+            let end = [
+                400.0 + (angle + 0.1).cos() * 100.0,
+                300.0 + (angle + 0.1).sin() * 100.0,
+            ];
+            tool.handle_event(&mut ctx, pe_press([400.0, 300.0], ModifierKeys::empty()));
+            let preview = tool.handle_event(&mut ctx, pe_move(end, ModifierKeys::SHIFT));
+            assert_eq!(ctx.doc.scene.len(), 0);
+            let response = tool.handle_event(&mut ctx, pe_release(end, ModifierKeys::SHIFT));
+            assert!(response.wants_exit);
+            assert!(!tool.is_drafting());
+            let id = *doc.selection.as_slice().first().expect("selected arrow");
+            let NodeData::Vector(vector) = &doc.scene.get(id).expect("arrow").data else {
+                panic!("arrow must be a vector")
+            };
+            let lines = path_lines(
+                &vector.path,
+                doc.scene.world_transform(id).expect("arrow transform"),
+            );
+            assert_eq!(lines.len(), 3);
+            let (start, tip) = lines.first().expect("shaft");
+            assert!(start.length() < 1e-9);
+            assert!(tip.distance(DVec2::new(angle.cos(), angle.sin()) * 100.0) < 1e-9);
+            assert_lines_match(&preview_lines(&preview), &lines);
+        }
+    }
+
+    #[test]
+    fn arrow_uses_grid_snapping_for_preview_and_commit() {
+        let (mut doc, mut viewport, mut snap, size) = ctx_pieces();
+        snap.targets = fanta_canvas::SnapTargets::GRID;
+        let mut ctx = ToolContext::new(&mut doc, &mut viewport, snap, size);
+        let mut tool = LineTool::arrow();
+        tool.handle_event(&mut ctx, pe_press([401.0, 309.0], ModifierKeys::empty()));
+        let preview = tool.handle_event(&mut ctx, pe_move([465.0, 341.0], ModifierKeys::empty()));
+        tool.handle_event(&mut ctx, pe_release([465.0, 341.0], ModifierKeys::empty()));
+        let id = *doc.selection.as_slice().first().expect("selected arrow");
+        let NodeData::Vector(vector) = &doc.scene.get(id).expect("arrow").data else {
+            panic!("arrow must be a vector")
+        };
+        let lines = path_lines(
+            &vector.path,
+            doc.scene.world_transform(id).expect("arrow transform"),
+        );
+        assert_eq!(
+            lines.first(),
+            Some(&(DVec2::new(0.0, 8.0), DVec2::new(64.0, 40.0)))
+        );
+        assert_lines_match(&preview_lines(&preview), &lines);
+        assert!(
+            preview.overlays.len() > 3,
+            "snapped drag should retain its guides"
+        );
+    }
+
+    #[test]
+    fn arrow_creation_preserves_world_geometry_on_transformed_page_and_undo_redo() {
+        let (mut doc, mut viewport, snap, size) = ctx_pieces();
+        let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page.transform = Transform2D::scale_xy(2.0, 0.5)
+            .then(&Transform2D::rotation(0.35))
+            .then(&Transform2D::translation(120.0, -75.0));
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page))
+            .expect("create page");
+        doc.add_page(page_id);
+        doc.set_active_page(Some(page_id));
+        doc.history = Default::default();
+        let color = Color::rgba(204, 51, 102, 179);
+        let mut ctx =
+            ToolContext::new(&mut doc, &mut viewport, snap, size).with_new_shape_fill(color);
+        let mut tool = LineTool::arrow();
+        assert_eq!(tool.name(), "arrow");
+        tool.handle_event(&mut ctx, pe_press([510.0, 420.0], ModifierKeys::empty()));
+        let preview = tool.handle_event(&mut ctx, pe_move([430.0, 335.0], ModifierKeys::empty()));
+        tool.handle_event(&mut ctx, pe_release([430.0, 335.0], ModifierKeys::empty()));
+        assert_eq!(doc.scene.len(), 2);
+        assert_eq!(doc.history.undo_depth(), 1);
+        let [id] = doc.selection.as_slice() else {
+            panic!("arrow must be the sole selection")
+        };
+        let created = doc.scene.get(*id).expect("arrow").clone();
+        assert_eq!(created.name, "Arrow");
+        assert_eq!(created.parent, Some(page_id));
+        let NodeData::Vector(vector) = &created.data else {
+            panic!("arrow must be a vector")
+        };
+        assert!(vector.fills.is_empty());
+        let [stroke] = vector.strokes.as_slice() else {
+            panic!("arrow must have one stroke")
+        };
+        assert_eq!(stroke.paint, Fill::solid(color));
+        assert_eq!(stroke.width, 2.0);
+        let lines = path_lines(
+            &vector.path,
+            doc.scene
+                .world_transform(created.id)
+                .expect("world transform"),
+        );
+        assert_lines_match(&preview_lines(&preview), &lines);
+        assert_lines_match(
+            &lines[..1],
+            &[(DVec2::new(110.0, 120.0), DVec2::new(30.0, 35.0))],
+        );
+        assert!(doc.undo().expect("undo arrow"));
+        assert_eq!(doc.scene.len(), 1);
+        assert!(doc.scene.get(created.id).is_none());
+        assert_eq!(doc.history.undo_depth(), 0);
+        assert!(doc.redo().expect("redo arrow"));
+        assert_eq!(doc.scene.get(created.id), Some(&created));
+        assert_eq!(doc.history.undo_depth(), 1);
+    }
+
+    #[test]
+    fn arrow_zero_length_cancel_and_nonfinite_events_do_not_create_nodes() {
+        for case in ["zero", "escape", "deactivate", "press", "move", "release"] {
+            for invalid in [
+                [f64::NAN, 300.0],
+                [400.0, f64::INFINITY],
+                [f64::NEG_INFINITY, 300.0],
+            ] {
+                let (mut doc, mut viewport, snap, size) = ctx_pieces();
+                let mut ctx = ToolContext::new(&mut doc, &mut viewport, snap, size);
+                let mut tool = LineTool::arrow();
+                let start = if case == "press" {
+                    invalid
+                } else {
+                    [400.0, 300.0]
+                };
+                tool.handle_event(&mut ctx, pe_press(start, ModifierKeys::empty()));
+                if case == "move" {
+                    let preview =
+                        tool.handle_event(&mut ctx, pe_move(invalid, ModifierKeys::empty()));
+                    assert!(preview_lines(&preview).is_empty());
+                } else if case == "escape" {
+                    tool.handle_event(
+                        &mut ctx,
+                        ToolEvent::Key(KeyEvent::press(LogicalKey::Escape)),
+                    );
+                } else if case == "deactivate" {
+                    tool.deactivate(&mut ctx);
+                }
+                let end = match case {
+                    "zero" => start,
+                    "release" => invalid,
+                    _ => [500.0, 360.0],
+                };
+                let response = tool.handle_event(&mut ctx, pe_release(end, ModifierKeys::empty()));
+                assert!(preview_lines(&response).is_empty());
+                assert!(!tool.is_drafting(), "{case}");
+                assert!(doc.scene.is_empty(), "{case}");
+                assert!(doc.selection.is_empty(), "{case}");
+                assert_eq!(doc.history.undo_depth(), 0, "{case}");
+            }
+        }
     }
 
     #[test]

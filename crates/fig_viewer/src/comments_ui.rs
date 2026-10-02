@@ -11,23 +11,101 @@ use std::collections::HashMap;
 use editor::Editor;
 use fanta_doc::{DocId, NodeId};
 use glam::DVec2;
-use gpui::{AnyElement, App, Entity, Focusable as _, ObjectFit, SharedString, img};
+use gpui::{
+    AnyElement, App, Bounds, Entity, Focusable as _, ObjectFit, Pixels, Point, SharedString, Size,
+    Stateful, canvas, deferred, img, point,
+};
 use ui::prelude::*;
 use ui::{IconButton, IconButtonShape, Tooltip};
 use workspace::MultiWorkspace;
 
 use crate::canvas::{bounds_size, screen_position_in_bounds};
-use crate::comments::{self, Attachment, Comment, CommentSkill, Mention};
+use crate::comments::{self, Attachment, Comment, CommentSkill, Mention, MotionCommentAnchor};
 use crate::tools::ToolKind;
 use crate::view::FigView;
 
 /// Screen-fixed pin size; must match `canvas::COMMENT_PIN_SIZE`.
 pub(crate) const PIN_SIZE: f64 = 30.0;
 
+fn comment_overlay_origin(
+    limits: Bounds<Pixels>,
+    pin: Bounds<Pixels>,
+    card_size: Size<Pixels>,
+    offset: Point<Pixels>,
+) -> Point<Pixels> {
+    let preferred_left = pin.right() + offset.x;
+    let flipped_left = pin.left() - offset.x - card_size.width;
+    let left = if preferred_left + card_size.width > limits.right() && flipped_left >= limits.left()
+    {
+        flipped_left
+    } else {
+        preferred_left
+    };
+    point(
+        left.clamp(
+            limits.left(),
+            (limits.right() - card_size.width).max(limits.left()),
+        ),
+        (pin.top() + offset.y).clamp(
+            limits.top(),
+            (limits.bottom() - card_size.height).max(limits.top()),
+        ),
+    )
+}
+
+fn comment_overlay(
+    world: DVec2,
+    viewport: fanta_doc::Viewport,
+    offset: Point<Pixels>,
+    card: Stateful<gpui::Div>,
+) -> AnyElement {
+    // Workspace tabs paint after the canvas's parent, so the card must be deferred
+    // to remain visible and interactive above both the tabs and canvas toolbar.
+    deferred(
+        canvas(
+            move |bounds, window, cx| {
+                let inset = px(8.)
+                    .min(bounds.size.width / 2.)
+                    .min(bounds.size.height / 2.);
+                let limits = bounds.inset(inset);
+                let mut card = card
+                    .max_w(limits.size.width)
+                    .max_h(limits.size.height)
+                    .overflow_y_scroll()
+                    .occlude()
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                    .into_any_element();
+                // Measure after the canvas lays out: sidebar and window resizing can change
+                // these bounds without another render, and editor/picker heights vary.
+                let card_size = card.layout_as_root(limits.size.into(), window, cx);
+                let anchor = fanta_canvas::world_to_screen(
+                    world,
+                    &viewport,
+                    DVec2::new(f64::from(bounds.size.width), f64::from(bounds.size.height)),
+                );
+                let pin = Bounds::new(
+                    bounds.origin + point(px(anchor.x as f32), px((anchor.y - PIN_SIZE) as f32)),
+                    gpui::size(px(PIN_SIZE as f32), px(PIN_SIZE as f32)),
+                );
+                let origin = comment_overlay_origin(limits, pin, card_size, offset);
+                card.prepaint_at(origin, window, cx);
+                card
+            },
+            |_, mut card, window, cx| card.paint(window, cx),
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full(),
+    )
+    .into_any_element()
+}
+
 /// A comment being composed: the pin is placed but nothing is in the doc yet.
 pub(crate) struct CommentDraft {
     pub(crate) world: DVec2,
     pub(crate) editor: Entity<Editor>,
+    pub(crate) motion_anchor: Option<MotionCommentAnchor>,
     composer_id: String,
     origin: CommentOrigin,
 }
@@ -36,6 +114,12 @@ pub(crate) struct CommentDraft {
 struct CommentOrigin {
     document: DocId,
     page: NodeId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PendingMotionComment {
+    origin: CommentOrigin,
+    anchor: MotionCommentAnchor,
 }
 
 fn document_has_comment_origin(document: &fanta_doc::Doc, origin: CommentOrigin) -> bool {
@@ -104,6 +188,7 @@ impl CommentSubmitOutcome {
 #[derive(Default)]
 pub(crate) struct CommentState {
     pub(crate) draft: Option<CommentDraft>,
+    pending_motion_anchor: Option<PendingMotionComment>,
     pub(crate) open_thread: Option<String>,
     open_thread_origin: Option<CommentOrigin>,
     pub(crate) hovered_pin: Option<String>,
@@ -123,6 +208,41 @@ pub(crate) struct CommentState {
     pub(crate) read_until: HashMap<String, u64>,
 }
 
+impl CommentState {
+    fn arm_motion_anchor(&mut self, origin: CommentOrigin, anchor: MotionCommentAnchor) {
+        self.pending_motion_anchor = Some(PendingMotionComment { origin, anchor });
+    }
+
+    pub(crate) fn clear_pending_motion_anchor(&mut self) {
+        self.pending_motion_anchor = None;
+    }
+
+    pub(crate) fn motion_time_comment_active(&self) -> bool {
+        self.pending_motion_anchor.is_some()
+            || self
+                .draft
+                .as_ref()
+                .is_some_and(|draft| draft.motion_anchor.is_some())
+    }
+
+    pub(crate) fn pending_motion_anchor(&self) -> Option<MotionCommentAnchor> {
+        self.pending_motion_anchor.map(|pending| pending.anchor)
+    }
+
+    pub(crate) fn close_thread(&mut self) {
+        self.open_thread = None;
+        self.open_thread_origin = None;
+        self.reply_editor = None;
+        self.reply_composer_id = None;
+        self.reply_attachments.clear();
+        self.reply_error = None;
+        self.mention_picker = None;
+        self.skill_picker = None;
+        self.reply_skill = None;
+        self.skill_route_notice = None;
+    }
+}
+
 impl FigView {
     /// The active page's comments, when a document is loaded.
     fn page_comments(&self, cx: &App) -> Vec<Comment> {
@@ -136,13 +256,74 @@ impl FigView {
             .unwrap_or_default()
     }
 
+    fn visible_page_comments(&self, cx: &App) -> Vec<Comment> {
+        let active_motion_clip = self.active_motion_comment_clip(cx);
+        self.page_comments(cx)
+            .into_iter()
+            .filter(|comment| comments::comment_is_visible(comment, active_motion_clip))
+            .collect()
+    }
+
+    fn motion_comment_label(&self, anchor: MotionCommentAnchor, cx: &App) -> String {
+        self.item
+            .read(cx)
+            .document()
+            .map(|document| comments::motion_comment_label(&document.doc, anchor))
+            .unwrap_or_else(|| {
+                format!(
+                    "Animation unavailable · {}",
+                    comments::motion_comment_time_label(anchor.time_ms)
+                )
+            })
+    }
+
     fn active_comment_origin(&self, cx: &App) -> Option<CommentOrigin> {
         self.item.read(cx).document().and_then(|document| {
-            Some(CommentOrigin {
+            let origin = CommentOrigin {
                 document: document.doc.id,
                 page: document.doc.active_page()?,
-            })
+            };
+            document_has_comment_origin(&document.doc, origin).then_some(origin)
         })
+    }
+
+    pub(crate) fn arm_motion_comment_anchor(
+        &mut self,
+        anchor: MotionCommentAnchor,
+        cx: &App,
+    ) -> bool {
+        let Some(origin) = self.active_comment_origin(cx) else {
+            return false;
+        };
+        self.comment_state.arm_motion_anchor(origin, anchor);
+        true
+    }
+
+    pub(crate) fn has_unsent_comment_reply(&self, cx: &App) -> bool {
+        self.comment_state
+            .reply_editor
+            .as_ref()
+            .is_some_and(|editor| !editor.read(cx).text(cx).trim().is_empty())
+            || !self.comment_state.reply_attachments.is_empty()
+            || self.comment_state.reply_skill.is_some()
+    }
+
+    pub(crate) fn close_comment_thread_if_matches(
+        &mut self,
+        page: NodeId,
+        id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.comment_state.open_thread.as_deref() == Some(id)
+            && self
+                .comment_state
+                .open_thread_origin
+                .is_some_and(|origin| origin.page == page)
+        {
+            self.comment_state.close_thread();
+            self.invalidate_canvas_cache();
+            cx.notify();
+        }
     }
 
     fn comments_for_origin(&self, origin: CommentOrigin, cx: &App) -> Vec<Comment> {
@@ -178,19 +359,6 @@ impl FigView {
         }
     }
 
-    fn close_comment_thread_state(&mut self) {
-        self.comment_state.open_thread = None;
-        self.comment_state.open_thread_origin = None;
-        self.comment_state.reply_editor = None;
-        self.comment_state.reply_composer_id = None;
-        self.comment_state.reply_attachments.clear();
-        self.comment_state.reply_error = None;
-        self.comment_state.mention_picker = None;
-        self.comment_state.skill_picker = None;
-        self.comment_state.reply_skill = None;
-        self.comment_state.skill_route_notice = None;
-    }
-
     /// The pin's screen rect for `world`, or `None` without a viewport. The
     /// anchor is the teardrop's squared bottom-left tail.
     fn pin_screen_rect(&self, world: DVec2) -> Option<(DVec2, DVec2)> {
@@ -204,7 +372,7 @@ impl FigView {
 
     /// The comment whose pin contains `screen`, topmost (last painted) first.
     pub(crate) fn comment_pin_at(&self, screen: DVec2, cx: &App) -> Option<String> {
-        let comments = self.page_comments(cx);
+        let comments = self.visible_page_comments(cx);
         comments
             .iter()
             .rev()
@@ -233,6 +401,11 @@ impl FigView {
             return false;
         };
         let screen = screen_position_in_bounds(position, bounds);
+        if self.comment_state.draft.is_some() {
+            // A draft is open: clicks on the canvas are inert (Send or Escape
+            // decide its fate); they must not re-place the pin or open a thread.
+            return true;
+        }
         // Pin clicks work with ANY tool, like the original.
         if let Some(id) = self.comment_pin_at(screen, cx) {
             self.toggle_comment_thread(id, window, cx);
@@ -241,9 +414,13 @@ impl FigView {
         if self.tools.kind() != ToolKind::Comment || !self.is_editable(cx) {
             return false;
         }
-        if self.comment_state.draft.is_some() {
-            // A draft is open: clicks on the canvas are inert (Send or Escape
-            // decide its fate); they must not re-place the pin.
+        if self.has_unsent_comment_reply(cx) {
+            crate::view::show_canvas_notice(
+                "Send or clear the current reply before placing another comment.".to_string(),
+                window,
+                cx,
+            );
+            cx.notify();
             return true;
         }
         let Some(viewport) = self.viewport else {
@@ -251,6 +428,21 @@ impl FigView {
         };
         let Some(origin) = self.active_comment_origin(cx) else {
             return false;
+        };
+        let motion_anchor = match self.comment_state.pending_motion_anchor.take() {
+            Some(pending) if pending.origin == origin => Some(pending.anchor),
+            Some(_) => {
+                self.activate_tool(ToolKind::Select, cx);
+                crate::view::show_canvas_notice(
+                    "The page changed before the time comment was placed. Choose the animation and try again."
+                        .to_string(),
+                    window,
+                    cx,
+                );
+                cx.notify();
+                return true;
+            }
+            None => None,
         };
         let (width, height) = bounds_size(bounds);
         let world = fanta_canvas::screen_to_world(screen, &viewport, DVec2::new(width, height));
@@ -263,6 +455,7 @@ impl FigView {
         self.comment_state.draft = Some(CommentDraft {
             world,
             editor,
+            motion_anchor,
             composer_id: NodeId::new().to_string(),
             origin,
         });
@@ -299,18 +492,138 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.comment_state.draft.is_some() {
+            crate::view::show_canvas_notice(
+                "Send or cancel the current comment draft before opening a thread.".to_string(),
+                window,
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+        if self.has_unsent_comment_reply(cx) {
+            crate::view::show_canvas_notice(
+                "Send or clear the current reply before switching comment threads.".to_string(),
+                window,
+                cx,
+            );
+            cx.notify();
+            return;
+        }
         let Some(origin) = self.active_comment_origin(cx) else {
             return;
         };
+        self.comment_state.clear_pending_motion_anchor();
         if self.comment_state.open_thread.as_deref() == Some(id.as_str())
             && self.comment_state.open_thread_origin == Some(origin)
         {
-            self.close_comment_thread_state();
+            self.comment_state.close_thread();
         } else {
             self.open_comment_thread_for_origin(id, origin, window, cx);
         }
         self.invalidate_canvas_cache();
         cx.notify();
+    }
+
+    /// Open a thread from a panel row. Unlike a pin click this is idempotent:
+    /// re-opening an already selected timed thread navigates back to its clip
+    /// without discarding an unsent reply or its attachments.
+    pub(crate) fn show_comment_thread(
+        &mut self,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.comment_state.draft.is_some() {
+            crate::view::show_canvas_notice(
+                "Send or cancel the current comment draft before opening a thread.".to_string(),
+                window,
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+        let Some(origin) = self.active_comment_origin(cx) else {
+            return;
+        };
+        let already_open = self.comment_state.open_thread.as_deref() == Some(id.as_str())
+            && self.comment_state.open_thread_origin == Some(origin);
+        if !already_open && self.has_unsent_comment_reply(cx) {
+            crate::view::show_canvas_notice(
+                "Send or clear the current reply before switching comment threads.".to_string(),
+                window,
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+        self.comment_state.clear_pending_motion_anchor();
+        if already_open {
+            if let Some(comment) = self
+                .comments_for_origin(origin, cx)
+                .into_iter()
+                .find(|comment| comment.id == id)
+            {
+                self.comment_state
+                    .read_until
+                    .insert(id, comment.newest_created());
+                if let Some(anchor) = comment.motion_anchor {
+                    self.navigate_to_motion_comment(anchor, window, cx);
+                }
+            }
+        } else {
+            self.open_comment_thread_for_origin(id, origin, window, cx);
+        }
+        self.invalidate_canvas_cache();
+        cx.notify();
+    }
+
+    pub(crate) fn show_comment_thread_on_page(
+        &mut self,
+        page: NodeId,
+        id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let page_index = self.item.read(cx).document().and_then(|document| {
+            document
+                .pages
+                .iter()
+                .position(|candidate| candidate.root == Some(page))
+        });
+        let Some(page_index) = page_index else {
+            crate::view::show_canvas_notice(
+                "This comment's page is no longer available.".to_string(),
+                window,
+                cx,
+            );
+            return;
+        };
+        if self.comment_state.draft.is_some() {
+            crate::view::show_canvas_notice(
+                "Send or cancel the current comment draft before opening a thread.".to_string(),
+                window,
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+        let already_open = self.comment_state.open_thread.as_deref() == Some(id.as_str())
+            && self
+                .comment_state
+                .open_thread_origin
+                .is_some_and(|origin| origin.page == page);
+        if !already_open && self.has_unsent_comment_reply(cx) {
+            crate::view::show_canvas_notice(
+                "Send or clear the current reply before switching comment threads.".to_string(),
+                window,
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+        self.select_page(page_index, cx);
+        self.show_comment_thread(id, window, cx);
     }
 
     fn open_comment_thread_for_origin(
@@ -328,15 +641,21 @@ impl FigView {
             self.comment_state
                 .read_until
                 .insert(id.clone(), comment.newest_created());
+            if let Some(anchor) = comment.motion_anchor
+                && !self.is_dev_mode(cx)
+            {
+                self.navigate_to_motion_comment(anchor, window, cx);
+            }
         }
         self.comment_state.open_thread = Some(id);
         self.comment_state.open_thread_origin = Some(origin);
-        let editor = cx.new(|cx| {
-            let mut editor = Editor::auto_height(1, 4, window, cx);
-            editor.set_placeholder_text("Reply…", window, cx);
-            editor
+        self.comment_state.reply_editor = (!self.is_dev_mode(cx)).then(|| {
+            cx.new(|cx| {
+                let mut editor = Editor::auto_height(1, 4, window, cx);
+                editor.set_placeholder_text("Reply…", window, cx);
+                editor
+            })
         });
-        self.comment_state.reply_editor = Some(editor);
         self.comment_state.reply_composer_id = Some(NodeId::new().to_string());
         self.comment_state.reply_attachments.clear();
         self.comment_state.reply_error = None;
@@ -349,6 +668,13 @@ impl FigView {
     /// Post the draft: build the add op, open the new thread, return to Select
     /// (one pin per arming, like the original).
     pub(crate) fn post_comment_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_dev_mode(cx) {
+            self.comment_state.draft_error =
+                Some("Switch to Design to post comments. Your draft was kept.".to_owned());
+            cx.notify();
+            return;
+        }
+        self.finish_document_edits_for_external_change(cx);
         let Some(draft) = self.comment_state.draft.as_ref() else {
             return;
         };
@@ -358,9 +684,26 @@ impl FigView {
         let world = [draft.world.x, draft.world.y];
         let attachments = self.comment_state.draft_attachments.clone();
         let skill = self.comment_state.draft_skill;
+        let motion_anchor = draft.motion_anchor;
         let has_payload = !text.trim().is_empty() || !attachments.is_empty() || skill.is_some();
         self.comment_state.draft_error = None;
+        let preview_owner = cx.entity_id();
         let outcome = self.item.update(cx, |item, cx| {
+            if !item.can_preview_for_owner(preview_owner) || item.content_preview_active() {
+                return CommentSubmitOutcome::Failed(
+                    "Could not post comment while Save As, a source edit, or another canvas preview is active. Finish or cancel that edit and retry; your draft was kept."
+                        .to_string(),
+                );
+            }
+            if motion_anchor.is_some_and(|anchor| {
+                item.document()
+                    .is_none_or(|document| document.doc.motion.clip(anchor.clip).is_none())
+            }) {
+                return CommentSubmitOutcome::Failed(
+                    "Could not post time comment because its animation no longer exists. Choose a current animation and place the comment again; your draft was kept."
+                        .to_string(),
+                );
+            }
             let operation = item.document().and_then(|document| {
                 if !document_has_comment_origin(&document.doc, origin) {
                     return None;
@@ -374,6 +717,7 @@ impl FigView {
                     mentions,
                     attachments,
                     skill,
+                    motion_anchor,
                 )
             });
             let Some((id, operation)) = operation else {
@@ -386,7 +730,7 @@ impl FigView {
                     CommentSubmitOutcome::Empty
                 };
             };
-            match item.apply(operation, cx) {
+            match item.apply_for_preview_owner(preview_owner, operation, cx) {
                 Ok(()) => CommentSubmitOutcome::Applied(id),
                 Err(error) => {
                     CommentSubmitOutcome::Failed(format!("Could not post comment: {error:#}"))
@@ -409,6 +753,7 @@ impl FigView {
             self.comment_state.mention_picker = None;
             self.comment_state.skill_picker = None;
             self.comment_state.draft_skill = None;
+            self.comment_state.clear_pending_motion_anchor();
             self.comment_state
                 .read_until
                 .insert(id.clone(), comments::now_secs());
@@ -426,6 +771,7 @@ impl FigView {
     }
 
     pub(crate) fn cancel_comment_draft(&mut self, cx: &mut Context<Self>) -> bool {
+        let pending_motion_anchor = self.comment_state.pending_motion_anchor.take().is_some();
         if self.comment_state.draft.take().is_some() {
             self.comment_state.draft_attachments.clear();
             self.comment_state.draft_error = None;
@@ -438,10 +784,22 @@ impl FigView {
             cx.notify();
             return true;
         }
+        if pending_motion_anchor {
+            self.activate_tool(ToolKind::Select, cx);
+            cx.notify();
+            return true;
+        }
         false
     }
 
     fn post_comment_reply(&mut self, id: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_dev_mode(cx) {
+            self.comment_state.reply_error =
+                Some("Switch to Design to change comments. Your draft was kept.".to_owned());
+            cx.notify();
+            return;
+        }
+        self.finish_document_edits_for_external_change(cx);
         let Some(editor) = self.comment_state.reply_editor.clone() else {
             return;
         };
@@ -463,7 +821,14 @@ impl FigView {
         let skill = self.comment_state.reply_skill;
         let has_payload = !body.trim().is_empty() || !attachments.is_empty() || skill.is_some();
         self.comment_state.reply_error = None;
+        let preview_owner = cx.entity_id();
         let outcome = self.item.update(cx, |item, cx| {
+            if !item.can_preview_for_owner(preview_owner) || item.content_preview_active() {
+                return CommentSubmitOutcome::Failed(
+                    "Could not post reply while Save As, a source edit, or another canvas preview is active. Finish or cancel that edit and retry; your reply was kept."
+                        .to_string(),
+                );
+            }
             let operation = item.document().and_then(|document| {
                 if !document_has_comment_origin(&document.doc, origin) {
                     return None;
@@ -489,7 +854,7 @@ impl FigView {
                     CommentSubmitOutcome::Empty
                 };
             };
-            match item.apply(operation, cx) {
+            match item.apply_for_preview_owner(preview_owner, operation, cx) {
                 Ok(()) => CommentSubmitOutcome::Applied(id.clone()),
                 Err(error) => {
                     CommentSubmitOutcome::Failed(format!("Could not post reply: {error:#}"))
@@ -534,6 +899,13 @@ impl FigView {
     }
 
     fn resolve_comment_thread(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.is_dev_mode(cx) {
+            self.comment_state.reply_error =
+                Some("Switch to Design to change comments. Your draft was kept.".to_owned());
+            cx.notify();
+            return;
+        }
+        self.finish_document_edits_for_external_change(cx);
         let Some(origin) = self
             .comment_state
             .open_thread_origin
@@ -546,7 +918,14 @@ impl FigView {
             cx.notify();
             return;
         };
+        let preview_owner = cx.entity_id();
         let outcome = self.item.update(cx, |item, cx| {
+            if !item.can_preview_for_owner(preview_owner) || item.content_preview_active() {
+                return CommentMutationOutcome::Failed(
+                    "Could not change the thread status while Save As, a source edit, or another canvas preview is active. Finish or cancel that edit and retry."
+                        .to_string(),
+                );
+            }
             let operation = item.document().and_then(|document| {
                 document_has_comment_origin(&document.doc, origin)
                 .then(|| comments::toggle_resolved_op(&document.doc, origin.page, &id))
@@ -558,7 +937,7 @@ impl FigView {
                         .to_string(),
                 );
             };
-            match item.apply(operation, cx) {
+            match item.apply_for_preview_owner(preview_owner, operation, cx) {
                 Ok(()) => CommentMutationOutcome::Applied,
                 Err(error) => CommentMutationOutcome::Failed(format!(
                     "Could not change the thread status: {error:#}. Your reply draft and attachments were kept."
@@ -577,6 +956,13 @@ impl FigView {
     }
 
     fn delete_comment_thread(&mut self, id: String, cx: &mut Context<Self>) {
+        if self.is_dev_mode(cx) {
+            self.comment_state.reply_error =
+                Some("Switch to Design to change comments. Your draft was kept.".to_owned());
+            cx.notify();
+            return;
+        }
+        self.finish_document_edits_for_external_change(cx);
         let Some(origin) = self
             .comment_state
             .open_thread_origin
@@ -589,7 +975,14 @@ impl FigView {
             cx.notify();
             return;
         };
+        let preview_owner = cx.entity_id();
         let outcome = self.item.update(cx, |item, cx| {
+            if !item.can_preview_for_owner(preview_owner) || item.content_preview_active() {
+                return CommentMutationOutcome::Failed(
+                    "Could not delete the thread while Save As, a source edit, or another canvas preview is active. Finish or cancel that edit and retry."
+                        .to_string(),
+                );
+            }
             let operation = item.document().and_then(|document| {
                 document_has_comment_origin(&document.doc, origin)
                 .then(|| comments::remove_comment_op(&document.doc, origin.page, &id))
@@ -601,7 +994,7 @@ impl FigView {
                         .to_string(),
                 );
             };
-            match item.apply(operation, cx) {
+            match item.apply_for_preview_owner(preview_owner, operation, cx) {
                 Ok(()) => CommentMutationOutcome::Applied,
                 Err(error) => CommentMutationOutcome::Failed(format!(
                     "Could not delete the thread: {error:#}. The thread, reply draft, and attachments were kept."
@@ -609,7 +1002,7 @@ impl FigView {
             }
         });
         match outcome {
-            CommentMutationOutcome::Applied => self.close_comment_thread_state(),
+            CommentMutationOutcome::Applied => self.comment_state.close_thread(),
             CommentMutationOutcome::Failed(error) => {
                 log::error!("deleting a canvas comment failed: {error}");
                 self.comment_state.reply_error = Some(error);
@@ -870,11 +1263,22 @@ impl FigView {
                 .comments_for_origin(origin, cx)
                 .into_iter()
                 .find(|comment| comment.id == open)?;
+            let orphaned_motion_anchor = comment.motion_anchor.is_some_and(|anchor| {
+                self.item
+                    .read(cx)
+                    .document()
+                    .is_none_or(|document| document.doc.motion.clip(anchor.clip).is_none())
+            });
+            if !comments::comment_is_visible(&comment, self.active_motion_comment_clip(cx))
+                && !orphaned_motion_anchor
+            {
+                return None;
+            }
             return self.render_comment_thread(&comment, cx);
         }
         if let Some(hovered) = self.comment_state.hovered_pin.clone() {
             let comment = self
-                .page_comments(cx)
+                .visible_page_comments(cx)
                 .into_iter()
                 .find(|comment| comment.id == hovered)?;
             return self.render_comment_preview(&comment, cx);
@@ -887,14 +1291,16 @@ impl FigView {
         draft: &CommentDraft,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let (pin_min, _) = self.pin_screen_rect(draft.world)?;
+        let viewport = self.viewport?;
         let editor = draft.editor.clone();
         let context = self.render_comment_composer_context(CommentComposerTarget::Draft, cx);
-        Some(
+        Some(comment_overlay(
+            draft.world,
+            viewport,
+            point(px(12.), px(-4.)),
             v_flex()
-                .absolute()
-                .left(px((pin_min.x + PIN_SIZE + 12.0) as f32))
-                .top(px((pin_min.y - 4.0) as f32))
+                .id("fanta-comment-composer")
+                .debug_selector(|| "fanta-comment-composer".to_owned())
                 .w(px(300.))
                 .p_2p5()
                 .gap_2()
@@ -903,11 +1309,20 @@ impl FigView {
                 .border_1()
                 .border_color(cx.theme().colors().border)
                 .shadow_lg()
-                .child(div().child(editor))
+                .when_some(draft.motion_anchor, |this, anchor| {
+                    this.child(
+                        Label::new(self.motion_comment_label(anchor, cx))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Accent),
+                    )
+                })
+                .child(div().min_w_0().w_full().child(editor))
                 .children(context)
                 .child(
                     h_flex()
                         .justify_between()
+                        .flex_wrap()
+                        .gap_1()
                         .child(self.render_comment_composer_tools(CommentComposerTarget::Draft, cx))
                         .child(
                             IconButton::new("fanta-comment-send", IconName::ArrowUp)
@@ -918,9 +1333,8 @@ impl FigView {
                                     this.post_comment_draft(window, cx);
                                 })),
                         ),
-                )
-                .into_any_element(),
-        )
+                ),
+        ))
     }
 
     fn render_comment_preview(
@@ -929,16 +1343,18 @@ impl FigView {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let world = DVec2::new(comment.world[0], comment.world[1]);
-        let (pin_min, _) = self.pin_screen_rect(world)?;
+        let viewport = self.viewport?;
         let author: SharedString = display_author(comment).into();
         let when: SharedString = relative_time(comment.created).into();
         let body: SharedString = comment.text.clone().into();
-        Some(
+        Some(comment_overlay(
+            world,
+            viewport,
+            point(px(6.), px(-30.)),
             v_flex()
-                .absolute()
-                .left(px((pin_min.x + PIN_SIZE * 0.6 + 18.0) as f32))
-                .top(px((pin_min.y - 30.0) as f32))
-                .max_w(px(300.))
+                .id("fanta-comment-preview")
+                .debug_selector(|| "fanta-comment-preview".to_owned())
+                .w(px(300.))
                 .p_3()
                 .gap_1()
                 .rounded_xl()
@@ -948,6 +1364,7 @@ impl FigView {
                 .shadow_lg()
                 .child(
                     h_flex()
+                        .flex_wrap()
                         .gap_2()
                         .child(
                             Label::new(author)
@@ -956,6 +1373,13 @@ impl FigView {
                         )
                         .child(Label::new(when).size(LabelSize::XSmall).color(Color::Muted)),
                 )
+                .when_some(comment.motion_anchor, |this, anchor| {
+                    this.child(
+                        Label::new(self.motion_comment_label(anchor, cx))
+                            .size(LabelSize::XSmall)
+                            .color(Color::Accent),
+                    )
+                })
                 .child(Label::new(body).size(LabelSize::Small))
                 .children(Self::render_message_context(
                     &comment.mentions,
@@ -975,9 +1399,8 @@ impl FigView {
                     ))
                     .size(LabelSize::XSmall)
                     .color(Color::Muted),
-                )
-                .into_any_element(),
-        )
+                ),
+        ))
     }
 
     fn render_comment_thread(
@@ -986,7 +1409,7 @@ impl FigView {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let world = DVec2::new(comment.world[0], comment.world[1]);
-        let (pin_min, _) = self.pin_screen_rect(world)?;
+        let viewport = self.viewport?;
         let resolve_id = comment.id.clone();
         let delete_id = comment.id.clone();
         let reply_id = comment.id.clone();
@@ -1020,14 +1443,23 @@ impl FigView {
             ));
         }
 
-        let reply_editor = self.comment_state.reply_editor.clone();
+        let read_only = self.is_dev_mode(cx);
+        let copy_text = std::iter::once(comment.text.clone())
+            .chain(comment.replies.iter().map(|reply| reply.body.clone()))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let reply_editor = (!read_only)
+            .then(|| self.comment_state.reply_editor.clone())
+            .flatten();
         let reply_context = self.render_comment_composer_context(CommentComposerTarget::Reply, cx);
         let reply_tools = self.render_comment_composer_tools(CommentComposerTarget::Reply, cx);
-        Some(
+        Some(comment_overlay(
+            world,
+            viewport,
+            point(px(12.), px(-8.)),
             v_flex()
-                .absolute()
-                .left(px((pin_min.x + PIN_SIZE + 12.0) as f32))
-                .top(px((pin_min.y - 8.0) as f32))
+                .id("fanta-comment-thread")
+                .debug_selector(|| "fanta-comment-thread".to_owned())
                 .w(px(300.))
                 .rounded_xl()
                 .bg(cx.theme().colors().elevated_surface_background)
@@ -1040,10 +1472,14 @@ impl FigView {
                         .py_2()
                         .justify_between()
                         .items_center()
+                        .flex_wrap()
+                        .gap_1()
                         .border_b_1()
                         .border_color(cx.theme().colors().border)
                         .child(
                             h_flex()
+                                .min_w_0()
+                                .flex_wrap()
                                 .gap_2()
                                 .child(
                                     Label::new("Comment")
@@ -1058,7 +1494,14 @@ impl FigView {
                                         } else {
                                             Color::Accent
                                         }),
-                                ),
+                                )
+                                .when_some(comment.motion_anchor, |this, anchor| {
+                                    this.child(
+                                        Label::new(self.motion_comment_label(anchor, cx))
+                                            .size(LabelSize::XSmall)
+                                            .color(Color::Accent),
+                                    )
+                                }),
                         )
                         .child(
                             h_flex()
@@ -1073,6 +1516,7 @@ impl FigView {
                                         },
                                     )
                                     .icon_size(IconSize::XSmall)
+                                    .disabled(read_only)
                                     .tooltip(Tooltip::text(if comment.resolved {
                                         "Reopen"
                                     } else {
@@ -1086,6 +1530,7 @@ impl FigView {
                                 )
                                 .child(
                                     IconButton::new("fanta-comment-delete-thread", IconName::Trash)
+                                        .disabled(read_only)
                                         .icon_size(IconSize::XSmall)
                                         .tooltip(Tooltip::text("Delete Thread"))
                                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -1107,6 +1552,40 @@ impl FigView {
                         ),
                 )
                 .child(messages)
+                .when(read_only, |thread| {
+                    thread.child(
+                        h_flex()
+                            .debug_selector(|| "dev-comment-read-only".to_owned())
+                            .px_3p5()
+                            .py_2()
+                            .justify_between()
+                            .child(
+                                Label::new("Read-only in Dev")
+                                    .size(LabelSize::XSmall)
+                                    .color(Color::Muted),
+                            )
+                            .child(
+                                div()
+                                    .debug_selector(|| "dev-comment-copy".to_owned())
+                                    .child(
+                                        IconButton::new(
+                                            "fanta-comment-copy-thread",
+                                            IconName::Copy,
+                                        )
+                                        .tooltip(Tooltip::text("Copy thread text"))
+                                        .on_click(
+                                            move |_, _, cx| {
+                                                cx.write_to_clipboard(
+                                                    gpui::ClipboardItem::new_string(
+                                                        copy_text.clone(),
+                                                    ),
+                                                )
+                                            },
+                                        ),
+                                    ),
+                            ),
+                    )
+                })
                 .when_some(reply_editor, |this, editor| {
                     this.child(
                         v_flex()
@@ -1115,23 +1594,36 @@ impl FigView {
                             .gap_1p5()
                             .border_t_1()
                             .border_color(cx.theme().colors().border)
-                            .child(div().flex_1().child(editor))
+                            .child(div().min_w_0().w_full().child(editor))
                             .children(reply_context)
                             .child(
-                                h_flex().justify_between().child(reply_tools).child(
-                                    IconButton::new("fanta-comment-reply-send", IconName::ArrowUp)
+                                h_flex()
+                                    .justify_between()
+                                    .flex_wrap()
+                                    .gap_1()
+                                    .child(reply_tools)
+                                    .child(
+                                        IconButton::new(
+                                            "fanta-comment-reply-send",
+                                            IconName::ArrowUp,
+                                        )
                                         .shape(IconButtonShape::Square)
                                         .icon_size(IconSize::Small)
                                         .tooltip(Tooltip::text("Reply"))
-                                        .on_click(cx.listener(move |this, _, window, cx| {
-                                            this.post_comment_reply(reply_id.clone(), window, cx);
-                                        })),
-                                ),
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.post_comment_reply(
+                                                    reply_id.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            }),
+                                        ),
+                                    ),
                             ),
                     )
-                })
-                .into_any_element(),
-        )
+                }),
+        ))
     }
 
     fn render_comment_composer_tools(
@@ -1498,6 +1990,7 @@ impl FigView {
             .gap_1()
             .child(
                 h_flex()
+                    .flex_wrap()
                     .gap_2()
                     .child(
                         Label::new(SharedString::from(author))
@@ -1572,9 +2065,237 @@ mod tests {
     use fanta_doc::{CanvasNode, Doc, DocId, GroupNode, NodeData, NodeId, Operation};
 
     use super::{
-        Attachment, AttachmentPickerOrigin, CommentMutationOutcome, CommentOrigin,
-        CommentSubmitOutcome, document_has_comment_origin,
+        Attachment, AttachmentPickerOrigin, CommentComposerTarget, CommentMutationOutcome,
+        CommentOrigin, CommentSkill, CommentState, CommentSubmitOutcome, SkillRouteNotice,
+        document_has_comment_origin,
     };
+    use gpui::px;
+
+    #[gpui::test]
+    async fn comment_cards_fit_canvas_edges_after_resize_and_font_changes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use super::{CommentDraft, FigView, comments};
+        use gpui::{AppContext as _, VisualTestContext, size};
+        use project::{FakeFs, Project};
+        use settings::SettingsStore;
+
+        cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            let settings = SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut document = Doc::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_id = page.id;
+        document.apply(Operation::create_node(page)).expect("page");
+        document.add_page(page_id);
+        document.set_active_page(Some(page_id));
+        document.selection.select_only(page_id);
+        let (comment_id, operation) = comments::add_comment_op(
+            &document,
+            page_id,
+            [0., 0.],
+            "A comment with enough text to wrap onto several lines when the canvas gets narrower.",
+        )
+        .expect("comment");
+        document.apply(operation).expect("add comment");
+        let item = crate::document::ready_item_for_test(
+            &project,
+            "/tmp/Comment-layout.fig".into(),
+            document,
+            cx,
+        );
+        let before = item.read_with(cx, |item, _| {
+            let document = item.document().expect("document");
+            (
+                document.doc.scene.get(page_id).expect("page").meta.clone(),
+                document.doc.history.undo_depth(),
+                item.is_dirty(),
+            )
+        });
+        let window = cx.add_window({
+            let item = item.clone();
+            move |window, cx| FigView::new(item, project, window, cx)
+        });
+        let view = window.entity(cx).expect("view");
+        let mut visual = VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1_200.), px(800.)));
+        visual.update(|window, cx| window.draw(cx).clear());
+
+        for selector in [
+            "fanta-comment-composer",
+            "fanta-comment-thread",
+            "fanta-comment-preview",
+        ] {
+            visual.update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    view.comment_state = CommentState::default();
+                    let origin = view.active_comment_origin(cx).expect("origin");
+                    match selector {
+                        "fanta-comment-composer" => {
+                            let editor = cx.new(|cx| {
+                                let mut editor = editor::Editor::auto_height(1, 6, window, cx);
+                                editor.set_text(
+                                    "Draft that stays intact when resizing the canvas",
+                                    window,
+                                    cx,
+                                );
+                                editor
+                            });
+                            view.comment_state.draft = Some(CommentDraft {
+                                world: glam::DVec2::ZERO,
+                                editor,
+                                motion_anchor: None,
+                                composer_id: "layout-draft".to_owned(),
+                                origin,
+                            });
+                            view.comment_state.skill_picker = Some(CommentComposerTarget::Draft);
+                        }
+                        "fanta-comment-thread" => {
+                            view.open_comment_thread_for_origin(
+                                comment_id.clone(),
+                                origin,
+                                window,
+                                cx,
+                            );
+                        }
+                        _ => view.comment_state.hovered_pin = Some(comment_id.clone()),
+                    }
+                    cx.notify();
+                });
+            });
+            for font_size in [16., 24.] {
+                for window_size in [
+                    size(px(1_200.), px(800.)),
+                    size(px(900.), px(560.)),
+                    size(px(760.), px(420.)),
+                ] {
+                    visual.simulate_resize(window_size);
+                    visual.update(|window, cx| {
+                        window.set_rem_size(px(font_size));
+                        window.refresh();
+                        window.draw(cx).clear();
+                    });
+                    let canvas = visual.debug_bounds("fig-container").expect("canvas");
+                    let resized_card = visual.debug_bounds(selector).expect("resized comment card");
+                    assert!(
+                        resized_card.left() >= canvas.left()
+                            && resized_card.right() <= canvas.right(),
+                        "{selector} immediately after resize: {resized_card:?} outside {canvas:?}"
+                    );
+                    assert!(
+                        resized_card.top() >= canvas.top()
+                            && resized_card.bottom() <= canvas.bottom(),
+                        "{selector} immediately after resize: {resized_card:?} outside {canvas:?}"
+                    );
+                    for (horizontal, vertical) in [(0., 0.), (1., 0.), (0., 1.), (1., 1.)] {
+                        view.update(&mut visual, |view, cx| {
+                            view.viewport = Some(fanta_doc::Viewport {
+                                center: [
+                                    f64::from(canvas.size.width) * (0.5 - horizontal),
+                                    f64::from(canvas.size.height) * (0.5 - vertical),
+                                ],
+                                zoom: 1.,
+                            });
+                            cx.notify();
+                        });
+                        visual.update(|window, cx| window.draw(cx).clear());
+                        let card = visual.debug_bounds(selector).expect("comment card");
+                        assert!(card.size.width > px(0.) && card.size.height > px(0.));
+                        assert!(
+                            card.left() >= canvas.left() && card.right() <= canvas.right(),
+                            "{selector} at font {font_size}: {card:?} outside {canvas:?}"
+                        );
+                        assert!(
+                            card.top() >= canvas.top() && card.bottom() <= canvas.bottom(),
+                            "{selector} at font {font_size}: {card:?} outside {canvas:?}"
+                        );
+                    }
+                }
+            }
+            let card = visual.debug_bounds(selector).expect("comment card");
+            let viewport_before = view.read_with(&visual, |view, _| view.viewport);
+            let card_padding = gpui::point(card.right() - px(2.), card.top() + px(2.));
+            visual.simulate_click(card_padding, gpui::Modifiers::none());
+            visual.simulate_event(gpui::ScrollWheelEvent {
+                position: card_padding,
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-10_000.))),
+                ..Default::default()
+            });
+            visual.update(|window, cx| window.draw(cx).clear());
+            view.read_with(&visual, |view, _| {
+                assert_eq!(view.viewport, viewport_before)
+            });
+            item.read_with(&visual, |item, _| {
+                assert_eq!(
+                    item.document().expect("document").doc.selection.as_slice(),
+                    &[page_id]
+                );
+            });
+            if selector != "fanta-comment-preview" {
+                let send = visual
+                    .debug_bounds("ICON-ArrowUp")
+                    .expect("send button after scrolling");
+                assert!(
+                    send.left() >= card.left() && send.right() <= card.right(),
+                    "{selector} send button outside card: {send:?} outside {card:?}"
+                );
+                assert!(
+                    send.top() >= card.top() && send.bottom() <= card.bottom(),
+                    "{selector} send button unreachable after scrolling: {send:?} outside {card:?}"
+                );
+            }
+            if selector == "fanta-comment-composer" {
+                view.read_with(&visual, |view, cx| {
+                    assert_eq!(
+                        view.comment_state
+                            .draft
+                            .as_ref()
+                            .expect("draft")
+                            .editor
+                            .read(cx)
+                            .text(cx),
+                        "Draft that stays intact when resizing the canvas"
+                    );
+                });
+            }
+            let canvas = visual.debug_bounds("fig-container").expect("canvas");
+            visual.simulate_event(gpui::ScrollWheelEvent {
+                position: gpui::point(canvas.left() + px(2.), canvas.top() + px(2.)),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-20.))),
+                ..Default::default()
+            });
+            view.read_with(&visual, |view, _| {
+                assert_ne!(
+                    view.viewport, viewport_before,
+                    "canvas outside card still accepts wheel input"
+                );
+            });
+        }
+        let canvas = visual.debug_bounds("fig-container").expect("canvas");
+        visual.simulate_click(
+            gpui::point(canvas.left() + px(2.), canvas.top() + px(2.)),
+            gpui::Modifiers::none(),
+        );
+        item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            assert!(
+                document.doc.selection.is_empty(),
+                "canvas outside card still accepts selection input"
+            );
+            assert_eq!(
+                document.doc.scene.get(page_id).expect("page").meta,
+                before.0
+            );
+            assert_eq!(document.doc.history.undo_depth(), before.1);
+            assert_eq!(item.is_dirty(), before.2);
+        });
+    }
 
     #[test]
     fn comment_origin_remains_bound_to_its_page_when_the_active_page_changes() {
@@ -1693,5 +2414,38 @@ mod tests {
 
         assert_eq!(reply, Some("unsent reply"));
         assert_eq!(attachments.len(), 1);
+    }
+
+    #[test]
+    fn closing_a_thread_clears_every_reply_payload_and_picker() {
+        let mut state = CommentState::default();
+        state.open_thread = Some("thread".to_string());
+        state.open_thread_origin = Some(CommentOrigin {
+            document: DocId::new(),
+            page: NodeId::new(),
+        });
+        state.reply_composer_id = Some("composer".to_string());
+        state.reply_attachments.push(Attachment {
+            name: "reference.png".to_string(),
+            path: Some("/tmp/reference.png".into()),
+        });
+        state.reply_error = Some("retry".to_string());
+        state.mention_picker = Some(CommentComposerTarget::Reply);
+        state.skill_picker = Some(CommentComposerTarget::Reply);
+        state.reply_skill = Some(CommentSkill::Search);
+        state.skill_route_notice = Some(SkillRouteNotice::ReadyForReview);
+
+        state.close_thread();
+
+        assert!(state.open_thread.is_none());
+        assert!(state.open_thread_origin.is_none());
+        assert!(state.reply_editor.is_none());
+        assert!(state.reply_composer_id.is_none());
+        assert!(state.reply_attachments.is_empty());
+        assert!(state.reply_error.is_none());
+        assert!(state.mention_picker.is_none());
+        assert!(state.skill_picker.is_none());
+        assert!(state.reply_skill.is_none());
+        assert!(state.skill_route_notice.is_none());
     }
 }

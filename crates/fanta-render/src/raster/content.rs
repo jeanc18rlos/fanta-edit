@@ -5,8 +5,8 @@
 use super::{
     AudioNode, Bounds, Canvas, CanvasNode, Color, Fill, GroupNode, Model3dNode, NodeData, NodeId,
     Rect, RenderCtx, Scene, VideoNode, bounds_to_f32, draw_image_cached, draw_pattern_fill,
-    draw_placeholder, draw_shader_fill, draw_text_node, draw_vector, draw_video_fill,
-    fill_to_paint, rounded_rect_path, stroke_box_path,
+    draw_placeholder, draw_shader_fill, draw_text_node, draw_text_path_node, draw_vector,
+    draw_video_fill, fill_to_paint, rounded_rect_path, stroke_box_path,
 };
 
 /// This node's live playback position (0..=1) from the app-playback→render seam,
@@ -132,6 +132,11 @@ pub(crate) fn paint_node_content(
             ctx.metrics.nodes_drawn += 1;
             ContentPaintState::default()
         }
+        NodeData::TextPath(text_path) => {
+            draw_text_path_node(canvas, text_path);
+            ctx.metrics.nodes_drawn += 1;
+            ContentPaintState::default()
+        }
         NodeData::Bitmap(b) => {
             // Cache-hit → fit-draw the uploaded SkImage; miss → resolve/decode,
             // build/upload (cached by asset id), then draw. Anything that fails
@@ -153,6 +158,7 @@ pub(crate) fn paint_node_content(
                 super::ImageFillMods::default(),
             );
             if !drawn {
+                ctx.metrics.incomplete_artwork = true;
                 // The asset may still be decoding: what this painted can
                 // change with no scene edit, so an enclosing effects layer
                 // must not be cached from it.
@@ -163,6 +169,7 @@ pub(crate) fn paint_node_content(
             ContentPaintState::default()
         }
         NodeData::Video(v) => {
+            ctx.metrics.non_artwork_content = true;
             // Live playback state (frame / progress) is per-frame input, not
             // scene content — never cache a layer holding it.
             ctx.layer_volatile = true;
@@ -170,16 +177,19 @@ pub(crate) fn paint_node_content(
             ContentPaintState::default()
         }
         NodeData::Audio(a) => {
+            ctx.metrics.non_artwork_content = true;
             ctx.layer_volatile = true;
             paint_audio(canvas, a, scene_id, ctx);
             ContentPaintState::default()
         }
         NodeData::NodeGraph(n) => {
+            ctx.metrics.non_artwork_content = true;
             draw_placeholder(canvas, n.local_size, Color::rgba(255, 200, 120, 100));
             ctx.metrics.nodes_drawn += 1;
             ContentPaintState::default()
         }
         NodeData::Model3d(m) => {
+            ctx.metrics.non_artwork_content = true;
             // The mesh render is an image-cache entry the app invalidates on
             // orbit (`invalidate_image`) without any scene edit.
             ctx.layer_volatile = true;
@@ -187,6 +197,7 @@ pub(crate) fn paint_node_content(
             ContentPaintState::default()
         }
         NodeData::AiArtifact(a) => {
+            ctx.metrics.non_artwork_content = true;
             draw_placeholder(canvas, a.local_size, Color::rgba(255, 120, 200, 100));
             ctx.metrics.nodes_drawn += 1;
             ContentPaintState::default()
@@ -199,6 +210,7 @@ pub(crate) fn paint_node_content(
             ContentPaintState::default()
         }
         NodeData::Embed(e) => {
+            ctx.metrics.non_artwork_content = true;
             draw_placeholder(canvas, e.local_size, Color::rgba(180, 180, 180, 80));
             ctx.metrics.nodes_drawn += 1;
             ContentPaintState::default()
@@ -331,6 +343,7 @@ fn paint_group(
                     return;
                 }
                 ctx.layer_volatile = true;
+                ctx.metrics.incomplete_artwork = true;
             }
             if let Fill::Shader {
                 shader,
@@ -342,6 +355,7 @@ fn paint_group(
                     ctx.metrics.nodes_drawn += 1;
                     return;
                 }
+                ctx.metrics.incomplete_artwork = true;
             }
             if let Fill::Video {
                 video,
@@ -349,6 +363,7 @@ fn paint_group(
                 blend,
             } = fill
             {
+                ctx.metrics.non_artwork_content = true;
                 if draw_video_fill(canvas, path, b, video, *opacity, *blend, ctx) {
                     ctx.metrics.nodes_drawn += 1;
                     return;
@@ -391,6 +406,7 @@ fn paint_group(
                 );
                 canvas.restore();
                 if !drawn {
+                    ctx.metrics.incomplete_artwork = true;
                     // Unresolved asset or malformed buffer: the same
                     // placeholder paint as before, outside the clip. The
                     // asset may still be decoding — see `layer_volatile`.

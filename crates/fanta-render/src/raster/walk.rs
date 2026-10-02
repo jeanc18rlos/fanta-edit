@@ -10,7 +10,7 @@ use super::{
     PatternCache, RenderInputs, RenderMetrics, Scene, Transform2D, apply_background_blur,
     draw_inner_shadows, effects_layer_bounds, opacity_folds_into_paint, padded_layer_rect,
     paint_node_content, paint_node_foreground, render_instance, resolve_bound_value,
-    shadow_expanded_local_bounds, to_sk_matrix, visible_effects,
+    shadow_expanded_local_bounds, text_path_bounds, to_sk_matrix, visible_effects,
 };
 
 // ---------------------------------------------------------------------------
@@ -175,11 +175,17 @@ fn resolved_world_transform(ctx: &mut RenderCtx, id: NodeId) -> Option<Transform
 /// geometry directly; unclipped groups union resolved children. Boolean
 /// operands remain authored until the path-fold renderer can consume overlays.
 fn resolved_local_bounds(ctx: &mut RenderCtx, id: NodeId) -> Option<Bounds> {
-    if ctx.inputs.motion.is_none() {
-        return ctx.scene.local_bounds(id);
-    }
     if let Some(bounds) = ctx.resolved_local_bounds.get(&id) {
         return *bounds;
+    }
+
+    if ctx.inputs.motion.is_none() {
+        let node = ctx.scene.get(id)?;
+        match &node.data {
+            NodeData::TextPath(_) => {}
+            NodeData::Group(group) if !group_clips_children(node, group) => {}
+            _ => return ctx.scene.local_bounds(id),
+        }
     }
 
     let (union_children, mut computed) = {
@@ -203,6 +209,7 @@ fn resolved_local_bounds(ctx: &mut RenderCtx, id: NodeId) -> Option<Bounds> {
                 )
             }
             NodeData::Boolean(_) => (false, ctx.scene.local_bounds(id)),
+            NodeData::TextPath(text_path) => (false, text_path_bounds(text_path)),
             data => (false, data.local_bounds()),
         }
     };
@@ -235,7 +242,18 @@ fn resolved_local_bounds(ctx: &mut RenderCtx, id: NodeId) -> Option<Bounds> {
 /// Geometry, visibility, culling, and painting read the same transient overlay
 /// (see [`resolve_overlay`]); the document is never mutated by rendering.
 pub(crate) fn render_node(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
+    if ctx
+        .metrics
+        .sampling_budget
+        .as_mut()
+        .is_some_and(|budget| !budget.enter())
+    {
+        return;
+    }
     render_node_with_clip(canvas, id, ctx);
+    if let Some(budget) = &mut ctx.metrics.sampling_budget {
+        budget.leave();
+    }
 }
 
 fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
@@ -310,7 +328,11 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
     // not this node's own (empty) effects layer. Self-contained — frosts nothing
     // and is free when the node carries no visible background blur.
     if ctx.supports_offscreen_layers {
-        apply_background_blur(canvas, node, Some(id), ctx.scene, ctx.effective_scale);
+        if apply_background_blur(canvas, node, Some(id), ctx.scene, ctx.effective_scale)
+            == super::effects::BackgroundBlurOutcome::Failed
+        {
+            ctx.metrics.effect_failed = true;
+        }
     }
 
     // The node's ZOOM-EFFECTIVE effects: which authored shadows / layer blur

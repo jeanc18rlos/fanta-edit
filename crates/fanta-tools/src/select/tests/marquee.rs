@@ -69,3 +69,31 @@ fn alt_marquee_uses_intersects_mode() {
     );
     assert_eq!(ctx.doc.selection.as_slice(), &[id]);
 }
+
+#[test]
+fn host_interaction_bounds_refine_contains_marquee() {
+    fn reject_point_hit(_scene: &fanta_doc::Scene, _id: NodeId, _point: DVec2) -> bool {
+        false
+    }
+
+    fn narrowed_bounds(_scene: &fanta_doc::Scene, _id: NodeId) -> Option<Bounds> {
+        Some(Bounds::from_xywh(-10.0, -10.0, 20.0, 20.0))
+    }
+
+    let size = DVec2::new(800.0, 600.0);
+    let mut doc = Doc::new();
+    let id = rect_at_origin(&mut doc, 60.0, 60.0);
+    let mut viewport = Viewport::default();
+    let mut ctx = ToolContext::new(&mut doc, &mut viewport, SnapEngine::default(), size)
+        .with_hit_test_refiner(reject_point_hit)
+        .with_interaction_bounds_resolver(narrowed_bounds);
+    let mut tool = SelectTool::new();
+    let start = screen_for_world(DVec2::new(-15.0, -15.0), ctx.viewport, ctx.screen_size);
+    let end = screen_for_world(DVec2::new(15.0, 15.0), ctx.viewport, ctx.screen_size);
+
+    tool.handle_event(&mut ctx, pe_press(start, ModifierKeys::empty()));
+    tool.handle_event(&mut ctx, pe_move(end, ModifierKeys::empty()));
+    tool.handle_event(&mut ctx, pe_release(end, ModifierKeys::empty()));
+
+    assert_eq!(ctx.doc.selection.as_slice(), &[id]);
+}

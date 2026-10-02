@@ -257,6 +257,16 @@ impl ArtifactSession {
         if transaction.ops.iter().any(is_variable_op) {
             return Err(SessionError::UseWorkspaceArtifact);
         }
+        if transaction
+            .ops
+            .iter()
+            .any(|operation| artifact_op_impact(operation) == ArtifactOpImpact::ProjectStructure)
+        {
+            return Err(SessionError::InvalidState(
+                "page registry changes require the full project document and project-tree save"
+                    .into(),
+            ));
+        }
         if matches!(self.state, ArtifactDirty::DirtyText) {
             return Err(SessionError::InvalidState(
                 "canvas ops forbidden while DirtyText — commit_text_to_scene first".into(),
@@ -2043,6 +2053,7 @@ pub fn artifact_op_impact(op: &Operation) -> ArtifactOpImpact {
         | SetKeyframe { .. } => Impact::Motion,
 
         SetFlowStart { .. } | SetFlows { .. } | SetPresentation { .. } => Impact::Flow,
+        SetPageRegistry { .. } => Impact::ProjectStructure,
     }
 }
 

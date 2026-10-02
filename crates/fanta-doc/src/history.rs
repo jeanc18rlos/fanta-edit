@@ -150,6 +150,14 @@ impl History {
         self.redo.last().map(|t| t.label.as_str())
     }
 
+    pub fn next_undo_transaction(&self) -> Option<&Transaction> {
+        self.undo.last()
+    }
+
+    pub fn next_redo_transaction(&self) -> Option<&Transaction> {
+        self.redo.last()
+    }
+
     // ---- transaction lifecycle ----------------------------------------------
 
     /// Open a transaction. If one is already open, it is committed first so

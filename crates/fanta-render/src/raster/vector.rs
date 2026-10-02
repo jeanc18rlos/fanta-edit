@@ -196,8 +196,10 @@ pub(crate) fn stroke_sk_path(
             // Missing / still-decoding asset: placeholder stroke below, and
             // no enclosing effects layer may be cached from this frame.
             ctx.layer_volatile = true;
+            ctx.metrics.incomplete_artwork = true;
         }
         if matches!(stroke.paint, Fill::Video { .. }) {
+            ctx.metrics.non_artwork_content = true;
             if draw_video_stroke(canvas, sk_path, stroke, local_bounds_f32, ctx) {
                 ctx.metrics.nodes_drawn += 1;
                 continue;
@@ -210,12 +212,14 @@ pub(crate) fn stroke_sk_path(
                 continue;
             }
             ctx.layer_volatile = true;
+            ctx.metrics.incomplete_artwork = true;
         }
         if matches!(stroke.paint, Fill::Shader { .. }) {
             if draw_shader_stroke(canvas, sk_path, stroke, local_bounds_f32, ctx) {
                 ctx.metrics.nodes_drawn += 1;
                 continue;
             }
+            ctx.metrics.incomplete_artwork = true;
         }
         // `ctx.paint_alpha` is 1.0 unless the walk folded this leaf's node
         // opacity into its single draw (see `opacity_folds_into_paint`).
@@ -639,6 +643,14 @@ pub(crate) fn draw_per_side_border(
     if w <= 0.0 || h <= 0.0 {
         return false;
     }
+    if sides.iter().any(|width| *width > 0.0) {
+        if matches!(stroke.paint, Fill::Image { .. }) {
+            ctx.metrics.incomplete_artwork = true;
+        }
+        if matches!(stroke.paint, Fill::Video { .. }) {
+            ctx.metrics.non_artwork_content = true;
+        }
+    }
     // A fill paint sampled from the stroke's paint over the box bounds (so a
     // gradient border maps across the whole box just like a uniform stroke).
     let mut paint = if let Fill::Pattern {
@@ -652,6 +664,7 @@ pub(crate) fn draw_per_side_border(
             Some(paint) => paint,
             None => {
                 ctx.layer_volatile = true;
+                ctx.metrics.incomplete_artwork = true;
                 stroke_to_paint(stroke, local_bounds_f32)
             }
         }
@@ -662,8 +675,10 @@ pub(crate) fn draw_per_side_border(
     } = &stroke.paint
     {
         let bounds = Bounds::from_xywh(x as f64, y as f64, w as f64, h as f64);
-        shader_paint(bounds, shader, *opacity, *blend, ctx.paint_alpha)
-            .unwrap_or_else(|| stroke_to_paint(stroke, local_bounds_f32))
+        shader_paint(bounds, shader, *opacity, *blend, ctx.paint_alpha).unwrap_or_else(|| {
+            ctx.metrics.incomplete_artwork = true;
+            stroke_to_paint(stroke, local_bounds_f32)
+        })
     } else {
         stroke_to_paint(stroke, local_bounds_f32)
     };
@@ -1076,6 +1091,7 @@ pub(crate) fn paint_path_fills(
                 continue;
             }
             ctx.layer_volatile = true;
+            ctx.metrics.incomplete_artwork = true;
         }
         if let Fill::Shader {
             shader,
@@ -1095,6 +1111,7 @@ pub(crate) fn paint_path_fills(
                 ctx.metrics.nodes_drawn += 1;
                 continue;
             }
+            ctx.metrics.incomplete_artwork = true;
         }
         if let Fill::Video {
             video,
@@ -1102,6 +1119,7 @@ pub(crate) fn paint_path_fills(
             blend,
         } = fill
         {
+            ctx.metrics.non_artwork_content = true;
             if draw_video_fill(canvas, fill_path, bounds, video, *opacity, *blend, ctx) {
                 ctx.metrics.nodes_drawn += 1;
                 continue;
@@ -1161,6 +1179,7 @@ pub(crate) fn paint_path_fills(
             // which may still be decoding, so an enclosing effects layer
             // must not be cached from this frame (see `layer_volatile`).
             ctx.layer_volatile = true;
+            ctx.metrics.incomplete_artwork = true;
         }
         let mut paint = fill_to_paint(fill, local_bounds_f32);
         // 1.0 unless the walk folded this leaf's node opacity into its single

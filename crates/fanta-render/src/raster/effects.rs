@@ -6,8 +6,8 @@ use super::boolean::fold_operands;
 use super::{
     BlendMode, Blur, BlurKind, Bounds, Canvas, CanvasNode, Fill, GroupNode, NodeData, NodeFlags,
     NodeId, Paint, RenderCtx, Scene, Shadow, ShadowKind, bounds_to_f32, frame_box_bounds,
-    path_is_rect, rounded_rect_path, text_node_outline, to_sk_blend_mode, to_sk_color,
-    to_sk_fill_path,
+    path_is_rect, rounded_rect_path, text_node_outline, text_path_bounds, text_path_outline,
+    to_sk_blend_mode, to_sk_color, to_sk_fill_path,
 };
 
 /// Which of a node's authored effects actually PAINT at the frame's
@@ -386,9 +386,9 @@ pub(crate) const LAYER_BOUNDS_PAD_DEVICE_PX: f64 = 32.0;
 /// slower). Priority order:
 /// - a clipped frame's `clip_size` box — overlay-accurate (a binding can
 ///   resize the clip, and descendants are clipped to it anyway);
-/// - the node's own intrinsic geometry (vector path bounds, text/bitmap/media
-///   `local_size`) — also valid for TRANSIENT instance-expansion clones that
-///   have no scene entry;
+/// - the node's own intrinsic geometry (vector path bounds, shaped text-path
+///   glyph bounds, or text/bitmap/media `local_size`) — also valid for
+///   TRANSIENT instance-expansion clones that have no scene entry;
 /// - the scene's memoized subtree `local_bounds` for a live unclipped group
 ///   (a TRANSIENT unclipped group resolves to `None` here; the instance walk
 ///   falls back to the union of its transient children).
@@ -404,6 +404,7 @@ pub(crate) fn effects_layer_bounds(
         NodeData::Group(group) if !group_clips_children(node, group) => {
             scene_id.and_then(|id| scene.local_bounds(id))
         }
+        NodeData::TextPath(text_path) => text_path_bounds(text_path),
         data => data.local_bounds(),
     }
 }
@@ -417,12 +418,19 @@ pub(crate) fn group_clips_children(node: &CanvasNode, group: &GroupNode) -> bool
             .unwrap_or(true)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BackgroundBlurOutcome {
+    NoOp,
+    Applied,
+    Failed,
+}
+
 /// Paint the node's **background blur** ("frosted glass", Figma's
 /// BACKGROUND_BLUR): the backdrop already composited *behind* this node is
 /// sampled, Gaussian-blurred, and drawn back inside the node's silhouette,
-/// before the node's own content paints on top. Returns whether anything was
-/// frosted (purely informational — this is self-contained and pushes no lasting
-/// layer, so the caller does NOT restore anything for it).
+/// before the node's own content paints on top. Reports observable failures
+/// separately from a valid empty/offscreen/sub-pixel no-op, so sampling cannot
+/// certify omitted effects. No lasting layer is pushed; callers do not restore.
 ///
 /// ## Two strategies: backdrop save-layer (default) vs. sample → blur → blit
 ///
@@ -467,18 +475,13 @@ pub(crate) fn group_clips_children(node: &CanvasNode, group: &GroupNode) -> bool
 ///    filter at the **on-screen** sigma. The surrounding `save`/`restore`
 ///    balances the clip + matrix.
 ///
-/// Returns `false` (frosting nothing) when the node has no background blur, when
-/// the combined on-screen sigma is sub-pixel, when the node has no resolvable
-/// silhouette, when the backdrop is not readable (e.g. a recording canvas), or
-/// when the silhouette is fully off-surface — so a node without the effect pays
-/// nothing.
 pub(crate) fn apply_background_blur(
     canvas: &Canvas,
     node: &CanvasNode,
     scene_id: Option<NodeId>,
     scene: &Scene,
     effective_scale: f32,
-) -> bool {
+) -> BackgroundBlurOutcome {
     use skia_safe::{Bitmap, IRect, M44, image_filters};
     // Combine background-blur radii in quadrature, like layer blurs.
     let mut sigma_sq = 0.0f64;
@@ -490,7 +493,7 @@ pub(crate) fn apply_background_blur(
         sigma_sq += s * s;
     }
     if sigma_sq <= 0.0 {
-        return false;
+        return BackgroundBlurOutcome::NoOp;
     }
     // The ON-SCREEN (device-pixel) sigma. The blit below draws the read pixels at
     // an identity CTM, so the filter runs in device space and wants the on-screen
@@ -504,12 +507,12 @@ pub(crate) fn apply_background_blur(
     };
     let sigma = (sigma_sq.sqrt() as f32 * scale).clamp(0.0, SIGMA_SCREEN_MAX);
     if sigma < SIGMA_SCREEN_MIN {
-        return false;
+        return BackgroundBlurOutcome::NoOp;
     }
     // Confine the frosted region to the node's shape so only the backdrop behind
     // it is blurred (a background blur with no silhouette is ill-defined — skip).
     let Some(path) = node_silhouette_path(node, scene_id, scene) else {
-        return false;
+        return BackgroundBlurOutcome::NoOp;
     };
 
     // Device-space rect to sample: the silhouette bounds projected through the
@@ -527,10 +530,10 @@ pub(crate) fn apply_background_blur(
         dev_rect.bottom.ceil() as i32 + pad,
     );
     let Some(src) = IRect::intersect(&want, &surface_rect) else {
-        return false;
+        return BackgroundBlurOutcome::NoOp;
     };
     if src.width() <= 0 || src.height() <= 0 {
-        return false;
+        return BackgroundBlurOutcome::NoOp;
     }
 
     if background_blur_uses_backdrop_layer(canvas) {
@@ -553,7 +556,7 @@ pub(crate) fn apply_background_blur(
             None,
             None,
         ) else {
-            return false;
+            return BackgroundBlurOutcome::Failed;
         };
         canvas.save();
         canvas.clip_path(&path, skia_safe::ClipOp::Intersect, true);
@@ -563,7 +566,7 @@ pub(crate) fn apply_background_blur(
         canvas.save_layer(&rec);
         canvas.restore();
         canvas.restore();
-        return true;
+        return BackgroundBlurOutcome::Applied;
     }
 
     // Snapshot that device rect into a bitmap in the canvas's own pixel format
@@ -573,10 +576,10 @@ pub(crate) fn apply_background_blur(
     let read_info = info.with_dimensions((src.width(), src.height()));
     let mut bitmap = Bitmap::new();
     if !bitmap.set_info(&read_info, None) || !bitmap.try_alloc_pixels() {
-        return false;
+        return BackgroundBlurOutcome::Failed;
     }
     if !canvas.read_pixels_to_bitmap(&mut bitmap, (src.left, src.top)) {
-        return false;
+        return BackgroundBlurOutcome::Failed;
     }
     bitmap.set_immutable(); // share the pixels with the image rather than copy.
     let image = bitmap.as_image();
@@ -585,7 +588,7 @@ pub(crate) fn apply_background_blur(
     // flush against the surface edge stays frosted rather than fading out).
     let Some(blur) = image_filters::blur((sigma, sigma), skia_safe::TileMode::Clamp, None, None)
     else {
-        return false;
+        return BackgroundBlurOutcome::Failed;
     };
     let mut paint = Paint::default();
     paint.set_image_filter(blur);
@@ -599,7 +602,7 @@ pub(crate) fn apply_background_blur(
     canvas.set_matrix(&M44::new_identity());
     canvas.draw_image(&image, (src.left as f32, src.top as f32), Some(&paint));
     canvas.restore();
-    true
+    BackgroundBlurOutcome::Applied
 }
 
 /// Whether [`apply_background_blur`] frosts through Skia's backdrop
@@ -635,6 +638,52 @@ pub(crate) fn with_background_blur_backdrop<T>(backdrop: bool, f: impl FnOnce() 
     let out = f();
     BACKDROP_OVERRIDE.with(|o| o.set(previous));
     out
+}
+
+#[cfg(test)]
+mod sampling_tests {
+    use super::*;
+
+    #[test]
+    fn sampling_backdrop_readback_failure_is_distinct_from_empty_or_offscreen_effects() {
+        with_background_blur_backdrop(false, || {
+            let scene = Scene::new();
+            let mut surface = skia_safe::surfaces::null((32, 32)).expect("unreadable surface");
+            let mut node = CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode::rect_solid(
+                0.,
+                0.,
+                16.,
+                16.,
+                fanta_doc::Color::WHITE,
+            )));
+            assert_eq!(
+                apply_background_blur(surface.canvas(), &node, None, &scene, 1.),
+                BackgroundBlurOutcome::NoOp
+            );
+            node.blurs.push(Blur::background(4.));
+            assert_eq!(
+                apply_background_blur(surface.canvas(), &node, None, &scene, 1.),
+                BackgroundBlurOutcome::Failed
+            );
+            let mut raster =
+                skia_safe::surfaces::raster_n32_premul((32, 32)).expect("readable surface");
+            assert_eq!(
+                apply_background_blur(raster.canvas(), &node, None, &scene, 1.),
+                BackgroundBlurOutcome::Applied
+            );
+            node.data = NodeData::Vector(fanta_doc::VectorNode::rect_solid(
+                1000.,
+                1000.,
+                16.,
+                16.,
+                fanta_doc::Color::WHITE,
+            ));
+            assert_eq!(
+                apply_background_blur(surface.canvas(), &node, None, &scene, 1.),
+                BackgroundBlurOutcome::NoOp
+            );
+        });
+    }
 }
 
 /// Maximum on-SCREEN (device-pixel) Gaussian sigma we will ever ask Skia to
@@ -1072,8 +1121,8 @@ fn spread_morphology_filter(spread: f64, invert: bool) -> Option<skia_safe::Imag
 ///   vector path.
 /// - **Group / frame**: the rounded box of the frame's `clip_size`, else the
 ///   scene-computed content bounds for a background/border-only group.
-/// - **Text**: the shaped glyph outlines, preserving counters while leaving
-///   whitespace transparent, so inner shadows follow glyph alpha.
+/// - **Text / text path**: the shaped glyph outlines, preserving counters while
+///   leaving whitespace transparent, so inner shadows follow glyph alpha.
 /// - **Boolean**: the folded operand path, matching the geometry actually drawn.
 /// - **Instance / Bitmap / Video / media**: the node's `local_size` box — the
 ///   same box `effects_layer_bounds` uses. A degenerate box yields `None`.
@@ -1093,6 +1142,7 @@ pub(crate) fn node_silhouette_path(
             })
         }
         NodeData::Text(text) => text_node_outline(text).map(|path| to_sk_fill_path(&path)),
+        NodeData::TextPath(text_path) => text_path_outline(text_path).into_exact(),
         NodeData::Boolean(boolean) => fold_operands(scene, scene_id?, boolean.op),
         NodeData::Group(g) => frame_box_bounds(g, scene_id, scene).map(|b| {
             rounded_rect_path(

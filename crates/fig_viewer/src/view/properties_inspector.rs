@@ -453,6 +453,7 @@ impl FigView {
                         Vec::new(),
                         Vec::new(),
                         None,
+                        None,
                     )
                 });
                 if let Some((id, operation)) = created {

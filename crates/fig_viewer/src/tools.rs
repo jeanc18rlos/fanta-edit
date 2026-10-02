@@ -12,7 +12,7 @@ use fanta_tools::{
     BrushTool, Button, CursorHint, EllipseTool, EraserTool, FrameTool, HandTool, KeyEvent,
     LineTool, LogicalKey, ModifierKeys, NodeEditTool, PathSelectTool, PenTool, PencilTool,
     PointerEvent, PolygonTool, RectTool, ScaleTool, SectionTool, SelectTool, SliceTool, StarTool,
-    TextPathTool, TextTool, Tool, ToolContext, ToolEvent, ToolOverlay, ToolResponse,
+    TextTool, Tool, ToolContext, ToolEvent, ToolOverlay, ToolResponse,
 };
 use glam::DVec2;
 use gpui::{CursorStyle, Modifiers, MouseButton};
@@ -37,6 +37,7 @@ const NEW_MARK_FILL: Color = Color::BLACK;
 pub const TOOLBAR_GROUPS: [&[ToolKind]; 6] = [
     &[
         ToolKind::Select,
+        ToolKind::Inspect,
         ToolKind::PathSelect,
         ToolKind::RectangleSelect,
         ToolKind::EllipseSelect,
@@ -52,6 +53,7 @@ pub const TOOLBAR_GROUPS: [&[ToolKind]; 6] = [
         ToolKind::Rect,
         ToolKind::Ellipse,
         ToolKind::Line,
+        ToolKind::Arrow,
         ToolKind::Polygon,
         ToolKind::Star,
     ],
@@ -63,7 +65,7 @@ pub const TOOLBAR_GROUPS: [&[ToolKind]; 6] = [
         ToolKind::Pen,
     ],
     &[ToolKind::Text, ToolKind::TextPath],
-    &[ToolKind::Comment],
+    &[ToolKind::Comment, ToolKind::Measure, ToolKind::Annotation],
 ];
 
 /// The default face (button icon) for each toolbar group before the user picks
@@ -84,6 +86,7 @@ pub fn group_index_of(kind: ToolKind) -> Option<usize> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ToolKind {
     Select,
+    Inspect,
     PathSelect,
     RectangleSelect,
     EllipseSelect,
@@ -97,6 +100,7 @@ pub enum ToolKind {
     Rect,
     Ellipse,
     Line,
+    Arrow,
     Polygon,
     Star,
     Pen,
@@ -109,12 +113,15 @@ pub enum ToolKind {
     Text,
     TextPath,
     Comment,
+    Measure,
+    Annotation,
 }
 
 impl ToolKind {
     pub fn label(self) -> &'static str {
         match self {
             Self::Select => "Move",
+            Self::Inspect => "Inspect",
             Self::PathSelect => "Path Selection",
             Self::RectangleSelect => "Rectangle Selection",
             Self::EllipseSelect => "Ellipse Selection",
@@ -128,6 +135,7 @@ impl ToolKind {
             Self::Rect => "Rectangle",
             Self::Ellipse => "Ellipse",
             Self::Line => "Line",
+            Self::Arrow => "Arrow",
             Self::Polygon => "Polygon",
             Self::Star => "Star",
             Self::Pen => "Pen",
@@ -140,12 +148,15 @@ impl ToolKind {
             Self::Text => "Text",
             Self::TextPath => "Text on Path",
             Self::Comment => "Comment",
+            Self::Measure => "Measurement",
+            Self::Annotation => "Annotation",
         }
     }
 
     pub fn icon(self) -> IconName {
         match self {
             Self::Select => IconName::ToolSelect,
+            Self::Inspect => IconName::MagnifyingGlass,
             Self::PathSelect => IconName::ToolPathSelect,
             Self::RectangleSelect => IconName::ToolRect,
             Self::EllipseSelect => IconName::ToolEllipse,
@@ -158,6 +169,7 @@ impl ToolKind {
             Self::Rect => IconName::ToolRect,
             Self::Ellipse => IconName::ToolEllipse,
             Self::Line => IconName::ToolLine,
+            Self::Arrow => IconName::ArrowUpRight,
             Self::Polygon => IconName::ToolPolygon,
             Self::Star => IconName::ToolStar,
             Self::Pen => IconName::ToolPen,
@@ -170,24 +182,19 @@ impl ToolKind {
             Self::Text => IconName::ToolText,
             Self::TextPath => IconName::ToolTextPath,
             Self::Comment => IconName::Chat,
+            Self::Measure => IconName::ArrowRightLeft,
+            Self::Annotation => IconName::ToolPencil,
         }
     }
 
-    /// Placeholder tools that appear in the toolbar but have no behavior yet
-    /// (Text-on-path).
-    ///
-    /// The legacy native tool pill renders these with a "soon" hint. The
-    /// default fanta-gpui toolbar has no host-side API to hide or disable a
-    /// tool face, so `FigView::handle_toolbar_action` refuses to arm them and
-    /// says so in a notice instead — arming a tool that swallows every drag
-    /// reads as a frozen canvas.
     pub fn is_stub(self) -> bool {
-        matches!(self, Self::TextPath)
+        false
     }
 
     fn build(self) -> Box<dyn Tool> {
         match self {
             Self::Select => Box::new(SelectTool::new()),
+            Self::Inspect => Box::new(InspectTool),
             Self::PathSelect => Box::new(PathSelectTool::new()),
             Self::RectangleSelect => Box::new(RectangleSelectTool::new()),
             Self::EllipseSelect => Box::new(RegionSelectTool::new(RegionSelectionKind::Ellipse)),
@@ -203,6 +210,7 @@ impl ToolKind {
             Self::Rect => Box::new(RectTool::new()),
             Self::Ellipse => Box::new(EllipseTool::new()),
             Self::Line => Box::new(LineTool::new()),
+            Self::Arrow => Box::new(LineTool::arrow()),
             Self::Polygon => Box::new(PolygonTool::new()),
             Self::Star => Box::new(StarTool::new()),
             Self::Pen => Box::new(PenTool::new()),
@@ -213,11 +221,36 @@ impl ToolKind {
             Self::Section => Box::new(SectionTool::new()),
             Self::Slice => Box::new(SliceTool::new()),
             Self::Text => Box::new(TextTool::new()),
-            Self::TextPath => Box::new(TextPathTool::new()),
+            Self::TextPath => Box::new(SelectTool::new()),
             // Comment mode is handled by the shell (click-to-pin); the select
             // tool backs it so unconsumed events stay harmless.
             Self::Comment => Box::new(SelectTool::new()),
+            Self::Measure | Self::Annotation => Box::new(MeasureTool),
         }
+    }
+}
+
+struct InspectTool;
+
+impl Tool for InspectTool {
+    fn name(&self) -> &'static str {
+        "inspect"
+    }
+
+    fn handle_event(&mut self, _context: &mut ToolContext, _event: ToolEvent) -> ToolResponse {
+        ToolResponse::cursor(CursorHint::Default)
+    }
+}
+
+struct MeasureTool;
+
+impl Tool for MeasureTool {
+    fn name(&self) -> &'static str {
+        "measure"
+    }
+
+    fn handle_event(&mut self, _context: &mut ToolContext, _event: ToolEvent) -> ToolResponse {
+        ToolResponse::cursor(CursorHint::Crosshair)
     }
 }
 
@@ -391,15 +424,21 @@ pub fn tool_context<'a>(
         zoom: viewport.zoom,
         ..Default::default()
     };
-    ToolContext::new(doc, viewport, snap, screen_size).with_new_shape_fill(new_fill_for(kind))
+    ToolContext::new(doc, viewport, snap, screen_size)
+        .with_new_shape_fill(new_fill_for(kind))
+        .with_hit_test_refiner(crate::canvas::accepts_precise_hit)
+        .with_interaction_bounds_resolver(crate::canvas::authored_local_bounds)
 }
 
 /// The fill a tool creates its node with.
 fn new_fill_for(kind: ToolKind) -> Color {
     match kind {
-        ToolKind::Text | ToolKind::Line | ToolKind::Brush | ToolKind::Pencil | ToolKind::Pen => {
-            NEW_MARK_FILL
-        }
+        ToolKind::Text
+        | ToolKind::Line
+        | ToolKind::Arrow
+        | ToolKind::Brush
+        | ToolKind::Pencil
+        | ToolKind::Pen => NEW_MARK_FILL,
         _ => NEW_SHAPE_FILL,
     }
 }
