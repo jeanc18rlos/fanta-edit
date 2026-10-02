@@ -1683,6 +1683,19 @@ impl ConversationView {
                     return;
                 }
 
+                // "Summarize & Retry" on a context-too-large error: once the
+                // recovery compaction turn ends cleanly, resume the failed
+                // turn. Queued messages and the idle notification wait for
+                // the resumed turn's own stop.
+                if let Some(active) = self.thread_view(&session_id) {
+                    let resumed = active.update(cx, |active, cx| {
+                        active.resume_turn_after_compaction_if_pending(*stop_reason, cx)
+                    });
+                    if resumed {
+                        return;
+                    }
+                }
+
                 let sent_queued_message = if let Some(active) = self.root_thread_view() {
                     active.update(cx, |active, cx| {
                         // Don't auto-send while the user is editing the next message.

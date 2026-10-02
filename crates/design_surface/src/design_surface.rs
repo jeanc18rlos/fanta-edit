@@ -446,7 +446,7 @@ pub struct ScreenshotTarget {
     /// Render only this node's region of its page.
     #[serde(default)]
     pub node: Option<String>,
-    /// Cap on the longer output dimension in pixels (default 1024).
+    /// Cap on the longer output dimension in pixels (default 768, max 1568).
     #[serde(default)]
     pub max_dimension: Option<u32>,
 }

@@ -3,12 +3,19 @@ use std::sync::Arc;
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Context as _, Result};
-use base64::Engine as _;
 use design_surface::ScreenshotTarget;
-use gpui::{App, SharedString, Task};
-use language_model::{LanguageModelImage, LanguageModelToolResultContent};
+use gpui::{App, AppContext as _, SharedString, Task};
+use language_model::{
+    LanguageModelImage, LanguageModelToolResultContent, compress_png_to_language_model_image,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+/// Per-screenshot budget on the encoded PNG bytes (pre-base64). Threads route
+/// through api.fantaisa.net, whose serverless functions reject request bodies
+/// over ~4.5MB — screenshots must stay well under that even with a couple of
+/// recent ones retained in history (see `thread.rs` image eliding).
+const SCREENSHOT_MAX_ENCODED_BYTES: usize = 1024 * 1024;
 
 fn tool_content_err(e: impl std::fmt::Display) -> LanguageModelToolResultContent {
     LanguageModelToolResultContent::from(e.to_string())
@@ -29,7 +36,7 @@ pub struct DesignScreenshotToolInput {
     /// Render only this node's region of its page.
     #[serde(default)]
     pub node: Option<String>,
-    /// Cap on the longer output dimension in pixels (default 1024).
+    /// Cap on the longer output dimension in pixels (default 768, max 1568).
     #[serde(default)]
     pub max_dimension: Option<u32>,
 }
@@ -81,11 +88,18 @@ impl AgentTool for DesignScreenshotTool {
                 })
                 .map_err(tool_content_err)?;
             let png = render.await.map_err(tool_content_err)?;
-            let image = LanguageModelImage {
-                source: base64::engine::general_purpose::STANDARD
-                    .encode(&png)
-                    .into(),
-            };
+            // Enforce the per-image byte budget off the main thread; raw
+            // renders would otherwise bypass the size limits user-attached
+            // images go through and blow up the request body.
+            let image = cx
+                .background_spawn(async move {
+                    compress_png_to_language_model_image(&png, SCREENSHOT_MAX_ENCODED_BYTES)
+                })
+                .await
+                .map_err(tool_content_err)?
+                .ok_or_else(|| {
+                    tool_content_err("the screenshot could not be compressed under the size limit; retry with a smaller max_dimension or a specific node")
+                })?;
             emit_image(&image, &event_stream);
             Ok(image.into())
         })
