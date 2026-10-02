@@ -18,7 +18,7 @@ use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
 
 #[cfg(feature = "mac_app_store")]
-use fanta_revenuecat::{CustomerInfo, RevenueCat, RevenueCatError};
+use fanta_revenuecat::{CustomerInfo, IntroductoryTrial, Product, RevenueCat, RevenueCatError};
 
 const MAX_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 #[cfg(feature = "mac_app_store")]
@@ -384,6 +384,32 @@ fn build_usage(
     }
 }
 
+#[cfg(feature = "mac_app_store")]
+fn apple_pro_price_label(product: &Product) -> String {
+    if let Some(trial) = &product.eligible_introductory_trial {
+        format!(
+            "{} free, then {}",
+            trial.duration_label(),
+            product.localized_price
+        )
+    } else {
+        product.localized_price.clone()
+    }
+}
+
+#[cfg(feature = "mac_app_store")]
+fn apple_trial_description(
+    trial: &IntroductoryTrial,
+    localized_price: &str,
+    monthly_credits: i64,
+) -> String {
+    format!(
+        "Access Pro features during your free trial of {}. The trial adds no subscription credits; you can use credits already in your account. After the trial, Apple charges {localized_price} per month and you receive {} AI credits for each paid month. The subscription automatically renews monthly until canceled in your Apple Account. Cancel before the trial ends to avoid the first charge.",
+        trial.duration_label(),
+        comma(monthly_credits)
+    )
+}
+
 pub(super) async fn load_billing_snapshot(
     client: Arc<Client>,
     token: Arc<str>,
@@ -531,9 +557,7 @@ pub(super) async fn load_billing_snapshot(
             });
             #[cfg(feature = "mac_app_store")]
             let price_label = if plan.id == "pro" {
-                product
-                    .map(|p| p.localized_price.clone())
-                    .unwrap_or_default()
+                product.map(apple_pro_price_label).unwrap_or_default()
             } else if plan.id == "free" {
                 "Free".into()
             } else {
@@ -551,7 +575,14 @@ pub(super) async fn load_billing_snapshot(
             } else if !apple_account_ready {
                 BillingActionState::disabled("Connect personal workspace", apple_store_reason)
             } else if plan.id == "pro" && product.is_some() && can_manage {
-                BillingActionState::enabled("Choose Pro")
+                BillingActionState::enabled(
+                    if product.is_some_and(|product| product.eligible_introductory_trial.is_some())
+                    {
+                        "Start free trial"
+                    } else {
+                        "Choose Pro"
+                    },
+                )
             } else {
                 BillingActionState::disabled(
                     "Unavailable",
@@ -569,6 +600,36 @@ pub(super) async fn load_billing_snapshot(
                     "Ask a workspace owner or admin to manage billing.",
                 )
             };
+            let description = plan.description.unwrap_or_default();
+            #[cfg(feature = "mac_app_store")]
+            let description = if plan.id == "pro" {
+                product
+                    .and_then(|product| {
+                        product.eligible_introductory_trial.as_ref().map(|trial| {
+                            apple_trial_description(
+                                trial,
+                                &product.localized_price,
+                                plan.monthly_credits,
+                            )
+                        })
+                    })
+                    .unwrap_or(description)
+            } else {
+                description
+            };
+            let credits_label = if plan.id == "free" {
+                format!("{} credits on signup", comma(plan.monthly_credits))
+            } else {
+                format!("{} credits / month", comma(plan.monthly_credits))
+            };
+            #[cfg(feature = "mac_app_store")]
+            let credits_label = if plan.id == "pro"
+                && product.is_some_and(|product| product.eligible_introductory_trial.is_some())
+            {
+                format!("{} credits per paid month", comma(plan.monthly_credits))
+            } else {
+                credits_label
+            };
             BillingPlan {
                 id: plan.id.clone().into(),
                 name: plan.display_name.into(),
@@ -578,15 +639,10 @@ pub(super) async fn load_billing_snapshot(
                     "AVAILABLE PLAN"
                 }
                 .into(),
-                description: plan.description.unwrap_or_default().into(),
+                description: description.into(),
                 price_label: price_label.into(),
                 cadence_label: if plan.id == "free" { "" } else { "/ month" }.into(),
-                credits_label: if plan.id == "free" {
-                    format!("{} credits on signup", comma(plan.monthly_credits))
-                } else {
-                    format!("{} credits / month", comma(plan.monthly_credits))
-                }
-                .into(),
+                credits_label: credits_label.into(),
                 features: plan
                     .features
                     .as_object()
@@ -1001,7 +1057,7 @@ pub(super) async fn perform_billing_action(
                 };
                 ensure_account(&client, &token)?;
                 checked_customer(&purchase.customer_info, &me.user.id)?;
-                return Ok(BillingActionOutcome::Refresh { notice: Some("Apple confirmed Pro. Fanta will activate it and add credits to your personal workspace after processing.".into()) });
+                return Ok(BillingActionOutcome::Refresh { notice: Some("Apple confirmed Pro. Fanta will update your personal workspace after processing. Free trials add no subscription credits; each paid month adds 3,000 credits.".into()) });
             }
             #[cfg(not(feature = "mac_app_store"))]
             {
@@ -1074,6 +1130,34 @@ pub(super) async fn perform_billing_action(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(feature = "mac_app_store")]
+    #[test]
+    fn eligible_trial_shows_duration_price_and_paid_credit_timing() {
+        let trial = IntroductoryTrial {
+            duration: 3,
+            unit: fanta_revenuecat::TrialUnit::Day,
+        };
+        let product = Product {
+            identifier: PRO_MONTHLY.into(),
+            title: "Fanta Pro".into(),
+            description: String::new(),
+            localized_price: "$44.99".into(),
+            currency_code: "USD".into(),
+            eligible_introductory_trial: Some(trial.clone()),
+        };
+        assert_eq!(apple_pro_price_label(&product), "3 days free, then $44.99");
+        let description = apple_trial_description(&trial, &product.localized_price, 3000);
+        assert!(description.contains("free trial of 3 days"));
+        assert!(description.contains("trial adds no subscription credits"));
+        assert!(description.contains("3,000 AI credits for each paid month"));
+        assert!(description.contains("Cancel before the trial ends"));
+        let product = Product {
+            eligible_introductory_trial: None,
+            ..product
+        };
+        assert_eq!(apple_pro_price_label(&product), "$44.99");
+    }
 
     #[test]
     fn desktop_api_key_responses_match_billing_contract() -> Result<()> {

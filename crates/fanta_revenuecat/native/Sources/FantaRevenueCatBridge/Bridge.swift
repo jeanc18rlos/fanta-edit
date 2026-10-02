@@ -89,14 +89,38 @@ private func completeJSON(
     }
 }
 
-private func productJSON(_ product: StoreProduct) -> [String: Any] {
-    [
+private func productJSON(
+    _ product: StoreProduct,
+    introEligibility: IntroEligibilityStatus? = nil
+) -> [String: Any] {
+    var result: [String: Any] = [
         "identifier": product.productIdentifier,
         "title": product.localizedTitle,
         "description": product.localizedDescription,
         "localized_price": product.localizedPriceString,
         "currency_code": product.currencyCode ?? ""
     ]
+
+    if introEligibility == .eligible,
+       let discount = product.introductoryDiscount,
+       discount.paymentMode == .freeTrial {
+        let (duration, overflow) = discount.subscriptionPeriod.value.multipliedReportingOverflow(
+            by: discount.numberOfPeriods
+        )
+        if !overflow && duration > 0 {
+            let unit: String
+            switch discount.subscriptionPeriod.unit {
+            case .day: unit = "day"
+            case .week: unit = "week"
+            case .month: unit = "month"
+            case .year: unit = "year"
+            @unknown default: return result
+            }
+            result["eligible_introductory_trial"] = ["duration": duration, "unit": unit]
+        }
+    }
+
+    return result
 }
 
 private func customerJSON(_ info: CustomerInfo) -> [String: Any] {
@@ -224,7 +248,24 @@ public func fanta_rc_request(
                 return
             }
             Purchases.shared.getProducts(identifiers) { products in
-                completeJSON(callback, context: context, object: products.map(productJSON))
+                let trialProductIDs = products.compactMap { product in
+                    product.introductoryDiscount?.paymentMode == .freeTrial
+                        ? product.productIdentifier : nil
+                }
+                guard !trialProductIDs.isEmpty else {
+                    completeJSON(callback, context: context, object: products.map { productJSON($0) })
+                    return
+                }
+                Purchases.shared.checkTrialOrIntroDiscountEligibility(
+                    productIdentifiers: trialProductIDs
+                ) { eligibility in
+                    completeJSON(callback, context: context, object: products.map { product in
+                        productJSON(
+                            product,
+                            introEligibility: eligibility[product.productIdentifier]?.status
+                        )
+                    })
+                }
             }
         case "purchase":
             guard

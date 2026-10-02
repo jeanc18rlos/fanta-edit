@@ -1362,7 +1362,9 @@ fn render_surface_screenshot(
     node: Option<NodeId>,
     target: ScreenshotTarget,
 ) -> Result<Vec<u8>> {
-    let max_dimension = f64::from(target.max_dimension.unwrap_or(1024).clamp(16, 4096));
+    // Larger screenshots consume the gateway's request budget without adding
+    // detail after the model's image downscaling.
+    let max_dimension = f64::from(target.max_dimension.unwrap_or(768).clamp(16, 1568));
     let motion = match target.motion_clip {
         Some(raw) => {
             let clip = raw
