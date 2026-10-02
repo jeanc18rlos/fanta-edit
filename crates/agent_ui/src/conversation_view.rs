@@ -329,10 +329,12 @@ impl Conversation {
                     | AcpThreadEvent::WorkingDirectoriesUpdated
                     | AcpThreadEvent::PromptUpdated => {}
                 }
+                cx.notify();
             }
         });
         self.subscriptions.push(subscription);
         self.threads.insert(session_id, thread);
+        cx.notify();
     }
 
     pub fn permission_options_for_tool_call<'a>(

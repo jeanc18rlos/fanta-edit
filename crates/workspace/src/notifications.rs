@@ -1313,13 +1313,13 @@ pub mod simple_message_notification {
             struct UpdateRequiredError;
             impl WorkspaceError for UpdateRequiredError {
                 fn primary_message(&self) -> SharedString {
-                    "An update is required to continue using Zed AI.".into()
+                    "An update is required to continue using Fanta AI.".into()
                 }
                 fn severity(&self) -> ErrorSeverity {
                     ErrorSeverity::Critical
                 }
                 fn primary_action(&self) -> ErrorAction {
-                    ErrorAction::link("Update Zed", "https://zed.dev/releases")
+                    ErrorAction::link("Update Fanta", "https://fantaisa.net")
                 }
                 fn secondary_action(&self) -> Option<ErrorAction> {
                     Some(ErrorAction::dismiss())

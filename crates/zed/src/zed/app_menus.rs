@@ -80,6 +80,10 @@ pub fn app_menus() -> Vec<Menu> {
                     workspace::Open::default(),
                 ),
                 MenuItem::action("Open Recent…", zed_actions::OpenRecent::default()),
+                MenuItem::action(
+                    "Show Project in File Manager",
+                    zed_actions::fanta::RevealProjectInFileManager,
+                ),
                 MenuItem::separator(),
                 MenuItem::action("Save", workspace::Save { save_intent: None }),
                 MenuItem::action("Save As…", workspace::SaveAs),

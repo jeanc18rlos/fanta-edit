@@ -14,6 +14,7 @@ use gpui::{App, AppContext, AsyncApp, Entity, Task, WeakEntity};
 use language::language_settings::{self, FormatOnSave};
 use language::{Buffer, BufferEditSource, BufferEvent, LanguageRegistry};
 use language_model::LanguageModelToolResultContent;
+use parking_lot::Mutex;
 use project::lsp_store::{FormatTrigger, LspFormatTarget};
 use project::{AgentLocation, Project, ProjectPath};
 use reindent::{Reindenter, compute_indent_delta};
@@ -138,6 +139,7 @@ pub(crate) struct EditSessionContext {
     thread: WeakEntity<Thread>,
     action_log: Entity<ActionLog>,
     language_registry: Arc<LanguageRegistry>,
+    transactions: Arc<Mutex<Vec<text::TransactionId>>>,
 }
 
 impl EditSessionContext {
@@ -152,6 +154,7 @@ impl EditSessionContext {
             thread,
             action_log,
             language_registry,
+            transactions: Arc::default(),
         }
     }
 
@@ -172,6 +175,22 @@ impl EditSessionContext {
     }
 
     fn set_agent_location(&self, buffer: WeakEntity<Buffer>, position: text::Anchor, cx: &mut App) {
+        if let Some(path) = buffer
+            .read_with(cx, |buffer, cx| {
+                buffer
+                    .file()
+                    .and_then(|file| file.as_local())
+                    .map(|file| file.abs_path(cx))
+            })
+            .log_err()
+            .flatten()
+        {
+            self.thread
+                .update(cx, |thread, cx| {
+                    thread.report_source_activity(path.to_string_lossy().into_owned(), cx);
+                })
+                .log_err();
+        }
         let should_update_agent_location = self
             .thread
             .read_with(cx, |thread, _cx| !thread.is_subagent())
@@ -183,13 +202,64 @@ impl EditSessionContext {
         }
     }
 
-    async fn ensure_buffer_saved(&self, buffer: &Entity<Buffer>, cx: &mut AsyncApp) {
+    async fn validate_buffer_before_save(
+        &self,
+        buffer: &Entity<Buffer>,
+        abs_path: &std::path::Path,
+        cx: &mut AsyncApp,
+    ) -> Result<bool, String> {
+        let (candidate, version) =
+            buffer.read_with(cx, |buffer, _| (buffer.text(), buffer.version()));
+        let validation = cx.update(|cx| {
+            design_surface::active(cx).map(|surface| {
+                surface.validate_source_edit(
+                    abs_path.to_string_lossy().into_owned(),
+                    candidate.clone(),
+                    cx,
+                )
+            })
+        });
+        let managed_source = if let Some(validation) = validation {
+            let validation = validation
+                .await
+                .map_err(|error| format!("Cannot save invalid Fanta source: {error:#}"))?;
+            let applicable = validation
+                .get("applicable")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            if applicable
+                && validation
+                    .get("validated")
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+            {
+                return Err("The design surface did not validate this Fanta source candidate. It was not saved.".into());
+            }
+            applicable
+        } else {
+            false
+        };
+        if managed_source && buffer.read_with(cx, |buffer, _| buffer.version()) != version {
+            return Err("The file changed while its Fanta source was being validated. It was not saved. Read the file again before retrying.".into());
+        }
+        Ok(managed_source)
+    }
+
+    async fn ensure_buffer_saved(
+        &self,
+        buffer: &Entity<Buffer>,
+        abs_path: &std::path::Path,
+        cx: &mut AsyncApp,
+    ) -> Result<(), String> {
+        let managed_source = self
+            .validate_buffer_before_save(buffer, abs_path, cx)
+            .await?;
         let format_on_save_enabled = buffer.read_with(cx, |buffer, cx| {
             let settings = language_settings::LanguageSettings::for_buffer(buffer, cx);
             settings.format_on_save != FormatOnSave::Off
         });
 
-        if format_on_save_enabled {
+        if format_on_save_enabled && !managed_source {
             self.project
                 .update(cx, |project, cx| {
                     project.format(
@@ -201,17 +271,18 @@ impl EditSessionContext {
                     )
                 })
                 .await
-                .log_err();
+                .map_err(|error| format!("Failed to format file before saving: {error:#}"))?;
         }
 
         self.project
             .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
             .await
-            .log_err();
+            .map_err(|error| format!("Failed to save file: {error:#}"))?;
 
         self.action_log.update(cx, |log, cx| {
             log.buffer_edited(buffer.clone(), cx);
         });
+        Ok(())
     }
 
     pub(crate) fn initial_title_from_path(
@@ -270,6 +341,10 @@ pub(crate) enum EditSessionResult {
         error: String,
         session: Option<EditSession>,
     },
+    Interrupted {
+        error: String,
+        session: Option<EditSession>,
+    },
 }
 
 pub(crate) async fn run_session(
@@ -277,29 +352,29 @@ pub(crate) async fn run_session(
     event_stream: &ToolCallEventStream,
     cx: &mut AsyncApp,
 ) -> Result<EditSessionOutput, EditSessionOutput> {
-    match result {
-        EditSessionResult::Completed(session) => {
-            session
-                .context
-                .ensure_buffer_saved(&session.buffer, cx)
-                .await;
-            let (new_text, diff) = session.compute_new_text_and_diff(cx).await;
-            Ok(EditSessionOutput::Success {
-                old_text: session.old_text.clone(),
-                new_text,
-                input_path: session.input_path,
-                diff,
-            })
+    let (session, mut error, interrupted) = match result {
+        EditSessionResult::Completed(session) => (Some(session), None, false),
+        EditSessionResult::Failed { error, session } => (session, Some(error), false),
+        EditSessionResult::Interrupted { error, session } => (session, Some(error), true),
+    };
+    if let Some(session) = session {
+        if interrupted {
+            session.rollback(cx);
+        } else if let Err(save_error) = session
+            .context
+            .ensure_buffer_saved(&session.buffer, &session.abs_path, cx)
+            .await
+        {
+            session.rollback(cx);
+            error = Some(match error {
+                Some(error) => format!("{error}\n{save_error}"),
+                None => save_error,
+            });
+        } else {
+            session.context.transactions.lock().clear();
         }
-        EditSessionResult::Failed {
-            error,
-            session: Some(session),
-        } => {
-            session
-                .context
-                .ensure_buffer_saved(&session.buffer, cx)
-                .await;
-            let (_new_text, diff) = session.compute_new_text_and_diff(cx).await;
+        let (new_text, diff) = session.compute_new_text_and_diff(cx).await;
+        if let Some(error) = error {
             if diff.is_empty() {
                 event_stream.update_fields(acp::ToolCallUpdateFields::new().content(vec![
                     acp::ToolCallContent::Content(acp::Content::new(error.clone())),
@@ -310,20 +385,24 @@ pub(crate) async fn run_session(
                 input_path: Some(session.input_path),
                 diff,
             })
-        }
-        EditSessionResult::Failed {
-            error,
-            session: None,
-        } => {
-            event_stream.update_fields(acp::ToolCallUpdateFields::new().content(vec![
-                acp::ToolCallContent::Content(acp::Content::new(error.clone())),
-            ]));
-            Err(EditSessionOutput::Error {
-                error,
-                input_path: None,
-                diff: String::new(),
+        } else {
+            Ok(EditSessionOutput::Success {
+                old_text: session.old_text.clone(),
+                new_text,
+                input_path: session.input_path,
+                diff,
             })
         }
+    } else {
+        let error = error.unwrap_or_else(|| "The edit session did not complete".into());
+        event_stream.update_fields(acp::ToolCallUpdateFields::new().content(vec![
+            acp::ToolCallContent::Content(acp::Content::new(error.clone())),
+        ]));
+        Err(EditSessionOutput::Error {
+            error,
+            input_path: None,
+            diff: String::new(),
+        })
     }
 }
 
@@ -357,6 +436,7 @@ pub(crate) struct EditSession {
     parser: StreamingParser,
     pipeline: Pipeline,
     context: Arc<EditSessionContext>,
+    _rollback_guard: Deferred<Box<dyn FnOnce()>>,
     _finalize_diff_guard: Deferred<Box<dyn FnOnce()>>,
 }
 
@@ -428,12 +508,7 @@ impl WritePipeline {
             0..buffer_len
         };
 
-        agent_edit_buffer(
-            buffer,
-            [(edit_range, chunk.as_str())],
-            &context.action_log,
-            cx,
-        );
+        agent_edit_buffer(buffer, [(edit_range, chunk.as_str())], context, cx);
         cx.update(|cx| {
             context.set_agent_location(
                 buffer.downgrade(),
@@ -587,7 +662,7 @@ impl EditPipeline {
                     buffer,
                     original_snapshot,
                     edit_cursor,
-                    &context.action_log,
+                    context,
                     cx,
                 );
 
@@ -627,7 +702,7 @@ impl EditPipeline {
                     buffer,
                     &original_snapshot,
                     &mut edit_cursor,
-                    &context.action_log,
+                    context,
                     cx,
                 );
 
@@ -650,6 +725,12 @@ impl EditSession {
         event_stream: &ToolCallEventStream,
         cx: &mut AsyncApp,
     ) -> Result<Self, String> {
+        let context = Arc::new(EditSessionContext::new(
+            context.project.clone(),
+            context.thread.clone(),
+            context.action_log.clone(),
+            context.language_registry.clone(),
+        ));
         let target = if let Some(abs_path) =
             resolve_global_skill_path_for_edit_session(mode, &path, &context, cx).await?
         {
@@ -727,6 +808,29 @@ impl EditSession {
                 async move { Arc::new(old_snapshot.text()) }
             })
             .await;
+        let rollback_guard = util::defer(Box::new({
+            let buffer = buffer.downgrade();
+            let action_log = context.action_log.downgrade();
+            let transactions = context.transactions.clone();
+            let mut cx = cx.clone();
+            move || {
+                let transactions = std::mem::take(&mut *transactions.lock());
+                if transactions.is_empty() {
+                    return;
+                }
+                let restored = buffer.update(&mut cx, |buffer, cx| {
+                    for transaction in transactions.into_iter().rev() {
+                        buffer.undo_transaction(transaction, cx);
+                    }
+                    cx.entity()
+                });
+                if let Some(buffer) = restored.log_err() {
+                    action_log
+                        .update(&mut cx, |log, cx| log.buffer_edited(buffer, cx))
+                        .log_err();
+                }
+            }
+        }) as Box<dyn FnOnce()>);
 
         Ok(Self {
             abs_path,
@@ -738,7 +842,25 @@ impl EditSession {
             pipeline: Pipeline::new(mode, file_changed_since_last_read),
             context,
             _finalize_diff_guard: finalize_diff_guard,
+            _rollback_guard: rollback_guard,
         })
+    }
+
+    fn rollback(&self, cx: &mut AsyncApp) {
+        let transactions = std::mem::take(&mut *self.context.transactions.lock());
+        if transactions.is_empty() {
+            return;
+        }
+        cx.update(|cx| {
+            self.buffer.update(cx, |buffer, cx| {
+                for transaction in transactions.into_iter().rev() {
+                    buffer.undo_transaction(transaction, cx);
+                }
+            });
+            self.context.action_log.update(cx, |log, cx| {
+                log.buffer_edited(self.buffer.clone(), cx);
+            });
+        });
     }
 
     pub(crate) async fn finalize_edit(
@@ -888,7 +1010,7 @@ fn apply_char_operations(
     buffer: &Entity<Buffer>,
     snapshot: &text::BufferSnapshot,
     edit_cursor: &mut usize,
-    action_log: &Entity<ActionLog>,
+    context: &EditSessionContext,
     cx: &mut AsyncApp,
 ) {
     let mut edits: Vec<_> = Vec::new();
@@ -910,7 +1032,7 @@ fn apply_char_operations(
         }
     }
     if !edits.is_empty() {
-        agent_edit_buffer(buffer, edits, action_log, cx);
+        agent_edit_buffer(buffer, edits, context, cx);
     }
 }
 
@@ -959,7 +1081,7 @@ fn extract_match(
 fn agent_edit_buffer<I, S, T>(
     buffer: &Entity<Buffer>,
     edits: I,
-    action_log: &Entity<ActionLog>,
+    context: &EditSessionContext,
     cx: &mut AsyncApp,
 ) where
     I: IntoIterator<Item = (Range<S>, T)>,
@@ -968,11 +1090,20 @@ fn agent_edit_buffer<I, S, T>(
 {
     cx.update(|cx| {
         buffer.update(cx, |buffer, cx| {
+            // Cancellation must undo only this tool's chunks, never a grouped user edit.
+            buffer.finalize_last_transaction();
             buffer.start_transaction();
             buffer.edit(edits, None, cx);
-            buffer.end_transaction_with_source(BufferEditSource::Agent, cx);
+            if let Some(transaction) =
+                buffer.end_transaction_with_source(BufferEditSource::Agent, cx)
+            {
+                context.transactions.lock().push(transaction);
+            }
+            buffer.finalize_last_transaction();
         });
-        action_log.update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
+        context
+            .action_log
+            .update(cx, |log, cx| log.buffer_edited(buffer.clone(), cx));
     });
 }
 
@@ -994,7 +1125,7 @@ async fn ensure_buffer_saved(
     });
 
     if is_dirty {
-        resolve_dirty_buffer(buffer, mode, context, event_stream, cx).await?;
+        resolve_dirty_buffer(buffer, abs_path, mode, context, event_stream, cx).await?;
     }
 
     if let (Some(last_read), Some(current)) = (last_read_mtime, current_mtime)
@@ -1016,6 +1147,7 @@ async fn ensure_buffer_saved(
 /// automatically.
 async fn resolve_dirty_buffer(
     buffer: &Entity<Buffer>,
+    abs_path: &std::path::Path,
     mode: EditSessionMode,
     context: &EditSessionContext,
     event_stream: &ToolCallEventStream,
@@ -1079,10 +1211,13 @@ async fn resolve_dirty_buffer(
     match decision {
         super::tool_permissions::DirtyBufferDecision::Save => {
             context
+                .validate_buffer_before_save(buffer, abs_path, cx)
+                .await?;
+            context
                 .project
                 .update(cx, |project, cx| project.save_buffer(buffer.clone(), cx))
                 .await
-                .map_err(|e| format!("Failed to save buffer: {e}"))?;
+                .map_err(|error| format!("Failed to save buffer: {error:#}"))?;
         }
         super::tool_permissions::DirtyBufferDecision::Discard => {
             context

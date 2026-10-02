@@ -9594,9 +9594,9 @@ pub struct OpenChannelNotesById {
 actions!(
     zed,
     [
-        /// Opens the Zed log file.
+        /// Opens the Fanta log file.
         OpenLog,
-        /// Reveals the Zed log file in the system file manager.
+        /// Reveals the Fanta log file in the system file manager.
         RevealLogInFileManager
     ]
 );

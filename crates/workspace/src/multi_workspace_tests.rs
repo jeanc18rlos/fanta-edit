@@ -11,12 +11,81 @@ use serde_json::json;
 use settings::{Settings, SettingsStore};
 use util::path;
 
+use super::multi_workspace::{PROJECT_OPEN_FRAME_WAIT, wait_for_project_opening_frame};
+
 fn init_test(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let settings_store = SettingsStore::test(cx);
         cx.set_global(settings_store);
         theme_settings::init(theme::LoadThemes::JustBase, cx);
         DisableAiSettings::register(cx);
+    });
+}
+
+#[gpui::test]
+async fn test_project_open_frame_wait_is_bounded_without_native_frames(cx: &mut TestAppContext) {
+    let (frame_rendered, opening_frame) = futures::channel::oneshot::channel();
+    let background_executor = cx.executor();
+    let wait = background_executor.spawn(wait_for_project_opening_frame(
+        opening_frame,
+        background_executor.clone(),
+    ));
+    cx.run_until_parked();
+    assert!(!wait.is_ready());
+
+    cx.executor()
+        .advance_clock(PROJECT_OPEN_FRAME_WAIT - std::time::Duration::from_millis(1));
+    cx.run_until_parked();
+    assert!(!wait.is_ready());
+
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(1));
+    cx.run_until_parked();
+    wait.await
+        .expect("opening proceeds without a rendered frame");
+    drop(frame_rendered);
+}
+
+#[gpui::test]
+async fn test_project_open_frame_wait_proceeds_immediately_after_paint(cx: &mut TestAppContext) {
+    let (frame_rendered, opening_frame) = futures::channel::oneshot::channel();
+    let background_executor = cx.executor();
+    let wait = background_executor.spawn(wait_for_project_opening_frame(
+        opening_frame,
+        background_executor.clone(),
+    ));
+    cx.run_until_parked();
+    frame_rendered
+        .send(())
+        .expect("frame waiter is still alive");
+    cx.run_until_parked();
+    assert!(
+        wait.is_ready(),
+        "a visible window does not wait for the timer"
+    );
+    wait.await.expect("the opening frame was rendered");
+}
+
+#[gpui::test]
+async fn test_project_loader_clears_after_canceling_overlapping_opens(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    let project = Project::test(fs, [], cx).await;
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+
+    let (first, second) = multi_workspace.update_in(cx, |workspace, window, cx| {
+        let first = workspace.open_project(Vec::new(), OpenMode::Activate, window, cx);
+        let second = workspace.open_project(Vec::new(), OpenMode::Activate, window, cx);
+        assert_eq!(workspace.test_opening_project_count(), 2);
+        (first, second)
+    });
+
+    multi_workspace.update(cx, |_, _| drop(first));
+    multi_workspace.update(cx, |_, _| drop(second));
+    cx.run_until_parked();
+    multi_workspace.read_with(cx, |workspace, _| {
+        assert_eq!(workspace.test_opening_project_count(), 0);
     });
 }
 
@@ -916,6 +985,9 @@ async fn test_open_project_closes_empty_workspace_but_not_non_empty_ones(cx: &mu
     cx.run_until_parked();
 
     // Cancelling keeps the empty workspace.
+    assert!(!cx.has_pending_prompt());
+    cx.executor().advance_clock(PROJECT_OPEN_FRAME_WAIT);
+    cx.run_until_parked();
     assert!(cx.has_pending_prompt(),);
     cx.simulate_prompt_answer("Cancel");
     cx.run_until_parked();
@@ -942,6 +1014,8 @@ async fn test_open_project_closes_empty_workspace_but_not_non_empty_ones(cx: &mu
         .unwrap();
     cx.run_until_parked();
 
+    cx.executor().advance_clock(PROJECT_OPEN_FRAME_WAIT);
+    cx.run_until_parked();
     assert!(cx.has_pending_prompt(),);
     cx.simulate_prompt_answer("Don't Save");
     cx.run_until_parked();

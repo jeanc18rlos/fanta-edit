@@ -12,15 +12,18 @@ use std::rc::Rc;
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;
 use design_surface::{
-    AlignEdge, CrossAxisAlignment, DEFAULT_CHILD_LIMIT, DesignNodeType, DesignOp, DesignSurface,
-    DistributeAxis, LayerPosition, LayoutDirection, MainAxisAlignment, NamedLayerPosition,
-    NodeQuery, ScreenshotTarget, StrokeAlignment, TextAlignment,
+    AlignEdge, CrossAxisAlignment, DEFAULT_CHILD_LIMIT, DesignComponentPropertyKind,
+    DesignNodeType, DesignOp, DesignSurface, DesignSystemQuery, DesignVariableType, DistributeAxis,
+    LayerPosition, LayoutDirection, LayoutSizing, MainAxisAlignment, NamedLayerPosition, NodeQuery,
+    ScreenshotTarget, StrokeAlignment, TextAlignment, TextSizing, VariableBindingProperty,
 };
 use fanta_doc::{
-    AssetId, AutoLayout, BitmapNode, Bounds, CanvasNode, Color, ComponentId, CounterAlign, Doc,
-    Fill, GroupNode, ImageFitMode, IndexKey, InstanceNode, LayoutMode, NodeData, NodeFlags, NodeId,
-    Operation, PathData, PrimaryAlign, ShadowKind, Stroke, StrokeAlign, TextAlign, TextNode,
-    Transform2D, UnitInterval, VectorNode, Viewport,
+    AssetId, AutoLayout, AxisSizing, BitmapNode, BoundProp, Bounds, CanvasNode, Color, ComponentId,
+    CounterAlign, Doc, Fill, GroupNode, ImageFitMode, IndexKey, InstanceNode, LayoutMode, Mode,
+    ModeId, ModeScope, NodeData, NodeFlags, NodeId, Operation, PathData, PrimaryAlign,
+    ProjectAsset, ProjectAssetKind, ShadowKind, Stroke, StrokeAlign, TextAlign, TextAutoResize,
+    TextNode, Transform2D, UnitInterval, VarValue, Variable, VariableCollection,
+    VariableCollectionId, VariableId, VariableType, VectorNode, Viewport,
 };
 use fanta_render::{AssetResolver, RasterRenderer, visual_world_bounds};
 use gpui::{App, AppContext as _, Entity, Global, Task, WeakEntity};
@@ -29,7 +32,8 @@ use std::sync::Arc;
 
 use crate::clipboard::{create_operations, duplicate_operations};
 use crate::document::{
-    AssetStores, DocChange, FigDocument, FigItem, FigPage, MAX_IMAGE_SOURCE_BYTES, page_bounds,
+    AssetStores, DocChange, FigDocument, FigItem, FigPage, MAX_IMAGE_SOURCE_BYTES, PreparedImage,
+    SaveKind, page_bounds,
 };
 use crate::export::render_inputs;
 use crate::properties_ops::{
@@ -76,16 +80,325 @@ impl FigDesignSurface {
 }
 
 impl DesignSurface for FigDesignSurface {
+    fn prepare_asset(
+        &self,
+        request: design_surface::DesignAssetRequest,
+        cx: &mut App,
+    ) -> Result<Value> {
+        if request.prompt.trim().is_empty() || request.prompt.len() > 32 * 1024 {
+            bail!("the generation prompt must contain 1–32768 bytes");
+        }
+        if request
+            .preferred_model
+            .as_ref()
+            .is_some_and(|model| model.trim().is_empty() || model.len() > 512)
+        {
+            bail!("preferred_model must contain 1–512 bytes when provided");
+        }
+        let item = self.item()?;
+        let window = cx.active_window().context("no design window is active")?;
+        let kind = request.kind;
+        window.update(cx, |_, window, cx| {
+            crate::generation_workspace::open_prepared_asset(request, item.downgrade(), window, cx)
+        })??;
+        Ok(json!({"prepared": true, "submitted": false, "kind": kind,
+            "message": "The generation composer is prefilled. The user can review the catalog model and submit there; no generation was submitted."}))
+    }
+
+    fn read_design_spec(&self, cx: &mut App) -> Result<Option<design_surface::DesignSpec>> {
+        let Some(item) = self.active.borrow().as_ref().and_then(WeakEntity::upgrade) else {
+            return Ok(None);
+        };
+        let item = item.read(cx);
+        match item.project_root() {
+            Some(root) => design_surface::read_project_design_spec(root),
+            None => Ok(None),
+        }
+    }
+    fn validate_source_edit(
+        &self,
+        path: String,
+        source: String,
+        cx: &mut App,
+    ) -> Task<Result<Value>> {
+        if Path::new(&path)
+            .extension()
+            .is_none_or(|extension| extension != "fnx")
+        {
+            return Task::ready(Ok(json!({ "applicable": false })));
+        }
+        let root = match self.item() {
+            Ok(item) => item.read(cx).project_root().map(Path::to_path_buf),
+            Err(_) => None,
+        };
+        cx.background_spawn(async move {
+            validate_source_candidate(root.as_deref(), Path::new(&path), &source)
+        })
+    }
+
+    fn import_image(&self, bytes: Vec<u8>, name: String, cx: &mut App) -> Task<Result<Value>> {
+        let item = match self.item() {
+            Ok(item) => item,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        let prepared = cx.background_spawn(async move {
+            let format = fanta_format::MediaRegistry::with_builtins()
+                .sniff(&bytes)
+                .context("the image has an unsupported project asset format")?;
+            if format.family != "images" {
+                bail!("the result is not a supported raster image");
+            }
+            PreparedImage::new(bytes)
+        });
+        cx.spawn(async move |cx| {
+            let prepared = prepared.await?;
+            let mut result = item.update(cx, |item, cx| {
+                if !item.is_editable() {
+                    bail!("save or discard FNX source edits and wait for the canvas to load before importing images");
+                }
+                item.with_document(cx, |document| {
+                    let result = import_prepared_image(document, prepared, &name);
+                    let change = if result.is_ok() { DocChange::Content } else { DocChange::None };
+                    (result, change)
+                }).context("the design document is still loading")?
+            })?;
+            let save = item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+            save.await.context("the image is in the asset panel, but saving the project failed")?;
+            let root = item.read_with(cx, |item, _| item.project_root().map(Path::to_path_buf))
+                .context("the project has no saved asset directory")?;
+            let relative = result.get("path").and_then(Value::as_str)
+                .context("the imported image has no asset path")?;
+            let path = root.join(relative);
+            result["absolute_path"] = json!(path.display().to_string());
+            result["persisted"] = json!(true);
+            Ok(result)
+        })
+    }
+
+    fn comments(&self, page: Option<usize>, include_resolved: bool, cx: &mut App) -> Result<Value> {
+        let item = self.item()?;
+        let document = ready_document(item.read(cx))?;
+        let page_index = resolve_page_index(document, page)?;
+        let root = document
+            .pages
+            .get(page_index)
+            .and_then(|page| page.root)
+            .context("the page has no root node")?;
+        let comments = crate::comments::read_comments(&document.doc, root)
+            .into_iter()
+            .filter(|comment| include_resolved || !comment.resolved)
+            .collect::<Vec<_>>();
+        Ok(json!({ "page": page_index, "comments": comments }))
+    }
+
+    fn reply_comment(
+        &self,
+        page: Option<usize>,
+        id: String,
+        body: String,
+        author: String,
+        resolve: bool,
+        cx: &mut App,
+    ) -> Result<Value> {
+        let item = self.item()?;
+        item.update(cx, |item, cx| {
+            if !item.is_editable() {
+                bail!("save or discard source edits and wait for the canvas to load before replying to comments");
+            }
+            item.with_document(cx, |document| {
+                let result = (|| {
+                    let page_index = resolve_page_index(document, page)?;
+                    let root = document.pages.get(page_index).and_then(|page| page.root)
+                        .context("the page has no root node")?;
+                    let operation = crate::comments::agent_reply_comment_op(
+                        &document.doc, root, &id, &body, &author, resolve,
+                    )?;
+                    document.doc.apply(operation)?;
+                    Ok(json!({ "page": page_index, "comment_id": id, "replied": true, "resolved": resolve }))
+                })();
+                let change = if result.is_ok() { DocChange::Content } else { DocChange::None };
+                (result, change)
+            }).context("the document is still loading")?
+        })
+    }
+
+    fn report_source_activity(
+        &self,
+        path: String,
+        mut activity: design_surface::AgentActivity,
+        cx: &mut App,
+    ) -> Result<Value> {
+        {
+            let item = self.item()?;
+            let item = item.read(cx);
+            let document = ready_document(item)?;
+            let Some(root) = item.project_root() else {
+                return Ok(json!({ "reported": false }));
+            };
+            let source = Path::new(&path);
+            let source = if source.is_absolute() {
+                source.to_path_buf()
+            } else {
+                root.join(source)
+            };
+            let source = match source.canonicalize() {
+                Ok(source) => source,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(json!({ "reported": false }));
+                }
+                Err(error) => return Err(error).context("resolving agent source focus"),
+            };
+            let mut source_page = None;
+            for (index, page) in document.pages.iter().enumerate() {
+                let Some(page_source) = page
+                    .root
+                    .and_then(|page| fanta_format::locate_page_source(root, page))
+                else {
+                    continue;
+                };
+                if page_source
+                    .canonicalize()
+                    .context("resolving the page source focus")?
+                    == source
+                {
+                    source_page = Some(index);
+                    break;
+                }
+            }
+            let Some(page_index) = source_page else {
+                return Ok(json!({ "reported": false }));
+            };
+            activity.page = Some(page_index);
+            activity.node = None;
+            activity.source_path = Some(source.display().to_string());
+            let page_root = document.pages.get(page_index).and_then(|page| page.root);
+            activity.world = content_bounds(&document.doc, page_root)
+                .filter(Bounds::is_finite)
+                .map(|bounds| {
+                    let center = bounds.center();
+                    [center.x, center.y]
+                });
+        }
+        self.report_activity(activity, cx)
+    }
+
+    fn report_activity(
+        &self,
+        mut activity: design_surface::AgentActivity,
+        cx: &mut App,
+    ) -> Result<Value> {
+        if activity.agent_id.trim().is_empty()
+            || activity.agent_name.trim().is_empty()
+            || activity.action.trim().is_empty()
+        {
+            bail!("agent_id, agent_name and action must not be empty");
+        }
+        if activity
+            .world
+            .is_some_and(|world| !world.into_iter().all(f64::is_finite))
+        {
+            bail!("activity coordinates must be finite");
+        }
+        let item = self.item()?;
+        let item = item.read(cx);
+        let document = ready_document(item)?;
+        let page_index = if let Some(raw) = &activity.node {
+            let id = parse_node_id(raw)?;
+            let node_page = document
+                .page_index_of_node(id)
+                .with_context(|| format!("node {raw} is not on a design page"))?;
+            if let Some(page) = activity.page {
+                let page = resolve_page_index(document, Some(page))?;
+                if page != node_page {
+                    bail!("node {raw} does not belong to page {page}");
+                }
+            }
+            node_page
+        } else {
+            resolve_page_index(document, activity.page)?
+        };
+        activity.page = Some(page_index);
+        activity.source_path = activity.source_path.take().and_then(|path| {
+            let root = item.project_root()?;
+            let page_root = document.pages.get(page_index)?.root?;
+            let expected = fanta_format::locate_page_source(root, page_root)?;
+            let requested = Path::new(&path);
+            let requested = if requested.is_absolute() {
+                requested.to_path_buf()
+            } else {
+                root.join(requested)
+            };
+            match (requested.canonicalize(), expected.canonicalize()) {
+                (Ok(requested), Ok(expected)) if requested == expected => {
+                    Some(requested.display().to_string())
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    log::warn!("resolving agent source focus failed: {error}");
+                    None
+                }
+                _ => None,
+            }
+        });
+        activity.project_root = item.project_root().map(|root| root.display().to_string());
+        if let Some(raw) = &activity.node {
+            let id = parse_node_id(raw)?;
+            let bounds = document
+                .doc
+                .scene
+                .world_bounds(id)
+                .with_context(|| format!("node {raw} does not exist or has no bounds"))?;
+            if activity.world.is_none() {
+                let center = bounds.center();
+                activity.world = Some([center.x, center.y]);
+            }
+        }
+        if activity.world.is_none() {
+            let selected = document
+                .doc
+                .selection
+                .iter()
+                .copied()
+                .filter(|id| document.page_index_of_node(*id) == Some(page_index))
+                .collect::<Vec<_>>();
+            let bounds = union_bounds(&document.doc, &selected).or_else(|| {
+                let root = document.pages.get(page_index).and_then(|page| page.root);
+                content_bounds(&document.doc, root)
+            });
+            activity.world = bounds.filter(Bounds::is_finite).map(|bounds| {
+                let center = bounds.center();
+                [center.x, center.y]
+            });
+        }
+        design_surface::activity_state(cx).update(cx, |state, cx| state.record(activity, cx));
+        Ok(json!({ "reported": true }))
+    }
+
     fn state(&self, cx: &mut App) -> Result<Value> {
         let item = self.item()?;
+        let document_id = item.entity_id().as_u64();
         let item = item.read(cx);
         let document = ready_document(item)?;
         let doc = &document.doc;
         let project_root = item.project_root();
         let selection: Vec<NodeId> = doc.selection.iter().copied().collect();
+        let motion_source =
+            project_root.map(|root| root.join("doc/motion.json").display().to_string());
+        let motion_clips = doc
+            .motion
+            .clips
+            .values()
+            .map(|clip| {
+                json!({
+                    "id": clip.id.to_string(), "name": clip.name, "duration_ms": clip.duration_ms,
+                    "track_count": clip.tracks.len(),
+                })
+            })
+            .collect::<Vec<_>>();
         Ok(json!({
+            "document_id": document_id,
             "project": item.title().as_ref(),
             "project_root": project_root.map(|root| root.display().to_string()),
+            "design_spec": project_root.filter(|root| root.join("fanta.md").is_file()).map(|root| root.join("fanta.md").display().to_string()),
             "is_editable": item.is_editable(),
             "source_edit_locked": item.source_edit_locked(),
             "dirty": item.is_dirty(),
@@ -93,11 +406,23 @@ impl DesignSurface for FigDesignSurface {
             "pages": pages_json(&document.pages, doc, project_root),
             "active_page_bounds": bounds_json(content_bounds(doc, doc.active_page())),
             "components": components_json(doc, project_root),
+            "variable_collections": doc.variables.collections.len(),
+            "variables": doc.variables.variables.len(),
+            "design_system_sources": ["doc/variables.json", "doc/active_modes.json", "components/sets.json"],
+            "motion_source": motion_source,
+            "motion_clips": motion_clips,
             "selection": selection_ids(doc),
             "selection_bounds": bounds_json(union_bounds(doc, &selection)),
             "viewport": { "center": doc.viewport.center, "zoom": doc.viewport.zoom },
             "hints": STATE_HINTS,
         }))
+    }
+
+    fn design_system(&self, query: DesignSystemQuery, cx: &mut App) -> Result<Value> {
+        let item = self.item()?;
+        let item = item.read(cx);
+        let document = ready_document(item)?;
+        design_system_json(&document.doc, item.project_root(), query)
     }
 
     fn find_empty_space(
@@ -210,37 +535,8 @@ impl DesignSurface for FigDesignSurface {
             Ok(prepared) => prepared,
             Err(error) => return Task::ready(Err(error)),
         };
-        let max_dimension = f64::from(target.max_dimension.unwrap_or(1024).clamp(16, 4096));
         cx.background_spawn(async move {
-            let bounds = match node {
-                Some(node) => visual_world_bounds(&doc.scene, node, 0.0)
-                    .context("the node has no visible bounds")?,
-                None => page_bounds(&doc, page_root),
-            };
-            if !bounds.is_finite() || bounds.width() <= 0.0 || bounds.height() <= 0.0 {
-                bail!("the screenshot target has invalid or empty bounds");
-            }
-            // Fit within the dimension cap; allow mild upscale so small nodes
-            // (icons) stay legible without ballooning the surface.
-            let zoom = (max_dimension / bounds.width().max(bounds.height())).min(2.0);
-            let width = (bounds.width() * zoom).ceil().max(1.0) as u32;
-            let height = (bounds.height() * zoom).ceil().max(1.0) as u32;
-            let mut renderer = RasterRenderer::new(width, height).map_err(|error| {
-                anyhow!("creating {width}x{height} screenshot surface: {error}")
-            })?;
-            if let Some(asset_resolver) = asset_resolver {
-                renderer.set_asset_resolver(asset_resolver);
-            }
-            let center = bounds.center();
-            let viewport = Viewport {
-                center: [center.x, center.y],
-                zoom,
-            };
-            let inputs = render_inputs(&doc);
-            renderer.render_page_with(&doc.scene, &viewport, page_root, &inputs);
-            renderer
-                .encode_png()
-                .map_err(|error| anyhow!("encoding screenshot PNG: {error}"))
+            render_surface_screenshot(&doc, asset_resolver, page_root, node, target)
         })
     }
 
@@ -272,6 +568,204 @@ impl DesignSurface for FigDesignSurface {
             }
         }
     }
+}
+
+fn validate_source_candidate(
+    active_root: Option<&Path>,
+    source_path: &Path,
+    source: &str,
+) -> Result<Value> {
+    let path = if source_path.is_absolute() {
+        match source_path.canonicalize() {
+            Ok(path) => path,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => source_path.to_path_buf(),
+            Err(error) => return Err(error).context("resolving the agent source candidate"),
+        }
+    } else {
+        source_path.to_path_buf()
+    };
+    let inferred_root = if path.is_absolute() {
+        let singleton = path
+            .parent()
+            .filter(|parent| {
+                let file = path.file_name();
+                (parent.file_name().is_some_and(|name| name == "doc")
+                    && file.is_some_and(|name| {
+                        name == "variables.json" || name == "active_modes.json"
+                    }))
+                    || (parent.file_name().is_some_and(|name| name == "components")
+                        && file.is_some_and(|name| name == "sets.json"))
+            })
+            .and_then(Path::parent);
+        let directory = path.parent().and_then(Path::parent);
+        let managed = directory.is_some_and(|directory| {
+            (directory.file_name().is_some_and(|name| name == "pages")
+                && path.file_name().is_some_and(|name| name == "page.fnx"))
+                || (directory
+                    .file_name()
+                    .is_some_and(|name| name == "components")
+                    && path
+                        .file_name()
+                        .is_some_and(|name| name == "master.fnx" || name == "def.json"))
+        });
+        if singleton.is_some() || managed {
+            let root = singleton.or_else(|| directory.and_then(Path::parent));
+            match root {
+                Some(root) if root.join("fanta.json").try_exists()? => Some(root),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let Some(root) = inferred_root.or(active_root) else {
+        return Ok(json!({ "applicable": false }));
+    };
+    validate_agent_source_edit(root, &path, source)
+}
+
+fn validate_agent_source_edit(
+    project_root: &Path,
+    source_path: &Path,
+    source: &str,
+) -> Result<Value> {
+    use std::path::Component;
+    let canonical_root = project_root
+        .canonicalize()
+        .with_context(|| format!("resolving Fanta project {}", project_root.display()))?;
+    let requested = if source_path.is_absolute() {
+        source_path
+            .strip_prefix(project_root)
+            .map(|relative| canonical_root.join(relative))
+            .unwrap_or_else(|_| source_path.to_path_buf())
+    } else {
+        canonical_root.join(source_path)
+    };
+    let source_path = match requested.canonicalize() {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => requested,
+        Err(error) => return Err(error).context("resolving the FNX source candidate"),
+    };
+    let Ok(relative) = source_path.strip_prefix(&canonical_root) else {
+        return Ok(json!({ "applicable": false }));
+    };
+    let components = relative.components().collect::<Vec<_>>();
+    let json_source = match components.as_slice() {
+        [Component::Normal(directory), Component::Normal(file)]
+            if *directory == "doc" && *file == "variables.json" =>
+        {
+            validate_typed_json::<fanta_doc::VariableRegistry>(source)
+                .context("Invalid typed variable registry JSON")?;
+            true
+        }
+        [Component::Normal(directory), Component::Normal(file)]
+            if *directory == "doc" && *file == "active_modes.json" =>
+        {
+            validate_typed_json::<std::collections::BTreeMap<VariableCollectionId, ModeId>>(source)
+                .context("Invalid typed active-mode JSON")?;
+            true
+        }
+        [Component::Normal(directory), Component::Normal(file)]
+            if *directory == "components" && *file == "sets.json" =>
+        {
+            validate_typed_json::<std::collections::BTreeMap<ComponentId, fanta_doc::ComponentSet>>(source).context("Invalid typed component-set JSON")?;
+            true
+        }
+        [
+            Component::Normal(directory),
+            Component::Normal(_),
+            Component::Normal(file),
+        ] if *directory == "components" && *file == "def.json" => {
+            validate_typed_json::<fanta_doc::ComponentDef>(source)
+                .context("Invalid typed component-definition JSON")?;
+            true
+        }
+        _ => false,
+    };
+    if json_source {
+        return Ok(
+            json!({"applicable":true,"validated":true,"scope":"typed_json","path":source_path.display().to_string(),"diagnostics":[]}),
+        );
+    }
+    let managed = matches!(components.as_slice(), [
+        Component::Normal(directory), Component::Normal(_), Component::Normal(file)
+    ] if (*directory == "pages" && *file == "page.fnx")
+        || (*directory == "components" && *file == "master.fnx"));
+    if !managed {
+        return Ok(json!({ "applicable": false }));
+    }
+    fanta_fnx::parse_doc(source).with_context(|| format!(
+        "Invalid FNX in {}. FNX attributes require quoted JSON object keys and complete closing tags; repair the candidate before saving",
+        source_path.display()
+    ))?;
+    let sidecar = source_path.with_file_name(
+        if source_path
+            .file_name()
+            .is_some_and(|name| name == "page.fnx")
+        {
+            "page.ids.json"
+        } else {
+            "master.ids.json"
+        },
+    );
+    let (scope, diagnostics) = if source_path.is_file() && sidecar.is_file() {
+        let (_, diagnostics) = fanta_format::validate_project_source_edit_with_diagnostics(
+            &canonical_root, &source_path, source,
+        ).context("the FNX candidate cannot be materialized; the existing source has not been overwritten")?;
+        ("project", serde_json::to_value(diagnostics)?)
+    } else {
+        ("syntax", json!([]))
+    };
+    Ok(
+        json!({ "applicable": true, "validated": true, "scope": scope,
+        "path": source_path.display().to_string(), "diagnostics": diagnostics }),
+    )
+}
+
+fn validate_typed_json<T: serde::de::DeserializeOwned>(source: &str) -> Result<()> {
+    let value: Value = serde_json::from_str(source)?;
+    if !value.is_object() {
+        bail!("this managed JSON source requires an object");
+    }
+    serde_json::from_value::<T>(value)?;
+    Ok(())
+}
+
+fn import_prepared_image(
+    document: &mut FigDocument,
+    prepared: PreparedImage,
+    name: &str,
+) -> Result<Value> {
+    let (asset, natural_size, _) = document
+        .doc_and_assets()
+        .1
+        .add_prepared_image_tracked(prepared)?;
+    let name = name.trim().chars().take(80).collect::<String>();
+    document
+        .doc
+        .asset_library
+        .entry(asset)
+        .or_insert_with(|| ProjectAsset {
+            name: if name.is_empty() {
+                "Generated image".into()
+            } else {
+                name
+            },
+            kind: ProjectAssetKind::Image,
+        });
+    let bytes = document
+        .raw_assets
+        .get(&asset)
+        .context("the imported image bytes are unavailable")?;
+    let format = fanta_format::MediaRegistry::with_builtins()
+        .sniff(bytes)
+        .context("the imported image has an unsupported asset format")?;
+    Ok(json!({
+        "asset_id": asset.to_string(), "path": format!("assets/{}/{}.{}", format.family, asset, format.extension),
+        "width": natural_size[0], "height": natural_size[1], "in_asset_panel": true,
+    }))
 }
 
 fn ready_document(item: &FigItem) -> Result<&FigDocument> {
@@ -337,9 +831,227 @@ fn components_json(doc: &Doc, project_root: Option<&Path>) -> Vec<Value> {
                 "name": def.name,
                 "root": def.root.to_string(),
                 "source": relative_source(project_root, source),
+                "properties": def.props,
+                "variant_of": def.variant_of,
             })
         })
         .collect()
+}
+
+fn design_system_json(
+    doc: &Doc,
+    project_root: Option<&Path>,
+    query: DesignSystemQuery,
+) -> Result<Value> {
+    let collection = query
+        .collection
+        .as_deref()
+        .map(|key| find_collection(doc, key).map(|collection| collection.id))
+        .transpose()?;
+    let variables = doc
+        .variables
+        .variables
+        .values()
+        .filter(|variable| collection.is_none_or(|id| variable.collection == id))
+        .collect::<Vec<_>>();
+    let offset = query.offset.unwrap_or(0);
+    let limit = query.limit.unwrap_or(100).clamp(1, 200);
+    let bindings = if query.include_bindings {
+        doc.selection.iter().take(200).filter_map(|id| doc.scene.get(*id)).map(|node| {
+            json!({"node": node.id.to_string(), "bindings": node.bindings.iter().map(|(property, variable)| json!({"property":property,"variable":variable.to_string()})).collect::<Vec<_>>()})
+        }).collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    Ok(json!({
+        "collections": doc.variables.collections.values().filter(|current| collection.is_none_or(|id| current.id == id)).collect::<Vec<_>>(),
+        "active_modes": doc.active_modes,
+        "variables": variables.iter().skip(offset).take(limit).collect::<Vec<_>>(),
+        "variable_count": variables.len(), "offset": offset, "limit": limit,
+        "more_variables": offset.saturating_add(limit) < variables.len(),
+        "components": components_json(doc, project_root),
+        "component_sets": doc.components.sets.values().collect::<Vec<_>>(),
+        "selection_bindings": bindings,
+        "source_files": ["doc/variables.json", "doc/active_modes.json", "components/sets.json"],
+        "hints": ["Create semantic variables before components, bind properties, then reuse component instances.",
+          "Names are exact and must be unique when used instead of ids. Prefer returned ids for follow-up edits.",
+          "Variables use per-mode values. set_variable_mode selects a collection mode document-wide or pins a frame."]
+    }))
+}
+
+fn required_name(name: &str) -> Result<&str> {
+    let name = name.trim();
+    if name.is_empty() || name.len() > 512 {
+        bail!("names must contain 1–512 bytes");
+    }
+    Ok(name)
+}
+
+fn find_collection<'a>(doc: &'a Doc, key: &str) -> Result<&'a VariableCollection> {
+    if let Ok(id) = key.parse::<VariableCollectionId>() {
+        return doc
+            .variables
+            .collections
+            .get(&id)
+            .context("variable collection id does not exist");
+    }
+    let mut matches = doc
+        .variables
+        .collections
+        .values()
+        .filter(|collection| collection.name == key);
+    let collection = matches
+        .next()
+        .context("variable collection name does not exist")?;
+    if matches.next().is_some() {
+        bail!("ambiguous collection name; use its exact id");
+    }
+    Ok(collection)
+}
+
+fn find_variable<'a>(doc: &'a Doc, key: &str) -> Result<&'a Variable> {
+    if let Ok(id) = key.parse::<VariableId>() {
+        return doc
+            .variables
+            .variables
+            .get(&id)
+            .context("variable id does not exist");
+    }
+    let mut matches = doc
+        .variables
+        .variables
+        .values()
+        .filter(|variable| variable.name == key);
+    let variable = matches.next().context("variable name does not exist")?;
+    if matches.next().is_some() {
+        bail!("ambiguous variable name; use its exact id");
+    }
+    Ok(variable)
+}
+
+fn find_mode(collection: &VariableCollection, key: &str) -> Result<ModeId> {
+    if let Ok(id) = key.parse::<ModeId>() {
+        if collection.has_mode(id) {
+            return Ok(id);
+        }
+        bail!("mode does not belong to this collection");
+    }
+    let mut matches = collection.modes.iter().filter(|mode| mode.name == key);
+    let mode = matches
+        .next()
+        .context("mode name does not exist in this collection")?;
+    if matches.next().is_some() {
+        bail!("ambiguous mode name; use its exact id");
+    }
+    Ok(mode.id)
+}
+
+fn find_component_property<'a>(
+    definition: &'a fanta_doc::ComponentDef,
+    key: &str,
+) -> Result<&'a fanta_doc::ComponentPropDef> {
+    if let Ok(id) = key.parse::<fanta_doc::ComponentPropId>() {
+        return definition
+            .props
+            .iter()
+            .find(|property| property.id == id)
+            .context("property id does not belong to this component");
+    }
+    let mut matches = definition
+        .props
+        .iter()
+        .filter(|property| property.name == key);
+    let property = matches
+        .next()
+        .context("component property name does not exist")?;
+    if matches.next().is_some() {
+        bail!("ambiguous component property name; use its exact id");
+    }
+    Ok(property)
+}
+
+fn variable_type(kind: DesignVariableType) -> VariableType {
+    match kind {
+        DesignVariableType::Color => VariableType::Color,
+        DesignVariableType::Float => VariableType::Float,
+        DesignVariableType::String => VariableType::String,
+        DesignVariableType::Boolean => VariableType::Boolean,
+        DesignVariableType::Typography => VariableType::Typography,
+    }
+}
+
+fn parse_variable_value(doc: &Doc, kind: VariableType, value: &Value) -> Result<VarValue> {
+    if let Some(alias) = value.get("alias").and_then(Value::as_str) {
+        let target = find_variable(doc, alias)?;
+        if target.ty != kind {
+            bail!("alias target has a different variable type");
+        }
+        return Ok(VarValue::Alias {
+            variable: target.id,
+        });
+    }
+    Ok(match kind {
+        VariableType::Color => VarValue::Color {
+            value: parse_fill_color(value.as_str().context("color requires a hex string")?)?,
+        },
+        VariableType::Float => {
+            let value = value
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .context("float requires a finite number")?;
+            VarValue::Float { value }
+        }
+        VariableType::String => VarValue::String {
+            value: value.as_str().context("string requires text")?.to_owned(),
+        },
+        VariableType::Boolean => VarValue::Boolean {
+            value: value.as_bool().context("boolean requires true or false")?,
+        },
+        VariableType::Typography => {
+            let style: fanta_doc::TextStyle = serde_json::from_value(value.clone())
+                .context("typography requires a TextStyle object")?;
+            if style.font_family.trim().is_empty()
+                || !(style.size_px.is_finite() && style.size_px > 0.0)
+                || !(style.line_height.is_finite() && style.line_height > 0.0)
+                || !style.letter_spacing.is_finite()
+            {
+                bail!("typography requires a font family and positive finite size/line height");
+            }
+            VarValue::TextStyle { value: style }
+        }
+    })
+}
+
+fn binding_property(property: VariableBindingProperty) -> BoundProp {
+    match property {
+        VariableBindingProperty::FillColor { index } => BoundProp::FillColor { index },
+        VariableBindingProperty::StrokeColor { index } => BoundProp::StrokeColor { index },
+        VariableBindingProperty::StrokeWidth { index } => BoundProp::StrokeWidth { index },
+        VariableBindingProperty::CornerRadius => BoundProp::CornerRadius,
+        VariableBindingProperty::Opacity => BoundProp::Opacity,
+        VariableBindingProperty::Visible => BoundProp::Visible,
+        VariableBindingProperty::TextContent => BoundProp::TextContent,
+        VariableBindingProperty::TextStyle => BoundProp::TextStyle,
+        VariableBindingProperty::ClipWidth => BoundProp::ClipWidth,
+        VariableBindingProperty::ClipHeight => BoundProp::ClipHeight,
+    }
+}
+
+fn layout_sizing(sizing: LayoutSizing) -> AxisSizing {
+    match sizing {
+        LayoutSizing::Fixed => AxisSizing::Fixed,
+        LayoutSizing::Hug => AxisSizing::Hug,
+    }
+}
+
+fn counter_alignment(alignment: CrossAxisAlignment) -> CounterAlign {
+    match alignment {
+        CrossAxisAlignment::Start => CounterAlign::Start,
+        CrossAxisAlignment::Center => CounterAlign::Center,
+        CrossAxisAlignment::End => CounterAlign::End,
+        CrossAxisAlignment::Stretch => CounterAlign::Stretch,
+        CrossAxisAlignment::Baseline => CounterAlign::Baseline,
+    }
 }
 
 /// A located source as the project sees it — `pages/<slug>/page.fnx` — which
@@ -370,11 +1082,14 @@ fn world_bounds_json(doc: &Doc, id: NodeId) -> Value {
 /// What every state read tells the model up front, because the mistakes
 /// these prevent (guessed ids, y-up math, unverified results) are the common
 /// ones.
-const STATE_HINTS: [&str; 5] = [
+const STATE_HINTS: [&str; 8] = [
+    "Read each page/component source under project_root and edit the .fnx files with file tools; preserve stable ids and save before inspecting the reloaded canvas.",
     "Coordinates are world px with y growing downward; x/y of an op is the node's top-left corner.",
     "Ids are exact node ids from this state or a page listing; never guess or use layer names.",
     "Ask for empty_space before creating a new top-level frame so it does not land on existing work.",
-    "Batch related ops into one design_edit/batch_design call with a descriptive label; it is one undo step.",
+    "When using design_edit/batch_design as a fallback, batch related ops with a descriptive label; it is one undo step.",
+    "Author animation clips in motion_source (doc/motion.json), preserving clip/track/keyframe ids; verify with screenshot motion_clip and playhead_ms samples.",
+    "Import generated image files into project assets with import_project_image (native) or import_image (MCP); use the returned asset id/path when authoring the design.",
     "Verify substantive edits with a screenshot of the changed frame before reporting done.",
 ];
 
@@ -640,6 +1355,77 @@ fn summarize_kind(doc: &Doc, node: &CanvasNode, object: &mut serde_json::Map<Str
     }
 }
 
+fn render_surface_screenshot(
+    doc: &Doc,
+    asset_resolver: Option<Arc<dyn AssetResolver>>,
+    page_root: Option<NodeId>,
+    node: Option<NodeId>,
+    target: ScreenshotTarget,
+) -> Result<Vec<u8>> {
+    let max_dimension = f64::from(target.max_dimension.unwrap_or(1024).clamp(16, 4096));
+    let motion = match target.motion_clip {
+        Some(raw) => {
+            let clip = raw
+                .parse::<fanta_doc::AnimationClipId>()
+                .map_err(|_| anyhow!("{raw} is not a valid animation clip id"))?;
+            Some(
+                doc.motion
+                    .evaluate(clip, target.playhead_ms.unwrap_or(0))
+                    .with_context(|| format!("animation clip {raw} does not exist"))?,
+            )
+        }
+        None if target.playhead_ms.is_some() => bail!("playhead_ms requires motion_clip"),
+        None => None,
+    };
+    let motion_scene = motion.as_ref().map(|motion| {
+        let mut scene = doc.scene.clone();
+        let affected = motion
+            .overrides
+            .keys()
+            .map(|target| target.node)
+            .collect::<HashSet<_>>();
+        for id in affected {
+            if let Some(node) = scene.get_mut(id) {
+                *node = motion.apply_to_node(node);
+            }
+        }
+        scene
+    });
+    let bounds_scene = motion_scene.as_ref().unwrap_or(&doc.scene);
+    let bounds = match node {
+        Some(node) => visual_world_bounds(bounds_scene, node, 0.0)
+            .context("the node has no visible bounds")?,
+        None if motion_scene.is_some() => page_root
+            .and_then(|root| visual_world_bounds(bounds_scene, root, 0.0))
+            .unwrap_or_else(|| page_bounds(doc, page_root)),
+        None => page_bounds(doc, page_root),
+    };
+    if !bounds.is_finite() || bounds.width() <= 0.0 || bounds.height() <= 0.0 {
+        bail!("the screenshot target has invalid or empty bounds");
+    }
+    // Fit within the dimension cap; allow mild upscale so small nodes
+    // (icons) stay legible without ballooning the surface.
+    let zoom = (max_dimension / bounds.width().max(bounds.height())).min(2.0);
+    let width = (bounds.width() * zoom).ceil().max(1.0) as u32;
+    let height = (bounds.height() * zoom).ceil().max(1.0) as u32;
+    let mut renderer = RasterRenderer::new(width, height)
+        .map_err(|error| anyhow!("creating {width}x{height} screenshot surface: {error}"))?;
+    if let Some(asset_resolver) = asset_resolver {
+        renderer.set_asset_resolver(asset_resolver);
+    }
+    let center = bounds.center();
+    let viewport = Viewport {
+        center: [center.x, center.y],
+        zoom,
+    };
+    let mut inputs = render_inputs(doc);
+    inputs.motion = motion.as_ref();
+    renderer.render_page_with(&doc.scene, &viewport, page_root, &inputs);
+    renderer
+        .encode_png()
+        .map_err(|error| anyhow!("encoding screenshot PNG: {error}"))
+}
+
 #[allow(clippy::type_complexity)]
 fn prepare_screenshot(
     item: &mut FigItem,
@@ -690,10 +1476,23 @@ fn doc_get(document: &FigDocument, id: NodeId) -> Option<&CanvasNode> {
 
 fn list_source_files(root: &Path) -> Vec<String> {
     let mut files = Vec::new();
-    if root.join("fanta.json").is_file() {
-        files.push("fanta.json".to_string());
+    for source in [
+        "fanta.json",
+        "fanta.md",
+        "doc/motion.json",
+        "doc/variables.json",
+        "doc/active_modes.json",
+        "components/sets.json",
+    ] {
+        if root.join(source).is_file() {
+            files.push(source.into());
+        }
     }
-    for (directory, file_name) in [("pages", "page.fnx"), ("components", "master.fnx")] {
+    for (directory, file_name) in [
+        ("pages", "page.fnx"),
+        ("components", "master.fnx"),
+        ("motion", "motion.json"),
+    ] {
         let Ok(entries) = std::fs::read_dir(root.join(directory)) else {
             continue;
         };
@@ -1203,14 +2002,34 @@ fn apply_one(
             let def = doc
                 .components
                 .def(component_id)
-                .with_context(|| format!("component {component} does not exist"))?;
-            if Some(def.root) == parent
-                || parent.is_some_and(|parent| {
-                    doc.scene
-                        .ancestors_of(parent)
-                        .any(|ancestor| ancestor.id == def.root)
+                .or_else(|| {
+                    doc.components
+                        .sets
+                        .get(&component_id)
+                        .and_then(|set| doc.components.def(set.default_variant))
                 })
-            {
+                .with_context(|| format!("component {component} does not exist"))?;
+            let masters = doc
+                .components
+                .sets
+                .get(&component_id)
+                .map(|set| {
+                    set.members
+                        .iter()
+                        .filter_map(|id| doc.components.def(*id))
+                        .map(|definition| definition.root)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| vec![def.root]);
+            if parent.is_some_and(|parent| {
+                masters.iter().any(|root| {
+                    *root == parent
+                        || doc
+                            .scene
+                            .ancestors_of(parent)
+                            .any(|ancestor| ancestor.id == *root)
+                })
+            }) {
                 bail!("cannot place an instance of a component inside its own master");
             }
             let local_size = master_size(doc, def.root).unwrap_or([100.0, 100.0]);
@@ -1358,6 +2177,7 @@ fn apply_one(
             letter_spacing,
             align,
             color,
+            sizing,
         } => {
             let id = parse_node_id(id)?;
             let node = existing_node(doc, id)?;
@@ -1426,6 +2246,13 @@ fn apply_one(
                     if let Some(align) = align {
                         text.align = align;
                     }
+                    if let Some(sizing) = sizing {
+                        text.auto_resize = match sizing {
+                            TextSizing::Fixed => TextAutoResize::None,
+                            TextSizing::AutoHeight => TextAutoResize::Height,
+                            TextSizing::AutoWidth => TextAutoResize::WidthAndHeight,
+                        };
+                    }
                 }),
             )
         }
@@ -1436,6 +2263,12 @@ fn apply_one(
             padding,
             align_items,
             justify,
+            primary_sizing,
+            counter_sizing,
+            min_size,
+            max_size,
+            wrap,
+            counter_gap,
         } => {
             let id = parse_node_id(id)?;
             let node = existing_node(doc, id)?;
@@ -1451,6 +2284,18 @@ fn apply_one(
                 bail!("gap must be non-negative");
             }
             let padding = padding.as_deref().map(parse_padding).transpose()?;
+            if counter_gap.is_some_and(|gap| !gap.is_finite() || gap < 0.0) {
+                bail!("counter_gap must be finite and non-negative");
+            }
+            for size in [min_size, max_size].into_iter().flatten() {
+                if size
+                    .iter()
+                    .flatten()
+                    .any(|value| !value.is_finite() || *value < 0.0)
+                {
+                    bail!("min_size and max_size must be finite and non-negative");
+                }
+            }
             apply_all(
                 doc,
                 replace_data_operation(doc, id, |data| {
@@ -1467,6 +2312,24 @@ fn apply_one(
                     };
                     let layout = group.auto_layout.get_or_insert_with(AutoLayout::default);
                     layout.mode = mode;
+                    if let Some(sizing) = primary_sizing {
+                        layout.primary_sizing = layout_sizing(*sizing);
+                    }
+                    if let Some(sizing) = counter_sizing {
+                        layout.counter_sizing = layout_sizing(*sizing);
+                    }
+                    if let Some(size) = min_size {
+                        layout.min_size = *size;
+                    }
+                    if let Some(size) = max_size {
+                        layout.max_size = *size;
+                    }
+                    if let Some(wrap) = wrap {
+                        layout.wrap = *wrap;
+                    }
+                    if let Some(gap) = counter_gap {
+                        layout.counter_spacing = *gap;
+                    }
                     if let Some(gap) = gap {
                         layout.spacing = *gap;
                     }
@@ -1493,6 +2356,231 @@ fn apply_one(
                     }
                 }),
             )
+        }
+        DesignOp::SetLayoutChild {
+            id,
+            grow,
+            align_self,
+            absolute,
+        } => {
+            let id = parse_node_id(id)?;
+            let node = existing_node(doc, id)?;
+            if grow.is_some_and(|grow| !grow.is_finite() || grow < 0.0) {
+                bail!("grow must be finite and non-negative");
+            }
+            let old = node.layout_child;
+            let mut new = old.unwrap_or(fanta_doc::LayoutChild {
+                grow: 0.0,
+                absolute: false,
+                align_self: None,
+            });
+            if let Some(grow) = grow {
+                new.grow = *grow;
+            }
+            if let Some(align) = align_self {
+                new.align_self = Some(counter_alignment(*align));
+            }
+            if let Some(absolute) = absolute {
+                new.absolute = *absolute;
+            }
+            apply_all(
+                doc,
+                vec![Operation::SetLayoutChild {
+                    id,
+                    old,
+                    new: Some(new),
+                }],
+            )
+        }
+        DesignOp::CreateVariableCollection { name, modes } => {
+            let name = required_name(name)?;
+            if doc
+                .variables
+                .collections
+                .values()
+                .any(|collection| collection.name == name)
+            {
+                bail!("a variable collection named {name:?} already exists");
+            }
+            let names = if modes.is_empty() {
+                vec!["Default".to_owned()]
+            } else {
+                modes.clone()
+            };
+            let mut unique = HashSet::new();
+            let modes = names
+                .iter()
+                .map(|name| {
+                    let name = required_name(name)?;
+                    if !unique.insert(name.to_owned()) {
+                        bail!("duplicate mode name {name:?}");
+                    }
+                    Ok(Mode {
+                        id: ModeId::new(),
+                        name: name.to_owned(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let default_mode = modes.first().context("a collection requires a mode")?.id;
+            let collection = VariableCollection {
+                id: VariableCollectionId::new(),
+                name: name.to_owned(),
+                modes,
+                default_mode,
+                variable_order: Vec::new(),
+            };
+            let detail =
+                json!({"collection": collection.id.to_string(), "modes": collection.modes});
+            doc.apply(Operation::CreateVariableCollection {
+                collection: Box::new(collection),
+            })?;
+            Ok(Applied::Content {
+                created: None,
+                detail: Some(detail),
+            })
+        }
+        DesignOp::AddVariableMode { collection, name } => {
+            let collection = find_collection(doc, collection)?;
+            let name = required_name(name)?;
+            if collection.modes.iter().any(|mode| mode.name == name) {
+                bail!("mode {name:?} already exists");
+            }
+            let mode = Mode {
+                id: ModeId::new(),
+                name: name.to_owned(),
+            };
+            let detail = json!({"mode": mode.id.to_string()});
+            let transaction = doc.add_mode_transaction(collection.id, mode)?;
+            for operation in transaction.ops {
+                doc.apply(operation)?;
+            }
+            Ok(Applied::Content {
+                created: None,
+                detail: Some(detail),
+            })
+        }
+        DesignOp::CreateVariable {
+            collection,
+            name,
+            kind,
+            value,
+        } => {
+            let collection = find_collection(doc, collection)?;
+            let name = required_name(name)?;
+            if doc
+                .variables
+                .variables
+                .values()
+                .any(|variable| variable.collection == collection.id && variable.name == name)
+            {
+                bail!("variable {name:?} already exists in this collection");
+            }
+            if collection.modes.is_empty() {
+                bail!("add a mode before creating variables");
+            }
+            let ty = variable_type(*kind);
+            let value = parse_variable_value(doc, ty, value)?;
+            let variable = Variable {
+                id: VariableId::new(),
+                collection: collection.id,
+                name: name.to_owned(),
+                ty,
+                values_by_mode: collection
+                    .modes
+                    .iter()
+                    .map(|mode| (mode.id, value.clone()))
+                    .collect(),
+                scopes: Vec::new(),
+            };
+            let detail = json!({"variable": variable.id.to_string()});
+            doc.apply(Operation::CreateVariable {
+                variable: Box::new(variable),
+            })?;
+            Ok(Applied::Content {
+                created: None,
+                detail: Some(detail),
+            })
+        }
+        DesignOp::SetVariableValue {
+            variable,
+            mode,
+            value,
+        } => {
+            let variable = find_variable(doc, variable)?;
+            let collection = doc
+                .variables
+                .collection_of(variable.id)
+                .context("variable collection is missing")?;
+            let mode = find_mode(collection, mode)?;
+            let value = parse_variable_value(doc, variable.ty, value)?;
+            let operation = crate::variables_workspace::set_variable_value_operation(
+                doc,
+                variable.id,
+                mode,
+                value,
+            )
+            .map_err(|error| anyhow!(error))?;
+            apply_all(doc, operation.into_iter().collect())
+        }
+        DesignOp::SetVariableMode {
+            collection,
+            mode,
+            frame,
+        } => {
+            let collection = find_collection(doc, collection)?;
+            let new = mode
+                .as_deref()
+                .map(|mode| find_mode(collection, mode))
+                .transpose()?;
+            let (scope, old) = if let Some(frame) = frame {
+                let id = parse_node_id(frame)?;
+                let NodeData::Group(group) = &existing_node(doc, id)?.data else {
+                    bail!("mode pins require a frame or group");
+                };
+                (
+                    ModeScope::Frame { node: id },
+                    group.explicit_modes.get(&collection.id).copied(),
+                )
+            } else {
+                (
+                    ModeScope::Doc,
+                    doc.active_modes.get(&collection.id).copied(),
+                )
+            };
+            apply_all(
+                doc,
+                vec![Operation::SetActiveMode {
+                    scope,
+                    collection: collection.id,
+                    old,
+                    new,
+                }],
+            )
+        }
+        DesignOp::BindVariable {
+            id,
+            property,
+            variable,
+        } => {
+            let variable = find_variable(doc, variable)?.id;
+            let operation = crate::variable_binding::variable_binding_operation(
+                doc,
+                parse_node_id(id)?,
+                binding_property(*property),
+                Some(variable),
+            )
+            .map_err(|error| anyhow!(error))?;
+            apply_all(doc, operation.into_iter().collect())
+        }
+        DesignOp::UnbindVariable { id, property } => {
+            let operation = crate::variable_binding::variable_binding_operation(
+                doc,
+                parse_node_id(id)?,
+                binding_property(*property),
+                None,
+            )
+            .map_err(|error| anyhow!(error))?;
+            apply_all(doc, operation.into_iter().collect())
         }
         DesignOp::SetIndex { id, position } => {
             let id = parse_node_id(id)?;
@@ -1665,6 +2753,193 @@ fn apply_one(
                 created: None,
                 detail: Some(json!({ "component": component.to_string() })),
             })
+        }
+        DesignOp::CombineVariants { ids, name } => {
+            let ids = parse_content_ids(doc, ids)?;
+            if ids.len() < 2 {
+                bail!("combine_variants requires at least two standalone component masters");
+            }
+            let mut names = HashSet::new();
+            for id in &ids {
+                let def = doc
+                    .components
+                    .defs
+                    .values()
+                    .find(|def| def.root == *id)
+                    .context("every member must be a component master node id")?;
+                if def.variant_of.is_some() {
+                    bail!("a member already belongs to a variant set");
+                }
+                if !names.insert(def.name.clone()) {
+                    bail!("variant master names must be unique");
+                }
+            }
+            let mut operations = crate::properties_ops::combine_node_variants_operations(doc, &ids);
+            let Some(Operation::DefineComponentSet { set }) = operations.first_mut() else {
+                bail!("cannot create variant set");
+            };
+            if let Some(name) = name {
+                set.name = required_name(name)?.to_owned();
+            }
+            let set_id = set.id;
+            apply_all(doc, operations)?;
+            Ok(Applied::Content {
+                created: None,
+                detail: Some(json!({"component_set": set_id.to_string()})),
+            })
+        }
+        DesignOp::CreateComponentProperty {
+            component,
+            kind,
+            name,
+        } => {
+            use crate::component_properties::CreateComponentPropertyKind as Kind;
+            let component = resolve_component(doc, component)?;
+            let kind = match kind {
+                DesignComponentPropertyKind::Text => Kind::Text,
+                DesignComponentPropertyKind::Boolean => Kind::Boolean,
+                DesignComponentPropertyKind::Number => Kind::Number,
+                DesignComponentPropertyKind::Color => Kind::Color,
+                DesignComponentPropertyKind::InstanceSwap => Kind::InstanceSwap,
+                DesignComponentPropertyKind::Variant => Kind::Variant,
+            };
+            let mut operations = crate::component_properties::create_component_property_operations(
+                doc, component, kind,
+            );
+            let Some(Operation::SetComponentProps { new, .. }) = operations.first() else {
+                bail!("component has no available property/variant axis to expose");
+            };
+            let property = new.last().context("component property was not created")?.id;
+            if let Some(name) = name {
+                let name = required_name(name)?;
+                for operation in &mut operations {
+                    if let Operation::SetComponentProps { new, .. } = operation {
+                        if new
+                            .iter()
+                            .any(|current| current.id != property && current.name == name)
+                        {
+                            bail!("component property name already exists");
+                        }
+                        for current in new.iter_mut().filter(|current| current.id == property) {
+                            current.name = name.to_owned();
+                        }
+                    }
+                }
+            }
+            apply_all(doc, operations)?;
+            Ok(Applied::Content {
+                created: None,
+                detail: Some(json!({"property": property.to_string()})),
+            })
+        }
+        DesignOp::BindComponentProperty {
+            component,
+            id,
+            target,
+            property,
+        } => {
+            let component = resolve_component(doc, component)?;
+            let id = parse_node_id(id)?;
+            let target = binding_property(*target);
+            let definition = doc
+                .components
+                .def(component)
+                .context("component master is missing")?;
+            let node = existing_node(doc, id)?;
+            if id == definition.root
+                || !doc
+                    .scene
+                    .ancestors_of(id)
+                    .any(|ancestor| ancestor.id == definition.root)
+            {
+                bail!("target must be a descendant of the component master");
+            }
+            if !target.applies_to(&node) {
+                bail!("target property does not apply to this node");
+            }
+            let property = property
+                .as_deref()
+                .map(|property| find_component_property(definition, property))
+                .transpose()?;
+            if property.is_some_and(|property| {
+                !crate::component_properties::component_property_accepts_binding(
+                    &property.kind,
+                    target,
+                )
+            }) {
+                bail!("component property has an incompatible type");
+            }
+            let operations = crate::component_properties::set_component_property_binding_operations(
+                doc,
+                component,
+                id,
+                target,
+                property.map(|property| property.id),
+            );
+            apply_all(doc, operations)
+        }
+        DesignOp::SetInstanceProperty {
+            id,
+            property,
+            value,
+        } => {
+            let id = parse_node_id(id)?;
+            let node = existing_node(doc, id)?;
+            let NodeData::Instance(instance) = &node.data else {
+                bail!("node is not a component instance");
+            };
+            let definition = doc
+                .components
+                .def(instance.component)
+                .or_else(|| {
+                    doc.components
+                        .sets
+                        .get(&instance.component)
+                        .and_then(|set| doc.components.def(set.default_variant))
+                })
+                .context("instance component is missing")?;
+            let property = find_component_property(definition, property)?;
+            let kind = property
+                .kind
+                .default_value()
+                .variable_type()
+                .context("component property has no concrete type")?;
+            let mut new = parse_variable_value(doc, kind, value)?;
+            if let fanta_doc::ComponentPropKind::Variant { axis } = &property.kind {
+                let set = definition
+                    .variant_of
+                    .as_ref()
+                    .and_then(|member| doc.components.sets.get(&member.set))
+                    .context("variant set is missing")?;
+                let allowed = set
+                    .axes
+                    .iter()
+                    .find(|current| current.name == *axis)
+                    .context("variant axis is missing")?;
+                let Some(selected) = value.as_str() else {
+                    bail!("variant requires an exact axis value");
+                };
+                if !allowed.values.iter().any(|current| current == selected) {
+                    bail!("unknown variant value");
+                }
+            } else if property.kind == fanta_doc::ComponentPropKind::InstanceSwap {
+                let component = resolve_component(
+                    doc,
+                    value
+                        .as_str()
+                        .context("instance swap requires a component id or unique name")?,
+                )?;
+                new = VarValue::String {
+                    value: component.to_string(),
+                };
+            }
+            let operation = Operation::SetInstanceProp {
+                id,
+                prop: property.id,
+                old: instance.prop_values.get(&property.id).cloned(),
+                new: Some(new),
+            };
+            apply_all(doc, vec![operation])
         }
         DesignOp::Reparent { id, parent, index } => {
             let id = parse_node_id(id)?;
@@ -1879,7 +3154,7 @@ fn parse_padding(values: &[f64]) -> Result<[f64; 4]> {
 /// A component by id, or by name when exactly one component carries it.
 fn resolve_component(doc: &Doc, reference: &str) -> Result<ComponentId> {
     if let Ok(id) = reference.parse::<ComponentId>()
-        && doc.components.def(id).is_some()
+        && (doc.components.def(id).is_some() || doc.components.sets.contains_key(&id))
     {
         return Ok(id);
     }
@@ -1888,7 +3163,14 @@ fn resolve_component(doc: &Doc, reference: &str) -> Result<ComponentId> {
         .defs
         .values()
         .filter(|def| def.name == reference)
-        .map(|def| def.id);
+        .map(|def| def.id)
+        .chain(
+            doc.components
+                .sets
+                .values()
+                .filter(|set| set.name == reference)
+                .map(|set| set.id),
+        );
     let first = matches
         .next()
         .with_context(|| format!("no component is named or identified by `{reference}`"))?;
@@ -1991,7 +3273,7 @@ fn layer_position_index(
 /// deliberately not fetched here — the surface is synchronous and network
 /// access belongs to the tool layer (`place_generation`), which downloads and
 /// re-issues the op with base64.
-fn decode_image_source(source: &str) -> Result<Vec<u8>> {
+pub(crate) fn decode_image_source(source: &str) -> Result<Vec<u8>> {
     let source = source.trim();
     if source.starts_with("http://") || source.starts_with("https://") {
         bail!(
@@ -2089,6 +3371,203 @@ mod tests {
         apply_batch(doc, &mut stores.stores(), ops, label)
     }
 
+    #[test]
+    fn agent_design_system_creates_modes_bindings_and_persists_sources() -> Result<()> {
+        let (mut doc, _) = doc_with_page();
+        let result = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op":"create_variable_collection","name":"Theme","modes":["Light","Dark"]},
+                {"op":"create_variable","collection":"Theme","name":"surface/accent","kind":"color","value":"#2255EE"},
+                {"op":"create_node","node_type":"rectangle","x":0,"y":0,"width":128,"height":48,"fill":"#FFFFFF"}
+            ])),
+            "Create foundations",
+        );
+        assert_eq!(result.value["applied"], true);
+        let node = created_id(&result, 0);
+        let result = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op":"set_variable_value","variable":"surface/accent","mode":"Dark","value":"#88AAFF"},
+                {"op":"bind_variable","id":node.to_string(),"property":{"prop":"fill_color"},"variable":"surface/accent"},
+                {"op":"set_variable_mode","collection":"Theme","mode":"Dark"},
+                {"op":"add_variable_mode","collection":"Theme","name":"Contrast"}
+            ])),
+            "Bind and theme",
+        );
+        assert_eq!(result.value["applied"], true);
+        let variable = find_variable(&doc, "surface/accent")?;
+        let collection = find_collection(&doc, "Theme")?;
+        assert_eq!(variable.values_by_mode.len(), 3);
+        assert_eq!(
+            variable
+                .values_by_mode
+                .get(&find_mode(collection, "Contrast")?),
+            variable
+                .values_by_mode
+                .get(&find_mode(collection, "Light")?)
+        );
+        let variable_id = variable.id;
+        let resolved = fanta_doc::resolve_bound_value(
+            &doc.variables,
+            &doc.scene,
+            node,
+            &doc.active_modes,
+            variable_id,
+        )
+        .context("resolved token")?;
+        let mut painted = existing_node(&doc, node)?;
+        BoundProp::FillColor { index: 0 }.apply_resolved(&mut painted, resolved);
+        let NodeData::Vector(vector) = &painted.data else {
+            bail!("expected a vector");
+        };
+        assert_eq!(
+            vector.fills.first(),
+            Some(&Fill::solid(parse_fill_color("#88AAFF")?))
+        );
+        doc.selection.replace_with([node]);
+        let state = design_system_json(
+            &doc,
+            None,
+            DesignSystemQuery {
+                include_bindings: true,
+                ..Default::default()
+            },
+        )?;
+        assert_eq!(state["variable_count"], 1);
+        assert_eq!(
+            state["selection_bindings"][0]["bindings"][0]["variable"],
+            variable_id.to_string()
+        );
+        let directory = tempfile::tempdir()?;
+        fanta_format::write_project_tree(directory.path(), &doc, &Default::default())?;
+        let (saved, _) = fanta_format::read_project_tree(directory.path())?;
+        assert_eq!(saved.variables, doc.variables);
+        assert_eq!(saved.active_modes, doc.active_modes);
+        assert_eq!(
+            saved.scene.get(node).context("saved node")?.bindings,
+            doc.scene.get(node).context("node")?.bindings
+        );
+        doc.undo()?;
+        assert!(doc.active_modes.is_empty());
+        assert!(doc.scene.get(node).context("node")?.bindings.is_empty());
+        assert_eq!(find_collection(&doc, "Theme")?.modes.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn agent_design_system_rejects_invalid_aliases_and_rolls_back_variables() -> Result<()> {
+        let (mut doc, _) = doc_with_page();
+        let result = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op":"create_variable_collection","name":"Theme"},
+                {"op":"create_variable","collection":"Theme","name":"radius","kind":"float","value":8},
+                {"op":"create_variable","collection":"Theme","name":"accent","kind":"color","value":{"alias":"radius"}}
+            ])),
+            "Invalid system",
+        );
+        assert_eq!(result.value["applied"], false);
+        assert!(doc.variables.is_empty());
+        let result = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op":"create_variable_collection","name":"Theme"},
+                {"op":"create_variable","collection":"Theme","name":"a","kind":"float","value":8},
+                {"op":"create_variable","collection":"Theme","name":"b","kind":"float","value":{"alias":"a"}},
+                {"op":"set_variable_value","variable":"a","mode":"Default","value":{"alias":"b"}}
+            ])),
+            "Alias cycle",
+        );
+        assert_eq!(result.value["applied"], false);
+        assert!(doc.variables.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn agent_component_properties_and_variant_sets_drive_real_instances() -> Result<()> {
+        let (mut doc, page) = doc_with_page();
+        let mut masters = Vec::new();
+        let mut labels = Vec::new();
+        for name in ["Default", "Hover"] {
+            let mut master = CanvasNode::new(NodeData::Group(GroupNode {
+                clip_size: Some([128.0, 48.0]),
+                ..Default::default()
+            }));
+            master.name = name.into();
+            master.parent = Some(page);
+            let root = master.id;
+            doc.apply(Operation::create_node(master))?;
+            let mut label = CanvasNode::new(NodeData::Text(TextNode::new(name, 100.0, 20.0)));
+            label.parent = Some(root);
+            labels.push(label.id);
+            doc.apply(Operation::create_node(label))?;
+            masters.push(root);
+        }
+        let result = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op":"create_component","id":masters[0].to_string()},
+                {"op":"create_component","id":masters[1].to_string()},
+                {"op":"combine_variants","ids":masters.iter().map(ToString::to_string).collect::<Vec<_>>(),"name":"Button"},
+                {"op":"create_component_property","component":"Default","kind":"text","name":"Label"},
+                {"op":"bind_component_property","component":"Default","id":labels[0].to_string(),"target":{"prop":"text_content"},"property":"Label"},
+                {"op":"create_component_property","component":"Default","kind":"variant","name":"State"},
+                {"op":"create_instance","component":"Button","x":200,"y":100}
+            ])),
+            "Create reusable button",
+        );
+        assert_eq!(result.value["applied"], true, "{}", result.value);
+        let instance = created_id(&result, 0);
+        let result = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op":"set_instance_property","id":instance.to_string(),"property":"Label","value":"Continue"}
+            ])),
+            "Customize label",
+        );
+        assert_eq!(result.value["applied"], true);
+        let expanded_text = |doc: &Doc| -> Result<Vec<String>> {
+            let NodeData::Instance(instance) = &doc.scene.get(instance).context("instance")?.data
+            else {
+                bail!("expected instance");
+            };
+            Ok(
+                fanta_doc::expand_instance(&doc.scene, &doc.components, instance)
+                    .into_iter()
+                    .filter_map(|expanded| match expanded.node.data {
+                        NodeData::Text(text) => Some(text.content),
+                        _ => None,
+                    })
+                    .collect(),
+            )
+        };
+        assert_eq!(expanded_text(&doc)?, vec!["Continue"]);
+        let result = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op":"set_instance_property","id":instance.to_string(),"property":"State","value":"Hover"}
+            ])),
+            "Use hover variant",
+        );
+        assert_eq!(result.value["applied"], true);
+        assert_eq!(expanded_text(&doc)?, vec!["Hover"]);
+        let result = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op":"set_instance_property","id":instance.to_string(),"property":"State","value":"Unknown"}
+            ])),
+            "Reject unknown variant",
+        );
+        assert_eq!(result.value["applied"], false);
+        assert_eq!(expanded_text(&doc)?, vec!["Hover"]);
+        let directory = tempfile::tempdir()?;
+        fanta_format::write_project_tree(directory.path(), &doc, &Default::default())?;
+        let (saved, _) = fanta_format::read_project_tree(directory.path())?;
+        assert_eq!(expanded_text(&saved)?, vec!["Hover"]);
+        Ok(())
+    }
+
     /// A tiny valid PNG (2x1, opaque) as base64.
     fn tiny_png_base64() -> String {
         let mut png = Vec::new();
@@ -2097,6 +3576,227 @@ mod tests {
             .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
             .expect("encoding the fixture PNG");
         base64::engine::general_purpose::STANDARD.encode(&png)
+    }
+
+    #[test]
+    fn agent_source_validation_uses_the_target_project_when_focus_changes() -> Result<()> {
+        let (doc, page) = doc_with_page();
+        let target_project = tempfile::tempdir()?;
+        let focused_project = tempfile::tempdir()?;
+        for root in [target_project.path(), focused_project.path()] {
+            fanta_format::write_project_tree(root, &doc, &Default::default())?;
+        }
+        let path = fanta_format::locate_page_source(target_project.path(), page)
+            .context("target source")?;
+        let source = std::fs::read_to_string(&path)?;
+        for active_root in [None, Some(focused_project.path())] {
+            let valid = validate_source_candidate(active_root, &path, &source)?;
+            assert_eq!(valid["validated"], true);
+            assert_eq!(valid["scope"], "project");
+            assert_eq!(valid["path"], path.canonicalize()?.display().to_string());
+            let error = validate_source_candidate(active_root, &path, "<Group><Text")
+                .expect_err("unfocused target source still requires validation");
+            assert!(format!("{error:#}").contains("Invalid FNX"));
+            assert_eq!(std::fs::read_to_string(&path)?, source);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn agent_source_validation_rejects_malformed_candidates_without_writing() -> Result<()> {
+        let (mut doc, page) = doc_with_page();
+        doc.scene.get_mut(page).context("page")?.name = "Original".into();
+        let directory = tempfile::tempdir()?;
+        fanta_format::write_project_tree(directory.path(), &doc, &Default::default())?;
+        let path =
+            fanta_format::locate_page_source(directory.path(), page).context("page source")?;
+        let original = std::fs::read_to_string(&path)?;
+        let changed = original.replace("name=\"Original\"", "name=\"Changed\"");
+        assert_ne!(changed, original);
+        let valid = validate_agent_source_edit(directory.path(), &path, &changed)?;
+        assert_eq!(valid["validated"], true);
+        assert_eq!(valid["scope"], "project");
+        for candidate in [
+            r##"<Group background={{kind: "solid", color: fnxColor("#FFFFFF")}}/>"##,
+            r#"<Group name="Changed"><Text content="Interrupted""#,
+        ] {
+            let error = validate_agent_source_edit(directory.path(), &path, candidate)
+                .expect_err("malformed FNX must fail before saving");
+            assert!(format!("{error:#}").contains("Invalid FNX"));
+            assert_eq!(std::fs::read_to_string(&path)?, original);
+        }
+        let (reopened, _) = fanta_format::read_project_tree(directory.path())?;
+        assert_eq!(
+            reopened.scene.get(page).context("saved page")?.name,
+            "Original"
+        );
+        let ignored = validate_agent_source_edit(
+            directory.path(),
+            &directory.path().join("README.md"),
+            "draft",
+        )?;
+        assert_eq!(ignored["applicable"], false);
+        let new_path = directory.path().join("pages/new/page.fnx");
+        let new_source = validate_agent_source_edit(directory.path(), &new_path, &changed)?;
+        assert_eq!(new_source["scope"], "syntax");
+        assert!(!new_path.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn agent_source_validation_checks_typed_design_system_json_without_active_canvas() -> Result<()>
+    {
+        let (doc, _) = doc_with_page();
+        let directory = tempfile::tempdir()?;
+        fanta_format::write_project_tree(directory.path(), &doc, &Default::default())?;
+        for relative in [
+            "doc/variables.json",
+            "doc/active_modes.json",
+            "components/sets.json",
+        ] {
+            let path = directory.path().join(relative);
+            let original = std::fs::read_to_string(&path)?;
+            let valid = validate_source_candidate(None, &path, &original)?;
+            assert_eq!(valid["applicable"], true);
+            assert_eq!(valid["scope"], "typed_json");
+            for invalid in ["{\"unfinished\":", "[]"] {
+                assert!(validate_source_candidate(None, &path, invalid).is_err());
+                assert_eq!(std::fs::read_to_string(&path)?, original);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn imported_tool_images_persist_as_named_assets_without_canvas_layers() -> Result<()> {
+        let (doc, _) = doc_with_page();
+        let node_count = doc.scene.len();
+        let mut document = FigDocument::from_doc(doc, Default::default());
+        let bytes = base64::engine::general_purpose::STANDARD.decode(tiny_png_base64())?;
+        let result = import_prepared_image(
+            &mut document,
+            PreparedImage::new(bytes.clone())?,
+            "Hero photo",
+        )?;
+        let asset: AssetId = result["asset_id"].as_str().context("asset id")?.parse()?;
+        assert_eq!(document.doc.scene.len(), node_count);
+        assert_eq!(
+            document
+                .doc
+                .asset_library
+                .get(&asset)
+                .context("asset metadata")?
+                .name,
+            "Hero photo"
+        );
+        assert!(document.gpui_images.contains_key(&asset));
+        let repeated = import_prepared_image(
+            &mut document,
+            PreparedImage::new(bytes.clone())?,
+            "Same result",
+        )?;
+        assert_eq!(result["asset_id"], repeated["asset_id"]);
+        assert_eq!(document.raw_assets.len(), 1);
+        let directory = tempfile::tempdir()?;
+        fanta_format::write_project_tree(directory.path(), &document.doc, &document.raw_assets)?;
+        let relative = result["path"].as_str().context("asset path")?;
+        assert_eq!(std::fs::read(directory.path().join(relative))?, bytes);
+        let (reopened, raw_assets) = fanta_format::read_project_tree(directory.path())?;
+        assert_eq!(
+            reopened
+                .asset_library
+                .get(&asset)
+                .context("saved asset metadata")?
+                .name,
+            "Hero photo"
+        );
+        assert_eq!(raw_assets.get(&asset), Some(&bytes));
+        Ok(())
+    }
+
+    #[test]
+    fn animation_screenshots_sample_pixels_and_bounds_without_changing_source() -> Result<()> {
+        use fanta_doc::{
+            AnimationClip, AnimationClipId, AnimationTrack, AnimationTrackId, Keyframe, KeyframeId,
+            MotionProperty, MotionTarget, ResolvedVarValue,
+        };
+        let (mut doc, page_id) = doc_with_page();
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "rectangle", "x": 0.0, "y": 0.0,
+                 "width": 20.0, "height": 20.0, "fill": "#0000FF"},
+                {"op": "create_node", "node_type": "rectangle", "x": 30.0, "y": 0.0,
+                 "width": 20.0, "height": 20.0, "fill": "#FF0000"},
+            ])),
+            "Animation fixture",
+        );
+        let moving = outcome.value["created"]
+            .as_array()
+            .and_then(|created| created.get(1))
+            .and_then(Value::as_str)
+            .context("moving node id")?
+            .parse::<NodeId>()?;
+        let authored_transform = doc.scene.get(moving).context("moving node")?.transform;
+        let clip_id = AnimationClipId::from_u128(1);
+        let mut clip = AnimationClip::new(clip_id, "Slide", 1000);
+        let mut track = AnimationTrack::new(
+            AnimationTrackId::from_u128(2),
+            MotionTarget::new(moving, MotionProperty::PositionX),
+        );
+        for (id, time, value) in [(3, 0, 30.0), (4, 1000, 70.0)] {
+            let keyframe = Keyframe::new(
+                KeyframeId::from_u128(id),
+                time,
+                ResolvedVarValue::Float { value },
+            );
+            track.keyframes.insert(keyframe.id, keyframe);
+        }
+        clip.tracks.insert(track.id, track);
+        doc.motion.clips.insert(clip_id, clip);
+        let target = |clip, time| ScreenshotTarget {
+            page: None,
+            node: None,
+            max_dimension: Some(1024),
+            motion_clip: Some(clip),
+            playhead_ms: Some(time),
+        };
+        let initial = image::load_from_memory(&render_surface_screenshot(
+            &doc,
+            None,
+            Some(page_id),
+            None,
+            target(clip_id.to_string(), 0),
+        )?)?
+        .to_rgba8();
+        let final_frame = image::load_from_memory(&render_surface_screenshot(
+            &doc,
+            None,
+            Some(page_id),
+            None,
+            target(clip_id.to_string(), 1000),
+        )?)?
+        .to_rgba8();
+        assert!(final_frame.width() > initial.width());
+        assert_eq!(initial.height(), final_frame.height());
+        assert_ne!(initial.as_raw(), final_frame.as_raw());
+        assert_eq!(
+            doc.scene
+                .get(moving)
+                .context("authored moving node")?
+                .transform,
+            authored_transform
+        );
+        let error = render_surface_screenshot(
+            &doc,
+            None,
+            Some(page_id),
+            None,
+            target(AnimationClipId::from_u128(99).to_string(), 0),
+        )
+        .expect_err("unknown clips must be reported");
+        assert!(error.to_string().contains("does not exist"));
+        Ok(())
     }
 
     /// An agent that cannot tell which file backs a page cannot edit the

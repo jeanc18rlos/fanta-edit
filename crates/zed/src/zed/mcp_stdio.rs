@@ -8,21 +8,22 @@
 //! both ways, so a static MCP client config can point at the binary and still
 //! reach whatever socket the current launch happens to be using.
 //!
-//! Nothing removes the discovery file when the app quits, so the recorded pid
-//! is checked before the socket path next to it is trusted.
+//! The recorded pid is checked before the socket path is trusted because a
+//! crash can leave the discovery file behind.
 
 use std::fs;
 use std::io::{self, Write as _};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::thread;
+use std::time::{Duration, Instant};
 
 const NOT_RUNNING: &str =
     "Fanta is not running, or its live MCP server is off (settings: fanta_live_mcp.enabled)";
 
 /// Runs the bridge to completion. Returns the process exit code.
 pub fn run() -> i32 {
-    let stream = match connect() {
+    let stream = match connect_with_retry() {
         Some(stream) => stream,
         None => {
             eprintln!("{NOT_RUNNING}");
@@ -36,6 +37,19 @@ pub fn run() -> i32 {
             eprintln!("fanta --mcp-stdio: {error}");
             1
         }
+    }
+}
+
+fn connect_with_retry() -> Option<UnixStream> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if let Some(stream) = connect() {
+            return Some(stream);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(50));
     }
 }
 

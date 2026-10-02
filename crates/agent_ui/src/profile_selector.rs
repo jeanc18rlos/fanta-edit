@@ -390,6 +390,21 @@ impl ProfilePickerDelegate {
         match candidate.id.as_str() {
             builtin_profiles::WRITE => Some("Get help to write anything."),
             builtin_profiles::ASK => Some("Chat about your codebase."),
+            builtin_profiles::FULL_ACCESS => Some(
+                "Work unattended with file, canvas, terminal, and MCP tools. Tool approvals and the terminal sandbox are disabled for this chat; workspace trust and built-in security rules still apply.",
+            ),
+            builtin_profiles::ULTRA => Some(
+                "Coordinate a team of specialist agents automatically for complex design tasks. Ultra delegates independent work, integrates the results, and verifies the final canvas. It includes Full Access permissions and saved task checkpoints; specialist agents cannot create their own teams.",
+            ),
+            builtin_profiles::EDIT_VISUAL => Some(
+                "Edit the live canvas directly: create and adjust layers, import images, inspect screenshots, and respond to design comments. Uses Full Access permissions and saved task checkpoints with a focused visual toolkit; file edits, terminal commands, and delegation are disabled.",
+            ),
+            builtin_profiles::PLAN => Some(
+                "Inspect files and the canvas, then propose a plan. Project edits, terminal commands, and third-party tools are disabled.",
+            ),
+            builtin_profiles::REVIEW => Some(
+                "Review files, the canvas, and comments. Agents can reply to comments; project edits and terminal commands are disabled.",
+            ),
             builtin_profiles::MINIMAL => Some("Chat about anything with no tools."),
             _ => None,
         }
@@ -666,10 +681,35 @@ impl PickerDelegate for ProfilePickerDelegate {
                                 .inset(true)
                                 .spacing(ListItemSpacing::Sparse)
                                 .toggle_state(selected)
-                                .child(HighlightedLabel::new(
-                                    candidate.name.clone(),
-                                    entry.positions.clone(),
-                                ))
+                                .child(
+                                    v_flex()
+                                        .child(HighlightedLabel::new(
+                                            candidate.name.clone(),
+                                            entry.positions.clone(),
+                                        ))
+                                        .when(
+                                            candidate.id.as_str() == builtin_profiles::ULTRA,
+                                            |this| {
+                                                this.child(
+                                                    Label::new("Orchestrated team · Full Access")
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Muted),
+                                                )
+                                            },
+                                        )
+                                        .when(
+                                            candidate.id.as_str() == builtin_profiles::EDIT_VISUAL,
+                                            |this| {
+                                                this.child(
+                                                    Label::new(
+                                                        "Direct canvas editing · Full Access",
+                                                    )
+                                                    .size(LabelSize::XSmall)
+                                                    .color(Color::Muted),
+                                                )
+                                            },
+                                        ),
+                                )
                                 .when(has_end_slot, |this| {
                                     this.end_slot(
                                         h_flex()

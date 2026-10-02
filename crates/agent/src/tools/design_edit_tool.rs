@@ -25,6 +25,10 @@ fn tool_content_err(e: impl std::fmt::Display) -> LanguageModelToolResultContent
 /// justify; `none` turns it off). Arrange: `rotate`, `align`, `distribute`,
 /// `set_index` (z-order), `reparent`. Structure: `group`, `frame_selection`,
 /// `ungroup`, `create_component`, `delete`. Editor: `select`, `set_viewport`.
+/// Design-system foundations: `create_variable_collection`, `add_variable_mode`,
+/// `create_variable`, `set_variable_value`, `set_variable_mode`, `bind_variable`,
+/// `unbind_variable`. Read `design_system` first for exact ids, modes, values,
+/// bindings, and supported property types.
 ///
 /// The batch is one undoable transaction: if any op fails, everything rolls
 /// back and the result reports the failing op so it can be corrected. `x`/`y`
@@ -35,7 +39,7 @@ fn tool_content_err(e: impl std::fmt::Display) -> LanguageModelToolResultContent
 /// `children`; `create_component` reports the `component` id). Verify the
 /// result with `design_screenshot` after substantive edits. To place an image
 /// from a URL (e.g. a finished AI generation), use `place_generation` instead.
-/// Gradients, variables and per-run rich text are not ops: edit the page's
+/// Gradients and per-run rich text are not ops: edit the page's
 /// `.fnx` source with the file tools when the project is on disk.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct DesignEditToolInput {
@@ -77,7 +81,7 @@ impl AgentTool for DesignEditTool {
     fn run(
         self: Arc<Self>,
         input: ToolInput<Self::Input>,
-        _event_stream: ToolCallEventStream,
+        event_stream: ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |cx| {
@@ -85,6 +89,7 @@ impl AgentTool for DesignEditTool {
             let label = input.label.unwrap_or_else(|| "Agent edit".to_string());
             let value = cx
                 .update(|cx| {
+                    event_stream.report_design_activity(&label, None, None, None, cx);
                     let surface = design_surface::active(cx).context(
                         "no design canvas is available; ask the user to open a .fig file or Fanta project",
                     )?;

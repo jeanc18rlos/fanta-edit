@@ -913,7 +913,7 @@ fn add_mode_transaction(
     )?)
 }
 
-fn set_variable_value_operation(
+pub(crate) fn set_variable_value_operation(
     doc: &Doc,
     variable_id: VariableId,
     mode_id: ModeId,

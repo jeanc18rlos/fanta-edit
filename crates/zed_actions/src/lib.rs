@@ -951,7 +951,9 @@ pub mod fanta {
             /// Copies the command that connects Claude Code to the open design, and shows the Codex snippet.
             ConnectExternalAgent,
             /// Creates a new Fanta design.
-            NewDesign
+            NewDesign,
+            /// Reveals the current project's folder in the system file manager.
+            RevealProjectInFileManager
         ]
     );
 }

@@ -160,7 +160,7 @@ fn hash_mode_pins(scene: &Scene, anchor: NodeId) -> u64 {
 }
 
 /// Measure a text node's glyph box with the real `fanta-text` shaper, for the
-/// auto-layout solver's auto-width case, returning its `(width, height)`.
+/// auto-layout solver's auto-width and wrapped auto-height cases, returning `(width, height)`.
 ///
 /// Goes through the **shared shaped-text cache** ([`with_shaped_layout`]) rather
 /// than shaping a throwaway paragraph: the cache is keyed identically for measure
@@ -201,6 +201,18 @@ pub fn measure_text_node(t: &fanta_doc::TextNode) -> (f64, f64) {
 /// is `O(n)` over the page subtree, not a per-frame cost.
 pub fn solve_scene_layout(scene: &mut Scene, page: NodeId) {
     fanta_doc::solve_auto_layout(scene, page, &mut measure_text_node);
+}
+
+/// Resolve text-content and typography bindings before measuring layout, while
+/// retaining authored literals and bindings in the document.
+pub fn solve_doc_layout(doc: &mut fanta_doc::Doc, page: NodeId) {
+    fanta_doc::solve_auto_layout_with_variables(
+        &mut doc.scene,
+        page,
+        &doc.variables,
+        &doc.active_modes,
+        &mut measure_text_node,
+    );
 }
 
 /// The local AABB of a transient (expanded-instance) node's subtree, mirroring

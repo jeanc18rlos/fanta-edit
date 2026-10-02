@@ -1641,7 +1641,7 @@ struct Args {
     /// (Claude Code, Codex) can read and edit the design Fanta currently has open. Fanta must
     /// already be running; this does not start it.
     ///
-    /// Register it with:  claude mcp add -s user fanta -- <path to fanta> --mcp-stdio
+    /// Register it with:  claude mcp add --scope project --transport stdio fanta -- <path to fanta> --mcp-stdio
     #[cfg(not(target_os = "windows"))]
     #[arg(long, verbatim_doc_comment)]
     mcp_stdio: bool,

@@ -2,9 +2,10 @@ use anyhow::Result;
 use fs::Fs;
 
 use gpui::{
-    AnyView, App, Context, DragMoveEvent, Entity, EntityId, EventEmitter, FocusHandle, Focusable,
-    ManagedView, MouseButton, Pixels, Render, Subscription, Task, TaskExt, Tiling, WeakEntity,
-    Window, WindowId, actions, deferred, px,
+    AnyView, App, AsyncWindowContext, BackgroundExecutor, Context, DragMoveEvent, Entity, EntityId,
+    EventEmitter, FocusHandle, Focusable, ForegroundExecutor, ManagedView, MouseButton, Pixels,
+    Render, Subscription, Task, TaskExt, Tiling, WeakEntity, Window, WindowId, actions, deferred,
+    px,
 };
 pub use project::ProjectGroupKey;
 use project::{DisableAiSettings, Project};
@@ -15,6 +16,7 @@ use std::cell::Cell;
 use std::future::Future;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::time::Duration;
 use ui::prelude::*;
 use util::ResultExt;
 use util::path_list::PathList;
@@ -22,9 +24,10 @@ use zed_actions::agents_sidebar::ToggleThreadSwitcher;
 
 use agent_settings::AgentSettings;
 use settings::SidebarDockPosition;
-use ui::{ContextMenu, right_click_menu};
+use ui::{CommonAnimationExt as _, ContextMenu, right_click_menu};
 
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
+pub(super) const PROJECT_OPEN_FRAME_WAIT: Duration = Duration::from_millis(200);
 
 use crate::open_remote_project_with_existing_connection;
 use crate::{
@@ -299,10 +302,52 @@ pub struct MultiWorkspace {
     sidebar: Option<Box<dyn SidebarHandle>>,
     sidebar_open: bool,
     sidebar_overlay: Option<AnyView>,
+    opening_project_count: usize,
     pending_removal_tasks: Vec<Task<()>>,
     _serialize_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
     previous_focus_handle: Option<FocusHandle>,
+}
+
+struct ProjectOpeningIndicator {
+    multi_workspace: WeakEntity<MultiWorkspace>,
+    context: AsyncWindowContext,
+    foreground_executor: ForegroundExecutor,
+}
+
+impl Drop for ProjectOpeningIndicator {
+    fn drop(&mut self) {
+        let multi_workspace = self.multi_workspace.clone();
+        let mut context = self.context.clone();
+        // Cancellation can drop this guard during an update of the workspace.
+        // Queue cleanup so that update releases its entity borrow first.
+        self.foreground_executor
+            .spawn(async move {
+                if let Err(error) = multi_workspace.update(&mut context, |this, cx| {
+                    this.opening_project_count = this.opening_project_count.saturating_sub(1);
+                    cx.notify();
+                }) {
+                    log::debug!("removing the project loader from a closed window: {error:#}");
+                }
+            })
+            .detach();
+    }
+}
+
+pub(super) async fn wait_for_project_opening_frame(
+    opening_frame: futures::channel::oneshot::Receiver<()>,
+    background_executor: BackgroundExecutor,
+) -> Result<()> {
+    // Minimized or hidden windows may never receive another platform frame.
+    match futures::future::select(
+        opening_frame,
+        background_executor.timer(PROJECT_OPEN_FRAME_WAIT),
+    )
+    .await
+    {
+        futures::future::Either::Left((rendered, _)) => Ok(rendered?),
+        futures::future::Either::Right(_) => Ok(()),
+    }
 }
 
 impl EventEmitter<MultiWorkspaceEvent> for MultiWorkspace {}
@@ -358,6 +403,7 @@ impl MultiWorkspace {
             sidebar: None,
             sidebar_open: false,
             sidebar_overlay: None,
+            opening_project_count: 0,
             pending_removal_tasks: Vec::new(),
             _serialize_task: None,
             _subscriptions: vec![
@@ -1791,6 +1837,11 @@ impl MultiWorkspace {
         self.set_all_groups_expanded(true);
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_opening_project_count(&self) -> usize {
+        self.opening_project_count
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn assert_project_group_key_integrity(&self, cx: &App) -> anyhow::Result<()> {
         let mut retained_ids: collections::HashSet<EntityId> = Default::default();
@@ -2030,7 +2081,20 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Workspace>>> {
-        if self.multi_workspace_enabled(cx) {
+        self.opening_project_count += 1;
+        cx.notify();
+        let opening_indicator = ProjectOpeningIndicator {
+            multi_workspace: cx.weak_entity(),
+            context: window.to_async(cx),
+            foreground_executor: cx.foreground_executor().clone(),
+        };
+        let (frame_rendered, opening_frame) = futures::channel::oneshot::channel();
+        window.on_next_frame(move |_, _| {
+            if frame_rendered.send(()).is_err() {
+                log::debug!("project loading no longer waits for its first frame");
+            }
+        });
+        let open = if self.multi_workspace_enabled(cx) {
             let empty_workspace = if self
                 .active_workspace
                 .read(cx)
@@ -2046,6 +2110,8 @@ impl MultiWorkspace {
             };
 
             cx.spawn_in(window, async move |this, cx| {
+                wait_for_project_opening_frame(opening_frame, cx.background_executor().clone())
+                    .await?;
                 if let Some(empty_workspace) = empty_workspace.as_ref() {
                     let should_continue = empty_workspace
                         .update_in(cx, |workspace, window, cx| {
@@ -2083,6 +2149,8 @@ impl MultiWorkspace {
         } else {
             let workspace = self.workspace().clone();
             cx.spawn_in(window, async move |_this, cx| {
+                wait_for_project_opening_frame(opening_frame, cx.background_executor().clone())
+                    .await?;
                 let should_continue = workspace
                     .update_in(cx, |workspace, window, cx| {
                         workspace.prepare_to_close(crate::CloseIntent::ReplaceWindow, window, cx)
@@ -2098,7 +2166,20 @@ impl MultiWorkspace {
                     Ok(workspace)
                 }
             })
-        }
+        };
+        cx.spawn_in(window, async move |this, cx| {
+            let result = open.await;
+            this.update(cx, |this, cx| {
+                if let Err(error) = &result {
+                    this.active_workspace.update(cx, |workspace, cx| {
+                        workspace
+                            .show_error(format!("The project could not be opened: {error:#}"), cx);
+                    });
+                }
+            })?;
+            drop(opening_indicator);
+            result
+        })
     }
 }
 
@@ -2277,6 +2358,34 @@ impl Render for MultiWorkspace {
                 )
                 .children(right_sidebar)
                 .child(self.workspace().read(cx).modal_layer.clone())
+                .when(self.opening_project_count > 0, |this| {
+                    this.child(
+                        deferred(
+                            h_flex()
+                                .id("opening-project-indicator")
+                                .absolute()
+                                .top_8()
+                                .right_4()
+                                .items_center()
+                                .gap_2()
+                                .px_3()
+                                .py_2()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(cx.theme().colors().border)
+                                .bg(cx.theme().colors().editor_background)
+                                .occlude()
+                                .child(
+                                    Icon::new(IconName::LoadCircle)
+                                        .color(Color::Accent)
+                                        .size(IconSize::Small)
+                                        .with_rotate_animation(2),
+                                )
+                                .child(Label::new("Opening project…")),
+                        )
+                        .with_priority(1),
+                    )
+                })
                 .children(self.sidebar_overlay.as_ref().map(|view| {
                     deferred(div().absolute().size_full().inset_0().occlude().child(
                         v_flex().h(px(0.0)).top_20().items_center().child(

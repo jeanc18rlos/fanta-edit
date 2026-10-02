@@ -223,7 +223,13 @@ impl SceneSnapshot {
         measure: &mut impl FnMut(&crate::node::TextNode) -> (f64, f64),
     ) -> (Self, ResolvedSceneTrace) {
         let mut scene = doc.scene.clone();
-        crate::layout::solve_auto_layout(&mut scene, page, measure);
+        crate::layout::solve_auto_layout_with_variables(
+            &mut scene,
+            page,
+            &doc.variables,
+            &doc.active_modes,
+            measure,
+        );
         let mut nodes = Vec::new();
         let mut trace = Vec::new();
         visit_scene_node(doc, &scene, page, None, &mut nodes, &mut trace, measure);
@@ -247,7 +253,19 @@ fn metric_measure(t: &crate::node::TextNode) -> (f64, f64) {
     const AVG_ADVANCE: f64 = 0.52; // mean advance/em across Latin text
     let chars = t.content.chars().filter(|c| *c != '\n').count() as f64;
     let w = chars * t.style.size_px * AVG_ADVANCE;
-    let h = t.style.size_px * t.style.line_height;
+    let lines = if t.auto_resize == crate::node::TextAutoResize::Height && t.local_size[0] > 0.0 {
+        t.content
+            .split('\n')
+            .map(|line| {
+                (line.chars().count() as f64 * t.style.size_px * AVG_ADVANCE / t.local_size[0])
+                    .ceil()
+                    .max(1.0)
+            })
+            .sum::<f64>()
+    } else {
+        t.content.split('\n').count() as f64
+    };
+    let h = t.style.size_px * t.style.line_height * lines;
     (w, h)
 }
 

@@ -8,12 +8,8 @@
 //! `<data_dir>/fanta_live_mcp.json` for clients to discover:
 //! `{ "socket": "/…/mcp.sock", "pid": 1234 }`.
 //!
-//! Because it is on by default, every launch — including each dev
-//! `cargo run` — binds a new socket and overwrites that discovery file, and
-//! nothing removes the file when the app quits (only turning the setting off
-//! does). So a reader can find a file naming a dead process: the
-//! `--mcp-stdio` bridge has to check the recorded pid before trusting the
-//! socket path next to it.
+//! The discovery file is published atomically only after startup succeeds.
+//! The stdio bridge checks its recorded pid in case the app crashed.
 
 use anyhow::{Context as _, Result, bail};
 use base64::Engine as _;
@@ -24,11 +20,17 @@ use context_server::types::{
     VERSION_2025_06_18, requests,
 };
 use design_surface::{DesignOp, MAX_JSON_RESPONSE_BYTES, NodeQuery, ScreenshotTarget};
+use futures::{AsyncReadExt as _, FutureExt as _};
 use gpui::{App, AppContext as _, AsyncApp, ClipboardItem, Task};
+use http_client::HttpClient as _;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use settings::{RegisterSetting, Settings, SettingsStore};
-use std::path::PathBuf;
+use std::{
+    io::Write as _,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 use util::ResultExt as _;
 use workspace::Workspace;
 
@@ -54,6 +56,8 @@ impl Settings for FantaLiveMcpSettings {
 #[derive(Default)]
 struct LiveMcpState {
     server: Option<McpServer>,
+    enabled: bool,
+    _quit_subscription: Option<gpui::Subscription>,
     /// Guards against a stale startup finishing after the setting flipped
     /// off (or on/off/on): only the latest epoch may install its server.
     epoch: usize,
@@ -63,6 +67,16 @@ impl gpui::Global for LiveMcpState {}
 
 pub(crate) fn init(cx: &mut App) {
     cx.set_global(LiveMcpState::default());
+    let quit_subscription = cx.on_app_quit(|cx| {
+        let state = cx.global_mut::<LiveMcpState>();
+        state.epoch += 1;
+        state.enabled = false;
+        state.server.take();
+        design_surface::set_live_mcp_command(None, cx);
+        remove_discovery().log_err();
+        Task::ready(())
+    });
+    cx.global_mut::<LiveMcpState>()._quit_subscription = Some(quit_subscription);
     apply_setting(cx);
     cx.observe_global::<SettingsStore>(apply_setting).detach();
 }
@@ -70,29 +84,50 @@ pub(crate) fn init(cx: &mut App) {
 fn apply_setting(cx: &mut App) {
     let enabled = FantaLiveMcpSettings::get_global(cx).enabled;
     let state = cx.global_mut::<LiveMcpState>();
-    if enabled == state.server.is_some() {
+    if enabled == state.enabled {
         return;
     }
+    state.enabled = enabled;
     state.epoch += 1;
     let epoch = state.epoch;
     if !enabled {
         state.server.take();
-        cx.background_spawn(async move {
-            std::fs::remove_file(discovery_path()).ok();
-        })
-        .detach();
+        design_surface::set_live_mcp_command(None, cx);
+        remove_discovery().log_err();
         log::info!("fanta live MCP server stopped");
         return;
+    }
+    #[cfg(not(test))]
+    match std::env::current_exe() {
+        Ok(executable) => design_surface::set_live_mcp_command(
+            Some(design_surface::LiveMcpCommand {
+                executable: executable.display().to_string(),
+                args: vec![
+                    "--mcp-stdio".into(),
+                    "--user-data-dir".into(),
+                    paths::data_dir().display().to_string(),
+                ],
+            }),
+            cx,
+        ),
+        Err(error) => log::error!("locating the Fanta MCP bridge executable failed: {error:#}"),
     }
     cx.spawn(async move |cx| {
         let server = async {
             let mut server = McpServer::new(cx).await?;
             server.add_tool(GetEditorStateTool);
+            server.add_tool(GetDesignSystemTool);
+            server.add_tool(PrepareDesignAssetTool);
             server.add_tool(BatchGetTool);
             server.add_tool(BatchDesignTool);
             server.add_tool(GetScreenshotTool);
             server.add_tool(ReadFnxSourceTool);
+            server.add_tool(ValidateFnxSourceTool);
             server.add_tool(GetGuidelinesTool);
+            server.add_tool(ImportImageTool);
+            server.add_tool(ListCommentsTool);
+            server.add_tool(ReplyCommentTool);
+            server.add_tool(ReportActivityTool);
             server.handle_request::<requests::Initialize>(|params, cx| {
                 let client_name = params.client_info.name;
                 // The handler only holds `&App`, and the connecting agent is
@@ -149,29 +184,41 @@ fn apply_setting(cx: &mut App) {
             anyhow::Ok(server)
         }
         .await
-        .context("starting the fanta live MCP server")
-        .log_err();
-        let Some(server) = server else { return };
-
-        let discovery = serde_json::json!({
-            "socket": server.socket_path(),
-            "pid": std::process::id(),
-        });
-        cx.background_spawn(async move {
-            std::fs::write(
-                discovery_path(),
-                serde_json::to_string_pretty(&discovery).unwrap_or_default(),
-            )
-            .context("writing the live MCP discovery file")
-            .log_err();
-        })
-        .detach();
+        .context("starting the fanta live MCP server");
+        let server = match server {
+            Ok(server) => server,
+            Err(error) => {
+                log::error!("{error:#}");
+                cx.update(|cx| {
+                    let state = cx.global_mut::<LiveMcpState>();
+                    if state.epoch == epoch {
+                        state.enabled = false;
+                        design_surface::set_live_mcp_command(None, cx);
+                        show_connection_error(
+                            format!("Fanta live tools could not start: {error:#}"),
+                            cx,
+                        );
+                    }
+                });
+                return;
+            }
+        };
 
         cx.update(|cx| {
             let state = cx.global_mut::<LiveMcpState>();
             // The setting may have flipped again while we were binding the
             // socket; only the newest activation installs itself.
-            if state.epoch == epoch {
+            if state.epoch == epoch && state.enabled {
+                if let Err(error) = write_discovery(server.socket_path()) {
+                    log::error!("publishing the Fanta MCP connection failed: {error:#}");
+                    state.enabled = false;
+                    design_surface::set_live_mcp_command(None, cx);
+                    show_connection_error(
+                        format!("Fanta live tools could not publish the connection: {error:#}"),
+                        cx,
+                    );
+                    return;
+                }
                 log::info!(
                     "fanta live MCP server listening on {}",
                     server.socket_path().display()
@@ -183,8 +230,49 @@ fn apply_setting(cx: &mut App) {
     .detach();
 }
 
+fn show_connection_error(message: String, cx: &mut App) {
+    for window in cx.windows() {
+        window
+            .update(cx, |_, window, cx| {
+                crate::view::show_canvas_notice(message.clone(), window, cx);
+            })
+            .log_err();
+    }
+}
+
 fn discovery_path() -> PathBuf {
     paths::data_dir().join("fanta_live_mcp.json")
+}
+
+fn write_discovery(socket: &Path) -> Result<()> {
+    std::fs::create_dir_all(paths::data_dir())?;
+    let mut file = tempfile::NamedTempFile::new_in(paths::data_dir())?;
+    serde_json::to_writer(
+        &mut file,
+        &serde_json::json!({
+            "socket": socket, "pid": std::process::id(),
+        }),
+    )?;
+    file.flush()?;
+    file.persist(discovery_path())
+        .context("publishing the live MCP discovery file")?;
+    Ok(())
+}
+
+fn remove_discovery() -> Result<()> {
+    let path = discovery_path();
+    let contents = match std::fs::read(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let discovery: serde_json::Value = serde_json::from_slice(&contents)?;
+    if discovery.get("pid").and_then(serde_json::Value::as_u64)
+        == Some(u64::from(std::process::id()))
+    {
+        std::fs::remove_file(path).context("removing the live MCP discovery file")?;
+    }
+    Ok(())
 }
 
 /// `ping`, declared locally rather than reusing
@@ -217,20 +305,42 @@ pub(crate) fn register(workspace: &mut Workspace) {
                     return;
                 }
             };
-            let executable = executable.display().to_string();
-            cx.write_to_clipboard(ClipboardItem::new_string(format!(
-                "claude mcp add -s user fanta -- {executable} --mcp-stdio"
-            )));
+            if !FantaLiveMcpSettings::get_global(cx).enabled {
+                crate::view::show_canvas_notice("Enable fanta_live_mcp.enabled to connect an external agent".into(), window, cx);
+                return;
+            }
+            let instructions = connection_instructions(&executable, paths::data_dir());
+            cx.write_to_clipboard(ClipboardItem::new_string(instructions));
             crate::view::show_canvas_notice(
-                format!(
-                    "Claude Code command copied. For Codex, add to ~/.codex/config.toml: \
-                     [mcp_servers.fanta] command = \"{executable}\" args = [\"--mcp-stdio\"]"
-                ),
+                "Connection instructions copied for Codex and Claude Code. Keep this project open in Fanta.".into(),
                 window,
                 cx,
             );
         },
     );
+}
+
+fn connection_instructions(executable: &Path, data_directory: &Path) -> String {
+    let command = design_surface::LiveMcpCommand {
+        executable: executable.display().to_string(),
+        args: vec![
+            "--mcp-stdio".into(),
+            "--user-data-dir".into(),
+            data_directory.display().to_string(),
+        ],
+    };
+    format!(
+        "Fanta live canvas connection\n\nKeep Fanta running with this project open.\n\n\
+         Codex: add the following to this project's .codex/config.toml, then restart the agent:\n\n\
+         {}\n\
+         Claude Code: run this command from the project directory, then restart the agent:\n\n\
+         {}\n\n\
+         Verify with /mcp and call get_editor_state. Edit the returned .fnx files with file tools, \
+         validate complete candidates with validate_fnx_source, inspect the canvas with batch_get \
+         and get_screenshot, and register generated images with import_image.\n",
+        command.codex_config(),
+        command.claude_code_command(),
+    )
 }
 
 /// Deserialize helper: treat omitted/`null` MCP `arguments` as the default
@@ -308,6 +418,230 @@ fn read_only() -> ToolAnnotations {
     }
 }
 
+fn non_destructive_write() -> ToolAnnotations {
+    ToolAnnotations {
+        title: None,
+        read_only_hint: Some(false),
+        destructive_hint: Some(false),
+        idempotent_hint: Some(false),
+        open_world_hint: Some(false),
+    }
+}
+
+/// Import a generated image into the active project's Assets panel and persist
+/// its bytes under assets/images/. Supply exactly one of path (local file,
+/// relative to the project or absolute), url (HTTP/HTTPS), or source (base64 or
+/// a base64 data URI). Returns the asset id and saved path for FNX file edits.
+/// Use this after image generation, including images made by another MCP
+/// server. Importing an asset does not place a new layer on the canvas.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct ImportImageArgs {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Clone)]
+struct ImportImageTool;
+
+impl McpServerTool for ImportImageTool {
+    type Input = ImportImageArgs;
+    type Output = ();
+    const NAME: &'static str = "import_image";
+
+    fn annotations(&self) -> ToolAnnotations {
+        ToolAnnotations {
+            open_world_hint: Some(true),
+            ..non_destructive_write()
+        }
+    }
+
+    async fn run(&self, input: Self::Input, cx: &mut AsyncApp) -> Result<ToolResponse<()>> {
+        if [
+            input.path.is_some(),
+            input.url.is_some(),
+            input.source.is_some(),
+        ]
+        .into_iter()
+        .filter(|provided| *provided)
+        .count()
+            != 1
+        {
+            bail!("supply exactly one of path, url or source");
+        }
+        let initial_state = with_surface(cx, |surface, cx| surface.state(cx))?;
+        let document_id = initial_state.get("document_id").cloned();
+        let bytes = if let Some(path) = input.path {
+            let path = PathBuf::from(path);
+            let path = if path.is_absolute() {
+                path
+            } else {
+                let root = initial_state
+                    .get("project_root")
+                    .and_then(serde_json::Value::as_str)
+                    .context(
+                        "relative image paths require a saved project; use an absolute path",
+                    )?;
+                Path::new(root).join(path)
+            };
+            cx.background_spawn(async move {
+                use std::io::Read as _;
+                let file = std::fs::File::open(&path)
+                    .with_context(|| format!("opening image {}", path.display()))?;
+                if !file.metadata()?.is_file() {
+                    bail!("the image path must be a regular file");
+                }
+                let mut bytes = Vec::new();
+                file.take(crate::document::MAX_IMAGE_SOURCE_BYTES as u64 + 1)
+                    .read_to_end(&mut bytes)?;
+                if bytes.len() > crate::document::MAX_IMAGE_SOURCE_BYTES {
+                    bail!("the image exceeds the project asset limit");
+                }
+                Ok::<_, anyhow::Error>(bytes)
+            })
+            .await?
+        } else if let Some(url) = input.url {
+            let parsed = url::Url::parse(&url).context("the image URL is invalid")?;
+            if !matches!(parsed.scheme(), "http" | "https") {
+                bail!("the image URL must use HTTP or HTTPS");
+            }
+            let client = cx.update(|cx| client::Client::global(cx).http_client());
+            let executor = cx.background_executor().clone();
+            cx.background_spawn(async move {
+                let download = async {
+                    let response = client.get(&url, http_client::AsyncBody::empty(), true).await?;
+                    if !response.status().is_success() { bail!("the image download failed: {}", response.status()); }
+                    let mut bytes = Vec::new();
+                    response.into_body().take(crate::document::MAX_IMAGE_SOURCE_BYTES as u64 + 1).read_to_end(&mut bytes).await?;
+                    if bytes.len() > crate::document::MAX_IMAGE_SOURCE_BYTES { bail!("the image exceeds the project asset limit"); }
+                    Ok::<_, anyhow::Error>(bytes)
+                }.fuse();
+                let timeout = executor.timer(Duration::from_secs(60)).fuse();
+                futures::pin_mut!(download, timeout);
+                futures::select! {
+                    result = download => result,
+                    _ = timeout => Err(anyhow::anyhow!("the image download timed out; retry importing the image")),
+                }
+            }).await?
+        } else {
+            let source = input.source.context("the image source is missing")?;
+            cx.background_spawn(async move { crate::agent_surface::decode_image_source(&source) })
+                .await?
+        };
+        let name = input.name.unwrap_or_else(|| "Generated image".into());
+        let import = with_surface(cx, move |surface, cx| {
+            let state = surface.state(cx)?;
+            if state.get("document_id") != document_id.as_ref() {
+                bail!(
+                    "the active design changed during the image import; select the intended project and retry"
+                );
+            }
+            Ok(surface.import_image(bytes, name, cx))
+        })?;
+        Ok(text_response(import.await?))
+    }
+}
+
+/// Read canvas comment threads for design reviews. By default returns unresolved
+/// threads on the active page, including the pin position and existing replies.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
+struct ListCommentsArgs {
+    #[serde(default)]
+    page: Option<usize>,
+    #[serde(default)]
+    include_resolved: bool,
+}
+
+#[derive(Clone)]
+struct ListCommentsTool;
+
+impl McpServerTool for ListCommentsTool {
+    type Input = OrDefault<ListCommentsArgs>;
+    type Output = ();
+    const NAME: &'static str = "list_comments";
+    fn annotations(&self) -> ToolAnnotations {
+        read_only()
+    }
+    async fn run(&self, input: Self::Input, cx: &mut AsyncApp) -> Result<ToolResponse<()>> {
+        let args = input.0;
+        let value = with_surface(cx, move |surface, cx| {
+            surface.comments(args.page, args.include_resolved, cx)
+        })?;
+        bounded_text_response(value, "Read one page's comments at a time.")
+    }
+}
+
+/// Reply to a canvas comment as an agent. Use the exact comment id returned by
+/// list_comments, and set resolve only after addressing and verifying the note.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct ReplyCommentArgs {
+    #[serde(default)]
+    page: Option<usize>,
+    id: String,
+    body: String,
+    #[serde(default)]
+    author: Option<String>,
+    #[serde(default)]
+    resolve: bool,
+}
+
+#[derive(Clone)]
+struct ReplyCommentTool;
+
+impl McpServerTool for ReplyCommentTool {
+    type Input = ReplyCommentArgs;
+    type Output = ();
+    const NAME: &'static str = "reply_comment";
+    fn annotations(&self) -> ToolAnnotations {
+        non_destructive_write()
+    }
+    async fn run(&self, input: Self::Input, cx: &mut AsyncApp) -> Result<ToolResponse<()>> {
+        let value = with_surface(cx, move |surface, cx| {
+            surface.reply_comment(
+                input.page,
+                input.id,
+                input.body,
+                input.author.unwrap_or_else(|| "Fanta Agent".into()),
+                input.resolve,
+                cx,
+            )
+        })?;
+        Ok(text_response(value))
+    }
+}
+
+/// Show the agent's current work location and action on the canvas. Report
+/// before inspecting or editing each frame, and periodically during file edits.
+/// Set active false when finished. Each agent needs its own stable agent_id.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct ReportActivityArgs {
+    #[serde(flatten)]
+    activity: design_surface::AgentActivity,
+}
+
+#[derive(Clone)]
+struct ReportActivityTool;
+
+impl McpServerTool for ReportActivityTool {
+    type Input = ReportActivityArgs;
+    type Output = ();
+    const NAME: &'static str = "report_agent_activity";
+    fn annotations(&self) -> ToolAnnotations {
+        non_destructive_write()
+    }
+    async fn run(&self, input: Self::Input, cx: &mut AsyncApp) -> Result<ToolResponse<()>> {
+        let value = with_surface(cx, move |surface, cx| {
+            surface.report_activity(input.activity, cx)
+        })?;
+        Ok(text_response(value))
+    }
+}
+
 // ---- get_editor_state --------------------------------------------------------
 
 /// Overview of the open Fanta design document: project name and root, pages
@@ -379,13 +713,55 @@ impl McpServerTool for GetGuidelinesTool {
         read_only()
     }
 
-    async fn run(&self, _input: Self::Input, _cx: &mut AsyncApp) -> Result<ToolResponse<()>> {
+    async fn run(&self, _input: Self::Input, cx: &mut AsyncApp) -> Result<ToolResponse<()>> {
+        let spec = with_surface(cx, |surface, cx| surface.read_design_spec(cx))?;
+        let mut text = design_surface::DESIGN_GUIDELINES.to_string();
+        if let Some(spec) = spec {
+            text.push_str(&format!("\n\n{}", spec.prompt_context()));
+        }
         Ok(ToolResponse {
-            content: vec![context_server::types::ToolResponseContent::Text {
-                text: design_surface::DESIGN_GUIDELINES.to_string(),
-            }],
+            content: vec![context_server::types::ToolResponseContent::Text { text }],
             structured_content: (),
         })
+    }
+}
+
+/// Inspect reusable component properties/variant sets, variable collections, modes,
+/// paginated typed token values, and optional selected-node bindings. Read before creating a design system.
+#[derive(Clone)]
+struct GetDesignSystemTool;
+
+impl McpServerTool for GetDesignSystemTool {
+    type Input = OrDefault<design_surface::DesignSystemQuery>;
+    type Output = ();
+    const NAME: &'static str = "get_design_system";
+    fn annotations(&self) -> ToolAnnotations {
+        read_only()
+    }
+    async fn run(&self, input: Self::Input, cx: &mut AsyncApp) -> Result<ToolResponse<()>> {
+        let value = with_surface(cx, move |surface, cx| surface.design_system(input.0, cx))?;
+        bounded_text_response(
+            value,
+            "Choose a collection and lower limit; use offset for subsequent variable pages.",
+        )
+    }
+}
+
+/// Open the existing image or SVG generation composer with a prefilled prompt
+/// after user interest. No generation is submitted; the user reviews available catalog models and submits there.
+#[derive(Clone)]
+struct PrepareDesignAssetTool;
+
+impl McpServerTool for PrepareDesignAssetTool {
+    type Input = design_surface::DesignAssetRequest;
+    type Output = ();
+    const NAME: &'static str = "prepare_design_asset";
+    fn annotations(&self) -> ToolAnnotations {
+        non_destructive_write()
+    }
+    async fn run(&self, input: Self::Input, cx: &mut AsyncApp) -> Result<ToolResponse<()>> {
+        let value = with_surface(cx, move |surface, cx| surface.prepare_asset(input, cx))?;
+        Ok(text_response(value))
     }
 }
 
@@ -484,10 +860,14 @@ impl McpServerTool for BatchGetTool {
 /// locked), set_stroke, set_shadow, set_text_style, set_auto_layout,
 /// set_index (z-order), rotate, align, distribute, group, frame_selection,
 /// ungroup, duplicate, create_component, reparent, delete, select,
-/// set_viewport. Coordinates are world px, y down, x/y = top-left; ids are
+/// set_viewport, set_layout_child, create_variable_collection, add_variable_mode,
+/// create_variable, set_variable_value, set_variable_mode, bind_variable,
+/// unbind_variable, combine_variants, create_component_property,
+/// bind_component_property, set_instance_property. Read get_design_system first.
+/// Coordinates are world px, y down, x/y = top-left; ids are
 /// exact node ids. If any op fails the whole batch rolls back and the result
 /// names the failing op; created ids come back in `created`. Gradients,
-/// variables and per-run rich text are not ops yet: for those, read the page
+/// per-run rich text are not ops yet: for those, read the page
 /// .fnx with read_fnx_source, edit the file, and the canvas reloads (the change
 /// is a git diff).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -544,6 +924,12 @@ struct GetScreenshotArgs {
     /// Cap on the longer output dimension in pixels (default 1024).
     #[serde(default)]
     max_dimension: Option<u32>,
+    /// Exact animation clip id from get_editor_state.motion_clips.
+    #[serde(default)]
+    motion_clip: Option<String>,
+    /// Time in milliseconds to sample (defaults to zero when a clip is given).
+    #[serde(default)]
+    playhead_ms: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -565,6 +951,8 @@ impl McpServerTool for GetScreenshotTool {
             page: args.page,
             node: args.node,
             max_dimension: args.max_dimension,
+            motion_clip: args.motion_clip,
+            playhead_ms: args.playhead_ms,
         };
         let render = with_surface(cx, move |surface, cx| Ok(surface.screenshot(target, cx)))?;
         let png = render.await?;
@@ -801,6 +1189,46 @@ impl McpServerTool for ReadFnxSourceTool {
             .unwrap_or_default();
         let slice = slice_source(text, args.offset, args.limit, args.max_bytes);
         Ok(text_response(slice.into_response(&path)))
+    }
+}
+
+/// Validate a complete FNX or managed design-system JSON candidate without changing the project. If source
+/// is omitted, validate the saved file. Errors include parser diagnostics;
+/// repair them before writing a candidate with external file tools.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct ValidateFnxSourceArgs {
+    path: String,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+#[derive(Clone)]
+struct ValidateFnxSourceTool;
+
+impl McpServerTool for ValidateFnxSourceTool {
+    type Input = ValidateFnxSourceArgs;
+    type Output = ();
+
+    const NAME: &'static str = "validate_fnx_source";
+
+    fn annotations(&self) -> ToolAnnotations {
+        read_only()
+    }
+
+    async fn run(&self, input: Self::Input, cx: &mut AsyncApp) -> Result<ToolResponse<()>> {
+        let validation = with_surface(cx, move |surface, cx| {
+            let source = match input.source {
+                Some(source) => source,
+                None => surface
+                    .read_source(Some(input.path.clone()), cx)?
+                    .get("text")
+                    .and_then(serde_json::Value::as_str)
+                    .context("the requested FNX source text is unavailable")?
+                    .to_owned(),
+            };
+            Ok(surface.validate_source_edit(input.path, source, cx))
+        })?;
+        bounded_text_response(validation.await?, "Additional FNX diagnostics omitted.")
     }
 }
 

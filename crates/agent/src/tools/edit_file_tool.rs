@@ -196,14 +196,14 @@ impl EditFileTool {
                             }
                             ToolInputPayload::InvalidJson { error_message } => {
                                 log::error!("Received invalid JSON: {error_message}");
-                                return EditSessionResult::Failed {
+                                return EditSessionResult::Interrupted {
                                     error: error_message,
                                     session,
                                 };
                             }
                         },
                         Err(error) => {
-                            return EditSessionResult::Failed {
+                            return EditSessionResult::Interrupted {
                                 error: error.to_string(),
                                 session,
                             };
@@ -211,7 +211,7 @@ impl EditFileTool {
                     }
                 }
                 _ = event_stream.cancelled_by_user().fuse() => {
-                    return EditSessionResult::Failed {
+                    return EditSessionResult::Interrupted {
                         error: "Edit cancelled by user".to_string(),
                         session,
                     };
@@ -1138,16 +1138,39 @@ mod tests {
 
     #[gpui::test]
     async fn test_streaming_input_sender_dropped_before_final(cx: &mut TestAppContext) {
-        let (edit_tool, _project, _action_log, _fs, _thread) =
+        let (edit_tool, project, _action_log, filesystem, _thread) =
             setup_test(cx, json!({"file.txt": "hello world\n"})).await;
         let (mut sender, input): (ToolInputSender, ToolInput<EditFileToolInput>) =
             ToolInput::test();
         let (event_stream, _event_rx) = ToolCallEventStream::test();
         let task = cx.update(|cx| edit_tool.clone().run(input, event_stream, cx));
 
-        // Send a partial then drop the sender without sending final
-        sender.send_partial(json!({}));
+        sender.send_partial(json!({"path": "root/file.txt"}));
         cx.run_until_parked();
+        sender.send_partial(json!({
+            "path": "root/file.txt",
+            "edits": [{"old_text": "hello world", "new_text": "unfinished replacement"}]
+        }));
+        cx.run_until_parked();
+        sender.send_partial(json!({
+            "path": "root/file.txt",
+            "edits": [
+                {"old_text": "hello world", "new_text": "unfinished replacement"},
+                {"old_text": "\n"}
+            ]
+        }));
+        cx.run_until_parked();
+
+        let buffer = project.update(cx, |project, cx| {
+            let path = project
+                .find_project_path("root/file.txt", cx)
+                .expect("path");
+            project.get_open_buffer(&path, cx).expect("streamed buffer")
+        });
+        assert_ne!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            "hello world\n"
+        );
 
         drop(sender);
 
@@ -1155,6 +1178,17 @@ mod tests {
         assert!(
             result.is_err(),
             "Tool should error when sender is dropped without sending final input"
+        );
+        buffer.read_with(cx, |buffer, _| {
+            assert_eq!(buffer.text(), "hello world\n");
+            assert!(!buffer.is_dirty());
+        });
+        assert_eq!(
+            filesystem
+                .load(path!("/root/file.txt").as_ref())
+                .await
+                .expect("file"),
+            "hello world\n"
         );
     }
 

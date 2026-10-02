@@ -76,7 +76,7 @@ pub mod requests {
         CompletionCompleteParams,
         CompletionCompleteResponse
     );
-    request!("ping", Ping, (), ());
+    request!("ping", Ping, (), serde_json::Map<String, serde_json::Value>);
     request!("tools/list", ListTools, (), ListToolsResponse);
     request!(
         "resources/templates/list",
@@ -748,7 +748,7 @@ pub enum ToolResponseContent {
     #[serde(rename = "audio", rename_all = "camelCase")]
     Audio { data: String, mime_type: String },
     #[serde(rename = "resource")]
-    Resource { resource: ResourceContents },
+    Resource { resource: ResourceContentsType },
     /// Link to an MCP resource on the server, without inlining its contents.
     /// Added in MCP 2025-06-18.
     #[serde(rename = "resource_link", rename_all = "camelCase")]
@@ -808,4 +808,27 @@ pub struct Root {
     pub uri: Url,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_response_preserves_embedded_image_data() -> anyhow::Result<()> {
+        let content: ToolResponseContent = serde_json::from_value(serde_json::json!({
+            "type": "resource", "resource": {
+                "uri": "generated://hero.png", "mimeType": "image/png", "blob": "aW1hZ2U=",
+            },
+        }))?;
+        let ToolResponseContent::Resource {
+            resource: ResourceContentsType::Blob(blob),
+        } = content
+        else {
+            anyhow::bail!("the image result did not retain its embedded bytes");
+        };
+        assert_eq!(blob.mime_type.as_deref(), Some("image/png"));
+        assert_eq!(blob.blob, "aW1hZ2U=");
+        Ok(())
+    }
 }

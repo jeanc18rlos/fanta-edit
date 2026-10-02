@@ -3,6 +3,7 @@
 //! and the `Item` integration that gives fanta projects text-editor-style
 //! dirty tracking and save.
 
+mod agent_presence;
 #[cfg(feature = "fanta-gpui-ui")]
 mod properties_inspector;
 #[cfg(feature = "fanta-gpui-ui")]
@@ -304,6 +305,7 @@ pub struct FigView {
     /// in-tab navigation ([`Self::select_page`]).
     scope: Option<FigScope>,
     is_focused: bool,
+    source_writer_focus: Option<(String, String)>,
     /// The document root this view last acted on: a `ScopeApplied` that
     /// merely restores our own root (switching back to this tab) must not
     /// clobber the saved viewport.
@@ -398,6 +400,7 @@ pub struct FigView {
     _editor_session_subscription: Subscription,
     _motion_sidebar_subscription: Subscription,
     _timeline_subscription: Subscription,
+    _agent_activity_subscription: Subscription,
 }
 
 pub enum FigViewEvent {
@@ -699,6 +702,7 @@ impl FigView {
             opened_entry_id,
             scope,
             is_focused: false,
+            source_writer_focus: None,
             last_seen_root,
             viewport: None,
             pan_last_position: None,
@@ -762,6 +766,7 @@ impl FigView {
             _editor_session_subscription: editor_session_subscription,
             _motion_sidebar_subscription: motion_sidebar_subscription,
             _timeline_subscription: timeline_subscription,
+            _agent_activity_subscription: Self::observe_agent_activity(window, cx),
         }
     }
 
@@ -6433,7 +6438,7 @@ impl Render for FigView {
                         .items_center()
                         .justify_center()
                         .gap_2()
-                        .child(Label::new("Could not open Figma file").size(LabelSize::Large))
+                        .child(Label::new("Could not open design").size(LabelSize::Large))
                         // `{:#}` prints the whole context chain, so the real
                         // loader failure (auth, parse, missing file) is shown
                         // instead of just the outermost wrapper.
@@ -6441,18 +6446,10 @@ impl Render for FigView {
                 )
             })
             .when_some(snapshot.loading_message, |this, message| {
-                this.child(
-                    v_flex()
-                        .size_full()
-                        .items_center()
-                        .justify_center()
-                        .gap_2()
-                        .child(Label::new(message).size(LabelSize::Large))
-                        .child(
-                            Label::new("The canvas will appear as soon as parsing finishes.")
-                                .color(Color::Muted),
-                        ),
-                )
+                this.child(crate::loading_indicator(
+                    message,
+                    "Your design will appear when this action finishes.",
+                ))
             })
             .when(!has_error && !is_loading, |this| {
                 let presenting_prototype = self.prototype_player.is_some();
@@ -6556,6 +6553,11 @@ impl Render for FigView {
                                                                 self.render_comment_overlay(cx)
                                                             {
                                                                 c.push(comments);
+                                                            }
+                                                            if let Some(activity) =
+                                                                self.render_agent_presence(cx)
+                                                            {
+                                                                c.push(activity);
                                                             }
                                                             // A loading or
                                                             // failed document
@@ -7360,6 +7362,7 @@ impl Item for FigView {
                 opened_entry_id,
                 scope,
                 is_focused: false,
+                source_writer_focus: None,
                 last_seen_root,
                 viewport,
                 pan_last_position: None,
@@ -7423,6 +7426,7 @@ impl Item for FigView {
                 _editor_session_subscription: editor_session_subscription,
                 _motion_sidebar_subscription: motion_sidebar_subscription,
                 _timeline_subscription: timeline_subscription,
+                _agent_activity_subscription: Self::observe_agent_activity(window, cx),
             }
         })))
     }
@@ -9373,6 +9377,75 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn following_an_agent_moves_between_pages_and_stops_on_request(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, _, _) = doc_with_two_pages();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Design.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item, project, window, cx))
+            })
+            .expect("view");
+        view.update(cx, |view, _| {
+            view.viewport = Some(Viewport {
+                center: [0.0, 0.0],
+                zoom: 2.0,
+            });
+        });
+        let activity = design_surface::AgentActivity {
+            agent_id: "reviewer".to_string(),
+            agent_name: "Reviewer".to_string(),
+            action: "Inspecting the hero".to_string(),
+            page: Some(1),
+            node: None,
+            world: Some([300.0, 400.0]),
+            active: true,
+            project_root: None,
+            source_path: None,
+        };
+        let state = cx.update(design_surface::activity_state);
+        state.update(cx, |state, cx| {
+            state.record(activity.clone(), cx);
+            state.follow(Some(activity.agent_id.clone()), cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.selected_page_index, Some(1));
+            assert_eq!(
+                view.viewport,
+                Some(Viewport {
+                    center: [300.0, 400.0],
+                    zoom: 2.0
+                })
+            );
+        });
+        state.update(cx, |state, cx| {
+            state.follow(None, cx);
+            state.record(
+                design_surface::AgentActivity {
+                    world: Some([900.0, 700.0]),
+                    ..activity
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.viewport.map(|viewport| viewport.center),
+                Some([300.0, 400.0])
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn selecting_the_current_page_preserves_its_viewport(cx: &mut TestAppContext) {
         init_test(cx);
         let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
@@ -11186,7 +11259,7 @@ impl FigView {
         }
         context.push_str(
             "\nThe ids above are exact node ids. The canvas tools are design_state (read), \
-             design_edit (change) and design_screenshot (verify).",
+             design_edit (change) and design_screenshot (verify). Prefer editing the real .fnx source with file tools, then verify on the canvas. Read canvas comments with design_comments and reply in their original threads.",
         );
         context
     }

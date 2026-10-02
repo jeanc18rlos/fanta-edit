@@ -90,6 +90,37 @@ fn min_width_holds_a_hug_frame_above_its_content() {
 }
 
 #[test]
+fn constrained_hug_button_honors_requested_alignment_on_both_axes() {
+    for (primary, counter, expected) in [
+        (PrimaryAlign::Start, CounterAlign::Start, [16.0, 8.0]),
+        (PrimaryAlign::Center, CounterAlign::Center, [44.0, 16.0]),
+        (PrimaryAlign::End, CounterAlign::End, [72.0, 24.0]),
+    ] {
+        let mut tree = VecTree::new();
+        let button = tree.push(frame(
+            0.0,
+            0.0,
+            AutoLayout {
+                mode: LayoutMode::Horizontal,
+                primary_sizing: AxisSizing::Hug,
+                counter_sizing: AxisSizing::Hug,
+                primary_align: primary,
+                counter_align: counter,
+                padding: [8.0, 16.0, 8.0, 16.0],
+                min_size: [Some(128.0), Some(48.0)],
+                ..Default::default()
+            },
+        ));
+        let label = tree.push(rect_child(button, 40.0, 16.0));
+
+        solve_auto_layout(&mut tree, button, &mut no_measure);
+
+        approx(placed_size(&tree, button), [128.0, 48.0]);
+        approx(placed_origin(&tree, label), expected);
+    }
+}
+
+#[test]
 fn max_height_caps_a_hug_frame_below_its_content() {
     let mut t = VecTree::new();
     let al = AutoLayout {

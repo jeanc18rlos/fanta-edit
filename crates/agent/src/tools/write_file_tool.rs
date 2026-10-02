@@ -174,14 +174,14 @@ impl WriteFileTool {
                             }
                             ToolInputPayload::InvalidJson { error_message } => {
                                 log::error!("Received invalid JSON: {error_message}");
-                                return EditSessionResult::Failed {
+                                return EditSessionResult::Interrupted {
                                     error: error_message,
                                     session,
                                 };
                             }
                         },
                         Err(error) => {
-                            return EditSessionResult::Failed {
+                            return EditSessionResult::Interrupted {
                                 error: error.to_string(),
                                 session,
                             };
@@ -189,7 +189,7 @@ impl WriteFileTool {
                     }
                 }
                 _ = event_stream.cancelled_by_user().fuse() => {
-                    return EditSessionResult::Failed {
+                    return EditSessionResult::Interrupted {
                         error: "Write cancelled by user".to_string(),
                         session,
                     };
@@ -279,9 +279,420 @@ mod tests {
     use prompt_store::ProjectContext;
     use serde_json::json;
     use settings::{Settings, SettingsStore};
-    use std::{path::PathBuf, sync::Arc};
+    use std::{cell::RefCell, path::PathBuf, rc::Rc, sync::Arc};
     use util::path;
     use util::rel_path::{RelPath, rel_path};
+
+    struct ValidatingSurface {
+        validation: RefCell<Option<gpui::Task<anyhow::Result<serde_json::Value>>>>,
+    }
+
+    impl design_surface::DesignSurface for ValidatingSurface {
+        fn state(&self, _: &mut App) -> anyhow::Result<serde_json::Value> {
+            Ok(json!({}))
+        }
+
+        fn get_nodes(
+            &self,
+            _: design_surface::NodeQuery,
+            _: &mut App,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(json!({}))
+        }
+
+        fn apply(
+            &self,
+            _: Vec<design_surface::DesignOp>,
+            _: String,
+            _: &mut App,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(json!({}))
+        }
+
+        fn screenshot(
+            &self,
+            _: design_surface::ScreenshotTarget,
+            _: &mut App,
+        ) -> gpui::Task<anyhow::Result<Vec<u8>>> {
+            gpui::Task::ready(Ok(Vec::new()))
+        }
+
+        fn read_source(&self, _: Option<String>, _: &mut App) -> anyhow::Result<serde_json::Value> {
+            Ok(json!({}))
+        }
+
+        fn find_empty_space(
+            &self,
+            _: f64,
+            _: f64,
+            _: Option<usize>,
+            _: &mut App,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(json!({}))
+        }
+
+        fn validate_source_edit(
+            &self,
+            _: String,
+            _: String,
+            _: &mut App,
+        ) -> gpui::Task<anyhow::Result<serde_json::Value>> {
+            self.validation
+                .take()
+                .expect("one candidate should be validated")
+        }
+    }
+
+    #[gpui::test]
+    async fn test_streaming_interrupted_write_rolls_back_and_can_retry(cx: &mut TestAppContext) {
+        let (write_tool, project, _action_log, filesystem, _thread) =
+            setup_test(cx, json!({"file.txt": "saved original\n"})).await;
+        let (mut sender, input) = ToolInput::<WriteFileToolInput>::test();
+        let task = cx.update(|cx| {
+            write_tool
+                .clone()
+                .run(input, ToolCallEventStream::test().0, cx)
+        });
+        sender.send_partial(json!({"path": "root/file.txt"}));
+        cx.run_until_parked();
+        sender.send_partial(json!({"path": "root/file.txt", "content": "unfinished\n"}));
+        cx.run_until_parked();
+        let buffer = project.update(cx, |project, cx| {
+            let path = project
+                .find_project_path("root/file.txt", cx)
+                .expect("path");
+            project.get_open_buffer(&path, cx).expect("streamed buffer")
+        });
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            "unfinished\n"
+        );
+        drop(sender);
+        assert!(task.await.is_err());
+        buffer.read_with(cx, |buffer, _| {
+            assert_eq!(buffer.text(), "saved original\n");
+            assert!(!buffer.is_dirty());
+        });
+        assert_eq!(
+            filesystem
+                .load(path!("/root/file.txt").as_ref())
+                .await
+                .expect("file"),
+            "saved original\n"
+        );
+        let result = cx
+            .update(|cx| {
+                write_tool.clone().run(
+                    ToolInput::resolved(WriteFileToolInput {
+                        path: "root/file.txt".into(),
+                        content: "complete retry\n".into(),
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await;
+        assert!(
+            result.is_ok(),
+            "rollback must not leave an overwrite confirmation"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_streaming_interrupted_new_write_does_not_create_file(cx: &mut TestAppContext) {
+        let (write_tool, project, _action_log, filesystem, _thread) =
+            setup_test(cx, json!({})).await;
+        let (mut sender, input) = ToolInput::<WriteFileToolInput>::test();
+        let task = cx.update(|cx| {
+            write_tool
+                .clone()
+                .run(input, ToolCallEventStream::test().0, cx)
+        });
+        sender.send_partial(json!({"path": "root/new.fnx"}));
+        cx.run_until_parked();
+        sender.send_partial(json!({"path": "root/new.fnx", "content": "<Page>\n"}));
+        cx.run_until_parked();
+        let buffer = project.update(cx, |project, cx| {
+            let path = project.find_project_path("root/new.fnx", cx).expect("path");
+            project.get_open_buffer(&path, cx).expect("streamed buffer")
+        });
+        assert!(!buffer.read_with(cx, |buffer, _| buffer.text()).is_empty());
+        drop(sender);
+        assert!(task.await.is_err());
+        buffer.read_with(cx, |buffer, _| {
+            assert!(buffer.text().is_empty());
+            assert!(!buffer.is_dirty());
+        });
+        assert!(!filesystem.is_file(path!("/root/new.fnx").as_ref()).await);
+    }
+
+    #[gpui::test]
+    async fn test_streaming_dropped_write_task_rolls_back(cx: &mut TestAppContext) {
+        let (write_tool, project, _action_log, _filesystem, _thread) =
+            setup_test(cx, json!({"file.txt": "original\n"})).await;
+        let (mut sender, input) = ToolInput::<WriteFileToolInput>::test();
+        let task = cx.update(|cx| {
+            write_tool
+                .clone()
+                .run(input, ToolCallEventStream::test().0, cx)
+        });
+        sender.send_partial(json!({"path": "root/file.txt"}));
+        cx.run_until_parked();
+        sender.send_partial(json!({"path": "root/file.txt", "content": "partial\n"}));
+        cx.run_until_parked();
+        let buffer = project.update(cx, |project, cx| {
+            let path = project
+                .find_project_path("root/file.txt", cx)
+                .expect("path");
+            project.get_open_buffer(&path, cx).expect("streamed buffer")
+        });
+        drop(task);
+        cx.run_until_parked();
+        buffer.read_with(cx, |buffer, _| {
+            assert_eq!(buffer.text(), "original\n");
+            assert!(!buffer.is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_streaming_interrupted_write_preserves_concurrent_user_edits(
+        cx: &mut TestAppContext,
+    ) {
+        let (write_tool, project, _action_log, filesystem, _thread) =
+            setup_test(cx, json!({"file.txt": "original\n"})).await;
+        let (mut sender, input) = ToolInput::<WriteFileToolInput>::test();
+        let task = cx.update(|cx| {
+            write_tool
+                .clone()
+                .run(input, ToolCallEventStream::test().0, cx)
+        });
+        sender.send_partial(json!({"path": "root/file.txt"}));
+        cx.run_until_parked();
+        sender.send_partial(json!({"path": "root/file.txt", "content": "partial\n"}));
+        cx.run_until_parked();
+        let buffer = project.update(cx, |project, cx| {
+            let path = project
+                .find_project_path("root/file.txt", cx)
+                .expect("path");
+            project.get_open_buffer(&path, cx).expect("streamed buffer")
+        });
+        buffer.update(cx, |buffer, cx| {
+            let end = buffer.len();
+            buffer.edit([(end..end, "user text\n")], None, cx);
+        });
+        drop(sender);
+        assert!(task.await.is_err());
+        buffer.read_with(cx, |buffer, _| {
+            assert_eq!(buffer.text(), "original\nuser text\n");
+            assert!(buffer.is_dirty());
+        });
+        assert_eq!(
+            filesystem
+                .load(path!("/root/file.txt").as_ref())
+                .await
+                .expect("file"),
+            "original\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_streaming_invalid_fnx_candidate_rolls_back_with_diagnostics(
+        cx: &mut TestAppContext,
+    ) {
+        let (write_tool, project, _action_log, filesystem, _thread) =
+            setup_test(cx, json!({"page.fnx": "<Page />\n"})).await;
+        cx.update(|cx| {
+            design_surface::register(
+                Rc::new(ValidatingSurface {
+                    validation: RefCell::new(Some(gpui::Task::ready(Err(anyhow::anyhow!(
+                        "FNX line 2 column 4: quoted JSON keys required"
+                    ))))),
+                }),
+                cx,
+            )
+        });
+        let result = cx
+            .update(|cx| {
+                write_tool.clone().run(
+                    ToolInput::resolved(WriteFileToolInput {
+                        path: "root/page.fnx".into(),
+                        content: "<Page style={{size: 2}} />\n".into(),
+                    }),
+                    ToolCallEventStream::test().0,
+                    cx,
+                )
+            })
+            .await;
+        let error = result.expect_err("invalid source").to_string();
+        assert!(
+            error.contains("FNX line 2 column 4: quoted JSON keys required"),
+            "{error}"
+        );
+        let buffer = project.update(cx, |project, cx| {
+            let path = project
+                .find_project_path("root/page.fnx", cx)
+                .expect("path");
+            project.get_open_buffer(&path, cx).expect("buffer")
+        });
+        buffer.read_with(cx, |buffer, _| {
+            assert_eq!(buffer.text(), "<Page />\n");
+            assert!(!buffer.is_dirty());
+        });
+        assert_eq!(
+            filesystem
+                .load(path!("/root/page.fnx").as_ref())
+                .await
+                .expect("file"),
+            "<Page />\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_streaming_fnx_validation_preserves_user_edits_during_await(
+        cx: &mut TestAppContext,
+    ) {
+        let (write_tool, project, _action_log, filesystem, _thread) =
+            setup_test(cx, json!({"page.fnx": "<Page />\n"})).await;
+        let (sender, receiver) = futures::channel::oneshot::channel();
+        cx.update(|cx| {
+            let validation = cx.spawn(async move |_| Ok(receiver.await?));
+            design_surface::register(
+                Rc::new(ValidatingSurface {
+                    validation: RefCell::new(Some(validation)),
+                }),
+                cx,
+            );
+        });
+        let task = cx.update(|cx| {
+            write_tool.clone().run(
+                ToolInput::resolved(WriteFileToolInput {
+                    path: "root/page.fnx".into(),
+                    content: "<Page><Frame /></Page>\n".into(),
+                }),
+                ToolCallEventStream::test().0,
+                cx,
+            )
+        });
+        cx.run_until_parked();
+        let buffer = project.update(cx, |project, cx| {
+            let path = project
+                .find_project_path("root/page.fnx", cx)
+                .expect("path");
+            project.get_open_buffer(&path, cx).expect("buffer")
+        });
+        buffer.update(cx, |buffer, cx| {
+            let end = buffer.len();
+            buffer.edit([(end..end, "user text\n")], None, cx);
+        });
+        sender
+            .send(json!({"applicable": true, "validated": true}))
+            .expect("validation waiting");
+        let error = task.await.expect_err("candidate changed").to_string();
+        assert!(
+            error.contains("changed while its Fanta source was being validated"),
+            "{error}"
+        );
+        buffer.read_with(cx, |buffer, _| {
+            assert_eq!(buffer.text(), "<Page />\nuser text\n");
+            assert!(buffer.is_dirty());
+        });
+        assert_eq!(
+            filesystem
+                .load(path!("/root/page.fnx").as_ref())
+                .await
+                .expect("file"),
+            "<Page />\n"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_streaming_dirty_fnx_save_validates_and_preserves_user_draft(
+        cx: &mut TestAppContext,
+    ) {
+        let (_, project, action_log, filesystem, thread) =
+            setup_test(cx, json!({"page.fnx": "<Page />\n"})).await;
+        let buffer = project
+            .update(cx, |project, cx| {
+                let path = project
+                    .find_project_path("root/page.fnx", cx)
+                    .expect("path");
+                project.open_buffer(path, cx)
+            })
+            .await
+            .expect("buffer");
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit(
+                [(0..buffer.len(), "<Page style={{size: 2}} />\n")],
+                None,
+                cx,
+            );
+        });
+        cx.update(|cx| {
+            design_surface::register(
+                Rc::new(ValidatingSurface {
+                    validation: RefCell::new(Some(gpui::Task::ready(Err(anyhow::anyhow!(
+                        "FNX line 1 column 15: quoted JSON keys required"
+                    ))))),
+                }),
+                cx,
+            )
+        });
+        let edit_tool = Arc::new(crate::EditFileTool::new(
+            project.clone(),
+            thread.downgrade(),
+            action_log,
+            project.read_with(cx, |project, _| project.languages().clone()),
+        ));
+        let (event_stream, mut events) = ToolCallEventStream::test();
+        let task = cx.update(|cx| {
+            edit_tool.run(
+                ToolInput::resolved(crate::EditFileToolInput {
+                    path: "root/page.fnx".into(),
+                    edits: vec![crate::Edit {
+                        old_text: "size: 2".into(),
+                        new_text: "\"size\": 2".into(),
+                    }],
+                }),
+                event_stream,
+                cx,
+            )
+        });
+        events.expect_update_fields().await;
+        let authorization = events.expect_authorization().await;
+        authorization
+            .response
+            .send(acp_thread::SelectedPermissionOutcome::new(
+                acp::PermissionOptionId::new("save"),
+                acp::PermissionOptionKind::AllowOnce,
+            ))
+            .expect("save requested");
+        let error = task
+            .await
+            .expect_err("invalid user source must not be saved")
+            .to_string();
+        assert!(
+            error.contains("FNX line 1 column 15: quoted JSON keys required"),
+            "{error}"
+        );
+        buffer.read_with(cx, |buffer, _| {
+            assert_eq!(buffer.text(), "<Page style={{size: 2}} />\n");
+            assert!(buffer.is_dirty());
+        });
+        assert_eq!(
+            filesystem
+                .load(path!("/root/page.fnx").as_ref())
+                .await
+                .expect("file"),
+            "<Page />\n"
+        );
+        buffer.update(cx, |buffer, cx| {
+            assert!(buffer.undo(cx).is_some());
+        });
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            "<Page />\n"
+        );
+    }
 
     #[gpui::test]
     async fn test_streaming_write_create_file(cx: &mut TestAppContext) {
@@ -528,6 +939,17 @@ mod tests {
     #[gpui::test]
     async fn test_streaming_format_on_save(cx: &mut TestAppContext) {
         init_test(cx);
+        cx.update(|cx| {
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .project
+                        .all_languages
+                        .defaults
+                        .enable_language_server = Some(true);
+                });
+            });
+        });
 
         let fs = project::FakeFs::new(cx.executor());
         fs.insert_tree("/root", json!({"src": {}})).await;
@@ -547,7 +969,7 @@ mod tests {
         ));
 
         let language_registry = project.read_with(cx, |project, _| project.languages().clone());
-        language_registry.add(rust_language);
+        language_registry.add(rust_language.clone());
 
         let mut fake_language_servers = language_registry.register_fake_lsp(
             "Rust",
@@ -575,6 +997,10 @@ mod tests {
             })
             .await
             .unwrap();
+
+        buffer.update(cx, |buffer, cx| {
+            buffer.set_language(Some(rust_language), cx);
+        });
 
         // Register the buffer with language servers
         let _handle = project.update(cx, |project, cx| {

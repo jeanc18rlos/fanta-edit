@@ -2555,7 +2555,7 @@ fn model_id_to_selection(model_id: &AgentModelId, cx: &App) -> LanguageModelSele
     agent_settings::language_model_to_selection(&resolved, current_user_selection.as_ref())
 }
 
-pub static ZED_AGENT_ID: LazyLock<AgentId> = LazyLock::new(|| AgentId::new("Zed Agent"));
+pub static ZED_AGENT_ID: LazyLock<AgentId> = LazyLock::new(|| AgentId::new("Fanta Agent"));
 
 impl acp_thread::AgentConnection for NativeAgentConnection {
     fn agent_id(&self) -> AgentId {
@@ -3027,6 +3027,8 @@ pub struct NativeThreadEnvironment {
     acp_thread: WeakEntity<AcpThread>,
 }
 
+pub(crate) const MAX_ULTRA_SPECIALISTS: usize = 3;
+
 impl NativeThreadEnvironment {
     pub(crate) fn create_subagent_thread(
         &self,
@@ -3253,6 +3255,29 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         request: SiblingThreadRequest,
         cx: &mut AsyncApp,
     ) -> Task<Result<SiblingThreadInfo>> {
+        let parent_session = match self
+            .thread
+            .read_with(cx, |thread, _| thread.parent_thread_id())
+        {
+            Ok(parent_session) => parent_session,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        if let Some(parent_session) = parent_session {
+            let parent_is_ultra = match self.agent.read_with(cx, |agent, cx| {
+                agent.sessions.get(&parent_session).is_some_and(|session| {
+                    session.thread.read(cx).profile().as_str()
+                        == agent_settings::builtin_profiles::ULTRA
+                })
+            }) {
+                Ok(parent_is_ultra) => parent_is_ultra,
+                Err(error) => return Task::ready(Err(error)),
+            };
+            if parent_is_ultra {
+                return Task::ready(Err(anyhow!(
+                    "Ultra specialists cannot start independent threads; return the work to the lead orchestrator"
+                )));
+            }
+        }
         let host = match self
             .agent
             .read_with(cx, |agent, _| agent.sibling_thread_host())
@@ -3330,7 +3355,7 @@ impl SubagentHandle for NativeSubagentHandle {
         let parent_thread = self.parent_thread.clone();
 
         cx.spawn(async move |cx| {
-            let (task, _subscription) = cx.update(|cx| {
+            let (task, _subscription) = cx.update(|cx| -> Result<_> {
                 let ratio_before_prompt = thread
                     .read(cx)
                     .latest_token_usage()
@@ -3338,9 +3363,15 @@ impl SubagentHandle for NativeSubagentHandle {
 
                 parent_thread
                     .update(cx, |parent_thread, _cx| {
-                        parent_thread.register_running_subagent(thread.downgrade())
+                        anyhow::ensure!(
+                            parent_thread.profile().as_str() != agent_settings::builtin_profiles::ULTRA
+                                || parent_thread.running_subagent_count() < MAX_ULTRA_SPECIALISTS,
+                            "Ultra already has {MAX_ULTRA_SPECIALISTS} active specialists; wait for one to finish before delegating more work"
+                        );
+                        parent_thread.register_running_subagent(thread.downgrade());
+                        anyhow::Ok(())
                     })
-                    .ok();
+                    ??;
 
                 let task = acp_thread.update(cx, |acp_thread, cx| {
                     acp_thread.send(vec![message.into()], cx)
@@ -3388,8 +3419,8 @@ impl SubagentHandle for NativeSubagentHandle {
                         }
                     });
 
-                (wait_for_prompt, subscription)
-            });
+                Ok((wait_for_prompt, subscription))
+            })?;
 
             let result = match task.await {
                 SubagentPromptResult::Completed => thread.read_with(cx, |thread, _cx| {
@@ -3782,6 +3813,70 @@ mod internal_tests {
             .skip(1)
             .map(language_model::LanguageModelRequestMessage::string_contents)
             .collect()
+    }
+
+    #[gpui::test]
+    async fn test_ultra_rejects_a_fourth_active_specialist(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_, agent, _, parent_acp) = setup_native_agent_session(cx).await;
+        let parent =
+            cx.update(|cx| native_thread_for_session(&agent, parent_acp.read(cx).session_id(), cx));
+        parent.update(cx, |thread, cx| {
+            thread.set_profile(
+                agent_settings::AgentProfileId(agent_settings::builtin_profiles::ULTRA.into()),
+                cx,
+            );
+        });
+        let children = (0..MAX_ULTRA_SPECIALISTS)
+            .map(|_| cx.new(|cx| Thread::new_subagent(&parent, cx)))
+            .collect::<Vec<_>>();
+        parent.update(cx, |thread, _| {
+            for child in &children {
+                thread.register_running_subagent(child.downgrade());
+            }
+        });
+        let environment = NativeThreadEnvironment {
+            agent: agent.downgrade(),
+            thread: parent.downgrade(),
+            acp_thread: parent_acp.downgrade(),
+        };
+        let specialist = cx
+            .update(|cx| environment.create_subagent_thread("Fourth specialist".into(), cx))
+            .expect("specialist session");
+        let task = cx.spawn(async move |cx| specialist.send("Review the design".into(), &cx).await);
+        let error = task.await.expect_err("the fourth specialist must wait");
+        assert!(error.to_string().contains("3 active specialists"));
+        assert_eq!(
+            parent.read_with(cx, |thread, _| thread.running_subagent_count()),
+            MAX_ULTRA_SPECIALISTS
+        );
+        let child_environment = NativeThreadEnvironment {
+            agent: agent.downgrade(),
+            thread: children.first().expect("specialist").downgrade(),
+            acp_thread: parent_acp.downgrade(),
+        };
+        let task = cx.spawn(async move |mut cx| {
+            child_environment
+                .create_sibling_thread(
+                    SiblingThreadRequest {
+                        title: "Untracked team".into(),
+                        prompt: "Delegate again".into(),
+                        agent_id: None,
+                        model: None,
+                        use_new_worktree: false,
+                        worktree_name: None,
+                        base_ref: None,
+                    },
+                    &mut cx,
+                )
+                .await
+        });
+        assert!(
+            task.await
+                .expect_err("specialists cannot bypass the team limit")
+                .to_string()
+                .contains("cannot start independent threads")
+        );
     }
 
     #[gpui::test]

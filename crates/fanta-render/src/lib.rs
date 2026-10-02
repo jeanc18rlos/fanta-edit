@@ -44,8 +44,8 @@ pub use path::to_sk_path;
 // shared with the app's flatten/outline/simplify geometry ops.
 pub use raster::{
     MediaPlayback, RasterRenderer, RenderError, RenderInputs, RenderMetrics, SvgRenderOptions,
-    SvgRenderOutput, measure_text_node, solve_scene_layout, text_caret_rect, text_first_baseline,
-    text_hit_test, text_line_height, text_node_outline, text_selection_rects,
+    SvgRenderOutput, measure_text_node, solve_doc_layout, solve_scene_layout, text_caret_rect,
+    text_first_baseline, text_hit_test, text_line_height, text_node_outline, text_selection_rects,
     vector_outline_sk_path,
 };
 pub use transform::to_sk_matrix;

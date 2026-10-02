@@ -4401,13 +4401,13 @@ mod tests {
             FrameDecision::ReuseCached
         );
 
-        let mut next_pixels = frame.clone();
+        let mut next_pixels = frame;
         next_pixels.revision += 1;
-        let mut next_progress = frame.clone();
+        let mut next_progress = frame;
         next_progress.progress_bits = 0.5_f32.to_bits();
-        let mut replacement_session = frame.clone();
+        let mut replacement_session = frame;
         replacement_session.session_revision += 1;
-        let mut other_node = frame.clone();
+        let mut other_node = frame;
         other_node.node_id = NodeId::from_u128(98);
         for next in [
             Some(next_pixels),

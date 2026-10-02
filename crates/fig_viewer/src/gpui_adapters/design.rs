@@ -2102,7 +2102,6 @@ impl DesignAdapter {
         let font_catalog =
             design_font_catalog(font_cache.try_list_font_families().unwrap_or_default());
         cx.spawn({
-            let font_cache = font_cache.clone();
             async move |this, cx| {
                 let families = loop {
                     if let Some(families) = font_cache.try_list_font_families() {
@@ -7905,7 +7904,7 @@ mod tests {
             .expect("distribute is wired");
         assert_eq!(ops.len(), 1, "the outermost squares stay anchored");
 
-        let mut tidy = doc.clone();
+        let mut tidy = doc;
         let ops = arrange_operations(&tidy, &ids, DesignArrangeOperation::TidyUp)
             .expect("tidy up is wired");
         assert!(!ops.is_empty());

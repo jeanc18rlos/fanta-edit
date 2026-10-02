@@ -48,16 +48,18 @@ pub(crate) enum CommentSkill {
     Summarize,
     Search,
     Format,
+    Review,
 }
 
 impl CommentSkill {
-    pub(crate) const ALL: [Self; 3] = [Self::Summarize, Self::Search, Self::Format];
+    pub(crate) const ALL: [Self; 4] = [Self::Summarize, Self::Search, Self::Format, Self::Review];
 
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Summarize => "Summarize",
             Self::Search => "Search",
             Self::Format => "Format",
+            Self::Review => "Review",
         }
     }
 
@@ -71,6 +73,9 @@ impl CommentSkill {
             }
             Self::Format => {
                 "Rewrite or format the requested content so it is clear, consistent, and ready to use. Preserve the original meaning and call out any ambiguity that needs a decision."
+            }
+            Self::Review => {
+                "Review the design on the referenced page with its unresolved canvas comments. Inspect the actual source and a canvas screenshot, identify actionable visual or interaction issues, and reply to the original comments with findings. Do not change scene content during review."
             }
         }
     }
@@ -249,6 +254,45 @@ pub(crate) fn reply_comment_full_op(
     set_comments_op(doc, page, &comments)
 }
 
+pub(crate) fn agent_reply_comment_op(
+    doc: &Doc,
+    page: NodeId,
+    id: &str,
+    body: &str,
+    author: &str,
+    resolve: bool,
+) -> anyhow::Result<Operation> {
+    let body = body.trim();
+    anyhow::ensure!(!body.is_empty(), "a comment reply must contain text");
+    anyhow::ensure!(
+        doc.scene.get(page).is_some(),
+        "the comment page no longer exists"
+    );
+    let mut comments = read_comments(doc, page);
+    let comment = comments
+        .iter_mut()
+        .find(|comment| comment.id == id)
+        .ok_or_else(|| anyhow::anyhow!("comment {id} does not exist on this page"))?;
+    comment.replies.push(CommentReply {
+        author: if author.trim().is_empty() {
+            "Fanta Agent".to_string()
+        } else {
+            clean_context_line(author)
+        },
+        body: body.to_string(),
+        created: now_secs(),
+        from_agent: true,
+        mentions: mentions_for_body(doc, page, body),
+        attachments: Vec::new(),
+        skill: None,
+    });
+    if resolve {
+        comment.resolved = true;
+    }
+    set_comments_op(doc, page, &comments)
+        .ok_or_else(|| anyhow::anyhow!("the comment reply could not be saved"))
+}
+
 /// Resolve the `@handles` currently present in a message. Agent names and
 /// layer names keep stable targets; unknown handles remain lossless text
 /// mentions so importing or later resolving them cannot discard information.
@@ -370,7 +414,9 @@ pub(crate) fn skill_prompt_for_comment(
             &reply.attachments,
         );
     }
-    prompt.push_str("\n\nRespond to the skill request above; do not claim work was completed unless you actually performed it.");
+    prompt.push_str(&format!(
+        "\n\nRespond to the skill request above. Post your answer back to canvas comment {comment_id} using design_comments (reply) or reply_comment, so the discussion remains on the canvas. Do not resolve the comment until its requested work has been verified. Do not claim work was completed unless you actually performed it."
+    ));
     Some(prompt)
 }
 
@@ -534,6 +580,54 @@ mod tests {
     }
 
     #[test]
+    fn agent_replies_are_attributed_persistent_and_undoable() {
+        let (mut doc, page) = doc_with_page();
+        let (id, operation) =
+            add_comment_op(&doc, page, [1.0, 2.0], "Check contrast").expect("create comment");
+        doc.apply(operation).expect("add comment");
+        let operation = agent_reply_comment_op(
+            &doc,
+            page,
+            &id,
+            "Verified the label contrast on the canvas.",
+            "Codex",
+            true,
+        )
+        .expect("agent reply");
+        doc.apply(operation).expect("save agent reply");
+        let comment = read_comments(&doc, page).remove(0);
+        assert!(comment.resolved);
+        let reply = comment.replies.first().expect("reply persisted");
+        assert_eq!(reply.author, "Codex");
+        assert!(reply.from_agent);
+        let serialized = serde_json::to_string(&comment).expect("serialize");
+        let restored: Comment = serde_json::from_str(&serialized).expect("deserialize");
+        assert_eq!(restored, comment);
+        doc.undo().expect("undo reply");
+        let comment = read_comments(&doc, page).remove(0);
+        assert!(!comment.resolved);
+        assert!(comment.replies.is_empty());
+    }
+
+    #[test]
+    fn invalid_agent_replies_return_actionable_errors() {
+        let (doc, page) = doc_with_page();
+        assert!(
+            agent_reply_comment_op(&doc, page, "missing", "  ", "Codex", false)
+                .expect_err("blank reply")
+                .to_string()
+                .contains("text")
+        );
+        assert!(
+            agent_reply_comment_op(&doc, page, "missing", "Checked", "Codex", false)
+                .expect_err("missing comment")
+                .to_string()
+                .contains("does not exist")
+        );
+        assert!(read_comments(&doc, page).is_empty());
+    }
+
+    #[test]
     fn rich_messages_round_trip_mentions_attachments_and_skill() {
         let (mut doc, page) = doc_with_page();
         let mut layer = CanvasNode::new(NodeData::Group(GroupNode::default()));
@@ -636,7 +730,8 @@ mod tests {
         assert!(prompt.contains("@Codex"));
         assert!(prompt.contains("/tmp/reference.png"));
         assert!(prompt.contains("untrusted context"));
-        assert!(prompt.contains("do not claim work was completed"));
+        assert!(prompt.contains("Do not claim work was completed"));
+        assert!(prompt.contains(&format!("Post your answer back to canvas comment {id}")));
     }
 
     #[test]

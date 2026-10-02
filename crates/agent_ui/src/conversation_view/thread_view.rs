@@ -28,9 +28,9 @@ use crate::message_editor::SharedSessionCapabilities;
 use crate::ui::{SandboxGroup, SandboxRow, SandboxSection, SandboxStatusTooltip};
 
 use db::kvp::KeyValueStore;
-use gpui::List;
 use gpui::Stateful;
 use gpui::TaskExt;
+use gpui::{Bounds, KeyDownEvent, List, MouseButton, Pixels, canvas, relative};
 use heapless::Vec as ArrayVec;
 use language_model::{
     FastModeConfirmation, LanguageModel, LanguageModelEffortLevel, LanguageModelId,
@@ -38,10 +38,7 @@ use language_model::{
 };
 use notifications::status_toast::StatusToast;
 use settings::{update_settings_file, update_settings_file_with_completion};
-use ui::{
-    ButtonLike, CalloutBorderPosition, SpinnerLabel, SpinnerVariant, SplitButton, SplitButtonStyle,
-    Tab,
-};
+use ui::{ButtonLike, CalloutBorderPosition, SpinnerLabel, SpinnerVariant, Tab};
 use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
 
 use super::elicitation::{
@@ -50,6 +47,73 @@ use super::elicitation::{
 use super::*;
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
+
+fn selected_effort_index(
+    levels: &[LanguageModelEffortLevel],
+    selected: Option<&str>,
+) -> Option<usize> {
+    levels
+        .iter()
+        .position(|level| Some(level.value.as_ref()) == selected)
+        .or_else(|| levels.iter().position(|level| level.is_default))
+        .or_else(|| (!levels.is_empty()).then_some(0))
+}
+
+fn effort_index_at_position(x: f32, left: f32, width: f32, count: usize) -> Option<usize> {
+    if count == 0 || !x.is_finite() || !left.is_finite() || !width.is_finite() || width <= 0.0 {
+        return None;
+    }
+    Some((((x - left) / width).clamp(0.0, 1.0) * count.saturating_sub(1) as f32).round() as usize)
+}
+
+fn generated_code_is_expanded(explicit: Option<bool>) -> bool {
+    explicit.unwrap_or(false)
+}
+
+#[cfg(test)]
+mod composer_control_tests {
+    use super::*;
+
+    #[test]
+    fn effort_slider_snaps_only_to_supported_levels_and_clamps_pointer_positions() {
+        assert_eq!(effort_index_at_position(40.0, 40.0, 100.0, 3), Some(0));
+        assert_eq!(effort_index_at_position(90.0, 40.0, 100.0, 3), Some(1));
+        assert_eq!(effort_index_at_position(140.0, 40.0, 100.0, 3), Some(2));
+        assert_eq!(effort_index_at_position(-100.0, 40.0, 100.0, 3), Some(0));
+        assert_eq!(effort_index_at_position(300.0, 40.0, 100.0, 3), Some(2));
+        assert_eq!(effort_index_at_position(90.0, 40.0, 100.0, 1), Some(0));
+        assert_eq!(effort_index_at_position(90.0, 40.0, 100.0, 0), None);
+        assert_eq!(effort_index_at_position(90.0, 40.0, 0.0, 3), None);
+        assert_eq!(effort_index_at_position(f32::NAN, 40.0, 100.0, 3), None);
+    }
+
+    #[test]
+    fn effort_selection_falls_back_to_the_models_default() {
+        let levels = [
+            LanguageModelEffortLevel {
+                name: "Low".into(),
+                value: "low".into(),
+                is_default: false,
+            },
+            LanguageModelEffortLevel {
+                name: "High".into(),
+                value: "high".into(),
+                is_default: true,
+            },
+        ];
+        assert_eq!(selected_effort_index(&levels, Some("low")), Some(0));
+        assert_eq!(selected_effort_index(&levels, Some("unsupported")), Some(1));
+        assert_eq!(selected_effort_index(&levels, None), Some(1));
+        assert_eq!(selected_effort_index(&[], None), None);
+    }
+
+    #[test]
+    fn generated_code_collapses_while_streaming_and_preserves_manual_expansion() {
+        assert!(!generated_code_is_expanded(None));
+        assert!(generated_code_is_expanded(Some(true)));
+        assert!(!generated_code_is_expanded(Some(false)));
+    }
+}
 
 #[derive(Default)]
 struct ThreadFeedbackState {
@@ -587,6 +651,10 @@ pub struct ThreadView {
     pub list_state: ListState,
     pub session_capabilities: SharedSessionCapabilities,
     pub expanded_tool_call_raw_inputs: HashSet<acp::ToolCallId>,
+    generated_code_expansion: HashMap<(gpui::EntityId, usize), bool>,
+    effort_slider_bounds: Option<Bounds<Pixels>>,
+    effort_slider_dragging: bool,
+    effort_slider_focus: FocusHandle,
     collapsed_sandbox_authorization_details: HashSet<acp::ToolCallId>,
     collapsed_sandbox_network_details: HashSet<acp::ToolCallId>,
     pub subagent_scroll_handles: RefCell<HashMap<acp::SessionId, ScrollHandle>>,
@@ -786,6 +854,9 @@ impl ThreadView {
     ) -> Self {
         let session_id = thread.read(cx).session_id().clone();
         let parent_session_id = thread.read(cx).parent_session_id().cloned();
+        let agent_activity = design_surface::activity_state(cx);
+        subscriptions.push(cx.observe(&agent_activity, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.observe(&conversation, |_, _, cx| cx.notify()));
 
         let has_slash_completions = session_capabilities.read().has_slash_completions();
         let placeholder = placeholder_text(agent_display_name.as_ref(), has_slash_completions);
@@ -994,6 +1065,10 @@ impl ThreadView {
             last_token_limit_telemetry: None,
             thread_feedback: Default::default(),
             expanded_tool_call_raw_inputs: HashSet::default(),
+            generated_code_expansion: HashMap::default(),
+            effort_slider_bounds: None,
+            effort_slider_dragging: false,
+            effort_slider_focus: cx.focus_handle().tab_stop(true),
             collapsed_sandbox_authorization_details: HashSet::default(),
             collapsed_sandbox_network_details: HashSet::default(),
             subagent_scroll_handles: RefCell::new(HashMap::default()),
@@ -1250,7 +1325,9 @@ impl ThreadView {
     ) {
         match &event.view_event {
             ViewEvent::NewDiff(tool_call_id) => {
-                if AgentSettings::get_global(cx).expand_edit_card {
+                if AgentSettings::get_global(cx).expand_edit_card
+                    && self.thread.read(cx).status() != ThreadStatus::Generating
+                {
                     self.entry_view_state.update(cx, |state, _cx| {
                         state.expand_tool_call(tool_call_id.clone());
                     });
@@ -4356,6 +4433,7 @@ impl ThreadView {
                                 )
                             }),
                     )
+                    .children(self.render_thinking_control(cx))
                     .child(
                         h_flex()
                             .w_full()
@@ -4367,8 +4445,8 @@ impl ThreadView {
                                     .gap_0p5()
                                     .child(self.render_add_context_button(cx))
                                     .child(self.render_follow_toggle(cx))
-                                    .children(self.render_fast_mode_control(cx))
-                                    .children(self.render_thinking_control(cx)),
+                                    .children(self.render_agent_follow_control(cx))
+                                    .children(self.render_fast_mode_control(cx)),
                             )
                             .child(
                                 h_flex()
@@ -4421,6 +4499,190 @@ impl ThreadView {
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.toggle_queue_entry_steer(entry_id, cx);
             }))
+    }
+
+    fn render_agent_follow_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let activity_state = design_surface::activity_state(cx);
+        let activities = activity_state.read(cx).activities();
+        let roots = self.workspace.upgrade()?.read(cx).root_paths(cx);
+        let activities = activities
+            .into_iter()
+            .filter(|activity| {
+                activity.project_root.as_ref().is_none_or(|root| {
+                    roots
+                        .iter()
+                        .any(|path| std::path::Path::new(root).starts_with(path))
+                })
+            })
+            .collect::<Vec<_>>();
+        if activities.is_empty() {
+            return None;
+        }
+        let followed_agent = activity_state.read(cx).followed_agent().map(str::to_owned);
+        let label = followed_agent
+            .as_ref()
+            .and_then(|followed| {
+                activities
+                    .iter()
+                    .find(|activity| &activity.agent_id == followed)
+            })
+            .map(|activity| format!("Following {}", activity.agent_name))
+            .unwrap_or_else(|| "Follow agent".into());
+        Some(
+            PopoverMenu::new("follow-design-agent")
+                .trigger(
+                    Button::new("follow-design-agent-trigger", label)
+                        .label_size(LabelSize::Small)
+                        .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
+                )
+                .menu(move |window, cx| {
+                    let activity_state = activity_state.clone();
+                    let activities = activities.clone();
+                    let followed_agent = followed_agent.clone();
+                    Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                        menu = menu.item(
+                            ContextMenuEntry::new("Stop following")
+                                .toggleable(IconPosition::End, followed_agent.is_none())
+                                .handler({
+                                    let activity_state = activity_state.clone();
+                                    move |_, cx| {
+                                        activity_state
+                                            .update(cx, |state, cx| state.follow(None, cx))
+                                    }
+                                }),
+                        );
+                        for activity in activities {
+                            let selected = followed_agent.as_ref() == Some(&activity.agent_id);
+                            menu = menu.item(
+                                ContextMenuEntry::new(format!(
+                                    "{} · {}",
+                                    activity.agent_name, activity.action
+                                ))
+                                .toggleable(IconPosition::End, selected)
+                                .handler({
+                                    let activity_state = activity_state.clone();
+                                    let agent_id = activity.agent_id;
+                                    move |_, cx| {
+                                        activity_state.update(cx, |state, cx| {
+                                            state.follow(Some(agent_id.clone()), cx)
+                                        })
+                                    }
+                                }),
+                            );
+                        }
+                        menu
+                    }))
+                })
+                .into_any_element(),
+        )
+    }
+
+    fn render_orchestration_status(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let root_session = self.parent_session_id.as_ref().unwrap_or(&self.session_id);
+        let connection = self.as_native_connection(cx)?;
+        let lead = connection.thread(root_session, cx)?;
+        if lead.read(cx).profile().as_str() != agent_settings::builtin_profiles::ULTRA {
+            return None;
+        }
+        let conversation = self.conversation.read(cx);
+        let mut participants = conversation
+            .threads
+            .iter()
+            .filter_map(|(session, thread)| {
+                let thread = thread.read(cx);
+                let is_lead = session == root_session;
+                if !is_lead && thread.parent_session_id() != Some(root_session) {
+                    return None;
+                }
+                let status = if conversation.pending_tool_call_count_for_session(session) > 0 {
+                    "Waiting for approval"
+                } else if thread.status() == ThreadStatus::Generating {
+                    "Working"
+                } else if thread.had_error() {
+                    "Failed"
+                } else {
+                    "Ready"
+                };
+                let name = if is_lead {
+                    "Lead orchestrator".to_owned()
+                } else {
+                    thread
+                        .title()
+                        .unwrap_or_else(|| "Specialist".into())
+                        .to_string()
+                };
+                Some((session.clone(), name, status, is_lead))
+            })
+            .collect::<Vec<_>>();
+        participants.sort_by(|left, right| right.3.cmp(&left.3).then_with(|| left.1.cmp(&right.1)));
+        let specialist_count = participants
+            .iter()
+            .filter(|participant| !participant.3)
+            .count();
+        let working = participants
+            .iter()
+            .filter(|participant| !participant.3 && participant.2 == "Working")
+            .count();
+        let label = if specialist_count == 0 {
+            "Automatically coordinates complex tasks".to_owned()
+        } else {
+            format!("{working} working · {specialist_count} specialists")
+        };
+        let server_view = self.server_view.clone();
+        Some(
+            h_flex()
+                .px_2p5()
+                .py_1()
+                .gap_1p5()
+                .flex_wrap()
+                .border_t_1()
+                .border_color(cx.theme().colors().border_variant)
+                .child(
+                    Label::new("Ultra team")
+                        .size(LabelSize::Small)
+                        .color(Color::Accent),
+                )
+                .child(
+                    Label::new(label)
+                        .size(LabelSize::XSmall)
+                        .color(Color::Muted),
+                )
+                .child(
+                    PopoverMenu::new("ultra-team-members")
+                        .trigger(
+                            Button::new("ultra-team-members-trigger", "Team")
+                                .label_size(LabelSize::Small)
+                                .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
+                        )
+                        .menu(move |window, cx| {
+                            let participants = participants.clone();
+                            let server_view = server_view.clone();
+                            Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                                for (session, name, status, _) in participants {
+                                    menu = menu.item(
+                                        ContextMenuEntry::new(format!("{name} · {status}"))
+                                            .handler({
+                                                let server_view = server_view.clone();
+                                                move |window, cx| {
+                                                    server_view
+                                                        .update(cx, |view, cx| {
+                                                            view.navigate_to_thread(
+                                                                session.clone(),
+                                                                window,
+                                                                cx,
+                                                            );
+                                                        })
+                                                        .log_err();
+                                                }
+                                            }),
+                                    );
+                                }
+                                menu
+                            }))
+                        }),
+                )
+                .into_any_element(),
+        )
     }
 
     fn render_message_queue_entries(
@@ -5058,132 +5320,468 @@ impl ThreadView {
     }
 
     fn render_thinking_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let thread = self.as_native_thread(cx)?.read(cx);
+        let thread = self.as_native_thread(cx)?;
+        let thread = thread.read(cx);
         let model = thread.model()?;
-
-        let supports_thinking = model.supports_thinking();
-        if !supports_thinking {
-            return None;
-        }
-
-        // A toggle would be dishonest for models that always think: only
-        // offer the effort selector.
-        if !model.supports_disabling_thinking() {
-            let effort_levels = model.supported_effort_levels();
-            if effort_levels.is_empty() {
-                return None;
-            }
-            return Some(
-                self.render_effort_selector(
-                    effort_levels,
-                    thread.thinking_effort().cloned(),
-                    true,
-                    cx,
-                )
-                .into_any_element(),
-            );
-        }
-
-        let thinking = thread.thinking_enabled();
-
-        let (tooltip_label, icon, color) = if thinking {
-            (
-                "Disable Thinking Mode",
-                IconName::ThinkingMode,
-                Color::Muted,
-            )
+        let supported = model.supports_thinking();
+        let always_on = supported && !model.supports_disabling_thinking();
+        let thinking = always_on || thread.thinking_enabled();
+        let effort_levels = model.supported_effort_levels();
+        let selected_effort = thread.thinking_effort().cloned();
+        let disabled = self.thread.read(cx).status() != ThreadStatus::Idle;
+        let model_name = model.name().0;
+        let toggle_label = if !supported {
+            "Thinking unavailable"
+        } else if always_on {
+            "Thinking always on"
+        } else if thinking {
+            "Thinking on"
         } else {
-            (
-                "Enable Thinking Mode",
-                IconName::ThinkingModeOff,
-                Color::Custom(cx.theme().colors().icon_disabled.opacity(0.8)),
-            )
+            "Thinking off"
         };
-
-        let focus_handle = self.message_editor.focus_handle(cx);
-
-        let thinking_toggle = IconButton::new("thinking-mode", icon)
-            .icon_size(IconSize::Small)
-            .icon_color(color)
-            .tooltip(move |_, cx| {
-                Tooltip::for_action_in(tooltip_label, &ToggleThinkingMode, &focus_handle, cx)
+        let tooltip = if !supported {
+            format!(
+                "{model_name} does not expose thinking controls. Select a reasoning model to use thinking and effort."
+            )
+        } else if always_on {
+            format!("{model_name} always thinks. Adjust its effort with the slider.")
+        } else {
+            "Let the model reason before answering. Changes apply to the next message.".into()
+        };
+        let toggle = Button::new("thinking-mode", toggle_label)
+            .label_size(LabelSize::Small)
+            .start_icon(
+                Icon::new(if thinking {
+                    IconName::ThinkingMode
+                } else {
+                    IconName::ThinkingModeOff
+                })
+                .size(IconSize::Small),
+            )
+            .toggle_state(thinking)
+            .disabled(!supported || always_on || disabled)
+            .color(if thinking {
+                Color::Accent
+            } else {
+                Color::Muted
             })
-            .on_click(cx.listener(move |this, _, _window, cx| {
-                if let Some(thread) = this.as_native_thread(cx) {
-                    thread.update(cx, |thread, cx| {
-                        let enable_thinking = !thread.thinking_enabled();
-                        thread.set_thinking_enabled(enable_thinking, cx);
-
-                        let favorite_key = thread.model().map(|model| {
-                            (model.provider_id().0.to_string(), model.id().0.to_string())
-                        });
-                        let fs = thread.project().read(cx).fs().clone();
-                        update_settings_file(fs, cx, move |settings, _| {
-                            if let Some(agent) = settings.agent.as_mut() {
-                                if let Some(default_model) = agent.default_model.as_mut() {
-                                    default_model.enable_thinking = enable_thinking;
-                                }
-                                if let Some((provider_id, model_id)) = &favorite_key {
-                                    agent.update_favorite_model(
-                                        provider_id,
-                                        model_id,
-                                        |favorite| favorite.enable_thinking = enable_thinking,
-                                    );
-                                }
-                            }
-                        });
-                    });
-                }
-            }));
-
-        if model.supported_effort_levels().is_empty() {
-            return Some(thinking_toggle.into_any_element());
-        }
-
-        if !model.supported_effort_levels().is_empty() && !thinking {
-            return Some(thinking_toggle.into_any_element());
-        }
-
-        let left_btn = thinking_toggle;
-        let right_btn = self.render_effort_selector(
-            model.supported_effort_levels(),
-            thread.thinking_effort().cloned(),
-            false,
-            cx,
-        );
-
+            .tooltip(Tooltip::text(tooltip))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_native_thinking(cx)));
         Some(
-            SplitButton::new(left_btn, right_btn.into_any_element())
-                .style(SplitButtonStyle::Transparent)
+            h_flex()
+                .w_full()
+                .gap_3()
+                .px_1()
+                .py_1()
+                .child(toggle)
+                .child(if !supported || effort_levels.is_empty() {
+                    v_flex()
+                        .flex_1()
+                        .gap_0p5()
+                        .child(
+                            Label::new("Effort")
+                                .size(LabelSize::XSmall)
+                                .color(Color::Muted),
+                        )
+                        .child(
+                            Label::new(if supported {
+                                "This model chooses its own effort"
+                            } else {
+                                "Unavailable for this model"
+                            })
+                            .size(LabelSize::XSmall)
+                            .color(Color::Disabled),
+                        )
+                        .into_any_element()
+                } else {
+                    self.render_effort_slider(
+                        effort_levels,
+                        selected_effort,
+                        !thinking || disabled,
+                        cx,
+                    )
+                })
                 .into_any_element(),
         )
+    }
+
+    fn render_effort_slider(
+        &self,
+        effort_levels: Vec<LanguageModelEffortLevel>,
+        selected_effort: Option<String>,
+        disabled: bool,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let selected_index =
+            selected_effort_index(&effort_levels, selected_effort.as_deref()).unwrap_or(0);
+        let last_index = effort_levels.len().saturating_sub(1);
+        let selected_fraction = if last_index == 0 {
+            0.0
+        } else {
+            selected_index as f32 / last_index as f32
+        };
+        let accent = cx.theme().colors().text_accent;
+        let weak_self = cx.weak_entity();
+        let mut track = div()
+            .id("thinking-effort-slider")
+            .role(gpui::Role::Slider)
+            .aria_label("Reasoning effort. Use arrow keys to adjust.")
+            .aria_numeric_value(selected_index as f64)
+            .aria_min_numeric_value(0.0)
+            .aria_max_numeric_value(last_index as f64)
+            .aria_numeric_value_step(1.0)
+            .aria_orientation(gpui::Orientation::Horizontal)
+            .aria_value(
+                effort_levels
+                    .get(selected_index)
+                    .map_or_else(|| "Unavailable".into(), |level| level.name.clone()),
+            )
+            .relative()
+            .w_full()
+            .h_5()
+            .track_focus(&self.effort_slider_focus)
+            .cursor_pointer()
+            .when(disabled, |this| this.opacity(0.45))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                    if disabled {
+                        return;
+                    }
+                    this.effort_slider_focus.focus(window, cx);
+                    this.effort_slider_dragging = true;
+                    this.set_effort_from_position(event.position.x, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .on_mouse_move(
+                cx.listener(move |this, event: &gpui::MouseMoveEvent, _, cx| {
+                    if !disabled
+                        && this.effort_slider_dragging
+                        && event.pressed_button == Some(MouseButton::Left)
+                    {
+                        this.set_effort_from_position(event.position.x, cx);
+                        cx.stop_propagation();
+                    }
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.effort_slider_dragging = false),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.effort_slider_dragging = false),
+            )
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                if !disabled {
+                    this.adjust_effort_with_key(&event.keystroke.key, cx);
+                }
+            }))
+            .child(
+                canvas(
+                    move |bounds, _, cx| {
+                        weak_self
+                            .update(cx, |this, _| this.effort_slider_bounds = Some(bounds))
+                            .log_err();
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .top(px(8.0))
+                    .h(px(4.0))
+                    .rounded_full()
+                    .bg(cx.theme().colors().border_variant),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top(px(8.0))
+                    .w(relative(selected_fraction))
+                    .h(px(4.0))
+                    .rounded_full()
+                    .bg(accent),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(relative(selected_fraction))
+                    .ml(px(-5.0))
+                    .top(px(4.0))
+                    .size(px(12.0))
+                    .rounded_full()
+                    .border_2()
+                    .border_color(cx.theme().colors().editor_background)
+                    .bg(accent)
+                    .shadow_sm(),
+            );
+        for index in 0..effort_levels.len() {
+            let fraction = if last_index == 0 {
+                0.0
+            } else {
+                index as f32 / last_index as f32
+            };
+            track = track.child(
+                div()
+                    .absolute()
+                    .left(relative(fraction))
+                    .ml(px(-1.0))
+                    .top(px(8.0))
+                    .size(px(4.0))
+                    .rounded_full()
+                    .bg(if index <= selected_index {
+                        accent
+                    } else {
+                        cx.theme().colors().text_muted
+                    }),
+            );
+        }
+        let mut labels = h_flex().w_full().justify_between().gap_0p5();
+        for (index, level) in effort_levels.iter().enumerate() {
+            if index != 0 && index != last_index {
+                continue;
+            }
+            labels = labels.child(
+                Button::new(format!("effort-level-{index}"), level.name.clone())
+                    .label_size(LabelSize::XSmall)
+                    .color(if index == selected_index {
+                        Color::Accent
+                    } else {
+                        Color::Muted
+                    })
+                    .disabled(disabled)
+                    .tooltip(Tooltip::text(format!(
+                        "Set reasoning effort to {}",
+                        level.name
+                    )))
+                    .on_click(
+                        cx.listener(move |this, _, _, cx| this.set_native_effort_index(index, cx)),
+                    ),
+            );
+        }
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .gap_0p5()
+            .child(
+                h_flex()
+                    .w_full()
+                    .justify_between()
+                    .child(
+                        Label::new("Effort")
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(self.render_effort_selector(
+                        effort_levels,
+                        selected_effort,
+                        disabled,
+                        cx,
+                    )),
+            )
+            .child(track)
+            .child(labels)
+            .into_any_element()
+    }
+
+    fn toggle_native_thinking(&mut self, cx: &mut Context<Self>) {
+        if self.thread.read(cx).status() != ThreadStatus::Idle {
+            return;
+        }
+        let Some(thread) = self.as_native_thread(cx) else {
+            return;
+        };
+        thread.update(cx, |thread, cx| {
+            let Some(model) = thread.model() else {
+                return;
+            };
+            if !model.supports_thinking() || !model.supports_disabling_thinking() {
+                return;
+            }
+            let provider_id = model.provider_id().0.to_string();
+            let model_id = model.id().0.to_string();
+            let enabled = !thread.thinking_enabled();
+            thread.set_thinking_enabled(enabled, cx);
+            let default_selection =
+                AgentSettings::get_global(cx)
+                    .default_model
+                    .clone()
+                    .filter(|selection| {
+                        selection.provider.0 == provider_id && selection.model == model_id
+                    });
+            let fs = thread.project().read(cx).fs().clone();
+            update_settings_file(fs, cx, move |settings, _| {
+                let agent = settings.agent.get_or_insert_default();
+                if let Some(selection) = default_selection {
+                    agent.default_model.get_or_insert(selection);
+                }
+                if let Some(default_model) = agent.default_model.as_mut()
+                    && default_model.provider.0 == provider_id
+                    && default_model.model == model_id
+                {
+                    default_model.enable_thinking = enabled;
+                }
+                agent.update_favorite_model(&provider_id, &model_id, |favorite| {
+                    favorite.enable_thinking = enabled
+                });
+            });
+        });
+        cx.notify();
+    }
+
+    fn set_native_effort_index(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.thread.read(cx).status() != ThreadStatus::Idle {
+            return;
+        }
+        let Some(thread) = self.as_native_thread(cx) else {
+            return;
+        };
+        let effort = {
+            let thread = thread.read(cx);
+            let Some(model) = thread.model() else {
+                return;
+            };
+            if !model.supports_thinking()
+                || (!thread.thinking_enabled() && model.supports_disabling_thinking())
+            {
+                return;
+            }
+            let levels = model.supported_effort_levels();
+            let Some(level) = levels.get(index) else {
+                return;
+            };
+            if thread
+                .thinking_effort()
+                .is_some_and(|current| current == level.value.as_ref())
+            {
+                return;
+            }
+            level.value.to_string()
+        };
+        self.apply_native_effort(effort, cx);
+    }
+
+    fn apply_native_effort(&mut self, effort: String, cx: &mut Context<Self>) {
+        if self.thread.read(cx).status() != ThreadStatus::Idle {
+            return;
+        }
+        let Some(thread) = self.as_native_thread(cx) else {
+            return;
+        };
+        thread.update(cx, |thread, cx| {
+            let Some(model) = thread.model() else {
+                return;
+            };
+            if !model.supports_thinking()
+                || (!thread.thinking_enabled() && model.supports_disabling_thinking())
+                || !model
+                    .supported_effort_levels()
+                    .iter()
+                    .any(|level| level.value.as_ref() == effort)
+            {
+                return;
+            }
+            let provider_id = model.provider_id().0.to_string();
+            let model_id = model.id().0.to_string();
+            thread.set_thinking_effort(Some(effort.clone()), cx);
+            let default_selection =
+                AgentSettings::get_global(cx)
+                    .default_model
+                    .clone()
+                    .filter(|selection| {
+                        selection.provider.0 == provider_id && selection.model == model_id
+                    });
+            let fs = thread.project().read(cx).fs().clone();
+            update_settings_file(fs, cx, move |settings, _| {
+                let agent = settings.agent.get_or_insert_default();
+                if let Some(selection) = default_selection {
+                    agent.default_model.get_or_insert(selection);
+                }
+                if let Some(default_model) = agent.default_model.as_mut()
+                    && default_model.provider.0 == provider_id
+                    && default_model.model == model_id
+                {
+                    default_model.effort = Some(effort.clone());
+                }
+                agent.update_favorite_model(&provider_id, &model_id, |favorite| {
+                    favorite.effort = Some(effort)
+                });
+            });
+        });
+        cx.notify();
+    }
+
+    fn set_effort_from_position(&mut self, x: Pixels, cx: &mut Context<Self>) {
+        let Some(bounds) = self.effort_slider_bounds else {
+            return;
+        };
+        let Some(thread) = self.as_native_thread(cx) else {
+            return;
+        };
+        let count = thread
+            .read(cx)
+            .model()
+            .map_or(0, |model| model.supported_effort_levels().len());
+        if let Some(index) = effort_index_at_position(
+            f32::from(x),
+            f32::from(bounds.left()),
+            f32::from(bounds.size.width),
+            count,
+        ) {
+            self.set_native_effort_index(index, cx);
+        }
+    }
+
+    fn adjust_effort_with_key(&mut self, key: &str, cx: &mut Context<Self>) {
+        let Some(thread) = self.as_native_thread(cx) else {
+            return;
+        };
+        let index = {
+            let thread = thread.read(cx);
+            let Some(model) = thread.model() else {
+                return;
+            };
+            let levels = model.supported_effort_levels();
+            let Some(current) =
+                selected_effort_index(&levels, thread.thinking_effort().map(String::as_str))
+            else {
+                return;
+            };
+            match key {
+                "left" | "down" => current.saturating_sub(1),
+                "right" | "up" => (current + 1).min(levels.len().saturating_sub(1)),
+                "home" => 0,
+                "end" => levels.len().saturating_sub(1),
+                _ => return,
+            }
+        };
+        self.set_native_effort_index(index, cx);
+        cx.stop_propagation();
     }
 
     fn render_effort_selector(
         &self,
         supported_effort_levels: Vec<LanguageModelEffortLevel>,
         selected_effort: Option<String>,
-        standalone: bool,
+        disabled: bool,
         cx: &Context<Self>,
     ) -> impl IntoElement {
         let weak_self = cx.weak_entity();
 
-        let default_effort_level = supported_effort_levels
-            .iter()
-            .find(|effort_level| effort_level.is_default)
+        let selected = selected_effort_index(&supported_effort_levels, selected_effort.as_deref())
+            .and_then(|index| supported_effort_levels.get(index))
             .cloned();
-
-        let selected = selected_effort.and_then(|effort| {
-            supported_effort_levels
-                .iter()
-                .find(|level| level.value == effort)
-                .cloned()
-        });
-
         let label = selected
-            .clone()
-            .or(default_effort_level)
-            .map_or("Select Effort".into(), |effort| effort.name);
+            .as_ref()
+            .map_or("Select Effort".into(), |effort| effort.name.clone());
 
         let (label_color, icon) = if self.thinking_effort_menu_handle.is_deployed() {
             (Color::Accent, IconName::ChevronUp)
@@ -5229,23 +5827,10 @@ impl ThreadView {
             }
         });
 
-        let trigger = if standalone {
-            ButtonLike::new("effort-selector-trigger").child(
-                h_flex()
-                    .gap_1()
-                    .child(
-                        Icon::new(IconName::ThinkingMode)
-                            .size(IconSize::Small)
-                            .color(label_color),
-                    )
-                    .child(Label::new(label).size(LabelSize::Small).color(label_color))
-                    .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted)),
-            )
-        } else {
-            ButtonLike::new_rounded_right("effort-selector-trigger")
-                .child(Label::new(label).size(LabelSize::Small).color(label_color))
-                .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted))
-        };
+        let trigger = ButtonLike::new("effort-selector-trigger")
+            .disabled(disabled)
+            .child(Label::new(label).size(LabelSize::Small).color(label_color))
+            .child(Icon::new(icon).size(IconSize::XSmall).color(Color::Muted));
 
         PopoverMenu::new("effort-selector")
             .trigger_with_tooltip(
@@ -5267,49 +5852,11 @@ impl ThreadView {
                             let effort = effort_level.value.clone();
                             let weak_self = weak_self.clone();
                             move |_window, cx| {
-                                let effort = effort.clone();
                                 weak_self
                                     .update(cx, |this, cx| {
-                                        if let Some(thread) = this.as_native_thread(cx) {
-                                            thread.update(cx, |thread, cx| {
-                                                thread.set_thinking_effort(
-                                                    Some(effort.to_string()),
-                                                    cx,
-                                                );
-
-                                                let favorite_key = thread.model().map(|model| {
-                                                    (
-                                                        model.provider_id().0.to_string(),
-                                                        model.id().0.to_string(),
-                                                    )
-                                                });
-                                                let fs = thread.project().read(cx).fs().clone();
-                                                update_settings_file(fs, cx, move |settings, _| {
-                                                    if let Some(agent) = settings.agent.as_mut() {
-                                                        if let Some(default_model) =
-                                                            agent.default_model.as_mut()
-                                                        {
-                                                            default_model.effort =
-                                                                Some(effort.to_string());
-                                                        }
-                                                        if let Some((provider_id, model_id)) =
-                                                            &favorite_key
-                                                        {
-                                                            agent.update_favorite_model(
-                                                                provider_id,
-                                                                model_id,
-                                                                |favorite| {
-                                                                    favorite.effort =
-                                                                        Some(effort.to_string())
-                                                                },
-                                                            );
-                                                        }
-                                                    }
-                                                });
-                                            });
-                                        }
+                                        this.apply_native_effort(effort.to_string(), cx);
                                     })
-                                    .ok();
+                                    .log_err();
                             }
                         }));
                     }
@@ -6267,8 +6814,12 @@ impl ThreadView {
                                     }
 
                                     Some(
-                                        self.render_markdown(md.clone(), style.clone(), cx)
-                                            .into_any_element(),
+                                        self.render_generated_markdown(
+                                            md.clone(),
+                                            style.clone(),
+                                            cx,
+                                        )
+                                        .into_any_element(),
                                     )
                                 })
                             }
@@ -9976,7 +10527,7 @@ impl ThreadView {
                 cx,
             )
             .unwrap_or_else(|| {
-                self.render_markdown(markdown, markdown_style, cx)
+                self.render_generated_markdown(markdown, markdown_style, cx)
                     .into_any()
             });
 
@@ -11029,6 +11580,95 @@ impl ThreadView {
         )
     }
 
+    fn render_generated_markdown(
+        &self,
+        markdown: Entity<Markdown>,
+        style: MarkdownStyle,
+        cx: &Context<Self>,
+    ) -> MarkdownElement {
+        let markdown_id = markdown.entity_id();
+        let source = markdown.read(cx).source().clone();
+        let expansion = self.generated_code_expansion.clone();
+        let weak_self = cx.weak_entity();
+        let generating = self.thread.read(cx).status() == ThreadStatus::Generating;
+        self.render_markdown(markdown, style, cx)
+            .code_block_transform(Arc::new(move |element, range, metadata, _, cx| {
+                let key = (markdown_id, range.start);
+                let expanded = generated_code_is_expanded(expansion.get(&key).copied());
+                let label = if generating && !metadata.is_fenced_closed {
+                    format!("Generating code · {} lines", metadata.line_count)
+                } else {
+                    format!("Code · {} lines", metadata.line_count)
+                };
+                let code = source
+                    .get(metadata.content_range)
+                    .unwrap_or_default()
+                    .to_owned();
+                let weak_self = weak_self.clone();
+                let wrapper = v_flex()
+                    .w_full()
+                    .min_w_0()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .bg(cx.theme().colors().editor_background)
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .px_1()
+                            .py_0p5()
+                            .child(
+                                Button::new(
+                                    format!(
+                                        "generated-code-{}-{}",
+                                        markdown_id.as_u64(),
+                                        range.start
+                                    ),
+                                    label,
+                                )
+                                .full_width()
+                                .label_size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .start_icon(
+                                    Icon::new(if expanded {
+                                        IconName::ChevronDown
+                                    } else {
+                                        IconName::ChevronRight
+                                    })
+                                    .size(IconSize::Small),
+                                )
+                                .tooltip(Tooltip::text(if expanded {
+                                    "Collapse generated code"
+                                } else {
+                                    "Expand generated code"
+                                }))
+                                .on_click(move |_, _, cx| {
+                                    weak_self
+                                        .update(cx, |this, cx| {
+                                            this.generated_code_expansion.insert(key, !expanded);
+                                            cx.notify();
+                                        })
+                                        .log_err();
+                                }),
+                            )
+                            .child(
+                                CopyButton::new(
+                                    format!(
+                                        "copy-generated-code-{}-{}",
+                                        markdown_id.as_u64(),
+                                        range.start
+                                    ),
+                                    code,
+                                )
+                                .tooltip_label("Copy Code"),
+                            ),
+                    )
+                    .when(expanded, |this| this.child(element.into_any_element()))
+                    .into();
+                (wrapper, expanded)
+            }))
+    }
+
     fn create_copy_button(&self, message: impl Into<String>) -> impl IntoElement {
         let message = message.into();
 
@@ -11642,7 +12282,9 @@ impl ThreadView {
             let Some(model) = thread_ref.model() else {
                 return;
             };
-            if !model.supports_thinking() || !thread_ref.thinking_enabled() {
+            if !model.supports_thinking()
+                || (!thread_ref.thinking_enabled() && model.supports_disabling_thinking())
+            {
                 return;
             }
             let effort_levels = model.supported_effort_levels();
@@ -11653,37 +12295,12 @@ impl ThreadView {
             (effort_levels, current_effort)
         };
 
-        let current_index = current_effort.and_then(|current| {
-            effort_levels
-                .iter()
-                .position(|level| level.value == current)
-        });
-        let next_index = match current_index {
-            Some(index) => (index + 1) % effort_levels.len(),
-            None => 0,
-        };
-        let next_effort = effort_levels[next_index].value.to_string();
-
-        thread.update(cx, |thread, cx| {
-            thread.set_thinking_effort(Some(next_effort.clone()), cx);
-
-            let favorite_key = thread
-                .model()
-                .map(|model| (model.provider_id().0.to_string(), model.id().0.to_string()));
-            let fs = thread.project().read(cx).fs().clone();
-            update_settings_file(fs, cx, move |settings, _| {
-                if let Some(agent) = settings.agent.as_mut() {
-                    if let Some(default_model) = agent.default_model.as_mut() {
-                        default_model.effort = Some(next_effort.clone());
-                    }
-                    if let Some((provider_id, model_id)) = &favorite_key {
-                        agent.update_favorite_model(provider_id, model_id, |favorite| {
-                            favorite.effort = Some(next_effort)
-                        });
-                    }
-                }
-            });
-        });
+        let current_index =
+            selected_effort_index(&effort_levels, current_effort.as_deref()).unwrap_or(0);
+        let next_index = (current_index + 1) % effort_levels.len();
+        if let Some(next_effort) = effort_levels.get(next_index) {
+            self.apply_native_effort(next_effort.value.to_string(), cx);
+        }
     }
 }
 
@@ -11840,16 +12457,7 @@ impl Render for ThreadView {
                 if this.thread.read(cx).status() != ThreadStatus::Idle {
                     return;
                 }
-                if let Some(thread) = this.as_native_thread(cx) {
-                    thread.update(cx, |thread, cx| {
-                        let model_allows_disabling = thread
-                            .model()
-                            .is_none_or(|model| model.supports_disabling_thinking());
-                        if model_allows_disabling {
-                            thread.set_thinking_enabled(!thread.thinking_enabled(), cx);
-                        }
-                    });
-                }
+                this.toggle_native_thinking(cx);
             }))
             .on_action(cx.listener(|this, _: &CycleThinkingEffort, _window, cx| {
                 if this.thread.read(cx).status() != ThreadStatus::Idle {
@@ -12042,6 +12650,7 @@ impl Render for ThreadView {
             )
             .children(self.render_token_limit_callout(cx))
             .children(self.render_request_elicitations(cx))
+            .children(self.render_orchestration_status(cx))
             .child(self.render_message_editor(window, cx))
     }
 }

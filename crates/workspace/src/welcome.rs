@@ -64,16 +64,6 @@ pub const HERO_SUBTITLE: &str = "A Fanta project is a git-tracked folder of .fnx
 #[cfg(feature = "mac_app_store")]
 pub const HERO_SUBTITLE: &str = "Create and edit designs in a folder you choose. Open .fig files or Fanta projects, refine the canvas, and save your work locally.";
 
-/// The command that registers this app as an MCP server for Claude Code, shown
-/// on the welcome page and copied by its "Copy command" button.
-#[cfg(not(feature = "mac_app_store"))]
-pub const CONNECT_CLAUDE_CODE_COMMAND: &str =
-    "claude mcp add -s user fanta -- /Applications/Fanta.app/Contents/MacOS/fanta --mcp-stdio";
-
-/// The equivalent entry for `~/.codex/config.toml`.
-#[cfg(not(feature = "mac_app_store"))]
-pub const CONNECT_CODEX_CONFIG: &str = "[mcp_servers.fanta]\ncommand = \"/Applications/Fanta.app/Contents/MacOS/fanta\"\nargs = [\"--mcp-stdio\"]\n";
-
 #[derive(IntoElement)]
 struct SectionHeader {
     title: SharedString,
@@ -326,6 +316,8 @@ pub struct WelcomePage {
     focus_handle: FocusHandle,
     fallback_to_recent_projects: bool,
     recent_workspaces: Option<Vec<RecentWorkspace>>,
+    #[cfg(not(feature = "mac_app_store"))]
+    _live_mcp_subscription: gpui::Subscription,
 }
 
 impl WelcomePage {
@@ -366,6 +358,8 @@ impl WelcomePage {
             focus_handle,
             fallback_to_recent_projects,
             recent_workspaces: None,
+            #[cfg(not(feature = "mac_app_store"))]
+            _live_mcp_subscription: design_surface::observe_live_mcp_command(cx),
         }
     }
 
@@ -560,7 +554,12 @@ impl WelcomePage {
     ) -> impl IntoElement {
         let color = cx.theme().colors();
 
-        let description = "Run this once and Claude Code can drive the open canvas over MCP. It registers Fanta user-wide, so every Claude Code session sees it.";
+        let command = design_surface::live_mcp_command(cx);
+        let claude_command = command
+            .as_ref()
+            .map(|command| command.claude_code_command());
+        let codex_config = command.as_ref().map(|command| command.codex_config());
+        let description = "Open a project in Fanta, then connect Codex or Claude Code from that project's directory. Keep Fanta running while the agent uses the canvas.";
 
         v_flex()
             .w_full()
@@ -597,7 +596,9 @@ impl WelcomePage {
                     .border_1()
                     .border_color(color.border_variant)
                     .child(
-                        Label::new(CONNECT_CLAUDE_CODE_COMMAND)
+                        Label::new(claude_command.clone().unwrap_or_else(|| {
+                            "Enable fanta_live_mcp.enabled to connect an external agent.".into()
+                        }))
                             .buffer_font(cx)
                             .size(LabelSize::XSmall)
                             .color(Color::Default)
@@ -613,10 +614,11 @@ impl WelcomePage {
                             .full_width()
                             .tab_index(tab_index as isize)
                             .style(ButtonStyle::Outlined)
-                            .on_click(|_, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                    CONNECT_CLAUDE_CODE_COMMAND.to_string(),
-                                ));
+                            .disabled(claude_command.is_none())
+                            .on_click(move |_, _, cx| {
+                                if let Some(command) = &claude_command {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(command.clone()));
+                                }
                             }),
                     )
                     .child(
@@ -624,15 +626,16 @@ impl WelcomePage {
                             .full_width()
                             .tab_index(tab_index as isize + 1)
                             .style(ButtonStyle::Outlined)
-                            .on_click(|_, _, cx| {
-                                cx.write_to_clipboard(ClipboardItem::new_string(
-                                    CONNECT_CODEX_CONFIG.to_string(),
-                                ));
+                            .disabled(codex_config.is_none())
+                            .on_click(move |_, _, cx| {
+                                if let Some(config) = &codex_config {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(config.clone()));
+                                }
                             }),
                     ),
             )
             .child(
-                Label::new("Codex has no per-project MCP file: paste that block into ~/.codex/config.toml.")
+                Label::new("Codex: paste the block into this project's .codex/config.toml and trust the project. Claude Code: run the command from this project's directory. Restart the agent and check /mcp.")
                     .size(LabelSize::XSmall)
                     .color(Color::Muted),
             )

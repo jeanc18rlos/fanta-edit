@@ -18,10 +18,22 @@ pub mod builtin_profiles {
 
     pub const WRITE: &str = "write";
     pub const ASK: &str = "ask";
+    pub const FULL_ACCESS: &str = "full_access";
+    pub const ULTRA: &str = "ultra";
+    pub const EDIT_VISUAL: &str = "edit_visual";
+    pub const PLAN: &str = "plan";
+    pub const REVIEW: &str = "review";
     pub const MINIMAL: &str = "minimal";
 
     pub fn is_builtin(profile_id: &AgentProfileId) -> bool {
-        profile_id.as_str() == WRITE || profile_id.as_str() == ASK || profile_id.as_str() == MINIMAL
+        matches!(
+            profile_id.as_str(),
+            WRITE | ASK | FULL_ACCESS | ULTRA | EDIT_VISUAL | PLAN | REVIEW | MINIMAL
+        )
+    }
+
+    pub fn is_full_access(profile_id: &AgentProfileId) -> bool {
+        matches!(profile_id.as_str(), FULL_ACCESS | ULTRA | EDIT_VISUAL)
     }
 }
 
@@ -99,7 +111,7 @@ impl AgentProfile {
     }
 }
 
-/// A profile for the Zed Agent that controls its behavior.
+/// A profile for the Fanta Agent that controls its behavior.
 #[derive(Debug, Clone)]
 pub struct AgentProfileSettings {
     /// The name of the profile.
@@ -272,6 +284,75 @@ mod tests {
         assert!(profile.is_context_server_tool_enabled("server", "enabled_tool"));
         assert!(!profile.is_context_server_tool_enabled("server", "other_tool"));
         assert!(!profile.is_context_server_tool_enabled("other_server", "any_tool"));
+    }
+
+    #[gpui::test]
+    fn edit_visual_ships_a_canvas_toolkit_with_full_access(cx: &mut gpui::App) {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+        let id = AgentProfileId(builtin_profiles::EDIT_VISUAL.into());
+        let settings = AgentSettings::get_global(cx);
+        let profile = settings.profiles.get(&id).expect("Edit Visual profile");
+        assert_eq!(profile.name.as_ref(), "Edit Visual");
+        for tool in [
+            "design_edit",
+            "design_state",
+            "design_system",
+            "design_screenshot",
+            "prepare_design_asset",
+            "read_file",
+        ] {
+            assert!(profile.is_tool_enabled(tool), "{tool}");
+        }
+        for tool in [
+            "terminal",
+            "write_file",
+            "edit_file",
+            "spawn_agent",
+            "create_thread",
+        ] {
+            assert!(!profile.is_tool_enabled(tool), "{tool}");
+        }
+        assert!(!profile.enable_all_context_servers);
+        assert!(builtin_profiles::is_builtin(&id));
+        assert!(builtin_profiles::is_full_access(&id));
+    }
+
+    #[gpui::test]
+    fn ultra_is_available_with_delegation_and_full_access(cx: &mut gpui::App) {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        project::DisableAiSettings::register(cx);
+        AgentSettings::register(cx);
+
+        let id = AgentProfileId(builtin_profiles::ULTRA.into());
+        let settings = AgentSettings::get_global(cx);
+        let ultra = settings.profiles.get(&id).expect("shipped Ultra profile");
+        assert_eq!(ultra.name.as_ref(), "Ultra");
+        for tool in [
+            "spawn_agent",
+            "edit_file",
+            "design_state",
+            "design_screenshot",
+            "terminal",
+        ] {
+            assert!(ultra.is_tool_enabled(tool), "Ultra must enable {tool}");
+        }
+        assert!(builtin_profiles::is_builtin(&id));
+        assert!(builtin_profiles::is_full_access(&id));
+        for profile in [
+            builtin_profiles::FULL_ACCESS,
+            builtin_profiles::PLAN,
+            builtin_profiles::REVIEW,
+        ] {
+            assert!(
+                settings
+                    .profiles
+                    .contains_key(&AgentProfileId(profile.into()))
+            );
+        }
     }
 
     #[gpui::test]

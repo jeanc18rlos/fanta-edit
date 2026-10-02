@@ -73,6 +73,8 @@ pub fn bundled_support_directory(binary: &Path) -> Option<PathBuf> {
     None
 }
 
+// Repository commands call this to construct the GitBinary command itself.
+#[allow(clippy::disallowed_methods)]
 pub fn command(binary: &Path) -> Command {
     let mut command = new_command(binary);
     if let Some(support) = bundled_support_directory(binary) {

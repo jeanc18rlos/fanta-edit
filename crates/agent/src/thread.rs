@@ -1,12 +1,13 @@
 use crate::{
     ApplyCodeActionTool, CodeActionStore, ContextServerRegistry, CopyPathTool, CreateDirectoryTool,
-    CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool, DesignEditTool,
-    DesignScreenshotTool, DesignStateTool, DiagnosticsTool, EditFileTool, FetchTool, FindPathTool,
-    FindReferencesTool, GetCodeActionsTool, GoToDefinitionTool, GrepTool, JevEvaluateTool,
-    ListAgentsAndModelsTool, ListDirectoryTool, MovePathTool, PlaceGenerationTool, ProjectSnapshot,
-    ReadFileTool, RenameTool, SandboxedTerminalTool, SpawnAgentTool, SystemPromptTemplate,
-    Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool, WriteFileTool,
-    decide_permission_from_settings,
+    CreateThreadTool, DbLanguageModel, DbThread, DeletePathTool, DesignCommentsTool,
+    DesignEditTool, DesignScreenshotTool, DesignStateTool, DesignSystemTool, DiagnosticsTool,
+    EditFileTool, FetchTool, FindPathTool, FindReferencesTool, GetCodeActionsTool,
+    GoToDefinitionTool, GrepTool, ImportProjectImageTool, JevEvaluateTool, ListAgentsAndModelsTool,
+    ListDirectoryTool, MovePathTool, PlaceGenerationTool, PrepareDesignAssetTool, ProjectSnapshot,
+    ReadFileTool, RenameTool, ReportAgentActivityTool, SandboxedTerminalTool, SpawnAgentTool,
+    SystemPromptTemplate, Template, Templates, TerminalTool, ToolPermissionDecision, WebSearchTool,
+    WriteFileTool, decide_permission_from_settings,
 };
 use acp_thread::{ClientUserMessageId, MentionUri};
 use action_log::ActionLog;
@@ -67,10 +68,66 @@ use std::{
     sync::Arc,
     time::{Duration, Instant},
 };
+use util::rel_path::RelPath;
 use util::{ResultExt, debug_panic, markdown::MarkdownCodeBlock, paths::PathStyle};
 use uuid::Uuid;
 
 const TOOL_CANCELED_MESSAGE: &str = "Tool canceled by user";
+const MAX_OUTPUT_LIMIT_CONTINUATIONS: usize = 3;
+const OUTPUT_LIMIT_CONTINUATION_PROMPT: &str = "The previous response reached its output limit. Continue the authorized task. Interrupted tool edits have been rolled back; read the affected file before retrying. Use smaller complete write_file calls, or a complete minimal file followed by targeted edit_file calls, so every tool input is valid JSON and every saved FNX file is complete and valid. Preserve user drafts and finish the remaining work with canvas verification.";
+
+const MAX_FANTA_SPEC_BYTES: usize = 64 * 1024;
+
+async fn read_fanta_specs(filesystem: &dyn Fs, roots: &[PathBuf]) -> Result<String> {
+    let mut specifications = String::new();
+    let mut remaining_bytes = MAX_FANTA_SPEC_BYTES;
+    let mut loaded_paths = HashSet::default();
+    for root in roots {
+        let path = root.join("fanta.md");
+        let Some(metadata) = filesystem
+            .metadata(&path)
+            .await
+            .with_context(|| format!("failed to inspect {}", path.display()))?
+        else {
+            continue;
+        };
+        anyhow::ensure!(
+            !metadata.is_dir && !metadata.is_fifo,
+            "{} must be a regular project specification file",
+            path.display()
+        );
+        anyhow::ensure!(
+            metadata.len <= remaining_bytes as u64,
+            "project fanta.md specifications exceed the {}-byte context limit; shorten {} or move reference material to other files",
+            MAX_FANTA_SPEC_BYTES,
+            path.display()
+        );
+        let canonical_root = filesystem.canonicalize(root).await?;
+        let canonical_path = filesystem.canonicalize(&path).await?;
+        anyhow::ensure!(
+            canonical_path.starts_with(&canonical_root),
+            "{} resolves outside its project root",
+            path.display()
+        );
+        if !loaded_paths.insert(canonical_path.clone()) {
+            continue;
+        }
+        let content = filesystem
+            .load(&canonical_path)
+            .await
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        anyhow::ensure!(
+            content.len() <= remaining_bytes,
+            "{} changed while reading and exceeds the project specification context limit",
+            path.display()
+        );
+        remaining_bytes -= content.len();
+        if !content.trim().is_empty() {
+            writeln!(specifications, "\n### {}\n\n{}", path.display(), content)?;
+        }
+    }
+    Ok(specifications)
+}
 pub const MAX_TOOL_NAME_LENGTH: usize = 64;
 pub const MAX_SUBAGENT_DEPTH: u8 = 1;
 
@@ -127,6 +184,12 @@ const COMPACTION_RETAINED_USER_MESSAGES_BYTE_BUDGET: usize = 80_000;
 /// Returned when a turn is attempted but no language model has been selected.
 #[derive(Debug)]
 pub struct NoModelConfiguredError;
+
+struct DesignProgress {
+    repository: Entity<project::git_store::Repository>,
+    scope: git::repository::RepoPath,
+    checkpoint_ref: String,
+}
 
 impl std::fmt::Display for NoModelConfiguredError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -677,9 +740,17 @@ impl AgentMessage {
                 }
                 AgentMessageContent::ToolUse(tool_use) => {
                     if self.tool_results.contains_key(&tool_use.id) {
+                        let mut tool_use = tool_use.clone();
+                        if !tool_use.is_input_complete
+                            || serde_json::from_str::<serde_json::Value>(&tool_use.raw_input)
+                                .is_err()
+                        {
+                            tool_use.raw_input = tool_use.input.to_string();
+                            tool_use.is_input_complete = true;
+                        }
                         assistant_message
                             .content
-                            .push(language_model::MessageContent::ToolUse(tool_use.clone()));
+                            .push(language_model::MessageContent::ToolUse(tool_use));
                     }
                 }
             };
@@ -1250,6 +1321,7 @@ pub struct Thread {
     /// the workspace is restricted. Used purely to surface a warning in the UI.
     profile_downgraded_for_restricted_workspace: bool,
     project_context: Entity<ProjectContext>,
+    fanta_specs: String,
     pub(crate) templates: Arc<Templates>,
     model: ThreadModel,
     summarization_model: Option<Arc<dyn LanguageModel>>,
@@ -1393,6 +1465,7 @@ impl Thread {
             profile_id,
             profile_downgraded_for_restricted_workspace,
             project_context,
+            fanta_specs: String::new(),
             templates,
             model,
             summarization_model: None,
@@ -1423,7 +1496,11 @@ impl Thread {
         self.thinking_enabled = parent.thinking_enabled;
         self.thinking_effort = parent.thinking_effort.clone();
         self.summarization_model = parent.summarization_model.clone();
-        self.profile_id = parent.profile_id.clone();
+        self.profile_id = if parent.profile_id.as_str() == builtin_profiles::ULTRA {
+            AgentProfileId(builtin_profiles::FULL_ACCESS.into())
+        } else {
+            parent.profile_id.clone()
+        };
         self.profile_downgraded_for_restricted_workspace =
             parent.profile_downgraded_for_restricted_workspace;
     }
@@ -1771,6 +1848,7 @@ impl Thread {
             profile_id,
             profile_downgraded_for_restricted_workspace: false,
             project_context,
+            fanta_specs: String::new(),
             templates,
             model,
             summarization_model: None,
@@ -1848,7 +1926,8 @@ impl Thread {
     /// Whether agent terminal commands are sandboxed for this thread's project,
     /// so the UI can decide whether to surface the sandbox status at all.
     pub fn sandboxing_enabled(&self, cx: &App) -> bool {
-        sandboxing_enabled_for_project(self.project.read(cx), cx)
+        !builtin_profiles::is_full_access(&self.profile_id)
+            && sandboxing_enabled_for_project(self.project.read(cx), cx)
     }
 
     /// Whether sandboxing is *applicable* for this thread's project (feature on,
@@ -2145,12 +2224,19 @@ impl Thread {
         // Design-canvas tools; they resolve the active surface from the
         // design_surface registry per call, so they carry no state.
         self.add_tool(DesignStateTool);
+        self.add_tool(DesignSystemTool);
+        self.add_tool(PrepareDesignAssetTool);
+        self.add_tool(ReportAgentActivityTool);
+        self.add_tool(DesignCommentsTool);
         self.add_tool(DesignEditTool);
         self.add_tool(DesignScreenshotTool);
         self.add_tool(PlaceGenerationTool::new(
             self.project.read(cx).client().http_client(),
         ));
-        self.add_tool(JevEvaluateTool::new(self.project.read(cx).client().clone()));
+        self.add_tool(ImportProjectImageTool::new(
+            self.project.read(cx).client().http_client(),
+        ));
+        self.add_tool(JevEvaluateTool::new(self.project.read(cx).client()));
 
         self.add_tool(DiagnosticsTool::new(self.project.clone()));
 
@@ -2220,7 +2306,10 @@ impl Thread {
         let is_write_or_ask = profile_id.as_str() == builtin_profiles::WRITE
             || profile_id.as_str() == builtin_profiles::ASK;
         let minimal = AgentProfileId(builtin_profiles::MINIMAL.into());
+        // Minimal removes every tool, including the restricted-safe canvas
+        // tools needed to edit an open Fanta design.
         if is_write_or_ask
+            && design_surface::active(cx).is_none()
             && TrustedWorktrees::has_restricted_worktrees(&project.read(cx).worktree_store(), cx)
             && AgentProfileSettings::is_unmodified_default(&profile_id, cx)
             && AgentProfileSettings::is_unmodified_default(&minimal, cx)
@@ -2247,14 +2336,29 @@ impl Thread {
             self.set_model(model, cx);
         }
 
+        let subagent_profile = if profile_id.as_str() == builtin_profiles::ULTRA {
+            AgentProfileId(builtin_profiles::FULL_ACCESS.into())
+        } else {
+            profile_id
+        };
         for subagent in &self.running_subagents {
             subagent
-                .update(cx, |thread, cx| thread.set_profile(profile_id.clone(), cx))
+                .update(cx, |thread, cx| {
+                    thread.set_profile(subagent_profile.clone(), cx)
+                })
                 .ok();
         }
     }
 
+    pub(crate) fn running_subagent_count(&self) -> usize {
+        self.running_subagents
+            .iter()
+            .filter(|subagent| subagent.upgrade().is_some())
+            .count()
+    }
+
     pub fn cancel(&mut self, cx: &mut Context<Self>) -> Task<()> {
+        self.report_activity("Stopped", false, cx);
         for subagent in self.running_subagents.drain(..) {
             if let Some(subagent) = subagent.upgrade() {
                 subagent.update(cx, |thread, cx| thread.cancel(cx)).detach();
@@ -2640,18 +2744,63 @@ impl Thread {
 
         let (events_tx, events_rx) = mpsc::unbounded::<Result<ThreadEvent>>();
         let event_stream = ThreadEventStream(events_tx);
+        self.report_activity("Working on your design", true, cx);
         let message_ix = self.messages.len().saturating_sub(1);
         self.clear_summary();
         let tools = self.enabled_tools(cx);
         let (cancellation_tx, mut cancellation_rx) = watch::channel(false);
+        let activity_heartbeat = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(10))
+                    .await;
+                let Ok(running) = this.update(cx, |thread, cx| {
+                    if thread.running_turn.is_none() {
+                        return false;
+                    }
+                    design_surface::activity_state(cx).update(cx, |state, cx| {
+                        state.refresh(&thread.id.to_string(), cx);
+                    });
+                    true
+                }) else {
+                    break;
+                };
+                if !running {
+                    break;
+                }
+            }
+        });
         let task = cx.spawn({
             let event_stream = event_stream.clone();
             async move |this, cx| {
+                let _activity_heartbeat = activity_heartbeat;
                 log::debug!("Starting agent turn execution");
 
-                let turn_result =
-                    Self::run_turn_internal(&this, &event_stream, cancellation_rx.clone(), cx)
-                        .await;
+                let progress_repository = Self::prepare_design_progress(&this, cx).await;
+                let mut turn_result = match &progress_repository {
+                    Ok(_) if !*cancellation_rx.borrow() => {
+                        Self::run_turn_internal(&this, &event_stream, cancellation_rx.clone(), cx)
+                            .await
+                    }
+                    Ok(_) => Ok(()),
+                    Err(error) => Err(anyhow!("Failed to prepare the design task branch: {error}")),
+                };
+                if let Ok(Some(progress)) = progress_repository
+                    && let Err(error) = Self::save_design_checkpoint(
+                        &progress.repository,
+                        &progress.scope,
+                        format!("{}/after", progress.checkpoint_ref),
+                        cx,
+                    )
+                    .await
+                {
+                    turn_result = Err(match turn_result {
+                        Ok(()) => anyhow!("Failed to save the design progress checkpoint: {error}"),
+                        Err(turn_error) => turn_error.context(format!(
+                            "Failed to save the design progress checkpoint: {error}"
+                        )),
+                    });
+                }
 
                 // Check if we were cancelled - if so, cancel() already took running_turn
                 // and we shouldn't touch it (it might be a NEW turn now)
@@ -2673,7 +2822,14 @@ impl Thread {
                         match error.downcast::<CompletionError>() {
                             Ok(CompletionError::Refusal) => {
                                 event_stream.send_stop(acp::StopReason::Refusal);
-                                _ = this.update(cx, |this, _| this.messages.truncate(message_ix));
+                                _ = this.update(cx, |this, _| {
+                                    let has_tool_results = this.messages.iter().skip(message_ix).any(|message| {
+                                        matches!(message.as_ref(), Message::Agent(message) if !message.tool_results.is_empty())
+                                    });
+                                    if !has_tool_results {
+                                        this.messages.truncate(message_ix);
+                                    }
+                                });
                             }
                             Ok(CompletionError::MaxTokens) => {
                                 event_stream.send_stop(acp::StopReason::MaxTokens);
@@ -2685,7 +2841,10 @@ impl Thread {
                     }
                 }
 
-                _ = this.update(cx, |this, _| this.running_turn.take());
+                _ = this.update(cx, |this, cx| {
+                    this.report_activity("Finished", false, cx);
+                    this.running_turn.take()
+                });
             }
         });
         self.running_turn = Some(RunningTurn::new(event_stream, tools, cancellation_tx, task));
@@ -2700,6 +2859,8 @@ impl Thread {
     ) -> Result<()> {
         let mut attempt = 0;
         let mut intent = CompletionIntent::UserPrompt;
+        let mut output_limit_continuations = 0;
+        let mut continuing_after_output_limit = false;
         // Set when a refusal fallback occurs so subsequent iterations use the fallback model.
         let mut refusal_fallback_model: Option<Arc<dyn LanguageModel>> = None;
         loop {
@@ -2782,7 +2943,9 @@ impl Thread {
             // mid-turn changes (e.g. the user switches model, toggles tools,
             // or changes profile) take effect between tool-call rounds.
             // If a refusal fallback is active, use that model instead.
-            let (model, request) = this.update(cx, |this, cx| {
+            Self::refresh_fanta_specs(this, cx).await?;
+            let (model, mut request) = this.update(cx, |this, cx| {
+                this.report_activity("Thinking", true, cx);
                 let model = refusal_fallback_model
                     .clone()
                     .or_else(|| this.model().cloned())
@@ -2792,7 +2955,9 @@ impl Thread {
                 this.current_request_token_usage = TokenUsage::default();
                 anyhow::Ok((model, request))
             })??;
-
+            if continuing_after_output_limit && let Some(message) = request.messages.last_mut() {
+                message.content = vec![OUTPUT_LIMIT_CONTINUATION_PROMPT.into()];
+            }
             telemetry::event!(
                 "Agent Thread Completion",
                 thread_id = this.read_with(cx, |this, _| this.id.to_string())?,
@@ -2809,13 +2974,14 @@ impl Thread {
 
             let (mut events, mut error) = match model.stream_completion(request, cx).await {
                 Ok(events) => (events.fuse(), None),
-                Err(err) => (stream::empty().boxed().fuse(), Some(err)),
+                Err(err) => (stream::empty().boxed().fuse(), Some(err.into())),
             };
             let mut tool_results: FuturesUnordered<Task<LanguageModelToolResult>> =
                 FuturesUnordered::new();
             let mut early_tool_results: Vec<LanguageModelToolResult> = Vec::new();
             let mut cancelled = false;
             let mut had_refusal = false;
+            let mut reached_output_limit = false;
             loop {
                 // Race between getting the first event, tool completion, and cancellation.
                 let first_event = futures::select! {
@@ -2897,6 +3063,13 @@ impl Thread {
 
                 tool_results.extend(batch_result.0);
                 if let Some(err) = batch_result.1 {
+                    if err
+                        .downcast_ref::<CompletionError>()
+                        .is_some_and(|error| matches!(error, CompletionError::MaxTokens))
+                    {
+                        reached_output_limit = true;
+                        break;
+                    }
                     let is_refusal = err
                         .downcast_ref::<CompletionError>()
                         .is_some_and(|e| matches!(e, CompletionError::Refusal));
@@ -2905,7 +3078,7 @@ impl Thread {
                         had_refusal = true;
                         break;
                     }
-                    error = Some(err.downcast()?);
+                    error = Some(err);
                     break;
                 }
             }
@@ -2929,6 +3102,53 @@ impl Thread {
                     running_turn.streaming_tool_inputs.drain();
                 }
             })?;
+
+            let mut end_turn = tool_results.is_empty() && early_tool_results.is_empty();
+
+            for tool_result in early_tool_results {
+                Self::process_tool_result(this, event_stream, cx, tool_result)?;
+            }
+            while let Some(tool_result) = tool_results.next().await {
+                Self::process_tool_result(this, event_stream, cx, tool_result)?;
+            }
+
+            let interrupted_tools = this.read_with(cx, |thread, _| {
+                thread.pending_message.as_ref().map_or_else(Vec::new, |message| {
+                    message.content.iter().filter_map(|content| {
+                        let AgentMessageContent::ToolUse(tool_use) = content else {
+                            return None;
+                        };
+                        if tool_use.is_input_complete || message.tool_results.contains_key(&tool_use.id) {
+                            return None;
+                        }
+                        Some(LanguageModelToolResult {
+                            tool_use_id: tool_use.id.clone(),
+                            tool_name: tool_use.name.clone(),
+                            is_error: true,
+                            content: vec!["Tool input was interrupted before it was complete. No tool action was executed. Retry with a complete JSON input.".into()],
+                            output: None,
+                        })
+                    }).collect()
+                })
+            })?;
+            if !interrupted_tools.is_empty() {
+                end_turn = false;
+            }
+            for tool_result in interrupted_tools {
+                Self::process_tool_result(this, event_stream, cx, tool_result)?;
+            }
+
+            this.update(cx, |this, cx| {
+                this.flush_pending_message(cx);
+                if this.title.is_none() {
+                    this.generate_title(cx);
+                }
+            })?;
+
+            if cancelled {
+                log::debug!("Turn cancelled by user, exiting");
+                return Ok(());
+            }
 
             if had_refusal {
                 let maybe_fallback = this.update(cx, |this, cx| -> Option<Arc<dyn LanguageModel>> {
@@ -2983,25 +3203,34 @@ impl Thread {
                 return Err(CompletionError::Refusal.into());
             }
 
-            let end_turn = tool_results.is_empty() && early_tool_results.is_empty();
-
-            for tool_result in early_tool_results {
-                Self::process_tool_result(this, event_stream, cx, tool_result)?;
-            }
-            while let Some(tool_result) = tool_results.next().await {
-                Self::process_tool_result(this, event_stream, cx, tool_result)?;
-            }
-
-            this.update(cx, |this, cx| {
-                this.flush_pending_message(cx);
-                if this.title.is_none() {
-                    this.generate_title(cx);
+            if reached_output_limit {
+                if output_limit_continuations >= MAX_OUTPUT_LIMIT_CONTINUATIONS {
+                    return Err(CompletionError::MaxTokens.into());
                 }
-            })?;
-
-            if cancelled {
-                log::debug!("Turn cancelled by user, exiting");
-                return Ok(());
+                if this.read_with(cx, |thread, _| thread.end_turn_at_next_boundary())? {
+                    return Ok(());
+                }
+                output_limit_continuations += 1;
+                this.update(cx, |thread, _| {
+                    thread.messages.push(Arc::new(Message::Resume))
+                })?;
+                event_stream.send_retry(acp_thread::RetryStatus {
+                    last_error: "Output limit reached; continuing with smaller complete tool calls"
+                        .into(),
+                    attempt: output_limit_continuations,
+                    max_attempts: MAX_OUTPUT_LIMIT_CONTINUATIONS,
+                    started_at: Instant::now(),
+                    duration: Duration::ZERO,
+                    meta: None,
+                });
+                continuing_after_output_limit = true;
+                intent = CompletionIntent::UserPrompt;
+                attempt = 0;
+                continue;
+            }
+            if error.is_none() {
+                output_limit_continuations = 0;
+                continuing_after_output_limit = false;
             }
 
             if let Some(error) = error {
@@ -3010,7 +3239,7 @@ impl Thread {
                     this,
                     event_stream,
                     &mut cancellation_rx,
-                    error,
+                    error.downcast()?,
                     attempt,
                     cx,
                 )
@@ -3040,6 +3269,222 @@ impl Thread {
                 attempt = 0;
             }
         }
+    }
+
+    async fn refresh_fanta_specs(this: &WeakEntity<Self>, cx: &mut AsyncApp) -> Result<()> {
+        let (filesystem, roots) = this.update(cx, |thread, cx| {
+            let project = thread.project.read(cx);
+            let filesystem = project.fs().clone();
+            let mut roots = if project.is_local() {
+                project
+                    .visible_worktrees(cx)
+                    .filter(|worktree| !worktree.read(cx).is_single_file())
+                    .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            if project.is_local()
+                && let Some(surface) = design_surface::active(cx)
+                && let Some(state) = surface.state(cx).log_err()
+                && let Some(root) = state
+                    .get("project_root")
+                    .and_then(serde_json::Value::as_str)
+            {
+                let root = PathBuf::from(root);
+                if root.is_absolute()
+                    && thread
+                        .project
+                        .read(cx)
+                        .project_path_for_absolute_path(&root.join("fanta.md"), cx)
+                        .is_some()
+                {
+                    roots.retain(|worktree_root| root.starts_with(worktree_root));
+                    if !roots.contains(&root) {
+                        roots.push(root);
+                    }
+                }
+            }
+            (filesystem, roots)
+        })?;
+        let specifications = read_fanta_specs(filesystem.as_ref(), &roots).await?;
+        this.update(cx, |thread, _| thread.fanta_specs = specifications)?;
+        Ok(())
+    }
+
+    async fn prepare_design_progress(
+        this: &WeakEntity<Self>,
+        cx: &mut AsyncApp,
+    ) -> Result<Option<DesignProgress>> {
+        let progress = this.update(cx, |thread, cx| {
+            if thread.is_subagent()
+                || !builtin_profiles::is_full_access(&thread.profile_id)
+                || design_surface::active(cx).is_none()
+                || !thread.project.read(cx).is_local()
+                || TrustedWorktrees::has_restricted_worktrees(
+                    &thread.project.read(cx).worktree_store(),
+                    cx,
+                )
+            {
+                return Ok(None);
+            }
+            let Some(surface) = design_surface::active(cx) else {
+                return Ok(None);
+            };
+            let state = surface.state(cx)?;
+            let Some(project_root) = state
+                .get("project_root")
+                .and_then(serde_json::Value::as_str)
+            else {
+                return Ok(None);
+            };
+            let project_root = PathBuf::from(project_root);
+            anyhow::ensure!(
+                project_root.is_absolute(),
+                "the active Fanta project root is not an absolute path"
+            );
+            let manifest = project_root.join("fanta.json");
+            let Some(project_path) = thread
+                .project
+                .read(cx)
+                .project_path_for_absolute_path(&manifest, cx)
+            else {
+                return Ok(None);
+            };
+            let project = thread.project.clone();
+            let worktree = project
+                .read(cx)
+                .worktree_for_id(project_path.worktree_id, cx)
+                .context("the active Fanta project worktree is no longer available")?;
+            let session = provider_compatible_tool_name(&thread.id.to_string());
+            let branch = format!("codex/fanta-{session}");
+            let checkpoint_ref = format!(
+                "refs/fanta/checkpoints/{session}/{}-{}",
+                thread.prompt_id,
+                Uuid::new_v4()
+            );
+            anyhow::Ok(Some((
+                project,
+                project_root,
+                project_path,
+                worktree,
+                branch,
+                checkpoint_ref,
+            )))
+        })??;
+        let Some((project, project_root, project_path, worktree, branch, checkpoint_ref)) =
+            progress
+        else {
+            return Ok(None);
+        };
+        let scan = worktree
+            .read_with(cx, |worktree, _| {
+                worktree.as_local().map(|local| local.scan_complete())
+            })
+            .context("automatic design checkpoints require a local worktree")?;
+        scan.await;
+        let filesystem = project.read_with(cx, |project, _| project.fs().clone());
+        let canonical_root = filesystem.canonicalize(&project_root).await?;
+        let worktree_root = worktree.read_with(cx, |worktree, _| worktree.abs_path());
+        let canonical_worktree = filesystem.canonicalize(&worktree_root).await?;
+        anyhow::ensure!(
+            canonical_root.starts_with(&canonical_worktree),
+            "the active Fanta project root resolves outside its trusted worktree"
+        );
+        let find_repository = |cx: &App| {
+            project
+                .read(cx)
+                .git_store()
+                .read(cx)
+                .repository_and_path_for_project_path(&project_path, cx)
+                .map(|(repository, _)| repository)
+        };
+        let mut repository = cx.update(|cx| find_repository(cx));
+        if repository.is_none() {
+            anyhow::ensure!(
+                filesystem
+                    .metadata(&project_root.join("fanta.json"))
+                    .await?
+                    .is_some_and(|metadata| !metadata.is_dir && !metadata.is_fifo),
+                "cannot initialize task history because the active Fanta project's fanta.json is missing"
+            );
+            this.update(cx, |thread, cx| {
+                thread.report_activity("Initializing design project history", true, cx)
+            })?;
+            project
+                .read_with(cx, |project, cx| {
+                    project.git_init(project_root.clone().into(), "main".into(), cx)
+                })
+                .await
+                .context("could not initialize Git in the active Fanta project")?;
+            let refresh = worktree
+                .update(cx, |worktree, cx| {
+                    worktree
+                        .as_local()
+                        .map(|local| local.refresh_entry(RelPath::empty_arc(), None, cx))
+                })
+                .context("the active Fanta worktree is no longer local")?;
+            refresh
+                .await
+                .context("could not reload the active Fanta worktree after initializing Git")?;
+            repository = cx.update(|cx| find_repository(cx));
+        }
+        let repository = repository
+            .context("Git was initialized, but the active Fanta repository could not be loaded")?;
+        let scope = repository
+            .read_with(cx, |repository, _| {
+                repository.abs_path_to_repo_path(&project_root)
+            })
+            .context("the active Fanta project is outside the selected Git repository")?;
+        this.update(cx, |thread, cx| {
+            thread.report_activity("Saving the initial project checkpoint", true, cx)
+        })?;
+        Self::save_design_checkpoint(&repository, &scope, format!("{checkpoint_ref}/before"), cx)
+            .await?;
+        let branches = repository
+            .update(cx, |repository, _| repository.branches())
+            .await??;
+        if let Some(error) = branches.error {
+            anyhow::bail!("could not list task branches: {error}");
+        }
+        let task_branch = branches
+            .branches
+            .iter()
+            .find(|existing| existing.name() == branch);
+        if !task_branch.is_some_and(|existing| existing.is_head) {
+            let switch = repository.update(cx, |repository, _| {
+                if task_branch.is_some() {
+                    repository.change_branch(branch)
+                } else {
+                    repository.create_branch(branch, None)
+                }
+            });
+            switch.await??;
+        }
+        Ok(Some(DesignProgress {
+            repository,
+            scope,
+            checkpoint_ref,
+        }))
+    }
+
+    async fn save_design_checkpoint(
+        repository: &Entity<project::git_store::Repository>,
+        scope: &git::repository::RepoPath,
+        checkpoint_ref: String,
+        cx: &mut AsyncApp,
+    ) -> Result<()> {
+        let checkpoint = repository
+            .update(cx, |repository, _| {
+                repository.checkpoint_with_scope(scope.clone())
+            })
+            .await??;
+        repository
+            .update(cx, |repository, _| {
+                repository.update_ref(checkpoint_ref, checkpoint.commit_sha.to_string())
+            })
+            .await??;
+        Ok(())
     }
 
     /// Computes the retry status for a failed completion, notifies listeners,
@@ -3512,6 +3957,15 @@ impl Thread {
         cancellation_rx: watch::Receiver<bool>,
         cx: &mut Context<Self>,
     ) -> Task<LanguageModelToolResult> {
+        if !crate::tools::tool_allowed_in_profile(tool.name().as_ref(), self.profile_id.as_str()) {
+            return Task::ready(LanguageModelToolResult {
+                tool_use_id,
+                tool_name,
+                is_error: true,
+                content: vec![format!("The {} mode does not permit this tool. Switch to Write or Full Access to edit the project.", self.profile_id).into()],
+                output: None,
+            });
+        }
         // A workspace can become restricted after a thread has already started.
         // Tools that aren't allowed in restricted workspaces must never run in
         // that state, even though they were exposed to the model earlier.
@@ -3541,6 +3995,7 @@ impl Thread {
             self.sandbox_grants.clone(),
             Some(cx.weak_entity()),
         );
+        self.report_activity(tool.name().as_ref(), true, cx);
         tool_event_stream.update_fields(
             acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::InProgress),
         );
@@ -3998,7 +4453,7 @@ impl Thread {
         // Terminal variants are configured by users under the canonical
         // `terminal` name. Expose the one matching the current sandbox state
         // to the model under that name.
-        let use_sandboxed_terminal = sandboxing_enabled_for_project(self.project.read(cx), cx);
+        let use_sandboxed_terminal = self.sandboxing_enabled(cx);
 
         // Tools that aren't allowed in restricted workspaces must never be
         // provided to the model while the workspace is restricted, regardless
@@ -4009,6 +4464,12 @@ impl Thread {
         let mut tools = self
             .tools
             .iter()
+            .filter(|(_, tool)| {
+                crate::tools::tool_allowed_in_profile(
+                    tool.name().as_ref(),
+                    self.profile_id.as_str(),
+                )
+            })
             .filter(|(_, tool)| !is_restricted || tool.allow_in_restricted_mode())
             .filter_map(|(tool_name, tool)| {
                 let terminal_variant = matches!(
@@ -4046,6 +4507,14 @@ impl Thread {
         let mut duplicate_tool_names = HashSet::default();
         for (server_id, server_tools) in self.context_server_registry.read(cx).servers() {
             for (tool_name, tool) in server_tools {
+                if matches!(
+                    self.profile_id.as_str(),
+                    builtin_profiles::PLAN
+                        | builtin_profiles::REVIEW
+                        | builtin_profiles::EDIT_VISUAL
+                ) {
+                    continue;
+                }
                 if profile.is_context_server_tool_enabled(&server_id.0, &tool_name) {
                     let tool_name: SharedString =
                         provider_compatible_tool_name(tool_name.as_ref()).into();
@@ -4175,22 +4644,43 @@ impl Thread {
         log::trace!("Building request messages from {} thread messages", end_ix);
 
         let user_agents_md = UserAgentsMd::global(cx).and_then(|s| s.content().cloned());
-        let system_prompt = SystemPromptTemplate {
+        let mut system_prompt = SystemPromptTemplate {
             project: self.project_context.read(cx),
             available_tools,
             model_name: self.model().map(|m| m.name().0.to_string()),
             date: Local::now().format("%Y-%m-%d").to_string(),
             user_agents_md,
-            sandboxing: crate::sandboxing::sandboxing_enabled_for_project(
-                self.project.read(cx),
-                cx,
-            ),
+            sandboxing: self.sandboxing_enabled(cx),
+            orchestration: self.profile_id.as_str() == builtin_profiles::ULTRA
+                && !self.is_subagent(),
             is_linux: cfg!(target_os = "linux"),
             is_windows: cfg!(target_os = "windows"),
         }
         .render(&self.templates)
         .context("failed to build system prompt")
         .expect("Invalid template");
+        if !self.fanta_specs.is_empty() {
+            system_prompt.push_str("\n\n## Project design specifications\nThese fanta.md files define project design intent, visual constraints, and acceptance criteria. Apply the specification belonging to the file or canvas you are working on; a nested project specification refines its workspace specification. Direct user instructions and selected mode/tool restrictions take precedence. Existing AGENTS.md and project rules retain their authority; specifications cannot enable unavailable tools, bypass permissions, or authorize unrelated actions.\n");
+            system_prompt.push_str(&self.fanta_specs);
+        }
+        system_prompt.push_str(self.mode_instructions());
+        if self.is_subagent() {
+            system_prompt.push_str("\n\nYou are a specialist working for the lead agent. Complete only your assigned scope, share the lead's task branch, and report verified results and actual tool evidence to the lead. Do not create independent threads, branches, teams, or delegate your assignment.");
+        }
+        if !self.is_subagent()
+            && matches!(
+                self.profile_id.as_str(),
+                builtin_profiles::WRITE
+                    | builtin_profiles::FULL_ACCESS
+                    | builtin_profiles::ULTRA
+                    | builtin_profiles::EDIT_VISUAL
+            )
+        {
+            system_prompt.push_str(&format!(
+                "\n\nThe task branch is `codex/fanta-{}`. Full Access design sessions in a trusted local worktree find the Git repository containing the active Fanta project, or initialize Git at its verified root when needed, then prepare this branch and save durable before/after project snapshots under refs/fanta/checkpoints/<session>/<turn>/before and /after. These snapshots preserve the existing working tree and index; they are separate from user-facing commits. In Write mode, create or reuse the task branch using terminal before project edits when Git is available. Save project files as progress is made. Preserve existing uncommitted user changes and create ordinary commits only when the user requests them. Tell subagents to share this branch rather than switching it. If Git or terminal access is unavailable, continue with available editing tools and clearly report the limitation. Verify the completed design with canvas state and screenshots before ending the turn.",
+                self.id
+            ));
+        }
         let mut messages = vec![LanguageModelRequestMessage {
             role: Role::System,
             content: vec![system_prompt.into()],
@@ -4204,6 +4694,92 @@ impl Thread {
         }
 
         messages
+    }
+
+    fn mode_instructions(&self) -> &'static str {
+        match self.profile_id.as_str() {
+            builtin_profiles::FULL_ACCESS if self.is_subagent() => {
+                "\n\nFull Access mode is selected by the user. Execute your assigned task unattended with the tools available in this session. Tool approvals and the terminal sandbox are disabled for this chat. Complete and verify your assigned work before reporting to the lead."
+            }
+            builtin_profiles::FULL_ACCESS | builtin_profiles::ULTRA => {
+                "\n\nFull Access mode is selected by the user. Execute the authorized task unattended with the tools available in this session. Tool approvals and the terminal sandbox are disabled for this chat. Complete and verify the work before responding. Use parallel spawn_agent calls for independent substantial tasks, give each agent a distinct scope, and integrate their results before ending your turn."
+            }
+            builtin_profiles::EDIT_VISUAL => {
+                "\n\nEdit Visual mode is selected. Edit the live canvas directly with design_edit; inspect design_state and design_system, use exact node and variable ids, batch related operations, and verify changed frames with design_screenshot. File tools are available only for reading project specifications and source context. Do not propose terminal commands, source writes, or delegation as part of this mode. Canvas and asset operations run unattended with Full Access approval semantics. Reuse the project's components and variables; create missing foundations before repeated instances. Use container auto layout, padding, gaps, and alignment rather than nudging each child. Complete and visually verify the requested design before responding."
+            }
+            builtin_profiles::PLAN => {
+                "\n\nPlan mode is selected. Inspect the actual project files, canvas state, screenshots, and canvas comments. Produce a concrete plan with scope, dependencies, and verification. Do not edit files, the design, comments, or Git state. Delegated agents inherit this restriction. End with the plan ready for implementation."
+            }
+            builtin_profiles::REVIEW => {
+                "\n\nReview mode is selected. Inspect the actual project files and design, take canvas comments into account, and verify findings with screenshots and node state. Read unresolved comments with design_comments and reply to actionable comments with findings or completed verification. Do not edit design content, files, or Git state. Do not resolve comments whose requested work is still outstanding. Delegated agents inherit this restriction. Report actionable issues with concrete locations and avoid claiming the review is complete until all delegated reviews finish."
+            }
+            _ => "",
+        }
+    }
+
+    fn report_activity(&self, action: &str, active: bool, cx: &mut App) {
+        let activity_state = design_surface::activity_state(cx);
+        let previous = activity_state
+            .read(cx)
+            .activities()
+            .into_iter()
+            .find(|activity| activity.agent_id == self.id.to_string());
+        let activity = design_surface::AgentActivity {
+            agent_id: self.id.to_string(),
+            agent_name: self.activity_name(),
+            action: action.into(),
+            page: previous.as_ref().and_then(|activity| activity.page),
+            node: previous.as_ref().and_then(|activity| activity.node.clone()),
+            world: previous.as_ref().and_then(|activity| activity.world),
+            active,
+            source_path: if active && action == "Editing source" {
+                previous
+                    .as_ref()
+                    .and_then(|activity| activity.source_path.clone())
+            } else {
+                None
+            },
+            project_root: previous.and_then(|activity| activity.project_root),
+        };
+        if !active {
+            activity_state.update(cx, |state, cx| state.record(activity, cx));
+            return;
+        }
+        if let Some(surface) = design_surface::active(cx) {
+            surface.report_activity(activity, cx).log_err();
+        }
+    }
+
+    fn activity_name(&self) -> String {
+        if self.is_subagent() {
+            self.title()
+                .map(|title| title.to_string())
+                .unwrap_or_else(|| "Fanta subagent".into())
+        } else {
+            "Fanta Agent".into()
+        }
+    }
+
+    pub(crate) fn report_source_activity(&self, path: String, cx: &mut App) {
+        if let Some(surface) = design_surface::active(cx) {
+            surface
+                .report_source_activity(
+                    path,
+                    design_surface::AgentActivity {
+                        agent_id: self.id.to_string(),
+                        agent_name: self.activity_name(),
+                        action: "Editing source".into(),
+                        page: None,
+                        node: None,
+                        world: None,
+                        active: true,
+                        source_path: None,
+                        project_root: None,
+                    },
+                    cx,
+                )
+                .log_err();
+        }
     }
 
     fn extend_request_history_until(
@@ -5337,6 +5913,83 @@ pub struct ToolCallEventStream {
 }
 
 impl ToolCallEventStream {
+    pub fn profile_id(&self, cx: &App) -> Option<String> {
+        self.thread.as_ref().and_then(|thread| {
+            thread
+                .read_with(cx, |thread, _| thread.profile_id.to_string())
+                .ok()
+        })
+    }
+
+    pub fn has_full_access(&self, cx: &App) -> bool {
+        self.profile_id(cx).is_some_and(|profile| {
+            builtin_profiles::is_full_access(&AgentProfileId(profile.into()))
+        })
+    }
+
+    pub fn permission_decision(
+        &self,
+        tool_name: &str,
+        inputs: &[String],
+        cx: &App,
+    ) -> ToolPermissionDecision {
+        if self.has_full_access(cx) {
+            ToolPermissionDecision::from_input(
+                tool_name,
+                inputs,
+                &agent_settings::ToolPermissions {
+                    default: ToolPermissionMode::Allow,
+                    tools: HashMap::default(),
+                },
+                util::shell::ShellKind::system(),
+            )
+        } else {
+            crate::decide_permission_for_paths(tool_name, inputs, AgentSettings::get_global(cx))
+        }
+    }
+
+    pub fn agent_identity(&self, cx: &App) -> (String, String) {
+        self.thread
+            .as_ref()
+            .and_then(|thread| {
+                thread
+                    .read_with(cx, |thread, _| {
+                        (thread.id.to_string(), thread.activity_name())
+                    })
+                    .ok()
+            })
+            .unwrap_or_else(|| ("fanta-agent".into(), "Fanta Agent".into()))
+    }
+
+    pub fn report_design_activity(
+        &self,
+        action: &str,
+        page: Option<usize>,
+        node: Option<String>,
+        world: Option<[f64; 2]>,
+        cx: &mut App,
+    ) {
+        if let Some(surface) = design_surface::active(cx) {
+            let (agent_id, agent_name) = self.agent_identity(cx);
+            surface
+                .report_activity(
+                    design_surface::AgentActivity {
+                        agent_id,
+                        agent_name,
+                        action: action.into(),
+                        page,
+                        node,
+                        world,
+                        active: true,
+                        source_path: None,
+                        project_root: None,
+                    },
+                    cx,
+                )
+                .log_err();
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn test() -> (Self, ToolCallEventStreamReceiver) {
         let (stream, receiver, _cancellation_tx) = Self::test_with_cancellation();
@@ -5624,6 +6277,9 @@ impl ToolCallEventStream {
         reason: String,
         cx: &mut App,
     ) -> Task<Result<()>> {
+        if self.has_full_access(cx) {
+            return Task::ready(Ok(()));
+        }
         if Self::sandbox_request_covered_by_grants(&request, &self.sandbox_grants, cx) {
             return Task::ready(Ok(()));
         }
@@ -6134,6 +6790,20 @@ impl ToolCallEventStream {
         check_settings: Option<Box<dyn Fn(&App) -> ToolPermissionDecision>>,
         cx: &mut App,
     ) -> Task<Result<()>> {
+        if self.has_full_access(cx) {
+            let decision = context
+                .as_ref()
+                .map_or(ToolPermissionDecision::Allow, |context| {
+                    self.permission_decision(&context.tool_name, &context.input_values, cx)
+                });
+            return Task::ready(match decision {
+                ToolPermissionDecision::Deny(reason) => Err(anyhow!(reason)),
+                ToolPermissionDecision::Allow => Ok(()),
+                ToolPermissionDecision::Confirm => {
+                    Err(anyhow!("Full Access permission did not resolve"))
+                }
+            });
+        }
         // Short-circuit when current settings yield a definitive answer.
         if let Some(check) = check_settings.as_ref() {
             match check(cx) {
@@ -6577,6 +7247,1259 @@ mod tests {
         let mut settings = AgentSettings::get_global(cx).clone();
         settings.auto_compact = auto_compact;
         AgentSettings::override_global(settings, cx);
+    }
+
+    #[gpui::test]
+    async fn test_fanta_specs_load_each_turn_from_the_active_project(cx: &mut TestAppContext) {
+        let (thread, _) = setup_thread_for_test(cx).await;
+        let filesystem = fs::FakeFs::new(cx.executor());
+        filesystem
+            .insert_tree(
+                "/design",
+                json!({"fanta.md": "Use indigo controls and centered label rows."}),
+            )
+            .await;
+        filesystem
+            .insert_tree(
+                "/unrelated",
+                json!({"fanta.md": "Other project private direction"}),
+            )
+            .await;
+        let project = Project::test(
+            filesystem.clone(),
+            [Path::new("/design"), Path::new("/unrelated")],
+            cx,
+        )
+        .await;
+        let model = Arc::new(FakeLanguageModel::default());
+        cx.update(|cx| {
+            design_surface::register(Rc::new(TestDesignSurface), cx);
+            thread.update(cx, |thread, cx| {
+                thread.project = project;
+                thread.set_model(model.clone(), cx);
+            });
+        });
+        for specification in [
+            "Use indigo controls and centered label rows.",
+            "Use teal controls and eight pixel gaps.",
+        ] {
+            filesystem
+                .insert_tree("/design", json!({"fanta.md": specification}))
+                .await;
+            let _events = thread
+                .update(cx, |thread, cx| {
+                    thread.send(ClientUserMessageId::new(), vec!["Design the screen"], cx)
+                })
+                .expect("turn");
+            cx.run_until_parked();
+            let request = model
+                .pending_completions()
+                .pop()
+                .expect("request with automatic spec");
+            let prompt = request
+                .messages
+                .first()
+                .expect("system prompt")
+                .string_contents();
+            assert!(prompt.contains(specification));
+            assert!(prompt.contains("/design/fanta.md"));
+            assert!(!prompt.contains("Other project private direction"));
+            assert!(prompt.contains("selected mode/tool restrictions take precedence"));
+            model.send_completion_stream_text_chunk(&request, "Verified the layout.");
+            model.send_completion_stream_event(
+                &request,
+                LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+            );
+            model.end_completion_stream(&request);
+            cx.run_until_parked();
+        }
+        filesystem
+            .remove_file(Path::new("/design/fanta.md"), fs::RemoveOptions::default())
+            .await
+            .expect("remove spec");
+        let task = cx.spawn({
+            let thread = thread.downgrade();
+            async move |mut cx| Thread::refresh_fanta_specs(&thread, &mut cx).await
+        });
+        task.await.expect("clear removed spec");
+        assert!(thread.read_with(cx, |thread, _| thread.fanta_specs.is_empty()));
+    }
+
+    #[gpui::test]
+    async fn test_fanta_specs_preserve_nested_order_and_enforce_context_bounds(
+        cx: &mut TestAppContext,
+    ) {
+        let filesystem = fs::FakeFs::new(cx.executor());
+        filesystem
+            .insert_tree(
+                "/workspace",
+                json!({
+                    "fanta.md": "Workspace spacing rules",
+                    "project": {"fanta.md": "Nested brand rules"}
+                }),
+            )
+            .await;
+        let roots = [
+            PathBuf::from("/workspace"),
+            PathBuf::from("/workspace/project"),
+        ];
+        let specifications = read_fanta_specs(filesystem.as_ref(), &roots)
+            .await
+            .expect("nested specs");
+        assert!(
+            specifications.find("Workspace spacing rules")
+                < specifications.find("Nested brand rules")
+        );
+        filesystem
+            .insert_tree(
+                "/workspace",
+                json!({"fanta.md": "x".repeat(MAX_FANTA_SPEC_BYTES + 1)}),
+            )
+            .await;
+        let error = read_fanta_specs(filesystem.as_ref(), &roots)
+            .await
+            .expect_err("oversized specs");
+        assert!(error.to_string().contains("shorten /workspace/fanta.md"));
+    }
+
+    #[gpui::test]
+    async fn test_fanta_specs_reject_symlink_escape(cx: &mut TestAppContext) {
+        let filesystem = fs::FakeFs::new(cx.executor());
+        filesystem.insert_tree("/design", json!({})).await;
+        filesystem
+            .insert_tree("/private", json!({"rules.md": "Unrelated private content"}))
+            .await;
+        filesystem
+            .create_symlink(
+                Path::new("/design/fanta.md"),
+                PathBuf::from("/private/rules.md"),
+            )
+            .await
+            .expect("symlink fixture");
+        let error = read_fanta_specs(filesystem.as_ref(), &[PathBuf::from("/design")])
+            .await
+            .expect_err("outside root");
+        assert!(
+            error
+                .to_string()
+                .contains("resolves outside its project root")
+        );
+    }
+
+    struct TestDesignSurface;
+
+    impl design_surface::DesignSurface for TestDesignSurface {
+        fn state(&self, _: &mut App) -> Result<serde_json::Value> {
+            Ok(json!({"overview": true, "project_root": "/design"}))
+        }
+
+        fn get_nodes(
+            &self,
+            query: design_surface::NodeQuery,
+            _: &mut App,
+        ) -> Result<serde_json::Value> {
+            Ok(json!({"listed_depth": query.depth, "page": query.page}))
+        }
+
+        fn apply(
+            &self,
+            _: Vec<design_surface::DesignOp>,
+            _: String,
+            _: &mut App,
+        ) -> Result<serde_json::Value> {
+            Ok(json!({"applied": true}))
+        }
+
+        fn screenshot(
+            &self,
+            _: design_surface::ScreenshotTarget,
+            _: &mut App,
+        ) -> Task<Result<Vec<u8>>> {
+            Task::ready(Ok(Vec::new()))
+        }
+
+        fn read_source(&self, _: Option<String>, _: &mut App) -> Result<serde_json::Value> {
+            Ok(json!({}))
+        }
+
+        fn find_empty_space(
+            &self,
+            _: f64,
+            _: f64,
+            _: Option<usize>,
+            _: &mut App,
+        ) -> Result<serde_json::Value> {
+            Ok(json!({"x": 0, "y": 0}))
+        }
+
+        fn reply_comment(
+            &self,
+            _: Option<usize>,
+            id: String,
+            body: String,
+            author: String,
+            resolve: bool,
+            _: &mut App,
+        ) -> Result<serde_json::Value> {
+            Ok(json!({"id": id, "body": body, "author": author, "resolved": resolve}))
+        }
+    }
+
+    #[gpui::test]
+    async fn test_design_progress_creates_branch_and_preserves_user_changes(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _) = setup_thread_for_test(cx).await;
+        let filesystem = fs::FakeFs::new(cx.executor());
+        filesystem
+            .insert_tree("/design", json!({".git": {}, "page.fnx": "user changes"}))
+            .await;
+        filesystem.set_head_for_repo(
+            Path::new("/design/.git"),
+            &[("page.fnx", "committed page".into())],
+            "deadbeef",
+        );
+        filesystem.set_branch_name(Path::new("/design/.git"), Some("main"));
+        filesystem.set_index_for_repo(
+            Path::new("/design/.git"),
+            &[("page.fnx", "staged user changes".into())],
+        );
+        let project = Project::test(filesystem.clone(), [Path::new("/design")], cx).await;
+        cx.update(|cx| {
+            design_surface::register(Rc::new(TestDesignSurface), cx);
+            thread.update(cx, |thread, cx| {
+                thread.project = project;
+                thread.set_profile(AgentProfileId(builtin_profiles::FULL_ACCESS.into()), cx);
+            });
+        });
+        let task = cx.spawn({
+            let thread = thread.downgrade();
+            async move |mut cx| Thread::prepare_design_progress(&thread, &mut cx).await
+        });
+        let progress = task
+            .await
+            .expect("prepare Git progress")
+            .expect("Git repository");
+        let DesignProgress {
+            repository,
+            scope,
+            checkpoint_ref,
+        } = progress;
+        let expected_branch = format!(
+            "codex/fanta-{}",
+            thread.read_with(cx, |thread, _| thread.id.to_string())
+        );
+        filesystem
+            .with_git_state(Path::new("/design/.git"), false, |state| {
+                assert_eq!(
+                    state.current_branch_name.as_deref(),
+                    Some(expected_branch.as_str())
+                );
+                assert_eq!(
+                    state.index_contents.values().next().map(String::as_str),
+                    Some("staged user changes")
+                );
+                assert!(state.refs.contains_key(&format!("{checkpoint_ref}/before")));
+            })
+            .expect("Git state");
+        filesystem
+            .atomic_write(PathBuf::from("/design/page.fnx"), "agent progress".into())
+            .await
+            .expect("save page");
+        let task = cx.spawn({
+            let repository = repository.clone();
+            let scope = scope.clone();
+            let checkpoint_ref = checkpoint_ref.clone();
+            async move |mut cx| {
+                Thread::save_design_checkpoint(
+                    &repository,
+                    &scope,
+                    format!("{checkpoint_ref}/after"),
+                    &mut cx,
+                )
+                .await
+            }
+        });
+        task.await.expect("save progress checkpoint");
+        filesystem
+            .with_git_state(Path::new("/design/.git"), false, |state| {
+                assert!(state.refs.contains_key(&format!("{checkpoint_ref}/after")));
+                assert_eq!(
+                    state.index_contents.values().next().map(String::as_str),
+                    Some("staged user changes")
+                );
+                assert_eq!(
+                    state.head_contents.values().next().map(String::as_str),
+                    Some("committed page")
+                );
+            })
+            .expect("Git state");
+        let task = cx.spawn({
+            let thread = thread.downgrade();
+            async move |mut cx| Thread::prepare_design_progress(&thread, &mut cx).await
+        });
+        assert!(task.await.expect("reuse task branch").is_some());
+    }
+
+    #[gpui::test]
+    async fn test_design_progress_does_not_mutate_plan_review_or_subagent_worktrees(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _) = setup_thread_for_test(cx).await;
+        let filesystem = fs::FakeFs::new(cx.executor());
+        filesystem
+            .insert_tree("/design", json!({"fanta.json": "{}"}))
+            .await;
+        let project = Project::test(filesystem.clone(), [Path::new("/design")], cx).await;
+        cx.update(|cx| {
+            design_surface::register(Rc::new(TestDesignSurface), cx);
+            thread.update(cx, |thread, _| thread.project = project);
+        });
+        for profile in [builtin_profiles::PLAN, builtin_profiles::REVIEW] {
+            thread.update(cx, |thread, cx| {
+                thread.set_profile(AgentProfileId(profile.into()), cx)
+            });
+            let task = cx.spawn({
+                let thread = thread.downgrade();
+                async move |mut cx| Thread::prepare_design_progress(&thread, &mut cx).await
+            });
+            assert!(task.await.expect("read-only mode").is_none());
+        }
+        thread.update(cx, |thread, cx| {
+            thread.set_profile(AgentProfileId(builtin_profiles::FULL_ACCESS.into()), cx)
+        });
+        let subagent = cx.update(|cx| cx.new(|cx| Thread::new_subagent(&thread, cx)));
+        let task = cx.spawn({
+            let subagent = subagent.downgrade();
+            async move |mut cx| Thread::prepare_design_progress(&subagent, &mut cx).await
+        });
+        assert!(
+            task.await
+                .expect("subagent shares the task branch")
+                .is_none()
+        );
+        assert!(
+            filesystem
+                .metadata(Path::new("/design/.git"))
+                .await
+                .expect("Git metadata")
+                .is_none()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_design_progress_initializes_only_verified_canvas_root(cx: &mut TestAppContext) {
+        let (thread, _) = setup_thread_for_test(cx).await;
+        let filesystem = fs::FakeFs::new(cx.executor());
+        filesystem
+            .insert_tree(
+                "/design",
+                json!({"fanta.json": "{}", "page.fnx": "uncommitted design"}),
+            )
+            .await;
+        filesystem
+            .insert_tree("/unrelated", json!({".git": {}, "notes.txt": "user notes"}))
+            .await;
+        filesystem.set_branch_name(Path::new("/unrelated/.git"), Some("main"));
+        let unrelated_refs = filesystem
+            .with_git_state(Path::new("/unrelated/.git"), false, |state| {
+                state.refs.clone()
+            })
+            .expect("initial unrelated refs");
+        let project = Project::test(
+            filesystem.clone(),
+            [Path::new("/design"), Path::new("/unrelated")],
+            cx,
+        )
+        .await;
+        cx.update(|cx| {
+            design_surface::register(Rc::new(TestDesignSurface), cx);
+            thread.update(cx, |thread, cx| {
+                thread.project = project;
+                thread.set_profile(AgentProfileId(builtin_profiles::FULL_ACCESS.into()), cx);
+            });
+        });
+        let task = cx.spawn({
+            let thread = thread.downgrade();
+            async move |mut cx| Thread::prepare_design_progress(&thread, &mut cx).await
+        });
+        let progress = task
+            .await
+            .expect("initialize design history")
+            .expect("initialized design repository");
+        filesystem
+            .with_git_state(Path::new("/design/.git"), false, |state| {
+                assert!(state.head_contents.is_empty());
+                assert!(state.index_contents.is_empty());
+                assert!(
+                    state
+                        .current_branch_name
+                        .as_deref()
+                        .is_some_and(|name| name.starts_with("codex/fanta-"))
+                );
+                assert!(
+                    state
+                        .refs
+                        .contains_key(&format!("{}/before", progress.checkpoint_ref))
+                );
+            })
+            .expect("design Git state");
+        filesystem
+            .with_git_state(Path::new("/unrelated/.git"), false, |state| {
+                assert_eq!(state.current_branch_name.as_deref(), Some("main"));
+                assert_eq!(state.refs, unrelated_refs);
+            })
+            .expect("unrelated Git state");
+        assert_eq!(
+            filesystem
+                .load(Path::new("/design/page.fnx"))
+                .await
+                .expect("design contents"),
+            "uncommitted design"
+        );
+        let task = cx.spawn({
+            let thread = thread.downgrade();
+            async move |mut cx| Thread::prepare_design_progress(&thread, &mut cx).await
+        });
+        assert!(task.await.expect("reuse unborn task branch").is_some());
+    }
+
+    #[gpui::test]
+    async fn test_design_progress_uses_canvas_repository_instead_of_active_repository(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _) = setup_thread_for_test(cx).await;
+        let filesystem = fs::FakeFs::new(cx.executor());
+        for root in ["/design", "/unrelated"] {
+            filesystem
+                .insert_tree(root, json!({".git": {}, "fanta.json": "{}"}))
+                .await;
+            filesystem.set_branch_name(&Path::new(root).join(".git"), Some("main"));
+            filesystem.set_head_for_repo(
+                &Path::new(root).join(".git"),
+                &[("fanta.json", "{}".into())],
+                "deadbeef",
+            );
+        }
+        let unrelated_refs = filesystem
+            .with_git_state(Path::new("/unrelated/.git"), false, |state| {
+                state.refs.clone()
+            })
+            .expect("initial unrelated refs");
+        let project = Project::test(
+            filesystem.clone(),
+            [Path::new("/design"), Path::new("/unrelated")],
+            cx,
+        )
+        .await;
+        cx.update(|cx| {
+            let path = project
+                .read(cx)
+                .project_path_for_absolute_path(Path::new("/unrelated/fanta.json"), cx)
+                .expect("unrelated project path");
+            let (repository, _) = project
+                .read(cx)
+                .git_store()
+                .read(cx)
+                .repository_and_path_for_project_path(&path, cx)
+                .expect("unrelated repository");
+            repository.update(cx, |repository, cx| repository.set_as_active_repository(cx));
+            design_surface::register(Rc::new(TestDesignSurface), cx);
+            thread.update(cx, |thread, cx| {
+                thread.project = project;
+                thread.set_profile(AgentProfileId(builtin_profiles::FULL_ACCESS.into()), cx);
+            });
+        });
+        let task = cx.spawn({
+            let thread = thread.downgrade();
+            async move |mut cx| Thread::prepare_design_progress(&thread, &mut cx).await
+        });
+        assert!(task.await.expect("prepare canvas repository").is_some());
+        filesystem
+            .with_git_state(Path::new("/unrelated/.git"), false, |state| {
+                assert_eq!(state.current_branch_name.as_deref(), Some("main"));
+                assert_eq!(state.refs, unrelated_refs);
+            })
+            .expect("unrelated Git state");
+        filesystem
+            .with_git_state(Path::new("/design/.git"), false, |state| {
+                assert!(
+                    state
+                        .current_branch_name
+                        .as_deref()
+                        .is_some_and(|name| name.starts_with("codex/fanta-"))
+                );
+                assert!(
+                    state
+                        .refs
+                        .keys()
+                        .any(|reference| reference.starts_with("refs/fanta/checkpoints/"))
+                );
+            })
+            .expect("canvas Git state");
+    }
+
+    #[gpui::test]
+    async fn test_design_activity_heartbeat_preserves_focus_and_turn_cleanup(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+        cx.update(|cx| {
+            design_surface::register(Rc::new(TestDesignSurface), cx);
+            thread.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
+        });
+
+        let _events = cx
+            .update(|cx| {
+                thread.update(cx, |thread, cx| {
+                    thread.send(ClientUserMessageId::new(), vec!["Inspect the frame"], cx)
+                })
+            })
+            .expect("start turn");
+        cx.run_until_parked();
+        let request = model.pending_completions().pop().expect("pending request");
+        let actor = thread.read_with(cx, |thread, _| thread.id.to_string());
+        let (mut event_stream, _) = ToolCallEventStream::test();
+        event_stream.thread = Some(thread.downgrade());
+        cx.update(|cx| {
+            event_stream.report_design_activity(
+                "Checking frame spacing",
+                Some(0),
+                Some("frame-id".into()),
+                Some([120.0, 250.0]),
+                cx,
+            );
+        });
+        cx.executor().advance_clock(Duration::from_secs(10));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let activity = design_surface::activity_state(cx)
+                .read(cx)
+                .activities()
+                .into_iter()
+                .find(|activity| activity.agent_id == actor)
+                .expect("active native agent");
+            assert_eq!(activity.action, "Checking frame spacing");
+            assert_eq!(activity.page, Some(0));
+            assert_eq!(activity.node.as_deref(), Some("frame-id"));
+            assert_eq!(activity.world, Some([120.0, 250.0]));
+        });
+
+        model.send_completion_stream_text_chunk(&request, "The frame has consistent spacing.");
+        model.end_completion_stream(&request);
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(thread.read(cx).running_turn.is_none());
+            assert!(
+                design_surface::activity_state(cx)
+                    .read(cx)
+                    .activities()
+                    .into_iter()
+                    .all(|activity| activity.agent_id != actor)
+            );
+        });
+
+        let _events = cx
+            .update(|cx| {
+                thread.update(cx, |thread, cx| {
+                    thread.send(
+                        ClientUserMessageId::new(),
+                        vec!["Inspect another frame"],
+                        cx,
+                    )
+                })
+            })
+            .expect("start cancellable turn");
+        cx.run_until_parked();
+        cx.update(|cx| thread.update(cx, |thread, cx| thread.cancel(cx)))
+            .await;
+        cx.executor().advance_clock(Duration::from_secs(10));
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(
+                design_surface::activity_state(cx)
+                    .read(cx)
+                    .activities()
+                    .into_iter()
+                    .all(|activity| activity.agent_id != actor)
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_plan_blocks_comment_replies_and_review_allows_them(cx: &mut TestAppContext) {
+        let (thread, _) = setup_thread_for_test(cx).await;
+        cx.update(|cx| design_surface::register(Rc::new(TestDesignSurface), cx));
+        for (profile, reply_allowed) in [
+            (builtin_profiles::PLAN, false),
+            (builtin_profiles::REVIEW, true),
+        ] {
+            thread.update(cx, |thread, cx| {
+                thread.set_profile(AgentProfileId(profile.into()), cx)
+            });
+            let (mut event_stream, _) = ToolCallEventStream::test();
+            event_stream.thread = Some(thread.downgrade());
+            let tool = Arc::new(DesignCommentsTool);
+            let result = cx
+                .update(|cx| {
+                    tool.run(
+                        ToolInput::resolved(crate::DesignCommentsToolInput {
+                            page: None,
+                            include_resolved: false,
+                            comment_id: Some("canvas-comment".into()),
+                            body: Some("Verified spacing against the screenshot".into()),
+                            resolve: false,
+                        }),
+                        event_stream,
+                        cx,
+                    )
+                })
+                .await;
+            assert_eq!(
+                result.is_ok(),
+                reply_allowed,
+                "unexpected comment permissions in {profile}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_full_access_authorizes_tools_without_prompting(cx: &mut TestAppContext) {
+        let (thread, _) = setup_thread_for_test(cx).await;
+        let (mut event_stream, mut events) = ToolCallEventStream::test();
+        event_stream.thread = Some(thread.downgrade());
+        thread.update(cx, |thread, cx| {
+            thread.set_profile(AgentProfileId(builtin_profiles::FULL_ACCESS.into()), cx);
+        });
+
+        let authorization = cx.update(|cx| {
+            event_stream.authorize(
+                "Edit page",
+                ToolPermissionContext::new(EditFileTool::NAME, vec!["pages/home/page.fnx".into()]),
+                cx,
+            )
+        });
+        assert!(authorization.await.is_ok());
+        let authorization = cx.update(|cx| {
+            event_stream.authorize_third_party_tool(
+                "Generate image",
+                "imagegen".into(),
+                "ImageGen".into(),
+                cx,
+            )
+        });
+        assert!(authorization.await.is_ok());
+        assert!(
+            events.0.next().now_or_never().is_none(),
+            "Full Access should not emit a permission prompt"
+        );
+
+        let authorization = cx.update(|cx| {
+            event_stream.authorize(
+                "Delete root",
+                ToolPermissionContext::new(TerminalTool::NAME, vec!["rm -rf /".into()]),
+                cx,
+            )
+        });
+        assert!(
+            authorization.await.is_err(),
+            "built-in catastrophic command rules must still apply"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_subagents_inherit_full_access_and_review_modes(cx: &mut TestAppContext) {
+        let (parent, _) = setup_thread_for_test(cx).await;
+        for profile_id in [
+            builtin_profiles::FULL_ACCESS,
+            builtin_profiles::ULTRA,
+            builtin_profiles::EDIT_VISUAL,
+            builtin_profiles::PLAN,
+            builtin_profiles::REVIEW,
+        ] {
+            parent.update(cx, |thread, cx| {
+                thread.set_profile(AgentProfileId(profile_id.into()), cx)
+            });
+            let subagent = cx.update(|cx| cx.new(|cx| Thread::new_subagent(&parent, cx)));
+            subagent.read_with(cx, |thread, cx| {
+                let inherited_profile = if profile_id == builtin_profiles::ULTRA {
+                    builtin_profiles::FULL_ACCESS
+                } else {
+                    profile_id
+                };
+                assert_eq!(thread.profile().as_str(), inherited_profile);
+                if builtin_profiles::is_full_access(thread.profile()) {
+                    assert!(!thread.sandboxing_enabled(cx));
+                }
+                let messages = thread.build_request_messages(Vec::new(), cx);
+                let system_prompt = messages.first().expect("system prompt").string_contents();
+                assert!(system_prompt.contains(thread.mode_instructions()));
+                assert!(
+                    system_prompt.contains("Do not create independent threads, branches, teams")
+                );
+                assert!(!system_prompt.contains("Use parallel spawn_agent calls"));
+                assert!(
+                    !system_prompt
+                        .contains(&format!("The task branch is `codex/fanta-{}`", thread.id)),
+                    "subagents must not change the shared task branch"
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn test_output_limit_automatically_continues_to_end_turn(cx: &mut TestAppContext) {
+        let (thread, _) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+        let mut events = thread
+            .update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread.send(ClientUserMessageId::new(), vec!["Finish the design"], cx)
+            })
+            .expect("turn");
+        cx.run_until_parked();
+        let first = model.pending_completions().pop().expect("first request");
+        model.send_completion_stream_text_chunk(&first, "Working on the design");
+        model.send_completion_stream_event(
+            &first,
+            LanguageModelCompletionEvent::Stop(StopReason::MaxTokens),
+        );
+        model.end_completion_stream(&first);
+        cx.run_until_parked();
+        let second = model
+            .pending_completions()
+            .pop()
+            .expect("automatic continuation");
+        assert_eq!(
+            second
+                .messages
+                .last()
+                .expect("continuation prompt")
+                .string_contents(),
+            OUTPUT_LIMIT_CONTINUATION_PROMPT
+        );
+        assert!(thread.read_with(cx, |thread, _| thread.running_turn.is_some()));
+        model.send_completion_stream_text_chunk(&second, "Completed and verified the design.");
+        model.send_completion_stream_event(
+            &second,
+            LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+        );
+        model.end_completion_stream(&second);
+        cx.run_until_parked();
+        assert!(thread.read_with(cx, |thread, _| thread.running_turn.is_none()));
+        assert!(model.pending_completions().is_empty());
+        let mut ended = false;
+        let mut retries = 0;
+        while let Some(event) = events.next().await {
+            match event.expect("no completion error") {
+                ThreadEvent::Retry(status) => {
+                    retries += 1;
+                    assert!(status.duration.is_zero());
+                }
+                ThreadEvent::Stop(reason) => {
+                    assert_eq!(reason, acp::StopReason::EndTurn);
+                    ended = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(ended);
+        assert_eq!(retries, 1);
+    }
+
+    #[gpui::test]
+    async fn test_output_limit_continuation_has_consecutive_failure_cap(cx: &mut TestAppContext) {
+        let (thread, _) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+        let mut events = thread
+            .update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread.send(ClientUserMessageId::new(), vec!["Finish the design"], cx)
+            })
+            .expect("turn");
+        for attempt in 0..=MAX_OUTPUT_LIMIT_CONTINUATIONS {
+            cx.run_until_parked();
+            let request = model.pending_completions().pop().expect("bounded request");
+            if attempt > 0 {
+                assert_eq!(
+                    request.messages.last().expect("prompt").string_contents(),
+                    OUTPUT_LIMIT_CONTINUATION_PROMPT
+                );
+            }
+            model.send_completion_stream_event(
+                &request,
+                LanguageModelCompletionEvent::Stop(StopReason::MaxTokens),
+            );
+            model.end_completion_stream(&request);
+        }
+        cx.run_until_parked();
+        assert!(model.pending_completions().is_empty());
+        assert!(thread.read_with(cx, |thread, _| thread.running_turn.is_none()));
+        let mut retries = 0;
+        let mut reached_limit = false;
+        while let Some(event) = events.next().await {
+            match event {
+                Ok(ThreadEvent::Retry(_)) => retries += 1,
+                Ok(ThreadEvent::Stop(acp::StopReason::MaxTokens)) => reached_limit = true,
+                Err(error) => assert!(
+                    error
+                        .downcast_ref::<CompletionError>()
+                        .is_some_and(|error| matches!(error, CompletionError::MaxTokens))
+                ),
+                _ => {}
+            }
+        }
+        assert_eq!(retries, MAX_OUTPUT_LIMIT_CONTINUATIONS);
+        assert!(reached_limit);
+    }
+
+    #[gpui::test]
+    async fn test_output_limit_waits_for_streamed_write_rollback_before_retry(
+        cx: &mut TestAppContext,
+    ) {
+        use fs::Fs as _;
+        let (thread, _) = setup_thread_for_test(cx).await;
+        let filesystem = fs::FakeFs::new(cx.executor());
+        filesystem
+            .insert_tree("/root", json!({"page.fnx": "<Page />\n"}))
+            .await;
+        let project = Project::test(filesystem.clone(), [std::path::Path::new("/root")], cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+        model.set_supports_streaming_tools(true);
+        let _events = thread
+            .update(cx, |thread, cx| {
+                thread.project = project.clone();
+                thread.set_profile(AgentProfileId(builtin_profiles::FULL_ACCESS.into()), cx);
+                thread.set_model(model.clone(), cx);
+                thread.add_tool(WriteFileTool::new(
+                    project.clone(),
+                    cx.weak_entity(),
+                    thread.action_log.clone(),
+                    project.read(cx).languages().clone(),
+                ));
+                thread.send(
+                    ClientUserMessageId::new(),
+                    vec!["Build a complete page"],
+                    cx,
+                )
+            })
+            .expect("turn");
+        cx.run_until_parked();
+        let first = model.pending_completions().pop().expect("first request");
+        let tool_use = LanguageModelToolUse {
+            id: "write-page".into(),
+            name: "write_file".into(),
+            raw_input: "{\"path\":\"root/page.fnx\"".into(),
+            input: json!({"path": "root/page.fnx"}),
+            is_input_complete: false,
+            thought_signature: None,
+        };
+        model.send_completion_stream_event(
+            &first,
+            LanguageModelCompletionEvent::ToolUse(tool_use.clone()),
+        );
+        cx.run_until_parked();
+        model.send_completion_stream_event(
+            &first,
+            LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+                raw_input: "{\"path\":\"root/page.fnx\",\"content\":\"<Page>\\n".into(),
+                input: json!({"path": "root/page.fnx", "content": "<Page>\n"}),
+                ..tool_use.clone()
+            }),
+        );
+        cx.run_until_parked();
+        let buffer = project.update(cx, |project, cx| {
+            let path = project
+                .find_project_path("root/page.fnx", cx)
+                .expect("path");
+            project.get_open_buffer(&path, cx).expect("streamed buffer")
+        });
+        assert_eq!(buffer.read_with(cx, |buffer, _| buffer.text()), "<Page>\n");
+        model.send_completion_stream_event(
+            &first,
+            LanguageModelCompletionEvent::Stop(StopReason::MaxTokens),
+        );
+        model.end_completion_stream(&first);
+        cx.run_until_parked();
+        let recovery = model
+            .pending_completions()
+            .pop()
+            .expect("retry after rollback");
+        buffer.read_with(cx, |buffer, _| {
+            assert_eq!(buffer.text(), "<Page />\n");
+            assert!(!buffer.is_dirty());
+        });
+        assert_eq!(
+            filesystem
+                .load(std::path::Path::new("/root/page.fnx"))
+                .await
+                .expect("disk source"),
+            "<Page />\n"
+        );
+        let replayed = recovery
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .find_map(|content| match content {
+                language_model::MessageContent::ToolUse(tool_use) => Some(tool_use),
+                _ => None,
+            })
+            .expect("interrupted tool is paired with its result");
+        assert!(replayed.is_input_complete);
+        assert!(serde_json::from_str::<serde_json::Value>(&replayed.raw_input).is_ok());
+        model.send_completion_stream_event(
+            &recovery,
+            LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+                id: "write-page-retry".into(),
+                name: "write_file".into(),
+                raw_input: json!({"path": "root/page.fnx", "content": "<Page><Frame /></Page>\n"})
+                    .to_string(),
+                input: json!({"path": "root/page.fnx", "content": "<Page><Frame /></Page>\n"}),
+                is_input_complete: true,
+                thought_signature: None,
+            }),
+        );
+        model.send_completion_stream_event(
+            &recovery,
+            LanguageModelCompletionEvent::Stop(StopReason::ToolUse),
+        );
+        model.end_completion_stream(&recovery);
+        cx.run_until_parked();
+        let final_request = model
+            .pending_completions()
+            .pop()
+            .expect("successful write result");
+        model.send_completion_stream_event(
+            &final_request,
+            LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+        );
+        model.end_completion_stream(&final_request);
+        cx.run_until_parked();
+        assert_eq!(
+            filesystem
+                .load(std::path::Path::new("/root/page.fnx"))
+                .await
+                .expect("complete source"),
+            "<Page><Frame /></Page>\n"
+        );
+        assert!(thread.read_with(cx, |thread, _| thread.running_turn.is_none()));
+    }
+
+    #[gpui::test]
+    async fn test_output_limit_transport_retry_preserves_instruction_and_budget(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+        let _events = thread
+            .update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread.send(ClientUserMessageId::new(), vec!["Finish the design"], cx)
+            })
+            .expect("turn");
+        for attempt in 0..=MAX_OUTPUT_LIMIT_CONTINUATIONS {
+            cx.run_until_parked();
+            let mut request = model.pending_completions().pop().expect("bounded request");
+            if attempt > 0 {
+                assert_eq!(
+                    request.messages.last().expect("prompt").string_contents(),
+                    OUTPUT_LIMIT_CONTINUATION_PROMPT
+                );
+                model.send_completion_stream_error(
+                    &request,
+                    LanguageModelCompletionError::UpstreamProviderError {
+                        message: "Transient service outage".into(),
+                        status: http_client::StatusCode::SERVICE_UNAVAILABLE,
+                        retry_after: Some(Duration::ZERO),
+                    },
+                );
+                model.end_completion_stream(&request);
+                cx.run_until_parked();
+                request = model.pending_completions().pop().expect("transport retry");
+                assert_eq!(
+                    request
+                        .messages
+                        .last()
+                        .expect("retained prompt")
+                        .string_contents(),
+                    OUTPUT_LIMIT_CONTINUATION_PROMPT
+                );
+            }
+            model.send_completion_stream_event(
+                &request,
+                LanguageModelCompletionEvent::Stop(StopReason::MaxTokens),
+            );
+            model.end_completion_stream(&request);
+        }
+        cx.run_until_parked();
+        assert!(
+            model.pending_completions().is_empty(),
+            "transport errors must not replenish the output-limit budget"
+        );
+        assert!(thread.read_with(cx, |thread, _| thread.running_turn.is_none()));
+    }
+
+    #[gpui::test]
+    async fn test_output_limit_cleanup_also_rolls_back_partial_write_before_refusal(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _) = setup_thread_for_test(cx).await;
+        let filesystem = fs::FakeFs::new(cx.executor());
+        filesystem
+            .insert_tree("/root", json!({"page.fnx": "<Page />\n"}))
+            .await;
+        let project = Project::test(filesystem, [std::path::Path::new("/root")], cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+        model.set_supports_streaming_tools(true);
+        let mut events = thread
+            .update(cx, |thread, cx| {
+                thread.project = project.clone();
+                thread.set_profile(AgentProfileId(builtin_profiles::FULL_ACCESS.into()), cx);
+                thread.set_model(model.clone(), cx);
+                thread.add_tool(WriteFileTool::new(
+                    project.clone(),
+                    cx.weak_entity(),
+                    thread.action_log.clone(),
+                    project.read(cx).languages().clone(),
+                ));
+                thread.send(ClientUserMessageId::new(), vec!["Build the page"], cx)
+            })
+            .expect("turn");
+        cx.run_until_parked();
+        let request = model.pending_completions().pop().expect("request");
+        let tool_use = LanguageModelToolUse {
+            id: "interrupted-page".into(),
+            name: "write_file".into(),
+            raw_input: "{\"path\":\"root/page.fnx\"".into(),
+            input: json!({"path": "root/page.fnx"}),
+            is_input_complete: false,
+            thought_signature: None,
+        };
+        model.send_completion_stream_event(
+            &request,
+            LanguageModelCompletionEvent::ToolUse(tool_use.clone()),
+        );
+        cx.run_until_parked();
+        model.send_completion_stream_event(
+            &request,
+            LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+                raw_input: "{\"path\":\"root/page.fnx\",\"content\":\"<Page>\\n".into(),
+                input: json!({"path": "root/page.fnx", "content": "<Page>\n"}),
+                ..tool_use.clone()
+            }),
+        );
+        cx.run_until_parked();
+        let buffer = project.update(cx, |project, cx| {
+            let path = project
+                .find_project_path("root/page.fnx", cx)
+                .expect("path");
+            project.get_open_buffer(&path, cx).expect("streamed buffer")
+        });
+        assert_eq!(buffer.read_with(cx, |buffer, _| buffer.text()), "<Page>\n");
+        model.send_completion_stream_event(
+            &request,
+            LanguageModelCompletionEvent::Stop(StopReason::Refusal),
+        );
+        model.end_completion_stream(&request);
+        cx.run_until_parked();
+        buffer.read_with(cx, |buffer, _| {
+            assert_eq!(buffer.text(), "<Page />\n");
+            assert!(!buffer.is_dirty());
+        });
+        thread.read_with(cx, |thread, _| {
+            assert!(thread.running_turn.is_none());
+            assert!(thread.messages.iter().any(|message| matches!(message.as_ref(), Message::Agent(message) if message.tool_results.contains_key(&tool_use.id))));
+        });
+        let mut refused = false;
+        while let Some(event) = events.next().await {
+            if matches!(
+                event.expect("no provider error"),
+                ThreadEvent::Stop(acp::StopReason::Refusal)
+            ) {
+                refused = true;
+            }
+        }
+        assert!(refused);
+    }
+
+    #[gpui::test]
+    async fn test_output_limit_budget_resets_after_complete_tool_batch(cx: &mut TestAppContext) {
+        let (thread, _) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+        cx.update(|cx| design_surface::register(Rc::new(TestDesignSurface), cx));
+        let _events = thread
+            .update(cx, |thread, cx| {
+                thread.set_profile(AgentProfileId(builtin_profiles::PLAN.into()), cx);
+                thread.set_model(model.clone(), cx);
+                thread.add_tool(DesignStateTool);
+                thread.send(ClientUserMessageId::new(), vec!["Inspect the design"], cx)
+            })
+            .expect("turn");
+        for index in 0..MAX_OUTPUT_LIMIT_CONTINUATIONS + 1 {
+            cx.run_until_parked();
+            let request = model
+                .pending_completions()
+                .pop()
+                .expect("request after completed batch");
+            model.send_completion_stream_event(
+                &request,
+                LanguageModelCompletionEvent::Stop(StopReason::MaxTokens),
+            );
+            model.end_completion_stream(&request);
+            cx.run_until_parked();
+            let request = model.pending_completions().pop().expect("recovery request");
+            model.send_completion_stream_event(
+                &request,
+                LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+                    id: format!("state-{index}").into(),
+                    name: "design_state".into(),
+                    raw_input: "{}".into(),
+                    input: json!({}),
+                    is_input_complete: true,
+                    thought_signature: None,
+                }),
+            );
+            model.send_completion_stream_event(
+                &request,
+                LanguageModelCompletionEvent::Stop(StopReason::ToolUse),
+            );
+            model.end_completion_stream(&request);
+        }
+        cx.run_until_parked();
+        let request = model
+            .pending_completions()
+            .pop()
+            .expect("more than three total recoveries allowed");
+        model.send_completion_stream_text_chunk(&request, "Inspection complete");
+        model.send_completion_stream_event(
+            &request,
+            LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+        );
+        model.end_completion_stream(&request);
+        cx.run_until_parked();
+        assert!(thread.read_with(cx, |thread, _| thread.running_turn.is_none()));
+    }
+
+    #[gpui::test]
+    async fn test_output_limit_completes_interrupted_nonstreaming_tool_call(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+        cx.update(|cx| design_surface::register(Rc::new(TestDesignSurface), cx));
+        let mut events = thread
+            .update(cx, |thread, cx| {
+                thread.set_profile(AgentProfileId(builtin_profiles::PLAN.into()), cx);
+                thread.set_model(model.clone(), cx);
+                thread.add_tool(DesignStateTool);
+                thread.send(ClientUserMessageId::new(), vec!["Inspect the page"], cx)
+            })
+            .expect("turn");
+        cx.run_until_parked();
+        let request = model.pending_completions().pop().expect("request");
+        model.send_completion_stream_event(
+            &request,
+            LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+                id: "interrupted-state".into(),
+                name: "design_state".into(),
+                raw_input: "{\"page\":".into(),
+                input: json!({}),
+                is_input_complete: false,
+                thought_signature: None,
+            }),
+        );
+        model.send_completion_stream_event(
+            &request,
+            LanguageModelCompletionEvent::Stop(StopReason::MaxTokens),
+        );
+        model.end_completion_stream(&request);
+        cx.run_until_parked();
+        let recovery = model.pending_completions().pop().expect("recovery request");
+        let result = recovery
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .find_map(|content| match content {
+                language_model::MessageContent::ToolResult(result) => Some(result),
+                _ => None,
+            })
+            .expect("incomplete nonstreaming call has an error result");
+        assert!(result.is_error);
+        assert_eq!(result.tool_use_id, "interrupted-state".into());
+        model.send_completion_stream_event(
+            &recovery,
+            LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+        );
+        model.end_completion_stream(&recovery);
+        cx.run_until_parked();
+        let mut completed_call = false;
+        while let Some(event) = events.next().await {
+            if let ThreadEvent::ToolCallUpdate(acp_thread::ToolCallUpdate::UpdateFields(update)) =
+                event.expect("no provider error")
+            {
+                if update.fields.status == Some(acp::ToolCallStatus::Failed) {
+                    completed_call = true;
+                }
+            }
+        }
+        assert!(
+            completed_call,
+            "ACP must not retain a pending tool call after the turn ends"
+        );
+    }
+
+    #[test]
+    fn test_interrupted_tool_input_is_sanitized_for_provider_replay() {
+        let tool_use = LanguageModelToolUse {
+            id: "interrupted-write".into(),
+            name: "write_file".into(),
+            raw_input: "{\"path\":\"root/page.fnx\",\"content\":\"<Page>".into(),
+            input: json!({"path": "root/page.fnx", "content": "<Page>"}),
+            is_input_complete: false,
+            thought_signature: None,
+        };
+        let mut message = AgentMessage {
+            content: vec![AgentMessageContent::ToolUse(tool_use.clone())],
+            ..Default::default()
+        };
+        message.tool_results.insert(
+            tool_use.id.clone(),
+            LanguageModelToolResult {
+                tool_use_id: tool_use.id.clone(),
+                tool_name: tool_use.name.clone(),
+                is_error: true,
+                content: vec!["Interrupted tool input; agent edits rolled back".into()],
+                output: None,
+            },
+        );
+        let request = message.to_request();
+        let language_model::MessageContent::ToolUse(replayed) = &request
+            .first()
+            .expect("assistant")
+            .content
+            .first()
+            .expect("tool")
+        else {
+            panic!("tool use");
+        };
+        assert!(replayed.is_input_complete);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&replayed.raw_input)
+                .expect("valid provider input"),
+            tool_use.input
+        );
+        assert_eq!(
+            request.len(),
+            2,
+            "matching error result must follow the sanitized call"
+        );
+        let AgentMessageContent::ToolUse(original) = message.content.first().expect("stored input")
+        else {
+            panic!("tool use");
+        };
+        assert_eq!(original.raw_input, tool_use.raw_input);
+        assert!(!original.is_input_complete);
     }
 
     #[test]

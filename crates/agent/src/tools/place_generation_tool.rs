@@ -16,6 +16,170 @@ use ui::SharedString;
 use crate::sandboxing::{NetworkRequest, SandboxRequest};
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 
+/// Import a generated image into the active Fanta project's asset library
+/// without creating a canvas layer. Supply exactly one of url, path, or source
+/// (base64 or a base64 data URI). The saved asset_id and path can be referenced
+/// from FNX file edits. Relative paths resolve from the active Fanta project.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ImportProjectImageToolInput {
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+pub struct ImportProjectImageTool {
+    http_client: Arc<HttpClientWithUrl>,
+}
+
+impl ImportProjectImageTool {
+    pub fn new(http_client: Arc<HttpClientWithUrl>) -> Self {
+        Self { http_client }
+    }
+}
+
+impl AgentTool for ImportProjectImageTool {
+    type Input = ImportProjectImageToolInput;
+    type Output = LanguageModelToolResultContent;
+    const NAME: &'static str = "import_project_image";
+    fn kind() -> acp::ToolKind {
+        acp::ToolKind::Edit
+    }
+    fn allow_in_restricted_mode() -> bool {
+        false
+    }
+    fn initial_title(
+        &self,
+        input: Result<Self::Input, serde_json::Value>,
+        _cx: &mut App,
+    ) -> SharedString {
+        input
+            .ok()
+            .and_then(|input| input.name)
+            .map(|name| format!("Import project image: {name}"))
+            .unwrap_or_else(|| "Import project image".into())
+            .into()
+    }
+    fn run(
+        self: Arc<Self>,
+        input: ToolInput<Self::Input>,
+        event_stream: ToolCallEventStream,
+        cx: &mut App,
+    ) -> Task<Result<Self::Output, Self::Output>> {
+        cx.spawn(async move |cx| {
+            let input = input.recv().await.map_err(tool_content_err)?;
+            if [input.url.is_some(), input.path.is_some(), input.source.is_some()].into_iter().filter(|provided| *provided).count() != 1 {
+                return Err(tool_content_err("supply exactly one of url, path or source"));
+            }
+            let (surface, state) = cx.update(|cx| {
+                let surface = design_surface::active(cx).context("open a Fanta project before importing images")?;
+                let state = surface.state(cx)?;
+                Ok::<_, anyhow::Error>((surface, state))
+            }).map_err(tool_content_err)?;
+            let document_id = state.get("document_id").cloned();
+            let unsandboxed = cx.update(|cx| event_stream.unsandboxed_access_granted(cx));
+            let bytes = if let Some(url) = input.url {
+                if !unsandboxed {
+                    let host = host_pattern_for_url(&url).map_err(tool_content_err)?;
+                    let authorization = cx.update(|cx| event_stream.authorize_sandbox(SandboxRequest {
+                        network: NetworkRequest::Hosts(vec![host]), ..Default::default()
+                    }, String::new(), cx));
+                    authorization.await.map_err(tool_content_err)?;
+                }
+                let download = cx.background_spawn({
+                    let http_client = self.http_client.clone();
+                    async move { download_image(http_client, &url).await }
+                });
+                futures::select! {
+                    result = download.fuse() => result.map_err(tool_content_err)?,
+                    _ = event_stream.cancelled_by_user().fuse() => return Err(tool_content_err("Image import cancelled by user")),
+                }
+            } else if let Some(path) = input.path {
+                let path = std::path::PathBuf::from(path);
+                let root = state.get("project_root").and_then(serde_json::Value::as_str).map(std::path::PathBuf::from);
+                let path = if path.is_absolute() { path } else {
+                    root.as_ref().context("relative image paths require a saved Fanta project; use an absolute path")
+                        .map_err(tool_content_err)?.join(path)
+                };
+                let canonical = cx.background_spawn(async move { path.canonicalize().context("the image file cannot be opened") }).await.map_err(tool_content_err)?;
+                let root = cx.background_spawn(async move {
+                    root.map(|root| root.canonicalize()).transpose().context("the project directory cannot be resolved")
+                }).await.map_err(tool_content_err)?;
+                if !unsandboxed && !root.as_ref().is_some_and(|root| canonical.starts_with(root)) {
+                    let authorization = cx.update(|cx| event_stream.authorize_always_prompt(
+                        format!("Import image outside the project: {}", canonical.display()),
+                        crate::ToolPermissionContext::symlink_target(Self::NAME, vec![canonical.display().to_string()]), cx,
+                    ));
+                    authorization.await.map_err(tool_content_err)?;
+                }
+                let read = cx.background_spawn(async move {
+                    use std::io::Read as _;
+                    let file = std::fs::File::open(canonical).context("opening the generated image")?;
+                    anyhow::ensure!(file.metadata()?.is_file(), "the image path is not a regular file");
+                    let mut bytes = Vec::new();
+                    file.take(MAX_DOWNLOAD_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+                    anyhow::ensure!(bytes.len() <= MAX_DOWNLOAD_BYTES, "the image exceeds the project asset limit");
+                    Ok::<_, anyhow::Error>(bytes)
+                });
+                futures::select! {
+                    result = read.fuse() => result.map_err(tool_content_err)?,
+                    _ = event_stream.cancelled_by_user().fuse() => return Err(tool_content_err("Image import cancelled by user")),
+                }
+            } else {
+                let source = input.source.context("the image source is missing").map_err(tool_content_err)?;
+                cx.background_spawn(async move { decode_import_source(&source) }).await.map_err(tool_content_err)?
+            };
+            let name = input.name.unwrap_or_else(|| "Generated image".into());
+            let import = cx.update(|cx| {
+                let current_state = surface.state(cx)?;
+                anyhow::ensure!(current_state.get("document_id") == document_id.as_ref(), "the active design changed during the import; select the intended project and retry");
+                Ok::<_, anyhow::Error>(surface.import_image(bytes, name, cx))
+            }).map_err(tool_content_err)?;
+            let result = import.await.map_err(tool_content_err)?;
+            let text = serde_json::to_string(&result).map_err(tool_content_err)?;
+            event_stream.update_fields(acp::ToolCallUpdateFields::new().content(vec![
+                acp::ToolCallContent::Content(acp::Content::new(text.clone())),
+            ]));
+            Ok(text.into())
+        })
+    }
+}
+
+fn decode_import_source(source: &str) -> Result<Vec<u8>> {
+    anyhow::ensure!(
+        source.len() <= 90 * 1024 * 1024,
+        "the image source exceeds the project asset limit"
+    );
+    let payload = if let Some(data) = source.trim().strip_prefix("data:") {
+        let (header, payload) = data
+            .split_once(',')
+            .context("the image data URI has no payload")?;
+        anyhow::ensure!(
+            header.ends_with(";base64"),
+            "the image data URI must use base64"
+        );
+        payload
+    } else {
+        source
+    };
+    let compact = payload
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(compact)
+        .context("the image source is not valid base64")?;
+    anyhow::ensure!(
+        bytes.len() <= MAX_DOWNLOAD_BYTES,
+        "the image exceeds the project asset limit"
+    );
+    Ok(bytes)
+}
+
 fn tool_content_err(e: impl std::fmt::Display) -> LanguageModelToolResultContent {
     LanguageModelToolResultContent::from(e.to_string())
 }
@@ -224,18 +388,19 @@ async fn download_image(http_client: Arc<HttpClientWithUrl>, url: &str) -> Resul
         .get(url, AsyncBody::default(), true)
         .await
         .with_context(|| format!("requesting {url}"))?;
-    let mut body = Vec::new();
-    response
-        .body_mut()
-        .read_to_end(&mut body)
-        .await
-        .context("reading the image bytes")?;
     if !response.status().is_success() {
         bail!(
             "downloading the image failed with status {}",
             response.status().as_u16()
         );
     }
+    let mut body = Vec::new();
+    response
+        .body_mut()
+        .take(MAX_DOWNLOAD_BYTES as u64 + 1)
+        .read_to_end(&mut body)
+        .await
+        .context("reading the image bytes")?;
     if body.len() > MAX_DOWNLOAD_BYTES {
         bail!(
             "the image is {} bytes; the limit is {MAX_DOWNLOAD_BYTES}",
@@ -282,6 +447,21 @@ fn host_pattern_for_url(url: &str) -> Result<http_proxy::HostPattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn import_source_decodes_data_uris_and_reports_invalid_payloads() -> Result<()> {
+        let bytes = b"\x89PNG\r\n\x1a\nfixture";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+        assert_eq!(decode_import_source(&encoded)?, bytes);
+        assert_eq!(
+            decode_import_source(&format!("data:image/png;base64,{encoded}\n"))?,
+            bytes
+        );
+        assert!(decode_import_source("data:image/png,abc").is_err());
+        assert!(decode_import_source("data:image/png;base64").is_err());
+        assert!(decode_import_source("invalid%").is_err());
+        Ok(())
+    }
 
     #[test]
     fn sniffs_the_supported_image_formats() {

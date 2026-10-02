@@ -912,7 +912,8 @@ impl GitRepository for FakeGitRepository {
             {
                 state.remotes.insert(remote.to_owned(), "".to_owned());
             }
-            state.branches.insert(name);
+            state.branches.insert(name.clone());
+            state.current_branch_name = Some(name);
             Ok(())
         })
     }
@@ -1261,6 +1262,21 @@ impl GitRepository for FakeGitRepository {
             let entry = fs.entry(&repository_dir_path)?;
             checkpoints.lock().insert(oid, entry);
             Ok(GitRepositoryCheckpoint { commit_sha: oid })
+        }
+        .boxed()
+    }
+
+    fn checkpoint_with_scope(
+        &self,
+        scope: RepoPath,
+    ) -> BoxFuture<'static, Result<GitRepositoryCheckpoint>> {
+        let fs = self.fs.clone();
+        let repository_dir_path = self.repository_dir_path.parent().map(Path::to_path_buf);
+        let checkpoint = self.checkpoint();
+        async move {
+            let repository_dir_path = repository_dir_path.context("repository has no parent")?;
+            fs.entry(&repository_dir_path.join(scope.as_std_path()))?;
+            checkpoint.await
         }
         .boxed()
     }

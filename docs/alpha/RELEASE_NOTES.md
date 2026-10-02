@@ -75,21 +75,19 @@ Fanta runs a local MCP server over a Unix socket whenever the app is open. It is
 bridges a stdio MCP client onto that socket, and it is documented in
 `fanta --help`.
 
-Claude Code — this is the exact string the welcome page's **Copy command**
-button puts on your clipboard (`CONNECT_CLAUDE_CODE_COMMAND`):
+Open the intended project in Fanta and use **Connect Codex or Claude Code**
+from its design menu, or the welcome page's copy buttons. The generated
+instructions use the running executable and include its `--user-data-dir`,
+so the bridge connects to that Fanta instance.
 
-```
-claude mcp add -s user fanta -- /Applications/Fanta.app/Contents/MacOS/fanta --mcp-stdio
-```
+Claude Code — run the copied command from the project directory. It uses
+`claude mcp add --scope project --transport stdio` to register Fanta for that
+project.
 
-Codex — add this to `~/.codex/config.toml`; it is what the welcome page's
-**Copy Codex config** button copies (`CONNECT_CODEX_CONFIG`):
-
-```toml
-[mcp_servers.fanta]
-command = "/Applications/Fanta.app/Contents/MacOS/fanta"
-args = ["--mcp-stdio"]
-```
+Codex — paste the copied `[mcp_servers.fanta]` block into the project's
+`.codex/config.toml` and trust the project. Keep Fanta running with the design
+open, restart the agent, check `/mcp`, and call `get_editor_state` to verify
+the connection.
 
 **What to expect when it works.** The client's handshake completes, and the
 Fanta window raises a toast reading *"Agent connected: &lt;client name&gt;"*.

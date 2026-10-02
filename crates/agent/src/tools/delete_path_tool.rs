@@ -4,16 +4,18 @@ use super::tool_permissions::{
 };
 use crate::{
     AgentTool, ToolCallEventStream, ToolInput, ToolPermissionDecision,
-    authorize_with_sensitive_settings, decide_permission_for_path,
+    authorize_with_sensitive_settings,
 };
 use action_log::ActionLog;
 use agent_client_protocol::schema::v1 as acp;
+#[cfg(test)]
 use agent_settings::AgentSettings;
 use futures::{FutureExt as _, SinkExt, StreamExt, channel::mpsc};
 use gpui::{App, AppContext, Entity, SharedString, Task};
 use project::{Project, ProjectPath};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use settings::Settings;
 use std::path::Path;
 use std::sync::Arc;
@@ -87,7 +89,7 @@ impl AgentTool for DeletePathTool {
             let path = input.path;
 
             let decision = cx.update(|cx| {
-                decide_permission_for_path(Self::NAME, &path, AgentSettings::get_global(cx))
+                event_stream.permission_decision(Self::NAME, std::slice::from_ref(&path), cx)
             });
 
             if let ToolPermissionDecision::Deny(reason) = decision {

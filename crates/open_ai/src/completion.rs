@@ -680,6 +680,11 @@ impl OpenAiEventMapper {
             Some("stop") => {
                 events.push(Ok(LanguageModelCompletionEvent::Stop(StopReason::EndTurn)));
             }
+            Some("length") => {
+                events.push(Ok(LanguageModelCompletionEvent::Stop(
+                    StopReason::MaxTokens,
+                )));
+            }
             Some("tool_calls") => {
                 events.extend(self.tool_calls_by_index.drain().map(|(_, tool_call)| {
                     match parse_tool_arguments(&tool_call.arguments) {
@@ -3306,6 +3311,55 @@ mod tests {
                 text: "thinking".into(),
                 signature: None,
             }]
+        );
+    }
+
+    #[test]
+    fn chat_completion_length_maps_to_max_tokens_without_completing_partial_tools() {
+        let mut mapper = OpenAiEventMapper::new();
+        let partial = mapper
+            .map_event(ResponseStreamEvent {
+                choices: vec![ChoiceDelta {
+                    index: 0,
+                    delta: Some(ResponseMessageDelta {
+                        role: None,
+                        content: None,
+                        reasoning: None,
+                        tool_calls: Some(vec![ToolCallChunk {
+                            index: 0,
+                            id: Some("write-1".into()),
+                            function: Some(FunctionChunk {
+                                name: Some("write_file".into()),
+                                arguments: Some(
+                                    r#"{"path":"pages/home/page.fnx","content":"<Group"#.into(),
+                                ),
+                            }),
+                        }]),
+                        reasoning_content: None,
+                    }),
+                    finish_reason: None,
+                }],
+                usage: None,
+            })
+            .into_iter()
+            .map(|event| event.expect("partial tool event"))
+            .collect::<Vec<_>>();
+        assert!(partial.iter().any(|event| matches!(event, LanguageModelCompletionEvent::ToolUse(tool) if !tool.is_input_complete)));
+        let stopped = mapper
+            .map_event(ResponseStreamEvent {
+                choices: vec![ChoiceDelta {
+                    index: 0,
+                    delta: None,
+                    finish_reason: Some("length".into()),
+                }],
+                usage: None,
+            })
+            .into_iter()
+            .map(|event| event.expect("length stop event"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            stopped,
+            vec![LanguageModelCompletionEvent::Stop(StopReason::MaxTokens)]
         );
     }
 

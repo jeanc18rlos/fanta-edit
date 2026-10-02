@@ -4418,7 +4418,13 @@ async fn test_streaming_tool_completes_when_llm_stream_ends_without_final_input(
             },
             LanguageModelRequestMessage {
                 role: Role::Assistant,
-                content: vec![language_model::MessageContent::ToolUse(tool_use.clone())],
+                content: vec![language_model::MessageContent::ToolUse(
+                    LanguageModelToolUse {
+                        raw_input: tool_use.input.to_string(),
+                        is_input_complete: true,
+                        ..tool_use.clone()
+                    }
+                )],
                 cache: false,
                 reasoning_details: None,
             },
@@ -7991,7 +7997,13 @@ async fn test_streaming_tool_error_breaks_stream_loop_immediately(cx: &mut TestA
             },
             LanguageModelRequestMessage {
                 role: Role::Assistant,
-                content: vec![language_model::MessageContent::ToolUse(tool_use.clone())],
+                content: vec![language_model::MessageContent::ToolUse(
+                    LanguageModelToolUse {
+                        raw_input: tool_use.input.to_string(),
+                        is_input_complete: true,
+                        ..tool_use.clone()
+                    }
+                )],
                 cache: false,
                 reasoning_details: None,
             },
@@ -8100,8 +8112,16 @@ async fn test_streaming_tool_error_waits_for_prior_tools_to_complete(cx: &mut Te
             LanguageModelRequestMessage {
                 role: Role::Assistant,
                 content: vec![
-                    language_model::MessageContent::ToolUse(first_tool_use.clone()),
-                    language_model::MessageContent::ToolUse(second_tool_use.clone())
+                    language_model::MessageContent::ToolUse(LanguageModelToolUse {
+                        raw_input: first_tool_use.input.to_string(),
+                        is_input_complete: true,
+                        ..first_tool_use.clone()
+                    }),
+                    language_model::MessageContent::ToolUse(LanguageModelToolUse {
+                        raw_input: second_tool_use.input.to_string(),
+                        is_input_complete: true,
+                        ..second_tool_use.clone()
+                    })
                 ],
                 cache: false,
                 reasoning_details: None,

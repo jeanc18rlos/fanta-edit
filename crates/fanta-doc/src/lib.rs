@@ -74,7 +74,10 @@ pub use journal::{
     JournalEvent, JournalSink, JournalViewport, Provenance, RecordedInput, SessionJournal,
     SessionStep,
 };
-pub use layout::{ExpandedTree, LayoutTree, Measure, solve_auto_layout, solve_expanded};
+pub use layout::{
+    ExpandedTree, LayoutTree, Measure, solve_auto_layout, solve_auto_layout_with_variables,
+    solve_expanded,
+};
 pub use motion::{
     AnimationClip, AnimationTrack, Interpolation, Keyframe, MotionEvaluation, MotionLibrary,
     MotionProperty, MotionTarget, MotionTransform,

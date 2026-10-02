@@ -52,7 +52,8 @@ mod view;
 mod view_text;
 mod workspace_hooks;
 
-use gpui::{App, AsyncWindowContext, Entity, WeakEntity};
+use gpui::{AnyElement, App, AsyncWindowContext, Entity, SharedString, WeakEntity};
+use ui::{CommonAnimationExt as _, prelude::*};
 use workspace::{Panel, Workspace};
 
 pub use code_workspace::{CodeWorkspaceFile, FantaCodeWorkspace};
@@ -111,6 +112,27 @@ pub async fn add_workspace_panels(
     .await;
 
     Ok(())
+}
+
+pub(crate) fn loading_indicator(
+    message: impl Into<SharedString>,
+    detail: impl Into<SharedString>,
+) -> AnyElement {
+    v_flex()
+        .id("fanta-document-loader")
+        .size_full()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .child(
+            Icon::new(IconName::LoadCircle)
+                .color(Color::Accent)
+                .size(IconSize::XLarge)
+                .with_rotate_animation(2),
+        )
+        .child(Label::new(message).size(LabelSize::Large))
+        .child(Label::new(detail).color(Color::Muted))
+        .into_any_element()
 }
 
 async fn add_panel_when_ready<P: Panel>(

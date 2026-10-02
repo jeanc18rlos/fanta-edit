@@ -1,14 +1,10 @@
-use crate::{
-    Thread, ToolCallEventStream, ToolPermissionContext, ToolPermissionDecision,
-    decide_permission_for_path,
-};
+use crate::{Thread, ToolCallEventStream, ToolPermissionContext, ToolPermissionDecision};
 use agent_client_protocol::schema::v1 as acp;
 use agent_skills::is_agents_skills_path;
 use anyhow::{Result, anyhow};
 use fs::Fs;
 use gpui::{App, Entity, Task, WeakEntity};
 use project::{Project, ProjectPath};
-use settings::Settings;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use util::{normalize_path, paths::component_matches_ignore_ascii_case};
@@ -633,8 +629,7 @@ pub fn authorize_file_edit(
 ) -> Task<Result<()>> {
     let path_str = path.to_string_lossy();
 
-    let settings = agent_settings::AgentSettings::get_global(cx);
-    let decision = decide_permission_for_path(tool_name, &path_str, settings);
+    let decision = event_stream.permission_decision(tool_name, &[path_str.to_string()], cx);
 
     if let ToolPermissionDecision::Deny(reason) = decision {
         return Task::ready(Err(anyhow!("{}", reason)));
@@ -828,6 +823,12 @@ pub fn authorize_dirty_buffer(
     event_stream: &ToolCallEventStream,
     cx: &mut App,
 ) -> Task<Result<DirtyBufferDecision>> {
+    if event_stream.has_full_access(cx) {
+        return Task::ready(Ok(match kind {
+            DirtyBufferPromptKind::Edit => DirtyBufferDecision::Save,
+            DirtyBufferPromptKind::Overwrite => DirtyBufferDecision::Keep,
+        }));
+    }
     let (message, options) = match kind {
         DirtyBufferPromptKind::Edit => (
             "This file has unsaved changes. Do you want to save or discard them \

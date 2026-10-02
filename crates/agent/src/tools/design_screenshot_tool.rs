@@ -32,6 +32,12 @@ pub struct DesignScreenshotToolInput {
     /// Cap on the longer output dimension in pixels (default 1024).
     #[serde(default)]
     pub max_dimension: Option<u32>,
+    /// Animation clip id to sample while rendering the design.
+    #[serde(default)]
+    pub motion_clip: Option<String>,
+    /// Playhead position in milliseconds for an animation sample.
+    #[serde(default)]
+    pub playhead_ms: Option<u32>,
 }
 
 pub struct DesignScreenshotTool;
@@ -67,6 +73,7 @@ impl AgentTool for DesignScreenshotTool {
             let input = input.recv().await.map_err(tool_content_err)?;
             let render = cx
                 .update(|cx| {
+                    event_stream.report_design_activity("Checking design screenshot", input.page, input.node.clone(), None, cx);
                     let surface = design_surface::active(cx).context(
                         "no design canvas is available; ask the user to open a .fig file or Fanta project",
                     )?;
@@ -75,6 +82,8 @@ impl AgentTool for DesignScreenshotTool {
                             page: input.page,
                             node: input.node.clone(),
                             max_dimension: input.max_dimension,
+                            motion_clip: input.motion_clip.clone(),
+                            playhead_ms: input.playhead_ms,
                         },
                         cx,
                     ))

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{AgentTool, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::{Context as _, Result};
-use design_surface::NodeQuery;
+use design_surface::{DesignAssetRequest, DesignSystemQuery, NodeQuery};
 use gpui::{App, SharedString, Task};
 use language_model::LanguageModelToolResultContent;
 use schemars::JsonSchema;
@@ -73,6 +73,190 @@ fn default_true() -> bool {
 
 pub struct DesignStateTool;
 
+pub struct PrepareDesignAssetTool;
+
+impl AgentTool for PrepareDesignAssetTool {
+    type Input = DesignAssetRequest;
+    type Output = LanguageModelToolResultContent;
+
+    const NAME: &'static str = "prepare_design_asset";
+
+    fn description() -> SharedString {
+        "Prepare an image or SVG icon prompt in Fanta's generation composer after the user expresses interest. Opens a prefilled composer and reports the available models. Does not submit a generation or spend credits; submitted remains false. Use existing asset import or placement tools after an asset has actually been generated.".into()
+    }
+
+    fn kind() -> acp::ToolKind {
+        acp::ToolKind::Other
+    }
+
+    fn initial_title(
+        &self,
+        _: Result<Self::Input, serde_json::Value>,
+        _: &mut App,
+    ) -> SharedString {
+        "Prepare design asset".into()
+    }
+
+    fn run(
+        self: Arc<Self>,
+        input: ToolInput<Self::Input>,
+        event_stream: ToolCallEventStream,
+        cx: &mut App,
+    ) -> Task<Result<Self::Output, Self::Output>> {
+        cx.spawn(async move |cx| {
+            let input = input.recv().await.map_err(tool_content_err)?;
+            let value = cx
+                .update(|cx| {
+                    event_stream.report_design_activity(
+                        "Preparing a design asset",
+                        None,
+                        None,
+                        None,
+                        cx,
+                    );
+                    design_surface::active(cx)
+                        .context("no design canvas is available")?
+                        .prepare_asset(input, cx)
+                })
+                .map_err(tool_content_err)?;
+            Ok(serde_json::to_string(&value)
+                .map_err(tool_content_err)?
+                .into())
+        })
+    }
+}
+
+/// Read the project's design-system foundations before creating or editing UI.
+/// Returns collections, modes, typed variables and aliases, component metadata,
+/// supported editing schema, and source paths. Use a collection and pagination
+/// to narrow a large library. Include bindings to inspect selected nodes.
+pub struct DesignSystemTool;
+
+impl AgentTool for DesignSystemTool {
+    type Input = DesignSystemQuery;
+    type Output = LanguageModelToolResultContent;
+
+    const NAME: &'static str = "design_system";
+
+    fn description() -> SharedString {
+        "Read the project's design system: collections, modes, typed variables and aliases, components, editing schema, and source paths. Inspect before creating foundations or repeated UI. Choose a collection and paginate large libraries; include_bindings inspects selected nodes.".into()
+    }
+
+    fn kind() -> acp::ToolKind {
+        acp::ToolKind::Read
+    }
+
+    fn initial_title(
+        &self,
+        _: Result<Self::Input, serde_json::Value>,
+        _: &mut App,
+    ) -> SharedString {
+        "Read design system".into()
+    }
+
+    fn run(
+        self: Arc<Self>,
+        input: ToolInput<Self::Input>,
+        event_stream: ToolCallEventStream,
+        cx: &mut App,
+    ) -> Task<Result<Self::Output, Self::Output>> {
+        cx.spawn(async move |cx| {
+            let input = input.recv().await.map_err(tool_content_err)?;
+            let value = cx
+                .update(|cx| {
+                    event_stream.report_design_activity("Reading design system", None, None, None, cx);
+                    design_surface::active(cx)
+                        .context("no design canvas is available")?
+                        .design_system(input, cx)
+                })
+                .map_err(tool_content_err)?;
+            let text = serde_json::to_string(&value).map_err(tool_content_err)?;
+            if text.len() > design_surface::MAX_JSON_RESPONSE_BYTES {
+                return Err("design system result exceeds the response limit; choose a collection, lower limit, and omit bindings".into());
+            }
+            Ok(text.into())
+        })
+    }
+}
+
+/// Report what you are inspecting on the canvas, including the current page,
+/// node, or world coordinates. Call before a file-editing or animation step
+/// so the user can follow your progress. The session supplies your identity.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+pub struct ReportAgentActivityToolInput {
+    pub action: String,
+    #[serde(default)]
+    pub page: Option<usize>,
+    #[serde(default)]
+    pub node: Option<String>,
+    #[serde(default)]
+    pub world: Option<[f64; 2]>,
+    #[serde(default = "default_true")]
+    pub active: bool,
+}
+
+pub struct ReportAgentActivityTool;
+
+impl AgentTool for ReportAgentActivityTool {
+    type Input = ReportAgentActivityToolInput;
+    type Output = LanguageModelToolResultContent;
+
+    const NAME: &'static str = "report_agent_activity";
+
+    fn kind() -> acp::ToolKind {
+        acp::ToolKind::Read
+    }
+
+    fn initial_title(
+        &self,
+        _: Result<Self::Input, serde_json::Value>,
+        _: &mut App,
+    ) -> SharedString {
+        "Update agent canvas focus".into()
+    }
+
+    fn run(
+        self: Arc<Self>,
+        input: ToolInput<Self::Input>,
+        event_stream: ToolCallEventStream,
+        cx: &mut App,
+    ) -> Task<Result<Self::Output, Self::Output>> {
+        cx.spawn(async move |cx| {
+            let input = input.recv().await.map_err(tool_content_err)?;
+            if input
+                .world
+                .is_some_and(|position| position.iter().any(|value| !value.is_finite()))
+            {
+                return Err("canvas coordinates must be finite".into());
+            }
+            let value = cx
+                .update(|cx| {
+                    let surface =
+                        design_surface::active(cx).context("no design canvas is available")?;
+                    let (agent_id, agent_name) = event_stream.agent_identity(cx);
+                    surface.report_activity(
+                        design_surface::AgentActivity {
+                            agent_id,
+                            agent_name,
+                            action: input.action,
+                            page: input.page,
+                            node: input.node,
+                            world: input.world,
+                            active: input.active,
+                            source_path: None,
+                            project_root: None,
+                        },
+                        cx,
+                    )
+                })
+                .map_err(tool_content_err)?;
+            Ok(serde_json::to_string(&value)
+                .map_err(tool_content_err)?
+                .into())
+        })
+    }
+}
+
 impl AgentTool for DesignStateTool {
     type Input = DesignStateToolInput;
     type Output = LanguageModelToolResultContent;
@@ -91,7 +275,15 @@ impl AgentTool for DesignStateTool {
         match input {
             Ok(input) if input.nodes.is_some() => "Read design nodes".into(),
             Ok(input) if input.empty_space.is_some() => "Find empty canvas space".into(),
-            Ok(input) if input.page.is_some() => "List design page".into(),
+            Ok(input)
+                if input.page.is_some()
+                    || input.depth.is_some()
+                    || input.offset.is_some()
+                    || input.limit.is_some()
+                    || !input.include_geometry =>
+            {
+                "List design page".into()
+            }
             _ => "Read design state".into(),
         }
     }
@@ -99,15 +291,21 @@ impl AgentTool for DesignStateTool {
     fn run(
         self: Arc<Self>,
         input: ToolInput<Self::Input>,
-        _event_stream: ToolCallEventStream,
+        event_stream: ToolCallEventStream,
         cx: &mut App,
     ) -> Task<Result<Self::Output, Self::Output>> {
         cx.spawn(async move |cx| {
             let input = input.recv().await.map_err(tool_content_err)?;
-            let listing =
-                input.empty_space.is_none() && input.nodes.is_none() && input.page.is_some();
+            let listing = input.empty_space.is_none()
+                && input.nodes.is_none()
+                && (input.page.is_some()
+                    || input.depth.is_some()
+                    || input.offset.is_some()
+                    || input.limit.is_some()
+                    || !input.include_geometry);
             let value = cx
                 .update(|cx| {
+                    event_stream.report_design_activity("Reading design state", input.page, input.nodes.as_ref().and_then(|nodes| nodes.first()).cloned(), None, cx);
                     let surface = design_surface::active(cx).context(
                         "no design canvas is available; ask the user to open a .fig file or Fanta project",
                     )?;
@@ -118,7 +316,7 @@ impl AgentTool for DesignStateTool {
                             state.insert("empty_space".into(), spot);
                         }
                         Ok(state)
-                    } else if input.nodes.is_some() || input.page.is_some() {
+                    } else if input.nodes.is_some() || listing {
                         surface.get_nodes(
                             NodeQuery {
                                 ids: input.nodes.clone(),

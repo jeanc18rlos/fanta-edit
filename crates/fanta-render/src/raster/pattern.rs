@@ -500,6 +500,10 @@ fn make_motif(
     recorder.finish_recording_as_picture(Some(&motif_bounds))
 }
 
+#[expect(
+    clippy::manual_clamp,
+    reason = "max/min maps NaN spacing to zero instead of retaining NaN"
+)]
 pub(crate) fn pattern_paint(
     bounds: Bounds,
     pattern: &PatternFill,

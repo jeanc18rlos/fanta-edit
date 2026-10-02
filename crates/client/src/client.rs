@@ -91,9 +91,9 @@ pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(20);
 actions!(
     client,
     [
-        /// Signs in to Zed account.
+        /// Signs in to Fanta account.
         SignIn,
-        /// Signs out of Zed account.
+        /// Signs out of Fanta account.
         SignOut,
         /// Reconnects to the collaboration server.
         Reconnect

@@ -8148,6 +8148,22 @@ impl Repository {
         })
     }
 
+    pub fn checkpoint_with_scope(
+        &mut self,
+        scope: RepoPath,
+    ) -> oneshot::Receiver<Result<GitRepositoryCheckpoint>> {
+        self.send_job("checkpoint_with_scope", None, move |repo, _cx| async move {
+            match repo {
+                RepositoryState::Local(LocalRepositoryState { backend, .. }) => {
+                    backend.checkpoint_with_scope(scope).await
+                }
+                RepositoryState::Remote(_) => {
+                    bail!("design checkpoints require a local repository")
+                }
+            }
+        })
+    }
+
     pub fn restore_checkpoint(
         &mut self,
         checkpoint: GitRepositoryCheckpoint,

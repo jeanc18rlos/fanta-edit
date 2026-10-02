@@ -3179,6 +3179,31 @@ impl AcpThread {
         Ok(())
     }
 
+    pub fn append_tool_call_text(
+        &mut self,
+        id: &acp::ToolCallId,
+        text: String,
+        cx: &mut Context<Self>,
+    ) -> Result<()> {
+        let index = self
+            .index_for_tool_call(id)
+            .context("the tool call is no longer available")?;
+        let languages = self.project.read(cx).languages().clone();
+        let path_style = self.project.read(cx).path_style(cx);
+        let content = ContentBlock::new_tool_call_content(
+            acp::ContentBlock::Text(acp::TextContent::new(text)),
+            &languages,
+            path_style,
+            cx,
+        );
+        let Some(AgentThreadEntry::ToolCall(call)) = self.entries.get_mut(index) else {
+            anyhow::bail!("the tool call is no longer available");
+        };
+        call.content.push(ToolCallContent::ContentBlock(content));
+        cx.emit(AcpThreadEvent::EntryUpdated(index));
+        Ok(())
+    }
+
     /// Updates a tool call if id matches an existing entry, otherwise inserts a new one.
     pub fn upsert_tool_call(
         &mut self,
@@ -4264,6 +4289,25 @@ impl AcpThread {
         content: String,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        self.write_text_file_inner(path, content, false, cx)
+    }
+
+    pub fn write_validated_source_file(
+        &self,
+        path: PathBuf,
+        content: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.write_text_file_inner(path, content, true, cx)
+    }
+
+    fn write_text_file_inner(
+        &self,
+        path: PathBuf,
+        content: String,
+        managed_source: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
         let project = self.project.clone();
         let action_log = self.action_log.clone();
         let should_update_agent_location = self.parent_session_id.is_none();
@@ -4276,11 +4320,17 @@ impl AcpThread {
             });
             let buffer = load?.await?;
             let snapshot = this.update(cx, |this, cx| {
-                this.shared_buffers
-                    .get(&buffer)
-                    .cloned()
-                    .unwrap_or_else(|| buffer.read(cx).snapshot())
-            })?;
+                if let Some(snapshot) = this.shared_buffers.get(&buffer) {
+                    return anyhow::Ok(snapshot.clone());
+                }
+                let buffer = buffer.read(cx);
+                anyhow::ensure!(
+                    !managed_source || !buffer.is_dirty(),
+                    "The FNX file has unsaved edits that the agent has not read. The user's draft has been preserved; read the file before retrying."
+                );
+                Ok(buffer.snapshot())
+            })??;
+            let version = snapshot.version().clone();
             let edits = cx
                 .background_executor()
                 .spawn(async move {
@@ -4293,6 +4343,10 @@ impl AcpThread {
                         .collect::<Vec<_>>()
                 })
                 .await;
+
+            if managed_source && buffer.read_with(cx, |buffer, _| buffer.version()) != version {
+                anyhow::bail!("The FNX file changed after the agent read it. The user's draft has been preserved; read the file again before retrying.");
+            }
 
             if should_update_agent_location {
                 project.update(cx, |project, cx| {
@@ -4322,13 +4376,20 @@ impl AcpThread {
                     let settings =
                         language::language_settings::LanguageSettings::for_buffer(buffer, cx);
 
-                    settings.format_on_save != FormatOnSave::Off
+                    // A generic formatter can replace FNX JSON syntax after validation.
+                    settings.format_on_save != FormatOnSave::Off && !managed_source
                 });
                 action_log.update(cx, |action_log, cx| {
                     action_log.buffer_edited(buffer.clone(), cx);
                 });
                 format_on_save
             });
+
+            if managed_source {
+                this.update(cx, |this, cx| {
+                    this.shared_buffers.insert(buffer.clone(), buffer.read(cx).snapshot());
+                })?;
+            }
 
             if format_on_save {
                 let format_task = project.update(cx, |project, cx| {
@@ -5952,6 +6013,89 @@ mod tests {
             assert_eq!(message.client_id, None);
             assert!(message.is_optimistic);
         });
+    }
+
+    #[gpui::test]
+    async fn test_validated_source_write_preserves_a_newer_user_draft(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let path = PathBuf::from(path!("/design/page.fnx"));
+        let original = "<Group name=\"Original\"/>\n";
+        fs.insert_tree(path!("/design"), json!({"page.fnx": original}))
+            .await;
+        let project = Project::test(fs.clone(), [Path::new(path!("/design"))], cx).await;
+        let buffer = project
+            .update(cx, |project, cx| {
+                let project_path = project
+                    .project_path_for_absolute_path(&path, cx)
+                    .expect("managed source path");
+                project.open_buffer(project_path, cx)
+            })
+            .await
+            .expect("open source");
+        let connection = Rc::new(FakeAgentConnection::new());
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/design"))]), cx)
+            })
+            .await
+            .expect("create session");
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(0..0, "// Unread user draft\n")], None, cx)
+        });
+        let unread_result = thread
+            .update(cx, |thread, cx| {
+                thread.write_validated_source_file(
+                    path.clone(),
+                    "<Group name=\"Agent\"/>\n".into(),
+                    cx,
+                )
+            })
+            .await;
+        assert!(
+            unread_result
+                .expect_err("an unread user draft must not be overwritten")
+                .to_string()
+                .contains("agent has not read")
+        );
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            format!("// Unread user draft\n{original}")
+        );
+        let read = thread
+            .update(cx, |thread, cx| {
+                thread.read_text_file(path.clone(), None, None, false, cx)
+            })
+            .await
+            .expect("read source");
+        assert_eq!(read, format!("// Unread user draft\n{original}"));
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(0..0, "// User draft\n")], None, cx)
+        });
+        let result = thread
+            .update(cx, |thread, cx| {
+                thread.write_validated_source_file(
+                    path.clone(),
+                    "<Group name=\"Agent\"/>\n".into(),
+                    cx,
+                )
+            })
+            .await;
+        assert!(
+            result
+                .expect_err("stale validated content must not overwrite user changes")
+                .to_string()
+                .contains("draft has been preserved")
+        );
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            format!("// User draft\n// Unread user draft\n{original}")
+        );
+        assert_eq!(
+            String::from_utf8(fs.read_file_sync(&path).expect("saved source"))
+                .expect("UTF-8 source"),
+            original
+        );
     }
 
     #[gpui::test]

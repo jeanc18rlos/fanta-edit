@@ -5,15 +5,17 @@ use super::tool_permissions::{
 };
 use crate::{
     AgentTool, ToolCallEventStream, ToolInput, ToolPermissionDecision,
-    authorize_with_sensitive_settings, decide_permission_for_paths,
+    authorize_with_sensitive_settings,
 };
 use agent_client_protocol::schema::v1 as acp;
+#[cfg(test)]
 use agent_settings::AgentSettings;
 use futures::FutureExt as _;
 use gpui::{App, Entity, Task};
 use project::Project;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use settings::Settings;
 use std::path::Path;
 use std::sync::Arc;
@@ -93,7 +95,7 @@ impl AgentTool for CopyPathTool {
             let input = input.recv().await.map_err(|e| e.to_string())?;
             let paths = vec![input.source_path.clone(), input.destination_path.clone()];
             let decision = cx.update(|cx| {
-                decide_permission_for_paths(Self::NAME, &paths, &AgentSettings::get_global(cx))
+                event_stream.permission_decision(Self::NAME, &paths, cx)
             });
             if let ToolPermissionDecision::Deny(reason) = decision {
                 return Err(reason);

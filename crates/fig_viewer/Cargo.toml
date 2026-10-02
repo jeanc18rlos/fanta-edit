@@ -40,6 +40,7 @@ fanta-canvas.workspace = true
 fanta-doc.workspace = true
 fanta-fig-interop.workspace = true
 fanta-format.workspace = true
+fanta-fnx.workspace = true
 fanta-present.workspace = true
 fanta-render.workspace = true
 fanta-text.workspace = true

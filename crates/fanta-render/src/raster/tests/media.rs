@@ -94,7 +94,7 @@ fn video_fill_prefers_live_frame_and_reverts_to_poster() {
     let mut resolver = InMemoryAssetResolver::new();
     resolver.insert(
         poster,
-        DecodedImage::new(Arc::new(vec![0, 255, 0, 255].repeat(4)), 2, 2),
+        DecodedImage::new(Arc::new([0, 255, 0, 255].repeat(4)), 2, 2),
     );
     let mut vector = VectorNode::rect_solid(-20.0, -20.0, 40.0, 40.0, Color::BLACK);
     vector.fills = smallvec_of(video_fill(source, Some(poster), 1.0));

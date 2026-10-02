@@ -4,6 +4,7 @@ mod copy_path_tool;
 mod create_directory_tool;
 mod create_thread_tool;
 mod delete_path_tool;
+mod design_comments_tool;
 mod design_edit_tool;
 mod design_screenshot_tool;
 mod design_state_tool;
@@ -73,6 +74,7 @@ pub use copy_path_tool::*;
 pub use create_directory_tool::*;
 pub use create_thread_tool::*;
 pub use delete_path_tool::*;
+pub use design_comments_tool::*;
 pub use design_edit_tool::*;
 pub use design_screenshot_tool::*;
 pub use design_state_tool::*;
@@ -201,9 +203,11 @@ tools! {
     CreateDirectoryTool,
     CreateThreadTool,
     DeletePathTool,
+    DesignCommentsTool,
     DesignEditTool,
     DesignScreenshotTool,
     DesignStateTool,
+    DesignSystemTool,
     DiagnosticsTool,
     EditFileTool,
     FetchTool,
@@ -212,12 +216,15 @@ tools! {
     GetCodeActionsTool,
     GoToDefinitionTool,
     GrepTool,
+    ImportProjectImageTool,
     JevEvaluateTool,
     ListAgentsAndModelsTool,
     ListDirectoryTool,
     MovePathTool,
     PlaceGenerationTool,
+    PrepareDesignAssetTool,
     ReadFileTool,
+    ReportAgentActivityTool,
     RenameTool,
     SkillTool,
     SpawnAgentTool,
@@ -247,15 +254,142 @@ pub fn tool_feature_flag_enabled(tool_name: &str, cx: &App) -> bool {
     }
 }
 
+pub(crate) fn tool_allowed_in_profile(tool_name: &str, profile_id: &str) -> bool {
+    use agent_settings::builtin_profiles;
+    if profile_id == builtin_profiles::EDIT_VISUAL {
+        return matches!(
+            tool_name,
+            DesignCommentsTool::NAME
+                | DesignEditTool::NAME
+                | DesignScreenshotTool::NAME
+                | DesignStateTool::NAME
+                | DesignSystemTool::NAME
+                | FetchTool::NAME
+                | FindPathTool::NAME
+                | GrepTool::NAME
+                | ImportProjectImageTool::NAME
+                | ListDirectoryTool::NAME
+                | PlaceGenerationTool::NAME
+                | PrepareDesignAssetTool::NAME
+                | ReadFileTool::NAME
+                | ReportAgentActivityTool::NAME
+                | WebSearchTool::NAME
+        );
+    }
+    if !matches!(
+        profile_id,
+        builtin_profiles::PLAN | builtin_profiles::REVIEW
+    ) {
+        return true;
+    }
+    matches!(
+        tool_name,
+        DesignCommentsTool::NAME
+            | DesignScreenshotTool::NAME
+            | DesignStateTool::NAME
+            | DesignSystemTool::NAME
+            | DiagnosticsTool::NAME
+            | FetchTool::NAME
+            | FindPathTool::NAME
+            | FindReferencesTool::NAME
+            | GetCodeActionsTool::NAME
+            | GoToDefinitionTool::NAME
+            | GrepTool::NAME
+            | ListAgentsAndModelsTool::NAME
+            | ListDirectoryTool::NAME
+            | ReadFileTool::NAME
+            | ReportAgentActivityTool::NAME
+            | SpawnAgentTool::NAME
+            | WebSearchTool::NAME
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edit_visual_only_allows_canvas_edits_and_project_reads() {
+        let profile = agent_settings::builtin_profiles::EDIT_VISUAL;
+        for tool in [
+            DesignEditTool::NAME,
+            DesignStateTool::NAME,
+            DesignSystemTool::NAME,
+            DesignScreenshotTool::NAME,
+            DesignCommentsTool::NAME,
+            ImportProjectImageTool::NAME,
+            PlaceGenerationTool::NAME,
+            PrepareDesignAssetTool::NAME,
+            ReadFileTool::NAME,
+        ] {
+            assert!(tool_allowed_in_profile(tool, profile), "{tool}");
+        }
+        for tool in [
+            WriteFileTool::NAME,
+            EditFileTool::NAME,
+            TerminalTool::NAME,
+            SandboxedTerminalTool::NAME,
+            JevEvaluateTool::NAME,
+            CreateThreadTool::NAME,
+            SpawnAgentTool::NAME,
+            "third_party_mutating_tool",
+        ] {
+            assert!(!tool_allowed_in_profile(tool, profile), "{tool}");
+        }
+    }
+
+    #[test]
+    fn planning_and_review_cannot_enable_mutating_tools() {
+        for profile in [
+            agent_settings::builtin_profiles::PLAN,
+            agent_settings::builtin_profiles::REVIEW,
+        ] {
+            for tool in [
+                EditFileTool::NAME,
+                WriteFileTool::NAME,
+                DesignEditTool::NAME,
+                TerminalTool::NAME,
+                PlaceGenerationTool::NAME,
+                PrepareDesignAssetTool::NAME,
+                JevEvaluateTool::NAME,
+                CreateThreadTool::NAME,
+            ] {
+                assert!(
+                    !tool_allowed_in_profile(tool, profile),
+                    "{profile} unexpectedly permits {tool}"
+                );
+            }
+            for tool in [
+                ReadFileTool::NAME,
+                DesignStateTool::NAME,
+                DesignScreenshotTool::NAME,
+                DesignCommentsTool::NAME,
+                SpawnAgentTool::NAME,
+            ] {
+                assert!(
+                    tool_allowed_in_profile(tool, profile),
+                    "{profile} should permit {tool}"
+                );
+            }
+            assert!(!tool_allowed_in_profile(
+                "third_party_mutating_tool",
+                profile
+            ));
+        }
+        assert!(tool_allowed_in_profile(
+            TerminalTool::NAME,
+            agent_settings::builtin_profiles::FULL_ACCESS
+        ));
+    }
 
     #[test]
     fn fetch_and_terminal_are_forbidden_in_restricted_mode() {
         assert!(!tool_allowed_in_restricted_mode(FetchTool::NAME));
         assert!(!tool_allowed_in_restricted_mode(TerminalTool::NAME));
         assert!(!tool_allowed_in_restricted_mode(PlaceGenerationTool::NAME));
+        assert!(!tool_allowed_in_restricted_mode(
+            ImportProjectImageTool::NAME
+        ));
         assert!(!tool_allowed_in_restricted_mode(JevEvaluateTool::NAME));
 
         // Every other built-in tool, and unknown (e.g. MCP) tools, are allowed.
@@ -263,6 +397,7 @@ mod tests {
             let expected = *name != FetchTool::NAME
                 && *name != TerminalTool::NAME
                 && *name != PlaceGenerationTool::NAME
+                && *name != ImportProjectImageTool::NAME
                 && *name != JevEvaluateTool::NAME;
             assert_eq!(
                 tool_allowed_in_restricted_mode(name),

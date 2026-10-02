@@ -10,6 +10,7 @@ use agent_client_protocol::schema::{
 use agent_client_protocol::{Agent, Client, ConnectionTo, JsonRpcResponse, Lines, Responder};
 use anyhow::anyhow;
 use async_channel;
+use base64::Engine as _;
 use collections::{HashMap, HashSet};
 use feature_flags::{AcpBetaFeatureFlag, FeatureFlagAppExt as _};
 use futures::channel::mpsc;
@@ -1947,13 +1948,63 @@ impl AgentConnection for AcpConnection {
 
     fn prompt(
         &self,
-        params: acp::PromptRequest,
+        mut params: acp::PromptRequest,
         cx: &mut App,
     ) -> Task<Result<acp::PromptResponse>> {
         let conn = self.connection.clone();
         let sessions = self.sessions.clone();
         let session_id = params.session_id.clone();
+        let specification_context = self
+            .sessions
+            .borrow()
+            .get(&session_id)
+            .and_then(|session| session.thread.upgrade())
+            .map(|thread| {
+                let project = thread.read(cx).project().clone();
+                let filesystem = project.read(cx).fs().clone();
+                let local = project.read(cx).is_local();
+                let mut roots = if local {
+                    project
+                        .read(cx)
+                        .visible_worktrees(cx)
+                        .filter(|worktree| !worktree.read(cx).is_single_file())
+                        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                        .collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                };
+                if local
+                    && let Some(surface) = design_surface::active(cx)
+                    && let Some(state) = surface.state(cx).log_err()
+                    && let Some(root) = state
+                        .get("project_root")
+                        .and_then(serde_json::Value::as_str)
+                {
+                    let root = PathBuf::from(root);
+                    if root.is_absolute()
+                        && project
+                            .read(cx)
+                            .project_path_for_absolute_path(&root.join("fanta.md"), cx)
+                            .is_some()
+                    {
+                        roots.retain(|worktree_root| root.starts_with(worktree_root));
+                        if !roots.contains(&root) {
+                            roots.push(root);
+                        }
+                    }
+                }
+                (filesystem, roots)
+            });
         cx.foreground_executor().spawn(async move {
+            if let Some((filesystem, roots)) = specification_context {
+                let specifications = read_acp_design_specs(filesystem.as_ref(), &roots).await?;
+                if !specifications.is_empty() {
+                    params.prompt.insert(
+                        0,
+                        acp::ContentBlock::Text(acp::TextContent::new(specifications)),
+                    );
+                }
+            }
             let result = conn.send_request(params).block_task().await;
 
             let mut suppress_abort_err = false;
@@ -2065,6 +2116,54 @@ impl AgentConnection for AcpConnection {
     fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
         self
     }
+}
+
+async fn read_acp_design_specs(filesystem: &dyn fs::Fs, roots: &[PathBuf]) -> Result<String> {
+    const MAX_BYTES: usize = 64 * 1024;
+    let mut remaining = MAX_BYTES;
+    let mut loaded = HashSet::default();
+    let mut context = String::new();
+    for root in roots {
+        let path = root.join("fanta.md");
+        let Some(metadata) = filesystem
+            .metadata(&path)
+            .await
+            .with_context(|| format!("failed to inspect {}", path.display()))?
+        else {
+            continue;
+        };
+        if metadata.is_dir || metadata.is_fifo || metadata.len > remaining as u64 {
+            anyhow::bail!(
+                "{} must be a regular specification within the 65536-byte context limit",
+                path.display()
+            );
+        }
+        let canonical_root = filesystem.canonicalize(root).await?;
+        let canonical_path = filesystem.canonicalize(&path).await?;
+        if !canonical_path.starts_with(canonical_root) {
+            anyhow::bail!("{} resolves outside its project root", path.display());
+        }
+        if !loaded.insert(canonical_path.clone()) {
+            continue;
+        }
+        let content = filesystem.load(&canonical_path).await?;
+        if content.len() > remaining {
+            anyhow::bail!(
+                "{} changed while reading and exceeds the specification limit",
+                path.display()
+            );
+        }
+        remaining -= content.len();
+        if !content.trim().is_empty() {
+            let spec = design_surface::DesignSpec {
+                path: canonical_path.display().to_string(),
+                content,
+            };
+            context.push_str(&spec.prompt_context());
+            context.push_str("\n\n");
+        }
+    }
+    Ok(context)
 }
 
 fn map_acp_error(err: acp::Error) -> anyhow::Error {
@@ -2704,6 +2803,75 @@ mod tests {
     use feature_flags::FeatureFlag as _;
     use gpui::UpdateGlobal as _;
     use settings::Settings as _;
+
+    #[gpui::test]
+    async fn acp_design_specs_refresh_and_stay_scoped(cx: &mut gpui::TestAppContext) {
+        let filesystem = fs::FakeFs::new(cx.executor());
+        filesystem.insert_tree("/", serde_json::json!({"design":{"fanta.md":"Use aligned indigo controls."},"other":{"fanta.md":"Private other direction"}})).await;
+        let roots = vec![PathBuf::from("/design")];
+        let context = read_acp_design_specs(filesystem.as_ref(), &roots)
+            .await
+            .expect("read project specification");
+        assert!(context.contains("Use aligned indigo controls."));
+        assert!(context.contains("Direct user instructions"));
+        assert!(!context.contains("Private other direction"));
+        filesystem
+            .insert_tree(
+                "/design",
+                serde_json::json!({"fanta.md":"Use a new brand direction."}),
+            )
+            .await;
+        let context = read_acp_design_specs(filesystem.as_ref(), &roots)
+            .await
+            .expect("refresh project specification");
+        assert!(context.contains("Use a new brand direction."));
+        assert!(!context.contains("Use aligned indigo controls."));
+        filesystem
+            .insert_tree("/design", serde_json::json!({"fanta.md":"x".repeat(65537)}))
+            .await;
+        assert!(
+            read_acp_design_specs(filesystem.as_ref(), &roots)
+                .await
+                .is_err()
+        );
+    }
+
+    #[gpui::test]
+    async fn local_sessions_receive_the_running_fanta_mcp_bridge(cx: &mut gpui::TestAppContext) {
+        init_feature_flags_test(cx);
+        let fs = fs::FakeFs::new(cx.executor());
+        fs.insert_tree("/", serde_json::json!({ "design": {} }))
+            .await;
+        let project = project::Project::test(fs, [std::path::Path::new("/design")], cx).await;
+        cx.update(|cx| {
+            assert!(mcp_servers_for_project(&project, cx).is_empty());
+            let arguments = vec![
+                "--mcp-stdio".into(),
+                "--user-data-dir".into(),
+                "/instance".into(),
+            ];
+            design_surface::set_live_mcp_command(
+                Some(design_surface::LiveMcpCommand {
+                    executable: "/Applications/Fanta.app/Contents/MacOS/fanta".into(),
+                    args: arguments.clone(),
+                }),
+                cx,
+            );
+            let servers = mcp_servers_for_project(&project, cx);
+            assert_eq!(servers.len(), 1);
+            let Some(acp::McpServer::Stdio(server)) = servers.first() else {
+                panic!("the local bridge must use stdio");
+            };
+            assert_eq!(server.name, "fanta");
+            assert_eq!(
+                server.command,
+                std::path::PathBuf::from("/Applications/Fanta.app/Contents/MacOS/fanta")
+            );
+            assert_eq!(server.args, arguments);
+            design_surface::set_live_mcp_command(None, cx);
+            assert!(mcp_servers_for_project(&project, cx).is_empty());
+        });
+    }
 
     #[cfg(all(feature = "mac_app_store", target_os = "macos"))]
     #[gpui::test]
@@ -4370,7 +4538,7 @@ mod tests {
 fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpServer> {
     let context_server_store = project.read(cx).context_server_store().read(cx);
     let is_local = project.read(cx).is_local();
-    context_server_store
+    let mut servers: Vec<_> = context_server_store
         .configured_server_ids()
         .iter()
         .filter_map(|id| {
@@ -4412,7 +4580,21 @@ fn mcp_servers_for_project(project: &Entity<Project>, cx: &App) -> Vec<acp::McpS
                 _ => None,
             }
         })
-        .collect()
+        .collect();
+    if is_local {
+        if let Some(command) = design_surface::live_mcp_command(cx) {
+            servers.retain(|server| match server {
+                acp::McpServer::Stdio(server) => server.name != "fanta",
+                acp::McpServer::Http(server) => server.name != "fanta",
+                acp::McpServer::Sse(server) => server.name != "fanta",
+                _ => true,
+            });
+            servers.push(acp::McpServer::Stdio(
+                acp::McpServerStdio::new("fanta", command.executable).args(command.args),
+            ));
+        }
+    }
+    servers
 }
 
 fn config_state(
@@ -4746,9 +4928,32 @@ fn handle_write_text_file(
 
     cx.spawn(async move |cx| {
         let result: Result<_, acp::Error> = async {
+            let validation = cx.update(|cx| {
+                design_surface::active(cx).map(|surface| {
+                    surface.validate_source_edit(
+                        args.path.to_string_lossy().into_owned(),
+                        args.content.clone(),
+                        cx,
+                    )
+                })
+            });
+            let managed_source = if let Some(validation) = validation {
+                validation
+                    .await
+                    .map_err(|error| acp::Error::internal_error().data(format!("{error:#}")))?
+                    .get("applicable")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false)
+            } else {
+                false
+            };
             thread
                 .update(cx, |thread, cx| {
-                    thread.write_text_file(args.path, args.content, cx)
+                    if managed_source {
+                        thread.write_validated_source_file(args.path, args.content, cx)
+                    } else {
+                        thread.write_text_file(args.path, args.content, cx)
+                    }
                 })
                 .map_err(acp::Error::from)?
                 .await?;
@@ -4901,6 +5106,7 @@ fn handle_session_notification(
     }
 
     // Post-handle: stream terminal output/exit if present on ToolCallUpdate meta.
+    import_session_tool_images(&notification.update, thread.clone(), cx);
     if let acp::SessionUpdate::ToolCallUpdate(tcu) = &notification.update {
         if let Some(meta) = &tcu.meta {
             if let Some(term_out) = meta.get("terminal_output") {
@@ -4951,6 +5157,99 @@ fn handle_session_notification(
             }
         }
     }
+}
+
+fn import_session_tool_images(
+    update: &acp::SessionUpdate,
+    thread: WeakEntity<AcpThread>,
+    cx: &mut AsyncApp,
+) {
+    let (id, content) = match update {
+        acp::SessionUpdate::ToolCall(call) => (&call.tool_call_id, call.content.as_slice()),
+        acp::SessionUpdate::ToolCallUpdate(update) => {
+            let Some(content) = &update.fields.content else {
+                return;
+            };
+            (&update.tool_call_id, content.as_slice())
+        }
+        _ => return,
+    };
+    let name = match thread.read_with(cx, |thread, cx| {
+        let (_, call) = thread.tool_call(id)?;
+        let name = call
+            .tool_name
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| call.label.read(cx).source().to_string());
+        let lower = name.to_lowercase();
+        (call.kind != acp::ToolKind::Read
+            && !lower.contains("screenshot")
+            && !lower.contains("capture_screen"))
+        .then_some(name)
+    }) {
+        Ok(Some(name)) => name,
+        _ => return,
+    };
+    let images = content
+        .iter()
+        .filter_map(|content| match content {
+            acp::ToolCallContent::Content(content) => match &content.content {
+                acp::ContentBlock::Image(image) => Some(image.data.clone()),
+                acp::ContentBlock::Resource(resource) => match &resource.resource {
+                    acp::EmbeddedResourceResource::BlobResourceContents(blob)
+                        if blob
+                            .mime_type
+                            .as_ref()
+                            .is_some_and(|mime| mime.starts_with("image/")) =>
+                    {
+                        Some(blob.blob.clone())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if images.is_empty() {
+        return;
+    }
+    let surface = cx.update(|cx| {
+        let surface = design_surface::active(cx)?;
+        let state = surface.state(cx).ok()?;
+        Some((surface, state.get("document_id").cloned()))
+    });
+    let Some((surface, document_id)) = surface else {
+        return;
+    };
+    let id = id.clone();
+    cx.spawn(async move |cx| {
+        for data in images {
+            let decoded = cx.background_spawn(async move {
+                anyhow::ensure!(data.len() <= 90 * 1024 * 1024, "the tool image exceeds the project asset limit");
+                base64::engine::general_purpose::STANDARD.decode(data.as_bytes()).context("the agent returned invalid image data")
+            }).await;
+            let imported = match decoded {
+                Ok(bytes) => {
+                    let import = cx.update(|cx| {
+                        let state = surface.state(cx)?;
+                        anyhow::ensure!(state.get("document_id") == document_id.as_ref(), "the active design changed while decoding the tool image; select the intended project and retry");
+                        Ok::<_, anyhow::Error>(surface.import_image(bytes, format!("{name} image"), cx))
+                    });
+                    match import {
+                        Ok(import) => import.await,
+                        Err(error) => Err(error),
+                    }
+                },
+                Err(error) => Err(error),
+            };
+            let status = match imported {
+                Ok(value) => format!("Image imported into the Fanta project assets: {value}"),
+                Err(error) => format!("Image asset import failed: {error:#}. Retry with the Fanta import_image tool before finishing."),
+            };
+            thread.update(cx, |thread, cx| thread.append_tool_call_text(&id, status, cx)).flatten().log_err();
+        }
+    }).detach();
 }
 
 fn handle_create_terminal(

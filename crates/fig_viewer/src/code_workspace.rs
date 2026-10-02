@@ -1,13 +1,15 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use collections::HashSet;
 use editor::{Editor, MultiBufferOffset, SelectionEffects, scroll::Autoscroll};
 use fanta_doc::NodeId;
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, Entity, FocusHandle, Focusable, IntoElement, Render,
-    SharedString, Subscription, Task, Window, div, px,
+    Animation, AnimationExt as _, AnyElement, App, ClipboardItem, Context, Entity, FocusHandle,
+    Focusable, IntoElement, Render, SharedString, Subscription, Task, Window, div,
+    pulsating_between, px,
 };
 use language::{Buffer, Capability};
 use project::Project;
@@ -16,6 +18,7 @@ use ui::Tooltip;
 use ui::prelude::*;
 
 use crate::document::{FigItem, FigItemEvent};
+use workspace::FollowableItem as _;
 
 const EDITABLE_STATUS: &str = "Edit FNX source · save to update the canvas";
 
@@ -110,12 +113,15 @@ pub struct FantaCodeWorkspace {
     json_source_observation: Option<Subscription>,
     json_source_version: Option<clock::Global>,
     source_save_in_progress: bool,
+    source_writer: Option<design_surface::AgentActivity>,
+    follow_source_writer: bool,
     loading_fnx: bool,
     loading_json: bool,
     error_message: Option<SharedString>,
     fnx_load_task: Option<Task<()>>,
     json_load_task: Option<Task<()>>,
     _item_subscription: Subscription,
+    _project_subscription: Subscription,
 }
 
 impl FantaCodeWorkspace {
@@ -158,6 +164,15 @@ impl FantaCodeWorkspace {
                 cx.notify();
             },
         );
+        let project_subscription = cx.subscribe_in(
+            &project,
+            window,
+            |this: &mut Self, _, event: &project::Event, window, cx| {
+                if matches!(event, project::Event::AgentLocationChanged) {
+                    this.follow_source_location(window, cx);
+                }
+            },
+        );
         let requested_page = item.read(cx).doc().and_then(|doc| doc.active_page());
         let mut workspace = Self {
             item,
@@ -177,15 +192,66 @@ impl FantaCodeWorkspace {
             json_source_observation: None,
             json_source_version: None,
             source_save_in_progress: false,
+            source_writer: None,
+            follow_source_writer: false,
             loading_fnx: false,
             loading_json: false,
             error_message: None,
             fnx_load_task: None,
             json_load_task: None,
             _item_subscription: item_subscription,
+            _project_subscription: project_subscription,
         };
         workspace.refresh_from_item(window, cx);
         workspace
+    }
+
+    pub(crate) fn set_source_writer(
+        &mut self,
+        writer: Option<design_surface::AgentActivity>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let identity = |writer: &design_surface::AgentActivity| {
+            (writer.agent_id.clone(), writer.source_path.clone())
+        };
+        if self.source_writer.as_ref().map(identity) != writer.as_ref().map(identity) {
+            self.follow_source_writer = writer.is_some();
+            if writer.is_some() {
+                self.selected_file = CodeWorkspaceFile::Fnx;
+            }
+        }
+        self.source_writer = writer;
+        self.follow_source_location(window, cx);
+        cx.notify();
+    }
+
+    fn source_writer_matches_file(&self) -> bool {
+        self.source_writer
+            .as_ref()
+            .and_then(|writer| writer.source_path.as_deref())
+            .is_some_and(|path| self.fnx_path.as_deref() == Some(Path::new(path)))
+    }
+
+    fn follow_source_location(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.follow_source_writer || !self.source_writer_matches_file() {
+            return;
+        }
+        let Some(location) = self.project.read(cx).agent_location() else {
+            return;
+        };
+        if !self
+            .fnx_source_buffer
+            .as_ref()
+            .is_some_and(|buffer| buffer.entity_id() == location.buffer.entity_id())
+        {
+            return;
+        }
+        if let Some(editor) = &self.fnx_editor {
+            editor.update(cx, |editor, cx| {
+                editor.update_agent_location(location.position, window, cx);
+            });
+        }
     }
 
     pub fn refresh_page(
@@ -524,7 +590,7 @@ impl FantaCodeWorkspace {
                     Ok(buffer) => {
                         this.fnx_source_observation =
                             Some(cx.observe_in(&buffer, window, |this, buffer, window, cx| {
-                                this.source_buffer_changed(buffer.clone(), window, cx);
+                                this.source_buffer_changed(buffer, window, cx);
                             }));
                         this.fnx_source_buffer = Some(buffer.clone());
                         this.show_fnx_editor(buffer.clone(), window, cx);
@@ -533,6 +599,7 @@ impl FantaCodeWorkspace {
                         // should be revealed in it, so catch up once here.
                         this.last_synced_selection = None;
                         this.sync_selection_to_source(window, cx);
+                        this.follow_source_location(window, cx);
                     }
                     Err(error) => {
                         this.error_message =
@@ -573,7 +640,7 @@ impl FantaCodeWorkspace {
                     Ok(buffer) => {
                         this.json_source_observation =
                             Some(cx.observe_in(&buffer, window, |this, buffer, window, cx| {
-                                this.show_json_preview(buffer.clone(), window, cx);
+                                this.show_json_preview(buffer, window, cx);
                             }));
                         this.json_source_buffer = Some(buffer.clone());
                         this.show_json_preview(buffer, window, cx);
@@ -612,7 +679,7 @@ impl FantaCodeWorkspace {
     fn source_buffer_changed(
         &mut self,
         buffer: Entity<Buffer>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let dirty = self.source_save_in_progress
@@ -625,6 +692,7 @@ impl FantaCodeWorkspace {
             self.error_message = None;
         }
         self.update_fnx_editability(cx);
+        self.follow_source_location(window, cx);
         cx.notify();
     }
 
@@ -855,7 +923,29 @@ impl FantaCodeWorkspace {
 
     fn render_body(&self, cx: &App) -> AnyElement {
         if let Some(editor) = self.active_editor() {
-            return div().size_full().child(editor.clone()).into_any_element();
+            return div()
+                .relative()
+                .size_full()
+                .child(editor.clone())
+                .when(self.source_writer_matches_file(), |element| {
+                    element.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .w_full()
+                            .h(px(3.0))
+                            .bg(gpui::rgb(0x387bff))
+                            .with_animation(
+                                "live-source-writing",
+                                Animation::new(Duration::from_millis(1200))
+                                    .repeat()
+                                    .with_easing(pulsating_between(0.35, 1.0)),
+                                |element, opacity| element.opacity(opacity),
+                            ),
+                    )
+                })
+                .into_any_element();
         }
         let loading = match self.selected_file {
             CodeWorkspaceFile::Fnx => self.loading_fnx,
@@ -1038,6 +1128,19 @@ impl Render for FantaCodeWorkspace {
         let status = error_message.unwrap_or_else(|| {
             if self.source_save_in_progress {
                 "Saving FNX…".into()
+            } else if self.source_writer_matches_file() {
+                format!(
+                    "{} is writing · {}",
+                    self.source_writer
+                        .as_ref()
+                        .map_or("Agent", |writer| writer.agent_name.as_str()),
+                    if self.follow_source_writer {
+                        "Following live source"
+                    } else {
+                        "Follow paused"
+                    },
+                )
+                .into()
             } else if self.selected_file == CodeWorkspaceFile::Json {
                 "JSON preview · edit the FNX source to change the canvas".into()
             } else if self.item.read(cx).is_dirty() {
@@ -1051,6 +1154,8 @@ impl Render for FantaCodeWorkspace {
         v_flex()
             .track_focus(&self.focus_handle)
             .size_full()
+            // The floating workspace selector must not cover source controls.
+            .pt(px(48.))
             .overflow_hidden()
             .bg(cx.theme().colors().editor_background)
             .child(
@@ -1070,7 +1175,26 @@ impl Render for FantaCodeWorkspace {
                                 .color(status_color)
                                 .single_line(),
                         ),
-                    ),
+                    )
+                    .when(self.source_writer_matches_file(), |element| {
+                        element.child(
+                            Button::new(
+                                "follow-live-source",
+                                if self.follow_source_writer {
+                                    "Pause follow"
+                                } else {
+                                    "Follow"
+                                },
+                            )
+                            .on_click(cx.listener(
+                                |this, _, window, cx| {
+                                    this.follow_source_writer = !this.follow_source_writer;
+                                    this.follow_source_location(window, cx);
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                    }),
             )
             .child(div().flex_1().min_h_0().child(self.render_body(cx)))
     }
@@ -1223,6 +1347,89 @@ mod tests {
         let project = open_test_project(root, cx).await;
         let (item, workspace) = open_code_workspace_for_project(project.clone(), cx).await;
         (project, item, workspace)
+    }
+
+    #[gpui::test]
+    async fn source_follow_uses_the_shared_buffer_and_respects_pause(cx: &mut TestAppContext) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("temporary project");
+        let (page, child) = write_project_with_children(temporary.path());
+        let (project, _, workspace) = open_code_workspace(temporary.path(), cx).await;
+        cx.run_until_parked();
+        let path = fanta_format::locate_page_source(temporary.path(), page).expect("source");
+        let buffer = workspace
+            .read_with(cx, |workspace, _| {
+                workspace
+                    .fnx_source_buffer
+                    .clone()
+                    .expect("shared source buffer")
+            })
+            .expect("workspace");
+        let position = buffer.read_with(cx, |buffer, _| {
+            buffer.anchor_before(language::Point::new(
+                source_row_of(&path, "Second child"),
+                0,
+            ))
+        });
+        let writer = design_surface::AgentActivity {
+            agent_id: "lead".into(),
+            agent_name: "Designer".into(),
+            action: "Editing source".into(),
+            page: Some(0),
+            node: Some(child.to_string()),
+            world: None,
+            active: true,
+            project_root: Some(temporary.path().display().to_string()),
+            source_path: Some(path.display().to_string()),
+        };
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace.set_source_writer(Some(writer.clone()), window, cx);
+            })
+            .expect("set writer");
+        project.update(cx, |project, cx| {
+            project.set_agent_location(
+                Some(project::AgentLocation {
+                    buffer: buffer.downgrade(),
+                    position,
+                }),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            fnx_selection_row(&workspace, cx),
+            source_row_of(&path, "Second child")
+        );
+        workspace
+            .update(cx, |workspace, _, _| workspace.follow_source_writer = false)
+            .expect("pause");
+        let position = buffer.read_with(cx, |buffer, _| buffer.anchor_before(0));
+        project.update(cx, |project, cx| {
+            project.set_agent_location(
+                Some(project::AgentLocation {
+                    buffer: buffer.downgrade(),
+                    position,
+                }),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            fnx_selection_row(&workspace, cx),
+            source_row_of(&path, "Second child")
+        );
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace.set_source_writer(Some(writer), window, cx);
+                assert!(
+                    !workspace.follow_source_writer,
+                    "stream chunks must not reset manual pause"
+                );
+                workspace.set_source_writer(None, window, cx);
+                assert!(!workspace.source_writer_matches_file());
+            })
+            .expect("stop writer");
     }
 
     /// Opening a project source file (`page.fnx`) while the project is open

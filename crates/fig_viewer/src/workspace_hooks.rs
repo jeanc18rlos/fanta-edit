@@ -38,6 +38,36 @@ pub fn init(cx: &mut App) {
             return;
         };
         crate::new_design::register(workspace);
+        workspace.register_action(
+            |workspace, _: &zed_actions::fanta::RevealProjectInFileManager, window, cx| {
+                let root = workspace
+                    .active_item_as::<FigView>(cx)
+                    .and_then(|view| {
+                        view.read(cx)
+                            .item()
+                            .read(cx)
+                            .project_root()
+                            .map(Path::to_path_buf)
+                    })
+                    .or_else(|| {
+                        workspace
+                            .project()
+                            .read(cx)
+                            .visible_worktrees(cx)
+                            .next()
+                            .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                    });
+                if let Some(root) = root {
+                    cx.reveal_path(&root);
+                } else {
+                    crate::view::show_canvas_notice(
+                        "Open or save a project before revealing its folder.".into(),
+                        window,
+                        cx,
+                    );
+                }
+            },
+        );
         crate::generation_workspace::register(workspace);
         crate::live_mcp::register(workspace);
 

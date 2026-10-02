@@ -1142,6 +1142,7 @@ struct GenerationWorkspace {
     vector_operation: VectorOperation,
     models: Vec<GenerationModel>,
     selected_model: Option<String>,
+    prepared_model: Option<String>,
     size: String,
     prompt: Entity<InputField>,
     prompt_drafts: Vec<(GenerationMode, Entity<InputField>)>,
@@ -1243,7 +1244,85 @@ pub(crate) fn open_from_canvas(
     }
 }
 
+pub(crate) fn open_prepared_asset(
+    request: design_surface::DesignAssetRequest,
+    item: WeakEntity<FigItem>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Result<()> {
+    let workspace = window
+        .root::<MultiWorkspace>()
+        .flatten()
+        .map(|root| root.read(cx).workspace().clone())
+        .context("the active window has no design workspace")?;
+    let canvas_item = item.upgrade().context("the design document is closed")?;
+    let project = workspace.read(cx).project().clone();
+    let project_path = project::ProjectItem::project_path(canvas_item.read(cx), cx)
+        .context("the design document has no project path")?;
+    if project
+        .read(cx)
+        .worktree_for_id(project_path.worktree_id, cx)
+        .is_none()
+    {
+        bail!("the active window belongs to a different project");
+    }
+    let mode = match request.kind {
+        design_surface::DesignAssetKind::Image => GenerationMode::Image,
+        design_surface::DesignAssetKind::Svg => GenerationMode::Vector,
+    };
+    let workspace_handle = workspace.downgrade();
+    let view = cx.new(|cx| {
+        let mut view = GenerationWorkspace::new(workspace_handle, Some(item), mode, window, cx);
+        view.prepare_asset_draft(request, window, cx);
+        view
+    });
+    workspace.update(cx, |workspace, cx| {
+        workspace.add_item_to_active_pane(Box::new(view), None, true, window, cx);
+    });
+    Ok(())
+}
+
 impl GenerationWorkspace {
+    fn prepare_asset_draft(
+        &mut self,
+        request: design_surface::DesignAssetRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.prompt.update(cx, |prompt, cx| {
+            prompt.set_text(&request.prompt, window, cx);
+        });
+        if let Some(screen) = &self.generation_screen {
+            screen.update(cx, |screen, cx| {
+                screen.set_draft(
+                    GenerationDraft {
+                        prompt: request.prompt.into(),
+                        ..GenerationDraft::default()
+                    },
+                    window,
+                    cx,
+                );
+            });
+        }
+        self.prepared_model = request.preferred_model;
+        self.apply_prepared_model();
+        self.status =
+            "Your designer prepared this idea. Choose a model and Generate when ready.".into();
+        cx.notify();
+    }
+
+    fn apply_prepared_model(&mut self) {
+        let Some(preferred) = self.prepared_model.as_deref() else {
+            return;
+        };
+        if self
+            .models
+            .iter()
+            .any(|model| model.id == preferred && self.accepts_model(model))
+        {
+            self.selected_model = self.prepared_model.take();
+        }
+    }
     fn mount_generation_screen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(old) = self.generation_screen.take() {
             let kind = old.read(cx).kind();
@@ -2408,6 +2487,7 @@ impl GenerationWorkspace {
             vector_operation: VectorOperation::Create,
             models: Vec::new(),
             selected_model: None,
+            prepared_model: None,
             size: "1024x1024".into(),
             prompt_drafts: vec![(mode, prompt.clone())],
             prompt,
@@ -2590,6 +2670,7 @@ impl GenerationWorkspace {
                         this.member_id = Some(member_id);
                         this.restore_history(submissions, history);
                         this.choose_default_model();
+                        this.apply_prepared_model();
                         if this.mode.generation_kind().is_some()
                             && !this.models.iter().any(|model| {
                                 Some(model.id.as_str()) == this.selected_model.as_deref()
@@ -3946,6 +4027,7 @@ impl GenerationWorkspace {
                     page: None,
                     node,
                     max_dimension: Some(2048),
+                    ..Default::default()
                 },
                 cx,
             ))
@@ -4478,7 +4560,7 @@ impl GenerationWorkspace {
                 .upgrade()
                 .context("This workspace was closed.")?;
             let prompt = format!(
-                "Create this design in the active Fanta canvas using editable native layers: {}\n\nUse design_state to inspect the current page and find empty_space for a new top-level frame. Keep existing work. Use design_edit to create frames, text, and shapes, applying auto layout where useful. Finish by checking design_screenshot.",
+                "Create this design in the active Fanta canvas using editable native layers: {}\n\nUse design_state to inspect the current page, its .fnx source path, and empty_space for a new top-level frame. Keep existing work. Prefer reading and editing the actual .fnx source with file tools; apply auto layout where useful. Use design_edit when source editing is unavailable or the editor operation is required. Import generated images into project assets before using them. Verify progress and the final result with design_screenshot.",
                 prompt.trim()
             );
             agent_ui::open_external_prompt_for_review(workspace, &prompt, window, cx)
@@ -6574,6 +6656,46 @@ mod tests {
         cx.simulate_resize(gpui::size(px(1000.), px(768.)));
         cx.run_until_parked();
         (view, cx)
+    }
+
+    #[gpui::test]
+    fn agent_asset_draft_is_prefilled_without_submitting_or_inventing_a_model(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (view, cx) = visual_workspace(GenerationMode::Image, cx);
+        view.update_in(cx, |view, window, cx| {
+            view.prepare_asset_draft(
+                design_surface::DesignAssetRequest {
+                    kind: design_surface::DesignAssetKind::Image,
+                    prompt: "A luminous blue glass illustration".into(),
+                    preferred_model: Some("gpt-image-unavailable".into()),
+                },
+                window,
+                cx,
+            );
+            assert_eq!(
+                view.generation_screen
+                    .as_ref()
+                    .expect("screen")
+                    .read(cx)
+                    .draft(cx)
+                    .prompt,
+                "A luminous blue glass illustration"
+            );
+            assert!(!view.pending);
+            assert!(view.active_run.is_none());
+            assert!(view.task.is_none());
+            assert!(view.selected_model.is_none());
+            let mut available = model("image");
+            available.id = "gpt-image-unavailable".into();
+            available.capabilities = json!({"hosted":true,"operations":["text_to_image"]});
+            view.models.push(available);
+            view.apply_prepared_model();
+            assert_eq!(
+                view.selected_model.as_deref(),
+                Some("gpt-image-unavailable")
+            );
+        });
     }
 
     #[gpui::test]

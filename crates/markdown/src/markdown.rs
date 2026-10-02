@@ -456,6 +456,9 @@ pub type CodeBlockRenderFn = Arc<
 pub type CodeBlockTransformFn =
     Arc<dyn Fn(AnyDiv, Range<usize>, CodeBlockMetadata, &mut Window, &App) -> AnyDiv>;
 
+pub type CodeBlockPresentationFn =
+    Arc<dyn Fn(AnyDiv, Range<usize>, CodeBlockMetadata, &mut Window, &App) -> (AnyDiv, bool)>;
+
 actions!(
     markdown,
     [
@@ -1221,6 +1224,7 @@ pub struct MarkdownElement {
     markdown: Entity<Markdown>,
     style: MarkdownStyle,
     code_block_renderer: CodeBlockRenderer,
+    code_block_transform: Option<CodeBlockPresentationFn>,
     on_url_click: Option<Rc<dyn Fn(SharedString, &mut Window, &mut App)>>,
     code_span_link: Option<CodeSpanLinkCallback>,
     on_source_click: Option<SourceClickCallback>,
@@ -1240,6 +1244,7 @@ impl MarkdownElement {
                 wrap_button_visibility: WrapButtonVisibility::Hidden,
                 border: false,
             },
+            code_block_transform: None,
             on_url_click: None,
             code_span_link: None,
             on_source_click: None,
@@ -1273,6 +1278,12 @@ impl MarkdownElement {
 
     pub fn code_block_renderer(mut self, variant: CodeBlockRenderer) -> Self {
         self.code_block_renderer = variant;
+        self
+    }
+
+    /// Return false for hidden content so selection never uses unlaid-out text.
+    pub fn code_block_transform(mut self, transform: CodeBlockPresentationFn) -> Self {
+        self.code_block_transform = Some(transform);
         self
     }
 
@@ -2083,6 +2094,7 @@ impl Element for MarkdownElement {
         let mut handled_html_block = false;
         let mut rendered_mermaid_block = false;
         let mut rendered_metadata_block = false;
+        let mut current_code_block_metadata = None;
         for (index, (range, event)) in parsed_markdown.events.iter().enumerate() {
             // Skip alt text for images that rendered
             if let Some(current_img_block_range) = &current_img_block_range
@@ -2196,7 +2208,7 @@ impl Element for MarkdownElement {
                                 markdown_end,
                             );
                         }
-                        MarkdownTag::CodeBlock { kind, .. } => {
+                        MarkdownTag::CodeBlock { kind, metadata } => {
                             if render_mermaid_diagrams
                                 && let Some(mermaid_diagram) =
                                     parsed_markdown.mermaid_diagrams.get(&range.start)
@@ -2239,6 +2251,9 @@ impl Element for MarkdownElement {
                             };
 
                             let is_indented = matches!(kind, CodeBlockKind::Indented);
+                            builder.flush_text();
+                            current_code_block_metadata = (!is_indented)
+                                .then(|| (metadata.clone(), builder.rendered_lines.len()));
                             let scroll_handle = if self.style.code_block_overflow_x_scroll {
                                 self.markdown.update(cx, |markdown, _| {
                                     markdown.code_block_scroll_handle(range.start)
@@ -2612,6 +2627,22 @@ impl Element for MarkdownElement {
 
                                 el.child(button_row)
                             });
+                        }
+
+                        if let Some(transform) = &self.code_block_transform
+                            && let Some((metadata, first_content_line)) =
+                                current_code_block_metadata.take()
+                        {
+                            let mut content_visible = true;
+                            builder.modify_current_div(|element| {
+                                let (element, visible) =
+                                    transform(element, range.clone(), metadata, window, cx);
+                                content_visible = visible;
+                                element
+                            });
+                            if !content_visible {
+                                builder.rendered_lines.truncate(first_content_line);
+                            }
                         }
 
                         // Pop the parent container.
@@ -2989,7 +3020,7 @@ pub enum AnyDiv {
 }
 
 impl AnyDiv {
-    fn into_any_element(self) -> AnyElement {
+    pub fn into_any_element(self) -> AnyElement {
         match self {
             Self::Div(div) => div.into_any_element(),
             Self::Stateful(div) => div.into_any_element(),
@@ -4076,6 +4107,156 @@ mod tests {
                 theme_settings::init(theme::LoadThemes::JustBase, cx);
             }
         });
+    }
+
+    #[gpui::test]
+    fn test_code_block_transform_preserves_prose_and_default_code_rendering(
+        cx: &mut TestAppContext,
+    ) {
+        struct TestMarkdownElement {
+            element: MarkdownElement,
+            rendered_text: Rc<std::cell::RefCell<Option<RenderedText>>>,
+        }
+
+        impl IntoElement for TestMarkdownElement {
+            type Element = Self;
+
+            fn into_element(self) -> Self::Element {
+                self
+            }
+        }
+
+        impl Element for TestMarkdownElement {
+            type RequestLayoutState = RenderedMarkdown;
+            type PrepaintState = Hitbox;
+
+            fn id(&self) -> Option<ElementId> {
+                self.element.id()
+            }
+
+            fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+                self.element.source_location()
+            }
+
+            fn request_layout(
+                &mut self,
+                id: Option<&GlobalElementId>,
+                inspector_id: Option<&gpui::InspectorElementId>,
+                window: &mut Window,
+                cx: &mut App,
+            ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+                self.element.request_layout(id, inspector_id, window, cx)
+            }
+
+            fn prepaint(
+                &mut self,
+                id: Option<&GlobalElementId>,
+                inspector_id: Option<&gpui::InspectorElementId>,
+                bounds: Bounds<Pixels>,
+                state: &mut Self::RequestLayoutState,
+                window: &mut Window,
+                cx: &mut App,
+            ) -> Self::PrepaintState {
+                self.element
+                    .prepaint(id, inspector_id, bounds, state, window, cx)
+            }
+
+            fn paint(
+                &mut self,
+                id: Option<&GlobalElementId>,
+                inspector_id: Option<&gpui::InspectorElementId>,
+                bounds: Bounds<Pixels>,
+                state: &mut Self::RequestLayoutState,
+                hitbox: &mut Self::PrepaintState,
+                window: &mut Window,
+                cx: &mut App,
+            ) {
+                self.element
+                    .paint(id, inspector_id, bounds, state, hitbox, window, cx);
+                *self.rendered_text.borrow_mut() = Some(state.text.clone());
+            }
+        }
+
+        struct TestCodeBlock {
+            markdown: Entity<Markdown>,
+            expanded: bool,
+            rendered_text: Rc<std::cell::RefCell<Option<RenderedText>>>,
+        }
+
+        impl Render for TestCodeBlock {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let expanded = self.expanded;
+                let element = MarkdownElement::new(self.markdown.clone(), MarkdownStyle::default())
+                    .code_block_transform(Arc::new(move |content, range, metadata, _, _| {
+                        assert_eq!(range.start, 8);
+                        assert!(metadata.is_fenced_closed);
+                        assert_eq!(metadata.line_count, 1);
+                        (
+                            div()
+                                .child("Generated code")
+                                .when(expanded, |element| {
+                                    element.child(content.into_any_element())
+                                })
+                                .into(),
+                            expanded,
+                        )
+                    }));
+                TestMarkdownElement {
+                    element,
+                    rendered_text: self.rendered_text.clone(),
+                }
+            }
+        }
+
+        ensure_theme_initialized(cx);
+        let (_, cx) = cx.add_window_view(|_, _| TestWindow);
+        let source = "Before\n\n```rust\nfn main() {}\n```\n\nAfter";
+        let markdown = cx.new(|cx| Markdown::new(source.into(), None, None, cx));
+        cx.run_until_parked();
+        for expanded in [false, true] {
+            let rendered_text = Rc::new(std::cell::RefCell::new(None));
+            cx.draw(Default::default(), size(px(600.0), px(600.0)), |_, cx| {
+                cx.new(|_| TestCodeBlock {
+                    markdown: markdown.clone(),
+                    expanded,
+                    rendered_text: rendered_text.clone(),
+                })
+                .into_any_element()
+            });
+            let visible_text = rendered_text
+                .borrow()
+                .as_ref()
+                .expect("Markdown did not paint")
+                .text_for_range(0..source.len());
+            assert!(visible_text.contains("Before"));
+            assert!(visible_text.contains("After"));
+            assert_eq!(visible_text.contains("fn main() {}"), expanded);
+        }
+    }
+
+    #[gpui::test]
+    fn test_code_block_transform_keeps_its_start_while_streaming(cx: &mut TestAppContext) {
+        ensure_theme_initialized(cx);
+        let (_, cx) = cx.add_window_view(|_, _| TestWindow);
+        let markdown =
+            cx.new(|cx| Markdown::new("Intro\n\n```rust\nfn main() {".into(), None, None, cx));
+        cx.run_until_parked();
+        for (suffix, expected_closed) in [
+            ("", false),
+            ("\n    let answer = 42;", false),
+            ("\n}\n```\n", true),
+        ] {
+            markdown.update(cx, |markdown, cx| markdown.append(suffix, cx));
+            cx.run_until_parked();
+            cx.draw(Default::default(), size(px(600.0), px(600.0)), |_, _| {
+                MarkdownElement::new(markdown.clone(), MarkdownStyle::default())
+                    .code_block_transform(Arc::new(move |_, range, metadata, _, _| {
+                        assert_eq!(range.start, 7);
+                        assert_eq!(metadata.is_fenced_closed, expected_closed);
+                        (div().child("Generated code").into(), false)
+                    }))
+            });
+        }
     }
 
     #[gpui::test]

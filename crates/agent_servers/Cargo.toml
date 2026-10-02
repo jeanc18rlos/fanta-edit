@@ -31,9 +31,11 @@ action_log.workspace = true
 async-channel.workspace = true
 agent-client-protocol.workspace = true
 anyhow.workspace = true
+base64.workspace = true
 chrono.workspace = true
 client.workspace = true
 collections.workspace = true
+design_surface.workspace = true
 env_logger = { workspace = true, optional = true }
 fs.workspace = true
 futures.workspace = true

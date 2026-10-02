@@ -37,6 +37,7 @@ clock.workspace = true
 collections.workspace = true
 component.workspace = true
 db.workspace = true
+design_surface.workspace = true
 dirs.workspace = true
 fanta-format = { workspace = true, optional = true }
 futures-lite.workspace = true

@@ -8,6 +8,7 @@ use crate::error::{FormatError, Result};
 use fanta_doc::{Doc, DocId, SCHEMA_VERSION};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest as _, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -90,10 +91,44 @@ pub(crate) const GITIGNORE_NAME: &str = ".gitignore";
 /// Derived/transient directories and OS noise stay out of history.
 pub(crate) const GITIGNORE: &str = "previews/\nexports/\n.fanta-transaction*/\n.DS_Store\n";
 
-/// Agent-guide file at the project root. Zed's agent auto-loads it as a rules
+/// Agent-guide file at the project root. Fanta's agent auto-loads it as a rules
 /// file (`RULES_FILE_NAMES` in `prompt_store`), so seeding it teaches any AI
 /// agent working the project how the format round-trips.
 pub(crate) const AGENTS_MD_NAME: &str = "AGENTS.md";
+
+pub(crate) const FANTA_SPEC: &str = r#"# Project design specification
+
+This project-local specification records design intent. Update it as the brief becomes concrete. Direct user instructions, AGENTS.md and the selected agent mode take precedence. Preserve existing work and use this project’s actual foundations rather than assuming a generic style.
+
+## Product and audience
+- Product purpose and key task: to be defined from the brief.
+- Intended audience, content and representative screen sizes: to be defined.
+- Choose a coherent visual direction suited to the product; maintain established brand decisions.
+
+## Foundations
+- Define semantic palette roles such as surface, text, muted text, border, accent and status; check readable contrast.
+- Define typography roles such as display, heading, body, label and caption. Preserve existing font choices when present.
+- Use a consistent spacing scale with explicit container padding and gaps. Record chosen token values here as the design evolves.
+
+## Layout and alignment
+- Buttons: use a horizontal auto-layout frame, intentional padding/gap and requested alignment. Auto-width labels hug their text; minimum control dimensions belong to the container. Check label/icon alignment in screenshots.
+- Cards: use nested rows/columns, stretch or fill children deliberately, and let auto-height paragraphs wrap at their assigned width. Hug content height where appropriate; fixed height requires a deliberate clipping/overflow decision.
+- Avoid per-child position nudges to compensate for incorrect container sizing. Verify narrow and wide representative sizes for wrapping, clipping and stable alignment.
+
+## Reusable design system
+- Inspect existing components, collections, modes, variable values and bindings first.
+- Create semantic foundation variables, then reusable component masters, bind applicable properties to variables and compose screens from instances. Keep stable identities and reuse existing tokens/components.
+- Record component roles, states, variants, and chosen theme modes here. Verify that mode changes resolve the intended bound values.
+
+## Images and vectors
+- Reuse supplied project assets. Offer generated imagery or SVG artwork when it materially improves the requested design and the brief leaves it open; ask about intent before preparing a generation request.
+- Generation preparation opens the existing composer for review. It does not submit a paid request or promise an unavailable model.
+
+## Acceptance checks
+- Save complete valid FNX documents and inspect parser diagnostics.
+- Verify screenshots of changed frames at representative sizes; fix misalignment, overlaps, clipping, typography and contrast before reporting completion.
+- Check component reuse and bound variable modes. Preserve user content and existing project rules.
+"#;
 
 /// Project-local declarations consumed by TypeScript-compatible editor
 /// tooling when an `.fnx` source is open.
@@ -105,7 +140,7 @@ pub(crate) const FNX_PRETTIER_NAME: &str = ".prettierrc.json";
 pub(crate) const FNX_PRETTIER: &str = include_str!("fnx.prettierrc.json");
 
 /// The seed contents of [`AGENTS_MD_NAME`]. Written only when absent so a
-/// user's edits are never clobbered.
+/// user's edits are never clobbered; untouched previous seeds are upgraded.
 /// The guide is intentionally practical and format-accurate — it is derived
 /// from the real `.fnx` projection, not invented.
 pub(crate) const AGENTS_MD: &str = r##"# Working on this Fanta design project
@@ -118,10 +153,37 @@ on the canvas save back to these same files. So working here as a text agent
 *is* the design-to-canvas loop — no export step.
 
 If Fanta is running with this project open you also have a more direct route: a
-live MCP server that reads and edits the focused canvas. Jump to *Driving the
-open canvas over MCP* below — prefer it when the app is up, and fall back to
-editing the files by hand when it is not. Either way, call `get_guidelines`
-(or read the condensed rules the built-in agent carries) before designing.
+live MCP server that reads and edits the focused canvas. Prefer reading and
+editing the actual project source files for building and changing designs.
+Use the live canvas tools to inspect progress, check screenshots, and perform
+operations that require editor state. Try available tools before claiming
+missing access. Read *Driving the open canvas over MCP* below and call
+`get_guidelines` before designing.
+
+## Safe FNX edits
+
+Read `fanta.md` for this project’s product, visual direction, layout and acceptance
+criteria. Preserve customized specifications. Inspect the live `get_design_system`
+tool for existing components, variable collections, modes, values and bindings.
+Build semantic foundation variables before components; compose repeated UI from
+instances. Variables live in `doc/variables.json`, document mode pins in
+`doc/active_modes.json`; preserve their existing ids and value schema.
+
+Use explicit auto-layout sizing/alignment: button labels can hug unwrapped text
+inside padded, min-constrained aligned frames; card paragraphs should auto-height
+at their assigned width. Do not compensate for container errors with manual
+child-coordinate nudges. Verify wrapping and alignment at representative sizes.
+
+FNX is JSX with JSON attribute values. Every object key inside `{{...}}` must
+be double quoted, including nested objects: `style={{"size_px": 16, "weight": 400}}`.
+Do not use JavaScript object syntax with unquoted keys. Read the existing source
+and types before editing. Save only complete documents with balanced tags and
+complete JSON values. Build large designs through small, complete frame or
+component edits; do not stream a whole large page in one tool response.
+Parser diagnostics are repair instructions: correct the candidate and retry,
+without force-saving an incomplete draft. Native and ACP file tools validate
+managed FNX before saving; external file agents can call `validate_fnx_source`
+with a complete candidate before writing it.
 
 ## Directory layout
 
@@ -289,20 +351,21 @@ canvas that is focused right now**. It is on by default; it is turned off with
 
 - **Connecting.** In Fanta, run the **Connect External Agent** command (Help
   menu, or the command palette). It copies a ready-to-paste
-  `claude mcp add -s user fanta -- /path/to/Fanta --mcp-stdio` to the clipboard,
-  and shows the equivalent `[mcp_servers.fanta]` snippet for
-  `~/.codex/config.toml`. There is deliberately no `.mcp.json` committed in this
-  project: it would have to hard-code an install path, and the user-scope
-  command above covers the same ground.
+  `claude mcp add --scope project --transport stdio fanta -- /path/to/Fanta --mcp-stdio`
+  command to the clipboard, and shows the equivalent `[mcp_servers.fanta]`
+  snippet for the trusted project's `.codex/config.toml`. Use the exact copied
+  command so its executable and instance data directory are correct. Codex
+  and Claude chats launched inside Fanta receive the bridge automatically.
 - **How the transport works.** The server listens on a Unix socket in a private
   temp directory and advertises the path in
   `~/Library/Application Support/Fanta/fanta_live_mcp.json` (the platform data
   directory elsewhere) as `{"socket": "…/mcp.sock", "pid": 1234}`.
   `fanta --mcp-stdio` reads that file and bridges stdio to the socket. The file
-  is rewritten on every launch and is *not* deleted on quit, so anything reading
-  it directly must check that `pid` is still alive before trusting `socket`.
+  is published atomically after startup and removed on clean shutdown. Anything
+  reading it directly must still check that `pid` is alive before trusting
+  `socket`, in case the app crashed.
 
-### The six tools
+### Canvas tools
 
 **`get_editor_state`** — `{ empty_space?, page? }`, both optional. Returns the
 project name and `project_root`, every page (`index`, `name`, root node id,
@@ -385,7 +448,35 @@ tagged by `"op"`:
 - `select` — `ids`, replacing the editor selection.
 - `set_viewport` — optional `center` (`[x, y]`) and `zoom`.
 
-Gradients, variables and per-run rich text are **not** `batch_design` ops yet.
+**`get_design_system`** — optional `collection` (exact id or unique name),
+`offset`, `limit` (up to 200), `include_bindings`. Inspect existing component
+properties, variant sets, collections, modes and typed variable values first.
+
+Variables are real undoable ops: `create_variable_collection` (`name`, `modes`),
+`add_variable_mode`, `create_variable` (`collection`, `name`, `kind`, primitive
+`value`), `set_variable_value` (`variable`, `mode`, `value`), `set_variable_mode`
+(`collection`, optional `mode`/`frame`), `bind_variable` / `unbind_variable`
+(`id`, `property` such as `{ "prop": "fill_color", "index": 0 }`).
+Variable values are hex colors, finite numbers, strings, booleans or TextStyle
+objects. Aliases use `{ "alias": "exact variable id or unique name" }`.
+Create foundations before components and prefer returned ids.
+
+Component ops include `combine_variants` (standalone master node `ids`, optional
+`name`), `create_component_property` (`component`, `kind`, optional `name`),
+`bind_component_property` (`component`, descendant `id`, `target` field,
+optional exposed `property`) and `set_instance_property` (`id`, `property`,
+primitive `value`). Variant sets can be instanced by id; Variant property
+values select the named member. Inspect the returned property schema.
+
+`set_auto_layout` also accepts primary/counter `*_sizing` (`fixed`/`hug`),
+`min_size`/`max_size` ([width,height], null clears an axis), `wrap` and `counter_gap`.
+`set_layout_child` accepts `grow`, `align_self`, `absolute`; positive grow fills
+the parent’s primary axis. `set_text_style.sizing` is `fixed`, `auto_height` or
+`auto_width`. A centered button: horizontal layout, center justify/align_items,
+Hug axes, padding [8,16], min_size [128,48], auto-width label. A wrapping card:
+vertical Hug height, fixed width, Stretch children and auto-height paragraphs.
+
+Gradients and per-run rich text still require source editing.
 For those, read the page's `.fnx`, edit the file with your normal file tools,
 and let the canvas reload — that edit is also a reviewable git diff, which a
 `batch_design` call is not until the editor saves.
@@ -404,18 +495,55 @@ root are rejected. This tool only reads — write with your own file tools. On a
 document that has never been saved it fails with *the document has no on-disk
 Fanta project yet; save the canvas once to materialize one*.
 
+**`import_image`** imports a generated image from a local `path`, `url`, or
+base64 `source` into the saved project asset library and returns its asset id
+and file path. Use those references in source edits. Generated image blocks
+returned by MCP tools are imported automatically when possible; an import
+failure is shown in chat.
+
+**`list_comments`** reads a page's unresolved comments. **`reply_comment`**
+posts an attributed agent reply to an exact comment id; resolve only after
+verifying the requested work. Review mode reads designs and replies to
+comments without changing scene content. Plan mode is read-only.
+
+**`report_agent_activity`** reports a stable agent id, name, action and
+page/node/world focus. The canvas draws a named animated cursor and allows
+the user to follow an agent. Set `active: false` when finished.
+
+## Creating animations
+
+Authored animation data lives in `doc/motion.json`, separately from page
+nodes. Read the existing JSON library before adding clips, tracks and
+keyframes targeting exact node ids. Preserve existing identities and verify
+multiple `get_screenshot` samples using `motion_clip` and `playhead_ms`
+after saving, then check playback in the Motion workspace when available. `motion/<slug>/` directories
+are index stubs; their presence alone does not create playable animations.
+
 The built-in Fanta agent uses the same surface through its native tools
 `design_state` (= `get_editor_state` + `batch_get`, with `empty_space`),
 `design_edit` (= `batch_design`), `design_screenshot` (= `get_screenshot`) and
-`place_generation` (download an image URL and place it as a `create_image`).
+`place_generation` (download an image URL and place it as a `create_image`),
+`import_project_image` (save an image without creating a layer),
+`design_comments`, and `report_agent_activity`.
 
 ### When no canvas is open
 
 Every one of these tools fails with *no design canvas is open; open a .fig file
 or Fanta project in Fanta first* unless a design canvas is focused in the app.
-That is not something to work around — stop and ask the user to open the project
-(or, if they cannot, edit the `.fnx` files directly and tell them the canvas will
-pick the change up when they next open it).
+You can continue editing the actual source files without an open canvas.
+For visual verification, open the project in Fanta or report the specific
+verification limitation. Do not replace authorized file edits with a
+ready-to-paste code block merely because live canvas access is unavailable.
+
+## Saving, reloading, and checkpoints
+
+Native Full Access initializes Git when needed at the verified active Fanta
+project root in a trusted local worktree, creates a `codex/fanta-...` task
+branch, and saves durable before/after project snapshots under
+`refs/fanta/checkpoints/`. The temporary snapshot index preserves user staging
+and dirty changes. Save source progress and verify the design; create normal
+commits only when requested. External agents should preserve user changes
+when creating task branches and checkpoints.
 
 ## Saving, reloading, and committing
 
@@ -530,6 +658,7 @@ pub fn scaffold_project_tree(dir: &Path) -> Result<()> {
     fs::create_dir_all(dir.join(EXPORTS_DIR))?;
     seed_gitignore(dir)?;
     seed_agents_md(dir)?;
+    seed_fanta_spec(dir)?;
     seed_fnx_types(dir)?;
     seed_fnx_prettier(dir)?;
     if !existing_manifest {
@@ -557,7 +686,16 @@ pub fn ensure_project_editor_support(dir: &Path) -> Result<()> {
     // an AI agent reads before touching `.fnx`. Previously only snapshot
     // imports seeded it, so projects written by `write_project_tree` never
     // gained the guide at all.
-    seed_agents_md(dir)
+    seed_agents_md(dir)?;
+    seed_fanta_spec(dir)
+}
+
+fn seed_fanta_spec(dir: &Path) -> Result<()> {
+    let path = dir.join("fanta.md");
+    if path.exists() {
+        return Ok(());
+    }
+    super::write::write_with_parents(&path, FANTA_SPEC.as_bytes())
 }
 
 fn seed_gitignore(dir: &Path) -> Result<()> {
@@ -576,12 +714,24 @@ fn seed_gitignore(dir: &Path) -> Result<()> {
 }
 
 /// Write the [`AGENTS_MD`] guide to the project root, but only when no
-/// `AGENTS.md` already exists. Unlike the seeded `.gitignore`, this file
-/// is a user-ownable seed: once present (whether from an earlier scaffold or
-/// hand-authored) it is left untouched so customizations survive re-saves.
+/// customized `AGENTS.md` already exists. The exact previous seed is upgraded
+/// so corrected agent instructions reach existing projects; customizations
+/// survive re-saves.
 fn seed_agents_md(dir: &Path) -> Result<()> {
     let path = dir.join(AGENTS_MD_NAME);
-    if !path.exists() {
+    // Upgrade only the exact previous seed; edited guides remain user-owned.
+    let previous_seeds = [
+        "9b50be64e96b0a3a0dae85e78f5855821edf2969ce4ea74de0cbc8f0035a716a",
+        "e9cd2913d2c9f6cb86653928d192fa1a11668fc0e9feffed2f2c2b760f4565e7",
+    ];
+    let should_write = match fs::read(&path) {
+        Ok(contents) => {
+            previous_seeds.contains(&format!("{:x}", Sha256::digest(&contents)).as_str())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => return Err(error.into()),
+    };
+    if should_write {
         super::write::write_with_parents(&path, AGENTS_MD.as_bytes())?;
     }
     Ok(())
@@ -883,6 +1033,24 @@ mod tests {
             fs::read(dir.path().join(GITIGNORE_NAME)).expect("custom ignore"),
             b"# project-specific rules\n"
         );
+    }
+
+    #[test]
+    fn project_design_spec_is_seeded_and_customizations_are_preserved() -> Result<()> {
+        let dir = tempdir()?;
+        scaffold_project_tree(dir.path())?;
+        assert_eq!(fs::read_to_string(dir.path().join("fanta.md"))?, FANTA_SPEC);
+        fs::write(
+            dir.path().join("fanta.md"),
+            "# Custom brand\nUse indigo buttons.",
+        )?;
+        ensure_project_editor_support(dir.path())?;
+        scaffold_project_tree(dir.path())?;
+        assert_eq!(
+            fs::read_to_string(dir.path().join("fanta.md"))?,
+            "# Custom brand\nUse indigo buttons."
+        );
+        Ok(())
     }
 
     /// A project written before the manifest dropped its per-save timestamp

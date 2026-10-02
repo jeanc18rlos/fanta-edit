@@ -57,6 +57,7 @@ pub struct SystemPromptTemplate<'a> {
     pub is_linux: bool,
     /// Whether sandboxed terminal commands run through WSL on Windows.
     pub is_windows: bool,
+    pub orchestration: bool,
 }
 
 impl Template for SystemPromptTemplate<'_> {
@@ -93,6 +94,85 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_design_source_instructions_render_in_both_prompt_templates() {
+        let project = prompt_store::ProjectContext::default();
+        let template = SystemPromptTemplate {
+            project: &project,
+            available_tools: vec!["design_state".into()],
+            model_name: None,
+            date: "2026-01-01".into(),
+            user_agents_md: None,
+            sandboxing: false,
+            is_linux: false,
+            is_windows: false,
+            orchestration: false,
+        };
+        let templates = Templates::new();
+        for name in ["system_prompt.hbs", "experimental_system_prompt.hbs"] {
+            let rendered = templates.0.render(name, &template).expect(name);
+            assert!(rendered.contains("Source edits first"), "{name}");
+            assert!(rendered.contains("Complete FNX candidates"), "{name}");
+            assert!(
+                rendered.contains(r#"{"size_px": 16, "weight": 400}"#),
+                "{name} must preserve the literal JSON example"
+            );
+            assert!(rendered.contains("In Edit Visual mode"), "{name}");
+            assert!(rendered.contains("matching SVG icon set"), "{name}");
+            assert!(rendered.contains("prepare_design_asset"), "{name}");
+            assert!(rendered.contains("submitted: false"), "{name}");
+            assert!(rendered.contains("cross-axis alignment"), "{name}");
+            assert!(
+                rendered.contains("automatically loaded project `fanta.md`"),
+                "{name}"
+            );
+            assert!(rendered.contains("component masters"), "{name}");
+            assert!(rendered.contains("then recheck"), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_ultra_orchestration_requires_profile_and_spawn_capability() {
+        let project = prompt_store::ProjectContext::default();
+        let templates = Templates::new();
+        let mut template = SystemPromptTemplate {
+            project: &project,
+            available_tools: vec!["design_state".into(), "spawn_agent".into()],
+            model_name: None,
+            date: "2026-01-01".into(),
+            user_agents_md: None,
+            sandboxing: false,
+            is_linux: false,
+            is_windows: false,
+            orchestration: true,
+        };
+        let rendered = template.render(&templates).expect("Ultra prompt");
+        assert!(rendered.contains("## Ultra orchestration"));
+        assert!(rendered.contains("automatically use `spawn_agent`"));
+        assert!(rendered.contains("same file"));
+        assert!(rendered.contains("at most three specialists active"));
+        assert!(rendered.contains("cannot delegate further"));
+        assert!(rendered.contains("Source edits first"));
+
+        template.orchestration = false;
+        assert!(
+            !template
+                .render(&templates)
+                .expect("specialist prompt")
+                .contains("## Ultra orchestration")
+        );
+        template.orchestration = true;
+        template
+            .available_tools
+            .retain(|tool| tool.as_ref() != "spawn_agent");
+        assert!(
+            !template
+                .render(&templates)
+                .expect("prompt without delegation")
+                .contains("## Ultra orchestration")
+        );
+    }
+
+    #[test]
     fn test_system_prompt_template() {
         let project = prompt_store::ProjectContext::default();
         let template = SystemPromptTemplate {
@@ -104,6 +184,7 @@ mod tests {
             sandboxing: false,
             is_linux: false,
             is_windows: false,
+            orchestration: false,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -119,18 +200,21 @@ mod tests {
         let project = prompt_store::ProjectContext::default();
         let template = SystemPromptTemplate {
             project: &project,
-            available_tools: vec!["design_state".into(), "design_edit".into()],
+            available_tools: vec!["design_state".into()],
             model_name: None,
             date: "2026-01-01".to_string(),
             user_agents_md: None,
             sandboxing: false,
             is_linux: false,
             is_windows: false,
+            orchestration: false,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
         assert!(rendered.contains("## Design canvas"));
         assert!(rendered.contains("empty_space"));
+        assert!(rendered.contains("Source edits first"));
+        assert!(rendered.contains("original threads"));
     }
 
     #[test]
@@ -157,6 +241,7 @@ mod tests {
             sandboxing: false,
             is_linux: false,
             is_windows: false,
+            orchestration: false,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -186,6 +271,7 @@ mod tests {
             sandboxing: false,
             is_linux: false,
             is_windows: false,
+            orchestration: false,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -219,6 +305,7 @@ mod tests {
             sandboxing: true,
             is_linux: false,
             is_windows: false,
+            orchestration: false,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -257,6 +344,7 @@ mod tests {
             sandboxing: true,
             is_linux: true,
             is_windows: false,
+            orchestration: false,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -287,6 +375,7 @@ mod tests {
             sandboxing: true,
             is_linux: false,
             is_windows: true,
+            orchestration: false,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -311,6 +400,7 @@ mod tests {
             sandboxing: true,
             is_linux: false,
             is_windows: false,
+            orchestration: false,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -331,6 +421,7 @@ mod tests {
             sandboxing: false,
             is_linux: false,
             is_windows: false,
+            orchestration: false,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();
@@ -349,6 +440,7 @@ mod tests {
             sandboxing: false,
             is_linux: false,
             is_windows: false,
+            orchestration: false,
         };
         let templates = Templates::new();
         let rendered = template.render(&templates).unwrap();

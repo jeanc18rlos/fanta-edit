@@ -76,6 +76,7 @@ fn main() -> Result<()> {
         mode_generation: 0,
         motion: None,
         playback: None,
+        video_fill_frames: None,
         dark_ui: false,
     };
     renderer.render_page_with(&doc.scene, &viewport, Some(page), &inputs);

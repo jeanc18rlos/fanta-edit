@@ -1,5 +1,5 @@
 //! Auto-width text: WidthAndHeight labels snap to the injected glyph
-//! measure; Height/None modes keep authored width (measure never fires).
+//! measure; Height wraps at its authored width and None keeps authored geometry.
 
 use super::*;
 
@@ -54,9 +54,6 @@ fn height_and_none_mode_text_keep_authored_width() {
         },
     ));
 
-    // Height-mode keeps width; None-mode keeps both. Neither calls measure for
-    // width — but apply_text_autoresize only fires for WidthAndHeight, so a
-    // panicking measurer proves neither is touched.
     let mut h = TextNode::new("Wrapped", 120.0, 20.0);
     h.auto_resize = TextAutoResize::Height;
     let mut hn = CanvasNode::new(NodeData::Text(h));
@@ -69,8 +66,194 @@ fn height_and_none_mode_text_keep_authored_width() {
     nn.parent = Some(f);
     let nid = t.push(nn);
 
-    solve_auto_layout(&mut t, f, &mut no_measure);
+    solve_auto_layout(&mut t, f, &mut |text| {
+        assert_eq!(text.content, "Wrapped");
+        assert_eq!(text.local_size[0], 120.0);
+        (100.0, 48.0)
+    });
 
-    approx(placed_size(&t, hid), [120.0, 20.0]);
+    approx(placed_size(&t, hid), [120.0, 48.0]);
     approx(placed_size(&t, nid), [80.0, 30.0]);
+}
+
+#[test]
+fn stretched_card_remeasures_wrapped_text_and_hugs_height_in_one_pass() {
+    let mut tree = VecTree::new();
+    let outer = tree.push(frame(
+        240.0,
+        600.0,
+        AutoLayout {
+            mode: LayoutMode::Vertical,
+            counter_align: CounterAlign::Stretch,
+            ..Default::default()
+        },
+    ));
+    let mut card = frame(
+        400.0,
+        1.0,
+        AutoLayout {
+            mode: LayoutMode::Vertical,
+            primary_sizing: AxisSizing::Hug,
+            counter_align: CounterAlign::Stretch,
+            padding: [16.0; 4],
+            spacing: 12.0,
+            ..Default::default()
+        },
+    );
+    card.parent = Some(outer);
+    let card = tree.push(card);
+    let mut paragraph = TextNode::new("A wrapped paragraph", 368.0, 1.0);
+    paragraph.auto_resize = TextAutoResize::Height;
+    let mut paragraph = CanvasNode::new(NodeData::Text(paragraph));
+    paragraph.parent = Some(card);
+    let paragraph = tree.push(paragraph);
+    let footer = tree.push(rect_child(card, 60.0, 24.0));
+    let mut measure = |text: &TextNode| {
+        (
+            text.local_size[0],
+            (600.0 / text.local_size[0]).ceil() * 20.0,
+        )
+    };
+
+    solve_auto_layout(&mut tree, outer, &mut measure);
+
+    approx(placed_size(&tree, paragraph), [208.0, 60.0]);
+    approx(placed_origin(&tree, footer), [16.0, 88.0]);
+    approx(placed_size(&tree, card), [240.0, 128.0]);
+    solve_auto_layout(&mut tree, outer, &mut measure);
+    approx(placed_size(&tree, card), [240.0, 128.0]);
+    approx(placed_origin(&tree, footer), [16.0, 88.0]);
+}
+
+#[test]
+fn typography_and_content_modes_reflow_cards_without_rewriting_literals() {
+    use crate::{
+        BoundProp, Doc, Mode, ModeId, Operation, VarValue, Variable, VariableCollection,
+        VariableCollectionId, VariableId, VariableType,
+    };
+    use std::collections::BTreeMap;
+    let mut doc = Doc::new();
+    let card = frame(
+        200.0,
+        1.0,
+        AutoLayout {
+            mode: LayoutMode::Vertical,
+            primary_sizing: AxisSizing::Hug,
+            counter_align: CounterAlign::Stretch,
+            padding: [16.0; 4],
+            ..Default::default()
+        },
+    );
+    let card_id = card.id;
+    doc.apply(Operation::create_node(card)).expect("card");
+    let collection = VariableCollectionId::new();
+    let light = ModeId::new();
+    let dark = ModeId::new();
+    doc.variables.collections.insert(
+        collection,
+        VariableCollection {
+            id: collection,
+            name: "Theme".into(),
+            modes: vec![
+                Mode {
+                    id: light,
+                    name: "Light".into(),
+                },
+                Mode {
+                    id: dark,
+                    name: "Dark".into(),
+                },
+            ],
+            default_mode: light,
+            variable_order: Vec::new(),
+        },
+    );
+    let typography = VariableId::new();
+    let content = VariableId::new();
+    let mut small = crate::TextStyle::default();
+    small.size_px = 16.0;
+    small.line_height = 1.5;
+    let mut large = small.clone();
+    large.size_px = 32.0;
+    doc.variables.variables.insert(
+        typography,
+        Variable {
+            id: typography,
+            collection,
+            name: "Body".into(),
+            ty: VariableType::Typography,
+            values_by_mode: BTreeMap::from([
+                (light, VarValue::TextStyle { value: small }),
+                (dark, VarValue::TextStyle { value: large }),
+            ]),
+            scopes: Vec::new(),
+        },
+    );
+    doc.variables.variables.insert(
+        content,
+        Variable {
+            id: content,
+            collection,
+            name: "Copy".into(),
+            ty: VariableType::String,
+            values_by_mode: BTreeMap::from([
+                (
+                    light,
+                    VarValue::String {
+                        value: "Brief".into(),
+                    },
+                ),
+                (
+                    dark,
+                    VarValue::String {
+                        value: "A much longer paragraph for the narrow card".into(),
+                    },
+                ),
+            ]),
+            scopes: Vec::new(),
+        },
+    );
+    let mut paragraph = TextNode::new("Authored fallback", 400.0, 1.0);
+    paragraph.auto_resize = TextAutoResize::Height;
+    let literal_style = paragraph.style.clone();
+    let mut paragraph = CanvasNode::new(NodeData::Text(paragraph));
+    paragraph.parent = Some(card_id);
+    paragraph.bindings.insert(BoundProp::TextStyle, typography);
+    paragraph.bindings.insert(BoundProp::TextContent, content);
+    let paragraph_id = paragraph.id;
+    doc.apply(Operation::create_node(paragraph))
+        .expect("paragraph");
+    let mut measure = |text: &TextNode| {
+        let width = text.content.chars().count() as f64 * text.style.size_px * 0.5;
+        (
+            text.local_size[0],
+            (width / text.local_size[0]).ceil() * text.style.size_px * text.style.line_height,
+        )
+    };
+    let mut heights = Vec::new();
+    for mode in [light, dark, light] {
+        doc.active_modes.insert(collection, mode);
+        solve_auto_layout_with_variables(
+            &mut doc.scene,
+            card_id,
+            &doc.variables,
+            &doc.active_modes,
+            &mut measure,
+        );
+        let paragraph = doc.scene.get(paragraph_id).expect("paragraph");
+        let NodeData::Text(text) = &paragraph.data else {
+            panic!("text");
+        };
+        assert_eq!(text.content, "Authored fallback");
+        assert_eq!(text.style, literal_style);
+        assert_eq!(paragraph.bindings.len(), 2);
+        let NodeData::Group(card) = &doc.scene.get(card_id).expect("card").data else {
+            panic!("card");
+        };
+        assert_eq!(card.clip_size, Some([200.0, text.local_size[1] + 32.0]));
+        heights.push(text.local_size[1]);
+    }
+    assert_eq!(heights[0], 24.0);
+    assert!(heights[1] > heights[0]);
+    assert_eq!(heights[2], heights[0]);
 }

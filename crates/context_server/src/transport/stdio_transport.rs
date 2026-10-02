@@ -154,7 +154,7 @@ impl Drop for StdioTransport {
 #[cfg(all(test, feature = "mac_app_store", target_os = "macos"))]
 mod mac_app_store_tests {
     use super::*;
-    use gpui::{AppContext as _, TestAppContext};
+    use gpui::TestAppContext;
 
     #[gpui::test]
     async fn rejects_stdio_before_process_spawn(cx: &mut TestAppContext) {

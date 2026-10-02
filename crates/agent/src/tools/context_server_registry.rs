@@ -1,6 +1,7 @@
 use crate::{AgentToolOutput, AnyAgentTool, ToolCallEventStream, ToolInput};
 use agent_client_protocol::schema::v1 as acp;
-use anyhow::Result;
+use anyhow::{Context as _, Result};
+use base64::Engine as _;
 use collections::{BTreeMap, HashMap};
 use context_server::{ContextServerId, client::NotificationSubscription};
 use futures::FutureExt as _;
@@ -341,6 +342,14 @@ impl AnyAgentTool for ContextServerTool {
             return Task::ready(Err(anyhow::anyhow!("Context server not found").into()));
         };
         let tool_name = self.tool.name.clone();
+        let import_images = self
+            .tool
+            .annotations
+            .as_ref()
+            .and_then(|annotations| annotations.read_only_hint)
+            != Some(true)
+            && !tool_name.to_lowercase().contains("screenshot")
+            && !tool_name.to_lowercase().contains("capture_screen");
         let tool_id = mcp_tool_id(&self.server_id.0, &self.tool.name);
         let display_name = self.tool.name.clone();
         let initial_title = self.initial_title(serde_json::Value::Null, cx);
@@ -398,6 +407,20 @@ impl AnyAgentTool for ContextServerTool {
             let mut tool_call_content = Vec::new();
             let mut concatenated_text = String::new();
             for content in response.content {
+                let content = match content {
+                    context_server::types::ToolResponseContent::Resource {
+                        resource: context_server::types::ResourceContentsType::Blob(blob),
+                    } if blob.mime_type.as_ref().is_some_and(|mime| mime.starts_with("image/")) => {
+                        context_server::types::ToolResponseContent::Image {
+                            data: blob.blob,
+                            mime_type: blob.mime_type.context("the image resource has no MIME type")?,
+                        }
+                    }
+                    context_server::types::ToolResponseContent::Resource {
+                        resource: context_server::types::ResourceContentsType::Text(text),
+                    } => context_server::types::ToolResponseContent::Text { text: text.text },
+                    content => content,
+                };
                 match content {
                     context_server::types::ToolResponseContent::Text { text } => {
                         concatenated_text.push_str(&text);
@@ -413,6 +436,46 @@ impl AnyAgentTool for ContextServerTool {
                                 mime_type.clone(),
                             )),
                         )));
+                        if import_images {
+                            let surface = cx.update(|cx| {
+                                let surface = design_surface::active(cx)?;
+                                let state = surface.state(cx).ok()?;
+                                Some((surface, state.get("document_id").cloned()))
+                            });
+                            if let Some((surface, document_id)) = surface {
+                                let bytes = cx.background_spawn({
+                                    let data = data.clone();
+                                    async move {
+                                        anyhow::ensure!(data.len() <= 90 * 1024 * 1024, "the MCP image exceeds the project asset limit");
+                                        base64::engine::general_purpose::STANDARD.decode(data.as_bytes())
+                                            .context("the MCP tool returned invalid base64 image data")
+                                    }
+                                }).await;
+                                let imported = match bytes {
+                                    Ok(bytes) => {
+                                        let import = cx.update(|cx| {
+                                            let state = surface.state(cx)?;
+                                            anyhow::ensure!(state.get("document_id") == document_id.as_ref(), "the active design changed while decoding the tool image; select the intended project and retry");
+                                            Ok::<_, anyhow::Error>(surface.import_image(bytes, format!("{} image", self.tool.name), cx))
+                                        });
+                                        match import {
+                                            Ok(import) => import.await,
+                                            Err(error) => Err(error),
+                                        }
+                                    },
+                                    Err(error) => Err(error),
+                                };
+                                let status = match imported {
+                                    Ok(value) => format!("Image imported into the Fanta project assets: {}", value),
+                                    Err(error) => format!("Image asset import failed: {error:#}. The tool result remains available; retry with import_project_image or place_generation before finishing."),
+                                };
+                                concatenated_text.push_str(&format!("\n{status}\n"));
+                                tool_call_content.push(acp::ToolCallContent::Content(acp::Content::new(
+                                    acp::ContentBlock::Text(acp::TextContent::new(status.clone())),
+                                )));
+                                llm_output.push(LanguageModelToolResultContent::Text(status.into()));
+                            }
+                        }
                         let language_model_image = cx
                             .background_spawn({
                                 let mime_type = mime_type.clone();

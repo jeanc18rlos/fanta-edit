@@ -13,8 +13,8 @@ use std::{
 use anyhow::{Context as _, Result};
 use fanta_doc::{AssetId, Doc, NodeId, Operation, Viewport};
 use fanta_fig_interop::{fig_to_doc, read_fig};
-use fanta_render::{AssetResolver, DecodedImage, asset::LazyAssetResolver, solve_scene_layout};
-use futures::FutureExt as _;
+use fanta_render::{AssetResolver, DecodedImage, asset::LazyAssetResolver, solve_doc_layout};
+use futures::{FutureExt as _, StreamExt as _, channel::mpsc};
 use gpui::{
     App, AppContext as _, Context, Entity, EntityId, EventEmitter, Image, ImageFormat,
     SharedString, Subscription, Task, WeakEntity,
@@ -536,7 +536,7 @@ impl FigDocument {
         let mut solved_pages = HashSet::new();
         if let Some(page_root) = default_page_root {
             let started = Instant::now();
-            solve_scene_layout(&mut doc.scene, page_root);
+            solve_doc_layout(&mut doc, page_root);
             crate::report_slow("document load: solve default page layout", started);
             solved_pages.insert(page_root);
         }
@@ -621,6 +621,21 @@ impl FigDocument {
     /// writes that touch the registry.
     pub(crate) fn mark_variables_changed(&mut self) {
         self.variables_generation = next_variables_generation();
+        if self.doc.variables.variables.values().any(|variable| {
+            matches!(
+                variable.ty,
+                fanta_doc::VariableType::Typography | fanta_doc::VariableType::String
+            )
+        }) {
+            self.solved_pages.clear();
+            if let Some(root) = self.doc.active_page() {
+                if let Some(index) = self.pages.iter().position(|page| page.root == Some(root)) {
+                    self.ensure_page_solved(index);
+                } else {
+                    self.ensure_root_solved(root);
+                }
+            }
+        }
     }
 
     pub(crate) fn render_generation(&self) -> u64 {
@@ -748,7 +763,7 @@ impl FigDocument {
             return;
         };
         if self.solved_pages.insert(page_root) {
-            solve_scene_layout(&mut self.doc.scene, page_root);
+            solve_doc_layout(&mut self.doc, page_root);
             self.refresh_page_bounds(page_index);
         }
     }
@@ -759,7 +774,7 @@ impl FigDocument {
     /// solved-once tracking, keyed by root id.
     pub fn ensure_root_solved(&mut self, root: NodeId) {
         if self.doc.scene.get(root).is_some() && self.solved_pages.insert(root) {
-            solve_scene_layout(&mut self.doc.scene, root);
+            solve_doc_layout(&mut self.doc, root);
         }
     }
 
@@ -818,7 +833,7 @@ impl FigDocument {
         let Some(page_root) = page_root else {
             return;
         };
-        solve_scene_layout(&mut self.doc.scene, page_root);
+        solve_doc_layout(&mut self.doc, page_root);
         self.solved_pages.insert(page_root);
         if let Some(index) = self
             .pages
@@ -1137,20 +1152,33 @@ impl project::ProjectItem for FigItem {
                         let set_loading = |message: &'static str| {
                             let message = SharedString::from(message);
                             move |this: &mut FigItem, cx: &mut Context<FigItem>| {
+                                if this.sync_epoch != 0
+                                    || !matches!(&this.document, FigDocumentState::Loading { .. })
+                                {
+                                    return;
+                                }
                                 this.document = FigDocumentState::Loading { message };
                                 cx.notify();
                             }
                         };
-                        if let Err(error) = this.update(cx, set_loading("Reading document...")) {
+                        let opening_message = if load_project_root.is_some() {
+                            "Opening Fanta project…"
+                        } else {
+                            "Reading design file…"
+                        };
+                        if let Err(error) = this.update(cx, set_loading(opening_message)) {
                             log::debug!("dropping load update for closed .fig item: {error:#}");
                             return;
                         }
 
-                        let load_result = cx
+                        let (progress, mut loading_messages) = mpsc::unbounded();
+                        let load = cx
                             .background_spawn(async move {
                                 match load_project_root {
                                     Some(root) => {
+                                        report_load_progress(&progress, "Opening project files…");
                                         let session = fanta_format::WorkspaceSession::open(&root)?;
+                                        report_load_progress(&progress, "Loading pages and assets…");
                                         let document = load_project_document(&root)?;
                                         Ok((document, None, Some(session)))
                                     }
@@ -1163,20 +1191,32 @@ impl project::ProjectItem for FigItem {
                                     // degrades to the old in-memory mode — the
                                     // parse is still shown and the first save
                                     // retries the write.
-                                    None => load_imported_document(&load_path).map(|document| {
+                                    None => {
+                                        let document = load_imported_document(&load_path, &progress)?;
+                                        report_load_progress(
+                                            &progress,
+                                            "Creating the editable project…",
+                                        );
                                         let materialized =
                                             materialize_project_on_open(&load_path, &document);
+                                        report_load_progress(&progress, "Opening project files…");
                                         let session = materialized
                                             .as_ref()
                                             .and_then(|project| {
                                                 fanta_format::WorkspaceSession::open(&project.root)
                                                     .ok()
                                             });
-                                        (document, materialized, session)
-                                    }),
+                                        Ok((document, materialized, session))
+                                    }
                                 }
-                            })
-                            .await;
+                            });
+                        while let Some(message) = loading_messages.next().await {
+                            if let Err(error) = this.update(cx, set_loading(message)) {
+                                log::debug!("dropping load progress for a closed design: {error:#}");
+                                return;
+                            }
+                        }
+                        let load_result = load.await;
 
                         let (document, materialized, session) = match load_result {
                             Ok((document, materialized, session)) => {
@@ -1248,7 +1288,11 @@ impl project::ProjectItem for FigItem {
                     abs_path,
                     entry_id,
                     document: FigDocumentState::Loading {
-                        message: "Opening document...".into(),
+                        message: if project_root.is_some() {
+                            "Opening Fanta project…".into()
+                        } else {
+                            "Reading design file…".into()
+                        },
                     },
                     project_root,
                     dirty: false,
@@ -3292,7 +3336,7 @@ fn import_formats() -> Result<&'static fanta_format::FormatRegistry> {
         .get_or_init(|| {
             let mut formats = fanta_format::FormatRegistry::with_native_formats();
             formats
-                .register(FigImportFormat)
+                .register(FigImportFormat::default())
                 .map_err(|error| error.to_string())?;
             Ok(formats)
         })
@@ -3300,16 +3344,34 @@ fn import_formats() -> Result<&'static fanta_format::FormatRegistry> {
         .map_err(|error| anyhow::anyhow!(error.clone()))
 }
 
-fn load_imported_document(path: &Path) -> Result<FigDocument> {
+fn report_load_progress(progress: &mpsc::UnboundedSender<&'static str>, message: &'static str) {
+    if let Err(error) = progress.unbounded_send(message) {
+        log::debug!("the design loader's progress receiver was closed: {error}");
+    }
+}
+
+fn load_imported_document(
+    path: &Path,
+    progress: &mpsc::UnboundedSender<&'static str>,
+) -> Result<FigDocument> {
     let started = Instant::now();
-    let imported = import_formats()?.import_path(path)?;
+    let mut formats = fanta_format::FormatRegistry::with_native_formats();
+    formats.register(FigImportFormat {
+        progress: Some(progress.clone()),
+    })?;
+    report_load_progress(progress, "Reading design file…");
+    let imported = formats.import_path(path)?;
     crate::report_slow("document load: import design", started);
+    report_load_progress(progress, "Preparing canvas and image assets…");
     let mut document = FigDocument::from_doc(imported.doc, imported.assets);
     document.prewarm_default_page_assets();
     Ok(document)
 }
 
-struct FigImportFormat;
+#[derive(Default)]
+struct FigImportFormat {
+    progress: Option<mpsc::UnboundedSender<&'static str>>,
+}
 
 impl fanta_format::FormatHandler for FigImportFormat {
     fn descriptor(&self) -> fanta_format::FormatDescriptor {
@@ -3332,7 +3394,13 @@ impl fanta_format::FormatHandler for FigImportFormat {
         path: &Path,
     ) -> fanta_format::FormatHandlerResult<fanta_format::ImportedDesign> {
         let bytes = std::fs::read(path)?;
+        if let Some(progress) = self.progress.as_ref() {
+            report_load_progress(progress, "Parsing Figma design…");
+        }
         let fig = read_fig(&bytes)?;
+        if let Some(progress) = self.progress.as_ref() {
+            report_load_progress(progress, "Importing Figma layers and components…");
+        }
         let (doc, _report, assets) = fig_to_doc(&fig)?;
         Ok(fanta_format::ImportedDesign {
             doc,

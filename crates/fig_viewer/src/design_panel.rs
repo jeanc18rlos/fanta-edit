@@ -24,8 +24,8 @@ use fs::Fs;
 #[cfg(test)]
 use gpui::px;
 use gpui::{
-    AnyElement, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
-    Pixels, SharedString, Subscription, WeakEntity, Window, actions,
+    Action as _, AnyElement, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle,
+    Focusable, Pixels, SharedString, Subscription, WeakEntity, Window, actions,
 };
 use settings::{Settings as _, update_settings_file};
 use ui::prelude::*;
@@ -1080,7 +1080,7 @@ impl Render for FantaDesignPanel {
                     )
                 };
                 if let Some(message) = loading_message {
-                    centered_message(message)
+                    crate::loading_indicator(message, "Loading pages, layers and assets…")
                 } else if has_error {
                     centered_message("Could not open this document")
                 } else {
@@ -1149,6 +1149,20 @@ impl Render for FantaDesignPanel {
             .overflow_hidden()
             .when(!self.file_inspector_collapsed, |panel| {
                 panel.bg(cx.theme().colors().editor_background)
+            })
+            .when(self.active_view(cx).is_some(), |panel| {
+                panel.child(
+                    h_flex().px_2().py_1().child(
+                        Button::new("reveal-fanta-project", "Show Project in File Manager")
+                            .start_icon(Icon::new(IconName::Folder))
+                            .on_click(|_, window, cx| {
+                                window.dispatch_action(
+                                    zed_actions::fanta::RevealProjectInFileManager.boxed_clone(),
+                                    cx,
+                                );
+                            }),
+                    ),
+                )
             })
             .child(body)
             .children(picker)

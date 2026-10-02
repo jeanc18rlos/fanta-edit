@@ -3,19 +3,21 @@ use super::tool_permissions::{
     resolve_creatable_global_skill_path, sensitive_settings_kind,
 };
 use agent_client_protocol::schema::v1 as acp;
+#[cfg(test)]
 use agent_settings::AgentSettings;
 use futures::FutureExt as _;
 use gpui::{App, Entity, SharedString, Task};
 use project::Project;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use settings::Settings;
 use std::sync::Arc;
 use util::markdown::MarkdownInlineCode;
 
 use crate::{
     AgentTool, ToolCallEventStream, ToolInput, ToolPermissionDecision,
-    authorize_with_sensitive_settings, decide_permission_for_path,
+    authorize_with_sensitive_settings,
 };
 use std::path::Path;
 
@@ -84,7 +86,7 @@ impl AgentTool for CreateDirectoryTool {
         cx.spawn(async move |cx| {
             let input = input.recv().await.map_err(|e| e.to_string())?;
             let decision = cx.update(|cx| {
-                decide_permission_for_path(Self::NAME, &input.path, AgentSettings::get_global(cx))
+                event_stream.permission_decision(Self::NAME, std::slice::from_ref(&input.path), cx)
             });
 
             if let ToolPermissionDecision::Deny(reason) = decision {

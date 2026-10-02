@@ -830,9 +830,12 @@ pub(crate) fn create_component_operations(doc: &Doc, id: NodeId) -> Vec<Operatio
 /// "Variant" axis whose values are the masters' names. The first selected master
 /// becomes the set's default variant.
 pub(crate) fn combine_as_variants_operations(doc: &Doc) -> Vec<Operation> {
+    combine_node_variants_operations(doc, &doc.selection.iter().copied().collect::<Vec<_>>())
+}
+
+pub(crate) fn combine_node_variants_operations(doc: &Doc, nodes: &[NodeId]) -> Vec<Operation> {
     let masters = master_roots(&doc.components);
-    let members: Vec<ComponentId> = doc
-        .selection
+    let members: Vec<ComponentId> = nodes
         .iter()
         .filter_map(|id| masters.get(id).copied())
         // A master already in a set would need its old set repaired first.

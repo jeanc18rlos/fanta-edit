@@ -36,6 +36,7 @@ pub struct McpServer {
     tools: Rc<RefCell<HashMap<&'static str, RegisteredTool>>>,
     handlers: Rc<RefCell<HashMap<&'static str, RequestHandler>>>,
     _server_task: Task<()>,
+    _connection_tasks: Rc<RefCell<Vec<Task<()>>>>,
 }
 
 struct RegisteredTool {
@@ -54,7 +55,7 @@ type RequestHandler = Box<dyn Fn(RequestId, Option<Box<RawValue>>, &App) -> Task
 impl McpServer {
     pub fn new(cx: &AsyncApp) -> Task<Result<Self>> {
         let task = cx.background_spawn(async move {
-            let temp_dir = tempfile::Builder::new().prefix("zed-mcp").tempdir()?;
+            let temp_dir = tempfile::Builder::new().prefix("fanta-mcp").tempdir()?;
             let socket_path = temp_dir.path().join("mcp.sock");
             let listener = UnixListener::bind(&socket_path).context("creating mcp socket")?;
 
@@ -65,12 +66,24 @@ impl McpServer {
             let (temp_dir, socket_path, listener) = task.await?;
             let tools = Rc::new(RefCell::new(HashMap::default()));
             let handlers = Rc::new(RefCell::new(HashMap::default()));
+            let connection_tasks = Rc::new(RefCell::new(Vec::new()));
             let server_task = cx.spawn({
                 let tools = tools.clone();
                 let handlers = handlers.clone();
+                let connection_tasks = Rc::downgrade(&connection_tasks);
                 async move |cx| {
                     while let Ok((stream, _)) = listener.accept().await {
-                        Self::serve_connection(stream, tools.clone(), handlers.clone(), cx);
+                        let Some(connection_tasks) = connection_tasks.upgrade() else {
+                            break;
+                        };
+                        let mut connection_tasks = connection_tasks.borrow_mut();
+                        connection_tasks.retain(|task: &Task<()>| !task.is_ready());
+                        connection_tasks.extend(Self::serve_connection(
+                            stream,
+                            tools.clone(),
+                            handlers.clone(),
+                            cx,
+                        ));
                     }
                     drop(temp_dir)
                 }
@@ -78,6 +91,7 @@ impl McpServer {
             Ok(Self {
                 socket_path,
                 _server_task: server_task,
+                _connection_tasks: connection_tasks,
                 tools,
                 handlers,
             })
@@ -202,34 +216,41 @@ impl McpServer {
         tools: Rc<RefCell<HashMap<&'static str, RegisteredTool>>>,
         handlers: Rc<RefCell<HashMap<&'static str, RequestHandler>>>,
         cx: &mut AsyncApp,
-    ) {
+    ) -> [Task<()>; 2] {
         let (read, write) = stream.split();
         let (incoming_tx, mut incoming_rx) = unbounded();
         let (outgoing_tx, outgoing_rx) = unbounded();
 
-        cx.background_spawn(Self::handle_io(outgoing_rx, incoming_tx, write, read))
-            .detach();
+        let io_task = cx.background_spawn(async move {
+            Self::handle_io(outgoing_rx, incoming_tx, write, read)
+                .await
+                .log_err();
+        });
 
-        cx.spawn(async move |cx| {
+        let dispatch_task = cx.spawn(async move |cx| {
+            let mut request_tasks = Vec::new();
             while let Some(request) = incoming_rx.next().await {
+                request_tasks.retain(|task: &Task<()>| !task.is_ready());
                 let Some(request_id) = request.id.clone() else {
                     continue;
                 };
 
                 if request.method == CallTool::METHOD {
-                    Self::handle_call_tool(request_id, request.params, &tools, &outgoing_tx, cx)
-                        .await;
+                    if let Some(task) =
+                        Self::handle_call_tool(request_id, request.params, &tools, &outgoing_tx, cx)
+                    {
+                        request_tasks.push(task);
+                    }
                 } else if request.method == ListTools::METHOD {
-                    Self::handle_list_tools(request.id.unwrap(), &tools, &outgoing_tx);
+                    Self::handle_list_tools(request_id, &tools, &outgoing_tx);
                 } else if let Some(handler) = handlers.borrow().get(&request.method.as_ref()) {
                     let outgoing_tx = outgoing_tx.clone();
 
                     let task = cx.update(|cx| handler(request_id, request.params, cx));
-                    cx.spawn(async move |_| {
+                    request_tasks.push(cx.spawn(async move |_| {
                         let response = task.await;
-                        outgoing_tx.unbounded_send(response).ok();
-                    })
-                    .detach();
+                        outgoing_tx.unbounded_send(response).log_err();
+                    }));
                 } else {
                     Self::send_err(
                         request_id,
@@ -238,8 +259,11 @@ impl McpServer {
                     );
                 }
             }
-        })
-        .detach();
+            for task in request_tasks {
+                task.await;
+            }
+        });
+        [io_task, dispatch_task]
     }
 
     fn handle_list_tools(
@@ -265,13 +289,13 @@ impl McpServer {
             .ok();
     }
 
-    async fn handle_call_tool(
+    fn handle_call_tool(
         request_id: RequestId,
         params: Option<Box<RawValue>>,
         tools: &Rc<RefCell<HashMap<&'static str, RegisteredTool>>>,
         outgoing_tx: &UnboundedSender<String>,
         cx: &mut AsyncApp,
-    ) {
+    ) -> Option<Task<()>> {
         let result: Result<CallToolParams, serde_json::Error> = match params.as_ref() {
             Some(params) => serde_json::from_str(params.get()),
             None => serde_json::from_value(serde_json::Value::Null),
@@ -283,7 +307,7 @@ impl McpServer {
                     let outgoing_tx = outgoing_tx.clone();
 
                     let task = (tool.handler)(params.arguments, cx);
-                    cx.spawn(async move |_| {
+                    Some(cx.spawn(async move |_| {
                         let response = match task.await {
                             Ok(result) => CallToolResponse {
                                 content: result.content,
@@ -297,7 +321,7 @@ impl McpServer {
                             },
                             Err(err) => CallToolResponse {
                                 content: vec![ToolResponseContent::Text {
-                                    text: err.to_string(),
+                                    text: format!("{err:#}"),
                                 }],
                                 is_error: Some(true),
                                 meta: None,
@@ -315,18 +339,19 @@ impl McpServer {
                                 .unwrap_or_default(),
                             )
                             .ok();
-                    })
-                    .detach();
+                    }))
                 } else {
                     Self::send_err(
                         request_id,
                         format!("Tool not found: {}", params.name),
                         outgoing_tx,
                     );
+                    None
                 }
             }
             Err(err) => {
                 Self::send_err(request_id, err.to_string(), outgoing_tx);
+                None
             }
         }
     }
@@ -366,13 +391,20 @@ impl McpServer {
                         log::trace!("send: {}", &message);
                         outgoing_bytes.write_all(message.as_bytes()).await?;
                         outgoing_bytes.write_all(&[b'\n']).await?;
+                        outgoing_bytes.flush().await?;
                     } else {
                         break;
                     }
                 }
                 bytes_read = output_reader.read_line(&mut incoming_line).fuse() => {
                     if bytes_read? == 0 {
-                        break
+                        drop(incoming_tx);
+                        while let Some(message) = outgoing_rx.next().await {
+                            outgoing_bytes.write_all(message.as_bytes()).await?;
+                            outgoing_bytes.write_all(&[b'\n']).await?;
+                            outgoing_bytes.flush().await?;
+                        }
+                        return Ok(());
                     }
                     log::trace!("recv: {}", &incoming_line);
                     match serde_json::from_str(&incoming_line) {
@@ -383,11 +415,13 @@ impl McpServer {
                             outgoing_bytes.write_all(serde_json::to_string(&json!({
                                 "jsonrpc": "2.0",
                                 "error": json!({
-                                    "code": -32603,
+                                    "code": -32700,
                                     "message": format!("Failed to parse: {error}"),
                                 }),
+                                "id": null,
                             }))?.as_bytes()).await?;
                             outgoing_bytes.write_all(&[b'\n']).await?;
+                            outgoing_bytes.flush().await?;
                             log::error!("failed to parse incoming message: {error}. Raw: {incoming_line}");
                         }
                     }
@@ -435,4 +469,124 @@ struct RawRequest {
     method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     params: Option<Box<serde_json::value::RawValue>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[gpui::test]
+    async fn stopping_the_server_closes_existing_client_connections(cx: &mut gpui::TestAppContext) {
+        // Socket readiness comes from the kernel rather than the deterministic dispatcher.
+        cx.executor().allow_parking();
+        let async_cx = cx.to_async();
+        let mut server = McpServer::new(&async_cx).await.expect("start MCP server");
+        server.handle_request::<crate::types::requests::Ping>(|_, _| {
+            Task::ready(Ok(Default::default()))
+        });
+        let socket = server.socket_path().to_path_buf();
+        let client = cx
+            .background_spawn(async move {
+                let stream = UnixStream::connect(socket).await?;
+                let mut client = BufReader::new(stream);
+                client
+                    .get_mut()
+                    .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+                    .await?;
+                client.get_mut().flush().await?;
+                let mut response = String::new();
+                client.read_line(&mut response).await?;
+                let response: serde_json::Value = serde_json::from_str(&response)?;
+                anyhow::ensure!(
+                    response["id"] == 1,
+                    "the connected client did not receive a response"
+                );
+                anyhow::ensure!(
+                    response["result"] == json!({}),
+                    "MCP ping must return an empty object"
+                );
+                Ok::<_, anyhow::Error>(client)
+            })
+            .await
+            .expect("connect and ping the server");
+        drop(server);
+        cx.run_until_parked();
+        let closed = cx
+            .background_spawn(async move {
+                let mut client = client;
+                let mut byte = [0u8];
+                client.read(&mut byte).await
+            })
+            .await
+            .expect("read socket closure");
+        assert_eq!(
+            closed, 0,
+            "stopping the server must disconnect existing clients"
+        );
+    }
+
+    #[test]
+    fn pending_responses_are_drained_after_request_eof() -> Result<()> {
+        let (incoming_tx, mut incoming_rx) = unbounded();
+        let (outgoing_tx, outgoing_rx) = unbounded();
+        let input = futures::io::Cursor::new(
+            b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n".to_vec(),
+        );
+        let mut output = futures::io::Cursor::new(Vec::new());
+        let (io_result, response_result) = futures::executor::block_on(async {
+            futures::join!(
+                McpServer::handle_io(outgoing_rx, incoming_tx, &mut output, input),
+                async move {
+                    let mut requests = Vec::new();
+                    while let Some(request) = incoming_rx.next().await {
+                        requests.push(request);
+                    }
+                    for request in requests {
+                        outgoing_tx.unbounded_send(serde_json::to_string(&json!({
+                            "jsonrpc": "2.0", "id": request.id, "result": {},
+                        }))?)?;
+                    }
+                    Ok::<_, anyhow::Error>(())
+                }
+            )
+        });
+        io_result?;
+        response_result?;
+        let bytes = output.into_inner();
+        assert!(bytes.ends_with(b"\n"));
+        let response: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["result"], json!({}));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_requests_return_a_framed_parse_error() -> Result<()> {
+        let (incoming_tx, mut incoming_rx) = unbounded();
+        let (outgoing_tx, outgoing_rx) = unbounded();
+        let mut output = futures::io::Cursor::new(Vec::new());
+        let result = futures::executor::block_on(async {
+            futures::join!(
+                McpServer::handle_io(
+                    outgoing_rx,
+                    incoming_tx,
+                    &mut output,
+                    futures::io::Cursor::new(b"not json\n".to_vec())
+                ),
+                async move {
+                    while incoming_rx.next().await.is_some() {}
+                    drop(outgoing_tx);
+                }
+            )
+            .0
+        });
+        result?;
+        let bytes = output.into_inner();
+        assert!(bytes.ends_with(b"\n"));
+        let response: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert_eq!(response["error"]["code"], -32700);
+        assert!(response["id"].is_null());
+        Ok(())
+    }
 }

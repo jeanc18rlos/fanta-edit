@@ -342,6 +342,9 @@ fn stroke_details(strokes: &[Stroke]) -> String {
                 Fill::Solid { color, .. } => color.to_hex(),
                 Fill::Gradient { .. } => "gradient".to_string(),
                 Fill::Image { .. } => "image".to_string(),
+                Fill::Video { .. } => "video".to_string(),
+                Fill::Pattern { .. } => "pattern".to_string(),
+                Fill::Shader { .. } => "shader".to_string(),
             };
             format!(
                 "{{w={:.2},align={:?},paint={},per_side={:?}}}",

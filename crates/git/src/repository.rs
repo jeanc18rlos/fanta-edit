@@ -1049,6 +1049,12 @@ pub trait GitRepository: Send + Sync {
     /// Creates a checkpoint for the repository.
     fn checkpoint(&self) -> BoxFuture<'static, Result<GitRepositoryCheckpoint>>;
 
+    /// Captures a design project, including ignored assets, without changing the index or HEAD.
+    fn checkpoint_with_scope(
+        &self,
+        scope: RepoPath,
+    ) -> BoxFuture<'static, Result<GitRepositoryCheckpoint>>;
+
     /// Resets to a previously-created checkpoint.
     fn restore_checkpoint(&self, checkpoint: GitRepositoryCheckpoint) -> BoxFuture<'_, Result<()>>;
 
@@ -2798,6 +2804,82 @@ impl GitRepository for RealGitRepository {
             .boxed()
     }
 
+    fn checkpoint_with_scope(
+        &self,
+        scope: RepoPath,
+    ) -> BoxFuture<'static, Result<GitRepositoryCheckpoint>> {
+        let git = self.git_binary_in_worktree();
+        self.executor
+            .spawn(async move {
+                let mut git = git?.envs(checkpoint_author_envs());
+                git.with_temp_index(async |git| {
+                    let output = git
+                        .build_command(&["rev-parse", "--verify", "--quiet", "HEAD"])
+                        .output()
+                        .await?;
+                    let head_sha = if output.status.success() {
+                        Some(String::from_utf8(output.stdout)?.trim().to_owned())
+                    } else if output.status.code() == Some(1) {
+                        None
+                    } else {
+                        bail!(
+                            "failed to read checkpoint parent: {}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    };
+
+                    if let Some(head_sha) = head_sha.as_deref() {
+                        git.run(&["read-tree", head_sha]).await?;
+                    } else {
+                        git.run(&["read-tree", "--empty"]).await?;
+                    }
+
+                    git.run(&[
+                        OsString::from("--literal-pathspecs"),
+                        OsString::from("add"),
+                        OsString::from("--all"),
+                        OsString::from("--"),
+                        scope.as_std_path().as_os_str().to_owned(),
+                    ])
+                    .await?;
+
+                    // Generated assets are required to reopen the design even when a
+                    // user's image patterns ignore them. Other ignores still apply.
+                    let assets_path = scope.as_std_path().join("assets");
+                    match smol::fs::symlink_metadata(git.working_directory.join(&assets_path)).await
+                    {
+                        Ok(_) => {
+                            git.run(&[
+                                OsString::from("--literal-pathspecs"),
+                                OsString::from("add"),
+                                OsString::from("--all"),
+                                OsString::from("--force"),
+                                OsString::from("--"),
+                                assets_path.into_os_string(),
+                            ])
+                            .await?;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+
+                    let tree = git.run(&["write-tree"]).await?;
+                    let checkpoint_sha = if let Some(head_sha) = head_sha.as_deref() {
+                        git.run(&["commit-tree", &tree, "-p", head_sha, "-m", "Checkpoint"])
+                            .await?
+                    } else {
+                        git.run(&["commit-tree", &tree, "-m", "Checkpoint"]).await?
+                    };
+
+                    Ok(GitRepositoryCheckpoint {
+                        commit_sha: checkpoint_sha.parse()?,
+                    })
+                })
+                .await
+            })
+            .boxed()
+    }
+
     fn restore_checkpoint(&self, checkpoint: GitRepositoryCheckpoint) -> BoxFuture<'_, Result<()>> {
         let git = self.git_binary_in_worktree();
         self.executor
@@ -3896,10 +3978,16 @@ fn parse_upstream_track(upstream_track: &str) -> Result<UpstreamTracking> {
 
 fn checkpoint_author_envs() -> HashMap<String, String> {
     HashMap::from_iter([
-        ("GIT_AUTHOR_NAME".to_string(), "Zed".to_string()),
-        ("GIT_AUTHOR_EMAIL".to_string(), "hi@zed.dev".to_string()),
-        ("GIT_COMMITTER_NAME".to_string(), "Zed".to_string()),
-        ("GIT_COMMITTER_EMAIL".to_string(), "hi@zed.dev".to_string()),
+        ("GIT_AUTHOR_NAME".to_string(), "Fanta".to_string()),
+        (
+            "GIT_AUTHOR_EMAIL".to_string(),
+            "noreply@fantaisa.net".to_string(),
+        ),
+        ("GIT_COMMITTER_NAME".to_string(), "Fanta".to_string()),
+        (
+            "GIT_COMMITTER_EMAIL".to_string(),
+            "noreply@fantaisa.net".to_string(),
+        ),
     ])
 }
 
@@ -4003,6 +4091,10 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "fixture setup invokes local Git before asynchronous test work"
+    )]
     fn test_git_bundle(directory: &Path) -> PathBuf {
         use std::os::unix::fs::symlink;
 
@@ -4924,6 +5016,258 @@ mod tests {
         //         .ok(),
         //     None
         // );
+    }
+
+    #[gpui::test]
+    async fn test_scoped_checkpoint_keeps_large_ignored_assets_in_unborn_repository(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().expect("temporary repository");
+        git_init_repo(directory.path());
+        fs::create_dir_all(directory.path().join("pages")).expect("pages directory");
+        fs::create_dir_all(directory.path().join("assets/images")).expect("assets directory");
+        fs::create_dir_all(directory.path().join(".fanta-transaction"))
+            .expect("transaction directory");
+        fs::write(
+            directory.path().join(".gitignore"),
+            "assets/\n*.png\nsecret.txt\n.fanta-transaction*/\n",
+        )
+        .expect("ignore rules");
+        fs::write(
+            directory.path().join("pages/page.fnx"),
+            "design before agent",
+        )
+        .expect("design file");
+        let asset = vec![0xff; 2 * 1024 * 1024 + 1];
+        fs::write(directory.path().join("assets/images/generated.png"), &asset)
+            .expect("generated image");
+        fs::write(directory.path().join("assets/index.json"), "asset metadata")
+            .expect("asset index");
+        fs::write(directory.path().join("secret.txt"), "private").expect("ignored file");
+        fs::write(
+            directory.path().join(".fanta-transaction/journal"),
+            "pending",
+        )
+        .expect("transaction journal");
+
+        let repository = RealGitRepository::new(
+            &directory.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .expect("repository backend");
+        let checkpoint = repository
+            .checkpoint_with_scope(repo_path(""))
+            .await
+            .expect("unborn design checkpoint");
+        repository
+            .update_ref(
+                "refs/fanta/checkpoints/test".into(),
+                checkpoint.commit_sha.to_string(),
+            )
+            .await
+            .expect("durable checkpoint ref");
+        repository
+            .create_branch("codex/fanta-test".into(), None)
+            .await
+            .expect("task branch in an unborn repository");
+        let branches = repository.branches().await.expect("unborn branch scan");
+        assert!(branches.error.is_none());
+        let task_branch = branches
+            .branches
+            .iter()
+            .find(|branch| branch.name() == "codex/fanta-test")
+            .expect("current task branch remains discoverable");
+        assert!(task_branch.is_head);
+        assert!(task_branch.most_recent_commit.is_none());
+        fs::write(directory.path().join("pages/page.fnx"), "second agent turn")
+            .expect("subsequent design edit");
+        let subsequent_checkpoint = repository
+            .checkpoint_with_scope(repo_path(""))
+            .await
+            .expect("subsequent checkpoint without an ordinary commit");
+        repository
+            .update_ref(
+                "refs/fanta/checkpoints/test-second-turn".into(),
+                subsequent_checkpoint.commit_sha.to_string(),
+            )
+            .await
+            .expect("durable subsequent checkpoint ref");
+        git_command(directory.path(), ["gc", "--prune=now"]);
+
+        let git = repository.git_binary_in_worktree().expect("git binary");
+        assert_eq!(
+            git.run(&["symbolic-ref", "HEAD"])
+                .await
+                .expect("task branch"),
+            "refs/heads/codex/fanta-test"
+        );
+        assert_eq!(
+            git.run(&[
+                "show",
+                &format!("{}:pages/page.fnx", subsequent_checkpoint.commit_sha),
+            ])
+            .await
+            .expect("saved subsequent design"),
+            "second agent turn"
+        );
+        let asset_revision = format!("{}:assets/images/generated.png", checkpoint.commit_sha);
+        let output = git
+            .build_command(&["show", &asset_revision])
+            .output()
+            .await
+            .expect("checkpoint asset");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, asset);
+        let tree = git
+            .run(&[
+                "ls-tree",
+                "--name-only",
+                "-r",
+                &checkpoint.commit_sha.to_string(),
+            ])
+            .await
+            .expect("checkpoint tree");
+        assert!(tree.lines().any(|path| path == "assets/index.json"));
+        assert!(tree.lines().any(|path| path == "pages/page.fnx"));
+        assert!(!tree.lines().any(|path| path == "secret.txt"));
+        assert!(
+            !tree
+                .lines()
+                .any(|path| path.starts_with(".fanta-transaction/"))
+        );
+        assert!(!directory.path().join(".git/index").exists());
+        let head = git
+            .build_command(&["rev-parse", "--verify", "--quiet", "HEAD"])
+            .output()
+            .await
+            .expect("check unborn HEAD");
+        assert_eq!(head.status.code(), Some(1));
+
+        fs::write(
+            directory.path().join("assets/images/generated.png"),
+            b"changed",
+        )
+        .expect("later image edit");
+        repository
+            .restore_checkpoint(checkpoint)
+            .await
+            .expect("restore complete design");
+        assert_eq!(
+            fs::read(directory.path().join("assets/images/generated.png")).expect("restored image"),
+            asset
+        );
+        assert!(!directory.path().join(".git/index").exists());
+    }
+
+    #[gpui::test]
+    async fn test_scoped_checkpoint_preserves_user_index_and_unrelated_worktree(
+        cx: &mut TestAppContext,
+    ) {
+        disable_git_global_config();
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().expect("temporary repository");
+        git_init_repo(directory.path());
+        let design_directory = directory.path().join("Design[1]");
+        fs::create_dir_all(design_directory.join("assets/images"))
+            .expect("design assets directory");
+        fs::write(directory.path().join(".gitignore"), "*.png\nsecret.txt\n")
+            .expect("ignore rules");
+        fs::write(design_directory.join("page.fnx"), "initial design").expect("initial design");
+        fs::write(directory.path().join("outside.txt"), "initial outside")
+            .expect("initial outside file");
+        git_command(directory.path(), ["add", "--all"]);
+        git_command(directory.path(), ["commit", "-m", "initial"]);
+
+        fs::write(directory.path().join("outside.txt"), "staged outside")
+            .expect("staged outside file");
+        git_command(directory.path(), ["add", "outside.txt"]);
+        fs::write(directory.path().join("outside.txt"), "unstaged outside")
+            .expect("unstaged outside file");
+        fs::write(directory.path().join("untracked.txt"), "unrelated")
+            .expect("unrelated untracked file");
+        fs::write(design_directory.join("page.fnx"), "agent design").expect("agent design");
+        fs::write(
+            design_directory.join("assets/images/generated.png"),
+            [0xff, 0x00, 0x80],
+        )
+        .expect("generated image");
+        fs::write(design_directory.join("secret.txt"), "ignored secret")
+            .expect("ignored design file");
+
+        let repository = RealGitRepository::new(
+            &directory.path().join(".git"),
+            None,
+            Some("git".into()),
+            cx.executor(),
+        )
+        .expect("repository backend");
+        let git = repository.git_binary_in_worktree().expect("git binary");
+        let status_before = git
+            .run(&["status", "--porcelain=v1", "--untracked-files=all"])
+            .await
+            .expect("status before checkpoint");
+        let index_before = fs::read(directory.path().join(".git/index")).expect("user index");
+        let head_before = git.run(&["rev-parse", "HEAD"]).await.expect("user HEAD");
+
+        let checkpoint = repository
+            .checkpoint_with_scope(repo_path("Design[1]"))
+            .await
+            .expect("scoped design checkpoint");
+
+        assert_eq!(
+            fs::read(directory.path().join(".git/index")).expect("unchanged user index"),
+            index_before
+        );
+        assert_eq!(
+            git.run(&["status", "--porcelain=v1", "--untracked-files=all"])
+                .await
+                .expect("status after checkpoint"),
+            status_before
+        );
+        assert_eq!(
+            git.run(&["rev-parse", "HEAD"])
+                .await
+                .expect("unchanged HEAD"),
+            head_before
+        );
+        assert_eq!(
+            git.run(&["show", &format!("{}:outside.txt", checkpoint.commit_sha)])
+                .await
+                .expect("outside committed state"),
+            "initial outside"
+        );
+        assert_eq!(
+            git.run(&[
+                "show",
+                &format!("{}:Design[1]/page.fnx", checkpoint.commit_sha)
+            ])
+            .await
+            .expect("design state"),
+            "agent design"
+        );
+        let tree = git
+            .run(&[
+                "ls-tree",
+                "--name-only",
+                "-r",
+                &checkpoint.commit_sha.to_string(),
+            ])
+            .await
+            .expect("checkpoint tree");
+        assert!(
+            tree.lines()
+                .any(|path| path == "Design[1]/assets/images/generated.png")
+        );
+        assert!(!tree.lines().any(|path| path == "Design[1]/secret.txt"));
+        assert!(!tree.lines().any(|path| path == "untracked.txt"));
+        assert_eq!(
+            fs::read_to_string(directory.path().join("outside.txt")).expect("user worktree file"),
+            "unstaged outside"
+        );
     }
 
     #[gpui::test]

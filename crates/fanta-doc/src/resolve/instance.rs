@@ -221,6 +221,24 @@ fn expand_instance_inner(
             });
         }
     }
+    if let Some(context) = context {
+        for entry in &mut out {
+            for (property, variable) in entry.node.bindings.clone() {
+                if let Some(value) = resolve_bound_value(
+                    context.variables,
+                    scene,
+                    context.mode_anchor,
+                    context.active_modes,
+                    variable,
+                ) && property.apply_resolved(&mut entry.node, value)
+                {
+                    // Fresh clone ids have no scene ancestors; materialize once before
+                    // layout and prevent a later paint overlay from choosing another mode.
+                    entry.node.bindings.remove(&property);
+                }
+            }
+        }
+    }
     out
 }
 

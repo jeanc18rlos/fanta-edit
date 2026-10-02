@@ -42,9 +42,9 @@ use crate::transform::Transform2D;
 use glam::{DMat2, DVec2};
 use size::{LocalBox, local_box, set_size};
 
-/// Measures a text node's single-line glyph extent `(width, height)` — the size
-/// an auto-width ([`TextAutoResize::WidthAndHeight`]) label needs so it never
-/// wraps. Injected so the doc layer stays Skia-free: the oracle passes a metric
+/// Measures the text extent `(width, height)`. Auto-width text is unbounded;
+/// auto-height text wraps at its current `local_size[0]`. Injected so the doc
+/// layer stays Skia-free: the oracle passes a metric
 /// approximation, the renderer passes the real `fanta-text` shaper.
 pub type Measure<'a> = dyn FnMut(&TextNode) -> (f64, f64) + 'a;
 
@@ -146,6 +146,74 @@ pub fn solve_auto_layout<T: LayoutTree>(tree: &mut T, root: NodeId, measure: &mu
     solve_node(tree, root, measure);
 }
 
+/// Solve scene layout with effective typography and text-content tokens while
+/// retaining the author's literal values. Only computed geometry is written back.
+pub fn solve_auto_layout_with_variables(
+    scene: &mut crate::Scene,
+    root: NodeId,
+    variables: &crate::VariableRegistry,
+    active_modes: &std::collections::BTreeMap<crate::VariableCollectionId, crate::ModeId>,
+    measure: &mut Measure,
+) {
+    let overrides = scene
+        .descendants_of(root)
+        .filter_map(|id| {
+            let node = scene.get(id)?;
+            if !matches!(node.data, NodeData::Text(_)) {
+                return None;
+            }
+            let mut scratch = None;
+            for (property, variable) in &node.bindings {
+                if !matches!(
+                    property,
+                    crate::BoundProp::TextStyle | crate::BoundProp::TextContent
+                ) {
+                    continue;
+                }
+                if let Some(value) =
+                    crate::resolve_bound_value(variables, scene, node.id, active_modes, *variable)
+                {
+                    property.apply_resolved(scratch.get_or_insert_with(|| node.clone()), value);
+                }
+            }
+            scratch.map(|scratch| (node.id, scratch))
+        })
+        .collect::<crate::IdHashMap<_, _>>();
+    let mut tree = VariableTextTree { scene, overrides };
+    solve_auto_layout(&mut tree, root, measure);
+    for (id, solved) in tree.overrides {
+        if let Some(original) = tree.scene.get_mut(id) {
+            original.transform = solved.transform;
+            if let (NodeData::Text(original), NodeData::Text(solved)) =
+                (&mut original.data, solved.data)
+            {
+                original.local_size = solved.local_size;
+            }
+        }
+    }
+}
+
+struct VariableTextTree<'a> {
+    scene: &'a mut crate::Scene,
+    overrides: crate::IdHashMap<NodeId, CanvasNode>,
+}
+
+impl LayoutTree for VariableTextTree<'_> {
+    fn node(&self, id: NodeId) -> Option<&CanvasNode> {
+        self.overrides.get(&id).or_else(|| self.scene.get(id))
+    }
+    fn node_mut(&mut self, id: NodeId) -> Option<&mut CanvasNode> {
+        if self.overrides.contains_key(&id) {
+            self.overrides.get_mut(&id)
+        } else {
+            self.scene.get_mut(id)
+        }
+    }
+    fn children(&self, parent: NodeId) -> Vec<NodeId> {
+        self.scene.children_of(Some(parent)).to_vec()
+    }
+}
+
 /// Lay out one node's subtree bottom-up, returning nothing — the node's own box
 /// (size/transform) is mutated in place. Children are solved first (so their
 /// extents are final), then, if this node is an auto-layout frame, its flow
@@ -166,7 +234,7 @@ fn solve_node<T: LayoutTree>(tree: &mut T, id: NodeId, measure: &mut Measure) {
     let Some(al) = auto_layout_of(tree, id) else {
         return;
     };
-    layout_frame(tree, id, &al, &children);
+    layout_frame(tree, id, &al, &children, measure);
 }
 
 /// The [`AutoLayout`] config of `id` if it is an auto-layout frame, else `None`.
@@ -236,28 +304,43 @@ fn auto_layout_of<T: LayoutTree>(tree: &T, id: NodeId) -> Option<AutoLayout> {
 /// That is invisible until the same master is instanced at a different width — a
 /// 720-wide instance of a 400-wide composer master stretches the control-row
 /// frame to 720 but leaves its send button bunched where the 400-wide solve put
-/// it, with dead space on the right. Here we redistribute the child's own flow
-/// children across its new extent, forcing both axes to Fixed so the frame keeps
-/// the parent-assigned size instead of hugging back to its content. `layout_frame`
+/// it, with dead space on the right. Only assigned axes become Fixed: an untouched
+/// Hug height must still grow when newly constrained text wraps. `layout_frame`
 /// runs this same pass on grandchildren, so nesting re-flows recursively.
-fn reflow_after_resize<T: LayoutTree>(tree: &mut T, id: NodeId) {
+fn reflow_after_resize<T: LayoutTree>(
+    tree: &mut T,
+    id: NodeId,
+    changed: [bool; 2],
+    measure: &mut Measure,
+) {
     let Some(mut al) = auto_layout_of(tree, id) else {
         return;
     };
-    al.primary_sizing = AxisSizing::Fixed;
-    al.counter_sizing = AxisSizing::Fixed;
+    let horizontal = al.mode == LayoutMode::Horizontal;
+    if changed[usize::from(!horizontal)] {
+        al.primary_sizing = AxisSizing::Fixed;
+    }
+    if changed[usize::from(horizontal)] {
+        al.counter_sizing = AxisSizing::Fixed;
+    }
     let children = tree.children(id);
-    layout_frame(tree, id, &al, &children);
+    layout_frame(tree, id, &al, &children, measure);
 }
 
-/// Snap an auto-width text node to its measured single-line glyph box (so a label
-/// like "Edit"/"Copy" never wraps). `Height`-mode and `None`-mode text keep their
-/// authored width; only `WidthAndHeight` (Figma "Auto width") is overwritten.
+/// Auto-width labels hug unwrapped glyphs; auto-height paragraphs keep their
+/// authored width and hug the measured wrapped height. Fixed boxes stay authored.
 fn apply_text_autoresize<T: LayoutTree>(tree: &mut T, id: NodeId, measure: &mut Measure) {
     let new_size = match tree.node(id).map(|n| &n.data) {
-        Some(NodeData::Text(t)) if t.auto_resize == TextAutoResize::WidthAndHeight => {
+        Some(NodeData::Text(t)) if t.auto_resize != TextAutoResize::None => {
             let (w, h) = measure(t);
-            Some([w.max(0.0), h.max(0.0)])
+            Some([
+                if t.auto_resize == TextAutoResize::Height {
+                    t.local_size[0]
+                } else {
+                    w.max(0.0)
+                },
+                h.max(0.0),
+            ])
         }
         _ => None,
     };
@@ -442,7 +525,7 @@ fn counter_alignment_span(
     run: &[usize],
 ) -> f64 {
     if al.counter_sizing == AxisSizing::Hug {
-        run_max_cross(infos, run, flow.horizontal)
+        hugged_inner_extent(al, flow, run_max_cross(infos, run, flow.horizontal), false)
     } else {
         flow.inner_cross
     }
@@ -497,7 +580,7 @@ fn primary_cursor(
     count: usize,
 ) -> (f64, f64) {
     let align_main = if al.primary_sizing == AxisSizing::Hug {
-        metrics.packed
+        hugged_inner_extent(al, flow, metrics.packed, true)
     } else {
         flow.inner_main
     };
@@ -664,16 +747,56 @@ fn write_flow_children<T: LayoutTree>(tree: &mut T, infos: &[ChildInfo], flow_in
     }
 }
 
-fn reflow_resized_flow_children<T: LayoutTree>(
+fn refresh_resized_flow_children<T: LayoutTree>(
     tree: &mut T,
-    infos: &[ChildInfo],
+    infos: &mut [ChildInfo],
     flow_indices: &[usize],
+    measure: &mut Measure,
 ) {
-    for &i in flow_indices {
-        if infos[i].counter_align == CounterAlign::Stretch || infos[i].grow > 0.0 {
-            reflow_after_resize(tree, infos[i].id);
+    for &index in flow_indices {
+        let info = &mut infos[index];
+        let Some(node) = tree.node(info.id) else {
+            continue;
+        };
+        let old = local_box(node).size;
+        let changed = [old[0] != info.bx.size[0], old[1] != info.bx.size[1]];
+        if changed == [false, false] {
+            continue;
+        }
+        if let Some(node) = tree.node_mut(info.id) {
+            set_size(node, info.bx.size[0], info.bx.size[1]);
+        }
+        if changed[0]
+            && !changed[1]
+            && matches!(tree.node(info.id).map(|node| &node.data), Some(NodeData::Text(text)) if text.auto_resize == TextAutoResize::Height)
+        {
+            apply_text_autoresize(tree, info.id, measure);
+        }
+        reflow_after_resize(tree, info.id, changed, measure);
+        if let Some(node) = tree.node(info.id) {
+            info.bx = local_box(node);
         }
     }
+}
+
+fn constrained_extent(al: &AutoLayout, axis: usize, extent: f64) -> f64 {
+    let extent = al.min_size[axis].map_or(extent, |minimum| extent.max(minimum));
+    al.max_size[axis].map_or(extent, |maximum| extent.min(maximum))
+}
+
+fn hugged_inner_extent(al: &AutoLayout, flow: FrameFlow, content: f64, primary: bool) -> f64 {
+    let (axis, padding) = if primary {
+        (
+            usize::from(!flow.horizontal),
+            flow.pad_main_lo + flow.pad_main_hi,
+        )
+    } else {
+        (
+            usize::from(flow.horizontal),
+            flow.pad_cross_lo + flow.pad_cross_hi,
+        )
+    };
+    (constrained_extent(al, axis, content + padding) - padding).max(0.0)
 }
 
 fn set_hugged_frame_size<T: LayoutTree>(
@@ -688,16 +811,6 @@ fn set_hugged_frame_size<T: LayoutTree>(
     // Main/cross map to width/height depending on the flow direction, so the
     // per-axis min/max limits index by that.
     let (main_axis, cross_axis) = if flow.horizontal { (0, 1) } else { (1, 0) };
-    let clamp_axis = |value: f64, axis: usize| {
-        let mut v = value;
-        if let Some(min) = al.min_size[axis] {
-            v = v.max(min);
-        }
-        if let Some(max) = al.max_size[axis] {
-            v = v.min(max);
-        }
-        v
-    };
 
     let mut new_frame = frame_size;
     if al.primary_sizing == AxisSizing::Hug {
@@ -705,7 +818,7 @@ fn set_hugged_frame_size<T: LayoutTree>(
         set_main(
             &mut new_frame,
             flow.horizontal,
-            clamp_axis(hug_main, main_axis),
+            constrained_extent(al, main_axis, hug_main),
         );
     }
     if al.counter_sizing == AxisSizing::Hug {
@@ -713,7 +826,7 @@ fn set_hugged_frame_size<T: LayoutTree>(
         set_cross(
             &mut new_frame,
             flow.horizontal,
-            clamp_axis(hug_cross, cross_axis),
+            constrained_extent(al, cross_axis, hug_cross),
         );
     }
     if new_frame != frame_size {
@@ -731,12 +844,13 @@ fn layout_frame<T: LayoutTree>(
     frame_id: NodeId,
     al: &AutoLayout,
     children: &[NodeId],
+    measure: &mut Measure,
 ) {
     // Wrapping frames flow onto multiple rows/columns — a distinct enough
     // algorithm that it lives in its own function. A non-wrap frame (the common
     // case) continues through the single-line pipeline below.
     if al.wrap {
-        layout_frame_wrap(tree, frame_id, al, children);
+        layout_frame_wrap(tree, frame_id, al, children, measure);
         return;
     }
 
@@ -750,14 +864,6 @@ fn layout_frame<T: LayoutTree>(
 
     // Flow children only.
     let flow_indices = collect_flow_indices(&infos);
-
-    // On a HUG counter axis the frame's authored counter extent is not what the
-    // children align against — the frame *becomes* its content. Resolve the inner
-    // counter size to the max child extent up front so Center/End/Stretch place
-    // correctly relative to the hugged box (Start is unaffected). The symmetric
-    // HUG-primary case (no free space to justify into) is handled at primary
-    // placement below via `align_main`.
-    let inner_cross = counter_alignment_span(al, flow, &infos, &flow_indices);
 
     // ---- FILL distribution on the primary axis ------------------------------
     // grow>0 children share the primary space left over by the FIXED (non-grow)
@@ -781,10 +887,14 @@ fn layout_frame<T: LayoutTree>(
         al.primary_sizing != AxisSizing::Hug,
     );
 
+    refresh_resized_flow_children(tree, &mut infos, &flow_indices, measure);
+    let inner_cross = counter_alignment_span(al, flow, &infos, &flow_indices);
+
     // ---- Counter-axis Stretch -----------------------------------------------
     // A Stretch child fills the frame's counter inner size (origin pinned at the
     // counter padding-start, so its box spans the inner cross extent).
     stretch_run_counter(&mut infos, &flow_indices, flow.horizontal, inner_cross);
+    refresh_resized_flow_children(tree, &mut infos, &flow_indices, measure);
 
     // ---- Primary-axis placement ---------------------------------------------
     // On a HUG primary axis the frame's authored main extent is junk — the frame
@@ -803,13 +913,6 @@ fn layout_frame<T: LayoutTree>(
 
     // ---- Write back: sizes (FILL/Stretch may have changed them) + transforms.
     write_flow_children(tree, &infos, &flow_indices);
-
-    // ---- Re-flow resized auto-layout children at their new size. -------------
-    // A child we just Stretched or FILLed that is itself an auto-layout frame had
-    // its flow children packed for its old (Hug) extent; redistribute them across
-    // the new size so e.g. a wider instance pushes its trailing controls to the
-    // far edge instead of leaving them bunched. See [`reflow_after_resize`].
-    reflow_resized_flow_children(tree, &infos, &flow_indices);
 
     // ---- Hug sizing: resize the frame to its content on any Hug axis. --------
     // Primary hug = packed run + both primary paddings. Counter hug = max child
@@ -856,6 +959,7 @@ fn layout_frame_wrap<T: LayoutTree>(
     frame_id: NodeId,
     al: &AutoLayout,
     children: &[NodeId],
+    measure: &mut Measure,
 ) {
     let mut infos = gather_child_infos(tree, al, children);
 
@@ -886,12 +990,15 @@ fn layout_frame_wrap<T: LayoutTree>(
         al.primary_sizing != AxisSizing::Hug,
     );
 
+    refresh_resized_flow_children(tree, &mut infos, &flow_indices, measure);
+
     // ---- Each line's thickness (max child cross extent on that line). -------
     let line_thickness = line_thicknesses(&infos, &lines, flow.horizontal);
 
     // ---- Counter-axis Stretch: a stretched child fills its OWN line's
     // thickness (so each row's stretch children are the same height as that row).
     stretch_lines_counter(&mut infos, &lines, &line_thickness, flow.horizontal);
+    refresh_resized_flow_children(tree, &mut infos, &flow_indices, measure);
 
     // ---- The counter gap between lines: the authored `counter_spacing`, or
     // the space-between share when the gap is "Auto" (see [`wrap_counter_gap`]).
@@ -903,10 +1010,6 @@ fn layout_frame_wrap<T: LayoutTree>(
 
     // ---- Write back sizes + transforms for the flow children. ---------------
     write_flow_children(tree, &infos, &flow_indices);
-
-    // Re-flow resized auto-layout children at their new size (see the non-wrap
-    // path and [`reflow_after_resize`]).
-    reflow_resized_flow_children(tree, &infos, &flow_indices);
 
     // ---- Hug sizing. Primary hug → widest line's packed run; counter hug →
     // total line thickness + counter gaps. Both plus their paddings.
