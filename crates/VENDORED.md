@@ -9,6 +9,11 @@ reusable UI source lives separately in
 | `fanta-canvas`, `fanta-doc`, `fanta-fig-interop`, `fanta-fnx`, `fanta-format`, `fanta-present`, `fanta-render`, `fanta-text`, `fanta-tools` | `squidred-dev/fantaisa-engine` | `9370fa2` |
 | `fanta-gpui` (historical; now published) | `squidred-dev/fanta-ui` | `9183fa3` |
 
+The current inspector integration pins the complete GPUI package family to
+`fanta-ui` commit `7a2c123dd3be07069f68ce166679f30e728b7ba0` in the workspace patch table.
+Keep those revisions coordinated so host adapters and shared components use the
+same GPUI types; the integration does not require a sibling checkout.
+
 Upstream crates not vendored because nothing here uses them: `fanta-engine`,
 `fanta-harness`, `fanta-psd-interop`, `fanta-illustrator-interop`,
 `fanta-gpui-storybook`.

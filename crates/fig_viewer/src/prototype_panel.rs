@@ -365,6 +365,8 @@ pub struct FantaPrototypePanel {
     #[cfg(feature = "fanta-gpui-ui")]
     shared_subscription: Option<Subscription>,
     #[cfg(feature = "fanta-gpui-ui")]
+    show_presentation_action: bool,
+    #[cfg(feature = "fanta-gpui-ui")]
     selected_reaction: Option<ReactionId>,
 }
 
@@ -412,6 +414,8 @@ impl FantaPrototypePanel {
             shared: None,
             #[cfg(feature = "fanta-gpui-ui")]
             shared_subscription: None,
+            #[cfg(feature = "fanta-gpui-ui")]
+            show_presentation_action: true,
             #[cfg(feature = "fanta-gpui-ui")]
             selected_reaction: None,
         }
@@ -3631,6 +3635,16 @@ impl Render for FantaPrototypePanel {
 
 #[cfg(feature = "fanta-gpui-ui")]
 impl FantaPrototypePanel {
+    pub(crate) fn set_show_presentation_action(&mut self, show: bool, cx: &mut Context<Self>) {
+        if self.show_presentation_action != show {
+            self.show_presentation_action = show;
+            if let Some(panel) = &self.shared {
+                panel.update(cx, |panel, cx| panel.set_show_presentation_action(show, cx));
+            }
+            cx.notify();
+        }
+    }
+
     fn render_shared(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         use fanta_gpui::properties_tabs::{
             InspectorChoice, PrototypeConnection, PrototypeInspector, PrototypeInspectorViewData,
@@ -3638,7 +3652,10 @@ impl FantaPrototypePanel {
         self.ensure_parameter_editor(window, cx);
         if self.shared.is_none() {
             let panel = cx.new(|cx| {
-                PrototypeInspector::new("editor-prototype-inspector", Default::default(), cx)
+                let mut panel =
+                    PrototypeInspector::new("editor-prototype-inspector", Default::default(), cx);
+                panel.set_show_presentation_action(self.show_presentation_action, cx);
+                panel
             });
             self.shared_subscription =
                 Some(cx.subscribe_in(&panel, window, Self::handle_shared_action));
