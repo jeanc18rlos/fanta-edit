@@ -1067,6 +1067,15 @@ pub fn completion_error_from_anthropic(
             Error::DeserializeResponse { provider, error }
         }
         AnthropicError::ReadResponse(error) => Error::ApiReadResponseError { provider, error },
+        // A 413 without an Anthropic-shaped body comes from infrastructure in
+        // front of the API (e.g. Vercel's FUNCTION_PAYLOAD_TOO_LARGE HTML
+        // page); map it like `request_too_large` instead of leaking raw HTML.
+        AnthropicError::HttpResponseError {
+            status_code: StatusCode::PAYLOAD_TOO_LARGE,
+            message,
+        } => Error::PromptTooLarge {
+            tokens: parse_prompt_too_long(&message),
+        },
         AnthropicError::HttpResponseError {
             status_code,
             message,
@@ -1133,6 +1142,21 @@ pub fn completion_error_from_anthropic_api(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_413_maps_to_prompt_too_large() {
+        // Vercel-style FUNCTION_PAYLOAD_TOO_LARGE pages are HTML, not
+        // Anthropic error JSON; the raw body must not leak to the user.
+        let error = AnthropicError::HttpResponseError {
+            status_code: StatusCode::PAYLOAD_TOO_LARGE,
+            message: "<html>413: FUNCTION_PAYLOAD_TOO_LARGE</html>".to_string(),
+        };
+        let completion_error: language_model_core::LanguageModelCompletionError = error.into();
+        assert!(matches!(
+            completion_error,
+            language_model_core::LanguageModelCompletionError::PromptTooLarge { tokens: None }
+        ));
+    }
 
     fn listed_entry(id: &str, capabilities: ModelCapabilities) -> ListModelEntry {
         ListModelEntry {

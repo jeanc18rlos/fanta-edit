@@ -3737,6 +3737,8 @@ impl Thread {
         };
 
         self.extend_request_history_until(&mut request.messages, self.messages.len());
+        // Text-only output; images just inflate the request body.
+        elide_stale_images(&mut request.messages, 0);
 
         request.messages.push(LanguageModelRequestMessage {
             role: Role::User,
@@ -4154,6 +4156,10 @@ impl Thread {
             messages.extend(message.to_request());
         }
 
+        // Run after the pending message is in so its (newest) images count
+        // toward the retention budget.
+        elide_stale_images(&mut messages, RETAINED_IMAGES_BYTE_BUDGET);
+
         messages
     }
 
@@ -4307,6 +4313,13 @@ impl Thread {
         Some(insertion_ix)
     }
 
+    /// Whether a manually-triggered compaction has anything to summarize.
+    /// The UI uses this to decide if a `PromptTooLarge` turn can be recovered
+    /// by compacting and retrying instead of starting a new thread.
+    pub fn can_compact(&self) -> bool {
+        self.forced_compaction_target_ix().is_some()
+    }
+
     /// Insertion point for a manually-triggered compaction.
     /// Returns `None` only when there is nothing to summarize (no messages, or the thread already ends in a compaction).
     fn forced_compaction_target_ix(&self) -> Option<usize> {
@@ -4333,6 +4346,10 @@ impl Thread {
             messages: self.build_request_messages_until(Vec::new(), insertion_ix, cx),
             ..Default::default()
         };
+
+        // The summary is text-only; images add nothing but payload size, and a
+        // compaction that 413s would leave an oversized thread unrecoverable.
+        elide_stale_images(&mut request.messages, 0);
 
         request.messages.push(LanguageModelRequestMessage {
             role: Role::User,
@@ -4681,6 +4698,91 @@ pub(crate) fn messages_to_markdown(messages: &[Arc<Message>]) -> String {
     markdown
 }
 
+/// Total base64 bytes of images (tool results and user attachments) retained
+/// in a completion request; everything past the budget collapses to
+/// [`ELIDED_IMAGE_PLACEHOLDER`].
+///
+/// Images are replayed verbatim into every subsequent request, so a long
+/// design session grows the request body by one full base64 PNG per
+/// design_screenshot (or paste) until it exceeds the api.fantaisa.net (Vercel)
+/// ~4.5MB payload limit and the whole turn 413s. 3MB of images leaves ~1.5MB
+/// for the system prompt, tools, and compaction-bounded text history.
+const RETAINED_IMAGES_BYTE_BUDGET: usize = 3_000_000;
+
+const ELIDED_IMAGE_PLACEHOLDER: &str = "[image elided: an older image was removed to keep the \
+     request within the server's size limit. Re-run the tool (e.g. design_screenshot) or ask \
+     the user to re-attach it if you need it again.]";
+
+/// A User-role message authored by the user (or a summary standing in for
+/// one), as opposed to the User-role messages that carry tool results.
+/// Used as the stable "current turn" boundary for image retention.
+fn is_user_prompt_message(message: &LanguageModelRequestMessage) -> bool {
+    message.role == Role::User
+        && !message.content.is_empty()
+        && message.content.iter().all(|content| {
+            matches!(
+                content,
+                language_model::MessageContent::Text(_) | language_model::MessageContent::Image(_)
+            )
+        })
+}
+
+/// Replaces stale images in `messages` with a text placeholder, preserving the
+/// tool_use/tool_result pairing the API requires. Operates on the request copy
+/// only — thread state keeps the full images for replay in the UI.
+///
+/// Retention rule: images before the latest user prompt are always elided
+/// (their canvas state is stale, and a fixed boundary keeps the request prefix
+/// byte-stable for prompt caching until the next user turn); images from the
+/// current turn are kept newest-first while their cumulative base64 size fits
+/// `byte_budget`. Pass `byte_budget = 0` to elide every image (summarization
+/// paths, where images are pure payload).
+fn elide_stale_images(messages: &mut [LanguageModelRequestMessage], byte_budget: usize) {
+    let boundary = if byte_budget == 0 {
+        messages.len()
+    } else {
+        messages
+            .iter()
+            .rposition(is_user_prompt_message)
+            .unwrap_or(0)
+    };
+    let mut kept_bytes = 0_usize;
+    let mut keep = |image: &language_model::LanguageModelImage, ix: usize| {
+        if ix < boundary || kept_bytes + image.len() > byte_budget {
+            false
+        } else {
+            kept_bytes += image.len();
+            true
+        }
+    };
+    for (ix, message) in messages.iter_mut().enumerate().rev() {
+        for content in message.content.iter_mut().rev() {
+            match content {
+                language_model::MessageContent::ToolResult(tool_result) => {
+                    for part in tool_result.content.iter_mut().rev() {
+                        let LanguageModelToolResultContent::Image(image) = part else {
+                            continue;
+                        };
+                        if !keep(image, ix) {
+                            *part = LanguageModelToolResultContent::Text(
+                                ELIDED_IMAGE_PLACEHOLDER.into(),
+                            );
+                        }
+                    }
+                }
+                language_model::MessageContent::Image(image) => {
+                    if !keep(image, ix) {
+                        *content = language_model::MessageContent::Text(
+                            ELIDED_IMAGE_PLACEHOLDER.to_string(),
+                        );
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 fn extend_request_history_until(
     messages: &[Arc<Message>],
     request_messages: &mut Vec<LanguageModelRequestMessage>,
@@ -4760,6 +4862,8 @@ pub fn build_thread_title_request(
         ..Default::default()
     };
     extend_request_history_until(messages, &mut request.messages, messages.len());
+    // Text-only output; images just inflate the request body.
+    elide_stale_images(&mut request.messages, 0);
     request.messages.push(LanguageModelRequestMessage {
         role: Role::User,
         content: vec![SUMMARIZE_THREAD_PROMPT.into()],
@@ -6447,7 +6551,7 @@ impl UserMessageContent {
     pub fn from_content_block(value: acp::ContentBlock, path_style: PathStyle) -> Self {
         match value {
             acp::ContentBlock::Text(text_content) => Self::Text(text_content.text),
-            acp::ContentBlock::Image(image_content) => Self::Image(convert_image(image_content)),
+            acp::ContentBlock::Image(image_content) => convert_image(image_content),
             acp::ContentBlock::Audio(_) => {
                 // TODO
                 Self::Text("[audio]".to_string())
@@ -6516,9 +6620,21 @@ impl From<UserMessageContent> for acp::ContentBlock {
     }
 }
 
-fn convert_image(image_content: acp::ImageContent) -> LanguageModelImage {
-    LanguageModelImage {
-        source: image_content.data.into(),
+/// ACP clients attach arbitrary images; run them through the same
+/// dimension/byte enforcement as pasted images instead of trusting the raw
+/// base64 (an uncapped image can exceed the server's whole request-body
+/// limit by itself).
+fn convert_image(image_content: acp::ImageContent) -> UserMessageContent {
+    use language_model::LanguageModelImageExt as _;
+    match LanguageModelImage::from_base64_image(&image_content.data, &image_content.mime_type) {
+        Ok(Some(image)) => UserMessageContent::Image(image),
+        Ok(None) => UserMessageContent::Text(
+            "[image attached but too large to send to the model]".to_string(),
+        ),
+        Err(error) => {
+            log::error!("failed to convert attached image: {error:#}");
+            UserMessageContent::Text("[attached image could not be read]".to_string())
+        }
     }
 }
 
@@ -6591,6 +6707,115 @@ mod tests {
             text.as_str(),
             "The previous conversation was compacted. Use this summary as context:\n\nOlder context"
         );
+    }
+
+    #[test]
+    fn test_elide_stale_images() {
+        fn image_of_len(len: usize) -> LanguageModelImage {
+            LanguageModelImage {
+                source: "x".repeat(len).into(),
+            }
+        }
+        fn tool_result_message(
+            id: &str,
+            parts: Vec<LanguageModelToolResultContent>,
+        ) -> LanguageModelRequestMessage {
+            LanguageModelRequestMessage {
+                role: Role::User,
+                content: vec![language_model::MessageContent::ToolResult(
+                    LanguageModelToolResult {
+                        tool_use_id: LanguageModelToolUseId::from(id),
+                        tool_name: "design_screenshot".into(),
+                        is_error: false,
+                        content: parts,
+                        output: None,
+                    },
+                )],
+                cache: false,
+                reasoning_details: None,
+            }
+        }
+        fn user_prompt_message(
+            content: Vec<language_model::MessageContent>,
+        ) -> LanguageModelRequestMessage {
+            LanguageModelRequestMessage {
+                role: Role::User,
+                content,
+                cache: false,
+                reasoning_details: None,
+            }
+        }
+        fn parts_of(message: &LanguageModelRequestMessage) -> &[LanguageModelToolResultContent] {
+            match &message.content[0] {
+                language_model::MessageContent::ToolResult(tool_result) => &tool_result.content,
+                _ => panic!("expected a tool result"),
+            }
+        }
+        let tool_image = |len: usize| LanguageModelToolResultContent::Image(image_of_len(len));
+        let tool_text = |text: &str| LanguageModelToolResultContent::Text(text.to_string().into());
+        let tool_placeholder = tool_text(ELIDED_IMAGE_PLACEHOLDER);
+        let user_placeholder =
+            language_model::MessageContent::Text(ELIDED_IMAGE_PLACEHOLDER.to_string());
+
+        // A prior turn (user prompt with an attached image + a screenshot),
+        // then the current turn (user prompt + three screenshots).
+        let mut messages = vec![
+            user_prompt_message(vec![
+                language_model::MessageContent::Text("first ask".into()),
+                language_model::MessageContent::Image(image_of_len(10)),
+            ]),
+            tool_result_message("1", vec![tool_text("note"), tool_image(10)]),
+            user_prompt_message(vec![language_model::MessageContent::Text(
+                "second ask".into(),
+            )]),
+            tool_result_message("2", vec![tool_image(60)]),
+            tool_result_message("3", vec![tool_image(50)]),
+            tool_result_message("4", vec![tool_image(40)]),
+        ];
+        elide_stale_images(&mut messages, 100);
+
+        // Everything before the latest user prompt is elided regardless of
+        // budget: the prior turn's attachment and screenshot.
+        assert_eq!(messages[0].content[1], user_placeholder);
+        assert_eq!(
+            parts_of(&messages[1]),
+            &[tool_text("note"), tool_placeholder.clone()]
+        );
+        // Current turn keeps newest-first while cumulative size fits the
+        // budget: 40 + 50 fit, 60 would exceed 100.
+        assert_eq!(parts_of(&messages[5]), &[tool_image(40)]);
+        assert_eq!(parts_of(&messages[4]), &[tool_image(50)]);
+        assert_eq!(parts_of(&messages[3]), &[tool_placeholder.clone()]);
+        // The prompt text itself is untouched.
+        assert_eq!(
+            messages[0].content[0],
+            language_model::MessageContent::Text("first ask".into())
+        );
+
+        // An attachment on the latest user prompt counts as current turn.
+        let mut messages = vec![
+            tool_result_message("1", vec![tool_image(10)]),
+            user_prompt_message(vec![language_model::MessageContent::Image(image_of_len(
+                30,
+            ))]),
+        ];
+        elide_stale_images(&mut messages, 100);
+        assert_eq!(parts_of(&messages[0]), &[tool_placeholder.clone()]);
+        assert_eq!(
+            messages[1].content[0],
+            language_model::MessageContent::Image(image_of_len(30))
+        );
+
+        // Budget 0 (summarization paths) elides every image, boundary or not.
+        let mut messages = vec![
+            user_prompt_message(vec![language_model::MessageContent::Image(image_of_len(
+                10,
+            ))]),
+            tool_result_message("1", vec![tool_image(10)]),
+        ];
+        elide_stale_images(&mut messages, 0);
+        assert_eq!(messages[0].content[0], user_placeholder);
+        assert_eq!(parts_of(&messages[1]), &[tool_placeholder]);
     }
 
     fn user_text_message(id: ClientUserMessageId, text: &str) -> Arc<Message> {
@@ -7040,6 +7265,9 @@ mod tests {
                 thread.messages.push(agent_text_message("old assistant"));
                 // Auto-compaction would be a no-op here.
                 assert_eq!(thread.compaction_message_target_ix(cx), None);
+                // ...but there is history to summarize, so the UI may offer
+                // "Summarize & Retry" on a prompt-too-large error.
+                assert!(thread.can_compact());
             });
         });
 
@@ -7086,6 +7314,7 @@ mod tests {
                 // Re-running `/compact` with nothing new to summarize is a
                 // no-op: the thread already ends in a compaction.
                 assert_eq!(thread.forced_compaction_target_ix(), None);
+                assert!(!thread.can_compact());
             });
 
             thread
@@ -7185,6 +7414,60 @@ mod tests {
             assert!(matches!(&*thread.messages[0], Message::User(_)));
             assert!(matches!(&*thread.messages[1], Message::Agent(_)));
         });
+    }
+
+    /// The "Summarize & Retry" recovery for a prompt-too-large turn: a manual
+    /// compaction followed by `resume` must build a request containing the
+    /// summary (plus retained user messages) and a continue marker — not the
+    /// full pre-compaction history that overflowed the context window.
+    #[gpui::test]
+    async fn test_resume_after_manual_compact_elides_history(cx: &mut TestAppContext) {
+        let (thread, _event_stream) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+
+        cx.update(|cx| {
+            thread.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread
+                    .messages
+                    .push(user_text_message(ClientUserMessageId::new(), "old user"));
+                thread.messages.push(agent_text_message("old assistant"));
+            });
+        });
+
+        let _compact_events = cx
+            .update(|cx| {
+                thread.update(cx, |thread, cx| {
+                    thread.compact(ClientUserMessageId::new(), cx)
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let compaction_request = model.pending_completions().pop().unwrap();
+        model.send_completion_stream_text_chunk(&compaction_request, "summary of old context");
+        model.end_completion_stream(&compaction_request);
+        cx.run_until_parked();
+
+        let _resume_events = cx
+            .update(|cx| thread.update(cx, |thread, cx| thread.resume(cx)))
+            .unwrap();
+        cx.run_until_parked();
+
+        let resume_request = model.pending_completions().pop().unwrap();
+        assert_eq!(resume_request.intent, Some(CompletionIntent::UserPrompt));
+        assert_eq!(
+            request_texts_after_system(&resume_request.messages),
+            vec![
+                "old user".to_string(),
+                summary_request_text("summary of old context"),
+                "Continue where you left off".to_string(),
+            ]
+        );
+
+        model.send_completion_stream_text_chunk(&resume_request, "recovered answer");
+        model.end_completion_stream(&resume_request);
+        cx.run_until_parked();
     }
 
     /// `/compact` on an empty thread (nothing to summarize) is a no-op: it

@@ -174,7 +174,10 @@ impl DesignSurface for FigDesignSurface {
             Ok(prepared) => prepared,
             Err(error) => return Task::ready(Err(error)),
         };
-        let max_dimension = f64::from(target.max_dimension.unwrap_or(1024).clamp(16, 4096));
+        // Default/ceiling tuned for model consumption: Anthropic downscales
+        // anything past 1568px anyway, and larger renders inflate the request
+        // body that has to fit through the api.fantaisa.net payload limit.
+        let max_dimension = f64::from(target.max_dimension.unwrap_or(768).clamp(16, 1568));
         cx.background_spawn(async move {
             let bounds = match node {
                 Some(node) => visual_world_bounds(&doc.scene, node, 0.0)
@@ -1083,8 +1086,16 @@ mod tests {
         assert_eq!(outcome.change, DocChange::None);
         assert_eq!(outcome.value["ops"][1]["status"], json!("failed"));
         assert_eq!(outcome.value["ops"][0]["status"], json!("ok"));
-        assert_eq!(doc.scene.len(), nodes_before, "the created node was rolled back");
-        assert_eq!(doc.history.undo_depth(), 0, "no undo step for a failed batch");
+        assert_eq!(
+            doc.scene.len(),
+            nodes_before,
+            "the created node was rolled back"
+        );
+        assert_eq!(
+            doc.history.undo_depth(),
+            0,
+            "no undo step for a failed batch"
+        );
     }
 
     #[test]

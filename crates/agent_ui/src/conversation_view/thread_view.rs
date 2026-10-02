@@ -610,6 +610,10 @@ pub struct ThreadView {
     _sandbox_status_refresh_task: Option<Task<()>>,
     pub hovered_edited_file_buttons: Option<usize>,
     pub in_flight_prompt: Option<Vec<acp::ContentBlock>>,
+    /// One-shot continuation for "Summarize & Retry" on the context-too-large
+    /// error: set when the recovery compaction turn starts, consumed when that
+    /// turn stops so the failed turn can be resumed.
+    resume_turn_after_compaction: bool,
     pub _subscriptions: Vec<Subscription>,
     pub message_editor: Entity<MessageEditor>,
     pub add_context_menu_handle: PopoverMenuHandle<ContextMenu>,
@@ -1016,6 +1020,7 @@ impl ThreadView {
             _sandbox_status_refresh_task: None,
             hovered_edited_file_buttons: None,
             in_flight_prompt: None,
+            resume_turn_after_compaction: false,
             message_editor,
             add_context_menu_handle: PopoverMenuHandle::default(),
             thinking_effort_menu_handle: PopoverMenuHandle::default(),
@@ -1839,6 +1844,10 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) {
         let error = error.into();
+        // A failed turn invalidates any pending summarize-and-retry
+        // continuation: resuming after a failed compaction would just fail
+        // again.
+        self.resume_turn_after_compaction = false;
         self.emit_thread_error_telemetry(&error, cx);
         self.thread_error = Some(error);
         cx.notify();
@@ -1957,6 +1966,7 @@ impl ThreadView {
     pub fn cancel_generation(&mut self, cx: &mut Context<Self>) {
         self.thread_retry_status.take();
         self.thread_error.take();
+        self.resume_turn_after_compaction = false;
         self.message_queue.pause();
         self._cancel_task = Some(self.thread.update(cx, |thread, cx| thread.cancel(cx)));
         self.sync_generating_indicator(cx);
@@ -1985,6 +1995,60 @@ impl ThreadView {
             })
         })
         .detach();
+    }
+
+    /// Whether a turn that failed with `PromptTooLarge` can be recovered by
+    /// summarizing the conversation and resuming: the agent must support
+    /// retrying, and the native thread must have something left to compact.
+    fn can_summarize_and_retry(&self, cx: &App) -> bool {
+        self.thread.read(cx).parent_session_id().is_none()
+            && self.thread.read(cx).can_retry(cx)
+            && self
+                .as_native_thread(cx)
+                .is_some_and(|thread| thread.read(cx).can_compact())
+    }
+
+    /// Recover a turn that failed with `PromptTooLarge`: run the built-in
+    /// `/compact` command exactly as if the user had typed it, and mark the
+    /// thread view to resume the failed turn once the compaction turn stops.
+    fn summarize_and_retry(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_loading_contents || !self.can_summarize_and_retry(cx) {
+            return;
+        }
+
+        self.thread_error.take();
+        self.resume_turn_after_compaction = true;
+        cx.emit(AcpThreadViewEvent::Interacted);
+
+        let command_block = acp::ContentBlock::Text(acp::TextContent::new(format!(
+            "/{}",
+            agent::COMPACT_COMMAND_NAME
+        )));
+        self.send_content(
+            Task::ready(Ok(Some((vec![command_block], Vec::new())))),
+            true,
+            window,
+            cx,
+        );
+    }
+
+    /// Consume the pending summarize-and-retry continuation when the
+    /// recovery compaction turn stops. Returns true when the failed turn was
+    /// resumed; a turn that didn't end cleanly (cancelled, refused, ...)
+    /// drops the continuation instead.
+    pub(crate) fn resume_turn_after_compaction_if_pending(
+        &mut self,
+        stop_reason: acp::StopReason,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !std::mem::take(&mut self.resume_turn_after_compaction) {
+            return false;
+        }
+        if stop_reason != acp::StopReason::EndTurn {
+            return false;
+        }
+        self.retry_generation(cx);
+        true
     }
 
     pub fn regenerate(
@@ -10864,21 +10928,39 @@ impl ThreadView {
     }
 
     fn render_prompt_too_large_error(&self, cx: &mut Context<Self>) -> Callout {
-        const MESSAGE: &str = "This conversation is too long for the model's context window. \
-            Start a new thread or remove some attached files to continue.";
+        let can_summarize = self.can_summarize_and_retry(cx);
+        let message: &'static str = if can_summarize {
+            "This conversation is too long for the model's context window. \
+            Summarize it to free up space and retry, or start a new thread."
+        } else {
+            "This conversation is too long for the model's context window. \
+            Start a new thread or remove some attached files to continue."
+        };
 
         Callout::new()
             .severity(Severity::Error)
             .icon(IconName::XCircle)
             .title("Context Too Large")
-            .description(MESSAGE)
+            .description(message)
             .actions_slot(
                 h_flex()
                     .gap_0p5()
+                    .when(can_summarize, |this| {
+                        this.child(self.summarize_and_retry_button(cx))
+                    })
                     .child(self.new_thread_button(cx))
-                    .child(self.create_copy_button(MESSAGE)),
+                    .child(self.create_copy_button(message)),
             )
             .dismiss_action(self.dismiss_error_button(cx))
+    }
+
+    fn summarize_and_retry_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        Button::new("summarize_and_retry", "Summarize & Retry")
+            .label_size(LabelSize::Small)
+            .style(ButtonStyle::Filled)
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.summarize_and_retry(window, cx);
+            }))
     }
 
     fn retry_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
