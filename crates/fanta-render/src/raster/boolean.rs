@@ -29,6 +29,7 @@ pub(crate) fn paint_boolean(
     // Folding walks the scene for the operand subtree, so a transient (instance)
     // clone with no scene id cannot be folded — nothing to draw.
     let Some(scene_id) = scene_id else {
+        ctx.metrics.non_artwork_content = true;
         return;
     };
 
