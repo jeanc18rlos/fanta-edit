@@ -250,10 +250,7 @@ fn open_ai_reasoning_effort_is_supported(effort: open_ai::ReasoningEffort) -> bo
     effort != open_ai::ReasoningEffort::None
 }
 
-fn normalize_open_ai_response_thinking_effort(
-    request: &mut LanguageModelRequest,
-    model: &open_ai::Model,
-) {
+fn normalize_open_ai_thinking_effort(request: &mut LanguageModelRequest, model: &open_ai::Model) {
     let selected_effort_is_supported = request
         .thinking_effort
         .as_deref()
@@ -269,11 +266,29 @@ fn normalize_open_ai_response_thinking_effort(
 }
 
 fn supports_selectable_thinking_effort(model: &open_ai::Model) -> bool {
-    model.uses_responses_api()
+    model
+        .supported_reasoning_efforts()
+        .iter()
+        .any(|effort| open_ai_reasoning_effort_is_supported(*effort))
+}
+
+fn chat_completion_reasoning_effort(
+    request: &LanguageModelRequest,
+    model: &open_ai::Model,
+) -> Option<open_ai::ReasoningEffort> {
+    if !request.thinking_allowed
         && model
             .supported_reasoning_efforts()
-            .iter()
-            .any(|effort| open_ai_reasoning_effort_is_supported(*effort))
+            .contains(&open_ai::ReasoningEffort::None)
+    {
+        return Some(open_ai::ReasoningEffort::None);
+    }
+    request
+        .thinking_effort
+        .as_deref()
+        .and_then(|value| value.parse::<open_ai::ReasoningEffort>().ok())
+        .filter(|effort| model.supported_reasoning_efforts().contains(effort))
+        .or_else(|| model.reasoning_effort())
 }
 
 fn supported_thinking_effort_levels(model: &open_ai::Model) -> Vec<LanguageModelEffortLevel> {
@@ -341,6 +356,32 @@ mod tests {
             model
                 .supported_reasoning_efforts()
                 .contains(&open_ai::ReasoningEffort::None)
+        );
+    }
+
+    #[test]
+    fn chat_completion_models_forward_their_configured_reasoning_effort() {
+        let model = open_ai::Model::Custom {
+            name: "custom-chat-model".to_owned(),
+            display_name: None,
+            max_tokens: 128_000,
+            max_output_tokens: None,
+            max_completion_tokens: None,
+            reasoning_effort: Some(open_ai::ReasoningEffort::High),
+            supports_chat_completions: true,
+            supports_images: true,
+        };
+        assert!(supports_selectable_thinking_effort(&model));
+        let mut request = LanguageModelRequest {
+            thinking_allowed: true,
+            thinking_effort: Some("unsupported".into()),
+            ..Default::default()
+        };
+        normalize_open_ai_thinking_effort(&mut request, &model);
+        assert_eq!(request.thinking_effort, None);
+        assert_eq!(
+            chat_completion_reasoning_effort(&request, &model),
+            Some(open_ai::ReasoningEffort::High),
         );
     }
 }
@@ -488,6 +529,12 @@ impl LanguageModel for OpenAiLanguageModel {
         supports_selectable_thinking_effort(&self.model)
     }
 
+    fn supports_disabling_thinking(&self) -> bool {
+        self.model
+            .supported_reasoning_efforts()
+            .contains(&open_ai::ReasoningEffort::None)
+    }
+
     fn supports_fast_mode(&self) -> bool {
         self.model.supports_priority()
     }
@@ -533,8 +580,8 @@ impl LanguageModel for OpenAiLanguageModel {
         if !self.model.supports_priority() {
             request.speed = None;
         }
+        normalize_open_ai_thinking_effort(&mut request, &self.model);
         if self.model.uses_responses_api() {
-            normalize_open_ai_response_thinking_effort(&mut request, &self.model);
             let request = into_open_ai_response(
                 request,
                 self.model.id(),
@@ -553,6 +600,7 @@ impl LanguageModel for OpenAiLanguageModel {
             }
             .boxed()
         } else {
+            let reasoning_effort = chat_completion_reasoning_effort(&request, &self.model);
             let request = into_open_ai(
                 request,
                 self.model.id(),
@@ -560,7 +608,7 @@ impl LanguageModel for OpenAiLanguageModel {
                 self.model.supports_prompt_cache_key(),
                 self.max_output_tokens(),
                 ChatCompletionMaxTokensParameter::MaxCompletionTokens,
-                None,
+                reasoning_effort,
                 false,
             );
             let completions = self.stream_completion(request, cx);

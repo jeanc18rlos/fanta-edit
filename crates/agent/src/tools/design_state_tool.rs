@@ -164,7 +164,7 @@ impl AgentTool for DesignSystemTool {
             let input = input.recv().await.map_err(tool_content_err)?;
             let value = cx
                 .update(|cx| {
-                    event_stream.report_design_activity("Reading design system", None, None, None, cx);
+                    event_stream.report_workspace_activity("Reading design system", None, None, None, design_surface::AgentWorkspace::Variables, cx);
                     design_surface::active(cx)
                         .context("no design canvas is available")?
                         .design_system(input, cx)
@@ -179,18 +179,25 @@ impl AgentTool for DesignSystemTool {
     }
 }
 
-/// Report what you are inspecting on the canvas, including the current page,
-/// node, or world coordinates. Call before a file-editing or animation step
-/// so the user can follow your progress. The session supplies your identity.
+/// Report your current page, node, coordinates, source file and workspace
+/// (canvas, variables or code) so the user can follow your progress.
+/// Call before each visible editing milestone. The session supplies your identity.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct ReportAgentActivityToolInput {
     pub action: String,
+    /// Choose your stable wizard or mage display name (for example Merlyn, Morgana, Cornelius or Severus) on your first report. Omit it on later reports to preserve your identity.
+    #[serde(default)]
+    pub agent_name: Option<String>,
     #[serde(default)]
     pub page: Option<usize>,
     #[serde(default)]
     pub node: Option<String>,
     #[serde(default)]
     pub world: Option<[f64; 2]>,
+    #[serde(default)]
+    pub source_path: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<design_surface::AgentWorkspace>,
     #[serde(default = "default_true")]
     pub active: bool,
 }
@@ -212,7 +219,7 @@ impl AgentTool for ReportAgentActivityTool {
         _: Result<Self::Input, serde_json::Value>,
         _: &mut App,
     ) -> SharedString {
-        "Update agent canvas focus".into()
+        "Update agent focus".into()
     }
 
     fn run(
@@ -233,21 +240,26 @@ impl AgentTool for ReportAgentActivityTool {
                 .update(|cx| {
                     let surface =
                         design_surface::active(cx).context("no design canvas is available")?;
+                    if let Some(name) = input.agent_name {
+                        event_stream.set_agent_name(name, cx)?;
+                    }
                     let (agent_id, agent_name) = event_stream.agent_identity(cx);
-                    surface.report_activity(
-                        design_surface::AgentActivity {
-                            agent_id,
-                            agent_name,
-                            action: input.action,
-                            page: input.page,
-                            node: input.node,
-                            world: input.world,
-                            active: input.active,
-                            source_path: None,
-                            project_root: None,
-                        },
-                        cx,
-                    )
+                    let activity = design_surface::AgentActivity {
+                        agent_id,
+                        agent_name,
+                        action: input.action,
+                        page: input.page,
+                        node: input.node,
+                        world: input.world,
+                        active: input.active,
+                        source_path: input.source_path.clone(),
+                        project_root: None,
+                        workspace: input.workspace,
+                    };
+                    match input.source_path {
+                        Some(path) => surface.report_source_activity(path, activity, cx),
+                        None => surface.report_activity(activity, cx),
+                    }
                 })
                 .map_err(tool_content_err)?;
             Ok(serde_json::to_string(&value)

@@ -70,6 +70,15 @@ fn generated_code_is_expanded(explicit: Option<bool>) -> bool {
     explicit.unwrap_or(false)
 }
 
+fn should_offer_plan_approval(
+    profile: &str,
+    idle: bool,
+    had_error: bool,
+    has_response: bool,
+) -> bool {
+    profile == agent_settings::builtin_profiles::PLAN && idle && !had_error && has_response
+}
+
 #[cfg(test)]
 mod composer_control_tests {
     use super::*;
@@ -112,6 +121,15 @@ mod composer_control_tests {
         assert!(!generated_code_is_expanded(None));
         assert!(generated_code_is_expanded(Some(true)));
         assert!(!generated_code_is_expanded(Some(false)));
+    }
+
+    #[test]
+    fn plan_approval_requires_a_successful_finished_plan_response() {
+        assert!(should_offer_plan_approval("plan", true, false, true));
+        assert!(!should_offer_plan_approval("plan", false, false, true));
+        assert!(!should_offer_plan_approval("plan", true, true, true));
+        assert!(!should_offer_plan_approval("plan", true, false, false));
+        assert!(!should_offer_plan_approval("write", true, false, true));
     }
 }
 
@@ -655,6 +673,8 @@ pub struct ThreadView {
     effort_slider_bounds: Option<Bounds<Pixels>>,
     effort_slider_dragging: bool,
     effort_slider_focus: FocusHandle,
+    dismissed_plan_entry_count: Option<usize>,
+    last_prompt_completed: Option<bool>,
     collapsed_sandbox_authorization_details: HashSet<acp::ToolCallId>,
     collapsed_sandbox_network_details: HashSet<acp::ToolCallId>,
     pub subagent_scroll_handles: RefCell<HashMap<acp::SessionId, ScrollHandle>>,
@@ -1073,6 +1093,8 @@ impl ThreadView {
             effort_slider_bounds: None,
             effort_slider_dragging: false,
             effort_slider_focus: cx.focus_handle().tab_stop(true),
+            dismissed_plan_entry_count: None,
+            last_prompt_completed: None,
             collapsed_sandbox_authorization_details: HashSet::default(),
             collapsed_sandbox_network_details: HashSet::default(),
             subagent_scroll_handles: RefCell::new(HashMap::default()),
@@ -1735,6 +1757,7 @@ impl ThreadView {
         let thread = self.thread.downgrade();
 
         self.is_loading_contents = true;
+        self.last_prompt_completed = Some(false);
 
         let model_id = self.current_model_id(cx);
         let mode_id = self.current_mode_id(cx);
@@ -1832,6 +1855,13 @@ impl ThreadView {
             });
 
             let res = send.await;
+            this.update(cx, |this, cx| {
+                this.last_prompt_completed = Some(matches!(
+                    &res,
+                    Ok(Some(response)) if response.stop_reason == acp::StopReason::EndTurn
+                ));
+                cx.notify();
+            })?;
             let turn_time_ms = turn_start_time.elapsed().as_millis();
             drop(_stop_turn);
             let status = if res.is_ok() {
@@ -2059,6 +2089,7 @@ impl ThreadView {
         }
 
         let task = thread.update(cx, |thread, cx| thread.retry(cx));
+        self.last_prompt_completed = Some(false);
         cx.emit(AcpThreadViewEvent::Interacted);
         self.sync_generating_indicator(cx);
         cx.notify();
@@ -2066,9 +2097,14 @@ impl ThreadView {
             let result = task.await;
 
             this.update(cx, |this, cx| {
+                this.last_prompt_completed = Some(matches!(
+                    &result,
+                    Ok(Some(response)) if response.stop_reason == acp::StopReason::EndTurn
+                ));
                 if let Err(err) = result {
                     this.handle_thread_error(err, cx);
                 }
+                cx.notify();
             })
         })
         .detach();
@@ -4450,7 +4486,11 @@ impl ThreadView {
                     .when_some(max_content_width, |this, max_w| this.flex_basis(max_w))
                     .when(max_content_width.is_none(), |this| this.w_full())
                     .when(fills_container, |this| this.h_full())
-                    .px_2()
+                    .p_3()
+                    .rounded_xl()
+                    .border_1()
+                    .border_color(cx.theme().colors().border_variant)
+                    .bg(cx.theme().colors().panel_background)
                     .flex_shrink_1()
                     .flex_grow_0()
                     .justify_between()
@@ -4497,6 +4537,7 @@ impl ThreadView {
                                 )
                             }),
                     )
+                    .children(self.render_plan_approval(cx))
                     .children(self.render_thinking_control(cx))
                     .child(
                         h_flex()
@@ -4504,6 +4545,10 @@ impl ThreadView {
                             .flex_none()
                             .flex_wrap()
                             .justify_between()
+                            .gap_2()
+                            .pt_2()
+                            .border_t_1()
+                            .border_color(cx.theme().colors().border_variant)
                             .child(
                                 h_flex()
                                     .gap_0p5()
@@ -4565,73 +4610,264 @@ impl ThreadView {
             }))
     }
 
-    fn render_agent_follow_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let activity_state = design_surface::activity_state(cx);
-        let activities = activity_state.read(cx).activities();
-        let roots = self.workspace.upgrade()?.read(cx).root_paths(cx);
-        let activities = activities
-            .into_iter()
-            .filter(|activity| {
-                activity.project_root.as_ref().is_none_or(|root| {
-                    roots
-                        .iter()
-                        .any(|path| std::path::Path::new(root).starts_with(path))
-                })
-            })
-            .collect::<Vec<_>>();
-        if activities.is_empty() {
+    fn plan_is_ready_for_approval(&self, cx: &App) -> bool {
+        let Some(native_thread) = self.as_native_thread(cx) else {
+            return false;
+        };
+        let thread = self.thread.read(cx);
+        let has_response = thread
+            .entries()
+            .iter()
+            .rev()
+            .take_while(|entry| !matches!(entry, AgentThreadEntry::UserMessage(_)))
+            .any(|entry| {
+                matches!(entry, AgentThreadEntry::AssistantMessage(message) if
+                !message.is_subagent_output && message.chunks.iter().any(|chunk| {
+                    matches!(chunk, AssistantMessageChunk::Message { block, .. }
+                        if block.text_content(cx).is_some_and(|text| !text.trim().is_empty()))
+                }))
+            });
+        should_offer_plan_approval(
+            native_thread.read(cx).profile().as_str(),
+            thread.status() == ThreadStatus::Idle && !self.is_loading_contents,
+            thread.had_error() || self.thread_error.is_some(),
+            has_response && self.last_prompt_completed != Some(false),
+        )
+    }
+
+    fn render_plan_approval(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        if !self.plan_is_ready_for_approval(cx)
+            || self.dismissed_plan_entry_count == Some(self.thread.read(cx).entries().len())
+        {
             return None;
         }
-        let followed_agent = activity_state.read(cx).followed_agent().map(str::to_owned);
-        let label = followed_agent
-            .as_ref()
-            .and_then(|followed| {
-                activities
-                    .iter()
-                    .find(|activity| &activity.agent_id == followed)
+        Some(
+            v_flex()
+                .w_full()
+                .gap_2()
+                .p_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(cx.theme().colors().text_accent.opacity(0.3))
+                .bg(cx.theme().colors().text_accent.opacity(0.06))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Icon::new(IconName::Check)
+                                .size(IconSize::Small)
+                                .color(Color::Accent),
+                        )
+                        .child(Label::new("Your plan is ready").size(LabelSize::Small)),
+                )
+                .child(
+                    Label::new("Would you like to apply this plan?")
+                        .size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("apply-approved-plan", "Apply plan")
+                                .style(ButtonStyle::Tinted(TintColor::Accent))
+                                .start_icon(Icon::new(IconName::PlayOutlined).size(IconSize::Small))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.apply_approved_plan(window, cx)
+                                })),
+                        )
+                        .child(Button::new("keep-planning", "Keep planning").on_click(
+                            cx.listener(|this, _, window, cx| {
+                                this.dismissed_plan_entry_count =
+                                    Some(this.thread.read(cx).entries().len());
+                                this.message_editor.focus_handle(cx).focus(window, cx);
+                                cx.notify();
+                            }),
+                        )),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn apply_approved_plan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.plan_is_ready_for_approval(cx) {
+            return;
+        }
+        let Some(thread) = self.as_native_thread(cx) else {
+            return;
+        };
+        thread.update(cx, |thread, cx| {
+            thread.set_profile(
+                AgentProfileId(agent_settings::builtin_profiles::WRITE.into()),
+                cx,
+            );
+        });
+        self.dismissed_plan_entry_count = None;
+        self.thread_error.take();
+        self.thread_feedback.clear();
+        cx.emit(AcpThreadViewEvent::Interacted);
+        self.send_content(
+            Task::ready(Ok(Some((
+                vec![acp::ContentBlock::Text(acp::TextContent::new(
+                    "Apply the plan above. Implement the agreed changes and run the relevant verification.",
+                ))],
+                Vec::new(),
+            )))),
+            false,
+            window,
+            cx,
+        );
+    }
+
+    fn render_agent_follow_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let activity_state = design_surface::activity_state(cx);
+        let roots = self.workspace.upgrade()?.read(cx).root_paths(cx);
+        let activities = activity_state
+            .read(cx)
+            .activities()
+            .into_iter()
+            .filter(|activity| {
+                activity
+                    .project_root
+                    .as_ref()
+                    .is_none_or(|root| roots.iter().any(|path| Path::new(root).starts_with(path)))
             })
+            .collect::<Vec<_>>();
+        let followed_agent = activity_state.read(cx).followed_agent().map(str::to_owned);
+        if activities.is_empty() && followed_agent.is_none() {
+            return None;
+        }
+        let followed_activity = followed_agent.as_ref().and_then(|followed| {
+            activities
+                .iter()
+                .find(|activity| &activity.agent_id == followed)
+        });
+        let label = followed_activity
             .map(|activity| format!("Following {}", activity.agent_name))
-            .unwrap_or_else(|| "Follow agent".into());
+            .unwrap_or_else(|| {
+                if followed_agent.is_some() {
+                    "Following · waiting".into()
+                } else {
+                    "Follow agent".into()
+                }
+            });
+        let followed_color = followed_activity
+            .map(|activity| Color::Custom(design_surface::agent_color(&activity.agent_id)))
+            .unwrap_or(Color::Muted);
         Some(
             PopoverMenu::new("follow-design-agent")
                 .trigger(
                     Button::new("follow-design-agent-trigger", label)
                         .label_size(LabelSize::Small)
-                        .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
+                        .start_icon(
+                            Icon::new(IconName::Crosshair)
+                                .size(IconSize::Small)
+                                .color(followed_color),
+                        )
+                        .toggle_state(followed_agent.is_some())
+                        .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                        .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall))
+                        .tooltip(Tooltip::text(
+                            "Follow an agent's active file or canvas location",
+                        )),
                 )
                 .menu(move |window, cx| {
+                    let mut activities = activity_state
+                        .read(cx)
+                        .activities()
+                        .into_iter()
+                        .filter(|activity| {
+                            activity.project_root.as_ref().is_none_or(|root| {
+                                roots.iter().any(|path| Path::new(root).starts_with(path))
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    activities.sort_by(|left, right| {
+                        left.agent_name
+                            .cmp(&right.agent_name)
+                            .then_with(|| left.agent_id.cmp(&right.agent_id))
+                    });
+                    let followed_agent =
+                        activity_state.read(cx).followed_agent().map(str::to_owned);
                     let activity_state = activity_state.clone();
-                    let activities = activities.clone();
-                    let followed_agent = followed_agent.clone();
                     Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
-                        menu = menu.item(
-                            ContextMenuEntry::new("Stop following")
-                                .toggleable(IconPosition::End, followed_agent.is_none())
-                                .handler({
-                                    let activity_state = activity_state.clone();
-                                    move |_, cx| {
-                                        activity_state
-                                            .update(cx, |state, cx| state.follow(None, cx))
-                                    }
-                                }),
-                        );
+                        menu = menu
+                            .header("Follow an agent")
+                            .item(
+                                ContextMenuEntry::new("Free navigation")
+                                    .icon(IconName::Crosshair)
+                                    .toggleable(IconPosition::End, followed_agent.is_none())
+                                    .handler({
+                                        let activity_state = activity_state.clone();
+                                        move |_, cx| {
+                                            activity_state
+                                                .update(cx, |state, cx| state.follow(None, cx))
+                                        }
+                                    }),
+                            )
+                            .separator();
+                        if activities.is_empty() {
+                            menu = menu.header("Waiting for agent activity");
+                        }
                         for activity in activities {
                             let selected = followed_agent.as_ref() == Some(&activity.agent_id);
-                            menu = menu.item(
-                                ContextMenuEntry::new(format!(
-                                    "{} · {}",
-                                    activity.agent_name, activity.action
-                                ))
-                                .toggleable(IconPosition::End, selected)
-                                .handler({
+                            let color = design_surface::agent_color(&activity.agent_id);
+                            let agent_id = activity.agent_id;
+                            let agent_name = activity.agent_name;
+                            let detail = activity
+                                .source_path
+                                .as_deref()
+                                .and_then(|path| Path::new(path).file_name())
+                                .map(|name| {
+                                    format!("{} · {}", activity.action, name.to_string_lossy())
+                                })
+                                .unwrap_or(activity.action);
+                            menu = menu.custom_entry(
+                                move |_, _cx| {
+                                    h_flex()
+                                        .w(rems(18.0))
+                                        .gap_2()
+                                        .py_1()
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .size(px(8.0))
+                                                .rounded_full()
+                                                .bg(color),
+                                        )
+                                        .child(
+                                            v_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .child(
+                                                    Label::new(agent_name.clone())
+                                                        .size(LabelSize::Small)
+                                                        .truncate(),
+                                                )
+                                                .child(
+                                                    Label::new(detail.clone())
+                                                        .size(LabelSize::XSmall)
+                                                        .color(Color::Muted)
+                                                        .truncate(),
+                                                ),
+                                        )
+                                        .when(selected, |this| {
+                                            this.child(
+                                                Icon::new(IconName::Check)
+                                                    .size(IconSize::Small)
+                                                    .color(Color::Accent),
+                                            )
+                                        })
+                                        .into_any_element()
+                                },
+                                {
                                     let activity_state = activity_state.clone();
-                                    let agent_id = activity.agent_id;
                                     move |_, cx| {
                                         activity_state.update(cx, |state, cx| {
                                             state.follow(Some(agent_id.clone()), cx)
-                                        })
+                                        });
                                     }
-                                }),
+                                },
                             );
                         }
                         menu
@@ -5387,31 +5623,18 @@ impl ThreadView {
         let thread = self.as_native_thread(cx)?;
         let thread = thread.read(cx);
         let model = thread.model()?;
-        let supported = model.supports_thinking();
-        let always_on = supported && !model.supports_disabling_thinking();
-        let thinking = always_on || thread.thinking_enabled();
         let effort_levels = model.supported_effort_levels();
+        let supports_toggle = model.supports_thinking() && model.supports_disabling_thinking();
+        let supports_effort_selection = effort_levels.len() > 1;
+        if !supports_toggle && !supports_effort_selection {
+            return None;
+        }
+        let always_on = !model.supports_disabling_thinking();
+        let thinking = always_on || thread.thinking_enabled();
         let selected_effort = thread.thinking_effort().cloned();
-        let disabled = self.thread.read(cx).status() != ThreadStatus::Idle;
-        let model_name = model.name().0;
-        let toggle_label = if !supported {
-            "Thinking unavailable"
-        } else if always_on {
-            "Thinking always on"
-        } else if thinking {
-            "Thinking on"
-        } else {
-            "Thinking off"
-        };
-        let tooltip = if !supported {
-            format!(
-                "{model_name} does not expose thinking controls. Select a reasoning model to use thinking and effort."
-            )
-        } else if always_on {
-            format!("{model_name} always thinks. Adjust its effort with the slider.")
-        } else {
-            "Let the model reason before answering. Changes apply to the next message.".into()
-        };
+        let disabled =
+            self.thread.read(cx).status() != ThreadStatus::Idle || self.is_loading_contents;
+        let toggle_label = if thinking { "Thinking" } else { "Quick reply" };
         let toggle = Button::new("thinking-mode", toggle_label)
             .label_size(LabelSize::Small)
             .start_icon(
@@ -5423,47 +5646,31 @@ impl ThreadView {
                 .size(IconSize::Small),
             )
             .toggle_state(thinking)
-            .disabled(!supported || always_on || disabled)
+            .disabled(disabled)
             .color(if thinking {
                 Color::Accent
             } else {
                 Color::Muted
             })
-            .tooltip(Tooltip::text(tooltip))
+            .tooltip(Tooltip::text(
+                "Let the model reason before answering. Changes apply to the next message.",
+            ))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_native_thinking(cx)));
         Some(
             h_flex()
                 .w_full()
                 .gap_3()
-                .px_1()
-                .py_1()
-                .child(toggle)
-                .child(if !supported || effort_levels.is_empty() {
-                    v_flex()
-                        .flex_1()
-                        .gap_0p5()
-                        .child(
-                            Label::new("Effort")
-                                .size(LabelSize::XSmall)
-                                .color(Color::Muted),
-                        )
-                        .child(
-                            Label::new(if supported {
-                                "This model chooses its own effort"
-                            } else {
-                                "Unavailable for this model"
-                            })
-                            .size(LabelSize::XSmall)
-                            .color(Color::Disabled),
-                        )
-                        .into_any_element()
-                } else {
-                    self.render_effort_slider(
+                .p_2()
+                .rounded_lg()
+                .bg(cx.theme().colors().element_background.opacity(0.5))
+                .when(supports_toggle, |this| this.child(toggle))
+                .when(supports_effort_selection, |this| {
+                    this.child(self.render_effort_slider(
                         effort_levels,
                         selected_effort,
                         !thinking || disabled,
                         cx,
-                    )
+                    ))
                 })
                 .into_any_element(),
         )
@@ -5502,9 +5709,9 @@ impl ThreadView {
             )
             .relative()
             .w_full()
-            .h_5()
+            .h_6()
             .track_focus(&self.effort_slider_focus)
-            .cursor_pointer()
+            .when(!disabled, |this| this.cursor_pointer())
             .when(disabled, |this| this.opacity(0.45))
             .on_mouse_down(
                 MouseButton::Left,
@@ -5559,8 +5766,8 @@ impl ThreadView {
                     .absolute()
                     .left_0()
                     .right_0()
-                    .top(px(8.0))
-                    .h(px(4.0))
+                    .top(px(10.0))
+                    .h(px(5.0))
                     .rounded_full()
                     .bg(cx.theme().colors().border_variant),
             )
@@ -5568,9 +5775,9 @@ impl ThreadView {
                 div()
                     .absolute()
                     .left_0()
-                    .top(px(8.0))
+                    .top(px(10.0))
                     .w(relative(selected_fraction))
-                    .h(px(4.0))
+                    .h(px(5.0))
                     .rounded_full()
                     .bg(accent),
             )
@@ -5578,13 +5785,13 @@ impl ThreadView {
                 div()
                     .absolute()
                     .left(relative(selected_fraction))
-                    .ml(px(-5.0))
-                    .top(px(4.0))
-                    .size(px(12.0))
+                    .ml(px(-7.0))
+                    .top(px(5.0))
+                    .size(px(15.0))
                     .rounded_full()
                     .border_2()
                     .border_color(cx.theme().colors().editor_background)
-                    .bg(accent)
+                    .bg(cx.theme().colors().text)
                     .shadow_sm(),
             );
         for index in 0..effort_levels.len() {
@@ -5598,7 +5805,7 @@ impl ThreadView {
                     .absolute()
                     .left(relative(fraction))
                     .ml(px(-1.0))
-                    .top(px(8.0))
+                    .top(px(10.0))
                     .size(px(4.0))
                     .rounded_full()
                     .bg(if index <= selected_index {

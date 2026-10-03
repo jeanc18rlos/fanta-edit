@@ -558,12 +558,14 @@ impl Pane {
             None
         };
 
+        let activity = design_surface::activity_state(cx);
         let subscriptions = vec![
             cx.on_focus(&focus_handle, window, Pane::focus_in),
             cx.on_focus_in(&focus_handle, window, Pane::focus_in),
             cx.on_focus_out(&focus_handle, window, Pane::focus_out),
             cx.observe_global_in::<SettingsStore>(window, Self::settings_changed),
             cx.subscribe(&project, Self::project_events),
+            cx.observe(&activity, |_, _, cx| cx.notify()),
         ];
 
         let handle = cx.entity().downgrade();
@@ -2897,6 +2899,20 @@ impl Pane {
             .map(|id| id == item.item_id())
             .unwrap_or(false);
 
+        let activity_color = item.tab_color(cx).or_else(|| {
+            let activity = design_surface::existing_activity_state(cx)?;
+            let project = self.project.upgrade()?;
+            let project = project.read(cx);
+            item.project_entry_ids(cx).into_iter().find_map(|entry| {
+                let path = project.path_for_entry(entry, cx)?;
+                let path = project.absolute_path(&path, cx)?;
+                activity
+                    .read(cx)
+                    .source_activity(&path)
+                    .map(|activity| design_surface::agent_color(&activity.agent_id))
+            })
+        });
+        let icon_color = activity_color.map(Color::Custom).unwrap_or(Color::Muted);
         let label = item.tab_content(
             TabContentParams {
                 detail: Some(detail),
@@ -2905,6 +2921,7 @@ impl Pane {
                 deemphasized: !self.has_focus(window, cx),
                 max_title_len: None,
                 truncate_title_middle: false,
+                text_color_override: activity_color,
             },
             window,
             cx,
@@ -2926,18 +2943,18 @@ impl Pane {
                 cx.theme().colors().tab_bar_background
             };
 
-            let (icon_decoration, icon_color) = if matches!(diagnostic, &DiagnosticSeverity::ERROR)
-            {
-                (IconDecorationKind::X, Color::Error)
-            } else {
-                (IconDecorationKind::Triangle, Color::Warning)
-            };
+            let (icon_decoration, decoration_color) =
+                if matches!(diagnostic, &DiagnosticSeverity::ERROR) {
+                    (IconDecorationKind::X, Color::Error)
+                } else {
+                    (IconDecorationKind::Triangle, Color::Warning)
+                };
 
             Some(DecoratedIcon::new(
-                icon.size(IconSize::Small).color(Color::Muted),
+                icon.size(IconSize::Small).color(icon_color),
                 Some(
                     IconDecoration::new(icon_decoration, knockout_item_color, cx)
-                        .color(icon_color.color(cx))
+                        .color(decoration_color.color(cx))
                         .position(Point {
                             x: px(-2.),
                             y: px(-2.),
@@ -2950,9 +2967,7 @@ impl Pane {
             match item_diagnostic {
                 Some(&DiagnosticSeverity::ERROR) => None,
                 Some(&DiagnosticSeverity::WARNING) => None,
-                _ => item
-                    .tab_icon(window, cx)
-                    .map(|icon| icon.color(Color::Muted)),
+                _ => item.tab_icon(window, cx).map(|icon| icon.color(icon_color)),
             }
             .map(|icon| icon.size(IconSize::Small))
         } else {
@@ -5044,6 +5059,7 @@ impl Render for DraggedTab {
                 deemphasized: false,
                 max_title_len: None,
                 truncate_title_middle: false,
+                text_color_override: self.item.tab_color(cx),
             },
             window,
             cx,

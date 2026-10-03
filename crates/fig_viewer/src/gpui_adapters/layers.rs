@@ -144,7 +144,40 @@ pub(crate) fn layers_tree(
     expanded: &HashSet<NodeId>,
 ) -> Vec<LayersPanelItem> {
     let context = KindContext::from_doc(doc);
+    if let Some(root) = page_root
+        && doc.is_component_root(root)
+    {
+        return build_node(doc, root, expanded, &context)
+            .into_iter()
+            .collect();
+    }
     build_children(doc, page_root, expanded, &context)
+}
+
+fn build_node(
+    doc: &Doc,
+    id: NodeId,
+    expanded: &HashSet<NodeId>,
+    context: &KindContext,
+) -> Option<LayersPanelItem> {
+    let node = doc.scene.get(id)?;
+    let kind = layers_kind(id, node, context);
+    let has_children = !doc.scene.children_of(Some(id)).is_empty();
+    let children = if has_children && expanded.contains(&id) {
+        build_children(doc, Some(id), expanded, context)
+    } else {
+        Vec::new()
+    };
+    Some(LayersPanelItem {
+        id: SharedString::from(id.to_string()),
+        title: SharedString::from(node.name.clone()),
+        kind,
+        children,
+        has_children,
+        visible: !node.flags.contains(fanta_doc::NodeFlags::HIDDEN),
+        locked: node.flags.contains(fanta_doc::NodeFlags::LOCKED),
+        context_actions: Some(context_actions_with_kind(doc, id, kind)),
+    })
 }
 
 fn build_children(
@@ -160,26 +193,7 @@ fn build_children(
     children
         .iter()
         .rev()
-        .filter_map(|child| {
-            let node = doc.scene.get(*child)?;
-            let kind = layers_kind(*child, node, context);
-            let has_children = !doc.scene.children_of(Some(*child)).is_empty();
-            let children = if has_children && expanded.contains(child) {
-                build_children(doc, Some(*child), expanded, context)
-            } else {
-                Vec::new()
-            };
-            Some(LayersPanelItem {
-                id: SharedString::from(child.to_string()),
-                title: SharedString::from(node.name.clone()),
-                kind,
-                children,
-                has_children,
-                visible: !node.flags.contains(fanta_doc::NodeFlags::HIDDEN),
-                locked: node.flags.contains(fanta_doc::NodeFlags::LOCKED),
-                context_actions: Some(context_actions_with_kind(doc, *child, kind)),
-            })
-        })
+        .filter_map(|child| build_node(doc, *child, expanded, context))
         .collect()
 }
 
@@ -377,6 +391,41 @@ mod tests {
         let leaf_item = &tree[1].children[0].children[0];
         assert_eq!(node_id(&leaf_item.id), Some(leaf));
         assert!(!leaf_item.has_children);
+    }
+
+    #[test]
+    fn a_component_canvas_keeps_its_editable_master_and_children_in_the_tree() {
+        let mut doc = Doc::new();
+        let page = insert(&mut doc, group(), None);
+        doc.add_page(page);
+        let master = insert(&mut doc, group(), Some(page));
+        let child = insert(&mut doc, rect(), Some(master));
+        let component = ComponentId::new();
+        doc.components
+            .defs
+            .insert(component, ComponentDef::new(component, master, "Card"));
+
+        let tree = layers_tree(&doc, Some(master), &HashSet::new());
+        let root = tree.first().expect("editable master row");
+        assert_eq!(tree.len(), 1);
+        assert_eq!(node_id(&root.id), Some(master));
+        assert_eq!(root.kind, LayersPanelNodeKind::Component);
+        assert!(root.has_children);
+        assert!(root.children.is_empty());
+
+        let tree = layers_tree(&doc, Some(master), &HashSet::from([master]));
+        let children = &tree.first().expect("expanded master row").children;
+        assert_eq!(children.len(), 1);
+        assert_eq!(
+            node_id(&children.first().expect("child row").id),
+            Some(child)
+        );
+
+        let tree = layers_tree(&doc, Some(page), &HashSet::new());
+        assert_eq!(
+            node_id(&tree.first().expect("page child row").id),
+            Some(master)
+        );
     }
 
     #[test]

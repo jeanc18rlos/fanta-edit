@@ -708,6 +708,14 @@ pub struct ScreenshotTarget {
     pub playhead_ms: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentWorkspace {
+    Canvas,
+    Variables,
+    Code,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AgentActivity {
     pub agent_id: String,
@@ -725,35 +733,118 @@ pub struct AgentActivity {
     pub project_root: Option<String>,
     #[serde(default)]
     pub source_path: Option<String>,
+    #[serde(default)]
+    pub workspace: Option<AgentWorkspace>,
 }
 
 fn activity_active() -> bool {
     true
 }
 
+pub fn agent_color(agent_id: &str) -> gpui::Hsla {
+    let identity = agent_id.bytes().fold(0u32, |identity, byte| {
+        identity.wrapping_mul(31).wrapping_add(u32::from(byte))
+    });
+    gpui::rgb(match identity % 4 {
+        0 => 0x387bff,
+        1 => 0xd83bea,
+        2 => 0x008b68,
+        _ => 0xc65b06,
+    })
+    .into()
+}
+
 #[derive(Default)]
 pub struct AgentActivityState {
-    activities: Vec<(AgentActivity, std::time::Instant)>,
+    activities: Vec<(AgentActivity, std::time::Instant, Option<[f64; 2]>, u64)>,
     followed_agent: Option<String>,
+    revision: u64,
+    expiration_tasks: std::collections::BTreeMap<String, Task<()>>,
 }
 
 impl AgentActivityState {
     pub fn record(&mut self, activity: AgentActivity, cx: &mut Context<Self>) {
-        self.activities.retain(|(existing, recorded)| {
+        self.expiration_tasks.remove(&activity.agent_id);
+        let previous_world = self.activities.iter().find_map(|(existing, _, _, _)| {
+            (existing.agent_id == activity.agent_id
+                && existing.project_root == activity.project_root
+                && existing.page == activity.page)
+                .then_some(existing.world)
+                .flatten()
+        });
+        self.activities.retain(|(existing, recorded, _, _)| {
             existing.agent_id != activity.agent_id && recorded.elapsed().as_secs() < 30
         });
+        self.expiration_tasks.retain(|agent_id, _| {
+            self.activities
+                .iter()
+                .any(|(activity, _, _, _)| &activity.agent_id == agent_id)
+        });
         if activity.active {
-            self.activities.push((activity, std::time::Instant::now()));
+            self.revision = self.revision.wrapping_add(1);
+            let recorded = std::time::Instant::now();
+            self.schedule_expiration(activity.agent_id.clone(), recorded, cx);
+            self.activities
+                .push((activity, recorded, previous_world, self.revision));
         }
         cx.notify();
+    }
+
+    fn schedule_expiration(
+        &mut self,
+        agent_id: String,
+        recorded: std::time::Instant,
+        cx: &mut Context<Self>,
+    ) {
+        let task = cx.spawn({
+            let agent_id = agent_id.clone();
+            async move |state, cx| {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(30))
+                    .await;
+                if let Some(state) = state.upgrade() {
+                    state.update(cx, |state, cx| {
+                        if state
+                            .activities
+                            .iter()
+                            .any(|(activity, last_recorded, _, _)| {
+                                activity.agent_id == agent_id && *last_recorded == recorded
+                            })
+                        {
+                            state.stop(&agent_id, cx);
+                        }
+                    });
+                }
+            }
+        });
+        self.expiration_tasks.insert(agent_id, task);
     }
 
     pub fn activities(&self) -> Vec<AgentActivity> {
         self.activities
             .iter()
-            .filter(|(_, recorded)| recorded.elapsed().as_secs() < 30)
-            .map(|(activity, _)| activity.clone())
+            .filter(|(_, recorded, _, _)| recorded.elapsed().as_secs() < 30)
+            .map(|(activity, _, _, _)| activity.clone())
             .collect()
+    }
+
+    pub fn source_activity(&self, source: &std::path::Path) -> Option<&AgentActivity> {
+        self.activities
+            .iter()
+            .rev()
+            .find_map(|(activity, recorded, _, _)| {
+                (recorded.elapsed().as_secs() < 30
+                    && activity.source_path.as_deref().map(std::path::Path::new) == Some(source))
+                .then_some(activity)
+            })
+    }
+
+    pub fn cursor_motion(&self, agent_id: &str) -> Option<(Option<[f64; 2]>, u64)> {
+        self.activities
+            .iter()
+            .find_map(|(activity, _, previous_world, revision)| {
+                (activity.agent_id == agent_id).then_some((*previous_world, *revision))
+            })
     }
 
     pub fn followed_agent(&self) -> Option<&str> {
@@ -761,19 +852,22 @@ impl AgentActivityState {
     }
 
     pub fn refresh(&mut self, agent_id: &str, cx: &mut Context<Self>) {
-        if let Some((_, recorded)) = self
+        if let Some((_, recorded, _, _)) = self
             .activities
             .iter_mut()
-            .find(|(activity, _)| activity.agent_id == agent_id)
+            .find(|(activity, _, _, _)| activity.agent_id == agent_id)
         {
             *recorded = std::time::Instant::now();
+            let recorded = *recorded;
+            self.schedule_expiration(agent_id.to_string(), recorded, cx);
             cx.notify();
         }
     }
 
     pub fn stop(&mut self, agent_id: &str, cx: &mut Context<Self>) {
+        self.expiration_tasks.remove(agent_id);
         self.activities
-            .retain(|(activity, _)| activity.agent_id != agent_id);
+            .retain(|(activity, _, _, _)| activity.agent_id != agent_id);
         cx.notify();
     }
 
@@ -794,6 +888,11 @@ pub fn activity_state(cx: &mut App) -> Entity<AgentActivityState> {
     let state = cx.new(|_| AgentActivityState::default());
     cx.set_global(AgentActivityRegistry(state.clone()));
     state
+}
+
+pub fn existing_activity_state(cx: &App) -> Option<Entity<AgentActivityState>> {
+    cx.try_global::<AgentActivityRegistry>()
+        .map(|registry| registry.0.clone())
 }
 
 #[derive(Clone, Debug)]
@@ -895,14 +994,26 @@ pub trait DesignSurface: 'static {
     /// ids and per-op status; on failure the batch is rolled back.
     fn apply(&self, ops: Vec<DesignOp>, label: String, cx: &mut App) -> Result<serde_json::Value>;
 
+    fn apply_streamed(
+        &self,
+        ops: Vec<DesignOp>,
+        label: String,
+        _activity: Option<AgentActivity>,
+        cx: &mut App,
+    ) -> Task<Result<serde_json::Value>> {
+        Task::ready(self.apply(ops, label, cx))
+    }
+
     /// Render a PNG of a page or node region.
     fn screenshot(&self, target: ScreenshotTarget, cx: &mut App) -> Task<Result<Vec<u8>>>;
 
     /// List the project's FNX source files, or return one file's text.
     fn read_source(&self, path: Option<String>, cx: &mut App) -> Result<serde_json::Value>;
 
-    /// Validate a complete source candidate before an agent saves it. Source
-    /// validation remains available while an unsaved draft locks canvas edits.
+    /// Validate managed FNX and JSON candidates before an agent saves them.
+    /// Existing files are validated against the project; new files use their
+    /// source schema until their design source pair exists. Validation remains
+    /// available while an unsaved draft locks canvas edits.
     fn validate_source_edit(
         &self,
         _path: String,
@@ -946,10 +1057,11 @@ pub trait DesignSurface: 'static {
 
     fn report_source_activity(
         &self,
-        _path: String,
-        activity: AgentActivity,
+        path: String,
+        mut activity: AgentActivity,
         cx: &mut App,
     ) -> Result<serde_json::Value> {
+        activity.source_path = Some(path);
         self.report_activity(activity, cx)
     }
 
@@ -1054,9 +1166,9 @@ mode use canvas operations; source file mutation is unavailable.
   import_project_image; SVG remains vector source/placement, not raster import.
 
 ## Working method
-- Prefer editing the actual `.fnx` source files for design creation, layout, styling, components and animations. Read existing source before changing it, preserve ids, save, then inspect the live canvas and verify with screenshots. Use canvas mutations when source editing is unavailable or the operation requires editor state. Never claim missing tool access without trying the available tools and reporting the real error.
+- Prioritize visible progress: build one component or screen section at a time with small streamed canvas batches. Keep each new component visible on the current page or its own named component page, then place an instance on the screen before starting the next component. Use small complete FNX source edits when they help, preserving identities; save and verify each milestone. Never claim missing tool access without trying the available tools and reporting the real error.
 - Read unresolved comments with `list_comments` / `design_comments`, use them during reviews, and reply in their original canvas threads. Only resolve verified requests.
-- Report agent focus with `report_agent_activity` (stable agent id, name, action, page and node/world position); clear it with `active: false` when done.
+- Report agent focus with `report_agent_activity` (stable agent id, mage name, action, page and node/world position); update it for every placement or adjustment. Include `workspace` (canvas, variables or code) and `source_path` when moving between files or tabs so Follow can track your actual work. External MCP agents must pass the same identity in `batch_design.activity` to preserve Follow through each streamed placement. Clear it with `active: false` when done.
 - Native Full Access and Ultra initialize Git when needed at the verified local Fanta project root, create a task branch, and save durable before/after snapshots. External unattended agents should create a task branch and preserve progress without altering user changes or their staged index; create ordinary commits only when requested. Plan mode is read-only; Review mode can reply to comments but cannot edit scene content.
 1. Read state first (`design_state` / `get_editor_state`), then the page tree
    with `depth` 1–2; fetch nodes by id for detail. A page listing returns at
@@ -1065,8 +1177,9 @@ mode use canvas operations; source file mutation is unavailable.
    `more_children` is true, call again with `offset` advanced by the limit to
    walk the rest of the page. Imported pages are wide — do not assume the
    first window is the whole page.
-2. Batch related ops into ONE call with a descriptive `label` ("Add login
-   card"); the batch is one undo step and rolls back entirely on failure.
+2. Batch related ops for one visible component or section with a descriptive
+   `label` ("Add login card"); changes stream gradually as one undo step and
+   roll back entirely on failure. Do not build the whole screen in one batch.
    Use the `created` ids the result returns for follow-up ops.
 3. Verify with a screenshot (`design_screenshot` / `get_screenshot`) of the
    frame you changed before reporting done. Fix what you see, then re-check.
@@ -1074,15 +1187,17 @@ mode use canvas operations; source file mutation is unavailable.
    sees it.
 
 ## Two editing lanes
-- Prefer source edits for building and adjusting designs. Canvas ops are
-  immediate and undoable; use them when source editing is unavailable or
-  a specific operation requires editor state.
+- Use streamed canvas ops for visible element creation and placement. Use
+  source edits for small complete subtrees or typed JSON changes; verify each
+  save on the live canvas before moving to the next component or section.
 - `.fnx` files: each page is `pages/<slug>/page.fnx`, each component master
   `components/<slug>/master.fnx` (paths are in the state's `pages[].source`
   and `components[].source`). Read and edit these files with normal file tools for design creation,
   styling, layout, components and structural changes; the open canvas hot-reloads about 300 ms after save. Keep the
   JSX well-formed.
-- Never touch `*.ids.json` sidecars, `fanta.json`, `previews/` or `exports/`.
+- JSON metadata and identity sidecars are editable: inspect their schema,
+  preserve existing identities, and validate the complete project after edits.
+  Generated previews and exports are outputs, not authoring source.
 - Do not mix lanes on the same nodes in one step: finish canvas edits (they
   autosave) before editing the file, and vice versa.
 
@@ -1118,6 +1233,102 @@ pub fn active(cx: &App) -> Option<Rc<dyn DesignSurface>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn source_activity(agent_id: &str, project_root: &str, source: &str) -> AgentActivity {
+        AgentActivity {
+            agent_id: agent_id.into(),
+            agent_name: "Morgana".into(),
+            action: "Inspecting source".into(),
+            page: None,
+            node: None,
+            world: None,
+            active: true,
+            project_root: Some(project_root.into()),
+            source_path: Some(source.into()),
+            workspace: Some(AgentWorkspace::Code),
+        }
+    }
+
+    #[gpui::test]
+    fn source_activity_tracks_file_changes_and_stops(cx: &mut gpui::TestAppContext) {
+        let state = cx.new(|_| AgentActivityState::default());
+        let first = Path::new("/project-a/file.rs");
+        let second = Path::new("/project-b/file.rs");
+        state.update(cx, |state, cx| {
+            state.record(
+                source_activity("reader", "/project-a", "/project-a/file.rs"),
+                cx,
+            );
+            assert!(state.source_activity(first).is_some());
+            assert!(state.source_activity(second).is_none());
+            state.record(
+                source_activity("reader", "/project-b", "/project-b/file.rs"),
+                cx,
+            );
+            assert!(state.source_activity(first).is_none());
+            assert!(state.source_activity(second).is_some());
+            state.record(
+                AgentActivity {
+                    active: false,
+                    ..source_activity("reader", "/project-b", "/project-b/file.rs")
+                },
+                cx,
+            );
+            assert!(state.source_activity(second).is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn source_activity_expires_and_notifies_observers_after_a_refresh(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use std::{cell::Cell, time::Duration};
+
+        cx.executor().allow_parking();
+        let state = cx.new(|_| AgentActivityState::default());
+        let notifications = Rc::new(Cell::new(0));
+        let _subscription = cx.update({
+            let notifications = notifications.clone();
+            |cx| {
+                cx.observe(&state, move |_, _| {
+                    notifications.set(notifications.get() + 1)
+                })
+            }
+        });
+        state.update(cx, |state, cx| {
+            state.record(
+                source_activity("reader", "/project-a", "/project-a/file.rs"),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(20));
+        cx.run_until_parked();
+        state.update(cx, |state, cx| state.refresh("reader", cx));
+        cx.run_until_parked();
+        let notifications_after_refresh = notifications.get();
+        cx.executor().advance_clock(Duration::from_secs(11));
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            assert!(
+                state
+                    .source_activity(Path::new("/project-a/file.rs"))
+                    .is_some()
+            );
+        });
+        assert_eq!(notifications.get(), notifications_after_refresh);
+        cx.executor().advance_clock(Duration::from_secs(19));
+        cx.run_until_parked();
+        state.read_with(cx, |state, _| {
+            assert!(state.activities().is_empty());
+            assert!(
+                state
+                    .source_activity(Path::new("/project-a/file.rs"))
+                    .is_none()
+            );
+        });
+        assert!(notifications.get() > notifications_after_refresh);
+    }
 
     #[test]
     fn design_system_and_asset_mcp_schemas_have_required_descriptions() {

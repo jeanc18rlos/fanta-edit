@@ -1954,48 +1954,49 @@ impl AgentConnection for AcpConnection {
         let conn = self.connection.clone();
         let sessions = self.sessions.clone();
         let session_id = params.session_id.clone();
-        let specification_context = self
-            .sessions
-            .borrow()
-            .get(&session_id)
-            .and_then(|session| session.thread.upgrade())
-            .map(|thread| {
-                let project = thread.read(cx).project().clone();
-                let filesystem = project.read(cx).fs().clone();
-                let local = project.read(cx).is_local();
-                let mut roots = if local {
-                    project
-                        .read(cx)
-                        .visible_worktrees(cx)
-                        .filter(|worktree| !worktree.read(cx).is_single_file())
-                        .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
-                        .collect::<Vec<_>>()
-                } else {
-                    Vec::new()
-                };
-                if local
-                    && let Some(surface) = design_surface::active(cx)
-                    && let Some(state) = surface.state(cx).log_err()
-                    && let Some(root) = state
-                        .get("project_root")
-                        .and_then(serde_json::Value::as_str)
-                {
-                    let root = PathBuf::from(root);
-                    if root.is_absolute()
-                        && project
-                            .read(cx)
-                            .project_path_for_absolute_path(&root.join("fanta.md"), cx)
-                            .is_some()
-                    {
-                        roots.retain(|worktree_root| root.starts_with(worktree_root));
-                        if !roots.contains(&root) {
-                            roots.push(root);
+        cx.spawn(async move |cx| {
+            let specification_context = cx.update(|cx| {
+                sessions
+                    .borrow()
+                    .get(&session_id)
+                    .and_then(|session| session.thread.upgrade())
+                    .map(|thread| {
+                        let project = thread.read(cx).project().clone();
+                        let filesystem = project.read(cx).fs().clone();
+                        let local = project.read(cx).is_local();
+                        let mut roots = if local {
+                            project
+                                .read(cx)
+                                .visible_worktrees(cx)
+                                .filter(|worktree| !worktree.read(cx).is_single_file())
+                                .map(|worktree| worktree.read(cx).abs_path().to_path_buf())
+                                .collect::<Vec<_>>()
+                        } else {
+                            Vec::new()
+                        };
+                        if local
+                            && let Some(surface) = design_surface::active(cx)
+                            && let Some(state) = surface.state(cx).log_err()
+                            && let Some(root) = state
+                                .get("project_root")
+                                .and_then(serde_json::Value::as_str)
+                        {
+                            let root = PathBuf::from(root);
+                            if root.is_absolute()
+                                && project
+                                    .read(cx)
+                                    .project_path_for_absolute_path(&root.join("fanta.md"), cx)
+                                    .is_some()
+                            {
+                                roots.retain(|worktree_root| root.starts_with(worktree_root));
+                                if !roots.contains(&root) {
+                                    roots.push(root);
+                                }
+                            }
                         }
-                    }
-                }
-                (filesystem, roots)
+                        (filesystem, roots)
+                    })
             });
-        cx.foreground_executor().spawn(async move {
             if let Some((filesystem, roots)) = specification_context {
                 let specifications = read_acp_design_specs(filesystem.as_ref(), &roots).await?;
                 if !specifications.is_empty() {

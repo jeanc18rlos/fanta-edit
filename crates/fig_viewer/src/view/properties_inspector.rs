@@ -32,6 +32,18 @@ fn inspector_tab(mode: EditorMode) -> PropertiesInspectorTab {
 }
 
 impl FigView {
+    pub(super) fn render_properties_content(&self, mode: EditorMode) -> Option<AnyElement> {
+        let adapter = self.gpui_properties.as_ref()?;
+        Some(match mode {
+            EditorMode::Design => adapter.design.clone().into_any_element(),
+            EditorMode::Draw => adapter.draw.clone().into_any_element(),
+            EditorMode::Code | EditorMode::Dev => adapter.code.clone().into_any_element(),
+            EditorMode::Motion => self.motion_sidebar.clone().into_any_element(),
+            EditorMode::Prototype => self.prototype_sidebar.clone().into_any_element(),
+            EditorMode::Comments => adapter.comments.clone().into_any_element(),
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn properties_inspector_for_test(&self) -> Option<Entity<PropertiesInspector>> {
         self.gpui_properties

@@ -229,8 +229,13 @@ impl WorkspaceSession {
             replacements.push((id.clone(), session.root(), nodes));
         }
 
-        let metadata = serde_json::from_value(self.shared.metadata.clone())
-            .map_err(|error| SessionError::DocAssemble(error.to_string()))?;
+        let metadata = super::workspace::decode_shared_json(
+            &self
+                .root
+                .join(crate::project::layout::DOC_DIR)
+                .join(crate::project::layout::METADATA_JSON),
+            &self.shared.metadata,
+        )?;
         if report.changed.is_empty() {
             document.components = self.components.defs.clone();
             document.variables = self.shared.variables.clone();

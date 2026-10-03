@@ -615,9 +615,11 @@ impl McpServerTool for ReplyCommentTool {
     }
 }
 
-/// Show the agent's current work location and action on the canvas. Report
-/// before inspecting or editing each frame, and periodically during file edits.
-/// Set active false when finished. Each agent needs its own stable agent_id.
+/// Report each visible editing milestone with its page, node, coordinates,
+/// source_path and workspace (canvas, variables or code). Choose a stable
+/// mage name and agent_id so the user can follow you across files and tabs.
+/// Reuse that identity in batch_design.activity for streamed canvas changes.
+/// Set active false when finished.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct ReportActivityArgs {
     #[serde(flatten)]
@@ -636,7 +638,10 @@ impl McpServerTool for ReportActivityTool {
     }
     async fn run(&self, input: Self::Input, cx: &mut AsyncApp) -> Result<ToolResponse<()>> {
         let value = with_surface(cx, move |surface, cx| {
-            surface.report_activity(input.activity, cx)
+            match input.activity.source_path.clone() {
+                Some(path) => surface.report_source_activity(path, input.activity, cx),
+                None => surface.report_activity(input.activity, cx),
+            }
         })?;
         Ok(text_response(value))
     }
@@ -869,7 +874,8 @@ impl McpServerTool for BatchGetTool {
 /// names the failing op; created ids come back in `created`. Gradients,
 /// per-run rich text are not ops yet: for those, read the page
 /// .fnx with read_fnx_source, edit the file, and the canvas reloads (the change
-/// is a git diff).
+/// is a git diff). Pass activity with the same stable mage name and agent_id
+/// used in report_agent_activity so the user can follow each streamed step.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 struct BatchDesignArgs {
     /// The ops to apply, in order.
@@ -877,6 +883,10 @@ struct BatchDesignArgs {
     /// Undo-history label for the batch (e.g. "Add login card").
     #[serde(default)]
     label: Option<String>,
+    /// Agent identity for the streamed steps. Reuse agent_id and agent_name
+    /// from report_agent_activity; action and location update per operation.
+    #[serde(default)]
+    activity: Option<design_surface::AgentActivity>,
 }
 
 #[derive(Clone)]
@@ -903,7 +913,11 @@ impl McpServerTool for BatchDesignTool {
     async fn run(&self, input: Self::Input, cx: &mut AsyncApp) -> Result<ToolResponse<()>> {
         let label = input.label.unwrap_or_else(|| "MCP edit".to_string());
         let ops = input.ops;
-        let value = with_surface(cx, move |surface, cx| surface.apply(ops, label, cx))?;
+        let activity = input.activity;
+        let apply = with_surface(cx, move |surface, cx| {
+            Ok(surface.apply_streamed(ops, label, activity, cx))
+        })?;
+        let value = apply.await?;
         Ok(text_response(value))
     }
 }
@@ -1235,6 +1249,40 @@ impl McpServerTool for ValidateFnxSourceTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_design_activity_is_optional_and_preserves_agent_identity() {
+        let legacy: BatchDesignArgs = serde_json::from_value(serde_json::json!({
+            "ops": [],
+            "label": "Add login card"
+        }))
+        .expect("existing batch input remains valid");
+        assert!(legacy.activity.is_none());
+
+        let identified: BatchDesignArgs = serde_json::from_value(serde_json::json!({
+            "ops": [],
+            "activity": {
+                "agent_id": "cornelius-design",
+                "agent_name": "Cornelius",
+                "action": "Add login card"
+            }
+        }))
+        .expect("batch input accepts a stable agent identity");
+        let activity = identified.activity.expect("the identity is retained");
+        assert_eq!(activity.agent_id, "cornelius-design");
+        assert_eq!(activity.agent_name, "Cornelius");
+
+        let schema = serde_json::to_value(schemars::schema_for!(BatchDesignArgs))
+            .expect("the input schema serializes");
+        assert!(schema["properties"]["activity"].is_object());
+        assert!(
+            !schema["required"]
+                .as_array()
+                .expect("batch ops remain required")
+                .iter()
+                .any(|field| field == "activity")
+        );
+    }
 
     #[test]
     fn slice_returns_a_whole_small_file_untruncated() {

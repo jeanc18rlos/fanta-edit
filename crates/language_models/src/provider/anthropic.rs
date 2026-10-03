@@ -458,6 +458,10 @@ impl LanguageModel for AnthropicModel {
         self.model.supports_thinking
     }
 
+    fn supports_disabling_thinking(&self) -> bool {
+        !self.model.supports_adaptive_thinking
+    }
+
     fn supports_fast_mode(&self) -> bool {
         self.model.supports_speed
     }
@@ -480,16 +484,9 @@ impl LanguageModel for AnthropicModel {
             .iter()
             .map(|e| {
                 let is_default = matches!(e, anthropic::Effort::High);
-                let (name, value) = match e {
-                    anthropic::Effort::Low => ("Low".into(), "low".into()),
-                    anthropic::Effort::Medium => ("Medium".into(), "medium".into()),
-                    anthropic::Effort::High => ("High".into(), "high".into()),
-                    anthropic::Effort::XHigh => ("XHigh".into(), "xhigh".into()),
-                    anthropic::Effort::Max => ("Max".into(), "max".into()),
-                };
                 language_model::LanguageModelEffortLevel {
-                    name,
-                    value,
+                    name: e.label().into(),
+                    value: e.value().into(),
                     is_default,
                 }
             })
@@ -517,7 +514,7 @@ impl LanguageModel for AnthropicModel {
 
     fn stream_completion(
         &self,
-        request: LanguageModelRequest,
+        mut request: LanguageModelRequest,
         cx: &AsyncApp,
     ) -> BoxFuture<
         'static,
@@ -526,6 +523,19 @@ impl LanguageModel for AnthropicModel {
             LanguageModelCompletionError,
         >,
     > {
+        if self.model.supports_adaptive_thinking {
+            request.thinking_allowed = true;
+        }
+        if !self
+            .model
+            .supported_effort_levels
+            .iter()
+            .any(|effort| Some(effort.value()) == request.thinking_effort.as_deref())
+        {
+            request.thinking_effort = self
+                .default_effort_level()
+                .map(|effort| effort.value.to_string());
+        }
         let has_tools = !request.tools.is_empty();
         let request_id = self.model.request_id(has_tools).to_string();
         let mut request = into_anthropic(

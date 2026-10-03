@@ -189,6 +189,7 @@ pub struct FigItem {
     pending_external_full_reload: bool,
     /// The project changed on disk while the canvas had unsaved edits.
     conflict: bool,
+    source_reload_error: Option<SharedString>,
     /// An open FNX buffer has edits that are not yet represented by the
     /// persisted project tree. The validated source may still be previewed,
     /// but canvas-authored content changes must not race it.
@@ -332,6 +333,7 @@ pub enum FigItemEvent {
     ReloadedFromDisk {
         merged: bool,
     },
+    SourceReloadFailed,
     /// The project diverged from disk while the canvas had unsaved edits, or
     /// that conflict was resolved by saving or reloading.
     ConflictChanged,
@@ -759,13 +761,17 @@ impl FigDocument {
         )
     }
 
-    /// The index into [`pages`](Self::pages) of the page that contains `node`
-    /// (walking up to its top-level root), including hidden pages. Used to
-    /// navigate to a component master, which lives on the hidden Components
-    /// page.
+    /// The index of the nearest component master or containing page,
+    /// including hidden scopes.
     pub fn page_index_of_node(&self, node: NodeId) -> Option<usize> {
         let mut current = node;
         loop {
+            if self.doc.is_component_root(current) {
+                return self
+                    .pages
+                    .iter()
+                    .position(|page| page.root == Some(current));
+            }
             let parent = self.doc.scene.get(current)?.parent;
             match parent {
                 Some(parent) => current = parent,
@@ -932,14 +938,8 @@ impl FigDocument {
     }
 
     fn sync_page_registry(&mut self) -> bool {
-        let unchanged = if self.doc.pages().is_empty() {
-            self.pages.len() == 1 && self.pages.first().is_some_and(|page| page.root.is_none())
-        } else {
-            self.pages
-                .iter()
-                .map(|page| page.root)
-                .eq(self.doc.pages().iter().copied().map(Some))
-        };
+        let roots = editor_page_roots(&self.doc);
+        let unchanged = self.pages.iter().map(|page| page.root).eq(roots);
         if unchanged {
             return false;
         }
@@ -951,38 +951,14 @@ impl FigDocument {
             .into_iter()
             .filter_map(|page| page.root.map(|root| (root, page)))
             .collect();
-        self.pages = if self.doc.pages().is_empty() {
-            collect_pages(&self.doc, &[])
-        } else {
-            self.doc
-                .pages()
-                .iter()
-                .enumerate()
-                .map(|(index, root)| {
-                    let bounds = previous
-                        .remove(root)
-                        .map(|page| page.bounds)
-                        .unwrap_or_else(|| page_bounds(&self.doc, Some(*root)));
-                    FigPage {
-                        root: Some(*root),
-                        name: self
-                            .doc
-                            .page_name(*root)
-                            .filter(|name| !name.is_empty())
-                            .map(SharedString::from)
-                            .unwrap_or_else(|| format!("Page {}", index + 1).into()),
-                        bounds,
-                        hidden: self
-                            .doc
-                            .scene
-                            .get(*root)
-                            .and_then(|node| node.meta.get("hidden_page"))
-                            .and_then(|value| value.as_bool())
-                            == Some(true),
-                    }
-                })
-                .collect()
-        };
+        self.pages = collect_pages(&self.doc, &visible_page_roots(&self.doc));
+        for page in &mut self.pages {
+            if let Some(root) = page.root
+                && let Some(previous) = previous.remove(&root)
+            {
+                page.bounds = previous.bounds;
+            }
+        }
         self.default_page_index = self
             .pages
             .iter()
@@ -993,6 +969,21 @@ impl FigDocument {
                     .position(|page| page.root == self.doc.active_page())
             })
             .unwrap_or(0);
+        if self.doc.active_page().is_some_and(|root| {
+            !self.doc.pages().contains(&root) && !self.doc.is_component_root(root)
+        }) {
+            // Undo or cancellation can remove a followed master's definition
+            // while its scene node remains; recover a valid viewing scope.
+            let root = self
+                .pages
+                .get(self.default_page_index)
+                .and_then(|page| page.root);
+            self.doc.set_active_page(root);
+            if let Some(root) = root {
+                self.solved_pages.remove(&root);
+                self.ensure_root_solved(root);
+            }
+        }
         self.solved_pages
             .retain(|root| self.doc.scene.contains(*root));
         self.prewarmed_pages
@@ -1313,9 +1304,9 @@ impl project::ProjectItem for FigItem {
             // One live item per project directory: a scoped open (page.fnx,
             // master.fnx, variables.json) of an already-open project reuses
             // the SHARED document — instant (no re-read of the tree), and the
-            // pane's entry-id dedupe then activates the existing editor tab,
-            // making the click pure navigation. Applying the scope re-targets
-            // that shared document.
+            // pane's entry-id dedupe then activates the existing editor tab.
+            // Loading a background tab must not re-target the shared document;
+            // its view applies the descriptor's scope when it becomes active.
             let registry_key = project_root
                 .as_deref()
                 .map(|root| root.canonicalize().unwrap_or_else(|_| root.to_path_buf()));
@@ -1328,9 +1319,6 @@ impl project::ProjectItem for FigItem {
                     // project's worktree events too, or external-edit
                     // detection dies with the original window.
                     item.subscribe_to_project(&project, cx);
-                    if let Some(scope) = initial_scope {
-                        item.request_scope(scope, ScopeRequester::Open, cx);
-                    }
                 });
                 cx.update(|cx| {
                     set_pending_view_descriptor(
@@ -1500,6 +1488,7 @@ impl project::ProjectItem for FigItem {
                     external_change_pending: false,
                     pending_external_full_reload: false,
                     conflict: false,
+                    source_reload_error: None,
                     source_edit_locked: false,
                     pending_watcher_paths: BTreeSet::new(),
                     watcher_check_in_flight: false,
@@ -1639,6 +1628,21 @@ impl FigItem {
 
     pub fn has_conflict(&self) -> bool {
         self.conflict
+    }
+
+    pub fn source_reload_error(&self) -> Option<&str> {
+        self.source_reload_error.as_deref()
+    }
+
+    fn report_source_reload_error(&mut self, error: &anyhow::Error, cx: &mut Context<Self>) {
+        let message: SharedString = format!(
+            "Could not update the design from source: {error:#}. Showing the last valid canvas. Correct the file and save again."
+        ).into();
+        if self.source_reload_error.as_ref() != Some(&message) {
+            self.source_reload_error = Some(message);
+            cx.emit(FigItemEvent::SourceReloadFailed);
+            cx.notify();
+        }
     }
 
     fn set_conflict(&mut self, conflict: bool, cx: &mut Context<Self>) {
@@ -1873,6 +1877,7 @@ impl FigItem {
                         if this.sync_epoch != epoch {
                             this.schedule_resync(cx);
                         } else if !this.defer_external_change_for_preview() {
+                            this.report_source_reload_error(&error, cx);
                             this.set_conflict(true, cx);
                         }
                     }) {
@@ -2014,6 +2019,7 @@ impl FigItem {
         self.last_saved_scene = None;
         self.write_cache = None;
         self.workspace_session = Some(session);
+        self.source_reload_error = None;
         self.external_change_pending = false;
         self.pending_external_full_reload = false;
         self.sync_epoch += 1;
@@ -2106,6 +2112,9 @@ impl FigItem {
                     return;
                 }
                 if matches!(&loaded, Ok(None)) {
+                    if this.source_reload_error.take().is_some() {
+                        this.set_conflict(false, cx);
+                    }
                     this.external_change_pending = false;
                     this.pending_external_full_reload = false;
                     cx.emit(FigItemEvent::Edited);
@@ -2128,6 +2137,7 @@ impl FigItem {
                         log::error!(
                             "reloading Fanta project after a disk change failed: {error:#}"
                         );
+                        this.report_source_reload_error(&error, cx);
                         // Keep the last good document: the failure may be a
                         // half-written batch of files whose next watcher
                         // event will reload it in full.
@@ -2179,6 +2189,7 @@ impl FigItem {
             document.doc.scene.revision(),
         ));
         self.document = FigDocumentState::Ready(document);
+        self.source_reload_error = None;
         self.write_cache = None;
         self.workspace_session = session;
         self.dirty = false;
@@ -2222,9 +2233,21 @@ impl FigItem {
         self.reload_task = None;
         let epoch = self.sync_epoch;
         cx.spawn(async move |this, cx| {
-            let document = cx
+            let document = match cx
                 .background_spawn(async move { load_project_document(&root) })
-                .await?;
+                .await
+            {
+                Ok(document) => document,
+                Err(error) => {
+                    this.update(cx, |this, cx| {
+                        if this.sync_epoch == epoch {
+                            this.report_source_reload_error(&error, cx);
+                            this.set_conflict(true, cx);
+                        }
+                    })?;
+                    return Err(error);
+                }
+            };
             this.update(cx, |this, cx| {
                 // A save/adoption superseded this discard while its snapshot
                 // loaded; applying the older snapshot would revert (and on
@@ -2471,6 +2494,10 @@ impl FigItem {
                         owner,
                         dirty_before: self.dirty,
                     });
+                }
+                if document.sync_page_registry() {
+                    self.last_scope = self.last_scope.filter(|scope| document.valid_scope(*scope));
+                    cx.emit(FigItemEvent::PageRegistryChanged);
                 }
                 document.advance_render_generation();
                 self.mark_edited(true, cx);
@@ -3133,6 +3160,7 @@ pub(crate) fn ready_item_with_root_for_test(
         external_change_pending: false,
         pending_external_full_reload: false,
         conflict: false,
+        source_reload_error: None,
         source_edit_locked: false,
         pending_watcher_paths: BTreeSet::new(),
         watcher_check_in_flight: false,
@@ -3953,34 +3981,59 @@ fn default_page_root(doc: &Doc, visible_page_roots: &[NodeId]) -> Option<NodeId>
     })
 }
 
-fn collect_pages(doc: &Doc, visible_page_roots: &[NodeId]) -> Vec<FigPage> {
-    let all_roots = doc.pages();
-    if all_roots.is_empty() {
-        return vec![FigPage {
-            root: None,
-            name: "Document".into(),
-            bounds: page_bounds(doc, None),
-            hidden: false,
-        }];
-    }
+fn editor_page_roots(doc: &Doc) -> Vec<Option<NodeId>> {
+    let mut roots = if doc.pages().is_empty() {
+        vec![None]
+    } else {
+        doc.pages().iter().copied().map(Some).collect()
+    };
+    let mut components = doc
+        .components
+        .defs
+        .values()
+        .map(|definition| definition.root)
+        .filter(|root| doc.scene.contains(*root) && !doc.pages().contains(root))
+        .collect::<Vec<_>>();
+    components.sort_unstable();
+    components.dedup();
+    roots.extend(components.into_iter().map(Some));
+    roots
+}
 
+fn collect_pages(doc: &Doc, visible_page_roots: &[NodeId]) -> Vec<FigPage> {
     // Every page is included so the canvas can navigate to a hidden library
     // page (to focus a component master); `hidden` marks the ones the Pages
     // panel filters out. `index + 1` numbers unnamed pages by their absolute
     // position, which stays stable as pages are added/removed.
     let visible: HashSet<NodeId> = visible_page_roots.iter().copied().collect();
-    all_roots
-        .iter()
+    editor_page_roots(doc)
+        .into_iter()
         .enumerate()
-        .map(|(index, root)| FigPage {
-            root: Some(*root),
-            name: doc
-                .page_name(*root)
-                .filter(|name| !name.is_empty())
-                .map(SharedString::from)
-                .unwrap_or_else(|| format!("Page {}", index + 1).into()),
-            bounds: page_bounds(doc, Some(*root)),
-            hidden: !visible.contains(root),
+        .map(|(index, root)| {
+            let Some(root) = root else {
+                return FigPage {
+                    root: None,
+                    name: "Document".into(),
+                    bounds: page_bounds(doc, None),
+                    hidden: false,
+                };
+            };
+            let component = doc
+                .components
+                .defs
+                .values()
+                .find(|definition| definition.root == root);
+            FigPage {
+                root: Some(root),
+                name: component
+                    .map(|definition| definition.name.as_str())
+                    .or_else(|| doc.page_name(root))
+                    .filter(|name| !name.is_empty())
+                    .map(SharedString::from)
+                    .unwrap_or_else(|| format!("Page {}", index + 1).into()),
+                bounds: page_bounds(doc, Some(root)),
+                hidden: !doc.pages().contains(&root) || !visible.contains(&root),
+            }
         })
         .collect()
 }
@@ -6682,6 +6735,7 @@ mod tests {
             external_change_pending: false,
             pending_external_full_reload: false,
             conflict: false,
+            source_reload_error: None,
             source_edit_locked: false,
             pending_watcher_paths: BTreeSet::new(),
             watcher_check_in_flight: false,
@@ -6721,6 +6775,58 @@ mod tests {
                 item.is_editable(),
                 "a parsed .fig edits in memory immediately"
             );
+        });
+    }
+
+    #[gpui::test]
+    async fn invalid_disk_json_preserves_the_canvas_and_clears_its_error_after_repair(
+        cx: &mut TestAppContext,
+    ) {
+        let project = empty_project(cx).await;
+        let directory = tempfile::tempdir().expect("temporary project");
+        let base = doc_with_one_page();
+        let page = base.active_page().expect("active page");
+        write_project(directory.path(), &base, &BTreeMap::new()).expect("write project");
+        let metadata_path = directory.path().join("doc/metadata.json");
+        let original = std::fs::read_to_string(&metadata_path).expect("metadata");
+        let item = ready_item(
+            &project,
+            directory.path().join("fanta.json"),
+            Some(directory.path().to_path_buf()),
+            base,
+            cx,
+        );
+
+        std::fs::write(&metadata_path, "{\"title\":").expect("incomplete disk edit");
+        assert!(
+            item.update(cx, |item, cx| item.reload_from_disk(cx))
+                .await
+                .is_err()
+        );
+        item.read_with(cx, |item, _| {
+            assert!(item.has_ready_document());
+            assert_eq!(item.doc().and_then(|doc| doc.active_page()), Some(page));
+            assert!(item.has_conflict());
+            assert!(
+                item.source_reload_error()
+                    .is_some_and(|error| error.contains("metadata.json"))
+            );
+        });
+
+        let mut metadata: serde_json::Value = serde_json::from_str(&original).expect("JSON");
+        metadata["title"] = serde_json::json!("Repaired source");
+        std::fs::write(metadata_path, metadata.to_string()).expect("repair disk edit");
+        item.update(cx, |item, cx| item.reload_from_disk(cx))
+            .await
+            .expect("reload repaired JSON");
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.doc().map(|doc| doc.metadata.title.as_str()),
+                Some("Repaired source")
+            );
+            assert_eq!(item.doc().and_then(|doc| doc.active_page()), Some(page));
+            assert!(item.source_reload_error().is_none());
+            assert!(!item.has_conflict());
         });
     }
 

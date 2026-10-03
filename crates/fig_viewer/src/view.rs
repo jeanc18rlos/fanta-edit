@@ -361,7 +361,12 @@ pub struct FigView {
     /// in-tab navigation ([`Self::select_page`]).
     scope: Option<FigScope>,
     is_focused: bool,
-    source_writer_focus: Option<(String, String)>,
+    agent_navigation_focus: Option<(
+        String,
+        Option<String>,
+        Option<usize>,
+        design_surface::AgentWorkspace,
+    )>,
     /// The document root this view last acted on: a `ScopeApplied` that
     /// merely restores our own root (switching back to this tab) must not
     /// clobber the saved viewport.
@@ -464,6 +469,7 @@ pub struct FigView {
     _motion_sidebar_subscription: Subscription,
     _timeline_subscription: Subscription,
     _agent_activity_subscription: Subscription,
+    workspace_activation_subscription: Option<Subscription>,
 }
 
 pub enum FigViewEvent {
@@ -704,21 +710,9 @@ impl FigView {
                 this.handle_timeline_event(event.clone(), cx);
             });
         let focus_handle = cx.focus_handle();
-        // The agent's design tools target the most recently opened or focused
-        // canvas; keep the registry pointed at this item.
-        crate::agent_surface::set_active_item(item.downgrade(), cx);
         cx.on_focus(&focus_handle, window, |this: &mut Self, _, cx| {
             this.is_focused = true;
-            crate::agent_surface::set_active_item(this.item.downgrade(), cx);
-            // The shared document has ONE render root; re-assert this tab's
-            // scope so focusing the tab brings its page/component back.
-            // `request_scope` is a cheap no-op when the root is already ours.
-            if let Some(scope) = this.scope {
-                let view = cx.entity_id();
-                this.item.update(cx, |item, cx| {
-                    item.request_scope(scope, ScopeRequester::View(view), cx)
-                });
-            }
+            this.activate_design_scope(cx);
         })
         .detach();
         // A space held across a focus change (panel click, window switch, a
@@ -735,10 +729,8 @@ impl FigView {
             }
         })
         .detach();
-        // The root the document currently shows. For a scoped open of an
-        // already-ready shared item the scope was applied in `try_open`, so
-        // this starts as our own root and the echoing `ScopeApplied` (or a
-        // later tab switch back to us) does not reset the viewport.
+        // A background scoped open leaves the shared root unchanged. The
+        // activation event applies this tab's scope and fits its own viewport.
         let last_seen_root = item
             .read(cx)
             .document()
@@ -769,7 +761,7 @@ impl FigView {
             opened_entry_id,
             scope,
             is_focused: false,
-            source_writer_focus: None,
+            agent_navigation_focus: None,
             last_seen_root,
             viewport: None,
             pan_last_position: None,
@@ -841,6 +833,17 @@ impl FigView {
             _motion_sidebar_subscription: motion_sidebar_subscription,
             _timeline_subscription: timeline_subscription,
             _agent_activity_subscription: Self::observe_agent_activity(window, cx),
+            workspace_activation_subscription: None,
+        }
+    }
+
+    fn activate_design_scope(&mut self, cx: &mut Context<Self>) {
+        crate::agent_surface::set_active_item(self.item.downgrade(), cx);
+        if let Some(scope) = self.scope {
+            let requester = ScopeRequester::View(cx.entity_id());
+            self.item.update(cx, |item, cx| {
+                item.request_scope(scope, requester, cx);
+            });
         }
     }
 
@@ -1023,8 +1026,14 @@ impl FigView {
                     };
                     show_canvas_notice_deferred(message, cx);
                 }
+                FigItemEvent::SourceReloadFailed => {
+                    if let Some(message) = this.item.read(cx).source_reload_error() {
+                        show_canvas_notice_deferred(message.to_string(), cx);
+                    }
+                    cx.emit(FigViewEvent::TitleChanged);
+                }
                 FigItemEvent::ConflictChanged => {
-                    if this.item.read(cx).has_conflict() {
+                    if this.item.read(cx).has_conflict() && this.item.read(cx).source_reload_error().is_none() {
                         show_canvas_notice_deferred(
                             "External edits conflict with unsaved canvas edits — save or reload to resolve"
                                 .to_string(),
@@ -2427,6 +2436,11 @@ impl FigView {
     #[cfg(test)]
     pub(crate) fn inspector_for_test(&self) -> Entity<FantaPropertiesPanel> {
         self.inspector_sidebar.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scope_for_test(&self) -> Option<FigScope> {
+        self.scope
     }
 
     pub fn selected_page_index(&self) -> Option<usize> {
@@ -5340,7 +5354,19 @@ impl FigView {
         self.selected_page_root = root;
         // Focus re-assertion must follow in-tab navigation: this tab now
         // means this page, and the root it shows is already current.
-        self.scope = root.map(FigScope::Page);
+        self.scope = root.map(|root| {
+            self.item
+                .read(cx)
+                .doc()
+                .and_then(|doc| {
+                    doc.components
+                        .defs
+                        .values()
+                        .find(|definition| definition.root == root)
+                        .map(|definition| FigScope::Component(definition.id))
+                })
+                .unwrap_or(FigScope::Page(root))
+        });
         self.last_seen_root = root;
         if changed_for_view {
             self.viewport = None;
@@ -5466,9 +5492,18 @@ impl FigView {
     pub fn toggle_inspector_sidebar(
         &mut self,
         _: &ToggleInspectorSidebar,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(feature = "fanta-gpui-ui")]
+        if let Some(adapter) = &self.gpui_properties {
+            adapter
+                .design
+                .update(cx, |design, cx| design.deactivate(window, cx));
+        }
+        #[cfg(not(feature = "fanta-gpui-ui"))]
+        let _ = window;
+        self.finish_panel_edits(cx);
         self.inspector_sidebar_visible = !self.inspector_sidebar_visible;
         self.persist_sidebar_layout(cx);
         cx.notify();
@@ -5643,13 +5678,9 @@ impl FigView {
                 // when its adapter mounted; `FANTA_GPUI_DESIGN=0` (or the
                 // process-wide `FANTA_GPUI_UI=0`) keeps the legacy panel.
                 #[cfg(feature = "fanta-gpui-ui")]
-                if let Some(adapter) = &self.gpui_properties {
+                if let Some(content) = self.render_properties_content(mode) {
                     if records.is_empty() && self.page_annotations(cx).is_empty() {
-                        return self.render_inspector_body(
-                            adapter.layout.clone().into_any_element(),
-                            tabs,
-                            cx,
-                        );
+                        return self.render_inspector_body(content, tabs, cx);
                     }
                 }
                 #[cfg(feature = "fanta-gpui-ui")]
@@ -5734,13 +5765,142 @@ impl FigView {
                 v_flex()
                     .size_full()
                     .overflow_hidden()
-                    .child(h_flex().flex_none().justify_center().py_1().child(tabs))
+                    .child(self.render_inspector_toolbar(false, cx))
+                    .child(
+                        h_flex()
+                            .w_full()
+                            .min_w_0()
+                            .flex_none()
+                            .justify_center()
+                            .py_1()
+                            .border_t_1()
+                            .border_b_1()
+                            .border_color(cx.theme().colors().border)
+                            .child(tabs),
+                    )
                     .child(div().flex_1().min_h_0().child(body)),
             )
             .child(self.render_sidebar_resize_handle(SidebarKind::Inspector));
         #[cfg(test)]
         let sidebar = sidebar.debug_selector(|| "fanta-inspector-sidebar".to_owned());
         sidebar.into_any_element()
+    }
+
+    fn render_inspector_toolbar(&self, collapsed: bool, cx: &mut Context<Self>) -> AnyElement {
+        let view = cx.weak_entity();
+        h_flex()
+            .id("fanta-inspector-controls")
+            .flex_none()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .bg(cx.theme().colors().panel_background)
+            .when(collapsed, |toolbar| {
+                toolbar
+                    .debug_selector(|| "properties-inspector-floating-card".to_owned())
+                    .rounded_xl()
+                    .shadow_md()
+                    .occlude()
+            })
+            .when(!collapsed, |toolbar| toolbar.w_full())
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .on_pinch(|_, _, cx| cx.stop_propagation())
+            .child(
+                IconButton::new("inspector-zoom-out", IconName::Dash)
+                    .tooltip(Tooltip::for_action_title("Zoom Out", &ZoomOut))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.zoom_out(&ZoomOut, window, cx);
+                    })),
+            )
+            .child(
+                PopoverMenu::new("inspector-zoom-menu")
+                    .trigger(
+                        Button::new(
+                            "inspector-zoom-percent",
+                            format!("{}%", self.current_zoom_percent(cx)),
+                        )
+                        .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
+                    )
+                    .menu(move |window, cx| {
+                        let view = view.clone();
+                        Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                            for percent in [25, 50, 100, 200] {
+                                let view = view.clone();
+                                menu = menu.entry(format!("{percent}%"), None, move |_, cx| {
+                                    view.update(cx, |view, cx| view.zoom_to_percent(percent, cx))
+                                        .log_err();
+                                });
+                            }
+                            let selection_view = view.clone();
+                            menu.separator()
+                                .entry("Fit to View", None, move |window, cx| {
+                                    view.update(cx, |view, cx| {
+                                        view.fit_to_view(&FitToView, window, cx)
+                                    })
+                                    .log_err();
+                                })
+                                .entry("Fit to Selection", None, move |_, cx| {
+                                    selection_view
+                                        .update(cx, |view, cx| view.zoom_to_selection(cx))
+                                        .log_err();
+                                })
+                        }))
+                    }),
+            )
+            .child(
+                IconButton::new("inspector-zoom-in", IconName::Plus)
+                    .tooltip(Tooltip::for_action_title("Zoom In", &ZoomIn))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.zoom_in(&ZoomIn, window, cx);
+                    })),
+            )
+            .child(div().h_5().mx_1().child(Divider::vertical()))
+            .child(
+                div().debug_selector(|| "zoombar-fit".to_owned()).child(
+                    IconButton::new("inspector-fit-view", IconName::Maximize)
+                        .tooltip(Tooltip::for_action_title("Fit to View", &FitToView))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.fit_to_view(&FitToView, window, cx);
+                        })),
+                ),
+            )
+            .when(!collapsed, |toolbar| toolbar.child(div().flex_1()))
+            .when(self.editor_mode(cx) == EditorMode::Prototype, |toolbar| {
+                let can_present = self.item.read(cx).document().is_some_and(|document| {
+                    crate::prototype_player::prototype_entry_frame(&document.doc).is_some()
+                });
+                toolbar.child(
+                    IconButton::new("inspector-play-prototype", IconName::PlayOutlined)
+                        .disabled(!can_present)
+                        .tooltip(Tooltip::for_action_title("Play Prototype", &PlayPrototype))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.play_prototype(&PlayPrototype, window, cx);
+                        })),
+                )
+            })
+            .child(
+                div()
+                    .debug_selector(|| "properties-inspector-toggle".to_owned())
+                    .child(
+                        IconButton::new(
+                            "inspector-toggle",
+                            if collapsed {
+                                IconName::ThreadsSidebarRightClosed
+                            } else {
+                                IconName::ThreadsSidebarRightOpen
+                            },
+                        )
+                        .tooltip(Tooltip::text(if collapsed {
+                            "Show Properties"
+                        } else {
+                            "Collapse Properties"
+                        }))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.toggle_inspector_sidebar(&ToggleInspectorSidebar, window, cx);
+                        })),
+                    ),
+            )
+            .into_any_element()
     }
 
     fn render_workspace_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -8011,13 +8171,14 @@ impl Render for FigView {
                                 self.gpui_properties
                                     .as_ref()
                                     .filter(|_| !self.inspector_sidebar_visible)
-                                    .map(|adapter| {
+                                    .map(|_| {
                                         gpui::deferred(
                                             div()
                                                 .absolute()
                                                 .top_0()
                                                 .right_0()
-                                                .child(adapter.layout.clone()),
+                                                .p_2()
+                                                .child(self.render_inspector_toolbar(true, cx)),
                                         )
                                         .with_priority(3)
                                     })
@@ -8038,6 +8199,30 @@ impl Render for FigView {
                         )
                         .into_any_element()
                 };
+                let workspace_body = div()
+                    .size_full()
+                    .relative()
+                    .child(workspace_body)
+                    .children(
+                        (editor_workspace != EditorWorkspace::Canvas && !presenting_prototype)
+                            .then(|| self.render_agent_presence(cx))
+                            .flatten(),
+                    )
+                    .children(self.item.read(cx).source_reload_error().map(|message| {
+                        div()
+                            .id("fanta-source-reload-error")
+                            .absolute()
+                            .top(px(96.0))
+                            .left_4()
+                            .right_4()
+                            .p_3()
+                            .rounded_md()
+                            .bg(cx.theme().colors().elevated_surface_background)
+                            .border_1()
+                            .border_color(cx.theme().status().error_border)
+                            .text_sm()
+                            .child(message.to_string())
+                    }));
                 this.child(workspace_body)
                     .children((!presenting_prototype).then(|| self.render_workspace_tabs(cx)))
             })
@@ -8322,14 +8507,35 @@ impl Item for FigView {
 
     fn added_to_workspace(
         &mut self,
-        _: &mut workspace::Workspace,
+        workspace: &mut workspace::Workspace,
         _: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
+        if let Some(workspace_entity) = workspace.weak_handle().upgrade() {
+            self.workspace_activation_subscription = Some(cx.subscribe(
+                &workspace_entity,
+                |view, workspace, event, cx| {
+                    if matches!(event, workspace::Event::ActiveItemChanged)
+                        && workspace
+                            .read(cx)
+                            .active_item(cx)
+                            .is_some_and(|item| item.item_id() == cx.entity_id())
+                    {
+                        view.activate_design_scope(cx);
+                    }
+                },
+            ));
+        }
+        if workspace
+            .active_item(cx)
+            .is_some_and(|item| item.item_id() == cx.entity_id())
+        {
+            self.activate_design_scope(cx);
+        }
         #[cfg(target_os = "macos")]
         if self.canvas_video_removed.replace(false) {
-            self.clear_canvas_video(_cx);
-            self.clear_canvas_video_fills(_cx);
+            self.clear_canvas_video(cx);
+            self.clear_canvas_video_fills(cx);
         }
     }
 
@@ -8430,7 +8636,23 @@ impl Item for FigView {
     }
 
     fn tab_content_text(&self, _: usize, cx: &App) -> SharedString {
-        self.item.read(cx).title()
+        let item = self.item.read(cx);
+        let name = item.document().and_then(|document| match self.scope {
+            Some(FigScope::Page(root)) => {
+                document.doc.scene.get(root).map(|node| node.name.clone())
+            }
+            Some(FigScope::Component(component)) => document
+                .doc
+                .components
+                .defs
+                .get(&component)
+                .map(|definition| definition.name.clone()),
+            Some(FigScope::Variables) => Some("Variables".into()),
+            None => None,
+        });
+        name.filter(|name| !name.is_empty())
+            .map(SharedString::from)
+            .unwrap_or_else(|| item.title())
     }
 
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString> {
@@ -8447,12 +8669,21 @@ impl Item for FigView {
 
     fn tab_icon(&self, _: &Window, cx: &App) -> Option<Icon> {
         let item = self.item.read(cx);
-        let path = item.abs_path();
+        let project = self.project.read(cx);
+        let source_path = self
+            .opened_entry_id
+            .and_then(|entry| project.path_for_entry(entry, cx))
+            .and_then(|path| project.absolute_path(&path, cx));
+        let path = source_path.as_deref().unwrap_or_else(|| item.abs_path());
         ItemSettings::get_global(cx)
             .file_icons
             .then(|| FileIcons::get_icon(path, cx))
             .flatten()
             .map(Icon::from_path)
+    }
+
+    fn tab_color(&self, cx: &App) -> Option<gpui::Hsla> {
+        self.agent_tab_color(cx)
     }
 
     fn buffer_kind(&self, _: &App) -> workspace::item::ItemBufferKind {
@@ -8777,7 +9008,7 @@ impl Item for FigView {
                 opened_entry_id,
                 scope,
                 is_focused: false,
-                source_writer_focus: None,
+                agent_navigation_focus: None,
                 last_seen_root,
                 viewport,
                 pan_last_position: None,
@@ -8849,6 +9080,7 @@ impl Item for FigView {
                 _motion_sidebar_subscription: motion_sidebar_subscription,
                 _timeline_subscription: timeline_subscription,
                 _agent_activity_subscription: Self::observe_agent_activity(window, cx),
+                workspace_activation_subscription: None,
             }
         })))
     }
@@ -10832,6 +11064,7 @@ mod tests {
             active: true,
             project_root: None,
             source_path: None,
+            workspace: None,
         };
         let state = cx.update(design_surface::activity_state);
         state.update(cx, |state, cx| {
@@ -10848,6 +11081,43 @@ mod tests {
                     zoom: 2.0
                 })
             );
+        });
+        view.update(cx, |view, _| {
+            view.container_bounds = Some(Bounds::new(
+                gpui::point(px(0.0), px(0.0)),
+                gpui::size(px(1000.0), px(800.0)),
+            ));
+        });
+        state.update(cx, |state, cx| {
+            state.record(
+                design_surface::AgentActivity {
+                    world: Some([350.0, 420.0]),
+                    workspace: Some(design_surface::AgentWorkspace::Code),
+                    ..activity.clone()
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.editor_workspace(cx), EditorWorkspace::Code);
+            assert_eq!(
+                view.viewport.map(|viewport| viewport.center),
+                Some([300.0, 400.0])
+            );
+        });
+        state.update(cx, |state, cx| {
+            state.record(
+                design_surface::AgentActivity {
+                    workspace: Some(design_surface::AgentWorkspace::Variables),
+                    ..activity.clone()
+                },
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.editor_workspace(cx), EditorWorkspace::Variables);
         });
         state.update(cx, |state, cx| {
             state.follow(None, cx);
@@ -11995,7 +12265,6 @@ mod tests {
 impl FigView {
     /// The zoom the toolbar should display: live viewport zoom, or the fit
     /// zoom the canvas will initialize with before first interaction.
-    #[cfg(feature = "fanta-gpui-ui")]
     fn current_zoom_percent(&self, cx: &App) -> u16 {
         let zoom = self
             .viewport

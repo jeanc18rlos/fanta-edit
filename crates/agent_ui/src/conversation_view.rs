@@ -3319,14 +3319,14 @@ mod agent_display_name_tests {
     use super::*;
 
     #[test]
-    fn built_in_agent_id_is_never_shown_raw() {
+    fn built_in_agent_uses_the_branded_display_name() {
         assert_eq!(
             fallback_agent_display_name(&agent::ZED_AGENT_ID),
             Agent::NativeAgent.label()
         );
-        assert_ne!(
+        assert_eq!(
             fallback_agent_display_name(&agent::ZED_AGENT_ID).as_ref(),
-            agent::ZED_AGENT_ID.as_ref()
+            "Fanta Agent"
         );
     }
 
@@ -6606,7 +6606,9 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn init_test(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
         cx.update(|cx| {
+            <dyn Fs>::set_global(fs, cx);
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
             // Use an isolated DB so parallel tests can't overwrite each

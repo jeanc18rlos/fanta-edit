@@ -6,7 +6,8 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use super::read::{
-    FnxSourceOverride, read_project_tree_with_source_override, reconcile_fnx_sidecar,
+    FnxSourceOverride, JsonSourceOverride, persisted_fnx_sidecar, read_fnx_sidecar,
+    read_project_tree_with_json_override, read_project_tree_with_source_override,
 };
 use super::session::SourceDiagnostic;
 use super::session::diagnostics::unknown_attribute_diagnostics;
@@ -44,14 +45,7 @@ pub fn validate_project_source_edit_with_diagnostics(
 ) -> Result<(ProjectSourceEdit, Vec<SourceDiagnostic>)> {
     let (project_root, source_path) = checked_source_path(project_root, source_path)?;
     let sidecar_path = sidecar_path(&source_path)?;
-    let persisted_sidecar: fanta_fnx::FnxSidecar =
-        serde_json::from_slice(&fs::read(&sidecar_path)?).map_err(|error| {
-            FormatError::InvalidProjectTree(format!(
-                "{}: bad sidecar: {error}",
-                source_path.display()
-            ))
-        })?;
-    let sidecar = reconcile_fnx_sidecar(&source_path, source, &persisted_sidecar)?;
+    let sidecar = read_fnx_sidecar(&source_path, source, &sidecar_path)?;
     let source_override = FnxSourceOverride {
         path: &source_path,
         source,
@@ -108,16 +102,12 @@ pub fn apply_project_source_edit_with_diagnostics(
     let checked_source_path = source_path_for_read(project_root, source_path)?;
     let original = fs::read(&checked_source_path)?;
     let checked_sidecar_path = sidecar_path(&checked_source_path)?;
-    let original_sidecar = fs::read(&checked_sidecar_path)?;
-    let persisted_sidecar: fanta_fnx::FnxSidecar = serde_json::from_slice(&original_sidecar)
-        .map_err(|error| {
-            FormatError::InvalidProjectTree(format!(
-                "{}: bad sidecar: {error}",
-                checked_source_path.display()
-            ))
-        })?;
-    let sidecar = reconcile_fnx_sidecar(&checked_source_path, source, &persisted_sidecar)?;
-    let sidecar_changed = sidecar != persisted_sidecar;
+    let original_sidecar = read_optional(&checked_sidecar_path)?;
+    let sidecar = persisted_fnx_sidecar(source, original_sidecar.as_deref())?;
+    let persisted_sidecar = original_sidecar
+        .as_ref()
+        .and_then(|bytes| serde_json::from_slice::<fanta_fnx::FnxSidecar>(bytes).ok());
+    let sidecar_changed = persisted_sidecar.as_ref() != Some(&sidecar);
     let (edit, diagnostics) =
         validate_project_source_edit_with_diagnostics(project_root, source_path, source)?;
     let current = fs::read(&edit.source_path)?;
@@ -127,7 +117,7 @@ pub fn apply_project_source_edit_with_diagnostics(
             edit.source_path.display()
         )));
     }
-    if fs::read(&checked_sidecar_path)? != original_sidecar {
+    if read_optional(&checked_sidecar_path)? != original_sidecar {
         return Err(FormatError::InvalidProjectTree(format!(
             "{} changed while the FNX edit was being validated",
             checked_sidecar_path.display()
@@ -145,7 +135,10 @@ pub fn apply_project_source_edit_with_diagnostics(
     if source_changed && let Err(source_error) = atomic_write(&edit.source_path, source.as_bytes())
     {
         if sidecar_changed
-            && let Err(rollback_error) = atomic_write(&checked_sidecar_path, &original_sidecar)
+            && let Err(rollback_error) = match original_sidecar {
+                Some(bytes) => atomic_write(&checked_sidecar_path, &bytes),
+                None => fs::remove_file(&checked_sidecar_path).map_err(FormatError::Io),
+            }
         {
             return Err(FormatError::InvalidProjectTree(format!(
                 "writing {} failed: {source_error}; restoring {} also failed: {rollback_error}",
@@ -162,9 +155,14 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().ok_or_else(|| {
         FormatError::InvalidProjectTree(format!("{} has no parent directory", path.display()))
     })?;
-    let permissions = fs::metadata(path)?.permissions();
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary.as_file().set_permissions(permissions)?;
+    match fs::metadata(path) {
+        Ok(metadata) => temporary
+            .as_file()
+            .set_permissions(metadata.permissions())?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     temporary.write_all(bytes)?;
     temporary.flush()?;
     temporary.as_file().sync_all()?;
@@ -172,6 +170,104 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
         .persist(path)
         .map_err(|error| FormatError::Io(error.error))?;
     Ok(())
+}
+
+fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn validate_project_json_edit(
+    project_root: &Path,
+    source_path: &Path,
+    source: &str,
+) -> Result<ProjectSourceEdit> {
+    let project_root = project_root.canonicalize()?;
+    let source_path = if source_path.is_absolute() {
+        source_path.to_path_buf()
+    } else {
+        project_root.join(source_path)
+    }
+    .canonicalize()?;
+    if !source_path.starts_with(&project_root)
+        || source_path
+            .extension()
+            .is_none_or(|extension| extension != "json")
+    {
+        return Err(FormatError::InvalidProjectTree(format!(
+            "{} is not a JSON source within {}",
+            source_path.display(),
+            project_root.display()
+        )));
+    }
+    let value: serde_json::Value = serde_json::from_str(source).map_err(|error| {
+        FormatError::InvalidProjectTree(format!("{}: {error}", source_path.display()))
+    })?;
+    if source_path
+        .file_name()
+        .is_some_and(|name| name == "page.ids.json" || name == "master.ids.json")
+    {
+        super::read::validate_project_json_shape(&source_path, &value)?;
+        let sidecar: fanta_fnx::FnxSidecar = serde_json::from_value(value.clone())?;
+        for entry in &sidecar.ids {
+            super::layout::id_from_key::<fanta_doc::NodeId>(&entry.id).map_err(|error| {
+                FormatError::InvalidProjectTree(format!("invalid sidecar node ID: {error}"))
+            })?;
+            if !entry.index.is_null() && !entry.index.is_number() {
+                return Err(FormatError::InvalidProjectTree(
+                    "sidecar sibling order must be a number".into(),
+                ));
+            }
+        }
+        if let Some(parent) = &sidecar.root_parent {
+            super::layout::id_from_key::<fanta_doc::NodeId>(parent)?;
+        }
+        let fnx_name = if source_path
+            .file_name()
+            .is_some_and(|name| name == "page.ids.json")
+        {
+            "page.fnx"
+        } else {
+            "master.fnx"
+        };
+        let fnx_path = source_path.with_file_name(fnx_name);
+        super::read::reconcile_fnx_sidecar(&fnx_path, &fs::read_to_string(&fnx_path)?, &sidecar)?;
+    }
+    let source_override = JsonSourceOverride {
+        path: &source_path,
+        value: &value,
+    };
+    let (document, assets) = read_project_tree_with_json_override(&project_root, &source_override)?;
+    Ok(ProjectSourceEdit {
+        document,
+        assets,
+        source_path,
+    })
+}
+
+pub fn apply_project_json_edit(
+    project_root: &Path,
+    source_path: &Path,
+    source: &str,
+) -> Result<ProjectSourceEdit> {
+    let original_path = if source_path.is_absolute() {
+        source_path.to_path_buf()
+    } else {
+        project_root.join(source_path)
+    };
+    let original = fs::read(&original_path)?;
+    let edit = validate_project_json_edit(project_root, source_path, source)?;
+    if fs::read(&edit.source_path)? != original {
+        return Err(FormatError::InvalidProjectTree(format!(
+            "{} changed while the JSON edit was being validated",
+            edit.source_path.display()
+        )));
+    }
+    atomic_write(&edit.source_path, source.as_bytes())?;
+    Ok(edit)
 }
 
 fn sidecar_path(source_path: &Path) -> Result<PathBuf> {
@@ -294,6 +390,139 @@ mod tests {
             .expect_err("invalid source must fail");
         assert!(matches!(error, FormatError::InvalidProjectTree(_)));
         assert_eq!(fs::read_to_string(source_path).unwrap(), original);
+    }
+
+    #[test]
+    fn source_save_repairs_missing_and_damaged_modern_sidecars() {
+        let (directory, source_path) = project();
+        let original = fs::read_to_string(&source_path).expect("read source");
+        let sidecar_path = source_path.with_file_name("page.ids.json");
+        fs::remove_file(&sidecar_path).expect("remove sidecar");
+        let changed = original.replace("name=\"Original\"", "name=\"Changed\"");
+        let edit = apply_project_source_edit(directory.path(), &source_path, &changed)
+            .expect("save with missing sidecar");
+        let page = edit.document.pages().first().copied().expect("page");
+        assert_eq!(edit.document.scene.get(page).expect("root").name, "Changed");
+        let repaired = fs::read(&sidecar_path).expect("recreated sidecar");
+        fs::write(&sidecar_path, b"{\"ids\": [").expect("damage sidecar");
+        apply_project_source_edit(directory.path(), &source_path, &changed)
+            .expect("repair damaged sidecar");
+        assert_eq!(fs::read(&sidecar_path).expect("repaired sidecar"), repaired);
+    }
+
+    #[test]
+    fn typed_json_edits_are_validated_before_any_write() {
+        let (directory, source_path) = project();
+        let header_path = source_path.with_file_name("page.json");
+        let original = fs::read_to_string(&header_path).expect("read page header");
+        let mut header: serde_json::Value = serde_json::from_str(&original).expect("header JSON");
+        header["order"] = serde_json::json!("later");
+        assert!(
+            apply_project_json_edit(directory.path(), &header_path, &header.to_string()).is_err()
+        );
+        assert_eq!(
+            fs::read_to_string(&header_path).expect("untouched header"),
+            original
+        );
+        header["order"] = serde_json::json!(3);
+        apply_project_json_edit(directory.path(), &header_path, &header.to_string())
+            .expect("save validated JSON");
+        assert_eq!(
+            fs::read_to_string(&header_path).expect("saved JSON"),
+            header.to_string()
+        );
+        super::super::read::read_project_tree(directory.path()).expect("project still loads");
+    }
+
+    #[test]
+    fn document_json_edits_materialize_and_bad_types_preserve_the_file() {
+        let (directory, _) = project();
+        let path = directory.path().join("doc/metadata.json");
+        let original = fs::read_to_string(&path).expect("metadata");
+        let mut metadata: serde_json::Value = serde_json::from_str(&original).expect("JSON");
+        metadata["title"] = serde_json::json!("Updated document");
+        let edit = validate_project_json_edit(directory.path(), &path, &metadata.to_string())
+            .expect("validate metadata");
+        assert_eq!(edit.document.metadata.title, "Updated document");
+        assert_eq!(
+            fs::read_to_string(&path).expect("unchanged metadata"),
+            original
+        );
+        metadata["created_at"] = serde_json::json!("yesterday");
+        let error = apply_project_json_edit(directory.path(), &path, &metadata.to_string())
+            .expect_err("invalid metadata type");
+        assert!(error.to_string().contains("metadata.created_at"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("unchanged metadata"),
+            original
+        );
+    }
+
+    #[test]
+    fn variable_registry_arrays_are_rejected_by_edit_validation_and_disk_loading() {
+        let (directory, _) = project();
+        let path = directory.path().join("doc/variables.json");
+        let original = fs::read_to_string(&path).expect("variables");
+        let error = validate_project_json_edit(directory.path(), &path, "[]")
+            .expect_err("an array cannot replace the variable registry");
+        assert!(
+            error
+                .to_string()
+                .contains("variables.json must contain an object")
+        );
+        apply_project_json_edit(directory.path(), &path, "[]")
+            .expect_err("invalid registry must not be saved");
+        assert_eq!(
+            fs::read_to_string(&path).expect("untouched registry"),
+            original
+        );
+
+        fs::write(&path, "[]").expect("simulate external invalid edit");
+        let error = super::super::read::read_project_tree(directory.path())
+            .expect_err("disk loading enforces the same registry schema");
+        assert!(
+            error
+                .to_string()
+                .contains("variables.json must contain an object")
+        );
+        fs::write(&path, original).expect("restore registry");
+        super::super::read::read_project_tree(directory.path()).expect("repaired registry loads");
+    }
+
+    #[test]
+    fn invalid_asset_ids_in_valid_json_are_rejected_before_source_is_written() {
+        let (directory, source_path) = project();
+        let original = fs::read_to_string(&source_path).expect("source");
+        let invalid_asset = "OKUCWRFB73B2XMEHY2MVAS5W34";
+        let index_path = directory.path().join("assets/index.json");
+        let original_index = fs::read_to_string(&index_path).expect("asset index");
+        let index = serde_json::json!({
+            "version": 1,
+            "assets": {format!("a_{invalid_asset}"): {
+                "size": 1,
+                "sha256": "0".repeat(64),
+            }},
+        });
+        let error = apply_project_json_edit(directory.path(), &index_path, &index.to_string())
+            .expect_err("valid JSON with an invalid asset identity");
+        assert!(error.to_string().contains("assets/index.json"));
+        assert!(error.to_string().contains(invalid_asset));
+        assert_eq!(
+            fs::read_to_string(&index_path).expect("index"),
+            original_index
+        );
+
+        let source = original.replace(
+            " />\n  );\n}",
+            &format!(
+                ">\n      <Frame name=\"Photo\" background={{{{\"kind\":\"image\",\"asset\":\"{invalid_asset}\",\"mode\":\"fill\"}}}} />\n    </Frame>\n  );\n}}"
+            ),
+        );
+        assert_ne!(source, original);
+        let error = apply_project_source_edit(directory.path(), &source_path, &source)
+            .expect_err("invalid image reference");
+        assert!(error.to_string().contains("scene.nodes"));
+        assert_eq!(fs::read_to_string(&source_path).expect("source"), original);
     }
 
     #[test]

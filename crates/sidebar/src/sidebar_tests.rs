@@ -1551,7 +1551,7 @@ async fn test_selection_preserves_project_header_when_groups_change(cx: &mut Tes
     let (multi_workspace, cx) =
         cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
     let sidebar = setup_sidebar(&multi_workspace, cx);
-    let fs = project.read_with(cx, |project, _| project.fs().as_fake().clone());
+    let fs = project.read_with(cx, |project, _| project.fs().as_fake());
     fs.insert_tree("/project-b", serde_json::json!({ "src": {} }))
         .await;
     let project_b = project::Project::test(fs, [Path::new("/project-b")], cx).await;

@@ -390,6 +390,14 @@ impl AgentTool for ReadFileTool {
                     ))),
                 ]));
 
+                cx.update(|cx| {
+                    event_stream.report_source_activity(
+                        abs_path.to_string_lossy().into_owned(),
+                        "Inspecting source",
+                        cx,
+                    );
+                });
+
                 return Ok(language_model_image.into());
             }
 
@@ -483,6 +491,16 @@ impl AgentTool for ReadFileTool {
                 }
             };
 
+            if result.is_ok() {
+                cx.update(|cx| {
+                    event_stream.report_source_activity(
+                        abs_path.to_string_lossy().into_owned(),
+                        "Inspecting source",
+                        cx,
+                    );
+                });
+            }
+
             project.update(cx, |project, cx| {
                 if self.update_agent_location {
                     project.set_agent_location(
@@ -546,6 +564,142 @@ mod test {
     use std::path::PathBuf;
     use std::sync::Arc;
     use util::path;
+
+    struct SourceActivitySurface;
+
+    impl design_surface::DesignSurface for SourceActivitySurface {
+        fn state(&self, _: &mut App) -> anyhow::Result<serde_json::Value> {
+            Ok(json!({}))
+        }
+
+        fn get_nodes(
+            &self,
+            _: design_surface::NodeQuery,
+            _: &mut App,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(json!({}))
+        }
+
+        fn apply(
+            &self,
+            _: Vec<design_surface::DesignOp>,
+            _: String,
+            _: &mut App,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(json!({}))
+        }
+
+        fn screenshot(
+            &self,
+            _: design_surface::ScreenshotTarget,
+            _: &mut App,
+        ) -> Task<anyhow::Result<Vec<u8>>> {
+            Task::ready(Ok(Vec::new()))
+        }
+
+        fn read_source(&self, _: Option<String>, _: &mut App) -> anyhow::Result<serde_json::Value> {
+            Ok(json!({}))
+        }
+
+        fn find_empty_space(
+            &self,
+            _: f64,
+            _: f64,
+            _: Option<usize>,
+            _: &mut App,
+        ) -> anyhow::Result<serde_json::Value> {
+            anyhow::bail!("source presence tests do not provide canvas placement")
+        }
+    }
+
+    #[gpui::test]
+    async fn successful_reads_report_source_presence_and_failed_reads_preserve_it(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| design_surface::register(std::rc::Rc::new(SourceActivitySurface), cx));
+        let file_system = FakeFs::new(cx.executor());
+        for directory in [path!("/project-a"), path!("/project-b")] {
+            file_system
+                .insert_tree(directory, json!({"file.rs": "fn main() {}"}))
+                .await;
+        }
+        let project = Project::test(
+            file_system,
+            [path!("/project-a").as_ref(), path!("/project-b").as_ref()],
+            cx,
+        )
+        .await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let tool = Arc::new(ReadFileTool::new(project, action_log, true));
+        for (path, expected_source) in [
+            ("project-a/file.rs", path!("/project-a/file.rs")),
+            ("project-b/file.rs", path!("/project-b/file.rs")),
+        ] {
+            let (event_stream, _) = ToolCallEventStream::test();
+            let result = cx
+                .update(|cx| {
+                    tool.clone().run(
+                        ToolInput::resolved(ReadFileToolInput {
+                            path: path.into(),
+                            start_line: None,
+                            end_line: None,
+                        }),
+                        event_stream,
+                        cx,
+                    )
+                })
+                .await;
+            assert!(result.is_ok());
+            cx.update(|cx| {
+                let state = design_surface::activity_state(cx);
+                let state = state.read(cx);
+                let activity = state
+                    .source_activity(Path::new(expected_source))
+                    .expect("file inspection presence");
+                assert_eq!(activity.action, "Inspecting source");
+                assert_eq!(
+                    activity.workspace,
+                    Some(design_surface::AgentWorkspace::Code)
+                );
+                assert_eq!(state.activities().len(), 1);
+            });
+        }
+        let (event_stream, _) = ToolCallEventStream::test();
+        let result = cx
+            .update(|cx| {
+                tool.run(
+                    ToolInput::resolved(ReadFileToolInput {
+                        path: "project-a/missing.rs".into(),
+                        start_line: None,
+                        end_line: None,
+                    }),
+                    event_stream,
+                    cx,
+                )
+            })
+            .await;
+        assert!(result.is_err());
+        cx.update(|cx| {
+            let state = design_surface::activity_state(cx);
+            let state = state.read(cx);
+            assert!(
+                state
+                    .source_activity(Path::new(path!("/project-a/file.rs")))
+                    .is_none()
+            );
+            assert!(
+                state
+                    .source_activity(Path::new(path!("/project-a/missing.rs")))
+                    .is_none()
+            );
+            assert!(
+                state
+                    .source_activity(Path::new(path!("/project-b/file.rs")))
+                    .is_some()
+            );
+        });
+    }
 
     #[gpui::test]
     async fn test_read_directory_path(cx: &mut TestAppContext) {

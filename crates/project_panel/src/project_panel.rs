@@ -663,6 +663,9 @@ impl ProjectPanel {
             let focus_handle = cx.focus_handle();
             cx.on_focus(&focus_handle, window, Self::focus_in).detach();
 
+            let activity = design_surface::activity_state(cx);
+            cx.observe(&activity, |_, _, cx| cx.notify()).detach();
+
             cx.subscribe_in(
                 &git_store,
                 window,
@@ -5577,7 +5580,19 @@ impl ProjectPanel {
             }
         }
 
-        let filename_text_color = details.filename_text_color;
+        let agent_color = design_surface::existing_activity_state(cx).and_then(|activity| {
+            let project = self.project.read(cx);
+            let path = project.path_for_entry(entry_id, cx)?;
+            let path = project.absolute_path(&path, cx)?;
+            activity
+                .read(cx)
+                .source_activity(&path)
+                .map(|activity| design_surface::agent_color(&activity.agent_id))
+        });
+        let filename_text_color = agent_color
+            .map(Color::Custom)
+            .unwrap_or(details.filename_text_color);
+        let icon_color = agent_color.map(Color::Custom).unwrap_or(Color::Muted);
         let diagnostic_severity = details.diagnostic_severity;
         let diagnostic_count = details.diagnostic_count;
         let item_colors = get_item_color(is_sticky, cx);
@@ -6091,7 +6106,7 @@ impl ProjectPanel {
                                 .unwrap_or(false);
                             div().child(
                                 DecoratedIcon::new(
-                                    Icon::from_path(icon.clone()).color(Color::Muted),
+                                    Icon::from_path(icon.clone()).color(icon_color),
                                     Some(
                                         IconDecoration::new(
                                             if kind.is_file() {
@@ -6118,14 +6133,16 @@ impl ProjectPanel {
                                 .into_any_element(),
                             )
                         } else {
-                            h_flex().child(Icon::from_path(icon.to_string()).color(Color::Muted))
+                            h_flex().child(Icon::from_path(icon.to_string()).color(icon_color))
                         }
                     } else if let Some((icon_name, color)) =
                         entry_diagnostic_aware_icon_name_and_color(diagnostic_severity)
                     {
-                        h_flex()
-                            .size(IconSize::default().rems())
-                            .child(Icon::new(icon_name).color(color).size(IconSize::Small))
+                        h_flex().size(IconSize::default().rems()).child(
+                            Icon::new(icon_name)
+                                .color(agent_color.map(Color::Custom).unwrap_or(color))
+                                .size(IconSize::Small),
+                        )
                     } else {
                         h_flex()
                             .size(IconSize::default().rems())

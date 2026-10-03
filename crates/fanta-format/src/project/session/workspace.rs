@@ -57,6 +57,15 @@ impl Default for WorkspaceSharedState {
     }
 }
 
+pub(super) fn decode_shared_json<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    value: &Value,
+) -> Result<T, SessionError> {
+    crate::project::read::validate_project_json_shape(path, value)?;
+    serde_path_to_error::deserialize(value)
+        .map_err(|error| SessionError::InvalidSource(format!("{}: {error}", path.display())))
+}
+
 /// Live editor session for one project directory.
 #[derive(Debug)]
 pub struct WorkspaceSession {
@@ -125,16 +134,17 @@ impl WorkspaceSession {
 
         let mut shared = WorkspaceSharedState::default();
         let doc_dir = root.join(DOC_DIR);
-        if doc_dir.join(METADATA_JSON).is_file() {
-            shared.metadata = read_json_file(&doc_dir.join(METADATA_JSON))?;
-        }
+        let metadata = read_json_or(&doc_dir.join(METADATA_JSON), shared.metadata.clone())?;
+        decode_shared_json::<fanta_doc::DocMetadata>(&doc_dir.join(METADATA_JSON), &metadata)?;
         let variables_val = read_json_or(&doc_dir.join(VARIABLES_JSON), json!({}))?;
-        shared.variables = serde_json::from_value(variables_val.clone())
-            .unwrap_or_else(|_| VariableRegistry::new());
+        let variables = decode_shared_json(&doc_dir.join(VARIABLES_JSON), &variables_val)?;
         let modes_val = read_json_or(&doc_dir.join(ACTIVE_MODES_JSON), json!({}))?;
-        shared.active_modes = serde_json::from_value(modes_val.clone()).unwrap_or_default();
+        let active_modes = decode_shared_json(&doc_dir.join(ACTIVE_MODES_JSON), &modes_val)?;
         // Hash *on-disk* bytes (not re-serialized) so TOCTOU compares apples-to-apples.
         let h = hash_workspace_shared_on_disk(&root)?;
+        shared.metadata = metadata;
+        shared.variables = variables;
+        shared.active_modes = active_modes;
         shared.disk_hash = h;
         shared.base_hash = h;
         shared.base_json = json!({
@@ -434,18 +444,12 @@ impl WorkspaceSession {
         let Some(files) = self.file_hash_index.get(id) else {
             return false;
         };
-        let (source, ids) = match id {
-            ArtifactId::Page(_) => (
-                crate::project::layout::PAGE_FNX,
-                crate::project::layout::PAGE_IDS,
-            ),
-            ArtifactId::Component(_) => (
-                crate::project::layout::MASTER_FNX,
-                crate::project::layout::MASTER_IDS,
-            ),
+        let source = match id {
+            ArtifactId::Page(_) => crate::project::layout::PAGE_FNX,
+            ArtifactId::Component(_) => crate::project::layout::MASTER_FNX,
             _ => return false,
         };
-        files.contains_key(source) && files.contains_key(ids)
+        files.contains_key(source)
     }
 
     /// Source and identity bytes for the open page/component sessions. The
@@ -571,7 +575,23 @@ impl WorkspaceSession {
                     }
                     Ok(bytes)
                 };
-                (read_indexed(source_name)?, read_indexed(ids_name)?)
+                let source = read_indexed(source_name)?;
+                let ids = if expected.contains_key(ids_name) {
+                    Some(read_indexed(ids_name)?)
+                } else {
+                    if self.root.join(&meta.design_dir).join(ids_name).exists() {
+                        return Err(SessionError::SaveBlocked(SaveBlocked::DiskChangedAgain));
+                    }
+                    None
+                };
+                let text = std::str::from_utf8(&source)
+                    .map_err(|error| SessionError::other(error.to_string()))?;
+                let sidecar = crate::project::read::persisted_fnx_sidecar(text, ids.as_deref())?;
+                let ids = crate::project::layout::json_bytes(
+                    &serde_json::to_value(sidecar)
+                        .map_err(|error| SessionError::other(error.to_string()))?,
+                )?;
+                (source, ids)
             };
             if rekeyed.insert(projected_dir.clone(), bytes).is_some() {
                 return Err(SessionError::other(
@@ -1398,12 +1418,14 @@ impl WorkspaceSession {
         let doc_dir = self.root.join(DOC_DIR);
         let variables_val = read_json_or(&doc_dir.join(VARIABLES_JSON), json!({}))?;
         let modes_val = read_json_or(&doc_dir.join(ACTIVE_MODES_JSON), json!({}))?;
-        self.shared.metadata =
-            read_json_or(&doc_dir.join(METADATA_JSON), self.shared.metadata.clone())?;
-        self.shared.variables = serde_json::from_value(variables_val.clone())
-            .unwrap_or_else(|_| VariableRegistry::new());
-        self.shared.active_modes = serde_json::from_value(modes_val.clone()).unwrap_or_default();
+        let metadata = read_json_or(&doc_dir.join(METADATA_JSON), self.shared.metadata.clone())?;
+        decode_shared_json::<fanta_doc::DocMetadata>(&doc_dir.join(METADATA_JSON), &metadata)?;
+        let variables = decode_shared_json(&doc_dir.join(VARIABLES_JSON), &variables_val)?;
+        let active_modes = decode_shared_json(&doc_dir.join(ACTIVE_MODES_JSON), &modes_val)?;
         let h = hash_workspace_shared_on_disk(&self.root)?;
+        self.shared.metadata = metadata;
+        self.shared.variables = variables;
+        self.shared.active_modes = active_modes;
         self.shared.disk_hash = h;
         self.shared.base_hash = h;
         self.shared.base_json = json!({ "variables": variables_val, "active_modes": modes_val });
@@ -1756,20 +1778,12 @@ fn read_indexed_file_set(
     if !matches!(kind, ArtifactKind::Page | ArtifactKind::Component) {
         return Ok(files);
     }
-    let (source_name, ids_name) = match kind {
-        ArtifactKind::Page => (
-            crate::project::layout::PAGE_FNX,
-            crate::project::layout::PAGE_IDS,
-        ),
-        ArtifactKind::Component => (
-            crate::project::layout::MASTER_FNX,
-            crate::project::layout::MASTER_IDS,
-        ),
+    let source_name = match kind {
+        ArtifactKind::Page => crate::project::layout::PAGE_FNX,
+        ArtifactKind::Component => crate::project::layout::MASTER_FNX,
         _ => return Ok(files),
     };
-    if files.iter().any(|(name, _)| name == source_name)
-        && files.iter().any(|(name, _)| name == ids_name)
-    {
+    if files.iter().any(|(name, _)| name == source_name) {
         return Ok(files);
     }
     let nodes_dir = design_dir.join("nodes");
