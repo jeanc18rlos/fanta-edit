@@ -732,7 +732,9 @@ impl Item for Editor {
     }
 
     fn tab_content(&self, params: TabContentParams, _: &Window, cx: &App) -> AnyElement {
-        let label_color = if ItemSettings::get_global(cx).git_status {
+        let label_color = if let Some(color) = params.text_color_override {
+            Color::Custom(color)
+        } else if ItemSettings::get_global(cx).git_status {
             self.buffer()
                 .read(cx)
                 .as_singleton()

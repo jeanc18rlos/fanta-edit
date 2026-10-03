@@ -5280,6 +5280,7 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
     model.send_last_completion_stream_text_chunk("spawning subagent");
     let subagent_tool_input = SpawnAgentToolInput {
         label: "label".to_string(),
+        mage_name: None,
         message: "subagent task prompt".to_string(),
         session_id: None,
     };
@@ -5326,6 +5327,8 @@ async fn test_subagent_tool_call_end_to_end(cx: &mut TestAppContext) {
             ## User
 
             subagent task prompt
+
+            Your display name is Morgana. Keep this name stable in activity reports and keep your assigned task description separate.
 
             ## Assistant
 
@@ -5414,6 +5417,7 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
     model.send_last_completion_stream_text_chunk("spawning subagent");
     let subagent_tool_input = SpawnAgentToolInput {
         label: "label".to_string(),
+        mage_name: None,
         message: "subagent task prompt".to_string(),
         session_id: None,
     };
@@ -5465,6 +5469,8 @@ async fn test_subagent_tool_output_does_not_include_thinking(cx: &mut TestAppCon
             ## User
 
             subagent task prompt
+
+            Your display name is Morgana. Keep this name stable in activity reports and keep your assigned task description separate.
 
             ## Assistant
 
@@ -5561,6 +5567,7 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
     model.send_last_completion_stream_text_chunk("spawning subagent");
     let subagent_tool_input = SpawnAgentToolInput {
         label: "label".to_string(),
+        mage_name: None,
         message: "subagent task prompt".to_string(),
         session_id: None,
     };
@@ -5634,6 +5641,8 @@ async fn test_subagent_tool_call_cancellation_during_task_prompt(cx: &mut TestAp
 
                 subagent task prompt
 
+                Your display name is Morgana. Keep this name stable in activity reports and keep your assigned task description separate.
+
             "}
         );
     });
@@ -5690,6 +5699,7 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
     model.send_last_completion_stream_text_chunk("spawning subagent");
     let subagent_tool_input = SpawnAgentToolInput {
         label: "initial task".to_string(),
+        mage_name: None,
         message: "do the first task".to_string(),
         session_id: None,
     };
@@ -5751,6 +5761,7 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
     model.send_last_completion_stream_text_chunk("resuming subagent");
     let resume_tool_input = SpawnAgentToolInput {
         label: "follow-up task".to_string(),
+        mage_name: None,
         message: "do the follow-up task".to_string(),
         session_id: Some(subagent_session_id.clone()),
     };
@@ -5802,6 +5813,8 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
 
             do the first task
 
+            Your display name is Morgana. Keep this name stable in activity reports and keep your assigned task description separate.
+
             ## Assistant
 
             first task response
@@ -5809,6 +5822,8 @@ async fn test_subagent_tool_resume_session(cx: &mut TestAppContext) {
             ## User
 
             do the follow-up task
+
+            Your display name is Morgana. Keep this name stable in activity reports and keep your assigned task description separate.
 
             ## Assistant
 
@@ -6337,6 +6352,7 @@ async fn test_subagent_context_window_warning(cx: &mut TestAppContext) {
     model.send_last_completion_stream_text_chunk("spawning subagent");
     let subagent_tool_input = SpawnAgentToolInput {
         label: "label".to_string(),
+        mage_name: None,
         message: "subagent task prompt".to_string(),
         session_id: None,
     };
@@ -6462,6 +6478,7 @@ async fn test_subagent_no_context_window_warning_when_already_at_warning(cx: &mu
     model.send_last_completion_stream_text_chunk("spawning subagent");
     let subagent_tool_input = SpawnAgentToolInput {
         label: "initial task".to_string(),
+        mage_name: None,
         message: "do the first task".to_string(),
         session_id: None,
     };
@@ -6528,6 +6545,7 @@ async fn test_subagent_no_context_window_warning_when_already_at_warning(cx: &mu
     model.send_last_completion_stream_text_chunk("resuming subagent");
     let resume_tool_input = SpawnAgentToolInput {
         label: "follow-up task".to_string(),
+        mage_name: None,
         message: "do the follow-up task".to_string(),
         session_id: Some(subagent_session_id.clone()),
     };
@@ -6635,6 +6653,7 @@ async fn test_subagent_error_propagation(cx: &mut TestAppContext) {
     model.send_last_completion_stream_text_chunk("spawning subagent");
     let subagent_tool_input = SpawnAgentToolInput {
         label: "label".to_string(),
+        mage_name: None,
         message: "subagent task prompt".to_string(),
         session_id: None,
     };

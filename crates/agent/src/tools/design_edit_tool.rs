@@ -87,15 +87,28 @@ impl AgentTool for DesignEditTool {
         cx.spawn(async move |cx| {
             let input = input.recv().await.map_err(tool_content_err)?;
             let label = input.label.unwrap_or_else(|| "Agent edit".to_string());
-            let value = cx
+            let apply = cx
                 .update(|cx| {
                     event_stream.report_design_activity(&label, None, None, None, cx);
                     let surface = design_surface::active(cx).context(
                         "no design canvas is available; ask the user to open a .fig file or Fanta project",
                     )?;
-                    surface.apply(input.ops, label, cx)
+                    let (agent_id, agent_name) = event_stream.agent_identity(cx);
+                    Ok::<_, anyhow::Error>(surface.apply_streamed(input.ops, label.clone(), Some(design_surface::AgentActivity {
+                        agent_id,
+                        agent_name,
+                        action: label,
+                        page: None,
+                        node: None,
+                        world: None,
+                        active: true,
+                        source_path: None,
+                        project_root: None,
+                        workspace: Some(design_surface::AgentWorkspace::Canvas),
+                    }), cx))
                 })
                 .map_err(tool_content_err)?;
+            let value = apply.await.map_err(tool_content_err)?;
             let applied = value
                 .get("applied")
                 .and_then(serde_json::Value::as_bool)

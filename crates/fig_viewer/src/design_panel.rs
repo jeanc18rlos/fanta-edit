@@ -24,8 +24,8 @@ use fs::Fs;
 #[cfg(test)]
 use gpui::px;
 use gpui::{
-    Action as _, AnyElement, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle,
-    Focusable, Pixels, SharedString, Subscription, WeakEntity, Window, actions,
+    AnyElement, App, AsyncWindowContext, Context, Entity, EventEmitter, FocusHandle, Focusable,
+    Pixels, SharedString, Subscription, WeakEntity, Window, actions,
 };
 use settings::{Settings as _, update_settings_file};
 use ui::prelude::*;
@@ -1045,13 +1045,11 @@ impl FantaDesignPanel {
         if anchor != self.last_reveal_anchor {
             self.last_reveal_anchor = anchor;
             if let Some(anchor) = anchor {
-                // The page root is never a row, so expanding it would only
-                // invalidate the memoized tree for nothing.
-                for ancestor in doc
-                    .scene
-                    .ancestors_of(anchor)
-                    .filter(|ancestor| Some(ancestor.id) != page_root)
-                {
+                // Component canvases include their editable master row;
+                // ordinary page roots have no row to expand.
+                for ancestor in doc.scene.ancestors_of(anchor).filter(|ancestor| {
+                    Some(ancestor.id) != page_root || doc.is_component_root(ancestor.id)
+                }) {
                     self.set_node_expanded(ancestor.id, true);
                 }
                 self.pending_reveal = Some(anchor);
@@ -1159,20 +1157,6 @@ impl Render for FantaDesignPanel {
             .overflow_hidden()
             .when(!self.file_inspector_collapsed, |panel| {
                 panel.bg(cx.theme().colors().editor_background)
-            })
-            .when(self.active_view(cx).is_some(), |panel| {
-                panel.child(
-                    h_flex().px_2().py_1().child(
-                        Button::new("reveal-fanta-project", "Show Project in File Manager")
-                            .start_icon(Icon::new(IconName::Folder))
-                            .on_click(|_, window, cx| {
-                                window.dispatch_action(
-                                    zed_actions::fanta::RevealProjectInFileManager.boxed_clone(),
-                                    cx,
-                                );
-                            }),
-                    ),
-                )
             })
             .child(body)
             .children(picker)
@@ -2687,6 +2671,21 @@ mod gpui_layers_tests {
         let mut harness = setup(cx, 1).await;
         let master = harness.fixture.master;
         let instance = harness.fixture.instance;
+        let item = harness
+            .view
+            .read_with(&harness.cx, |view, _| view.item().clone());
+        let child = harness
+            .cx
+            .update(|_, cx| {
+                item.update(cx, |item, cx| {
+                    item.with_document(cx, |document| {
+                        let child =
+                            insert(&mut document.doc, rect(0.0, 0.0), Some(master), "Label");
+                        (child, DocChange::Content)
+                    })
+                })
+            })
+            .expect("ready document");
         select_on_canvas(&mut harness, instance);
         context_action(
             &mut harness,
@@ -2694,7 +2693,31 @@ mod gpui_layers_tests {
             LayersPanelContextAction::GoToMainComponent,
         );
         assert_eq!(selection(&harness), vec![master]);
+        assert_eq!(with_doc(&harness, Doc::active_page), Some(master));
+        let component = with_doc(&harness, |doc| {
+            doc.components
+                .defs
+                .values()
+                .find(|definition| definition.root == master)
+                .expect("master definition")
+                .id
+        });
+        assert_eq!(
+            harness
+                .view
+                .read_with(&harness.cx, |view, _| view.scope_for_test()),
+            Some(crate::document::FigScope::Component(component))
+        );
         let row = row_bounds(&mut harness, master).expect("the master row is shown");
+        assert!(row.size.height > px(0.));
+        emit(
+            &mut harness,
+            LayersPanelAction::ExpansionChanged {
+                node_id: row_id(master),
+                expanded: true,
+            },
+        );
+        let row = row_bounds(&mut harness, child).expect("the component child row is shown");
         assert!(row.size.height > px(0.));
     }
 

@@ -37,6 +37,81 @@ fn page_fixture() -> (tempfile::TempDir, NodeId) {
 }
 
 #[test]
+fn modern_source_keeps_identity_when_the_sidecar_is_missing_or_damaged() {
+    let (directory, page) = page_fixture();
+    let (original, _) = crate::read_project_tree(directory.path()).expect("original project");
+    let source_path = crate::locate_page_source(directory.path(), page).expect("page source");
+    let sidecar_path = source_path.with_file_name("page.ids.json");
+    let mut sidecar: Value =
+        serde_json::from_slice(&std::fs::read(&sidecar_path).expect("sidecar"))
+            .expect("sidecar JSON");
+    sidecar["ids"][0]["id"] = json!("bad-id");
+    sidecar["ids"][1]["index"] = json!("not-a-number");
+    for damaged in [
+        None,
+        Some(b"{".to_vec()),
+        Some(sidecar.to_string().into_bytes()),
+    ] {
+        match damaged {
+            Some(bytes) => std::fs::write(&sidecar_path, bytes).expect("damage sidecar"),
+            None => std::fs::remove_file(&sidecar_path).expect("remove sidecar"),
+        }
+        let (loaded, _) = crate::read_project_tree(directory.path()).expect("recover source");
+        for id in original.scene.descendants_of(page) {
+            assert_eq!(loaded.scene.get(id), original.scene.get(id));
+        }
+        let mut workspace = WorkspaceSession::open(directory.path()).expect("open workspace");
+        assert!(workspace.has_indexed_source(&ArtifactId::Page(page)));
+        workspace
+            .open_artifact(ArtifactId::Page(page))
+            .expect("open repaired page");
+        workspace
+            .validated_source_overrides_for_document(&loaded)
+            .expect("canvas saves can regenerate the sidecar");
+    }
+}
+
+#[test]
+fn missing_legacy_sidecar_does_not_assign_new_node_identities() {
+    let (directory, page) = page_fixture();
+    let (document, _) = crate::read_project_tree(directory.path()).expect("project");
+    let source_path = crate::locate_page_source(directory.path(), page).expect("source");
+    let mut source = std::fs::read_to_string(&source_path).expect("source text");
+    for id in document.scene.descendants_of(page) {
+        source = source.replace(&format!("id=\"{}\"", id.0), "");
+    }
+    std::fs::write(&source_path, &source).expect("legacy source");
+    std::fs::remove_file(source_path.with_file_name("page.ids.json")).expect("remove sidecar");
+    let error = crate::read_project_tree(directory.path())
+        .expect_err("legacy identity cannot be recovered");
+    assert!(error.to_string().contains("restore the sidecar"));
+    assert_eq!(
+        std::fs::read_to_string(&source_path).expect("preserved legacy source"),
+        source
+    );
+}
+
+#[test]
+fn valid_legacy_sidecar_keeps_identity_and_order() {
+    let (directory, page) = page_fixture();
+    let (original, _) = crate::read_project_tree(directory.path()).expect("original project");
+    let source_path = crate::locate_page_source(directory.path(), page).expect("source");
+    let mut source = std::fs::read_to_string(&source_path).expect("source text");
+    for id in original.scene.descendants_of(page) {
+        source = source.replace(&format!("id=\"{}\"", id.0), "");
+    }
+    std::fs::write(&source_path, source).expect("legacy source");
+    let (loaded, _) = crate::read_project_tree(directory.path()).expect("legacy identity");
+    for id in original.scene.descendants_of(page) {
+        assert_eq!(loaded.scene.get(id), original.scene.get(id));
+    }
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
+    workspace
+        .open_artifact(ArtifactId::Page(page))
+        .expect("legacy artifact");
+}
+
+#[test]
 fn session_indexes_the_same_duplicate_page_winner_as_the_reader() {
     let (directory, page) = page_fixture();
     let original = WorkspaceSession::open(directory.path()).expect("open project");
@@ -1548,6 +1623,115 @@ fn fresh_disk_snapshot_applies_changed_page_and_shared_metadata() {
     );
     assert_eq!(running_document.scene.get(page).unwrap().name, "Agent Home");
     assert_eq!(running_document.metadata.title, "Agent Project");
+}
+
+#[test]
+fn invalid_shared_json_preserves_incremental_state_until_source_is_repaired() {
+    let (directory, _) = page_fixture();
+    let (mut document, assets) = crate::read_project_tree(directory.path()).expect("project");
+    let collection = fanta_doc::VariableCollectionId::new();
+    let mode = fanta_doc::ModeId::new();
+    document.variables.collections.insert(
+        collection,
+        fanta_doc::VariableCollection {
+            id: collection,
+            name: "Theme".into(),
+            modes: vec![fanta_doc::Mode {
+                id: mode,
+                name: "Light".into(),
+            }],
+            default_mode: mode,
+            variable_order: Vec::new(),
+        },
+    );
+    document.active_modes.insert(collection, mode);
+    document.metadata.title = "Last valid project".into();
+    crate::write_project_tree(directory.path(), &document, &assets).expect("shared state");
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
+    let baseline = workspace.disk_snapshot();
+    let original_document = serde_json::to_value(&document).expect("document snapshot");
+    let original_hash = workspace.shared.disk_hash;
+    let original_generation = workspace.workspace_generation;
+    let original_shared_json = workspace.shared.base_json.clone();
+    let source_files = ["metadata.json", "variables.json", "active_modes.json"].map(|name| {
+        let path = directory.path().join("doc").join(name);
+        let text = std::fs::read_to_string(&path).expect("shared source");
+        (path, text)
+    });
+
+    for (name, invalid) in [
+        ("variables.json", "[]"),
+        ("variables.json", "{\"collections\":\"unfinished\"}"),
+        ("active_modes.json", "[]"),
+        (
+            "active_modes.json",
+            "{\"invalid-collection\":\"invalid-mode\"}",
+        ),
+        ("metadata.json", "[]"),
+        ("metadata.json", "{\"created_at\":\"yesterday\"}"),
+    ] {
+        for (path, text) in &source_files {
+            std::fs::write(path, text).expect("restore shared source");
+        }
+        let metadata_path = directory.path().join("doc/metadata.json");
+        let mut metadata = serde_json::to_value(&document.metadata).expect("metadata");
+        metadata["title"] = json!("Pending source title");
+        std::fs::write(metadata_path, metadata.to_string()).expect("stage valid metadata edit");
+        let path = directory.path().join("doc").join(name);
+        std::fs::write(&path, invalid).expect("invalid external source");
+
+        let error = WorkspaceSession::open(directory.path()).expect_err("invalid shared source");
+        assert!(error.to_string().contains(name), "{error}");
+        let events = workspace.notify_fs_event(FsEvent::Modified { path: path.clone() });
+        assert!(matches!(
+            events.as_slice(),
+            [SessionEvent::Invalidated { id: ArtifactId::Workspace, error }]
+                if error.contains(name)
+        ));
+        assert_eq!(workspace.shared.variables, document.variables);
+        assert_eq!(workspace.shared.active_modes, document.active_modes);
+        assert_eq!(
+            workspace.shared.metadata,
+            serde_json::to_value(&document.metadata).expect("last valid metadata")
+        );
+        assert_eq!(workspace.shared.disk_hash, original_hash);
+        assert_eq!(workspace.shared.base_json, original_shared_json);
+        assert_eq!(workspace.workspace_generation, original_generation);
+        workspace
+            .reconcile_disk_snapshot()
+            .expect_err("invalid source cannot advance the disk snapshot");
+        workspace
+            .apply_report_to_doc(
+                &mut document,
+                &ApplyReport {
+                    events,
+                    ..ApplyReport::default()
+                },
+            )
+            .expect_err("invalid incremental report cannot replace the canvas");
+        assert_eq!(
+            serde_json::to_value(&document).expect("preserved document"),
+            original_document
+        );
+    }
+
+    for (path, text) in &source_files {
+        std::fs::write(path, text).expect("repair shared source");
+    }
+    let mut fresh = WorkspaceSession::open(directory.path()).expect("repaired workspace");
+    let report = fresh
+        .reconcile_from_disk_snapshot(&baseline)
+        .expect("repaired disk snapshot");
+    assert_eq!(
+        fresh
+            .apply_report_to_doc(&mut document, &report)
+            .expect("apply repaired shared state"),
+        IncrementalDocApply::Applied
+    );
+    assert_eq!(
+        serde_json::to_value(&document).expect("repaired document"),
+        original_document
+    );
 }
 
 #[test]

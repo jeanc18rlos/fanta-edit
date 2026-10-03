@@ -1020,14 +1020,13 @@ impl ArtifactSession {
 
         // Deleted covers the partial case too: `read_file_set` skips missing
         // files silently, so a crashed writer or a mid-checkout git state can
-        // leave the header behind while `page.fnx` / the ids sidecar are gone.
-        // Disk no longer holds a loadable edition either way — route it to the
+        // leave the header behind while `page.fnx` is gone. An explicit-ID
+        // source can recover its sidecar, but not its content — route it to the
         // Deleted conflict (KeepOurs rescues the working copy, TakeTheirs
         // accepts the removal) instead of surfacing a raw "missing page.fnx"
         // load error out of `save`.
-        let (fnx_name, ids_name, _) = file_names(self.kind);
-        let unloadable = !observed_files.iter().any(|(name, _)| name == fnx_name)
-            || !observed_files.iter().any(|(name, _)| name == ids_name);
+        let (fnx_name, _, _) = file_names(self.kind);
+        let unloadable = !observed_files.iter().any(|(name, _)| name == fnx_name);
         if unloadable {
             let ours = self.snapshot_ours_edition()?;
             let base = self.snapshot_base_edition();
@@ -1737,12 +1736,9 @@ pub fn load_artifact_session(
     let mut source =
         FnxSourceMirror::from_source_with(source_text, ir.sidecar(), Arc::clone(&ref_table))?;
     let missing_ids = source.insert_missing_ids(ir.sidecar())?;
-    let persisted_sidecar: FnxSidecar = file_bytes(&files, file_names(meta.kind).1)
-        .ok_or_else(|| SessionError::other("artifact sidecar disappeared while opening"))
-        .and_then(|bytes| {
-            serde_json::from_slice(&bytes).map_err(|error| SessionError::other(error.to_string()))
-        })?;
-    let needs_migration = missing_ids || persisted_sidecar != *ir.sidecar();
+    let persisted_sidecar: Option<FnxSidecar> = file_bytes(&files, file_names(meta.kind).1)
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    let needs_migration = missing_ids || persisted_sidecar.as_ref() != Some(ir.sidecar());
     let scoped = match meta.kind {
         ArtifactKind::Page => {
             materialize_page(&ir, project_id, components, variables, active_modes)?
@@ -1842,11 +1838,14 @@ fn load_ir_and_map(
     let source = file_bytes(files, fnx_name)
         .ok_or_else(|| SessionError::other(format!("missing {fnx_name}")))?;
     let source = std::str::from_utf8(&source).map_err(|e| SessionError::other(e.to_string()))?;
-    let sidecar: FnxSidecar = file_bytes(files, ids_name)
-        .ok_or_else(|| SessionError::other(format!("missing {ids_name}")))
-        .and_then(|b| serde_json::from_slice(&b).map_err(|e| SessionError::other(e.to_string())))?;
+    let sidecar_bytes = file_bytes(files, ids_name);
+    let sidecar = crate::project::read::persisted_fnx_sidecar(source, sidecar_bytes.as_deref())?;
     let header: Value = file_bytes(files, header_name)
-        .map(|b| serde_json::from_slice(&b).unwrap_or(Value::Null))
+        .map(|bytes| {
+            serde_json::from_slice(&bytes)
+                .map_err(|error| SessionError::InvalidSource(format!("{header_name}: {error}")))
+        })
+        .transpose()?
         .unwrap_or(Value::Null);
     let sidecar = deterministic_reconcile(source, &sidecar)?;
     let nodes = fanta_fnx::decode_subtree_with(source, &sidecar, refs)?;

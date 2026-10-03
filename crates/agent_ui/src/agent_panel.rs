@@ -1170,6 +1170,7 @@ pub struct AgentPanel {
     _project_subscription: Subscription,
     zoomed: bool,
     pending_serialization: Option<Task<Result<()>>>,
+    pending_agent_selection_persistence: Option<futures::future::Shared<Task<()>>>,
     new_user_onboarding: Entity<AgentPanelOnboarding>,
     new_user_onboarding_upsell_dismissed: AtomicBool,
     selected_agent: Agent,
@@ -1565,6 +1566,7 @@ impl AgentPanel {
             _project_subscription,
             zoomed: false,
             pending_serialization: None,
+            pending_agent_selection_persistence: None,
             new_user_onboarding: onboarding,
             thread_store,
             selected_agent: Agent::default(),
@@ -1923,13 +1925,21 @@ impl AgentPanel {
             self.serialize(cx);
         }
 
-        cx.background_spawn({
-            let kvp = KeyValueStore::global(cx);
-            async move {
-                write_global_last_used_agent(kvp, agent).await;
-            }
-        })
-        .detach();
+        let persistence = cx
+            .background_spawn({
+                let kvp = KeyValueStore::global(cx);
+                let previous = self.pending_agent_selection_persistence.take();
+                async move {
+                    // Initial draft writes must finish before a newer selection is persisted.
+                    if let Some(previous) = previous {
+                        previous.await;
+                    }
+                    write_global_last_used_agent(kvp, agent).await;
+                }
+            })
+            .shared();
+        self.pending_agent_selection_persistence = Some(persistence.clone());
+        cx.background_spawn(persistence).detach();
     }
 
     /// Sets the panel's selected agent without opening the panel or focusing
@@ -10315,12 +10325,28 @@ mod tests {
                 .workspace()
                 .clone()
         });
-        workspace.update_in(&mut cx, |workspace, window, cx| {
-            workspace.focus_handle(cx).focus(window, cx);
-        });
+        let center_item = workspace
+            .update_in(&mut cx, |workspace, window, cx| {
+                workspace.open_abs_path(
+                    PathBuf::from("/project/file.txt"),
+                    workspace::OpenOptions {
+                        focus: Some(true),
+                        ..Default::default()
+                    },
+                    window,
+                    cx,
+                )
+            })
+            .await
+            .expect("center document should open");
+        cx.run_until_parked();
         cx.update(|window, cx| {
             assert!(window.is_window_active());
-            assert!(workspace.read(cx).focus_handle(cx).is_focused(window));
+            assert!(
+                center_item
+                    .item_focus_handle(cx)
+                    .contains_focused(window, cx)
+            );
             assert!(!panel.read(cx).focus_handle(cx).contains_focused(window, cx));
         });
 
@@ -11022,6 +11048,7 @@ mod tests {
         let source_title: SharedString = "Source Thread Title".into();
         let db_thread = agent::DbThread {
             title: source_title.clone(),
+            agent_name: None,
             messages: Vec::new(),
             updated_at: Utc::now(),
             detailed_summary: None,
@@ -13641,15 +13668,20 @@ mod tests {
             "fresh destination panel should inherit the source agent"
         );
 
-        panel_b.read_with(cx, |panel, _cx| {
+        panel_b.read_with(cx, |panel, cx| {
             assert_eq!(
                 panel.selected_agent,
                 Agent::Stub,
                 "destination panel should inherit the source panel's selected agent"
             );
+            let draft = panel
+                .draft_thread
+                .as_ref()
+                .expect("empty draft should exist");
+            assert_eq!(*draft.read(cx).agent_key(), Agent::Stub);
             assert!(
-                panel.active_conversation_view().is_none(),
-                "agent-only initialization should not create a draft thread"
+                !panel.draft_has_content(draft, cx),
+                "agent-only initialization should keep the draft empty"
             );
         });
     }

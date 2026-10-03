@@ -136,12 +136,15 @@ pub struct TabContentParams {
     /// Maximum character length for the title. None = use the item's own default (typically MAX_TAB_TITLE_LEN).
     pub max_title_len: Option<usize>,
     pub truncate_title_middle: bool,
+    pub text_color_override: Option<gpui::Hsla>,
 }
 
 impl TabContentParams {
     /// Returns the text color to be used for the tab content.
     pub fn text_color(&self) -> Color {
-        if self.deemphasized {
+        if let Some(color) = self.text_color_override {
+            Color::Custom(color)
+        } else if self.deemphasized {
             if self.selected {
                 Color::Muted
             } else {
@@ -196,6 +199,10 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
     }
 
     fn tab_icon(&self, _window: &Window, _cx: &App) -> Option<Icon> {
+        None
+    }
+
+    fn tab_color(&self, _cx: &App) -> Option<gpui::Hsla> {
         None
     }
 
@@ -516,6 +523,7 @@ pub trait ItemHandle: 'static + Send {
     fn suggested_filename(&self, cx: &App) -> SharedString;
     fn suggested_save_as_directory(&self, cx: &App) -> Option<PathBuf>;
     fn tab_icon(&self, window: &Window, cx: &App) -> Option<Icon>;
+    fn tab_color(&self, cx: &App) -> Option<gpui::Hsla>;
     fn tab_tooltip_text(&self, cx: &App) -> Option<SharedString>;
     fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent>;
     fn telemetry_event_text(&self, cx: &App) -> Option<&'static str>;
@@ -676,6 +684,10 @@ impl<T: Item> ItemHandle for Entity<T> {
 
     fn tab_icon(&self, window: &Window, cx: &App) -> Option<Icon> {
         self.read(cx).tab_icon(window, cx)
+    }
+
+    fn tab_color(&self, cx: &App) -> Option<gpui::Hsla> {
+        self.read(cx).tab_color(cx)
     }
 
     fn tab_tooltip_content(&self, cx: &App) -> Option<TabTooltipContent> {

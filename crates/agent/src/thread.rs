@@ -872,6 +872,15 @@ pub trait ThreadEnvironment {
 
     fn create_subagent(&self, label: String, cx: &mut App) -> Result<Rc<dyn SubagentHandle>>;
 
+    fn create_named_subagent(
+        &self,
+        label: String,
+        _agent_name: Option<String>,
+        cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>> {
+        self.create_subagent(label, cx)
+    }
+
     fn resume_subagent(
         &self,
         _session_id: acp::SessionId,
@@ -1327,6 +1336,7 @@ pub struct Thread {
     prompt_id: PromptId,
     updated_at: DateTime<Utc>,
     title: Option<SharedString>,
+    agent_name: Option<SharedString>,
     pending_title_generation: Option<Task<()>>,
     title_generation_failed: bool,
     pending_summary_generation: Option<Shared<Task<Option<SharedString>>>>,
@@ -1478,6 +1488,7 @@ impl Thread {
             prompt_id: PromptId::new(),
             updated_at: Utc::now(),
             title: None,
+            agent_name: None,
             pending_title_generation: None,
             title_generation_failed: false,
             pending_summary_generation: None,
@@ -1866,6 +1877,7 @@ impl Thread {
             } else {
                 Some(db_thread.title.clone())
             },
+            agent_name: db_thread.agent_name,
             pending_title_generation: None,
             title_generation_failed: false,
             pending_summary_generation: None,
@@ -1986,6 +1998,7 @@ impl Thread {
         let initial_project_snapshot = self.initial_project_snapshot.clone();
         let mut thread = DbThread {
             title: self.title().unwrap_or_default(),
+            agent_name: self.agent_name.clone(),
             messages: self.messages.clone(),
             updated_at: self.updated_at,
             detailed_summary: self.summary.clone(),
@@ -2198,6 +2211,24 @@ impl Thread {
 
     pub fn last_message(&self) -> Option<&Message> {
         self.messages.last().map(std::ops::Deref::deref)
+    }
+
+    pub(crate) fn reference_images(&self) -> Vec<LanguageModelImage> {
+        let mut seen_images = HashSet::default();
+        self.messages
+            .iter()
+            .filter_map(|message| match &**message {
+                Message::User(message) => Some(message),
+                _ => None,
+            })
+            .flat_map(|message| message.content.iter())
+            .filter_map(|content| match content {
+                UserMessageContent::Image(image) if seen_images.insert(image.clone()) => {
+                    Some(image.clone())
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -3438,6 +3469,24 @@ impl Thread {
         };
         let mut repository = cx.update(|cx| find_repository(cx));
         if repository.is_none() {
+            // File refreshes can finish before asynchronous Git discovery reaches GitStore.
+            let (repository_sender, repository_receiver) = oneshot::channel();
+            let _repository_subscription = cx.update(|cx| {
+                let git_store = project.read(cx).git_store().clone();
+                let project_path = project_path.clone();
+                let mut repository_sender = Some(repository_sender);
+                cx.subscribe(&git_store, move |git_store, event, cx| {
+                    if matches!(event, project::git_store::GitStoreEvent::RepositoryAdded)
+                        && let Some((repository, _)) = git_store
+                            .read(cx)
+                            .repository_and_path_for_project_path(&project_path, cx)
+                        && let Some(repository_sender) = repository_sender.take()
+                        && repository_sender.send(repository).is_err()
+                    {
+                        log::debug!("Design repository discovery is no longer being awaited");
+                    }
+                })
+            });
             anyhow::ensure!(
                 filesystem
                     .metadata(&project_root.join("fanta.json"))
@@ -3465,6 +3514,21 @@ impl Thread {
                 .await
                 .context("could not reload the active Fanta worktree after initializing Git")?;
             repository = cx.update(|cx| find_repository(cx));
+            if repository.is_none() {
+                let repository_receiver = repository_receiver.fuse();
+                let timeout = cx
+                    .background_executor()
+                    .timer(Duration::from_secs(10))
+                    .fuse();
+                futures::pin_mut!(repository_receiver, timeout);
+                repository = Some(futures::select! {
+                    repository = repository_receiver => repository
+                        .context("the active Fanta repository discovery ended before it was loaded")?,
+                    _ = timeout => anyhow::bail!(
+                        "Git was initialized, but loading the active Fanta repository timed out"
+                    ),
+                });
+            }
         }
         let repository = repository
             .context("Git was initialized, but the active Fanta repository could not be loaded")?;
@@ -4037,8 +4101,9 @@ impl Thread {
             acp::ToolCallUpdateFields::new().status(acp::ToolCallStatus::InProgress),
         );
         let supports_images = self.model().is_some_and(|model| model.supports_images());
-        let tool_result = tool.run(tool_input, tool_event_stream, cx);
-        cx.foreground_executor().spawn(async move {
+        // Tools may read their owning thread during synchronous startup.
+        cx.spawn(async move |_thread, cx| {
+            let tool_result = cx.update(|cx| tool.run(tool_input, tool_event_stream, cx));
             let (is_error, output) = match tool_result.await {
                 Ok(mut output) => {
                     let contains_image = output
@@ -4775,14 +4840,17 @@ impl Thread {
             node: previous.as_ref().and_then(|activity| activity.node.clone()),
             world: previous.as_ref().and_then(|activity| activity.world),
             active,
-            source_path: if active && action == "Editing source" {
+            source_path: if active {
                 previous
                     .as_ref()
                     .and_then(|activity| activity.source_path.clone())
             } else {
                 None
             },
-            project_root: previous.and_then(|activity| activity.project_root),
+            project_root: previous
+                .as_ref()
+                .and_then(|activity| activity.project_root.clone()),
+            workspace: previous.and_then(|activity| activity.workspace),
         };
         if !active {
             activity_state.update(cx, |state, cx| state.record(activity, cx));
@@ -4793,14 +4861,43 @@ impl Thread {
         }
     }
 
-    fn activity_name(&self) -> String {
-        if self.is_subagent() {
-            self.title()
-                .map(|title| title.to_string())
-                .unwrap_or_else(|| "Fanta subagent".into())
-        } else {
-            "Fanta Agent".into()
+    pub(crate) fn activity_name(&self) -> String {
+        self.agent_name
+            .as_ref()
+            .map(|name| name.to_string())
+            .unwrap_or_else(|| {
+                if self.is_subagent() {
+                    "Morgana".into()
+                } else {
+                    "Merlyn".into()
+                }
+            })
+    }
+
+    pub(crate) fn set_agent_name(&mut self, name: String, cx: &mut Context<Self>) -> Result<()> {
+        let name = name.trim();
+        anyhow::ensure!(
+            !name.is_empty() && name.chars().count() <= 64 && !name.chars().any(char::is_control),
+            "agent name must contain 1 to 64 characters without control characters"
+        );
+        if self.agent_name.as_deref() == Some(name) {
+            return Ok(());
         }
+        let task = self.title.as_ref().map(|title| {
+            self.agent_name
+                .as_ref()
+                .and_then(|previous| title.strip_prefix(&format!("{previous} · ")))
+                .unwrap_or(title.as_ref())
+                .to_string()
+        });
+        self.agent_name = Some(name.to_string().into());
+        if self.is_subagent() {
+            if let Some(task) = task {
+                self.set_title(format!("{name} · {task}").into(), cx);
+            }
+        }
+        cx.notify();
+        Ok(())
     }
 
     pub(crate) fn report_source_activity(&self, path: String, cx: &mut App) {
@@ -4818,6 +4915,7 @@ impl Thread {
                         active: true,
                         source_path: None,
                         project_root: None,
+                        workspace: None,
                     },
                     cx,
                 )
@@ -5352,12 +5450,10 @@ fn is_user_prompt_message(message: &LanguageModelRequestMessage) -> bool {
 /// tool_use/tool_result pairing the API requires. Operates on the request copy
 /// only — thread state keeps the full images for replay in the UI.
 ///
-/// Retention rule: images before the latest user prompt are always elided
-/// (their canvas state is stale, and a fixed boundary keeps the request prefix
-/// byte-stable for prompt caching until the next user turn); images from the
-/// current turn are kept newest-first while their cumulative base64 size fits
-/// `byte_budget`. Pass `byte_budget = 0` to elide every image (summarization
-/// paths, where images are pure payload).
+/// User attachments remain design references across turns, unlike screenshots
+/// of earlier canvas states. Reserve their budget before retaining current-turn
+/// tool images, and avoid sending repeated copies of reattached references.
+/// Pass `byte_budget = 0` to elide every image in text-only summarization paths.
 fn elide_stale_images(messages: &mut [LanguageModelRequestMessage], byte_budget: usize) {
     let boundary = if byte_budget == 0 {
         messages.len()
@@ -5368,14 +5464,24 @@ fn elide_stale_images(messages: &mut [LanguageModelRequestMessage], byte_budget:
             .unwrap_or(0)
     };
     let mut kept_bytes = 0_usize;
-    let mut keep = |image: &language_model::LanguageModelImage, index: usize| {
-        if index < boundary || image.len() > byte_budget.saturating_sub(kept_bytes) {
-            false
-        } else {
-            kept_bytes += image.len();
-            true
+    let mut seen_references = HashSet::default();
+    for message in messages.iter_mut().rev() {
+        for content in message.content.iter_mut().rev() {
+            let MessageContent::Image(image) = content else {
+                continue;
+            };
+            if seen_references.contains(image) {
+                *content = MessageContent::Text(
+                    "[duplicate reference image: an identical attachment is included in a later user message]".into(),
+                );
+            } else if image.len() <= byte_budget.saturating_sub(kept_bytes) && byte_budget > 0 {
+                kept_bytes += image.len();
+                seen_references.insert(image.clone());
+            } else {
+                *content = MessageContent::Text(ELIDED_IMAGE_PLACEHOLDER.into());
+            }
         }
-    };
+    }
     for (index, message) in messages.iter_mut().enumerate().rev() {
         for content in message.content.iter_mut().rev() {
             match content {
@@ -5384,18 +5490,14 @@ fn elide_stale_images(messages: &mut [LanguageModelRequestMessage], byte_budget:
                         let LanguageModelToolResultContent::Image(image) = part else {
                             continue;
                         };
-                        if !keep(image, index) {
+                        if index < boundary || image.len() > byte_budget.saturating_sub(kept_bytes)
+                        {
                             *part = LanguageModelToolResultContent::Text(
                                 ELIDED_IMAGE_PLACEHOLDER.into(),
                             );
+                        } else {
+                            kept_bytes += image.len();
                         }
-                    }
-                }
-                language_model::MessageContent::Image(image) => {
-                    if !keep(image, index) {
-                        *content = language_model::MessageContent::Text(
-                            ELIDED_IMAGE_PLACEHOLDER.to_string(),
-                        );
                     }
                 }
                 _ => {}
@@ -5425,6 +5527,18 @@ fn extend_request_history_until(
             messages,
             compaction_ix,
         ));
+    } else {
+        for message in &messages[..compaction_ix] {
+            if let Message::User(user_message) = &**message {
+                let mut message = user_message.to_request();
+                message
+                    .content
+                    .retain(|content| matches!(content, MessageContent::Image(_)));
+                if !message.content.is_empty() {
+                    request_messages.push(message);
+                }
+            }
+        }
     }
 
     for message in &messages[compaction_ix..end_ix] {
@@ -5443,6 +5557,8 @@ fn retained_user_request_messages_before(
     compaction_ix: usize,
 ) -> Vec<LanguageModelRequestMessage> {
     let mut remaining_bytes = COMPACTION_RETAINED_USER_MESSAGES_BYTE_BUDGET;
+    let mut remaining_image_bytes = RETAINED_IMAGES_BYTE_BUDGET;
+    let mut seen_images = HashSet::default();
     let mut retained_messages = Vec::new();
 
     for message in messages[..compaction_ix].iter().rev() {
@@ -5453,19 +5569,37 @@ fn retained_user_request_messages_before(
             continue;
         }
 
-        let request_message = user_message.to_request();
+        let mut request_message = user_message.to_request();
+        let mut retained_images = Vec::new();
+        for content in request_message.content.iter().rev() {
+            if let MessageContent::Image(image) = content
+                && !seen_images.contains(image)
+                && let Some(bytes) = remaining_image_bytes.checked_sub(image.len())
+            {
+                remaining_image_bytes = bytes;
+                seen_images.insert(image.clone());
+                retained_images.push(MessageContent::Image(image.clone()));
+            }
+        }
+        retained_images.reverse();
+        request_message
+            .content
+            .retain(|content| !matches!(content, MessageContent::Image(_)));
         let byte_count = user_message_byte_len(&request_message);
         if let Some(bytes) = remaining_bytes.checked_sub(byte_count) {
             remaining_bytes = bytes;
-            retained_messages.push(request_message);
         } else {
-            if remaining_bytes > 0
-                && let Some(request_message) =
-                    truncate_user_message_to_byte_budget(request_message, remaining_bytes)
-            {
-                retained_messages.push(request_message);
-            }
-            break;
+            request_message =
+                truncate_user_message_to_byte_budget(request_message.clone(), remaining_bytes)
+                    .unwrap_or_else(|| LanguageModelRequestMessage {
+                        content: Vec::new(),
+                        ..request_message
+                    });
+            remaining_bytes = 0;
+        }
+        request_message.content.extend(retained_images);
+        if !request_message.content.is_empty() {
+            retained_messages.push(request_message);
         }
     }
 
@@ -6099,7 +6233,14 @@ impl ToolCallEventStream {
                     })
                     .ok()
             })
-            .unwrap_or_else(|| ("fanta-agent".into(), "Fanta Agent".into()))
+            .unwrap_or_else(|| ("fanta-agent".into(), "Merlyn".into()))
+    }
+
+    pub fn set_agent_name(&self, name: String, cx: &mut App) -> Result<()> {
+        self.thread
+            .as_ref()
+            .context("agent session is unavailable")?
+            .update(cx, |thread, cx| thread.set_agent_name(name, cx))?
     }
 
     pub fn report_design_activity(
@@ -6108,6 +6249,49 @@ impl ToolCallEventStream {
         page: Option<usize>,
         node: Option<String>,
         world: Option<[f64; 2]>,
+        cx: &mut App,
+    ) {
+        self.report_workspace_activity(
+            action,
+            page,
+            node,
+            world,
+            design_surface::AgentWorkspace::Canvas,
+            cx,
+        );
+    }
+
+    pub fn report_source_activity(&self, path: String, action: &str, cx: &mut App) {
+        if let Some(surface) = design_surface::active(cx) {
+            let (agent_id, agent_name) = self.agent_identity(cx);
+            surface
+                .report_source_activity(
+                    path,
+                    design_surface::AgentActivity {
+                        agent_id,
+                        agent_name,
+                        action: action.into(),
+                        page: None,
+                        node: None,
+                        world: None,
+                        active: true,
+                        source_path: None,
+                        project_root: None,
+                        workspace: Some(design_surface::AgentWorkspace::Code),
+                    },
+                    cx,
+                )
+                .log_err();
+        }
+    }
+
+    pub fn report_workspace_activity(
+        &self,
+        action: &str,
+        page: Option<usize>,
+        node: Option<String>,
+        world: Option<[f64; 2]>,
+        workspace: design_surface::AgentWorkspace,
         cx: &mut App,
     ) {
         if let Some(surface) = design_surface::active(cx) {
@@ -6124,6 +6308,7 @@ impl ToolCallEventStream {
                         active: true,
                         source_path: None,
                         project_root: None,
+                        workspace: Some(workspace),
                     },
                     cx,
                 )
@@ -8017,6 +8202,82 @@ mod tests {
         }
     }
 
+    struct ThirdPartyAuthorizationTool;
+
+    impl AgentTool for ThirdPartyAuthorizationTool {
+        type Input = ();
+        type Output = String;
+
+        const NAME: &'static str = "test_third_party_authorization";
+
+        fn kind() -> acp::ToolKind {
+            acp::ToolKind::Other
+        }
+
+        fn initial_title(
+            &self,
+            _input: Result<Self::Input, serde_json::Value>,
+            _cx: &mut App,
+        ) -> SharedString {
+            "Third-party authorization".into()
+        }
+
+        fn run(
+            self: Arc<Self>,
+            _input: ToolInput<Self::Input>,
+            event_stream: ToolCallEventStream,
+            cx: &mut App,
+        ) -> Task<Result<Self::Output, Self::Output>> {
+            let authorization = event_stream.authorize_third_party_tool(
+                "Generate image",
+                "imagegen".into(),
+                "ImageGen".into(),
+                cx,
+            );
+            let (agent_id, _) = event_stream.agent_identity(cx);
+            cx.spawn(async move |_| {
+                authorization.await.map_err(|error| error.to_string())?;
+                Ok(agent_id)
+            })
+        }
+    }
+
+    #[gpui::test]
+    async fn test_run_tool_can_authorize_and_read_owning_thread(cx: &mut TestAppContext) {
+        let (thread, _) = setup_thread_for_test(cx).await;
+        let (events_tx, mut events_rx) = mpsc::unbounded();
+        let event_stream = ThreadEventStream(events_tx);
+        let (_cancellation_tx, cancellation_rx) = watch::channel(false);
+        let tool = ThirdPartyAuthorizationTool.erase();
+        let agent_id = thread.read_with(cx, |thread, _| thread.id.to_string());
+
+        let result = thread.update(cx, |thread, cx| {
+            thread.set_profile(AgentProfileId(builtin_profiles::FULL_ACCESS.into()), cx);
+            thread.run_tool(
+                tool,
+                ToolInput::resolved(serde_json::Value::Null),
+                "authorization-test".into(),
+                ThirdPartyAuthorizationTool::NAME.into(),
+                &event_stream,
+                cancellation_rx,
+                cx,
+            )
+        });
+
+        let result = result.await;
+        assert!(!result.is_error);
+        assert_eq!(result.output, Some(json!(agent_id)));
+        while let Some(Some(event)) = events_rx.next().now_or_never() {
+            assert!(
+                !matches!(
+                    event.expect("tool event"),
+                    ThreadEvent::ToolCallAuthorization(_)
+                ),
+                "Full Access should not emit a permission prompt"
+            );
+        }
+    }
+
     #[gpui::test]
     async fn test_full_access_authorizes_tools_without_prompting(cx: &mut TestAppContext) {
         let (thread, _) = setup_thread_for_test(cx).await;
@@ -8742,15 +9003,14 @@ mod tests {
         ];
         elide_stale_images(&mut messages, 100);
 
-        // Everything before the latest user prompt is elided regardless of
-        // budget: the prior turn's attachment and screenshot.
-        assert_eq!(messages[0].content[1], user_placeholder);
+        assert_eq!(
+            messages[0].content[1],
+            language_model::MessageContent::Image(image_of_len(10))
+        );
         assert_eq!(
             parts_of(&messages[1]),
             &[tool_text("note"), tool_placeholder.clone()]
         );
-        // Current turn keeps newest-first while cumulative size fits the
-        // budget: 40 + 50 fit, 60 would exceed 100.
         assert_eq!(parts_of(&messages[5]), &[tool_image(40)]);
         assert_eq!(parts_of(&messages[4]), &[tool_image(50)]);
         assert_eq!(
@@ -8790,6 +9050,89 @@ mod tests {
         elide_stale_images(&mut messages, 0);
         assert_eq!(messages[0].content[0], user_placeholder);
         assert_eq!(parts_of(&messages[1]), &[tool_placeholder]);
+    }
+
+    #[test]
+    fn test_references_take_priority_over_tool_screenshots_and_reattached_copies() {
+        let reference = LanguageModelImage {
+            source: "reference".into(),
+        };
+        let screenshot = LanguageModelImage {
+            source: "screenshot that consumes the budget".into(),
+        };
+        let user_message = |content| LanguageModelRequestMessage {
+            role: Role::User,
+            content,
+            cache: false,
+            reasoning_details: None,
+        };
+        let mut messages = vec![
+            user_message(vec![MessageContent::Image(reference.clone())]),
+            user_message(vec!["Continue".into()]),
+            user_message(vec![MessageContent::Image(reference.clone())]),
+            user_message(vec![MessageContent::ToolResult(LanguageModelToolResult {
+                tool_use_id: "screenshot".into(),
+                tool_name: "design_screenshot".into(),
+                is_error: false,
+                content: vec![screenshot.into()],
+                output: None,
+            })]),
+        ];
+        elide_stale_images(&mut messages, reference.len());
+        assert_eq!(messages[2].content, vec![MessageContent::Image(reference)]);
+        assert!(
+            matches!(messages[0].content.first(), Some(MessageContent::Text(text)) if text.contains("duplicate reference image"))
+        );
+        let Some(MessageContent::ToolResult(result)) = messages[3].content.first() else {
+            panic!("expected screenshot result");
+        };
+        assert_eq!(result.content, vec![ELIDED_IMAGE_PLACEHOLDER.into()]);
+    }
+
+    #[test]
+    fn test_compaction_keeps_reference_images_outside_the_text_budget() {
+        let image = LanguageModelImage {
+            source: "x"
+                .repeat(COMPACTION_RETAINED_USER_MESSAGES_BYTE_BUDGET + 1)
+                .into(),
+        };
+        let mut messages = vec![
+            Arc::new(Message::User(UserMessage {
+                id: ClientUserMessageId::new(),
+                content: vec![
+                    UserMessageContent::Text("Build this screen".into()),
+                    UserMessageContent::Image(image.clone()),
+                ]
+                .into(),
+            })),
+            user_text_message(
+                ClientUserMessageId::new(),
+                &"x".repeat(COMPACTION_RETAINED_USER_MESSAGES_BYTE_BUDGET),
+            ),
+            summary_compaction("Building the screen"),
+            user_text_message(ClientUserMessageId::new(), "Continue"),
+        ];
+        for compaction in [
+            CompactionInfo::Summary("Building the screen".into()),
+            CompactionInfo::ProviderNative {
+                provider: "test".to_string().into(),
+                items: vec![json!({"type": "compaction"})],
+            },
+        ] {
+            *messages.get_mut(2).expect("compaction") = Arc::new(Message::Compaction(compaction));
+            let mut request_messages = Vec::new();
+            extend_request_history_until(&messages, &mut request_messages, messages.len());
+            elide_stale_images(&mut request_messages, RETAINED_IMAGES_BYTE_BUDGET);
+            let images = request_messages
+                .iter()
+                .flat_map(|message| &message.content)
+                .filter_map(|content| match content {
+                    MessageContent::Image(image) => Some(image),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(images, vec![&image]);
+        }
     }
 
     #[test]

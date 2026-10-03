@@ -37,8 +37,11 @@ use crate::{AgentTool, ThreadEnvironment, ToolCallEventStream, ToolInput};
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct SpawnAgentToolInput {
-    /// Short label displayed in the UI while the agent runs (e.g., "Researching alternatives")
+    /// Short task description displayed separately from the agent's name (e.g., "Building navigation").
     pub label: String,
+    /// Choose a distinct wizard or mage name for this specialist, such as Morgana, Cornelius or Severus. Keep it stable on follow-ups; the session preserves the task description separately.
+    #[serde(default)]
+    pub mage_name: Option<String>,
     /// The prompt for the agent. For new sessions, include full context needed for the task. For follow-ups (with session_id), you can rely on the agent already having the previous message.
     pub message: String,
     /// Session ID of an existing agent session to continue instead of creating a new one.
@@ -145,7 +148,8 @@ impl AgentTool for SpawnAgentTool {
                 let subagent = if let Some(session_id) = input.session_id {
                     self.environment.resume_subagent(session_id, cx)
                 } else {
-                    self.environment.create_subagent(input.label, cx)
+                    self.environment
+                        .create_named_subagent(input.label, input.mage_name, cx)
                 };
                 let subagent = subagent.map_err(|err| SpawnAgentToolOutput::Error {
                     session_id: None,

@@ -314,14 +314,7 @@ pub fn into_anthropic(
             && matches!(mode, AnthropicModelMode::AdaptiveThinking)
         {
             request.thinking_effort.as_deref().and_then(|effort| {
-                let effort = match effort {
-                    "low" => Some(crate::Effort::Low),
-                    "medium" => Some(crate::Effort::Medium),
-                    "high" => Some(crate::Effort::High),
-                    "xhigh" => Some(crate::Effort::XHigh),
-                    "max" => Some(crate::Effort::Max),
-                    _ => None,
-                };
+                let effort = effort.parse::<crate::Effort>().ok();
                 effort.map(|effort| crate::OutputConfig {
                     effort: Some(effort),
                 })

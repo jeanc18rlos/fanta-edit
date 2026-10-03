@@ -152,6 +152,7 @@ mod tests {
     fn make_thread(title: &str, updated_at: DateTime<Utc>) -> DbThread {
         DbThread {
             title: title.to_string().into(),
+            agent_name: None,
             messages: Vec::new(),
             updated_at,
             detailed_summary: None,

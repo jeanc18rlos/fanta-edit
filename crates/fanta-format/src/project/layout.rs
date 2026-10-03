@@ -307,7 +307,9 @@ Every element has a stable bare-ULID `id="…"` in `.fnx`. Keep that ID when cha
 moving an element. To duplicate one, remove `id` from the copy so the editor
 assigns and writes a fresh ID; two elements with the same explicit ID fail to
 parse. The neighboring `.ids.json` file is a compatibility/order sidecar kept
-in sync by the editor. Do not hand-edit sidecars or ids in `fanta.json`.
+in sync by the editor. JSON files are editable; preserve identities and validate
+their schema and references before saving. Modern FNX with explicit IDs can
+recover a missing or damaged identity sidecar without changing those IDs.
 
 ## What you can do by editing `.fnx`
 
@@ -327,8 +329,10 @@ Editing the readable source changes the design directly:
 
 - Keep the JSX well-formed: balanced tags, valid attribute values. A `.fnx`
   that fails to parse will not load.
-- Do not hand-edit `page.ids.json`, `master.ids.json`, or ids in
-  `fanta.json`. Preserve each existing element's explicit `id` in `.fnx`.
+- Preserve each existing element's explicit `id` in `.fnx` and identity
+  references in JSON. Inspect the current schema before editing sidecars or
+  manifest metadata. A JSON file parsing successfully does not prove its
+  typed values and references are valid; validate the complete project.
 - Assets are shared **by reference**: they live under `assets/<family>/` and are
   named by content id. `assets/index.json` records full SHA-256 digests and
   sizes. Reference assets by id; never paste binary data inline into `.fnx`.
@@ -506,9 +510,25 @@ posts an attributed agent reply to an exact comment id; resolve only after
 verifying the requested work. Review mode reads designs and replies to
 comments without changing scene content. Plan mode is read-only.
 
-**`report_agent_activity`** reports a stable agent id, name, action and
-page/node/world focus. The canvas draws a named animated cursor and allows
-the user to follow an agent. Set `active: false` when finished.
+**`report_agent_activity`** reports a stable agent id, mage name, action,
+page/node/world focus, `source_path` and `workspace` (`canvas`, `variables`,
+`code`). Choose a mage name such as Merlyn, Morgana, Cornelius or Severus.
+Use the same name throughout the task. The user can follow that agent across
+source-file tabs and editor workspaces. Report the actual working location
+at every visible milestone. External MCP agents must reuse the same identity
+in `batch_design.activity` so each streamed placement stays attributed to
+that agent. Set `active: false` when finished.
+
+### Visible progress
+
+Build one component or one coherent screen section at a time. Prefer native
+canvas operations, which paint each edit gradually. For source edits, save a
+complete, valid milestone before continuing. Show each new component on the
+current page or open its own page/file tab, focus it, and place a representative
+instance before building the next component. Do not build a hidden component
+library before showing the screen. Give delegated agents the same visibility
+requirements and the user's reference attachments. Let actual edits drive
+cursor positions and highlights; report file/workspace focus when switching.
 
 ## Creating animations
 
@@ -857,7 +877,8 @@ pub(crate) fn read_json_file(path: &Path) -> Result<Value> {
             FormatError::Io(e)
         }
     })?;
-    Ok(serde_json::from_str(&text)?)
+    serde_json::from_str(&text)
+        .map_err(|error| FormatError::InvalidProjectTree(format!("{}: {error}", path.display())))
 }
 
 /// Read a JSON file, substituting `fallback` when the file doesn't exist.

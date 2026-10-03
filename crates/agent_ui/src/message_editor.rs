@@ -2262,7 +2262,7 @@ mod tests {
     use futures::{FutureExt as _, StreamExt as _};
     use gpui::{
         AppContext, ClipboardEntry, ClipboardItem, Entity, EventEmitter, ExternalPaths,
-        FocusHandle, Focusable, Task, TestAppContext, VisualTestContext,
+        FocusHandle, Focusable, Task, TestAppContext, UpdateGlobal, VisualTestContext,
     };
     use language_model::LanguageModelRegistry;
     use lsp::{CompletionContext, CompletionTriggerKind};
@@ -3155,6 +3155,17 @@ mod tests {
     #[gpui::test]
     async fn test_context_completion_provider_mentions(cx: &mut TestAppContext) {
         init_test(cx);
+        cx.update(|cx| {
+            settings::SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings
+                        .project
+                        .all_languages
+                        .defaults
+                        .enable_language_server = Some(true);
+                });
+            });
+        });
 
         let app_state = cx.update(AppState::test);
 

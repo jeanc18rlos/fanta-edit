@@ -736,6 +736,8 @@ pub enum AdaptiveThinkingDisplay {
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum Effort {
+    None,
+    Minimal,
     Low,
     Medium,
     High,
@@ -743,6 +745,32 @@ pub enum Effort {
     #[strum(serialize = "xhigh")]
     XHigh,
     Max,
+}
+
+impl Effort {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "Off",
+            Self::Minimal => "Minimal",
+            Self::Low => "Low",
+            Self::Medium => "Medium",
+            Self::High => "High",
+            Self::XHigh => "Extra high",
+            Self::Max => "Max",
+        }
+    }
+
+    pub fn value(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -2988,6 +2988,30 @@ impl Sidebar {
                             )
                         });
 
+                        let menu = menu.when(project_group_key.host().is_none(), |menu| {
+                            let project_root = project_group_key
+                                .path_list()
+                                .ordered_paths()
+                                .find(|path| path.is_dir())
+                                .cloned()
+                                .or_else(|| {
+                                    project_group_key.path_list().ordered_paths().next().map(
+                                        |path| {
+                                            if path.is_file() {
+                                                path.parent().unwrap_or(path).to_path_buf()
+                                            } else {
+                                                path.clone()
+                                            }
+                                        },
+                                    )
+                                });
+                            menu.entry("Show Project in File Manager", None, move |_, cx| {
+                                if let Some(project_root) = &project_root {
+                                    cx.reveal_path(project_root);
+                                }
+                            })
+                        });
+
                         let menu = menu
                             .custom_entry(
                                 {

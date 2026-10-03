@@ -45,15 +45,91 @@ pub(super) fn read_project_tree_with_source_override(
     source_override: Option<&FnxSourceOverride<'_>>,
 ) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>)> {
     super::layout::with_project_read_lock(dir, || {
-        read_project_tree_with_source_override_locked(dir, source_override)
+        read_project_tree_with_source_override_locked(dir, source_override, None)
     })
+}
+
+pub(super) struct JsonSourceOverride<'a> {
+    pub path: &'a Path,
+    pub value: &'a Value,
+}
+
+pub(super) fn read_project_tree_with_json_override(
+    dir: &Path,
+    source_override: &JsonSourceOverride<'_>,
+) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>)> {
+    super::layout::with_project_read_lock(dir, || {
+        read_project_tree_with_source_override_locked(dir, None, Some(source_override))
+    })
+}
+
+fn read_project_json(
+    path: &Path,
+    source_override: Option<&JsonSourceOverride<'_>>,
+) -> Result<Value> {
+    let value = match source_override.filter(|source| source.path == path) {
+        Some(source) => source.value.clone(),
+        None => read_json_file(path)?,
+    };
+    validate_project_json_shape(path, &value)?;
+    Ok(value)
+}
+
+fn read_project_json_or(
+    path: &Path,
+    fallback: Value,
+    source_override: Option<&JsonSourceOverride<'_>>,
+) -> Result<Value> {
+    let value = match source_override.filter(|source| source.path == path) {
+        Some(source) => source.value.clone(),
+        None => read_json_or(path, fallback)?,
+    };
+    validate_project_json_shape(path, &value)?;
+    Ok(value)
+}
+
+pub(super) fn validate_project_json_shape(path: &Path, value: &Value) -> Result<()> {
+    let (valid, expected) = match path.file_name().and_then(|name| name.to_str()) {
+        Some(FLOW_START_JSON) => (value.is_null() || value.is_string(), "a node ID or null"),
+        Some(FLOWS_JSON) => (value.is_array(), "an array"),
+        Some(PRESENTATION_JSON) => (value.is_null() || value.is_object(), "an object or null"),
+        _ => (value.is_object(), "an object"),
+    };
+    if !valid {
+        return Err(FormatError::InvalidProjectTree(format!(
+            "{} must contain {expected}",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn read_project_tree_with_source_override_locked(
     dir: &Path,
     source_override: Option<&FnxSourceOverride<'_>>,
+    json_override: Option<&JsonSourceOverride<'_>>,
 ) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>)> {
-    let manifest = read_manifest(dir)?;
+    let manifest =
+        match json_override.filter(|source| source.path == dir.join(super::layout::FANTA_JSON)) {
+            Some(source) => {
+                validate_project_json_shape(source.path, source.value)?;
+                let manifest: super::layout::ProjectManifest =
+                    serde_json::from_value(source.value.clone())?;
+                if manifest.format != super::layout::FORMAT_TAG {
+                    return Err(FormatError::NotAProject {
+                        path: dir.to_path_buf(),
+                    });
+                }
+                if manifest.version > super::layout::PROJECT_VERSION {
+                    return Err(FormatError::UnsupportedProjectVersion {
+                        found: manifest.version,
+                        supported: super::layout::PROJECT_VERSION,
+                    });
+                }
+                manifest
+            }
+            None => read_manifest(dir)?,
+        };
     if manifest.schema_version > SCHEMA_VERSION {
         return Err(FormatError::UnsupportedSchema {
             found: manifest.schema_version,
@@ -78,31 +154,33 @@ fn read_project_tree_with_source_override_locked(
     let doc_dir = dir.join(DOC_DIR);
     root.insert(
         "metadata".to_owned(),
-        read_json_file(&doc_dir.join(METADATA_JSON))?,
+        read_project_json(&doc_dir.join(METADATA_JSON), json_override)?,
     );
     root.insert(
         "asset_library".to_owned(),
-        read_json_or(&doc_dir.join(ASSET_LIBRARY_JSON), json!({}))?,
+        read_project_json_or(&doc_dir.join(ASSET_LIBRARY_JSON), json!({}), json_override)?,
     );
-    let variables = read_json_or(&doc_dir.join(VARIABLES_JSON), json!({}))?;
+    let variables = read_project_json_or(&doc_dir.join(VARIABLES_JSON), json!({}), json_override)?;
     root.insert("variables".to_owned(), variables.clone());
     root.insert(
         "active_modes".to_owned(),
-        read_json_or(&doc_dir.join(ACTIVE_MODES_JSON), json!({}))?,
+        read_project_json_or(&doc_dir.join(ACTIVE_MODES_JSON), json!({}), json_override)?,
     );
     root.insert(
         "motion".to_owned(),
-        read_json_or(&doc_dir.join(MOTION_JSON), json!({}))?,
+        read_project_json_or(&doc_dir.join(MOTION_JSON), json!({}), json_override)?,
     );
-    let flow_start = read_json_or(&doc_dir.join(FLOW_START_JSON), Value::Null)?;
+    let flow_start =
+        read_project_json_or(&doc_dir.join(FLOW_START_JSON), Value::Null, json_override)?;
     if !flow_start.is_null() {
         root.insert("flow_start".to_owned(), flow_start);
     }
     root.insert(
         "flows".to_owned(),
-        read_json_or(&doc_dir.join(FLOWS_JSON), json!([]))?,
+        read_project_json_or(&doc_dir.join(FLOWS_JSON), json!([]), json_override)?,
     );
-    let presentation = read_json_or(&doc_dir.join(PRESENTATION_JSON), Value::Null)?;
+    let presentation =
+        read_project_json_or(&doc_dir.join(PRESENTATION_JSON), Value::Null, json_override)?;
     if !presentation.is_null() {
         root.insert("presentation".to_owned(), presentation);
     }
@@ -115,7 +193,7 @@ fn read_project_tree_with_source_override_locked(
     // deduped winner set. Names are emitted back only for layout v4+ trees;
     // resolution is accepted on read regardless (like the width/height
     // sugar), so a hand-named reference in an older tree still loads.
-    let component_scan = scan_components(dir)?;
+    let component_scan = scan_components(dir, json_override)?;
     let refs = crate::project::refs_ctx::build_ref_table_json(
         &component_scan.defs,
         &variables,
@@ -125,12 +203,20 @@ fn read_project_tree_with_source_override_locked(
     let mut nodes = Map::new();
     root.insert(
         "pages".to_owned(),
-        read_pages(dir, manifest.version, source_override, &refs, &mut nodes)?,
+        read_pages(
+            dir,
+            manifest.version,
+            source_override,
+            json_override,
+            &refs,
+            &mut nodes,
+        )?,
     );
     read_component_masters(
         &component_scan,
         manifest.version,
         source_override,
+        json_override,
         &refs,
         &mut nodes,
     )?;
@@ -144,10 +230,14 @@ fn read_project_tree_with_source_override_locked(
     if manifest.schema_version < SCHEMA_VERSION {
         value = migrate(value, manifest.schema_version, SCHEMA_VERSION)?;
     }
-    let doc = Doc::from_json_str(&value.to_string())
-        .map_err(|e| FormatError::InvalidProjectTree(format!("doc failed to reassemble: {e}")))?;
-
-    let assets = read_assets(dir)?;
+    let assets = read_assets(dir, json_override)?;
+    let doc = Doc::from_json_str(&value.to_string()).map_err(|error| {
+        let error = match serde_path_to_error::deserialize::<_, Doc>(&value) {
+            Err(error) => error.to_string(),
+            Ok(_) => error.to_string(),
+        };
+        FormatError::InvalidProjectTree(format!("{}: {error}", dir.display()))
+    })?;
     Ok((doc, assets))
 }
 
@@ -169,6 +259,7 @@ fn read_pages(
     dir: &Path,
     version: u32,
     source_override: Option<&FnxSourceOverride<'_>>,
+    json_override: Option<&JsonSourceOverride<'_>>,
     refs: &fanta_fnx::RefTable,
     nodes: &mut Map<String, Value>,
 ) -> Result<Value> {
@@ -190,13 +281,13 @@ fn read_pages(
             let name = dir_name(&entry)?;
             if name == LOOSE_DIR {
                 // Orphans are kept as per-node JSON (they need not form a tree).
-                read_nodes_into(&entry.join(NODES_DIR), nodes)?;
+                read_nodes_into(&entry.join(NODES_DIR), json_override, nodes)?;
                 continue;
             }
             if !entry.join(PAGE_JSON).is_file() {
                 continue;
             }
-            let header = read_json_file(&entry.join(PAGE_JSON))?;
+            let header = read_project_json(&entry.join(PAGE_JSON), json_override)?;
             let (id, id_from_header) = match header.get("id").and_then(Value::as_str) {
                 Some(id) => {
                     let id = id.parse().map_err(|e| {
@@ -256,6 +347,7 @@ fn read_pages(
                 version,
                 true,
                 source_override,
+                json_override,
                 refs,
                 nodes,
             )?;
@@ -396,7 +488,10 @@ struct ComponentScan {
 /// slug-changing save can leave the old and the new dir side by side); losing
 /// directories contribute neither a def nor nodes — see
 /// [`select_design_winners`].
-fn scan_components(dir: &Path) -> Result<ComponentScan> {
+fn scan_components(
+    dir: &Path,
+    json_override: Option<&JsonSourceOverride<'_>>,
+) -> Result<ComponentScan> {
     struct ComponentDir {
         id: ComponentId,
         id_from_header: bool,
@@ -412,7 +507,7 @@ fn scan_components(dir: &Path) -> Result<ComponentScan> {
         for entry in sorted_entries(&comp_dir)? {
             if entry.is_file() {
                 if entry.file_name().is_some_and(|n| n == SETS_JSON) {
-                    sets = read_json_file(&entry)?;
+                    sets = read_project_json(&entry, json_override)?;
                 }
                 continue;
             }
@@ -423,7 +518,7 @@ fn scan_components(dir: &Path) -> Result<ComponentScan> {
             if !entry.join(DEF_JSON).is_file() {
                 continue;
             }
-            let def = read_json_file(&entry.join(DEF_JSON))?;
+            let def = read_project_json(&entry.join(DEF_JSON), json_override)?;
             let (id, id_from_header) = match def.get("id").and_then(Value::as_str) {
                 Some(key) => {
                     let id = id_from_key(key).map_err(|e| {
@@ -495,6 +590,7 @@ fn read_component_masters(
     scan: &ComponentScan,
     version: u32,
     source_override: Option<&FnxSourceOverride<'_>>,
+    json_override: Option<&JsonSourceOverride<'_>>,
     refs: &fanta_fnx::RefTable,
     nodes: &mut Map<String, Value>,
 ) -> Result<()> {
@@ -509,6 +605,7 @@ fn read_component_masters(
             version,
             false,
             source_override,
+            json_override,
             refs,
             nodes,
         )?;
@@ -538,6 +635,7 @@ fn read_design_nodes(
     version: u32,
     required: bool,
     source_override: Option<&FnxSourceOverride<'_>>,
+    json_override: Option<&JsonSourceOverride<'_>>,
     refs: &fanta_fnx::RefTable,
     nodes: &mut Map<String, Value>,
 ) -> Result<Option<NodeId>> {
@@ -551,7 +649,7 @@ fn read_design_nodes(
         // NOT a silently-empty page that the next save would erase forever.
         let nodes_dir = design_dir.join(NODES_DIR);
         if nodes_dir.is_dir() {
-            read_nodes_into(&nodes_dir, nodes)?;
+            read_nodes_into(&nodes_dir, json_override, nodes)?;
             return Ok(None);
         }
         if required && version >= 2 {
@@ -568,14 +666,14 @@ fn read_design_nodes(
     let sidecar: fanta_fnx::FnxSidecar =
         match source_override.and_then(|source_override| source_override.sidecar) {
             Some(sidecar) => sidecar.clone(),
-            None => serde_json::from_value(read_json_file(&design_dir.join(ids_name))?).map_err(
-                |error| {
-                    FormatError::InvalidProjectTree(format!(
-                        "{}: bad sidecar: {error}",
-                        fnx_path.display()
-                    ))
-                },
-            )?,
+            None => {
+                let sidecar_path = design_dir.join(ids_name);
+                if let Some(source) = json_override.filter(|source| source.path == sidecar_path) {
+                    persisted_fnx_sidecar(&text, Some(&serde_json::to_vec(source.value)?))?
+                } else {
+                    read_fnx_sidecar(&fnx_path, &text, &sidecar_path)?
+                }
+            }
         };
     let sidecar = reconcile_fnx_sidecar(&fnx_path, &text, &sidecar).map_err(|error| {
         FormatError::InvalidProjectTree(format!("{}: {error}", fnx_path.display()))
@@ -725,9 +823,92 @@ pub(super) fn reconcile_fnx_sidecar(
     .map_err(|error| FormatError::InvalidProjectTree(error.to_string()))
 }
 
+pub(super) fn read_fnx_sidecar(
+    source_path: &Path,
+    source: &str,
+    sidecar_path: &Path,
+) -> Result<fanta_fnx::FnxSidecar> {
+    let bytes = match std::fs::read(sidecar_path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    persisted_fnx_sidecar(source, bytes.as_deref()).map_err(|error| {
+        FormatError::InvalidProjectTree(format!("{}: {error}", source_path.display()))
+    })
+}
+
+pub(crate) fn persisted_fnx_sidecar(
+    source: &str,
+    bytes: Option<&[u8]>,
+) -> Result<fanta_fnx::FnxSidecar> {
+    let persisted = bytes
+        .ok_or_else(|| FormatError::InvalidProjectTree("missing identity sidecar".into()))
+        .and_then(|bytes| {
+            serde_json::from_slice::<fanta_fnx::FnxSidecar>(bytes).map_err(|error| {
+                FormatError::InvalidProjectTree(format!("invalid identity sidecar: {error}"))
+            })
+        });
+    let result = persisted
+        .as_ref()
+        .map_err(|error| error.to_string())
+        .and_then(|sidecar| {
+            if sidecar.ids.iter().any(|entry| {
+                id_from_key::<NodeId>(&entry.id).is_err()
+                    || (!entry.index.is_null() && !entry.index.is_number())
+            }) || sidecar
+                .root_parent
+                .as_ref()
+                .is_some_and(|parent| id_from_key::<NodeId>(parent).is_err())
+            {
+                return Err("invalid node identity or sibling order in identity sidecar".into());
+            }
+            reconcile_fnx_sidecar(Path::new(""), source, sidecar).map_err(|error| error.to_string())
+        });
+    match result {
+        Ok(sidecar) => Ok(sidecar),
+        Err(error) => {
+            // Modern source pins every identity itself. Reconstruct its order
+            // from nesting rather than letting a damaged compatibility file
+            // make the whole project unopenable or invent legacy identities.
+            let root = fanta_fnx::parse_doc(source)
+                .map_err(|error| FormatError::InvalidProjectTree(error.to_string()))?;
+            fn has_explicit_ids(element: &fanta_fnx::FnxElement) -> bool {
+                element
+                    .attrs
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| id_from_key::<NodeId>(id).is_ok())
+                    && element.children.iter().all(has_explicit_ids)
+            }
+            if !has_explicit_ids(&root) {
+                return Err(FormatError::InvalidProjectTree(format!(
+                    "{error}; restore the sidecar for source without explicit node IDs"
+                )));
+            }
+            let root_parent = persisted
+                .ok()
+                .and_then(|sidecar| sidecar.root_parent)
+                .filter(|parent| id_from_key::<NodeId>(parent).is_ok());
+            reconcile_fnx_sidecar(
+                Path::new(""),
+                source,
+                &fanta_fnx::FnxSidecar {
+                    root_parent,
+                    ids: Vec::new(),
+                },
+            )
+        }
+    }
+}
+
 /// Read every `<node-id>.json` in `nodes_dir` into the flat scene map, keyed
 /// by the id's serde form. The filename is the id of record.
-fn read_nodes_into(nodes_dir: &Path, nodes: &mut Map<String, Value>) -> Result<()> {
+fn read_nodes_into(
+    nodes_dir: &Path,
+    json_override: Option<&JsonSourceOverride<'_>>,
+    nodes: &mut Map<String, Value>,
+) -> Result<()> {
     if !nodes_dir.is_dir() {
         return Ok(());
     }
@@ -741,7 +922,7 @@ fn read_nodes_into(nodes_dir: &Path, nodes: &mut Map<String, Value>) -> Result<(
         let id: NodeId = stem.parse().map_err(|e| {
             FormatError::InvalidProjectTree(format!("node file {stem:?} is not a NodeId: {e}"))
         })?;
-        nodes.insert(json_key(&id)?, read_json_file(&path)?);
+        nodes.insert(json_key(&id)?, read_project_json(&path, json_override)?);
     }
     Ok(())
 }
@@ -749,17 +930,25 @@ fn read_nodes_into(nodes_dir: &Path, nodes: &mut Map<String, Value>) -> Result<(
 /// Scan `assets/**` and parse each filename stem back into an [`AssetId`].
 /// Family folder and extension are projections only; files whose stem isn't an
 /// id (OS noise like `.DS_Store`) are skipped with a warning.
-fn read_assets(dir: &Path) -> Result<BTreeMap<AssetId, Vec<u8>>> {
+fn read_assets(
+    dir: &Path,
+    json_override: Option<&JsonSourceOverride<'_>>,
+) -> Result<BTreeMap<AssetId, Vec<u8>>> {
     let mut assets = BTreeMap::new();
     let assets_dir = dir.join(ASSETS_DIR);
     if assets_dir.is_dir() {
         let index_path = assets_dir.join(super::media::ASSET_INDEX_FILE);
-        let index = index_path
-            .is_file()
-            .then(|| std::fs::read(&index_path))
-            .transpose()?
-            .map(|bytes| super::media::read_asset_index(&bytes))
-            .transpose()?;
+        let index = match json_override.filter(|source| source.path == index_path) {
+            Some(source) => Some(super::media::read_asset_index(&serde_json::to_vec(
+                source.value,
+            )?)?),
+            None => index_path
+                .is_file()
+                .then(|| std::fs::read(&index_path))
+                .transpose()?
+                .map(|bytes| super::media::read_asset_index(&bytes))
+                .transpose()?,
+        };
         collect_assets(&assets_dir, &mut assets, index.as_ref())?;
         if let Some(index) = index {
             index.verify_complete(&assets)?;

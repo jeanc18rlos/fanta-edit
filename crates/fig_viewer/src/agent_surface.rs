@@ -8,6 +8,7 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;
@@ -29,11 +30,12 @@ use fanta_render::{AssetResolver, RasterRenderer, visual_world_bounds};
 use gpui::{App, AppContext as _, Entity, Global, Task, WeakEntity};
 use serde_json::{Value, json};
 use std::sync::Arc;
+use util::ResultExt as _;
 
 use crate::clipboard::{create_operations, duplicate_operations};
 use crate::document::{
-    AssetStores, DocChange, FigDocument, FigItem, FigPage, MAX_IMAGE_SOURCE_BYTES, PreparedImage,
-    SaveKind, page_bounds,
+    AssetStores, DocChange, FigDocument, FigItem, FigItemEvent, FigPage, MAX_IMAGE_SOURCE_BYTES,
+    PreparedImage, SaveKind, page_bounds,
 };
 use crate::export::render_inputs;
 use crate::properties_ops::{
@@ -77,6 +79,53 @@ impl FigDesignSurface {
             .and_then(WeakEntity::upgrade)
             .context("no design canvas is open; open a .fig file or Fanta project first")
     }
+}
+
+fn project_source_path(root: &Path, source: &Path) -> Result<PathBuf> {
+    let project_root = root
+        .canonicalize()
+        .context("resolving the design project")?;
+    let requested = if source.is_absolute() {
+        source.to_path_buf()
+    } else {
+        root.join(source)
+    };
+    let mut ancestor = requested.as_path();
+    let mut missing = Vec::new();
+    let mut resolved = loop {
+        match ancestor.canonicalize() {
+            Ok(resolved) => break resolved,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match std::fs::symlink_metadata(ancestor) {
+                    Ok(metadata) if metadata.file_type().is_symlink() => {
+                        bail!("agent source focus contains an unresolved symbolic link");
+                    }
+                    Ok(_) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error).context("reading agent source focus"),
+                }
+                let Some(std::path::Component::Normal(name)) = ancestor.components().next_back()
+                else {
+                    bail!("agent source focus must have a project-contained path");
+                };
+                missing.push(name.to_os_string());
+                ancestor = ancestor
+                    .parent()
+                    .context("agent source focus has no parent")?;
+            }
+            Err(error) => return Err(error).context("resolving agent source focus"),
+        }
+    };
+    if !missing.is_empty() && !resolved.is_dir() {
+        bail!("agent source focus parent must be a directory");
+    }
+    for name in missing.into_iter().rev() {
+        resolved.push(name);
+    }
+    if !resolved.starts_with(project_root) {
+        bail!("agent source focus must be inside the design project");
+    }
+    Ok(resolved)
 }
 
 impl DesignSurface for FigDesignSurface {
@@ -123,7 +172,7 @@ impl DesignSurface for FigDesignSurface {
     ) -> Task<Result<Value>> {
         if Path::new(&path)
             .extension()
-            .is_none_or(|extension| extension != "fnx")
+            .is_none_or(|extension| extension != "fnx" && extension != "json")
         {
             return Task::ready(Ok(json!({ "applicable": false })));
         }
@@ -235,49 +284,45 @@ impl DesignSurface for FigDesignSurface {
             let Some(root) = item.project_root() else {
                 return Ok(json!({ "reported": false }));
             };
-            let source = Path::new(&path);
-            let source = if source.is_absolute() {
-                source.to_path_buf()
-            } else {
-                root.join(source)
-            };
-            let source = match source.canonicalize() {
-                Ok(source) => source,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Ok(json!({ "reported": false }));
-                }
-                Err(error) => return Err(error).context("resolving agent source focus"),
-            };
-            let mut source_page = None;
-            for (index, page) in document.pages.iter().enumerate() {
-                let Some(page_source) = page
-                    .root
-                    .and_then(|page| fanta_format::locate_page_source(root, page))
-                else {
-                    continue;
-                };
-                if page_source
-                    .canonicalize()
-                    .context("resolving the page source focus")?
-                    == source
-                {
-                    source_page = Some(index);
-                    break;
-                }
-            }
-            let Some(page_index) = source_page else {
-                return Ok(json!({ "reported": false }));
-            };
-            activity.page = Some(page_index);
-            activity.node = None;
+            let source = project_source_path(root, Path::new(&path))?;
+            let source_page = document.pages.iter().enumerate().find_map(|(index, page)| {
+                let page_root = page.root?;
+                let page_source = document
+                    .doc
+                    .components
+                    .defs
+                    .values()
+                    .find(|definition| definition.root == page_root)
+                    .and_then(|definition| fanta_format::locate_master_source(root, definition.id))
+                    .or_else(|| fanta_format::locate_page_source(root, page_root))?;
+                (page_source.canonicalize().ok().as_ref() == Some(&source)).then_some(index)
+            });
             activity.source_path = Some(source.display().to_string());
-            let page_root = document.pages.get(page_index).and_then(|page| page.root);
-            activity.world = content_bounds(&document.doc, page_root)
-                .filter(Bounds::is_finite)
-                .map(|bounds| {
-                    let center = bounds.center();
-                    [center.x, center.y]
-                });
+            activity.workspace.get_or_insert_with(|| {
+                match source.file_name().and_then(|name| name.to_str()) {
+                    Some("variables.json" | "active_modes.json") => {
+                        design_surface::AgentWorkspace::Variables
+                    }
+                    _ if source
+                        .extension()
+                        .is_some_and(|extension| extension == "fnx") =>
+                    {
+                        design_surface::AgentWorkspace::Canvas
+                    }
+                    _ => design_surface::AgentWorkspace::Code,
+                }
+            });
+            if let Some(page_index) = source_page {
+                activity.page = Some(page_index);
+                activity.node = None;
+                let page_root = document.pages.get(page_index).and_then(|page| page.root);
+                activity.world = content_bounds(&document.doc, page_root)
+                    .filter(Bounds::is_finite)
+                    .map(|bounds| {
+                        let center = bounds.center();
+                        [center.x, center.y]
+                    });
+            }
         }
         self.report_activity(activity, cx)
     }
@@ -302,6 +347,8 @@ impl DesignSurface for FigDesignSurface {
         let item = self.item()?;
         let item = item.read(cx);
         let document = ready_document(item)?;
+        let unscoped_source =
+            activity.source_path.is_some() && activity.page.is_none() && activity.node.is_none();
         let page_index = if let Some(raw) = &activity.node {
             let id = parse_node_id(raw)?;
             let node_page = document
@@ -317,28 +364,14 @@ impl DesignSurface for FigDesignSurface {
         } else {
             resolve_page_index(document, activity.page)?
         };
-        activity.page = Some(page_index);
-        activity.source_path = activity.source_path.take().and_then(|path| {
-            let root = item.project_root()?;
-            let page_root = document.pages.get(page_index)?.root?;
-            let expected = fanta_format::locate_page_source(root, page_root)?;
-            let requested = Path::new(&path);
-            let requested = if requested.is_absolute() {
-                requested.to_path_buf()
-            } else {
-                root.join(requested)
-            };
-            match (requested.canonicalize(), expected.canonicalize()) {
-                (Ok(requested), Ok(expected)) if requested == expected => {
-                    Some(requested.display().to_string())
-                }
-                (Err(error), _) | (_, Err(error)) => {
-                    log::warn!("resolving agent source focus failed: {error}");
-                    None
-                }
-                _ => None,
-            }
-        });
+        activity.page = (!unscoped_source).then_some(page_index);
+        if let Some(path) = &activity.source_path {
+            let root = item
+                .project_root()
+                .context("agent source focus requires a design project")?;
+            let requested = project_source_path(root, Path::new(path))?;
+            activity.source_path = Some(requested.display().to_string());
+        }
         activity.project_root = item.project_root().map(|root| root.display().to_string());
         if let Some(raw) = &activity.node {
             let id = parse_node_id(raw)?;
@@ -352,7 +385,7 @@ impl DesignSurface for FigDesignSurface {
                 activity.world = Some([center.x, center.y]);
             }
         }
-        if activity.world.is_none() {
+        if activity.world.is_none() && !unscoped_source {
             let selected = document
                 .doc
                 .selection
@@ -527,6 +560,195 @@ impl DesignSurface for FigDesignSurface {
         })
     }
 
+    fn apply_streamed(
+        &self,
+        ops: Vec<DesignOp>,
+        label: String,
+        activity: Option<design_surface::AgentActivity>,
+        cx: &mut App,
+    ) -> Task<Result<Value>> {
+        let item = match self.item() {
+            Ok(item) => item,
+            Err(error) => return Task::ready(Err(error)),
+        };
+        if ops.is_empty() {
+            return Task::ready(Err(anyhow!("the ops list is empty")));
+        }
+        let default_container = item.read(cx).doc().and_then(Doc::active_page);
+        let batch = cx.new(|cx| {
+            cx.on_release(|batch: &mut StreamedDesignBatch, cx| batch.cancel(cx))
+                .detach();
+            StreamedDesignBatch {
+                item: item.downgrade(),
+                owner: cx.entity_id(),
+                progress: BatchProgress {
+                    default_container,
+                    ..BatchProgress::default()
+                },
+                original_selection: Vec::new(),
+                original_viewport: Viewport::default(),
+                pending: false,
+            }
+        });
+        let activity = activity.unwrap_or_else(|| design_surface::AgentActivity {
+            agent_id: "external-designer".into(),
+            agent_name: "Cornelius".into(),
+            action: label.clone(),
+            page: None,
+            node: None,
+            world: None,
+            active: true,
+            project_root: None,
+            source_path: None,
+            workspace: Some(design_surface::AgentWorkspace::Canvas),
+        });
+        cx.spawn(async move |cx| {
+            loop {
+                let started = batch.update(cx, |batch, cx| {
+                    item.update(cx, |item, cx| {
+                        if !item.is_editable() {
+                            bail!(
+                                "save or discard the current source edit before editing the design"
+                            );
+                        }
+                        if item.content_preview_active() {
+                            return Ok(false);
+                        }
+                        if !item.can_preview_for_owner(batch.owner) {
+                            bail!("finish saving the project before editing the design");
+                        }
+                        item.with_document_for_preview_owner(batch.owner, cx, |document| {
+                            batch.original_selection =
+                                document.doc.selection.iter().copied().collect();
+                            batch.original_viewport = document.doc.viewport;
+                            document.doc.history.begin(&label, &mut document.doc.scene);
+                            batch.pending = true;
+                            (true, DocChange::ContentPreview)
+                        })
+                        .context("the design document is still loading")
+                    })
+                })?;
+                if started {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(90))
+                    .await;
+            }
+
+            for (index, operation) in ops.iter().enumerate() {
+                let next_activity = batch.update(cx, |batch, cx| {
+                    item.update(cx, |item, cx| {
+                        let project_root =
+                            item.project_root().map(|root| root.display().to_string());
+                        let mut next_activity = item
+                            .with_document_for_preview_owner(batch.owner, cx, |document| {
+                                {
+                                    let (doc, mut assets) = document.doc_and_assets();
+                                    batch.progress.apply(doc, &mut assets, index, operation);
+                                }
+                                let target = batch
+                                    .progress
+                                    .statuses
+                                    .last()
+                                    .and_then(|status| status.get("created"))
+                                    .and_then(Value::as_str)
+                                    .and_then(|id| id.parse::<NodeId>().ok())
+                                    .or_else(|| design_operation_node(&document.doc, operation));
+                                if let Some(root) = document.doc.active_page() {
+                                    document.solved_pages.remove(&root);
+                                    document.ensure_root_solved(root);
+                                }
+                                if let Some(target) = target {
+                                    let root = document
+                                        .doc
+                                        .scene
+                                        .ancestors_of(target)
+                                        .last()
+                                        .map_or(target, |node| node.id);
+                                    document.solved_pages.remove(&root);
+                                    document.ensure_root_solved(root);
+                                }
+                                if design_operation_is_variable(operation) {
+                                    document.mark_variables_changed();
+                                }
+                                let mut activity = activity.clone();
+                                activity.action =
+                                    format!("{} · {} of {}", label, index + 1, ops.len());
+                                activity.active = true;
+                                activity.source_path = None;
+                                activity.workspace =
+                                    Some(if design_operation_is_variable(operation) {
+                                        design_surface::AgentWorkspace::Variables
+                                    } else {
+                                        design_surface::AgentWorkspace::Canvas
+                                    });
+                                activity.project_root = project_root;
+                                activity.node = target.map(|node| node.to_string());
+                                activity.page =
+                                    target.and_then(|node| document.page_index_of_node(node));
+                                activity.world = target
+                                    .and_then(|node| document.doc.scene.world_bounds(node))
+                                    .filter(Bounds::is_finite)
+                                    .map(|bounds| {
+                                        let center = bounds.center();
+                                        [center.x, center.y]
+                                    });
+                                (activity, DocChange::ContentPreview)
+                            })
+                            .context("the design document became unavailable")?;
+                        let document = ready_document(item)?;
+                        next_activity.page = next_activity
+                            .node
+                            .as_deref()
+                            .and_then(|node| node.parse::<NodeId>().ok())
+                            .and_then(|node| document.page_index_of_node(node));
+                        // Agent previews can introduce layers and variables;
+                        // panels that skip drag previews must project these steps.
+                        cx.emit(FigItemEvent::Edited);
+                        Ok::<_, anyhow::Error>(next_activity)
+                    })
+                })?;
+                cx.update(|cx| {
+                    design_surface::activity_state(cx)
+                        .update(cx, |state, cx| state.record(next_activity, cx));
+                });
+                if batch.read_with(cx, |batch, _| batch.progress.failure.is_some()) {
+                    break;
+                }
+                // Yield a painted frame for each operation without splitting the undo transaction.
+                cx.background_executor()
+                    .timer(Duration::from_millis(90))
+                    .await;
+            }
+            batch.update(cx, |batch, cx| {
+                item.update(cx, |item, cx| {
+                    let success = batch.progress.failure.is_none();
+                    let outcome = item
+                        .with_document_for_owner(batch.owner, cx, |document| {
+                            let outcome = {
+                                let (doc, mut assets) = document.doc_and_assets();
+                                batch.progress.finish(doc, &mut assets, ops.len())
+                            };
+                            if !success {
+                                refresh_streamed_layout(document);
+                            }
+                            let change = if success {
+                                outcome.change
+                            } else {
+                                DocChange::ContentPreview
+                            };
+                            (outcome.value, change)
+                        })
+                        .context("the design document became unavailable")?;
+                    batch.pending = false;
+                    item.finish_content_preview(batch.owner, success, cx);
+                    Ok(outcome)
+                })
+            })
+        })
+    }
+
     fn screenshot(&self, target: ScreenshotTarget, cx: &mut App) -> Task<Result<Vec<u8>>> {
         let prepared = self
             .item()
@@ -584,42 +806,15 @@ fn validate_source_candidate(
     } else {
         source_path.to_path_buf()
     };
-    let inferred_root = if path.is_absolute() {
-        let singleton = path
-            .parent()
-            .filter(|parent| {
-                let file = path.file_name();
-                (parent.file_name().is_some_and(|name| name == "doc")
-                    && file.is_some_and(|name| {
-                        name == "variables.json" || name == "active_modes.json"
-                    }))
-                    || (parent.file_name().is_some_and(|name| name == "components")
-                        && file.is_some_and(|name| name == "sets.json"))
-            })
-            .and_then(Path::parent);
-        let directory = path.parent().and_then(Path::parent);
-        let managed = directory.is_some_and(|directory| {
-            (directory.file_name().is_some_and(|name| name == "pages")
-                && path.file_name().is_some_and(|name| name == "page.fnx"))
-                || (directory
-                    .file_name()
-                    .is_some_and(|name| name == "components")
-                    && path
-                        .file_name()
-                        .is_some_and(|name| name == "master.fnx" || name == "def.json"))
-        });
-        if singleton.is_some() || managed {
-            let root = singleton.or_else(|| directory.and_then(Path::parent));
-            match root {
-                Some(root) if root.join("fanta.json").try_exists()? => Some(root),
-                _ => None,
+    let mut inferred_root = None;
+    if path.is_absolute() {
+        for ancestor in path.parent().into_iter().flat_map(Path::ancestors) {
+            if ancestor.join("fanta.json").try_exists()? {
+                inferred_root = Some(ancestor);
+                break;
             }
-        } else {
-            None
         }
-    } else {
-        None
-    };
+    }
     let Some(root) = inferred_root.or(active_root) else {
         return Ok(json!({ "applicable": false }));
     };
@@ -646,47 +841,24 @@ fn validate_agent_source_edit(
     let source_path = match requested.canonicalize() {
         Ok(path) => path,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => requested,
-        Err(error) => return Err(error).context("resolving the FNX source candidate"),
+        Err(error) => return Err(error).context("resolving the design source candidate"),
     };
     let Ok(relative) = source_path.strip_prefix(&canonical_root) else {
         return Ok(json!({ "applicable": false }));
     };
     let components = relative.components().collect::<Vec<_>>();
-    let json_source = match components.as_slice() {
-        [Component::Normal(directory), Component::Normal(file)]
-            if *directory == "doc" && *file == "variables.json" =>
-        {
-            validate_typed_json::<fanta_doc::VariableRegistry>(source)
-                .context("Invalid typed variable registry JSON")?;
-            true
-        }
-        [Component::Normal(directory), Component::Normal(file)]
-            if *directory == "doc" && *file == "active_modes.json" =>
-        {
-            validate_typed_json::<std::collections::BTreeMap<VariableCollectionId, ModeId>>(source)
-                .context("Invalid typed active-mode JSON")?;
-            true
-        }
-        [Component::Normal(directory), Component::Normal(file)]
-            if *directory == "components" && *file == "sets.json" =>
-        {
-            validate_typed_json::<std::collections::BTreeMap<ComponentId, fanta_doc::ComponentSet>>(source).context("Invalid typed component-set JSON")?;
-            true
-        }
-        [
-            Component::Normal(directory),
-            Component::Normal(_),
-            Component::Normal(file),
-        ] if *directory == "components" && *file == "def.json" => {
-            validate_typed_json::<fanta_doc::ComponentDef>(source)
-                .context("Invalid typed component-definition JSON")?;
-            true
-        }
-        _ => false,
-    };
-    if json_source {
+    if validate_managed_json(relative, source)
+        .with_context(|| format!("Invalid managed JSON in {}", source_path.display()))?
+    {
+        let scope = if source_path.is_file() {
+            fanta_format::validate_project_json_edit(&canonical_root, &source_path, source)
+                .context("the JSON candidate cannot be materialized; the existing source has not been overwritten")?;
+            "project"
+        } else {
+            "typed_json"
+        };
         return Ok(
-            json!({"applicable":true,"validated":true,"scope":"typed_json","path":source_path.display().to_string(),"diagnostics":[]}),
+            json!({"applicable":true,"validated":true,"scope":scope,"path":source_path.display().to_string(),"diagnostics":[]}),
         );
     }
     let managed = matches!(components.as_slice(), [
@@ -700,17 +872,7 @@ fn validate_agent_source_edit(
         "Invalid FNX in {}. FNX attributes require quoted JSON object keys and complete closing tags; repair the candidate before saving",
         source_path.display()
     ))?;
-    let sidecar = source_path.with_file_name(
-        if source_path
-            .file_name()
-            .is_some_and(|name| name == "page.fnx")
-        {
-            "page.ids.json"
-        } else {
-            "master.ids.json"
-        },
-    );
-    let (scope, diagnostics) = if source_path.is_file() && sidecar.is_file() {
+    let (scope, diagnostics) = if source_path.is_file() {
         let (_, diagnostics) = fanta_format::validate_project_source_edit_with_diagnostics(
             &canonical_root, &source_path, source,
         ).context("the FNX candidate cannot be materialized; the existing source has not been overwritten")?;
@@ -726,11 +888,149 @@ fn validate_agent_source_edit(
 
 fn validate_typed_json<T: serde::de::DeserializeOwned>(source: &str) -> Result<()> {
     let value: Value = serde_json::from_str(source)?;
-    if !value.is_object() {
+    if !value.is_object() && !value.is_null() {
         bail!("this managed JSON source requires an object");
     }
     serde_json::from_value::<T>(value)?;
     Ok(())
+}
+
+fn validate_json_value<T: serde::de::DeserializeOwned>(source: &str) -> Result<()> {
+    serde_json::from_str::<T>(source)?;
+    Ok(())
+}
+
+fn validate_managed_json(relative: &Path, source: &str) -> Result<bool> {
+    use std::collections::BTreeMap;
+    use std::path::Component;
+
+    let components = relative.components().collect::<Vec<_>>();
+    match components.as_slice() {
+        [Component::Normal(file)] if *file == "fanta.json" => {
+            validate_typed_json::<fanta_format::ProjectManifest>(source)?;
+            let manifest: fanta_format::ProjectManifest = serde_json::from_str(source)?;
+            if manifest.format != "fanta-project" {
+                bail!("the project manifest requires the fanta-project format tag");
+            }
+            manifest.project_id.parse::<fanta_doc::DocId>()?;
+        }
+        [Component::Normal(directory), Component::Normal(file)] if *directory == "doc" => {
+            match file.to_str() {
+                Some("metadata.json") => validate_typed_json::<fanta_doc::DocMetadata>(source)?,
+                Some("asset_library.json") => {
+                    validate_typed_json::<BTreeMap<AssetId, ProjectAsset>>(source)?
+                }
+                Some("variables.json") => {
+                    validate_typed_json::<fanta_doc::VariableRegistry>(source)?
+                }
+                Some("active_modes.json") => {
+                    validate_typed_json::<BTreeMap<VariableCollectionId, ModeId>>(source)?
+                }
+                Some("motion.json") => validate_typed_json::<fanta_doc::MotionLibrary>(source)?,
+                Some("flow_start.json") => validate_json_value::<Option<NodeId>>(source)?,
+                Some("flows.json") => validate_json_value::<Vec<fanta_doc::Flow>>(source)?,
+                Some("presentation.json") => {
+                    validate_typed_json::<Option<fanta_doc::PresentationConfig>>(source)?
+                }
+                _ => return Ok(false),
+            }
+        }
+        [Component::Normal(directory), Component::Normal(file)]
+            if *directory == "components" && *file == "sets.json" =>
+        {
+            validate_typed_json::<BTreeMap<ComponentId, fanta_doc::ComponentSet>>(source)?;
+        }
+        [Component::Normal(directory), Component::Normal(file)]
+            if *directory == "assets" && *file == "index.json" =>
+        {
+            let index: Value = serde_json::from_str(source)?;
+            if index.get("version").and_then(Value::as_u64) != Some(1) {
+                bail!("the asset index requires version 1");
+            }
+            for (name, record) in index
+                .get("assets")
+                .and_then(Value::as_object)
+                .context("the asset index requires an assets object")?
+            {
+                name.parse::<AssetId>()?;
+                record
+                    .get("size")
+                    .and_then(Value::as_u64)
+                    .context("asset size must be an unsigned integer")?;
+                let digest = record
+                    .get("sha256")
+                    .and_then(Value::as_str)
+                    .context("asset SHA-256 must be a string")?;
+                if digest.len() != 64
+                    || !digest
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    bail!("asset {name} requires a lowercase SHA-256 digest");
+                }
+            }
+        }
+        [
+            Component::Normal(directory),
+            Component::Normal(_),
+            Component::Normal(file),
+        ] if *directory == "pages" && *file == "page.json" => {
+            let header: Value = serde_json::from_str(source)?;
+            header
+                .get("order")
+                .and_then(Value::as_u64)
+                .context("page order must be an unsigned integer")?;
+            if let Some(id) = header.get("id") {
+                id.as_str()
+                    .context("page identity must be a string")?
+                    .parse::<NodeId>()?;
+            }
+            if let Some(name) = header.get("name") {
+                name.as_str().context("page name must be a string")?;
+            }
+        }
+        [
+            Component::Normal(directory),
+            Component::Normal(_),
+            Component::Normal(file),
+        ] if *directory == "components" && *file == "def.json" => {
+            validate_typed_json::<fanta_doc::ComponentDef>(source)?;
+        }
+        [
+            Component::Normal(directory),
+            Component::Normal(_),
+            Component::Normal(file),
+        ] if (*directory == "pages" && *file == "page.ids.json")
+            || (*directory == "components" && *file == "master.ids.json") =>
+        {
+            validate_typed_json::<fanta_fnx::FnxSidecar>(source)?;
+            let sidecar: fanta_fnx::FnxSidecar = serde_json::from_str(source)?;
+            for entry in sidecar.ids {
+                serde_json::from_value::<NodeId>(json!(entry.id))?;
+                if !entry.index.is_null() && !entry.index.is_number() {
+                    bail!("sidecar sibling order must be a number");
+                }
+            }
+            if let Some(parent) = sidecar.root_parent {
+                serde_json::from_value::<NodeId>(json!(parent))?;
+            }
+        }
+        [
+            Component::Normal(directory),
+            Component::Normal(_),
+            Component::Normal(nodes),
+            Component::Normal(file),
+        ] if (*directory == "pages" || *directory == "components")
+            && *nodes == "nodes"
+            && Path::new(file)
+                .extension()
+                .is_some_and(|extension| extension == "json") =>
+        {
+            validate_typed_json::<CanvasNode>(source)?;
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
 }
 
 fn import_prepared_image(
@@ -1590,100 +1890,230 @@ fn apply_batch(
     ops: &[DesignOp],
     label: &str,
 ) -> BatchOutcome {
-    let mut created: Vec<String> = Vec::new();
-    let mut statuses: Vec<Value> = Vec::new();
-    let mut ingested_assets: Vec<AssetId> = Vec::new();
-    let mut removed_nodes: HashSet<NodeId> = HashSet::new();
-    let mut content_changed = false;
-    let mut selection_changed = false;
-    let mut failure: Option<(usize, String)> = None;
-
+    let mut progress = BatchProgress {
+        default_container: doc.active_page(),
+        ..BatchProgress::default()
+    };
     doc.history.begin(label, &mut doc.scene);
-    for (index, op) in ops.iter().enumerate() {
-        match apply_one(doc, assets, &mut ingested_assets, &mut removed_nodes, op) {
-            Ok(Applied::Content {
-                created: id,
-                detail,
-            }) => {
-                content_changed = true;
+    for (index, operation) in ops.iter().enumerate() {
+        progress.apply(doc, assets, index, operation);
+        if progress.failure.is_some() {
+            break;
+        }
+    }
+    progress.finish(doc, assets, ops.len())
+}
+
+#[derive(Default)]
+struct BatchProgress {
+    default_container: Option<NodeId>,
+    created: Vec<String>,
+    statuses: Vec<Value>,
+    ingested_assets: Vec<AssetId>,
+    removed_nodes: HashSet<NodeId>,
+    content_changed: bool,
+    selection_changed: bool,
+    failure: Option<(usize, String)>,
+}
+
+impl BatchProgress {
+    fn apply(
+        &mut self,
+        doc: &mut Doc,
+        assets: &mut AssetStores<'_>,
+        index: usize,
+        operation: &DesignOp,
+    ) {
+        match apply_one(
+            doc,
+            assets,
+            &mut self.ingested_assets,
+            &mut self.removed_nodes,
+            operation,
+            self.default_container,
+        ) {
+            Ok(Applied::Content { created, detail }) => {
+                self.content_changed = true;
                 let mut status = json!({ "index": index, "status": "ok" });
-                if let Some(id) = id {
+                if let Some(id) = created {
                     status["created"] = json!(id);
-                    created.push(id);
+                    self.created.push(id);
                 }
                 if let (Some(Value::Object(detail)), Some(status)) =
                     (detail, status.as_object_mut())
                 {
                     status.extend(detail);
                 }
-                statuses.push(status);
+                self.statuses.push(status);
             }
             Ok(Applied::Selection) => {
-                selection_changed = true;
-                statuses.push(json!({ "index": index, "status": "ok" }));
+                self.selection_changed = true;
+                self.statuses
+                    .push(json!({ "index": index, "status": "ok" }));
             }
             Ok(Applied::Viewport | Applied::Nothing) => {
-                statuses.push(json!({ "index": index, "status": "ok" }));
+                self.statuses
+                    .push(json!({ "index": index, "status": "ok" }));
             }
-            Err(error) => {
-                failure = Some((index, format!("{error:#}")));
-                break;
-            }
+            Err(error) => self.failure = Some((index, format!("{error:#}"))),
         }
     }
 
-    match failure {
-        None => {
-            doc.history.commit(&mut doc.scene);
-            if doc
-                .selection
-                .iter()
-                .any(|selected| removed_nodes.contains(selected))
-            {
-                let surviving: Vec<NodeId> = doc
+    fn finish(
+        &mut self,
+        doc: &mut Doc,
+        assets: &mut AssetStores<'_>,
+        operation_count: usize,
+    ) -> BatchOutcome {
+        match self.failure.take() {
+            None => {
+                doc.history.commit(&mut doc.scene);
+                if doc
                     .selection
                     .iter()
-                    .copied()
-                    .filter(|selected| !removed_nodes.contains(selected))
-                    .collect();
-                doc.selection.replace_with(surviving);
+                    .any(|selected| self.removed_nodes.contains(selected))
+                {
+                    let surviving: Vec<NodeId> = doc
+                        .selection
+                        .iter()
+                        .copied()
+                        .filter(|selected| !self.removed_nodes.contains(selected))
+                        .collect();
+                    doc.selection.replace_with(surviving);
+                }
+                BatchOutcome {
+                    value: json!({ "applied": true, "created": self.created, "ops": self.statuses }),
+                    change: if self.content_changed {
+                        DocChange::Content
+                    } else if self.selection_changed {
+                        DocChange::Selection
+                    } else {
+                        DocChange::None
+                    },
+                }
             }
-            BatchOutcome {
-                value: json!({ "applied": true, "created": created, "ops": statuses }),
-                change: if content_changed {
-                    DocChange::Content
-                } else if selection_changed {
-                    DocChange::Selection
-                } else {
-                    DocChange::None
-                },
-            }
-        }
-        Some((index, mut message)) => {
-            if let Err(abort_error) = doc.abort_transaction() {
-                message = format!("{message}; rolling back also failed: {abort_error}");
-            }
-            for asset in ingested_assets {
-                assets.remove(asset);
-            }
-            statuses.push(json!({ "index": index, "status": "failed", "error": message }));
-            for skipped in index + 1..ops.len() {
-                statuses.push(json!({ "index": skipped, "status": "skipped" }));
-            }
-            BatchOutcome {
-                value: json!({
-                    "applied": false,
-                    "error": format!("op {index} failed; the batch was rolled back"),
-                    "ops": statuses,
-                }),
-                change: if selection_changed {
-                    DocChange::Selection
-                } else {
-                    DocChange::None
-                },
+            Some((index, mut message)) => {
+                if let Err(abort_error) = doc.abort_transaction() {
+                    message = format!("{message}; rolling back also failed: {abort_error}");
+                }
+                for asset in self.ingested_assets.drain(..) {
+                    assets.remove(asset);
+                }
+                self.statuses
+                    .push(json!({ "index": index, "status": "failed", "error": message }));
+                for skipped in index + 1..operation_count {
+                    self.statuses
+                        .push(json!({ "index": skipped, "status": "skipped" }));
+                }
+                BatchOutcome {
+                    value: json!({ "applied": false,
+                        "error": format!("op {index} failed; the batch was rolled back"), "ops": self.statuses }),
+                    change: if self.selection_changed {
+                        DocChange::Selection
+                    } else {
+                        DocChange::None
+                    },
+                }
             }
         }
     }
+}
+
+struct StreamedDesignBatch {
+    item: WeakEntity<FigItem>,
+    owner: gpui::EntityId,
+    progress: BatchProgress,
+    original_selection: Vec<NodeId>,
+    original_viewport: Viewport,
+    pending: bool,
+}
+
+impl StreamedDesignBatch {
+    fn cancel(&mut self, cx: &mut App) {
+        if !self.pending {
+            return;
+        }
+        self.item
+            .update(cx, |item, cx| {
+                item.with_document_for_owner(self.owner, cx, |document| {
+                    {
+                        let (doc, mut assets) = document.doc_and_assets();
+                        if let Err(error) = doc.abort_transaction() {
+                            log::error!(
+                                "rolling back an interrupted agent design edit failed: {error}"
+                            );
+                        }
+                        for asset in self.progress.ingested_assets.drain(..) {
+                            assets.remove(asset);
+                        }
+                        doc.selection
+                            .replace_with(self.original_selection.iter().copied());
+                        doc.viewport = self.original_viewport;
+                    }
+                    refresh_streamed_layout(document);
+                    ((), DocChange::ContentPreview)
+                });
+                item.finish_content_preview(self.owner, false, cx);
+            })
+            .log_err();
+        self.pending = false;
+    }
+}
+
+fn refresh_streamed_layout(document: &mut FigDocument) {
+    if let Some(root) = document.doc.active_page() {
+        document.solved_pages.remove(&root);
+        document.ensure_root_solved(root);
+    }
+    document.mark_variables_changed();
+}
+
+fn design_operation_is_variable(operation: &DesignOp) -> bool {
+    matches!(
+        operation,
+        DesignOp::CreateVariableCollection { .. }
+            | DesignOp::AddVariableMode { .. }
+            | DesignOp::CreateVariable { .. }
+            | DesignOp::SetVariableValue { .. }
+            | DesignOp::SetVariableMode { .. }
+    )
+}
+
+fn design_operation_node(doc: &Doc, operation: &DesignOp) -> Option<NodeId> {
+    let id = match operation {
+        DesignOp::SetProps { id, .. }
+        | DesignOp::SetStroke { id, .. }
+        | DesignOp::SetShadow { id, .. }
+        | DesignOp::SetTextStyle { id, .. }
+        | DesignOp::SetAutoLayout { id, .. }
+        | DesignOp::SetLayoutChild { id, .. }
+        | DesignOp::BindVariable { id, .. }
+        | DesignOp::UnbindVariable { id, .. }
+        | DesignOp::SetIndex { id, .. }
+        | DesignOp::Rotate { id, .. }
+        | DesignOp::Ungroup { id }
+        | DesignOp::Duplicate { id, .. }
+        | DesignOp::CreateComponent { id }
+        | DesignOp::BindComponentProperty { id, .. }
+        | DesignOp::SetInstanceProperty { id, .. }
+        | DesignOp::Reparent { id, .. }
+        | DesignOp::Delete { id } => Some(id),
+        DesignOp::Align { ids, .. }
+        | DesignOp::Distribute { ids, .. }
+        | DesignOp::Group { ids, .. }
+        | DesignOp::FrameSelection { ids, .. }
+        | DesignOp::CombineVariants { ids, .. }
+        | DesignOp::Select { ids } => ids.first(),
+        DesignOp::CreateComponentProperty { component, .. } => {
+            return resolve_component(doc, component)
+                .ok()
+                .and_then(|component| doc.components.def(component))
+                .map(|definition| definition.root);
+        }
+        _ => None,
+    };
+    id.and_then(|id| id.parse::<NodeId>().ok())
+        .filter(|id| doc.scene.get(*id).is_some())
 }
 
 /// Apply one op. Assets it ingests go into `ingested_assets` and nodes it
@@ -1695,6 +2125,7 @@ fn apply_one(
     ingested_assets: &mut Vec<AssetId>,
     removed_nodes: &mut HashSet<NodeId>,
     op: &DesignOp,
+    default_container: Option<NodeId>,
 ) -> Result<Applied> {
     match op {
         DesignOp::CreateImage {
@@ -1707,7 +2138,7 @@ fn apply_one(
             height,
             meta,
         } => {
-            let parent = resolve_container(doc, parent.as_deref())?;
+            let parent = resolve_container(doc, parent.as_deref(), default_container)?;
             let bytes = decode_image_source(source)?;
             let (asset, natural_size, inserted) = assets.add_image_tracked(bytes)?;
             // Track before any fallible step so a later failure in this batch
@@ -1775,7 +2206,7 @@ fn apply_one(
             if !(width.is_finite() && *width > 0.0 && height.is_finite() && *height > 0.0) {
                 bail!("width and height must be positive");
             }
-            let parent = resolve_container(doc, parent.as_deref())?;
+            let parent = resolve_container(doc, parent.as_deref(), default_container)?;
             let fill_color = fill.as_deref().map(parse_fill_color).transpose()?;
             let (data, origin) = match node_type {
                 DesignNodeType::Frame => (
@@ -2027,7 +2458,7 @@ fn apply_one(
             if !(x.is_finite() && y.is_finite()) {
                 bail!("x and y must be finite");
             }
-            let parent = resolve_container(doc, parent.as_deref())?;
+            let parent = resolve_container(doc, parent.as_deref(), default_container)?;
             let component_id = resolve_component(doc, component)?;
             let def = doc
                 .components
@@ -2978,7 +3409,7 @@ fn apply_one(
                 .get(id)
                 .with_context(|| format!("node {id} does not exist"))?
                 .clone();
-            let new_parent = resolve_container(doc, parent.as_deref())?;
+            let new_parent = resolve_container(doc, parent.as_deref(), default_container)?;
             if new_parent == Some(id)
                 || new_parent.is_some_and(|parent| {
                     doc.scene
@@ -3065,26 +3496,27 @@ fn apply_one(
     }
 }
 
-/// Resolve an optional parent id to a container node, defaulting to the
-/// active page.
-fn resolve_container(doc: &Doc, parent: Option<&str>) -> Result<Option<NodeId>> {
-    match parent {
-        Some(raw) => {
-            let id = parse_node_id(raw)?;
-            let node = doc
-                .scene
-                .get(id)
-                .with_context(|| format!("parent {raw} does not exist"))?;
-            if !node.can_have_children() {
-                bail!(
-                    "parent {raw} is a {} node and cannot have children",
-                    node.data.kind_tag()
-                );
-            }
-            Ok(Some(id))
-        }
-        None => Ok(doc.active_page()),
+fn resolve_container(
+    doc: &Doc,
+    parent: Option<&str>,
+    default_container: Option<NodeId>,
+) -> Result<Option<NodeId>> {
+    // Follow can change the viewed page between streamed operations; viewing
+    // must not change the destination captured for this batch.
+    let Some(id) = parent.map(parse_node_id).transpose()?.or(default_container) else {
+        return Ok(None);
+    };
+    let node = doc
+        .scene
+        .get(id)
+        .with_context(|| format!("parent {id} does not exist"))?;
+    if !node.can_have_children() {
+        bail!(
+            "parent {id} is a {} node and cannot have children",
+            node.data.kind_tag()
+        );
     }
+    Ok(Some(id))
 }
 
 /// The fractional index for inserting at `position` among `parent`'s children
@@ -3371,6 +3803,42 @@ fn set_solid_fill(data: &mut NodeData, color: Color) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn agent_source_focus_accepts_new_files_inside_the_project() -> Result<()> {
+        let project = tempfile::tempdir()?;
+        let relative = Path::new("components/Card/master.fnx");
+        assert_eq!(
+            project_source_path(project.path(), relative)?,
+            project.path().canonicalize()?.join(relative),
+        );
+        let escaped = project.path().join("../outside-fanta-project/new.fnx");
+        assert!(project_source_path(project.path(), &escaped).is_err());
+        assert!(project_source_path(project.path(), Path::new("missing/../other.fnx")).is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_source_focus_resolves_links_before_accepting_new_files() -> Result<()> {
+        let project = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        let outside_link = project.path().join("Outside");
+        std::os::unix::fs::symlink(outside.path(), &outside_link)?;
+        assert!(project_source_path(project.path(), &outside_link.join("new.fnx")).is_err());
+        let dangling_link = project.path().join("Unresolved");
+        std::os::unix::fs::symlink(outside.path().join("missing"), &dangling_link)?;
+        assert!(project_source_path(project.path(), &dangling_link.join("new.fnx")).is_err());
+        let components = project.path().join("components");
+        std::fs::create_dir(&components)?;
+        let internal_link = project.path().join("Library");
+        std::os::unix::fs::symlink(&components, &internal_link)?;
+        assert_eq!(
+            project_source_path(project.path(), &internal_link.join("Card/master.fnx"))?,
+            components.canonicalize()?.join("Card/master.fnx"),
+        );
+        Ok(())
+    }
+
     fn ops(value: Value) -> Vec<DesignOp> {
         serde_json::from_value(value).expect("ops JSON matches the DesignOp schema")
     }
@@ -3399,6 +3867,359 @@ mod tests {
     fn run_batch(doc: &mut Doc, ops: &[DesignOp], label: &str) -> BatchOutcome {
         let mut stores = crate::document::TestAssetStores::default();
         apply_batch(doc, &mut stores.stores(), ops, label)
+    }
+
+    async fn streamed_design_fixture(
+        cx: &mut gpui::TestAppContext,
+    ) -> (Entity<FigItem>, FigDesignSurface, Entity<project::Project>) {
+        cx.update(|cx| {
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+        });
+        let project = project::Project::test(fs::FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, _) = doc_with_page();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/Design.fig"),
+            doc,
+            cx,
+        );
+        let surface = FigDesignSurface {
+            active: Rc::new(RefCell::new(Some(item.downgrade()))),
+        };
+        (item, surface, project)
+    }
+
+    #[gpui::test]
+    async fn inspecting_component_source_reports_its_component_scope(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        async {
+            let (_, _, project) = streamed_design_fixture(cx).await;
+            let (mut doc, page) = doc_with_page();
+            let mut master = CanvasNode::new(NodeData::Group(GroupNode::default()));
+            master.name = "Card".into();
+            master.parent = Some(page);
+            let master_root = master.id;
+            doc.apply(Operation::create_node(master))?;
+            let component = fanta_doc::ComponentId::new();
+            doc.apply(Operation::DefineComponent {
+                def: Box::new(fanta_doc::ComponentDef::new(component, master_root, "Card")),
+            })?;
+            let directory = tempfile::tempdir()?;
+            fanta_format::write_project_tree(directory.path(), &doc, &Default::default())?;
+            let source = fanta_format::locate_master_source(directory.path(), component)
+                .context("component source")?;
+            let item = crate::document::ready_item_with_root_for_test(
+                &project,
+                directory.path().join("fanta.json"),
+                Some(directory.path().to_path_buf()),
+                doc,
+                cx,
+            );
+            let component_page = item
+                .read_with(cx, |item, _| {
+                    item.document()
+                        .and_then(|document| document.page_index_of_node(master_root))
+                })
+                .context("component scope")?;
+            let surface = FigDesignSurface {
+                active: Rc::new(RefCell::new(Some(item.downgrade()))),
+            };
+            cx.update(|cx| {
+                surface.report_source_activity(
+                    source.display().to_string(),
+                    design_surface::AgentActivity {
+                        agent_id: "reader".into(),
+                        agent_name: "Morgana".into(),
+                        action: "Inspecting source".into(),
+                        page: None,
+                        node: None,
+                        world: None,
+                        active: true,
+                        project_root: None,
+                        source_path: None,
+                        workspace: Some(design_surface::AgentWorkspace::Code),
+                    },
+                    cx,
+                )
+            })?;
+            let state = cx.update(design_surface::activity_state);
+            state.read_with(cx, |state, _| {
+                let activity = state
+                    .activities()
+                    .into_iter()
+                    .find(|activity| activity.agent_id == "reader")
+                    .context("component inspection activity")?;
+                assert_eq!(activity.page, Some(component_page));
+                assert_eq!(
+                    activity.workspace,
+                    Some(design_surface::AgentWorkspace::Code)
+                );
+                assert_eq!(
+                    activity.source_path,
+                    Some(source.canonicalize()?.display().to_string())
+                );
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await
+        .expect("component source inspection should identify its component scope");
+    }
+
+    #[gpui::test]
+    async fn streamed_design_paints_each_node_and_commits_one_undo_step(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        async {
+            let (item, surface, _) = streamed_design_fixture(cx).await;
+            let operations = ops(json!([
+                {"op":"create_node","node_type":"rectangle","name":"First","x":20,"y":30,"width":100,"height":40},
+                {"op":"create_node","node_type":"rectangle","name":"Second","x":180,"y":90,"width":80,"height":40}
+            ]));
+            let task =
+                cx.update(|cx| surface.apply_streamed(operations, "Build cards".into(), None, cx));
+            cx.run_until_parked();
+            item.read_with(cx, |item, _| {
+                let doc = item.doc().expect("ready document");
+                assert_eq!(
+                    doc.scene.len(),
+                    2,
+                    "the first node is visible before the second"
+                );
+                assert!(item.content_preview_active());
+                assert_eq!(doc.history.undo_depth(), 0);
+            });
+            let state = cx.update(design_surface::activity_state);
+            let first = state
+                .read_with(cx, |state, _| state.activities().first().cloned())
+                .context("first activity")?;
+            assert_eq!(first.world, Some([70.0, 50.0]));
+            cx.executor().advance_clock(Duration::from_millis(90));
+            cx.run_until_parked();
+            item.read_with(cx, |item, _| {
+                assert_eq!(item.doc().expect("document").scene.len(), 3)
+            });
+            let second = state
+                .read_with(cx, |state, _| state.activities().first().cloned())
+                .context("second activity")?;
+            assert_eq!(second.world, Some([220.0, 110.0]));
+            assert_ne!(first.node, second.node);
+            cx.executor().advance_clock(Duration::from_millis(90));
+            assert_eq!(task.await?["applied"], true);
+            item.update(cx, |item, cx| {
+                assert!(!item.content_preview_active());
+                assert_eq!(item.doc().context("document")?.history.undo_depth(), 1);
+                assert!(item.undo(cx)?);
+                assert_eq!(item.doc().context("document")?.scene.len(), 1);
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await
+        .expect("streamed design and undo checks must complete");
+    }
+
+    #[gpui::test]
+    async fn streamed_design_keeps_its_destination_when_the_viewed_scope_changes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        async {
+            let (item, surface, _) = streamed_design_fixture(cx).await;
+            let viewed_page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+            let viewed_root = viewed_page.id;
+            let destination = item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    let result = (|| {
+                        let destination = document.doc.active_page().context("original page")?;
+                        document.doc.apply(Operation::create_node(viewed_page))?;
+                        document.doc.add_page(viewed_root);
+                        document.doc.set_active_page(Some(destination));
+                        Ok::<_, anyhow::Error>(destination)
+                    })();
+                    (result, DocChange::Content)
+                })
+            });
+            let destination = destination.context("ready document")??;
+            let operations = ops(json!([
+                {"op":"create_node","node_type":"rectangle","name":"First","x":20,"y":30,"width":100,"height":40},
+                {"op":"create_node","node_type":"rectangle","name":"Second","x":180,"y":90,"width":80,"height":40},
+                {"op":"create_node","node_type":"rectangle","parent":viewed_root.to_string(),"name":"Explicit","x":20,"y":30,"width":80,"height":40}
+            ]));
+            let task = cx.update(|cx| {
+                surface.apply_streamed(operations, "Build across pages".into(), None, cx)
+            });
+            cx.run_until_parked();
+            item.update(cx, |item, cx| {
+                item.request_scope(
+                    crate::document::FigScope::Page(viewed_root),
+                    crate::document::ScopeRequester::Open,
+                    cx,
+                );
+            });
+            cx.executor().advance_clock(Duration::from_millis(90));
+            cx.run_until_parked();
+            item.read_with(cx, |item, _| {
+                let doc = item.doc().expect("ready document");
+                assert_eq!(doc.active_page(), Some(viewed_root));
+                assert_eq!(doc.scene.children_of(Some(destination)).len(), 2);
+                assert!(doc.scene.children_of(Some(viewed_root)).is_empty());
+            });
+            cx.executor().advance_clock(Duration::from_millis(90));
+            cx.run_until_parked();
+            cx.executor().advance_clock(Duration::from_millis(90));
+            assert_eq!(task.await?["applied"], true);
+            item.read_with(cx, |item, _| {
+                let doc = item.doc().expect("ready document");
+                assert_eq!(doc.active_page(), Some(viewed_root));
+                assert_eq!(doc.scene.children_of(Some(destination)).len(), 2);
+                assert_eq!(doc.scene.children_of(Some(viewed_root)).len(), 1);
+            });
+            Ok::<_, anyhow::Error>(())
+        }
+        .await
+        .expect("viewing another page must not retarget a streamed batch");
+    }
+
+    #[gpui::test]
+    async fn streamed_component_is_followable_before_the_batch_commits(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        async {
+            let (item, surface, project) = streamed_design_fixture(cx).await;
+            let mut master = CanvasNode::new(NodeData::Group(GroupNode {
+                clip_size: Some([100.0, 40.0]),
+                ..GroupNode::default()
+            }));
+            master.name = "Card".into();
+            let master_root = master.id;
+            let page = item
+                .update(cx, |item, cx| {
+                    item.with_document(cx, |document| {
+                        let result = (|| {
+                            let page = document.doc.active_page().context("original page")?;
+                            master.parent = Some(page);
+                            document.doc.apply(Operation::create_node(master))?;
+                            Ok::<_, anyhow::Error>(page)
+                        })();
+                        (result, DocChange::Content)
+                    })
+                })
+                .context("ready document")??;
+            let window = cx.add_window(|_, _| gpui::Empty);
+            let view = window.update(cx, |_, window, cx| {
+                cx.new(|cx| crate::view::FigView::new(item.clone(), project, window, cx))
+            })?;
+            view.update(cx, |view, cx| view.select_page(0, cx));
+            let registry_changes = Rc::new(std::cell::Cell::new(0));
+            let _subscription = cx.update(|cx| {
+                let registry_changes = registry_changes.clone();
+                cx.subscribe(&item, move |_, event, _| {
+                    if matches!(event, FigItemEvent::PageRegistryChanged) {
+                        registry_changes.set(registry_changes.get() + 1);
+                    }
+                })
+            });
+            let state = cx.update(design_surface::activity_state);
+            state.update(cx, |state, cx| {
+                state.follow(Some("external-designer".into()), cx)
+            });
+            let initial_undo_depth = item.read_with(cx, |item, _| {
+                item.doc().expect("ready document").history.undo_depth()
+            });
+            let operations = ops(json!([
+                {"op":"create_component","id":master_root.to_string()},
+                {"op":"set_props","id":master_root.to_string(),"width":160}
+            ]));
+            let task =
+                cx.update(|cx| surface.apply_streamed(operations, "Build Card".into(), None, cx));
+            cx.run_until_parked();
+            let component_page = item.read_with(cx, |item, _| {
+                assert!(item.content_preview_active());
+                let document = item.document().expect("ready document");
+                assert_eq!(document.doc.pages(), &[page]);
+                assert_eq!(document.doc.active_page(), Some(master_root));
+                assert_eq!(document.doc.history.undo_depth(), initial_undo_depth);
+                let index = document
+                    .page_index_of_node(master_root)
+                    .expect("component scope");
+                let component = document.pages.get(index).expect("registered component");
+                assert_eq!(component.name.as_ref(), "Card");
+                assert!(component.hidden);
+                index
+            });
+            assert_eq!(
+                view.read_with(cx, |view, _| view.selected_page_index()),
+                Some(component_page)
+            );
+            assert_eq!(
+                state.read_with(cx, |state, _| state
+                    .activities()
+                    .first()
+                    .and_then(|activity| activity.page)),
+                Some(component_page)
+            );
+            assert_eq!(registry_changes.get(), 1);
+            cx.executor().advance_clock(Duration::from_millis(90));
+            cx.run_until_parked();
+            assert!(item.read_with(cx, |item, _| item.content_preview_active()));
+            assert_eq!(registry_changes.get(), 1);
+            cx.executor().advance_clock(Duration::from_millis(90));
+            assert_eq!(task.await?["applied"], true);
+            assert_eq!(registry_changes.get(), 1);
+            assert_eq!(
+                item.read_with(cx, |item, _| item
+                    .doc()
+                    .expect("ready document")
+                    .history
+                    .undo_depth()),
+                initial_undo_depth + 1
+            );
+            assert!(item.update(cx, |item, cx| item.undo(cx))?);
+            cx.run_until_parked();
+            item.read_with(cx, |item, _| {
+                let document = item.document().expect("ready document");
+                assert!(!document.doc.is_component_root(master_root));
+                assert_eq!(document.doc.active_page(), Some(page));
+                assert_eq!(document.doc.history.undo_depth(), initial_undo_depth);
+                assert_eq!(document.pages.len(), 1);
+                assert_eq!(document.page_index_of_node(master_root), Some(0));
+            });
+            assert_eq!(
+                view.read_with(cx, |view, _| view.selected_page_index()),
+                Some(0)
+            );
+            assert_eq!(registry_changes.get(), 2);
+            Ok::<_, anyhow::Error>(())
+        }
+        .await
+        .expect("new component scopes must be visible during streamed construction");
+    }
+
+    #[gpui::test]
+    async fn cancelling_streamed_design_rolls_back_the_preview(cx: &mut gpui::TestAppContext) {
+        let (item, surface, _) = streamed_design_fixture(cx).await;
+        let operations = ops(json!([
+            {"op":"create_node","node_type":"rectangle","x":0,"y":0,"width":10,"height":10},
+            {"op":"create_node","node_type":"rectangle","x":20,"y":20,"width":10,"height":10}
+        ]));
+        let task =
+            cx.update(|cx| surface.apply_streamed(operations, "Cancelled edit".into(), None, cx));
+        cx.run_until_parked();
+        assert!(item.read_with(cx, |item, _| item.content_preview_active()));
+        drop(task);
+        cx.run_until_parked();
+        // Cancellation releases the batch outside App updates; its rollback
+        // observer runs when the next update flushes dropped entities.
+        cx.update(|_| {});
+        item.read_with(cx, |item, _| {
+            assert!(!item.content_preview_active());
+            assert!(!item.is_dirty());
+            let doc = item.doc().expect("ready document");
+            assert_eq!(doc.scene.len(), 1);
+            assert_eq!(doc.history.undo_depth(), 0);
+        });
     }
 
     #[test]
@@ -3688,12 +4509,100 @@ mod tests {
             let original = std::fs::read_to_string(&path)?;
             let valid = validate_source_candidate(None, &path, &original)?;
             assert_eq!(valid["applicable"], true);
-            assert_eq!(valid["scope"], "typed_json");
+            assert_eq!(valid["scope"], "project");
             for invalid in ["{\"unfinished\":", "[]"] {
-                assert!(validate_source_candidate(None, &path, invalid).is_err());
+                assert!(
+                    validate_source_candidate(None, &path, invalid).is_err(),
+                    "{relative} accepted invalid source {invalid:?}"
+                );
                 assert_eq!(std::fs::read_to_string(&path)?, original);
             }
         }
+        Ok(())
+    }
+
+    #[gpui::test]
+    async fn agent_json_preflight_runs_without_an_active_canvas(cx: &mut gpui::TestAppContext) {
+        let result: Result<()> = async {
+            let (doc, page) = doc_with_page();
+            let directory = tempfile::tempdir()?;
+            fanta_format::write_project_tree(directory.path(), &doc, &Default::default())?;
+            let path = fanta_format::locate_page_source(directory.path(), page)
+                .context("page source")?
+                .with_file_name("page.json");
+            let original = std::fs::read_to_string(&path)?;
+            let surface = FigDesignSurface {
+                active: Rc::new(RefCell::new(None)),
+            };
+            let validate = cx.update(|cx| {
+                surface.validate_source_edit(path.display().to_string(), original.clone(), cx)
+            });
+            let valid = validate.await?;
+            assert_eq!(valid["applicable"], true);
+            assert_eq!(valid["scope"], "project");
+            let mut header: Value = serde_json::from_str(&original)?;
+            header["id"] = json!(NodeId::new().to_string());
+            let validate = cx.update(|cx| {
+                surface.validate_source_edit(path.display().to_string(), header.to_string(), cx)
+            });
+            let error = validate
+                .await
+                .expect_err("valid JSON cannot rebind the page");
+            assert!(format!("{error:#}").contains("differs from FNX root"));
+            assert_eq!(std::fs::read_to_string(path)?, original);
+            Ok(())
+        }
+        .await;
+        result.expect("validate managed JSON before saving without an active canvas");
+    }
+
+    #[test]
+    fn agent_json_validation_targets_the_file_project_and_allows_new_metadata() -> Result<()> {
+        let (doc, page) = doc_with_page();
+        let directory = tempfile::tempdir()?;
+        let focused_project = tempfile::tempdir()?;
+        for root in [directory.path(), focused_project.path()] {
+            fanta_format::write_project_tree(root, &doc, &Default::default())?;
+        }
+        let existing = directory.path().join("doc/metadata.json");
+        let original = std::fs::read_to_string(&existing)?;
+        for active_root in [None, Some(focused_project.path())] {
+            let valid = validate_source_candidate(active_root, &existing, &original)?;
+            assert_eq!(valid["scope"], "project");
+            assert_eq!(
+                valid["path"],
+                existing.canonicalize()?.display().to_string()
+            );
+        }
+        let definition = serde_json::to_string(&fanta_doc::ComponentDef::new(
+            ComponentId::new(),
+            NodeId::new(),
+            "New component",
+        ))?;
+        for (relative, source) in [
+            ("components/new/def.json", definition),
+            (
+                "pages/new/page.json",
+                json!({"id":page.to_string(),"order":1}).to_string(),
+            ),
+            ("doc/flows.json", "[]".into()),
+            ("doc/presentation.json", "null".into()),
+        ] {
+            let path = directory.path().join(relative);
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+            }
+            let valid = validate_source_candidate(None, &path, &source)?;
+            assert_eq!(valid["applicable"], true);
+            assert_eq!(valid["scope"], "typed_json");
+            assert!(validate_source_candidate(None, &path, "{\"unfinished\":").is_err());
+            assert!(!path.exists());
+        }
+        let unmanaged = directory.path().join("settings.json");
+        assert_eq!(
+            validate_source_candidate(None, &unmanaged, "custom settings")?["applicable"],
+            false
+        );
         Ok(())
     }
 

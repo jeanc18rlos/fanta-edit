@@ -78,7 +78,8 @@ pub use session::{
 };
 pub use snapshot::{export_fant_snapshot, import_fant_snapshot};
 pub use source_edit::{
-    ProjectSourceEdit, apply_project_source_edit, apply_project_source_edit_with_diagnostics,
+    ProjectSourceEdit, apply_project_json_edit, apply_project_source_edit,
+    apply_project_source_edit_with_diagnostics, validate_project_json_edit,
     validate_project_source_edit, validate_project_source_edit_with_diagnostics,
 };
 pub use write::{

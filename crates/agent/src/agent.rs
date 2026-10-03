@@ -3035,6 +3035,15 @@ impl NativeThreadEnvironment {
         label: String,
         cx: &mut App,
     ) -> Result<Rc<dyn SubagentHandle>> {
+        self.create_named_subagent_thread(label, None, cx)
+    }
+
+    fn create_named_subagent_thread(
+        &self,
+        label: String,
+        agent_name: Option<String>,
+        cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>> {
         let Some(parent_thread_entity) = self.thread.upgrade() else {
             anyhow::bail!("Parent thread no longer exists".to_string());
         };
@@ -3049,11 +3058,27 @@ impl NativeThreadEnvironment {
             ));
         }
 
+        let existing_names = self.agent.read_with(cx, |agent, cx| {
+            agent
+                .sessions
+                .values()
+                .map(|session| session.thread.read(cx).activity_name())
+                .collect::<HashSet<_>>()
+        })?;
+        let requested_name = agent_name.unwrap_or_else(|| "Morgana".into());
+        let requested_name = requested_name.trim();
+        let mut name = requested_name.to_string();
+        let mut suffix = 2;
+        while existing_names.contains(&name) {
+            name = format!("{requested_name} {suffix}");
+            suffix += 1;
+        }
         let subagent_thread: Entity<Thread> = cx.new(|cx| {
             let mut thread = Thread::new_subagent(&parent_thread_entity, cx);
             thread.set_title(label.into(), cx);
             thread
         });
+        subagent_thread.update(cx, |thread, cx| thread.set_agent_name(name, cx))?;
 
         let session_id = subagent_thread.read(cx).id().clone();
 
@@ -3242,6 +3267,15 @@ impl ThreadEnvironment for NativeThreadEnvironment {
         self.create_subagent_thread(label, cx)
     }
 
+    fn create_named_subagent(
+        &self,
+        label: String,
+        agent_name: Option<String>,
+        cx: &mut App,
+    ) -> Result<Rc<dyn SubagentHandle>> {
+        self.create_named_subagent_thread(label, agent_name, cx)
+    }
+
     fn resume_subagent(
         &self,
         session_id: acp::SessionId,
@@ -3373,8 +3407,30 @@ impl SubagentHandle for NativeSubagentHandle {
                     })
                     ??;
 
+                let mut content = vec![message.into()];
+                content.push(format!(
+                    "\n\nYour display name is {}. Keep this name stable in activity reports and keep your assigned task description separate.",
+                    thread.read(cx).activity_name()
+                ).into());
+                if thread
+                    .read(cx)
+                    .model()
+                    .is_some_and(|model| model.supports_images())
+                {
+                    let references = parent_thread
+                        .read_with(cx, |thread, _| thread.reference_images())?;
+                    if !references.is_empty() {
+                        content.push("\n\nThe following image attachments were sent by the user in the lead chat. Use them as visual references for your assigned task.".into());
+                        content.extend(references.into_iter().map(|image| {
+                            acp::ContentBlock::Image(acp::ImageContent::new(
+                                image.source,
+                                "image/png",
+                            ))
+                        }));
+                    }
+                }
                 let task = acp_thread.update(cx, |acp_thread, cx| {
-                    acp_thread.send(vec![message.into()], cx)
+                    acp_thread.send(content, cx)
                 });
 
                 let (token_limit_tx, token_limit_rx) = oneshot::channel::<()>();
@@ -3813,6 +3869,144 @@ mod internal_tests {
             .skip(1)
             .map(language_model::LanguageModelRequestMessage::string_contents)
             .collect()
+    }
+
+    #[gpui::test]
+    async fn test_ai_mage_names_keep_task_titles_and_persist(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_, agent, _, parent_acp) = setup_native_agent_session(cx).await;
+        let parent =
+            cx.update(|cx| native_thread_for_session(&agent, parent_acp.read(cx).session_id(), cx));
+        let environment = NativeThreadEnvironment {
+            agent: agent.downgrade(),
+            thread: parent.downgrade(),
+            acp_thread: parent_acp.downgrade(),
+        };
+        let (specialist, other_specialist) = cx.update(|cx| {
+            let first = environment
+                .create_named_subagent_thread(
+                    "Navigation components".into(),
+                    Some("Morgana".into()),
+                    cx,
+                )
+                .expect("first named specialist");
+            let second = environment
+                .create_named_subagent_thread("Screen layout".into(), Some("Morgana".into()), cx)
+                .expect("second named specialist");
+            (
+                native_thread_for_session(&agent, &first.id(), cx),
+                native_thread_for_session(&agent, &second.id(), cx),
+            )
+        });
+        assert_eq!(
+            specialist.read_with(cx, |thread, _| thread.activity_name()),
+            "Morgana"
+        );
+        assert_eq!(
+            other_specialist.read_with(cx, |thread, _| thread.activity_name()),
+            "Morgana 2"
+        );
+        specialist.update(cx, |thread, cx| {
+            assert_eq!(
+                thread.title(),
+                Some("Morgana · Navigation components".into())
+            );
+            thread
+                .set_agent_name("Severus".into(), cx)
+                .expect("rename specialist");
+            assert_eq!(
+                thread.title(),
+                Some("Severus · Navigation components".into())
+            );
+            assert!(thread.set_agent_name("bad\nname".into(), cx).is_err());
+        });
+        parent.update(cx, |thread, cx| {
+            thread.set_title("Build a dashboard".into(), cx);
+            thread
+                .set_agent_name("Cornelius".into(), cx)
+                .expect("name lead");
+            assert_eq!(thread.activity_name(), "Cornelius");
+            assert_eq!(thread.title(), Some("Build a dashboard".into()));
+        });
+        let stored = specialist
+            .read_with(cx, |thread, cx| thread.to_db(cx))
+            .await;
+        let json = serde_json::to_string(&stored).expect("serialize named specialist");
+        let restored: DbThread = serde_json::from_str(&json).expect("restore named specialist");
+        assert_eq!(restored.agent_name, Some("Severus".into()));
+        assert_eq!(restored.title.as_ref(), "Severus · Navigation components");
+    }
+
+    #[gpui::test]
+    async fn test_specialist_receives_original_reference_attachments(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (_, agent, project, parent_acp) = setup_native_agent_session(cx).await;
+        let parent =
+            cx.update(|cx| native_thread_for_session(&agent, parent_acp.read(cx).session_id(), cx));
+        let model = Arc::new(FakeLanguageModel::default());
+        model.set_supports_images(true);
+        let image_data = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
+        cx.update(|cx| {
+            let path_style = project.read(cx).path_style(cx);
+            parent.update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                for prompt in ["Build this screen", "Use the same reference"] {
+                    thread.push_acp_user_block(
+                        ClientUserMessageId::new(),
+                        [
+                            prompt.into(),
+                            acp::ContentBlock::Image(acp::ImageContent::new(
+                                image_data,
+                                "image/png",
+                            )),
+                        ],
+                        path_style,
+                        cx,
+                    );
+                }
+                assert_eq!(thread.reference_images().len(), 1);
+            });
+        });
+        let environment = NativeThreadEnvironment {
+            agent: agent.downgrade(),
+            thread: parent.downgrade(),
+            acp_thread: parent_acp.downgrade(),
+        };
+        let specialist = cx
+            .update(|cx| environment.create_subagent_thread("Component designer".into(), cx))
+            .expect("specialist session");
+        let task = cx.spawn(async move |cx| {
+            specialist
+                .send("Build the navigation component".into(), &cx)
+                .await
+        });
+        cx.run_until_parked();
+        let request = model
+            .pending_completions()
+            .pop()
+            .expect("specialist request");
+        let images = request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|content| match content {
+                language_model::MessageContent::Image(image) => Some(image),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let references = parent.read_with(cx, |thread, _| thread.reference_images());
+        assert_eq!(images, references.iter().collect::<Vec<_>>());
+        assert!(request.messages.iter().any(|message| {
+            message
+                .string_contents()
+                .contains("Build the navigation component")
+        }));
+        model.send_completion_stream_text_chunk(&request, "Navigation component complete");
+        model.end_completion_stream(&request);
+        assert_eq!(
+            task.await.expect("specialist result"),
+            "Navigation component complete"
+        );
     }
 
     #[gpui::test]

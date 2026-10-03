@@ -52,6 +52,9 @@ struct CatalogModel {
     available: AvailableModel,
     cost: Option<LanguageModelCostInfo>,
     adaptive_thinking: bool,
+    reasoning_efforts: Vec<anthropic::Effort>,
+    default_reasoning_effort: Option<anthropic::Effort>,
+    supports_disabling_thinking: bool,
     forced_tool_choice: bool,
 }
 
@@ -61,6 +64,9 @@ impl From<AvailableModel> for CatalogModel {
             available,
             cost: None,
             adaptive_thinking: false,
+            reasoning_efforts: Vec::new(),
+            default_reasoning_effort: None,
+            supports_disabling_thinking: true,
             forced_tool_choice: true,
         }
     }
@@ -181,19 +187,161 @@ fn available_model_to_anthropic_model(record: &CatalogModel) -> anthropic::Model
         supports_images: available.capabilities.images,
         supports_speed: false,
         supports_compaction: false,
-        supported_effort_levels: if supports_adaptive_thinking {
-            vec![
-                anthropic::Effort::Low,
-                anthropic::Effort::Medium,
-                anthropic::Effort::High,
-                anthropic::Effort::XHigh,
-            ]
-        } else {
-            Vec::new()
-        },
+        supported_effort_levels: record.reasoning_efforts.clone(),
         tool_override: available.tool_override.clone(),
         extra_beta_headers: available.extra_beta_headers.clone(),
     }
+}
+
+fn catalog_reasoning(capabilities: &Value, id: &str) -> (Vec<anthropic::Effort>, bool) {
+    use anthropic::Effort;
+
+    let options = capabilities["reasoning_options"].as_array();
+    let declared_efforts = capabilities["effort_levels"]
+        .as_array()
+        .or_else(|| capabilities["supported_effort_levels"].as_array())
+        .or_else(|| capabilities["reasoning_efforts"].as_array())
+        .or_else(|| {
+            options?.iter().find_map(|option| {
+                (option["type"].as_str() == Some("effort"))
+                    .then(|| option["values"].as_array())
+                    .flatten()
+            })
+        });
+    let efforts = if let Some(values) = declared_efforts {
+        values
+            .iter()
+            .filter_map(Value::as_str)
+            .filter_map(|value| value.parse::<Effort>().ok())
+            .fold(Vec::new(), |mut efforts, effort| {
+                if !efforts.contains(&effort) {
+                    efforts.push(effort);
+                }
+                efforts
+            })
+    } else {
+        // These aliases are verified against the gateway's reasoning_options;
+        // older account catalogs omit their reasoning metadata.
+        let model_id = id.strip_prefix("openai/").unwrap_or(id);
+        let model_id = model_id.strip_suffix("-fast").unwrap_or(model_id);
+        match model_id {
+            "gpt-6-sol" | "gpt-6-luna" | "gpt-5.6-luna" => {
+                vec![
+                    Effort::None,
+                    Effort::Low,
+                    Effort::Medium,
+                    Effort::High,
+                    Effort::XHigh,
+                    Effort::Max,
+                ]
+            }
+            "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini" | "gpt-5.4-nano" | "gpt-5.4-pro"
+            | "gpt-5.3-codex" | "gpt-5.2" | "gpt-5.1-thinking" => {
+                vec![
+                    Effort::None,
+                    Effort::Minimal,
+                    Effort::Low,
+                    Effort::Medium,
+                    Effort::High,
+                    Effort::XHigh,
+                ]
+            }
+            "gpt-5.6-sol" | "gpt-5.6-terra" => vec![
+                Effort::None,
+                Effort::Minimal,
+                Effort::Low,
+                Effort::Medium,
+                Effort::High,
+                Effort::XHigh,
+                Effort::Max,
+            ],
+            "gpt-6-astra" | "gpt-6.1-sol" => vec![
+                Effort::Low,
+                Effort::Medium,
+                Effort::High,
+                Effort::XHigh,
+                Effort::Max,
+            ],
+            "gpt-5.5-pro" | "gpt-5.2-pro" => vec![Effort::Medium, Effort::High, Effort::XHigh],
+            "gpt-5.1-codex" | "gpt-5.1-codex-max" | "gpt-5.1-codex-mini" | "gpt-5.2-codex" => {
+                vec![Effort::None, Effort::Low, Effort::Medium, Effort::High]
+            }
+            "gpt-5" | "gpt-5-mini" | "gpt-5-nano" => {
+                vec![Effort::Minimal, Effort::Low, Effort::Medium, Effort::High]
+            }
+            "gpt-5-pro" => vec![Effort::High],
+            "gpt-5-codex" | "o1" | "o3" | "o3-mini" | "o3-pro" | "o4-mini" => {
+                vec![Effort::Low, Effort::Medium, Effort::High]
+            }
+            "claude-opus-5-5" | "anthropic/claude-opus-5.5" => {
+                vec![
+                    Effort::Low,
+                    Effort::Medium,
+                    Effort::High,
+                    Effort::XHigh,
+                    Effort::Max,
+                ]
+            }
+            _ if capabilities["reasoning_mode"].as_str() == Some("adaptive") => {
+                vec![Effort::Low, Effort::Medium, Effort::High, Effort::XHigh]
+            }
+            _ => Vec::new(),
+        }
+    };
+    let supports_toggle = capabilities["supports_disabling_thinking"]
+        .as_bool()
+        .unwrap_or_else(|| {
+            efforts.contains(&Effort::None)
+                || options.is_some_and(|options| {
+                    options
+                        .iter()
+                        .any(|option| option["type"].as_str() == Some("toggle"))
+                })
+        });
+    (efforts, supports_toggle)
+}
+
+fn into_compatible_request(
+    mut request: LanguageModelRequest,
+    model: &anthropic::Model,
+    default_reasoning_effort: Option<anthropic::Effort>,
+    supports_disabling_thinking: bool,
+    forced_tool_choice: bool,
+    cache_mode: AnthropicPromptCacheMode,
+) -> anthropic::Request {
+    if model.supports_adaptive_thinking && !supports_disabling_thinking {
+        request.thinking_allowed = true;
+    }
+    let thinking_allowed = request.thinking_allowed;
+    if !model
+        .supported_effort_levels
+        .iter()
+        .any(|effort| Some(effort.value()) == request.thinking_effort.as_deref())
+    {
+        request.thinking_effort = default_reasoning_effort.map(|effort| effort.value().to_owned());
+    }
+    if !forced_tool_choice && request.tool_choice == Some(LanguageModelToolChoice::Any) {
+        request.tool_choice = Some(LanguageModelToolChoice::Auto);
+    }
+    let has_tools = !request.tools.is_empty();
+    let request_id = model.request_id(has_tools).to_string();
+    let mut request = into_anthropic(
+        request,
+        request_id,
+        model.default_temperature,
+        model.max_output_tokens,
+        model.mode.clone(),
+        cache_mode,
+    );
+    if !model.supports_speed {
+        request.speed = None;
+    }
+    if model.supports_adaptive_thinking && supports_disabling_thinking && !thinking_allowed {
+        request.output_config = Some(anthropic::OutputConfig {
+            effort: Some(anthropic::Effort::None),
+        });
+    }
+    request
 }
 
 fn parse_catalog(value: &Value) -> Result<Vec<CatalogModel>> {
@@ -252,10 +400,30 @@ fn parse_catalog(value: &Value) -> Result<Vec<CatalogModel>> {
                     output_credits_per_1m,
                 }
             });
+        let (mut reasoning_efforts, supports_disabling_thinking) =
+            catalog_reasoning(capabilities, id);
+        reasoning_efforts.retain(|effort| *effort != anthropic::Effort::None);
+        let default_reasoning_effort = capabilities["default_effort"]
+            .as_str()
+            .and_then(|value| value.parse::<anthropic::Effort>().ok())
+            .filter(|effort| reasoning_efforts.contains(effort))
+            .or_else(|| {
+                let default = if id.starts_with("gpt-") || id.starts_with("openai/") {
+                    anthropic::Effort::Medium
+                } else {
+                    anthropic::Effort::High
+                };
+                reasoning_efforts.contains(&default).then_some(default)
+            })
+            .or_else(|| reasoning_efforts.first().copied());
         models.push(CatalogModel {
             available,
             cost,
-            adaptive_thinking: capabilities["reasoning_mode"].as_str() == Some("adaptive"),
+            adaptive_thinking: capabilities["reasoning_mode"].as_str() == Some("adaptive")
+                || !reasoning_efforts.is_empty(),
+            reasoning_efforts,
+            default_reasoning_effort,
+            supports_disabling_thinking,
             forced_tool_choice: capabilities["forced_tool_choice"].as_bool().unwrap_or(true),
         });
     }
@@ -449,6 +617,8 @@ impl AnthropicCompatibleLanguageModelProvider {
             model,
             capabilities,
             cost: record.cost,
+            default_reasoning_effort: record.default_reasoning_effort,
+            supports_disabling_thinking: record.supports_disabling_thinking,
             forced_tool_choice: record.forced_tool_choice,
             cache_mode,
             state: self.state.clone(),
@@ -670,6 +840,8 @@ pub struct AnthropicCompatibleLanguageModel {
     model: anthropic::Model,
     capabilities: ModelCapabilities,
     cost: Option<LanguageModelCostInfo>,
+    default_reasoning_effort: Option<anthropic::Effort>,
+    supports_disabling_thinking: bool,
     forced_tool_choice: bool,
     cache_mode: AnthropicPromptCacheMode,
     state: Entity<State>,
@@ -789,26 +961,17 @@ impl LanguageModel for AnthropicCompatibleLanguageModel {
     }
 
     fn supports_disabling_thinking(&self) -> bool {
-        !self.model.supports_adaptive_thinking
+        self.supports_disabling_thinking
     }
 
     fn supported_effort_levels(&self) -> Vec<language_model::LanguageModelEffortLevel> {
         self.model
             .supported_effort_levels
             .iter()
-            .map(|effort| {
-                let (name, value) = match effort {
-                    anthropic::Effort::Low => ("Low", "low"),
-                    anthropic::Effort::Medium => ("Medium", "medium"),
-                    anthropic::Effort::High => ("High", "high"),
-                    anthropic::Effort::XHigh => ("XHigh", "xhigh"),
-                    anthropic::Effort::Max => ("Max", "max"),
-                };
-                language_model::LanguageModelEffortLevel {
-                    name: name.into(),
-                    value: value.into(),
-                    is_default: matches!(effort, anthropic::Effort::High),
-                }
+            .map(|effort| language_model::LanguageModelEffortLevel {
+                name: effort.label().into(),
+                value: effort.value().into(),
+                is_default: Some(*effort) == self.default_reasoning_effort,
             })
             .collect()
     }
@@ -831,7 +994,7 @@ impl LanguageModel for AnthropicCompatibleLanguageModel {
 
     fn stream_completion(
         &self,
-        mut request: LanguageModelRequest,
+        request: LanguageModelRequest,
         cx: &AsyncApp,
     ) -> BoxFuture<
         'static,
@@ -840,25 +1003,14 @@ impl LanguageModel for AnthropicCompatibleLanguageModel {
             LanguageModelCompletionError,
         >,
     > {
-        if self.model.supports_adaptive_thinking {
-            request.thinking_allowed = true;
-        }
-        if !self.forced_tool_choice && request.tool_choice == Some(LanguageModelToolChoice::Any) {
-            request.tool_choice = Some(LanguageModelToolChoice::Auto);
-        }
-        let has_tools = !request.tools.is_empty();
-        let request_id = self.model.request_id(has_tools).to_string();
-        let mut request = into_anthropic(
+        let request = into_compatible_request(
             request,
-            request_id,
-            self.model.default_temperature,
-            self.model.max_output_tokens,
-            self.model.mode.clone(),
+            &self.model,
+            self.default_reasoning_effort,
+            self.supports_disabling_thinking,
+            self.forced_tool_choice,
             self.cache_mode,
         );
-        if !self.model.supports_speed {
-            request.speed = None;
-        }
         let completion_request = self.stream_completion(request, cx);
         let provider_name = self.provider_name.clone();
         let future = self.request_limiter.stream(async move {
@@ -873,6 +1025,137 @@ impl LanguageModel for AnthropicCompatibleLanguageModel {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn catalog_model(id: &str, capabilities: Value) -> Result<CatalogModel> {
+        parse_catalog(&json!({
+            "models": [{ "id": id, "kind": "chat", "capabilities": capabilities }]
+        }))?
+        .into_iter()
+        .next()
+        .context("test catalog must contain a model")
+    }
+
+    #[test]
+    fn gpt_catalog_aliases_expose_their_verified_efforts_and_toggle() -> Result<()> {
+        let sol = catalog_model("gpt-6-sol", json!({}))?;
+        assert!(sol.adaptive_thinking);
+        assert!(sol.supports_disabling_thinking);
+        assert_eq!(
+            sol.default_reasoning_effort,
+            Some(anthropic::Effort::Medium)
+        );
+        assert_eq!(
+            sol.reasoning_efforts
+                .iter()
+                .map(|effort| effort.value())
+                .collect::<Vec<_>>(),
+            ["low", "medium", "high", "xhigh", "max"],
+        );
+        let five = catalog_model("gpt-5.5", json!({}))?;
+        assert_eq!(
+            five.reasoning_efforts
+                .iter()
+                .map(|effort| effort.value())
+                .collect::<Vec<_>>(),
+            ["minimal", "low", "medium", "high", "xhigh"],
+        );
+        let unknown = catalog_model("unknown-model", json!({}))?;
+        assert!(!available_model_to_anthropic_model(&unknown).supports_thinking);
+        assert!(unknown.reasoning_efforts.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_metadata_overrides_alias_defaults_and_filters_invalid_efforts() -> Result<()> {
+        let model = catalog_model(
+            "gpt-6-sol",
+            json!({
+                "effort_levels": ["low", "high", "ultra-unknown", "high", 17],
+                "default_effort": "high",
+                "supports_disabling_thinking": false,
+            }),
+        )?;
+        assert_eq!(
+            model.reasoning_efforts,
+            [anthropic::Effort::Low, anthropic::Effort::High]
+        );
+        assert_eq!(
+            model.default_reasoning_effort,
+            Some(anthropic::Effort::High)
+        );
+        assert!(!model.supports_disabling_thinking);
+        let disabled = catalog_model("gpt-6-sol", json!({ "effort_levels": [] }))?;
+        assert!(!available_model_to_anthropic_model(&disabled).supports_thinking);
+        Ok(())
+    }
+
+    #[test]
+    fn compatible_requests_forward_gpt_effort_and_explicit_thinking_off() -> Result<()> {
+        let record = catalog_model("gpt-6-sol", json!({}))?;
+        let model = available_model_to_anthropic_model(&record);
+        for (thinking_allowed, selected, expected) in [
+            (true, "max", "max"),
+            (true, "unsupported", "medium"),
+            (false, "high", "none"),
+        ] {
+            let request = into_compatible_request(
+                LanguageModelRequest {
+                    thinking_allowed,
+                    thinking_effort: Some(selected.to_owned()),
+                    ..Default::default()
+                },
+                &model,
+                record.default_reasoning_effort,
+                record.supports_disabling_thinking,
+                record.forced_tool_choice,
+                AnthropicPromptCacheMode::Disabled,
+            );
+            let serialized = serde_json::to_value(&request)?;
+            assert_eq!(serialized["output_config"]["effort"], expected);
+            assert_eq!(request.thinking.is_some(), thinking_allowed);
+        }
+        let record = catalog_model("gpt-5.5", json!({}))?;
+        let request = into_compatible_request(
+            LanguageModelRequest {
+                thinking_allowed: true,
+                thinking_effort: Some("minimal".into()),
+                ..Default::default()
+            },
+            &available_model_to_anthropic_model(&record),
+            record.default_reasoning_effort,
+            record.supports_disabling_thinking,
+            true,
+            AnthropicPromptCacheMode::Disabled,
+        );
+        assert_eq!(
+            serde_json::to_value(request)?["output_config"]["effort"],
+            "minimal"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compatible_requests_preserve_always_on_claude_reasoning() -> Result<()> {
+        let record = catalog_model("claude-opus-5-5", json!({}))?;
+        let request = into_compatible_request(
+            LanguageModelRequest {
+                thinking_allowed: false,
+                thinking_effort: Some("max".into()),
+                ..Default::default()
+            },
+            &available_model_to_anthropic_model(&record),
+            record.default_reasoning_effort,
+            record.supports_disabling_thinking,
+            true,
+            AnthropicPromptCacheMode::Disabled,
+        );
+        assert!(request.thinking.is_some());
+        assert_eq!(
+            serde_json::to_value(request)?["output_config"]["effort"],
+            "max"
+        );
+        Ok(())
+    }
 
     #[test]
     fn catalog_exposes_only_chat_models_with_server_authored_capabilities_and_prices() {

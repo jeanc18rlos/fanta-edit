@@ -2590,16 +2590,20 @@ mod echo_tests {
         cx.simulate_resize(size(px(1280.), px(800.)));
         cx.run_until_parked();
         let expanded = cx.debug_bounds("fig-container").expect("canvas");
+        let expanded_sidebar = cx
+            .debug_bounds("fanta-inspector-sidebar")
+            .expect("properties sidebar");
+        assert!(cx.debug_bounds("properties-inspector-tabs").is_none());
         let toggle = cx
             .debug_bounds("properties-inspector-toggle")
             .expect("properties toggle");
         cx.simulate_click(toggle.center(), Modifiers::default());
         cx.run_until_parked();
         assert!(cx.debug_bounds("fanta-inspector-sidebar").is_none());
-        assert!(
-            cx.debug_bounds("properties-inspector-floating-card")
-                .is_some()
-        );
+        let collapsed_controls = cx
+            .debug_bounds("properties-inspector-floating-card")
+            .expect("collapsed properties controls");
+        assert!(collapsed_controls.size.width < expanded_sidebar.size.width);
         assert!(cx.debug_bounds("fig-container").expect("canvas").size.width > expanded.size.width);
         let toggle = cx
             .debug_bounds("properties-inspector-toggle")

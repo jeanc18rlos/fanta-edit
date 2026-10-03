@@ -110,7 +110,21 @@ mod tests {
         let templates = Templates::new();
         for name in ["system_prompt.hbs", "experimental_system_prompt.hbs"] {
             let rendered = templates.0.render(name, &template).expect(name);
-            assert!(rendered.contains("Source edits first"), "{name}");
+            assert!(rendered.contains("Visible progress first"), "{name}");
+            assert!(
+                rendered.contains("report_agent_activity.agent_name"),
+                "{name}"
+            );
+            assert!(rendered.contains("spawn_agent.mage_name"), "{name}");
+            assert!(
+                rendered.contains("Place a representative instance"),
+                "{name}"
+            );
+            assert!(
+                rendered.contains("one complete component or section per milestone"),
+                "{name}"
+            );
+            assert!(rendered.contains("source_path"), "{name}");
             assert!(rendered.contains("Complete FNX candidates"), "{name}");
             assert!(
                 rendered.contains(r#"{"size_px": 16, "weight": 400}"#),
@@ -151,7 +165,7 @@ mod tests {
         assert!(rendered.contains("same file"));
         assert!(rendered.contains("at most three specialists active"));
         assert!(rendered.contains("cannot delegate further"));
-        assert!(rendered.contains("Source edits first"));
+        assert!(rendered.contains("Visible progress first"));
 
         template.orchestration = false;
         assert!(
@@ -213,7 +227,7 @@ mod tests {
         let rendered = template.render(&templates).unwrap();
         assert!(rendered.contains("## Design canvas"));
         assert!(rendered.contains("empty_space"));
-        assert!(rendered.contains("Source edits first"));
+        assert!(rendered.contains("Visible progress first"));
         assert!(rendered.contains("original threads"));
     }
 

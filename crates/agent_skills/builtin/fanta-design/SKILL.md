@@ -31,12 +31,22 @@ user to open one.
 
 1. **Inspect** — `design_state` (no args) for the overview, then
    `design_state {page: N}` for the node tree of the page you'll work on.
-2. **Build** — `design_edit` with an ops batch. Give each batch a `label`
-   (it becomes the undo step's name).
+2. **Build visibly** — `design_edit` with a small ops batch for one component
+   or coherent section. Give each batch a `label` (one undo step). Edits paint
+   progressively, with a cursor at each affected element. Show each component
+   on the current page or open and focus its own page/file tab, then place a
+   representative instance before creating the next component.
 3. **Verify** — `design_screenshot {node: <frame-id>}` after each substantive
    batch and READ the image. Coordinates lie; pixels don't.
 4. **Refine** — target nodes by id from the returned `created` list or a
    fresh `design_state`.
+
+Use `report_agent_activity` at every visible milestone with the actual
+`page`, `node` or `world`, plus `source_path` and `workspace` (`canvas`,
+`variables`, `code`) when switching files or editor tabs. Choose a mage name
+such as Merlyn, Morgana, Cornelius or Severus and keep it stable. Users who
+follow you should see the file and place where you are working. Delegated
+agents must follow these visibility rules and receive the reference images.
 
 ## Canvas ops (`design_edit`)
 
@@ -77,10 +87,11 @@ Mechanics that matter:
 
 ## When ops aren't enough: edit the FNX source
 
-Auto-layout stacks, gradients, shadows, blurs, strokes, per-corner radii,
-component instances, and variable bindings are not covered by canvas ops yet.
-For those, edit the project's `.fnx` sources directly with the normal
-`read_file`/`edit_file` tools:
+Read `design_guidelines` for the full native operation schema, including
+auto layout, components, styling and variable bindings. Prefer native edits
+for visible progress. When an operation is unavailable, edit the project's
+`.fnx` or typed JSON sources with the normal `read_file`/`edit_file` tools.
+Save and show one complete component or section before moving to the next:
 
 - Sources live in the project directory: `pages/<page-id>/page.fnx` and
   `components/<cid>/master.fnx` (JSX-like: element = node, attributes = the
@@ -88,6 +99,9 @@ For those, edit the project's `.fnx` sources directly with the normal
 - The canvas reloads from DISK, not from a dirty buffer: SAVE the FNX buffer
   (or write with `edit_file`, which saves) to trigger the reload (~300ms
   debounce); then `design_screenshot` to verify.
+- JSON files and identity sidecars are editable. Inspect their current schema,
+  preserve identities and validate the complete project before saving; JSON
+  syntax alone is insufficient. Invalid saves retain the last valid canvas.
 - Do NOT mix lanes mid-flight: while an FNX buffer has unsaved edits the
   canvas is locked (`design_edit` will refuse with `source_edit_locked`).
 - A freshly opened `.fig` has no source tree until the user saves it as a
