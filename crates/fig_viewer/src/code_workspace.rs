@@ -19,7 +19,7 @@ use crate::document::{FigItem, FigItemEvent};
 /// the file is authored by the agent or by an ordinary editor — never by this
 /// pane. Stated once, where the panes are; kept short so the path header —
 /// the thing that answers "which file is this?" — gets the room.
-const READ_ONLY_STATUS: &str = "Read-only — the canvas follows this file.";
+const READ_ONLY_STATUS: &str = "Read-only saved source";
 
 /// Every JSX tag the FNX printer can emit: the canonical node tags plus the
 /// two authoring-sugar shape tags. Restricting the opening-tag scan to these
@@ -789,7 +789,13 @@ impl Render for FantaCodeWorkspace {
         } else {
             Color::Muted
         };
-        let status = error_message.unwrap_or_else(|| READ_ONLY_STATUS.into());
+        let status = error_message.unwrap_or_else(|| {
+            if self.item.read(cx).is_dirty() {
+                "Saved source may differ from unsaved canvas changes".into()
+            } else {
+                READ_ONLY_STATUS.into()
+            }
+        });
         v_flex()
             .track_focus(&self.focus_handle)
             .size_full()

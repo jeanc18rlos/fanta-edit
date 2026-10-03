@@ -21,8 +21,8 @@ use fanta_text::TextBuffer;
 use fs::Fs;
 use gpui::{
     App, AsyncWindowContext, Bounds, Context, DragMoveEvent, Entity, EventEmitter, FocusHandle,
-    Focusable, KeyDownEvent, Pixels, Point, ScrollHandle, SharedString, Subscription, Task,
-    WeakEntity, Window, actions, px,
+    Focusable, KeyDownEvent, Pixels, Point, RenderOnce, ScrollHandle, SharedString, Subscription,
+    Task, WeakEntity, Window, actions, px,
 };
 use settings::{Settings as _, update_settings_file};
 use ui::Divider;
@@ -71,6 +71,146 @@ actions!(
 );
 
 const NO_DOCUMENT_MESSAGE: &str = "Open a Figma document to inspect properties";
+
+type MeasurementActionHandler = Box<dyn Fn(&mut Window, &mut App)>;
+
+#[derive(IntoElement)]
+pub(crate) struct MeasurementProperties {
+    distance: SharedString,
+    start: [f64; 2],
+    end: [f64; 2],
+    editable: bool,
+    on_copy: MeasurementActionHandler,
+    on_delete: MeasurementActionHandler,
+}
+
+impl MeasurementProperties {
+    pub(crate) fn new(
+        distance: SharedString,
+        start: [f64; 2],
+        end: [f64; 2],
+        editable: bool,
+        on_copy: impl Fn(&mut Window, &mut App) + 'static,
+        on_delete: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            distance,
+            start,
+            end,
+            editable,
+            on_copy: Box::new(on_copy),
+            on_delete: Box::new(on_delete),
+        }
+    }
+}
+
+impl RenderOnce for MeasurementProperties {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let on_copy = self.on_copy;
+        let on_delete = self.on_delete;
+        v_flex()
+            .id("fanta-measurement-properties")
+            .w_full()
+            .max_h(px(340.))
+            .flex_shrink_0()
+            .min_w_0()
+            .overflow_y_scroll()
+            .bg(cx.theme().colors().panel_background)
+            .child(crate::inspector_components::InspectorSectionHeader::new(
+                "Measurement",
+            ))
+            .child(
+                v_flex()
+                    .p_3()
+                    .gap_3()
+                    .child(Label::new(self.distance))
+                    .children(
+                        [("Start", self.start), ("End", self.end)].map(|(label, point)| {
+                            h_flex()
+                                .gap_2()
+                                .flex_wrap()
+                                .justify_between()
+                                .child(Label::new(label).color(Color::Muted))
+                                .child(Label::new(format!(
+                                    "{}, {} px",
+                                    format_number(point[0]),
+                                    format_number(point[1]),
+                                )))
+                        }),
+                    )
+                    .child(Label::new("Fixed positions on this page").color(Color::Muted))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .flex_wrap()
+                            .child(
+                                Button::new("copy-measurement", "Copy value")
+                                    .on_click(move |_, window, cx| on_copy(window, cx)),
+                            )
+                            .child(
+                                Button::new("delete-measurement", "Delete")
+                                    .disabled(!self.editable)
+                                    .on_click(move |_, window, cx| on_delete(window, cx)),
+                            ),
+                    ),
+            )
+    }
+}
+
+type MeasurementSelectionHandler = std::rc::Rc<dyn Fn(SharedString, &mut Window, &mut App)>;
+
+#[derive(IntoElement)]
+pub(crate) struct MeasurementList {
+    rows: Vec<(SharedString, SharedString)>,
+    selected: Option<SharedString>,
+    on_select: MeasurementSelectionHandler,
+}
+
+impl MeasurementList {
+    pub(crate) fn new(
+        rows: Vec<(SharedString, SharedString)>,
+        selected: Option<SharedString>,
+        on_select: impl Fn(SharedString, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            rows,
+            selected,
+            on_select: std::rc::Rc::new(on_select),
+        }
+    }
+}
+
+impl RenderOnce for MeasurementList {
+    fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let mut content = v_flex()
+            .id("fanta-measurement-list")
+            .w_full()
+            .min_h_0()
+            .flex_1()
+            .overflow_y_scroll()
+            .bg(cx.theme().colors().panel_background)
+            .child(crate::inspector_components::InspectorSectionHeader::new(
+                "Measurements on this page",
+            ));
+        if self.rows.is_empty() {
+            return content.child(crate::inspector_components::InspectorMessage::new(
+                "This page has no measurements yet.",
+            ));
+        }
+        for (id, label) in self.rows {
+            let on_select = self.on_select.clone();
+            let selected = self.selected.as_ref() == Some(&id);
+            content = content.child(
+                div().px_2().py_1().child(
+                    Button::new(SharedString::from(format!("measurement-list-{id}")), label)
+                        .toggle_state(selected)
+                        .on_click(move |_, window, cx| on_select(id.clone(), window, cx)),
+                ),
+            );
+        }
+        content
+    }
+}
 
 /// The panel's draggable slider tracks. Their painted bounds are captured every
 /// frame so a press maps straight to a fraction of the track.
@@ -395,9 +535,9 @@ impl FantaPropertiesPanel {
                     let item = view.read(cx).item().clone();
                     self.draft_preserving_focus_scope =
                         Some(view.read(cx).draft_preserving_toolbar_focus_scope(cx));
-                    self.set_inspecting(view.read(cx).is_inspecting(), cx);
+                    self.set_inspecting(view.read(cx).is_art_read_only(cx), cx);
                     self._inspection_subscription = Some(cx.observe(&view, |this, view, cx| {
-                        this.set_inspecting(view.read(cx).is_inspecting(), cx);
+                        this.set_inspecting(view.read(cx).is_art_read_only(cx), cx);
                     }));
                     self._active_view_subscription = Some(cx.subscribe(
                         &item,
@@ -1675,30 +1815,69 @@ impl FantaPropertiesPanel {
             return;
         };
         let item = view.read(cx).item().clone();
-        let selected_page = view.read(cx).selected_page_index();
-        let (page_index, current_index) = {
-            let fig_item = item.read(cx);
-            let Some(document) = fig_item.document() else {
+        let Some(doc) = item.read(cx).doc() else {
+            return;
+        };
+        let [instance] = doc.selection.as_slice() else {
+            return;
+        };
+        let expected_instance = *instance;
+        let expected_scene = doc.scene.instance_id();
+        let expected_page = doc.active_page();
+        let view = view.downgrade();
+        // Navigation finishes inspector edits and echoes its permissions;
+        // both must wait until this inspector's click releases its lease.
+        cx.defer(move |cx| {
+            let Some(view) = view.upgrade() else {
                 return;
             };
-            (
-                document.page_index_of_node(target),
-                document.page_index(selected_page),
-            )
-        };
-        view.update(cx, |view, cx| {
-            if let Some(index) = page_index
-                && Some(index) != current_index
-            {
-                view.select_page(index, cx);
+            if view.read(cx).item().entity_id() != item.entity_id() {
+                return;
             }
-            view.focus_node(target, cx);
-        });
-        item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
-                document.doc.selection.select_only(target);
-                ((), DocChange::Selection)
+            let selected_page = view.read(cx).selected_page_index();
+            let (page_index, current_index) = {
+                let item = item.read(cx);
+                let Some(document) = item.document() else {
+                    return;
+                };
+                let doc = &document.doc;
+                if doc.scene.instance_id() != expected_scene
+                    || doc.active_page() != expected_page
+                    || doc.selection.as_slice() != [expected_instance]
+                {
+                    return;
+                }
+                let Some(NodeData::Instance(instance)) =
+                    doc.scene.get(expected_instance).map(|node| &node.data)
+                else {
+                    return;
+                };
+                if doc.components.def(instance.component).map(|def| def.root) != Some(target) {
+                    return;
+                }
+                let Some(index) = document.page_index_of_node(target) else {
+                    return;
+                };
+                (index, document.page_index(selected_page))
+            };
+            let navigated = view.update(cx, |view, cx| {
+                if Some(page_index) != current_index {
+                    view.select_page(page_index, cx);
+                    if view.selected_page_index() != Some(page_index) {
+                        return false;
+                    }
+                }
+                view.focus_node(target, cx);
+                true
             });
+            if navigated {
+                item.update(cx, |item, cx| {
+                    item.with_document(cx, |document| {
+                        document.doc.selection.select_only(target);
+                        ((), DocChange::Selection)
+                    });
+                });
+            }
         });
     }
 

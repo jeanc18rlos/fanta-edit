@@ -44,6 +44,7 @@ pub(crate) fn render_instance(
     };
     let expanded = expand_instance_memoized(ctx, instance_id, inst, mode_anchor);
     if expanded.is_empty() {
+        ctx.metrics.incomplete_artwork = true;
         // Genuinely unresolvable instance (master deleted / not loaded). Draw a
         // faint dashed outline of the instance box so it stays *locatable*
         // without painting a heavy translucent-blue block over the design.
@@ -90,13 +91,15 @@ pub(crate) fn expand_instance_memoized(
     // for committed edits, `preview_rev` for in-flight previews that bypass
     // history; both must key the memo or a drag inside a master would not
     // refresh its instances.
-    let (rev, preview_rev) = fanta_doc::resolved_component_with_context(
+    let resolved_component = fanta_doc::resolved_component_with_context(
         ctx.scene,
         ctx.inputs.components,
         inst,
         &expansion_context,
-    )
-    .map_or((0, 0), |resolved| (resolved.rev, resolved.preview_rev));
+    );
+    let (rev, preview_rev) = resolved_component
+        .as_ref()
+        .map_or((0, 0), |resolved| (resolved.rev, resolved.preview_rev));
     // Only a live-scene instance has a stamp to memoize its override hash on;
     // a nested transient clone (fresh id, not in the scene) hashes directly.
     let stamp = ctx
@@ -113,6 +116,18 @@ pub(crate) fn expand_instance_memoized(
     };
     if let Some(cached) = ctx.instance_cache.lookup(&key) {
         return cached;
+    }
+    if let Some(budget) = &mut ctx.metrics.sampling_budget
+        && let Some(component) = resolved_component
+    {
+        // The walk sees clones only AFTER expansion/layout. Reserve the whole
+        // resolved master first so a wide recursive component cannot allocate
+        // a fresh wide subtree at every level before the walk reaches its cap.
+        for _ in ctx.scene.descendants_of(component.resolved_root) {
+            if !budget.reserve_expanded_node() {
+                return Arc::new(Vec::new());
+            }
+        }
     }
     let mut expanded = fanta_doc::expand_instance_with_context(
         ctx.scene,
@@ -277,6 +292,28 @@ pub(crate) fn render_expanded(
     children: &HashMap<NodeId, Vec<usize>>,
     ctx: &mut RenderCtx,
 ) {
+    if ctx
+        .metrics
+        .sampling_budget
+        .as_mut()
+        .is_some_and(|budget| !budget.enter())
+    {
+        return;
+    }
+    render_expanded_inner(canvas, node, is_root, expanded, children, ctx);
+    if let Some(budget) = &mut ctx.metrics.sampling_budget {
+        budget.leave();
+    }
+}
+
+fn render_expanded_inner(
+    canvas: &Canvas,
+    node: &CanvasNode,
+    is_root: bool,
+    expanded: &[ExpandedNode],
+    children: &HashMap<NodeId, Vec<usize>>,
+    ctx: &mut RenderCtx,
+) {
     ctx.metrics.nodes_visited += 1;
 
     // Binding overlay on the transient clone. The clone is not in the scene, so
@@ -307,7 +344,11 @@ pub(crate) fn render_expanded(
     // layer (so it reads the real backdrop, not this node's own layer). No scene
     // id, so a background-only group has no fallback silhouette and won't frost.
     if ctx.supports_offscreen_layers {
-        apply_background_blur(canvas, node, None, ctx.scene, ctx.effective_scale);
+        if apply_background_blur(canvas, node, None, ctx.scene, ctx.effective_scale)
+            == super::effects::BackgroundBlurOutcome::Failed
+        {
+            ctx.metrics.effect_failed = true;
+        }
     }
 
     // Same opacity fold as the live walk: a single-draw leaf vector applies its

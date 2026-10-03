@@ -68,6 +68,43 @@ impl Operation {
                     Ok(())
                 }
             },
+            Self::SetPageRegistry {
+                old_pages,
+                new_pages,
+                old_active_page,
+                new_active_page,
+            } => {
+                let pages = dir.pick(old_pages, new_pages);
+                let active_page = *dir.pick(old_active_page, new_active_page);
+                let mut unique = std::collections::HashSet::new();
+                for root in pages {
+                    if !unique.insert(*root) {
+                        return Err(SceneError::InvariantViolated("duplicate page root".into()));
+                    }
+                    let node = ctx.scene.get(*root).ok_or(SceneError::NotFound(*root))?;
+                    if node.parent.is_some() || !matches!(node.data, NodeData::Group(_)) {
+                        return Err(SceneError::InvariantViolated(
+                            "page root must be a root-level group".into(),
+                        ));
+                    }
+                }
+                if let Some(active) = active_page
+                    && (!ctx.scene.contains(active)
+                        || (!pages.contains(&active)
+                            && !ctx
+                                .components
+                                .defs
+                                .values()
+                                .any(|definition| definition.root == active)))
+                {
+                    return Err(SceneError::InvariantViolated(
+                        "invalid active page root".into(),
+                    ));
+                }
+                *ctx.pages = pages.clone();
+                *ctx.active_page = active_page;
+                Ok(())
+            }
             Self::Reparent {
                 id,
                 old_parent,

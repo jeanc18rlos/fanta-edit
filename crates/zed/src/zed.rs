@@ -1810,12 +1810,14 @@ fn quit(_: &Quit, cx: &mut App) {
                         // is left as they had it.
                         window
                             .update(cx, |multi_workspace, window, cx| {
-                                multi_workspace.activate(
-                                    originally_active.clone(),
-                                    None,
-                                    window,
-                                    cx,
-                                );
+                                if multi_workspace.can_close(window, cx) {
+                                    multi_workspace.activate(
+                                        originally_active.clone(),
+                                        None,
+                                        window,
+                                        cx,
+                                    );
+                                }
                             })
                             .log_err();
                         return Ok(());
@@ -1851,7 +1853,24 @@ fn quit(_: &Quit, cx: &mut App) {
         }
         futures::future::join_all(flush_tasks).await;
 
-        cx.update(|cx| cx.quit());
+        cx.update(|cx| {
+            for window in cx
+                .windows()
+                .into_iter()
+                .filter_map(|window| window.downcast::<MultiWorkspace>())
+            {
+                if window
+                    .update(cx, |multi_workspace, window, cx| {
+                        multi_workspace.can_close(window, cx)
+                    })
+                    .log_err()
+                    .is_some_and(|allowed| !allowed)
+                {
+                    return;
+                }
+            }
+            cx.quit();
+        });
         anyhow::Ok(())
     })
     .detach_and_log_err(cx);

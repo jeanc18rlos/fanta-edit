@@ -221,6 +221,55 @@ fn apply_refuses_variable_ops() {
 }
 
 #[test]
+fn page_registry_requires_project_persistence_and_rejects_scoped_transactions_atomically() {
+    let (directory, page) = page_fixture();
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
+    let id = ArtifactId::Page(page);
+    workspace.open_artifact(id.clone()).expect("page artifact");
+    let artifact = workspace.artifact_mut(&id).expect("artifact");
+    let before = serde_json::to_value(artifact.doc()).expect("document snapshot");
+    let source = artifact.source_text();
+    let generation = artifact.working_generation();
+    let registry = Operation::SetPageRegistry {
+        old_pages: artifact.doc().pages().to_vec(),
+        new_pages: vec![page],
+        old_active_page: artifact.doc().active_page(),
+        new_active_page: Some(page),
+    };
+    assert_eq!(
+        artifact_op_impact(&registry),
+        ArtifactOpImpact::ProjectStructure
+    );
+    let transaction = Transaction {
+        label: "Page registry cannot belong to one artifact".into(),
+        ops: vec![
+            Operation::SetName {
+                id: page,
+                old: artifact.doc().scene.get(page).expect("page").name.clone(),
+                new: "Must stay unmodified".into(),
+            },
+            registry.clone(),
+        ],
+    };
+    assert!(matches!(
+        artifact.apply_transaction_atomic(transaction),
+        Err(SessionError::InvalidState(_))
+    ));
+    assert_eq!(
+        serde_json::to_value(artifact.doc()).expect("document snapshot"),
+        before
+    );
+    assert_eq!(artifact.source_text(), source);
+    assert_eq!(artifact.working_generation(), generation);
+    let shared_generation = workspace.workspace_generation();
+    assert!(matches!(
+        workspace.apply_workspace_op(registry),
+        Err(SessionError::InvalidState(_))
+    ));
+    assert_eq!(workspace.workspace_generation(), shared_generation);
+}
+
+#[test]
 fn canvas_property_patch_updates_retained_source_without_touching_disk() {
     let (dir, page) = page_fixture();
     let source_path = crate::locate_page_source(dir.path(), page).unwrap();

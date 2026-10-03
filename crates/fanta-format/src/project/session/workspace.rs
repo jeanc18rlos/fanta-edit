@@ -425,6 +425,12 @@ impl WorkspaceSession {
     }
 
     pub fn apply_workspace_op(&mut self, op: Operation) -> Result<(), SessionError> {
+        if matches!(op, Operation::SetPageRegistry { .. }) {
+            return Err(SessionError::InvalidState(
+                "page registry changes require the full project document and project-tree save"
+                    .into(),
+            ));
+        }
         // Build a throwaway doc that holds only variables for apply.
         let mut doc = fanta_doc::Doc::new();
         doc.id = self.project_id;

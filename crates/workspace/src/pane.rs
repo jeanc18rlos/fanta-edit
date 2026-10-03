@@ -1220,6 +1220,14 @@ impl Pane {
     ) -> Option<usize> {
         let item_idx = self.preview_item_idx()?;
         let id = self.preview_item_id()?;
+        if self
+            .items
+            .get(item_idx)
+            .is_some_and(|item| item.close_blocker(cx).is_some())
+        {
+            self.unpreview_item_if_preview(id);
+            return None;
+        }
         self.preview_item_id = None;
 
         let prev_active_item_index = self.active_item_index;
@@ -1296,6 +1304,10 @@ impl Pane {
         let existing_item_index = self.items.iter().position(|existing_item| {
             if existing_item.item_id() == item.item_id() {
                 true
+            } else if item.close_blocker(cx).is_some() || existing_item.close_blocker(cx).is_some()
+            {
+                // Shared model identity does not make view-local drafts interchangeable.
+                false
             } else if existing_item.buffer_kind(cx) == ItemBufferKind::Singleton {
                 existing_item
                     .project_entry_ids(cx)
@@ -1887,7 +1899,11 @@ impl Pane {
                 continue;
             }
 
-            if let Some(true) = self.items.get(index).map(|item| item.is_dirty(cx)) {
+            if let Some(true) = self
+                .items
+                .get(index)
+                .map(|item| item.is_dirty(cx) || item.close_blocker(cx).is_some())
+            {
                 continue;
             }
 
@@ -1962,6 +1978,44 @@ impl Pane {
         }
     }
 
+    pub(crate) fn can_close_item(
+        &mut self,
+        item_id: EntityId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(index) = self.index_for_item_id(item_id) else {
+            return true;
+        };
+        let Some(message) = self
+            .items
+            .get(index)
+            .and_then(|item| item.close_blocker(cx))
+        else {
+            return true;
+        };
+        self.activate_item(index, true, true, window, cx);
+        let workspace = self.workspace.clone();
+        // Close can be requested while Workspace is already being updated.
+        cx.defer(move |cx| {
+            workspace
+                .update(cx, |workspace, cx| {
+                    workspace.show_toast(
+                        crate::Toast::new(
+                            crate::notifications::NotificationId::composite::<Pane>((
+                                "close-blocker",
+                                item_id,
+                            )),
+                            message.to_string(),
+                        ),
+                        cx,
+                    );
+                })
+                .log_err();
+        });
+        false
+    }
+
     pub fn close_items(
         &self,
         window: &mut Window,
@@ -1994,6 +2048,13 @@ impl Pane {
             return Task::ready(Ok(()));
         };
         cx.spawn_in(window, async move |pane, cx| {
+            for item in &items_to_close {
+                if !pane.update_in(cx, |pane, window, cx| {
+                    pane.can_close_item(item.item_id(), window, cx)
+                })? {
+                    return Ok(());
+                }
+            }
             let dirty_items = workspace.update(cx, |workspace, cx| {
                 items_to_close
                     .iter()
@@ -2068,6 +2129,9 @@ impl Pane {
                 // Remove the item from the pane.
                 if should_close {
                     pane.update_in(cx, |pane, window, cx| {
+                        if !pane.can_close_item(item_to_close.item_id(), window, cx) {
+                            return;
+                        }
                         pane.remove_item(
                             item_to_close.item_id(),
                             false,
@@ -2344,9 +2408,15 @@ impl Pane {
                         .await?
                     }
                     Ok(1) => {
-                        pane.update_in(cx, |pane, window, cx| {
-                            pane.remove_item(item.item_id(), false, true, window, cx)
-                        })?;
+                        if !pane.update_in(cx, |pane, window, cx| {
+                            if !pane.can_close_item(item.item_id(), window, cx) {
+                                return false;
+                            }
+                            pane.remove_item(item.item_id(), false, true, window, cx);
+                            true
+                        })? {
+                            return Ok(false);
+                        }
                     }
                     _ => return Ok(false),
                 }
@@ -2512,16 +2582,22 @@ impl Pane {
                     let new_path = ProjectPath { worktree_id, path };
 
                     pane.update_in(cx, |pane, window, cx| {
-                        if let Some(item) = pane.item_for_path(new_path.clone(), cx) {
-                            pane.remove_item(item.item_id(), false, false, window, cx);
+                        if let Some(existing) = pane.item_for_path(new_path.clone(), cx) {
+                            if !pane.can_close_item(existing.item_id(), window, cx) {
+                                return None;
+                            }
+                            pane.remove_item(existing.item_id(), false, false, window, cx);
                         }
 
-                        item.save_as(project.clone(), new_path, window, cx)
+                        Some(item.save_as(project.clone(), new_path, window, cx))
                     })?
                 } else {
                     return Ok(false);
                 };
 
+                let Some(save_task) = save_task else {
+                    return Ok(false);
+                };
                 save_task.await?;
                 if should_format {
                     pane.update_in(cx, |pane, window, cx| {
@@ -2632,6 +2708,9 @@ impl Pane {
             }
         })?;
 
+        if !self.can_close_item(item_id, window, cx) {
+            return None;
+        }
         self.remove_item(item_id, false, true, window, cx);
         self.nav_history.remove_item(item_id);
 
@@ -8389,6 +8468,156 @@ mod tests {
         cx.simulate_prompt_answer("Discard all");
         save.await.unwrap();
         assert_item_labels(&pane, ["C", "A*^"], cx);
+    }
+
+    #[gpui::test]
+    async fn test_view_local_close_blocker_precedes_shared_item_dedup(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let owner = add_labeled_item(&pane, "Owner", true, cx);
+        let sibling = add_labeled_item(&pane, "Sibling", true, cx);
+        let shared = cx.update(|_, cx| TestProjectItem::new_dirty(1, "Shared.txt", cx));
+        owner.update(cx, |item, _| {
+            item.project_items.push(shared.clone());
+            item.state = "recoverable local draft".into();
+            item.close_blocker = Some("Finish or cancel the draft first.".into());
+        });
+        sibling.update(cx, |item, _| item.project_items.push(shared.clone()));
+
+        for intent in [SaveIntent::Close, SaveIntent::Skip] {
+            pane.update_in(cx, |pane, window, cx| {
+                pane.close_item_by_id(owner.item_id(), intent, window, cx)
+            })
+            .await
+            .expect("blocked close succeeds without removing the view");
+            assert_item_labels(&pane, ["Owner*^", "Sibling^"], cx);
+            owner.read_with(cx, |item, _| {
+                assert_eq!(item.state, "recoverable local draft");
+                assert_eq!((item.save_count, item.reload_count), (0, 0));
+            });
+            assert!(!cx.has_pending_prompt());
+        }
+        pane.update_in(cx, |pane, window, cx| {
+            pane.close_item_by_id(sibling.item_id(), SaveIntent::Close, window, cx)
+        })
+        .await
+        .expect("sibling can close independently");
+        assert_item_labels(&pane, ["Owner*^"], cx);
+        owner.update(cx, |item, _| item.close_blocker = None);
+        pane.update_in(cx, |pane, window, cx| {
+            pane.close_item_by_id(owner.item_id(), SaveIntent::Skip, window, cx)
+        })
+        .await
+        .expect("explicit file discard still works once local authoring finishes");
+        assert_item_labels(&pane, [], cx);
+        owner.read_with(cx, |item, _| assert_eq!(item.reload_count, 1));
+    }
+
+    #[gpui::test]
+    async fn test_view_local_close_blocker_preserves_preview_and_lru_but_allows_transfer(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update_global::<SettingsStore, ()>(|store, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.preview_tabs.get_or_insert_default().enabled = Some(true);
+            });
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
+        let owner = add_labeled_item(&pane, "Owner", false, cx);
+        owner.update(cx, |item, _| {
+            item.state = "local draft".into();
+            item.close_blocker = Some("Finish or cancel the draft first.".into());
+        });
+        pane.update_in(cx, |pane, window, cx| {
+            pane.set_preview_item_id(Some(owner.item_id()), cx);
+            assert_eq!(pane.preview_item_id(), Some(owner.item_id()));
+            assert!(pane.close_current_preview_item(window, cx).is_none());
+            assert_eq!(pane.preview_item_id(), None);
+            assert_eq!(pane.items_len(), 1);
+        });
+        add_labeled_item(&pane, "Disposable", false, cx);
+        pane.update_in(cx, |pane, window, cx| {
+            pane.close_items_to_target_count(Some(1), false, window, cx);
+            assert_eq!(pane.items_len(), 1);
+            assert_eq!(
+                pane.active_item().expect("retained owner").item_id(),
+                owner.item_id()
+            );
+            let moved = pane.take_active_item(window, cx).expect("tab transfer");
+            assert_eq!(moved.item_id(), owner.item_id());
+            pane.add_item(moved, false, true, None, window, cx);
+        });
+        owner.read_with(cx, |item, _| {
+            assert_eq!(item.state, "local draft");
+            assert!(item.close_blocker.is_some());
+        });
+        assert!(!cx.has_pending_prompt());
+    }
+
+    #[gpui::test]
+    async fn test_view_local_close_blocker_survives_same_project_tab_transfer(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        for incoming_owns_draft in [true, false] {
+            let project = Project::test(FakeFs::new(cx.executor()), None, cx).await;
+            let (workspace, visual) =
+                cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+            let source =
+                workspace.read_with(visual, |workspace, _| workspace.active_pane().clone());
+            let incoming = add_labeled_item(&source, "Incoming", false, visual);
+            let destination = workspace.update_in(visual, |workspace, window, cx| {
+                workspace.split_pane(source.clone(), SplitDirection::Right, window, cx)
+            });
+            let existing = add_labeled_item(&destination, "Existing", false, visual);
+            let shared = visual.update(|_, cx| TestProjectItem::new(1, "Shared.txt", cx));
+            incoming.update(visual, |item, _| item.project_items.push(shared.clone()));
+            existing.update(visual, |item, _| item.project_items.push(shared.clone()));
+            let owner = if incoming_owns_draft {
+                &incoming
+            } else {
+                &existing
+            };
+            owner.update(visual, |item, _| {
+                item.state = "draft survives tab transfer".into();
+                item.close_blocker = Some("Finish or cancel the draft.".into());
+            });
+            destination.update_in(visual, |pane, window, cx| {
+                pane.handle_tab_drop(
+                    &DraggedTab {
+                        pane: source.clone(),
+                        item: incoming.boxed_clone(),
+                        ix: 0,
+                        detail: 0,
+                        is_active: true,
+                    },
+                    0,
+                    false,
+                    window,
+                    cx,
+                );
+            });
+            visual.run_until_parked();
+            destination.read_with(visual, |pane, _| {
+                assert_eq!(pane.items_len(), 2);
+                assert!(pane.index_for_item_id(incoming.item_id()).is_some());
+                assert!(pane.index_for_item_id(existing.item_id()).is_some());
+            });
+            source.read_with(visual, |pane, _| {
+                assert!(pane.index_for_item_id(incoming.item_id()).is_none());
+            });
+            owner.read_with(visual, |item, _| {
+                assert_eq!(item.state, "draft survives tab transfer");
+                assert!(item.close_blocker.is_some());
+            });
+        }
     }
 
     #[gpui::test]

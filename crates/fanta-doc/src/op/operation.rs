@@ -35,6 +35,15 @@ pub enum Operation {
     /// can re-insert the subtree exactly as it was.
     DeleteSubtree { snapshot: Vec<CanvasNode> },
 
+    /// Replace the ordered page roots and navigation root together. Page
+    /// creation/deletion groups this with the corresponding scene operation.
+    SetPageRegistry {
+        old_pages: Vec<NodeId>,
+        new_pages: Vec<NodeId>,
+        old_active_page: Option<NodeId>,
+        new_active_page: Option<NodeId>,
+    },
+
     /// Move a node to a new parent and/or position.
     Reparent {
         id: NodeId,
@@ -446,6 +455,7 @@ impl Operation {
         match self {
             Self::CreateNode { .. } => "Create",
             Self::DeleteSubtree { .. } => "Delete",
+            Self::SetPageRegistry { .. } => "Pages",
             Self::Reparent { .. } => "Move",
             Self::SetIndex { .. } => "Reorder",
             Self::SetTransform { .. } => "Transform",

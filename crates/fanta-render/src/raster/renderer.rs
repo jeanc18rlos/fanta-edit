@@ -59,6 +59,15 @@ pub struct RenderMetrics {
     /// populate — the cache). Direct save-layers are counted only in
     /// `effect_layers`.
     pub layer_cache_misses: u32,
+    /// A painter substituted a missing image or unresolved component. Sampling
+    /// must not report that diagnostic placeholder as document artwork.
+    pub incomplete_artwork: bool,
+    /// Media cards and unimplemented content have UI/placeholder pixels whose
+    /// color is not the static artwork contract used by the sampler.
+    pub non_artwork_content: bool,
+    /// An observable filter/allocation/readback failure omitted a backdrop effect.
+    pub effect_failed: bool,
+    pub(crate) sampling_budget: Option<crate::sampling::SamplingWorkBudget>,
 }
 
 /// Serialization controls for the headless SVG canvas.
@@ -506,6 +515,7 @@ pub(crate) fn hash_overrides(instance: &InstanceNode) -> u64 {
 pub struct RasterRenderer {
     width: u32,
     height: u32,
+    sampling_budget_enabled: bool,
     /// The owned CPU pixel surface. Starts as a draw-discarding NULL surface
     /// (no pixel memory) and is upgraded to a real `width × height` raster
     /// surface by the first path that actually draws to or reads it
@@ -627,6 +637,7 @@ impl RasterRenderer {
         Ok(Self {
             width,
             height,
+            sampling_budget_enabled: false,
             surface,
             surface_is_placeholder: true,
             background: Color::TRANSPARENT,
@@ -968,7 +979,10 @@ impl RasterRenderer {
         // calls (with a Ganesh-backed canvas). Same code, two surfaces.
         let (width, height) = (self.width, self.height);
         let started = Instant::now();
-        let mut metrics = RenderMetrics::default();
+        let mut metrics = RenderMetrics {
+            sampling_budget: self.sampling_budget_enabled.then(Default::default),
+            ..Default::default()
+        };
 
         // First CPU render allocates the owned surface. Allocation failure
         // (memory exhaustion; the dimensions were validated at construction)
@@ -1523,6 +1537,58 @@ impl RasterRenderer {
             "read_pixels failed on a materialized surface; copy_rgba would return a blank frame"
         );
         buf
+    }
+
+    pub(crate) fn sample_page_rgba(
+        &mut self,
+        scene: &Scene,
+        viewport: &Viewport,
+        page_root: NodeId,
+        inputs: &RenderInputs,
+        pixels: &mut [u8],
+    ) -> Result<(), crate::sampling::SamplingError> {
+        self.ensure_raster_surface()?;
+        self.sampling_budget_enabled = true;
+        let metrics = self.render_page_with(scene, viewport, Some(page_root), inputs);
+        self.sampling_budget_enabled = false;
+        if metrics
+            .sampling_budget
+            .as_ref()
+            .is_some_and(|budget| budget.expansion_exhausted)
+        {
+            return Err(crate::sampling::SamplingError::ExpansionTooLarge);
+        }
+        if metrics.effect_failed {
+            return Err(crate::sampling::SamplingError::EffectFailed);
+        }
+        if metrics
+            .sampling_budget
+            .as_ref()
+            .is_some_and(|budget| budget.exhausted)
+        {
+            return Err(crate::sampling::SamplingError::TooComplex);
+        }
+        if metrics.incomplete_artwork {
+            return Err(crate::sampling::SamplingError::IncompleteArtwork);
+        }
+        if metrics.non_artwork_content {
+            return Err(crate::sampling::SamplingError::UnsupportedContent);
+        }
+        let info = ImageInfo::new(
+            (self.width as i32, self.height as i32),
+            ColorType::RGBA8888,
+            AlphaType::Unpremul,
+            None,
+        );
+        let row_bytes = (self.width as usize)
+            .checked_mul(4)
+            .ok_or(crate::sampling::SamplingError::Readback)?;
+        if row_bytes.checked_mul(self.height as usize) != Some(pixels.len())
+            || !self.surface.read_pixels(&info, pixels, row_bytes, (0, 0))
+        {
+            return Err(crate::sampling::SamplingError::Readback);
+        }
+        Ok(())
     }
 
     /// Encode the current surface contents as PNG. Use after [`render`].

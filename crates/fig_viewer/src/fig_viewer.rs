@@ -3,6 +3,7 @@
 //! panels and the floating canvas toolbar.
 
 mod agent_surface;
+mod annotations;
 mod canvas;
 mod clipboard;
 mod code_workspace;
@@ -12,6 +13,7 @@ mod comments_panel;
 mod comments_ui;
 mod component_properties;
 mod design_panel;
+mod dev_history;
 mod document;
 mod editor_session;
 mod export;
@@ -27,6 +29,7 @@ mod inspector_widgets;
 mod instance_text;
 mod live_mcp;
 mod mode_overrides;
+mod measurements;
 mod motion_edit;
 mod motion_panel;
 mod new_design;

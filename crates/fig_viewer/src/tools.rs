@@ -50,7 +50,7 @@ pub const TOOLBAR_GROUPS: [&[ToolKind]; 6] = [
     ],
     &[ToolKind::NodeEdit, ToolKind::Pencil, ToolKind::Pen],
     &[ToolKind::Text, ToolKind::TextPath],
-    &[ToolKind::Comment],
+    &[ToolKind::Comment, ToolKind::Measure, ToolKind::Annotation],
 ];
 
 /// The default face (button icon) for each toolbar group before the user picks
@@ -90,6 +90,8 @@ pub enum ToolKind {
     Text,
     TextPath,
     Comment,
+    Measure,
+    Annotation,
 }
 
 impl ToolKind {
@@ -115,6 +117,8 @@ impl ToolKind {
             Self::Text => "Text",
             Self::TextPath => "Text on Path",
             Self::Comment => "Comment",
+            Self::Measure => "Measurement",
+            Self::Annotation => "Annotation",
         }
     }
 
@@ -140,6 +144,8 @@ impl ToolKind {
             Self::Text => IconName::ToolText,
             Self::TextPath => IconName::ToolTextPath,
             Self::Comment => IconName::Chat,
+            Self::Annotation => IconName::ToolPencil,
+            Self::Measure => IconName::ArrowRightLeft,
         }
     }
 
@@ -170,6 +176,7 @@ impl ToolKind {
             // Comment mode is handled by the shell (click-to-pin); the select
             // tool backs it so unconsumed events stay harmless.
             Self::Comment => Box::new(SelectTool::new()),
+            Self::Measure | Self::Annotation => Box::new(MeasureTool),
         }
     }
 }
@@ -185,6 +192,20 @@ impl Tool for InspectTool {
         // FigView owns inspection selection; unconsumed input must never reach
         // an authoring tool such as Select or PathSelect.
         ToolResponse::cursor(CursorHint::Default)
+    }
+}
+
+struct MeasureTool;
+
+impl Tool for MeasureTool {
+    fn name(&self) -> &'static str {
+        "measure"
+    }
+
+    fn handle_event(&mut self, _ctx: &mut ToolContext, _event: ToolEvent) -> ToolResponse {
+        // The host owns page metadata and measurement drafts; an unconsumed
+        // event must not edit a scene layer through a fallback tool.
+        ToolResponse::cursor(CursorHint::Crosshair)
     }
 }
 
@@ -393,8 +414,7 @@ mod tests {
     use super::*;
     use gpui::NavigationDirection;
 
-    #[test]
-    fn inspect_fallback_cannot_author_or_change_selection() {
+    fn assert_host_fallback_is_inert(kind: ToolKind, cursor: CursorHint, style: CursorStyle) {
         let mut doc = Doc::new();
         let node = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Text(fanta_doc::TextNode::new(
             "Inspect me",
@@ -409,14 +429,9 @@ mod tests {
         let original = serde_json::to_value(&doc).expect("document snapshot");
         let mut viewport = Viewport::default();
         let mut shell = ToolShell::new();
-        let mut context = tool_context(
-            &mut doc,
-            &mut viewport,
-            DVec2::new(200., 200.),
-            ToolKind::Inspect,
-        );
-        shell.activate(ToolKind::Inspect, &mut context);
-        assert_eq!(shell.cursor_style(false), CursorStyle::Arrow);
+        let mut context = tool_context(&mut doc, &mut viewport, DVec2::new(200., 200.), kind);
+        shell.activate(kind, &mut context);
+        assert_eq!(shell.cursor_style(false), style);
         for event in [
             press_event(
                 DVec2::new(120., 120.),
@@ -440,7 +455,7 @@ mod tests {
             let response = shell.handle_event(&mut context, event);
             assert!(!response.wants_exit);
             assert!(response.overlays.is_empty());
-            assert_eq!(response.cursor, Some(CursorHint::Default));
+            assert_eq!(response.cursor, Some(cursor));
             assert_eq!(
                 serde_json::to_value(&*context.doc).expect("document snapshot"),
                 original
@@ -448,6 +463,29 @@ mod tests {
             assert_eq!(context.doc.selection.as_slice(), &[node_id]);
             assert_eq!(context.doc.history.undo_depth(), 0);
         }
+    }
+
+    #[test]
+    fn inspect_fallback_cannot_author_or_change_selection() {
+        assert_host_fallback_is_inert(ToolKind::Inspect, CursorHint::Default, CursorStyle::Arrow);
+    }
+
+    #[test]
+    fn measure_fallback_cannot_author_or_change_selection() {
+        assert_host_fallback_is_inert(
+            ToolKind::Measure,
+            CursorHint::Crosshair,
+            CursorStyle::Crosshair,
+        );
+    }
+
+    #[test]
+    fn annotation_fallback_cannot_author_or_change_selection() {
+        assert_host_fallback_is_inert(
+            ToolKind::Annotation,
+            CursorHint::Crosshair,
+            CursorStyle::Crosshair,
+        );
     }
 
     /// Filled shapes land in Figma's neutral grey; the tools that spend the

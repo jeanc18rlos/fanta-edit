@@ -17,9 +17,9 @@ use editor::{
     Editor, EditorEvent,
     actions::{Cancel, SelectAll},
 };
-use fanta_doc::{
-    CanvasNode, Doc, GroupNode, IndexKey, NodeData, NodeFlags, NodeId, Operation, Scene,
-};
+#[cfg(test)]
+use fanta_doc::{CanvasNode, GroupNode};
+use fanta_doc::{Doc, IndexKey, NodeData, NodeFlags, NodeId, Operation, Scene};
 use fs::Fs;
 use gpui::{
     AnyElement, App, AsyncWindowContext, ClickEvent, Context, DragMoveEvent, Empty, Entity,
@@ -34,7 +34,7 @@ use workspace::{
     dock::{DockPosition, Panel, PanelEvent},
 };
 
-use crate::document::{DocChange, FigDocument, FigPage, page_bounds};
+use crate::document::{DocChange, FigDocument};
 use crate::panel_settings::FantaDesignPanelSettings;
 use crate::view::{
     CopySelection, CutSelection, DeleteSelection, DuplicateSelection, FigView, FrameSelection,
@@ -658,9 +658,9 @@ impl FantaDesignPanel {
                     // document events, never in render — preview frames can't
                     // change tree structure, so they're skipped too.
                     let item = view.read(cx).item().clone();
-                    self.inspecting = view.read(cx).is_inspecting();
+                    self.inspecting = view.read(cx).is_art_read_only(cx);
                     self._inspection_subscription = Some(cx.observe(&view, |this, view, cx| {
-                        this.set_inspecting(view.read(cx).is_inspecting(), cx);
+                        this.set_inspecting(view.read(cx).is_art_read_only(cx), cx);
                     }));
                     self._active_view_subscription = Some(cx.subscribe(
                         &item,
@@ -1227,67 +1227,14 @@ impl FantaDesignPanel {
     }
 
     fn add_page(&mut self, cx: &mut Context<Self>) {
-        if !self.is_editable(cx) {
-            return;
-        }
-        let Some(view) = self.active_view(cx) else {
-            return;
-        };
-        let item = view.read(cx).item().clone();
-        if !item.read(cx).is_editable() {
-            return;
-        }
-        view.update(cx, |view, cx| {
-            view.finish_document_edits_for_external_change(cx);
-        });
-        let Some((page_node, page_name)) = ({
-            let fig_item = item.read(cx);
-            fig_item.document().and_then(|document| {
-                // A doc without explicit page roots renders every root as one
-                // implicit page; adding a real page there would hide all of
-                // that content behind the new empty active page.
-                if !document.pages.iter().all(|page| page.root.is_some()) {
-                    return None;
-                }
-                let mut page_node = CanvasNode::new(NodeData::Group(GroupNode::default()));
-                let visible_count = document.pages.iter().filter(|page| !page.hidden).count();
-                page_node.name = format!("Page {}", visible_count + 1);
-                page_node.index = document.doc.scene.next_root_index();
-                let page_name = SharedString::from(page_node.name.clone());
-                Some((page_node, page_name))
-            })
-        }) else {
-            return;
-        };
-        let root = page_node.id;
-
-        let applied = item.update(cx, |item, cx| {
-            item.apply(Operation::create_node(page_node), cx)
-        });
-        if let Err(error) = applied {
-            log::error!("fanta design panel: failed to add a page: {error:#}");
-            return;
-        }
-        let new_page_index = item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
-                document.doc.add_page(root);
-                document.doc.set_active_page(Some(root));
-                let bounds = page_bounds(&document.doc, Some(root));
-                document.pages.push(FigPage {
-                    root: Some(root),
-                    name: page_name,
-                    bounds,
-                    hidden: false,
-                });
-                (document.pages.len() - 1, DocChange::Content)
-            })
-        });
-        if let Some(new_page_index) = new_page_index {
-            view.update(cx, |view, cx| view.select_page(new_page_index, cx));
-        }
+        self.edit_pages(None, cx);
     }
 
     fn delete_page(&mut self, page_index: usize, cx: &mut Context<Self>) {
+        self.edit_pages(Some(page_index), cx);
+    }
+
+    fn edit_pages(&mut self, deleted_page: Option<usize>, cx: &mut Context<Self>) {
         if !self.is_editable(cx) {
             return;
         }
@@ -1295,57 +1242,36 @@ impl FantaDesignPanel {
             return;
         };
         let item = view.read(cx).item().clone();
-        if !item.read(cx).is_editable() {
+        let owner = view.entity_id();
+        if !item.read(cx).is_editable() || !item.read(cx).can_preview_for_owner(owner) {
             return;
         }
         view.update(cx, |view, cx| {
-            view.finish_document_edits_for_external_change(cx);
+            view.finish_document_edits_for_external_change(cx)
         });
-        let Some((root, snapshot)) = ({
-            let fig_item = item.read(cx);
-            fig_item.document().and_then(|document| {
-                if document.pages.len() <= 1 {
-                    return None;
-                }
-                let root = document.pages.get(page_index)?.root?;
-                // `descendants_of` yields the page root first, which is what
-                // `DeleteSubtree` expects its snapshot to start with.
-                let snapshot: Vec<CanvasNode> = document
-                    .doc
-                    .scene
-                    .descendants_of(root)
-                    .filter_map(|node_id| document.doc.scene.get(node_id).cloned())
-                    .collect();
-                (!snapshot.is_empty()).then_some((root, snapshot))
-            })
-        }) else {
-            return;
-        };
-
-        let applied = item.update(cx, |item, cx| {
-            item.apply(Operation::DeleteSubtree { snapshot }, cx)
-        });
-        if let Err(error) = applied {
-            log::error!("fanta design panel: failed to delete the page: {error:#}");
-            return;
-        }
-        let next_page_index = item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
-                document.doc.remove_page(root);
-                if page_index < document.pages.len() {
-                    document.pages.remove(page_index);
-                }
-                let active_root = document.doc.active_page();
-                let next_page_index = document
-                    .pages
-                    .iter()
-                    .position(|page| page.root == active_root)
-                    .unwrap_or(0);
-                (next_page_index, DocChange::Content)
+        let result = item.update(cx, |item, cx| {
+            if !item.is_editable() || !item.can_preview_for_owner(owner) {
+                return None;
+            }
+            item.with_document_for_preview_owner(owner, cx, |document| {
+                let result = match deleted_page {
+                    Some(index) => document.delete_page(index),
+                    None => document.add_page(),
+                };
+                let change = if matches!(result, Ok(Some(_))) {
+                    DocChange::Content
+                } else {
+                    DocChange::None
+                };
+                (result, change)
             })
         });
-        if let Some(next_page_index) = next_page_index {
-            view.update(cx, |view, cx| view.select_page(next_page_index, cx));
+        match result {
+            Some(Ok(Some(index))) if deleted_page.is_none() => {
+                view.update(cx, |view, cx| view.select_page(index, cx));
+            }
+            Some(Err(error)) => log::error!("fanta design panel: failed to edit pages: {error:#}"),
+            _ => {}
         }
     }
 
@@ -1744,6 +1670,7 @@ impl FantaDesignPanel {
             .child(
                 div()
                     .id(("fanta-page-name", index))
+                    .debug_selector(move || format!("native-page-name-{index}"))
                     .flex_1()
                     .min_w_0()
                     .tooltip(Tooltip::text(page_name.clone()))
@@ -2904,6 +2831,284 @@ mod gpui_layers_tests {
     fn row_bounds(harness: &mut Harness, id: NodeId) -> Option<gpui::Bounds<Pixels>> {
         let selector: &'static str = Box::leak(format!("layers-row-{id}").into_boxed_str());
         harness.cx.debug_bounds(selector)
+    }
+
+    #[gpui::test]
+    async fn sidebar_page_history_restores_measurements_and_navigation(cx: &mut TestAppContext) {
+        use crate::measurements::{Measurement, create_measurement_op, read_measurements};
+        let mut harness = setup(cx, 1).await;
+        let first = harness.fixture.page;
+        let item = harness
+            .view
+            .read_with(&harness.cx, |view, _| view.item().clone());
+        item.update(&mut harness.cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.history = fanta_doc::History::new();
+                ((), DocChange::None)
+            });
+        });
+        harness
+            .panel
+            .update_in(&mut harness.cx, |panel, _, cx| panel.add_page(cx));
+        harness.cx.run_until_parked();
+        let second = with_doc(&harness, |doc| {
+            assert_eq!(doc.pages().len(), 2);
+            assert_eq!(doc.history.next_undo_label(), Some("Add Page"));
+            doc.active_page().expect("new page is active")
+        });
+        assert_eq!(
+            harness
+                .view
+                .read_with(&harness.cx, |view, _| view.selected_page_index()),
+            Some(1)
+        );
+        item.update(&mut harness.cx, |item, cx| {
+            assert!(item.undo(cx).expect("undo add"))
+        });
+        harness.cx.run_until_parked();
+        with_doc(&harness, |doc| {
+            assert_eq!(doc.pages(), &[first]);
+            assert!(!doc.scene.contains(second));
+            assert!(!doc.history.can_undo());
+        });
+        assert_eq!(
+            harness
+                .view
+                .read_with(&harness.cx, |view, _| view.selected_page_index()),
+            Some(0)
+        );
+        item.update(&mut harness.cx, |item, cx| {
+            assert!(item.redo(cx).expect("redo add"))
+        });
+        harness.cx.run_until_parked();
+        harness
+            .view
+            .update_in(&mut harness.cx, |view, _, cx| view.select_page(1, cx));
+        let measurement =
+            Measurement::new([10.0, 20.0], [13.0, 24.0], "Tester".into(), 7).expect("measurement");
+        item.update(&mut harness.cx, |item, cx| {
+            let operation = create_measurement_op(item.doc().expect("doc"), second, &measurement)
+                .expect("create measurement");
+            item.apply(operation, cx).expect("apply measurement");
+        });
+        let page_snapshot = with_doc(&harness, |doc| {
+            doc.scene.get(second).cloned().expect("page")
+        });
+        harness
+            .panel
+            .update_in(&mut harness.cx, |panel, _, cx| panel.delete_page(1, cx));
+        harness.cx.run_until_parked();
+        with_doc(&harness, |doc| {
+            assert_eq!(doc.pages(), &[first]);
+            assert_eq!(doc.active_page(), Some(first));
+            assert!(!doc.scene.contains(second));
+            assert_eq!(doc.history.next_undo_label(), Some("Delete Page"));
+        });
+        item.read_with(&harness.cx, |item, _| {
+            assert_eq!(item.document().expect("document").pages.len(), 1);
+        });
+        item.update(&mut harness.cx, |item, cx| {
+            assert!(item.undo(cx).expect("undo delete"))
+        });
+        harness.cx.run_until_parked();
+        with_doc(&harness, |doc| {
+            assert_eq!(doc.pages(), &[first, second]);
+            assert_eq!(doc.active_page(), Some(second));
+            assert_eq!(doc.scene.get(second), Some(&page_snapshot));
+            assert_eq!(
+                read_measurements(doc, second).expect("restored marks")[0].measurement(),
+                &measurement
+            );
+        });
+        item.read_with(&harness.cx, |item, _| {
+            let pages = &item.document().expect("document").pages;
+            assert_eq!(pages[1].root, Some(second));
+            assert_eq!(pages[1].name.as_ref(), "Page 2");
+        });
+        harness
+            .view
+            .update_in(&mut harness.cx, |view, _, cx| view.select_page(1, cx));
+        with_doc(&harness, |doc| {
+            assert_eq!(
+                read_measurements(doc, doc.active_page().expect("active page"))
+                    .expect("marks on navigated page")[0]
+                    .measurement()
+                    .label()
+                    .expect("label"),
+                "5 px"
+            );
+        });
+        item.update(&mut harness.cx, |item, cx| {
+            assert!(item.redo(cx).expect("redo delete"))
+        });
+        harness.cx.run_until_parked();
+        with_doc(&harness, |doc| {
+            assert_eq!(doc.pages(), &[first]);
+            assert!(!doc.scene.contains(second));
+        });
+        assert_eq!(
+            harness
+                .view
+                .read_with(&harness.cx, |view, _| view.selected_page_index()),
+            Some(0)
+        );
+    }
+
+    #[gpui::test]
+    async fn sidebar_page_delete_undo_restores_exact_annotation_metadata(cx: &mut TestAppContext) {
+        use crate::annotations::{DeveloperAnnotation, create_annotation_op, read_annotations};
+
+        let mut harness = setup(cx, 1).await;
+        let first = harness.fixture.page;
+        let item = harness
+            .view
+            .read_with(&harness.cx, |view, _| view.item().clone());
+        harness
+            .panel
+            .update_in(&mut harness.cx, |panel, _, cx| panel.add_page(cx));
+        harness.cx.run_until_parked();
+        let second = with_doc(&harness, |doc| {
+            assert_eq!(doc.pages().len(), 2);
+            doc.active_page().expect("added page is active")
+        });
+        let annotation = DeveloperAnnotation::new(
+            [-18.5, 72.0],
+            "Keep this annotation after page deletion is undone.\nSecond line.".into(),
+            "Reviewer".into(),
+            71,
+        )
+        .expect("page annotation");
+        item.update(&mut harness.cx, |item, cx| {
+            let metadata = serde_json::json!({
+                "annotations": [{"version": 2, "id": "future-note", "opaque": {"keep": true}}],
+                "integration": {"page-token": "preserved"}
+            });
+            let old = item
+                .doc()
+                .expect("doc")
+                .scene
+                .get(second)
+                .expect("page")
+                .meta
+                .clone();
+            item.apply(
+                Operation::SetMeta {
+                    id: second,
+                    old,
+                    new: metadata,
+                },
+                cx,
+            )
+            .expect("seed unknown page metadata");
+            let operation = create_annotation_op(item.doc().expect("doc"), second, &annotation)
+                .expect("create annotation");
+            item.apply(operation, cx).expect("apply annotation");
+            item.with_document(cx, |document| {
+                document.doc.history = fanta_doc::History::new();
+                ((), DocChange::None)
+            });
+        });
+        harness.cx.run_until_parked();
+        let (first_snapshot, second_snapshot) = with_doc(&harness, |doc| {
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert_eq!(
+                read_annotations(doc, second)
+                    .expect("note before delete")
+                    .len(),
+                1
+            );
+            (
+                doc.scene.get(first).cloned().expect("first page"),
+                doc.scene.get(second).cloned().expect("annotated page"),
+            )
+        });
+
+        harness
+            .panel
+            .update_in(&mut harness.cx, |panel, _, cx| panel.delete_page(1, cx));
+        harness.cx.run_until_parked();
+        for cycle in 0..2 {
+            with_doc(&harness, |doc| {
+                assert_eq!(doc.pages(), &[first]);
+                assert_eq!(doc.active_page(), Some(first));
+                assert_eq!(doc.scene.get(first), Some(&first_snapshot));
+                assert!(!doc.scene.contains(second));
+                assert!(read_annotations(doc, second).is_err());
+                assert!(
+                    read_annotations(doc, first)
+                        .expect("surviving page notes")
+                        .is_empty()
+                );
+                assert_eq!(doc.history.undo_depth(), 1);
+                assert_eq!(doc.history.next_undo_label(), Some("Delete Page"));
+            });
+            item.read_with(&harness.cx, |item, _| {
+                let pages = &item.document().expect("document").pages;
+                assert_eq!(pages.len(), 1);
+                assert_eq!(pages.first().expect("remaining page").root, Some(first));
+            });
+            assert_eq!(
+                harness
+                    .view
+                    .read_with(&harness.cx, |view, _| view.selected_page_index()),
+                Some(0)
+            );
+            item.update(&mut harness.cx, |item, cx| {
+                assert!(item.undo(cx).expect("undo page deletion"));
+            });
+            harness.cx.run_until_parked();
+            with_doc(&harness, |doc| {
+                assert_eq!(doc.pages(), &[first, second]);
+                assert_eq!(doc.active_page(), Some(second));
+                assert_eq!(doc.scene.get(first), Some(&first_snapshot));
+                assert_eq!(doc.scene.get(second), Some(&second_snapshot));
+                assert_eq!(doc.history.undo_depth(), 0);
+                let restored = read_annotations(doc, second).expect("restored page notes");
+                assert_eq!(restored.len(), 1);
+                assert_eq!(
+                    restored.first().expect("restored note").annotation(),
+                    &annotation
+                );
+            });
+            item.read_with(&harness.cx, |item, _| {
+                let pages = &item.document().expect("document").pages;
+                assert_eq!(pages.len(), 2);
+                let restored = pages.get(1).expect("restored page row");
+                assert_eq!(restored.root, Some(second));
+                assert_eq!(restored.name.as_ref(), "Page 2");
+            });
+            assert_eq!(
+                harness
+                    .view
+                    .read_with(&harness.cx, |view, _| view.selected_page_index()),
+                Some(0)
+            );
+            harness
+                .view
+                .update_in(&mut harness.cx, |view, _, cx| view.select_page(1, cx));
+            harness.cx.run_until_parked();
+            assert_eq!(
+                harness
+                    .view
+                    .read_with(&harness.cx, |view, _| view.selected_page_index()),
+                Some(1)
+            );
+            harness.view.read_with(&harness.cx, |view, cx| {
+                assert_eq!(
+                    view.page_annotations(cx)
+                        .first()
+                        .expect("annotation is reachable on the restored page")
+                        .annotation(),
+                    &annotation
+                );
+            });
+            if cycle == 0 {
+                item.update(&mut harness.cx, |item, cx| {
+                    assert!(item.redo(cx).expect("redo page deletion"));
+                });
+                harness.cx.run_until_parked();
+            }
+        }
     }
 
     #[gpui::test]

@@ -150,6 +150,19 @@ impl History {
         self.redo.last().map(|t| t.label.as_str())
     }
 
+    pub fn next_undo_transaction(&self) -> Option<&Transaction> {
+        // Undo commits an open gesture first, so inspecting only the stack
+        // could authorize a different transaction from the one it reverts.
+        self.open
+            .as_ref()
+            .filter(|transaction| !transaction.is_empty())
+            .or_else(|| self.undo.last())
+    }
+
+    pub fn next_redo_transaction(&self) -> Option<&Transaction> {
+        self.redo.last()
+    }
+
     // ---- transaction lifecycle ----------------------------------------------
 
     /// Open a transaction. If one is already open, it is committed first so
@@ -197,6 +210,8 @@ impl History {
         let mut active_modes = std::collections::BTreeMap::new();
         let mut motion = crate::motion::MotionLibrary::new();
         let mut flow_start = None;
+        let mut pages = Vec::new();
+        let mut active_page = None;
         let mut ctx = OpCtx {
             scene,
             components: &mut components,
@@ -204,6 +219,8 @@ impl History {
             active_modes: &mut active_modes,
             motion: &mut motion,
             flow_start: &mut flow_start,
+            pages: &mut pages,
+            active_page: &mut active_page,
         };
         self.abort_with(&mut ctx)
     }
@@ -361,6 +378,8 @@ mod tests {
         active_modes: BTreeMap<VariableCollectionId, ModeId>,
         motion: crate::motion::MotionLibrary,
         flow_start: Option<NodeId>,
+        pages: Vec<NodeId>,
+        active_page: Option<NodeId>,
     }
     impl TestDoc {
         fn new() -> Self {
@@ -371,6 +390,8 @@ mod tests {
                 active_modes: BTreeMap::new(),
                 motion: crate::motion::MotionLibrary::new(),
                 flow_start: None,
+                pages: Vec::new(),
+                active_page: None,
             }
         }
         fn ctx(&mut self) -> OpCtx<'_> {
@@ -381,6 +402,8 @@ mod tests {
                 active_modes: &mut self.active_modes,
                 motion: &mut self.motion,
                 flow_start: &mut self.flow_start,
+                pages: &mut self.pages,
+                active_page: &mut self.active_page,
             }
         }
     }
@@ -509,5 +532,110 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(history.undo_depth(), 3);
+    }
+
+    #[test]
+    fn transaction_peeks_follow_undo_redo_without_mutating_history() {
+        let mut document = TestDoc::new();
+        let mut history = History::new();
+        assert!(history.next_undo_transaction().is_none());
+        assert!(history.next_redo_transaction().is_none());
+        let node = rect_node();
+        let id = node.id;
+        document.scene.insert(node).expect("insert node");
+        history.begin("Move twice", &mut document.scene);
+        for (old, new) in [(0.0, 10.0), (10.0, 20.0)] {
+            history
+                .apply(
+                    Operation::SetTransform {
+                        id,
+                        old: Transform2D::translation(old, 0.0),
+                        new: Transform2D::translation(new, 0.0),
+                    },
+                    &mut document.ctx(),
+                )
+                .expect("move node");
+        }
+        history.commit(&mut document.scene);
+        let before = serde_json::to_value(&history).expect("history snapshot");
+        let transaction = history.next_undo_transaction().expect("undo transaction");
+        assert_eq!(transaction.label, "Move twice");
+        assert_eq!(transaction.ops.len(), 2);
+        let expected = serde_json::to_value(transaction).expect("transaction snapshot");
+        assert!(history.next_redo_transaction().is_none());
+        assert_eq!(serde_json::to_value(&history).expect("history"), before);
+
+        assert!(history.undo(&mut document.ctx()).expect("undo"));
+        assert!(history.next_undo_transaction().is_none());
+        assert_eq!(
+            serde_json::to_value(history.next_redo_transaction()).expect("redo transaction"),
+            expected
+        );
+        assert!(history.redo(&mut document.ctx()).expect("redo"));
+        assert_eq!(
+            serde_json::to_value(history.next_undo_transaction()).expect("undo transaction"),
+            expected
+        );
+        assert!(history.next_redo_transaction().is_none());
+        assert_eq!(
+            document.scene.get(id).expect("node").transform,
+            Transform2D::translation(20.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn undo_peek_accounts_for_implicit_open_transaction_commit() {
+        let mut document = TestDoc::new();
+        let mut history = History::new();
+        let node = rect_node();
+        let id = node.id;
+        history
+            .apply(Operation::create_node(node), &mut document.ctx())
+            .expect("create node");
+        history.begin("Unchanged gesture", &mut document.scene);
+        assert!(matches!(
+            history
+                .next_undo_transaction()
+                .expect("previous undo transaction")
+                .ops
+                .first(),
+            Some(Operation::CreateNode { .. })
+        ));
+
+        history.begin("Pending move", &mut document.scene);
+        history
+            .apply(
+                Operation::SetTransform {
+                    id,
+                    old: Transform2D::IDENTITY,
+                    new: Transform2D::translation(25.0, 0.0),
+                },
+                &mut document.ctx(),
+            )
+            .expect("pending move");
+        assert_eq!(history.undo_depth(), 1);
+        assert_eq!(
+            history.next_undo_transaction().expect("pending undo").label,
+            "Pending move"
+        );
+        assert_eq!(history.undo_depth(), 1);
+        assert!(history.next_redo_transaction().is_none());
+        assert!(
+            history
+                .undo(&mut document.ctx())
+                .expect("undo pending move")
+        );
+        assert_eq!(
+            history
+                .next_redo_transaction()
+                .expect("redo pending move")
+                .label,
+            "Pending move"
+        );
+        assert_eq!(
+            document.scene.get(id).expect("node remains").transform,
+            Transform2D::IDENTITY
+        );
+        assert_eq!(history.undo_depth(), 1);
     }
 }
