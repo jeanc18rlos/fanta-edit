@@ -1822,6 +1822,55 @@ mod tests {
         );
     }
 
+    /// Dev and Preview builds talk to the Fanta v2 backend; Stable stays on v1. Account auth is
+    /// only attached when a URL matches `server_url`, so every Fanta endpoint must move together,
+    /// and the repeated Fanta model list must not drift from the base one.
+    #[test]
+    fn test_default_settings_fanta_v2_channel_overrides() {
+        let (parsed, status) = UserSettingsContent::parse_json(&default_settings());
+        assert!(
+            parsed.is_some() && matches!(status, ParseStatus::Success),
+            "{status:?}"
+        );
+
+        let defaults: serde_json::Value =
+            crate::parse_json_with_comments(&default_settings()).unwrap();
+        let base_models =
+            &defaults["language_models"]["anthropic_compatible"]["Fanta"]["available_models"];
+        assert_eq!(defaults["server_url"], "https://api.fantaisa.net");
+        assert_eq!(
+            defaults["context_servers"]["fanta-design"]["enabled"],
+            false
+        );
+        assert!(defaults["stable"].get("server_url").is_none());
+
+        for channel in ["dev", "preview"] {
+            let overrides = &defaults[channel];
+            let server = overrides["server_url"].as_str().unwrap();
+            assert_eq!(server, "https://api-v2.fantaisa.net", "{channel}");
+            let fanta = &overrides["language_models"]["anthropic_compatible"]["Fanta"];
+            assert_eq!(fanta["api_url"], server, "{channel}");
+            assert_eq!(&fanta["available_models"], base_models, "{channel}");
+            assert_eq!(
+                overrides["edit_predictions"]["open_ai_compatible_api"]["api_url"],
+                format!("{server}/v1/completions"),
+                "{channel}"
+            );
+            let servers = &overrides["context_servers"];
+            assert_eq!(
+                servers["fanta"]["url"],
+                format!("{server}/mcp"),
+                "{channel}"
+            );
+            assert_eq!(
+                servers["fanta-design"]["url"],
+                format!("{server}/v2/mcp"),
+                "{channel}"
+            );
+            assert_eq!(servers["fanta-design"]["enabled"], true, "{channel}");
+        }
+    }
+
     #[gpui::test]
     fn test_settings_store_basic(cx: &mut App) {
         let mut store = SettingsStore::new(cx, &default_settings());

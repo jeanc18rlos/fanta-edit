@@ -2874,6 +2874,49 @@
   // Mostly useful for developers who are managing multiple instances of Zed.
   "preview": {
     // "theme": "Andromeda"
+    // Fanta v2 backend (Cloud Run, its own accounts and credits). Stable stays on
+    // api.fantaisa.net. Every Fanta endpoint moves together: account auth is only
+    // attached when a URL matches server_url.
+    "server_url": "https://api-v2.fantaisa.net",
+    // The whole provider entry is repeated (available_models is required, and a list
+    // replaces rather than merges); a settings test keeps it in step with the base.
+    "language_models": {
+      "anthropic_compatible": {
+        "Fanta": {
+          "api_url": "https://api-v2.fantaisa.net",
+          "available_models": [
+            {
+              "name": "claude-sonnet-5",
+              "display_name": "Fanta Sonnet",
+              "max_tokens": 200000,
+              "max_output_tokens": 32000,
+              "capabilities": { "tools": true, "images": true, "prompt_caching": true },
+            },
+            {
+              "name": "claude-opus-4-8",
+              "display_name": "Fanta Opus",
+              "max_tokens": 200000,
+              "max_output_tokens": 32000,
+              "capabilities": { "tools": true, "images": true, "prompt_caching": true },
+            },
+            {
+              "name": "claude-haiku-4-5",
+              "display_name": "Fanta Haiku",
+              "max_tokens": 200000,
+              "max_output_tokens": 32000,
+              "capabilities": { "tools": true, "images": true, "prompt_caching": true },
+            },
+          ],
+        },
+      },
+    },
+    "edit_predictions": {
+      "open_ai_compatible_api": { "api_url": "https://api-v2.fantaisa.net/v1/completions" },
+    },
+    "context_servers": {
+      "fanta": { "enabled": true, "url": "https://api-v2.fantaisa.net/mcp", "timeout": 120, "headers": {} },
+      "fanta-design": { "enabled": true, "url": "https://api-v2.fantaisa.net/v2/mcp", "timeout": 120, "headers": {} },
+    },
   },
   // Settings overrides to use when using Zed Nightly.
   // Mostly useful for developers who are managing multiple instances of Zed.
@@ -2894,6 +2937,49 @@
   // Mostly useful for developers who are managing multiple instances of Zed.
   "dev": {
     // "theme": "Andromeda"
+    // Fanta v2 backend (Cloud Run, its own accounts and credits). Stable stays on
+    // api.fantaisa.net. Every Fanta endpoint moves together: account auth is only
+    // attached when a URL matches server_url.
+    "server_url": "https://api-v2.fantaisa.net",
+    // The whole provider entry is repeated (available_models is required, and a list
+    // replaces rather than merges); a settings test keeps it in step with the base.
+    "language_models": {
+      "anthropic_compatible": {
+        "Fanta": {
+          "api_url": "https://api-v2.fantaisa.net",
+          "available_models": [
+            {
+              "name": "claude-sonnet-5",
+              "display_name": "Fanta Sonnet",
+              "max_tokens": 200000,
+              "max_output_tokens": 32000,
+              "capabilities": { "tools": true, "images": true, "prompt_caching": true },
+            },
+            {
+              "name": "claude-opus-4-8",
+              "display_name": "Fanta Opus",
+              "max_tokens": 200000,
+              "max_output_tokens": 32000,
+              "capabilities": { "tools": true, "images": true, "prompt_caching": true },
+            },
+            {
+              "name": "claude-haiku-4-5",
+              "display_name": "Fanta Haiku",
+              "max_tokens": 200000,
+              "max_output_tokens": 32000,
+              "capabilities": { "tools": true, "images": true, "prompt_caching": true },
+            },
+          ],
+        },
+      },
+    },
+    "edit_predictions": {
+      "open_ai_compatible_api": { "api_url": "https://api-v2.fantaisa.net/v1/completions" },
+    },
+    "context_servers": {
+      "fanta": { "enabled": true, "url": "https://api-v2.fantaisa.net/mcp", "timeout": 120, "headers": {} },
+      "fanta-design": { "enabled": true, "url": "https://api-v2.fantaisa.net/v2/mcp", "timeout": 120, "headers": {} },
+    },
     "instrumentation": {
       "performance_profiler": {
         "enabled": true,
@@ -2977,6 +3063,15 @@
     "fanta": {
       "enabled": true,
       "url": "https://api.fantaisa.net/mcp",
+      "timeout": 120,
+      "headers": {}
+    },
+    // Fanta v2 design tools (fonts, icons, stock images, lint, critique, palettes).
+    // Served by the v2 backend only, so it is enabled in the dev and preview
+    // overrides below, which point at it.
+    "fanta-design": {
+      "enabled": false,
+      "url": "https://api.fantaisa.net/v2/mcp",
       "timeout": 120,
       "headers": {}
     }
