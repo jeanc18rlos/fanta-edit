@@ -20,7 +20,7 @@ pub fn materialize_graphics(
     variables: VariableRegistry,
     active_modes: BTreeMap<fanta_doc::VariableCollectionId, fanta_doc::ModeId>,
 ) -> Result<ScopedDoc, SessionError> {
-    let nodes = ir.to_nodes()?;
+    let nodes = super::materialize::scoped_nodes(ir)?;
     validate_no_live_instance(ArtifactKind::Graphics, &nodes)?;
     let root = root_id(&nodes)?;
     let mut doc = Doc::new();

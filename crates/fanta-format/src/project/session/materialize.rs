@@ -8,7 +8,7 @@ use fanta_doc::{
 };
 use fanta_fnx::{ArtifactIr, ArtifactKind, ImportTarget, import_allowed};
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 /// Materialize a page IR into a scoped `Doc` (page nodes only; no masters in scene).
 pub fn materialize_page(
@@ -18,7 +18,7 @@ pub fn materialize_page(
     variables: VariableRegistry,
     active_modes: BTreeMap<fanta_doc::VariableCollectionId, fanta_doc::ModeId>,
 ) -> Result<ScopedDoc, SessionError> {
-    let nodes = ir.to_nodes()?;
+    let nodes = scoped_nodes(ir)?;
     validate_import_matrix(ArtifactKind::Page, &nodes)?;
     let root = root_id_from_nodes(&nodes)?;
     ensure_page_root_is_group(&nodes, root)?;
@@ -41,7 +41,7 @@ pub fn materialize_component(
     variables: VariableRegistry,
     active_modes: BTreeMap<fanta_doc::VariableCollectionId, fanta_doc::ModeId>,
 ) -> Result<ScopedDoc, SessionError> {
-    let nodes = ir.to_nodes()?;
+    let nodes = scoped_nodes(ir)?;
     validate_import_matrix(ArtifactKind::Component, &nodes)?;
     let root = root_id_from_nodes(&nodes)?;
     if def.root != root {
@@ -144,6 +144,30 @@ fn empty_scoped_doc(project_id: DocId) -> Doc {
     doc.selection = Selection::new();
     doc.viewport = Viewport::default();
     doc
+}
+
+/// An artifact's nodes with its root detached from anything outside the artifact.
+///
+/// FNX keeps a root's external parent (the sidecar's `root_parent`), so a
+/// component master that sits on a page decodes still pointing at that page,
+/// both from disk and when a save adopts it from the whole workspace document.
+/// The scoped document holds only this artifact, so its root has no parent.
+pub(crate) fn scoped_nodes(ir: &ArtifactIr) -> Result<Vec<Value>, SessionError> {
+    let mut nodes = ir.to_nodes()?;
+    let ids: HashSet<String> = nodes
+        .iter()
+        .filter_map(|node| node.get("id").and_then(Value::as_str).map(str::to_owned))
+        .collect();
+    for node in &mut nodes {
+        let external = node
+            .get("parent")
+            .and_then(Value::as_str)
+            .is_some_and(|parent| !ids.contains(parent));
+        if external {
+            node["parent"] = Value::Null;
+        }
+    }
+    Ok(nodes)
 }
 
 fn root_id_from_nodes(nodes: &[Value]) -> Result<NodeId, SessionError> {
@@ -293,7 +317,7 @@ fn parse_component_def(
         return Ok(def);
     }
     // Minimal def from tree root.
-    let nodes = ir.to_nodes()?;
+    let nodes = scoped_nodes(ir)?;
     let root = root_id_from_nodes(&nodes)?;
     let name = nodes
         .iter()
