@@ -381,3 +381,99 @@ fn upgrading_a_v4_project_moves_it_to_v5_once() {
     let again = fanta_format::upgrade_project(dir.path()).unwrap();
     assert_eq!((again.from, again.to), (5, 5));
 }
+
+/// The editor's save sequence (fig_viewer's `FigItem::save`) for `doc`, with
+/// `open` artifacts adopted the way open tabs are.
+fn editor_save(dir: &Path, session: &mut WorkspaceSession, doc: &Doc, open: &[ArtifactId]) {
+    let persisted = doc.clone_for_persist();
+    session.adopt_document_shared(&persisted);
+    for id in open {
+        session
+            .artifact_mut(id)
+            .unwrap()
+            .adopt_document(&persisted)
+            .unwrap();
+    }
+    let sources = session
+        .validated_source_overrides_for_document(&persisted)
+        .unwrap();
+    let expected = session.source_write_preconditions(&persisted).unwrap();
+    let mut cache = fanta_format::ProjectWriteCache::default();
+    let report = fanta_format::write_project_tree_cached_with_sources_checked(
+        dir,
+        &persisted,
+        &BTreeMap::new(),
+        &mut cache,
+        &sources,
+        &expected,
+    )
+    .unwrap();
+    let index_hash = report
+        .written_hashes
+        .get(Path::new("assets/index.json"))
+        .copied()
+        .or_else(|| session.asset_index_disk_hash())
+        .unwrap();
+    session
+        .accept_written_sources(&persisted, index_hash, &sources, &report.written_hashes)
+        .unwrap();
+}
+
+#[test]
+fn moving_a_master_into_its_set_frame_survives_the_editors_save() {
+    // The variants start as masters on their own (as a project keeps them
+    // before they are arranged) and are then moved into the set's frame, as
+    // `arrange_variants` does. That parent is outside each component's scope,
+    // so no component looks edited; the save must still record it.
+    let dir = tempdir().unwrap();
+    let mut f = fixture();
+    for (_, root) in &f.variants {
+        let node = f.doc.scene.get(*root).unwrap().clone();
+        let index = f.doc.scene.next_child_index(None);
+        f.doc
+            .apply(fanta_doc::Operation::Reparent {
+                id: *root,
+                old_parent: node.parent,
+                old_index: node.index,
+                new_parent: None,
+                new_index: index,
+            })
+            .unwrap();
+    }
+    write_project_tree(dir.path(), &f.doc, &BTreeMap::new()).unwrap();
+    let (on_disk, _) = read_project_tree(dir.path()).unwrap();
+    assert_eq!(on_disk.scene.get(f.variants[0].1).unwrap().parent, None);
+
+    let mut session = WorkspaceSession::open(dir.path()).unwrap();
+    let open: Vec<ArtifactId> = f
+        .variants
+        .iter()
+        .map(|(id, _)| ArtifactId::Component(*id))
+        .collect();
+    for id in &open {
+        session.open_artifact(id.clone()).unwrap();
+    }
+    for (_, root) in &f.variants {
+        let node = f.doc.scene.get(*root).unwrap().clone();
+        let index = f.doc.scene.next_child_index(Some(f.frame));
+        f.doc
+            .apply(fanta_doc::Operation::Reparent {
+                id: *root,
+                old_parent: node.parent,
+                old_index: node.index,
+                new_parent: Some(f.frame),
+                new_index: index,
+            })
+            .unwrap();
+    }
+    editor_save(dir.path(), &mut session, &f.doc, &open);
+
+    let (saved, _) = read_project_tree(dir.path()).unwrap();
+    for (_, root) in &f.variants {
+        assert_eq!(
+            saved.scene.get(*root).unwrap().parent,
+            Some(f.frame),
+            "the variant is still inside its set frame after reopening"
+        );
+    }
+}

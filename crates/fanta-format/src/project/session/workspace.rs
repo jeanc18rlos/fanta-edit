@@ -586,6 +586,12 @@ impl WorkspaceSession {
                 )?;
                 (source, ids)
             };
+            let bytes = match id {
+                ArtifactId::Component(component) => {
+                    with_document_root_parent(document, *component, bytes)?
+                }
+                _ => bytes,
+            };
             if rekeyed.insert(projected_dir.clone(), bytes).is_some() {
                 return Err(SessionError::other(
                     "two artifacts have the same projected path",
@@ -1771,6 +1777,47 @@ fn find_artifact_by_id(root: &Path, id: &ArtifactId) -> Result<Option<ArtifactMe
         }
     }
     Ok(None)
+}
+
+/// A component's source and sidecar with the sidecar's `root_parent` set to
+/// where `document` has the master. That parent (a page, or a variant set's
+/// frame) is outside the component's scope, so moving the master there marks
+/// no artifact dirty: without this, a save writes back the old sidecar and the
+/// master falls out of its frame on reopening.
+fn with_document_root_parent(
+    document: &fanta_doc::Doc,
+    component: fanta_doc::ComponentId,
+    (source, ids): (Vec<u8>, Vec<u8>),
+) -> Result<(Vec<u8>, Vec<u8>), SessionError> {
+    let Some(root) = document.components.def(component).map(|def| def.root) else {
+        return Ok((source, ids));
+    };
+    let Some(node) = document.scene.get(root) else {
+        return Ok((source, ids));
+    };
+    let parent = node
+        .parent
+        .map(|parent| {
+            serde_json::to_value(parent)
+                .map_err(|error| SessionError::other(error.to_string()))
+                .and_then(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| SessionError::other("a node id is not a string"))
+                })
+        })
+        .transpose()?;
+    let mut sidecar: fanta_fnx::FnxSidecar = serde_json::from_slice(&ids)
+        .map_err(|error| SessionError::other(format!("component sidecar: {error}")))?;
+    if sidecar.root_parent == parent {
+        return Ok((source, ids));
+    }
+    sidecar.root_parent = parent;
+    let ids = json_bytes(
+        &serde_json::to_value(&sidecar).map_err(|error| SessionError::other(error.to_string()))?,
+    )?;
+    Ok((source, ids))
 }
 
 /// Workspace files outside any artifact that a save rewrites and that a
