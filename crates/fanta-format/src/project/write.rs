@@ -819,7 +819,11 @@ fn project_designs(
                 .join(LOOSE_DIR)
                 .join(NODES_DIR)
                 .join(format!("{id}.json")),
-            Arc::new(json_bytes(&serde_json::to_value(node)?)?),
+            Arc::new(json_bytes(&{
+                let mut value = serde_json::to_value(node)?;
+                crate::project::read::repair_non_finite_geometry(&mut value);
+                value
+            })?),
         );
     }
     Ok(())
@@ -947,7 +951,10 @@ fn project_design_cached(
             .scene
             .get(*id)
             .ok_or_else(|| FormatError::InvalidProjectTree(format!("node {id} vanished")))?;
-        values.push(serde_json::to_value(node)?);
+        let mut value = serde_json::to_value(node)?;
+        // A non-finite number would be written as `null` and fail the read.
+        crate::project::read::repair_non_finite_geometry(&mut value);
+        values.push(value);
     }
     let produced = project_fnx_design(design_dir, fnx_name, ids_name, &values, fn_name, refs)?;
     for (relative, bytes) in &produced {
