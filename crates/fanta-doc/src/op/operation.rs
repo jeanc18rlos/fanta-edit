@@ -184,6 +184,14 @@ pub enum Operation {
         new: Vec<ComponentPropDef>,
     },
 
+    /// Rename a component def. Page sources name components, so saving
+    /// re-prints every page that names this one.
+    SetComponentName {
+        id: ComponentId,
+        old: String,
+        new: String,
+    },
+
     /// Register a component set (variant group).
     DefineComponentSet { set: Box<ComponentSet> },
 
@@ -521,6 +529,7 @@ impl Operation {
             Self::DefineComponent { .. } => "Create Component",
             Self::DeleteComponent { .. } => "Delete Component",
             Self::SetComponentProps { .. } => "Edit Component Props",
+            Self::SetComponentName { .. } => "Rename Component",
             Self::DefineComponentSet { .. } => "Create Variant Set",
             Self::DeleteComponentSet { .. } => "Delete Variant Set",
             Self::SetVariantMembership { .. } => "Set Variant",

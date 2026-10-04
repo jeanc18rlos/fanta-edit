@@ -57,7 +57,8 @@ pub use binding::BoundProp;
 pub use color::{Color, Gradient, GradientStop};
 pub use component::{
     ComponentDef, ComponentLibrary, ComponentPropDef, ComponentPropFormatter, ComponentPropKind,
-    ComponentSet, ComponentSetMembership, PropBindingTarget, VariantAxis,
+    ComponentSet, ComponentSetMembership, PropBindingTarget, VariantAxis, parse_variant_name,
+    variant_name,
 };
 pub use doc::{
     Doc, DocLoadError, DocMetadata, DocMigrationError, Flow, PresentationConfig, ProjectAsset,

@@ -121,6 +121,7 @@ fn register_component_sets(
         let members = collect_set_members(doc, pending.root, set_id, components);
         let default_variant = members.ids.first().copied().unwrap_or(set_id);
         let set = ComponentSet {
+            root: Some(pending.root),
             id: set_id,
             name: display_name(doc, pending.root, &pending.name),
             axes: variant_axes_from_map(members.axes),

@@ -1619,7 +1619,7 @@ fn gate_capabilities(
         kind,
         DesignPanelNodeKind::Frame | DesignPanelNodeKind::Group | DesignPanelNodeKind::Component
     );
-    capabilities.grid_auto_layout = false;
+    capabilities.grid_auto_layout = capabilities.auto_layout_container;
     capabilities.layout_guides = false;
     capabilities.pass_through_blend = matches!(
         kind,

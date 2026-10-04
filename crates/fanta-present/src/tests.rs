@@ -2221,6 +2221,7 @@ fn update_variant_action_visually_switches_component_member() {
     doc.components.sets.insert(
         set_id,
         ComponentSet {
+            root: None,
             id: set_id,
             name: "Toggle".to_owned(),
             axes: vec![VariantAxis {
@@ -2552,6 +2553,7 @@ fn interactive_variant_document() -> (Doc, NodeId, NodeId, NodeId) {
     doc.components.sets.insert(
         set_id,
         ComponentSet {
+            root: None,
             id: set_id,
             name: "Button".into(),
             axes: vec![VariantAxis {
@@ -2714,6 +2716,7 @@ fn update_variant_smart_animate_interpolates_matched_component_layers_locally() 
     doc.components.sets.insert(
         set_id,
         ComponentSet {
+            root: None,
             id: set_id,
             name: "Toggle".into(),
             axes: vec![VariantAxis {
@@ -2824,6 +2827,7 @@ fn directional_update_variant_moves_only_the_affected_component_layer() {
     doc.components.sets.insert(
         set_id,
         ComponentSet {
+            root: None,
             id: set_id,
             name: "Toggle".into(),
             axes: vec![VariantAxis {

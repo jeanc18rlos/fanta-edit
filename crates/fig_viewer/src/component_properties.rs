@@ -444,6 +444,7 @@ mod tests {
         doc.components.sets.insert(
             set_id,
             ComponentSet {
+                root: None,
                 id: set_id,
                 name: "Button".to_string(),
                 axes: vec![VariantAxis {

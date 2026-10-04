@@ -2185,7 +2185,9 @@ pub fn artifact_op_impact(op: &Operation) -> ArtifactOpImpact {
         | SetKeyframe { .. } => Impact::Motion,
 
         SetFlowStart { .. } | SetFlows { .. } | SetPresentation { .. } => Impact::Flow,
-        SetPageRegistry { .. } => Impact::ProjectStructure,
+        // A rename moves the component's folder and re-prints every page
+        // that names it.
+        SetPageRegistry { .. } | SetComponentName { .. } => Impact::ProjectStructure,
     }
 }
 
