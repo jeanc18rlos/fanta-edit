@@ -407,8 +407,24 @@ fn arrange_in_plan(plan: &mut Plan, set_id: ComponentId) -> Result<NodeId> {
     }
 
     let (columns, cells) = grid_cells(&set.axes, members.iter().map(|(_, _, values)| values));
-    let frame = match set.root.filter(|frame| plan.doc.scene.contains(*frame)) {
-        Some(frame) => frame,
+    let frame = match set
+        .root
+        .filter(|frame| plan.doc.scene.contains(*frame))
+        .or_else(|| shared_frame(&plan.doc, members.iter().map(|(_, root, _)| *root)))
+    {
+        Some(frame) if set.root == Some(frame) => frame,
+        Some(frame) => {
+            let new_set = ComponentSet {
+                root: Some(frame),
+                ..set.clone()
+            };
+            plan.apply(Operation::SetComponentSet {
+                id: set_id,
+                old: Box::new(set.clone()),
+                new: Box::new(new_set),
+            })?;
+            frame
+        }
         None => {
             let frame = create_set_frame(plan, &set, members.iter().map(|(_, root, _)| *root))?;
             let new_set = ComponentSet {
@@ -468,30 +484,79 @@ fn arrange_in_plan(plan: &mut Plan, set_id: ComponentId) -> Result<NodeId> {
     Ok(frame)
 }
 
-/// A new frame for `set`, in the first member's parent, at the top-left of
-/// the members' bounds.
+/// The frame a set's masters already share (not a page), adopted as the
+/// set's frame instead of nesting a new one.
+fn shared_frame(doc: &Doc, mut roots: impl Iterator<Item = NodeId>) -> Option<NodeId> {
+    let parent = doc.scene.get(roots.next()?)?.parent?;
+    let shared = roots.all(|root| {
+        doc.scene
+            .get(root)
+            .is_some_and(|node| node.parent == Some(parent))
+    });
+    let is_frame = doc
+        .scene
+        .get(parent)
+        .is_some_and(|node| matches!(node.data, NodeData::Group(_)));
+    (shared && is_frame && !doc.pages().contains(&parent) && !doc.is_component_root(parent))
+        .then_some(parent)
+}
+
+/// The union of `ids`' world bounds as `[min_x, min_y, max_x, max_y]`.
+fn world_union(doc: &Doc, ids: impl Iterator<Item = NodeId>) -> Option<[f64; 4]> {
+    ids.filter_map(|id| doc.scene.world_bounds(id))
+        .fold(None, |union, bounds| {
+            Some(match union {
+                Some([x0, y0, x1, y1]) => [
+                    f64::min(x0, bounds.min_x),
+                    f64::min(y0, bounds.min_y),
+                    f64::max(x1, bounds.max_x),
+                    f64::max(y1, bounds.max_y),
+                ],
+                None => [bounds.min_x, bounds.min_y, bounds.max_x, bounds.max_y],
+            })
+        })
+}
+
+/// A new frame for `set`: in the first member's parent at the top-left of the
+/// members' bounds, or, for masters that sit on their own (a project's
+/// `components/`), on the first visible page below its content.
 fn create_set_frame(
     plan: &mut Plan,
     set: &ComponentSet,
     roots: impl Iterator<Item = NodeId>,
 ) -> Result<NodeId> {
     let roots: Vec<NodeId> = roots.collect();
-    let parent = plan
+    let member_parent = plan
         .doc
         .scene
         .get(roots[0])
         .context("variant master")?
         .parent;
-    let origin = roots
-        .iter()
-        .filter_map(|root| plan.doc.scene.world_bounds(*root))
-        .fold(None::<[f64; 2]>, |origin, bounds| {
-            Some(match origin {
-                Some([x, y]) => [x.min(bounds.min_x), y.min(bounds.min_y)],
-                None => [bounds.min_x, bounds.min_y],
-            })
-        })
-        .unwrap_or_default();
+    let (parent, origin) = match member_parent {
+        Some(parent) => {
+            let bounds = world_union(&plan.doc, roots.iter().copied()).unwrap_or_default();
+            (
+                Some(parent),
+                [bounds[0] - SET_PADDING, bounds[1] - SET_PADDING],
+            )
+        }
+        None => {
+            let page = plan.doc.pages().iter().copied().find(|page| {
+                plan.doc
+                    .scene
+                    .get(*page)
+                    .and_then(|node| node.meta.get("hidden_page"))
+                    .and_then(serde_json::Value::as_bool)
+                    != Some(true)
+            });
+            let content = page.and_then(|page| {
+                let children = plan.doc.scene.children_of(Some(page)).to_vec();
+                world_union(&plan.doc, children.into_iter())
+            });
+            let origin = content.map_or([0.0, 0.0], |bounds| [bounds[0], bounds[3] + 160.0]);
+            (page, origin)
+        }
+    };
     let parent_world = parent
         .and_then(|parent| plan.doc.scene.world_transform(parent))
         .unwrap_or(Transform2D::IDENTITY);
@@ -508,8 +573,7 @@ fn create_set_frame(
     frame.name = set.name.clone();
     frame.parent = parent;
     frame.index = plan.doc.scene.next_child_index(parent);
-    frame.transform = Transform2D::translation(origin[0] - SET_PADDING, origin[1] - SET_PADDING)
-        .then(&parent_world.inverse());
+    frame.transform = Transform2D::translation(origin[0], origin[1]).then(&parent_world.inverse());
     let id = frame.id;
     plan.apply(Operation::create_node(frame))?;
     Ok(id)
@@ -962,6 +1026,76 @@ mod tests {
                 .unwrap()
                 .operations
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn masters_on_their_own_go_into_a_set_frame_below_the_page_content() {
+        // A Fanta project keeps each master in `components/`: a scene root
+        // with no parent, as the 12 Button variants of demo-v2 were.
+        let (mut doc, page, masters) = doc_with_masters(&[
+            "Variant=Primary, State=Default",
+            "Variant=Primary, State=Hover",
+        ]);
+        let mut docs = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([720.0, 400.0]),
+            ..Default::default()
+        }));
+        docs.parent = Some(page);
+        docs.index = doc.scene.next_child_index(Some(page));
+        let docs_id = docs.id;
+        doc.apply(Operation::create_node(docs)).unwrap();
+        for (_, root) in &masters {
+            let node = doc.scene.get(*root).unwrap().clone();
+            let index = doc.scene.next_child_index(None);
+            doc.apply(Operation::Reparent {
+                id: *root,
+                old_parent: node.parent,
+                old_index: node.index,
+                new_parent: None,
+                new_index: index,
+            })
+            .unwrap();
+        }
+        let (_, frame) = apply(&mut doc, |doc| {
+            combine_variants(doc, &roots(&masters), Some("Button")).unwrap()
+        });
+        let frame = frame.unwrap();
+        assert_eq!(doc.scene.get(frame).unwrap().parent, Some(page));
+        assert_eq!(doc.scene.children_of(Some(page)), [docs_id, frame]);
+        assert_eq!(
+            doc.scene.children_of(Some(frame)),
+            roots(&masters).as_slice()
+        );
+        let world = doc.scene.world_transform(frame).unwrap();
+        assert!(
+            world.0.translation.y >= 400.0,
+            "the frame sits below the page's content"
+        );
+    }
+
+    #[test]
+    fn a_frame_the_variants_already_share_becomes_the_set_frame() {
+        let (mut doc, page, masters) = doc_with_masters(&["Size=S", "Size=L"]);
+        let (set_id, frame) = apply(&mut doc, |doc| {
+            combine_variants(doc, &roots(&masters), Some("Chip")).unwrap()
+        });
+        let frame = frame.unwrap();
+        // Forget the frame, as a set built outside the editor would.
+        let set = doc.components.sets[&set_id].clone();
+        doc.apply(Operation::SetComponentSet {
+            id: set_id,
+            old: Box::new(set.clone()),
+            new: Box::new(ComponentSet { root: None, ..set }),
+        })
+        .unwrap();
+        let (_, adopted) = apply(&mut doc, |doc| arrange_variants(doc, set_id).unwrap());
+        assert_eq!(adopted, Some(frame));
+        assert_eq!(doc.components.sets[&set_id].root, Some(frame));
+        assert_eq!(
+            doc.scene.children_of(Some(page)),
+            [frame],
+            "no nested frame"
         );
     }
 
