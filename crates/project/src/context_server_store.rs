@@ -36,15 +36,24 @@ use crate::{
 /// Prevents extremely large timeout values from tying up resources indefinitely.
 const MAX_TIMEOUT_SECS: u64 = 600; // 10 minutes
 
+/// The Fanta backend's own MCP servers, by settings id: generation tools at `/mcp`, and the v2
+/// design tools (fonts, icons, stock, lint, critique, palettes) at `/v2/mcp`.
+const FANTA_ACCOUNT_MCP_PATHS: &[(&str, &str)] = &[("fanta", "/mcp"), ("fanta-design", "/v2/mcp")];
+
 fn uses_account_auth(
     id: &str,
     endpoint: &str,
     headers: &HashMap<String, String>,
     server_url: &str,
 ) -> bool {
-    id == "fanta"
-        && !server_url.is_empty()
-        && endpoint.trim_end_matches('/') == format!("{}/mcp", server_url.trim_end_matches('/'))
+    let Some((_, path)) = FANTA_ACCOUNT_MCP_PATHS
+        .iter()
+        .find(|(fanta_id, _)| *fanta_id == id)
+    else {
+        return false;
+    };
+    !server_url.is_empty()
+        && endpoint.trim_end_matches('/') == format!("{}{path}", server_url.trim_end_matches('/'))
         && !headers.keys().any(|header| {
             header.eq_ignore_ascii_case("authorization") || header.eq_ignore_ascii_case("x-api-key")
         })
@@ -2188,6 +2197,31 @@ mod tests {
                 &headers,
                 server_url
             ));
+        }
+    }
+
+    #[test]
+    fn test_fanta_design_mcp_account_token_is_limited_to_v2_endpoint() {
+        let headers = HashMap::default();
+        let server_url = "https://api-v2.fantaisa.net";
+        assert!(uses_account_auth(
+            "fanta-design",
+            "https://api-v2.fantaisa.net/v2/mcp",
+            &headers,
+            server_url
+        ));
+        for (id, endpoint) in [
+            // Each id is pinned to its own path.
+            ("fanta-design", "https://api-v2.fantaisa.net/mcp"),
+            ("fanta", "https://api-v2.fantaisa.net/v2/mcp"),
+            // And to the configured server.
+            ("fanta-design", "https://api.fantaisa.net/v2/mcp"),
+            (
+                "fanta-design",
+                "https://api-v2.fantaisa.net.evil.example/v2/mcp",
+            ),
+        ] {
+            assert!(!uses_account_auth(id, endpoint, &headers, server_url));
         }
     }
 }
