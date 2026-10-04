@@ -197,6 +197,57 @@ pub struct InitCrashHandler {
 pub struct CrashPanic {
     pub message: String,
     pub span: String,
+    /// The panicking thread's frames, `function (file.rs:line)`, innermost
+    /// first. Crash upload is off and no symbols are kept, so without this a
+    /// local report names only the line that panicked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backtrace: Vec<String>,
+}
+
+/// The panicking thread's frames, cut to the code above the panic machinery.
+/// Only file names are kept, never absolute paths.
+fn panic_backtrace() -> Vec<String> {
+    const MAX_FRAMES: usize = 64;
+    let rendered = std::backtrace::Backtrace::force_capture().to_string();
+    let mut frames = Vec::new();
+    let mut lines = rendered.lines().peekable();
+    while let Some(line) = lines.next() {
+        // `  12: crate::module::function`, optionally followed by
+        // `             at /path/to/file.rs:41:9`.
+        let Some((_, function)) = line.trim_start().split_once(": ") else {
+            continue;
+        };
+        let location = lines
+            .next_if(|next| next.trim_start().starts_with("at "))
+            .and_then(|next| {
+                let path = next.trim_start().trim_start_matches("at ");
+                let file = path.rsplit(['/', '\\']).next()?;
+                let mut parts = file.split(':');
+                Some(format!("{}:{}", parts.next()?, parts.next().unwrap_or("?")))
+            });
+        frames.push(match location {
+            Some(location) => format!("{function} ({location})"),
+            None => function.to_owned(),
+        });
+    }
+    // Skip the leading frames that only report the panic: this capture, the
+    // hook and the closure that calls it, and std's unwinding entry points.
+    let is_machinery = |frame: &str| {
+        frame.contains("panic_backtrace")
+            || frame.contains("panic_hook")
+            || frame.contains("PanicHookInfo")
+            || frame.contains("crashes::connect_and_keepalive")
+            || frame.starts_with("std::backtrace")
+            || frame.starts_with("std::sys::backtrace")
+            || frame.starts_with("std::panicking")
+            || frame.starts_with("core::panicking")
+            || frame.contains("rust_begin_unwind")
+    };
+    let start = frames
+        .iter()
+        .position(|frame| !is_machinery(frame))
+        .unwrap_or(0);
+    frames.into_iter().skip(start).take(MAX_FRAMES).collect()
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -370,11 +421,19 @@ pub fn panic_hook(crash_client: Arc<Client>, message: &str, location: Option<&Lo
     let thread_name = current_thread.name().unwrap_or("<unnamed>");
 
     let location = location.map_or_else(|| "<unknown>".to_owned(), |location| location.to_string());
-    log::error!("thread '{thread_name}' panicked at {location}:\n{message}...");
+    let backtrace = panic_backtrace();
+    log::error!(
+        "thread '{thread_name}' panicked at {location}:\n{message}\n{}",
+        backtrace.join("\n")
+    );
 
     send_crash_server_message(
         &crash_client,
-        CrashServerMessage::Panic(CrashPanic { message, span }),
+        CrashServerMessage::Panic(CrashPanic {
+            message,
+            span,
+            backtrace,
+        }),
     );
     log::error!("triggering a crash to generate a minidump...");
 
@@ -531,4 +590,35 @@ pub fn crash_server(socket: &Path, logs_dir: PathBuf) {
             Some(CRASH_HANDLER_PING_TIMEOUT),
         )
         .expect("failed to run server");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panic_backtrace_names_functions_without_absolute_paths() {
+        let frames = panic_backtrace();
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame.contains("panic_backtrace_names_functions")),
+            "the caller's frame is resolved: {frames:#?}"
+        );
+        for frame in &frames {
+            if let Some((_, location)) = frame.rsplit_once(" (") {
+                assert!(
+                    !location.contains('/') && !location.contains('\\'),
+                    "{frame}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn crash_panic_reads_reports_written_before_backtraces() {
+        let panic: CrashPanic =
+            serde_json::from_str(r#"{"message":"boom","span":"a.rs:1"}"#).expect("old report");
+        assert!(panic.backtrace.is_empty());
+    }
 }
