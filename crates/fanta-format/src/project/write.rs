@@ -410,17 +410,32 @@ fn heal_directory_case(dir: &Path, files: &ProjectedFiles) -> Result<()> {
             expected.insert((managed, design));
         }
     }
+    // List each managed parent once and index it by lowercase name: listing
+    // it again for every design made this quadratic (2.5 s per save on a
+    // project with ~2,400 components).
+    let mut listings: BTreeMap<&str, BTreeMap<String, Vec<String>>> = BTreeMap::new();
     for (managed, design) in expected {
-        let parent = dir.join(managed);
-        let Ok(entries) = fs::read_dir(&parent) else {
+        let listing = listings.entry(managed).or_insert_with(|| {
+            let mut by_lowercase: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            if let Ok(entries) = fs::read_dir(dir.join(managed)) {
+                for entry in entries.flatten() {
+                    if let Ok(name) = entry.file_name().into_string() {
+                        by_lowercase
+                            .entry(name.to_ascii_lowercase())
+                            .or_default()
+                            .push(name);
+                    }
+                }
+            }
+            by_lowercase
+        });
+        let Some(names) = listing.get(&design.to_ascii_lowercase()) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if name != design && name.eq_ignore_ascii_case(design) {
+        let parent = dir.join(managed);
+        for name in names {
+            let name = name.as_str();
+            if name != design {
                 let from = parent.join(name);
                 let via = parent.join(format!("{design}.case-heal"));
                 let to = parent.join(design);
