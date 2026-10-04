@@ -2071,3 +2071,55 @@ fn component_definition_root_cannot_rebind_an_unchanged_master() {
 
     assert!(crate::read_project_tree(directory.path()).is_err());
 }
+
+#[test]
+fn canvas_save_adopts_a_component_master_placed_on_a_page() {
+    use fanta_doc::{ComponentDef, ComponentId};
+
+    let directory = tempdir().expect("temporary project");
+    let mut document = Doc::new();
+    let page = document
+        .scene
+        .insert(CanvasNode::new(NodeData::Group(GroupNode::default())))
+        .expect("page root");
+    document.add_page(page);
+    let mut master = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    master.name = "Button".into();
+    master.parent = Some(page);
+    let master_id = document.scene.insert(master).expect("component master");
+    let mut label = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    label.name = "Label".into();
+    label.parent = Some(master_id);
+    document.scene.insert(label).expect("master child");
+    let component_id = ComponentId::new();
+    document.components.defs.insert(
+        component_id,
+        ComponentDef::new(component_id, master_id, "Button"),
+    );
+    crate::write_project_tree(directory.path(), &document, &BTreeMap::new())
+        .expect("write project");
+
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("open project");
+    let id = ArtifactId::Component(component_id);
+    workspace.open_artifact(id.clone()).expect("open component");
+    document.scene.get_mut(master_id).expect("master").transform =
+        Transform2D::translation(4.0, 2.0);
+    // Saving adopts each changed artifact from the whole document, where the
+    // master still points at the page it sits on.
+    workspace
+        .artifact_mut(&id)
+        .expect("component session")
+        .adopt_document(&document)
+        .expect("adopt the edited master");
+
+    let scoped = workspace.artifact(&id).expect("component session").doc();
+    assert!(
+        scoped
+            .scene
+            .get(master_id)
+            .expect("master in scope")
+            .parent
+            .is_none()
+    );
+    assert_eq!(scoped.scene.children_of(Some(master_id)).len(), 1);
+}
