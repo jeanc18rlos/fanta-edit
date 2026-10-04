@@ -2,6 +2,7 @@
 //! editable Fanta projects, plus the design (layers) and properties dock
 //! panels and the floating canvas toolbar.
 
+mod agent_style;
 mod agent_surface;
 mod annotations;
 mod canvas;

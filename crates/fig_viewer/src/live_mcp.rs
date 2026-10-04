@@ -828,6 +828,12 @@ struct BatchGetArgs {
     /// given.
     #[serde(default)]
     limit: Option<usize>,
+    /// `summary`, `style` or `raw`. With `ids` the default is `style`: the
+    /// node's editable style in the ops' own vocabulary (send a value back in
+    /// an op unchanged); `raw` is the internal record. A page listing defaults
+    /// to `summary`; `style` merges each listed node's style into it.
+    #[serde(default)]
+    detail: Option<design_surface::NodeDetail>,
 }
 
 /// How a caller narrows a result that overran [`MAX_JSON_RESPONSE_BYTES`].
@@ -869,6 +875,7 @@ impl McpServerTool for BatchGetTool {
             include_geometry: args.include_geometry,
             offset: args.offset,
             limit: args.limit,
+            detail: args.detail,
         };
         let value = with_surface(cx, move |surface, cx| surface.get_nodes(query, cx))?;
         bounded_text_response(value, narrowing_hint(listing))
