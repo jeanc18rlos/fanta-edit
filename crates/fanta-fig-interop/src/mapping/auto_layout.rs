@@ -1,8 +1,9 @@
 //! Auto-layout ("stack") + per-child layout participation + mask flag reads.
 
 use super::{
-    AutoLayout, AxisSizing, CanvasNode, CounterAlign, KiwiValue, LayoutChild, LayoutMode, MaskType,
-    PrimaryAlign, ScrollBehavior, ScrollDirection,
+    AutoLayout, AxisSizing, CanvasNode, CounterAlign, GridAlign, GridCell, GridLayout, GridTrack,
+    KiwiValue, LayoutChild, LayoutMode, MaskType, PrimaryAlign, ScrollBehavior, ScrollDirection,
+    guid_key,
 };
 
 /// Read the auto-layout ("stack") configuration from a `NodeChange`, or `None`
@@ -10,7 +11,8 @@ use super::{
 ///
 /// Figma stack spacing, padding, alignment, sizing, wrapping, and reverse-z
 /// fields are mapped into Fanta's model only when `stackMode` is an explicit
-/// HORIZONTAL or VERTICAL flow. Real `.fig` files can carry stale `stack*`
+/// HORIZONTAL or VERTICAL flow, or a GRID (whose tracks [`read_grid_layout`]
+/// reads). Real `.fig` files can carry stale `stack*`
 /// fields on free-positioned frames; inferring auto-layout from those values
 /// reflows baked Figma compositions incorrectly.
 ///
@@ -62,6 +64,7 @@ pub(crate) fn read_auto_layout(change: &KiwiValue) -> Option<AutoLayout> {
     let mode = match stack_mode {
         Some("HORIZONTAL") => LayoutMode::Horizontal,
         Some("VERTICAL") => LayoutMode::Vertical,
+        Some("GRID") => LayoutMode::Grid,
         _ => return None,
     };
 
@@ -103,6 +106,200 @@ pub(crate) fn read_auto_layout(change: &KiwiValue) -> Option<AutoLayout> {
         min_size: [f("minWidth"), f("minHeight")],
         max_size: [f("maxWidth"), f("maxHeight")],
     })
+}
+
+/// Read a GRID frame's tracks and gaps (`gridColumns`/`gridRows` ordered by
+/// their fractional `position`, sized by `gridColumnsSizing`/`gridRowsSizing`,
+/// and `gridColumnGap`/`gridRowGap`). `None` unless `stackMode == GRID`.
+pub(crate) fn read_grid_layout(change: &KiwiValue) -> Option<GridLayout> {
+    if change.get("stackMode").and_then(KiwiValue::as_str) != Some("GRID") {
+        return None;
+    }
+    let gap = |name: &str| {
+        change
+            .get(name)
+            .and_then(KiwiValue::as_f64)
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0)
+    };
+    let tracks = |axis: GridAxis| {
+        grid_tracks(change, axis)
+            .into_iter()
+            .map(|(_, track)| track)
+            .collect()
+    };
+    Some(GridLayout {
+        columns: tracks(GridAxis::Columns),
+        rows: tracks(GridAxis::Rows),
+        column_gap: gap("gridColumnGap"),
+        row_gap: gap("gridRowGap"),
+    })
+}
+
+/// The track ids of a GRID frame in track order, which its children's
+/// `gridColumnAnchor`/`gridRowAnchor` name. `None` unless `stackMode == GRID`.
+pub(crate) fn read_grid_track_ids(change: &KiwiValue) -> Option<GridTrackIds> {
+    if change.get("stackMode").and_then(KiwiValue::as_str) != Some("GRID") {
+        return None;
+    }
+    let ids = |axis| {
+        grid_tracks(change, axis)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    };
+    Some(GridTrackIds {
+        columns: ids(GridAxis::Columns),
+        rows: ids(GridAxis::Rows),
+    })
+}
+
+/// A GRID frame's track ids per axis, in track order.
+#[derive(Debug, Default)]
+pub(crate) struct GridTrackIds {
+    pub(crate) columns: Vec<String>,
+    pub(crate) rows: Vec<String>,
+}
+
+/// A grid child's cell as Figma stores it: anchored to the parent's track ids,
+/// which only the parent can turn into indices ([`GridAnchor::resolve`]).
+#[derive(Debug)]
+pub(crate) struct GridAnchor {
+    column: Option<String>,
+    row: Option<String>,
+    column_span: u16,
+    row_span: u16,
+    horizontal: GridAlign,
+    vertical: GridAlign,
+}
+
+impl GridAnchor {
+    /// The cell in `tracks`' indices, or `None` when neither anchor names one of
+    /// the parent's tracks (the child is then auto-placed, as Figma does).
+    pub(crate) fn resolve(&self, tracks: &GridTrackIds) -> Option<GridCell> {
+        let index = |anchor: &Option<String>, ids: &[String]| {
+            let anchor = anchor.as_deref()?;
+            ids.iter()
+                .position(|id| id == anchor)
+                .and_then(|index| u16::try_from(index).ok())
+        };
+        let column = index(&self.column, &tracks.columns);
+        let row = index(&self.row, &tracks.rows);
+        if column.is_none() && row.is_none() {
+            return None;
+        }
+        Some(GridCell {
+            column: column.unwrap_or(0),
+            row: row.unwrap_or(0),
+            column_span: self.column_span,
+            row_span: self.row_span,
+            horizontal: self.horizontal,
+            vertical: self.vertical,
+        })
+    }
+}
+
+/// Read a child's grid cell anchors (`gridColumnAnchor`/`gridRowAnchor`,
+/// `gridColumnSpan`/`gridRowSpan`, `gridChildHorizontalAlign`/
+/// `gridChildVerticalAlign`). `None` when it names no track.
+pub(crate) fn read_grid_anchor(change: &KiwiValue) -> Option<GridAnchor> {
+    let anchor = |name: &str| change.get(name).and_then(guid_key);
+    let column = anchor("gridColumnAnchor");
+    let row = anchor("gridRowAnchor");
+    if column.is_none() && row.is_none() {
+        return None;
+    }
+    let span = |name: &str| {
+        change
+            .get(name)
+            .and_then(KiwiValue::as_f64)
+            .filter(|span| span.is_finite() && *span >= 1.0)
+            .map_or(1, |span| span.min(f64::from(u16::MAX)) as u16)
+    };
+    let align = |name: &str| match change.get(name).and_then(KiwiValue::as_str) {
+        Some("CENTER") => GridAlign::Center,
+        Some("MAX") => GridAlign::End,
+        // MIN, and AUTO (the default: the cell's start).
+        _ => GridAlign::Start,
+    };
+    Some(GridAnchor {
+        column,
+        row,
+        column_span: span("gridColumnSpan"),
+        row_span: span("gridRowSpan"),
+        horizontal: align("gridChildHorizontalAlign"),
+        vertical: align("gridChildVerticalAlign"),
+    })
+}
+
+#[derive(Clone, Copy)]
+enum GridAxis {
+    Columns,
+    Rows,
+}
+
+/// One axis's tracks: ids ordered by their fractional-index `position` (a
+/// string compared lexicographically, like `parentIndex.position`), each sized
+/// from its `GridTrackSize` (`maxSizing`, else `minSizing`): FIXED ⇒ that many
+/// pixels, FLEX ⇒ that many `fr` (1 when unset), HUG ⇒ content. A track with
+/// no sizing entry is `1fr`, Figma's default.
+fn grid_tracks(change: &KiwiValue, axis: GridAxis) -> Vec<(String, GridTrack)> {
+    let (positions, sizing) = match axis {
+        GridAxis::Columns => ("gridColumns", "gridColumnsSizing"),
+        GridAxis::Rows => ("gridRows", "gridRowsSizing"),
+    };
+    let entries = |name: &str| {
+        change
+            .get(name)
+            .and_then(|map| map.get("entries"))
+            .and_then(KiwiValue::as_array)
+            .unwrap_or_default()
+    };
+    let sizes: std::collections::HashMap<String, GridTrack> = entries(sizing)
+        .iter()
+        .filter_map(|entry| {
+            let id = guid_key(entry.get("id")?)?;
+            let size = entry.get("trackSize")?;
+            let function = size.get("maxSizing").or_else(|| size.get("minSizing"))?;
+            let value = function
+                .get("value")
+                .and_then(KiwiValue::as_f64)
+                .filter(|value| value.is_finite() && *value > 0.0);
+            let track = match function.get("type").and_then(KiwiValue::as_str)? {
+                "FIXED" => GridTrack::Fixed {
+                    size: value.unwrap_or(0.0),
+                },
+                "HUG" => GridTrack::Hug,
+                _ => GridTrack::Flex {
+                    fr: value.unwrap_or(1.0),
+                },
+            };
+            Some((id, track))
+        })
+        .collect();
+    let mut tracks: Vec<(String, String)> = entries(positions)
+        .iter()
+        .filter_map(|entry| {
+            let id = guid_key(entry.get("id")?)?;
+            let position = entry
+                .get("position")
+                .and_then(KiwiValue::as_str)
+                .unwrap_or_default()
+                .to_owned();
+            Some((position, id))
+        })
+        .collect();
+    tracks.sort();
+    tracks
+        .into_iter()
+        .map(|(_, id)| {
+            let track = sizes
+                .get(&id)
+                .cloned()
+                .unwrap_or(GridTrack::Flex { fr: 1.0 });
+            (id, track)
+        })
+        .collect()
 }
 
 /// Map Figma `StackSize` → [`AxisSizing`]. `RESIZE_TO_FIT*` ⇒ HUG, else FIXED
@@ -170,6 +367,7 @@ pub(crate) fn read_layout_child(change: &KiwiValue) -> Option<LayoutChild> {
         _ => None,
     };
     let lc = LayoutChild {
+        grid: None,
         grow,
         absolute,
         align_self,

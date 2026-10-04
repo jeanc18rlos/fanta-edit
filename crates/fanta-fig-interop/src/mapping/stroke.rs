@@ -224,6 +224,7 @@ pub(crate) fn group_with_optional_clip(
     let has_size = change.get("size").is_some() && (size.0 > 1.0 || size.1 > 1.0);
     let (uniform, per_corner) = corner_radii(change);
     GroupNode {
+        grid: None,
         local_size: None,
         scrollable: false,
         clip_size: has_size.then_some([size.0, size.1]),

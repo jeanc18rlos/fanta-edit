@@ -3,17 +3,18 @@
 //! pending side-table records and parent-resolution helper it drives.
 
 use super::{
-    AssetId, BoundProp, CanvasNode, Doc, FigDocument, FigError, FigResult, Fill, GroupNode,
-    HashMap, IndexKey, KiwiValue, MapReport, NodeBuild, NodeData, NodeId, PendingMotion,
-    PropDefInfo, PropRefKind, Stroke, VarValue, VariableId, VariableType, apply_bindings,
-    apply_explicit_modes, apply_instance_overrides, apply_motion, apply_paint_color_bindings,
-    apply_reactions, asset_id_for_image, build_components_and_sets, build_node, build_stroke,
-    build_variables, clips_content, collect_motion_change, collect_motion_consumers,
-    collect_prop_def_infos, guid_key, hide_master_variant_placeholders, image_hash_hex,
-    is_state_group, node_name, populate_instance_prop_values, prune_unreferenced_empty_collections,
-    read_component_prop_refs, read_explicit_modes, read_fills, read_paint,
-    read_paint_color_bindings, read_pending_variable, read_prop_defs_raw, read_set_modes,
-    resolve_style_references, tally_fidelity,
+    AssetId, BoundProp, CanvasNode, Doc, FigDocument, FigError, FigResult, Fill, GridAnchor,
+    GridTrackIds, GroupNode, HashMap, IndexKey, KiwiValue, LayoutChild, MapReport, NodeBuild,
+    NodeData, NodeId, PendingMotion, PropDefInfo, PropRefKind, Stroke, VarValue, VariableId,
+    VariableType, apply_bindings, apply_explicit_modes, apply_instance_overrides, apply_motion,
+    apply_paint_color_bindings, apply_reactions, asset_id_for_image, build_components_and_sets,
+    build_node, build_stroke, build_variables, clips_content, collect_motion_change,
+    collect_motion_consumers, collect_prop_def_infos, guid_key, hide_master_variant_placeholders,
+    image_hash_hex, is_state_group, node_name, populate_instance_prop_values,
+    prune_unreferenced_empty_collections, read_component_prop_refs, read_explicit_modes,
+    read_fills, read_grid_anchor, read_grid_track_ids, read_paint, read_paint_color_bindings,
+    read_pending_variable, read_prop_defs_raw, read_set_modes, resolve_style_references,
+    tally_fidelity,
 };
 use std::collections::HashSet;
 
@@ -251,6 +252,8 @@ pub fn fig_to_doc(fig: &FigDocument) -> FigResult<(Doc, MapReport, HashMap<Asset
         prop_def_infos,
         variant_masters,
         motion: pending_motion,
+        grid_tracks,
+        grid_anchors,
     } = pending;
 
     // Which NodeIds are instances — so pass 2 can prune their virtual subtrees.
@@ -287,6 +290,7 @@ pub fn fig_to_doc(fig: &FigDocument) -> FigResult<(Doc, MapReport, HashMap<Asset
         &mut guid_to_node,
         &all_instance_ids,
     )?;
+    resolve_grid_cells(&mut doc, &mut report, &grid_tracks, grid_anchors);
 
     // ---- pass 3: register pages + relocate component masters ----
     for &id in &page_ids {
@@ -738,6 +742,11 @@ struct Pending<'a> {
     /// KEYFRAME changes plus the consuming nodes' KEYFRAME-expression bindings
     /// and timeline durations. Resolved onto [`Doc::motion`] in pass 4.
     motion: PendingMotion,
+    /// GRID frames' track ids in order, and grid children's raw cell anchors
+    /// (track ids). Resolved into [`fanta_doc::GridCell`]s once pass 2 knows
+    /// each child's parent.
+    grid_tracks: HashMap<NodeId, GridTrackIds>,
+    grid_anchors: Vec<(NodeId, GridAnchor)>,
 }
 
 /// Tally a freshly-built node's geometry-recovery counters: decoded-vs-fallback
@@ -948,6 +957,41 @@ fn collect_per_node_side_tables<'a>(
     // maps (which track drives which motion channel of this node) plus any
     // timeline definitions (clip durations) the node carries.
     collect_motion_consumers(&mut pending.motion, id, change);
+    if let Some(tracks) = read_grid_track_ids(change) {
+        pending.grid_tracks.insert(id, tracks);
+    }
+    if let Some(anchor) = read_grid_anchor(change) {
+        pending.grid_anchors.push((id, anchor));
+    }
+}
+
+/// Turn each grid child's track-id anchors into a cell of its parent's tracks
+/// (Figma anchors a child to a track by id; the model indexes tracks). A child
+/// whose parent is not a grid, or whose anchors name none of its tracks, keeps
+/// no cell and is auto-placed.
+fn resolve_grid_cells(
+    doc: &mut Doc,
+    report: &mut MapReport,
+    tracks: &HashMap<NodeId, GridTrackIds>,
+    anchors: Vec<(NodeId, GridAnchor)>,
+) {
+    for (id, anchor) in anchors {
+        let Some(cell) = doc
+            .scene
+            .get(id)
+            .and_then(|node| node.parent)
+            .and_then(|parent| tracks.get(&parent))
+            .and_then(|tracks| anchor.resolve(tracks))
+        else {
+            continue;
+        };
+        if let Some(node) = doc.scene.get_mut(id) {
+            node.layout_child
+                .get_or_insert_with(LayoutChild::default)
+                .grid = Some(cell);
+            report.grid_cells_resolved += 1;
+        }
+    }
 }
 
 /// Collect the embedded-image asset map: every `image.hash` referenced by a

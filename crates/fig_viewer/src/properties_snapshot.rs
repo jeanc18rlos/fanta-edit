@@ -9,10 +9,9 @@ use fanta_canvas::transform_angle;
 use fanta_doc::{
     Action, AxisSizing, BlendMode, Blur, BlurKind, BoundProp, Bounds, CanvasNode,
     Color as FantaColor, ComponentDef, ComponentId, ComponentLibrary, ComponentPropId,
-    ComponentPropKind, CounterAlign, Doc, Fill, Gradient, ImageFitMode, InstanceNode, LayoutChild,
-    LayoutMode, NodeData, NodeFlags, NodeId, PrimaryAlign, Reaction, Shadow, ShadowKind,
-    StrokeAlign, TextAlign, TextAutoResize, Transform2D, Trigger, UnitInterval,
-    VAlign as TextVAlign, VarValue,
+    ComponentPropKind, CounterAlign, Doc, Fill, Gradient, ImageFitMode, InstanceNode, LayoutMode,
+    NodeData, NodeFlags, NodeId, PrimaryAlign, Reaction, Shadow, ShadowKind, StrokeAlign,
+    TextAlign, TextAutoResize, Transform2D, Trigger, UnitInterval, VAlign as TextVAlign, VarValue,
 };
 use glam::DVec2;
 use smallvec::SmallVec;
@@ -355,9 +354,10 @@ pub(crate) const STROKE_ALIGNS: [(StrokeAlign, &str); 3] = [
     (StrokeAlign::Outside, "Outside"),
 ];
 
-pub(crate) const LAYOUT_MODES: [(LayoutMode, &str); 2] = [
+pub(crate) const LAYOUT_MODES: [(LayoutMode, &str); 3] = [
     (LayoutMode::Horizontal, "Horizontal"),
     (LayoutMode::Vertical, "Vertical"),
+    (LayoutMode::Grid, "Grid"),
 ];
 
 pub(crate) const AXIS_SIZINGS: [(AxisSizing, &str); 2] = [
@@ -1125,6 +1125,10 @@ pub(crate) fn auto_layout_snapshot(node: &CanvasNode) -> Option<AutoLayoutSnapsh
     let (gap_h, gap_v) = match layout.mode {
         LayoutMode::Horizontal => (layout.spacing, layout.counter_spacing),
         LayoutMode::Vertical => (layout.counter_spacing, layout.spacing),
+        LayoutMode::Grid => group
+            .grid
+            .as_ref()
+            .map_or((0.0, 0.0), |grid| (grid.column_gap, grid.row_gap)),
     };
     let [top, right, bottom, left] = layout.padding;
     let [min_width, min_height] = layout.min_size;
@@ -1166,7 +1170,7 @@ pub(crate) fn align_grid_active_cell(layout: &AutoLayoutSnapshot) -> Option<(u8,
         CounterAlign::Stretch | CounterAlign::Baseline => return None,
     };
     Some(match layout.mode {
-        LayoutMode::Horizontal => (primary_cell, counter_cell),
+        LayoutMode::Horizontal | LayoutMode::Grid => (primary_cell, counter_cell),
         LayoutMode::Vertical => (counter_cell, primary_cell),
     })
 }
@@ -1180,11 +1184,7 @@ pub(crate) fn layout_child_snapshot(doc: &Doc, node: &CanvasNode) -> Option<Layo
     if !parent_layout.child_layout {
         return None;
     }
-    let child = node.layout_child.unwrap_or(LayoutChild {
-        grow: 0.0,
-        absolute: false,
-        align_self: None,
-    });
+    let child = node.layout_child.unwrap_or_default();
     Some(LayoutChildSnapshot {
         fills_container: child.grow > 0.0,
         absolute: child.absolute,

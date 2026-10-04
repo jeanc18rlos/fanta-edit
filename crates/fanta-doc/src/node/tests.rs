@@ -836,6 +836,7 @@ fn layout_child_round_trips_on_wrapper_and_skips_when_absent() {
     assert!(!serde_json::to_string(&n).unwrap().contains("layout_child"));
 
     let lc = LayoutChild {
+        grid: None,
         grow: 1.0,
         absolute: false,
         align_self: Some(CounterAlign::Center),
@@ -851,6 +852,7 @@ fn layout_child_round_trips_on_wrapper_and_skips_when_absent() {
     // A trivial LayoutChild reports as such (the importer drops it to None).
     assert!(
         LayoutChild {
+            grid: None,
             grow: 0.0,
             absolute: false,
             align_self: None

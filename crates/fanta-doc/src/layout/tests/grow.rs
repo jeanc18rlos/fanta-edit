@@ -20,6 +20,7 @@ fn grow_children_share_leftover_primary_space_equally() {
     let fixed = t.push(rect_child(f, 30.0, 10.0));
     let mut g1 = rect_child(f, 10.0, 10.0);
     g1.layout_child = Some(LayoutChild {
+        grid: None,
         grow: 1.0,
         absolute: false,
         align_self: None,
@@ -27,6 +28,7 @@ fn grow_children_share_leftover_primary_space_equally() {
     let g1 = t.push(g1);
     let mut g2 = rect_child(f, 10.0, 10.0);
     g2.layout_child = Some(LayoutChild {
+        grid: None,
         grow: 1.0,
         absolute: false,
         align_self: None,
@@ -61,6 +63,7 @@ fn grow_children_with_unequal_bases_end_up_the_same_size() {
     let f = t.push(frame(200.0, 50.0, al));
     let mut g1 = rect_child(f, 10.0, 10.0); // tiny base
     g1.layout_child = Some(LayoutChild {
+        grid: None,
         grow: 1.0,
         absolute: false,
         align_self: None,
@@ -68,6 +71,7 @@ fn grow_children_with_unequal_bases_end_up_the_same_size() {
     let g1 = t.push(g1);
     let mut g2 = rect_child(f, 90.0, 10.0); // fat base
     g2.layout_child = Some(LayoutChild {
+        grid: None,
         grow: 1.0,
         absolute: false,
         align_self: None,
@@ -100,6 +104,7 @@ fn grow_share_counts_only_fixed_children_against_the_frame() {
     let fixed = t.push(rect_child(f, 30.0, 10.0));
     let mut g = rect_child(f, 999.0, 10.0); // junk base — must be discarded
     g.layout_child = Some(LayoutChild {
+        grid: None,
         grow: 1.0,
         absolute: false,
         align_self: None,
@@ -128,6 +133,7 @@ fn grow_children_collapse_to_zero_when_fixed_exceeds_frame() {
     let fixed = t.push(rect_child(f, 120.0, 10.0)); // already overflows 100
     let mut g = rect_child(f, 40.0, 10.0);
     g.layout_child = Some(LayoutChild {
+        grid: None,
         grow: 1.0,
         absolute: false,
         align_self: None,
@@ -160,6 +166,7 @@ fn wrap_grow_children_with_unequal_bases_match_per_line() {
     let fixed = t.push(rect_child(f, 40.0, 10.0));
     let mut g1 = rect_child(f, 10.0, 10.0);
     g1.layout_child = Some(LayoutChild {
+        grid: None,
         grow: 1.0,
         absolute: false,
         align_self: None,
@@ -167,6 +174,7 @@ fn wrap_grow_children_with_unequal_bases_match_per_line() {
     let g1 = t.push(g1);
     let mut g2 = rect_child(f, 90.0, 10.0);
     g2.layout_child = Some(LayoutChild {
+        grid: None,
         grow: 1.0,
         absolute: false,
         align_self: None,

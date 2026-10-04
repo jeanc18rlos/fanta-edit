@@ -1218,3 +1218,141 @@ fn swap_state_navigation_imports_as_update_variant() {
         other => panic!("SWAP_STATE must import as UpdateVariant, got {other:?}"),
     }
 }
+
+#[test]
+fn grid_frame_imports_tracks_and_resolves_child_cells() {
+    // `stackMode: GRID` with tracks keyed by GUID: the column map lists them
+    // out of order (track order is the fractional `position`), sizing comes
+    // from each track's `maxSizing`, and children anchor to track ids.
+    let entries = |items: Vec<KiwiValue>| o("Map", vec![("entries", KiwiValue::array(items))]);
+    let position = |lid: u32, at: &str| {
+        o(
+            "GUIDPositionMapEntry",
+            vec![
+                ("id", guid(9, lid)),
+                ("position", KiwiValue::String(at.to_owned())),
+            ],
+        )
+    };
+    let sizing = |lid: u32, kind: &str, value: f32| {
+        o(
+            "GUIDGridTrackSizeMapEntry",
+            vec![
+                ("id", guid(9, lid)),
+                (
+                    "trackSize",
+                    o(
+                        "GridTrackSize",
+                        vec![(
+                            "maxSizing",
+                            o(
+                                "GridTrackSizingFunction",
+                                vec![
+                                    ("type", KiwiValue::Enum(kind.into())),
+                                    ("value", KiwiValue::Float(value)),
+                                ],
+                            ),
+                        )],
+                    ),
+                ),
+            ],
+        )
+    };
+    let fig = doc_from(vec![
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 0)),
+                ("type", KiwiValue::Enum("DOCUMENT".into())),
+            ],
+        ),
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 1)),
+                ("parentIndex", parent_index(0, 0)),
+                ("type", KiwiValue::Enum("CANVAS".into())),
+                ("name", KiwiValue::String("Page".to_owned())),
+            ],
+        ),
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 2)),
+                ("parentIndex", parent_index(0, 1)),
+                ("type", KiwiValue::Enum("FRAME".into())),
+                ("name", KiwiValue::String("Grid".to_owned())),
+                ("size", vector(300.0, 200.0)),
+                ("stackMode", KiwiValue::Enum("GRID".into())),
+                (
+                    "gridColumns",
+                    entries(vec![position(1, "b"), position(0, "a")]),
+                ),
+                ("gridRows", entries(vec![position(5, "a")])),
+                (
+                    "gridColumnsSizing",
+                    entries(vec![sizing(0, "FIXED", 100.0), sizing(1, "FLEX", 2.0)]),
+                ),
+                ("gridRowsSizing", entries(vec![sizing(5, "HUG", 0.0)])),
+                ("gridColumnGap", KiwiValue::Float(8.0)),
+                ("gridRowGap", KiwiValue::Float(4.0)),
+            ],
+        ),
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 3)),
+                ("parentIndex", parent_index(0, 2)),
+                ("type", KiwiValue::Enum("RECTANGLE".into())),
+                ("name", KiwiValue::String("Anchored".to_owned())),
+                ("size", vector(40.0, 20.0)),
+                ("gridColumnAnchor", guid(9, 1)),
+                ("gridRowAnchor", guid(9, 5)),
+                ("gridRowSpan", KiwiValue::Uint(2)),
+                ("gridChildHorizontalAlign", KiwiValue::Enum("CENTER".into())),
+                ("gridChildVerticalAlign", KiwiValue::Enum("MAX".into())),
+            ],
+        ),
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 4)),
+                ("parentIndex", parent_index(0, 2)),
+                ("type", KiwiValue::Enum("RECTANGLE".into())),
+                ("name", KiwiValue::String("Auto".to_owned())),
+                ("size", vector(40.0, 20.0)),
+            ],
+        ),
+    ]);
+    let (doc, report, _) = fig_to_doc(&fig).unwrap();
+    let frame = group_named(&doc, "Grid");
+    assert_eq!(
+        frame.auto_layout.expect("grid auto layout").mode,
+        LayoutMode::Grid
+    );
+    let grid = frame.grid.expect("grid tracks");
+    assert_eq!(
+        grid.columns,
+        vec![
+            fanta_doc::GridTrack::Fixed { size: 100.0 },
+            fanta_doc::GridTrack::Flex { fr: 2.0 },
+        ]
+    );
+    assert_eq!(grid.rows, vec![fanta_doc::GridTrack::Hug]);
+    assert_eq!((grid.column_gap, grid.row_gap), (8.0, 4.0));
+
+    let cell = node_named(&doc, "Anchored")
+        .layout_child
+        .and_then(|child| child.grid)
+        .expect("anchored child gets a cell");
+    assert_eq!((cell.column, cell.row), (1, 0));
+    assert_eq!((cell.column_span, cell.row_span), (1, 2));
+    assert_eq!(cell.horizontal, fanta_doc::GridAlign::Center);
+    assert_eq!(cell.vertical, fanta_doc::GridAlign::End);
+    assert!(
+        node_named(&doc, "Auto").layout_child.is_none(),
+        "an unanchored child is auto-placed"
+    );
+    assert_eq!(report.auto_layout_grid, 1);
+    assert_eq!(report.grid_cells_resolved, 1);
+}

@@ -9,8 +9,8 @@ use anyhow::Context as _;
 use fanta_doc::MeasuredPath;
 use fanta_doc::{
     AssetId, BlendMode, Blur, BlurKind, BooleanOp, BoundProp, Color as FantaColor, ComponentId,
-    ComponentPropKind, CounterAlign, Doc, Fill, Gradient, ImageFitMode, LayoutChild, LayoutMode,
-    MaskType, NodeData, NodeFlags, NodeId, Operation, ParametricShape, PatternFill,
+    ComponentPropKind, CounterAlign, Doc, Fill, Gradient, GridTrack, ImageFitMode, LayoutChild,
+    LayoutMode, MaskType, NodeData, NodeFlags, NodeId, Operation, ParametricShape, PatternFill,
     PatternHorizontalAlignment, PatternSpacing, PatternTileType, PrimaryAlign, Shadow, ShadowKind,
     StrokeAlign, StrokeCap, StrokeJoin, TextAlign, TextAutoResize, TextPathAlignment,
     TextPathDirection, TextPathSide, TextPathStart, Transform2D, VAlign as TextVAlign, VarValue,
@@ -24,19 +24,20 @@ use fanta_gpui::design::{
     DesignEffectStyleViewData, DesignEffectVector, DesignExportConfiguration, DesignExportFormat,
     DesignExportMode, DesignExportSizing as DesignPanelExportSizing, DesignExportViewData,
     DesignFontFamily, DesignFontSource, DesignFontStyle, DesignFontViewData, DesignGradientStop,
-    DesignImageFilters, DesignItemSpacingMode, DesignLayout, DesignLayoutAlignSelf,
-    DesignLayoutMode, DesignLayoutPositioning, DesignLetterSpacing, DesignLineHeight,
-    DesignMaskType, DesignMediaCropAction, DesignMediaCropToolState, DesignMediaKind,
-    DesignMediaPaintAsset, DesignMediaPaintCapabilities, DesignMediaPaintPlacement,
-    DesignMediaPaintView, DesignMediaPaintViewData, DesignMediaQuarterTurn, DesignPaint,
-    DesignPaintCollectionEditMode, DesignPaintKind, DesignPaintPayload, DesignPaintProperty,
-    DesignPaintSource, DesignPaintStyleViewData, DesignPaintTransform, DesignPaintType,
-    DesignPaintValue, DesignPanel, DesignPanelAction, DesignPanelAutoLayoutDirection,
-    DesignPanelAutoLayoutParticipation, DesignPanelAutoLayoutWrap, DesignPanelCollection,
-    DesignPanelEditPhase, DesignPanelNode, DesignPanelNodeCapabilities, DesignPanelNodeKind,
-    DesignPanelParentLayout, DesignPanelProperty, DesignPanelPropertyValueState,
-    DesignPanelSection, DesignPanelSelection, DesignPanelTarget, DesignPanelValue,
-    DesignPatternHorizontalAlignment, DesignPatternPaint, DesignPatternSource,
+    DesignGridAutoTracks, DesignGridItemAlignment, DesignGridItemsPositioning, DesignGridTrack,
+    DesignGridTrackSizing, DesignImageFilters, DesignItemSpacingMode, DesignLayout,
+    DesignLayoutAlignSelf, DesignLayoutMode, DesignLayoutPositioning, DesignLetterSpacing,
+    DesignLineHeight, DesignMaskType, DesignMediaCropAction, DesignMediaCropToolState,
+    DesignMediaKind, DesignMediaPaintAsset, DesignMediaPaintCapabilities,
+    DesignMediaPaintPlacement, DesignMediaPaintView, DesignMediaPaintViewData,
+    DesignMediaQuarterTurn, DesignPaint, DesignPaintCollectionEditMode, DesignPaintKind,
+    DesignPaintPayload, DesignPaintProperty, DesignPaintSource, DesignPaintStyleViewData,
+    DesignPaintTransform, DesignPaintType, DesignPaintValue, DesignPanel, DesignPanelAction,
+    DesignPanelAutoLayoutDirection, DesignPanelAutoLayoutParticipation, DesignPanelAutoLayoutWrap,
+    DesignPanelCollection, DesignPanelEditPhase, DesignPanelNode, DesignPanelNodeCapabilities,
+    DesignPanelNodeKind, DesignPanelParentLayout, DesignPanelProperty,
+    DesignPanelPropertyValueState, DesignPanelSection, DesignPanelSelection, DesignPanelTarget,
+    DesignPanelValue, DesignPatternHorizontalAlignment, DesignPatternPaint, DesignPatternSource,
     DesignPatternTileType, DesignPolygonGeometry, DesignSelectionHeaderCommand,
     DesignSelectionHeaderControl, DesignSelectionHeaderControlKind, DesignSelectionHeaderMenu,
     DesignSelectionHeaderMenuItem, DesignSelectionHeaderViewData, DesignShaderDefinition,
@@ -1253,20 +1254,50 @@ fn design_layout(
         out.mode = match auto.mode {
             LayoutMode::Horizontal => DesignLayoutMode::Horizontal,
             LayoutMode::Vertical => DesignLayoutMode::Vertical,
+            LayoutMode::Grid => DesignLayoutMode::Grid,
         };
+        // A grid's primary axis is its width, as for a horizontal stack.
         let (primary_gap, counter_gap) = match auto.mode {
-            LayoutMode::Horizontal => (auto.gap_h, auto.gap_v),
+            LayoutMode::Horizontal | LayoutMode::Grid => (auto.gap_h, auto.gap_v),
             LayoutMode::Vertical => (auto.gap_v, auto.gap_h),
         };
         out.gap = primary_gap as f32;
-        out.counter_axis_gap = auto.wrap.then_some(counter_gap as f32);
+        // The panel reads a grid's row gap from the counter-axis gap.
+        out.counter_axis_gap =
+            (auto.wrap || auto.mode == LayoutMode::Grid).then_some(counter_gap as f32);
+        if auto.mode == LayoutMode::Grid
+            && let NodeData::Group(group) = &node.data
+        {
+            let mut grid = group.grid.clone().unwrap_or_default();
+            if grid.columns.is_empty() {
+                grid.columns.push(GridTrack::Flex { fr: 1.0 });
+            }
+            while grid.rows.len() < grid_rows_in_use(doc, node.id) {
+                grid.rows.push(GridTrack::Hug);
+            }
+            out.grid_columns = grid.columns.iter().map(design_grid_track).collect();
+            out.grid_rows = grid.rows.iter().map(design_grid_track).collect();
+            // The engine adds the rows the children need.
+            out.grid_auto_tracks = DesignGridAutoTracks::Rows;
+            let pinned = doc.scene.children_of(Some(node.id)).iter().any(|child| {
+                doc.scene
+                    .get(*child)
+                    .and_then(|child| child.layout_child)
+                    .is_some_and(|child| child.grid.is_some())
+            });
+            out.grid_items_positioning = if pinned {
+                DesignGridItemsPositioning::Manual
+            } else {
+                DesignGridItemsPositioning::RowAutoFlow
+            };
+        }
         out.wrap = auto.wrap;
         let sizing = |axis: fanta_doc::AxisSizing| match axis {
             fanta_doc::AxisSizing::Fixed => DesignSizingMode::Fixed,
             fanta_doc::AxisSizing::Hug => DesignSizingMode::Hug,
         };
         let (horizontal, vertical) = match auto.mode {
-            LayoutMode::Horizontal => (auto.primary_sizing, auto.counter_sizing),
+            LayoutMode::Horizontal | LayoutMode::Grid => (auto.primary_sizing, auto.counter_sizing),
             LayoutMode::Vertical => (auto.counter_sizing, auto.primary_sizing),
         };
         out.horizontal_sizing = sizing(horizontal);
@@ -1282,7 +1313,7 @@ fn design_layout(
             CounterAlign::End => 2,
         };
         (out.alignment_x, out.alignment_y) = match auto.mode {
-            LayoutMode::Horizontal => (primary_cell, counter_cell),
+            LayoutMode::Horizontal | LayoutMode::Grid => (primary_cell, counter_cell),
             LayoutMode::Vertical => (counter_cell, primary_cell),
         };
         out.item_spacing_mode = if matches!(
@@ -1329,11 +1360,7 @@ fn design_layout(
         }
     }
     if section.layout_child.is_some() {
-        let child = node.layout_child.unwrap_or(LayoutChild {
-            grow: 0.0,
-            absolute: false,
-            align_self: None,
-        });
+        let child = node.layout_child.unwrap_or_default();
         out.item.positioning = if child.absolute {
             DesignLayoutPositioning::Absolute
         } else {
@@ -1353,7 +1380,7 @@ fn design_layout(
                 _ => None,
             })
         {
-            let (primary, counter) = if parent_mode == LayoutMode::Horizontal {
+            let (primary, counter) = if parent_mode != LayoutMode::Vertical {
                 (&mut out.horizontal_sizing, &mut out.vertical_sizing)
             } else {
                 (&mut out.vertical_sizing, &mut out.horizontal_sizing)
@@ -1363,6 +1390,16 @@ fn design_layout(
             }
             if child.align_self == Some(CounterAlign::Stretch) {
                 *counter = DesignSizingMode::Fill;
+            }
+            if parent_mode == LayoutMode::Grid
+                && let Some(cell) = current_grid_cell(doc, node.id)
+            {
+                out.item.grid_column_index = usize::from(cell.column);
+                out.item.grid_row_index = usize::from(cell.row);
+                out.item.grid_column_span = cell.column_span;
+                out.item.grid_row_span = cell.row_span;
+                out.item.grid_horizontal_alignment = design_grid_alignment(cell.horizontal);
+                out.item.grid_vertical_alignment = design_grid_alignment(cell.vertical);
             }
         }
     }
@@ -1948,6 +1985,7 @@ pub(crate) fn parent_layout_for(doc: &Doc, id: NodeId) -> DesignPanelParentLayou
     let direction = match layout.mode {
         LayoutMode::Horizontal => DesignPanelAutoLayoutDirection::Horizontal,
         LayoutMode::Vertical => DesignPanelAutoLayoutDirection::Vertical,
+        LayoutMode::Grid => DesignPanelAutoLayoutDirection::Grid,
     };
     let wrap = if layout.wrap {
         DesignPanelAutoLayoutWrap::Wrap
@@ -8163,6 +8201,98 @@ fn property_operations(
                 child.grow = grow;
             }))
         }
+        (P::GridColumnCount, _) | (P::GridRowCount, _) => {
+            let count = number(value)?.round().clamp(1.0, 256.0) as usize;
+            let columns = property == P::GridColumnCount;
+            Some(grid_layout_operations(doc, id, move |grid| {
+                let (tracks, default) = if columns {
+                    (&mut grid.columns, GridTrack::Flex { fr: 1.0 })
+                } else {
+                    (&mut grid.rows, GridTrack::Hug)
+                };
+                let fill = tracks.last().copied().unwrap_or(default);
+                tracks.resize(count, fill);
+            }))
+        }
+        (P::GridColumnTrack(index), V::GridTrack(track))
+        | (P::GridRowTrack(index), V::GridTrack(track)) => {
+            let columns = matches!(property, P::GridColumnTrack(_));
+            let track = grid_track_from_design(*track);
+            Some(grid_layout_operations(doc, id, move |grid| {
+                if let Some(slot) = grid_track_slot(grid, columns, index) {
+                    *slot = track;
+                }
+            }))
+        }
+        (P::GridColumnTrackValue(index), _) | (P::GridRowTrackValue(index), _) => {
+            let columns = matches!(property, P::GridColumnTrackValue(_));
+            let value = number(value)?;
+            if !value.is_finite() {
+                return None;
+            }
+            Some(grid_layout_operations(
+                doc,
+                id,
+                move |grid| match grid_track_slot(grid, columns, index) {
+                    Some(GridTrack::Fixed { size }) => *size = value.max(0.0),
+                    Some(GridTrack::Flex { fr }) if value > 0.0 => *fr = value,
+                    _ => {}
+                },
+            ))
+        }
+        (P::GridItemsPositioning, V::GridItemsPositioning(positioning)) => {
+            // Auto flow unpins every child; manual pins each where it sits now.
+            let pin = *positioning == DesignGridItemsPositioning::Manual;
+            let operations: Vec<Operation> = fanta_doc::grid_cells(&doc.scene, id)
+                .into_iter()
+                .flat_map(|(child, cell)| {
+                    layout_child_operations(doc, child, move |layout_child| {
+                        layout_child.grid = pin.then_some(cell);
+                    })
+                })
+                .collect();
+            Some(operations)
+        }
+        (P::GridAutoTracks, _) => {
+            log::debug!("fig design adapter: grid rows are always added as the children need");
+            None
+        }
+        (P::GridColumnIndex, _)
+        | (P::GridRowIndex, _)
+        | (P::GridColumnSpan, _)
+        | (P::GridRowSpan, _) => {
+            let number = number(value)?.round();
+            if !number.is_finite() {
+                return None;
+            }
+            let current = current_grid_cell(doc, id);
+            Some(layout_child_operations(doc, id, move |child| {
+                let mut cell = child.grid.or(current).unwrap_or_default();
+                let track = number.clamp(0.0, f64::from(u16::MAX)) as u16;
+                match property {
+                    P::GridColumnIndex => cell.column = track,
+                    P::GridRowIndex => cell.row = track,
+                    P::GridColumnSpan => cell.column_span = track.max(1),
+                    _ => cell.row_span = track.max(1),
+                }
+                child.grid = Some(cell);
+            }))
+        }
+        (P::GridHorizontalAlignment, V::GridItemAlignment(alignment))
+        | (P::GridVerticalAlignment, V::GridItemAlignment(alignment)) => {
+            let align = grid_alignment_from_design(*alignment);
+            let horizontal = property == P::GridHorizontalAlignment;
+            let current = current_grid_cell(doc, id);
+            Some(layout_child_operations(doc, id, move |child| {
+                let mut cell = child.grid.or(current).unwrap_or_default();
+                if horizontal {
+                    cell.horizontal = align;
+                } else {
+                    cell.vertical = align;
+                }
+                child.grid = Some(cell);
+            }))
+        }
         (P::Gap, _) => {
             let gap = number(value)?;
             let horizontal = primary_axis_is_horizontal(doc, id)?;
@@ -8259,7 +8389,7 @@ fn property_operations(
                 });
             let mut operations = Vec::new();
             if let Some(parent_layout) = parent_layout {
-                let primary = horizontal == (parent_layout.mode == LayoutMode::Horizontal);
+                let primary = horizontal == (parent_layout.mode != LayoutMode::Vertical);
                 match mode {
                     DesignSizingMode::Fill => {
                         return Some(layout_child_operations(doc, id, move |child| {
@@ -8294,7 +8424,7 @@ fn property_operations(
                     if let NodeData::Group(group) = data
                         && let Some(layout) = group.auto_layout.as_mut()
                     {
-                        let primary = horizontal == (layout.mode == LayoutMode::Horizontal);
+                        let primary = horizontal == (layout.mode != LayoutMode::Vertical);
                         if primary {
                             layout.primary_sizing = sizing;
                         } else {
@@ -8594,13 +8724,13 @@ fn auto_layout_alignment(layout: fanta_doc::AutoLayout) -> (u8, u8) {
         CounterAlign::End => 2,
     };
     match layout.mode {
-        LayoutMode::Horizontal => (primary, counter),
+        LayoutMode::Horizontal | LayoutMode::Grid => (primary, counter),
         LayoutMode::Vertical => (counter, primary),
     }
 }
 
 fn set_auto_layout_alignment(layout: &mut fanta_doc::AutoLayout, x: u8, y: u8) {
-    let (primary, counter) = if layout.mode == LayoutMode::Horizontal {
+    let (primary, counter) = if layout.mode != LayoutMode::Vertical {
         (x, y)
     } else {
         (y, x)
@@ -8658,11 +8788,7 @@ fn layout_child_operations(
         return Vec::new();
     }
     let old = node.layout_child;
-    let mut child = old.unwrap_or(LayoutChild {
-        grow: 0.0,
-        absolute: false,
-        align_self: None,
-    });
+    let mut child = old.unwrap_or_default();
     change(&mut child);
     let new = (!child.is_trivial()).then_some(child);
     if new == old {
@@ -8677,15 +8803,13 @@ fn layout_mode_operations(doc: &Doc, id: NodeId, mode: DesignLayoutMode) -> Opti
         DesignLayoutMode::None => None,
         DesignLayoutMode::Horizontal => Some(LayoutMode::Horizontal),
         DesignLayoutMode::Vertical => Some(LayoutMode::Vertical),
-        DesignLayoutMode::Grid => {
-            log::debug!("fig design adapter: grid auto layout is not supported by the engine");
-            return None;
-        }
+        DesignLayoutMode::Grid => Some(LayoutMode::Grid),
     };
     let node = doc.scene.get(id)?;
     if !matches!(node.data, NodeData::Group(_)) {
         return None;
     }
+    let child_count = doc.scene.children_of(Some(id)).len();
     let size = doc
         .scene
         .local_bounds(id)
@@ -8709,6 +8833,19 @@ fn layout_mode_operations(doc: &Doc, id: NodeId, mode: DesignLayoutMode) -> Opti
                 }
             },
         }
+        // Grid tracks only mean something on a grid; a stack switched to one
+        // starts with columns for its children, spaced like the stack was.
+        match (target, group.auto_layout) {
+            (Some(LayoutMode::Grid), Some(layout)) => {
+                if group.grid.is_none() {
+                    group.grid = Some(fanta_doc::GridLayout::for_children(
+                        child_count,
+                        layout.spacing,
+                    ));
+                }
+            }
+            _ => group.grid = None,
+        }
     }))
 }
 
@@ -8717,7 +8854,7 @@ fn primary_axis_is_horizontal(doc: &Doc, id: NodeId) -> Option<bool> {
         Some(NodeData::Group(group)) => group
             .auto_layout
             .as_ref()
-            .map(|layout| layout.mode == LayoutMode::Horizontal),
+            .map(|layout| layout.mode != LayoutMode::Vertical),
         _ => None,
     }
 }
@@ -9808,6 +9945,132 @@ mod tests {
             tidy.apply(op).expect("apply tidy up");
         }
         assert!((min_x(&tidy, ids[1]) - 65.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn grid_layout_controls_write_tracks_and_cells_and_echo_them() {
+        let (mut doc, _page, rect) = doc_with_rect();
+        let create =
+            crate::layer_context_ops::auto_layout(&doc, rect, Some(LayoutMode::Horizontal))
+                .expect("wrap the rectangle in auto layout");
+        let group = crate::layer_context_ops::created_roots(&create)[0];
+        for operation in create {
+            doc.apply(operation).expect("create layout frame");
+        }
+        let change = |doc: &mut Doc, id, property, value| {
+            let operations =
+                property_operations(doc, id, property, &value).expect("the grid control is backed");
+            for operation in operations {
+                doc.apply(operation).expect("apply grid control");
+            }
+        };
+        change(
+            &mut doc,
+            group,
+            DesignPanelProperty::LayoutMode,
+            DesignPanelValue::LayoutMode(DesignLayoutMode::Grid),
+        );
+        change(
+            &mut doc,
+            group,
+            DesignPanelProperty::GridColumnCount,
+            DesignPanelValue::Number(3.0),
+        );
+        change(
+            &mut doc,
+            group,
+            DesignPanelProperty::GridColumnTrack(0),
+            DesignPanelValue::GridTrack(DesignGridTrack::fixed(80.0)),
+        );
+        change(
+            &mut doc,
+            group,
+            DesignPanelProperty::GridColumnTrackValue(1),
+            DesignPanelValue::Number(2.0),
+        );
+        change(
+            &mut doc,
+            group,
+            DesignPanelProperty::Gap,
+            DesignPanelValue::Number(6.0),
+        );
+        change(
+            &mut doc,
+            group,
+            DesignPanelProperty::CounterAxisGap,
+            DesignPanelValue::OptionalNumber(Some(9.0)),
+        );
+        change(
+            &mut doc,
+            rect,
+            DesignPanelProperty::GridColumnIndex,
+            DesignPanelValue::Number(2.0),
+        );
+        change(
+            &mut doc,
+            rect,
+            DesignPanelProperty::GridVerticalAlignment,
+            DesignPanelValue::GridItemAlignment(DesignGridItemAlignment::End),
+        );
+
+        let node = doc.scene.get(group).expect("grid frame exists");
+        let NodeData::Group(frame) = &node.data else {
+            panic!("the wrapper is a group");
+        };
+        assert_eq!(frame.auto_layout.expect("layout").mode, LayoutMode::Grid);
+        let grid = frame.grid.clone().expect("grid tracks");
+        assert_eq!(
+            grid.columns,
+            vec![
+                GridTrack::Fixed { size: 80.0 },
+                GridTrack::Flex { fr: 2.0 },
+                GridTrack::Flex { fr: 1.0 },
+            ]
+        );
+        assert_eq!((grid.column_gap, grid.row_gap), (6.0, 9.0));
+        let cell = doc
+            .scene
+            .get(rect)
+            .and_then(|child| child.layout_child)
+            .and_then(|child| child.grid)
+            .expect("the child is pinned");
+        assert_eq!((cell.column, cell.row), (2, 0));
+        assert_eq!(cell.vertical, fanta_doc::GridAlign::End);
+
+        let section =
+            node_section(&doc, group, &master_roots(&doc.components)).expect("grid frame snapshot");
+        let echoed = design_layout(&doc, node, &section).expect("layout controls");
+        assert_eq!(echoed.mode, DesignLayoutMode::Grid);
+        assert_eq!(echoed.grid_columns.len(), 3);
+        assert_eq!(echoed.grid_rows.len(), 1, "the child's auto row is shown");
+        assert_eq!((echoed.gap, echoed.counter_axis_gap), (6.0, Some(9.0)));
+        assert_eq!(
+            echoed.grid_items_positioning,
+            DesignGridItemsPositioning::Manual
+        );
+        let child = doc.scene.get(rect).expect("child");
+        let child_section =
+            node_section(&doc, rect, &master_roots(&doc.components)).expect("child snapshot");
+        let child_echo = design_layout(&doc, child, &child_section).expect("child controls");
+        assert_eq!(child_echo.item.grid_column_index, 2);
+        assert_eq!(
+            child_echo.item.grid_vertical_alignment,
+            DesignGridItemAlignment::End
+        );
+
+        // Auto flow unpins every child.
+        change(
+            &mut doc,
+            group,
+            DesignPanelProperty::GridItemsPositioning,
+            DesignPanelValue::GridItemsPositioning(DesignGridItemsPositioning::RowAutoFlow),
+        );
+        assert!(
+            doc.scene
+                .get(rect)
+                .and_then(|child| child.layout_child)
+                .is_none_or(|child| child.grid.is_none())
+        );
     }
 
     #[test]
@@ -12762,4 +13025,101 @@ mod tests {
             );
         });
     }
+}
+
+fn design_grid_track(track: &fanta_doc::GridTrack) -> DesignGridTrack {
+    match *track {
+        fanta_doc::GridTrack::Fixed { size } => DesignGridTrack::fixed(size as f32),
+        fanta_doc::GridTrack::Flex { fr } => DesignGridTrack::fraction(fr as f32),
+        fanta_doc::GridTrack::Hug => DesignGridTrack::hug(),
+    }
+}
+
+fn grid_track_from_design(track: DesignGridTrack) -> fanta_doc::GridTrack {
+    let value = f64::from(track.value);
+    let value = if value.is_finite() { value } else { 0.0 };
+    match track.sizing {
+        DesignGridTrackSizing::Fixed => fanta_doc::GridTrack::Fixed {
+            size: value.max(0.0),
+        },
+        DesignGridTrackSizing::Fraction => fanta_doc::GridTrack::Flex {
+            fr: if value > 0.0 { value } else { 1.0 },
+        },
+        DesignGridTrackSizing::Hug => fanta_doc::GridTrack::Hug,
+    }
+}
+
+/// The panel's `Auto` is the cell's start, the engine's default.
+fn design_grid_alignment(align: fanta_doc::GridAlign) -> DesignGridItemAlignment {
+    match align {
+        fanta_doc::GridAlign::Start => DesignGridItemAlignment::Auto,
+        fanta_doc::GridAlign::Center => DesignGridItemAlignment::Center,
+        fanta_doc::GridAlign::End => DesignGridItemAlignment::End,
+    }
+}
+
+fn grid_alignment_from_design(align: DesignGridItemAlignment) -> fanta_doc::GridAlign {
+    match align {
+        DesignGridItemAlignment::Auto | DesignGridItemAlignment::Start => {
+            fanta_doc::GridAlign::Start
+        }
+        DesignGridItemAlignment::Center => fanta_doc::GridAlign::Center,
+        DesignGridItemAlignment::End => fanta_doc::GridAlign::End,
+    }
+}
+
+/// Edit a grid frame's tracks and gaps (the frame must already be a grid).
+fn grid_layout_operations(
+    doc: &Doc,
+    id: NodeId,
+    change: impl FnOnce(&mut fanta_doc::GridLayout),
+) -> Vec<Operation> {
+    let rows_in_use = grid_rows_in_use(doc, id);
+    replace_data_operation(doc, id, |data| {
+        if let NodeData::Group(group) = data
+            && group
+                .auto_layout
+                .is_some_and(|layout| layout.mode == LayoutMode::Grid)
+        {
+            let grid = group.grid.get_or_insert_with(Default::default);
+            // Show-and-edit the rows the engine added for the children as
+            // real tracks.
+            while grid.rows.len() < rows_in_use {
+                grid.rows.push(GridTrack::Hug);
+            }
+            if grid.columns.is_empty() {
+                grid.columns.push(GridTrack::Flex { fr: 1.0 });
+            }
+            change(grid);
+        }
+    })
+}
+
+/// How many rows a grid frame's children occupy, auto-added ones included.
+fn grid_rows_in_use(doc: &Doc, id: NodeId) -> usize {
+    fanta_doc::grid_cells(&doc.scene, id)
+        .iter()
+        .map(|(_, cell)| usize::from(cell.row) + usize::from(cell.row_span))
+        .max()
+        .unwrap_or(0)
+}
+
+fn grid_track_slot(
+    grid: &mut fanta_doc::GridLayout,
+    columns: bool,
+    index: usize,
+) -> Option<&mut GridTrack> {
+    if columns {
+        grid.columns.get_mut(index)
+    } else {
+        grid.rows.get_mut(index)
+    }
+}
+
+/// The cell a grid child sits in now, pinned or auto-placed.
+fn current_grid_cell(doc: &Doc, id: NodeId) -> Option<fanta_doc::GridCell> {
+    let parent = doc.scene.get(id)?.parent?;
+    fanta_doc::grid_cells(&doc.scene, parent)
+        .into_iter()
+        .find_map(|(child, cell)| (child == id).then_some(cell))
 }

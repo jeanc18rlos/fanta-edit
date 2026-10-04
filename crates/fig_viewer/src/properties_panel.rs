@@ -1496,7 +1496,26 @@ impl FantaPropertiesPanel {
         mode: LayoutMode,
         cx: &mut Context<Self>,
     ) {
-        self.update_auto_layout(id, move |layout| layout.mode = mode, cx);
+        self.apply_document_ops(cx, move |doc| {
+            let children = doc.scene.children_of(Some(id)).len();
+            replace_data_operation(doc, id, |data| {
+                let NodeData::Group(group) = data else {
+                    return;
+                };
+                let Some(layout) = group.auto_layout.as_mut() else {
+                    return;
+                };
+                layout.mode = mode;
+                if mode != LayoutMode::Grid {
+                    group.grid = None;
+                } else if group.grid.is_none() {
+                    group.grid = Some(fanta_doc::GridLayout::for_children(
+                        children,
+                        layout.spacing,
+                    ));
+                }
+            })
+        });
     }
 
     pub(crate) fn set_primary_align(
@@ -1525,7 +1544,7 @@ impl FantaPropertiesPanel {
             id,
             move |layout| {
                 let (primary_cell, counter_cell) = match layout.mode {
-                    LayoutMode::Horizontal => (col, row),
+                    LayoutMode::Horizontal | LayoutMode::Grid => (col, row),
                     LayoutMode::Vertical => (row, col),
                 };
                 layout.primary_align = match primary_cell {
@@ -1617,11 +1636,7 @@ impl FantaPropertiesPanel {
                 return Vec::new();
             };
             let old = node.layout_child;
-            let mut child = old.unwrap_or(LayoutChild {
-                grow: 0.0,
-                absolute: false,
-                align_self: None,
-            });
+            let mut child = old.unwrap_or_default();
             mutate(&mut child);
             let new = (!child.is_trivial()).then_some(child);
             if new == old {

@@ -153,6 +153,7 @@ fn inferred_stack_can_ignore_child_stretch() {
     let f = t.push(frame(200.0, 100.0, al));
     let mut a = rect_child(f, 30.0, 20.0);
     a.layout_child = Some(LayoutChild {
+        grid: None,
         grow: 0.0,
         absolute: false,
         align_self: Some(CounterAlign::Stretch),

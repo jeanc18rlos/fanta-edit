@@ -21,6 +21,7 @@ fn absolute_child_excluded_from_flow_and_untouched() {
     let mut abs_node = rect_child(f, 20.0, 10.0);
     abs_node.transform = Transform2D::translation(150.0, 30.0);
     abs_node.layout_child = Some(LayoutChild {
+        grid: None,
         grow: 0.0,
         absolute: true,
         align_self: None,

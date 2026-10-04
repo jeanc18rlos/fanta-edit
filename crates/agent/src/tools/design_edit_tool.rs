@@ -22,7 +22,8 @@ fn tool_content_err(e: impl std::fmt::Display) -> LanguageModelToolResultContent
 /// corner_radius, text, hidden, locked), `set_stroke`, `set_shadow`,
 /// `set_text_style` (family, weight, size, line height, letter spacing,
 /// align, color), `set_auto_layout` (direction, gap, padding, align_items,
-/// justify; `none` turns it off). Arrange: `rotate`, `align`, `distribute`,
+/// justify; `none` turns it off), `set_grid_layout` (columns/rows as px,
+/// `"1fr"` or `"auto"`, gaps; cells via `set_layout_child` column/row). Arrange: `rotate`, `align`, `distribute`,
 /// `set_index` (z-order), `reparent`. Structure: `group`, `frame_selection`,
 /// `ungroup`, `create_component`, `delete`. Editor: `select`, `set_viewport`.
 /// Design-system foundations: `create_variable_collection`, `add_variable_mode`,

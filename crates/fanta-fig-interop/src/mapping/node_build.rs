@@ -7,9 +7,9 @@ use super::{
     StrokeCap, StrokeJoin, TextAutoResize, VectorNode, arc_ellipse_path, blend_mode, build_stroke,
     build_text, build_vector, corner_radii, corner_smoothing, first_fill, group_with_optional_clip,
     guid_key, has_independent_corners, make_shape, read_arc_shape, read_auto_layout, read_blurs,
-    read_color_with_opacity, read_effects, read_fills, read_layout_child, read_mask, read_paint,
-    read_scroll_behavior, read_scroll_direction, read_scroll_offset, read_size, read_transform,
-    text_case_of, viewport,
+    read_color_with_opacity, read_effects, read_fills, read_grid_layout, read_layout_child,
+    read_mask, read_paint, read_scroll_behavior, read_scroll_direction, read_scroll_offset,
+    read_size, read_transform, text_case_of, viewport,
 };
 
 /// The outcome of trying to turn a Figma node change into a Fantaisa node.
@@ -50,6 +50,7 @@ pub(crate) fn build_node(type_name: &str, change: &KiwiValue, blobs: &[Vec<u8>])
         // enabled), NOT in the paint arrays — read it first and fall back to
         // any background paints for older exports.
         "CANVAS" => NodeData::Group(GroupNode {
+            grid: None,
             local_size: None,
             scrollable: false,
             scroll_direction: None,
@@ -74,6 +75,7 @@ pub(crate) fn build_node(type_name: &str, change: &KiwiValue, blobs: &[Vec<u8>])
         "FRAME" => {
             let (uniform, per_corner) = corner_radii(change);
             NodeData::Group(GroupNode {
+                grid: None,
                 local_size: None,
                 clip_size: Some([size.0, size.1]),
                 background: first,
@@ -106,6 +108,7 @@ pub(crate) fn build_node(type_name: &str, change: &KiwiValue, blobs: &[Vec<u8>])
         "SECTION" => {
             let (uniform, per_corner) = corner_radii(change);
             NodeData::Group(GroupNode {
+                grid: None,
                 local_size: None,
                 clip_size: Some([size.0, size.1]),
                 background: first,
@@ -220,6 +223,7 @@ pub(crate) fn build_node(type_name: &str, change: &KiwiValue, blobs: &[Vec<u8>])
     // data too (Stage 2 lays them out).
     if let NodeData::Group(g) = &mut node.data {
         g.auto_layout = read_auto_layout(change);
+        g.grid = read_grid_layout(change);
     }
     node.layout_child = read_layout_child(change);
 
@@ -544,6 +548,7 @@ fn tally_auto_layout(report: &mut MapReport, node: &CanvasNode) {
             match al.mode {
                 LayoutMode::Horizontal => report.auto_layout_horizontal += 1,
                 LayoutMode::Vertical => report.auto_layout_vertical += 1,
+                LayoutMode::Grid => report.auto_layout_grid += 1,
             }
             if al.primary_sizing == AxisSizing::Hug {
                 report.auto_layout_primary_hug += 1;

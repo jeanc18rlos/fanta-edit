@@ -11,9 +11,8 @@ use serde::{Deserialize, Serialize};
 
 /// Primary (main-axis) flow direction of an [`AutoLayout`] container.
 ///
-/// Maps from Figma's `stackMode` (`HORIZONTAL`/`VERTICAL`; `NONE` means the
-/// frame is *not* auto-layout, so it carries no [`AutoLayout`] at all, and
-/// `GRID` is not yet modelled — a grid frame imports without auto-layout).
+/// Maps from Figma's `stackMode` (`HORIZONTAL`/`VERTICAL`/`GRID`; `NONE` means
+/// the frame is *not* auto-layout, so it carries no [`AutoLayout`] at all).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LayoutMode {
@@ -22,6 +21,109 @@ pub enum LayoutMode {
     Horizontal,
     /// Children flow top→bottom along the y axis (CSS `flex-direction: column`).
     Vertical,
+    /// Children sit in the cells of a column × row grid (CSS grid). The tracks
+    /// live on the frame's [`GroupNode::grid`](crate::node::GroupNode::grid)
+    /// and each child's cell on its [`LayoutChild::grid`]. Width is the primary
+    /// axis for the frame's [`AutoLayout`] sizing, height the counter axis.
+    Grid,
+}
+
+/// The tracks of a [`LayoutMode::Grid`] frame (Figma `gridColumns` /
+/// `gridRows` with their `grid*Sizing`, and the gaps).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct GridLayout {
+    pub columns: Vec<GridTrack>,
+    pub rows: Vec<GridTrack>,
+    #[serde(default)]
+    pub column_gap: f64,
+    #[serde(default)]
+    pub row_gap: f64,
+}
+
+impl GridLayout {
+    /// The grid a stack becomes when switched to [`LayoutMode::Grid`]: ⌈√n⌉
+    /// equal (`1fr`) columns for its `children`, rows added as they need, and
+    /// `gap` between both.
+    pub fn for_children(children: usize, gap: f64) -> Self {
+        let columns = (children.max(1) as f64).sqrt().ceil() as usize;
+        let gap = if gap.is_finite() { gap.max(0.0) } else { 0.0 };
+        Self {
+            columns: vec![GridTrack::Flex { fr: 1.0 }; columns],
+            rows: Vec::new(),
+            column_gap: gap,
+            row_gap: gap,
+        }
+    }
+}
+
+/// How one grid track sizes itself (Figma `GridTrackSizingType`).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum GridTrack {
+    /// A fixed extent in logical px.
+    Fixed { size: f64 },
+    /// A share of the space the fixed and hug tracks leave (CSS `fr`).
+    Flex { fr: f64 },
+    /// As large as its largest single-track child.
+    Hug,
+}
+
+/// Where a child sits in its [`LayoutMode::Grid`] parent: 0-based column and
+/// row, how many tracks it spans, and its alignment inside that cell area
+/// (Figma `gridColumnAnchor`/`gridRowAnchor`, `grid*Span`,
+/// `gridChild*Align`). A child without one is auto-placed in the first free
+/// cell, row by row.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct GridCell {
+    pub column: u16,
+    pub row: u16,
+    #[serde(default = "one_track", skip_serializing_if = "is_one_track")]
+    pub column_span: u16,
+    #[serde(default = "one_track", skip_serializing_if = "is_one_track")]
+    pub row_span: u16,
+    #[serde(default, skip_serializing_if = "GridAlign::is_start")]
+    pub horizontal: GridAlign,
+    #[serde(default, skip_serializing_if = "GridAlign::is_start")]
+    pub vertical: GridAlign,
+}
+
+impl Default for GridCell {
+    /// The first cell, one track each way, aligned to its start.
+    fn default() -> Self {
+        Self {
+            column: 0,
+            row: 0,
+            column_span: 1,
+            row_span: 1,
+            horizontal: GridAlign::Start,
+            vertical: GridAlign::Start,
+        }
+    }
+}
+
+const fn one_track() -> u16 {
+    1
+}
+
+fn is_one_track(span: &u16) -> bool {
+    *span == 1
+}
+
+/// A child's alignment inside its grid cell area. Figma's `AUTO` and `MIN` are
+/// [`GridAlign::Start`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GridAlign {
+    #[default]
+    Start,
+    Center,
+    End,
+}
+
+impl GridAlign {
+    fn is_start(&self) -> bool {
+        *self == GridAlign::Start
+    }
 }
 
 /// How an [`AutoLayout`] axis sizes itself: a fixed extent, or hug-to-content.
@@ -204,7 +306,7 @@ impl Default for AutoLayout {
 /// absent ⇒ the child takes the parent's defaults (auto-positioned, no grow,
 /// `alignSelf: AUTO`). Maps from the child NodeChange's `stackChildPrimaryGrow`,
 /// `stackPositioning`, and `stackChildAlignSelf`.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct LayoutChild {
     /// Flex grow factor along the parent's primary axis (Figma
     /// `stackChildPrimaryGrow`). `> 0` ⇒ the child FILLs available primary space
@@ -220,12 +322,16 @@ pub struct LayoutChild {
     /// `None` ⇒ inherit the parent's [`AutoLayout::counter_align`] (Figma `AUTO`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub align_self: Option<CounterAlign>,
+    /// The child's cell when its parent is a [`LayoutMode::Grid`] frame;
+    /// `None` auto-places it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid: Option<GridCell>,
 }
 
 impl LayoutChild {
     /// Whether this carries no non-default data (so it can be dropped to `None`
     /// for a byte-stable round-trip).
     pub fn is_trivial(&self) -> bool {
-        self.grow == 0.0 && !self.absolute && self.align_self.is_none()
+        self.grow == 0.0 && !self.absolute && self.align_self.is_none() && self.grid.is_none()
     }
 }

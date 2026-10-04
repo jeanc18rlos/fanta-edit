@@ -263,6 +263,7 @@ fn hug_primary_grow_is_noop_keeps_child_base_size() {
     let fixed = t.push(rect_child(f, 30.0, 10.0));
     let mut g = rect_child(f, 40.0, 10.0);
     g.layout_child = Some(LayoutChild {
+        grid: None,
         grow: 1.0,
         absolute: false,
         align_self: None,

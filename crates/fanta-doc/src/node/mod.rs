@@ -60,7 +60,10 @@ pub mod variants;
 pub use instance::{
     DerivedOverride, DerivedText, InstanceNode, Override, OverridePath, OverrideValue,
 };
-pub use layout::{AutoLayout, AxisSizing, CounterAlign, LayoutChild, LayoutMode, PrimaryAlign};
+pub use layout::{
+    AutoLayout, AxisSizing, CounterAlign, GridAlign, GridCell, GridLayout, GridTrack, LayoutChild,
+    LayoutMode, PrimaryAlign,
+};
 pub use prototype::{
     Action, Direction, Easing, OverlayPosition, OverlaySettings, PrototypeAnimation, Reaction,
     Transition, TransitionStyle, Trigger, spring_progress,

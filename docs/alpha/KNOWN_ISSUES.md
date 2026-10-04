@@ -168,13 +168,15 @@ actually driven. Nothing here claims more than that record supports.
   were reached over MCP on 2026-09-09: `batch_design`'s `group` and `ungroup`
   ops both succeeded on both test documents. `frame_selection` was not among
   the ops driven.
-- Grid auto layout is offered in the inspector and the engine ignores it: the
-  adapter logs a line and returns no operations at all
-  (`gpui_adapters/design.rs::layout_mode_operations`). Horizontal and vertical
-  auto layout work.
-- Pass Through, Linear Burn and Linear Dodge are listed as blend modes and do
-  nothing; the engine has no equivalent, so the adapter emits no operation
-  (`gpui_adapters/design.rs`). The other blend modes map straight through.
+- Grid auto layout has gaps against Figma. The "Auto rows" toggle does nothing:
+  rows the children need are always added (as hug rows). A child spanning
+  several tracks never sizes them, and a hug grid's flex tracks hug instead of
+  sharing space (`fanta-doc/src/layout/grid.rs`). The `.fig` import reads the
+  grid fields from the embedded schema, but no grid frame from a real file has
+  been imported yet.
+- Pass Through is listed as a blend mode and does nothing; the engine has no
+  equivalent, so the adapter emits no operation (`gpui_adapters/design.rs`).
+  The other blend modes map straight through.
 - Effects are limited to drop shadow, inner shadow, layer blur and background
   blur. Every other effect kind is reported as unsupported in the inspector.
 - **Select more than 512 layers and the per-layer outlines disappear.** Above

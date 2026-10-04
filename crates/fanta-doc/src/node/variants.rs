@@ -36,6 +36,10 @@ pub struct GroupNode {
     /// rest of the paint stack without turning them into editable child layers.
     #[serde(default, skip_serializing_if = "SmallVec::is_empty")]
     pub background_fills: SmallVec<[Fill; 1]>,
+    /// The tracks of a [`LayoutMode::Grid`](crate::node::LayoutMode::Grid)
+    /// frame. Kept here rather than on the `Copy` [`AutoLayout`](crate::node::AutoLayout).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grid: Option<crate::node::GridLayout>,
     /// Per-frame theme pin: which mode is forced for a given variable
     /// collection within this subtree. The nearest ancestor with an entry for
     /// a collection wins during mode resolution (see

@@ -896,6 +896,15 @@ pub(crate) fn layout_gap_operations(
         if let NodeData::Group(group) = data
             && let Some(layout) = group.auto_layout.as_mut()
         {
+            if layout.mode == LayoutMode::Grid {
+                let grid = group.grid.get_or_insert_with(Default::default);
+                if horizontal {
+                    grid.column_gap = gap;
+                } else {
+                    grid.row_gap = gap;
+                }
+                return;
+            }
             let primary = horizontal == (layout.mode == LayoutMode::Horizontal);
             if primary {
                 layout.spacing = gap;

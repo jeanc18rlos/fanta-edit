@@ -1528,7 +1528,7 @@ impl FantaPropertiesPanel {
     ) -> AnyElement {
         // Which underlying axis reads as "W" depends on the flow direction,
         // exactly like the original's Resize W / Resize H pills.
-        let horizontal = matches!(layout.mode, LayoutMode::Horizontal);
+        let horizontal = layout.mode != LayoutMode::Vertical;
         let (w_primary, w_sizing) = if horizontal {
             (true, layout.primary_sizing)
         } else {

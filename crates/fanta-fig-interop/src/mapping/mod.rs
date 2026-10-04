@@ -74,11 +74,11 @@ pub(crate) use fanta_doc::id::{
 };
 pub(crate) use fanta_doc::index::IndexKey;
 pub(crate) use fanta_doc::node::{
-    Action, AutoLayout, AxisSizing, CanvasNode, CounterAlign, Easing, FontVariation, GroupNode,
-    InstanceNode, LayoutChild, LayoutMode, MaskType, NodeData, NodeFlags, Override, OverridePath,
-    OverrideValue, ParametricShape, PrimaryAlign, Reaction, ScrollBehavior, ScrollDirection,
-    TextAlign, TextAutoResize, TextNode, TextStyle, TextStyleRun, Transition, TransitionStyle,
-    Trigger, VAlign, VectorNode,
+    Action, AutoLayout, AxisSizing, CanvasNode, CounterAlign, Easing, FontVariation, GridAlign,
+    GridCell, GridLayout, GridTrack, GroupNode, InstanceNode, LayoutChild, LayoutMode, MaskType,
+    NodeData, NodeFlags, Override, OverridePath, OverrideValue, ParametricShape, PrimaryAlign,
+    Reaction, ScrollBehavior, ScrollDirection, TextAlign, TextAutoResize, TextNode, TextStyle,
+    TextStyleRun, Transition, TransitionStyle, Trigger, VAlign, VectorNode,
 };
 pub(crate) use fanta_doc::path::PathData;
 pub(crate) use fanta_doc::style::{
