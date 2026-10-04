@@ -1626,6 +1626,13 @@ impl FigItem {
         }
     }
 
+    /// The disk snapshot a real load records ([`Self::merge_base`]); test
+    /// fixtures built from a document skip the load and set it here.
+    #[cfg(test)]
+    pub(crate) fn set_merge_base_for_test(&mut self, base: Doc) {
+        self.merge_base = Some(base);
+    }
+
     pub fn has_conflict(&self) -> bool {
         self.conflict
     }
