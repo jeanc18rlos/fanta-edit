@@ -456,6 +456,11 @@ tagged by `"op"`:
 `offset`, `limit` (up to 200), `include_bindings`. Inspect existing component
 properties, variant sets, collections, modes and typed variable values first.
 
+**`prepare_design_asset`** — `{ kind: "image" | "svg", prompt, preferred_model? }`.
+Opens the image or SVG generation composer with that prompt as a draft for the
+user to review. It never submits a generation or spends credits; use it when
+the user asks for an asset, then place the result once they generate it.
+
 Variables are real undoable ops: `create_variable_collection` (`name`, `modes`),
 `add_variable_mode`, `create_variable` (`collection`, `name`, `kind`, primitive
 `value`), `set_variable_value` (`variable`, `mode`, `value`), `set_variable_mode`

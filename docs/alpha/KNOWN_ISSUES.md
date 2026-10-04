@@ -400,7 +400,14 @@ actually driven. Nothing here claims more than that record supports.
   `max_dimension` 1200 on the 9.6 MB document returned a 147,712-byte PNG in
   0.19 s that visibly contained the edits made over MCP, and the same call on
   the 128 MB UI kit returned 52,007 bytes in 0.15 s.
-- **`tools/list` now returns six tools, and every document that said five is
+- **`tools/list` returns thirteen tools.** `get_editor_state`, `get_design_system`,
+  `prepare_design_asset`, `batch_get`, `batch_design`, `get_screenshot`,
+  `read_fnx_source`, `validate_fnx_source`, `get_guidelines`, `import_image`,
+  `list_comments`, `reply_comment` and `report_agent_activity`, listed once in
+  `live_tools!` (`crates/fig_viewer/src/live_mcp.rs`); the test
+  `every_live_tool_is_described` fails if any of them ships without a
+  description. The seeded `AGENTS.md` documents all thirteen. The history of
+  the six-tool surface follows. **`tools/list` once returned six tools, and every document that said five was
   a step behind.** `get_guidelines` was added next to `get_editor_state`,
   `batch_get`, `batch_design`, `get_screenshot` and `read_fnx_source`
   (`server.add_tool(…)`, `crates/fig_viewer/src/live_mcp.rs`); it takes no
