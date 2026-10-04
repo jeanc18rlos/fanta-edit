@@ -11,7 +11,9 @@ use crate::id::{
 };
 use crate::index::IndexKey;
 use crate::motion::{AnimationClip, AnimationTrack, Keyframe, MotionTarget};
-use crate::node::{CanvasNode, LayoutChild, MaskType, NodeData, NodeFlags, Override, Reaction};
+use crate::node::{
+    CanvasNode, Constraints, LayoutChild, MaskType, NodeData, NodeFlags, Override, Reaction,
+};
 use crate::op::ModeScope;
 use crate::style::{BlendMode, Blur, Shadow, UnitInterval};
 use crate::transform::Transform2D;
@@ -139,6 +141,14 @@ pub enum Operation {
         id: NodeId,
         old: Option<LayoutChild>,
         new: Option<LayoutChild>,
+    },
+
+    /// Change how a node resizes with its (non-auto-layout) parent: Figma's
+    /// constraints. `None` keeps the node's default (left/top).
+    SetConstraints {
+        id: NodeId,
+        old: Option<Constraints>,
+        new: Option<Constraints>,
     },
 
     /// Replace the variant-specific data. Heaviest op; AI re-rolls, path edits.
@@ -459,6 +469,7 @@ impl Operation {
             | Self::SetMask { id, .. }
             | Self::SetMaskType { id, .. }
             | Self::SetLayoutChild { id, .. }
+            | Self::SetConstraints { id, .. }
             | Self::ReplaceData { id, .. }
             | Self::SetInstanceOverride { id, .. }
             | Self::SwapInstance { id, .. }
@@ -504,6 +515,7 @@ impl Operation {
             Self::SetMask { .. } => "Mask",
             Self::SetMaskType { .. } => "Mask type",
             Self::SetLayoutChild { .. } => "Layout Child",
+            Self::SetConstraints { .. } => "Constraints",
             Self::ReplaceData { .. } => "Edit",
             Self::CreateInstance { .. } => "Insert Instance",
             Self::DefineComponent { .. } => "Create Component",

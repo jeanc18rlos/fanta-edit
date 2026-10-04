@@ -2138,6 +2138,7 @@ pub fn artifact_op_impact(op: &Operation) -> ArtifactOpImpact {
         | SetMask { .. }
         | SetMaskType { .. }
         | SetLayoutChild { .. }
+        | SetConstraints { .. }
         | ReplaceData { .. }
         | SetInstanceOverride { .. }
         | SwapInstance { .. }
