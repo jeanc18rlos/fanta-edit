@@ -387,14 +387,19 @@ for agents (coordinates, frames vs groups, auto layout, spacing and type
 scales, naming, components, the working method, and when to edit `.fnx`
 instead). Read it once per session before designing.
 
-**`batch_get`** — `{ ids?, page?, depth?, include_geometry? }`. With `ids`,
-returns those nodes in full detail. Without them it lists one page's tree in
+**`batch_get`** — `{ ids?, page?, depth?, include_geometry?, detail? }`. With
+`ids`, returns those nodes' editable style (`detail: "style"`, the default) in
+the ops' own vocabulary — `bounds`, `fills`, `strokes`, `effects`,
+`auto_layout`, `layout_child`, `constraints`, `text`, `bindings` — so a value
+you read can be sent back in an op unchanged; `detail: "raw"` returns the
+internal record instead. Without them it lists one page's tree in
 compact form, where `page` is a page *index* (default: the active page), `depth`
 limits how many levels of children come back (default 2; a cut-off node reports
 `child_count`), and `include_geometry: true` adds world-space bounding boxes.
 Each listed node carries its id, kind and name plus kind-specific facts: a
 frame's `size` and `auto_layout` mode, a text's `text` and `font`, a shape's
-first solid `fill`, an instance's `component` name.
+first solid `fill`, an instance's `component` name. With `detail: "style"` each listed node
+also carries its full style.
 
 **`batch_design`** — `{ ops, label? }`. Applies `ops` in order as **one undo
 step**, named by `label` (default `"MCP edit"`). If any op fails the whole batch
@@ -418,10 +423,28 @@ tagged by `"op"`:
 - `set_props` — `id` plus only the fields you are changing: `name`, `x`, `y`,
   `width`, `height`, `opacity` (0.0–1.0), `fill`, `corner_radius`, `text`,
   `hidden`, `locked`.
-- `set_stroke` — `id`, optional `color`, `width` (`0` removes the stroke) and
-  `align` (`"inside"`, `"center"`, `"outside"`). Creates the stroke if absent.
+- `set_stroke` — `id`, optional `color`, `width` (`0` removes the stroke),
+  `align` (`"inside"`, `"center"`, `"outside"`), `sides` (`[top, right, bottom,
+  left]` widths, e.g. `[0, 0, 1, 0]` for a bottom border), `dash` (`[on, off]`),
+  `cap` (`butt|round|square`) and `join` (`miter|round|bevel`). Creates the
+  stroke if absent.
 - `set_shadow` — `id`, optional `color`, `x`, `y`, `blur`, `spread`; edits or
   adds the drop shadow. `remove: true` deletes every drop shadow.
+- `set_effects` — `id`, `effects`: the whole stack, bottom first. Shadows are
+  `{kind: "drop_shadow"|"inner_shadow", color?, x?, y?, blur?, spread?}`; blurs
+  are `{kind: "layer_blur"|"background_blur", radius}`. `[]` removes them all.
+- `set_fill` — `id`, `paints`, bottom first: `{kind: "solid", color}`,
+  `{kind: "linear", from?, to?, stops: [{position, color}]}`,
+  `{kind: "radial", center?, radius?, stops}` (points in the node's 0–1 box) or
+  `{kind: "image", source, fit?}`. Frames and shapes; text color is
+  `set_text_style`.
+- `set_constraints` — `id`, optional `horizontal`
+  (`left|right|left_right|center|scale`) and `vertical`
+  (`top|bottom|top_bottom|center|scale`): how the node follows a resized
+  parent outside auto layout.
+- `create_shape` — `shape` (`line|polygon|star|path`), `x`, `y`, `width`,
+  `height`, optional `points` (polygon sides / star points), `inner_ratio`,
+  `path` (SVG `d` in the shape's own box), `fill`, `stroke`, `stroke_width`.
 - `set_text_style` — `id` plus optional `font_family`, `font_weight`
   (100–900), `font_size`, `line_height` (multiple of the size),
   `letter_spacing`, `align` (`left|center|right|justify`), `color`.
