@@ -519,8 +519,9 @@ impl FantaCodeWorkspace {
                 .requested_page
                 .or_else(|| item.doc().and_then(|doc| doc.active_page()));
             // The active root may be a component master (a component-scoped
-            // view) rather than a listed page; its source is
-            // `components/<id>/master.fnx`, with `def.json` as the JSON pane.
+            // view) rather than a listed page; its source is its folder's
+            // `master.fnx` (`components/<slug>/`, or a variant's
+            // `components/<set>/<variant>/`), with `def.json` as the JSON pane.
             let component = page.and_then(|root| {
                 item.doc().and_then(|doc| {
                     doc.components

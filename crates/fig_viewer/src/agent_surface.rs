@@ -491,7 +491,7 @@ impl DesignSurface for FigDesignSurface {
             "components": components_json(doc, project_root),
             "variable_collections": doc.variables.collections.len(),
             "variables": doc.variables.variables.len(),
-            "design_system_sources": ["doc/variables.json", "doc/active_modes.json", "components/sets.json"],
+            "design_system_sources": ["doc/variables.json", "doc/active_modes.json", "components/<set>/set.json"],
             "motion_source": motion_source,
             "motion_clips": motion_clips,
             "selection": selection_ids(doc),
@@ -909,7 +909,12 @@ fn validate_agent_source_edit(
     let managed = matches!(components.as_slice(), [
         Component::Normal(directory), Component::Normal(_), Component::Normal(file)
     ] if (*directory == "pages" && *file == "page.fnx")
-        || (*directory == "components" && *file == "master.fnx"));
+        || (*directory == "components" && *file == "master.fnx"))
+        // A variant's master, inside its component set's folder.
+        || matches!(components.as_slice(), [
+            Component::Normal(directory), Component::Normal(_), Component::Normal(_),
+            Component::Normal(file)
+        ] if *directory == "components" && *file == "master.fnx");
     if !managed {
         return Ok(json!({ "applicable": false }));
     }
@@ -985,6 +990,21 @@ fn validate_managed_json(relative: &Path, source: &str) -> Result<bool> {
         {
             validate_typed_json::<BTreeMap<ComponentId, fanta_doc::ComponentSet>>(source)?;
         }
+        [
+            Component::Normal(directory),
+            Component::Normal(_),
+            Component::Normal(file),
+        ] if *directory == "components" && *file == "set.json" => {
+            validate_typed_json::<fanta_doc::ComponentSet>(source)?;
+        }
+        [
+            Component::Normal(directory),
+            Component::Normal(_),
+            Component::Normal(_),
+            Component::Normal(file),
+        ] if *directory == "components" && *file == "def.json" => {
+            validate_typed_json::<fanta_doc::ComponentDef>(source)?;
+        }
         [Component::Normal(directory), Component::Normal(file)]
             if *directory == "assets" && *file == "index.json" =>
         {
@@ -1043,6 +1063,12 @@ fn validate_managed_json(relative: &Path, source: &str) -> Result<bool> {
         }
         [
             Component::Normal(directory),
+            Component::Normal(_),
+            Component::Normal(file),
+        ]
+        | [
+            Component::Normal(directory),
+            Component::Normal(_),
             Component::Normal(_),
             Component::Normal(file),
         ] if (*directory == "pages" && *file == "page.ids.json")
@@ -1217,7 +1243,7 @@ fn design_system_json(
         "components": components_json(doc, project_root),
         "component_sets": doc.components.sets.values().collect::<Vec<_>>(),
         "selection_bindings": bindings,
-        "source_files": ["doc/variables.json", "doc/active_modes.json", "components/sets.json"],
+        "source_files": ["doc/variables.json", "doc/active_modes.json", "components/<set>/set.json"],
         "hints": ["Create semantic variables before components, bind properties, then reuse component instances.",
           "Names are exact and must be unique when used instead of ids. Prefer returned ids for follow-up edits.",
           "Variables use per-mode values. set_variable_mode selects a collection mode document-wide or pins a frame."]
@@ -1926,12 +1952,31 @@ fn list_source_files(root: &Path) -> Vec<String> {
         };
         let mut found: Vec<String> = entries
             .flatten()
-            .filter(|entry| entry.path().join(file_name).is_file())
-            .map(|entry| {
-                format!(
-                    "{directory}/{}/{file_name}",
-                    entry.file_name().to_string_lossy()
-                )
+            .flat_map(|entry| {
+                let folder = entry.file_name().to_string_lossy().into_owned();
+                let mut sources = Vec::new();
+                if entry.path().join(file_name).is_file() {
+                    sources.push(format!("{directory}/{folder}/{file_name}"));
+                }
+                // A component set's folder: its set.json and its variants.
+                if directory == "components" && entry.path().join("set.json").is_file() {
+                    sources.push(format!("{directory}/{folder}/set.json"));
+                    let mut variants: Vec<String> = std::fs::read_dir(entry.path())
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .filter(|variant| variant.path().join(file_name).is_file())
+                        .map(|variant| {
+                            format!(
+                                "{directory}/{folder}/{}/{file_name}",
+                                variant.file_name().to_string_lossy()
+                            )
+                        })
+                        .collect();
+                    variants.sort();
+                    sources.append(&mut variants);
+                }
+                sources
             })
             .collect();
         found.sort();
@@ -5208,13 +5253,36 @@ mod tests {
     #[test]
     fn agent_source_validation_checks_typed_design_system_json_without_active_canvas() -> Result<()>
     {
-        let (doc, _) = doc_with_page();
+        let (mut doc, _) = doc_with_page();
+        // A variant set, so the project has a `components/chip/set.json`.
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "frame", "name": "Size=S",
+                 "x": 0.0, "y": 0.0, "width": 40.0, "height": 20.0},
+                {"op": "create_node", "node_type": "frame", "name": "Size=L",
+                 "x": 60.0, "y": 0.0, "width": 80.0, "height": 20.0},
+            ])),
+            "Frames",
+        );
+        let (small, large) = (created_id(&outcome, 0), created_id(&outcome, 1));
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_component", "id": small.to_string()},
+                {"op": "create_component", "id": large.to_string()},
+                {"op": "combine_variants", "ids": [small.to_string(), large.to_string()], "name": "Chip"},
+            ])),
+            "Chip",
+        );
+        assert_applied(&outcome);
         let directory = tempfile::tempdir()?;
         fanta_format::write_project_tree(directory.path(), &doc, &Default::default())?;
         for relative in [
             "doc/variables.json",
             "doc/active_modes.json",
-            "components/sets.json",
+            "components/chip/set.json",
+            "components/chip/s/def.json",
         ] {
             let path = directory.path().join(relative);
             let original = std::fs::read_to_string(&path)?;

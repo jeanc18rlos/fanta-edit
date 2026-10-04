@@ -46,8 +46,8 @@ use super::layout::{
     ACTIVE_MODES_JSON, ASSET_LIBRARY_JSON, ASSETS_DIR, COMPONENTS_DIR, DEF_JSON, DOC_DIR,
     EXPORTS_DIR, FANTA_JSON, FLOW_START_JSON, FLOWS_JSON, LOOSE_DIR, MASTER_FNX, MASTER_IDS,
     METADATA_JSON, MOTION_JSON, NODES_DIR, PAGE_FNX, PAGE_IDS, PAGE_JSON, PAGES_DIR,
-    PRESENTATION_JSON, PREVIEWS_DIR, PROJECT_VERSION, ProjectManifest, SETS_JSON, VARIABLES_JSON,
-    WORKSPACE_FNX, id_from_key, json_bytes, json_key, slugify, sorted_entries,
+    PRESENTATION_JSON, PREVIEWS_DIR, PROJECT_VERSION, ProjectManifest, SET_JSON, SETS_JSON,
+    VARIABLES_JSON, WORKSPACE_FNX, id_from_key, json_bytes, json_key, slugify, sorted_entries,
 };
 use super::media::{ASSET_INDEX_FILE, MediaRegistry, asset_index_bytes, sniff_media};
 
@@ -594,7 +594,7 @@ enum Bucket {
 /// Assign every design a unique directory slug from its name. Collisions get
 /// deterministic `-2`, `-3`, … suffixes in id order, so the slug set is a pure
 /// function of the doc (the byte-determinism contract).
-fn design_slugs<Id: Ord + Copy>(
+pub(crate) fn design_slugs<Id: Ord + Copy>(
     named: impl IntoIterator<Item = (Id, String)>,
     fallback: &str,
 ) -> BTreeMap<Id, String> {
@@ -613,6 +613,35 @@ fn design_slugs<Id: Ord + Copy>(
         slugs.insert(id, slug);
     }
     slugs
+}
+
+/// What [`upgrade_project`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProjectUpgrade {
+    /// The layout version the project had.
+    pub from: u32,
+    /// The layout version it has now ([`PROJECT_VERSION`] after an upgrade).
+    pub to: u32,
+}
+
+/// Bring a project folder up to the current layout now, instead of on its
+/// next save: read it at whatever layout it has and write it back, which
+/// moves files to where the current layout keeps them and removes the old
+/// ones (layout v5 moves each component set's variants into the set's folder
+/// and drops `components/sets.json`). A project already at the current
+/// layout is left untouched. Nothing is lost: every design, asset and
+/// workspace file round-trips.
+pub fn upgrade_project(dir: &Path) -> Result<ProjectUpgrade> {
+    let from = super::layout::read_manifest(dir)?.version;
+    if from >= PROJECT_VERSION {
+        return Ok(ProjectUpgrade { from, to: from });
+    }
+    let (doc, assets) = super::read::read_project_tree(dir)?;
+    write_project_tree(dir, &doc, &assets)?;
+    Ok(ProjectUpgrade {
+        from,
+        to: super::layout::read_manifest(dir)?.version,
+    })
 }
 
 /// Predicted page and component directories for a document. Session source
@@ -635,16 +664,7 @@ pub fn projected_design_dirs(
     .into_iter()
     .map(|(id, slug)| (id, PathBuf::from(PAGES_DIR).join(slug)))
     .collect();
-    let components = design_slugs(
-        doc.components
-            .defs
-            .iter()
-            .map(|(id, def)| (*id, def.name.clone())),
-        "component",
-    )
-    .into_iter()
-    .map(|(id, slug)| (id, PathBuf::from(COMPONENTS_DIR).join(slug)))
-    .collect();
+    let components = super::component_dirs::component_dirs(doc).components;
     (pages, components)
 }
 
@@ -670,13 +690,18 @@ fn project_designs(
         }),
         "page",
     );
-    let component_slugs: BTreeMap<ComponentId, String> = design_slugs(
-        doc.components
-            .defs
-            .iter()
-            .map(|(cid, def)| (*cid, def.name.clone())),
-        "component",
-    );
+    // v5: a standalone component is `components/<slug>/`; a variant is
+    // `components/<set>/<variant>/` beside its set's `set.json`. The bucket
+    // key is the path under `components/`.
+    let component_dirs = super::component_dirs::component_dirs(doc);
+    let component_slugs: BTreeMap<ComponentId, String> = component_dirs
+        .components
+        .iter()
+        .map(|(cid, dir)| {
+            let under = dir.strip_prefix(COMPONENTS_DIR).unwrap_or(dir);
+            (*cid, under.to_string_lossy().replace('\\', "/"))
+        })
+        .collect();
     let slug_of_page = |page: &NodeId| -> Result<&String> {
         page_slugs.get(page).ok_or_else(|| {
             FormatError::InvalidProjectTree(format!("page {page} has no directory slug"))
@@ -718,8 +743,8 @@ fn project_designs(
         );
     }
 
-    // components/<slug>/def.json + components/sets.json — each def exactly as
-    // `Doc` serializes it (the def carries the component's id).
+    // components/…/def.json + components/<set>/set.json — each def and set
+    // exactly as `Doc` serializes it (both carry their id).
     for (cid, def) in &doc.components.defs {
         files.insert(
             PathBuf::from(COMPONENTS_DIR)
@@ -728,10 +753,15 @@ fn project_designs(
             Arc::new(json_bytes(&serde_json::to_value(def)?)?),
         );
     }
-    files.insert(
-        PathBuf::from(COMPONENTS_DIR).join(SETS_JSON),
-        Arc::new(json_bytes(&serde_json::to_value(&doc.components.sets)?)?),
-    );
+    for (set_id, set) in &doc.components.sets {
+        let set_dir = component_dirs.sets.get(set_id).ok_or_else(|| {
+            FormatError::InvalidProjectTree(format!("set {set_id} has no directory"))
+        })?;
+        files.insert(
+            set_dir.join(SET_JSON),
+            Arc::new(json_bytes(&serde_json::to_value(set)?)?),
+        );
+    }
 
     // v2: one readable `.fnx` source + an `.ids` sidecar per page / component
     // (was one JSON file per node). Keys are sorted (determinism contract) then
@@ -946,7 +976,10 @@ fn project_design_cached(
     sources: &BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>,
 ) -> Result<()> {
     if let Some((source, sidecar)) = sources.get(design_dir) {
-        files.insert(design_dir.join(fnx_name), Arc::new(source.clone()));
+        files.insert(
+            design_dir.join(fnx_name),
+            Arc::new(placed_source(design_dir, source)),
+        );
         files.insert(design_dir.join(ids_name), Arc::new(sidecar.clone()));
         cache.designs.remove(design_dir);
         return Ok(());
@@ -985,6 +1018,18 @@ fn project_design_cached(
     Ok(())
 }
 
+/// A design's `.fnx` source as written into `design_dir`: its `fnx` import
+/// points at the project root from that folder (a variant inside its set's
+/// folder is one deeper than a page). Non-UTF-8 bytes are left as they are.
+pub(crate) fn placed_source(design_dir: &Path, source: &[u8]) -> Vec<u8> {
+    match String::from_utf8(source.to_vec()) {
+        Ok(text) => {
+            fanta_fnx::with_module_depth(text, design_dir.components().count()).into_bytes()
+        }
+        Err(error) => error.into_bytes(),
+    }
+}
+
 /// Project one design's `.fnx` source + `.ids` sidecar into `design_dir`. If
 /// the bucket can't be encoded as a single-rooted `.fnx` tree (e.g. a
 /// multi-root bucket from corrupt data, or a node whose `type` has no JSX tag
@@ -1000,7 +1045,13 @@ fn project_fnx_design(
 ) -> Result<Vec<(PathBuf, Arc<Vec<u8>>)>> {
     match fanta_fnx::encode_subtree_with(nodes, fn_name, refs) {
         Ok((text, sidecar)) => Ok(vec![
-            (design_dir.join(fnx_name), Arc::new(text.into_bytes())),
+            (
+                design_dir.join(fnx_name),
+                Arc::new(
+                    fanta_fnx::with_module_depth(text, design_dir.components().count())
+                        .into_bytes(),
+                ),
+            ),
             (
                 design_dir.join(ids_name),
                 Arc::new(json_bytes(&serde_json::to_value(&sidecar)?)?),
@@ -1262,7 +1313,10 @@ fn is_generated_artifact(relative: &Path) -> bool {
         .contains(name),
         [COMPONENTS_DIR, SETS_JSON] | [ASSETS_DIR, ASSET_INDEX_FILE] => true,
         [PAGES_DIR, _, name] => [PAGE_JSON, PAGE_FNX, PAGE_IDS].contains(name),
-        [COMPONENTS_DIR, _, name] => [DEF_JSON, MASTER_FNX, MASTER_IDS].contains(name),
+        [COMPONENTS_DIR, _, name] => [DEF_JSON, MASTER_FNX, MASTER_IDS, SET_JSON].contains(name),
+        [COMPONENTS_DIR, _, variant, name] if *variant != NODES_DIR => {
+            [DEF_JSON, MASTER_FNX, MASTER_IDS].contains(name)
+        }
         [PAGES_DIR | COMPONENTS_DIR, _, NODES_DIR, name] => {
             Path::new(name)
                 .extension()
@@ -1283,6 +1337,21 @@ fn is_generated_artifact(relative: &Path) -> bool {
 fn validate_source_override_keys(sources: &BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>) -> Result<()> {
     for design_dir in sources.keys() {
         let components: Vec<_> = design_dir.components().collect();
+        // A variant's design is one folder deeper, inside its set's folder.
+        let components = match components.as_slice() {
+            [
+                root @ std::path::Component::Normal(name),
+                std::path::Component::Normal(set),
+                variant @ std::path::Component::Normal(_),
+            ] if *name == COMPONENTS_DIR
+                && set
+                    .to_str()
+                    .is_some_and(|set| !set.is_empty() && set.bytes().all(slug_byte)) =>
+            {
+                vec![*root, *variant]
+            }
+            _ => components,
+        };
         let [
             std::path::Component::Normal(root),
             std::path::Component::Normal(slug),
@@ -1307,9 +1376,7 @@ fn validate_source_override_keys(sources: &BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>
         };
         if ![PAGES_DIR, COMPONENTS_DIR].contains(&root)
             || slug.is_empty()
-            || !slug
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            || !slug.bytes().all(slug_byte)
         {
             return Err(FormatError::InvalidProjectTree(format!(
                 "source override path {} is not a projected design directory",
@@ -1318,6 +1385,10 @@ fn validate_source_override_keys(sources: &BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>
         }
     }
     Ok(())
+}
+
+fn slug_byte(byte: u8) -> bool {
+    byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
 }
 
 fn validate_expected_disk_paths(expected_disk: &BTreeMap<PathBuf, Option<[u8; 32]>>) -> Result<()> {
@@ -1391,20 +1462,24 @@ fn stale_managed_files(dir: &Path, keep: &BTreeSet<&Path>) -> Result<Vec<Planned
                     .next()
                     .and_then(|part| part.as_os_str().to_str());
                 let depth = relative_dir.components().count();
+                let has_header = |header: &str| {
+                    keep.contains(relative.join(header).as_path())
+                        || fs::symlink_metadata(path.join(header))
+                            .is_ok_and(|metadata| metadata.is_file())
+                };
+                let in_set = |set_dir: &Path| {
+                    keep.contains(set_dir.join(SET_JSON).as_path())
+                        || fs::symlink_metadata(dir.join(set_dir).join(SET_JSON))
+                            .is_ok_and(|metadata| metadata.is_file())
+                };
                 let scan = match (root, depth) {
                     (Some(ASSETS_DIR), 1) => true,
                     (Some(PAGES_DIR), 1) if name == LOOSE_DIR => true,
-                    (Some(PAGES_DIR), 1) | (Some(COMPONENTS_DIR), 1) => {
-                        let header = if root == Some(PAGES_DIR) {
-                            PAGE_JSON
-                        } else {
-                            DEF_JSON
-                        };
-                        let projected_header = relative.join(header);
-                        keep.contains(projected_header.as_path())
-                            || fs::symlink_metadata(path.join(header))
-                                .is_ok_and(|metadata| metadata.is_file())
-                    }
+                    (Some(PAGES_DIR), 1) => has_header(PAGE_JSON),
+                    // A component, or a variant set's folder (v5).
+                    (Some(COMPONENTS_DIR), 1) => has_header(DEF_JSON) || has_header(SET_JSON),
+                    // A variant inside its set's folder (v5).
+                    (Some(COMPONENTS_DIR), 2) if in_set(&relative_dir) => has_header(DEF_JSON),
                     (Some(PAGES_DIR | COMPONENTS_DIR), 2) => name == NODES_DIR,
                     _ => false,
                 };
