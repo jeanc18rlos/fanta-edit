@@ -37,6 +37,7 @@ mod motion_edit;
 mod motion_panel;
 mod new_design;
 mod panel_settings;
+mod plan_build;
 mod properties_ops;
 mod properties_panel;
 mod properties_render;

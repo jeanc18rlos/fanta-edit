@@ -71,6 +71,52 @@ pub(crate) fn set_active_item(item: WeakEntity<FigItem>, cx: &mut App) {
     }
 }
 
+/// Apply `ops` to `item`'s document as one undoable batch, exactly as the
+/// `batch_design` tool does. The result reports `applied` and, on a failure,
+/// the failing op (the batch is then rolled back).
+pub(crate) fn apply_ops_to_item(
+    item: &Entity<FigItem>,
+    ops: &[DesignOp],
+    label: &str,
+    cx: &mut App,
+) -> Result<Value> {
+    if ops.is_empty() {
+        bail!("the ops list is empty");
+    }
+    item.update(cx, |item, cx| {
+        if !item.is_editable() {
+            if item.source_edit_locked() {
+                bail!(
+                    "the FNX source has unsaved edits; save or discard them before editing the canvas"
+                );
+            }
+            bail!("the design document is still loading");
+        }
+        item.with_document(cx, |document| {
+            let (doc, mut assets) = document.doc_and_assets();
+            let outcome = apply_batch(doc, &mut assets, ops, label);
+            (Ok(outcome.value), outcome.change)
+        })
+        .unwrap_or_else(|| Err(anyhow!("the document is no longer available")))
+    })
+}
+
+/// The active page's top-level layers (up to `limit`, `depth` levels deep) in
+/// the style projection with world bounds: what `batch_get` returns for a page
+/// listing with `detail: "style"`, and what the v2 agent sessions read.
+pub(crate) fn page_scene(item: &FigItem, depth: u32, limit: usize) -> Result<Vec<Value>> {
+    let document = ready_document(item)?;
+    let doc = &document.doc;
+    let page = &document.pages[resolve_page_index(document, None)?];
+    let root = page.root.context("the page has no root node")?;
+    let mut listing = paginated_node_summary(doc, root, Some(depth), true, 0, limit);
+    crate::agent_style::attach_styles(doc, &mut listing);
+    Ok(match listing.get_mut("children").map(Value::take) {
+        Some(Value::Array(children)) => children,
+        _ => Vec::new(),
+    })
+}
+
 struct FigDesignSurface {
     active: Rc<RefCell<Option<WeakEntity<FigItem>>>>,
 }
@@ -556,26 +602,7 @@ impl DesignSurface for FigDesignSurface {
     }
 
     fn apply(&self, ops: Vec<DesignOp>, label: String, cx: &mut App) -> Result<Value> {
-        if ops.is_empty() {
-            bail!("the ops list is empty");
-        }
-        let item = self.item()?;
-        item.update(cx, |item, cx| {
-            if !item.is_editable() {
-                if item.source_edit_locked() {
-                    bail!(
-                        "the FNX source has unsaved edits; save or discard them before editing the canvas"
-                    );
-                }
-                bail!("the design document is still loading");
-            }
-            item.with_document(cx, |document| {
-                let (doc, mut assets) = document.doc_and_assets();
-                let outcome = apply_batch(doc, &mut assets, &ops, &label);
-                (Ok(outcome.value), outcome.change)
-            })
-            .unwrap_or_else(|| Err(anyhow!("the document is no longer available")))
-        })
+        apply_ops_to_item(&self.item()?, &ops, &label, cx)
     }
 
     fn apply_streamed(

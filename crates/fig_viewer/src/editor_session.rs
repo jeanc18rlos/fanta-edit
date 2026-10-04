@@ -15,6 +15,8 @@ pub enum EditorMode {
     Dev,
     Code,
     Comments,
+    /// Plan & build: the v2 agent plans tasks and builds them on the canvas.
+    Build,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -46,7 +48,7 @@ impl EditorWorkspace {
 }
 
 impl EditorMode {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Design,
         Self::Motion,
         Self::Draw,
@@ -54,6 +56,7 @@ impl EditorMode {
         Self::Code,
         Self::Prototype,
         Self::Comments,
+        Self::Build,
     ];
 
     pub fn label(self) -> &'static str {
@@ -65,6 +68,7 @@ impl EditorMode {
             Self::Dev => "Dev",
             Self::Code => "Code",
             Self::Comments => "Comments",
+            Self::Build => "Build",
         }
     }
 
@@ -77,6 +81,7 @@ impl EditorMode {
             Self::Dev => IconName::FileCode,
             Self::Code => IconName::FileCode,
             Self::Comments => IconName::Chat,
+            Self::Build => IconName::Sparkle,
         }
     }
 }
@@ -264,7 +269,8 @@ mod tests {
                 "Dev",
                 "Code",
                 "Prototype",
-                "Comments"
+                "Comments",
+                "Build"
             ]
         );
         assert_eq!(EditorMode::default(), EditorMode::Design);

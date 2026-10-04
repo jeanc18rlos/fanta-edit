@@ -248,7 +248,7 @@ mod tests {
         cx.run_until_parked();
     }
 
-    const MODE_TAB_SELECTORS: [&str; 7] = [
+    const MODE_TAB_SELECTORS: [&str; 8] = [
         "fanta-collapsible-tab-fanta-editor-mode-0",
         "fanta-collapsible-tab-fanta-editor-mode-1",
         "fanta-collapsible-tab-fanta-editor-mode-2",
@@ -256,6 +256,7 @@ mod tests {
         "fanta-collapsible-tab-fanta-editor-mode-4",
         "fanta-collapsible-tab-fanta-editor-mode-5",
         "fanta-collapsible-tab-fanta-editor-mode-6",
+        "fanta-collapsible-tab-fanta-editor-mode-7",
     ];
 
     fn visible_native_mode_tab(

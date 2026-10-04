@@ -337,6 +337,7 @@ pub struct FigView {
     _file_inspector_subscription: Subscription,
     inspector_sidebar: Entity<FantaPropertiesPanel>,
     prototype_sidebar: Entity<FantaPrototypePanel>,
+    plan_build_sidebar: Entity<crate::plan_build::PlanBuildPanel>,
     motion_sidebar: Entity<FantaMotionPanel>,
     variables_workspace: Entity<FantaVariablesWorkspace>,
     code_workspace: Entity<FantaCodeWorkspace>,
@@ -688,6 +689,8 @@ impl FigView {
             },
         );
         let prototype_sidebar = cx.new(|cx| FantaPrototypePanel::new(item.clone(), cx));
+        let plan_build_sidebar =
+            cx.new(|cx| crate::plan_build::PlanBuildPanel::new(item.downgrade(), cx));
         let timeline_shell = cx.new(|cx| {
             let mut timeline = TimelineShell::new();
             timeline.set_authoring_enabled(false, cx);
@@ -748,6 +751,7 @@ impl FigView {
             _file_inspector_subscription: file_inspector_subscription,
             inspector_sidebar,
             prototype_sidebar,
+            plan_build_sidebar,
             motion_sidebar,
             variables_workspace,
             code_workspace,
@@ -5625,6 +5629,7 @@ impl FigView {
         let body = match mode {
             EditorMode::Prototype => self.prototype_sidebar.clone().into_any_element(),
             EditorMode::Comments => self.render_comments_sidebar(cx),
+            EditorMode::Build => self.plan_build_sidebar.clone().into_any_element(),
             EditorMode::Motion => self.motion_sidebar.clone().into_any_element(),
             EditorMode::Design | EditorMode::Draw | EditorMode::Code | EditorMode::Dev => {
                 let records = self.page_measurements(cx);
@@ -8973,6 +8978,8 @@ impl Item for FigView {
                 },
             );
             let prototype_sidebar = cx.new(|cx| FantaPrototypePanel::new(item.clone(), cx));
+            let plan_build_sidebar =
+                cx.new(|cx| crate::plan_build::PlanBuildPanel::new(item.downgrade(), cx));
             let timeline_shell = cx.new(|cx| {
                 let mut timeline = TimelineShell::new();
                 timeline.set_authoring_enabled(timeline_authoring_enabled, cx);
@@ -9015,6 +9022,7 @@ impl Item for FigView {
                 _file_inspector_subscription: file_inspector_subscription,
                 inspector_sidebar,
                 prototype_sidebar,
+                plan_build_sidebar,
                 motion_sidebar,
                 variables_workspace,
                 code_workspace,
