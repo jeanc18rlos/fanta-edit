@@ -359,9 +359,7 @@ pub enum DesignShape {
 /// `get_editor_state` so a planner never sends an op the editor lacks. Each op
 /// is named on its own (`op:<name>`; `op:set_stroke` covers `sides`, `dash`,
 /// `cap` and `join`; `op:set_auto_layout` the `grid` direction and
-/// `align_content`; `op:set_layout_child` the grid cell fields). The blanket
-/// `design-ops/2` would also promise componentize, which this build does not
-/// implement.
+/// `align_content`; `op:set_layout_child` the grid cell fields).
 pub const DESIGN_OP_CAPABILITIES: &[&str] = &[
     "op:set_effects",
     "op:set_fill",
@@ -371,6 +369,7 @@ pub const DESIGN_OP_CAPABILITIES: &[&str] = &[
     "op:set_grid_layout",
     "op:set_auto_layout",
     "op:set_layout_child",
+    "op:componentize",
     "batch_get:detail",
 ];
 
@@ -695,6 +694,14 @@ pub enum DesignOp {
         cell_vertical: Option<CellAlignment>,
         #[serde(default)]
         auto_place: Option<bool>,
+    },
+    /// Turn look-alike layers into one component: the first id becomes the
+    /// master and every other one is replaced, in place, by an instance of it
+    /// that overrides whatever it changed (text, fills, hidden layers, …).
+    /// Copies must have the master's structure: the same kinds of layers in
+    /// the same order. Reports the `component` and the new `instances`.
+    Componentize {
+        ids: Vec<String>,
     },
     /// Create reusable variable foundations. Modes default to ["Default"]. Names must be unique.
     CreateVariableCollection {
@@ -1439,8 +1446,10 @@ mode use canvas operations; source file mutation is unavailable.
 - Name layers by role in Title Case: "Header", "Primary Button", "Card /
   Title". Never leave "Rectangle 12" behind in finished work.
 - Repeated elements are components: build one instance right, `create_component`
-  it, then `create_instance` the rest. Reference an existing component by its
-  id (or unique name) from `design_state` `components`.
+  it, then `create_instance` the rest. When the copies already exist,
+  `componentize` them (master id first): they become instances that keep
+  their own text and colors. Reference an existing component by its id (or
+  unique name) from `design_state` `components`.
 - Inspect `design_system` / `get_design_system` before inventing tokens or
   components. Collections own named modes; variables have typed values per
   mode. Create foundations with `create_variable_collection` and

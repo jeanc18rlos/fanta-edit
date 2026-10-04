@@ -2174,6 +2174,7 @@ fn design_operation_node(doc: &Doc, operation: &DesignOp) -> Option<NodeId> {
         | DesignOp::Group { ids, .. }
         | DesignOp::FrameSelection { ids, .. }
         | DesignOp::CombineVariants { ids, .. }
+        | DesignOp::Componentize { ids }
         | DesignOp::Select { ids } => ids.first(),
         DesignOp::CreateComponentProperty { component, .. } => {
             return resolve_component(doc, component)
@@ -3658,6 +3659,101 @@ fn apply_one(
             Ok(Applied::Content {
                 created: None,
                 detail: Some(json!({ "component": component.to_string() })),
+            })
+        }
+        DesignOp::Componentize { ids } => {
+            let ids = parse_content_ids(doc, ids)?;
+            let Some((&master, copies)) =
+                ids.split_first().filter(|(_, copies)| !copies.is_empty())
+            else {
+                bail!("componentize needs the master's id and at least one copy");
+            };
+            let related = |a: NodeId, b: NodeId| {
+                doc.scene.ancestors_of(a).any(|ancestor| ancestor.id == b)
+                    || doc.scene.ancestors_of(b).any(|ancestor| ancestor.id == a)
+            };
+            for (index, &copy) in copies.iter().enumerate() {
+                if related(master, copy)
+                    || copies[..index].iter().any(|&other| related(other, copy))
+                {
+                    bail!(
+                        "node {copy} is inside another of the ids; componentize layers side by side"
+                    );
+                }
+                if doc.components.defs.values().any(|def| def.root == copy) {
+                    bail!("node {copy} is already a component master");
+                }
+            }
+            // Check every copy before changing anything.
+            let plans = copies
+                .iter()
+                .map(|&copy| {
+                    Ok((
+                        copy,
+                        crate::componentize::overrides_for_copy(doc, master, copy)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let component = match doc.components.defs.values().find(|def| def.root == master) {
+                Some(def) if def.variant_of.is_some() => {
+                    bail!("node {master} is a variant; componentize a standalone layer")
+                }
+                Some(def) => def.id,
+                None => {
+                    let operations = create_component_operations(doc, master);
+                    let Some(Operation::DefineComponent { def }) = operations.first() else {
+                        bail!(
+                            "only frames and groups can become components, not a {} node",
+                            existing_node(doc, master)?.data.kind_tag()
+                        );
+                    };
+                    let component = def.id;
+                    for operation in operations {
+                        doc.apply(operation)?;
+                    }
+                    component
+                }
+            };
+
+            let mut instances = Vec::with_capacity(plans.len());
+            for (copy, overrides) in plans {
+                let original = existing_node(doc, copy)?.clone();
+                let size = master_size(doc, copy).unwrap_or([100.0, 100.0]);
+                let snapshot: Vec<CanvasNode> = doc
+                    .scene
+                    .descendants_of(copy)
+                    .filter_map(|descendant| doc.scene.get(descendant).cloned())
+                    .collect();
+                removed_nodes.extend(snapshot.iter().map(|node| node.id));
+                doc.apply(Operation::DeleteSubtree { snapshot })?;
+
+                let mut node = CanvasNode::new(NodeData::Instance(InstanceNode {
+                    component,
+                    overrides,
+                    prop_values: Default::default(),
+                    derived: Vec::new(),
+                    local_size: size,
+                }));
+                node.name = original.name;
+                node.parent = original.parent;
+                node.index = original.index;
+                node.transform = original.transform;
+                node.layout_child = original.layout_child;
+                node.constraints = original.constraints;
+                node.flags = original.flags;
+                instances.push(node.id.to_string());
+                doc.apply(Operation::CreateInstance {
+                    node: Box::new(node),
+                })
+                .context("replacing a copy with an instance")?;
+            }
+            Ok(Applied::Content {
+                created: None,
+                detail: Some(json!({
+                    "component": component.to_string(),
+                    "instances": instances,
+                })),
             })
         }
         DesignOp::CombineVariants { ids, name } => {
@@ -6070,6 +6166,147 @@ mod tests {
         assert_eq!((bounds.min_x, bounds.min_y), (60.0, 10.0));
         assert_eq!(doc.scene.children_of(Some(page_id)), &[rect, copy]);
         assert_eq!(doc.history.undo_depth(), 2);
+    }
+
+    #[test]
+    fn componentize_replaces_copies_with_instances_that_keep_their_differences() {
+        let (mut doc, page_id) = doc_with_page();
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "frame", "name": "Card",
+                 "x": 0.0, "y": 0.0, "width": 100.0, "height": 60.0},
+            ])),
+            "Frame",
+        );
+        let card = created_id(&outcome, 0);
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "text", "text": "Title", "parent": card.to_string(),
+                 "x": 8.0, "y": 8.0, "width": 80.0, "height": 20.0},
+                {"op": "create_node", "node_type": "rectangle", "parent": card.to_string(), "fill": "#00ff00",
+                 "x": 8.0, "y": 32.0, "width": 20.0, "height": 20.0},
+            ])),
+            "Contents",
+        );
+        assert_applied(&outcome);
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([{"op": "duplicate", "id": card.to_string(), "dx": 150.0, "dy": 0.0}])),
+            "Copy",
+        );
+        let copy = created_id(&outcome, 0);
+        let copy_children = doc.scene.children_of(Some(copy)).to_vec();
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "set_props", "id": copy_children[0].to_string(), "text": "Other"},
+                {"op": "set_props", "id": copy_children[1].to_string(), "fill": "#ff0000"},
+                {"op": "set_props", "id": copy.to_string(), "opacity": 0.5},
+            ])),
+            "Edit the copy",
+        );
+        assert_applied(&outcome);
+        let copy_node = doc.scene.get(copy).unwrap().clone();
+        let copy_index = doc
+            .scene
+            .children_of(Some(page_id))
+            .iter()
+            .position(|id| *id == copy);
+
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([{"op": "componentize", "ids": [card.to_string(), copy.to_string()]}])),
+            "Componentize",
+        );
+        assert_applied(&outcome);
+        let detail = &outcome.value["ops"][0];
+        let instance: NodeId = detail["instances"][0].as_str().unwrap().parse().unwrap();
+        assert!(!doc.scene.contains(copy));
+        assert!(
+            doc.components
+                .defs
+                .values()
+                .any(|def| def.root == card && def.id.to_string() == detail["component"])
+        );
+        let node = doc
+            .scene
+            .get(instance)
+            .expect("the instance replaced the copy");
+        assert_eq!(node.parent, copy_node.parent);
+        assert_eq!(node.transform, copy_node.transform);
+        assert_eq!(node.name, copy_node.name);
+        assert_eq!(
+            doc.scene
+                .children_of(Some(page_id))
+                .iter()
+                .position(|id| *id == instance),
+            copy_index,
+            "the instance keeps the copy's z-order"
+        );
+
+        let NodeData::Instance(data) = &node.data else {
+            panic!("expected an instance");
+        };
+        // Only what the copy changed: its text, its rectangle's fill, its
+        // root's opacity.
+        let overridden: Vec<_> = data
+            .overrides
+            .iter()
+            .map(|o| match &o.value {
+                fanta_doc::OverrideValue::Field { value } => format!("field {value}"),
+                fanta_doc::OverrideValue::Text { .. } => "text".to_owned(),
+                fanta_doc::OverrideValue::Fills { .. } => "fills".to_owned(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            overridden,
+            vec!["field {\"opacity\":0.5}", "text", "fills"],
+            "{:?}",
+            data.overrides
+        );
+        let expanded = fanta_doc::expand_instance(&doc.scene, &doc.components, data);
+        let text = expanded
+            .iter()
+            .find_map(|clone| match &clone.node.data {
+                NodeData::Text(text) => Some(text.content.clone()),
+                _ => None,
+            })
+            .expect("text clone");
+        assert_eq!(text, "Other");
+        let fill = expanded
+            .iter()
+            .find_map(|clone| match &clone.node.data {
+                NodeData::Vector(vector) => vector.fills.first().and_then(Fill::solid_color),
+                _ => None,
+            })
+            .expect("rectangle clone");
+        assert_eq!(fill.to_hex(), "#FF0000");
+        let root = expanded
+            .iter()
+            .find(|clone| clone.def_path.is_empty())
+            .unwrap();
+        assert_eq!(root.node.opacity.get(), 0.5);
+
+        // A copy whose structure differs is refused, and nothing changes.
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "frame", "name": "Odd",
+                 "x": 0.0, "y": 200.0, "width": 100.0, "height": 60.0},
+            ])),
+            "Odd frame",
+        );
+        let odd = created_id(&outcome, 0);
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([{"op": "componentize", "ids": [card.to_string(), odd.to_string()]}])),
+            "Mismatch",
+        );
+        assert_eq!(outcome.value["applied"], json!(false));
+        assert!(doc.scene.contains(odd));
     }
 
     #[test]

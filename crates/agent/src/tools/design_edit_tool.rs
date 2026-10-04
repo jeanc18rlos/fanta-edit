@@ -25,7 +25,8 @@ fn tool_content_err(e: impl std::fmt::Display) -> LanguageModelToolResultContent
 /// justify; `none` turns it off), `set_grid_layout` (columns/rows as px,
 /// `"1fr"` or `"auto"`, gaps; cells via `set_layout_child` column/row). Arrange: `rotate`, `align`, `distribute`,
 /// `set_index` (z-order), `reparent`. Structure: `group`, `frame_selection`,
-/// `ungroup`, `create_component`, `delete`. Editor: `select`, `set_viewport`.
+/// `ungroup`, `create_component`, `componentize` (the first id becomes the
+/// master, the rest become instances keeping their differences), `delete`. Editor: `select`, `set_viewport`.
 /// Design-system foundations: `create_variable_collection`, `add_variable_mode`,
 /// `create_variable`, `set_variable_value`, `set_variable_mode`, `bind_variable`,
 /// `unbind_variable`. Read `design_system` first for exact ids, modes, values,

@@ -468,6 +468,10 @@ tagged by `"op"`:
   the original; the copy's id is in `created`.
 - `create_component` — `id` of a frame or group: makes it a component master
   in place and reports the `component` id.
+- `componentize` — `ids` of look-alike layers: the first becomes the master
+  and the others are replaced in place by instances that override whatever
+  they changed (text, fills, hidden layers, other properties). Copies must have
+  the master's structure. Reports the `component` and the new `instances`.
 - `reparent` — `id`, optional `parent` (omit to move to the active page root)
   and optional `index` among the new siblings (0 = bottom; omit to append on
   top). The node keeps its world position.

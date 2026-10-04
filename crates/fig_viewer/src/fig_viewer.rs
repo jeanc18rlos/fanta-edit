@@ -13,6 +13,7 @@ mod comments;
 mod comments_panel;
 mod comments_ui;
 mod component_properties;
+mod componentize;
 mod design_panel;
 mod dev_history;
 mod document;
