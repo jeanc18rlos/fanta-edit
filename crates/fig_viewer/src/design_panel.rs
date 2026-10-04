@@ -3600,18 +3600,11 @@ impl FantaDesignPanel {
                 );
             }
             LayersPanelContextAction::GoToMainComponent => {
+                // An instance of a variant set lands on the variant it shows.
                 let master = self.active_view(cx).and_then(|view| {
                     let item = view.read(cx).item().read(cx);
                     let document = item.document()?;
-                    let NodeData::Instance(instance) = &document.doc.scene.get(id)?.data else {
-                        return None;
-                    };
-                    document
-                        .doc
-                        .components
-                        .defs
-                        .get(&instance.component)
-                        .map(|def| def.root)
+                    crate::component_actions::main_component_root(&document.doc, id)
                 });
                 if let Some(master) = master {
                     self.focus_component(master, cx);

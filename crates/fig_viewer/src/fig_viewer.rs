@@ -12,6 +12,7 @@ mod color_picker;
 mod comments;
 mod comments_panel;
 mod comments_ui;
+mod component_actions;
 mod component_properties;
 mod componentize;
 mod design_panel;
@@ -56,6 +57,7 @@ mod variant_sets;
 #[cfg(target_os = "macos")]
 mod video_playback;
 mod view;
+mod view_context_menu;
 mod view_text;
 mod workspace_hooks;
 

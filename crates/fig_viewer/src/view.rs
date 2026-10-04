@@ -459,7 +459,8 @@ pub struct FigView {
     /// a release delivered through the canvas's window-level mouse listener,
     /// which has no `Window`, so the session is opened on the next render.
     pending_text_edit: Option<NodeId>,
-    prototype_player: Option<PrototypePlayerState>,
+    pub(crate) prototype_player: Option<PrototypePlayerState>,
+    pub(crate) canvas_context_menu: Option<crate::view_context_menu::CanvasContextMenu>,
     prototype_saved_viewport: Option<Viewport>,
     prototype_tick_task: Option<Task<()>>,
     prototype_last_tick: Option<std::time::Instant>,
@@ -828,6 +829,7 @@ impl FigView {
             text_edit: None,
             pending_text_edit: None,
             prototype_player: None,
+            canvas_context_menu: None,
             prototype_saved_viewport: None,
             prototype_tick_task: None,
             prototype_last_tick: None,
@@ -8101,6 +8103,12 @@ impl Render for FigView {
                                                             MouseButton::Middle,
                                                             cx.listener(Self::handle_mouse_down),
                                                         )
+                                                        .on_mouse_down(
+                                                            MouseButton::Right,
+                                                            cx.listener(
+                                                                Self::deploy_canvas_context_menu,
+                                                            ),
+                                                        )
                                                         .on_mouse_up(
                                                             MouseButton::Left,
                                                             cx.listener(Self::handle_mouse_up),
@@ -8137,6 +8145,11 @@ impl Render for FigView {
                                                                 self.render_agent_presence(cx)
                                                             {
                                                                 c.push(activity);
+                                                            }
+                                                            if let Some(menu) =
+                                                                self.render_canvas_context_menu()
+                                                            {
+                                                                c.push(menu);
                                                             }
                                                             // A loading or
                                                             // failed document
@@ -9099,6 +9112,7 @@ impl Item for FigView {
                 text_edit: None,
                 pending_text_edit: None,
                 prototype_player: None,
+                canvas_context_menu: None,
                 prototype_saved_viewport: None,
                 prototype_tick_task: None,
                 prototype_last_tick: None,
@@ -12112,6 +12126,120 @@ mod tests {
             let pasted = doc.selection.as_slice()[0];
             assert_ne!(pasted, frame_id);
             assert_eq!(doc.scene.children_of(Some(pasted)).len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn right_click_menu_creates_an_instance_and_goes_back_to_its_main_component(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = Doc::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page)).expect("page");
+        doc.add_page(page_id);
+        doc.set_active_page(Some(page_id));
+        let mut master = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([100.0, 40.0]),
+            ..Default::default()
+        }));
+        master.name = "Badge".into();
+        master.parent = Some(page_id);
+        master.transform = Transform2D::translation(-50.0, -20.0);
+        let master_id = master.id;
+        doc.apply(Operation::create_node(master)).expect("master");
+        let component = fanta_doc::ComponentId::new();
+        doc.apply(Operation::DefineComponent {
+            def: Box::new(fanta_doc::ComponentDef::new(component, master_id, "Badge")),
+        })
+        .expect("component");
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/ContextMenu.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("create fig view");
+        view.update(cx, |view, _| {
+            view.set_container_bounds(Bounds {
+                origin: point(px(0.0), px(0.0)),
+                size: size(px(800.0), px(600.0)),
+            });
+            view.set_viewport_silent(Viewport::default());
+        });
+        let right_click = |position: Point<Pixels>, cx: &mut TestAppContext| {
+            scratch
+                .update(cx, |_, window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.deploy_canvas_context_menu(
+                            &MouseDownEvent {
+                                button: MouseButton::Right,
+                                position,
+                                modifiers: gpui::Modifiers::default(),
+                                click_count: 1,
+                                first_mouse: false,
+                            },
+                            window,
+                            cx,
+                        );
+                    });
+                })
+                .expect("right click");
+        };
+
+        // A right-click on the main component selects it and opens the menu.
+        right_click(point(px(400.0), px(300.0)), cx);
+        view.read_with(cx, |view, _| assert!(view.canvas_context_menu.is_some()));
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.doc().unwrap().selection.as_slice(), &[master_id]);
+        });
+
+        // Create instance: placed beside the main component, and selected.
+        scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.create_instance_of(master_id, window, cx)
+                });
+            })
+            .expect("create instance");
+        let instance = item.read_with(cx, |item, _| {
+            let doc = item.doc().unwrap();
+            let instance = doc.selection.as_slice()[0];
+            assert!(matches!(
+                &doc.scene.get(instance).unwrap().data,
+                NodeData::Instance(instance) if instance.component == component
+            ));
+            assert_eq!(doc.scene.world_bounds(instance).unwrap().min_x, 90.0);
+            instance
+        });
+
+        // Right-click the instance, then Go to main component.
+        right_click(point(px(520.0), px(300.0)), cx);
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.doc().unwrap().selection.as_slice(), &[instance]);
+        });
+        scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    view.go_to_main_component(instance, window, cx)
+                });
+            })
+            .expect("go to main");
+        item.read_with(cx, |item, _| {
+            assert_eq!(item.doc().unwrap().selection.as_slice(), &[master_id]);
+        });
+
+        // On empty canvas the selection clears.
+        right_click(point(px(20.0), px(20.0)), cx);
+        item.read_with(cx, |item, _| {
+            assert!(item.doc().unwrap().selection.is_empty())
         });
     }
 

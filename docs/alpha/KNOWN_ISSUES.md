@@ -141,6 +141,17 @@ actually driven. Nothing here claims more than that record supports.
   boundary. Without a working agent configuration (see Agents) you get a draft
   you cannot send anywhere. Source reading — no toolbar button has been clicked
   in a build of this tree.
+- **The canvas context menu is new and has only been exercised by tests.**
+  Right-click (two-finger click) on the canvas selects what a click would and
+  opens a menu (`view_context_menu.rs`): Copy, Cut, Paste, Duplicate, Delete;
+  *Create instance* on a main component or a component set's frame (placed
+  beside it, or beside the set's frame for a variant);
+  *Go to main component*, *Detach instance* and *Reset all overrides* on an
+  instance; *Create component* on a frame; grouping and z-order. An instance's
+  Variant / State choices now show in the Properties panel's component
+  section, and picking one swaps the variant. *Go to main component* switches
+  page when the main component lives on another one. Covered by view, panel
+  and unit tests; it has not been clicked in a running build.
 - **Group, Frame selection and Ungroup now exist, and nobody has pressed the
   keys yet.** `cmd-g`, `cmd-alt-g` and `cmd-shift-g` are bound to
   `fig_viewer::GroupSelection` / `FrameSelection` / `UngroupSelection` in both
