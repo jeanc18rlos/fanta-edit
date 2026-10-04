@@ -152,11 +152,13 @@ pub(crate) fn design_blend_mode(mode: BlendMode) -> DesignBlendMode {
         BlendMode::Saturation => DesignBlendMode::Saturation,
         BlendMode::Color => DesignBlendMode::Color,
         BlendMode::Luminosity => DesignBlendMode::Luminosity,
+        BlendMode::LinearBurn => DesignBlendMode::LinearBurn,
+        BlendMode::LinearDodge => DesignBlendMode::LinearDodge,
     }
 }
 
-/// Panel → engine blend mode. Partial: the engine has no Pass through (it is
-/// modeled from `NodeFlags::ISOLATED_BLEND`) and no Linear burn/dodge.
+/// Panel → engine blend mode. Partial only for Pass through, which the engine
+/// models from `NodeFlags::ISOLATED_BLEND` instead of a blend mode.
 pub(crate) fn engine_blend_mode(mode: DesignBlendMode) -> Option<BlendMode> {
     Some(match mode {
         DesignBlendMode::Normal => BlendMode::Normal,
@@ -175,11 +177,9 @@ pub(crate) fn engine_blend_mode(mode: DesignBlendMode) -> Option<BlendMode> {
         DesignBlendMode::Saturation => BlendMode::Saturation,
         DesignBlendMode::Color => BlendMode::Color,
         DesignBlendMode::Luminosity => BlendMode::Luminosity,
-        DesignBlendMode::PassThrough
-        | DesignBlendMode::LinearBurn
-        | DesignBlendMode::LinearDodge => {
-            return None;
-        }
+        DesignBlendMode::LinearBurn => BlendMode::LinearBurn,
+        DesignBlendMode::LinearDodge => BlendMode::LinearDodge,
+        DesignBlendMode::PassThrough => return None,
     })
 }
 
@@ -2229,16 +2229,7 @@ impl DesignAdapter {
                 DesignEffectStyleViewData::default().with_enabled(false),
                 cx,
             );
-            let supported_blend_modes: Vec<_> = DesignBlendMode::ALL
-                .into_iter()
-                .filter(|mode| {
-                    !matches!(
-                        mode,
-                        DesignBlendMode::LinearBurn | DesignBlendMode::LinearDodge
-                    )
-                })
-                .collect();
-            panel.set_supported_blend_modes(&supported_blend_modes, cx);
+            panel.set_supported_blend_modes(&DesignBlendMode::ALL, cx);
         });
         let subscription = cx.subscribe_in(&panel, window, FigView::handle_design_action);
         Self {

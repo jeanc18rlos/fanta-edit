@@ -387,7 +387,7 @@ pub(crate) const BLUR_KINDS: [(BlurKind, &str); 2] = [
     (BlurKind::Background, "Background blur"),
 ];
 
-pub(crate) const BLEND_MODES: [(BlendMode, &str); 16] = [
+pub(crate) const BLEND_MODES: [(BlendMode, &str); 18] = [
     (BlendMode::Normal, "Normal"),
     (BlendMode::Multiply, "Multiply"),
     (BlendMode::Screen, "Screen"),
@@ -395,7 +395,9 @@ pub(crate) const BLEND_MODES: [(BlendMode, &str); 16] = [
     (BlendMode::Darken, "Darken"),
     (BlendMode::Lighten, "Lighten"),
     (BlendMode::ColorDodge, "Color Dodge"),
+    (BlendMode::LinearDodge, "Linear Dodge"),
     (BlendMode::ColorBurn, "Color Burn"),
+    (BlendMode::LinearBurn, "Linear Burn"),
     (BlendMode::HardLight, "Hard Light"),
     (BlendMode::SoftLight, "Soft Light"),
     (BlendMode::Difference, "Difference"),

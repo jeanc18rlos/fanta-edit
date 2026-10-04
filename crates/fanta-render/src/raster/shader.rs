@@ -308,7 +308,7 @@ pub(crate) fn shader_paint(
     paint.set_shader(skia_shader);
     paint.set_alpha_f((opacity * paint_alpha).clamp(0.0, 1.0));
     if !blend.is_normal() {
-        paint.set_blend_mode(crate::paint::to_sk_blend_mode(blend));
+        crate::paint::apply_blend_mode(&mut paint, blend);
     }
     Some(paint)
 }

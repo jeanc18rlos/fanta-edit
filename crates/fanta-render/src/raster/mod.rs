@@ -172,7 +172,7 @@ pub(crate) use crate::asset::AssetResolver;
 pub(crate) use crate::color::to_sk_color;
 pub(crate) use crate::image::{ImageCache, ImageFillMods, draw_image_cached};
 pub(crate) use crate::paint::{
-    fill_to_paint, scale_paint_alpha, stroke_to_paint, to_sk_blend_mode,
+    apply_blend_mode, fill_to_paint, scale_paint_alpha, stroke_to_paint,
 };
 pub(crate) use crate::path::{to_sk_fill_path, to_sk_path};
 pub(crate) use crate::transform::to_sk_matrix;

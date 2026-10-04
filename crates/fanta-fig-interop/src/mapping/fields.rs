@@ -1124,6 +1124,8 @@ pub(crate) fn blend_mode(member: &str) -> Option<BlendMode> {
         "SATURATION" => BlendMode::Saturation,
         "COLOR" => BlendMode::Color,
         "LUMINOSITY" => BlendMode::Luminosity,
+        "LINEAR_BURN" => BlendMode::LinearBurn,
+        "LINEAR_DODGE" => BlendMode::LinearDodge,
         _ => return None,
     })
 }
@@ -1152,4 +1154,17 @@ pub(crate) fn read_color_with_opacity(color: &KiwiValue, opacity: f64) -> Option
         to_u8(b),
         to_u8(a * opacity.clamp(0.0, 1.0)),
     ))
+}
+
+#[cfg(test)]
+mod blend_mode_tests {
+    use super::*;
+
+    #[test]
+    fn figma_linear_blends_import_as_linear_blends() {
+        assert_eq!(blend_mode("LINEAR_BURN"), Some(BlendMode::LinearBurn));
+        assert_eq!(blend_mode("LINEAR_DODGE"), Some(BlendMode::LinearDodge));
+        assert_eq!(blend_mode("PASS_THROUGH"), Some(BlendMode::Normal));
+        assert_eq!(blend_mode("SOMETHING_NEW"), None);
+    }
 }

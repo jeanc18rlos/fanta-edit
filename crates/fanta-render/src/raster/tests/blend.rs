@@ -91,3 +91,59 @@ fn multiply_solid_fill_darkens_the_backdrop() {
          (multiply {multiply:?} vs normal {normal:?})"
     );
 }
+
+#[test]
+fn linear_burn_and_dodge_add_the_channels() {
+    // Bottom orange (200, 100, 50), top light blue (100, 200, 255).
+    // Linear Burn: max(0, s + d - 255) = (45, 45, 50).
+    let burn = overlap_pixel(BlendMode::LinearBurn);
+    for (channel, expected) in [(0, 45), (1, 45), (2, 50)] {
+        assert!(
+            (i32::from(burn[channel]) - expected).abs() <= 2,
+            "Linear Burn channel {channel}: expected ≈{expected}, got {burn:?}"
+        );
+    }
+    assert_eq!(burn[3], 255);
+    // Linear Dodge: min(255, s + d) saturates every channel here.
+    let dodge = overlap_pixel(BlendMode::LinearDodge);
+    assert!(dodge[..3].iter().all(|&value| value >= 253), "{dodge:?}");
+}
+
+#[test]
+fn linear_burn_composites_a_translucent_source_by_its_alpha() {
+    const N: u32 = 64;
+    let mut doc = Doc::new();
+    doc.apply(Operation::create_node(solid_rect(
+        -32.0,
+        -32.0,
+        64.0,
+        64.0,
+        Color::rgb(200, 100, 50),
+        BlendMode::Normal,
+        IndexKey::FIRST,
+    )))
+    .unwrap();
+    doc.apply(Operation::create_node(solid_rect(
+        -16.0,
+        -16.0,
+        32.0,
+        32.0,
+        Color::rgba(100, 200, 255, 128),
+        BlendMode::LinearBurn,
+        IndexKey::after(IndexKey::FIRST),
+    )))
+    .unwrap();
+    let mut r = RasterRenderer::new(N, N).unwrap();
+    r.render(&doc.scene, &doc.viewport);
+    let pixel = rgba_at(&r.copy_rgba(), N, N / 2, N / 2);
+    // W3C separable compositing over an opaque backdrop: co = d·(1 - as) + as·B
+    // with B = (45, 45, 50) and as ≈ 0.5, so ≈ (122, 72, 50), still opaque. A
+    // plain `src + dst - 1` blend would also burn the alpha.
+    for (channel, expected) in [(0, 122), (1, 72), (2, 50)] {
+        assert!(
+            (i32::from(pixel[channel]) - expected).abs() <= 3,
+            "channel {channel}: expected ≈{expected}, got {pixel:?}"
+        );
+    }
+    assert_eq!(pixel[3], 255);
+}
