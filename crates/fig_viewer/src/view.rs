@@ -58,7 +58,7 @@ use crate::canvas::{
 };
 use crate::clipboard::{
     CanvasClipboard, ClipboardPlacement, apply_transaction as apply_canvas_transaction,
-    create_operations, delete_operations,
+    clone_component_operations, create_operations, delete_operations,
 };
 use crate::code_workspace::FantaCodeWorkspace;
 use crate::comments::MotionCommentAnchor;
@@ -4976,12 +4976,20 @@ impl FigView {
         }
         let result = self.item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
-                let pasted = match payload.instantiate(&document.doc, offset, placement) {
+                let mut pasted = match payload.instantiate(&document.doc, offset, placement) {
                     Ok(pasted) => pasted,
                     Err(error) => return (Err(error), DocChange::None),
                 };
-                match apply_canvas_transaction(&mut document.doc, label, create_operations(&pasted))
-                {
+                let operations = match placement {
+                    ClipboardPlacement::Paste => create_operations(&pasted),
+                    ClipboardPlacement::Duplicate => {
+                        match clone_component_operations(&document.doc, payload, &mut pasted) {
+                            Ok(operations) => operations,
+                            Err(error) => return (Err(error), DocChange::None),
+                        }
+                    }
+                };
+                match apply_canvas_transaction(&mut document.doc, label, operations) {
                     Ok(true) => {
                         document.doc.selection.replace_with(pasted.roots);
                         (Ok(true), DocChange::Content)
@@ -12582,6 +12590,275 @@ mod tests {
             assert_ne!(pasted, frame_id);
             assert_eq!(doc.scene.children_of(Some(pasted)).len(), 1);
         });
+    }
+
+    #[gpui::test]
+    async fn mounted_duplicate_action_preserves_components_while_paste_retains_references(
+        cx: &mut TestAppContext,
+    ) {
+        use fanta_doc::{
+            Action, ComponentDef, ComponentId, ComponentSet, ComponentSetMembership, InstanceNode,
+            Reaction, ReactionId, Trigger, VariantAxis,
+        };
+
+        init_visual_test(cx);
+        cx.update(|cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new("cmd-d", DuplicateSelection, Some("FigViewer")),
+                gpui::KeyBinding::new("cmd-c", CopySelection, Some("FigViewer")),
+                gpui::KeyBinding::new("cmd-v", PasteSelection, Some("FigViewer")),
+            ]);
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let page = doc.active_page().expect("active page");
+        let mut section = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([400.0, 200.0]),
+            ..Default::default()
+        }));
+        section.parent = Some(page);
+        section.transform = Transform2D::translation(-200.0, -100.0);
+        let section_id = section.id;
+        doc.apply(Operation::create_node(section)).expect("section");
+        let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([140.0, 60.0]),
+            ..Default::default()
+        }));
+        frame.parent = Some(section_id);
+        frame.name = "Variant set frame".into();
+        let frame_id = frame.id;
+        doc.apply(Operation::create_node(frame)).expect("set frame");
+        let set = ComponentId::new();
+        let member = ComponentId::new();
+        let hover = ComponentId::new();
+        let external = ComponentId::new();
+        for (component, state, parent, x) in [
+            (member, "Default", frame_id, 0.0),
+            (hover, "Hover", frame_id, 70.0),
+            (external, "External", page, 300.0),
+        ] {
+            let mut master = CanvasNode::new(NodeData::Group(GroupNode {
+                clip_size: Some([50.0, 30.0]),
+                ..Default::default()
+            }));
+            master.parent = Some(parent);
+            master.index = doc.scene.next_child_index(Some(parent));
+            master.name = format!("State={state}");
+            master.transform = Transform2D::translation(x, 0.0);
+            let root = master.id;
+            doc.apply(Operation::create_node(master)).expect("master");
+            let mut definition = ComponentDef::new(component, root, state);
+            if component != external {
+                definition.variant_of = Some(ComponentSetMembership {
+                    set,
+                    axis_values: [("State".into(), state.into())].into_iter().collect(),
+                });
+            }
+            doc.apply(Operation::DefineComponent {
+                def: Box::new(definition),
+            })
+            .expect("component definition");
+        }
+        doc.apply(Operation::DefineComponentSet {
+            set: Box::new(ComponentSet {
+                id: set,
+                name: "Button".into(),
+                axes: vec![VariantAxis {
+                    name: "State".into(),
+                    values: vec!["Default".into(), "Hover".into()],
+                }],
+                members: vec![member, hover],
+                default_variant: member,
+                root: Some(frame_id),
+            }),
+        })
+        .expect("component set");
+        for (name, component, x) in [
+            ("Set placement", set, 0.0),
+            ("Member placement", member, 70.0),
+            ("External placement", external, 140.0),
+        ] {
+            let mut instance = CanvasNode::new(NodeData::Instance(InstanceNode {
+                component,
+                overrides: Vec::new(),
+                prop_values: Default::default(),
+                derived: Vec::new(),
+                local_size: [50.0, 30.0],
+            }));
+            instance.parent = Some(section_id);
+            instance.index = doc.scene.next_child_index(Some(section_id));
+            instance.name = name.into();
+            instance.transform = Transform2D::translation(x, 100.0);
+            instance.reactions.push(Reaction {
+                id: ReactionId::new(),
+                trigger: Trigger::Click,
+                action: Action::UpdateVariant {
+                    component: set,
+                    variant: "Hover".into(),
+                },
+                extra_actions: vec![
+                    Action::UpdateVariant {
+                        component: member,
+                        variant: "Default".into(),
+                    },
+                    Action::UpdateVariant {
+                        component: external,
+                        variant: "External".into(),
+                    },
+                    Action::OpenLink {
+                        url: "https://example.com/unchanged".into(),
+                    },
+                ],
+                transition: None,
+                animation: None,
+            });
+            doc.apply(Operation::create_node(instance))
+                .expect("instance");
+        }
+        doc.selection.select_only(section_id);
+        doc.history = Default::default();
+        let content = |doc: &Doc| {
+            let mut snapshot = doc.clone();
+            snapshot.history = Default::default();
+            snapshot.selection.clear();
+            // Undo/Redo record the current edit time instead of rewinding it.
+            snapshot.metadata.modified_at = 0;
+            serde_json::to_value(snapshot).expect("document content")
+        };
+
+        for duplicate in [true, false] {
+            let (item, view, mut visual) =
+                mounted_canvas_interaction_fixture(&project, doc.clone(), BTreeMap::new(), cx);
+            visual.update(|window, cx| {
+                view.update(cx, |view, cx| view.focus_handle.focus(window, cx));
+                window.draw(cx).clear();
+            });
+            let before = item.read_with(&visual, |item, _| item.doc().expect("document").clone());
+            if duplicate {
+                visual.simulate_keystrokes("cmd-d");
+            } else {
+                visual.simulate_keystrokes("cmd-c cmd-v");
+            }
+            visual.run_until_parked();
+            visual.update(|window, cx| window.draw(cx).clear());
+            let after = item.read_with(&visual, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(doc.history.undo_depth(), 1);
+                assert_eq!(doc.selection.len(), 1);
+                let copy = *doc.selection.as_slice().first().expect("selected copy");
+                assert_ne!(copy, section_id);
+                let copied_nodes = doc
+                    .scene
+                    .descendants_of(copy)
+                    .map(|id| doc.scene.get(id).expect("copied node"))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    copied_nodes.len(),
+                    before.scene.descendants_of(section_id).count()
+                );
+                assert_eq!(doc.components.defs.len(), if duplicate { 5 } else { 3 });
+                assert_eq!(doc.components.sets.len(), if duplicate { 2 } else { 1 });
+                let (expected_set, expected_member) = if duplicate {
+                    let copied_set = doc
+                        .components
+                        .sets
+                        .values()
+                        .find(|candidate| candidate.id != set)
+                        .expect("Cmd-D keeps copied masters registered as a new set");
+                    let copied_frame = copied_set.root.expect("copied set frame");
+                    assert!(copied_nodes.iter().any(|node| node.id == copied_frame));
+                    for component in &copied_set.members {
+                        let definition = doc.components.def(*component).expect("copied definition");
+                        assert!(copied_nodes.iter().any(|node| node.id == definition.root));
+                        assert_eq!(
+                            definition.variant_of.as_ref().expect("membership").set,
+                            copied_set.id
+                        );
+                    }
+                    (copied_set.id, copied_set.default_variant)
+                } else {
+                    assert_eq!(
+                        doc.components, before.components,
+                        "ordinary Paste retains definitions"
+                    );
+                    (set, member)
+                };
+                for original_id in before.scene.descendants_of(page) {
+                    assert_eq!(
+                        doc.scene.get(original_id),
+                        before.scene.get(original_id),
+                        "source nodes stay unchanged"
+                    );
+                }
+                assert_eq!(
+                    doc.components.def(external),
+                    before.components.def(external)
+                );
+                for node in copied_nodes {
+                    let NodeData::Instance(instance) = &node.data else {
+                        continue;
+                    };
+                    let expected_component = match node.name.as_str() {
+                        "Set placement" => expected_set,
+                        "Member placement" => expected_member,
+                        "External placement" => external,
+                        name => panic!("unexpected fixture instance: {name}"),
+                    };
+                    assert_eq!(instance.component, expected_component, "{}", node.name);
+                    let original = before
+                        .scene
+                        .descendants_of(section_id)
+                        .filter_map(|id| before.scene.get(id))
+                        .find(|original| original.name == node.name)
+                        .expect("source instance");
+                    let mut expected = original.reactions.first().expect("source reaction").clone();
+                    expected.action = Action::UpdateVariant {
+                        component: expected_set,
+                        variant: "Hover".into(),
+                    };
+                    *expected
+                        .extra_actions
+                        .first_mut()
+                        .expect("secondary variant action") = Action::UpdateVariant {
+                        component: expected_member,
+                        variant: "Default".into(),
+                    };
+                    assert_eq!(
+                        node.reactions,
+                        vec![expected],
+                        "action order and external targets stay intact"
+                    );
+                }
+                content(doc)
+            });
+            visual.simulate_keystrokes("cmd-z");
+            visual.run_until_parked();
+            item.read_with(&visual, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(
+                    content(doc),
+                    content(&before),
+                    "Undo restores exact document content"
+                );
+                assert_eq!(doc.history.undo_depth(), 0);
+                assert!(
+                    doc.selection.is_empty(),
+                    "Undo prunes the removed copy from selection"
+                );
+            });
+            visual.simulate_keystrokes("cmd-shift-z");
+            visual.run_until_parked();
+            item.read_with(&visual, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(
+                    content(doc),
+                    after,
+                    "Redo restores the exact copies and definition IDs"
+                );
+                assert_eq!(doc.history.undo_depth(), 1);
+                assert!(doc.selection.is_empty());
+            });
+        }
     }
 
     #[gpui::test]
