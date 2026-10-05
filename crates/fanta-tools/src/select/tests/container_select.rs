@@ -240,3 +240,192 @@ fn dragging_a_covered_frame_moves_the_whole_frame() {
         child_min_before + 50.0
     );
 }
+
+#[test]
+fn rapid_clicks_drill_once_per_pair_and_do_not_enter_leaf_nodes() {
+    let mut doc = Doc::new();
+    let page = active_page(&mut doc);
+    let outer = frame_surface(&mut doc, Some(page), 0.0, 0.0, 200.0, 200.0);
+    let inner = frame_surface(&mut doc, Some(outer), 50.0, 50.0, 100.0, 100.0);
+    let leaf = covering_rect(&mut doc, inner, 100.0, 100.0);
+    let history_depth = doc.history.undo_depth();
+    let mut viewport = Viewport::default();
+    let at = screen_for_world(DVec2::new(100.0, 100.0), &viewport, SIZE);
+    let mut context = ToolContext::new(&mut doc, &mut viewport, SnapEngine::default(), SIZE);
+    let mut tool = SelectTool::new();
+
+    for (count, selected, scope) in [
+        (1, outer, None),
+        (2, inner, Some(outer)),
+        (3, inner, Some(outer)),
+        (4, leaf, Some(inner)),
+        (5, leaf, Some(inner)),
+        (6, leaf, Some(inner)),
+    ] {
+        tool.handle_event(
+            &mut context,
+            ToolEvent::Pointer(PointerEvent::Press {
+                screen: at,
+                button: Button::Primary,
+                modifiers: ModifierKeys::empty(),
+                count,
+            }),
+        );
+        tool.handle_event(&mut context, pe_release(at, ModifierKeys::empty()));
+        assert_eq!(
+            context.doc.selection.as_slice(),
+            &[selected],
+            "click {count}"
+        );
+        assert_eq!(tool.entered_scope(), scope, "click {count}");
+        assert_eq!(context.doc.history.undo_depth(), history_depth);
+    }
+}
+
+#[test]
+fn extending_double_click_toggles_the_container_without_drilling() {
+    let mut doc = Doc::new();
+    let page = active_page(&mut doc);
+    let frame = frame_surface(&mut doc, Some(page), 0.0, 0.0, 200.0, 200.0);
+    covering_rect(&mut doc, frame, 200.0, 200.0);
+    doc.selection.select_only(frame);
+    let mut viewport = Viewport::default();
+    let at = screen_for_world(DVec2::new(100.0, 100.0), &viewport, SIZE);
+    let mut context = ToolContext::new(&mut doc, &mut viewport, SnapEngine::default(), SIZE);
+    let mut tool = SelectTool::new();
+
+    tool.handle_event(&mut context, pe_double_press(at, ModifierKeys::SHIFT));
+    tool.handle_event(&mut context, pe_release(at, ModifierKeys::SHIFT));
+    assert!(context.doc.selection.is_empty());
+    assert_eq!(tool.entered_scope(), None);
+}
+
+#[test]
+fn double_click_at_container_resize_handle_still_drills_into_child() {
+    let mut doc = Doc::new();
+    let page = active_page(&mut doc);
+    let frame = frame_surface(&mut doc, Some(page), 0.0, 0.0, 200.0, 200.0);
+    let child = covering_rect(&mut doc, frame, 200.0, 200.0);
+    doc.selection.select_only(frame);
+    let mut viewport = Viewport::default();
+    let at = screen_for_world(DVec2::new(1.0, 1.0), &viewport, SIZE);
+    let mut context = ToolContext::new(&mut doc, &mut viewport, SnapEngine::default(), SIZE);
+    let mut tool = SelectTool::new();
+
+    tool.handle_event(&mut context, pe_double_press(at, ModifierKeys::empty()));
+    tool.handle_event(&mut context, pe_release(at, ModifierKeys::empty()));
+    assert_eq!(context.doc.selection.as_slice(), &[child]);
+    assert_eq!(tool.entered_scope(), Some(frame));
+}
+
+#[test]
+fn boolean_operands_are_atomic_until_the_container_is_entered() {
+    let mut doc = Doc::new();
+    let page = active_page(&mut doc);
+    let container = frame_surface(&mut doc, Some(page), 0.0, 0.0, 200.0, 200.0);
+    doc.scene.get_mut(container).expect("container").data =
+        NodeData::Boolean(fanta_doc::BooleanNode::default());
+    let leaf = covering_rect(&mut doc, container, 200.0, 200.0);
+    let mut viewport = Viewport::default();
+    let at = screen_for_world(DVec2::new(100.0, 100.0), &viewport, SIZE);
+    let mut context = ToolContext::new(&mut doc, &mut viewport, SnapEngine::default(), SIZE);
+    assert_eq!(
+        context.hit_test(DVec2::new(100.0, 100.0), fanta_canvas::HitPrecision::Path),
+        Some(container)
+    );
+    let history_depth = context.doc.history.undo_depth();
+    let mut tool = SelectTool::new();
+    tool.handle_event(&mut context, pe_press(at, ModifierKeys::empty()));
+    tool.handle_event(&mut context, pe_release(at, ModifierKeys::empty()));
+    assert_eq!(context.doc.selection.as_slice(), &[container]);
+    tool.handle_event(&mut context, pe_double_press(at, ModifierKeys::empty()));
+    tool.handle_event(&mut context, pe_release(at, ModifierKeys::empty()));
+    assert_eq!(context.doc.selection.as_slice(), &[leaf]);
+    assert_eq!(tool.entered_scope(), Some(container));
+    tool.handle_event(&mut context, pe_press(at, ModifierKeys::empty()));
+    tool.handle_event(&mut context, pe_release(at, ModifierKeys::empty()));
+    assert_eq!(context.doc.selection.as_slice(), &[leaf]);
+    assert_eq!(context.doc.history.undo_depth(), history_depth);
+    assert_eq!(
+        context.hit_test(DVec2::new(100.0, 100.0), fanta_canvas::HitPrecision::Path),
+        Some(container)
+    );
+}
+
+#[test]
+fn nested_booleans_require_a_separate_double_click_per_container() {
+    let mut doc = Doc::new();
+    let page = active_page(&mut doc);
+    let outer = frame_surface(&mut doc, Some(page), 0.0, 0.0, 200.0, 200.0);
+    let inner = frame_surface(&mut doc, Some(outer), 20.0, 20.0, 160.0, 160.0);
+    for container in [outer, inner] {
+        doc.scene.get_mut(container).expect("container").data =
+            NodeData::Boolean(fanta_doc::BooleanNode::default());
+    }
+    let leaf = covering_rect(&mut doc, inner, 160.0, 160.0);
+    let mut viewport = Viewport::default();
+    let at = screen_for_world(DVec2::new(100.0, 100.0), &viewport, SIZE);
+    let mut context = ToolContext::new(&mut doc, &mut viewport, SnapEngine::default(), SIZE);
+    let mut tool = SelectTool::new();
+    for (count, selected, scope) in [
+        (1, outer, None),
+        (2, inner, Some(outer)),
+        (3, inner, Some(outer)),
+        (4, leaf, Some(inner)),
+        (5, leaf, Some(inner)),
+    ] {
+        tool.handle_event(
+            &mut context,
+            ToolEvent::Pointer(PointerEvent::Press {
+                screen: at,
+                button: Button::Primary,
+                modifiers: ModifierKeys::empty(),
+                count,
+            }),
+        );
+        tool.handle_event(&mut context, pe_release(at, ModifierKeys::empty()));
+        assert_eq!(
+            context.doc.selection.as_slice(),
+            &[selected],
+            "click {count}"
+        );
+        assert_eq!(tool.entered_scope(), scope, "click {count}");
+    }
+}
+
+#[test]
+fn boolean_focus_scope_selects_operands_but_keeps_locked_operands_protected() {
+    let mut doc = Doc::new();
+    let page = active_page(&mut doc);
+    let container = frame_surface(&mut doc, Some(page), 0.0, 0.0, 200.0, 200.0);
+    doc.scene.get_mut(container).expect("container").data =
+        NodeData::Boolean(fanta_doc::BooleanNode::default());
+    let leaf = covering_rect(&mut doc, container, 200.0, 200.0);
+    let mut viewport = Viewport::default();
+    let at = screen_for_world(DVec2::new(100.0, 100.0), &viewport, SIZE);
+    let mut context = ToolContext::new(&mut doc, &mut viewport, SnapEngine::default(), SIZE)
+        .with_scope_root(Some(container));
+    assert_eq!(
+        fanta_canvas::hit_test(
+            &context.doc.scene,
+            DVec2::new(100.0, 100.0),
+            fanta_canvas::HitPrecision::Path,
+            Some(container)
+        ),
+        Some(leaf),
+    );
+    let mut tool = SelectTool::new();
+    tool.handle_event(&mut context, pe_press(at, ModifierKeys::empty()));
+    tool.handle_event(&mut context, pe_release(at, ModifierKeys::empty()));
+    assert_eq!(context.doc.selection.as_slice(), &[leaf]);
+    context
+        .doc
+        .scene
+        .get_mut(leaf)
+        .expect("operand")
+        .flags
+        .insert(fanta_doc::NodeFlags::LOCKED);
+    tool.handle_event(&mut context, pe_double_press(at, ModifierKeys::empty()));
+    tool.handle_event(&mut context, pe_release(at, ModifierKeys::empty()));
+    assert_ne!(context.doc.selection.as_slice(), &[leaf]);
+}

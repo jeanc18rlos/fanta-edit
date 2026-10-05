@@ -807,3 +807,168 @@ impl FigView {
         cx.notify();
     }
 }
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use crate::annotations::{DeveloperAnnotation, create_annotation_op};
+    use crate::measurements::{Measurement, create_measurement_op};
+    use fanta_doc::{Color as DocumentColor, GroupNode, VectorNode};
+    use gpui::{TestAppContext, VisualTestContext, size};
+    use project::FakeFs;
+
+    async fn inspector_fixture(
+        cx: &mut TestAppContext,
+    ) -> (Entity<FigView>, NodeId, VisualTestContext) {
+        cx.update(|cx| {
+            zlog::init_test();
+            assets::Assets.load_test_fonts(cx);
+            let store = settings::SettingsStore::test(cx);
+            cx.set_global(store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+            gpui_component::init(cx);
+            fanta_gpui::init(cx);
+            crate::theme_bridge::init(cx);
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = Doc::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_id = page.id;
+        doc.scene.insert(page).expect("insert page");
+        doc.add_page(page_id);
+        doc.set_active_page(Some(page_id));
+        let mut rectangle = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            200.0,
+            100.0,
+            DocumentColor::BLACK,
+        )));
+        rectangle.name =
+            "A very long layer name that must not widen the properties inspector".to_owned();
+        rectangle.parent = Some(page_id);
+        doc.selection.select_only(rectangle.id);
+        doc.scene.insert(rectangle).expect("insert rectangle");
+        let item = crate::document::ready_item_for_test(
+            &project,
+            "/tmp/Inspector-layout.fig".into(),
+            doc,
+            cx,
+        );
+        let (view, visual) =
+            cx.add_window_view(|window, cx| FigView::new(item, project, window, cx));
+        visual.simulate_resize(size(px(1200.0), px(1600.0)));
+        visual.run_until_parked();
+        view.update_in(visual, |view, _, cx| {
+            view.inspector_sidebar_width = clamp_sidebar_width(px(260.0), SidebarKind::Inspector);
+            view.refresh_gpui_design(cx);
+            cx.notify();
+        });
+        visual.run_until_parked();
+        (view, page_id, visual.clone())
+    }
+
+    fn draw_inspector(cx: &mut VisualTestContext) -> Bounds<Pixels> {
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        cx.debug_bounds("fanta-inspector-sidebar")
+            .expect("visible properties sidebar")
+    }
+
+    fn assert_inside_sidebar(bounds: Bounds<Pixels>, sidebar: Bounds<Pixels>) {
+        assert!(
+            bounds.left() >= sidebar.left()
+                && bounds.right() <= sidebar.right()
+                && bounds.top() >= sidebar.top()
+                && bounds.bottom() <= sidebar.bottom(),
+            "{bounds:?} overflows sidebar {sidebar:?}"
+        );
+    }
+
+    #[gpui::test]
+    async fn inspector_minimum_width_keeps_fields_inside_the_sidebar(cx: &mut TestAppContext) {
+        let (_view, _page, mut visual) = inspector_fixture(cx).await;
+        let sidebar = draw_inspector(&mut visual);
+        assert!(
+            sidebar.size.width
+                >= px(fanta_gpui::properties_inspector::PROPERTIES_INSPECTOR_MIN_WIDTH),
+            "the host must honor the inspector's minimum supported width"
+        );
+        for selector in [
+            "fig-gpui-design-x",
+            "fig-gpui-design-y",
+            "fig-gpui-design-width",
+            "fig-gpui-design-height",
+        ] {
+            let field = visual
+                .debug_bounds(selector)
+                .expect("visible geometry field");
+            assert!(
+                field.is_contained_within(&sidebar),
+                "{selector} overflows the minimum-width sidebar: {field:?} in {sidebar:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn page_notes_keep_the_composed_inspector_and_separate_list_space(
+        cx: &mut TestAppContext,
+    ) {
+        let (view, page, mut visual) = inspector_fixture(cx).await;
+        let item = view.read_with(&visual, |view, _| view.item().clone());
+        for add_measurement in [false, true] {
+            item.update(&mut visual, |item, cx| {
+                item.with_document(cx, |document| {
+                    let operation = if add_measurement {
+                        let measurement =
+                            Measurement::new([0.0, 0.0], [100.0, 0.0], "Test".into(), 1)
+                                .expect("valid measurement");
+                        create_measurement_op(&document.doc, page, &measurement)
+                            .expect("create measurement")
+                    } else {
+                        let annotation = DeveloperAnnotation::new(
+                            [0.0, 0.0],
+                            "Keep this annotation visible beside the design controls".into(),
+                            "Test".into(),
+                            1,
+                        )
+                        .expect("valid annotation");
+                        create_annotation_op(&document.doc, page, &annotation)
+                            .expect("create annotation")
+                    };
+                    document.doc.apply(operation).expect("add page note");
+                    ((), DocChange::Content)
+                });
+            });
+            visual.run_until_parked();
+            let sidebar = draw_inspector(&mut visual);
+            let inspector = visual
+                .debug_bounds("editor-design-inspector")
+                .expect("page notes retain the composed design inspector");
+            let annotations = visual
+                .debug_bounds("fanta-inspector-annotations")
+                .expect("annotation list remains visible");
+            assert_inside_sidebar(inspector, sidebar);
+            assert_inside_sidebar(annotations, sidebar);
+            assert!(inspector.bottom() <= annotations.top());
+            if add_measurement {
+                let measurements = visual
+                    .debug_bounds("fanta-inspector-measurements")
+                    .expect("measurement list remains visible");
+                assert_inside_sidebar(measurements, sidebar);
+                assert!(inspector.bottom() <= measurements.top());
+                assert!(measurements.bottom() <= annotations.top());
+            }
+            assert!(
+                visual
+                    .debug_bounds("fig-gpui-design-tab-properties")
+                    .is_none(),
+                "page notes must not introduce a second row of inspector navigation"
+            );
+        }
+    }
+}

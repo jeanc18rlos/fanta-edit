@@ -12,9 +12,9 @@ use fanta_canvas::{
 };
 use fanta_doc::{
     BlendMode, Blur, BlurKind, Bounds as FantaBounds, CanvasNode, Color as FantaColor,
-    ComponentDef, ComponentId, ComponentPropId, ComponentSet, ComponentSetMembership, Doc, Fill,
-    Gradient, GroupNode, LayoutMode, NodeData, NodeId, Operation, Shadow, ShadowKind, Stroke,
-    TextAutoResize, Transform2D, UnitInterval, VarValue, VariantAxis, expand_instance,
+    ComponentDef, ComponentId, ComponentPropId, Doc, Fill, Gradient, GroupNode, LayoutMode,
+    NodeData, NodeId, Operation, Shadow, ShadowKind, Stroke, TextAutoResize, Transform2D,
+    UnitInterval, VarValue, expand_instance,
 };
 use glam::DVec2;
 use gpui::Rgba;
@@ -1535,6 +1535,7 @@ pub(crate) fn fanta_color_rgba(color: FantaColor) -> Rgba {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fanta_doc::{ComponentSet, ComponentSetMembership, VariantAxis};
 
     use fanta_doc::{
         ComponentDef, ComponentPropKind, ImageFitMode, InstanceNode, PathData, TextPathNode,

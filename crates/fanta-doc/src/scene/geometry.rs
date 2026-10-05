@@ -352,6 +352,16 @@ impl Scene {
     pub fn topmost_hit_where(
         &self,
         world_point: DVec2,
+        accept: impl FnMut(NodeId) -> bool,
+    ) -> Option<NodeId> {
+        self.topmost_hit_in_scope_where(world_point, None, accept)
+    }
+
+    /// Like `topmost_hit_where`, with boolean operands exposed below an entered scope.
+    pub fn topmost_hit_in_scope_where(
+        &self,
+        world_point: DVec2,
+        scope: Option<NodeId>,
         mut accept: impl FnMut(NodeId) -> bool,
     ) -> Option<NodeId> {
         self.with_spatial_index(|index| {
@@ -374,7 +384,7 @@ impl Scene {
                 // A boolean-op node's operands are not independently selectable —
                 // the boolean node itself (a non-group, so it self-catches) is the
                 // hit target for its whole folded shape.
-                if self.has_boolean_ancestor(id) {
+                if self.has_boolean_ancestor_below(id, scope) {
                     return false;
                 }
                 if !self.ancestors_contain_point(id, world_point) {
@@ -387,9 +397,15 @@ impl Scene {
 
     /// Whether any ancestor of `id` is a boolean-operation node (so `id` is an
     /// operand, folded into that ancestor's shape and not selectable on its own).
-    fn has_boolean_ancestor(&self, id: NodeId) -> bool {
+    fn has_boolean_ancestor_below(&self, id: NodeId, scope: Option<NodeId>) -> bool {
+        if Some(id) == scope {
+            return false;
+        }
         let mut cursor = self.nodes.get(&id).and_then(|n| n.parent);
         while let Some(p) = cursor {
+            if Some(p) == scope {
+                return false;
+            }
             match self.nodes.get(&p) {
                 Some(node) if matches!(node.data, NodeData::Boolean(_)) => return true,
                 Some(node) => cursor = node.parent,
@@ -406,6 +422,17 @@ impl Scene {
     pub fn deep_hits_where(
         &self,
         world_point: DVec2,
+        accept: impl FnMut(NodeId) -> bool,
+    ) -> Vec<NodeId> {
+        self.deep_hits_in_scope_where(world_point, None, accept)
+    }
+
+    /// Like `deep_hits_where`, but boolean operands below an explicitly entered
+    /// container are selectable. Boolean descendants remain atomic until entered.
+    pub fn deep_hits_in_scope_where(
+        &self,
+        world_point: DVec2,
+        scope: Option<NodeId>,
         mut accept: impl FnMut(NodeId) -> bool,
     ) -> Vec<NodeId> {
         self.with_spatial_index(|index| {
@@ -421,7 +448,7 @@ impl Scene {
                     }
                 }
                 // Boolean operands are folded into their ancestor, not selectable.
-                if self.has_boolean_ancestor(id) {
+                if self.has_boolean_ancestor_below(id, scope) {
                     return false;
                 }
                 if !self.ancestors_contain_point(id, world_point) {

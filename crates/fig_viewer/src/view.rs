@@ -275,6 +275,10 @@ const ZOOM_STEP: f32 = 1.1;
 const SCROLL_LINE_MULTIPLIER: f32 = 20.0;
 pub(crate) const RENDER_PADDING: f64 = 48.0;
 const MIN_LAYERS_SIDEBAR_WIDTH: f32 = 220.0;
+#[cfg(feature = "fanta-gpui-ui")]
+const MIN_INSPECTOR_SIDEBAR_WIDTH: f32 =
+    fanta_gpui::properties_inspector::PROPERTIES_INSPECTOR_MIN_WIDTH;
+#[cfg(not(feature = "fanta-gpui-ui"))]
 const MIN_INSPECTOR_SIDEBAR_WIDTH: f32 = 260.0;
 const MAX_SIDEBAR_WIDTH: f32 = 560.0;
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.);
@@ -622,6 +626,13 @@ fn prototype_tick_elapsed(
 }
 
 impl EventEmitter<FigViewEvent> for FigView {}
+
+enum CanvasDoubleClickAction {
+    Text(NodeId),
+    Tool(ToolKind),
+    Instance,
+    Inspector,
+}
 
 /// How a freshly opened text session seeds its selection: the text tool and
 /// enter-to-edit select everything (the first keystroke replaces it), a
@@ -1253,7 +1264,7 @@ impl FigView {
         self.editor_session.read(cx).workspace()
     }
 
-    fn finish_panel_edits(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn finish_panel_edits(&mut self, cx: &mut Context<Self>) {
         if self
             .inspector_sidebar
             .read(cx)
@@ -2379,7 +2390,7 @@ impl FigView {
         pending_edit
     }
 
-    fn defer_after_preserved_design_draft(
+    pub(crate) fn defer_after_preserved_design_draft(
         &mut self,
         _window: &mut Window,
         _cx: &mut Context<Self>,
@@ -3354,6 +3365,125 @@ impl FigView {
 
     // === Mouse handling ===================================================
 
+    pub(crate) fn reveal_node_properties(&mut self, cx: &mut Context<Self>) {
+        self.inspector_sidebar_visible = true;
+        cx.notify();
+    }
+
+    fn handle_node_double_click(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if event.button != MouseButton::Left
+            || event.click_count < 2
+            || !event.click_count.is_multiple_of(2)
+            || event.modifiers != gpui::Modifiers::default()
+            || self.space_pan
+            || self.editor_mode(cx) != EditorMode::Design
+            || self.tools.kind() != ToolKind::Select
+            || !self.is_editable(cx)
+        {
+            return false;
+        }
+        let Some((bounds, viewport)) = self.container_bounds.zip(self.viewport) else {
+            return false;
+        };
+        let screen = screen_position_in_bounds(event.position, bounds);
+        let (width, height) = bounds_size(bounds);
+        let screen_size = DVec2::new(width, height);
+        let action = {
+            let Some(doc) = self.item.read(cx).doc() else {
+                return false;
+            };
+            let Some(selected) = single_selection(doc) else {
+                return false;
+            };
+            let mut hit = precise_hit_test_screen(
+                &doc.scene,
+                &viewport,
+                screen_size,
+                screen,
+                HitPrecision::Path,
+                doc.active_page(),
+            )
+            .or_else(|| {
+                fanta_tools::NodeEditTool::vector_at_screen(
+                    doc,
+                    &viewport,
+                    screen_size,
+                    doc.active_page(),
+                    screen,
+                )
+            });
+            while let Some(container) = hit
+                && doc
+                    .scene
+                    .get(container)
+                    .is_some_and(|node| matches!(node.data, NodeData::Boolean(_)))
+                && doc
+                    .scene
+                    .ancestors_of(selected)
+                    .any(|node| node.id == container)
+            {
+                let inner = precise_hit_test_screen(
+                    &doc.scene,
+                    &viewport,
+                    screen_size,
+                    screen,
+                    HitPrecision::Path,
+                    Some(container),
+                );
+                if inner == hit {
+                    break;
+                }
+                hit = inner;
+            }
+            // The first pair enters a container; only a later pair can edit
+            // its selected child. Hit testing also keeps covered or locked
+            // selections from opening through a different visible layer.
+            if hit != Some(selected) {
+                return false;
+            }
+            let Some(node) = doc.scene.get(selected) else {
+                return false;
+            };
+            match &node.data {
+                NodeData::Group(_) | NodeData::Boolean(_) => return false,
+                NodeData::Text(_) | NodeData::TextPath(_) => {
+                    CanvasDoubleClickAction::Text(selected)
+                }
+                NodeData::Vector(_) => CanvasDoubleClickAction::Tool(ToolKind::NodeEdit),
+                NodeData::Bitmap(_) => CanvasDoubleClickAction::Tool(ToolKind::Crop),
+                NodeData::Instance(_) => CanvasDoubleClickAction::Instance,
+                NodeData::Video(_)
+                | NodeData::Audio(_)
+                | NodeData::NodeGraph(_)
+                | NodeData::Model3d(_)
+                | NodeData::AiArtifact(_)
+                | NodeData::Embed(_) => CanvasDoubleClickAction::Inspector,
+            }
+        };
+        self.focus_handle.focus(window, cx);
+        match action {
+            CanvasDoubleClickAction::Text(node) => {
+                self.open_text_edit(node, TextEditSeed::WordAt(screen), window, cx);
+            }
+            CanvasDoubleClickAction::Tool(kind) => self.activate_tool(kind, cx),
+            CanvasDoubleClickAction::Instance => {
+                if let Some(target) = self.instance_text_at(screen, cx) {
+                    self.open_instance_text_edit(target, TextEditSeed::WordAt(screen), window, cx);
+                } else {
+                    self.reveal_node_properties(cx);
+                }
+            }
+            CanvasDoubleClickAction::Inspector => self.reveal_node_properties(cx),
+        }
+        cx.notify();
+        true
+    }
+
     fn handle_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -3396,101 +3526,11 @@ impl FigView {
             return;
         }
 
-        // A double-click with the select tool on a text node opens the
-        // in-place text editor instead of reaching the tool — Figma's
-        // enter-text-edit gesture. The pair's first press already ran
-        // selection through the tool; this press is consumed here.
-        if event.button == MouseButton::Left
-            && event.click_count >= 2
-            && event.click_count.is_multiple_of(2)
-            && self.editor_mode(cx) == EditorMode::Design
-            && self.tools.kind() == ToolKind::Select
-            && self.is_editable(cx)
-            && let Some(bounds) = self.container_bounds
-        {
-            let screen = screen_position_in_bounds(event.position, bounds);
-            if let Some(node) = self.text_node_at(screen, cx) {
-                // A wrapped text layer first has to be drilled into by the
-                // select tool. Only a text layer that is already the sole
-                // selection enters editing on this press. Standalone text is
-                // selected by the first press in the double-click pair, so it
-                // still opens on an ordinary double-click.
-                if self.single_selected_text_node(cx) == Some(node) {
-                    self.open_text_edit(node, TextEditSeed::WordAt(screen), window, cx);
-                    return;
-                }
-            } else if let Some(target) = self.instance_text_at(screen, cx) {
-                // Instance text is virtual and cannot become its own scene
-                // selection; selecting the wrapping instance is the equivalent
-                // prerequisite before opening an override editor.
-                let instance_selected = self.item.read(cx).document().is_some_and(|document| {
-                    document.doc.selection.as_slice() == [target.instance_id]
-                });
-                if instance_selected {
-                    self.open_instance_text_edit(target, TextEditSeed::WordAt(screen), window, cx);
-                    return;
-                }
-            }
-        }
-
         if self.handle_annotation_mouse_down(event, window, cx)
             || self.handle_measurement_mouse_down(event, window, cx)
+            || self.handle_node_double_click(event, window, cx)
         {
             return;
-        }
-        if event.button == MouseButton::Left
-            && event.click_count >= 2
-            && event.click_count.is_multiple_of(2)
-            && self.editor_mode(cx) == EditorMode::Design
-            && self.tools.kind() == ToolKind::Select
-            && self.is_editable(cx)
-            && let Some(bounds) = self.container_bounds
-        {
-            let screen = screen_position_in_bounds(event.position, bounds);
-            if let Some(node) = self.text_node_at(screen, cx) {
-                // A wrapped text layer first has to be drilled into by the
-                // select tool. Only a text layer that is already the sole
-                // selection enters editing on this press. Standalone text is
-                // selected by the first press in the double-click pair, so it
-                // still opens on an ordinary double-click.
-                if self.single_selected_text_node(cx) == Some(node) {
-                    self.open_text_edit(node, TextEditSeed::WordAt(screen), window, cx);
-                    return;
-                }
-            } else if let Some(target) = self.instance_text_at(screen, cx) {
-                // Instance text is virtual and cannot become its own scene
-                // selection; selecting the wrapping instance is the equivalent
-                // prerequisite before opening an override editor.
-                let instance_selected = self.item.read(cx).document().is_some_and(|document| {
-                    document.doc.selection.as_slice() == [target.instance_id]
-                });
-                if instance_selected {
-                    self.open_instance_text_edit(target, TextEditSeed::WordAt(screen), window, cx);
-                    return;
-                }
-            }
-            let selected_vector = self
-                .item
-                .read(cx)
-                .doc()
-                .and_then(fanta_tools::NodeEditTool::selected_editable_vector);
-            if let Some(node) = selected_vector
-                && let Some(viewport) = self.viewport
-                && self.item.read(cx).doc().is_some_and(|doc| {
-                    let (width, height) = bounds_size(bounds);
-                    fanta_tools::NodeEditTool::vector_at_screen(
-                        doc,
-                        &viewport,
-                        DVec2::new(width, height),
-                        doc.active_page(),
-                        screen,
-                    ) == Some(node)
-                })
-            {
-                self.focus_handle.focus(window, cx);
-                self.activate_tool(ToolKind::NodeEdit, cx);
-                return;
-            }
         }
 
         self.focus_handle.focus(window, cx);
@@ -5708,16 +5748,12 @@ impl FigView {
                 // when its adapter mounted; `FANTA_GPUI_DESIGN=0` (or the
                 // process-wide `FANTA_GPUI_UI=0`) keeps the legacy panel.
                 #[cfg(feature = "fanta-gpui-ui")]
-                if let Some(content) = self.render_properties_content(mode) {
-                    if records.is_empty() && self.page_annotations(cx).is_empty() {
-                        return self.render_inspector_body(content, tabs, cx);
+                let body = self.render_properties_content(mode).unwrap_or_else(|| {
+                    match self.gpui_design.as_ref() {
+                        Some(adapter) => adapter.panel.clone().into_any_element(),
+                        None => self.inspector_sidebar.clone().into_any_element(),
                     }
-                }
-                #[cfg(feature = "fanta-gpui-ui")]
-                let body = match self.gpui_design.as_ref() {
-                    Some(adapter) => adapter.panel.clone().into_any_element(),
-                    None => self.inspector_sidebar.clone().into_any_element(),
-                };
+                });
                 #[cfg(not(feature = "fanta-gpui-ui"))]
                 let body = self.inspector_sidebar.clone().into_any_element();
                 if records.is_empty() {
@@ -5754,8 +5790,15 @@ impl FigView {
                     );
                     v_flex()
                         .size_full()
-                        .child(div().flex_1().min_h_0().child(body))
-                        .child(div().h(px(180.0)).flex_shrink_0().child(list))
+                        .min_w_0()
+                        .child(div().flex_1().min_h_0().min_w_0().child(body))
+                        .child(
+                            div()
+                                .debug_selector(|| "fanta-inspector-measurements".to_owned())
+                                .h(px(180.0))
+                                .flex_shrink_0()
+                                .child(list),
+                        )
                         .into_any_element()
                 }
             }
@@ -5763,9 +5806,11 @@ impl FigView {
         let body = if self.is_design_canvas_mode(cx) && !self.page_annotations(cx).is_empty() {
             v_flex()
                 .size_full()
-                .child(div().flex_1().min_h_0().child(body))
+                .min_w_0()
+                .child(div().flex_1().min_h_0().min_w_0().child(body))
                 .child(
                     div()
+                        .debug_selector(|| "fanta-inspector-annotations".to_owned())
                         .h(px(150.0))
                         .flex_shrink_0()
                         .child(self.render_annotation_list(cx)),
@@ -5794,6 +5839,7 @@ impl FigView {
             .child(
                 v_flex()
                     .size_full()
+                    .min_w_0()
                     .overflow_hidden()
                     .child(self.render_inspector_toolbar(false, cx))
                     .child(
@@ -5808,7 +5854,7 @@ impl FigView {
                             .border_color(cx.theme().colors().border)
                             .child(tabs),
                     )
-                    .child(div().flex_1().min_h_0().child(body)),
+                    .child(div().flex_1().min_h_0().min_w_0().child(body)),
             )
             .child(self.render_sidebar_resize_handle(SidebarKind::Inspector));
         #[cfg(test)]
@@ -10102,11 +10148,60 @@ mod tests {
         (doc, text_id, frame)
     }
 
+    fn canvas_interaction_fixture(
+        project: &Entity<Project>,
+        doc: Doc,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<FigItem>,
+        Entity<FigView>,
+        gpui::WindowHandle<gpui::Empty>,
+    ) {
+        let item = crate::document::ready_item_for_test(
+            project,
+            std::path::PathBuf::from("/tmp/CanvasInteraction.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let view = scratch
+            .update(cx, |_, window, cx| {
+                cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
+            })
+            .expect("create interaction view");
+        view.update(cx, |view, _| {
+            view.set_container_bounds(Bounds {
+                origin: point(px(0.0), px(0.0)),
+                size: size(px(800.0), px(600.0)),
+            });
+            view.set_viewport_silent(Viewport::default());
+        });
+        (item, view, scratch)
+    }
+
     fn send_canvas_click(
         scratch: gpui::WindowHandle<gpui::Empty>,
         view: &Entity<FigView>,
         position: Point<Pixels>,
         click_count: usize,
+        cx: &mut TestAppContext,
+    ) {
+        send_canvas_click_with_modifiers(
+            scratch,
+            view,
+            position,
+            click_count,
+            gpui::Modifiers::default(),
+            cx,
+        );
+    }
+
+    fn send_canvas_click_with_modifiers(
+        scratch: gpui::WindowHandle<gpui::Empty>,
+        view: &Entity<FigView>,
+        position: Point<Pixels>,
+        click_count: usize,
+        modifiers: gpui::Modifiers,
         cx: &mut TestAppContext,
     ) {
         scratch
@@ -10116,7 +10211,7 @@ mod tests {
                         &MouseDownEvent {
                             button: MouseButton::Left,
                             position,
-                            modifiers: gpui::Modifiers::default(),
+                            modifiers,
                             click_count,
                             first_mouse: false,
                         },
@@ -10127,7 +10222,7 @@ mod tests {
                         &MouseUpEvent {
                             button: MouseButton::Left,
                             position,
-                            modifiers: gpui::Modifiers::default(),
+                            modifiers,
                             click_count,
                         },
                         window,
@@ -12359,6 +12454,523 @@ mod tests {
                 .expect("second double-click opens text editing");
             let range = edit.session.selected_range();
             assert!(range.start < range.end, "word selection stays intact");
+        });
+    }
+
+    #[gpui::test]
+    async fn canvas_double_click_routes_each_leaf_kind_without_changing_document(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let asset = AssetId::new();
+        let cases = [
+            (
+                NodeData::Vector(VectorNode::rect_solid(0.0, 0.0, 120.0, 40.0, Color::WHITE)),
+                ToolKind::NodeEdit,
+            ),
+            (
+                NodeData::Bitmap(fanta_doc::BitmapNode {
+                    asset,
+                    natural_size: [120, 40],
+                    local_size: [120.0, 40.0],
+                    crop: None,
+                    fit: fanta_doc::ImageFitMode::Fill,
+                    tint: None,
+                }),
+                ToolKind::Crop,
+            ),
+            (
+                NodeData::Video(fanta_doc::VideoNode {
+                    asset,
+                    natural_size: [120, 40],
+                    local_size: [120.0, 40.0],
+                    time_range_us: [0, 1_000_000],
+                    speed: 1.0,
+                    muted: false,
+                    volume: 1.0,
+                    poster_frame_us: None,
+                    poster: None,
+                    fit: fanta_doc::ImageFitMode::Fill,
+                }),
+                ToolKind::Select,
+            ),
+            (
+                NodeData::Audio(fanta_doc::AudioNode {
+                    asset,
+                    local_size: [120.0, 40.0],
+                    time_range_us: [0, 1_000_000],
+                    volume: 1.0,
+                    muted: false,
+                    waveform_color: Color::WHITE,
+                }),
+                ToolKind::Select,
+            ),
+            (
+                NodeData::NodeGraph(fanta_doc::NodeGraphNode {
+                    local_size: [120.0, 40.0],
+                    graph: Default::default(),
+                    preview: None,
+                }),
+                ToolKind::Select,
+            ),
+            (
+                NodeData::Model3d(fanta_doc::Model3dNode {
+                    asset,
+                    local_size: [120.0, 40.0],
+                    camera: Default::default(),
+                    overrides: serde_json::Value::Null,
+                }),
+                ToolKind::Select,
+            ),
+            (
+                NodeData::AiArtifact(fanta_doc::AiArtifactNode {
+                    local_size: [120.0, 40.0],
+                    prompt: "Keep this prompt".into(),
+                    model: "test".into(),
+                    params: serde_json::json!({"preserved": true}),
+                    inputs: Vec::new(),
+                    lineage_parent: None,
+                    output: Some(asset),
+                    status: fanta_doc::GenerationStatus::Done,
+                    seed: Some(42),
+                }),
+                ToolKind::Select,
+            ),
+            (
+                NodeData::Embed(fanta_doc::EmbedNode {
+                    local_size: [120.0, 40.0],
+                    kind: "test".into(),
+                    payload: serde_json::json!({"preserved": true}),
+                }),
+                ToolKind::Select,
+            ),
+            (
+                NodeData::Instance(fanta_doc::InstanceNode {
+                    component: fanta_doc::ComponentId::new(),
+                    local_size: [120.0, 40.0],
+                    overrides: Vec::new(),
+                    prop_values: BTreeMap::new(),
+                    derived: Vec::new(),
+                }),
+                ToolKind::Select,
+            ),
+        ];
+        for (data, expected_tool) in cases {
+            let kind = data.kind_tag();
+            let mut doc = doc_with_one_page();
+            let mut node = CanvasNode::new(data);
+            node.parent = doc.active_page();
+            node.transform = Transform2D::translation(-60.0, -20.0);
+            let node_id = node.id;
+            doc.apply(Operation::create_node(node))
+                .expect("create test node");
+            let history_depth = doc.history.undo_depth();
+            let node_count = doc.scene.len();
+            let (item, view, scratch) = canvas_interaction_fixture(&project, doc, cx);
+            let original = item.read_with(cx, |item, _| {
+                item.doc()
+                    .expect("loaded document")
+                    .scene
+                    .get(node_id)
+                    .expect("loaded node")
+                    .clone()
+            });
+            view.update(cx, |view, _| view.inspector_sidebar_visible = false);
+            let position = point(px(390.0), px(300.0));
+            send_canvas_click(scratch, &view, position, 1, cx);
+            item.read_with(cx, |item, _| {
+                assert_eq!(
+                    item.doc().expect("document").selection.as_slice(),
+                    &[node_id],
+                    "{kind}"
+                );
+            });
+            send_canvas_click(scratch, &view, position, 2, cx);
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.active_tool(), expected_tool, "{kind}");
+                assert!(view.text_edit.is_none(), "{kind}");
+                if expected_tool == ToolKind::Select {
+                    assert!(
+                        view.inspector_sidebar_visible,
+                        "{kind} reveals its properties"
+                    );
+                }
+            });
+            item.read_with(cx, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(doc.scene.get(node_id), Some(&original), "{kind}");
+                assert_eq!(doc.scene.len(), node_count, "{kind}");
+                assert_eq!(doc.history.undo_depth(), history_depth, "{kind}");
+                assert!(!item.is_dirty(), "{kind}");
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn canvas_double_click_respects_wrappers_for_vector_and_bitmap(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        for (data, expected_tool) in [
+            (
+                NodeData::Vector(VectorNode::rect_solid(0.0, 0.0, 120.0, 40.0, Color::WHITE)),
+                ToolKind::NodeEdit,
+            ),
+            (
+                NodeData::Bitmap(fanta_doc::BitmapNode {
+                    asset: AssetId::new(),
+                    natural_size: [120, 40],
+                    local_size: [120.0, 40.0],
+                    crop: None,
+                    fit: fanta_doc::ImageFitMode::Fill,
+                    tint: None,
+                }),
+                ToolKind::Crop,
+            ),
+        ] {
+            let (mut doc, node_id, frame) = text_selection_doc(true);
+            doc.scene.get_mut(node_id).expect("child").data = data;
+            let (item, view, scratch) = canvas_interaction_fixture(&project, doc, cx);
+            let position = point(px(350.0), px(290.0));
+            for (count, selected) in [(1, frame.expect("wrapper")), (2, node_id), (3, node_id)] {
+                send_canvas_click(scratch, &view, position, count, cx);
+                item.read_with(cx, |item, _| {
+                    assert_eq!(
+                        item.doc().expect("document").selection.as_slice(),
+                        &[selected]
+                    );
+                });
+                view.read_with(cx, |view, _| {
+                    assert_eq!(view.active_tool(), ToolKind::Select)
+                });
+            }
+            send_canvas_click(scratch, &view, position, 4, cx);
+            view.read_with(cx, |view, _| assert_eq!(view.active_tool(), expected_tool));
+        }
+    }
+
+    #[gpui::test]
+    async fn canvas_double_click_boolean_operand_edits_and_undo_preserves_container(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (mut doc, operand, container) = text_selection_doc(true);
+        let container = container.expect("container");
+        doc.scene.get_mut(container).expect("container").data =
+            NodeData::Boolean(fanta_doc::BooleanNode::default());
+        doc.scene.get_mut(operand).expect("operand").data =
+            NodeData::Vector(VectorNode::rect_solid(0.0, 0.0, 120.0, 40.0, Color::WHITE));
+        let (item, view, scratch) = canvas_interaction_fixture(&project, doc, cx);
+        let (original_operand, original_container, history_depth) =
+            item.read_with(cx, |item, _| {
+                let doc = item.doc().expect("document");
+                (
+                    doc.scene.get(operand).expect("operand").clone(),
+                    doc.scene.get(container).expect("container").clone(),
+                    doc.history.undo_depth(),
+                )
+            });
+        let position = point(px(350.0), px(290.0));
+        for count in 1..=4 {
+            send_canvas_click(scratch, &view, position, count, cx);
+        }
+        view.update(cx, |view, cx| {
+            assert_eq!(view.active_tool(), ToolKind::NodeEdit);
+            view.dispatch_tool_event(
+                press_event(
+                    DVec2::new(320.0, 270.0),
+                    ToolButton::Primary,
+                    gpui::Modifiers::default(),
+                    1,
+                ),
+                cx,
+            );
+            view.dispatch_tool_event(
+                move_event(DVec2::new(330.0, 280.0), gpui::Modifiers::default()),
+                cx,
+            );
+            view.dispatch_tool_event(
+                release_event(
+                    DVec2::new(330.0, 280.0),
+                    ToolButton::Primary,
+                    gpui::Modifiers::default(),
+                ),
+                cx,
+            );
+        });
+        item.update(cx, |item, cx| {
+            let doc = item.doc().expect("document");
+            assert_ne!(
+                doc.scene.get(operand).expect("operand").data,
+                original_operand.data
+            );
+            assert_eq!(doc.scene.get(container), Some(&original_container));
+            assert_eq!(doc.history.undo_depth(), history_depth + 1);
+            assert!(item.undo(cx).expect("undo operand edit"));
+            assert_eq!(
+                item.doc().expect("document").scene.get(operand),
+                Some(&original_operand)
+            );
+            assert_eq!(
+                item.doc().expect("document").scene.get(container),
+                Some(&original_container)
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn canvas_double_click_does_not_edit_covered_or_locked_text(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        for hidden in [false, true] {
+            let (mut doc, text_id, frame) = text_selection_doc(true);
+            let flag = if hidden {
+                fanta_doc::NodeFlags::HIDDEN
+            } else {
+                fanta_doc::NodeFlags::LOCKED
+            };
+            doc.scene.get_mut(text_id).expect("text").flags.insert(flag);
+            doc.selection.select_only(text_id);
+            let (item, view, scratch) = canvas_interaction_fixture(&project, doc, cx);
+            send_canvas_click(scratch, &view, point(px(340.0), px(285.0)), 2, cx);
+            view.read_with(cx, |view, _| assert!(view.text_edit.is_none()));
+            item.read_with(cx, |item, _| {
+                assert_eq!(
+                    item.doc().expect("document").selection.as_slice(),
+                    &[frame.expect("wrapper")]
+                );
+                assert!(!item.is_dirty());
+            });
+        }
+        let (mut doc, text_id, _) = text_selection_doc(false);
+        let mut cover = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            -60.0,
+            -20.0,
+            120.0,
+            40.0,
+            Color::WHITE,
+        )));
+        cover.parent = doc.active_page();
+        cover.index = IndexKey::after(doc.scene.get(text_id).expect("text").index);
+        let cover_id = cover.id;
+        doc.apply(Operation::create_node(cover))
+            .expect("cover text");
+        doc.selection.select_only(text_id);
+        let (item, view, scratch) = canvas_interaction_fixture(&project, doc, cx);
+        send_canvas_click(scratch, &view, point(px(390.0), px(300.0)), 2, cx);
+        view.read_with(cx, |view, _| assert!(view.text_edit.is_none()));
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.doc().expect("document").selection.as_slice(),
+                &[cover_id]
+            )
+        });
+    }
+
+    #[gpui::test]
+    async fn canvas_double_click_with_shift_or_space_does_not_enter_editing(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        for pan in [false, true] {
+            let (mut doc, text_id, _) = text_selection_doc(false);
+            doc.selection.select_only(text_id);
+            let (item, view, scratch) = canvas_interaction_fixture(&project, doc, cx);
+            view.update(cx, |view, _| view.space_pan = pan);
+            let modifiers = gpui::Modifiers {
+                shift: !pan,
+                ..Default::default()
+            };
+            send_canvas_click_with_modifiers(
+                scratch,
+                &view,
+                point(px(360.0), px(295.0)),
+                2,
+                modifiers,
+                cx,
+            );
+            view.read_with(cx, |view, _| assert!(view.text_edit.is_none()));
+            item.read_with(cx, |item, _| {
+                let doc = item.doc().expect("document");
+                if pan {
+                    assert_eq!(doc.selection.as_slice(), &[text_id]);
+                } else {
+                    assert!(doc.selection.is_empty());
+                }
+                assert!(!item.is_dirty());
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn canvas_double_click_text_path_edit_preserves_baseline_and_undo(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut baseline = fanta_doc::PathData::new();
+        baseline.move_to(-60.0, 20.0).line_to(180.0, 20.0);
+        let text_path = fanta_doc::TextPathNode::new(baseline, "Hello world");
+        let bounds = fanta_render::text_path_visual_bounds(&text_path).expect("visible text path");
+        let world = (0..=bounds.height().ceil() as usize)
+            .flat_map(|y| {
+                (0..=bounds.width().ceil() as usize)
+                    .map(move |x| [bounds.min_x + x as f64, bounds.min_y + y as f64])
+            })
+            .find(|point| fanta_render::text_path_contains_point(&text_path, *point))
+            .expect("point on a rendered glyph");
+        let mut doc = doc_with_one_page();
+        let mut node = CanvasNode::new(NodeData::TextPath(text_path));
+        node.parent = doc.active_page();
+        let original = node.clone();
+        let node_id = node.id;
+        doc.apply(Operation::create_node(node)).expect("text path");
+        let history_depth = doc.history.undo_depth();
+        let (item, view, scratch) = canvas_interaction_fixture(&project, doc, cx);
+        let position = point(px((400.0 + world[0]) as f32), px((300.0 + world[1]) as f32));
+        send_canvas_click(scratch, &view, position, 1, cx);
+        send_canvas_click(scratch, &view, position, 2, cx);
+        view.read_with(cx, |view, _| assert!(view.text_edit.is_some()));
+        scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    gpui::EntityInputHandler::replace_text_in_range(
+                        view,
+                        Some(0..11),
+                        "Edited path",
+                        window,
+                        cx,
+                    );
+                    view.commit_text_edit(cx);
+                });
+            })
+            .expect("commit path text input");
+        item.update(cx, |item, cx| {
+            let doc = item.doc().expect("document");
+            let NodeData::TextPath(edited) = &doc.scene.get(node_id).expect("path").data else {
+                panic!("text path preserved");
+            };
+            assert_eq!(edited.content, "Edited path");
+            let NodeData::TextPath(original_path) = &original.data else {
+                panic!("path fixture")
+            };
+            assert_eq!(edited.path, original_path.path);
+            assert_eq!(edited.start, original_path.start);
+            assert_eq!(edited.alignment, original_path.alignment);
+            assert_eq!(edited.direction, original_path.direction);
+            assert_eq!(edited.side, original_path.side);
+            assert_eq!(edited.style, original_path.style);
+            assert!(edited.style_runs.iter().all(|run| {
+                run.style == original_path.style
+                    && run.start < run.end
+                    && run.end <= edited.content.len()
+            }));
+            assert_eq!(doc.history.undo_depth(), history_depth + 1);
+            assert!(item.undo(cx).expect("undo text path edit"));
+            assert_eq!(
+                item.doc().expect("document").scene.get(node_id),
+                Some(&original)
+            );
+            assert!(item.redo(cx).expect("redo text path edit"));
+        });
+    }
+
+    #[gpui::test]
+    async fn canvas_double_click_instance_text_commits_override_without_changing_master(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (mut doc, master_text, master) = text_selection_doc(true);
+        let master = master.expect("master frame");
+        doc.scene.get_mut(master).expect("master").transform =
+            Transform2D::translation(1000.0, 1000.0);
+        let original_master_text = doc.scene.get(master_text).expect("master text").clone();
+        let component = fanta_doc::ComponentId::new();
+        doc.components.defs.insert(
+            component,
+            fanta_doc::ComponentDef::new(component, master, "Card"),
+        );
+        let mut instance = CanvasNode::new(NodeData::Instance(fanta_doc::InstanceNode {
+            component,
+            overrides: Vec::new(),
+            prop_values: BTreeMap::new(),
+            derived: Vec::new(),
+            local_size: [200.0, 100.0],
+        }));
+        instance.parent = doc.active_page();
+        instance.transform = Transform2D::translation(-100.0, -50.0);
+        let instance_id = instance.id;
+        let original_instance = instance.clone();
+        doc.apply(Operation::create_node(instance))
+            .expect("instance");
+        let history_depth = doc.history.undo_depth();
+        let (item, view, scratch) = canvas_interaction_fixture(&project, doc, cx);
+        let position = point(px(340.0), px(285.0));
+        send_canvas_click(scratch, &view, position, 1, cx);
+        send_canvas_click(scratch, &view, position, 2, cx);
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.text_edit
+                    .as_ref()
+                    .expect("inline instance text")
+                    .session
+                    .instance()
+                    .is_some()
+            );
+        });
+        scratch
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    gpui::EntityInputHandler::replace_text_in_range(
+                        view,
+                        Some(0..11),
+                        "Instance only",
+                        window,
+                        cx,
+                    );
+                    view.commit_text_edit(cx);
+                });
+            })
+            .expect("commit instance text input");
+        item.update(cx, |item, cx| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.scene.get(master_text), Some(&original_master_text));
+            let NodeData::Instance(instance) = &doc.scene.get(instance_id).expect("instance").data else {
+                panic!("instance preserved");
+            };
+            assert!(instance.overrides.iter().any(|entry| {
+                matches!(&entry.value, fanta_doc::OverrideValue::Text { value } if value == "Instance only")
+            }));
+            assert_eq!(doc.history.undo_depth(), history_depth + 1);
+            assert!(item.undo(cx).expect("undo instance override"));
+            assert_eq!(item.doc().expect("document").scene.get(instance_id), Some(&original_instance));
+            assert!(item.redo(cx).expect("redo instance override"));
+            assert_eq!(item.doc().expect("document").scene.get(master_text), Some(&original_master_text));
+        });
+    }
+
+    #[gpui::test]
+    async fn canvas_double_click_read_only_document_does_not_enter_editing(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (mut doc, text_id, _) = text_selection_doc(false);
+        doc.selection.select_only(text_id);
+        let original = doc.scene.get(text_id).expect("text").clone();
+        let (item, view, scratch) = canvas_interaction_fixture(&project, doc, cx);
+        item.update(cx, |item, cx| item.set_source_edit_locked(true, cx));
+        send_canvas_click(scratch, &view, point(px(360.0), px(295.0)), 2, cx);
+        view.read_with(cx, |view, _| assert!(view.text_edit.is_none()));
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.doc().expect("document").scene.get(text_id),
+                Some(&original)
+            );
+            assert!(!item.is_dirty());
         });
     }
 

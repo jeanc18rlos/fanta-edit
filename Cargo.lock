@@ -5262,6 +5262,7 @@ dependencies = [
  "fanta-gpui-gpui-platform",
  "fanta-gpui-http-client",
  "fanta-gpui-media",
+ "fanta-gpui-menu",
  "fanta-gpui-theme",
  "fanta-gpui-ui",
  "fanta-gpui-ui-input",

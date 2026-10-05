@@ -238,8 +238,9 @@ fn context_actions_with_kind(
             return matches!(action, Action::Copy | Action::CopyPasteAs | Action::LockUnlock | Action::GoToMainComponent);
         }
         match action {
+            Action::Flatten => crate::layer_context_ops::can_flatten(doc, id),
             Action::OutlineStroke => match &node.data {
-                NodeData::Text(_) => true,
+                NodeData::Text(_) => crate::layer_context_ops::can_flatten(doc, id),
                 NodeData::Vector(value) => !value.strokes.is_empty(),
                 NodeData::Group(value) => !value.strokes.is_empty(),
                 NodeData::Boolean(value) => !value.strokes.is_empty(),
