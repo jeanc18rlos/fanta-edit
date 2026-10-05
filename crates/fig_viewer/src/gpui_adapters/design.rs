@@ -2554,6 +2554,18 @@ impl FigView {
                 panel.set_page_view_data(page_view_data, cx);
             }
             panel.set_inspection_context(inspection_context, cx);
+            if selection.is_empty() && panel.node().id.as_ref() != "fig-gpui-design-empty" {
+                // Export reads the compatibility node's name even in Page context.
+                // The panel retains the last selection there until the host resets it.
+                panel.set_node(
+                    DesignPanelNode::new(
+                        "fig-gpui-design-empty",
+                        "Page",
+                        DesignPanelNodeKind::Frame,
+                    ),
+                    cx,
+                );
+            }
             panel.set_export_view_data(export_view_data, cx);
             panel.set_media_paint_view_data(media_paints, cx);
             if let Some(add_auto_layout) = add_auto_layout {
@@ -11207,6 +11219,79 @@ mod tests {
             assert!(!capabilities.aspect_ratio_lock);
             assert!(!panel.paint_style_view_data().enabled);
         });
+    }
+
+    #[gpui::test]
+    async fn design_export_label_returns_to_page_after_deselecting_nodes(cx: &mut TestAppContext) {
+        let (mut doc, page, rectangle) = doc_with_rect();
+        let component = fanta_doc::ComponentId::new();
+        doc.components.defs.insert(
+            component,
+            fanta_doc::ComponentDef::new(component, rectangle, "Badge"),
+        );
+        let mut instance = CanvasNode::new(NodeData::Instance(fanta_doc::InstanceNode {
+            component,
+            overrides: Vec::new(),
+            prop_values: Default::default(),
+            derived: Vec::new(),
+            local_size: [120.0, 60.0],
+        }));
+        instance.name = "Instance".into();
+        instance.parent = Some(page);
+        let instance_id = instance.id;
+        doc.scene.insert(instance).expect("insert instance");
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        let configurations = panel.read_with(cx, |panel, _| {
+            panel
+                .view_data()
+                .projections
+                .export
+                .expect("export projection")
+                .configurations
+        });
+        for selection in [vec![instance_id], vec![], vec![rectangle], vec![]] {
+            item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    document.doc.selection.replace_with(selection.clone());
+                    ((), DocChange::Selection)
+                });
+            });
+            view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+            cx.run_until_parked();
+            panel.read_with(cx, |panel, _| {
+                let export = panel
+                    .view_data()
+                    .projections
+                    .export
+                    .expect("export projection");
+                assert_eq!(export.configurations, configurations);
+                if selection.is_empty() {
+                    assert_eq!(
+                        panel.node().name.as_ref(),
+                        "Page",
+                        "Export uses this display name"
+                    );
+                    assert!(panel.inspection_context().selection().items().is_empty());
+                    assert_eq!(
+                        export.target,
+                        DesignPanelTarget::Page {
+                            page_id: page.to_string().into()
+                        }
+                    );
+                } else {
+                    assert_eq!(panel.node().id.as_ref(), selection[0].to_string());
+                    assert_ne!(panel.node().name.as_ref(), "Page");
+                    assert_eq!(
+                        export.target,
+                        DesignPanelTarget::Nodes {
+                            node_ids: selection.iter().map(|id| id.to_string().into()).collect(),
+                        }
+                    );
+                }
+            });
+        }
     }
 
     #[gpui::test]
