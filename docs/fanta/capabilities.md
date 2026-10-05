@@ -19,7 +19,9 @@ component FNX source, identity sidecars, metadata and assets. See
   parent or position. Page roots and component recursion have edit guards.
 - Canvas edits support Undo/Redo and debounced autosave. Save commits active
   valid property edits; failures remain visible. Save As creates a separate
-  project and rejects occupied or unsafe destinations.
+  project and rejects occupied or unsafe destinations. Clean canvas tabs restore
+  their project and page/component scope when the workspace reopens. Unsaved
+  canvas or source content still requires the normal close/save decision.
 - The **Code** workspace edits FNX and supported JSON sources. Saving valid
   source updates the canvas; invalid drafts preserve the last valid file and
   scene. An unsaved source buffer locks conflicting visual edits. Selecting a
@@ -52,7 +54,9 @@ Implementation: [document.rs](../../crates/fig_viewer/src/document.rs),
 The properties inspector adapts to the selected kind and selection count. Its
 supported sections include position, size, rotation, constraints, opacity/blend,
 fills and gradients, strokes, effects, corners, typography, auto-layout/grid,
-variables, components and export. Page selection has page-specific properties.
+variables, components and export. Page selection has page-specific properties. Audio and specialist leaves show
+their own type labels and expose supported position, dimensions, appearance,
+effects and export controls; these controls preserve the underlying content.
 Mixed values must remain identifiable; controls must neither erase unsupported
 data nor silently apply to a stale selection. Numeric and color gestures preview
 live, commit as one history step, and restore the previous value when cancelled.
@@ -84,7 +88,9 @@ Command or Control keep their selection meaning; Space panning does not activate
 an editor. Only the even click in each pair activates or drills in, preventing a
 triple-click from accidentally descending another level. Instance text also
 respects locked ancestors, overlapping virtual content and clipping, including
-rounded corners. Automated regressions cover these cases; native input
+rounded corners. Text on Path accepts the shaped text area, including letter
+counters and spaces, while rejecting distant empty areas along the baseline.
+Inspection keeps exact glyph geometry. Automated regressions cover these cases; native input
 verification remains tracked in the release report.
 
 ### Canvas context menu
@@ -98,7 +104,8 @@ handled before changing the target; protected drafts are preserved.
 | Text or Text on Path | **Edit text** opens inline editing with its text selected. |
 | Vector | **Edit vector** opens Edit Path. |
 | Bitmap | **Crop image** activates Crop. |
-| Video, audio or other leaf | **Video properties**, **Audio properties** or **Layer properties** reveals the inspector. |
+| Video or audio | **Video properties** or **Audio properties** reveals the inspector. |
+| Boolean, node graph, 3D, AI artifact or embed | The corresponding **Boolean properties**, **Node graph properties**, **3D properties**, **AI artifact properties** or **Embed properties** entry reveals the inspector. |
 | Main component or instantiable variant-set frame | **Create instance** places an instance beside the component. |
 | Instance with an available main component | **Go to main component**, **Detach instance** and **Reset all overrides**. Detach preserves the expanded content and can be undone. |
 | Eligible node | **Create component**, **Add auto layout**, **Outline stroke**, **Flatten** and **Use as mask** appear only when applicable, using the same operations as the layers panel. |
@@ -200,7 +207,9 @@ Implementation: [export](../../crates/fig_viewer/src/export.rs),
 Node-graph, generic AI-artifact and embed node types exist in the format, but the
 canvas renderer currently draws placeholders for those types. A 3D node has a
 renderer hook; this inventory does not establish a complete shipped 3D editor.
-Neither storage support nor a node enum constitutes a finished user workflow.
+Existing 3D payloads and assets are preserved when unrelated canvas changes are
+saved and reopened. Neither storage support nor a node enum constitutes a
+finished user workflow.
 
 Mac App Store builds restrict local process execution, external agents and
 related inherited editor features; see [MAC_APP_STORE.md](../alpha/MAC_APP_STORE.md).
