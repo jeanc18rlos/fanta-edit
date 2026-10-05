@@ -796,6 +796,61 @@ mod tests {
     }
 
     #[test]
+    fn duplicating_a_variant_set_frame_makes_a_set_framed_by_the_copy() {
+        let mut doc = Doc::new();
+        let page = CanvasNode::new(NodeData::Group(fanta_doc::GroupNode::default()));
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page)).expect("page");
+        doc.add_page(page_id);
+        doc.set_active_page(Some(page_id));
+        let mut roots = Vec::new();
+        for name in ["Size=S", "Size=L"] {
+            let mut master = CanvasNode::new(NodeData::Group(fanta_doc::GroupNode {
+                clip_size: Some([40.0, 20.0]),
+                ..Default::default()
+            }));
+            master.name = name.into();
+            master.parent = Some(page_id);
+            master.index = doc.scene.next_child_index(Some(page_id));
+            let root = master.id;
+            doc.apply(Operation::create_node(master)).expect("master");
+            let component = fanta_doc::ComponentId::new();
+            doc.apply(Operation::DefineComponent {
+                def: Box::new(fanta_doc::ComponentDef::new(component, root, name)),
+            })
+            .expect("component");
+            roots.push(root);
+        }
+        let edit = crate::variant_sets::combine_variants(&doc, &roots, Some("Chip")).expect("set");
+        for operation in edit.operations {
+            doc.apply(operation).expect("combine");
+        }
+        let frame = edit.frame.expect("frame");
+
+        for operation in duplicate_layer_operations(&doc, frame).expect("duplicate") {
+            doc.apply(operation).expect("apply duplicate");
+        }
+        let copy = doc
+            .components
+            .sets
+            .values()
+            .find(|set| set.id != edit.set)
+            .expect("the copied set");
+        let copied_frame = copy.root.expect("the copied set has a frame");
+        assert_ne!(copied_frame, frame);
+        let copied_roots: Vec<_> = copy
+            .members
+            .iter()
+            .map(|member| doc.components.def(*member).expect("copied variant").root)
+            .collect();
+        assert_eq!(
+            doc.scene.children_of(Some(copied_frame)),
+            copied_roots.as_slice()
+        );
+        assert_eq!(doc.components.sets[&edit.set].root, Some(frame));
+    }
+
+    #[test]
     fn page_duplicate_preserves_component_masters_and_local_instances() {
         let mut doc = Doc::new();
         let mut page = CanvasNode::new(NodeData::Group(fanta_doc::GroupNode::default()));
@@ -1061,6 +1116,9 @@ fn clone_component_operations(
         copy.default_variant = *components
             .get(&set.default_variant)
             .context("missing copied default variant")?;
+        // The copied set's frame is the copy of its frame, when that was
+        // copied too; otherwise the copied variants have no frame.
+        copy.root = set.root.and_then(|root| nodes.get(&root).copied());
         operations.push(Operation::DefineComponentSet {
             set: Box::new(copy),
         });

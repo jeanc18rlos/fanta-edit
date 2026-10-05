@@ -184,6 +184,9 @@ pub(crate) fn engine_blend_mode(mode: DesignBlendMode) -> Option<BlendMode> {
     })
 }
 
+/// Panel property ids for an instance's variant choices: `variant:<axis>`.
+const VARIANT_PROPERTY_PREFIX: &str = "variant:";
+
 /// The kind fold from engine node data to the panel's canonical taxonomy.
 /// Vector provenance recovers Rectangle via `PathData::is_rect` and the
 /// parametric shapes; component masters override their Group data; media
@@ -1886,10 +1889,26 @@ pub(crate) fn design_node(
             overrides: Default::default(),
             authoring: None,
         });
+        // The variant choices (Variant, State, …) come first, as in Figma;
+        // picking another value swaps the instance to that variant.
         out.component_properties = instance
-            .props
+            .variants
             .iter()
-            .map(|prop| {
+            .map(|axis| {
+                DesignComponentProperty::variant(
+                    SharedString::from(format!("{VARIANT_PROPERTY_PREFIX}{}", axis.axis)),
+                    axis.axis.clone(),
+                    axis.options
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| axis.value.clone()),
+                    axis.value.clone(),
+                    axis.options.clone(),
+                )
+            })
+            .collect();
+        out.component_properties
+            .extend(instance.props.iter().map(|prop| {
                 let prop_id = SharedString::from(prop.id.to_string());
                 match &prop.value {
                     PropValueSnapshot::Bool(value) => {
@@ -1920,8 +1939,7 @@ pub(crate) fn design_node(
                         value.clone(),
                     ),
                 }
-            })
-            .collect();
+            }));
     }
 
     out.capabilities = Some(gate_capabilities(
@@ -1932,11 +1950,14 @@ pub(crate) fn design_node(
     ));
     let mut states = boxless_geometry_states(&section);
     if let Some(instance) = &section.instance {
+        // Panel rows are the variant axes first, then the props.
+        let offset = instance.variants.len();
         states.extend(
             instance
                 .props
                 .iter()
                 .enumerate()
+                .map(|(index, prop)| (index + offset, prop))
                 .filter_map(|(index, prop)| {
                     let PropValueSnapshot::Display(value) = &prop.value else {
                         return None;
@@ -4086,27 +4107,22 @@ impl FigView {
                 let Some(id) = node_id(id) else {
                     return;
                 };
-                let item = self.item().clone();
-                item.update(cx, |item, cx| {
-                    item.with_document(cx, |document| {
-                        let main_root = match document.doc.scene.get(id).map(|node| &node.data) {
-                            Some(NodeData::Instance(instance)) => document
-                                .doc
-                                .components
-                                .def(instance.component)
-                                .map(|def| def.root),
-                            _ => None,
-                        };
-                        let change = match main_root {
-                            Some(root) if document.doc.scene.contains(root) => {
-                                document.doc.selection.replace_with([root]);
-                                DocChange::Selection
-                            }
-                            _ => DocChange::None,
-                        };
-                        ((), change)
-                    });
+                self.go_to_main_component(id, window, cx);
+            }
+            DesignPanelAction::ResetInstanceOverridesRequested { node_id: id } => {
+                let Some(id) = node_id(id) else {
+                    return;
+                };
+                self.finish_document_edits_for_external_change(cx);
+                let ops = self.design_ops(cx, |doc| {
+                    crate::layer_context_ops::simple(
+                        doc,
+                        id,
+                        fanta_gpui::layers::LayersPanelContextAction::ResetInstance,
+                    )
+                    .unwrap_or_default()
                 });
+                self.design_apply_ops(ops, cx);
             }
             DesignPanelAction::PageBackgroundChangeRequested { page_id, color } => {
                 self.handle_design_page_background(
@@ -5750,6 +5766,19 @@ impl FigView {
         let Some(id) = node_id(id) else {
             return;
         };
+        if let Some(axis) = property_id.strip_prefix(VARIANT_PROPERTY_PREFIX) {
+            // Reset has no meaning for a variant choice; a value swaps the
+            // instance to the variant with that value on this axis.
+            let Some(DesignComponentPropertyValue::Variant(choice)) = value else {
+                return;
+            };
+            self.finish_document_edits_for_external_change(cx);
+            let ops = self.design_ops(cx, |doc| {
+                crate::properties_ops::variant_select_operations(doc, id, axis, choice)
+            });
+            self.design_apply_ops(ops, cx);
+            return;
+        }
         let Ok(prop) = property_id.parse() else {
             return;
         };
@@ -11650,6 +11679,114 @@ mod tests {
             );
             assert!(!instance.prop_values.contains_key(&unsupported_prop));
             assert!(doc.history.can_undo());
+        });
+    }
+
+    #[gpui::test]
+    async fn an_instance_shows_its_variant_choices_and_switches_variant(cx: &mut TestAppContext) {
+        let (mut doc, page, _) = doc_with_rect();
+        let set_id = ComponentId::new();
+        let label = ComponentPropId::new();
+        let mut members = Vec::new();
+        for state in ["Default", "Hover"] {
+            let mut master = CanvasNode::new(NodeData::Group(GroupNode {
+                clip_size: Some([80.0, 30.0]),
+                ..Default::default()
+            }));
+            master.name = format!("State={state}");
+            master.parent = Some(page);
+            let root = master.id;
+            doc.scene.insert(master).expect("insert master");
+            let component = ComponentId::new();
+            let mut definition = ComponentDef::new(component, root, format!("State={state}"));
+            definition.variant_of = Some(fanta_doc::ComponentSetMembership {
+                set: set_id,
+                axis_values: BTreeMap::from([("State".to_owned(), state.to_owned())]),
+            });
+            definition.props = vec![ComponentPropDef {
+                id: label,
+                name: "Label".into(),
+                kind: ComponentPropKind::Text,
+                formatter: Default::default(),
+                default: VarValue::String {
+                    value: "Button".into(),
+                },
+                bindings: Vec::new(),
+            }];
+            doc.components.defs.insert(component, definition);
+            members.push((component, root));
+        }
+        doc.components.sets.insert(
+            set_id,
+            fanta_doc::ComponentSet {
+                id: set_id,
+                name: "Button".into(),
+                axes: vec![fanta_doc::VariantAxis {
+                    name: "State".into(),
+                    values: vec!["Default".into(), "Hover".into()],
+                }],
+                members: members.iter().map(|(id, _)| *id).collect(),
+                default_variant: members[0].0,
+                root: None,
+            },
+        );
+        let mut instance = CanvasNode::new(NodeData::Instance(InstanceNode {
+            component: set_id,
+            overrides: Vec::new(),
+            prop_values: BTreeMap::new(),
+            derived: Vec::new(),
+            local_size: [80.0, 30.0],
+        }));
+        instance.parent = Some(page);
+        let id = instance.id;
+        doc.scene.insert(instance).expect("insert instance");
+        doc.selection.replace_with([id]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+
+        panel.read_with(cx, |panel, _| {
+            let properties = &panel.node().component_properties;
+            assert_eq!(properties.len(), 2, "the State choice, then Label");
+            assert_eq!(properties[0].name, "State");
+            assert_eq!(
+                properties[0].resolved_value,
+                DesignComponentPropertyValue::Variant("Default".into())
+            );
+            assert_eq!(properties[1].name, "Label");
+        });
+
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::ComponentPropertyChangeRequested {
+                node_id: id.to_string().into(),
+                property_id: "variant:State".into(),
+                value: DesignComponentPropertyValue::Variant("Hover".into()),
+            });
+        });
+        cx.run_until_parked();
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            let NodeData::Instance(instance) = &doc.scene.get(id).expect("instance").data else {
+                panic!("instance node");
+            };
+            assert_eq!(instance.component, members[1].0, "now the Hover variant");
+        });
+
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::GoToMainComponentRequested {
+                node_id: id.to_string().into(),
+            });
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            assert_eq!(
+                doc.selection.iter().copied().collect::<Vec<_>>(),
+                [members[1].1],
+                "Go to main lands on the Hover master"
+            );
         });
     }
 
