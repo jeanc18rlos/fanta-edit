@@ -6,6 +6,11 @@ reports are degraded inspector UI, double-clicks with no useful node action,
 failures or missing content, and slow editing on large pages. Treat those as
 release blockers until reproduced and verified on the candidate build.
 
+The selected distribution is a **direct-download Mac app**. Final acceptance
+must use the signed, notarized DMG and the app installed from that exact DMG.
+The isolated development QA bundles and Mac App Store checks are separate
+evidence; neither establishes direct-download installation readiness.
+
 The [capability guide](../fanta/capabilities.md) inventories current source.
 This report maps that inventory to executable tests and outstanding acceptance
 work. The dated evidence appendix records completed checks; the capability map
@@ -39,7 +44,7 @@ open. Passing these checks does not validate the combined release artifact.
 | Prototype interaction removal | **Bounded native PASS:** explicit Remove/Save and single Undo/Save on `a82f90f87b`; a fresh matching user-edited baseline passes Save and verified process restart with exact typed content and all 19 files on `ac038333e3`. | The older strict restart failed against a stale baseline after confirmed user position edits and remains retained. Remove/Undo and playback were not repeated on the newer build; broader triggers/overlays remain open. |
 | Inspector and per-node actions | Corrected bound-paint display, picker detachment, mixed opacity, Export labels, representative double-clicks and context actions have recorded native samples and mounted regressions. | Complete the remaining per-kind, mixed-selection, scrub/cancel, clipping and keyboard matrix on the final build. |
 | Large-page responsiveness | Correctness tests and bounded CPU diagnostics pass; Save acceptance hashing improves one measured phase. Gesture instrumentation passes focused worker-time/lifecycle tests only. | Native full Save remains slow in the development candidate; matched complete Save, pointer/frame p50/p95 and memory measurements on the final build are open. Instrumentation is not native input-latency evidence. No result establishes the drag p95 target below 16 ms. |
-| Final artifact and services | Earlier automated, component visual, MCP and distribution evidence is retained with its build identity. | Combined candidate full suite, native journeys, live services, signed/notarized installer and clean-account/Mac checks remain open. |
+| Final artifact and services | Earlier automated, component visual, MCP and distribution evidence is retained with its build identity. Direct-download macOS is the selected release target. | Combined candidate full suite, native journeys, live services, Developer ID signing, DMG notarization/stapling and clean-account/Mac installation checks remain open. |
 
 ## Evidence levels
 
