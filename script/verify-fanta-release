@@ -9,10 +9,13 @@ Usage: script/verify-fanta-release [--list] [--stage NAME] [--output-dir PATH]
 Runs the engine, import, source-order, editor, ui, build, and lint stages.
 Use --stage more than once to select stages; --list prints commands without running.
 The optional visual stage requires a macOS desktop and compares UI component images.
+The optional import-preservation stage requires FANTA_FIG_FIXTURE and fails on
+reported node-structure loss; it does not establish visual or override fidelity.
 Logs and results.tsv are written below target/release-verification by default.
 
 This does not validate an installer, operate the full app UI, contact production
-services, or run ignored benchmarks, network tests, or private Figma fixtures.
+services, or run ignored benchmarks or network tests. Private Figma fixtures run
+only when import-preservation is explicitly selected.
 EOF
 }
 
@@ -32,7 +35,7 @@ while [[ $# -gt 0 ]]; do
             fi
             if [[ "$1" == --stage ]]; then
                 case "$2" in
-                    engine|import|source-order|editor|ui|build|lint|visual)
+                    engine|import|import-preservation|source-order|editor|ui|build|lint|visual)
                         if [[ " ${selected_stages[*]-} " == *" $2 "* ]]; then
                             printf 'Stage selected more than once: %s\n' "$2" >&2
                             exit 2
@@ -94,7 +97,7 @@ if [[ "$list_only" == false ]]; then
         uname -a
         rustc --version
         printf 'Stages: %s\n' "${selected_stages[*]}"
-        printf 'Scope: automated local suites only; ignored tests and private fixtures are not release evidence.\n'
+        printf 'Scope: automated local suites only; private fixtures require the explicit import-preservation stage.\n'
     } > "$output_directory/environment.txt"
     printf 'Verification results: %s\n' "$output_directory"
 fi
@@ -146,6 +149,10 @@ for stage in "${selected_stages[@]}"; do
             # Spectrum integration binaries return success without a fixture;
             # keep those opt-in checks separate from reproducible synthetic tests.
             run_stage "$stage" "$cargo_binary" test --locked -p fanta-fig-interop --lib
+            ;;
+        import-preservation)
+            run_stage "$stage" "$cargo_binary" test --locked -p fanta-fig-interop --lib \
+                imports_real_fig_fixture_without_node_structure_loss -- --ignored --nocapture
             ;;
         source-order)
             run_stage "$stage" "$cargo_binary" test --locked \

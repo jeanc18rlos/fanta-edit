@@ -14,6 +14,10 @@ Create a design from **New Design**, open a Fanta project folder, or import a
 component FNX source, identity sidecars, metadata and assets. See
 [project-schema.md](project-schema.md) for the layout.
 
+- Figma imports warn when known layer structures are flattened or omitted.
+  Imported Boolean operations currently retain baked vector shapes but lose
+  editable operand layers. The original `.fig` remains unchanged. This warning
+  does not cover every possible rendering or component-override difference.
 - Use the left panel to find and switch pages, rename, reorder, duplicate or
   delete pages, select layers, expand nesting, and drag layers into a different
   parent or position. Page roots and component recursion have edit guards.
@@ -52,11 +56,13 @@ Implementation: [document.rs](../../crates/fig_viewer/src/document.rs),
 | Media | Place supported local images, editable SVG, MP4 video and MP3 audio, or generation results. Files are validated before placement. Canvas media controls include playback and seek; video trim preserves the original asset and supports Undo/Redo. |
 
 The properties inspector adapts to the selected kind and selection count. Its
-supported sections include position, size, rotation, constraints, opacity/blend,
+supported sections include position, size, rotation, opacity/blend,
 fills and gradients, strokes, effects, corners, typography, auto-layout/grid,
 variables, components and export. Page selection has page-specific properties. Audio and specialist leaves show
 their own type labels and expose supported position, dimensions, appearance,
 effects and export controls; these controls preserve the underlying content.
+Constraint data can be retained by the document, but constraint controls are
+currently disabled in the default Design inspector.
 Mixed values must remain identifiable; controls must neither erase unsupported
 data nor silently apply to a stale selection. Numeric and color gestures preview
 live, commit as one history step, and restore the previous value when cancelled.
