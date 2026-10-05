@@ -91,8 +91,8 @@ check. Logs, exact source hashes and `combined-root-verification.json` are in
 `target/release-verification/component-prototype-copy-references-20261005/`.
 These are typed-reference/operation tests, not native prototype playback proof;
 arbitrary string-valued component properties are outside the remapping scope.
-Both clipboard corrections postdate the native binary above, so their native
-clipboard acceptance remains open.
+Both clipboard corrections postdate the native binary above. The later bounded
+native keyboard acceptance on `9ca127c1be` is recorded below.
 
 Canvas, keyboard and toolbar Duplicate now use the same component-aware copy
 path as Layers menu Duplicate. A mounted Command+D regression reproduced the
@@ -105,6 +105,24 @@ asserted selection/history. The combined editor suite passed **1,055 tests
 (1 ignored)** and `./script/clippy --locked -p fig_viewer` passed. Evidence is in
 `target/release-verification/canvas-duplicate-components-20261005/`.
 This correction also postdates the native binary above.
+
+Native keyboard clipboard acceptance passed on `9ca127c1be1296d25a69a7102b8680337f3df909`
+(binary SHA-256 `b5ce6e5f9990f8a3ada90b8486cd9932f5b6f984c6197ac81f188d4cdf578183`).
+The asset-free fixture starts with 21 nodes, three component definitions and one
+complete two-member set. Command+D copied the 15-node subtree, producing 36
+nodes, five definitions and two sets; ordinary Command+C/Command+V produced 36
+nodes while retaining the original three definitions and one set. Typed saved
+readback verifies internal node/component targets, ordered primary/secondary
+actions, unchanged external controls and all other persisted fields against the
+explicit expected copy. Save/Undo/Save restored the baseline and Redo/Save
+restored each copy, with only `modified_at` excluded and reported separately.
+The saved **Paste** state then survived clean process quit/reopen and another
+Save with complete persisted equality, including the timestamp. All nine
+comparison reports pass. `native-clipboard-20261005/native-acceptance.json`
+retains snapshot/report hashes, independently rechecked binary and startup-log
+identity, and scope below `target/release-verification/`. Duplicate restart,
+prototype playback, Cut, page/menu Duplicate and asset-bearing component/subtree
+copies remain separate checks; this does not close the Spectrum Save blocker.
 
 The large Spectrum native journey on `0a0d3cd1c4` is **failed/open**. At 100%
 zoom, the image-filled master at page index 9 / traversal index 2110 moved from
@@ -155,6 +173,35 @@ their existing ownership, and separate parse/conflict paths can still build
 tables. This proves bounded sharing and preservation, not measured native memory
 or save latency; the corrected Spectrum native journey remains open.
 
+The native retry on `9ca127c1be` also remains **failed/open**. The same image
+master visibly moved by (32, 16), retaining its image and 40 × 40 size. A single
+Save at **09:43:25.895 UTC** was rejected because external changes were still
+being reconciled. A startup process sample showed eight concurrent watcher
+reloads, seven waiting on the project read lock; this is not a controlled startup
+benchmark. Undo restored the displayed (17548, 1105) position. Quit/Don't Save
+left the app busy, so only the verified disposable QA process was terminated.
+The post-stop snapshot is byte-for-byte identical to the baseline, and the exact
+comparison reports **zero differences**, including the timestamp: **73,925 nodes,
+23 roots, 9,012 component definitions, 41 unchanged asset manifests and 12 Boolean
+bakes**. Native observations and binary identity are in
+`native-copy-save-candidate-20261005/native-spectrum-retry.json`; the snapshot,
+reader provenance, log and `after-rejected-reload-save-comparison.json` are in
+`native-spectrum-20261005/`, both below `target/release-verification/`. This
+confirms preservation after the rejected attempt; watcher reconciliation and a
+successful edit/Save/Undo/Save/restart journey remain release blockers.
+
+The reload correction now serializes initial, watcher, merge and discard reads
+through an asynchronous gate owned by each document's worker. Obsolete queued
+reloads can be cancelled before parsing, and initial-load watcher reconciliation
+waits for adoption of success or failure. Conservative full/asset refresh and
+existing conflict/epoch checks remain. Four original regressions failed before
+the fix; the final **5 focused tests passed across 5 scheduler seeds**, followed
+by **1,066 editor tests (1 ignored)**, the viewer repository lint gate and
+formatting checks. Production source stayed unchanged through final validation.
+Evidence is in `target/release-verification/project-reload-coalescing-20261005/validation.json`.
+The corrected native retry is pending; these checks establish neither startup
+nor Save latency.
+
 The inspector/menu native follow-up used `85fc694b67c78f616401def73506e515594f52d7`,
 binary SHA-256 `d42e94c0febfa6c701c257485a470779b5c991c7e3567b856f6e5b6fb7dced99`.
 Build/source fingerprints and observations are in
@@ -184,7 +231,7 @@ new ID and a 16×16 translation, preserving its payload, asset reference, all 34
 original nodes and all asset bytes. Undo/Save restored the original document and
 Redo/Save restored the pasted document, each except `metadata.modified_at`.
 See `bitmap-cross-page-verdict.json` and its Undo/Redo comparisons in the same
-directory. Component/subtree clipboard journeys remain separate.
+directory. Asset-bearing component/subtree clipboard journeys remain separate.
 
 The same build exposed two defects. A Node Graph + 3D opacity edit
 correctly saved only their opacities as 0.5, and Undo restored both, but the mixed
@@ -738,7 +785,7 @@ coverage. The final column highlights the remaining acceptance work.
 | Create/open/import | `fig_viewer::new_design::tests`, `document::tests`; `fanta-fig-interop` mapping/parser tests | New project and `.fig`/`.fant` import, collision handling, malformed file and missing asset UI; compare representative imported pages with reference renders. |
 | Save/autosave/Save As/reopen | `fanta-format` full suite; `fig_viewer::document::tests`, `view::tests`, `view::serialization::tests` (`canvas_session_*`, `save_generation_*`, `a_failing_autosave_is_reported_until_a_save_succeeds`, `save_as_*`) | Verify file hashes and node/assets inventory across edit, cancel, save, restart and Save As. Inject write failures and concurrent edits; original content must survive. |
 | Source ↔ canvas | `fig_viewer::code_workspace::tests`, `editor_session::tests`; `fanta-fnx` and format tests with and without `serde_json/preserve_order` | FNX and JSON typing/saving, invalid drafts, watcher reload, source lock, multiple tabs/windows and agent source-follow on the actual app. |
-| Pages/layers/structure | Viewer design-panel, structure, layer-context and clipboard tests; `canvas_menu_reorder_entries_execute_and_undo` confirms both ordering entries. Other menu GPUI cases confirm primary text/vector/bitmap/video/audio entries and retain a selected boolean operand. | Layer drag/drop, all per-kind context actions, page deletion/duplication and component/subtree clipboard journeys. Bitmap cross-page Save/Undo/Redo/restart and visible cross-document refusal passed as recorded above. Test hidden/locked rules in the native app. |
+| Pages/layers/structure | Viewer design-panel, structure, layer-context and clipboard tests; `canvas_menu_reorder_entries_execute_and_undo` confirms both ordering entries. Other menu GPUI cases confirm primary text/vector/bitmap/video/audio entries and retain a selected boolean operand. | Layer drag/drop, all per-kind context actions, page deletion/duplication, Cut and asset-bearing component/subtree copies remain. The asset-free keyboard Duplicate/Paste, Save/Undo/Redo and Paste restart journey passed on `9ca127c1be`; bitmap cross-page Save/Undo/Redo/restart and visible cross-document refusal also passed as recorded above. Test hidden/locked rules in the native app. |
 | Navigation/selection/transforms | `fanta-canvas` hit-test/snap tests and `tests/end_to_end.rs`; `fanta-tools::select::tests`, `scale::tests`; viewer toolbar adapter tests | Pan, zoom, nested selection, rapid drag/release, resizing and scaling in a dense imported page. Check focus and pointer capture. |
 | Double-click by node | Viewer `canvas_double_click_*`, `mounted_curved_text_path_*` and mounted crop/drill/guard cases, existing standalone/wrapped text cases; tools `rapid_clicks_drill_once_per_pair_and_do_not_enter_leaf_nodes`, `extending_double_click_toggles_the_container_without_drilling`, `double_click_at_container_resize_handle_still_drills_into_child` | Native pass of the [per-kind contract](../fanta/capabilities.md#double-click-behavior-by-node), including selected/unselected, nested, locked/Inspect states. Check entry, feedback, Escape, Undo and unrelated content. |
 | Properties inspector | `fig_viewer::gpui_adapters::design::tests`, `properties_panel::tests`, `properties_ops::tests`, `properties_snapshot::tests`; mounted `view/properties_inspector.rs::layout_tests` checks geometry fields at minimum width and the composed inspector with annotation/measurement lists | Actual scrub/drag cancellation; differing-value mixed selection, themes, scrolling and popovers. Numeric/hex draft cancellation, invalid-draft page switching, Export labels and two-kind aggregate-opacity display/edit/Undo passed natively. Mounted layout bounds are not a full visual baseline. |
@@ -767,7 +814,7 @@ native inputs and final comparison.
 | Priority | Fixture and bounded journey | Required evidence and limit |
 | --- | --- | --- |
 | 1 — Inspector drafts | Continue on `/tmp/fanta-release-inspector-acceptance-20261005` or a fresh node-matrix copy. Test a selection whose starting values differ, edit/Undo, and an actual scrub/drag cancellation. | Numeric/hex draft Escape, invalid-draft page switching and Export labels passed at 320 px on `85fc694b67`; two-kind opacity display/edit/Undo passed on `ee80ec48c6`. Compare all unrelated typed content/assets after Save/reopen; keyboard draft cancellation does not prove drag cancellation. |
-| 2 — Clipboard and structure | Use a copy of `/tmp/fanta-release-qa-20261005` for component/subtree copy/paste, Cut, Undo/Redo and restart. | Bitmap cross-page placement, Save and Undo/Redo passed on `85fc694b67`; strict bitmap-state restart and visible cross-document refusal passed on `ee80ec48c6`. Verify component dependencies and original masters in the remaining subtree journeys. A rejected unsupported transfer is not a successful cross-project-copy capability. |
+| 2 — Clipboard and structure | Preserve `/tmp/fanta-clipboard-native-20261005`; use a fresh copy for Cut, page/menu Duplicate, asset-bearing subtrees and Duplicate-state restart. | The 15-node complete-set keyboard Duplicate/Paste journey, saved Undo/Redo, external-reference preservation and Paste restart passed on `9ca127c1be`. Bitmap cross-page checks and visible cross-document refusal passed earlier. Compare complete content/assets and original masters in the remaining journeys; prototype playback and successful cross-project transfer are not established here. |
 | 3 — Large-page save and drag | Open `/tmp/fanta-spectrum-release-save-check-20261005`, generated from the unchanged Spectrum `.fig`. On page index 9, move the instance corresponding to import index 4358 and image-filled frame index 2110, then Save, Undo, Save and restart. | Full offline write/readback preserves inventories/assets with only the 15,278 explicitly recorded FNX normalizations above; strict equality fails. Native edit/save/restart and quiet-machine pointer/frame timings remain open. Reconfirm the target nodes after opening; imported IDs are not stable. CPU `drag_bench` and isolated Boolean images do not establish native latency or whole-page visual fidelity. |
 | 4 — Variables, Motion and Prototype | Continue on `/tmp/fanta-release-variables-prototype-20261005`, preserving its evidence. Sample explicit interaction Remove/Undo, easing cancellation and another prototype trigger; separately exercise aliases or a different binding type. | The earlier two-mode, Motion and prototype samples passed on `ee80ec48c6`. Corrected title containment/toggle, bound row/picker/Detach/Undo, time-field seek and non-destructive detail X passed on `0a0d3cd1c4`, with strict restart equality. Compare complete typed content and assets; these samples do not cover all triggers, easing types, aliases or variant combinations. |
 
