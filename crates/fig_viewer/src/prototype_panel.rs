@@ -1463,6 +1463,7 @@ impl FantaPrototypePanel {
         components: &[PrototypeComponent],
         clips: &[PrototypeClip],
         editable: bool,
+        close_details: Option<fn(&mut Self, &mut Context<Self>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1489,11 +1490,22 @@ impl FantaPrototypePanel {
                 h_flex()
                     .justify_between()
                     .child(Label::new(format!("Interaction {}", index + 1)).size(LabelSize::Small))
-                    .when(editable, |row| {
+                    .when_some(close_details, |row, close_details| {
+                        row.child(
+                            IconButton::new(
+                                reaction_element_id("fanta-prototype-close", reaction_id),
+                                IconName::Close,
+                            )
+                            .icon_size(IconSize::XSmall)
+                            .tooltip(Tooltip::text("Close interaction details"))
+                            .on_click(cx.listener(move |panel, _, _, cx| close_details(panel, cx))),
+                        )
+                    })
+                    .when(editable && close_details.is_none(), |row| {
                         row.child(
                             IconButton::new(
                                 reaction_element_id("fanta-prototype-remove", reaction_id),
-                                IconName::Close,
+                                IconName::Dash,
                             )
                             .icon_size(IconSize::XSmall)
                             .tooltip(Tooltip::text("Remove interaction"))
@@ -1979,6 +1991,7 @@ impl FantaPrototypePanel {
                             &components,
                             &clips,
                             editable,
+                            None,
                             window,
                             cx,
                         ));
@@ -2668,6 +2681,289 @@ mod tests {
         let second_id = second.id;
         doc.apply(Operation::create_node(second)).unwrap();
         (doc, first_id, second_id)
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn mounted_prototype_detail_close_preserves_saved_interaction_and_explicit_remove(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            fanta_gpui::init(cx);
+            crate::theme_bridge::init(cx);
+        });
+        let (mut doc, first, second) = document_with_two_frames();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page))
+            .expect("create page");
+        for (index, node) in [first, second].into_iter().enumerate() {
+            doc.scene
+                .set_parent(
+                    node,
+                    Some(page_id),
+                    fanta_doc::IndexKey::from_raw(index as f64),
+                )
+                .expect("attach frame to page");
+        }
+        doc.add_page(page_id);
+        doc.set_active_page(Some(page_id));
+        doc.flow_start = Some(first);
+        doc.selection.select_only(first);
+        doc.history = Default::default();
+        let directory = tempfile::tempdir().expect("prototype project");
+        fanta_format::write_project_tree(directory.path(), &doc, &BTreeMap::new())
+            .expect("write initial project");
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let item = crate::document::ready_item_with_root_for_test(
+            &project,
+            directory.path().join("fanta.json"),
+            Some(directory.path().to_path_buf()),
+            doc,
+            cx,
+        );
+        let (panel, visual) = cx.add_window_view({
+            let item = item.clone();
+            move |_, cx| FantaPrototypePanel::new(item, cx)
+        });
+        visual.simulate_resize(gpui::size(px(400.0), px(1000.0)));
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+        let add = visual
+            .debug_bounds("editor-prototype-inspector-add")
+            .expect("Add interaction");
+        visual.simulate_click(add.center(), gpui::Modifiers::none());
+        visual.run_until_parked();
+        let reaction = item.read_with(visual, |item, _| {
+            let doc = item.doc().expect("document");
+            let reactions = &doc.scene.get(first).expect("start frame").reactions;
+            assert_eq!(reactions.len(), 1);
+            assert_eq!(reactions[0].action, Action::Navigate { to: second });
+            reactions[0].clone()
+        });
+        item.update(visual, |item, cx| {
+            item.save(crate::document::SaveKind::Explicit, cx)
+        })
+        .await
+        .expect("save added interaction");
+        visual.update(|window, cx| window.draw(cx).clear());
+        let close = visual
+            .debug_bounds("ICON-Close")
+            .expect("detail close button");
+        visual.simulate_click(close.center(), gpui::Modifiers::none());
+        visual.run_until_parked();
+        item.read_with(visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(
+                doc.scene.get(first).expect("start frame").reactions,
+                vec![reaction.clone()]
+            );
+            assert_eq!(
+                doc.history.undo_depth(),
+                1,
+                "closing adds no document operation"
+            );
+            assert!(
+                !item.is_dirty(),
+                "closing clean details must not dirty the document"
+            );
+        });
+        assert!(panel.read_with(visual, |panel, _| panel.selected_reaction.is_none()));
+        visual.update(|window, cx| window.draw(cx).clear());
+        assert!(visual.debug_bounds("ICON-Close").is_none(), "details close");
+        item.update(visual, |item, cx| {
+            item.save(crate::document::SaveKind::Explicit, cx)
+        })
+        .await
+        .expect("save after closing details");
+        let (reopened, _) =
+            fanta_format::read_project_tree(directory.path()).expect("reopen project");
+        assert_eq!(
+            reopened.scene.get(first).expect("saved start").reactions,
+            vec![reaction.clone()]
+        );
+        assert_eq!(reopened.flow_start(), Some(first));
+
+        let remove_selector = Box::leak(
+            format!("editor-prototype-inspector-remove-{}", reaction.id).into_boxed_str(),
+        );
+        let remove = visual
+            .debug_bounds(remove_selector)
+            .expect("explicit Minus remove control");
+        visual.simulate_click(remove.center(), gpui::Modifiers::none());
+        visual.run_until_parked();
+        item.read_with(visual, |item, _| {
+            assert!(
+                item.doc()
+                    .expect("document")
+                    .scene
+                    .get(first)
+                    .expect("start frame")
+                    .reactions
+                    .is_empty()
+            );
+            assert!(item.is_dirty());
+        });
+        assert!(
+            item.update(visual, |item, cx| item.undo(cx))
+                .expect("undo explicit removal")
+        );
+        item.read_with(visual, |item, _| {
+            assert_eq!(
+                item.doc()
+                    .expect("document")
+                    .scene
+                    .get(first)
+                    .expect("start frame")
+                    .reactions,
+                vec![reaction]
+            );
+        });
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn mounted_prototype_detail_close_validates_drafts_and_remains_available_read_only(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            fanta_gpui::init(cx);
+            crate::theme_bridge::init(cx);
+        });
+        let (mut doc, first, _) = document_with_two_frames();
+        let reaction = Reaction {
+            id: ReactionId::new(),
+            trigger: Trigger::AfterDelay { delay_ms: 300 },
+            action: Action::Back,
+            extra_actions: Vec::new(),
+            transition: None,
+            animation: None,
+        };
+        doc.apply(Operation::AddReaction {
+            node: first,
+            reaction: reaction.clone(),
+        })
+        .expect("initial interaction");
+        doc.selection.select_only(first);
+        doc.history = Default::default();
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let item = ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/PrototypeCloseDraft.fanta"),
+            doc,
+            cx,
+        );
+        let (panel, visual) = cx.add_window_view({
+            let item = item.clone();
+            move |_, cx| FantaPrototypePanel::new(item, cx)
+        });
+        visual.simulate_resize(gpui::size(px(400.0), px(1000.0)));
+        panel.update(visual, |panel, cx| {
+            panel.selected_reaction = Some(reaction.id);
+            cx.notify();
+        });
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.start_parameter_edit(
+                    ReactionParameter {
+                        node: first,
+                        reaction: reaction.id,
+                        kind: ParameterKind::Delay,
+                    },
+                    "300".into(),
+                    window,
+                    cx,
+                );
+                panel
+                    .parameter_editor
+                    .clone()
+                    .expect("parameter editor")
+                    .update(cx, |editor, cx| editor.set_text("invalid", window, cx));
+            });
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+        let close = visual.debug_bounds("ICON-Close").expect("detail close");
+        visual.simulate_click(close.center(), gpui::Modifiers::none());
+        visual.run_until_parked();
+        panel.read_with(visual, |panel, cx| {
+            assert_eq!(panel.selected_reaction, Some(reaction.id));
+            assert!(panel.editing_parameter.is_some());
+            assert!(panel.parameter_error.is_some());
+            assert_eq!(
+                panel
+                    .parameter_editor
+                    .as_ref()
+                    .expect("editor")
+                    .read(cx)
+                    .text(cx),
+                "invalid"
+            );
+        });
+        item.read_with(visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(reaction_by_id(doc, first, reaction.id), Some(&reaction));
+            assert_eq!(doc.history.undo_depth(), 0);
+        });
+        visual.update(|window, cx| {
+            let editor = panel.read(cx).parameter_editor.clone().expect("editor");
+            editor.update(cx, |editor, cx| editor.set_text("900", window, cx));
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+        let close = visual
+            .debug_bounds("ICON-Close")
+            .expect("detail close after correction");
+        visual.simulate_click(close.center(), gpui::Modifiers::none());
+        visual.run_until_parked();
+        assert!(
+            panel.read_with(visual, |panel, _| panel.selected_reaction.is_none()
+                && panel.editing_parameter.is_none())
+        );
+        item.read_with(visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(
+                reaction_by_id(doc, first, reaction.id)
+                    .expect("interaction retained")
+                    .trigger,
+                Trigger::AfterDelay { delay_ms: 900 }
+            );
+            assert_eq!(
+                doc.history.undo_depth(),
+                1,
+                "closing commits the valid edit once"
+            );
+        });
+        assert!(
+            item.update(visual, |item, cx| item.undo(cx))
+                .expect("undo parameter edit")
+        );
+        panel.update(visual, |panel, cx| {
+            panel.selected_reaction = Some(reaction.id);
+            cx.notify();
+        });
+        item.update(visual, |item, cx| item.set_source_edit_locked(true, cx));
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+        let close = visual
+            .debug_bounds("ICON-Close")
+            .expect("read-only detail close");
+        visual.simulate_click(close.center(), gpui::Modifiers::none());
+        visual.run_until_parked();
+        assert!(panel.read_with(visual, |panel, _| panel.selected_reaction.is_none()));
+        item.read_with(visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(reaction_by_id(doc, first, reaction.id), Some(&reaction));
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert!(
+                doc.history.can_redo(),
+                "closing read-only details preserves history"
+            );
+        });
     }
 
     #[gpui::test]
@@ -3656,6 +3952,14 @@ impl FantaPrototypePanel {
         }
     }
 
+    fn close_interaction_details(&mut self, cx: &mut Context<Self>) {
+        if !self.commit_parameter_edit_value(cx) {
+            return;
+        }
+        self.selected_reaction = None;
+        cx.notify();
+    }
+
     fn render_shared(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         use fanta_gpui::properties_tabs::{
             InspectorChoice, PrototypeConnection, PrototypeInspector, PrototypeInspectorViewData,
@@ -3793,6 +4097,7 @@ impl FantaPrototypePanel {
                     components,
                     clips,
                     *editable,
+                    Some(Self::close_interaction_details),
                     window,
                     cx,
                 ));

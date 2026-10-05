@@ -580,6 +580,53 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn mounted_timeline_time_input_seeks_after_host_keymap_reload(cx: &mut TestAppContext) {
+        let (view, timeline, target_id, mut cx) = setup(cx, true).await;
+        let cx = &mut cx;
+        cx.simulate_resize(gpui::size(px(1400.), px(900.)));
+        cx.run_until_parked();
+        let before = view.read_with(cx, |view, cx| {
+            serde_json::to_value(&view.item.read(cx).document().expect("document").doc)
+                .expect("document snapshot")
+        });
+        cx.update(|_, app| {
+            app.clear_key_bindings();
+            app.bind_keys(
+                settings::KeymapFile::load_asset_allow_partial_failure(
+                    settings::DEFAULT_KEYMAP_PATH,
+                    app,
+                )
+                .expect("shipped keybindings"),
+            );
+        });
+        let input = cx
+            .debug_bounds("timeline-current-time")
+            .expect("mounted current-time input");
+        cx.simulate_click(input.center(), gpui::Modifiers::none());
+        cx.simulate_keystrokes("secondary-a");
+        cx.simulate_input("0.5");
+        cx.simulate_keystrokes("enter");
+        cx.run_until_parked();
+
+        assert_eq!(
+            timeline.read_with(cx, |timeline, _| timeline.view_data().current_time_ms),
+            500
+        );
+        view.read_with(cx, |view, cx| {
+            assert_eq!(view.timeline_shell.read(cx).playhead_us(), 500_000);
+            let document = view.item.read(cx).document().expect("document");
+            assert_eq!(
+                document.doc.selection.iter().copied().collect::<Vec<_>>(),
+                [target_id]
+            );
+            assert_eq!(
+                serde_json::to_value(&document.doc).expect("document snapshot"),
+                before
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn timeline_transport_requires_an_active_clip(cx: &mut TestAppContext) {
         let (view, timeline, _, mut cx) = setup(cx, false).await;
         let cx = &mut cx;

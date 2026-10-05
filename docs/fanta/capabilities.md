@@ -159,6 +159,11 @@ rename/delete and compatible property bindings. Modes can apply at project,
 page and parent scopes. Unbinding bakes the resolved value. Shared styles and
 imported bindings participate in rendering and source persistence.
 
+The release-candidate check passed two-mode color binding, project-mode switching,
+unbind/Undo and reopening. The long Variables title and bound-fill inspector
+display still have UI corrections awaiting native verification; see the
+[coverage report](../alpha/CAPABILITY_COVERAGE.md).
+
 Implementation: [component actions](../../crates/fig_viewer/src/component_actions.rs),
 [component properties](../../crates/fig_viewer/src/component_properties.rs),
 [variants](../../crates/fig_viewer/src/variant_sets.rs), and
@@ -180,6 +185,16 @@ Implementation: [component actions](../../crates/fig_viewer/src/component_action
 - **Inspect/Dev:** inspect content and review information with artwork editing
   disabled. Read-only barriers also apply to shortcuts and agent/source paths;
   changing mode must preserve or explicitly finish a pending edit.
+
+Representative native checks passed Motion playback, ruler seeking and keyframe
+drag/Undo, plus prototype click navigation, Restart, Escape and saved-project
+reopening. Two candidate defects are still being corrected: the timeline's
+Current time field loses editing shortcuts after a keymap reload, and the
+interaction detail's X deletes its interaction instead of closing the detail.
+Ruler seeking works; Undo restores an interaction deleted by that X. Native
+verification of both corrections is pending. The
+[coverage report](../alpha/CAPABILITY_COVERAGE.md) records the tested build and
+remaining cases.
 
 Implementation: [timeline](../../crates/fig_viewer/src/timeline.rs),
 [motion](../../crates/fig_viewer/src/motion_panel.rs),
