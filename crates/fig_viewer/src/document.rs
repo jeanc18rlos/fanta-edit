@@ -2329,6 +2329,11 @@ impl FigItem {
         self.sync_epoch += 1;
         self.set_conflict(false, cx);
         cx.emit(FigItemEvent::StateChanged);
+        // Source-editor saves own the deferred geometry write until every dirty
+        // source buffer is saved. External reloads need normal Save/close protection.
+        if !self.source_edit_locked {
+            self.mark_source_layout_unsaved(cx);
+        }
         cx.notify();
     }
 
@@ -8779,6 +8784,301 @@ mod tests {
                 fanta_doc::Transform2D::translation(70.0, 80.0)
             );
         });
+    }
+
+    fn nested_imported_layout_fixture(grow: bool) -> (Doc, NodeId, NodeId, NodeId, NodeId) {
+        use fanta_doc::{
+            AutoLayout, CanvasNode, GroupNode, LayoutChild, NodeData, PrimaryAlign, VectorNode,
+        };
+        let mut doc = Doc::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_id = page.id;
+        doc.scene.insert(page).expect("page");
+        doc.add_page(page_id);
+        let mut outer = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([148.0, 60.0]),
+            auto_layout: Some(AutoLayout {
+                spacing: 8.0,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        outer.parent = Some(page_id);
+        let outer_id = outer.id;
+        doc.scene.insert(outer).expect("outer frame");
+        let mut nested = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([120.0, 40.0]),
+            auto_layout: Some(AutoLayout {
+                primary_align: PrimaryAlign::End,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        nested.parent = Some(outer_id);
+        nested.index = fanta_doc::IndexKey::FIRST;
+        nested.layout_child = grow.then_some(LayoutChild {
+            grow: 1.0,
+            ..Default::default()
+        });
+        let nested_id = nested.id;
+        doc.scene.insert(nested).expect("nested frame");
+        let mut imported = CanvasNode::new(NodeData::Vector(VectorNode {
+            local_size: Some([20.0, 20.0]),
+            ..VectorNode::rect_solid(0.0, 0.0, 20.0, 20.0, fanta_doc::Color::BLACK)
+        }));
+        imported.parent = Some(nested_id);
+        imported.transform = fanta_doc::Transform2D::translation(12.0, 7.0);
+        let imported_id = imported.id;
+        doc.scene.insert(imported).expect("imported nested child");
+        let mut sibling = CanvasNode::new(NodeData::Vector(VectorNode {
+            local_size: Some([20.0, 20.0]),
+            ..VectorNode::rect_solid(0.0, 0.0, 20.0, 20.0, fanta_doc::Color::BLACK)
+        }));
+        sibling.parent = Some(outer_id);
+        sibling.index = doc.scene.next_child_index(Some(outer_id));
+        sibling.transform = fanta_doc::Transform2D::translation(128.0, 0.0);
+        let sibling_id = sibling.id;
+        doc.scene.insert(sibling).expect("outer sibling");
+        (doc, outer_id, nested_id, imported_id, sibling_id)
+    }
+
+    #[gpui::test]
+    async fn scoped_layout_outer_spacing_preserves_fixed_nested_geometry_and_history(
+        cx: &mut TestAppContext,
+    ) {
+        let project = empty_project(cx).await;
+        let (doc, outer, nested, imported, sibling) = nested_imported_layout_fixture(false);
+        let before = serde_json::to_value(&doc.scene).expect("baseline");
+        let nested_before =
+            serde_json::to_value(doc.scene.extract_subtree(nested)).expect("nested baseline");
+        let item = ready_item(
+            &project,
+            PathBuf::from("/tmp/scoped-layout/Design.fig"),
+            None,
+            doc,
+            cx,
+        );
+        item.update(cx, |item, cx| {
+            let old = item
+                .doc()
+                .expect("document")
+                .scene
+                .get(outer)
+                .expect("outer")
+                .data
+                .clone();
+            let mut new = old.clone();
+            new.as_group_mut()
+                .expect("group")
+                .auto_layout
+                .as_mut()
+                .expect("layout")
+                .spacing = 16.0;
+            item.apply(
+                Operation::ReplaceData {
+                    id: outer,
+                    old: Box::new(old),
+                    new: Box::new(new),
+                },
+                cx,
+            )
+            .expect("spacing edit");
+            let document = item.doc().expect("document");
+            assert_eq!(
+                document.scene.get(sibling).expect("sibling").transform,
+                fanta_doc::Transform2D::translation(136.0, 0.0)
+            );
+            assert_eq!(
+                document
+                    .scene
+                    .get(imported)
+                    .expect("imported child")
+                    .transform,
+                fanta_doc::Transform2D::translation(12.0, 7.0),
+                "unchanged fixed allocation must retain imported child geometry"
+            );
+            assert_eq!(
+                serde_json::to_value(document.scene.extract_subtree(nested)).expect("nested"),
+                nested_before
+            );
+            assert_eq!(document.history.undo_depth(), 1);
+            let after = serde_json::to_value(&document.scene).expect("after");
+            assert!(item.undo(cx).expect("single undo"));
+            assert_eq!(
+                serde_json::to_value(&item.doc().expect("document").scene).expect("undo"),
+                before
+            );
+            assert!(!item.undo(cx).expect("only one transaction"));
+            assert!(item.redo(cx).expect("redo"));
+            assert_eq!(
+                serde_json::to_value(&item.doc().expect("document").scene).expect("redo"),
+                after
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn scoped_layout_changed_nested_allocation_reflows_and_undo_restores_import(
+        cx: &mut TestAppContext,
+    ) {
+        let project = empty_project(cx).await;
+        let (doc, outer, nested, imported, sibling) = nested_imported_layout_fixture(true);
+        let before = serde_json::to_value(&doc.scene).expect("baseline");
+        let item = ready_item(
+            &project,
+            PathBuf::from("/tmp/scoped-layout-resize/Design.fig"),
+            None,
+            doc,
+            cx,
+        );
+        item.update(cx, |item, cx| {
+            let old = item
+                .doc()
+                .expect("document")
+                .scene
+                .get(outer)
+                .expect("outer")
+                .data
+                .clone();
+            let mut new = old.clone();
+            new.as_group_mut().expect("group").clip_size = Some([188.0, 60.0]);
+            item.apply(
+                Operation::ReplaceData {
+                    id: outer,
+                    old: Box::new(old),
+                    new: Box::new(new),
+                },
+                cx,
+            )
+            .expect("outer resize");
+            let doc = item.doc().expect("document");
+            assert_eq!(
+                doc.scene
+                    .get(nested)
+                    .expect("nested")
+                    .data
+                    .as_group()
+                    .expect("group")
+                    .clip_size,
+                Some([160.0, 40.0])
+            );
+            assert_eq!(
+                doc.scene.get(imported).expect("child").transform,
+                fanta_doc::Transform2D::translation(140.0, 0.0)
+            );
+            assert_eq!(
+                doc.scene.get(sibling).expect("sibling").transform,
+                fanta_doc::Transform2D::translation(168.0, 0.0)
+            );
+            let after = serde_json::to_value(&doc.scene).expect("after");
+            assert!(item.undo(cx).expect("undo"));
+            assert_eq!(
+                serde_json::to_value(&item.doc().expect("document").scene).expect("undo"),
+                before
+            );
+            assert!(item.redo(cx).expect("redo"));
+            assert_eq!(
+                serde_json::to_value(&item.doc().expect("document").scene).expect("redo"),
+                after
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn scoped_layout_clean_external_reload_keeps_computed_geometry_dirty_until_save(
+        cx: &mut TestAppContext,
+    ) {
+        let project = empty_project(cx).await;
+        let directory = tempfile::tempdir().expect("project directory");
+        let (mut doc, outer, nested, _, sibling) = nested_imported_layout_fixture(false);
+        doc.scene
+            .get_mut(nested)
+            .expect("nested")
+            .data
+            .as_group_mut()
+            .expect("group")
+            .auto_layout = None;
+        fanta_format::write_project_tree(directory.path(), &doc, &BTreeMap::new())
+            .expect("write baseline");
+        let (baseline, _) =
+            fanta_format::read_project_tree(directory.path()).expect("read baseline");
+        let session =
+            fanta_format::WorkspaceSession::open(directory.path()).expect("source session");
+        let page = baseline.pages()[0];
+        let source = directory
+            .path()
+            .join(
+                &session
+                    .artifacts
+                    .get(&fanta_format::ArtifactId::Page(page))
+                    .expect("page artifact")
+                    .design_dir,
+            )
+            .join("page.fnx");
+        let item = ready_item(
+            &project,
+            directory.path().join("fanta.json"),
+            Some(directory.path().to_path_buf()),
+            baseline.clone(),
+            cx,
+        );
+        item.update(cx, |item, _| {
+            item.merge_base = Some(baseline);
+            item.workspace_session = Some(session);
+        });
+        let original = std::fs::read_to_string(&source).expect("source");
+        let edited = original.replacen("\"spacing\": 8.0", "\"spacing\": 16.0", 1);
+        assert_ne!(edited, original, "one source spacing change");
+        std::fs::write(&source, edited).expect("external FNX edit");
+        item.update(cx, |item, cx| {
+            item.pending_watcher_paths.insert(source);
+            item.schedule_watcher_check(cx);
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_secs(2));
+        cx.run_until_parked();
+        let computed = item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("reloaded document");
+            assert_eq!(
+                doc.scene
+                    .get(outer)
+                    .expect("outer")
+                    .data
+                    .as_group()
+                    .expect("group")
+                    .auto_layout
+                    .expect("layout")
+                    .spacing,
+                16.0
+            );
+            assert_eq!(
+                doc.scene.get(sibling).expect("sibling").transform,
+                fanta_doc::Transform2D::translation(136.0, 0.0)
+            );
+            assert!(item.has_unpersisted_source_layout());
+            assert!(
+                item.is_dirty(),
+                "computed source geometry must participate in Save and close protection"
+            );
+            assert!(
+                !doc.history.can_undo(),
+                "external source adoption is not a canvas edit transaction"
+            );
+            serde_json::to_value(&doc.scene).expect("computed scene")
+        });
+        item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect("persist computed source layout");
+        item.read_with(cx, |item, _| {
+            assert!(!item.is_dirty());
+            assert!(!item.has_unpersisted_source_layout());
+        });
+        let reopened = load_project_document(directory.path()).expect("cold reopen");
+        assert_eq!(
+            serde_json::to_value(&reopened.doc.scene).expect("reopened scene"),
+            computed
+        );
+        assert!(reopened.pending_layout_output_nodes.is_empty());
     }
 
     #[gpui::test]
