@@ -5288,6 +5288,7 @@ dependencies = [
  "remote_connection",
  "rodio",
  "schemars 1.0.4",
+ "search",
  "semver",
  "serde",
  "serde_json",
