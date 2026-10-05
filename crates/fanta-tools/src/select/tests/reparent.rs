@@ -285,3 +285,159 @@ fn dragging_frame_never_reparents_into_own_descendant() {
         "frame must not be reparented into its own subtree"
     );
 }
+
+fn nested_drop_frame(
+    doc: &mut Doc,
+    parent: Option<NodeId>,
+    position: [f64; 2],
+    size: [f64; 2],
+) -> Result<NodeId, Box<dyn std::error::Error>> {
+    let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+        clip_size: Some(size),
+        ..Default::default()
+    }));
+    frame.parent = parent;
+    frame.index = doc.scene.next_child_index(parent);
+    frame.transform = Transform2D::translation(position[0], position[1]);
+    let id = frame.id;
+    doc.apply(Operation::create_node(frame))?;
+    Ok(id)
+}
+
+fn nested_drop_fixture() -> Result<(Doc, NodeId, NodeId, NodeId), Box<dyn std::error::Error>> {
+    let mut doc = Doc::new();
+    let page = nested_drop_frame(&mut doc, None, [-400.0, -250.0], [900.0, 600.0])?;
+    doc.add_page(page);
+    doc.set_active_page(Some(page));
+    let outer = nested_drop_frame(&mut doc, Some(page), [60.0, 40.0], [650.0, 400.0])?;
+    let parent = nested_drop_frame(&mut doc, Some(outer), [170.0, 80.0], [312.0, 224.0])?;
+    let child = nested_drop_frame(&mut doc, Some(parent), [48.0, 48.0], [40.0, 40.0])?;
+    let component = fanta_doc::ComponentId::new();
+    doc.apply(Operation::DefineComponent {
+        def: Box::new(fanta_doc::ComponentDef::new(
+            component,
+            child,
+            "Image master",
+        )),
+    })?;
+    doc.selection.select_only(child);
+    Ok((doc, outer, parent, child))
+}
+
+fn assert_nested_pointer_drop(
+    mut doc: Doc,
+    child: NodeId,
+    delta: [f64; 2],
+    expected_parent: NodeId,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let before = serde_json::to_value(&doc.scene)?;
+    let old_node = doc.scene.get(child).ok_or("missing dragged frame")?.clone();
+    let old_world = doc
+        .scene
+        .world_transform(child)
+        .ok_or("missing world transform")?;
+    let expected_index = if old_node.parent == Some(expected_parent) {
+        old_node.index
+    } else {
+        doc.scene.next_child_index(Some(expected_parent))
+    };
+    let world = old_world.then(&Transform2D::translation(delta[0], delta[1]));
+    let parent_world = doc
+        .scene
+        .world_transform(expected_parent)
+        .ok_or("missing parent")?;
+    let mut expected_node = old_node;
+    expected_node.parent = Some(expected_parent);
+    expected_node.index = expected_index;
+    expected_node.transform = world.then(&parent_world.inverse());
+    let mut expected = before.clone();
+    expected["nodes"][serde_json::to_value(child)?
+        .as_str()
+        .ok_or("invalid node ID")?] = serde_json::to_value(&expected_node)?;
+
+    let mut viewport = Viewport::default();
+    let size = DVec2::new(800.0, 600.0);
+    let mut ctx = ToolContext::new(&mut doc, &mut viewport, no_snap_engine(), size);
+    let center = ctx
+        .doc
+        .scene
+        .world_bounds(child)
+        .ok_or("missing frame bounds")?
+        .center();
+    let press = screen_for_world(center, ctx.viewport, size);
+    let release = [press[0] + delta[0], press[1] + delta[1]];
+    let undo_depth = ctx.doc.history.undo_depth();
+    let mut tool = SelectTool::new();
+    tool.handle_event(&mut ctx, pe_press(press, ModifierKeys::empty()));
+    tool.handle_event(&mut ctx, pe_move(release, ModifierKeys::empty()));
+    tool.handle_event(&mut ctx, pe_release(release, ModifierKeys::empty()));
+
+    assert_eq!(ctx.doc.scene.get(child), Some(&expected_node));
+    assert_eq!(ctx.doc.scene.world_transform(child), Some(world));
+    assert_eq!(serde_json::to_value(&ctx.doc.scene)?, expected);
+    assert_eq!(ctx.doc.selection.as_slice(), &[child]);
+    assert_eq!(ctx.doc.history.undo_depth(), undo_depth + 1);
+    assert_eq!(ctx.doc.components.defs.len(), 1);
+    assert_eq!(
+        ctx.doc.components.defs.values().next().map(|def| def.root),
+        Some(child)
+    );
+    ctx.doc.scene.validate()?;
+
+    assert!(ctx.doc.undo()?);
+    assert_eq!(serde_json::to_value(&ctx.doc.scene)?, before);
+    assert_eq!(ctx.doc.history.undo_depth(), undo_depth);
+    assert!(ctx.doc.redo()?);
+    assert_eq!(serde_json::to_value(&ctx.doc.scene)?, expected);
+    assert_eq!(ctx.doc.selection.as_slice(), &[child]);
+    ctx.doc.scene.validate()?;
+    Ok(())
+}
+
+#[test]
+fn nested_drag_inside_frame_preserves_parent_index_and_scene_undo_redo()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (doc, _, parent, child) = nested_drop_fixture()?;
+    assert_nested_pointer_drop(doc, child, [32.0, 16.0], parent)
+}
+
+#[test]
+fn nested_drag_inside_frame_ignores_less_specific_overlapping_container()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut doc, outer, parent, child) = nested_drop_fixture()?;
+    let page = doc.scene.get(outer).ok_or("missing outer frame")?.parent;
+    let behind = nested_drop_frame(&mut doc, page, [60.0, 40.0], [650.0, 400.0])?;
+    doc.scene.set_index(behind, IndexKey::from_raw(0.5))?;
+    assert_nested_pointer_drop(doc, child, [32.0, 16.0], parent)
+}
+
+#[test]
+fn nested_drag_partially_outside_frame_keeps_parent_until_fully_clear()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (doc, _, parent, child) = nested_drop_fixture()?;
+    // Center x=320 is outside the 312-wide parent, but 12 units still overlap.
+    assert_nested_pointer_drop(doc, child, [252.0, 0.0], parent)
+}
+
+#[test]
+fn nested_drag_fully_outside_frame_pops_one_level_and_preserves_world()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (doc, outer, _, child) = nested_drop_fixture()?;
+    assert_nested_pointer_drop(doc, child, [312.0, 0.0], outer)
+}
+
+#[test]
+fn nested_drag_into_sibling_frame_reparents_and_preserves_scene_undo_redo()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut doc, outer, _, child) = nested_drop_fixture()?;
+    let sibling = nested_drop_frame(&mut doc, Some(outer), [520.0, 80.0], [100.0, 224.0])?;
+    assert_nested_pointer_drop(doc, child, [322.0, 0.0], sibling)
+}
+
+#[test]
+fn nested_drag_into_deeper_frame_reparents_and_preserves_scene_undo_redo()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut doc, _, parent, child) = nested_drop_fixture()?;
+    let deeper = nested_drop_frame(&mut doc, Some(parent), [176.0, 40.0], [80.0, 100.0])?;
+    assert_nested_pointer_drop(doc, child, [148.0, 20.0], deeper)
+}

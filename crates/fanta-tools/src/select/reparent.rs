@@ -23,8 +23,8 @@ impl SelectTool {
     ///
     /// 1. **Drop INTO a container** (`findMoveDropTarget` + `doReorderChild`):
     ///    if the node's dropped center lands over a group/frame that is a *valid*
-    ///    new parent (not the node, not its own descendant, not already its
-    ///    parent), reparent into it. We pick the topmost such container under the
+    ///    new parent (not the node, its descendant, or an existing ancestor),
+    ///    reparent into it. We pick the most deeply nested container under the
     ///    center — Figma's "drop where the cursor is" semantic — and insert at the
     ///    top of its z-order (`next_child_index`), the sibling insertion index.
     ///
@@ -78,24 +78,30 @@ impl SelectTool {
         }
     }
 
-    /// Find the topmost group/frame under `center` that `id` may legally be
+    /// Find the deepest group/frame under `center` that `id` may legally be
     /// reparented into. Excludes `id` itself, any descendant of `id` (a cycle),
-    /// and `id`'s current parent (reparenting into the same parent is a no-op —
-    /// a pure z-order reorder, handled by a separate gesture). Returns `None`
-    /// when there is no eligible container (so the caller falls through to the
-    /// drop-outside check).
+    /// and ancestors above its current parent. The current parent participates
+    /// in depth selection but returns no target when it wins, preserving both
+    /// the parent and sibling index. Ancestor changes use the fully-outside
+    /// check instead, so partial overlap cannot prematurely pop a node out.
     fn drop_target_container(
         ctx: &ToolContext,
         id: NodeId,
         current_parent: Option<NodeId>,
         center: DVec2,
     ) -> Option<NodeId> {
-        // Walk every node under the point, top-z first, and take the first group
-        // that is a valid parent. `hit_test_deep` returns leaves; groups never
+        // `hit_test_deep` returns leaves; groups never
         // "catch" themselves there, so we instead test containers explicitly via
         // their world bounds, descending so the *innermost* containing frame wins
         // (Figma drops into the deepest frame under the cursor).
         let mut best: Option<(NodeId, usize)> = None;
+        let parent_ancestors: Vec<_> = ctx
+            .doc
+            .scene
+            .ancestors_of(id)
+            .skip(1)
+            .map(|node| node.id)
+            .collect();
         // Scope the drop-target search to the active page's subtree. `.fig`
         // pages share a world origin, so an unscoped search could reparent the
         // dropped node into an invisible frame on another page directly under
@@ -103,15 +109,16 @@ impl SelectTool {
         // root, preserving the old behavior.
         match ctx.scope() {
             Some(page) => {
-                Self::find_container(ctx, page, id, current_parent, center, 0, &mut best);
+                Self::find_container(ctx, page, id, &parent_ancestors, center, 0, &mut best);
             }
             None => {
                 for &root in ctx.doc.scene.roots() {
-                    Self::find_container(ctx, root, id, current_parent, center, 0, &mut best);
+                    Self::find_container(ctx, root, id, &parent_ancestors, center, 0, &mut best);
                 }
             }
         }
-        best.map(|(node, _)| node)
+        best.filter(|(node, _)| Some(*node) != current_parent)
+            .map(|(node, _)| node)
     }
 
     /// Depth-first descent that records the deepest valid container whose world
@@ -120,7 +127,7 @@ impl SelectTool {
         ctx: &ToolContext,
         node_id: NodeId,
         dragged: NodeId,
-        current_parent: Option<NodeId>,
+        parent_ancestors: &[NodeId],
         center: DVec2,
         depth: usize,
         best: &mut Option<(NodeId, usize)>,
@@ -143,17 +150,25 @@ impl SelectTool {
         if !bounds.contains_point(center) {
             return;
         }
-        // A valid container: a group that accepts children, is not the dragged
-        // node's current parent (that would be a no-op reparent), and is not the
-        // dragged node itself (guarded above).
-        if node.can_have_children() && Some(node_id) != current_parent {
+        // Existing ancestors must not bypass the fully-outside check. Keep the
+        // current parent in the depth comparison so an unrelated outer frame
+        // cannot capture a node that still belongs in its more specific frame.
+        if node.can_have_children() && !parent_ancestors.contains(&node_id) {
             match best {
                 Some((_, best_depth)) if *best_depth >= depth => {}
                 _ => *best = Some((node_id, depth)),
             }
         }
         for &child in ctx.doc.scene.children_of(Some(node_id)) {
-            Self::find_container(ctx, child, dragged, current_parent, center, depth + 1, best);
+            Self::find_container(
+                ctx,
+                child,
+                dragged,
+                parent_ancestors,
+                center,
+                depth + 1,
+                best,
+            );
         }
     }
 
