@@ -2090,6 +2090,19 @@ pub(crate) fn aggregate_selection(
     node.width = multi.width.unwrap_or(0.0) as f32;
     node.height = multi.height.unwrap_or(0.0) as f32;
     node.rotation = multi.rotation_degrees.unwrap_or(0.0) as f32;
+    let opacity = doc
+        .scene
+        .get(first)
+        .map(|node| node.opacity)
+        .filter(|opacity| {
+            ids.iter().all(|id| {
+                doc.scene
+                    .get(*id)
+                    .is_some_and(|node| node.opacity == *opacity)
+            })
+        });
+    let opacity_percent = opacity.map(|opacity| f64::from(opacity.get()) * 100.0);
+    node.opacity = opacity_percent.unwrap_or(0.0) as f32;
     let mut capabilities =
         DesignPanelNodeCapabilities::for_node_kind(DesignPanelNodeKind::MultipleSelection);
     capabilities.sections = vec![DesignPanelSection::Position, DesignPanelSection::Layer];
@@ -2121,6 +2134,7 @@ pub(crate) fn aggregate_selection(
         (DesignPanelProperty::Width, state(multi.width)),
         (DesignPanelProperty::Height, state(multi.height)),
         (DesignPanelProperty::Rotation, state(multi.rotation_degrees)),
+        (DesignPanelProperty::Opacity, state(opacity_percent)),
     ];
     (node, states)
 }
@@ -13009,6 +13023,132 @@ mod tests {
             assert!(
                 (panel.node().opacity - 100.0).abs() < 1e-3,
                 "the undo echoes back into the panel"
+            );
+        });
+    }
+
+    #[test]
+    fn multi_selection_opacity_projects_transparent_and_mixed_values() {
+        let (mut doc, _page, ids) = doc_with_three_squares();
+        for id in ids {
+            doc.scene.get_mut(id).expect("selected node").opacity =
+                fanta_doc::UnitInterval::new(0.0);
+        }
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        let (node, states) = aggregate_selection(&document, &ids, &HashMap::new());
+        assert_eq!(node.opacity, 0.0);
+        assert!(states.contains(&(
+            DesignPanelProperty::Opacity,
+            DesignPanelPropertyValueState::Uniform(DesignPanelValue::Number(0.0)),
+        )));
+
+        document
+            .doc
+            .scene
+            .get_mut(ids[1])
+            .expect("selected node")
+            .opacity = fanta_doc::UnitInterval::new(0.5);
+        let (_, states) = aggregate_selection(&document, &ids, &HashMap::new());
+        assert!(states.contains(&(
+            DesignPanelProperty::Opacity,
+            DesignPanelPropertyValueState::Mixed,
+        )));
+    }
+
+    #[gpui::test]
+    async fn multi_selection_opacity_echoes_for_specialist_nodes_and_undo(cx: &mut TestAppContext) {
+        let (mut doc, page, _) = doc_with_rect();
+        let mut ids = Vec::new();
+        for data in [
+            NodeData::NodeGraph(fanta_doc::NodeGraphNode {
+                local_size: [190.0, 160.0],
+                graph: fanta_doc::NodeGraph::default(),
+                preview: None,
+            }),
+            NodeData::Model3d(fanta_doc::Model3dNode {
+                asset: AssetId::new(),
+                local_size: [190.0, 160.0],
+                camera: fanta_doc::Camera3d::default(),
+                overrides: serde_json::json!({"material": "preserve"}),
+            }),
+        ] {
+            let mut node = CanvasNode::new(data);
+            node.parent = Some(page);
+            ids.push(node.id);
+            doc.scene.insert(node).expect("insert specialist node");
+        }
+        doc.selection.replace_with(ids.iter().copied());
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        let before = item.read_with(cx, |item, _| {
+            serde_json::to_value(&item.document().expect("document ready").doc.scene)
+                .expect("scene snapshot")
+        });
+
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::TargetedNodeActionRequested {
+                target: DesignPanelTarget::Nodes {
+                    node_ids: ids.iter().map(|id| id.to_string().into()).collect(),
+                },
+                action: Box::new(DesignPanelAction::PropertyChangeRequested {
+                    node_id: ids.first().expect("two selected nodes").to_string().into(),
+                    property: DesignPanelProperty::Opacity,
+                    value: DesignPanelValue::Number(50.0),
+                }),
+            });
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            for id in &ids {
+                assert_eq!(
+                    doc.scene.get(*id).expect("selected node").opacity.get(),
+                    0.5
+                );
+            }
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.node().opacity,
+                50.0,
+                "the inspector must echo the saved value"
+            );
+            assert_eq!(
+                panel
+                    .view_data()
+                    .property_states
+                    .get(&DesignPanelProperty::Opacity),
+                Some(&DesignPanelPropertyValueState::Uniform(
+                    DesignPanelValue::Number(50.0)
+                )),
+            );
+        });
+
+        item.update(cx, |item, cx| {
+            assert!(item.undo(cx).expect("undo opacity"));
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            assert_eq!(
+                serde_json::to_value(&doc.scene).expect("scene snapshot"),
+                before
+            );
+            assert!(!doc.history.can_undo(), "one Undo restores both nodes");
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.node().opacity, 100.0);
+            assert_eq!(
+                panel
+                    .view_data()
+                    .property_states
+                    .get(&DesignPanelProperty::Opacity),
+                Some(&DesignPanelPropertyValueState::Uniform(
+                    DesignPanelValue::Number(100.0)
+                )),
             );
         });
     }

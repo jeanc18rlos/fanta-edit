@@ -4994,6 +4994,7 @@ impl FigView {
         });
         if let Err(error) = result {
             log::error!("{label} canvas selection failed: {error:#}");
+            show_canvas_notice_deferred(format!("{label} failed: {error:#}"), cx);
         }
     }
 
@@ -12580,6 +12581,103 @@ mod tests {
             let pasted = doc.selection.as_slice()[0];
             assert_ne!(pasted, frame_id);
             assert_eq!(doc.scene.children_of(Some(pasted)).len(), 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn rejected_cross_document_canvas_paste_shows_notice_and_preserves_document(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+        cx.update(|cx| {
+            client::Client::set_global(project.read(cx).client(), cx);
+            <dyn fs::Fs>::set_global(file_system, cx);
+        });
+        let (mut source, source_text, _) = text_selection_doc(false);
+        source.selection.select_only(source_text);
+        let payload = CanvasClipboard::capture(&source).expect("copy source text");
+        cx.update(|cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(
+                payload.display_text(),
+                payload,
+            ));
+        });
+
+        let (mut destination, destination_text, _) = text_selection_doc(false);
+        assert_ne!(source.id, destination.id);
+        destination.selection.select_only(destination_text);
+        let asset = AssetId::new();
+        destination.asset_library.insert(
+            asset,
+            fanta_doc::ProjectAsset {
+                name: "Kept.svg".into(),
+                kind: ProjectAssetKind::Svg,
+            },
+        );
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/RejectedClipboard.fig"),
+            destination,
+            cx,
+        );
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                Arc::make_mut(&mut document.raw_assets).insert(
+                    asset,
+                    br#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>"#
+                        .to_vec(),
+                );
+                ((), DocChange::None)
+            });
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let view = cx.update(|window, cx| {
+            let view = cx.new(|cx| FigView::new(item.clone(), project, window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            });
+            window.activate_window();
+            view
+        });
+        cx.run_until_parked();
+        let snapshot = |item: &FigItem| {
+            let document = item.document().expect("destination document");
+            (
+                serde_json::to_value(&document.doc).expect("serialize destination"),
+                document.doc.selection.as_slice().to_vec(),
+                document.doc.history.undo_depth(),
+                document.doc.history.redo_depth(),
+                document.raw_assets.clone(),
+                item.is_dirty(),
+            )
+        };
+        let before = item.read_with(cx, |item, _| snapshot(item));
+        let notice = NotificationId::named(CANVAS_NOTICE_ID.into());
+        workspace.read_with(cx, |workspace, _| {
+            assert!(!workspace.notification_ids().contains(&notice));
+        });
+
+        view.update(cx, |view, cx| view.paste_selected_nodes(cx));
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace.notification_ids().contains(&notice),
+                "a rejected paste must reach the visible workspace notification surface"
+            );
+        });
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                snapshot(item),
+                before,
+                "rejection preserves content, selection, history, asset bytes and dirty state"
+            );
         });
     }
 
