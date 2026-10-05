@@ -52,7 +52,7 @@ jobs:
       - name: Test design engines, import, editor interactions and UI components
         run: |
           ./script/verify-fanta-release \
-            --stage engine --stage import --stage source-order --stage editor --stage ui \
+            --stage engine --stage import --stage source-order --stage editor --stage workspace --stage ui \
             --output-dir "${RUNNER_TEMP}/fanta-release-verification"
 
       - name: Preserve release verification evidence

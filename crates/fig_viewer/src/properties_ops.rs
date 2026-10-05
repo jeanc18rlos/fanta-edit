@@ -701,6 +701,13 @@ pub(crate) fn selection_color_operations(
                             .iter_mut()
                             .for_each(|stroke| replace(&mut stroke.paint));
                     }
+                    NodeData::Boolean(boolean) => {
+                        boolean.fills.iter_mut().for_each(replace);
+                        boolean
+                            .strokes
+                            .iter_mut()
+                            .for_each(|stroke| replace(&mut stroke.paint));
+                    }
                     NodeData::Group(group) => {
                         group
                             .background
@@ -1305,11 +1312,7 @@ pub(crate) fn set_corner_smoothing(data: &mut NodeData, smoothing: f32) {
 }
 
 pub(crate) fn stroke_list_mut(data: &mut NodeData) -> Option<&mut SmallVec<[Stroke; 1]>> {
-    match data {
-        NodeData::Vector(vector) => Some(&mut vector.strokes),
-        NodeData::Group(group) => Some(&mut group.strokes),
-        _ => None,
-    }
+    data.strokes_mut()
 }
 
 pub(crate) fn group_fill_slot(group: &mut GroupNode, index: usize) -> Option<&mut Fill> {
@@ -1327,6 +1330,7 @@ pub(crate) fn group_fill_slot(group: &mut GroupNode, index: usize) -> Option<&mu
 pub(crate) fn fill_slot_mut(data: &mut NodeData, index: usize) -> Option<&mut Fill> {
     match data {
         NodeData::Vector(vector) => vector.fills.get_mut(index),
+        NodeData::Boolean(boolean) => boolean.fills.get_mut(index),
         NodeData::Group(group) => group_fill_slot(group, index),
         _ => None,
     }
@@ -1435,6 +1439,11 @@ pub(crate) fn remove_fill(data: &mut NodeData, index: usize) {
                 vector.fills.remove(index);
             }
         }
+        NodeData::Boolean(boolean) => {
+            if index < boolean.fills.len() {
+                boolean.fills.remove(index);
+            }
+        }
         NodeData::Group(group) => {
             if group.background.is_some() {
                 if index == 0 {
@@ -1453,6 +1462,7 @@ pub(crate) fn remove_fill(data: &mut NodeData, index: usize) {
 pub(crate) fn add_fill(data: &mut NodeData) {
     match data {
         NodeData::Vector(vector) => vector.fills.push(Fill::solid(DEFAULT_FILL_COLOR)),
+        NodeData::Boolean(boolean) => boolean.fills.push(Fill::solid(DEFAULT_FILL_COLOR)),
         NodeData::Group(group) => {
             if group.background.is_none() {
                 group.background = Some(Fill::solid(DEFAULT_FILL_COLOR));

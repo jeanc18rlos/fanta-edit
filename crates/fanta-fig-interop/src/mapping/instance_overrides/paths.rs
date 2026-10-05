@@ -6,6 +6,38 @@ use super::{
     OverrideValue, guid_key,
 };
 
+pub(crate) struct SwapRedirect {
+    pub(crate) master_root: NodeId,
+    pub(crate) source_order: usize,
+}
+
+pub(crate) type InstanceSwapRedirects = HashMap<NodeId, HashMap<String, SwapRedirect>>;
+
+pub(crate) fn insert_swap_redirect(
+    redirects: &mut HashMap<String, SwapRedirect>,
+    path: String,
+    master_root: NodeId,
+    source_order: usize,
+) {
+    if redirects
+        .get(&path)
+        .is_none_or(|existing| existing.source_order <= source_order)
+    {
+        redirects.insert(
+            path,
+            SwapRedirect {
+                master_root,
+                source_order,
+            },
+        );
+    }
+}
+
+pub(crate) struct ResolvedOverrideTarget {
+    pub(crate) path: OverridePath,
+    pub(crate) instance_master: Option<NodeId>,
+}
+
 /// Path-resolution state shared by every instance of one import: the guid of
 /// each mapped node (the inverse of `guid_to_node`, built once) and each
 /// master's `guid → def-local-path` map, built the first time an override
@@ -27,6 +59,10 @@ impl<'a> MasterPathCache<'a> {
             node_to_guid,
             per_master: HashMap::new(),
         }
+    }
+
+    pub(crate) fn node_guid(&self, node: NodeId) -> Option<&str> {
+        self.node_to_guid.get(&node).copied()
     }
 
     /// Borrow (building + caching on first use) the `guid → def-local-path` map
@@ -64,25 +100,50 @@ pub(crate) fn resolve_full_guid_path(
     master_root: NodeId,
     guid_to_node: &HashMap<String, Option<NodeId>>,
     guids: &[KiwiValue],
-    swap_redirects: &HashMap<String, NodeId>,
+    swap_redirects: &InstanceSwapRedirects,
+    instance: NodeId,
     cache: &mut MasterPathCache<'_>,
 ) -> Option<OverridePath> {
+    resolve_override_target(
+        doc,
+        master_root,
+        guid_to_node,
+        guids,
+        swap_redirects,
+        instance,
+        cache,
+    )
+    .map(|target| target.path)
+}
+
+pub(crate) fn resolve_override_target(
+    doc: &Doc,
+    master_root: NodeId,
+    guid_to_node: &HashMap<String, Option<NodeId>>,
+    guids: &[KiwiValue],
+    swap_redirects: &InstanceSwapRedirects,
+    instance: NodeId,
+    cache: &mut MasterPathCache<'_>,
+) -> Option<ResolvedOverrideTarget> {
     if guids.is_empty() {
         return None;
     }
     let mut current_root = master_root;
     let mut out: OverridePath = OverridePath::new();
-    // The joined SOURCE guidPath prefix walked so far (guids, '>'-separated),
-    // used to look up a sibling swap that re-points the instance we're about to
-    // descend into (see `swap_redirects` / the nested duality).
-    let mut src_prefix = String::new();
+    // Outer placement overrides are applied after a nested instance's own
+    // overrides during expansion, so they must win when both swap the same slot.
+    let mut contexts: Vec<_> = swap_redirects
+        .get(&instance)
+        .map(|redirects| (redirects, String::new()))
+        .into_iter()
+        .collect();
     for (i, g) in guids.iter().enumerate() {
         let guid = guid_key(g)?;
-        if i == 0 {
-            src_prefix.push_str(&guid);
-        } else {
-            src_prefix.push('>');
-            src_prefix.push_str(&guid);
+        for (_, prefix) in &mut contexts {
+            if !prefix.is_empty() {
+                prefix.push('>');
+            }
+            prefix.push_str(&guid);
         }
         // MAIN-vs-PUBLISHED ROOT CASE. Figma roots a `guidPath` at the SYMBOL the
         // instance references: a path segment whose guid is the *current master's
@@ -106,26 +167,30 @@ pub(crate) fn resolve_full_guid_path(
             (seg, last)
         };
         out.extend(seg);
-        // For every guid but the last, descend into the nested instance it names.
-        if i + 1 < guids.len() {
-            // SWAP REDIRECT (the nested main-vs-published duality): if a sibling
-            // `overriddenSymbolID` override swapped THIS nested instance (keyed by
-            // the source-guid prefix up to and including it), descend into the
-            // SWAPPED master's root — the subsequent segments address the swapped
-            // variant's descendants, not the declared symbolID's. Otherwise descend
-            // into the instance's declared component master as before.
-            let next_root = if let Some(&swapped_root) = swap_redirects.get(&src_prefix) {
-                swapped_root
-            } else {
-                match doc.scene.get(last).map(|n| &n.data) {
-                    Some(NodeData::Instance(inst)) => master_root_for(doc, inst.component),
-                    _ => None,
-                }?
-            };
-            current_root = next_root;
+        let node = doc.scene.get(last)?;
+        let instance_master = match &node.data {
+            NodeData::Instance(nested) => contexts
+                .iter()
+                .find_map(|(redirects, prefix)| redirects.get(prefix).map(|swap| swap.master_root))
+                .or_else(|| master_root_for(doc, nested.component)),
+            _ if last == current_root => Some(current_root),
+            _ => None,
+        };
+        if i + 1 == guids.len() {
+            return Some(ResolvedOverrideTarget {
+                path: out,
+                instance_master,
+            });
+        }
+        if !matches!(node.data, NodeData::Instance(_)) {
+            return None;
+        }
+        current_root = instance_master?;
+        if let Some(redirects) = swap_redirects.get(&last) {
+            contexts.push((redirects, String::new()));
         }
     }
-    Some(out)
+    None
 }
 
 /// Build the per-instance SWAP REDIRECT map for nested override resolution.
@@ -146,9 +211,9 @@ pub(crate) fn build_swap_redirects(
     symbol_overrides: &[KiwiValue],
     symbol_guid_to_component: &HashMap<String, ComponentId>,
     master_root: impl Fn(ComponentId) -> Option<NodeId>,
-) -> HashMap<String, NodeId> {
-    let mut out: HashMap<String, NodeId> = HashMap::new();
-    for ov in symbol_overrides {
+) -> HashMap<String, SwapRedirect> {
+    let mut out = HashMap::new();
+    for (source_order, ov) in symbol_overrides.iter().enumerate() {
         let Some(swap_guid) = ov.get("overriddenSymbolID").and_then(guid_key) else {
             continue;
         };
@@ -167,7 +232,7 @@ pub(crate) fn build_swap_redirects(
         };
         let key: Vec<String> = guids.iter().filter_map(guid_key).collect();
         if key.len() == guids.len() && !key.is_empty() {
-            out.insert(key.join(">"), root);
+            insert_swap_redirect(&mut out, key.join(">"), root, source_order);
         }
     }
     out

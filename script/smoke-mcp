@@ -14,25 +14,34 @@ Options:
                                to reach disk (default 30)
     --quit-app                 terminate the app if this script started it
     --socket                   skip `--mcp-stdio` and talk to the unix socket
+    --screenshot-path PATH     retain the MCP screenshot as a PNG
+
+FANTA_USER_DATA_DIR selects the same isolated profile as the app and stdio bridge.
 
 Exit code is 0 only when every assertion passed.
 """
 
 import argparse
+import base64
 import json
 import os
 import shlex
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import threading
 import time
+import zlib
 from pathlib import Path
 
+PROFILE_DIRECTORY = os.environ.get("FANTA_USER_DATA_DIR", "")
 DISCOVERY_PATH = (
-    Path.home() / "Library" / "Application Support" / "Fanta" / "fanta_live_mcp.json"
-)
+    Path(PROFILE_DIRECTORY)
+    if PROFILE_DIRECTORY.strip()
+    else Path.home() / "Library" / "Application Support" / "Fanta"
+) / "fanta_live_mcp.json"
 REQUIRED_TOOLS = [
     "get_editor_state",
     "get_guidelines",
@@ -54,6 +63,76 @@ def excerpt(value, limit=900):
     if len(text) > limit:
         text = text[:limit] + f"… [{len(text)} chars]"
     return text
+
+
+def png_dimensions(data):
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("screenshot is not a PNG")
+    offset = 8
+    dimensions = None
+    row_lengths = []
+    compressed = bytearray()
+    while offset + 12 <= len(data):
+        length = struct.unpack_from(">I", data, offset)[0]
+        end = offset + 12 + length
+        if end > len(data):
+            break
+        kind = data[offset + 4:offset + 8]
+        payload = data[offset + 8:end - 4]
+        checksum = struct.unpack_from(">I", data, end - 4)[0]
+        if zlib.crc32(kind + payload) != checksum:
+            raise ValueError("screenshot has a corrupt PNG chunk")
+        if kind == b"IHDR":
+            if offset != 8 or length != 13:
+                raise ValueError("screenshot has an invalid PNG header")
+            width, height, depth, color, compression, filtering, interlace = struct.unpack(
+                ">IIBBBBB", payload
+            )
+            allowed_depths = {
+                0: (1, 2, 4, 8, 16), 2: (8, 16), 3: (1, 2, 4, 8),
+                4: (8, 16), 6: (8, 16),
+            }
+            if (
+                not width or not height or max(width, height) > 512
+                or depth not in allowed_depths.get(color, ())
+                or compression != 0 or filtering != 0 or interlace not in (0, 1)
+            ):
+                raise ValueError("screenshot has unsupported PNG dimensions or format")
+            dimensions = (width, height)
+            channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}[color]
+            passes = [(0, 0, 1, 1)] if interlace == 0 else [
+                (0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4),
+                (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2),
+            ]
+            for start_x, start_y, step_x, step_y in passes:
+                columns = max(0, (width - start_x + step_x - 1) // step_x)
+                rows = max(0, (height - start_y + step_y - 1) // step_y)
+                if columns and rows:
+                    row_lengths.extend([1 + (columns * channels * depth + 7) // 8] * rows)
+        elif kind == b"IDAT":
+            if dimensions is None:
+                raise ValueError("screenshot pixels precede the PNG header")
+            compressed.extend(payload)
+        elif kind == b"IEND" and dimensions and compressed and length == 0:
+            expected = sum(row_lengths)
+            decoder = zlib.decompressobj()
+            try:
+                pixels = decoder.decompress(compressed, expected + 1)
+            except zlib.error as error:
+                raise ValueError(f"screenshot PNG pixels are corrupt: {error}") from error
+            if (
+                not decoder.eof or decoder.unused_data or decoder.unconsumed_tail
+                or len(pixels) != expected
+            ):
+                raise ValueError("screenshot PNG pixel data is incomplete or has extra bytes")
+            row_start = 0
+            for row_length in row_lengths:
+                if pixels[row_start] > 4:
+                    raise ValueError("screenshot PNG has an invalid row filter")
+                row_start += row_length
+            return dimensions
+        offset = end
+    raise ValueError("screenshot PNG is incomplete")
 
 
 class Report:
@@ -400,6 +479,7 @@ def main():
     parser.add_argument("--autosave-timeout", type=float, default=30.0)
     parser.add_argument("--quit-app", action="store_true")
     parser.add_argument("--socket", action="store_true")
+    parser.add_argument("--screenshot-path", type=Path)
     args = parser.parse_args()
 
     binary = Path(args.binary).expanduser()
@@ -410,6 +490,7 @@ def main():
 
     print(f"smoke-mcp: {binary}")
     print(f"           {project}\n")
+    report.note(f"profile discovery: {DISCOVERY_PATH}")
 
     # --- preflight ------------------------------------------------------
     if not report.check(
@@ -576,7 +657,12 @@ def main():
 
         # --- the edit ----------------------------------------------------
         mtime_before = page_file.stat().st_mtime
-        git_before = git(project, "status", "--short").stdout
+        source_before = page_file.read_text()
+        rectangle_name = f"{RECTANGLE_NAME} {time.time_ns()}"
+        source_pathspec = f":(literal){source}"
+        git_before = git(
+            project, "status", "--short", "--untracked-files=all", "--", source_pathspec
+        ).stdout
 
         applied = None
         try:
@@ -588,7 +674,7 @@ def main():
                         {
                             "op": "create_node",
                             "node_type": "rectangle",
-                            "name": RECTANGLE_NAME,
+                            "name": rectangle_name,
                             "x": 0,
                             "y": 0,
                             "width": 120,
@@ -627,30 +713,37 @@ def main():
 
         # --- the product thesis ------------------------------------------
         deadline = time.monotonic() + args.autosave_timeout
-        mtime_after = page_file.stat().st_mtime
-        while mtime_after <= mtime_before and time.monotonic() < deadline:
+        source_after = page_file.read_text()
+        while rectangle_name not in source_after and time.monotonic() < deadline:
             time.sleep(0.5)
-            mtime_after = page_file.stat().st_mtime
+            source_after = page_file.read_text()
+        mtime_after = page_file.stat().st_mtime
         waited = args.autosave_timeout - max(deadline - time.monotonic(), 0)
         autosaved = report.check(
             "the edit reaches the .fnx on disk with no Cmd-S",
-            mtime_after > mtime_before,
+            source_after != source_before
+            and rectangle_name in source_after
+            and bool(created)
+            and all(f'id="{node_id.removeprefix("n_")}"' in source_after for node_id in created),
             f"{page_file.name} mtime {mtime_before:.0f} -> {mtime_after:.0f} after {waited:.1f}s"
             if mtime_after > mtime_before
             else f"{page_file} mtime never moved from {mtime_before:.0f} in "
             f"{args.autosave_timeout:.0f}s — nobody pressed Cmd-S, and that is the point",
         )
 
-        git_after = git(project, "status", "--short")
+        git_after = git(
+            project, "status", "--short", "--untracked-files=all", "--", source_pathspec
+        )
         report.check(
-            "the autosaved edit shows up as a git diff",
+            "the autosaved FNX is a tracked change or untracked file in git",
             git_after.returncode == 0 and git_after.stdout.strip() != "",
-            "git status --short:\n"
+            f"git status for {source}:\n"
             + "\n".join(
                 f"        {line}" for line in git_after.stdout.strip().splitlines()
             )
             if git_after.stdout.strip()
-            else f"`git status --short` is empty (it was {git_before.strip()!r} before the edit)",
+            else f"Git reports no change to {source} (it was {git_before.strip()!r} before the edit): "
+            f"{git_after.stderr.strip()}",
         )
 
         # --- the rest of the toolbelt against a live document -------------
@@ -658,24 +751,28 @@ def main():
             shot = connection.call_tool("get_screenshot", {"max_dimension": 512}, timeout=180)
             image = shot[0] if shot else {}
             data = image.get("data") or ""
+            pixels = base64.b64decode(data, validate=True)
+            dimensions = png_dimensions(pixels)
+            if args.screenshot_path and image.get("mimeType") == "image/png":
+                args.screenshot_path.write_bytes(pixels)
             report.check(
-                "get_screenshot renders the open page",
+                "get_screenshot returns a PNG with valid pixel data",
                 image.get("type") == "image"
                 and image.get("mimeType") == "image/png"
-                and len(data) > 1000,
-                f"{len(data)} base64 chars of {image.get('mimeType')}"
+                and all(dimensions),
+                f"{dimensions[0]}×{dimensions[1]} PNG, {len(pixels)} bytes"
                 if image.get("type") == "image"
                 else excerpt(shot),
             )
-        except RpcError as error:
-            report.check("get_screenshot renders the open page", False, str(error))
+        except (RpcError, ValueError, OSError) as error:
+            report.check("get_screenshot returns a PNG with valid pixel data", False, str(error))
 
         try:
             nodes = connection.call_tool_json("batch_get", {"ids": created}, timeout=60)
             fetched_names = [node.get("name") for node in nodes.get("nodes") or []]
             report.check(
                 "batch_get reads the node batch_design just made",
-                RECTANGLE_NAME in fetched_names,
+                rectangle_name in fetched_names,
                 f"names {fetched_names}",
             )
         except RpcError as error:

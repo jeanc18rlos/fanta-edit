@@ -31,16 +31,139 @@ evidence on its own.
 Virtual instance text now rejects locked text/ancestors, occluded targets and
 content outside ordinary or rounded clips. Four targeted regressions passed in
 the local editor checkpoint. Boolean operands also support explicit drill-in
-and vector editing with Undo preserving the boolean container. These harness
-results still require native app acceptance.
+and vector editing with Undo preserving the boolean container. Native Boolean
+samples are recorded below; the full hit-guard/input matrix remains incomplete.
 
 ## Local checkpoint — 5 October
 
-The integrated working tree passed all seven default verification stages.
+The inspector/menu native follow-up used `85fc694b67c78f616401def73506e515594f52d7`,
+binary SHA-256 `d42e94c0febfa6c701c257485a470779b5c991c7e3567b856f6e5b6fb7dced99`.
+Build/source fingerprints and observations are in
+`target/release-verification/native-inspector-followup-20261005/`. The matching
+automated rerun passed 1,041 editor tests (1 ignored), 3 benchmark CLI tests,
+234 workspace tests, 9 UI tests and the repository lint gate in
+`2026-10-05-menu-export-retry/`. After the two fixes described below, the combined
+working-tree rerun passed **1,044 editor tests (1 ignored), 3 benchmark CLI tests
+and the full twelve-crate lint gate** in `2026-10-05-opacity-paste-final/`.
+The subsequent native build verified both fixes as recorded below.
+
+At the 320-logical-pixel inspector width, native checks now pass for context-menu
+Escape (menu closes and selection stays), clicking from a menu into the X field,
+and short, medium and long Export labels. The long label truncates within the
+button padding and exports the correctly named 440×29 PNG. Typing X from 30 to 45
+then pressing Escape restored 30. An invalid numeric draft showed its red border;
+switching Core → Specialist pages retained the original X. In the text-fill
+picker, replacing hex `232837` with `E34A6F` without Return, then pressing Escape,
+restored `232837`. Save/readback after the numeric and color cancellations matched
+every typed field and all asset bytes strictly. See `native-control-observations.json`,
+`after-numeric-cancel-compare.json` and `after-color-cancel-compare.json`.
+These are typed-draft cancellations; mouse-down → Escape → mouse-up scrub/color
+drag cancellation remains unverified because the native automation drag is atomic.
+
+Native bitmap copy/paste onto another page created exactly one new node with a
+new ID and a 16×16 translation, preserving its payload, asset reference, all 34
+original nodes and all asset bytes. Undo/Save restored the original document and
+Redo/Save restored the pasted document, each except `metadata.modified_at`.
+See `bitmap-cross-page-verdict.json` and its Undo/Redo comparisons in the same
+directory. Component/subtree clipboard journeys remain separate.
+
+The same build exposed two defects. A Node Graph + 3D opacity edit
+correctly saved only their opacities as 0.5, and Undo restored both, but the mixed
+inspector still displayed 100%. The aggregate-opacity correction passed its two
+focused regressions and the combined suite. Pasting that bitmap into a separate
+New Design correctly preserved the destination unchanged but gave no visible
+refusal; the error appeared only in the log. The new notification and regression
+also passed the combined suite. The original evidence includes
+`after-mixed-opacity-verdict.json`, `after-mixed-opacity-undo-compare.json`,
+`mixed-opacity-before.log`, `mixed-opacity-after.log`, and
+`cross-document-before-fix-compare.json`.
+
+Both corrections passed native acceptance on
+`ee80ec48c642b42b704d674da2a87dc8c7f42a67`, binary SHA-256
+`01d17bcfa2791ce3eab72cbf56779da39cbe2f2132d7ae0432962e6439215b8c`.
+The rebuilt app reopened the saved 35-node bitmap-paste state with strict typed
+equality and identical asset bytes. Deleting only that test paste through the UI
+restored the 34-node baseline except `metadata.modified_at`. Editing the Node
+Graph + 3D selection to 50% then saving changed exactly those two opacities;
+the inspector still showed 50% after collapsing/reopening Appearance. One canvas
+Undo restored the 100% display and the full typed baseline and asset bytes,
+except the save timestamp. Pasting into the separate design now showed the
+explicit **Paste failed: cross-document canvas paste is not supported yet**
+notice, and Save/readback left the destination strictly unchanged. Cross-document
+canvas paste remains unsupported; displaying its refusal does not add that
+capability. Provenance, `bitmap-restart-compare.json`, `opacity-native-verdict.json`,
+`opacity-saved-verdict.json`, `opacity-undo-compare.json`,
+`cross-document-native-verdict.json` and `cross-document-after-fix-compare.json`
+are in `target/release-verification/native-opacity-paste-20261005/`.
+
+The Boolean/import candidate is `a4adca9570`, followed by the behavior-preserving
+lint cleanup `0bec851a8a`. Its engine, importer and
+source-order checks are in `2026-10-05-preservation-engine/`; the editor and
+remaining assembled-app checks are in `2026-10-05-preservation-app/`, all under
+`target/release-verification/`. That checkpoint recorded 1,764 engine
+tests (6 ignored), 282 importer tests (11 ignored), 310 source-order tests,
+1,040 editor tests (1 ignored), and 3 benchmark CLI tests, with zero failures.
+Eight focused standalone-document tests additionally cover the final JSON
+precision dependency. Source-file hashes are retained with the app run.
+The same app run passed all 234 workspace tests, 9 UI tests and app/CLI
+compilation. Existing component baselines also passed without regeneration:
+animation panel 99.973%, timeline 99.989%, inspector 99.956% (minimum 99.95%).
+The initial lint failure is retained; the result-conversion cleanup passed the
+full repository lint gate in `2026-10-05-preservation-lint/`. That source
+passed all eight default stages plus component visuals. The
+final native rebuild is recorded separately; historical native results below
+do not substitute for it.
+
+The earlier isolated native QA bundle was built at
+`6fd579b408860b0d09ec44d3260c4ae1a1b66d1d`, binary SHA-256
+`226082debcbb88f462eab356e402b04fe1d9ae0a691d5f62ed5abb8dd9572d9a`.
+Build and working-tree fingerprints are retained in
+`native-preservation-20261005/provenance.json`. Live MCP passed **18/18 assertions
+over stdio and 18/18 over the Unix socket** on this bundle, including exact
+created-node persistence in FNX, the active file's Git status and valid PNG pixel
+data. Logs, commands and screenshots are `mcp-stdio.log`, `mcp-socket.log`,
+`mcp-metadata.json`, `mcp-stdio.png` and `mcp-socket.png` in that directory.
+These passes establish protocol and persistence behavior, not native control
+coverage. Native Boolean journeys below are separate from these MCP results.
+
+Native Boolean acceptance on this same bundle passed on the isolated 53-node
+project built from all 12 Spectrum Boolean subtrees. Recolor changed only the
+selected fill; Flatten produced the exact preserved vector and removed only its
+two operands; double-click selected the rectangle operand, whose one-step move
+changed only its local X and invalidated only its parent’s baked appearance. Each
+Undo and Save restored the full typed baseline except the save timestamp, with
+all 12 bakes active. Quit/relaunch restored the page and all 19 non-Git files were
+byte-identical; typed data exactly matched the pre-quit snapshot. Evidence:
+`native-preservation-20261005/boolean-native-journey-provenance.json` and its
+referenced snapshots/comparisons. This is complete acceptance for those sampled
+Boolean journeys, not every Boolean operation or the entire Spectrum project.
+
+The same native pass found that Escape did not dismiss the canvas context menu
+and instead cleared the underlying selection. A mounted right-click/keyboard
+regression reproduces that failure; the focus correction passed the subsequent
+`85fc694b67` native check recorded above.
+
+Native inspection on `6fd579b408` also caught an Export-label defect: the label
+could collapse to an ellipsis despite the passing component visual baselines.
+The upstream Fanta UI PR #8 correction was integrated and passed the subsequent
+`85fc694b67` native assembled-inspector label/export check recorded above.
+The earlier long-name overflow fix and component screenshot pass alone did not
+close this defect.
+
+The previous full local automated checkpoint is recorded in
+`2026-10-05-acceptance-engine/` and `2026-10-05-acceptance-final/`
+under `target/release-verification/`; the historical table below gives its exact counts.
+Native checks then used the isolated QA bundle built at
+`450efc87934aee3d1834b24bc13be37ad3fcc8d4`, SHA-256
+`caa67385097a608c6a7db3b627ec3f86ba0802cfeaf879b68268a5e213e17edb`.
+`native-acceptance-20261005/provenance.json` records the build and the separately
+owned pointer-appearance working-tree change included in that binary.
+
+The initial polished working tree passed all seven default verification stages.
 The initial evidence is retained under
 `target/release-verification/2026-10-05-release-polish/`, including command output
 and environment records. Final engine evidence is in
-`2026-10-05-engine-final/`; the latest complete editor, benchmark-test and
+`2026-10-05-engine-final/`; the earlier complete editor, benchmark-test and
 app/CLI build checks are in `2026-10-05-pattern-guard-final/`, all under
 `target/release-verification/`. The final Clippy rerun passed in
 `2026-10-05-pattern-guard-lint/`. The combined run's earlier failed lint log is
@@ -54,7 +177,7 @@ export checks also wrote page/selection PNGs; their log is retained as
 benchmark example compilation error; the corrected example passed the final
 lint and test reruns.
 
-The full editor and app/CLI checks below cover the final production changes
+The historical editor and app/CLI checks below cover the production changes
 from `55d420ae87`. The QA binary was then rebuilt at
 `02f33b7f789bc313de689d4d28400d1cbb991894` and opened successfully through the
 native app. On 5 October at 04:14 UTC, all 24 recorded project files matched
@@ -68,13 +191,13 @@ complete capability coverage or signed-distribution acceptance.
 
 | Stage | Recorded result |
 | --- | --- |
-| Engine libraries, integration suites and doctests | 1,752 passed, 0 failed, 6 ignored across 35 test targets. |
-| Synthetic Figma importer | 266 passed, 0 failed, 10 ignored. This synthetic stage excludes private fixtures; the separate Spectrum timing is recorded below. |
-| FNX/format with preserved JSON order | 308 passed, 0 failed. |
-| Editor GPUI/unit suite | Latest rerun: 1,016 library/GPUI tests plus 3 benchmark CLI tests passed, 0 failed; 1 projection benchmark ignored in the ordinary suite and run separately. Library test execution 54.94 seconds. Includes eight per-node double-click cases, four virtual-text hit guards, both mounted inspector layout checks, context-menu entry activation/ordering/Undo, mounted blank-click input and Flatten appearance/pattern/undo checks. |
+| Engine libraries, integration suites and doctests | Acceptance rerun: 1,754 passed, 0 failed, 6 ignored across 35 test targets; 53 seconds including compilation. Evidence: `2026-10-05-acceptance-engine/`. |
+| Synthetic Figma importer | Import-report rerun: 269 passed, 0 failed, 11 ignored. The loader warning regression also passed 1/1. The explicit private Spectrum preservation gate failed: 12 flattened Boolean parents and 28 omitted operands. Evidence: `spectrum-import-20261005/spectrum-preservation-final-validation.json`. |
+| FNX/format with preserved JSON order | Acceptance rerun: 310 passed, 0 failed; 24 seconds including compilation. Evidence: `2026-10-05-acceptance-engine/`. |
+| Editor GPUI/unit suite | Acceptance rerun: 1,030 library/GPUI tests plus 3 benchmark CLI tests passed, 0 failed; 1 projection benchmark ignored in the ordinary suite and run separately. Library test execution 58.07 seconds. Evidence: `2026-10-05-acceptance-final/`. Includes eight per-node double-click cases, four virtual-text hit guards, both mounted inspector layout checks, context-menu entry activation/ordering/Undo, mounted blank-click input and Flatten appearance/pattern/undo checks. |
 | UI primitives | 9 passed, 0 failed. |
-| App and CLI compilation | `cargo check --locked -p zed -p cli` passed. |
-| Repository Clippy gate | Final `./script/clippy --locked` rerun passed for the runner's eleven Fanta crates, including all targets/features and denied warnings. Evidence: `2026-10-05-pattern-guard-lint/`. |
+| App and CLI compilation | Acceptance rerun: `cargo check --locked -p zed -p cli` passed in 11 seconds. Evidence: `2026-10-05-acceptance-final/`. |
+| Repository Clippy gate | Acceptance `./script/clippy --locked` rerun passed for the runner's eleven Fanta crates, including all targets/features and denied warnings, in 37 seconds. Evidence: `2026-10-05-acceptance-final/`. |
 | Native component screenshots | Passed against existing baselines: animation panel 99.973%, timeline 99.989%, inspector 99.956% pixel match (required 99.95%). Images and logs are in `target/release-verification/2026-10-05-native-components/`. No baseline was regenerated; these are component galleries, not full-app inspector screenshots. |
 | Native debug build | Passed with isolated-profile log-path support. Final QA build provenance is recorded separately in `target/release-verification/native-qa-20261005/`. The disposable QA bundle is not a signed-distribution acceptance pass. |
 
@@ -135,6 +258,155 @@ response was checked in memory but not saved by this script. It does not replace
 native menu/pointer checks; the separate native quit/reopen evidence is recorded
 above.
 
+The subsequent native Save As pass used the `02f33b7f789b` binary. Cancelling
+the picker preserved all 24 original project/export files. Completing Save As
+activated the copy; moving a rectangle then autosaved its new position only in
+the destination. Native Quit/reopen preserved all 22 destination project files
+and all 24 original files, and the copied canvas retained its component master,
+both instances, shapes and comments. Loading both projects through the format
+reader confirmed the same eight nodes, one page and one component; every node
+and component definition matched except the intended rectangle translation.
+Existing PNG exports were not copied into
+the new project. Evidence is retained in
+`target/release-verification/native-save-as-20261005/`.
+
+That pass exposed a separate restoration defect: reopening the workspace
+activated the original project, even though the copied design was active at
+Quit. Both tabs and their content were available. Canvas tabs lacked persisted
+restoration state, and asynchronous project auto-opening chose the active tab
+by completion order. The fix at `b5fe804c0c` persists canvas navigation and prevents late background
+opens from taking focus. Five regression tests passed across five deterministic
+scheduler seeds, including a reproduced/fixed race between scoped-tab identities.
+They release the original views before restoring saved content, verify clean page
+navigation, and retain the close prompt for dirty canvas and actual dirty FNX
+buffers. Logs, including the race failure, are in `canvas-restore-20261005/`.
+Native Save As on `450efc8793` preserved every typed node, document field and
+asset byte in the copy. Quit/relaunch restored that destination and its selected
+third page. A subsequent copy-content comparison detected a 3D-node move during
+concurrent window interaction; the original stayed unchanged. The failed
+comparison is retained and is not an unchanged-content restart pass.
+A fresh-copy repeat then passed: crop Apply/Save/Undo/Save restored all 34 nodes
+and five assets except the modification timestamp. Quit/relaunch restored the
+copy and selected media page, with strict typed equality and all 30 file hashes
+unchanged. Both earlier projects also retained their 30 file hashes.
+Evidence: `native-acceptance-20261005/clean-repeat-*-compare.json` and
+`clean-repeat-all-project-restart-hashes.json`.
+Two scoped page tabs after Save As and immediate Quit now pass all seven
+canvas-restoration tests across five scheduler seeds. The queue fix flushes
+queued/in-flight item state and orders regular batches so an older slow write
+cannot overwrite a newer one. Eight workspace serialization and five Hot Exit
+tests also passed across five seeds. These changes preserve existing dirty-state
+and content-save behavior. The failure logs and successful reruns remain in
+`canvas-restore-20261005/`, including `immediate-flush-before.log` and
+`workspace-flush-order-before.log`.
+
+Native New Design on `450efc8793` passed picker cancellation with all 30 files
+of the previous project unchanged, project creation and text insertion/save.
+It exposed a dark-canvas/light-inspector background mismatch and repeated local
+image placement rejection while the native picker was open. The canvas background pixel regression passed for default, authored and
+explicitly transparent pages without changing document data. The rebuilt native
+app now places PNGs through the system picker and shows the matching light page
+background. One Undo/Save restores all typed document data except the modification
+timestamp; the imported PNG remains unreferenced on disk, so strict file equality
+is explicitly not claimed. The same new project's invalid-source journey passed:
+saving broken FNX showed a parse error and left all 19 files unchanged; the canvas
+retained its text and blocked a drag. Native source Undo/Save cleared the lock,
+and a subsequent drag saved its position. Canvas Undo/Save restored all typed
+content except `metadata.modified_at`. Evidence is in
+`native-acceptance-20261005/new-design-*.json`. Native inspector JPG, SVG and
+PDF exports of the text also passed visual inspection at 87×19; a repeated PDF
+export created `Text-2.pdf` and preserved all original export hashes. Evidence:
+`native-acceptance-20261005/native-text-export-results.json`.
+
+The later native build used `793aa5cb91` plus the resolver change committed as
+`ed4efa03ee` and the unchanged, separate agent-presence working-tree edit. Its
+binary SHA-256 is
+`4ca4c465ae4d6b4b1ad198b34367b4d5984ef5aa0dbbac58dfbd2dba98ad0593`.
+Source provenance and observed results are in
+`native-acceptance-latest-20261005/`. Native two-page Save As preserved exact typed
+document data and asset bytes; two successive Quit/relaunch journeys restored
+both scoped tabs and the latest active tab/page. No fixed delay was inserted
+between navigation and Quit, although native event-delivery latency was not
+measured. All 30 source files, 30 destination files and 24 files in the separate
+media project retained their hashes through both restarts. A long image name
+exposed an Export-button overflow. The shared UI fix passed all hosted checks
+and merged as Fanta UI PR #7 (`179643a0f4`); the editor pins its tested
+`d4dd5163` revision. Native validation of the rebuilt editor is recorded separately.
+
+The same `4ca4c465` binary passed all **18 live MCP assertions** using the
+isolated profile, including a uniquely named rectangle, its exact node ID in
+the autosaved FNX and a retained 240×160 PNG inspected as the expected red
+rectangle. Evidence: `native-acceptance-latest-20261005/mcp-smoke-strict.log`,
+`mcp-smoke-strict-metadata.json` and `mcp-screenshot-strict.png`. The disposable child project had a committed
+baseline, although its parent project also contained untracked files; the
+original whole-repository Git-status assertion alone was insufficient proof.
+The first run's failures are retained: the harness compared prefixed MCP IDs
+with unprefixed FNX IDs and rejected a valid compact PNG by byte length. The
+harness now compares normalized IDs, checks the exact FNX Git path and validates
+PNG chunks, decompressed scanline lengths and filter bytes. Its retained negative
+checks reject unrelated Git changes and corrupt/incomplete screenshot pixels.
+This is live protocol/persistence evidence, not a complete native UI pass.
+
+A new forced-write-failure regression passed 1/1 and is committed at
+`8b572a41c1`. It pauses a real save, makes newer edits and places an image, then
+forces a write failure. The live edits, asset bytes, history and previous disk
+content survive; a subsequent save reopens the latest content with a decodable
+image, and Undo/Redo still works. This is GPUI/file-system harness evidence;
+the log is `target/release-verification/save-failure-20261005/focused.log`.
+
+Four additional mounted pointer/keyboard regressions passed and are committed
+at `fadf63b2db`: bitmap crop apply with repeat-Enter protection and Undo/Redo;
+crop cancellation during and after a drag; Group → Boolean → Vector drilling;
+and locked/source-read-only Bitmap and Vector guards. Crop checks preserve the
+original asset bytes, bitmap payload and world placement. These use actual
+GPUI input dispatch in the harness, not native OS input. Their log and metadata
+are in `target/release-verification/mounted-node-input-20261005/`.
+
+The broader native node fixture on `02f33b7f789b` verified crop Apply/Cancel
+and Undo, Group → child text word editing, Boolean → operand path-tool entry,
+and video/audio/specialist selection and menu routing. It exposed a real save
+failure: an existing 3D leaf caused `import not allowed: model3d` after an
+unrelated crop edit. All 30 baseline files remained unchanged during the failed
+save. The fix at `c676649fe5` preserves stored 3D payloads in both materialization
+paths; two focused regressions passed, including an unrelated page edit, checked
+save and reopen with model nodes in another page and a component. Evidence is in
+`native-node-matrix-20261005/`; a native explicit Save on `450efc8793` subsequently persisted both a curved-text
+edit and a cropped bitmap while retaining the stored 3D node and all five assets.
+This closes the explicit-save reproduction; it does not independently establish
+autosave timing.
+The follow-up `66f478fd91` gives Audio/Node Graph/3D/AI/Embed their own titles
+and supported dimensions/effects/export sections, plus specific context-menu
+labels. Two focused wrapper tests passed, exercising all five kinds through real
+property actions, exact Undo restoration and 120×80 PNG exports. All seven menu
+tests passed, including activation of the specialist entries. Matching-layer
+selection now keeps these node types distinct. Native rechecking on `450efc8793` confirmed all five inspector titles,
+size/effects/export sections and their corresponding context-menu labels. Each
+properties entry was activated. These are wrapper controls, not specialist
+authoring engines.
+
+That fixture also reproduced missed Text on Path clicks inside a letter counter.
+The fix at `b808faeefc` adds the shaped-cluster footprint for authoring while
+retaining exact-ink inspection. Two mounted-input regressions passed at 100% and
+65% zoom, covering ink, counters, whitespace, Crop → Escape, editing and Undo,
+plus occlusion, locks, ordinary/rounded clipping and distant empty baseline
+space. All 27 existing canvas geometry tests passed. Evidence and source/binary
+fingerprints are in `text-path-authoring-20261005/`. Native verification on `450efc8793` selected the curved `EDIT` word from its
+letter counter, replaced it with `QA`, and saved `PATH QA ME`. Native Undo and
+Save restored the original typed document and exact assets except the modified
+timestamp. Evidence is in `native-acceptance-20261005/`. The first crop
+apply/Undo save comparison in the same fixture also recorded three vector
+viewport backfills performed by the existing load path; its strict comparison
+remains explicitly unequal. No comparison exception was added for them; the
+fresh-copy repeat above passes after that existing load normalization.
+
+The subsequent native Motion-mode pass on `02f33b7f789b` played and sought
+the local H.264 video: both the preview playhead and burned-in frame timestamp
+advanced, and seeking displayed the expected later frame. Audio Play switched to
+Pause with an advancing marker, and seeking updated its elapsed-time display;
+audible output was not captured. `native-node-matrix-20261005/native-media-controls.json`
+records these checks. Trim, complete animation timelines, specialist editors and
+the final rebuilt binary are outside that pass.
+
 On a synthetic CPU render of 256 shadowed rectangles, moving one rectangle for
 120 frames at 1024×768 produced the following single before/after runs:
 
@@ -185,6 +457,83 @@ it establishes no improvement. The fixture hash stayed unchanged at the SHA-256
 recorded above. Command, build/revision metadata, binary hash and raw timings are
 in `target/release-verification/spectrum-import-20261005/`.
 
+A source-level audit subsequently classified those 28 removals: they are
+**24 vector and 4 rounded-rectangle operands under 12 Boolean operations**,
+not instance expansion copies. The parents retain baked paths, but their
+editable operations and children are flattened away. The parents occur on
+Wireframes and Application Frames & Grids, without instance/component ancestry.
+A reduced projection reproduced 40 source nodes becoming 12 vectors, with 28
+operands removed. This reproduced a structure-preservation defect without
+establishing missing rendered artwork. Evidence and unchanged source
+hash are retained in `spectrum-import-20261005/spectrum-preservation-classification.json`.
+The corrected importer retains all 12 Boolean operations and 28 operands.
+Its full synthetic library suite passed 282 tests (11 ignored), and the explicit
+Spectrum structure gate reports zero flattened Booleans, lost operands, other
+child losses or skipped nodes. All 12 isolated local subtrees render to
+byte-identical PNGs at the same recorded viewport and 4× scale before and after
+the change. This comparison excludes outer ancestor effects and is not a Figma
+screenshot or full-page oracle. Evidence is in `boolean-preservation-20261005/`,
+including `interop-final.log`, `pixel-parity.json` and `capture-after-run.json`.
+Direct import → FNX → reopened typed scene → render also preserves all 12
+stored geometry signatures and produces 12 byte-identical PNGs; root independently
+compared their hashes with the original vector baseline. Evidence:
+`direct-fnx-summary.json` and `root-independent-direct-fnx-parity.json` in the
+same directory. Four operand translations change from about `1.69e-13` to zero
+under the existing FNX precision policy, so typed payloads are not all bit-exact.
+The signature now uses that same precision and stable key ordering. A failed
+intermediate JSON harness run is retained separately: its decoder lacked the
+`float_roundtrip` feature already used by the application's FNX/project codecs,
+altering other coordinates by one floating-point unit. That failed run is not
+counted as a successful persistence check.
+The standalone document API had the same precision gap without feature
+unification from those codecs. Its own `float_roundtrip` dependency and a
+compact/pretty JSON regression now preserve exact operand values and active
+baked geometry; all eight focused document Boolean tests pass. The reproduced
+failure and successful rerun are `doc-json-roundtrip-before.log` and
+`doc-json-roundtrip-after.log`.
+Two assembled-inspector regressions pass for normal and stroke-outline Boolean
+paints: the Fill/Stroke sections project their actual values, color edits render,
+geometry edits invalidate the bake, and Undo restores node data and artwork.
+Evidence: `inspector-paints-second.log`.
+Unknown operations and unsupported or unavailable operands still use the
+explicitly reported vector fallback. Native edit/restart acceptance on the
+rebuilt candidate remains separate.
+The initial report also had 504 unresolved nested override/derived paths out of
+9,342. The first resolver fix (`ed4efa03ee`) recovered 376 paths by following
+component-property swaps and inherited nested swaps in the correct master
+context. The second (`6dd4f5192f`) applies component assignments nested inside
+symbol overrides, recovering the remaining 128. The untouched Spectrum import
+and an independent typed-swap checker now both resolve **9,342/9,342 paths**.
+A separate check confirms all 64 affected placements emit the component selected
+by the source assignment. Regressions cover selected component, text, derived
+geometry, source order, precedence and rejection of foreign-component paths.
+Evidence is in `spectrum-override-classification-20261005/`, including
+`nested-assignment-selection-validation.json` and
+`unmodified-report-nested-assignment.log`. The original fixture hash is unchanged.
+These checks establish routing and component choices; they do not claim complete
+rendered fidelity. Boolean preservation and rendered parity are being verified
+separately, including expanded component instances.
+
+The full Spectrum import → project write → typed readback diagnostic now
+retains **73,925 nodes, 23 pages, 9,012 component definitions and all 41 assets**.
+Ordered roots/children are unchanged, all asset bytes match, and the 12 Booleans
+retain their 28 operands and active baked appearances. **Strict equality fails**:
+15,278 values across 5,052 nodes change from nonzero magnitudes below `1e-9` to
+zero under the existing FNX printer policy. The largest magnitude is
+`9.417827628865894e-10`; affected fields are paths, transforms, derived geometry
+and gradient starts. The raw report retains every difference, with **zero
+unexpected or inventory differences** and no blanket precision waiver. The
+comparison covers the entire persisted typed document and assets, excluding
+only selection, history, viewport and active-page presence state. The source
+fixture hash remains unchanged. Evidence:
+`spectrum-save-reopen-20261005/attempt2/spectrum-save-reopen-summary.json` and
+`spectrum-save-reopen-report.json`; the command deliberately exits 1 because
+strict comparison fails. The first attempt ran out of disk space during the
+transactional write, before readback, and its failure remains recorded in
+`spectrum-save-reopen-attempts.json`. This is an offline format/import diagnostic,
+not a native app save/restart, full-page visual oracle or drag-latency result.
+Compilation ran concurrently, so its recorded durations are not performance gates.
+
 The subsequent `55d420ae87` change protects direct and indirect pattern sources
 from destructive Flatten operations. Its focused Flatten-filter run passed eight
 tests, including typed paint-slot/override coverage and pixel preservation when
@@ -214,18 +563,19 @@ drag latency. Raw before/after and focused test logs are retained in
 
 ## Capability-to-test map
 
-Paths below are relative to the repository. Every row still needs a native
-release-candidate journey; the final column highlights the most important gap.
+Paths below are relative to the repository. The completed native samples above
+cover parts of this map; no row implies exhaustive native release-candidate
+coverage. The final column highlights the remaining acceptance work.
 
 | Capability | Existing automated evidence to run | Remaining acceptance work |
 | --- | --- | --- |
 | Create/open/import | `fig_viewer::new_design::tests`, `document::tests`; `fanta-fig-interop` mapping/parser tests | New project and `.fig`/`.fant` import, collision handling, malformed file and missing asset UI; compare representative imported pages with reference renders. |
-| Save/autosave/Save As/reopen | `fanta-format` full suite; `fig_viewer::document::tests`, `view::tests` (`save_generation_*`, `a_failing_autosave_is_reported_until_a_save_succeeds`, `save_as_*`) | Verify file hashes and node/assets inventory across edit, cancel, save, restart and Save As. Inject write failures and concurrent edits; original content must survive. |
+| Save/autosave/Save As/reopen | `fanta-format` full suite; `fig_viewer::document::tests`, `view::tests`, `view::serialization::tests` (`canvas_session_*`, `save_generation_*`, `a_failing_autosave_is_reported_until_a_save_succeeds`, `save_as_*`) | Verify file hashes and node/assets inventory across edit, cancel, save, restart and Save As. Inject write failures and concurrent edits; original content must survive. |
 | Source ↔ canvas | `fig_viewer::code_workspace::tests`, `editor_session::tests`; `fanta-fnx` and format tests with and without `serde_json/preserve_order` | FNX and JSON typing/saving, invalid drafts, watcher reload, source lock, multiple tabs/windows and agent source-follow on the actual app. |
-| Pages/layers/structure | Viewer design-panel, structure, layer-context and clipboard tests; `canvas_menu_reorder_entries_execute_and_undo` confirms both ordering entries. Other menu GPUI cases confirm primary text/vector/bitmap/video/audio entries and retain a selected boolean operand. | Layer drag/drop, all per-kind context actions, page deletion/duplication, copy/paste and undo with components/assets. Test active-page and hidden/locked rules in the native app. |
+| Pages/layers/structure | Viewer design-panel, structure, layer-context and clipboard tests; `canvas_menu_reorder_entries_execute_and_undo` confirms both ordering entries. Other menu GPUI cases confirm primary text/vector/bitmap/video/audio entries and retain a selected boolean operand. | Layer drag/drop, all per-kind context actions, page deletion/duplication and component/subtree clipboard journeys. Bitmap cross-page Save/Undo/Redo/restart and visible cross-document refusal passed as recorded above. Test hidden/locked rules in the native app. |
 | Navigation/selection/transforms | `fanta-canvas` hit-test/snap tests and `tests/end_to_end.rs`; `fanta-tools::select::tests`, `scale::tests`; viewer toolbar adapter tests | Pan, zoom, nested selection, rapid drag/release, resizing and scaling in a dense imported page. Check focus and pointer capture. |
-| Double-click by node | Viewer `canvas_double_click_*` GPUI cases, existing standalone/wrapped text cases; tools `rapid_clicks_drill_once_per_pair_and_do_not_enter_leaf_nodes`, `extending_double_click_toggles_the_container_without_drilling`, `double_click_at_container_resize_handle_still_drills_into_child` | Native pass of the [per-kind contract](../fanta/capabilities.md#double-click-behavior-by-node), including selected/unselected, nested, locked/Inspect states. Check entry, feedback, Escape, Undo and unrelated content. |
-| Properties inspector | `fig_viewer::gpui_adapters::design::tests`, `properties_panel::tests`, `properties_ops::tests`, `properties_snapshot::tests`; mounted `view/properties_inspector.rs::layout_tests` checks geometry fields at minimum width and the composed inspector with annotation/measurement lists | Assembled inspector screenshots and input journeys for empty/single/mixed selection, narrow panel, light/dark themes, scrolling, popovers and page switches. Mounted layout bounds are not a full visual baseline; legacy-panel tests alone do not cover the default inspector. |
+| Double-click by node | Viewer `canvas_double_click_*`, `mounted_curved_text_path_*` and mounted crop/drill/guard cases, existing standalone/wrapped text cases; tools `rapid_clicks_drill_once_per_pair_and_do_not_enter_leaf_nodes`, `extending_double_click_toggles_the_container_without_drilling`, `double_click_at_container_resize_handle_still_drills_into_child` | Native pass of the [per-kind contract](../fanta/capabilities.md#double-click-behavior-by-node), including selected/unselected, nested, locked/Inspect states. Check entry, feedback, Escape, Undo and unrelated content. |
+| Properties inspector | `fig_viewer::gpui_adapters::design::tests`, `properties_panel::tests`, `properties_ops::tests`, `properties_snapshot::tests`; mounted `view/properties_inspector.rs::layout_tests` checks geometry fields at minimum width and the composed inspector with annotation/measurement lists | Actual scrub/drag cancellation; differing-value mixed selection, themes, scrolling and popovers. Numeric/hex draft cancellation, invalid-draft page switching, Export labels and two-kind aggregate-opacity display/edit/Undo passed natively. Mounted layout bounds are not a full visual baseline. |
 | Drawing/path/region/crop | `fanta-tools` full suite, including `tests/end_to_end.rs` and `ink_oracle.rs`; viewer toolbar adapter tests | Every visible tool, path/anchor editing, brush/eraser, region operation, crop Apply/Cancel and their keyboard shortcuts. |
 | Text/text on path | `fanta-text`, `fanta-tools::text_path::tests`, renderer text/text-path tests; viewer `text_edit`, `instance_text` and design adapter tests | Inline range selection, rich styles, multiline/Unicode/IME input, fonts, path conversion errors, instance overrides, save/reopen and exports. |
 | Layout/paints/effects/rendering | `fanta-doc` layout tests; complete `fanta-render` library and bitmap/SVG/compose/golden integration suites | Visual parity for gradients, masks, booleans, clipping, shadows/blur, blend modes, auto-layout/grid and imported instances under edits. |
@@ -241,6 +591,20 @@ release-candidate journey; the final column highlights the most important gap.
 | App shell/distribution/accounts | Existing `Check` jobs: sidebar, path prompt, agent toggle, Git, auth, Store restrictions; release packaging workflow | Menu/keyboard discovery, clean-profile launch, install/quarantine, signature/notarization, Keychain, sandbox file access, billing/restore and backend release compatibility. |
 | Large-page performance | Import scaling tests, renderer cache/culling tests, ignored format latency gate and profiling examples | Matched before/after import, save and gesture timings on Spectrum plus a synthetic scene. Measure frame p50/p95/max and memory, not just load completion. |
 
+## Next bounded native checks
+
+These four areas retain bounded follow-up work; completed parts are identified
+below. Use disposable fixtures without replacing their existing evidence.
+Record the exact candidate binary, initial typed document and asset hashes,
+native inputs and final comparison.
+
+| Priority | Fixture and bounded journey | Required evidence and limit |
+| --- | --- | --- |
+| 1 — Inspector drafts | Continue on `/tmp/fanta-release-inspector-acceptance-20261005` or a fresh node-matrix copy. Test a selection whose starting values differ, edit/Undo, and an actual scrub/drag cancellation. | Numeric/hex draft Escape, invalid-draft page switching and Export labels passed at 320 px on `85fc694b67`; two-kind opacity display/edit/Undo passed on `ee80ec48c6`. Compare all unrelated typed content/assets after Save/reopen; keyboard draft cancellation does not prove drag cancellation. |
+| 2 — Clipboard and structure | Use a copy of `/tmp/fanta-release-qa-20261005` for component/subtree copy/paste, Cut, Undo/Redo and restart. | Bitmap cross-page placement, Save and Undo/Redo passed on `85fc694b67`; strict bitmap-state restart and visible cross-document refusal passed on `ee80ec48c6`. Verify component dependencies and original masters in the remaining subtree journeys. A rejected unsupported transfer is not a successful cross-project-copy capability. |
+| 3 — Large-page save and drag | Open `/tmp/fanta-spectrum-release-save-check-20261005`, generated from the unchanged Spectrum `.fig`. On page index 9, move the instance corresponding to import index 4358 and image-filled frame index 2110, then Save, Undo, Save and restart. | Full offline write/readback preserves inventories/assets with only the 15,278 explicitly recorded FNX normalizations above; strict equality fails. Native edit/save/restart and quiet-machine pointer/frame timings remain open. Reconfirm the target nodes after opening; imported IDs are not stable. CPU `drag_bench` and isolated Boolean images do not establish native latency or whole-page visual fidelity. |
+| 4 — Variables, Motion and Prototype | In another copy of `/tmp/fanta-release-node-matrix-20261005`, create one color variable with two modes and bind a shape; switch modes, unbind and Undo. Add two small frames, one motion track and one prototype navigation link through the UI. | Verify the displayed bound values, undoable edits, scrub/play and navigation/restart/exit with restored editor viewport. Save/reopen and compare bindings, track/keyframes and reactions. This is one representative native journey per subsystem, not all triggers, easing types, aliases or variant combinations. |
+
 ## Reproducible local verification
 
 ```sh
@@ -250,6 +614,8 @@ release-candidate journey; the final column highlights the most important gap.
 ./script/verify-fanta-release --stage editor
 # Separate native component screenshot comparison on macOS:
 ./script/verify-fanta-release --stage visual
+# Explicit representative-file node-structure gate:
+FANTA_FIG_FIXTURE=/path/to/design.fig ./script/verify-fanta-release --stage import-preservation
 ```
 
 The runner uses `--locked`, executes public engine integration suites as well
@@ -272,14 +638,22 @@ integration binaries are deliberately excluded: they return early when
 the fixture. Run them explicitly with the correct local Spectrum fixture and
 save the fixture identity, dimensions/counts and output with the report. Normal
 test runs also skip `#[ignore]` benchmarks and the network font-download test.
+The explicit `import-preservation` stage fails if its fixture is missing or if
+the importer reports flattened Boolean operations, omitted operands, other
+non-container losses, or skipped/malformed nodes. It checks structure reports;
+it does not establish rendered parity or complete instance override fidelity.
 
 For live MCP, run `script/smoke-mcp <candidate-binary> <disposable-project>`
 against an explicitly isolated QA app/project: it writes a rectangle and can
-reuse a running app. Retain its assertions and screenshot alongside native UI
+reuse a running app. Set `FANTA_USER_DATA_DIR` to the candidate profile and use
+`--screenshot-path` to retain its PNG. Retain its assertions and screenshot alongside native UI
 evidence. It is intentionally outside the default runner.
 
-The `Check` workflow runs the runner's engine, import, source-order, editor and
-UI stages and uploads their logs/results, including after a failed test stage.
+The `Check` workflow runs the runner's engine, import, source-order, editor,
+workspace and UI stages and uploads their logs/results, including after a failed test stage.
+The default runner also includes build and lint. Workspace coverage exercises
+serialization ordering, immediate Quit, Hot Exit and tab restoration alongside
+the canvas-specific journeys in the editor suite.
 It also covers account/provider, sidebar, Git and Mac App Store execution
 restrictions. Verify both hosted jobs for the exact
 candidate revision; local editor suites do not replace them. Run the optional

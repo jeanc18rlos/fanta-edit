@@ -42,27 +42,21 @@ fn local_visual_bounds(scene: &Scene, id: NodeId, effective_scale: f32) -> Optio
                     .unwrap_or(true);
             (own, clips_children)
         }
-        NodeData::Vector(vector) => {
-            let own = node
-                .data
-                .local_bounds()
-                .map(|bounds| expand_for_strokes(bounds, &vector.strokes, vector.path.is_rect()));
-            let viewport = vector_viewport_clip(vector, node.flags, || vector.path.rough_bounds());
-            let own = match (own, viewport) {
-                (Some(bounds), Some([width, height])) => {
-                    intersect_bounds(bounds, Bounds::from_xywh(0.0, 0.0, width, height))
-                }
-                (bounds, None) => bounds,
-                (None, Some(_)) => None,
+        NodeData::Vector(vector) => (vector_visual_bounds(vector, node.flags), false),
+        NodeData::Boolean(boolean) => {
+            let baked = boolean.baked.as_ref().and_then(|_| {
+                fanta_doc::boolean_geometry_signature(scene, id)
+                    .ok()
+                    .and_then(|signature| boolean.baked_vector(&signature))
+            });
+            let own = match baked {
+                Some(vector) => vector_visual_bounds(&vector, node.flags),
+                None => scene
+                    .local_bounds(id)
+                    .map(|bounds| expand_for_strokes(bounds, &boolean.strokes, false)),
             };
-            (own, false)
+            (own, true)
         }
-        NodeData::Boolean(boolean) => (
-            scene
-                .local_bounds(id)
-                .map(|bounds| expand_for_strokes(bounds, &boolean.strokes, false)),
-            true,
-        ),
         NodeData::TextPath(text_path) => (text_path_bounds(text_path), false),
         _ => (node.data.local_bounds(), false),
     };
@@ -83,6 +77,23 @@ fn local_visual_bounds(scene: &Scene, id: NodeId, effective_scale: f32) -> Optio
     result.map(|bounds| {
         shadow_expanded_local_bounds(bounds, &node.effects, &node.blurs, effective_scale)
     })
+}
+
+pub(crate) fn vector_visual_bounds(vector: &VectorNode, flags: NodeFlags) -> Option<Bounds> {
+    let own = vector
+        .path
+        .rough_bounds()
+        .map(|bounds| expand_for_strokes(bounds, &vector.strokes, vector.path.is_rect()));
+    match (
+        own,
+        vector_viewport_clip(vector, flags, || vector.path.rough_bounds()),
+    ) {
+        (Some(bounds), Some([width, height])) => {
+            intersect_bounds(bounds, Bounds::from_xywh(0.0, 0.0, width, height))
+        }
+        (bounds, None) => bounds,
+        (None, Some(_)) => None,
+    }
 }
 
 /// Imported vector boxes crop geometry that exceeds the authored viewport, but
@@ -131,7 +142,7 @@ fn intersect_bounds(left: Bounds, right: Bounds) -> Option<Bounds> {
         .then_some(intersection)
 }
 
-fn expand_for_strokes(
+pub(crate) fn expand_for_strokes(
     mut bounds: Bounds,
     strokes: &[fanta_doc::Stroke],
     rectangular: bool,

@@ -156,6 +156,7 @@ fn build_scene(
         op: BooleanOp::Union,
         fills: smallvec![Fill::solid(Color::rgb(80, 160, 80))],
         strokes: smallvec![],
+        baked: None,
     }));
     boolean.name = "BoolUnion".into();
     boolean.transform = Transform2D::translation(20.0, 150.0);

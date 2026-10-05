@@ -310,6 +310,185 @@ fn materialize_page_rejects_non_frame_root() {
 }
 
 #[test]
+fn model3d_materialization_preserves_payload_in_page_and_component_scopes() {
+    use fanta_doc::{AssetId, Camera3d, ComponentDef, ComponentId, Model3dNode};
+
+    for kind in [ArtifactKind::Page, ArtifactKind::Component] {
+        let mut document = Doc::new();
+        let root = document
+            .scene
+            .insert(CanvasNode::new(NodeData::Group(GroupNode::default())))
+            .expect("root");
+        document.add_page(root);
+        let mut model = CanvasNode::new(NodeData::Model3d(Model3dNode {
+            asset: AssetId::new(),
+            local_size: [240.0, 160.0],
+            camera: Camera3d {
+                azimuth: 0.25,
+                elevation: 1.5,
+                distance: 8.0,
+                target: [1.0, 2.0, 3.0],
+                fov_deg: 45.0,
+            },
+            overrides: json!({"material": {"roughness": 0.75}, "future": ["retain", 7]}),
+        }));
+        model.parent = Some(root);
+        model.name = "Existing model payload".into();
+        model.transform = Transform2D::translation(21.0, 34.0);
+        model.opacity = 0.5.into();
+        model.meta = json!({"preserved": true});
+        let model_id = document.scene.insert(model.clone()).expect("model");
+        let definition = ComponentDef::new(ComponentId::new(), root, "Existing model component");
+        if kind == ArtifactKind::Component {
+            document
+                .components
+                .defs
+                .insert(definition.id, definition.clone());
+        }
+        let nodes = document
+            .scene
+            .descendants_of(root)
+            .map(|id| {
+                serde_json::to_value(document.scene.get(id).expect("node")).expect("node JSON")
+            })
+            .collect::<Vec<_>>();
+        let ir = ArtifactIr::from_nodes(kind, "ExistingModel", &nodes).expect("source IR");
+        let materialized = if kind == ArtifactKind::Page {
+            materialize_page(
+                &ir,
+                document.id,
+                document.components.clone(),
+                document.variables.clone(),
+                document.active_modes.clone(),
+            )
+        } else {
+            materialize_component(
+                &ir,
+                document.id,
+                definition.clone(),
+                document.variables.clone(),
+                document.active_modes.clone(),
+            )
+        }
+        .expect("stored model may materialize without a 3D authoring surface");
+        let shared = super::materialize::scope_from_document(
+            &document,
+            kind,
+            root,
+            (kind == ArtifactKind::Component).then_some(&definition),
+        )
+        .expect("page/component sharing path")
+        .expect("stored model may be adopted by the live session");
+        assert_eq!(materialized.doc.scene.get(model_id), Some(&model));
+        assert_eq!(shared.doc.scene.get(model_id), Some(&model));
+    }
+}
+
+#[test]
+fn model3d_payloads_survive_an_unrelated_canvas_save_and_reopen() {
+    use fanta_doc::{AssetId, ComponentDef, ComponentId, Model3dNode, VectorNode};
+
+    let directory = tempdir().expect("project directory");
+    let mut document = Doc::new();
+    let edited_page = document
+        .scene
+        .insert(CanvasNode::new(NodeData::Group(GroupNode::default())))
+        .expect("edited page");
+    document.add_page(edited_page);
+    let mut rectangle = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+        0.0,
+        0.0,
+        100.0,
+        80.0,
+        fanta_doc::Color::WHITE,
+    )));
+    rectangle.parent = Some(edited_page);
+    let rectangle = document.scene.insert(rectangle).expect("rectangle");
+    let model_page = document
+        .scene
+        .insert(CanvasNode::new(NodeData::Group(GroupNode::default())))
+        .expect("model page");
+    document.add_page(model_page);
+    let mut master = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    master.parent = Some(model_page);
+    let master = document.scene.insert(master).expect("component master");
+    let component = ComponentId::new();
+    document.components.defs.insert(
+        component,
+        ComponentDef::new(component, master, "Stored 3D component"),
+    );
+    let asset = AssetId::new();
+    let assets = BTreeMap::from([(asset, b"opaque existing model asset bytes".to_vec())]);
+    let mut preserved_models = Vec::new();
+    for parent in [model_page, master] {
+        let mut model = CanvasNode::new(NodeData::Model3d(Model3dNode {
+            asset,
+            local_size: [240.0, 160.0],
+            camera: Default::default(),
+            overrides: json!({"preserve": {"lighting": "custom", "values": [1, 2, 3]}}),
+        }));
+        model.parent = Some(parent);
+        preserved_models.push(model.clone());
+        document.scene.insert(model).expect("existing model");
+    }
+    crate::write_project_tree(directory.path(), &document, &assets).expect("existing project");
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("index project");
+    let artifacts = [
+        ArtifactId::Page(edited_page),
+        ArtifactId::Page(model_page),
+        ArtifactId::Component(component),
+    ];
+    for artifact in &artifacts {
+        workspace
+            .open_artifact(artifact.clone())
+            .expect("open existing source");
+    }
+    document
+        .scene
+        .get_mut(rectangle)
+        .expect("rectangle")
+        .transform = Transform2D::translation(30.0, 45.0);
+    workspace.adopt_document_shared(&document);
+    for artifact in &artifacts {
+        workspace
+            .artifact_mut(artifact)
+            .expect("open session")
+            .adopt_document(&document)
+            .expect("adopt whole-document canvas state");
+    }
+    let sources = workspace
+        .validated_source_overrides_for_document(&document)
+        .expect("validate retained model sources");
+    let preconditions = workspace
+        .source_write_preconditions(&document)
+        .expect("save preconditions");
+    crate::write_project_tree_cached_with_sources_checked(
+        directory.path(),
+        &document,
+        &assets,
+        &mut crate::ProjectWriteCache::default(),
+        &sources,
+        &preconditions,
+    )
+    .expect("unrelated edits must save despite a retained model");
+    let (reopened, reopened_assets) = crate::read_project_tree(directory.path()).expect("reopen");
+    assert_eq!(reopened.scene.len(), document.scene.len());
+    assert_eq!(reopened.pages(), document.pages());
+    assert_eq!(reopened.components, document.components);
+    assert_eq!(reopened_assets, assets);
+    assert_eq!(reopened.scene.get(rectangle), document.scene.get(rectangle));
+    for model in preserved_models {
+        assert_eq!(reopened.scene.get(model.id), Some(&model));
+    }
+    let mut reopened_workspace = WorkspaceSession::open(directory.path()).expect("reopen session");
+    for artifact in artifacts {
+        reopened_workspace
+            .open_artifact(artifact)
+            .expect("materialize saved source");
+    }
+}
+
+#[test]
 fn materialize_page_round_trips_group_tree() {
     let root = NodeId::new();
     let child = NodeId::new();

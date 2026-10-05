@@ -290,6 +290,7 @@ pub fn fig_to_doc(fig: &FigDocument) -> FigResult<(Doc, MapReport, HashMap<Asset
         &mut guid_to_node,
         &all_instance_ids,
     )?;
+    super::prepare_imported_booleans(&mut doc, &mut report, &mut guid_to_node, &guid_to_parent)?;
     resolve_grid_cells(&mut doc, &mut report, &grid_tracks, grid_anchors);
 
     // ---- pass 3: register pages + relocate component masters ----
@@ -448,6 +449,7 @@ pub fn fig_to_doc(fig: &FigDocument) -> FigResult<(Doc, MapReport, HashMap<Asset
     );
     report.image_assets_extracted = assets.len();
 
+    super::seal_imported_booleans(&mut doc)?;
     Ok((doc, report, assets))
 }
 
@@ -477,22 +479,53 @@ fn attach_to_parents(
                 // The resolved parent should be a container, but a malformed /
                 // unusual chain can land on a non-container (e.g. an instance
                 // the pre-scan missed) or on a node already dropped with its
-                // subtree; rather than abort the whole import, that node is
-                // treated as virtual instance content and dropped.
+                // subtree. Keep the existing partial import, but distinguish
+                // authored operands from regenerated instance content in its report.
                 let parent_accepts_children = built
                     .get(&parent_id)
                     .is_some_and(|parent| parent.can_have_children());
                 if parent_accepts_children {
                     plan.attach(&mut built, node_id, Some(parent_id));
                 } else {
-                    drop_virtual_node(report, guid, node_id, &mut built, &mut plan, guid_to_node);
+                    let reason = if built.get(&parent_id).is_some_and(|parent| {
+                        matches!(&parent.data, NodeData::Vector(_))
+                            && parent
+                                .meta
+                                .get("figma_type")
+                                .and_then(serde_json::Value::as_str)
+                                == Some("BOOLEAN_OPERATION")
+                    }) {
+                        DropReason::BooleanOperand
+                    } else {
+                        plan.dropped
+                            .get(&parent_id)
+                            .copied()
+                            .unwrap_or(DropReason::NonContainerChild)
+                    };
+                    drop_unstored_subtree(
+                        report,
+                        guid,
+                        node_id,
+                        reason,
+                        &mut built,
+                        &mut plan,
+                        guid_to_node,
+                    );
                 }
             }
             ParentResolution::Root => plan.attach(&mut built, node_id, None),
             ParentResolution::InsideInstance => {
                 // Inside an instance's virtual subtree — drop it. The expansion
                 // (`expand_instance`) reproduces this content from the master.
-                drop_virtual_node(report, guid, node_id, &mut built, &mut plan, guid_to_node);
+                drop_unstored_subtree(
+                    report,
+                    guid,
+                    node_id,
+                    DropReason::InstanceContent,
+                    &mut built,
+                    &mut plan,
+                    guid_to_node,
+                );
             }
         }
     }
@@ -545,6 +578,14 @@ struct AttachPlan {
     /// but in neither set was never visited, and would otherwise be discarded
     /// silently when the batch is filtered out of `order`.
     planned: HashSet<NodeId>,
+    dropped: HashMap<NodeId, DropReason>,
+}
+
+#[derive(Clone, Copy)]
+enum DropReason {
+    InstanceContent,
+    BooleanOperand,
+    NonContainerChild,
 }
 
 impl AttachPlan {
@@ -574,33 +615,44 @@ impl AttachPlan {
     }
 
     /// Forget `root` and every node planned under it, transitively.
-    fn drop_subtree(&mut self, built: &mut HashMap<NodeId, Box<CanvasNode>>, root: NodeId) {
+    fn drop_subtree(
+        &mut self,
+        built: &mut HashMap<NodeId, Box<CanvasNode>>,
+        root: NodeId,
+        reason: DropReason,
+    ) -> usize {
         let mut stack = vec![root];
+        let mut removed = 0;
         while let Some(id) = stack.pop() {
             self.planned.insert(id);
-            built.remove(&id);
+            if built.remove(&id).is_some() {
+                removed += 1;
+                self.dropped.insert(id, reason);
+            }
             if let Some(children) = self.children.remove(&id) {
                 stack.extend(children);
             }
         }
+        removed
     }
 }
 
-/// Drop a node that lives in an instance's virtual subtree (or under a
-/// non-container) together with whatever was planned under it, update the
-/// mapped/dropped counters, and forget its guid→id mapping so later passes
-/// don't reference a node that never reached the scene.
-fn drop_virtual_node(
+fn drop_unstored_subtree(
     report: &mut MapReport,
     guid: &str,
     node_id: NodeId,
+    reason: DropReason,
     built: &mut HashMap<NodeId, Box<CanvasNode>>,
     plan: &mut AttachPlan,
     guid_to_node: &mut HashMap<String, Option<NodeId>>,
 ) {
-    plan.drop_subtree(built, node_id);
-    report.mapped = report.mapped.saturating_sub(1);
-    report.instance_children_dropped += 1;
+    let removed = plan.drop_subtree(built, node_id, reason);
+    report.mapped = report.mapped.saturating_sub(removed);
+    match reason {
+        DropReason::InstanceContent => report.instance_children_dropped += removed,
+        DropReason::BooleanOperand => report.boolean_operands_dropped += removed,
+        DropReason::NonContainerChild => report.non_container_children_dropped += removed,
+    }
     guid_to_node.insert(guid.to_owned(), None);
 }
 

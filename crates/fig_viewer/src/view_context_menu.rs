@@ -10,8 +10,8 @@ use fanta_doc::{NodeData, NodeId};
 use fanta_gpui::layers::LayersPanelContextAction as LayerAction;
 use glam::DVec2;
 use gpui::{
-    AnyElement, Context, Entity, MouseDownEvent, Pixels, Point, Subscription, Window, anchored,
-    deferred,
+    AnyElement, Context, Entity, Focusable as _, MouseDownEvent, Pixels, Point, Subscription,
+    Window, anchored, deferred,
 };
 use ui::{ContextMenu, ContextMenuEntry, prelude::*};
 use util::ResultExt as _;
@@ -47,7 +47,11 @@ pub(crate) enum MenuTarget {
     Bitmap(NodeId),
     Video(NodeId),
     Audio(NodeId),
-    Layer(NodeId),
+    Boolean(NodeId),
+    NodeGraph(NodeId),
+    Model3d(NodeId),
+    AiArtifact(NodeId),
+    Embed(NodeId),
 }
 
 impl MenuTarget {
@@ -66,13 +70,11 @@ impl MenuTarget {
             Some(NodeData::Bitmap(_)) => Self::Bitmap(node),
             Some(NodeData::Video(_)) => Self::Video(node),
             Some(NodeData::Audio(_)) => Self::Audio(node),
-            Some(
-                NodeData::Boolean(_)
-                | NodeData::NodeGraph(_)
-                | NodeData::Model3d(_)
-                | NodeData::AiArtifact(_)
-                | NodeData::Embed(_),
-            ) => Self::Layer(node),
+            Some(NodeData::Boolean(_)) => Self::Boolean(node),
+            Some(NodeData::NodeGraph(_)) => Self::NodeGraph(node),
+            Some(NodeData::Model3d(_)) => Self::Model3d(node),
+            Some(NodeData::AiArtifact(_)) => Self::AiArtifact(node),
+            Some(NodeData::Embed(_)) => Self::Embed(node),
             None => Self::Canvas,
         }
     }
@@ -88,7 +90,11 @@ impl MenuTarget {
             | Self::Bitmap(node)
             | Self::Video(node)
             | Self::Audio(node)
-            | Self::Layer(node) => Some(node),
+            | Self::Boolean(node)
+            | Self::NodeGraph(node)
+            | Self::Model3d(node)
+            | Self::AiArtifact(node)
+            | Self::Embed(node) => Some(node),
         }
     }
 
@@ -99,7 +105,11 @@ impl MenuTarget {
             Self::Bitmap(_) => Some("Crop image"),
             Self::Video(_) => Some("Video properties"),
             Self::Audio(_) => Some("Audio properties"),
-            Self::Layer(_) => Some("Layer properties"),
+            Self::Boolean(_) => Some("Boolean properties"),
+            Self::NodeGraph(_) => Some("Node graph properties"),
+            Self::Model3d(_) => Some("3D properties"),
+            Self::AiArtifact(_) => Some("AI artifact properties"),
+            Self::Embed(_) => Some("Embed properties"),
             _ => None,
         }
     }
@@ -289,20 +299,24 @@ impl FigView {
             }
             menu
         });
-        let dismiss = cx.subscribe_in(
-            &menu,
-            window,
-            |view, _, _: &gpui::DismissEvent, window, cx| {
+        let menu_focus = menu.focus_handle(cx);
+        let dismiss = cx.subscribe_in(&menu, window, {
+            let menu_focus = menu_focus.clone();
+            move |view, _, _: &gpui::DismissEvent, window, cx| {
+                let restore_focus = menu_focus.contains_focused(window, cx);
                 view.canvas_context_menu = None;
-                view.focus_handle.focus(window, cx);
+                if restore_focus {
+                    view.focus_handle.focus(window, cx);
+                }
                 cx.notify();
-            },
-        );
+            }
+        });
         self.canvas_context_menu = Some(CanvasContextMenu {
             menu,
             position: event.position,
             _dismiss: dismiss,
         });
+        window.focus(&menu_focus, cx);
         cx.notify();
     }
 
@@ -614,7 +628,10 @@ mod tests {
     }
 
     fn leaf_menu_cases() -> Vec<(NodeData, &'static str)> {
-        use fanta_doc::{AssetId, AudioNode, BitmapNode, TextNode, VectorNode, VideoNode};
+        use fanta_doc::{
+            AiArtifactNode, AssetId, AudioNode, BitmapNode, EmbedNode, Model3dNode, NodeGraphNode,
+            TextNode, VectorNode, VideoNode,
+        };
         vec![
             (
                 NodeData::Text(TextNode::new("Title", 100.0, 30.0)),
@@ -667,6 +684,45 @@ mod tests {
                 }),
                 "Audio properties",
             ),
+            (
+                NodeData::NodeGraph(NodeGraphNode {
+                    local_size: [100.0, 100.0],
+                    graph: Default::default(),
+                    preview: None,
+                }),
+                "Node graph properties",
+            ),
+            (
+                NodeData::Model3d(Model3dNode {
+                    asset: AssetId::new(),
+                    local_size: [100.0, 100.0],
+                    camera: Default::default(),
+                    overrides: serde_json::json!({"retained": true}),
+                }),
+                "3D properties",
+            ),
+            (
+                NodeData::AiArtifact(AiArtifactNode {
+                    local_size: [100.0, 100.0],
+                    prompt: "Existing generation".into(),
+                    model: "local.fixture".into(),
+                    params: Default::default(),
+                    inputs: Vec::new(),
+                    lineage_parent: None,
+                    output: None,
+                    status: Default::default(),
+                    seed: Some(42),
+                }),
+                "AI artifact properties",
+            ),
+            (
+                NodeData::Embed(EmbedNode {
+                    local_size: [100.0, 100.0],
+                    kind: "local.fixture".into(),
+                    payload: serde_json::json!({"retained": true}),
+                }),
+                "Embed properties",
+            ),
         ]
     }
 
@@ -689,6 +745,181 @@ mod tests {
         assert_eq!(
             MenuTarget::of(&doc, Some(NodeId::new())),
             MenuTarget::Canvas
+        );
+        let boolean = doc
+            .scene
+            .insert(CanvasNode::new(NodeData::Boolean(
+                fanta_doc::BooleanNode::default(),
+            )))
+            .expect("boolean");
+        assert_eq!(
+            MenuTarget::of(&doc, Some(boolean)).editor_label(),
+            Some("Boolean properties")
+        );
+    }
+
+    #[gpui::test]
+    async fn canvas_context_menu_escape_dismisses_without_clearing_selection(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use fanta_doc::{BooleanNode, Color, VectorNode, Viewport};
+        use gpui::{MouseButton, MouseUpEvent, px, size};
+        use project::Project;
+
+        cx.update(|cx| {
+            zlog::init_test();
+            assets::Assets.load_test_fonts(cx);
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+            #[cfg(feature = "fanta-gpui-ui")]
+            {
+                gpui_component::init(cx);
+                fanta_gpui::init(cx);
+                crate::theme_bridge::init(cx);
+            }
+            cx.bind_keys([
+                gpui::KeyBinding::new("escape", crate::view::Cancel, Some("FigViewer")),
+                gpui::KeyBinding::new("escape", menu::Cancel, Some("menu")),
+            ]);
+        });
+        let project = Project::test(fs::FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = Doc::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page)).expect("page");
+        doc.add_page(page_id);
+        doc.set_active_page(Some(page_id));
+        let mut boolean = CanvasNode::new(NodeData::Boolean(BooleanNode {
+            fills: [fanta_doc::Fill::solid(Color::BLACK)].into_iter().collect(),
+            ..Default::default()
+        }));
+        boolean.parent = Some(page_id);
+        let boolean_id = boolean.id;
+        doc.apply(Operation::create_node(boolean)).expect("Boolean");
+        let mut operand = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            -50.,
+            -50.,
+            100.,
+            100.,
+            Color::BLACK,
+        )));
+        operand.parent = Some(boolean_id);
+        doc.apply(Operation::create_node(operand)).expect("operand");
+        doc.history = Default::default();
+        let original_scene = serde_json::to_value(&doc.scene).expect("scene");
+        let item = crate::document::ready_item_for_test(
+            &project,
+            "/tmp/CanvasMenuEscape.fig".into(),
+            doc,
+            cx,
+        );
+        let (view, visual) = cx.add_window_view({
+            let item = item.clone();
+            move |window, cx| FigView::new(item, project, window, cx)
+        });
+        visual.simulate_resize(size(px(1400.), px(900.)));
+        view.update(visual, |view, cx| {
+            view.set_viewport_silent(Viewport::default());
+            cx.notify();
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+        let position = view.read_with(visual, |view, _| {
+            view.container_bounds.expect("canvas").center()
+        });
+        visual.simulate_event(MouseDownEvent {
+            position,
+            button: MouseButton::Right,
+            modifiers: Default::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        visual.simulate_event(MouseUpEvent {
+            position,
+            button: MouseButton::Right,
+            modifiers: Default::default(),
+            click_count: 1,
+        });
+        visual.run_until_parked();
+        view.read_with(visual, |view, _| {
+            assert!(view.canvas_context_menu.is_some())
+        });
+        item.read_with(visual, |item, _| {
+            assert_eq!(
+                item.doc().expect("document").selection.as_slice(),
+                &[boolean_id]
+            )
+        });
+        visual.simulate_keystrokes("escape");
+        visual.run_until_parked();
+        view.read_with(visual, |view, _| {
+            assert!(
+                view.canvas_context_menu.is_none(),
+                "Escape dismisses the menu first"
+            )
+        });
+        item.read_with(visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(
+                doc.selection.as_slice(),
+                &[boolean_id],
+                "menu dismissal must preserve canvas selection"
+            );
+            assert_eq!(
+                serde_json::to_value(&doc.scene).expect("scene"),
+                original_scene
+            );
+            assert_eq!(doc.history.undo_depth(), 0);
+        });
+        visual.simulate_keystrokes("escape");
+        visual.run_until_parked();
+        item.read_with(visual, |item, _| {
+            assert!(
+                item.doc().expect("document").selection.is_empty(),
+                "after dismissal the canvas receives Escape again"
+            )
+        });
+        visual.simulate_event(MouseDownEvent {
+            position,
+            button: MouseButton::Right,
+            modifiers: Default::default(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        visual.simulate_event(MouseUpEvent {
+            position,
+            button: MouseButton::Right,
+            modifiers: Default::default(),
+            click_count: 1,
+        });
+        visual.run_until_parked();
+        view.read_with(visual, |view, _| {
+            assert!(view.canvas_context_menu.is_some())
+        });
+        visual.update(|window, cx| window.draw(cx).clear());
+        let next_focus = visual.update(|window, cx| {
+            let focus = cx.focus_handle();
+            window.focus(&focus, cx);
+            let menu = view
+                .read(cx)
+                .canvas_context_menu
+                .as_ref()
+                .expect("menu")
+                .menu
+                .clone();
+            menu.update(cx, |_, cx| cx.emit(gpui::DismissEvent));
+            focus
+        });
+        visual.run_until_parked();
+        view.read_with(visual, |view, _| {
+            assert!(view.canvas_context_menu.is_none())
+        });
+        assert!(
+            visual.update(|window, _| next_focus.is_focused(window)),
+            "a dismissal after focus transfer must not steal focus from the next control"
         );
     }
 

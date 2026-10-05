@@ -127,6 +127,15 @@ pub struct MapReport {
     /// Number of nodes dropped because they lived inside an instance subtree
     /// (virtual content — produced by `expand_instance`, never stored).
     pub instance_children_dropped: usize,
+    /// Boolean parents retained as baked vectors rather than editable operations.
+    pub boolean_operations_flattened: usize,
+    /// Reasons retained Boolean parents required a non-editable vector fallback.
+    pub boolean_fallbacks_by_reason: HashMap<String, usize>,
+    /// Authored operand nodes discarded below flattened Boolean parents.
+    pub boolean_operands_dropped: usize,
+    /// Nodes discarded below another non-container, excluding Boolean operands
+    /// and intentional instance-subtree pruning.
+    pub non_container_children_dropped: usize,
     /// Number of component masters (SYMBOL/COMPONENT) NOT relocated to the hidden
     /// Components page because they are embedded inside design content (a
     /// FRAME/SECTION/GROUP on a real page) and therefore render in place — Figma
@@ -385,8 +394,56 @@ pub struct MapReport {
 impl MapReport {
     /// Total skipped (unsupported + malformed). Does NOT include
     /// `instance_children_dropped`, which is intentional virtual-subtree pruning
-    /// rather than an unrecognized node.
+    /// rather than an unrecognized node. Boolean and non-container structure
+    /// losses have separate counters and appear in [`Self::content_loss_summary`].
     pub fn skipped(&self) -> usize {
         self.skipped_by_type.values().sum::<usize>() + self.malformed
+    }
+
+    /// Report known node-structure losses, excluding regenerated instance content.
+    /// Absence of this summary does not establish rendering or override fidelity.
+    pub fn content_loss_summary(&self) -> Option<String> {
+        let mut losses = Vec::new();
+        if self.boolean_operations_flattened > 0 || self.boolean_operands_dropped > 0 {
+            let operations = if self.boolean_operations_flattened == 1 {
+                "Boolean operation was"
+            } else {
+                "Boolean operations were"
+            };
+            let operands = if self.boolean_operands_dropped == 1 {
+                "operand layer is"
+            } else {
+                "operand layers are"
+            };
+            losses.push(format!(
+                "{} {operations} flattened to vectors; {} {operands} not editable",
+                self.boolean_operations_flattened, self.boolean_operands_dropped,
+            ));
+        }
+        if !self.boolean_fallbacks_by_reason.is_empty() {
+            let mut reasons = self.boolean_fallbacks_by_reason.iter().collect::<Vec<_>>();
+            reasons.sort_by_key(|(reason, _)| *reason);
+            losses.push(format!(
+                "Boolean fallback reasons: {}",
+                reasons
+                    .into_iter()
+                    .map(|(reason, count)| format!("{reason} ({count})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        if self.non_container_children_dropped > 0 {
+            losses.push(format!(
+                "{} layers with unsupported parent relationships were omitted",
+                self.non_container_children_dropped,
+            ));
+        }
+        if self.skipped() > 0 {
+            losses.push(format!(
+                "{} unsupported or malformed layers were omitted",
+                self.skipped(),
+            ));
+        }
+        (!losses.is_empty()).then(|| losses.join(". "))
     }
 }

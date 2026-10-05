@@ -246,6 +246,7 @@ fn wrap_mark(ctx: &mut ToolContext, id: NodeId) -> Result<NodeId, SceneError> {
         op: BooleanOp::Subtract,
         fills,
         strokes: Default::default(),
+        baked: None,
     }));
     wrapper.parent = source.parent;
     wrapper.index = source.index;

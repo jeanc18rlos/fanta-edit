@@ -288,6 +288,10 @@ fn instance_children_are_dropped_as_virtual_subtree() {
         report.instance_children_dropped, 1,
         "the nested rect is dropped"
     );
+    assert_eq!(report.boolean_operations_flattened, 0);
+    assert_eq!(report.boolean_operands_dropped, 0);
+    assert_eq!(report.non_container_children_dropped, 0);
+    assert!(report.content_loss_summary().is_none());
 
     let inst_id = doc
         .scene

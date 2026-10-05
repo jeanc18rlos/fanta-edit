@@ -97,6 +97,7 @@ impl BoundProp {
         match self {
             Self::FillColor { index } => match &node.data {
                 NodeData::Vector(v) => v.fills.get(*index as usize).is_some(),
+                NodeData::Boolean(boolean) => boolean.fills.get(*index as usize).is_some(),
                 NodeData::Group(g) => group_fill(g, *index).is_some(),
                 NodeData::Text(_) | NodeData::TextPath(_) => *index == 0,
                 _ => false,
@@ -322,6 +323,7 @@ impl BoundProp {
 fn node_fill_color(node: &CanvasNode, index: u16) -> Option<Color> {
     match &node.data {
         NodeData::Vector(v) => fill_color(v.fills.get(index as usize)),
+        NodeData::Boolean(boolean) => fill_color(boolean.fills.get(index as usize)),
         NodeData::Group(g) => fill_color(group_fill(g, index)),
         NodeData::Text(t) if index == 0 => Some(t.style.color),
         NodeData::TextPath(text) if index == 0 => Some(text.style.color),
@@ -333,6 +335,13 @@ fn set_node_fill_color(node: &mut CanvasNode, index: u16, color: Color) -> bool 
     match &mut node.data {
         NodeData::Vector(v) => {
             let Some(slot) = v.fills.get_mut(index as usize) else {
+                return false;
+            };
+            slot.set_solid_color(color);
+            true
+        }
+        NodeData::Boolean(boolean) => {
+            let Some(slot) = boolean.fills.get_mut(index as usize) else {
                 return false;
             };
             slot.set_solid_color(color);

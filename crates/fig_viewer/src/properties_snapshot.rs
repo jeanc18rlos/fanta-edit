@@ -1613,6 +1613,13 @@ pub(crate) fn node_solid_colors(node: &CanvasNode, out: &mut Vec<FantaColor>) {
                 .iter()
                 .for_each(|stroke| push_fill(&stroke.paint));
         }
+        NodeData::Boolean(boolean) => {
+            boolean.fills.iter().for_each(&mut push_fill);
+            boolean
+                .strokes
+                .iter()
+                .for_each(|stroke| push_fill(&stroke.paint));
+        }
         NodeData::Group(group) => {
             group
                 .background
@@ -1865,6 +1872,13 @@ pub(crate) fn node_fills(node: &CanvasNode) -> Option<Vec<PaintSnapshot>> {
                 .map(|fill| paint_snapshot(fill, None))
                 .collect(),
         ),
+        NodeData::Boolean(boolean) => Some(
+            boolean
+                .fills
+                .iter()
+                .map(|fill| paint_snapshot(fill, None))
+                .collect(),
+        ),
         NodeData::Group(group) => Some(
             group
                 .background
@@ -1878,11 +1892,7 @@ pub(crate) fn node_fills(node: &CanvasNode) -> Option<Vec<PaintSnapshot>> {
 }
 
 pub(crate) fn node_strokes(node: &CanvasNode) -> Option<Vec<PaintSnapshot>> {
-    let strokes = match &node.data {
-        NodeData::Vector(vector) => &vector.strokes,
-        NodeData::Group(group) => &group.strokes,
-        _ => return None,
-    };
+    let strokes = node.data.strokes()?;
     Some(
         strokes
             .iter()
@@ -1892,11 +1902,7 @@ pub(crate) fn node_strokes(node: &CanvasNode) -> Option<Vec<PaintSnapshot>> {
 }
 
 pub(crate) fn node_stroke_align(node: &CanvasNode) -> Option<StrokeAlign> {
-    let strokes = match &node.data {
-        NodeData::Vector(vector) => &vector.strokes,
-        NodeData::Group(group) => &group.strokes,
-        _ => return None,
-    };
+    let strokes = node.data.strokes()?;
     strokes.first().map(|stroke| stroke.align)
 }
 

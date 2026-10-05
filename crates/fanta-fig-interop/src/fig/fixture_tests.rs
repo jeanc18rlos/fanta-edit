@@ -6,6 +6,32 @@
 
 use super::*;
 
+/// Release gate for reported node-structure loss, independent of render fidelity.
+/// An unset fixture is an error, never a successful skipped gate.
+#[test]
+#[ignore = "release gate: requires FANTA_FIG_FIXTURE pointing at a representative .fig"]
+fn imports_real_fig_fixture_without_node_structure_loss() {
+    let path = std::env::var("FANTA_FIG_FIXTURE")
+        .expect("set FANTA_FIG_FIXTURE to the representative .fig being release-validated");
+    let bytes = std::fs::read(&path).expect("read preservation fixture");
+    let fig = read_fig(&bytes).expect("parse preservation fixture");
+    let (doc, report, _) = crate::mapping::fig_to_doc(&fig).expect("import preservation fixture");
+    doc.scene.validate().expect("imported scene validates");
+    eprintln!(
+        "node structure: {} flattened Boolean operations; {} Boolean operands omitted; \
+         {} other non-container children omitted; {} unsupported/malformed nodes skipped; \
+         {} virtual instance-child records pruned",
+        report.boolean_operations_flattened,
+        report.boolean_operands_dropped,
+        report.non_container_children_dropped,
+        report.skipped(),
+        report.instance_children_dropped,
+    );
+    if let Some(losses) = report.content_loss_summary() {
+        panic!("node-structure preservation gate failed for {path}: {losses}");
+    }
+}
+
 /// Opt-in instance-fidelity diagnostic against a real Figma export.
 /// Reports the STEP-1 measurement numbers for the component-instance
 /// rendering work: how many instances resolve to a def, how many of those
@@ -838,4 +864,7 @@ fn import_timing_diagnostic() {
         report.components,
         assets.len(),
     );
+    if let Some(losses) = report.content_loss_summary() {
+        eprintln!("  import limitations: {losses}");
+    }
 }

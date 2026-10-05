@@ -17,7 +17,8 @@
 //! | `INSTANCE`                             | [`NodeData::Instance`] (or Group fallback) |
 //! | `RECTANGLE`, `ROUNDED_RECTANGLE`       | [`NodeData::Vector`] rectangle         |
 //! | `ELLIPSE`                              | [`NodeData::Vector`] ellipse           |
-//! | `VECTOR`/`STAR`/`LINE`/`BOOLEAN_OPERATION`/`REGULAR_POLYGON` | [`NodeData::Vector`] — real path decoded from command blobs, else bbox fallback |
+//! | `VECTOR`/`STAR`/`LINE`/`REGULAR_POLYGON` | [`NodeData::Vector`] — real path decoded from command blobs, else bbox fallback |
+//! | `BOOLEAN_OPERATION` | [`NodeData::Boolean`] with editable operands and validated baked appearance; explicit vector fallback for unsupported cases |
 //! | `TEXT`                                 | [`NodeData::Text`] (string + style)    |
 //! | `VARIABLE_SET`                         | [`VariableCollection`] (+ modes)       |
 //! | `VARIABLE`                             | [`Variable`] (per-mode values)         |
@@ -92,6 +93,7 @@ pub(crate) use std::collections::HashMap;
 
 mod auto_layout;
 mod bindings;
+mod boolean;
 mod components;
 mod fields;
 mod instance_overrides;
@@ -109,6 +111,7 @@ mod vector;
 // other through `use super::*`, and so the public surface below is preserved.
 pub(crate) use auto_layout::*;
 pub(crate) use bindings::*;
+pub(crate) use boolean::*;
 pub(crate) use components::*;
 pub(crate) use fields::*;
 pub(crate) use instance_overrides::*;

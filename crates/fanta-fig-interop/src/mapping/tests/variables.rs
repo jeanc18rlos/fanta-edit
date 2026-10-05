@@ -329,6 +329,44 @@ fn paint_bound_variables_bind_frame_background_and_text_color() {
     );
 }
 
+#[test]
+fn paint_bound_variables_are_retained_on_imported_boolean_fills() {
+    let fig = doc_from(vec![
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 1)),
+                ("type", KiwiValue::Enum("BOOLEAN_OPERATION".into())),
+                ("booleanOperation", KiwiValue::Enum("UNION".into())),
+                ("size", vector(50.0, 50.0)),
+                (
+                    "fillPaints",
+                    KiwiValue::array(vec![bound_solid_paint(1.0, 1.0, 1.0, 1.0, 0, 101)]),
+                ),
+            ],
+        ),
+        o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 2)),
+                ("type", KiwiValue::Enum("RECTANGLE".into())),
+                ("parentIndex", parent_index(0, 1)),
+                ("size", vector(50.0, 50.0)),
+            ],
+        ),
+    ]);
+    let (doc, report, _) = fig_to_doc(&fig).expect("Boolean paint binding");
+    assert_eq!(report.bindings, 1);
+    assert!(report.content_loss_summary().is_none());
+    let root = *doc.scene.roots().first().expect("root");
+    let boolean = doc.scene.get(root).expect("Boolean");
+    assert!(matches!(boolean.data, NodeData::Boolean(_)));
+    assert_eq!(
+        boolean.bindings.get(&BoundProp::FillColor { index: 0 }),
+        Some(&guid_to_variable_id("0:101"))
+    );
+}
+
 // =============================================================================
 // explicitVariableModes — per-frame mode pinning
 // =============================================================================

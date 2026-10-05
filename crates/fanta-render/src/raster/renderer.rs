@@ -383,22 +383,17 @@ impl InstanceCache {
 
 /// Cache for the expensive Skia PathOp fold of a [`NodeData::Boolean`].
 ///
-/// Keyed by boolean node id, tagged with [`Scene::subtree_stamp`] at fold
-/// time: the fold bakes operand geometry, order, transforms, and visibility,
-/// all of which stamp some node inside the subtree when they change, and the
-/// subtree max strictly increases on any stamped change. An edit elsewhere in
-/// the document leaves the entry valid — the pre-stamp design keyed on the
-/// global revision and re-folded every boolean on every edit.
+/// The resolved geometry signature also covers transient visibility and motion
+/// overlays, which do not change scene stamps. Paint changes reuse the fold.
 ///
 /// A stale-tag lookup rebuilds in place (live ids can never accumulate stale
 /// entries); ids removed from the scene are purged only when
 /// [`Scene::removal_revision`] moved.
 ///
-/// [`Scene::subtree_stamp`]: fanta_doc::Scene::subtree_stamp
 /// [`Scene::removal_revision`]: fanta_doc::Scene::removal_revision
 #[derive(Default)]
 pub(crate) struct BooleanCache {
-    pub(crate) entries: IdHashMap<NodeId, (u64, skia_safe::Path)>,
+    pub(crate) entries: IdHashMap<NodeId, (String, skia_safe::Path)>,
     pub(crate) removal_seen: u64,
 }
 

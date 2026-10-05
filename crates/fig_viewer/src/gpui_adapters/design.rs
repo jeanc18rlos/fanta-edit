@@ -234,10 +234,12 @@ fn matching_design_layers<'a>(
     page: Option<NodeId>,
 ) -> impl Iterator<Item = NodeId> + 'a {
     let masters = crate::properties_snapshot::master_roots(&doc.components);
-    let kind = doc
-        .scene
-        .get(id)
-        .map(|node| design_kind(id, &node.data, &masters));
+    let inspected = doc.scene.get(id).map(|node| {
+        (
+            design_kind(id, &node.data, &masters),
+            std::mem::discriminant(&node.data),
+        )
+    });
     let roots = page
         .map(|page| doc.scene.children_of(Some(page)))
         .unwrap_or_else(|| doc.scene.children_of(None));
@@ -246,9 +248,11 @@ fn matching_design_layers<'a>(
         .copied()
         .flat_map(|root| doc.scene.descendants_of(root))
         .filter(move |candidate| {
-            kind.as_ref().is_some_and(|kind| {
+            inspected.is_some_and(|(kind, discriminant)| {
                 doc.scene.get(*candidate).is_some_and(|candidate_node| {
-                    design_kind(*candidate, &candidate_node.data, &masters) == *kind
+                    design_kind(*candidate, &candidate_node.data, &masters) == kind
+                        && (kind != DesignPanelNodeKind::Other
+                            || discriminant == std::mem::discriminant(&candidate_node.data))
                 })
             })
         })
@@ -314,6 +318,8 @@ pub(crate) fn selection_header_for_doc(
         format!("{} layers", selection.len())
     } else if crate::layer_context_ops::is_section(node) {
         "Section".to_string()
+    } else if kind == DesignPanelNodeKind::Other {
+        node.data.default_name().to_string()
     } else {
         kind.label().to_string()
     };
@@ -1509,11 +1515,7 @@ fn design_stroke(
     node: &fanta_doc::CanvasNode,
     snapshots: &[PaintSnapshot],
 ) -> Option<DesignStroke> {
-    let strokes = match &node.data {
-        NodeData::Vector(vector) => &vector.strokes,
-        NodeData::Group(group) => &group.strokes,
-        _ => return None,
-    };
+    let strokes = node.data.strokes()?;
     if strokes.is_empty() {
         return None;
     }
@@ -1634,9 +1636,13 @@ fn gate_capabilities(
     );
     capabilities.fill &= matches!(
         data,
-        NodeData::Vector(_) | NodeData::Group(_) | NodeData::Text(_) | NodeData::TextPath(_)
+        NodeData::Vector(_)
+            | NodeData::Boolean(_)
+            | NodeData::Group(_)
+            | NodeData::Text(_)
+            | NodeData::TextPath(_)
     );
-    capabilities.stroke &= matches!(data, NodeData::Vector(_) | NodeData::Group(_));
+    capabilities.stroke &= data.strokes().is_some();
     let fill = capabilities.fill;
     let stroke = capabilities.stroke;
     capabilities.sections.retain(|section| match section {
@@ -1647,10 +1653,17 @@ fn gate_capabilities(
     if kind == DesignPanelNodeKind::Other {
         // The engine can move, hide, and re-composite these nodes but cannot
         // edit their content: wrapper-level surfaces only.
-        capabilities.sections = vec![DesignPanelSection::Position, DesignPanelSection::Layer];
+        capabilities.sections = vec![
+            DesignPanelSection::Position,
+            DesignPanelSection::Layout,
+            DesignPanelSection::Layer,
+            DesignPanelSection::Effects,
+            DesignPanelSection::Export,
+        ];
+        capabilities.dimensions = true;
         capabilities.fill = false;
         capabilities.stroke = false;
-        capabilities.effects = false;
+        capabilities.effects = true;
         capabilities.auto_layout_container = false;
         capabilities.layer_appearance = true;
         capabilities.visibility = true;
@@ -1798,6 +1811,7 @@ pub(crate) fn design_node(
             .map(|(index, snapshot)| {
                 let fill = match &node.data {
                     NodeData::Vector(vector) => vector.fills.get(index),
+                    NodeData::Boolean(boolean) => boolean.fills.get(index),
                     NodeData::Group(group) => group
                         .background
                         .iter()
@@ -2076,6 +2090,19 @@ pub(crate) fn aggregate_selection(
     node.width = multi.width.unwrap_or(0.0) as f32;
     node.height = multi.height.unwrap_or(0.0) as f32;
     node.rotation = multi.rotation_degrees.unwrap_or(0.0) as f32;
+    let opacity = doc
+        .scene
+        .get(first)
+        .map(|node| node.opacity)
+        .filter(|opacity| {
+            ids.iter().all(|id| {
+                doc.scene
+                    .get(*id)
+                    .is_some_and(|node| node.opacity == *opacity)
+            })
+        });
+    let opacity_percent = opacity.map(|opacity| f64::from(opacity.get()) * 100.0);
+    node.opacity = opacity_percent.unwrap_or(0.0) as f32;
     let mut capabilities =
         DesignPanelNodeCapabilities::for_node_kind(DesignPanelNodeKind::MultipleSelection);
     capabilities.sections = vec![DesignPanelSection::Position, DesignPanelSection::Layer];
@@ -2107,6 +2134,7 @@ pub(crate) fn aggregate_selection(
         (DesignPanelProperty::Width, state(multi.width)),
         (DesignPanelProperty::Height, state(multi.height)),
         (DesignPanelProperty::Rotation, state(multi.rotation_degrees)),
+        (DesignPanelProperty::Opacity, state(opacity_percent)),
     ];
     (node, states)
 }
@@ -3821,6 +3849,12 @@ impl FigView {
                         {
                             let fill = vector.fills.remove(from);
                             vector.fills.insert(to, fill);
+                        } else if let NodeData::Boolean(boolean) = data
+                            && from < boolean.fills.len()
+                            && to < boolean.fills.len()
+                        {
+                            let fill = boolean.fills.remove(from);
+                            boolean.fills.insert(to, fill);
                         } else if let NodeData::Group(group) = data {
                             let count = usize::from(group.background.is_some())
                                 + group.background_fills.len();
@@ -6928,6 +6962,13 @@ fn current_paint(doc: &Doc, id: NodeId, is_stroke: bool, index: usize) -> Option
                 vector.fills.get(index)
             }
         }
+        NodeData::Boolean(boolean) => {
+            if is_stroke {
+                boolean.strokes.get(index).map(|stroke| &stroke.paint)
+            } else {
+                boolean.fills.get(index)
+            }
+        }
         NodeData::Group(group) => {
             if is_stroke {
                 group.strokes.get(index).map(|stroke| &stroke.paint)
@@ -9840,6 +9881,227 @@ mod tests {
             .expect("paint exists")
     }
 
+    fn doc_with_baked_boolean(stroke_outline: bool) -> (Doc, NodeId) {
+        let (mut doc, _, id) = doc_with_rect();
+        let node = doc.scene.get_mut(id).expect("source vector");
+        let NodeData::Vector(mut vector) = node.data.clone() else {
+            panic!("source vector");
+        };
+        vector.local_size = Some([200., 100.]);
+        let stroke = fanta_doc::Stroke::solid(FantaColor::rgb(0xe0, 0x30, 0x30), 2.);
+        if !stroke_outline {
+            vector.strokes.push(stroke.clone());
+        }
+        node.data = NodeData::Boolean(BooleanNode {
+            op: BooleanOp::Union,
+            fills: if stroke_outline {
+                Default::default()
+            } else {
+                vector.fills.clone()
+            },
+            strokes: smallvec::smallvec![stroke],
+            baked: Some(fanta_doc::BooleanBakedGeometry {
+                vector: vector.clone(),
+                source: String::new(),
+                stroke_outline,
+            }),
+        });
+        let mut operand = CanvasNode::new(NodeData::Vector(vector));
+        operand.parent = Some(id);
+        doc.scene.insert(operand).expect("editable operand");
+        let signature = fanta_doc::boolean_geometry_signature(&doc.scene, id).expect("signature");
+        doc.scene
+            .get_mut(id)
+            .expect("Boolean")
+            .data
+            .as_boolean_mut()
+            .expect("Boolean")
+            .baked
+            .as_mut()
+            .expect("bake")
+            .source = signature;
+        doc.selection.replace_with([id]);
+        (doc, id)
+    }
+
+    fn boolean_paint_png(doc: &Doc) -> Vec<u8> {
+        let mut renderer = fanta_render::RasterRenderer::new(320, 180).expect("renderer");
+        let metrics = renderer.render(
+            &doc.scene,
+            &fanta_doc::Viewport {
+                center: [110., 70.],
+                zoom: 1.,
+            },
+        );
+        assert!(!metrics.incomplete_artwork);
+        renderer.encode_png().expect("PNG")
+    }
+
+    async fn assert_boolean_inspector_paints(stroke_outline: bool, cx: &mut TestAppContext) {
+        let (doc, id) = doc_with_baked_boolean(stroke_outline);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        let (baseline, baseline_png) = item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document").doc;
+            (
+                doc.scene
+                    .descendants_of(id)
+                    .map(|id| doc.scene.get(id).expect("node").clone())
+                    .collect::<Vec<_>>(),
+                boolean_paint_png(doc),
+            )
+        });
+        panel.read_with(cx, |panel, _| {
+            let node = panel.node();
+            let capabilities = node.capabilities.as_ref().expect("capabilities");
+            assert!(capabilities.fill && capabilities.stroke);
+            assert!(capabilities.sections.contains(&DesignPanelSection::Fill));
+            assert!(capabilities.sections.contains(&DesignPanelSection::Stroke));
+            assert_eq!(node.fills.len(), usize::from(!stroke_outline));
+            assert_eq!(
+                node.stroke.as_ref().expect("stroke controls").paints.len(),
+                1
+            );
+        });
+        let color = DesignColor::rgb(20, 120, 220);
+        emit_inspector_paint_in_collection(
+            &panel,
+            cx,
+            id,
+            if stroke_outline {
+                DesignPanelCollection::Stroke
+            } else {
+                DesignPanelCollection::Fill
+            },
+            DesignPaintProperty::Color,
+            DesignPaintValue::Color(color),
+            DesignPanelEditPhase::Commit,
+        );
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document").doc;
+            assert_eq!(
+                current_paint(doc, id, stroke_outline, 0).and_then(Fill::solid_color),
+                Some(fanta_color(color))
+            );
+            let boolean = doc
+                .scene
+                .get(id)
+                .expect("node")
+                .data
+                .as_boolean()
+                .expect("Boolean");
+            let signature =
+                fanta_doc::boolean_geometry_signature(&doc.scene, id).expect("signature");
+            assert!(
+                boolean.baked_vector(&signature).is_some(),
+                "paint edits retain valid geometry"
+            );
+            assert_ne!(
+                boolean_paint_png(doc),
+                baseline_png,
+                "the new color is painted"
+            );
+        });
+        panel.read_with(cx, |panel, _| {
+            let node = panel.node();
+            let paint = if stroke_outline {
+                &node.stroke.as_ref().expect("stroke").paints[0]
+            } else {
+                &node.fills[0]
+            };
+            assert_eq!(paint.color, color);
+        });
+        assert!(
+            item.update(cx, |item, cx| item.undo(cx))
+                .expect("undo color")
+        );
+        cx.run_until_parked();
+
+        for action in [
+            DesignPanelAction::PropertyChangeRequested {
+                node_id: id.to_string().into(),
+                property: DesignPanelProperty::StrokeWeight,
+                value: DesignPanelValue::Number(6.),
+            },
+            DesignPanelAction::CollectionItemAddRequested {
+                node_id: id.to_string().into(),
+                collection: DesignPanelCollection::Fill,
+                target: DesignPaintTarget::WholeLayer,
+            },
+            DesignPanelAction::CollectionItemAddRequested {
+                node_id: id.to_string().into(),
+                collection: DesignPanelCollection::Stroke,
+                target: DesignPaintTarget::WholeLayer,
+            },
+            DesignPanelAction::PropertyChangeRequested {
+                node_id: id.to_string().into(),
+                property: DesignPanelProperty::BooleanOperation,
+                value: DesignPanelValue::BooleanOperation(DesignBooleanOperation::Exclude),
+            },
+        ] {
+            let changes_operation = matches!(
+                &action,
+                DesignPanelAction::PropertyChangeRequested {
+                    property: DesignPanelProperty::BooleanOperation,
+                    ..
+                }
+            );
+            panel.update_in(cx, |_, _, cx| cx.emit(action));
+            cx.run_until_parked();
+            item.read_with(cx, |item, _| {
+                let doc = &item.document().expect("document").doc;
+                let boolean = doc
+                    .scene
+                    .get(id)
+                    .expect("node")
+                    .data
+                    .as_boolean()
+                    .expect("Boolean");
+                let signature =
+                    fanta_doc::boolean_geometry_signature(&doc.scene, id).expect("signature");
+                assert_eq!(
+                    boolean.baked_vector(&signature).is_some(),
+                    !stroke_outline && !changes_operation
+                );
+                assert_ne!(
+                    doc.scene.get(id),
+                    baseline.first(),
+                    "panel action changes the document"
+                );
+                boolean_paint_png(doc);
+            });
+            assert!(
+                item.update(cx, |item, cx| item.undo(cx))
+                    .expect("undo geometry edit")
+            );
+            cx.run_until_parked();
+            item.read_with(cx, |item, _| {
+                let doc = &item.document().expect("document").doc;
+                for node in &baseline {
+                    assert_eq!(doc.scene.get(node.id), Some(node));
+                }
+                assert_eq!(boolean_paint_png(doc), baseline_png);
+                assert!(
+                    !doc.history.can_undo(),
+                    "each panel action is exactly one undo step"
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn boolean_inspector_normal_paints_edit_render_and_undo(cx: &mut TestAppContext) {
+        assert_boolean_inspector_paints(false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn boolean_inspector_stroke_outline_paints_edit_render_and_undo(cx: &mut TestAppContext) {
+        assert_boolean_inspector_paints(true, cx).await;
+    }
+
     #[test]
     fn paint_visibility_mutates_fills_and_strokes_and_restores_their_alpha() {
         let (mut doc, _page, rect) = doc_with_rect();
@@ -11636,9 +11898,9 @@ mod tests {
             false,
             DesignCornerCapabilities::NONE,
         );
-        assert!(!boolean_caps.fill && !boolean_caps.stroke);
-        assert!(!boolean_caps.sections.contains(&DesignPanelSection::Fill));
-        assert!(!boolean_caps.sections.contains(&DesignPanelSection::Stroke));
+        assert!(boolean_caps.fill && boolean_caps.stroke);
+        assert!(boolean_caps.sections.contains(&DesignPanelSection::Fill));
+        assert!(boolean_caps.sections.contains(&DesignPanelSection::Stroke));
 
         let vector = NodeData::Vector(VectorNode::rect_solid(
             0.0,
@@ -11965,6 +12227,188 @@ mod tests {
             assert!(adapter.crop_session.is_none());
             assert!(adapter.last_echo.is_none());
         });
+    }
+
+    #[gpui::test]
+    async fn specialized_wrapper_inspector_edits_undo_and_exports_without_changing_content(
+        cx: &mut TestAppContext,
+    ) {
+        use fanta_doc::{AiArtifactNode, AudioNode, EmbedNode, Model3dNode, NodeGraphNode};
+
+        let cases = [
+            NodeData::Audio(AudioNode {
+                asset: AssetId::new(),
+                local_size: [120.0, 80.0],
+                time_range_us: [0, 3_000_000],
+                volume: 0.5,
+                muted: false,
+                waveform_color: FantaColor::BLACK,
+            }),
+            NodeData::NodeGraph(NodeGraphNode {
+                local_size: [120.0, 80.0],
+                graph: Default::default(),
+                preview: None,
+            }),
+            NodeData::Model3d(Model3dNode {
+                asset: AssetId::new(),
+                local_size: [120.0, 80.0],
+                camera: Default::default(),
+                overrides: serde_json::json!({"retained": true}),
+            }),
+            NodeData::AiArtifact(AiArtifactNode {
+                local_size: [120.0, 80.0],
+                prompt: "Retain the generation source".into(),
+                model: "local-fixture".into(),
+                params: serde_json::json!({"retained": true}),
+                inputs: Vec::new(),
+                lineage_parent: None,
+                output: None,
+                status: Default::default(),
+                seed: Some(42),
+            }),
+            NodeData::Embed(EmbedNode {
+                local_size: [120.0, 80.0],
+                kind: "local.fixture".into(),
+                payload: serde_json::json!({"retained": true}),
+            }),
+        ];
+        for data in cases {
+            let title = data.default_name();
+            let (mut doc, page, _) = doc_with_rect();
+            let mut node = CanvasNode::new(data);
+            node.name = "Wrapper".into();
+            node.parent = Some(page);
+            let original = node.clone();
+            let id = doc.scene.insert(node).expect("wrapper node");
+            doc.selection.replace_with([id]);
+            doc.history = Default::default();
+            let (view, panel, mut context) = setup_view(doc, cx).await;
+            let context = &mut context;
+            let item = view.read_with(context, |view, _| view.item().clone());
+            panel.read_with(context, |panel, _| {
+                let snapshot = panel.view_data();
+                let header = snapshot.projections.selection_header.expect("header");
+                assert_eq!(header.view_data.title.as_ref(), title);
+                let node = panel.node();
+                for section in [
+                    DesignPanelSection::Layout,
+                    DesignPanelSection::Effects,
+                    DesignPanelSection::Export,
+                ] {
+                    assert!(node.supports_section(section), "{title}: {section:?}");
+                }
+                let capabilities = node.capabilities.as_ref().expect("capabilities");
+                assert!(!capabilities.fill);
+                assert!(!capabilities.stroke);
+                assert!(!capabilities.add_auto_layout);
+                assert!(!capabilities.auto_layout_container);
+                assert!(!capabilities.clip_content);
+                assert!(node.typography.is_none());
+            });
+            for property in [DesignPanelProperty::Width, DesignPanelProperty::Height] {
+                panel.update_in(context, |_, _, cx| {
+                    cx.emit(DesignPanelAction::PropertyChangeRequested {
+                        node_id: id.to_string().into(),
+                        property,
+                        value: DesignPanelValue::Number(180.0),
+                    });
+                });
+                context.run_until_parked();
+                panel.read_with(context, |panel, _| {
+                    let actual = if property == DesignPanelProperty::Width {
+                        panel.node().width
+                    } else {
+                        panel.node().height
+                    };
+                    assert!((actual - 180.0).abs() < 0.01, "{title}: {property:?}");
+                });
+                item.read_with(context, |item, _| {
+                    let node = item.doc().expect("document").scene.get(id).expect("node");
+                    assert_eq!(node.data, original.data, "{title}: content retained");
+                });
+                assert!(
+                    item.update(context, |item, cx| item.undo(cx))
+                        .expect("undo size")
+                );
+                context.run_until_parked();
+                item.read_with(context, |item, _| {
+                    assert_eq!(item.doc().expect("document").scene.get(id), Some(&original));
+                });
+            }
+            for kind in [DesignEffectKind::DropShadow, DesignEffectKind::LayerBlur] {
+                panel.update_in(context, |_, _, cx| {
+                    cx.emit(DesignPanelAction::EffectAddRequested {
+                        node_id: id.to_string().into(),
+                        kind,
+                    });
+                });
+                context.run_until_parked();
+                item.read_with(context, |item, _| {
+                    let node = item.doc().expect("document").scene.get(id).expect("node");
+                    assert_eq!(node.data, original.data, "{title}: content retained");
+                    assert_eq!(
+                        node.effects.len() + node.blurs.len(),
+                        1,
+                        "{title}: {kind:?}"
+                    );
+                });
+                assert!(
+                    item.update(context, |item, cx| item.undo(cx))
+                        .expect("undo effect")
+                );
+                context.run_until_parked();
+                item.read_with(context, |item, _| {
+                    assert_eq!(item.doc().expect("document").scene.get(id), Some(&original));
+                });
+            }
+            panel.update_in(context, |_, _, cx| {
+                cx.emit(DesignPanelAction::ExportAllRequested {
+                    target: DesignPanelTarget::Nodes {
+                        node_ids: vec![id.to_string().into()],
+                    },
+                });
+            });
+            assert!(context.did_prompt_for_paths());
+            let output = tempfile::tempdir().expect("export destination");
+            let directory = output.path().to_path_buf();
+            context.simulate_path_prompt_response(move |_| Some(vec![directory]));
+            context.run_until_parked();
+            let exported = image::open(output.path().join("Wrapper.png")).expect("wrapper PNG");
+            assert_eq!(exported.dimensions(), (120, 80), "{title}");
+            item.read_with(context, |item, _| {
+                assert_eq!(item.doc().expect("document").scene.get(id), Some(&original));
+            });
+        }
+    }
+
+    #[test]
+    fn specialized_wrapper_matching_keeps_distinct_content_types_separate() {
+        let (mut doc, page, _) = doc_with_rect();
+        let data = NodeData::Audio(fanta_doc::AudioNode {
+            asset: AssetId::new(),
+            local_size: [120.0, 80.0],
+            time_range_us: [0, 3_000_000],
+            volume: 0.5,
+            muted: false,
+            waveform_color: FantaColor::BLACK,
+        });
+        let mut audio = CanvasNode::new(data);
+        audio.parent = Some(page);
+        let mut second_audio = audio.clone();
+        second_audio.id = NodeId::new();
+        let first = doc.scene.insert(audio).expect("first audio");
+        let second = doc.scene.insert(second_audio).expect("second audio");
+        let mut embed = CanvasNode::new(NodeData::Embed(fanta_doc::EmbedNode {
+            local_size: [120.0, 80.0],
+            kind: "local.fixture".into(),
+            payload: Default::default(),
+        }));
+        embed.parent = Some(page);
+        doc.scene.insert(embed).expect("embed");
+        assert_eq!(
+            matching_design_layers(&doc, first, Some(page)).collect::<HashSet<_>>(),
+            HashSet::from([first, second])
+        );
     }
 
     #[gpui::test]
@@ -12579,6 +13023,132 @@ mod tests {
             assert!(
                 (panel.node().opacity - 100.0).abs() < 1e-3,
                 "the undo echoes back into the panel"
+            );
+        });
+    }
+
+    #[test]
+    fn multi_selection_opacity_projects_transparent_and_mixed_values() {
+        let (mut doc, _page, ids) = doc_with_three_squares();
+        for id in ids {
+            doc.scene.get_mut(id).expect("selected node").opacity =
+                fanta_doc::UnitInterval::new(0.0);
+        }
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        let (node, states) = aggregate_selection(&document, &ids, &HashMap::new());
+        assert_eq!(node.opacity, 0.0);
+        assert!(states.contains(&(
+            DesignPanelProperty::Opacity,
+            DesignPanelPropertyValueState::Uniform(DesignPanelValue::Number(0.0)),
+        )));
+
+        document
+            .doc
+            .scene
+            .get_mut(ids[1])
+            .expect("selected node")
+            .opacity = fanta_doc::UnitInterval::new(0.5);
+        let (_, states) = aggregate_selection(&document, &ids, &HashMap::new());
+        assert!(states.contains(&(
+            DesignPanelProperty::Opacity,
+            DesignPanelPropertyValueState::Mixed,
+        )));
+    }
+
+    #[gpui::test]
+    async fn multi_selection_opacity_echoes_for_specialist_nodes_and_undo(cx: &mut TestAppContext) {
+        let (mut doc, page, _) = doc_with_rect();
+        let mut ids = Vec::new();
+        for data in [
+            NodeData::NodeGraph(fanta_doc::NodeGraphNode {
+                local_size: [190.0, 160.0],
+                graph: fanta_doc::NodeGraph::default(),
+                preview: None,
+            }),
+            NodeData::Model3d(fanta_doc::Model3dNode {
+                asset: AssetId::new(),
+                local_size: [190.0, 160.0],
+                camera: fanta_doc::Camera3d::default(),
+                overrides: serde_json::json!({"material": "preserve"}),
+            }),
+        ] {
+            let mut node = CanvasNode::new(data);
+            node.parent = Some(page);
+            ids.push(node.id);
+            doc.scene.insert(node).expect("insert specialist node");
+        }
+        doc.selection.replace_with(ids.iter().copied());
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        let before = item.read_with(cx, |item, _| {
+            serde_json::to_value(&item.document().expect("document ready").doc.scene)
+                .expect("scene snapshot")
+        });
+
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::TargetedNodeActionRequested {
+                target: DesignPanelTarget::Nodes {
+                    node_ids: ids.iter().map(|id| id.to_string().into()).collect(),
+                },
+                action: Box::new(DesignPanelAction::PropertyChangeRequested {
+                    node_id: ids.first().expect("two selected nodes").to_string().into(),
+                    property: DesignPanelProperty::Opacity,
+                    value: DesignPanelValue::Number(50.0),
+                }),
+            });
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            for id in &ids {
+                assert_eq!(
+                    doc.scene.get(*id).expect("selected node").opacity.get(),
+                    0.5
+                );
+            }
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(
+                panel.node().opacity,
+                50.0,
+                "the inspector must echo the saved value"
+            );
+            assert_eq!(
+                panel
+                    .view_data()
+                    .property_states
+                    .get(&DesignPanelProperty::Opacity),
+                Some(&DesignPanelPropertyValueState::Uniform(
+                    DesignPanelValue::Number(50.0)
+                )),
+            );
+        });
+
+        item.update(cx, |item, cx| {
+            assert!(item.undo(cx).expect("undo opacity"));
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document ready").doc;
+            assert_eq!(
+                serde_json::to_value(&doc.scene).expect("scene snapshot"),
+                before
+            );
+            assert!(!doc.history.can_undo(), "one Undo restores both nodes");
+        });
+        panel.read_with(cx, |panel, _| {
+            assert_eq!(panel.node().opacity, 100.0);
+            assert_eq!(
+                panel
+                    .view_data()
+                    .property_states
+                    .get(&DesignPanelProperty::Opacity),
+                Some(&DesignPanelPropertyValueState::Uniform(
+                    DesignPanelValue::Number(100.0)
+                )),
             );
         });
     }

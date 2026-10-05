@@ -14,6 +14,7 @@ mod measurements_host;
 mod media_host;
 #[cfg(feature = "fanta-gpui-ui")]
 mod properties_inspector;
+mod serialization;
 #[cfg(feature = "fanta-gpui-ui")]
 mod timeline_adapter;
 
@@ -4993,6 +4994,7 @@ impl FigView {
         });
         if let Err(error) = result {
             log::error!("{label} canvas selection failed: {error:#}");
+            show_canvas_notice_deferred(format!("{label} failed: {error:#}"), cx);
         }
     }
 
@@ -5425,6 +5427,9 @@ impl FigView {
             self.invalidate_canvas_cache();
         }
         self.sync_measurement_edit_barrier(cx);
+        if changed_for_view {
+            cx.emit(FigViewEvent::TitleChanged);
+        }
         cx.notify();
     }
 
@@ -8642,7 +8647,11 @@ impl Item for FigView {
     }
 
     fn workspace_deactivated(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        self.invalidate_local_media_origin();
+        // The native media picker deactivates its own workspace window. Page,
+        // tab, and document changes still invalidate the pending destination.
+        if self.media_import_task.is_none() {
+            self.invalidate_local_media_origin();
+        }
         self.freeze_annotation_move(cx);
         self.freeze_measurement_drag(cx);
         self.finish_document_edits(cx);
@@ -10196,6 +10205,178 @@ mod tests {
         );
     }
 
+    fn mounted_canvas_interaction_fixture(
+        project: &Entity<Project>,
+        doc: Doc,
+        images: BTreeMap<AssetId, Vec<u8>>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<FigItem>, Entity<FigView>, gpui::VisualTestContext) {
+        cx.update(|cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new("escape", Cancel, Some("FigViewer")),
+                gpui::KeyBinding::new("enter", Confirm, Some("FigViewer")),
+                gpui::KeyBinding::new("cmd-z", Undo, Some("FigViewer")),
+                gpui::KeyBinding::new("cmd-shift-z", Redo, Some("FigViewer")),
+            ]);
+        });
+        let item = crate::document::ready_item_for_test(
+            project,
+            std::path::PathBuf::from("/tmp/MountedCanvasInteraction.fig"),
+            doc,
+            cx,
+        );
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let (_, mut assets) = document.doc_and_assets();
+                for (expected, bytes) in images {
+                    let (actual, _) = assets.add_image(bytes).expect("fixture image");
+                    assert_eq!(actual, expected);
+                }
+                ((), DocChange::None)
+            });
+        });
+        let window = cx.add_window({
+            let item = item.clone();
+            let project = project.clone();
+            move |window, cx| FigView::new(item, project, window, cx)
+        });
+        let view = window.entity(cx).expect("mounted view");
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1400.0), px(900.0)));
+        view.update(&mut visual, |view, cx| {
+            view.set_viewport_silent(Viewport::default());
+            cx.notify();
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+        (item, view, visual)
+    }
+
+    fn mounted_canvas_click(
+        visual: &mut gpui::VisualTestContext,
+        position: Point<Pixels>,
+        click_count: usize,
+    ) {
+        visual.simulate_event(MouseDownEvent {
+            position,
+            button: MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count,
+            first_mouse: false,
+        });
+        visual.simulate_event(MouseUpEvent {
+            position,
+            button: MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count,
+        });
+    }
+
+    fn bitmap_canvas_doc() -> (Doc, NodeId, BTreeMap<AssetId, Vec<u8>>) {
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            2,
+            2,
+            image::Rgba([48, 96, 192, 255]),
+        ))
+        .write_to(&mut encoded, image::ImageFormat::Png)
+        .expect("fixture PNG");
+        let bytes = encoded.into_inner();
+        let asset = fanta_format::asset_id_for_bytes(&bytes);
+        let mut doc = doc_with_one_page();
+        let mut bitmap = CanvasNode::new(NodeData::Bitmap(fanta_doc::BitmapNode {
+            asset,
+            natural_size: [2, 2],
+            local_size: [200.0, 100.0],
+            crop: Some([0.1, 0.1, 0.8, 0.8]),
+            fit: fanta_doc::ImageFitMode::Fill,
+            tint: Some(Color::rgba(255, 192, 128, 200)),
+        }));
+        bitmap.parent = doc.active_page();
+        bitmap.transform = Transform2D::translation(-100.0, -50.0);
+        let bitmap_id = bitmap.id;
+        doc.apply(Operation::create_node(bitmap)).expect("bitmap");
+        doc.history = Default::default();
+        (doc, bitmap_id, BTreeMap::from([(asset, bytes)]))
+    }
+
+    fn curved_text_path_hit_fixture() -> (fanta_doc::TextPathNode, [f64; 2], [f64; 2], [f64; 2]) {
+        let mut baseline = fanta_doc::PathData::new();
+        baseline
+            .move_to(0.0, 55.0)
+            .quad_to(185.0, -35.0, 370.0, 55.0);
+        let mut text_path = fanta_doc::TextPathNode::new(baseline, "PATH EDIT ME");
+        text_path.style.size_px = 32.0;
+        let glyph_quad = fanta_render::text_path_selection_quads(&text_path, 6..7)
+            .into_iter()
+            .next()
+            .expect("D has shaped geometry");
+        let bounds = glyph_quad.points.into_iter().fold(
+            fanta_doc::Bounds {
+                min_x: f64::INFINITY,
+                min_y: f64::INFINITY,
+                max_x: f64::NEG_INFINITY,
+                max_y: f64::NEG_INFINITY,
+            },
+            |bounds, point| fanta_doc::Bounds {
+                min_x: bounds.min_x.min(point[0]),
+                min_y: bounds.min_y.min(point[1]),
+                max_x: bounds.max_x.max(point[0]),
+                max_y: bounds.max_y.max(point[1]),
+            },
+        );
+        let points = (0..=bounds.height().ceil() as usize * 2).flat_map(|y| {
+            (0..=bounds.width().ceil() as usize * 2)
+                .map(move |x| [bounds.min_x + x as f64 / 2.0, bounds.min_y + y as f64 / 2.0])
+        });
+        let contains = |point| fanta_render::text_path_contains_point(&text_path, point);
+        let in_d = |point| {
+            fanta_render::text_path_hit_test(&text_path, point)
+                .is_some_and(|byte| (6..=7).contains(&byte))
+        };
+        let ink = points
+            .clone()
+            .find(|point| {
+                in_d(*point)
+                    && [[0.0, 0.0], [-0.5, 0.0], [0.5, 0.0], [0.0, -0.5], [0.0, 0.5]]
+                        .into_iter()
+                        .all(|offset| contains([point[0] + offset[0], point[1] + offset[1]]))
+            })
+            .expect("interior ink on the D in EDIT");
+        let counter = points
+            .filter(|point| {
+                in_d(*point)
+                    && [[0.0, 0.0], [-0.5, 0.0], [0.5, 0.0], [0.0, -0.5], [0.0, 0.5]]
+                        .into_iter()
+                        .all(|offset| !contains([point[0] + offset[0], point[1] + offset[1]]))
+            })
+            .find(|point| {
+                [[-1.0, 0.0], [1.0, 0.0], [0.0, -1.0], [0.0, 1.0]]
+                    .into_iter()
+                    .all(|direction| {
+                        (1..=12).any(|distance| {
+                            contains([
+                                point[0] + direction[0] * f64::from(distance),
+                                point[1] + direction[1] * f64::from(distance),
+                            ])
+                        })
+                    })
+            })
+            .expect("enclosed counter surrounded by glyph ink");
+        let whitespace_quad = fanta_render::text_path_selection_quads(&text_path, 4..5)
+            .into_iter()
+            .next()
+            .expect("space has shaped geometry");
+        let whitespace = whitespace_quad
+            .points
+            .into_iter()
+            .fold([0.0, 0.0], |sum, point| {
+                [sum[0] + point[0] / 4.0, sum[1] + point[1] / 4.0]
+            });
+        assert!(!contains(whitespace));
+        (text_path, ink, counter, whitespace)
+    }
+
     fn send_canvas_click_with_modifiers(
         scratch: gpui::WindowHandle<gpui::Empty>,
         view: &Entity<FigView>,
@@ -10285,6 +10466,185 @@ mod tests {
                 ((), DocChange::Content)
             });
         });
+    }
+
+    async fn local_media_picker_fixture(
+        cx: &mut TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        Entity<workspace::Workspace>,
+        Entity<FigItem>,
+        Entity<FigView>,
+        &mut gpui::VisualTestContext,
+    ) {
+        init_visual_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+        let directory = tempfile::tempdir().expect("media directory");
+        let path = directory.path().join("Placed image.png");
+        image::RgbaImage::from_pixel(8, 4, image::Rgba([24, 96, 192, 255]))
+            .save(&path)
+            .expect("write picker image");
+        let (mut doc, first_page, _) = doc_with_two_pages();
+        let mut text = CanvasNode::new(NodeData::Text(TextNode::new("Saved text", 120., 40.)));
+        text.parent = Some(first_page);
+        doc.scene.insert(text).expect("initial text");
+        let root = directory.path().join("New design");
+        crate::document::write_project(&root, &doc, &BTreeMap::new()).expect("saved new design");
+        file_system.insert_tree_from_real_fs(&root, &root).await;
+        let item = crate::document::ready_item_with_root_for_test(
+            &project,
+            root.join("fanta.json"),
+            Some(root),
+            doc,
+            cx,
+        );
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::Workspace::test_new(project.clone(), window, cx)
+        });
+        let view = cx.update(|window, cx| {
+            let view = cx.new(|cx| FigView::new(item.clone(), project, window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            });
+            window.activate_window();
+            view
+        });
+        cx.run_until_parked();
+        (directory, path, workspace, item, view, cx)
+    }
+
+    #[gpui::test]
+    async fn local_media_picker_survives_native_window_deactivation(cx: &mut TestAppContext) {
+        let (_directory, path, _workspace, item, view, cx) = local_media_picker_fixture(cx).await;
+        let baseline = item.read_with(cx, |item, _| item.doc().expect("document").scene.clone());
+        view.update(cx, |view, cx| view.choose_local_media(cx));
+        assert!(cx.did_prompt_for_paths());
+        cx.deactivate_window();
+        cx.simulate_path_prompt_response(move |_| Some(vec![path]));
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("document");
+            assert_eq!(document.doc.scene.len(), baseline.len() + 1);
+            let bitmap = document
+                .doc
+                .scene
+                .roots()
+                .iter()
+                .flat_map(|root| document.doc.scene.descendants_of(*root))
+                .filter_map(|id| document.doc.scene.get(id))
+                .find(|node| matches!(node.data, NodeData::Bitmap(_)))
+                .expect("picker places its image after focus returns");
+            assert_eq!(bitmap.parent, document.doc.active_page());
+            assert_eq!(bitmap.name, "Placed image.png");
+            assert_eq!(document.raw_assets.len(), 1);
+        });
+        view.read_with(cx, |view, _| assert!(view.media_import_task.is_none()));
+        item.update(cx, |item, cx| item.undo(cx))
+            .expect("undo placement");
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("document");
+            assert_eq!(document.doc.scene.len(), baseline.len());
+            for id in baseline
+                .roots()
+                .iter()
+                .flat_map(|root| baseline.descendants_of(*root))
+            {
+                assert_eq!(document.doc.scene.get(id), baseline.get(id));
+            }
+        });
+    }
+
+    #[gpui::test]
+    async fn local_media_picker_rejects_page_round_trip_during_preparation(
+        cx: &mut TestAppContext,
+    ) {
+        let (_directory, path, _workspace, item, view, cx) = local_media_picker_fixture(cx).await;
+        let prepared = crate::generation_media::prepare_local_media(&path)
+            .await
+            .expect("prepare image");
+        let baseline_count =
+            item.read_with(cx, |item, _| item.doc().expect("document").scene.len());
+        let (prepared_sender, prepared_receiver) = futures::channel::oneshot::channel();
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let preparation_started = started.clone();
+        view.update(cx, |view, cx| {
+            view.choose_local_media_with(
+                move |_| async move {
+                    preparation_started.store(true, std::sync::atomic::Ordering::SeqCst);
+                    prepared_receiver.await.context("preparation canceled")
+                },
+                cx,
+            );
+        });
+        cx.deactivate_window();
+        cx.simulate_path_prompt_response(move |_| Some(vec![path]));
+        cx.run_until_parked();
+        assert!(
+            started.load(std::sync::atomic::Ordering::SeqCst),
+            "unchanged document reaches preparation"
+        );
+        view.update(cx, |view, cx| {
+            view.select_page(1, cx);
+            view.select_page(0, cx);
+        });
+        assert!(prepared_sender.send(prepared).is_ok());
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("document");
+            assert_eq!(document.doc.scene.len(), baseline_count);
+            assert!(document.raw_assets.is_empty());
+        });
+        view.read_with(cx, |view, _| assert!(view.media_import_task.is_none()));
+    }
+
+    #[gpui::test]
+    async fn local_media_picker_rejects_switching_to_another_document(cx: &mut TestAppContext) {
+        let (_directory, path, workspace, item, view, cx) = local_media_picker_fixture(cx).await;
+        let baseline_count =
+            item.read_with(cx, |item, _| item.doc().expect("document").scene.len());
+        view.update(cx, |view, cx| view.choose_local_media(cx));
+        cx.deactivate_window();
+        let project = view.read_with(cx, |view, _| view.project.clone());
+        let other_item = crate::document::ready_item_for_test(
+            &project,
+            "/tmp/Other-media-design.fig".into(),
+            doc_with_one_page(),
+            cx,
+        );
+        let other_view = cx.update(|window, cx| {
+            let other_view = cx.new(|cx| FigView::new(other_item.clone(), project, window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(
+                    Box::new(other_view.clone()),
+                    None,
+                    true,
+                    window,
+                    cx,
+                );
+            });
+            window.activate_window();
+            other_view
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .active_item(cx)
+                .map(|item| item.item_id())),
+            Some(other_view.entity_id())
+        );
+        cx.simulate_path_prompt_response(move |_| Some(vec![path]));
+        cx.run_until_parked();
+        for (item, expected_count) in [(item, baseline_count), (other_item, 1)] {
+            item.read_with(cx, |item, _| {
+                let document = item.document().expect("document");
+                assert_eq!(document.doc.scene.len(), expected_count);
+                assert!(document.raw_assets.is_empty());
+            });
+        }
+        view.read_with(cx, |view, _| assert!(view.media_import_task.is_none()));
     }
 
     #[gpui::test]
@@ -12225,6 +12585,103 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn rejected_cross_document_canvas_paste_shows_notice_and_preserves_document(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+        cx.update(|cx| {
+            client::Client::set_global(project.read(cx).client(), cx);
+            <dyn fs::Fs>::set_global(file_system, cx);
+        });
+        let (mut source, source_text, _) = text_selection_doc(false);
+        source.selection.select_only(source_text);
+        let payload = CanvasClipboard::capture(&source).expect("copy source text");
+        cx.update(|cx| {
+            cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(
+                payload.display_text(),
+                payload,
+            ));
+        });
+
+        let (mut destination, destination_text, _) = text_selection_doc(false);
+        assert_ne!(source.id, destination.id);
+        destination.selection.select_only(destination_text);
+        let asset = AssetId::new();
+        destination.asset_library.insert(
+            asset,
+            fanta_doc::ProjectAsset {
+                name: "Kept.svg".into(),
+                kind: ProjectAssetKind::Svg,
+            },
+        );
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/RejectedClipboard.fig"),
+            destination,
+            cx,
+        );
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                Arc::make_mut(&mut document.raw_assets).insert(
+                    asset,
+                    br#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>"#
+                        .to_vec(),
+                );
+                ((), DocChange::None)
+            });
+        });
+        let (multi_workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let view = cx.update(|window, cx| {
+            let view = cx.new(|cx| FigView::new(item.clone(), project, window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            });
+            window.activate_window();
+            view
+        });
+        cx.run_until_parked();
+        let snapshot = |item: &FigItem| {
+            let document = item.document().expect("destination document");
+            (
+                serde_json::to_value(&document.doc).expect("serialize destination"),
+                document.doc.selection.as_slice().to_vec(),
+                document.doc.history.undo_depth(),
+                document.doc.history.redo_depth(),
+                document.raw_assets.clone(),
+                item.is_dirty(),
+            )
+        };
+        let before = item.read_with(cx, |item, _| snapshot(item));
+        let notice = NotificationId::named(CANVAS_NOTICE_ID.into());
+        workspace.read_with(cx, |workspace, _| {
+            assert!(!workspace.notification_ids().contains(&notice));
+        });
+
+        view.update(cx, |view, cx| view.paste_selected_nodes(cx));
+        cx.run_until_parked();
+
+        workspace.read_with(cx, |workspace, _| {
+            assert!(
+                workspace.notification_ids().contains(&notice),
+                "a rejected paste must reach the visible workspace notification surface"
+            );
+        });
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                snapshot(item),
+                before,
+                "rejection preserves content, selection, history, asset bytes and dirty state"
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn right_click_menu_creates_an_instance_and_goes_back_to_its_main_component(
         cx: &mut TestAppContext,
     ) {
@@ -13095,6 +13552,544 @@ mod tests {
                 item.read_with(visual, |item, _| {
                     let doc = item.doc().expect("document");
                     assert!(doc.selection.is_empty(), "after_node_edit={after_node_edit}, paint_between_events={paint_between_events}");
+                    assert_eq!(doc.history.undo_depth(), 0);
+                    assert!(!item.is_dirty());
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn mounted_curved_text_path_counters_and_whitespace_edit_after_crop(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (mut doc, _, images) = bitmap_canvas_doc();
+        let (text_path, ink, counter, whitespace) = curved_text_path_hit_fixture();
+        let mut node = CanvasNode::new(NodeData::TextPath(text_path));
+        node.parent = doc.active_page();
+        node.index = doc.scene.next_child_index(node.parent);
+        node.transform = Transform2D::translation(-185.0, 100.0);
+        let node_id = node.id;
+        let original = node.clone();
+        doc.apply(Operation::create_node(node))
+            .expect("curved text path");
+        doc.history = Default::default();
+        let (item, view, mut visual) =
+            mounted_canvas_interaction_fixture(&project, doc, images, cx);
+        for zoom in [1.0, 0.65] {
+            view.update(&mut visual, |view, cx| {
+                view.set_viewport_silent(Viewport {
+                    center: [0.0, 0.0],
+                    zoom,
+                });
+                cx.notify();
+            });
+            visual.update(|window, cx| window.draw(cx).clear());
+            let canvas = view.read_with(&visual, |view, _| view.container_bounds.expect("canvas"));
+            mounted_canvas_click(&mut visual, canvas.center(), 1);
+            mounted_canvas_click(&mut visual, canvas.center(), 2);
+            assert_eq!(
+                view.read_with(&visual, |view, _| view.active_tool()),
+                ToolKind::Crop
+            );
+            visual.simulate_keystrokes("escape");
+            assert_eq!(
+                view.read_with(&visual, |view, _| view.active_tool()),
+                ToolKind::Select
+            );
+            let screen_point = |local: [f64; 2]| {
+                canvas.center()
+                    + point(
+                        px(((local[0] - 185.0) * zoom) as f32),
+                        px(((local[1] + 100.0) * zoom) as f32),
+                    )
+            };
+            let ink_position = screen_point(ink);
+            mounted_canvas_click(&mut visual, ink_position, 1);
+            item.read_with(&visual, |item, _| {
+                assert_eq!(
+                    item.doc().expect("document").selection.as_slice(),
+                    &[node_id]
+                );
+            });
+            mounted_canvas_click(&mut visual, ink_position, 2);
+            view.read_with(&visual, |view, _| {
+                let edit = view
+                    .text_edit
+                    .as_ref()
+                    .expect("visible curved glyph opens editor");
+                assert_eq!(edit.session.node_id(), node_id);
+                assert_eq!(edit.session.selected_range(), 5..9);
+            });
+            visual.simulate_keystrokes("escape");
+            for local in [whitespace, counter] {
+                let position = screen_point(local);
+                view.read_with(&visual, |view, cx| {
+                    let doc = item.read(cx).doc().expect("document");
+                    let (width, height) = bounds_size(canvas);
+                    assert_eq!(
+                        inspect_hit_test_screen(
+                            &doc.scene,
+                            &view.viewport.expect("viewport"),
+                            DVec2::new(width, height),
+                            screen_position_in_bounds(position, canvas),
+                            doc.active_page(),
+                        ),
+                        None,
+                        "inspection retains exact-ink geometry"
+                    );
+                });
+                mounted_canvas_click(&mut visual, position, 1);
+                item.read_with(&visual, |item, _| {
+                    assert_eq!(
+                        item.doc().expect("document").selection.as_slice(),
+                        &[node_id]
+                    );
+                });
+                mounted_canvas_click(&mut visual, position, 2);
+                view.read_with(&visual, |view, _| {
+                    let edit = view
+                        .text_edit
+                        .as_ref()
+                        .expect("shaped text footprint opens editor");
+                    assert_eq!(edit.session.node_id(), node_id);
+                    if local == counter {
+                        assert_eq!(edit.session.selected_range(), 5..9);
+                    }
+                });
+                if local == counter {
+                    visual.update(|window, cx| window.draw(cx).clear());
+                    visual.simulate_input("CHANGED");
+                }
+                visual.simulate_keystrokes("escape");
+            }
+            item.read_with(&visual, |item, _| {
+                let doc = item.doc().expect("document");
+                let NodeData::TextPath(edited) = &doc.scene.get(node_id).expect("text path").data
+                else {
+                    panic!("text path kind preserved");
+                };
+                let NodeData::TextPath(original_path) = &original.data else {
+                    panic!("text path fixture");
+                };
+                assert_eq!(edited.content, "PATH CHANGED ME");
+                assert_eq!(edited.path, original_path.path);
+                assert_eq!(doc.history.undo_depth(), 1);
+            });
+            visual.simulate_keystrokes("cmd-z");
+            item.read_with(&visual, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(doc.scene.get(node_id), Some(&original));
+                assert_eq!(doc.history.undo_depth(), 0);
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn mounted_curved_text_path_authoring_respects_occlusion_locks_and_clips(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        for guard in [
+            "distant baseline gap",
+            "locked",
+            "covered",
+            "clipped",
+            "rounded clip",
+        ] {
+            let (text_path, _, counter, _) = curved_text_path_hit_fixture();
+            let local = if guard == "distant baseline gap" {
+                let bounds = NodeData::TextPath(text_path.clone())
+                    .local_bounds()
+                    .expect("broad bounds");
+                [bounds.max_x - 1.0, bounds.max_y - 1.0]
+            } else {
+                counter
+            };
+            let mut doc = doc_with_one_page();
+            let page = doc.active_page();
+            let mut node = CanvasNode::new(NodeData::TextPath(text_path));
+            node.parent = page;
+            node.transform = Transform2D::translation(-local[0], -local[1]);
+            if guard == "locked" {
+                node.flags.insert(fanta_doc::NodeFlags::LOCKED);
+            }
+            if matches!(guard, "clipped" | "rounded clip") {
+                let inside = if guard == "rounded clip" {
+                    [5.0, 5.0]
+                } else {
+                    [210.0, 30.0]
+                };
+                let mut parent = CanvasNode::new(NodeData::Group(GroupNode {
+                    clip_size: Some([200.0, 120.0]),
+                    corner_radius: (guard == "rounded clip").then_some(60.0),
+                    ..Default::default()
+                }));
+                parent.parent = page;
+                parent.transform = Transform2D::translation(-inside[0], -inside[1]);
+                node.parent = Some(parent.id);
+                node.transform =
+                    Transform2D::translation(inside[0] - local[0], inside[1] - local[1]);
+                doc.apply(Operation::create_node(parent))
+                    .expect("clipping group");
+            }
+            let node_id = node.id;
+            doc.apply(Operation::create_node(node))
+                .expect("curved text");
+            if guard == "covered" {
+                let mut cover = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                    -12.0,
+                    -12.0,
+                    24.0,
+                    24.0,
+                    Color::BLACK,
+                )));
+                cover.parent = page;
+                cover.index = doc.scene.next_child_index(page);
+                doc.apply(Operation::create_node(cover))
+                    .expect("occluding vector");
+            }
+            doc.history = Default::default();
+            let (item, view, mut visual) =
+                mounted_canvas_interaction_fixture(&project, doc, BTreeMap::new(), cx);
+            let position = view.read_with(&visual, |view, _| {
+                view.container_bounds.expect("canvas").center()
+            });
+            for click_count in 1..=4 {
+                mounted_canvas_click(&mut visual, position, click_count);
+                view.read_with(&visual, |view, _| {
+                    assert!(view.text_edit.is_none(), "{guard}: click {click_count}");
+                });
+                item.read_with(&visual, |item, _| {
+                    let doc = item.doc().expect("document");
+                    assert!(
+                        !doc.selection.contains(node_id),
+                        "{guard}: click {click_count}"
+                    );
+                    assert_eq!(doc.history.undo_depth(), 0, "{guard}");
+                    assert!(!item.is_dirty(), "{guard}");
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn mounted_bitmap_crop_applies_once_and_history_preserves_the_asset(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, bitmap, images) = bitmap_canvas_doc();
+        let (item, view, mut visual) =
+            mounted_canvas_interaction_fixture(&project, doc, images, cx);
+        let (original, original_world, original_assets) = item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            (
+                document.doc.scene.get(bitmap).expect("bitmap").clone(),
+                document.doc.scene.world_transform(bitmap),
+                document.raw_assets.clone(),
+            )
+        });
+        let bounds = view.read_with(&visual, |view, _| view.container_bounds.expect("canvas"));
+        mounted_canvas_click(&mut visual, bounds.center(), 1);
+        assert_eq!(
+            view.read_with(&visual, |view, _| view.active_tool()),
+            ToolKind::Select
+        );
+        mounted_canvas_click(&mut visual, bounds.center(), 2);
+        assert_eq!(
+            view.read_with(&visual, |view, _| view.active_tool()),
+            ToolKind::Crop
+        );
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                item.doc().expect("document").selection.as_slice(),
+                &[bitmap]
+            );
+            assert!(!item.is_dirty());
+        });
+        let start = bounds.center() + point(px(-40.0), px(-20.0));
+        let end = bounds.center() + point(px(40.0), px(20.0));
+        visual.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::none());
+        visual.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::none());
+        visual.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(&visual, |view, _| {
+            assert!(
+                view.tools
+                    .overlays
+                    .iter()
+                    .any(|overlay| matches!(overlay, fanta_tools::ToolOverlay::PreviewRect { .. }))
+            );
+            assert!(!view.primary_pressed);
+        });
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                item.doc().expect("document").scene.get(bitmap),
+                Some(&original)
+            );
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 0);
+            assert!(!item.is_dirty());
+        });
+        visual.simulate_keystrokes("enter");
+        let crop = item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            let doc = &document.doc;
+            let crop = single_selection(doc).expect("crop selected");
+            assert_ne!(crop, bitmap);
+            assert_eq!(doc.history.undo_depth(), 1);
+            assert_eq!(doc.scene.len(), 3);
+            assert_eq!(doc.scene.children_of(Some(crop)), &[bitmap]);
+            assert!(matches!(&doc.scene.get(crop).expect("crop").data, NodeData::Group(group) if group.clip_size == Some([80.0, 40.0])));
+            assert_eq!(doc.scene.world_bounds(crop), Some(fanta_doc::Bounds::from_xywh(-40.0, -20.0, 80.0, 40.0)));
+            assert_eq!(doc.scene.get(bitmap).expect("bitmap").data, original.data);
+            assert_eq!(doc.scene.world_transform(bitmap), original_world);
+            assert_eq!(document.raw_assets, original_assets);
+            assert!(item.is_dirty());
+            crop
+        });
+        visual.simulate_keystrokes("enter");
+        item.read_with(&visual, |item, _| {
+            assert_eq!(item.doc().expect("document").history.undo_depth(), 1);
+        });
+        visual.simulate_keystrokes("cmd-z");
+        item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            assert_eq!(document.doc.scene.get(bitmap), Some(&original));
+            assert!(document.doc.scene.get(crop).is_none());
+            assert_eq!(document.doc.scene.len(), 2);
+            assert_eq!(document.doc.history.undo_depth(), 0);
+            assert_eq!(document.raw_assets, original_assets);
+        });
+        visual.simulate_keystrokes("cmd-shift-z");
+        item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            assert_eq!(
+                document.doc.scene.get(bitmap).expect("bitmap").parent,
+                Some(crop)
+            );
+            assert_eq!(
+                document.doc.scene.get(bitmap).expect("bitmap").data,
+                original.data
+            );
+            assert_eq!(document.doc.scene.world_transform(bitmap), original_world);
+            assert_eq!(document.doc.history.undo_depth(), 1);
+            assert_eq!(document.raw_assets, original_assets);
+        });
+    }
+
+    #[gpui::test]
+    async fn mounted_bitmap_crop_escape_discards_released_and_active_previews(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        for release_before_cancel in [false, true] {
+            let (doc, bitmap, images) = bitmap_canvas_doc();
+            let (item, view, mut visual) =
+                mounted_canvas_interaction_fixture(&project, doc, images, cx);
+            let (original_scene, original_assets) = item.read_with(&visual, |item, _| {
+                let document = item.document().expect("document");
+                (
+                    serde_json::to_value(&document.doc.scene).expect("scene"),
+                    document.raw_assets.clone(),
+                )
+            });
+            let bounds = view.read_with(&visual, |view, _| view.container_bounds.expect("canvas"));
+            mounted_canvas_click(&mut visual, bounds.center(), 1);
+            mounted_canvas_click(&mut visual, bounds.center(), 2);
+            assert_eq!(
+                view.read_with(&visual, |view, _| view.active_tool()),
+                ToolKind::Crop
+            );
+            let start = bounds.center() + point(px(-40.0), px(-20.0));
+            let end = bounds.center() + point(px(40.0), px(20.0));
+            visual.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::none());
+            visual.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::none());
+            if release_before_cancel {
+                visual.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::none());
+            }
+            view.read_with(&visual, |view, _| {
+                assert!(view.tools.overlays.iter().any(|overlay| matches!(
+                    overlay,
+                    fanta_tools::ToolOverlay::PreviewRect { .. }
+                )));
+            });
+            visual.simulate_keystrokes("escape");
+            if !release_before_cancel {
+                visual.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::none());
+            }
+            visual.simulate_keystrokes("enter");
+            view.read_with(&visual, |view, _| {
+                assert_eq!(view.active_tool(), ToolKind::Crop);
+                assert!(!view.primary_pressed);
+                assert!(!view.canvas_pointer_down);
+                assert!(!view.tools.overlays.iter().any(|overlay| matches!(
+                    overlay,
+                    fanta_tools::ToolOverlay::PreviewRect { .. }
+                )));
+            });
+            visual.simulate_keystrokes("escape");
+            assert_eq!(
+                view.read_with(&visual, |view, _| view.active_tool()),
+                ToolKind::Select
+            );
+            item.read_with(&visual, |item, _| {
+                let document = item.document().expect("document");
+                assert!(document.doc.scene.get(bitmap).is_some());
+                assert_eq!(
+                    serde_json::to_value(&document.doc.scene).expect("scene"),
+                    original_scene
+                );
+                assert_eq!(document.raw_assets, original_assets);
+                assert_eq!(document.doc.history.undo_depth(), 0);
+                assert!(!item.is_dirty());
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn mounted_canvas_pairs_drill_group_then_boolean_before_vector_editing(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let mut group = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([300.0, 200.0]),
+            ..Default::default()
+        }));
+        group.parent = doc.active_page();
+        group.transform = Transform2D::translation(-150.0, -100.0);
+        let group_id = group.id;
+        doc.apply(Operation::create_node(group)).expect("group");
+        let mut boolean = CanvasNode::new(NodeData::Boolean(fanta_doc::BooleanNode {
+            fills: [Fill::solid(Color::WHITE)].into_iter().collect(),
+            ..Default::default()
+        }));
+        boolean.parent = Some(group_id);
+        boolean.transform = Transform2D::translation(50.0, 50.0);
+        let boolean_id = boolean.id;
+        doc.apply(Operation::create_node(boolean)).expect("Boolean");
+        let mut vector = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            80.0,
+            40.0,
+            Color::WHITE,
+        )));
+        vector.parent = Some(boolean_id);
+        let vector_id = vector.id;
+        doc.apply(Operation::create_node(vector)).expect("vector");
+        doc.history = Default::default();
+        let (item, view, mut visual) =
+            mounted_canvas_interaction_fixture(&project, doc, BTreeMap::new(), cx);
+        let original_scene = item.read_with(&visual, |item, _| {
+            serde_json::to_value(&item.doc().expect("document").scene).expect("scene")
+        });
+        let bounds = view.read_with(&visual, |view, _| view.container_bounds.expect("canvas"));
+        let position = bounds.center() + point(px(-60.0), px(-30.0));
+        for (click_count, selected, tool) in [
+            (1, group_id, ToolKind::Select),
+            (2, boolean_id, ToolKind::Select),
+            (3, boolean_id, ToolKind::Select),
+            (4, vector_id, ToolKind::Select),
+            (5, vector_id, ToolKind::Select),
+            (6, vector_id, ToolKind::NodeEdit),
+        ] {
+            mounted_canvas_click(&mut visual, position, click_count);
+            assert_eq!(
+                view.read_with(&visual, |view, _| view.active_tool()),
+                tool,
+                "click {click_count}"
+            );
+            item.read_with(&visual, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(doc.selection.as_slice(), &[selected], "click {click_count}");
+                assert_eq!(
+                    serde_json::to_value(&doc.scene).expect("scene"),
+                    original_scene
+                );
+                assert_eq!(doc.history.undo_depth(), 0);
+                assert!(!item.is_dirty());
+            });
+        }
+        visual.simulate_keystrokes("escape");
+        assert_eq!(
+            view.read_with(&visual, |view, _| view.active_tool()),
+            ToolKind::Select
+        );
+        assert!(item.read_with(&visual, |item, _| {
+            item.doc().expect("document").selection.is_empty()
+        }));
+    }
+
+    #[gpui::test]
+    async fn mounted_canvas_locked_and_read_only_leaves_never_enter_specialist_editors(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        for bitmap_kind in [false, true] {
+            for read_only in [false, true] {
+                let (mut doc, node_id, images) = bitmap_canvas_doc();
+                let node = doc.scene.get_mut(node_id).expect("target");
+                if !bitmap_kind {
+                    node.data = NodeData::Vector(VectorNode::rect_solid(
+                        0.0,
+                        0.0,
+                        200.0,
+                        100.0,
+                        Color::WHITE,
+                    ));
+                }
+                if !read_only {
+                    node.flags.insert(fanta_doc::NodeFlags::LOCKED);
+                }
+                let (item, view, mut visual) =
+                    mounted_canvas_interaction_fixture(&project, doc, images, cx);
+                if read_only {
+                    item.update(&mut visual, |item, cx| {
+                        item.set_source_edit_locked(true, cx)
+                    });
+                    visual.run_until_parked();
+                }
+                let original_scene = item.read_with(&visual, |item, _| {
+                    serde_json::to_value(&item.doc().expect("document").scene).expect("scene")
+                });
+                let bounds =
+                    view.read_with(&visual, |view, _| view.container_bounds.expect("canvas"));
+                for click_count in 1..=4 {
+                    mounted_canvas_click(&mut visual, bounds.center(), click_count);
+                    view.read_with(&visual, |view, _| {
+                        assert_eq!(
+                            view.active_tool(),
+                            ToolKind::Select,
+                            "bitmap={bitmap_kind}, read_only={read_only}, click={click_count}"
+                        );
+                        assert!(view.text_edit.is_none());
+                        assert!(!view.primary_pressed);
+                        assert!(!view.canvas_pointer_down);
+                    });
+                }
+                visual.simulate_keystrokes("enter");
+                assert_eq!(
+                    view.read_with(&visual, |view, _| view.active_tool()),
+                    ToolKind::Select
+                );
+                item.read_with(&visual, |item, _| {
+                    let doc = item.doc().expect("document");
+                    if read_only {
+                        assert_eq!(doc.selection.as_slice(), &[node_id]);
+                    } else {
+                        assert!(doc.selection.is_empty());
+                    }
+                    assert_eq!(
+                        serde_json::to_value(&doc.scene).expect("scene"),
+                        original_scene
+                    );
                     assert_eq!(doc.history.undo_depth(), 0);
                     assert!(!item.is_dirty());
                 });

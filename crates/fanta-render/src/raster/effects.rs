@@ -481,6 +481,7 @@ pub(crate) fn apply_background_blur(
     scene_id: Option<NodeId>,
     scene: &Scene,
     effective_scale: f32,
+    silhouette: Option<&skia_safe::Path>,
 ) -> BackgroundBlurOutcome {
     use skia_safe::{Bitmap, IRect, M44, image_filters};
     // Combine background-blur radii in quadrature, like layer blurs.
@@ -511,7 +512,10 @@ pub(crate) fn apply_background_blur(
     }
     // Confine the frosted region to the node's shape so only the backdrop behind
     // it is blurred (a background blur with no silhouette is ill-defined — skip).
-    let Some(path) = node_silhouette_path(node, scene_id, scene) else {
+    let Some(path) = silhouette
+        .cloned()
+        .or_else(|| node_silhouette_path(node, scene_id, scene))
+    else {
         return BackgroundBlurOutcome::NoOp;
     };
 
@@ -657,18 +661,18 @@ mod sampling_tests {
                 fanta_doc::Color::WHITE,
             )));
             assert_eq!(
-                apply_background_blur(surface.canvas(), &node, None, &scene, 1.),
+                apply_background_blur(surface.canvas(), &node, None, &scene, 1., None),
                 BackgroundBlurOutcome::NoOp
             );
             node.blurs.push(Blur::background(4.));
             assert_eq!(
-                apply_background_blur(surface.canvas(), &node, None, &scene, 1.),
+                apply_background_blur(surface.canvas(), &node, None, &scene, 1., None),
                 BackgroundBlurOutcome::Failed
             );
             let mut raster =
                 skia_safe::surfaces::raster_n32_premul((32, 32)).expect("readable surface");
             assert_eq!(
-                apply_background_blur(raster.canvas(), &node, None, &scene, 1.),
+                apply_background_blur(raster.canvas(), &node, None, &scene, 1., None),
                 BackgroundBlurOutcome::Applied
             );
             node.data = NodeData::Vector(fanta_doc::VectorNode::rect_solid(
@@ -679,7 +683,7 @@ mod sampling_tests {
                 fanta_doc::Color::WHITE,
             ));
             assert_eq!(
-                apply_background_blur(surface.canvas(), &node, None, &scene, 1.),
+                apply_background_blur(surface.canvas(), &node, None, &scene, 1., None),
                 BackgroundBlurOutcome::NoOp
             );
         });
@@ -1204,6 +1208,7 @@ pub(crate) fn draw_inner_shadows(
     node: &CanvasNode,
     scene_id: Option<NodeId>,
     ctx: &mut RenderCtx,
+    silhouette: Option<&skia_safe::Path>,
 ) {
     use skia_safe::image_filters;
 
@@ -1219,7 +1224,10 @@ pub(crate) fn draw_inner_shadows(
     {
         return;
     }
-    let Some(path) = node_silhouette_path(node, scene_id, ctx.scene) else {
+    let Some(path) = silhouette
+        .cloned()
+        .or_else(|| node_silhouette_path(node, scene_id, ctx.scene))
+    else {
         return;
     };
 

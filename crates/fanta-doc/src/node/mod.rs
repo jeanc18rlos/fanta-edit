@@ -69,9 +69,9 @@ pub use prototype::{
     Transition, TransitionStyle, Trigger, spring_progress,
 };
 pub use variants::{
-    AiArtifactNode, AudioNode, BitmapNode, BooleanNode, BooleanOp, Camera3d, ConstraintH,
-    ConstraintV, Constraints, EmbedNode, FontVariation, GenerationStatus, GroupNode, Link,
-    Model3dNode, NodeGraph, NodeGraphNode, ParametricShape, ScrollBehavior, ScrollDirection,
+    AiArtifactNode, AudioNode, BitmapNode, BooleanBakedGeometry, BooleanNode, BooleanOp, Camera3d,
+    ConstraintH, ConstraintV, Constraints, EmbedNode, FontVariation, GenerationStatus, GroupNode,
+    Link, Model3dNode, NodeGraph, NodeGraphNode, ParametricShape, ScrollBehavior, ScrollDirection,
     TextAlign, TextAutoResize, TextNode, TextPathAlignment, TextPathDirection, TextPathNode,
     TextPathSide, TextPathStart, TextStyle, TextStyleRun, VAlign, VectorNode, VideoNode,
     WorkflowNode,

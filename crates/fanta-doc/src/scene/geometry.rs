@@ -231,6 +231,13 @@ impl Scene {
             }
             return bounds;
         }
+        if let Some(boolean) = node.data.as_boolean()
+            && boolean.baked.is_some()
+            && let Ok(signature) = crate::boolean_geometry_signature(self, id)
+            && let Some(vector) = boolean.baked_vector(&signature)
+        {
+            return crate::NodeData::Vector(vector).local_bounds();
+        }
         if let Some(bounds) = node.data.local_bounds() {
             return Some(bounds);
         }

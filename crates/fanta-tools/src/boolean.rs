@@ -31,7 +31,12 @@ pub fn make_boolean(doc: &mut Doc, operands: &[NodeId], op: BooleanOp) -> Option
         _ => (smallvec![Fill::solid(Color::BLACK)], smallvec![]),
     };
 
-    let mut boolean = CanvasNode::new(NodeData::Boolean(BooleanNode { op, fills, strokes }));
+    let mut boolean = CanvasNode::new(NodeData::Boolean(BooleanNode {
+        op,
+        fills,
+        strokes,
+        baked: None,
+    }));
     boolean.parent = parent;
     boolean.index = doc.scene.next_child_index(parent);
     let boolean_id = boolean.id;

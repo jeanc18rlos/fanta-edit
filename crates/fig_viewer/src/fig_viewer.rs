@@ -98,6 +98,7 @@ pub fn init(cx: &mut App) {
     agent_surface::init(cx);
     live_mcp::init(cx);
     workspace::register_project_item::<FigView>(cx);
+    workspace::register_serializable_item::<FigView>(cx);
     workspace_hooks::init(cx);
 }
 

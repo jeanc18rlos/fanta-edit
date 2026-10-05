@@ -60,11 +60,6 @@ pub(crate) fn scope_from_document(
                         feature: format!("live Instance in {}", kind.label()),
                     });
                 }
-                Some(fanta_doc::NodeData::Model3d(_)) => {
-                    return Err(SessionError::ImportNotAllowed {
-                        feature: "model3d".into(),
-                    });
-                }
                 _ => {}
             }
         }
@@ -306,7 +301,7 @@ pub(crate) fn insert_nodes_public(scene: &mut Scene, nodes: &[Value]) -> Result<
     insert_nodes(scene, nodes)
 }
 
-/// Reject live instances / model3d for the given kind.
+/// Reject live instances where the artifact kind cannot resolve them.
 pub(crate) fn validate_no_live_instance(
     kind: ArtifactKind,
     nodes: &[Value],
@@ -383,18 +378,13 @@ fn insert_nodes(scene: &mut Scene, nodes: &[Value]) -> Result<(), SessionError> 
     Ok(())
 }
 
+// Stored leaf payloads must remain saveable even without a dedicated authoring UI.
 fn validate_import_matrix(kind: ArtifactKind, nodes: &[Value]) -> Result<(), SessionError> {
     for n in nodes {
         let ty = n.get("type").and_then(Value::as_str).unwrap_or("");
         if ty == "instance" && !import_allowed(kind, ImportTarget::LiveComponent) {
             return Err(SessionError::ImportNotAllowed {
                 feature: format!("live Instance in {}", kind.label()),
-            });
-        }
-        if ty == "model3d" {
-            // 3D ignored / forbidden in session product surface
-            return Err(SessionError::ImportNotAllowed {
-                feature: "model3d".into(),
             });
         }
     }
