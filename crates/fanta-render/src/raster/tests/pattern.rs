@@ -212,6 +212,98 @@ fn editing_source_updates_existing_pattern_cache() {
 }
 
 #[test]
+fn reinstalling_the_same_resolver_keeps_patterns_and_replacing_it_rebuilds_them() {
+    let (doc, _) = pattern_doc(
+        PatternTileType::Rectangular,
+        PatternSpacing::default(),
+        PatternHorizontalAlignment::Start,
+        40.0,
+    );
+    let resolver = Arc::new(crate::asset::InMemoryAssetResolver::new());
+    let mut renderer = RasterRenderer::new(64, 64).expect("surface");
+    renderer.set_asset_resolver(resolver.clone());
+    let first = renderer.render(&doc.scene, &doc.viewport);
+    let pixels = renderer.copy_rgba();
+    let cached = renderer.render(&doc.scene, &doc.viewport);
+    assert!(first.nodes_visited > cached.nodes_visited);
+
+    renderer.set_asset_resolver(resolver);
+    let reinstalled = renderer.render(&doc.scene, &doc.viewport);
+    assert_eq!(reinstalled.nodes_visited, cached.nodes_visited);
+    assert_eq!(renderer.copy_rgba(), pixels);
+
+    renderer.set_asset_resolver(Arc::new(crate::asset::InMemoryAssetResolver::new()));
+    let replaced = renderer.render(&doc.scene, &doc.viewport);
+    assert_eq!(replaced.nodes_visited, first.nodes_visited);
+    assert_eq!(renderer.copy_rgba(), pixels);
+}
+
+#[test]
+fn a_reused_resolver_can_finish_decoding_pattern_images_and_clear_uploaded_assets() {
+    use crate::asset::{AssetResolver, DecodedImage, InMemoryAssetResolver};
+    use fanta_doc::{AssetId, BitmapNode, ImageFitMode};
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    struct DeferredResolver(Mutex<InMemoryAssetResolver>);
+
+    impl AssetResolver for DeferredResolver {
+        fn resolve(&self, id: AssetId) -> Option<DecodedImage> {
+            self.0.lock().expect("asset resolver lock").resolve(id)
+        }
+    }
+
+    let (mut doc, source) = pattern_doc(
+        PatternTileType::Rectangular,
+        PatternSpacing::default(),
+        PatternHorizontalAlignment::Start,
+        40.0,
+    );
+    let asset = AssetId::new();
+    doc.scene.get_mut(source).expect("pattern source").data = NodeData::Bitmap(BitmapNode {
+        asset,
+        natural_size: [1, 1],
+        local_size: [5.0, 10.0],
+        crop: None,
+        fit: ImageFitMode::Stretch,
+        tint: None,
+    });
+    let resolver = Arc::new(DeferredResolver::default());
+    let mut renderer = RasterRenderer::new(64, 64).expect("surface");
+    renderer.set_asset_resolver(resolver.clone());
+    assert!(
+        renderer
+            .render(&doc.scene, &doc.viewport)
+            .incomplete_artwork
+    );
+    assert_eq!(renderer.image_cache_len(), 0);
+
+    resolver.0.lock().expect("asset resolver lock").insert(
+        asset,
+        DecodedImage::new(Arc::new(vec![0, 255, 0, 255]), 1, 1),
+    );
+    renderer.set_asset_resolver(resolver.clone());
+    let decoded = renderer.render(&doc.scene, &doc.viewport);
+    assert!(!decoded.incomplete_artwork);
+    assert_eq!(renderer.image_cache_len(), 1);
+    let pixels = renderer.copy_rgba();
+    let sample = rgba_at(&pixels, 64, 14, 27);
+    assert!(sample[1] > 220 && sample[0] < 40, "{sample:?}");
+
+    renderer.set_asset_resolver(resolver);
+    let reused = renderer.render(&doc.scene, &doc.viewport);
+    assert!(reused.nodes_visited < decoded.nodes_visited);
+    assert_eq!(renderer.copy_rgba(), pixels);
+
+    renderer.set_asset_resolver(Arc::new(InMemoryAssetResolver::new()));
+    renderer.clear_image_cache();
+    assert_eq!(renderer.image_cache_len(), 0);
+    let unresolved = renderer.render(&doc.scene, &doc.viewport);
+    assert!(unresolved.incomplete_artwork);
+    assert_ne!(renderer.copy_rgba(), pixels);
+}
+
+#[test]
 fn hidden_source_still_supplies_visible_pattern() {
     let (mut doc, red_id) = pattern_doc(
         PatternTileType::Rectangular,

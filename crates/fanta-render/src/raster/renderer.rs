@@ -733,6 +733,13 @@ impl RasterRenderer {
     /// for bitmap nodes and image fills. Replaces any previously-set resolver.
     /// Cheap — stores an [`Arc`] clone; no decode happens here.
     pub fn set_asset_resolver(&mut self, resolver: Arc<dyn AssetResolver>) {
+        if self
+            .asset_resolver
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, &resolver))
+        {
+            return;
+        }
         self.asset_resolver = Some(resolver);
         self.pattern_cache.clear();
     }
