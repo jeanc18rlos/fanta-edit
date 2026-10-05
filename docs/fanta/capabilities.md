@@ -90,11 +90,11 @@ Removing a component master preserves supported surviving instance artwork.
 Cutting only part of a variant set, unresolved component dependencies, and
 detachments that cannot preserve appearance are refused before modifying the
 document; failed Cut leaves the clipboard unchanged. The app explains the
-refusal. These corrections pass the current automated suite, and native lock
-guards and three refusal paths pass on `938807f801`. Successful asset-bearing
-Save/Undo/Redo/restart acceptance remains open: those tests exposed a separate
-load-time vector viewport mutation, now corrected in automated tests with a
-native rerun pending. See the
+refusal. Bounded native checks now pass asset-bearing Duplicate, Copy/Paste,
+Cut/Paste, master/final-variant deletion, repeated component-bundle Paste,
+Undo/Redo, lock guards and saved-state reopening on `100fe26921`. Earlier visible
+refusal checks and the original load-time viewport failures remain recorded
+separately. These fixtures do not exhaust every dependency combination. See the
 [current acceptance status](../alpha/CAPABILITY_COVERAGE.md#current-acceptance-status).
 
 The properties inspector adapts to the selected kind and selection count. Its
@@ -110,7 +110,12 @@ currently disabled in the default Design inspector.
 Single-node opacity, visibility and uniform vector radius display their active
 variable values, including aliases and inherited mode pins. Explicit corner
 values keep precedence; unresolved bindings show a labeled fallback and remain
-detachable. These display corrections await native verification on the new build.
+detachable. Representative resolved and pinned values, explicit-corner summaries,
+and exact Open/Save/cold preservation passed native checks on `100fe26921`.
+The Available label is readable in One Dark and One Light; changing themes and
+returning to One Dark preserves the document exactly.
+The separate four-field equal-corner control and precedence label were not
+observed; unresolved-binding fallback remains covered by automated tests.
 Mixed values must remain identifiable; controls must neither erase unsupported
 data nor silently apply to a stale selection. Editable fields support draft
 cancellation and undoable commits. Controls that offer live previews restore
@@ -149,7 +154,12 @@ Command or Control keep their selection meaning; Space panning does not activate
 an editor. Only the even click in each pair activates or drills in, preventing a
 triple-click from accidentally descending another level. Instance text also
 respects locked ancestors, overlapping virtual content and clipping, including
-rounded corners. Text on Path accepts the shaped text area, including letter
+rounded corners. Alias-backed component text properties use the placed instance's
+active or inherited mode when resolving editable text. The later correction is
+covered by automated tests; native verification remains pending. Text inside true nested
+instances and virtual Text on Path are not recursively targeted. A direct
+text-content variable binding remains authoritative; changing its text requires
+changing the variable or binding. Text on Path accepts the shaped text area, including letter
 counters and spaces, while rejecting distant empty areas along the baseline.
 Inspection keeps exact glyph geometry. Automated regressions cover these cases; native input
 verification remains tracked in the release report.

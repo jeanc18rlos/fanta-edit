@@ -1222,11 +1222,12 @@ master with that extra field. These are strict preservation failures.
 Source inspection traces the additions to the unconditional
 `backfill_vector_viewports` call in generic `FigDocument` construction, before
 any clipboard command. Native authored shapes legitimately omit this field;
-the conversion must be restricted to its supported import boundary. A fix and
-new native acceptance are pending. The original fixtures and failed verdicts
-remain unchanged. A further inspector issue was observed: the bound-opacity
-instance displays its raw saved 100% value, although the binding resolves to
-40%; that display correction is also pending.
+the conversion must be restricted to its supported import boundary. At this
+checkpoint, a fix and new native acceptance were pending. The original fixtures
+and failed verdicts remain unchanged. A further inspector issue was observed:
+the bound-opacity instance displayed its raw saved 100% value although the binding
+resolved to 40%. Both corrections and their later `100fe26921` native acceptance
+are recorded below; the original failures are not reclassified.
 
 Evidence: `target/release-verification/native-clipboard-candidate-20261005/`,
 `native-asset-clipboard-20261005/` (including `root-native-actions-v1.json` and
@@ -1267,8 +1268,9 @@ hashes stayed unchanged during the run: `document.rs` SHA-256
 `f1fbd9339ffe5638c184da4fa11415d39517e7f07b13d9ded2c8ed27dae1d226`.
 The retained protected source file also stayed unchanged. This checkpoint did
 not repeat all eight runner stages, visual/private-fixture checks, native
-journeys or signed-artifact checks. Both corrected native journeys remain
-pending a new binary; the original failures are not reclassified as passing.
+journeys or signed-artifact checks. Native reruns were pending at this automated
+checkpoint; later `100fe26921` results are recorded below. The original failures
+are not reclassified as passing.
 
 Evidence: `target/release-verification/vector-viewport-load-20261005/validation.json`
 and `bound-opacity-inspector-20261005/` (`validation.json`,
@@ -1287,6 +1289,101 @@ Three focused Rust tests pass for the actual One Dark and One Light colors and
 translucent inputs. The affected crate passes the repository lint and dependency
 checks, and the changed file passes formatting. Computed status contrast is
 5.10:1 in One Dark and at least 4.5:1 in One Light; these are palette calculations,
-not native screenshot measurements. Native verification on the new bundle is
-pending. Evidence: `target/release-verification/inspector-success-contrast-20261005/`
+not native screenshot measurements. The later `100fe26921` native check observed
+readable Available labels in One Dark and One Light; custom-theme and filled
+success-button states remain outside the native check. Evidence: `target/release-verification/inspector-success-contrast-20261005/`
 (`success-contrast.patch`, `review.json`, `validation.json`, test and lint logs).
+
+## Native clipboard and bound-value acceptance — 100fe26921
+
+The dev candidate `100fe269210ad4f7adea22be10e0199efd7237db`, binary SHA-256
+`4d688bd5c27661a07baa4e2d456bc71bd13143264c7d1bf42c6f7f167c2d7fc3`,
+passes all 41 declared checkpoints in the small asset-clipboard harness. The
+original `938807f801` viewport-mutation failures remain retained; these are
+separate corrected-build results.
+
+| Journey | Completed checkpoints | Persisted result |
+| --- | --- | --- |
+| Image subtree Duplicate | Open, Duplicate/Save, Undo/Save, Redo/Save, restart (5) | Exactly three copied nodes, shared images, original content and omitted vector viewport preserved. Restart: 39 files exact. |
+| Image subtree Copy/Paste | Open, Paste/Save, Undo/Save, Redo/Save, restart (5) | Expected three-node copy and offset; Undo restores baseline, Redo the same copy IDs. Restart: 39 files exact. |
+| Image subtree Cut/Paste | Open, Cut/Save, Paste/Save, Undo-Paste/Save, Redo-Paste/Save, restart (6) | Cut removes only the subtree; Paste restores its payload and image references. Undo-Paste returns to the post-Cut state. Restart: 39 files exact. |
+| Delete component main | Open, Delete/Save, Undo/Save, Redo/Save, restart (5) | Surviving placed identity materializes two fresh image children; removed definition disappears. Restart: 36 files exact. |
+| Delete final variant | Open, Delete/Save, Undo/Save, Redo/Save, restart (5) | Surviving set instance retains resolved photo opacity 0.4 and images; removed definition and empty set registration disappear while the empty container remains. Restart: 35 files exact. |
+| Cut/Paste component bundle | Open, Cut/Save, first and second Paste/Save, Undo-second-Paste/Save, Redo-second-Paste/Save, restart (7) | Each Paste from the original clipboard restores five fresh nodes and an independent fresh definition; previous pasted content remains exact. Restart: 42 files exact. |
+| Direct and ancestor lock guards | Open, Cut/Duplicate/Delete for each locked case, restart (8) | All six keyboard actions preserve typed content, timestamp and all 39 file bytes. |
+
+Every saved-state oracle compares all persisted fields and asset SHA/lengths.
+Edits allow only separately validated, nondecreasing `modified_at`; copied fresh
+identities are matched bijectively against the declared baseline-derived result.
+Undo/Redo must recover the previously captured IDs. Initial opens, guards and
+restarts also require exact timestamp and project-file bytes. Recorded process
+exits and same-binary relaunches are 37930→39798 and 39798→47300. Root's native
+records describe the expected image artwork and layer structures after reopening;
+no post-restart Save was required for these checks. This harness does not prove
+unrecorded clipboard-buffer contents or every unsupported dependency combination.
+
+The 28-node binding fixture also passes native Open, Save, cold reopen and a
+theme roundtrip with all typed fields, timestamp and 25 project files exact. Before restart, root
+observed A01 wrapper opacity 40% separately from its 50% main, A03 hidden, B01
+radius 18, B02 explicit-corner summary 7, and B03 summary 1 with TL1/TR2/BL4/BR3
+controls. Ancestor-pinned controls show C01 opacity 70%, C02 visible and C03
+radius 26. Available is readable in both One Dark and One Light. A separate
+native theme roundtrip selected One Light, confirmed its chooser checkmark and
+40% bound-opacity value, then restored One Dark with the same value. No document
+edit or Save was performed; all 25 file bytes and typed fields stayed exact.
+Cold reopen confirms artwork and persisted bytes; the detailed inspector
+selections were observed before restart, with A01 repeated during the theme check. B02's four separate fields and the precedence label were not opened.
+Optional mode-change/Undo, unresolved-binding controls, custom themes and filled
+success-button native states remain unverified. Readability is a visual
+observation, not a screenshot contrast-ratio measurement.
+
+Evidence: `native-clipboard-capture-harness-20261005/ledger-final.json`,
+`native-asset-clipboard-20261005/viewport-ledger-*`,
+`native-whole-node-bindings-20261005/` (Open, Save, cold, theme-return and both
+root action records),
+and `native-viewport-candidate-20261005/`. Independent recomputation of all 41
+clipboard and three binding verdicts, plus plan/operator/runtime/file-hash checks,
+passes with no findings in `native-viewport-acceptance-review-20261005/all41/review.json`.
+The separately recomputed fourth binding checkpoint is recorded in
+`all41/theme-addendum.json`; the original 41+3 review remains unchanged.
+This is bounded native acceptance, not exhaustive release readiness, a native
+performance result or signed-distribution validation.
+
+## Ordered ancestor-paint and resolved instance-text source checkpoints
+
+Renderer commit `b1774b9ec4` extends the opt-in partition API to fixed clipped
+ancestors. Background commands belong to Below; clips apply in every phase;
+borders and inner shadows belong to Above after restoring the ancestor's own
+child clip. Raster-phase composition is rejected for these specs before touching
+the target. Ordered painting or Picture replay clears only Below and preserves
+Middle/Above pixels and incoming canvas state. Normal rendering remains separate;
+instances, masks, bindings, backdrop-dependent paints and composited ancestors
+remain outside the eligible subset.
+
+The full renderer library passed **362 tests, 2 ignored**, including all 21 split
+cases, and renderer/viewer lint passed. The 240-case ancestor matrix retains its
+2-LSB full-RGBA tolerance, reverse order, fractional/Retina scales, reflection,
+image/gradient backgrounds, stale-spec, empty-phase, cache and unchanged-document
+controls. The original separate-raster attempt failed 48 cases at low zoom
+(maximum channel differences 3–6); those artifacts remain retained. No retained
+native drag implementation, GPU/native timing or performance gain is claimed.
+Evidence: `renderer-split-ancestors-20261005/integration/validation.json`,
+`full-renderer.log`, `clippy.log` and `independent-review.json`.
+
+Instance-text commit `a3a51b0` uses the renderer's variable context at the placed
+instance. Component-property aliases, active/inherited modes, resolved virtual
+visibility/opacity, typography and clips therefore agree with the displayed
+text, while imported derived geometry and sparse override Undo remain intact.
+The regression-only run had **three real failures and one passing fallback
+control**; after correction, all **18 instance-text tests** pass. The full editor
+library passed **1,147 tests, 1 ignored**, and viewer lint passed. This latest
+run did not rerun the benchmark CLI or all eight release stages. Missing/cyclic
+alias fallback and unchanged authored content are covered; recursive true nested
+instances, virtual TextPath and a new policy for direct text-content bindings
+are not added. Direct text bindings retain their existing precedence over sparse
+overrides.
+
+Evidence: `resolved-instance-text-20261005/integration/final-validation.json`
+and its retained red, green, full-editor and lint logs. These two source changes
+are newer than the native `100fe26921` binary above. Native verification of the
+new instance-text behavior and any future renderer integration remains pending.
