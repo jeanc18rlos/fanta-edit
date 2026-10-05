@@ -252,6 +252,27 @@ fn typography_and_content_modes_reflow_cards_without_rewriting_literals() {
         };
         assert_eq!(card.clip_size, Some([200.0, text.local_size[1] + 32.0]));
         heights.push(text.local_size[1]);
+        let settled = doc.scene.clone();
+        let revision = doc.scene.revision();
+        solve_auto_layout_with_variables(
+            &mut doc.scene,
+            card_id,
+            &doc.variables,
+            &doc.active_modes,
+            &mut measure,
+        );
+        assert_eq!(
+            serde_json::to_value(&doc.scene).expect("scene"),
+            serde_json::to_value(&settled).expect("settled scene"),
+        );
+        assert!(
+            doc.scene
+                .changes_since(revision)
+                .expect("bounded delta")
+                .is_empty(),
+            "repeated mode resolution must not stamp unchanged geometry",
+        );
+        assert!(doc.scene.shares_node(&settled, paragraph_id));
     }
     assert_eq!(heights[0], 24.0);
     assert!(heights[1] > heights[0]);

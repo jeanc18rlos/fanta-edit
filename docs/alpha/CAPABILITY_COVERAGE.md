@@ -199,8 +199,57 @@ the fix; the final **5 focused tests passed across 5 scheduler seeds**, followed
 by **1,066 editor tests (1 ignored)**, the viewer repository lint gate and
 formatting checks. Production source stayed unchanged through final validation.
 Evidence is in `target/release-verification/project-reload-coalescing-20261005/validation.json`.
-The corrected native retry is pending; these checks establish neither startup
-nor Save latency.
+The subsequent native retry completed Save as recorded below; these checks
+establish neither startup nor Save latency.
+
+On native candidate `eaec74bfbbf89932b822f5d5363f6fe01f4dd257` (binary SHA-256
+`bf8e194f42b9e63db6c8eac40c695d4563de4dd7839f2eea734a6b073a87e878`), the single
+Spectrum Save completed, but **content preservation still failed**. Moving image
+2110 by (32, 16) unexpectedly reparented it from its mobile frame to the Avatar
+ancestor, changing its sibling index and local coordinates. The strict saved
+comparison also found **12,018 unrelated geometry changes across 6,552 nodes**:
+3,378 on the visited Darkest Theme page and 3,174 on the visited Wireframes page.
+The other 21 pages were unchanged. These changes affect 3,298 text nodes, 1,692
+groups, 958 instances and 604 vectors; they include frame resizing and shifts
+over 200 pixels, not just numeric rounding. Of these nodes, 6,532 have an
+auto-layout frame in their ancestry or are auto-layout frames themselves; the
+remaining 20 are auto-resizing text. Source inspection identifies page opening
+and post-edit layout solving as writers to the saved document. An independent
+solver replay has not yet established the cause of every individual value.
+
+Undo/Save completed and the app quit cleanly. Readback restored the moved node's
+parent, sibling order and full payload exactly, but retained **all 12,018 unrelated
+geometry changes**. The target component revision rose from its omitted/default
+zero to 3 after the move and 6 after Undo; the timestamp also changed. The strict
+Undo comparison therefore still fails with **12,020 differences**. All 73,925
+nodes, 23 roots, 9,012 definitions, 41 asset manifests and 12 Boolean bakes remain;
+unchanged inventory does not establish unchanged content. No geometry, numeric
+or revision exceptions were applied. Typed snapshots, complete differences,
+source classification and `eaec74-native-save-undo-verdict.json` are retained in
+`target/release-verification/native-spectrum-20261005/`. The several-minute Save
+observations include other app work and are not controlled performance results.
+
+The nested-drag correction reproduced three product failures with three controls
+passing, then passed **6 focused pointer regressions**, **346 tool unit tests,
+6 tool integration tests, 1 ink oracle test and 12 mounted viewer tests**, plus
+the tools/viewer repository lint gate. The cases cover staying inside or partly
+overlapping the current frame, overlapping less-specific containers, leaving
+the frame completely, and legitimate sibling/deeper targets, including exact
+scene Undo/Redo. Evidence is in
+`target/release-verification/nested-drag-parent-20261005/validation.json`.
+Its native retest and the separate layout-preservation correction remain pending.
+
+The layout engine also stopped recording mutations when calculated geometry is
+unchanged. A 2,051-node regression previously recorded 18,459 false mutations
+over nine unchanged passes, exhausting the precise scene-change history; it now
+records zero and retains a subsequent isolated transform change. Seven new
+regressions and the strengthened variable-text fixture cover settled horizontal,
+vertical and grid layouts, text sizing, unsized children and the existing vector
+scale tolerance. The complete document suite passed 391 tests (1 ignored), the
+renderer suite passed 341 (2 ignored), and repository lint/dependency checks
+passed. Evidence is in `layout-noop-mutations-20261005/validation.json` under the
+release-verification directory. This prevents false dirtying; it does not yet
+prove native layout preservation on load or repair the recorded Spectrum failure.
 
 The inspector/menu native follow-up used `85fc694b67c78f616401def73506e515594f52d7`,
 binary SHA-256 `d42e94c0febfa6c701c257485a470779b5c991c7e3567b856f6e5b6fb7dced99`.

@@ -60,6 +60,38 @@ pub(crate) fn local_box(node: &CanvasNode) -> LocalBox {
     }
 }
 
+// Acquiring a mutable Scene node already records a change, so the solver must
+// check the setter's supported variants and vector tolerance before borrowing.
+pub(crate) fn size_would_change(node: &CanvasNode, w: f64, h: f64) -> bool {
+    match &node.data {
+        NodeData::Group(group) => group
+            .clip_size
+            .or(group.local_size)
+            .is_some_and(|size| size != [w, h]),
+        NodeData::Vector(vector) => {
+            let Some(bounds) = vector.path.rough_bounds() else {
+                return false;
+            };
+            if vector.path.is_rect() {
+                [bounds.width(), bounds.height()] != [w, h]
+            } else {
+                let scale_x = if bounds.width() > 1e-9 {
+                    w / bounds.width()
+                } else {
+                    1.0
+                };
+                let scale_y = if bounds.height() > 1e-9 {
+                    h / bounds.height()
+                } else {
+                    1.0
+                };
+                (scale_x - 1.0).abs() > 1e-9 || (scale_y - 1.0).abs() > 1e-9
+            }
+        }
+        data => data.local_size().is_some_and(|size| size != [w, h]),
+    }
+}
+
 /// Overwrite a node's box size along both axes, keeping its local origin fixed.
 /// Used for FILL (grow) on the primary axis and Stretch on the counter axis. A
 /// vector is re-laid as an axis-aligned rect at its existing origin (auto-layout
