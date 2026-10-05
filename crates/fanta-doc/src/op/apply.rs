@@ -201,6 +201,11 @@ impl Operation {
                 n.layout_child = *dir.pick(old, new);
                 Ok(())
             }
+            Self::SetConstraints { id, old, new } => {
+                let n = ctx.scene.get_mut(*id).ok_or(SceneError::NotFound(*id))?;
+                n.constraints = *dir.pick(old, new);
+                Ok(())
+            }
             Self::ReplaceData { id, old, new } => {
                 let n = ctx.scene.get_mut(*id).ok_or(SceneError::NotFound(*id))?;
                 n.data = (**dir.pick(old, new)).clone();

@@ -184,6 +184,161 @@ pub enum DistributeAxis {
 /// back. Every `x`/`y` is a world (canvas) coordinate, y grows downward, and
 /// every `id` is an exact node id from `design_state` / `batch_get` (never a
 /// layer name).
+/// One layer of a node's effect stack (`set_effects`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DesignEffect {
+    /// A shadow cast outside the shape.
+    DropShadow(DesignShadow),
+    /// A shadow inside the shape's edge.
+    InnerShadow(DesignShadow),
+    /// Blur the node itself.
+    LayerBlur { radius: f64 },
+    /// Blur what is behind the node (frosted glass); give the node a
+    /// translucent fill.
+    BackgroundBlur { radius: f64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct DesignShadow {
+    /// `#RRGGBB` or `#RRGGBBAA` (default `#00000040`).
+    #[serde(default)]
+    pub color: Option<String>,
+    /// Horizontal offset in px (default 0).
+    #[serde(default)]
+    pub x: Option<f64>,
+    /// Vertical offset in px, positive is down (default 2).
+    #[serde(default)]
+    pub y: Option<f64>,
+    /// Blur radius in px (default 4).
+    #[serde(default)]
+    pub blur: Option<f64>,
+    /// Spread in px (default 0).
+    #[serde(default)]
+    pub spread: Option<f64>,
+}
+
+/// One fill paint (`set_fill`). Gradient geometry is in the node's own 0–1
+/// box: (0, 0) is its top-left corner and (1, 1) its bottom-right.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DesignPaint {
+    Solid {
+        /// `#RRGGBB` or `#RRGGBBAA`.
+        color: String,
+    },
+    Linear {
+        /// Start point (default top, `[0.5, 0]`).
+        #[serde(default)]
+        from: Option<[f32; 2]>,
+        /// End point (default bottom, `[0.5, 1]`).
+        #[serde(default)]
+        to: Option<[f32; 2]>,
+        stops: Vec<DesignGradientStop>,
+    },
+    Radial {
+        /// Center (default `[0.5, 0.5]`).
+        #[serde(default)]
+        center: Option<[f32; 2]>,
+        /// Radius as a fraction of the node's size (default 0.5).
+        #[serde(default)]
+        radius: Option<f32>,
+        stops: Vec<DesignGradientStop>,
+    },
+    /// An image paint: a `data:image/...;base64,...` URI or raw base64 of
+    /// PNG/JPEG/WebP/GIF bytes, stored as a project asset.
+    Image {
+        source: String,
+        #[serde(default)]
+        fit: Option<DesignImageFit>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct DesignGradientStop {
+    /// Position along the gradient, 0–1.
+    pub position: f32,
+    /// `#RRGGBB` or `#RRGGBBAA`.
+    pub color: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DesignImageFit {
+    /// Cover the node, cropping overflow (default).
+    Fill,
+    /// Fit inside the node, letterboxed.
+    Fit,
+    /// Stretch to the node's box.
+    Stretch,
+    /// Repeat at the image's natural size.
+    Tile,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DesignStrokeCap {
+    Butt,
+    Round,
+    Square,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DesignStrokeJoin {
+    Miter,
+    Round,
+    Bevel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HorizontalConstraint {
+    Left,
+    Right,
+    /// Pin both edges: the node stretches with the parent.
+    LeftRight,
+    Center,
+    Scale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum VerticalConstraint {
+    Top,
+    Bottom,
+    /// Pin both edges: the node stretches with the parent.
+    TopBottom,
+    Center,
+    Scale,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum DesignShape {
+    /// A straight line from the box's top-left to its bottom-right corner
+    /// (`height: 0` draws a horizontal line).
+    Line,
+    Polygon,
+    Star,
+    /// Any outline, from SVG path data in `path`.
+    Path,
+}
+
+/// What this build's design ops can do beyond the original set, advertised in
+/// `get_editor_state` so a planner never sends an op the editor lacks. Each op
+/// is named on its own (`op:<name>`; `op:set_stroke` covers `sides`, `dash`,
+/// `cap` and `join`). The blanket `design-ops/2` would also promise grid
+/// layout and componentize, which this build does not implement.
+pub const DESIGN_OP_CAPABILITIES: &[&str] = &[
+    "op:set_effects",
+    "op:set_fill",
+    "op:set_constraints",
+    "op:create_shape",
+    "op:set_stroke",
+    "batch_get:detail",
+];
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum DesignOp {
@@ -303,6 +458,19 @@ pub enum DesignOp {
         /// Where the stroke sits relative to the edge (default `center`).
         #[serde(default)]
         align: Option<StrokeAlignment>,
+        /// Per-side widths `[top, right, bottom, left]` for frames and
+        /// rectangles (a bottom border is `[0, 0, 1, 0]`); `null` returns to
+        /// one uniform width.
+        #[serde(default)]
+        sides: Option<Option<[f64; 4]>>,
+        /// Dash pattern in px, alternating on and off lengths (`[4, 2]`);
+        /// `[]` makes the stroke solid.
+        #[serde(default)]
+        dash: Option<Vec<f64>>,
+        #[serde(default)]
+        cap: Option<DesignStrokeCap>,
+        #[serde(default)]
+        join: Option<DesignStrokeJoin>,
     },
     /// Set (or remove) the node's drop shadow. Edits the first drop shadow in
     /// place, or adds one; `remove: true` deletes every drop shadow.
@@ -326,6 +494,64 @@ pub enum DesignOp {
         /// Remove all drop shadows instead of setting one.
         #[serde(default)]
         remove: Option<bool>,
+    },
+    /// Replace the node's whole effect stack: shadows and blurs, bottom first.
+    /// `[]` removes every effect. Use this for layered elevation (a soft
+    /// ambient shadow plus a tighter key shadow) or frosted glass.
+    SetEffects {
+        id: String,
+        effects: Vec<DesignEffect>,
+    },
+    /// Replace the node's fill paints, bottom first: solid colors, linear or
+    /// radial gradients and images. `[]` removes every fill. Applies to frames
+    /// and shapes; set text color with `set_text_style`.
+    SetFill {
+        id: String,
+        paints: Vec<DesignPaint>,
+    },
+    /// How the node moves and resizes when its parent frame is resized. Only
+    /// meaningful outside auto layout; omitted axes keep their value.
+    SetConstraints {
+        id: String,
+        #[serde(default)]
+        horizontal: Option<HorizontalConstraint>,
+        #[serde(default)]
+        vertical: Option<VerticalConstraint>,
+    },
+    /// Create a vector shape other than a rectangle or ellipse (those are
+    /// `create_node`). `x`/`y` are the world coordinates of the shape's
+    /// top-left corner; the shape fills the `width` x `height` box.
+    CreateShape {
+        shape: DesignShape,
+        /// Id of the parent frame/group. Omit to place on the active page.
+        #[serde(default)]
+        parent: Option<String>,
+        #[serde(default)]
+        name: Option<String>,
+        x: f64,
+        y: f64,
+        width: f64,
+        height: f64,
+        /// Polygon sides (default 3) or star points (default 5).
+        #[serde(default)]
+        points: Option<u32>,
+        /// Star inner radius as a fraction of the outer one (default 0.382).
+        #[serde(default)]
+        inner_ratio: Option<f64>,
+        /// SVG path data (`d`) for `shape: "path"`, in the shape's own box:
+        /// (0, 0) is its top-left corner and (`width`, `height`) its
+        /// bottom-right.
+        #[serde(default)]
+        path: Option<String>,
+        /// Solid fill color. Lines and open paths default to none.
+        #[serde(default)]
+        fill: Option<String>,
+        /// Stroke color; lines default to `#000000`.
+        #[serde(default)]
+        stroke: Option<String>,
+        /// Stroke width in px (default 1 when a stroke is set).
+        #[serde(default)]
+        stroke_width: Option<f64>,
     },
     /// Change the typography of a text node. Only the provided fields change;
     /// they apply to the whole text (rich-text runs included).
@@ -605,6 +831,23 @@ pub struct NodeQuery {
     /// fetching by `ids`.
     #[serde(default)]
     pub limit: Option<usize>,
+    /// What each node carries. `summary` (the default for a page listing): id,
+    /// kind, name and a few kind facts. `style` (the default with `ids`): the
+    /// editable style in the vocabulary of the ops — world bounds, rotation,
+    /// fills, strokes, effects, corner radius, auto layout, layout child,
+    /// constraints, typography, variable bindings and pinned modes — so a value
+    /// read here can be sent back in an op; a page listing with `style` merges
+    /// those keys into each listed node. `raw`: the internal node record.
+    #[serde(default)]
+    pub detail: Option<NodeDetail>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NodeDetail {
+    Summary,
+    Style,
+    Raw,
 }
 
 /// Inspect existing component properties and variant sets, variable collections,

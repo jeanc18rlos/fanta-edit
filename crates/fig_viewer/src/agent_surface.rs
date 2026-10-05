@@ -13,18 +13,20 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;
 use design_surface::{
-    AlignEdge, CrossAxisAlignment, DEFAULT_CHILD_LIMIT, DesignComponentPropertyKind,
-    DesignNodeType, DesignOp, DesignSurface, DesignSystemQuery, DesignVariableType, DistributeAxis,
-    LayerPosition, LayoutDirection, LayoutSizing, MainAxisAlignment, NamedLayerPosition, NodeQuery,
-    ScreenshotTarget, StrokeAlignment, TextAlignment, TextSizing, VariableBindingProperty,
+    AlignEdge, CrossAxisAlignment, DEFAULT_CHILD_LIMIT, DesignComponentPropertyKind, DesignEffect,
+    DesignImageFit, DesignNodeType, DesignOp, DesignPaint, DesignShadow, DesignShape,
+    DesignStrokeCap, DesignStrokeJoin, DesignSurface, DesignSystemQuery, DesignVariableType,
+    DistributeAxis, HorizontalConstraint, LayerPosition, LayoutDirection, LayoutSizing,
+    MainAxisAlignment, NamedLayerPosition, NodeDetail, NodeQuery, ScreenshotTarget,
+    StrokeAlignment, TextAlignment, TextSizing, VariableBindingProperty, VerticalConstraint,
 };
 use fanta_doc::{
     AssetId, AutoLayout, AxisSizing, BitmapNode, BoundProp, Bounds, CanvasNode, Color, ComponentId,
     CounterAlign, Doc, Fill, GroupNode, ImageFitMode, IndexKey, InstanceNode, LayoutMode, Mode,
     ModeId, ModeScope, NodeData, NodeFlags, NodeId, Operation, PathData, PrimaryAlign,
-    ProjectAsset, ProjectAssetKind, ShadowKind, Stroke, StrokeAlign, TextAlign, TextAutoResize,
-    TextNode, Transform2D, UnitInterval, VarValue, Variable, VariableCollection,
-    VariableCollectionId, VariableId, VariableType, VectorNode, Viewport,
+    ProjectAsset, ProjectAssetKind, Shadow, ShadowKind, Stroke, StrokeAlign, StrokeCap, StrokeJoin,
+    TextAlign, TextAutoResize, TextNode, Transform2D, UnitInterval, VarValue, Variable,
+    VariableCollection, VariableCollectionId, VariableId, VariableType, VectorNode, Viewport,
 };
 use fanta_render::{AssetResolver, RasterRenderer, visual_world_bounds};
 use gpui::{App, AppContext as _, Entity, Global, Task, WeakEntity};
@@ -39,9 +41,9 @@ use crate::document::{
 };
 use crate::export::render_inputs;
 use crate::properties_ops::{
-    DEFAULT_FILL_COLOR, create_component_operations, default_shadow, effects_operations,
-    parse_color, replace_data_operation, resize_operations, rotation_operations, set_corner_radius,
-    stroke_list_mut,
+    DEFAULT_FILL_COLOR, blurs_operations, create_component_operations, default_shadow,
+    effects_operations, parse_color, replace_data_operation, resize_operations,
+    rotation_operations, set_corner_radius, stroke_list_mut,
 };
 use crate::structure::{frame_selection_operations, group_operations, ungroup_operations};
 
@@ -448,6 +450,7 @@ impl DesignSurface for FigDesignSurface {
             "selection_bounds": bounds_json(union_bounds(doc, &selection)),
             "viewport": { "center": doc.viewport.center, "zoom": doc.viewport.zoom },
             "hints": STATE_HINTS,
+            "capabilities": design_surface::DESIGN_OP_CAPABILITIES,
         }))
     }
 
@@ -492,6 +495,7 @@ impl DesignSurface for FigDesignSurface {
         let doc = &document.doc;
 
         if let Some(ids) = &query.ids {
+            let detail = query.detail.unwrap_or(NodeDetail::Style);
             let mut nodes = Vec::with_capacity(ids.len());
             for raw in ids {
                 let id = parse_node_id(raw)?;
@@ -499,7 +503,11 @@ impl DesignSurface for FigDesignSurface {
                     .scene
                     .get(id)
                     .with_context(|| format!("node {raw} does not exist"))?;
-                let mut value = serde_json::to_value(node)?;
+                let mut value = match detail {
+                    NodeDetail::Raw => serde_json::to_value(node)?,
+                    NodeDetail::Style => crate::agent_style::node_style(doc, id),
+                    NodeDetail::Summary => node_summary(doc, id, Some(0), query.include_geometry),
+                };
                 if let Some(object) = value.as_object_mut() {
                     object.insert(
                         "children".into(),
@@ -523,17 +531,25 @@ impl DesignSurface for FigDesignSurface {
         let page_index = resolve_page_index(document, query.page)?;
         let page = &document.pages[page_index];
         let root = page.root.context("the page has no root node")?;
+        let mut listing = paginated_node_summary(
+            doc,
+            root,
+            query.depth,
+            query.include_geometry,
+            query.offset.unwrap_or(0),
+            query.limit.unwrap_or(DEFAULT_CHILD_LIMIT),
+        );
+        match query.detail {
+            Some(NodeDetail::Style) => crate::agent_style::attach_styles(doc, &mut listing),
+            Some(NodeDetail::Raw) => {
+                bail!("`detail: \"raw\"` returns whole node records; fetch them by `ids`")
+            }
+            Some(NodeDetail::Summary) | None => {}
+        }
         Ok(json!({
             "page": page_index,
             "name": truncate_summary_string(page.name.as_ref(), SUMMARY_LABEL_CHARS),
-            "root": paginated_node_summary(
-                doc,
-                root,
-                query.depth,
-                query.include_geometry,
-                query.offset.unwrap_or(0),
-                query.limit.unwrap_or(DEFAULT_CHILD_LIMIT),
-            ),
+            "root": listing,
         }))
     }
 
@@ -1367,7 +1383,7 @@ fn relative_source(project_root: Option<&Path>, source: Option<PathBuf>) -> Valu
     }
 }
 
-fn world_bounds_json(doc: &Doc, id: NodeId) -> Value {
+pub(crate) fn world_bounds_json(doc: &Doc, id: NodeId) -> Value {
     match doc.scene.world_bounds(id) {
         Some(bounds) => json!({
             "x": bounds.min_x,
@@ -2520,6 +2536,10 @@ fn apply_one(
             color,
             width,
             align,
+            sides,
+            dash,
+            cap,
+            join,
         } => {
             let id = parse_node_id(id)?;
             let node = existing_node(doc, id)?;
@@ -2539,6 +2559,28 @@ fn apply_one(
                 StrokeAlignment::Inside => StrokeAlign::Inside,
                 StrokeAlignment::Center => StrokeAlign::Center,
                 StrokeAlignment::Outside => StrokeAlign::Outside,
+            });
+            if let Some(Some(sides)) = sides
+                && sides.iter().any(|side| !(side.is_finite() && *side >= 0.0))
+            {
+                bail!("per-side stroke widths must be non-negative");
+            }
+            if let Some(dash) = dash
+                && dash
+                    .iter()
+                    .any(|length| !(length.is_finite() && *length >= 0.0))
+            {
+                bail!("dash lengths must be non-negative");
+            }
+            let cap = cap.map(|cap| match cap {
+                DesignStrokeCap::Butt => StrokeCap::Butt,
+                DesignStrokeCap::Round => StrokeCap::Round,
+                DesignStrokeCap::Square => StrokeCap::Square,
+            });
+            let join = join.map(|join| match join {
+                DesignStrokeJoin::Miter => StrokeJoin::Miter,
+                DesignStrokeJoin::Round => StrokeJoin::Round,
+                DesignStrokeJoin::Bevel => StrokeJoin::Bevel,
             });
             apply_all(
                 doc,
@@ -2568,8 +2610,218 @@ fn apply_one(
                     if let Some(align) = align {
                         stroke.align = align;
                     }
+                    if let Some(sides) = sides {
+                        stroke.per_side = *sides;
+                    }
+                    if let Some(dash) = dash {
+                        stroke.dash = dash.clone();
+                    }
+                    if let Some(cap) = cap {
+                        stroke.cap = cap;
+                    }
+                    if let Some(join) = join {
+                        stroke.join = join;
+                    }
                 }),
             )
+        }
+        DesignOp::SetEffects { id, effects } => {
+            let id = parse_node_id(id)?;
+            existing_node(doc, id)?;
+            let mut shadows = Vec::new();
+            let mut blurs = Vec::new();
+            for effect in effects {
+                match effect {
+                    DesignEffect::DropShadow(shadow) => {
+                        shadows.push(design_shadow(shadow, ShadowKind::Drop)?)
+                    }
+                    DesignEffect::InnerShadow(shadow) => {
+                        shadows.push(design_shadow(shadow, ShadowKind::Inner)?)
+                    }
+                    DesignEffect::LayerBlur { radius }
+                    | DesignEffect::BackgroundBlur { radius } => {
+                        if !(radius.is_finite() && *radius >= 0.0) {
+                            bail!("the blur radius must be non-negative");
+                        }
+                        let kind = if matches!(effect, DesignEffect::LayerBlur { .. }) {
+                            fanta_doc::BlurKind::Layer
+                        } else {
+                            fanta_doc::BlurKind::Background
+                        };
+                        blurs.push(fanta_doc::Blur {
+                            kind,
+                            radius: *radius,
+                        });
+                    }
+                }
+            }
+            let mut operations = effects_operations(doc, id, |effects| {
+                *effects = shadows.into_iter().collect();
+            });
+            operations.extend(blurs_operations(doc, id, |current| {
+                *current = blurs.into_iter().collect();
+            }));
+            apply_all(doc, operations)
+        }
+        DesignOp::SetFill { id, paints } => {
+            let id = parse_node_id(id)?;
+            let node = existing_node(doc, id)?;
+            if !matches!(
+                node.data,
+                NodeData::Vector(_) | NodeData::Boolean(_) | NodeData::Group(_)
+            ) {
+                bail!(
+                    "fills apply to frames and shapes, not a {} node (text color is set_text_style)",
+                    node.data.kind_tag()
+                );
+            }
+            let mut fills = Vec::with_capacity(paints.len());
+            for paint in paints {
+                fills.push(design_fill(paint, assets, ingested_assets)?);
+            }
+            apply_all(
+                doc,
+                replace_data_operation(doc, id, |data| match data {
+                    NodeData::Vector(vector) => vector.fills = fills.into_iter().collect(),
+                    NodeData::Boolean(boolean) => boolean.fills = fills.into_iter().collect(),
+                    NodeData::Group(group) => {
+                        let mut fills = fills.into_iter();
+                        group.background = fills.next();
+                        group.background_fills = fills.collect();
+                    }
+                    _ => {}
+                }),
+            )
+        }
+        DesignOp::SetConstraints {
+            id,
+            horizontal,
+            vertical,
+        } => {
+            let id = parse_node_id(id)?;
+            let node = existing_node(doc, id)?;
+            let old = node.constraints;
+            let mut new = old.unwrap_or_default();
+            if let Some(horizontal) = horizontal {
+                new.horizontal = match horizontal {
+                    HorizontalConstraint::Left => fanta_doc::ConstraintH::Left,
+                    HorizontalConstraint::Right => fanta_doc::ConstraintH::Right,
+                    HorizontalConstraint::LeftRight => fanta_doc::ConstraintH::LeftRight,
+                    HorizontalConstraint::Center => fanta_doc::ConstraintH::Center,
+                    HorizontalConstraint::Scale => fanta_doc::ConstraintH::Scale,
+                };
+            }
+            if let Some(vertical) = vertical {
+                new.vertical = match vertical {
+                    VerticalConstraint::Top => fanta_doc::ConstraintV::Top,
+                    VerticalConstraint::Bottom => fanta_doc::ConstraintV::Bottom,
+                    VerticalConstraint::TopBottom => fanta_doc::ConstraintV::TopBottom,
+                    VerticalConstraint::Center => fanta_doc::ConstraintV::Center,
+                    VerticalConstraint::Scale => fanta_doc::ConstraintV::Scale,
+                };
+            }
+            apply_all(
+                doc,
+                vec![Operation::SetConstraints {
+                    id,
+                    old,
+                    new: Some(new),
+                }],
+            )
+        }
+        DesignOp::CreateShape {
+            shape,
+            parent,
+            name,
+            x,
+            y,
+            width,
+            height,
+            points,
+            inner_ratio,
+            path,
+            fill,
+            stroke,
+            stroke_width,
+        } => {
+            if ![*x, *y, *width, *height]
+                .iter()
+                .all(|value| value.is_finite())
+                || *width < 0.0
+                || *height < 0.0
+            {
+                bail!("x, y, width and height must be finite and the size non-negative");
+            }
+            let parent = resolve_container(doc, parent.as_deref(), default_container)?;
+            let (path_data, open) = match shape {
+                DesignShape::Line => {
+                    let mut line = PathData::new();
+                    line.move_to(0.0, 0.0);
+                    line.line_to(*width, *height);
+                    (line, true)
+                }
+                DesignShape::Polygon => (
+                    PathData::polygon(*width, *height, points.unwrap_or(3)),
+                    false,
+                ),
+                DesignShape::Star => (
+                    PathData::star(
+                        *width,
+                        *height,
+                        points.unwrap_or(5),
+                        inner_ratio.unwrap_or(0.382),
+                    ),
+                    false,
+                ),
+                DesignShape::Path => {
+                    let d = path
+                        .as_deref()
+                        .context("shape \"path\" needs SVG path data in `path`")?;
+                    let data = PathData::from_svg_d(d)
+                        .map_err(|error| anyhow!("invalid SVG path data: {error}"))?;
+                    let open = !d.trim_end().to_ascii_lowercase().ends_with('z');
+                    (data, open)
+                }
+            };
+            let mut vector = VectorNode {
+                path: path_data,
+                ..VectorNode::default()
+            };
+            let fill = fill.as_deref().map(parse_fill_color).transpose()?;
+            if let Some(color) = fill.or((!open).then_some(DEFAULT_FILL_COLOR)) {
+                vector.fills.push(Fill::solid(color));
+            }
+            let stroke_color = stroke.as_deref().map(parse_fill_color).transpose()?;
+            if let Some(width) = stroke_width
+                && !(width.is_finite() && *width >= 0.0)
+            {
+                bail!("the stroke width must be non-negative");
+            }
+            if let Some(color) = stroke_color.or(open.then_some(Color::BLACK)) {
+                vector
+                    .strokes
+                    .push(Stroke::solid(color, stroke_width.unwrap_or(1.0)));
+            }
+            let mut node = CanvasNode::new(NodeData::Vector(vector));
+            node.name = name.clone().unwrap_or_else(|| {
+                match shape {
+                    DesignShape::Line => "Line",
+                    DesignShape::Polygon => "Polygon",
+                    DesignShape::Star => "Star",
+                    DesignShape::Path => "Vector",
+                }
+                .to_owned()
+            });
+            let parent_world = parent
+                .and_then(|parent| doc.scene.world_transform(parent))
+                .unwrap_or(Transform2D::IDENTITY);
+            node.parent = parent;
+            node.index = doc.scene.next_child_index(parent);
+            node.transform = Transform2D::translation(*x, *y).then(&parent_world.inverse());
+            let id = node.id;
+            doc.apply(Operation::create_node(node))
+                .context("creating the shape")?;
+            Ok(Applied::created(id))
         }
         DesignOp::SetShadow {
             id,
@@ -3777,6 +4029,125 @@ fn parse_fill_color(raw: &str) -> Result<Color> {
 
 /// Replace the node's primary paint with a solid color: a vector/boolean's
 /// first fill, a frame's background, a text node's glyph color.
+fn design_shadow(shadow: &DesignShadow, kind: ShadowKind) -> Result<Shadow> {
+    let defaults = default_shadow();
+    for (label, value) in [
+        ("x", shadow.x),
+        ("y", shadow.y),
+        ("blur", shadow.blur),
+        ("spread", shadow.spread),
+    ] {
+        if value.is_some_and(|value| !value.is_finite()) {
+            bail!("the shadow {label} must be finite");
+        }
+    }
+    if shadow.blur.is_some_and(|blur| blur < 0.0) {
+        bail!("the shadow blur must be non-negative");
+    }
+    Ok(Shadow {
+        kind,
+        color: match &shadow.color {
+            Some(color) => parse_fill_color(color)?,
+            None => defaults.color,
+        },
+        blur: shadow.blur.unwrap_or(defaults.blur),
+        spread: shadow.spread.unwrap_or(defaults.spread),
+        offset: [
+            shadow.x.unwrap_or(defaults.offset[0]),
+            shadow.y.unwrap_or(defaults.offset[1]),
+        ],
+        ..defaults
+    })
+}
+
+fn design_fill(
+    paint: &DesignPaint,
+    assets: &mut AssetStores<'_>,
+    ingested_assets: &mut Vec<AssetId>,
+) -> Result<Fill> {
+    let stops =
+        |stops: &[design_surface::DesignGradientStop]| -> Result<Vec<fanta_doc::GradientStop>> {
+            if stops.len() < 2 {
+                bail!("a gradient needs at least two stops");
+            }
+            stops
+                .iter()
+                .map(|stop| {
+                    if !(stop.position.is_finite() && (0.0..=1.0).contains(&stop.position)) {
+                        bail!("gradient stop positions must be between 0 and 1");
+                    }
+                    Ok(fanta_doc::GradientStop {
+                        position: stop.position,
+                        color: parse_fill_color(&stop.color)?,
+                    })
+                })
+                .collect()
+        };
+    let point = |value: Option<[f32; 2]>, default: [f32; 2]| -> Result<[f32; 2]> {
+        let point = value.unwrap_or(default);
+        if !point.iter().all(|coordinate| coordinate.is_finite()) {
+            bail!("gradient points must be finite");
+        }
+        Ok(point)
+    };
+    Ok(match paint {
+        DesignPaint::Solid { color } => Fill::solid(parse_fill_color(color)?),
+        DesignPaint::Linear {
+            from,
+            to,
+            stops: list,
+        } => Fill::Gradient {
+            gradient: fanta_doc::Gradient::Linear {
+                start: point(*from, [0.5, 0.0])?,
+                end: point(*to, [0.5, 1.0])?,
+                stops: stops(list)?,
+            },
+            blend: fanta_doc::BlendMode::Normal,
+        },
+        DesignPaint::Radial {
+            center,
+            radius,
+            stops: list,
+        } => {
+            let radius = radius.unwrap_or(0.5);
+            if !(radius.is_finite() && radius > 0.0) {
+                bail!("the gradient radius must be positive");
+            }
+            Fill::Gradient {
+                gradient: fanta_doc::Gradient::Radial {
+                    center: point(*center, [0.5, 0.5])?,
+                    radius,
+                    handles: None,
+                    stops: stops(list)?,
+                },
+                blend: fanta_doc::BlendMode::Normal,
+            }
+        }
+        DesignPaint::Image { source, fit } => {
+            let bytes = decode_image_source(source)?;
+            let (asset, _natural_size, inserted) = assets.add_image_tracked(bytes)?;
+            if inserted {
+                ingested_assets.push(asset);
+            }
+            Fill::Image {
+                asset,
+                mode: match fit.unwrap_or(DesignImageFit::Fill) {
+                    DesignImageFit::Fill => ImageFitMode::Fill,
+                    DesignImageFit::Fit => ImageFitMode::Fit,
+                    DesignImageFit::Stretch => ImageFitMode::Stretch,
+                    DesignImageFit::Tile => ImageFitMode::Tile,
+                },
+                opacity: 1.0,
+                crop: None,
+                adjust: Default::default(),
+                scale: None,
+                rotation: None,
+                blend: fanta_doc::BlendMode::Normal,
+            }
+        }
+    })
+}
+
 fn set_solid_fill(data: &mut NodeData, color: Color) {
     match data {
         NodeData::Vector(vector) => {
@@ -5753,5 +6124,231 @@ mod tests {
             "Weight",
         );
         assert_applied(&outcome);
+    }
+
+    /// The `style` projection speaks the ops' vocabulary: a value read from it
+    /// can be sent back through its op unchanged.
+    #[test]
+    fn style_values_round_trip_through_their_ops() {
+        let (mut doc, _) = doc_with_page();
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "frame",
+                 "x": 0.0, "y": 0.0, "width": 300.0, "height": 200.0},
+            ])),
+            "Frame",
+        );
+        let frame = created_id(&outcome, 0).to_string();
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "set_auto_layout", "id": frame, "direction": "vertical", "gap": 8.0,
+                 "padding": [16.0, 24.0], "align_items": "stretch", "justify": "space_between",
+                 "wrap": false, "counter_gap": 4.0},
+                {"op": "set_effects", "id": frame, "effects": [
+                    {"kind": "drop_shadow", "color": "#0000001A", "y": 1.0, "blur": 2.0},
+                    {"kind": "drop_shadow", "color": "#00000014", "y": 8.0, "blur": 24.0, "spread": -4.0},
+                    {"kind": "background_blur", "radius": 12.0},
+                ]},
+                {"op": "set_fill", "id": frame, "paints": [
+                    {"kind": "linear", "stops": [
+                        {"position": 0.0, "color": "#FFFFFF"},
+                        {"position": 1.0, "color": "#F4F4F5"},
+                    ]},
+                    {"kind": "solid", "color": "#FFFFFF80"},
+                ]},
+                {"op": "set_stroke", "id": frame, "color": "#E4E4E7", "width": 1.0,
+                 "sides": [0.0, 0.0, 1.0, 0.0], "dash": [4.0, 2.0], "cap": "round"},
+                {"op": "set_constraints", "id": frame, "horizontal": "left_right",
+                 "vertical": "top"},
+            ])),
+            "Style",
+        );
+        assert_applied(&outcome);
+        let id: NodeId = frame.parse().unwrap();
+        let style = crate::agent_style::node_style(&doc, id);
+        assert_eq!(style["auto_layout"]["direction"], "vertical");
+        assert_eq!(
+            style["auto_layout"]["padding"],
+            json!([16.0, 24.0, 16.0, 24.0])
+        );
+        assert_eq!(style["effects"].as_array().unwrap().len(), 3);
+        assert_eq!(style["fills"][0]["kind"], "linear");
+        assert_eq!(style["strokes"][0]["sides"], json!([0.0, 0.0, 1.0, 0.0]));
+        assert_eq!(style["constraints"]["horizontal"], "left_right");
+
+        // Write every read value back through its op.
+        let mut auto_layout = style["auto_layout"].clone();
+        auto_layout["op"] = json!("set_auto_layout");
+        auto_layout["id"] = json!(frame);
+        let mut stroke = style["strokes"][0].clone();
+        stroke["op"] = json!("set_stroke");
+        stroke["id"] = json!(frame);
+        let mut constraints = style["constraints"].clone();
+        constraints["op"] = json!("set_constraints");
+        constraints["id"] = json!(frame);
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                auto_layout,
+                {"op": "set_effects", "id": frame, "effects": style["effects"]},
+                {"op": "set_fill", "id": frame, "paints": style["fills"]},
+                stroke,
+                constraints,
+            ])),
+            "Round trip",
+        );
+        assert_applied(&outcome);
+        assert_eq!(crate::agent_style::node_style(&doc, id), style);
+    }
+
+    #[test]
+    fn a_style_listing_is_one_flat_node_per_entry() {
+        let (mut doc, page) = doc_with_page();
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "frame",
+                 "x": 0.0, "y": 0.0, "width": 200.0, "height": 100.0, "fill": "#FFFFFF"},
+            ])),
+            "Frame",
+        );
+        let frame = created_id(&outcome, 0).to_string();
+        assert_applied(&run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "set_auto_layout", "id": frame, "direction": "horizontal", "gap": 12.0},
+                {"op": "set_stroke", "id": frame, "width": 1.0},
+            ])),
+            "Style",
+        ));
+        let mut listing = paginated_node_summary(&doc, page, Some(1), true, 0, 10);
+        crate::agent_style::attach_styles(&doc, &mut listing);
+        let entry = listing["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|child| child["id"] == json!(frame))
+            .expect("the frame is listed");
+        assert_eq!(entry["fill"], "#FFFFFF", "the listing's own keys stay");
+        assert_eq!(
+            entry["auto_layout"]["gap"], 12.0,
+            "style replaces the mode string"
+        );
+        assert_eq!(entry["strokes"][0]["width"], 1.0);
+        assert!(entry.get("style").is_none());
+    }
+
+    #[test]
+    fn create_shape_builds_lines_polygons_stars_and_paths() {
+        let (mut doc, _) = doc_with_page();
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_shape", "shape": "line", "x": 0.0, "y": 0.0,
+                 "width": 120.0, "height": 0.0},
+                {"op": "create_shape", "shape": "polygon", "x": 0.0, "y": 0.0,
+                 "width": 60.0, "height": 60.0, "points": 6, "fill": "#22C55E"},
+                {"op": "create_shape", "shape": "star", "x": 0.0, "y": 0.0,
+                 "width": 60.0, "height": 60.0},
+                {"op": "create_shape", "shape": "path", "x": 10.0, "y": 20.0,
+                 "width": 24.0, "height": 24.0, "path": "M0 0 L24 12 L0 24 Z"},
+            ])),
+            "Shapes",
+        );
+        assert_applied(&outcome);
+        let vector = |index| {
+            let NodeData::Vector(vector) = doc
+                .scene
+                .get(created_id(&outcome, index))
+                .unwrap()
+                .data
+                .clone()
+            else {
+                panic!("expected a vector");
+            };
+            vector
+        };
+        let line = vector(0);
+        assert!(line.fills.is_empty(), "a line is not filled");
+        assert_eq!(line.strokes.len(), 1, "a line is stroked by default");
+        let polygon = vector(1);
+        assert_eq!(polygon.fills.len(), 1);
+        assert!(polygon.strokes.is_empty());
+        assert_eq!(
+            vector(2).fills.len(),
+            1,
+            "a closed star gets the default fill"
+        );
+        assert_eq!(
+            vector(3).fills.len(),
+            1,
+            "a closed path gets the default fill"
+        );
+
+        let bad = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_shape", "shape": "path", "x": 0.0, "y": 0.0,
+                 "width": 1.0, "height": 1.0, "path": "not svg"},
+            ])),
+            "Bad path",
+        );
+        assert!(bad.value["error"].is_string(), "{:?}", bad.value);
+    }
+
+    #[test]
+    fn new_ops_validate_and_undo() {
+        let (mut doc, _) = doc_with_page();
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "rectangle",
+                 "x": 0.0, "y": 0.0, "width": 40.0, "height": 40.0},
+            ])),
+            "Rect",
+        );
+        let rect = created_id(&outcome, 0);
+        let id = rect.to_string();
+        for (label, op) in [
+            (
+                "one stop",
+                json!({"op": "set_fill", "id": id, "paints": [
+                {"kind": "linear", "stops": [{"position": 0.0, "color": "#000000"}]}]}),
+            ),
+            (
+                "negative blur",
+                json!({"op": "set_effects", "id": id, "effects": [
+                {"kind": "layer_blur", "radius": -1.0}]}),
+            ),
+            (
+                "negative side",
+                json!({"op": "set_stroke", "id": id, "sides": [1.0, -1.0, 0.0, 0.0]}),
+            ),
+        ] {
+            let outcome = run_batch(&mut doc, &ops(json!([op])), label);
+            assert!(
+                outcome.value["error"].is_string(),
+                "{label}: {:?}",
+                outcome.value
+            );
+        }
+
+        assert!(doc.scene.get(rect).unwrap().constraints.is_none());
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "set_constraints", "id": id, "horizontal": "scale"},
+            ])),
+            "Constraints",
+        );
+        assert_applied(&outcome);
+        assert_eq!(
+            doc.scene.get(rect).unwrap().constraints.unwrap().horizontal,
+            fanta_doc::ConstraintH::Scale
+        );
+        assert!(doc.undo().unwrap());
+        assert!(doc.scene.get(rect).unwrap().constraints.is_none());
     }
 }

@@ -65,6 +65,13 @@ pub struct DesignStateToolInput {
     /// `empty_space: {page, x, y, width, height}`.
     #[serde(default)]
     pub empty_space: Option<[f64; 2]>,
+    /// `summary`, `style` or `raw`. Fetching `nodes` defaults to `style`: each
+    /// node's editable style in `design_edit`'s own vocabulary, so a value read
+    /// here can be written back unchanged. A page listing defaults to
+    /// `summary`; `style` merges each listed node's style into it. `raw` is the internal
+    /// record.
+    #[serde(default)]
+    pub detail: Option<design_surface::NodeDetail>,
 }
 
 fn default_true() -> bool {
@@ -337,6 +344,7 @@ impl AgentTool for DesignStateTool {
                                 include_geometry: input.include_geometry,
                                 offset: input.offset,
                                 limit: input.limit,
+                                detail: input.detail,
                             },
                             cx,
                         )
