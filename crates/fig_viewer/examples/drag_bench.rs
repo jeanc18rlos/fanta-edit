@@ -40,6 +40,7 @@ struct MetricTotals {
     nodes_drawn: u64,
     nodes_culled: u64,
     paths_built: u64,
+    instance_indexes_built: u64,
     effect_layers: u64,
     layer_cache_hits: u64,
     layer_cache_misses: u64,
@@ -54,6 +55,7 @@ impl MetricTotals {
         self.nodes_drawn += u64::from(metrics.nodes_drawn);
         self.nodes_culled += u64::from(metrics.nodes_culled);
         self.paths_built += u64::from(metrics.paths_built);
+        self.instance_indexes_built += u64::from(metrics.instance_indexes_built);
         self.effect_layers += u64::from(metrics.effect_layers);
         self.layer_cache_hits += u64::from(metrics.layer_cache_hits);
         self.layer_cache_misses += u64::from(metrics.layer_cache_misses);
