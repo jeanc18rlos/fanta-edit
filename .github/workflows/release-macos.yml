@@ -149,10 +149,15 @@ jobs:
         if: env.FANTA_APP_STORE != 'true'
         run: |
           app_path=target/aarch64-apple-darwin/release/dmg/Fanta.app
-          ./script/verify-macos-document-icon "$app_path"
-          ./script/verify-bundled-git "$app_path" --network
-          /usr/bin/codesign --verify --deep --strict --verbose=2 "$app_path"
-          /usr/libexec/PlistBuddy -c 'Print :CFBundleURLTypes' "$app_path/Contents/Info.plist" | grep -q fanta
+          verification_options=()
+          if [[ "$FANTA_REQUIRE_NOTARIZATION" == true ]]; then
+            verification_options+=(--notarized)
+          fi
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/zed/Cargo.toml)
+          python3 script/verify-macos-dmg \
+            target/aarch64-apple-darwin/release/Fanta-aarch64.dmg "$app_path" \
+            --version "$version" --network "${verification_options[@]}" \
+            --report "${RUNNER_TEMP}/macos-dmg-verification.json"
           cd target/aarch64-apple-darwin/release
           shasum -a 256 Fanta-aarch64.dmg > SHA256SUMS.txt
 
@@ -180,9 +185,14 @@ jobs:
           cd target/aarch64-apple-darwin/release/app-store
           shasum -a 256 Fanta-aarch64.pkg > SHA256SUMS.txt
 
-      - name: Verify Apple notarization
-        if: env.FANTA_REQUIRE_NOTARIZATION == 'true'
-        run: xcrun stapler validate target/aarch64-apple-darwin/release/Fanta-aarch64.dmg
+      - name: Preserve mounted DMG verification evidence
+        if: ${{ !cancelled() && env.FANTA_APP_STORE != 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-dmg-verification-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/macos-dmg-verification.json
+          if-no-files-found: ignore
+          retention-days: 30
 
       - name: Upload installer
         if: env.FANTA_APP_STORE != 'true'

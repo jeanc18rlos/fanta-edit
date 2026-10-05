@@ -1,0 +1,335 @@
+#!/usr/bin/env python3
+import argparse
+import contextlib
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import plistlib
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parent.parent
+loader = importlib.machinery.SourceFileLoader('verify_macos_dmg', str(ROOT / 'script/verify-macos-dmg'))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+verifier = importlib.util.module_from_spec(spec)
+loader.exec_module(verifier)
+NATIVE_DMG = False
+
+
+def fixture(app):
+    (app / 'Contents/MacOS').mkdir(parents=True)
+    (app / 'Contents/Resources').mkdir()
+    for name in ['fanta', 'cli', 'git']:
+        path = app / 'Contents/MacOS' / name
+        path.write_bytes(b'synthetic package fixture, never executed\n')
+        path.chmod(0o755)
+    (app / 'Contents/Resources/Document.icns').write_bytes(b'synthetic icon')
+    (app / 'Contents/Resources/resource.txt').write_text('retained resource\n')
+    (app / 'Contents/Resources/link').symlink_to('resource.txt')
+    documents = []
+    for key, value in [('LSItemContentTypes', 'public.folder'), ('CFBundleTypeExtensions', 'fig'), ('CFBundleTypeExtensions', 'fnx')]:
+        documents.append({key: [value], 'CFBundleTypeRole': 'Editor', 'CFBundleTypeIconFile': 'Document'})
+    info = {'CFBundleIdentifier': 'dev.fanta.Fanta', 'CFBundleExecutable': 'fanta',
+            'CFBundleShortVersionString': '1.2.3', 'CFBundleVersion': '1.2.3',
+            'CFBundleURLTypes': [{'CFBundleURLSchemes': ['fanta']}],
+            'CFBundleDocumentTypes': documents}
+    (app / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
+
+
+class PackagingPreflight(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix='fanta-packaging-preflight-')
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        for relative in ['script/bundle-mac', 'script/lib/blob-store.sh', 'crates/zed/Cargo.toml', 'crates/zed/RELEASE_CHANNEL']:
+            destination = self.root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(ROOT / relative, destination)
+        self.sentinels = self.root / 'sentinels'
+        self.sentinels.mkdir()
+        self.log = self.root / 'unexpected-commands.log'
+        for command in ['cargo', 'rustc', 'rustup', 'security', 'codesign', 'curl', 'xcrun', 'hdiutil']:
+            script = self.sentinels / command
+            script.write_text('#!/bin/sh\nprintf "%s\\n" "' + command + '" >> "$FANTA_SENTINEL_LOG"\nexit 99\n')
+            script.chmod(0o755)
+        self.environment = {'PATH': f'{self.sentinels}:/usr/bin:/bin', 'LC_ALL': 'C',
+                            'FANTA_SENTINEL_LOG': str(self.log)}
+        self.before = {str(path.relative_to(self.root)): path.read_bytes()
+                       for path in (self.root / 'script').rglob('*') if path.is_file()}
+        self.before.update({str(path.relative_to(self.root)): path.read_bytes()
+                            for path in (self.root / 'crates').rglob('*') if path.is_file()})
+
+    def reject(self, environment, reason, arguments=()):
+        result = subprocess.run(['/bin/bash', 'script/bundle-mac', *arguments], cwd=self.root,
+                                env={**self.environment, **environment}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(reason, result.stdout + result.stderr)
+        self.assertFalse(self.log.exists(), 'build/signing/network tooling was reached')
+        after = {str(path.relative_to(self.root)): path.read_bytes()
+                 for directory in ['script', 'crates'] for path in (self.root / directory).rglob('*') if path.is_file()}
+        self.assertEqual(after, self.before)
+
+    def test_invalid_notarization_flag(self):
+        self.reject({'FANTA_REQUIRE_NOTARIZATION': 'maybe'}, 'FANTA_REQUIRE_NOTARIZATION must be true or false')
+
+    def test_required_notarization_without_credentials(self):
+        self.reject({'FANTA_REQUIRE_NOTARIZATION': 'true'}, 'Distribution requires Apple notarization credentials')
+
+    def test_required_notarization_rejects_debug(self):
+        self.reject({'FANTA_REQUIRE_NOTARIZATION': 'true', 'APPLE_NOTARIZATION_KEYCHAIN_PROFILE': 'synthetic-never-read'},
+                    'Notarized distribution requires a release build', ['-d'])
+
+    def test_incomplete_certificate_pair(self):
+        for environment in [{'MACOS_CERTIFICATE': 'synthetic-not-a-certificate'}, {'MACOS_CERTIFICATE_PASSWORD': 'synthetic-not-a-secret'}]:
+            with self.subTest(environment=sorted(environment)):
+                self.reject(environment, 'MACOS_CERTIFICATE and MACOS_CERTIFICATE_PASSWORD must be provided together')
+
+    def test_invalid_channel(self):
+        self.reject({'FANTA_RELEASE_CHANNEL': 'unknown'}, 'Unsupported release channel')
+
+    def test_redirected_target_directory(self):
+        self.reject({'FANTA_RELEASE_CHANNEL': 'stable', 'CARGO_TARGET_DIR': str(self.root / 'alternate-target')},
+                    'Unset it before bundling')
+
+    def test_store_and_notarization_are_incompatible(self):
+        self.reject({'FANTA_REQUIRE_NOTARIZATION': 'true'}, 'Mac App Store packages are submitted to App Store Connect', ['-s'])
+
+    def test_sentinel_control_blocks_build_without_running_cargo(self):
+        result = subprocess.run(['/bin/bash', 'script/bundle-mac'], cwd=self.root,
+                                env={**self.environment, 'FANTA_RELEASE_CHANNEL': 'stable'}, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 99)
+        self.assertEqual(self.log.read_text().splitlines(), ['cargo', 'cargo'])
+
+
+class WorkflowPipeline(unittest.TestCase):
+    def test_failing_packaging_runner_is_not_masked_by_tee(self):
+        workflow = (ROOT / '.github/workflows/check.yml').read_text()
+        step = workflow.split('      - name: Test macOS packaging preflight and artifact checks\n', 1)[1].split('\n      - name:', 1)[0]
+        explicit_bash = '        shell: bash\n' in step
+        body = step.split('        run: |\n', 1)[1]
+        body = '\n'.join(line[10:] for line in body.splitlines() if line.strip())
+        with tempfile.TemporaryDirectory(prefix='fanta-workflow-pipeline-') as temporary:
+            directory = Path(temporary)
+            binaries = directory / 'bin'
+            binaries.mkdir()
+            runner = binaries / 'python3'
+            runner.write_text('#!/bin/sh\nprintf "synthetic packaging runner failure\\n"\nexit 7\n')
+            runner.chmod(0o755)
+            environment = {'PATH': f'{binaries}:/usr/bin:/bin', 'RUNNER_TEMP': str(directory)}
+            # GitHub's explicit bash shell enables pipefail; its unspecified default does not.
+            shell = ['/bin/bash', '--noprofile', '--norc', '-e', '-o', 'pipefail'] if explicit_bash else ['/bin/bash', '-e']
+            result = subprocess.run([*shell, '-c', body], cwd=directory, env=environment,
+                                    capture_output=True, text=True)
+            self.assertEqual((directory / 'macos-packaging-regressions.log').read_text(),
+                             'synthetic packaging runner failure\n')
+            self.assertEqual(result.returncode, 7,
+                             'The workflow must propagate a failing runner even when tee succeeds')
+            self.assertTrue(explicit_bash, 'Pin shell: bash to retain the tested pipefail contract')
+
+
+class MountedContents(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix='fanta-dmg-contents-')
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.staged = self.root / 'staging/Fanta.app'
+        fixture(self.staged)
+        self.mount = self.root / 'mount'
+        self.mount.mkdir()
+        self.app = self.mount / 'Fanta.app'
+        shutil.copytree(self.staged, self.app, symlinks=True)
+        (self.mount / 'Applications').symlink_to('/Applications')
+
+    def check(self):
+        return verifier.verify_contents(self.mount, self.staged, '1.2.3')
+
+    def change_metadata(self, change):
+        for app in [self.staged, self.app]:
+            path = app / 'Contents/Info.plist'
+            info = plistlib.loads(path.read_bytes())
+            change(info)
+            path.write_bytes(plistlib.dumps(info))
+
+    def test_exact_bundle(self):
+        self.assertGreater(self.check()['files'], 0)
+
+    def test_modified_resource(self):
+        (self.app / 'Contents/Resources/resource.txt').write_text('changed\n')
+        with self.assertRaisesRegex(verifier.VerificationError, 'Mounted bundle differs'):
+            self.check()
+
+    def test_missing_resource(self):
+        (self.app / 'Contents/Resources/resource.txt').unlink()
+        with self.assertRaisesRegex(verifier.VerificationError, 'missing='):
+            self.check()
+
+    def test_extra_resource(self):
+        (self.app / 'Contents/Resources/extra').write_text('unplanned')
+        with self.assertRaisesRegex(verifier.VerificationError, 'added='):
+            self.check()
+
+    def test_changed_symlink_target(self):
+        path = self.app / 'Contents/Resources/link'
+        path.unlink()
+        path.symlink_to('/tmp/unrelated')
+        with self.assertRaisesRegex(verifier.VerificationError, 'Mounted bundle differs'):
+            self.check()
+
+    def test_changed_executable_bits(self):
+        (self.app / 'Contents/MacOS/fanta').chmod(0o644)
+        with self.assertRaisesRegex(verifier.VerificationError, 'Mounted bundle differs'):
+            self.check()
+
+    def test_additional_application(self):
+        (self.mount / 'Unexpected.app').mkdir()
+        with self.assertRaisesRegex(verifier.VerificationError, 'Expected only Fanta.app'):
+            self.check()
+
+    def test_app_symlink_is_not_accepted(self):
+        shutil.rmtree(self.app)
+        self.app.symlink_to(self.staged, target_is_directory=True)
+        with self.assertRaisesRegex(verifier.VerificationError, 'Expected an app directory'):
+            self.check()
+
+    def test_applications_link_is_exact(self):
+        path = self.mount / 'Applications'
+        path.unlink()
+        path.symlink_to('/tmp/Applications')
+        with self.assertRaisesRegex(verifier.VerificationError, 'Applications symlink'):
+            self.check()
+
+    def test_identity_and_version(self):
+        for key, value in [('CFBundleIdentifier', 'dev.fanta.Fanta-Dev'),
+                           ('CFBundleExecutable', 'other'), ('CFBundleShortVersionString', '0.0.1'),
+                           ('CFBundleVersion', '0.0.1')]:
+            with self.subTest(key=key):
+                original = (self.app / 'Contents/Info.plist').read_bytes()
+                self.change_metadata(lambda info: info.update({key: value}))
+                with self.assertRaisesRegex(verifier.VerificationError, key):
+                    self.check()
+                for app in [self.staged, self.app]:
+                    (app / 'Contents/Info.plist').write_bytes(original)
+
+    def test_url_scheme(self):
+        self.change_metadata(lambda info: info.update(CFBundleURLTypes=[{'CFBundleURLSchemes': ['not-fanta']}]))
+        with self.assertRaisesRegex(verifier.VerificationError, 'exactly the fanta URL scheme'):
+            self.check()
+
+    def test_document_registration(self):
+        self.change_metadata(lambda info: info.update(CFBundleDocumentTypes=[]))
+        with self.assertRaisesRegex(verifier.VerificationError, 'document registration'):
+            self.check()
+
+    def test_malformed_plist_containers_report_validation_errors(self):
+        original = (self.app / 'Contents/Info.plist').read_bytes()
+        invalid = [([], 'Info.plist must contain a dictionary')]
+        for key, value in [('CFBundleURLTypes', 'wrong'), ('CFBundleURLTypes', ['wrong']),
+                           ('CFBundleURLTypes', [{'CFBundleURLSchemes': 'fanta'}]),
+                           ('CFBundleDocumentTypes', 'wrong'), ('CFBundleDocumentTypes', ['wrong']),
+                           ('CFBundleDocumentTypes', [{'CFBundleTypeExtensions': 'fig'}])]:
+            info = plistlib.loads(original)
+            info[key] = value
+            invalid.append((info, 'must be an array'))
+        for info, reason in invalid:
+            with self.subTest(info=info):
+                for app in [self.staged, self.app]:
+                    (app / 'Contents/Info.plist').write_bytes(plistlib.dumps(info))
+                with self.assertRaisesRegex(verifier.VerificationError, reason):
+                    self.check()
+
+    def test_shared_missing_executable(self):
+        for app in [self.staged, self.app]:
+            (app / 'Contents/MacOS/cli').unlink()
+        with self.assertRaisesRegex(verifier.VerificationError, 'Missing executable: cli'):
+            self.check()
+
+    def test_detach_runs_after_verification_failure(self):
+        commands = []
+        def command(arguments, records):
+            commands.append([str(value) for value in arguments])
+            return b''
+        with mock.patch.object(verifier, 'run_command', side_effect=command):
+            with self.assertRaisesRegex(verifier.VerificationError, 'deliberate failure'):
+                with verifier.mounted_image(self.root / 'unused.dmg', []):
+                    raise verifier.VerificationError('deliberate failure')
+        self.assertEqual([command[1] for command in commands], ['attach', 'detach'])
+        self.assertIn('-readonly', commands[0])
+        self.assertIn('-nobrowse', commands[0])
+        self.assertIn('-noautoopen', commands[0])
+
+    def test_full_path_verifies_mounted_copy_and_notarization(self):
+        dmg = self.root / 'fixture.dmg'
+        dmg.write_bytes(b'not an actual dmg: orchestration control')
+        commands = []
+        @contextlib.contextmanager
+        def mounted_image(path, records):
+            self.assertEqual(path, dmg)
+            yield self.mount
+        def command(arguments, records):
+            arguments = [str(value) for value in arguments]
+            commands.append(arguments)
+            output = ''
+            if '--display' in arguments:
+                output = 'Authority=Developer ID Application: Fixture (ABCDEFGHIJ)\nTeamIdentifier=ABCDEFGHIJ\nCodeDirectory flags=0x10000(runtime)\n'
+            records.append({'stdout': '', 'stderr': output})
+            return b''
+        with mock.patch.object(verifier, 'mounted_image', mounted_image), mock.patch.object(verifier, 'run_command', side_effect=command):
+            result = verifier.verify(dmg, self.staged, '1.2.3', True, True, [])
+        self.assertEqual(result['distribution_trust'], 'assessed')
+        self.assertEqual(sum(command[0] == '/usr/sbin/spctl' for command in commands), 2)
+        self.assertTrue(any('stapler' in command for command in commands))
+        self.assertTrue(any(command[0].endswith('/verify-bundled-git') and command[1] == str(self.app) and '--network' in command for command in commands))
+        self.assertTrue(any(command[0] == '/usr/bin/codesign' and command[-1] == str(self.app) for command in commands))
+
+    def test_synthetic_signature_policy_rejects_adhoc_store_and_missing_runtime(self):
+        invalid = ['Signature=adhoc\nTeamIdentifier=not set\n',
+                   'Authority=Apple Distribution: Fixture\nTeamIdentifier=ABCDEFGHIJ\nCodeDirectory flags=0x10000(runtime)\n',
+                   'Authority=Developer ID Application: Fixture\nTeamIdentifier=ABCDEFGHIJ\nCodeDirectory flags=0x0(none)\n']
+        for text in invalid:
+            with self.subTest(text=text):
+                with self.assertRaises(verifier.VerificationError):
+                    verifier.verify_signature_identity(text)
+
+    def test_real_readonly_dmg_contents_and_tamper_rejection(self):
+        if not NATIVE_DMG:
+            self.skipTest('opt in with --native-dmg; creates and mounts a tiny synthetic image')
+        dmg = self.root / 'fixture.dmg'
+        subprocess.run(['/usr/bin/hdiutil', 'create', '-volname', 'Fanta verification fixture',
+                        '-srcfolder', str(self.mount), '-format', 'UDZO', str(dmg)], check=True,
+                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        records = []
+        verifier.run_command(['/usr/bin/hdiutil', 'verify', dmg], records)
+        with verifier.mounted_image(dmg, records) as mount:
+            verifier.verify_contents(mount, self.staged, '1.2.3')
+            (self.staged / 'Contents/Resources/resource.txt').write_text('tampered staging')
+            with self.assertRaisesRegex(verifier.VerificationError, 'Mounted bundle differs'):
+                verifier.verify_contents(mount, self.staged, '1.2.3')
+        self.assertEqual(records[-1]['command'][1], 'detach')
+        self.assertEqual(records[-1]['exit_code'], 0)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--native-dmg', action='store_true')
+    parser.add_argument('--report', type=Path)
+    arguments = parser.parse_args()
+    NATIVE_DMG = arguments.native_dmg
+    if arguments.report and arguments.report.exists():
+        parser.error('existing report will not be overwritten')
+    result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__]))
+    if arguments.report:
+        report = {'passed': result.wasSuccessful(), 'tests_run': result.testsRun,
+                  'failures': len(result.failures), 'errors': len(result.errors), 'skipped': len(result.skipped),
+                  'native_synthetic_dmg': NATIVE_DMG,
+                  'scope': 'Isolated real script preflight rejection, synthetic bundle/orchestration cases, and optional tiny real read-only DMG. No signed product artifact, native app launch, Cargo or credentials.',
+                  'sources': {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
+                              for path in [Path(__file__), ROOT / 'script/verify-macos-dmg', ROOT / 'script/bundle-mac']}}
+        arguments.report.write_text(json.dumps(report, indent=2) + '\n')
+    raise SystemExit(0 if result.wasSuccessful() else 1)
