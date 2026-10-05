@@ -24,6 +24,7 @@ mod export;
 mod generation_journal;
 mod generation_media;
 mod generation_workspace;
+mod gesture_perf;
 #[cfg(feature = "fanta-gpui-ui")]
 mod gpui_adapters;
 mod inspector_components;

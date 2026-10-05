@@ -496,6 +496,14 @@ enum PaintPlan {
     PresentAndWait,
 }
 
+#[cfg(target_os = "macos")]
+fn reused_paint_classification(plan: &PaintPlan, reprojected: Option<bool>) -> Option<bool> {
+    match plan {
+        PaintPlan::RenderBlocking => None,
+        _ => reprojected,
+    }
+}
+
 /// The pure presentation policy behind [`GpuCanvas`]: given the newest
 /// completed frame, the request, and the render thread's state, decide what
 /// paint does. Unit-testable without a Metal device.
@@ -1017,6 +1025,7 @@ struct RenderRequest {
     /// `RenderInputs::mode_generation` for this frame: the variables/modes
     /// half of the document's [`InputsFingerprint`].
     mode_generation: u64,
+    perf_tag: Option<crate::gesture_perf::RequestTag>,
 }
 
 #[cfg(target_os = "macos")]
@@ -1032,12 +1041,20 @@ enum RenderReply {
     Frame {
         key: SurfaceKey,
         scale_factor: f32,
-        result: Result<(SendBuffer, Duration)>,
+        result: Result<(
+            SendBuffer,
+            Duration,
+            Option<crate::gesture_perf::FrameSample>,
+        )>,
+        perf_tag: Option<crate::gesture_perf::RequestTag>,
     },
     /// A [`RenderSource::Patch`] could not be applied (or found no snapshot to
     /// apply to); the render thread dropped its copy and rendered nothing. Not
     /// a render failure: the next paint sends a full snapshot.
-    SnapshotLost(anyhow::Error),
+    SnapshotLost {
+        error: anyhow::Error,
+        perf_tag: Option<crate::gesture_perf::RequestTag>,
+    },
     /// The render thread could not bring up Metal/Skia; the canvas falls back
     /// to the CPU raster path.
     InitFailed(anyhow::Error),
@@ -1166,7 +1183,10 @@ fn render_thread_loop(
                             // A half-applied copy is not a document state
                             // anyone ever had; drop it rather than render it.
                             snapshot = None;
-                            return RenderReply::SnapshotLost(error);
+                            return RenderReply::SnapshotLost {
+                                error,
+                                perf_tag: request.perf_tag,
+                            };
                         }
                     }
                 }
@@ -1180,7 +1200,9 @@ fn render_thread_loop(
             RenderReply::Frame {
                 key: request.key,
                 scale_factor: request.scale_factor,
-                result: result.map(|(buffer, duration)| (SendBuffer(buffer), duration)),
+                result: result
+                    .map(|(buffer, duration, metrics)| (SendBuffer(buffer), duration, metrics)),
+                perf_tag: request.perf_tag,
             }
         });
         if replies.send(reply).is_err() {
@@ -1337,7 +1359,11 @@ impl MacGpuRenderer {
         &mut self,
         inputs: FrameInputs<'_>,
         request: &RenderRequest,
-    ) -> Result<(CVPixelBuffer, Duration)> {
+    ) -> Result<(
+        CVPixelBuffer,
+        Duration,
+        Option<crate::gesture_perf::FrameSample>,
+    )> {
         let size = request.key.size;
         self.resize(size)?;
         if let Some(asset_resolver) = inputs.asset_resolver {
@@ -1423,7 +1449,7 @@ impl MacGpuRenderer {
             dark_ui: false,
         };
         let render_started = Instant::now();
-        self.raster_renderer.render_to_canvas(
+        let metrics = self.raster_renderer.render_to_canvas(
             surface.canvas(),
             size.0,
             size.1,
@@ -1434,7 +1460,9 @@ impl MacGpuRenderer {
         );
         // The compositor samples the IOSurface as soon as we hand it to
         // `paint_surface`, so the GPU work must be complete by then.
+        let flush_started = crate::gesture_perf::optional_timer(request.perf_tag.is_some());
         self.direct_context.flush_submit_and_sync_cpu();
+        let flush_duration = flush_started.map(|started| started.elapsed());
         drop(surface);
         drop(playback);
         drop(video_image);
@@ -1442,7 +1470,15 @@ impl MacGpuRenderer {
         // on the render thread.
         let duration = render_started.elapsed();
         crate::report_slow("canvas scene render", render_started);
-        Ok((pixel_buffer, duration))
+        let sample = flush_duration.map(|flush_duration| crate::gesture_perf::FrameSample {
+            metrics,
+            flush_sync_wall_us: crate::gesture_perf::duration_micros(flush_duration),
+            render_wall_us: crate::gesture_perf::duration_micros(duration),
+            physical_size: size,
+            viewport_zoom: request.key.viewport_zoom,
+            display_scale: request.scale_factor,
+        });
+        Ok((pixel_buffer, duration, sample))
     }
 }
 
@@ -1462,6 +1498,7 @@ struct CompletedFrame {
 /// [`FigView`]: crate::view::FigView
 #[cfg(target_os = "macos")]
 pub(crate) struct GpuCanvas {
+    gesture_perf: Option<crate::gesture_perf::SharedGesturePerf>,
     jobs: mpsc::Sender<RenderJob>,
     replies: mpsc::Receiver<RenderReply>,
     /// UI-side task that repaints the view when the render thread replies
@@ -1527,7 +1564,11 @@ impl GpuCanvas {
     /// CPU fallback, so a persistently failing device does not spin.
     const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 
-    pub(crate) fn new(size: (u32, u32), cx: &mut Context<FigView>) -> Self {
+    pub(crate) fn new(
+        size: (u32, u32),
+        gesture_perf: Option<crate::gesture_perf::SharedGesturePerf>,
+        cx: &mut Context<FigView>,
+    ) -> Self {
         let (jobs, job_rx) = mpsc::channel();
         let (reply_tx, replies) = mpsc::channel();
         let signal = Arc::new(WakeSignal::default());
@@ -1552,6 +1593,7 @@ impl GpuCanvas {
         });
 
         Self {
+            gesture_perf,
             jobs,
             replies,
             _reply_task: reply_task,
@@ -1585,9 +1627,20 @@ impl GpuCanvas {
     /// or the thread went idle and paint should re-plan).
     fn pump_replies(&mut self) -> bool {
         let mut any = false;
-        while let Ok(reply) = self.replies.try_recv() {
-            self.handle_reply(reply);
-            any = true;
+        loop {
+            match self.replies.try_recv() {
+                Ok(reply) => {
+                    self.handle_reply(reply);
+                    any = true;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if let Some(perf) = &self.gesture_perf {
+                        perf.borrow_mut().fail_pending("worker_disconnected");
+                    }
+                    break;
+                }
+            }
         }
         any
     }
@@ -1598,14 +1651,27 @@ impl GpuCanvas {
                 key,
                 scale_factor,
                 result,
+                perf_tag,
             } => {
                 self.in_flight = None;
                 match result {
-                    Ok((buffer, duration)) => {
+                    Ok((buffer, duration, sample)) => {
+                        if let Some((perf, tag)) = self.gesture_perf.as_ref().zip(perf_tag)
+                            && !perf
+                                .borrow_mut()
+                                .complete(tag, sample.ok_or("missing_diagnostics"))
+                        {
+                            log::warn!("duplicate or unknown canvas gesture completion");
+                        }
                         self.consecutive_failures = 0;
                         self.install_frame(key, scale_factor, buffer.0, duration);
                     }
                     Err(error) => {
+                        if let Some((perf, tag)) = self.gesture_perf.as_ref().zip(perf_tag)
+                            && !perf.borrow_mut().complete(tag, Err("render_error"))
+                        {
+                            log::warn!("duplicate or unknown canvas gesture failure");
+                        }
                         self.consecutive_failures += 1;
                         log::warn!("failed to render .fig canvas with Skia Metal: {error:#}");
                         if self.consecutive_failures >= Self::MAX_CONSECUTIVE_FAILURES {
@@ -1617,12 +1683,20 @@ impl GpuCanvas {
                     }
                 }
             }
-            RenderReply::SnapshotLost(error) => {
+            RenderReply::SnapshotLost { error, perf_tag } => {
+                if let Some((perf, tag)) = self.gesture_perf.as_ref().zip(perf_tag)
+                    && !perf.borrow_mut().complete(tag, Err("snapshot_lost"))
+                {
+                    log::warn!("duplicate or unknown canvas gesture snapshot failure");
+                }
                 self.in_flight = None;
                 self.worker_snapshot = None;
                 log::warn!("the canvas render thread dropped its scene copy: {error:#}");
             }
             RenderReply::InitFailed(error) => {
+                if let Some(perf) = &self.gesture_perf {
+                    perf.borrow_mut().fail_pending("worker_init_failed");
+                }
                 self.in_flight = None;
                 self.failed = Some(format!("Skia Metal is unavailable: {error:#}"));
             }
@@ -1700,10 +1774,21 @@ impl GpuCanvas {
     /// Hand the render thread one job. Coalesced by construction: paint only
     /// dispatches while nothing is in flight, and always for the latest
     /// viewport, so a burst of pan ticks costs one render, not a queue.
-    fn dispatch(&mut self, source: RenderSource, request: RenderRequest) -> Result<()> {
+    fn dispatch(&mut self, source: RenderSource, mut request: RenderRequest) -> Result<()> {
         if let Some(reason) = &self.failed {
             return Err(anyhow!("{reason}"));
         }
+        request.perf_tag = self.gesture_perf.as_ref().and_then(|perf| {
+            use crate::gesture_perf::RenderSourceKind;
+            let kind = match &source {
+                RenderSource::Live(_) => RenderSourceKind::Live,
+                RenderSource::Patch(_) => RenderSourceKind::Patch,
+                RenderSource::Snapshot(Some(_)) => RenderSourceKind::SnapshotFresh,
+                RenderSource::Snapshot(None) => RenderSourceKind::SnapshotReuse,
+            };
+            perf.borrow_mut().reserve(kind)
+        });
+        let perf_tag = request.perf_tag;
         let key = request.key;
         let job = RenderJob {
             source,
@@ -1711,8 +1796,15 @@ impl GpuCanvas {
             recycled: std::mem::take(&mut self.to_recycle),
         };
         if self.jobs.send(job).is_err() {
+            if let Some(perf) = &self.gesture_perf {
+                perf.borrow_mut().dispatch_failed("worker_send_failed");
+                perf.borrow_mut().fail_pending("worker_send_failed");
+            }
             self.failed = Some("the canvas render thread exited".into());
             return Err(anyhow!("the canvas render thread exited"));
+        }
+        if let Some((perf, tag)) = self.gesture_perf.as_ref().zip(perf_tag) {
+            perf.borrow_mut().submitted(tag);
         }
         self.in_flight = Some(key);
         Ok(())
@@ -1749,6 +1841,9 @@ impl GpuCanvas {
                 Err(_) => {
                     // The render thread is gone: whatever it was reading is
                     // no longer touched, so the live borrow ends safely.
+                    if let Some(perf) = &self.gesture_perf {
+                        perf.borrow_mut().fail_pending("worker_disconnected");
+                    }
                     self.in_flight = None;
                     self.failed = Some("the canvas render thread exited".into());
                     return Err(anyhow!("the canvas render thread exited mid-render"));
@@ -1841,6 +1936,7 @@ impl GpuCanvas {
                         .map(RenderVideoFillFrame::from)
                         .collect(),
                     mode_generation: self.inputs_fingerprint(document).variables,
+                    perf_tag: None,
                 };
                 self.render_blocking(LiveInputs::of(document), request)?;
             }
@@ -1857,13 +1953,25 @@ impl GpuCanvas {
                         .map(RenderVideoFillFrame::from)
                         .collect(),
                     mode_generation: fingerprint.variables,
+                    perf_tag: None,
                 };
                 let source = self.snapshot_source(document, stamp, fingerprint);
                 self.dispatch(source, request)?;
                 self.worker_snapshot = Some(WorkerSnapshot { stamp, fingerprint });
             }
         }
-        Ok((self.present(&key), repaint))
+        let frame = self.present(&key);
+        if let Some(perf) = &self.gesture_perf
+            && let Some(reprojected) = reused_paint_classification(
+                &plan,
+                frame
+                    .as_ref()
+                    .map(|frame| matches!(frame, GpuFrame::Reprojected { .. })),
+            )
+        {
+            perf.borrow_mut().reused_paint(reprojected);
+        }
+        Ok((frame, repaint))
     }
 
     /// The scene source for an off-thread render: the worker's copy as is, a
@@ -1907,6 +2015,15 @@ impl GpuCanvas {
 // thread — the only one that can drop the canvas — waits for its reply.
 
 #[cfg(target_os = "macos")]
+impl Drop for GpuCanvas {
+    fn drop(&mut self) {
+        if let Some(perf) = &self.gesture_perf {
+            perf.borrow_mut().fail_pending("gpu_canvas_dropped");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 impl FigView {
     /// Make sure the render thread exists for a `size` canvas. Returns whether
     /// the GPU path can serve this paint.
@@ -1919,7 +2036,7 @@ impl FigView {
             return false;
         }
         if self.gpu_canvas.is_none() {
-            self.gpu_canvas = Some(GpuCanvas::new(size, cx));
+            self.gpu_canvas = Some(GpuCanvas::new(size, self.gesture_perf.clone(), cx));
         }
         self.gpu_canvas
             .as_ref()
@@ -2469,6 +2586,9 @@ impl Element for CanvasElement {
                 }
             }
 
+            if let Some(perf) = &this.gesture_perf {
+                perf.borrow_mut().cpu_fallback_paint();
+            }
             this.render_cpu_canvas(
                 document,
                 page_root,
@@ -6141,6 +6261,43 @@ mod tests {
                     PaintPlan::Present
                 );
             }
+        }
+    }
+
+    #[test]
+    fn gesture_perf_fresh_dispatch_counts_the_previous_presentation_once() {
+        let cached = surface_key([0.0, 0.0], 0.1, 7);
+        let requested = surface_key([500.0, 0.0], 0.1, 7);
+        let dispatch = plan(
+            Some(&cached),
+            &requested,
+            false,
+            RenderCost::Expensive,
+            false,
+        );
+        assert_eq!(dispatch, PaintPlan::PresentAndRender);
+        assert_eq!(
+            reused_paint_classification(&dispatch, Some(true)),
+            Some(true)
+        );
+        assert_eq!(
+            reused_paint_classification(&dispatch, Some(false)),
+            Some(false)
+        );
+        assert_eq!(reused_paint_classification(&dispatch, None), None);
+        for previous in [None, Some(false), Some(true)] {
+            assert_eq!(
+                reused_paint_classification(&PaintPlan::RenderBlocking, previous),
+                None
+            );
+        }
+        for policy in [
+            PaintPlan::Present,
+            PaintPlan::PresentAndWait,
+            PaintPlan::Reproject,
+        ] {
+            assert_eq!(reused_paint_classification(&policy, Some(true)), Some(true));
+            assert_eq!(reused_paint_classification(&policy, None), None);
         }
     }
 
