@@ -30,9 +30,11 @@ pub enum SplitError {
     UnsupportedNode(NodeId),
     #[error("split rendering does not support composited or unbounded painted ancestor {0}")]
     UnsupportedAncestor(NodeId),
-    #[error("split rendering does not support masks ({0})")]
+    #[error("the split boundary intersects the mask run beginning at {0}")]
     Mask(NodeId),
-    #[error("split rendering does not support backdrop-dependent paint ({0})")]
+    #[error(
+        "split rendering does not support backdrop-sampling effects or blended ancestors ({0})"
+    )]
     Backdrop(NodeId),
     #[error("split rendering does not support pattern or shader paint ({0})")]
     DependentPaint(NodeId),
@@ -64,7 +66,7 @@ pub enum SplitError {
         source: Box<SplitError>,
     },
     #[error(
-        "prepared instance or ancestor paint requires ordered phase drawing, not raster phase compositing"
+        "prepared blend, mask, instance or ancestor paint requires ordered phase drawing, not raster phase compositing"
     )]
     RequiresOrderedPaint,
     #[error("split rendering requires a finite positive viewport and target size")]
@@ -89,8 +91,8 @@ impl AssetResolver for FrozenAssets {
 /// An opt-in paint partition for one immutable scene revision. Prepare again
 /// after any edit. This is not a retained-frame cache or an interactive move.
 /// Images are frozen here so asynchronous decode/eviction cannot change the
-/// artwork between phases. Clipped ancestors and instances require ordered
-/// command replay; remaining specs also permit raster phases composited source-over.
+/// artwork between phases. Clipped ancestors, instances, blends and masks require
+/// ordered command replay; remaining specs also permit raster phase compositing.
 /// Input registries are immutably borrowed for the plan lifetime, so public
 /// map edits require dropping/repreparing it. Rendering with another registry
 /// identity rejects conservatively even if its values happen to be equal.
@@ -202,6 +204,7 @@ impl<'inputs> SplitSpec<'inputs> {
                 pending.extend(children.iter().rev().copied().map(|child| (child, false)));
             }
         }
+        spec.validate_mask_partitions(scene)?;
         Ok(spec)
     }
 
@@ -363,6 +366,64 @@ impl<'inputs> SplitSpec<'inputs> {
         Ok(())
     }
 
+    fn validate_mask_partitions(&self, scene: &Scene) -> Result<(), SplitError> {
+        // Only ancestor sequences cross a phase boundary. Every other live or
+        // prepared-instance subtree is retained in one atomic phase.
+        for (&parent, atom) in &self.atoms {
+            if !matches!(atom, PaintAtom::Ancestor) {
+                continue;
+            }
+            let node = scene.get(parent).ok_or(SplitError::InvalidRoots)?;
+            let children = scene.children_of(Some(parent));
+            let reversed;
+            let children = if matches!(&node.data, NodeData::Group(group)
+                if group.auto_layout.as_ref().is_some_and(|layout| layout.reverse_z))
+            {
+                reversed = children.iter().rev().copied().collect::<Vec<_>>();
+                reversed.as_slice()
+            } else {
+                children
+            };
+            let is_mask = |id: NodeId| {
+                scene
+                    .get(id)
+                    .is_some_and(|node| node.is_mask && !node.flags.contains(NodeFlags::HIDDEN))
+            };
+            let mut children = children.iter().copied().peekable();
+            while let Some(first) = children.next() {
+                if !is_mask(first) {
+                    continue;
+                }
+                let mut run = vec![first];
+                while children.peek().is_some_and(|id| is_mask(*id)) {
+                    if let Some(mask) = children.next() {
+                        run.push(mask);
+                    }
+                }
+                let mut has_content = false;
+                while children.peek().is_some_and(|id| !is_mask(*id)) {
+                    if let Some(content) = children.next() {
+                        has_content = true;
+                        run.push(content);
+                    }
+                }
+                if !has_content {
+                    continue;
+                }
+                let Some(PaintAtom::Subtree(phase)) = self.atoms.get(&first) else {
+                    return Err(SplitError::Mask(first));
+                };
+                if run.iter().any(|id| {
+                    !matches!(self.atoms.get(id),
+                    Some(PaintAtom::Subtree(other)) if other == phase)
+                }) {
+                    return Err(SplitError::Mask(first));
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn validate_node(
         &mut self,
         node: &CanvasNode,
@@ -394,14 +455,11 @@ impl<'inputs> SplitSpec<'inputs> {
         if !node.bindings.is_empty() {
             return Err(SplitError::Binding(node.id));
         }
-        if node.is_mask {
-            return Err(SplitError::Mask(node.id));
-        }
-        if node.blend_mode != BlendMode::Normal
-            || node
-                .blurs
-                .iter()
-                .any(|blur| blur.kind == BlurKind::Background)
+        self.requires_ordered_paint |= node.is_mask || node.blend_mode != BlendMode::Normal;
+        if node
+            .blurs
+            .iter()
+            .any(|blur| blur.kind == BlurKind::Background)
         {
             return Err(SplitError::Backdrop(node.id));
         }
@@ -528,9 +586,7 @@ impl<'inputs> SplitSpec<'inputs> {
             }
             Fill::Video { .. } => return Err(SplitError::UnsupportedNode(node)),
         };
-        if blend != BlendMode::Normal {
-            return Err(SplitError::Backdrop(node));
-        }
+        self.requires_ordered_paint |= blend != BlendMode::Normal;
         Ok(())
     }
 
@@ -653,6 +709,26 @@ fn validate_ancestor(node: &CanvasNode, page: bool) -> Result<(), SplitError> {
     let NodeData::Group(group) = &node.data else {
         return Err(SplitError::UnsupportedAncestor(node.id));
     };
+    // Ancestor layers would be restored independently in several phases,
+    // changing their blend against the backdrop. Atomic descendants keep the
+    // original layer and per-paint commands intact on the ordered canvas.
+    if node.blend_mode != BlendMode::Normal
+        || group
+            .background
+            .iter()
+            .chain(&group.background_fills)
+            .chain(group.strokes.iter().map(|stroke| &stroke.paint))
+            .any(|fill| match fill {
+                Fill::Solid { blend, .. }
+                | Fill::Gradient { blend, .. }
+                | Fill::Image { blend, .. }
+                | Fill::Video { blend, .. }
+                | Fill::Pattern { blend, .. }
+                | Fill::Shader { blend, .. } => *blend != BlendMode::Normal,
+            })
+    {
+        return Err(SplitError::Backdrop(node.id));
+    }
     let page_clear_only = page
         && group.local_size.is_none()
         && group.clip_size.is_none()
