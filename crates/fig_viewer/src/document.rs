@@ -3678,15 +3678,35 @@ fn changed_artifact_ids(
     let Some((instance, revision)) = watermark else {
         return all();
     };
+    let Some(base) = base else {
+        return all();
+    };
     if instance != document.scene.instance_id()
-        || base.is_none_or(|base| {
-            base.pages() != document.pages()
-                || base.components != document.components
-                || base.variables != document.variables
-                || base.active_modes != document.active_modes
-        })
+        || base.pages() != document.pages()
+        || base.variables != document.variables
+        || base.active_modes != document.active_modes
+        || base.components.sets != document.components.sets
+        || base.components.defs.len() != document.components.defs.len()
     {
         return all();
+    }
+    let mut changed = BTreeSet::new();
+    for (id, definition) in &document.components.defs {
+        let Some(previous) = base.components.defs.get(id) else {
+            return all();
+        };
+        if previous == definition {
+            continue;
+        }
+        // Master edits bump expansion revisions without changing reference names.
+        // Opening every artifact here retains a full name table per component.
+        let mut previous = previous.clone();
+        previous.rev = definition.rev;
+        previous.preview_rev = definition.preview_rev;
+        if &previous != definition {
+            return all();
+        }
+        changed.insert(fanta_format::ArtifactId::Component(*id));
     }
     let Some(delta) = document.scene.changes_since(revision) else {
         return all();
@@ -3698,7 +3718,6 @@ fn changed_artifact_ids(
         .map(|(id, def)| (def.root, *id))
         .collect();
     let page_roots: HashSet<NodeId> = document.pages().iter().copied().collect();
-    let mut changed = BTreeSet::new();
     for node in delta.nodes.into_iter().chain(delta.transforms) {
         let mut current = Some(node);
         while let Some(id) = current {
@@ -4304,6 +4323,479 @@ pub(crate) fn fit_bounds(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn master_save_fixture(count: usize) -> (Doc, Vec<(fanta_doc::ComponentId, NodeId)>) {
+        let mut document = doc_with_one_page();
+        let page = *document.pages().first().expect("page");
+        document.set_active_page(Some(page));
+        let mut masters = Vec::new();
+        for index in 0..count {
+            let mut root =
+                fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(fanta_doc::GroupNode {
+                    clip_size: Some([40.0, 40.0]),
+                    ..Default::default()
+                }));
+            root.parent = Some(page);
+            root.index = document.scene.next_child_index(Some(page));
+            root.name = format!("Master {index}");
+            let root_id = root.id;
+            document
+                .apply(Operation::create_node(root))
+                .expect("master");
+            let component = fanta_doc::ComponentId::new();
+            document
+                .apply(Operation::DefineComponent {
+                    def: Box::new(fanta_doc::ComponentDef::new(
+                        component,
+                        root_id,
+                        format!("Master {index}"),
+                    )),
+                })
+                .expect("component definition");
+            masters.push((component, root_id));
+        }
+        document.history = Default::default();
+        (document, masters)
+    }
+
+    #[test]
+    fn master_save_invalidation_keeps_a_transform_scoped_in_a_large_library() {
+        let (mut document, masters) = master_save_fixture(128);
+        let &(component, root) = masters.first().expect("edited master");
+        let base = document.clone_for_persist();
+        let watermark = Some((document.scene.instance_id(), document.scene.revision()));
+        let old = document.scene.get(root).expect("master").transform;
+        document
+            .apply(Operation::SetTransform {
+                id: root,
+                old,
+                new: fanta_doc::Transform2D::translation(32.0, 16.0),
+            })
+            .expect("move master");
+        assert!(document.components.defs[&component].rev > base.components.defs[&component].rev);
+        assert_eq!(
+            changed_artifact_ids(&document, Some(&base), watermark),
+            BTreeSet::from([fanta_format::ArtifactId::Component(component)])
+        );
+    }
+
+    #[test]
+    fn master_save_invalidation_includes_revisions_without_scene_edits() {
+        let (mut document, masters) = master_save_fixture(4);
+        let component = masters.first().expect("master").0;
+        let preview = masters.get(1).expect("preview master").0;
+        let base = document.clone_for_persist();
+        let revision = document.scene.revision();
+        let watermark = Some((document.scene.instance_id(), revision));
+        document
+            .components
+            .defs
+            .get_mut(&component)
+            .expect("definition")
+            .rev += 1;
+        document
+            .components
+            .defs
+            .get_mut(&preview)
+            .expect("definition")
+            .preview_rev += 1;
+        assert!(
+            document
+                .scene
+                .changes_since(revision)
+                .expect("tracked delta")
+                .is_empty()
+        );
+        assert_eq!(
+            changed_artifact_ids(&document, Some(&base), watermark),
+            BTreeSet::from([
+                fanta_format::ArtifactId::Component(component),
+                fanta_format::ArtifactId::Component(preview)
+            ])
+        );
+    }
+
+    #[test]
+    fn master_save_invalidation_includes_nested_masters_and_page_edits() {
+        let (mut document, masters) = master_save_fixture(4);
+        let &(outer_component, outer) = masters.first().expect("outer");
+        let &(inner_component, inner) = masters.get(1).expect("inner");
+        let page = *document.pages().first().expect("page");
+        let inner_node = document.scene.get(inner).expect("inner");
+        document
+            .apply(Operation::Reparent {
+                id: inner,
+                old_parent: inner_node.parent,
+                old_index: inner_node.index,
+                new_parent: Some(outer),
+                new_index: fanta_doc::IndexKey::from_raw(1.0),
+            })
+            .expect("nest master");
+        let mut plain = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
+        plain.parent = Some(page);
+        plain.index = document.scene.next_child_index(Some(page));
+        let plain_id = plain.id;
+        document
+            .apply(Operation::create_node(plain))
+            .expect("ordinary page node");
+        let base = document.clone_for_persist();
+        let watermark = Some((document.scene.instance_id(), document.scene.revision()));
+        for id in [inner, plain_id] {
+            let old = document.scene.get(id).expect("node").transform;
+            document
+                .apply(Operation::SetTransform {
+                    id,
+                    old,
+                    new: fanta_doc::Transform2D::translation(5.0, 7.0),
+                })
+                .expect("move");
+        }
+        assert_eq!(
+            changed_artifact_ids(&document, Some(&base), watermark),
+            BTreeSet::from([
+                fanta_format::ArtifactId::Component(outer_component),
+                fanta_format::ArtifactId::Component(inner_component),
+                fanta_format::ArtifactId::Page(page),
+            ])
+        );
+    }
+
+    #[test]
+    fn master_save_invalidation_retains_all_artifacts_for_registry_or_structural_changes() {
+        for change in [
+            "name",
+            "root",
+            "property",
+            "membership",
+            "set",
+            "add",
+            "remove",
+            "page_order",
+            "mode",
+            "variables",
+            "structural",
+            "delete",
+            "reparent",
+            "missing_base",
+            "missing_watermark",
+            "scene_identity",
+        ] {
+            let (mut document, masters) = master_save_fixture(4);
+            let &(component, root) = masters.first().expect("master");
+            let base = document.clone_for_persist();
+            let watermark = Some((document.scene.instance_id(), document.scene.revision()));
+            match change {
+                "name" => {
+                    document
+                        .components
+                        .defs
+                        .get_mut(&component)
+                        .expect("definition")
+                        .name = "Master 1".into()
+                }
+                "root" => {
+                    document
+                        .components
+                        .defs
+                        .get_mut(&component)
+                        .expect("definition")
+                        .root = masters.get(1).expect("other master").1
+                }
+                "property" => document
+                    .components
+                    .defs
+                    .get_mut(&component)
+                    .expect("definition")
+                    .props
+                    .push(fanta_doc::ComponentPropDef {
+                        id: fanta_doc::ComponentPropId::new(),
+                        name: "Enabled".into(),
+                        kind: fanta_doc::ComponentPropKind::Bool,
+                        formatter: Default::default(),
+                        default: fanta_doc::VarValue::Boolean { value: true },
+                        bindings: Vec::new(),
+                    }),
+                "membership" => {
+                    document
+                        .components
+                        .defs
+                        .get_mut(&component)
+                        .expect("definition")
+                        .variant_of = Some(fanta_doc::ComponentSetMembership {
+                        set: fanta_doc::ComponentId::new(),
+                        axis_values: Default::default(),
+                    })
+                }
+                "set" => {
+                    let id = fanta_doc::ComponentId::new();
+                    document.components.sets.insert(
+                        id,
+                        fanta_doc::ComponentSet {
+                            id,
+                            name: "Set".into(),
+                            axes: Vec::new(),
+                            members: vec![component],
+                            default_variant: component,
+                            root: None,
+                        },
+                    );
+                }
+                "add" => {
+                    let id = fanta_doc::ComponentId::new();
+                    document
+                        .components
+                        .defs
+                        .insert(id, fanta_doc::ComponentDef::new(id, root, "Master 1"));
+                }
+                "remove" => {
+                    document
+                        .components
+                        .defs
+                        .remove(&component)
+                        .expect("remove definition");
+                }
+                "page_order" => document.pages.clear(),
+                "mode" => {
+                    document.active_modes.insert(
+                        fanta_doc::VariableCollectionId::new(),
+                        fanta_doc::ModeId::new(),
+                    );
+                }
+                "variables" => {
+                    let id = fanta_doc::VariableCollectionId::new();
+                    document.variables.collections.insert(
+                        id,
+                        fanta_doc::VariableCollection {
+                            id,
+                            name: "Tokens".into(),
+                            modes: Vec::new(),
+                            default_mode: fanta_doc::ModeId::new(),
+                            variable_order: Vec::new(),
+                        },
+                    );
+                }
+                "delete" => {
+                    let snapshot = vec![document.scene.get(root).expect("master").clone()];
+                    document
+                        .apply(Operation::DeleteSubtree { snapshot })
+                        .expect("delete master");
+                }
+                "reparent" => {
+                    let node = document.scene.get(root).expect("master");
+                    document
+                        .apply(Operation::Reparent {
+                            id: root,
+                            old_parent: node.parent,
+                            old_index: node.index,
+                            new_parent: Some(masters.get(1).expect("other master").1),
+                            new_index: fanta_doc::IndexKey::from_raw(1.0),
+                        })
+                        .expect("reparent master");
+                }
+                "structural" => {
+                    document
+                        .apply(Operation::create_node(fanta_doc::CanvasNode::new(
+                            fanta_doc::NodeData::Group(Default::default()),
+                        )))
+                        .expect("structural edit");
+                }
+                "scene_identity" => document.scene = document.scene.clone(),
+                _ => {}
+            }
+            let expected = document
+                .pages()
+                .iter()
+                .copied()
+                .map(fanta_format::ArtifactId::Page)
+                .chain(
+                    document
+                        .components
+                        .defs
+                        .keys()
+                        .copied()
+                        .map(fanta_format::ArtifactId::Component),
+                )
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                changed_artifact_ids(
+                    &document,
+                    (change != "missing_base").then_some(&base),
+                    if change == "missing_watermark" {
+                        None
+                    } else {
+                        watermark
+                    }
+                ),
+                expected,
+                "{change}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn master_save_invalidation_opens_only_edited_source_and_preserves_other_fnx(
+        cx: &mut TestAppContext,
+    ) {
+        let project = empty_project(cx).await;
+        let directory = tempfile::tempdir().expect("temporary project");
+        let root = directory.path().join("Design");
+        let (document, masters) = master_save_fixture(16);
+        let &(component, master) = masters.first().expect("edited master");
+        let unrelated = masters.get(1).expect("unrelated master").0;
+        write_project(&root, &document, &BTreeMap::new()).expect("initial project");
+        let (_, paths) = fanta_format::projected_design_dirs(&document);
+        let unrelated_source = root
+            .join(paths.get(&unrelated).expect("component directory"))
+            .join("master.fnx");
+        let mut source = std::fs::read_to_string(&unrelated_source).expect("unrelated FNX");
+        source.push_str("\n// Retain this authored comment during another master edit.\n");
+        std::fs::write(&unrelated_source, &source).expect("authored source comment");
+        let item = ready_item(
+            &project,
+            root.join("fanta.json"),
+            Some(root.clone()),
+            document,
+            cx,
+        );
+        item.update(cx, |item, _| {
+            let document = item.document.ready().expect("ready document");
+            item.merge_base = Some(document.doc.clone_for_persist());
+            item.last_saved_scene = Some((
+                document.doc.scene.instance_id(),
+                document.doc.scene.revision(),
+            ));
+            item.last_saved_assets = Some(document.raw_assets.clone());
+            item.workspace_session =
+                Some(fanta_format::WorkspaceSession::open(&root).expect("indexed session"));
+        });
+        item.update(cx, |item, cx| {
+            let old = item
+                .doc()
+                .expect("document")
+                .scene
+                .get(master)
+                .expect("master")
+                .transform;
+            item.apply(
+                Operation::SetTransform {
+                    id: master,
+                    old,
+                    new: fanta_doc::Transform2D::translation(32.0, 16.0),
+                },
+                cx,
+            )
+            .expect("move master");
+        });
+        item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect("save master edit");
+        let (saved, assets) = fanta_format::read_project_tree(&root).expect("read saved project");
+        item.read_with(cx, |item, _| {
+            assert!(!item.is_dirty());
+            let session = item.workspace_session.as_ref().expect("source session");
+            assert_eq!(
+                session.open.keys().cloned().collect::<BTreeSet<_>>(),
+                BTreeSet::from([fanta_format::ArtifactId::Component(component)])
+            );
+            let document = item.doc().expect("document");
+            assert_eq!(
+                serde_json::to_value(&saved.scene).expect("saved scene"),
+                serde_json::to_value(&document.scene).expect("live scene")
+            );
+            assert_eq!(saved.components, document.components);
+            assert_eq!(saved.variables, document.variables);
+        });
+        assert!(assets.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&unrelated_source).expect("retained source"),
+            source
+        );
+    }
+
+    #[gpui::test]
+    async fn master_save_invalidation_still_rejects_unopened_external_source_and_header_edits(
+        cx: &mut TestAppContext,
+    ) {
+        let project = empty_project(cx).await;
+        for external_file in ["master.fnx", "def.json"] {
+            let directory = tempfile::tempdir().expect("temporary project");
+            let root = directory.path().join("Design");
+            let (document, masters) = master_save_fixture(4);
+            let &(_, master) = masters.first().expect("edited master");
+            let unrelated = masters.get(1).expect("unrelated master").0;
+            write_project(&root, &document, &BTreeMap::new()).expect("initial project");
+            let (_, paths) = fanta_format::projected_design_dirs(&document);
+            let external_path = root
+                .join(paths.get(&unrelated).expect("component directory"))
+                .join(external_file);
+            let before_manifest = std::fs::read(root.join("fanta.json")).expect("manifest");
+            let item = ready_item(
+                &project,
+                root.join("fanta.json"),
+                Some(root.clone()),
+                document,
+                cx,
+            );
+            item.update(cx, |item, _| {
+                let document = item.document.ready().expect("ready document");
+                item.merge_base = Some(document.doc.clone_for_persist());
+                item.last_saved_scene = Some((
+                    document.doc.scene.instance_id(),
+                    document.doc.scene.revision(),
+                ));
+                item.last_saved_assets = Some(document.raw_assets.clone());
+                item.workspace_session =
+                    Some(fanta_format::WorkspaceSession::open(&root).expect("indexed session"));
+            });
+            let mut external_bytes = std::fs::read(&external_path).expect("unopened external file");
+            if external_file == "master.fnx" {
+                external_bytes.extend_from_slice(b"\n// External edit must not be overwritten.\n");
+            } else {
+                let mut header: serde_json::Value =
+                    serde_json::from_slice(&external_bytes).expect("component header");
+                header["name"] = serde_json::json!("External component name");
+                external_bytes = serde_json::to_vec_pretty(&header).expect("external header");
+            }
+            std::fs::write(&external_path, &external_bytes).expect("external edit");
+            item.update(cx, |item, cx| {
+                let old = item
+                    .doc()
+                    .expect("document")
+                    .scene
+                    .get(master)
+                    .expect("master")
+                    .transform;
+                item.apply(
+                    Operation::SetTransform {
+                        id: master,
+                        old,
+                        new: fanta_doc::Transform2D::translation(32.0, 16.0),
+                    },
+                    cx,
+                )
+                .expect("move master");
+            });
+            let error = item
+                .update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+                .await
+                .expect_err("external changes must block save");
+            assert!(
+                format!("{error:#}")
+                    .to_ascii_lowercase()
+                    .contains("changed"),
+                "{external_file}: {error:#}"
+            );
+            assert!(item.read_with(cx, |item, _| item.is_dirty()));
+            assert_eq!(
+                std::fs::read(&external_path).expect("external file remains"),
+                external_bytes
+            );
+            assert_eq!(
+                std::fs::read(root.join("fanta.json")).expect("unchanged manifest"),
+                before_manifest
+            );
+        }
+    }
 
     #[test]
     fn asset_preconditions_allow_checked_relocation_and_guard_both_paths() -> Result<()> {
