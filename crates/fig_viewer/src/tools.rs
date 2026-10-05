@@ -426,7 +426,7 @@ pub fn tool_context<'a>(
     };
     ToolContext::new(doc, viewport, snap, screen_size)
         .with_new_shape_fill(new_fill_for(kind))
-        .with_hit_test_refiner(crate::canvas::accepts_precise_hit)
+        .with_hit_test_refiner(crate::canvas::accepts_authoring_hit)
         .with_interaction_bounds_resolver(crate::canvas::authored_local_bounds)
 }
 

@@ -10295,6 +10295,83 @@ mod tests {
         (doc, bitmap_id, BTreeMap::from([(asset, bytes)]))
     }
 
+    fn curved_text_path_hit_fixture() -> (fanta_doc::TextPathNode, [f64; 2], [f64; 2], [f64; 2]) {
+        let mut baseline = fanta_doc::PathData::new();
+        baseline
+            .move_to(0.0, 55.0)
+            .quad_to(185.0, -35.0, 370.0, 55.0);
+        let mut text_path = fanta_doc::TextPathNode::new(baseline, "PATH EDIT ME");
+        text_path.style.size_px = 32.0;
+        let glyph_quad = fanta_render::text_path_selection_quads(&text_path, 6..7)
+            .into_iter()
+            .next()
+            .expect("D has shaped geometry");
+        let bounds = glyph_quad.points.into_iter().fold(
+            fanta_doc::Bounds {
+                min_x: f64::INFINITY,
+                min_y: f64::INFINITY,
+                max_x: f64::NEG_INFINITY,
+                max_y: f64::NEG_INFINITY,
+            },
+            |bounds, point| fanta_doc::Bounds {
+                min_x: bounds.min_x.min(point[0]),
+                min_y: bounds.min_y.min(point[1]),
+                max_x: bounds.max_x.max(point[0]),
+                max_y: bounds.max_y.max(point[1]),
+            },
+        );
+        let points = (0..=bounds.height().ceil() as usize * 2).flat_map(|y| {
+            (0..=bounds.width().ceil() as usize * 2)
+                .map(move |x| [bounds.min_x + x as f64 / 2.0, bounds.min_y + y as f64 / 2.0])
+        });
+        let contains = |point| fanta_render::text_path_contains_point(&text_path, point);
+        let in_d = |point| {
+            fanta_render::text_path_hit_test(&text_path, point)
+                .is_some_and(|byte| (6..=7).contains(&byte))
+        };
+        let ink = points
+            .clone()
+            .find(|point| {
+                in_d(*point)
+                    && [[0.0, 0.0], [-0.5, 0.0], [0.5, 0.0], [0.0, -0.5], [0.0, 0.5]]
+                        .into_iter()
+                        .all(|offset| contains([point[0] + offset[0], point[1] + offset[1]]))
+            })
+            .expect("interior ink on the D in EDIT");
+        let counter = points
+            .filter(|point| {
+                in_d(*point)
+                    && [[0.0, 0.0], [-0.5, 0.0], [0.5, 0.0], [0.0, -0.5], [0.0, 0.5]]
+                        .into_iter()
+                        .all(|offset| !contains([point[0] + offset[0], point[1] + offset[1]]))
+            })
+            .find(|point| {
+                [[-1.0, 0.0], [1.0, 0.0], [0.0, -1.0], [0.0, 1.0]]
+                    .into_iter()
+                    .all(|direction| {
+                        (1..=12).any(|distance| {
+                            contains([
+                                point[0] + direction[0] * f64::from(distance),
+                                point[1] + direction[1] * f64::from(distance),
+                            ])
+                        })
+                    })
+            })
+            .expect("enclosed counter surrounded by glyph ink");
+        let whitespace_quad = fanta_render::text_path_selection_quads(&text_path, 4..5)
+            .into_iter()
+            .next()
+            .expect("space has shaped geometry");
+        let whitespace = whitespace_quad
+            .points
+            .into_iter()
+            .fold([0.0, 0.0], |sum, point| {
+                [sum[0] + point[0] / 4.0, sum[1] + point[1] / 4.0]
+            });
+        assert!(!contains(whitespace));
+        (text_path, ink, counter, whitespace)
+    }
+
     fn send_canvas_click_with_modifiers(
         scratch: gpui::WindowHandle<gpui::Empty>,
         view: &Entity<FigView>,
@@ -13196,6 +13273,223 @@ mod tests {
                     assert!(doc.selection.is_empty(), "after_node_edit={after_node_edit}, paint_between_events={paint_between_events}");
                     assert_eq!(doc.history.undo_depth(), 0);
                     assert!(!item.is_dirty());
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn mounted_curved_text_path_counters_and_whitespace_edit_after_crop(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (mut doc, _, images) = bitmap_canvas_doc();
+        let (text_path, ink, counter, whitespace) = curved_text_path_hit_fixture();
+        let mut node = CanvasNode::new(NodeData::TextPath(text_path));
+        node.parent = doc.active_page();
+        node.index = doc.scene.next_child_index(node.parent);
+        node.transform = Transform2D::translation(-185.0, 100.0);
+        let node_id = node.id;
+        let original = node.clone();
+        doc.apply(Operation::create_node(node))
+            .expect("curved text path");
+        doc.history = Default::default();
+        let (item, view, mut visual) =
+            mounted_canvas_interaction_fixture(&project, doc, images, cx);
+        for zoom in [1.0, 0.65] {
+            view.update(&mut visual, |view, cx| {
+                view.set_viewport_silent(Viewport {
+                    center: [0.0, 0.0],
+                    zoom,
+                });
+                cx.notify();
+            });
+            visual.update(|window, cx| window.draw(cx).clear());
+            let canvas = view.read_with(&visual, |view, _| view.container_bounds.expect("canvas"));
+            mounted_canvas_click(&mut visual, canvas.center(), 1);
+            mounted_canvas_click(&mut visual, canvas.center(), 2);
+            assert_eq!(
+                view.read_with(&visual, |view, _| view.active_tool()),
+                ToolKind::Crop
+            );
+            visual.simulate_keystrokes("escape");
+            assert_eq!(
+                view.read_with(&visual, |view, _| view.active_tool()),
+                ToolKind::Select
+            );
+            let screen_point = |local: [f64; 2]| {
+                canvas.center()
+                    + point(
+                        px(((local[0] - 185.0) * zoom) as f32),
+                        px(((local[1] + 100.0) * zoom) as f32),
+                    )
+            };
+            let ink_position = screen_point(ink);
+            mounted_canvas_click(&mut visual, ink_position, 1);
+            item.read_with(&visual, |item, _| {
+                assert_eq!(
+                    item.doc().expect("document").selection.as_slice(),
+                    &[node_id]
+                );
+            });
+            mounted_canvas_click(&mut visual, ink_position, 2);
+            view.read_with(&visual, |view, _| {
+                let edit = view
+                    .text_edit
+                    .as_ref()
+                    .expect("visible curved glyph opens editor");
+                assert_eq!(edit.session.node_id(), node_id);
+                assert_eq!(edit.session.selected_range(), 5..9);
+            });
+            visual.simulate_keystrokes("escape");
+            for local in [whitespace, counter] {
+                let position = screen_point(local);
+                view.read_with(&visual, |view, cx| {
+                    let doc = item.read(cx).doc().expect("document");
+                    let (width, height) = bounds_size(canvas);
+                    assert_eq!(
+                        inspect_hit_test_screen(
+                            &doc.scene,
+                            &view.viewport.expect("viewport"),
+                            DVec2::new(width, height),
+                            screen_position_in_bounds(position, canvas),
+                            doc.active_page(),
+                        ),
+                        None,
+                        "inspection retains exact-ink geometry"
+                    );
+                });
+                mounted_canvas_click(&mut visual, position, 1);
+                item.read_with(&visual, |item, _| {
+                    assert_eq!(
+                        item.doc().expect("document").selection.as_slice(),
+                        &[node_id]
+                    );
+                });
+                mounted_canvas_click(&mut visual, position, 2);
+                view.read_with(&visual, |view, _| {
+                    let edit = view
+                        .text_edit
+                        .as_ref()
+                        .expect("shaped text footprint opens editor");
+                    assert_eq!(edit.session.node_id(), node_id);
+                    if local == counter {
+                        assert_eq!(edit.session.selected_range(), 5..9);
+                    }
+                });
+                if local == counter {
+                    visual.update(|window, cx| window.draw(cx).clear());
+                    visual.simulate_input("CHANGED");
+                }
+                visual.simulate_keystrokes("escape");
+            }
+            item.read_with(&visual, |item, _| {
+                let doc = item.doc().expect("document");
+                let NodeData::TextPath(edited) = &doc.scene.get(node_id).expect("text path").data
+                else {
+                    panic!("text path kind preserved");
+                };
+                let NodeData::TextPath(original_path) = &original.data else {
+                    panic!("text path fixture");
+                };
+                assert_eq!(edited.content, "PATH CHANGED ME");
+                assert_eq!(edited.path, original_path.path);
+                assert_eq!(doc.history.undo_depth(), 1);
+            });
+            visual.simulate_keystrokes("cmd-z");
+            item.read_with(&visual, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(doc.scene.get(node_id), Some(&original));
+                assert_eq!(doc.history.undo_depth(), 0);
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn mounted_curved_text_path_authoring_respects_occlusion_locks_and_clips(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        for guard in [
+            "distant baseline gap",
+            "locked",
+            "covered",
+            "clipped",
+            "rounded clip",
+        ] {
+            let (text_path, _, counter, _) = curved_text_path_hit_fixture();
+            let local = if guard == "distant baseline gap" {
+                let bounds = NodeData::TextPath(text_path.clone())
+                    .local_bounds()
+                    .expect("broad bounds");
+                [bounds.max_x - 1.0, bounds.max_y - 1.0]
+            } else {
+                counter
+            };
+            let mut doc = doc_with_one_page();
+            let page = doc.active_page();
+            let mut node = CanvasNode::new(NodeData::TextPath(text_path));
+            node.parent = page;
+            node.transform = Transform2D::translation(-local[0], -local[1]);
+            if guard == "locked" {
+                node.flags.insert(fanta_doc::NodeFlags::LOCKED);
+            }
+            if matches!(guard, "clipped" | "rounded clip") {
+                let inside = if guard == "rounded clip" {
+                    [5.0, 5.0]
+                } else {
+                    [210.0, 30.0]
+                };
+                let mut parent = CanvasNode::new(NodeData::Group(GroupNode {
+                    clip_size: Some([200.0, 120.0]),
+                    corner_radius: (guard == "rounded clip").then_some(60.0),
+                    ..Default::default()
+                }));
+                parent.parent = page;
+                parent.transform = Transform2D::translation(-inside[0], -inside[1]);
+                node.parent = Some(parent.id);
+                node.transform =
+                    Transform2D::translation(inside[0] - local[0], inside[1] - local[1]);
+                doc.apply(Operation::create_node(parent))
+                    .expect("clipping group");
+            }
+            let node_id = node.id;
+            doc.apply(Operation::create_node(node))
+                .expect("curved text");
+            if guard == "covered" {
+                let mut cover = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                    -12.0,
+                    -12.0,
+                    24.0,
+                    24.0,
+                    Color::BLACK,
+                )));
+                cover.parent = page;
+                cover.index = doc.scene.next_child_index(page);
+                doc.apply(Operation::create_node(cover))
+                    .expect("occluding vector");
+            }
+            doc.history = Default::default();
+            let (item, view, mut visual) =
+                mounted_canvas_interaction_fixture(&project, doc, BTreeMap::new(), cx);
+            let position = view.read_with(&visual, |view, _| {
+                view.container_bounds.expect("canvas").center()
+            });
+            for click_count in 1..=4 {
+                mounted_canvas_click(&mut visual, position, click_count);
+                view.read_with(&visual, |view, _| {
+                    assert!(view.text_edit.is_none(), "{guard}: click {click_count}");
+                });
+                item.read_with(&visual, |item, _| {
+                    let doc = item.doc().expect("document");
+                    assert!(
+                        !doc.selection.contains(node_id),
+                        "{guard}: click {click_count}"
+                    );
+                    assert_eq!(doc.history.undo_depth(), 0, "{guard}");
+                    assert!(!item.is_dirty(), "{guard}");
                 });
             }
         }

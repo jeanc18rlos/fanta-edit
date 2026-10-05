@@ -2834,7 +2834,39 @@ fn precise_hit_test(
 ) -> Option<NodeId> {
     fanta_canvas::hit_test_deep(scene, world_point, precision, active_page)
         .into_iter()
-        .find(|&id| accepts_precise_hit(scene, id, world_point))
+        .find(|&id| accepts_authoring_hit(scene, id, world_point))
+}
+
+pub(crate) fn accepts_authoring_hit(
+    scene: &fanta_doc::Scene,
+    id: NodeId,
+    world_point: DVec2,
+) -> bool {
+    let Some(node) = scene.get(id) else {
+        return false;
+    };
+    let fanta_doc::NodeData::TextPath(text_path) = &node.data else {
+        return true;
+    };
+    if scene
+        .ancestors_of(id)
+        .any(|ancestor| !inspect_descendants_visible_at(scene, ancestor, world_point))
+    {
+        return false;
+    }
+    if accepts_precise_hit(scene, id, world_point) {
+        return true;
+    }
+    let Some(local) = inspect_local_point(scene, id, world_point) else {
+        return false;
+    };
+    // Authoring targets the shaped text, including counters and whitespace.
+    // The baseline's conservative index box would also capture distant gaps.
+    fanta_render::text_path_selection_quads(text_path, 0..text_path.content.len())
+        .into_iter()
+        .any(|quad| {
+            crate::text_edit::screen_point_near_quad(local, quad.points.map(DVec2::from_array), 0.0)
+        })
 }
 
 pub(crate) fn accepts_precise_hit(

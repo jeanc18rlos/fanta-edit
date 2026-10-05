@@ -1258,7 +1258,7 @@ fn quad_bounds(quad: [DVec2; 4]) -> [f64; 4] {
     ]
 }
 
-fn screen_point_near_quad(point: DVec2, quad: [DVec2; 4], padding: f64) -> bool {
+pub(crate) fn screen_point_near_quad(point: DVec2, quad: [DVec2; 4], padding: f64) -> bool {
     if !point.is_finite()
         || !padding.is_finite()
         || padding < 0.0
