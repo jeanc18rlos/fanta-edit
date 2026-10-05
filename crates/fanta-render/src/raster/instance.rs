@@ -3,6 +3,7 @@
 //! ([`render_expanded`]) mirroring the live-scene walk. Also hosts the public
 //! [`solve_scene_layout`] entry point for scene-direct auto-layout frames.
 use super::effects::group_clips_children;
+use super::renderer::PreparedInstance;
 use super::{
     Arc, BlendMode, Bounds, Canvas, CanvasNode, ExpandedNode, HashMap, InstanceCacheKey,
     InstanceNode, NodeData, NodeFlags, NodeId, RenderCtx, Scene, apply_background_blur,
@@ -43,7 +44,7 @@ pub(crate) fn render_instance(
         ctx.instance_mode_anchor.unwrap_or(instance_id)
     };
     let expanded = expand_instance_memoized(ctx, instance_id, inst, mode_anchor);
-    if expanded.is_empty() {
+    if expanded.nodes.is_empty() {
         ctx.metrics.incomplete_artwork = true;
         // Genuinely unresolvable instance (master deleted / not loaded). Draw a
         // faint dashed outline of the instance box so it stays *locatable*
@@ -62,10 +63,16 @@ pub(crate) fn render_instance(
     // concatenated by the caller) is what positions this instance. Descendant
     // transforms are relative to the root's local space, so they compose
     // correctly under that identity root.
-    let children = build_child_index(&expanded);
-    if let Some(root) = expanded.iter().find(|e| e.def_path.is_empty()) {
+    if let Some(root) = expanded.root.and_then(|index| expanded.nodes.get(index)) {
         let previous_mode_anchor = ctx.instance_mode_anchor.replace(mode_anchor);
-        render_expanded(canvas, &root.node, true, &expanded, &children, ctx);
+        render_expanded(
+            canvas,
+            &root.node,
+            true,
+            &expanded.nodes,
+            &expanded.children,
+            ctx,
+        );
         ctx.instance_mode_anchor = previous_mode_anchor;
     }
 }
@@ -79,7 +86,7 @@ pub(crate) fn expand_instance_memoized(
     instance_id: NodeId,
     inst: &InstanceNode,
     mode_anchor: NodeId,
-) -> Arc<Vec<ExpandedNode>> {
+) -> Arc<PreparedInstance> {
     let expansion_context = fanta_doc::InstanceExpansionContext::new(
         ctx.inputs.variables,
         ctx.inputs.active_modes,
@@ -125,7 +132,7 @@ pub(crate) fn expand_instance_memoized(
         // a fresh wide subtree at every level before the walk reaches its cap.
         for _ in ctx.scene.descendants_of(component.resolved_root) {
             if !budget.reserve_expanded_node() {
-                return Arc::new(Vec::new());
+                return Arc::new(PreparedInstance::default());
             }
         }
     }
@@ -144,7 +151,8 @@ pub(crate) fn expand_instance_memoized(
     if inst.derived.is_empty() {
         fanta_doc::solve_expanded(&mut expanded, &mut measure_text_node);
     }
-    let expanded = Arc::new(expanded);
+    let expanded = Arc::new(PreparedInstance::new(expanded));
+    ctx.metrics.instance_indexes_built += 1;
     ctx.instance_cache.insert(key, Arc::clone(&expanded));
     expanded
 }
@@ -287,7 +295,7 @@ fn expanded_subtree_bounds(
 
 /// Map each expanded clone's parent id → its child clone indices, so the
 /// transient subtree can be walked top-down without a scene. Built once per
-/// instance render and indexed by clone `NodeId`.
+/// cached expansion and indexed by clone `NodeId`.
 pub(crate) fn build_child_index(expanded: &[ExpandedNode]) -> HashMap<NodeId, Vec<usize>> {
     let mut children: HashMap<NodeId, Vec<usize>> = HashMap::new();
     for (i, e) in expanded.iter().enumerate() {

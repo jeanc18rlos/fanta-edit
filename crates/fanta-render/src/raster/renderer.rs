@@ -7,10 +7,10 @@
 //! [`InstanceCache`]: InstanceCache
 use super::{
     AlphaType, Arc, AssetResolver, BTreeMap, Canvas, Color, ColorType, ComponentLibrary,
-    EncodedImageFormat, ExpandedNode, Fill, Hash, Hasher, IdHashMap, ImageCache, ImageInfo,
-    InstanceNode, Instant, LayerCache, LayerEpoch, ModeId, NodeData, NodeId, PatternCache, Rect,
-    RenderCtx, Scene, Surface, VariableCollectionId, VariableRegistry, Viewport, render_node,
-    surfaces, to_sk_color, visible_world_rect,
+    EncodedImageFormat, ExpandedNode, Fill, Hash, HashMap, Hasher, IdHashMap, ImageCache,
+    ImageInfo, InstanceNode, Instant, LayerCache, LayerEpoch, ModeId, NodeData, NodeId,
+    PatternCache, Rect, RenderCtx, Scene, Surface, VariableCollectionId, VariableRegistry,
+    Viewport, render_node, surfaces, to_sk_color, visible_world_rect,
 };
 use fanta_doc::AssetId;
 
@@ -42,6 +42,8 @@ pub struct RenderMetrics {
     /// per-node geometry-stamp invalidation: a steady frame reports 0, an
     /// edit to one node reports 1, never the scene size.
     pub paths_built: u32,
+    /// Instance child indexes prepared on expansion misses; cache hits reuse them.
+    pub instance_indexes_built: u32,
     /// Node-level effects save-layers pushed this frame (opacity, drop shadow,
     /// layer blur, blend mode, isolation). Each is an offscreen allocation and,
     /// on the GPU, its own render pass — the count is the observable for the
@@ -275,8 +277,29 @@ pub(crate) struct InstanceCache {
 /// One instance's memoized expansion and the key it was built under.
 pub(crate) struct InstanceCacheEntry {
     pub(crate) key: InstanceCacheKey,
-    pub(crate) expanded: Arc<Vec<ExpandedNode>>,
+    pub(crate) expanded: Arc<PreparedInstance>,
     last_used: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct PreparedInstance {
+    pub(crate) nodes: Vec<ExpandedNode>,
+    pub(crate) children: HashMap<NodeId, Vec<usize>>,
+    pub(crate) root: Option<usize>,
+}
+
+impl PreparedInstance {
+    pub(crate) fn new(nodes: Vec<ExpandedNode>) -> Self {
+        // These indices refer to the immutable expansion's slots, so they must
+        // be replaced and evicted with that expansion, preserving its tie order.
+        let children = super::instance::build_child_index(&nodes);
+        let root = nodes.iter().position(|entry| entry.def_path.is_empty());
+        Self {
+            nodes,
+            children,
+            root,
+        }
+    }
 }
 
 /// Frames an entry may go without a lookup before it is dropped. Long enough
@@ -315,7 +338,7 @@ impl InstanceCache {
 
     /// The memoized expansion for `key`'s instance, if it was built under
     /// exactly this key.
-    pub(crate) fn lookup(&mut self, key: &InstanceCacheKey) -> Option<Arc<Vec<ExpandedNode>>> {
+    pub(crate) fn lookup(&mut self, key: &InstanceCacheKey) -> Option<Arc<PreparedInstance>> {
         let entry = self.entries.get_mut(&key.instance)?;
         if entry.key != *key {
             return None;
@@ -324,7 +347,7 @@ impl InstanceCache {
         Some(Arc::clone(&entry.expanded))
     }
 
-    pub(crate) fn insert(&mut self, key: InstanceCacheKey, expanded: Arc<Vec<ExpandedNode>>) {
+    pub(crate) fn insert(&mut self, key: InstanceCacheKey, expanded: Arc<PreparedInstance>) {
         self.entries.insert(
             key.instance,
             InstanceCacheEntry {
@@ -1722,6 +1745,35 @@ mod instance_cache_tests {
     }
 
     #[test]
+    fn prepared_instance_preserves_equal_index_child_order_and_root_slot() {
+        let root = fanta_doc::CanvasNode::new(NodeData::Group(Default::default()));
+        let root_id = root.id;
+        let mut first = fanta_doc::CanvasNode::new(NodeData::Group(Default::default()));
+        first.parent = Some(root_id);
+        let first_id = first.id;
+        let mut second = fanta_doc::CanvasNode::new(NodeData::Group(Default::default()));
+        second.parent = Some(root_id);
+        let second_id = second.id;
+        assert_eq!(first.index, second.index);
+        let prepared = PreparedInstance::new(vec![
+            ExpandedNode {
+                node: second,
+                def_path: smallvec::smallvec![second_id],
+            },
+            ExpandedNode {
+                node: root,
+                def_path: Default::default(),
+            },
+            ExpandedNode {
+                node: first,
+                def_path: smallvec::smallvec![first_id],
+            },
+        ]);
+        assert_eq!(prepared.root, Some(1));
+        assert_eq!(prepared.children.get(&root_id), Some(&vec![0, 2]));
+    }
+
+    #[test]
     fn override_hash_is_served_from_the_stamp_memo_until_the_stamp_moves() {
         let mut cache = InstanceCache::default();
         let id = NodeId::new();
@@ -1772,13 +1824,13 @@ mod instance_cache_tests {
     fn a_changed_key_replaces_the_instances_entry_instead_of_leaking() {
         let mut cache = InstanceCache::default();
         let id = NodeId::new();
-        cache.insert(key(id, 1, 0), Arc::new(Vec::new()));
+        cache.insert(key(id, 1, 0), Arc::new(PreparedInstance::default()));
         assert!(cache.lookup(&key(id, 1, 0)).is_some());
         assert!(
             cache.lookup(&key(id, 2, 0)).is_none(),
             "a new override hash misses"
         );
-        cache.insert(key(id, 2, 0), Arc::new(Vec::new()));
+        cache.insert(key(id, 2, 0), Arc::new(PreparedInstance::default()));
         assert_eq!(cache.len(), 1, "one entry per instance");
         assert!(cache.lookup(&key(id, 1, 0)).is_none());
         assert!(cache.lookup(&key(id, 2, 0)).is_some());
@@ -1791,14 +1843,14 @@ mod instance_cache_tests {
         let live = NodeId::new();
         let stale_mode = NodeId::new();
         cache.begin_frame(&scene, 7);
-        cache.insert(key(live, 1, 7), Arc::new(Vec::new()));
-        cache.insert(key(stale_mode, 1, 6), Arc::new(Vec::new()));
+        cache.insert(key(live, 1, 7), Arc::new(PreparedInstance::default()));
+        cache.insert(key(stale_mode, 1, 6), Arc::new(PreparedInstance::default()));
         cache.begin_frame(&scene, 7);
         assert!(cache.lookup(&key(stale_mode, 1, 6)).is_none());
         assert!(cache.lookup(&key(live, 1, 7)).is_some());
 
         let idle = NodeId::new();
-        cache.insert(key(idle, 1, 7), Arc::new(Vec::new()));
+        cache.insert(key(idle, 1, 7), Arc::new(PreparedInstance::default()));
         for _ in 0..INSTANCE_CACHE_IDLE_FRAMES {
             cache.begin_frame(&scene, 7);
             // `live` is looked up every frame and must survive.

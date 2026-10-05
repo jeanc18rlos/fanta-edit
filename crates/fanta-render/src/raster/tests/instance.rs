@@ -602,3 +602,134 @@ fn editing_a_master_repaints_a_plain_instance() {
         "editing the master must repaint the instance blue, got {after:?}"
     );
 }
+
+fn indexed_instance_fixture() -> Result<(Doc, NodeId, NodeId), Box<dyn std::error::Error>> {
+    let mut doc = Doc::new();
+    let mut master = CanvasNode::new(NodeData::Group(GroupNode {
+        clip_size: Some([32.0, 32.0]),
+        ..Default::default()
+    }));
+    master.transform = Transform2D::translation(10_000.0, 0.0);
+    let master_id = master.id;
+    doc.apply(Operation::create_node(master))?;
+    let mut group = CanvasNode::new(NodeData::Group(GroupNode {
+        clip_size: Some([24.0, 24.0]),
+        ..Default::default()
+    }));
+    group.parent = Some(master_id);
+    group.transform = Transform2D::translation(4.0, 4.0);
+    let group_id = group.id;
+    doc.apply(Operation::create_node(group))?;
+    let mut red = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+        0.0,
+        0.0,
+        20.0,
+        20.0,
+        Color::rgb(255, 0, 0),
+    )));
+    red.parent = Some(group_id);
+    doc.apply(Operation::create_node(red))?;
+    let mut blue = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+        0.0,
+        0.0,
+        20.0,
+        20.0,
+        Color::rgb(0, 0, 255),
+    )));
+    blue.parent = Some(group_id);
+    blue.index = fanta_doc::IndexKey::after(fanta_doc::IndexKey::FIRST);
+    blue.transform = Transform2D::translation(4.0, 4.0);
+    let blue_id = blue.id;
+    doc.apply(Operation::create_node(blue))?;
+    let component = ComponentId::new();
+    doc.components.defs.insert(
+        component,
+        ComponentDef::new(component, master_id, "Indexed children"),
+    );
+    let mut placed = CanvasNode::new(NodeData::Instance(InstanceNode {
+        component,
+        overrides: Vec::new(),
+        prop_values: Default::default(),
+        derived: Vec::new(),
+        local_size: [32.0, 32.0],
+    }));
+    placed.transform = Transform2D::translation(-16.0, -16.0);
+    let placed_id = placed.id;
+    doc.apply(Operation::create_node(placed))?;
+    Ok((doc, placed_id, blue_id))
+}
+
+fn assert_indexed_instance_matches_fresh(
+    renderer: &mut RasterRenderer,
+    doc: &Doc,
+) -> Result<(RenderMetrics, Vec<u8>), Box<dyn std::error::Error>> {
+    let inputs = RenderInputs::for_doc(doc);
+    let metrics = renderer.render_with(&doc.scene, &doc.viewport, &inputs);
+    assert!(!metrics.incomplete_artwork);
+    let pixels = renderer.copy_rgba();
+    let mut fresh = RasterRenderer::new(64, 64)?;
+    fresh.render_with(&doc.scene, &doc.viewport, &inputs);
+    assert_eq!(
+        pixels,
+        fresh.copy_rgba(),
+        "cached and fresh instance pixels"
+    );
+    Ok((metrics, pixels))
+}
+
+#[test]
+fn instance_child_index_reuses_across_transform_frames() -> Result<(), Box<dyn std::error::Error>> {
+    let (mut doc, placed, _) = indexed_instance_fixture()?;
+    let mut renderer = RasterRenderer::new(64, 64)?;
+    let (cold, original) = assert_indexed_instance_matches_fresh(&mut renderer, &doc)?;
+    assert_eq!(cold.instance_indexes_built, 1);
+    assert_eq!(rgba_at(&original, 64, 32, 32), [0, 0, 255, 255]);
+    for offset in [0.0, 0.25, 1.0, -2.0] {
+        doc.scene
+            .set_transform(placed, Transform2D::translation(-16.0 + offset, -16.0))?;
+        let (warm, _) = assert_indexed_instance_matches_fresh(&mut renderer, &doc)?;
+        assert_eq!(warm.instance_indexes_built, 0, "translation {offset}");
+    }
+    renderer.clear_instance_cache();
+    let (cleared, _) = assert_indexed_instance_matches_fresh(&mut renderer, &doc)?;
+    assert_eq!(cleared.instance_indexes_built, 1);
+    Ok(())
+}
+
+#[test]
+fn instance_child_index_rebuilds_on_master_reorder_preview_and_undo()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut doc, _, blue) = indexed_instance_fixture()?;
+    let mut renderer = RasterRenderer::new(64, 64)?;
+    let (_, original) = assert_indexed_instance_matches_fresh(&mut renderer, &doc)?;
+    let old = doc.scene.get(blue).expect("blue child").index;
+    doc.apply(Operation::SetIndex {
+        id: blue,
+        old,
+        new: fanta_doc::IndexKey::before(fanta_doc::IndexKey::FIRST),
+    })?;
+    let (reordered, pixels) = assert_indexed_instance_matches_fresh(&mut renderer, &doc)?;
+    assert_eq!(reordered.instance_indexes_built, 1);
+    assert_ne!(pixels, original);
+    assert_eq!(rgba_at(&pixels, 64, 32, 32), [255, 0, 0, 255]);
+    assert!(doc.undo()?);
+    let (undone, pixels) = assert_indexed_instance_matches_fresh(&mut renderer, &doc)?;
+    assert_eq!(undone.instance_indexes_built, 1);
+    assert_eq!(pixels, original);
+
+    let original_transform = doc.scene.get(blue).expect("blue child").transform;
+    doc.scene
+        .set_transform(blue, Transform2D::translation(30.0, 0.0))?;
+    assert_eq!(doc.components.bump_preview_for_node(&doc.scene, blue), 1);
+    let (preview, pixels) = assert_indexed_instance_matches_fresh(&mut renderer, &doc)?;
+    assert_eq!(preview.instance_indexes_built, 1);
+    assert_ne!(pixels, original);
+    doc.scene.set_transform(blue, original_transform)?;
+    assert_eq!(doc.components.bump_preview_for_node(&doc.scene, blue), 1);
+    let (cancelled, pixels) = assert_indexed_instance_matches_fresh(&mut renderer, &doc)?;
+    assert_eq!(cancelled.instance_indexes_built, 1);
+    assert_eq!(pixels, original);
+    let (settled, _) = assert_indexed_instance_matches_fresh(&mut renderer, &doc)?;
+    assert_eq!(settled.instance_indexes_built, 0);
+    Ok(())
+}
