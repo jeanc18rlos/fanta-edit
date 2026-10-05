@@ -6057,7 +6057,7 @@ impl FigView {
                     .child(
                         div().flex_1().min_w_0().child(
                             Label::new(
-                                "Canvas editing is locked while FNX has unsaved changes. Pan and selection remain available; save FNX to resume editing.",
+                                "Canvas editing is locked while source has unsaved changes. Pan and selection remain available; save or discard the source edits to resume editing.",
                             )
                             .size(LabelSize::Small)
                             .line_clamp(2),

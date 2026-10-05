@@ -13,12 +13,16 @@ use gpui::{
 };
 use language::{Buffer, Capability};
 use project::Project;
+use search::{
+    BufferSearchBar,
+    buffer_search::{Deploy, DivRegistrar},
+};
 use serde::Deserialize;
 use ui::Tooltip;
 use ui::prelude::*;
 
 use crate::document::{FigItem, FigItemEvent};
-use workspace::FollowableItem as _;
+use workspace::{FollowableItem as _, ItemHandle, ToolbarItemView as _};
 
 const EDITABLE_STATUS: &str = "Edit source · save to validate and update the canvas";
 
@@ -92,6 +96,8 @@ pub struct FantaCodeWorkspace {
     item: Entity<FigItem>,
     project: Entity<Project>,
     focus_handle: FocusHandle,
+    search_bar: Entity<BufferSearchBar>,
+    search_editor: Option<Entity<Editor>>,
     selected_file: CodeWorkspaceFile,
     requested_page: Option<NodeId>,
     /// The root whose source the panes are currently showing — a page root or
@@ -114,6 +120,7 @@ pub struct FantaCodeWorkspace {
     fnx_source_version: Option<clock::Global>,
     json_source_version: Option<clock::Global>,
     source_save_in_progress: bool,
+    source_discard_in_progress: bool,
     development_read_only: bool,
     source_writer: Option<design_surface::AgentActivity>,
     follow_source_writer: bool,
@@ -156,7 +163,7 @@ impl FantaCodeWorkspace {
                     // have. Preserve the editor when paths stay the same.
                     if this.saved_source_paths_changed(cx) {
                         this.refresh_from_item(window, cx);
-                    } else if !this.source_save_in_progress {
+                    } else if !this.source_save_in_progress && !this.source_discard_in_progress {
                         this.reload_saved_sources(window, cx);
                     }
                     this.update_fnx_editability(cx);
@@ -180,6 +187,8 @@ impl FantaCodeWorkspace {
             item,
             project,
             focus_handle: cx.focus_handle(),
+            search_bar: cx.new(|cx| BufferSearchBar::new(None, window, cx)),
+            search_editor: None,
             selected_file: CodeWorkspaceFile::Fnx,
             requested_page,
             source_root: None,
@@ -195,6 +204,7 @@ impl FantaCodeWorkspace {
             fnx_source_version: None,
             json_source_version: None,
             source_save_in_progress: false,
+            source_discard_in_progress: false,
             development_read_only: false,
             source_writer: None,
             follow_source_writer: false,
@@ -292,6 +302,7 @@ impl FantaCodeWorkspace {
 
     pub(crate) fn source_is_dirty(&self, cx: &App) -> bool {
         self.source_save_in_progress
+            || self.source_discard_in_progress
             || [&self.fnx_source_buffer, &self.json_source_buffer]
                 .into_iter()
                 .flatten()
@@ -307,9 +318,9 @@ impl FantaCodeWorkspace {
     }
 
     pub(crate) fn save_source_edit(&mut self, cx: &mut Context<Self>) -> Option<Task<Result<()>>> {
-        if self.source_save_in_progress {
+        if self.source_save_in_progress || self.source_discard_in_progress {
             return Some(Task::ready(Err(anyhow!(
-                "a source save is already in progress"
+                "a source operation is already in progress"
             ))));
         }
         let files = match self.selected_file {
@@ -346,7 +357,13 @@ impl FantaCodeWorkspace {
         let (source, version, capability) = buffer.read_with(cx, |buffer, _| {
             (buffer.text(), buffer.version(), buffer.capability())
         });
-        buffer.update(cx, |buffer, cx| buffer.set_capability(Capability::Read, cx));
+        let authored_transaction = buffer.update(cx, |buffer, cx| {
+            let transaction = buffer
+                .finalize_last_transaction()
+                .map(|transaction| transaction.id);
+            buffer.set_capability(Capability::Read, cx);
+            transaction
+        });
         self.source_save_in_progress = true;
         self.error_message = None;
         self.update_fnx_editability(cx);
@@ -379,9 +396,19 @@ impl FantaCodeWorkspace {
                     "source changed while saving; resolve the newer edit before retrying"
                 );
                 let reload_buffer = project.update(cx, |project, cx| {
-                    project.reload_buffers(std::iter::once(buffer.clone()).collect(), false, cx)
+                    project.reload_buffers(std::iter::once(buffer.clone()).collect(), true, cx)
                 });
-                reload_buffer.await?;
+                let reloaded = reload_buffer.await?;
+                if let Some(authored) = authored_transaction
+                    && let Some(transaction) = reloaded.0.get(&buffer)
+                    && transaction.id != authored
+                {
+                    buffer.update(cx, |buffer, _| {
+                        if buffer.get_transaction(authored).is_some() {
+                            buffer.merge_transactions(transaction.id, authored);
+                        }
+                    });
+                }
                 anyhow::ensure!(
                     buffer.read_with(cx, |buffer, _| !buffer.has_unsaved_edits()),
                     "source changed while refreshing the editor; resolve its file conflict"
@@ -416,11 +443,23 @@ impl FantaCodeWorkspace {
                             .collect()
                     })?;
                     let reload_buffer = project.update(cx, |project, cx| {
-                        project.reload_buffers(saved_buffers, false, cx)
+                        project.reload_buffers(saved_buffers, true, cx)
                     });
-                    reload_buffer
+                    let reloaded = reload_buffer
                         .await
                         .context("refreshing computed source geometry")?;
+                    // The canonical geometry belongs to the source edit that caused it.
+                    // A no-op reload can return that same transaction, so never forget it.
+                    if let Some(authored) = authored_transaction
+                        && let Some(transaction) = reloaded.0.get(&buffer)
+                        && transaction.id != authored
+                    {
+                        buffer.update(cx, |buffer, _| {
+                            if buffer.get_transaction(authored).is_some() {
+                                buffer.merge_transactions(transaction.id, authored);
+                            }
+                        });
+                    }
                 }
                 if !diagnostics.is_empty() {
                     log::warn!("FNX saved with {} source diagnostics", diagnostics.len());
@@ -449,9 +488,9 @@ impl FantaCodeWorkspace {
     }
 
     pub(crate) fn discard_source_edit(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
-        if self.source_save_in_progress {
+        if self.source_save_in_progress || self.source_discard_in_progress {
             return Task::ready(Err(anyhow!(
-                "wait for the source save to finish before discarding changes"
+                "wait for the source operation to finish before discarding changes"
             )));
         }
         let buffers = [&self.fnx_source_buffer, &self.json_source_buffer]
@@ -494,6 +533,82 @@ impl FantaCodeWorkspace {
                 Ok(())
             }
         })
+    }
+
+    fn discard_current_source_edit(&mut self, cx: &mut Context<Self>) -> Task<Result<()>> {
+        if self.source_save_in_progress || self.source_discard_in_progress {
+            return Task::ready(Err(anyhow!(
+                "wait for the source operation to finish before discarding changes"
+            )));
+        }
+        let source = match self.selected_file {
+            CodeWorkspaceFile::Fnx => self.fnx_source_buffer.as_ref(),
+            CodeWorkspaceFile::Json => self.json_source_buffer.as_ref(),
+        };
+        let Some(buffer) = source
+            .filter(|buffer| {
+                let buffer = buffer.read(cx);
+                buffer.is_dirty() || buffer.has_unsaved_edits()
+            })
+            .cloned()
+        else {
+            return Task::ready(Ok(()));
+        };
+        let label = self.selected_file.label();
+        let capability = buffer.read(cx).capability();
+        buffer.update(cx, |buffer, cx| buffer.set_capability(Capability::Read, cx));
+        self.source_discard_in_progress = true;
+        self.update_fnx_editability(cx);
+        cx.notify();
+        let reload = self.project.update(cx, |project, cx| {
+            project.reload_buffers(std::iter::once(buffer.clone()).collect(), false, cx)
+        });
+        cx.spawn(async move |this, cx| {
+            let result: Result<()> = async {
+                reload.await?;
+                anyhow::ensure!(
+                    buffer.read_with(cx, |buffer, _| {
+                        !buffer.is_dirty() && !buffer.has_unsaved_edits()
+                    }),
+                    "source changed again while discarding its edits"
+                );
+                Ok(())
+            }
+            .await;
+            buffer.update(cx, |buffer, cx| buffer.set_capability(capability, cx));
+            this.update(cx, |this, cx| {
+                this.source_discard_in_progress = false;
+                let still_dirty = this.source_is_dirty(cx);
+                this.item.update(cx, |item, cx| {
+                    item.set_source_edit_locked(still_dirty, cx);
+                    if !still_dirty {
+                        item.mark_source_layout_unsaved(cx);
+                    }
+                });
+                this.error_message = result
+                    .as_ref()
+                    .err()
+                    .map(|error| format!("Could not discard {label}: {error:#}").into());
+                this.update_fnx_editability(cx);
+                cx.notify();
+            })?;
+            result
+        })
+    }
+
+    fn sync_search_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let editor = self.active_editor().cloned();
+        if editor == self.search_editor {
+            return;
+        }
+        self.search_bar.update(cx, |search_bar, cx| {
+            search_bar.set_active_pane_item(
+                editor.as_ref().map(|editor| editor as &dyn ItemHandle),
+                window,
+                cx,
+            );
+        });
+        self.search_editor = editor;
     }
 
     fn saved_source_paths_changed(&self, cx: &App) -> bool {
@@ -539,7 +654,7 @@ impl FantaCodeWorkspace {
         }
         let reload = self
             .project
-            .update(cx, |project, cx| project.reload_buffers(buffers, false, cx));
+            .update(cx, |project, cx| project.reload_buffers(buffers, true, cx));
         cx.spawn_in(window, async move |this, cx| {
             let result = reload.await;
             if let Err(error) = this.update_in(cx, |this, _, cx| {
@@ -789,7 +904,8 @@ impl FantaCodeWorkspace {
     fn update_fnx_editability(&mut self, cx: &mut Context<Self>) {
         let read_only = self.development_read_only
             || self.item.read(cx).is_dirty()
-            || self.source_save_in_progress;
+            || self.source_save_in_progress
+            || self.source_discard_in_progress;
         for editor in [&self.fnx_editor, &self.json_editor].into_iter().flatten() {
             if editor.read(cx).read_only(cx) != read_only {
                 editor.update(cx, |editor, _| editor.set_read_only(read_only));
@@ -1213,7 +1329,8 @@ impl Focusable for FantaCodeWorkspace {
 }
 
 impl Render for FantaCodeWorkspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_search_editor(window, cx);
         let error_message = self.error_message.clone().or_else(|| {
             self.item
                 .read(cx)
@@ -1226,7 +1343,9 @@ impl Render for FantaCodeWorkspace {
             Color::Muted
         };
         let status = error_message.unwrap_or_else(|| {
-            if self.source_save_in_progress {
+            if self.source_discard_in_progress {
+                format!("Discarding {} draft…", self.selected_file.label()).into()
+            } else if self.source_save_in_progress {
                 format!("Saving {}…", self.selected_file.label()).into()
             } else if self.source_writer_matches_file() {
                 format!(
@@ -1249,7 +1368,24 @@ impl Render for FantaCodeWorkspace {
                 EDITABLE_STATUS.into()
             }
         });
-        v_flex()
+        let selected_dirty = match self.selected_file {
+            CodeWorkspaceFile::Fnx => self.fnx_source_buffer.as_ref(),
+            CodeWorkspaceFile::Json => self.json_source_buffer.as_ref(),
+        }
+        .is_some_and(|buffer| buffer.read(cx).is_dirty() || buffer.read(cx).has_unsaved_edits());
+        let mut context = gpui::KeyContext::new_with_defaults();
+        self.search_bar
+            .read(cx)
+            .contribute_context(&mut context, cx);
+        let mut registrar = DivRegistrar::new(
+            |this: &Self, _, _| this.active_editor().map(|_| this.search_bar.clone()),
+            cx,
+        );
+        BufferSearchBar::register(&mut registrar);
+        registrar
+            .into_div()
+            .v_flex()
+            .key_context(context)
             .track_focus(&self.focus_handle)
             .size_full()
             // The floating workspace selector must not cover source controls.
@@ -1274,6 +1410,39 @@ impl Render for FantaCodeWorkspace {
                                 .single_line(),
                         ),
                     )
+                    .child(
+                        Button::new("fanta-source-find", "Find")
+                            .size(ButtonSize::Compact)
+                            .disabled(self.active_editor().is_none())
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.sync_search_editor(window, cx);
+                                this.search_bar.update(cx, |search_bar, cx| {
+                                    search_bar.deploy(&Deploy::find(), None, window, cx);
+                                });
+                                cx.notify();
+                            })),
+                    )
+                    .when(selected_dirty, |element| {
+                        element.child(
+                            div()
+                                .debug_selector(|| "fanta-source-discard-target".to_owned())
+                                .child(
+                                    Button::new("fanta-source-discard", "Discard draft")
+                                        .size(ButtonSize::Compact)
+                                        .disabled(
+                                            self.source_save_in_progress
+                                                || self.source_discard_in_progress,
+                                        )
+                                        .tooltip(Tooltip::text(
+                                            "Discard unsaved changes in the selected source file",
+                                        ))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.discard_current_source_edit(cx)
+                                                .detach_and_log_err(cx);
+                                        })),
+                                ),
+                        )
+                    })
                     .when(self.source_writer_matches_file(), |element| {
                         element.child(
                             Button::new(
@@ -1293,6 +1462,17 @@ impl Render for FantaCodeWorkspace {
                             )),
                         )
                     }),
+            )
+            .when(
+                !self.search_bar.read(cx).is_dismissed() && self.active_editor().is_some(),
+                |element| {
+                    element.child(
+                        div()
+                            .debug_selector(|| "fanta-source-search".to_owned())
+                            .flex_none()
+                            .child(self.search_bar.clone()),
+                    )
+                },
             )
             .child(div().flex_1().min_h_0().child(self.render_body(cx)))
     }
@@ -2926,5 +3106,561 @@ mod tests {
         for tag in &tags {
             assert!(source[tag.offset..].starts_with('<'), "{}", tag.offset);
         }
+    }
+    fn bind_source_editor_keys(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                "keymaps/default-macos.json",
+                cx,
+            )
+            .expect("default editor keymap");
+            cx.bind_keys(bindings);
+        });
+    }
+
+    #[gpui::test]
+    async fn embedded_source_find_keeps_fnx_and_json_unchanged(cx: &mut TestAppContext) {
+        init_test(cx);
+        bind_source_editor_keys(cx);
+        let temporary = tempfile::tempdir().expect("temporary project");
+        write_project_with_children(temporary.path());
+        let (_, item, window) = open_code_workspace(temporary.path(), cx).await;
+        let workspace = window.entity(cx).expect("source workspace");
+        let before_document = item.read_with(cx, |item, _| {
+            serde_json::to_value(item.doc().expect("document")).expect("document snapshot")
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let cx = &mut visual;
+        cx.simulate_resize(gpui::size(px(1100.0), px(700.0)));
+        for (file, query, read_only) in [
+            (CodeWorkspaceFile::Fnx, "Second child", false),
+            (CodeWorkspaceFile::Json, "Home", false),
+            (CodeWorkspaceFile::Fnx, "First child", true),
+        ] {
+            let (editor, before_text) = workspace.update_in(cx, |workspace, window, cx| {
+                workspace.set_development_read_only(read_only, cx);
+                workspace.select_file(file, window, cx);
+                let editor = workspace.active_editor().expect("source editor").clone();
+                let text = editor.read(cx).buffer().read(cx).snapshot(cx).text();
+                (editor, text)
+            });
+            cx.run_until_parked();
+            cx.simulate_keystrokes("cmd-f cmd-a");
+            cx.simulate_input(query);
+            cx.run_until_parked();
+            assert_eq!(
+                editor.read_with(cx, |editor, cx| editor
+                    .buffer()
+                    .read(cx)
+                    .snapshot(cx)
+                    .text()),
+                before_text,
+                "Find input must never become an authored source edit"
+            );
+            assert!(cx.debug_bounds("fanta-source-search").is_some());
+            workspace.read_with(cx, |workspace, cx| {
+                let search = workspace.search_bar.read(cx);
+                assert_eq!(search.query(cx), query);
+                assert!(
+                    search.has_active_match(),
+                    "query must match the active source"
+                );
+            });
+            workspace.read_with(cx, |workspace, cx| assert!(!workspace.source_is_dirty(cx)));
+            item.read_with(cx, |item, _| {
+                assert!(!item.source_edit_locked());
+                assert_eq!(
+                    serde_json::to_value(item.doc().expect("document")).expect("document"),
+                    before_document
+                );
+            });
+            cx.simulate_keystrokes("escape");
+            cx.run_until_parked();
+            editor.update_in(cx, |editor, window, cx| {
+                assert!(editor.focus_handle(cx).is_focused(window));
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn embedded_source_find_retargets_a_new_page(cx: &mut TestAppContext) {
+        init_test(cx);
+        bind_source_editor_keys(cx);
+        let temporary = tempfile::tempdir().expect("temporary project");
+        let page = write_project(temporary.path());
+        let (mut doc, assets) =
+            fanta_format::read_project_tree(temporary.path()).expect("document");
+        let mut other = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        other.name = "Other needle".to_owned();
+        let other_page = other.id;
+        doc.scene.insert(other).expect("other page");
+        doc.add_page(other_page);
+        fanta_format::write_project_tree(temporary.path(), &doc, &assets).expect("two pages");
+        let (_, item, window) = open_code_workspace(temporary.path(), cx).await;
+        let workspace = window.entity(cx).expect("workspace");
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let cx = &mut visual;
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.select_file(CodeWorkspaceFile::Fnx, window, cx);
+        });
+        cx.simulate_keystrokes("cmd-f");
+        cx.simulate_input("Original");
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("fanta-source-search").is_some());
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.set_active_page(Some(other_page));
+                ((), crate::document::DocChange::Selection)
+            });
+        });
+        cx.run_until_parked();
+        let editor = workspace.update_in(cx, |workspace, window, cx| {
+            assert_eq!(workspace.requested_page, Some(other_page));
+            assert_ne!(workspace.requested_page, Some(page));
+            workspace.select_file(CodeWorkspaceFile::Fnx, window, cx);
+            workspace.active_editor().expect("other editor").clone()
+        });
+        let text = editor.read_with(cx, |editor, cx| {
+            editor.buffer().read(cx).snapshot(cx).text()
+        });
+        cx.simulate_keystrokes("cmd-f cmd-a");
+        cx.simulate_input("Other needle");
+        cx.run_until_parked();
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .text()),
+            text
+        );
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(!workspace.source_is_dirty(cx));
+            let search = workspace.search_bar.read(cx);
+            assert_eq!(search.query(cx), "Other needle");
+            assert!(
+                search.has_active_match(),
+                "Find must target the newly loaded page"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn source_save_preserves_authored_undo_without_geometry(cx: &mut TestAppContext) {
+        init_test(cx);
+        bind_source_editor_keys(cx);
+        let temporary = tempfile::tempdir().expect("temporary project");
+        let (page, _) = write_project_with_children(temporary.path());
+        let path = page_source_path(temporary.path(), page);
+        let original = std::fs::read_to_string(&path).expect("FNX");
+        let changed = original.replace("Second child", "Renamed child");
+        let (_, item, window) = open_code_workspace(temporary.path(), cx).await;
+        let workspace = window.entity(cx).expect("workspace");
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let cx = &mut visual;
+        let editor = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.select_file(CodeWorkspaceFile::Fnx, window, cx);
+            workspace.active_editor().expect("FNX editor").clone()
+        });
+        cx.simulate_keystrokes("cmd-a");
+        cx.update(|_, cx| cx.write_to_clipboard(ClipboardItem::new_string(changed.clone())));
+        cx.simulate_keystrokes("cmd-v");
+        cx.run_until_parked();
+        let save = workspace.update(cx, |workspace, cx| {
+            workspace.save_source_edit(cx).expect("save")
+        });
+        save.await.expect("save source");
+        cx.run_until_parked();
+        assert_eq!(std::fs::read_to_string(&path).expect("saved FNX"), changed);
+        item.update(cx, |item, cx| {
+            item.save(crate::document::SaveKind::Explicit, cx)
+        })
+        .await
+        .expect("repeat Save with no authored changes");
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert_eq!(workspace.active_editor(), Some(&editor));
+            editor.focus_handle(cx).focus(window, cx);
+        });
+        cx.simulate_keystrokes("cmd-z");
+        cx.run_until_parked();
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .text()),
+            original
+        );
+        assert!(workspace.read_with(cx, |workspace, cx| workspace.source_is_dirty(cx)));
+        let save = workspace.update(cx, |workspace, cx| {
+            workspace.save_source_edit(cx).expect("save Undo")
+        });
+        save.await.expect("persist Undo");
+        cx.run_until_parked();
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("restored FNX"),
+            original
+        );
+        assert!(!item.read_with(cx, |item, _| item.is_dirty()));
+        cx.simulate_keystrokes("cmd-shift-z");
+        cx.run_until_parked();
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .text()),
+            changed
+        );
+    }
+
+    fn write_spacing_project(root: &Path) -> (NodeId, NodeId) {
+        let page = write_project(root);
+        let (mut document, assets) = fanta_format::read_project_tree(root).expect("document");
+        let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([120.0, 40.0]),
+            auto_layout: Some(fanta_doc::AutoLayout {
+                spacing: 8.0,
+                primary_sizing: fanta_doc::AxisSizing::Fixed,
+                counter_sizing: fanta_doc::AxisSizing::Fixed,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        frame.parent = Some(page);
+        let parent = frame.id;
+        document.scene.insert(frame).expect("frame");
+        let mut second = None;
+        for index in 0..2 {
+            let mut child = CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode::rect_solid(
+                0.0,
+                0.0,
+                20.0,
+                20.0,
+                fanta_doc::Color::BLACK,
+            )));
+            child.parent = Some(parent);
+            child.index = if index == 0 {
+                IndexKey::FIRST
+            } else {
+                IndexKey::after(IndexKey::FIRST)
+            };
+            child.transform = fanta_doc::Transform2D::translation(f64::from(index) * 28.0, 0.0);
+            second = Some(child.id);
+            document.scene.insert(child).expect("child");
+        }
+        fanta_format::write_project_tree(root, &document, &assets).expect("spacing fixture");
+        (page, second.expect("two children"))
+    }
+
+    #[gpui::test]
+    async fn source_save_computed_geometry_undoes_with_the_authored_edit(cx: &mut TestAppContext) {
+        init_test(cx);
+        bind_source_editor_keys(cx);
+        let temporary = tempfile::tempdir().expect("temporary project");
+        let (page, child) = write_spacing_project(temporary.path());
+        let path = page_source_path(temporary.path(), page);
+        let original = std::fs::read_to_string(&path).expect("FNX");
+        let changed = original.replacen("\"spacing\": 8.0", "\"spacing\": 16.0", 1);
+        assert_ne!(changed, original, "fixture spacing encoding");
+        let (baseline, baseline_assets) =
+            fanta_format::read_project_tree(temporary.path()).expect("baseline");
+        let (_, _, window) = open_code_workspace(temporary.path(), cx).await;
+        let workspace = window.entity(cx).expect("workspace");
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let cx = &mut visual;
+        let editor = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.select_file(CodeWorkspaceFile::Fnx, window, cx);
+            workspace.active_editor().expect("editor").clone()
+        });
+        cx.simulate_keystrokes("cmd-a");
+        cx.update(|_, cx| cx.write_to_clipboard(ClipboardItem::new_string(changed.clone())));
+        cx.simulate_keystrokes("cmd-v");
+        cx.run_until_parked();
+        let save = workspace.update(cx, |workspace, cx| {
+            workspace.save_source_edit(cx).expect("save")
+        });
+        save.await.expect("save layout");
+        cx.run_until_parked();
+        let persisted = std::fs::read_to_string(&path).expect("computed FNX");
+        let (saved, _) = fanta_format::read_project_tree(temporary.path()).expect("saved");
+        assert_eq!(
+            saved
+                .scene
+                .get(child)
+                .expect("child")
+                .transform
+                .0
+                .translation
+                .x,
+            36.0
+        );
+        assert_ne!(persisted, changed);
+        editor.update_in(cx, |editor, window, cx| {
+            editor.focus_handle(cx).focus(window, cx)
+        });
+        cx.simulate_keystrokes("cmd-z");
+        cx.run_until_parked();
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .text()),
+            original,
+            "one Undo must restore the authored spacing and derived position together"
+        );
+        let save = workspace.update(cx, |workspace, cx| {
+            workspace.save_source_edit(cx).expect("save Undo")
+        });
+        save.await.expect("persist layout Undo");
+        cx.run_until_parked();
+        let (restored, assets) =
+            fanta_format::read_project_tree(temporary.path()).expect("restored");
+        assert_eq!(
+            serde_json::to_value(&restored.scene).expect("scene"),
+            serde_json::to_value(&baseline.scene).expect("baseline")
+        );
+        assert_eq!(assets, baseline_assets);
+        cx.simulate_keystrokes("cmd-shift-z");
+        cx.run_until_parked();
+        assert_eq!(
+            editor.read_with(cx, |editor, cx| editor
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .text()),
+            persisted
+        );
+        let save = workspace.update(cx, |workspace, cx| {
+            workspace.save_source_edit(cx).expect("save Redo")
+        });
+        save.await.expect("persist layout Redo");
+        cx.run_until_parked();
+        let (redone, _) = fanta_format::read_project_tree(temporary.path()).expect("redone");
+        assert_eq!(
+            serde_json::to_value(&redone.scene).expect("scene"),
+            serde_json::to_value(&saved.scene).expect("saved")
+        );
+    }
+
+    #[gpui::test]
+    async fn source_discard_button_discards_only_the_selected_draft(cx: &mut TestAppContext) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("project");
+        let page = write_project(temporary.path());
+        let path = page_source_path(temporary.path(), page);
+        let fnx = std::fs::read_to_string(&path).expect("FNX");
+        let json = std::fs::read_to_string(path.with_file_name("page.json")).expect("JSON");
+        let (_, item, window) = open_code_workspace(temporary.path(), cx).await;
+        let workspace = window.entity(cx).expect("workspace");
+        let before = item.read_with(cx, |item, _| {
+            serde_json::to_value(item.doc().expect("doc")).expect("document")
+        });
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let cx = &mut visual;
+        cx.simulate_resize(gpui::size(px(1600.0), px(800.0)));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace
+                .fnx_editor
+                .as_ref()
+                .expect("FNX")
+                .update(cx, |editor, cx| editor.set_text("<invalid FNX", window, cx));
+            workspace
+                .json_editor
+                .as_ref()
+                .expect("JSON")
+                .update(cx, |editor, cx| {
+                    editor.set_text("{ invalid JSON", window, cx)
+                });
+            workspace.select_file(CodeWorkspaceFile::Json, window, cx);
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        let button = cx
+            .debug_bounds("fanta-source-discard-target")
+            .expect("discard selected draft control");
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(
+                workspace
+                    .json_source_buffer
+                    .as_ref()
+                    .expect("JSON")
+                    .read(cx)
+                    .text(),
+                json
+            );
+            assert_eq!(
+                workspace
+                    .fnx_source_buffer
+                    .as_ref()
+                    .expect("FNX")
+                    .read(cx)
+                    .text(),
+                "<invalid FNX"
+            );
+            assert!(workspace.source_is_dirty(cx));
+            assert!(workspace.error_message.is_none());
+        });
+        item.read_with(cx, |item, _| {
+            assert!(item.source_edit_locked());
+            assert_eq!(
+                serde_json::to_value(item.doc().expect("doc")).expect("doc"),
+                before
+            );
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.select_file(CodeWorkspaceFile::Fnx, window, cx)
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        let button = cx
+            .debug_bounds("fanta-source-discard-target")
+            .expect("FNX discard");
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(!workspace.source_is_dirty(cx));
+            assert_eq!(
+                workspace
+                    .fnx_source_buffer
+                    .as_ref()
+                    .expect("FNX")
+                    .read(cx)
+                    .text(),
+                fnx
+            );
+        });
+        item.read_with(cx, |item, _| assert!(!item.source_edit_locked()));
+        assert_eq!(std::fs::read_to_string(path).expect("unchanged FNX"), fnx);
+    }
+
+    #[gpui::test]
+    async fn source_discard_button_retains_validated_layout_after_invalid_json(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("project");
+        let (page, child) = write_spacing_project(temporary.path());
+        let path = page_source_path(temporary.path(), page);
+        let original = std::fs::read_to_string(&path).expect("FNX");
+        let (_, baseline_assets) =
+            fanta_format::read_project_tree(temporary.path()).expect("baseline");
+        let (_, item, window) = open_code_workspace(temporary.path(), cx).await;
+        let workspace = window.entity(cx).expect("workspace");
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        let cx = &mut visual;
+        cx.simulate_resize(gpui::size(px(1600.0), px(800.0)));
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace
+                .fnx_editor
+                .as_ref()
+                .expect("FNX")
+                .update(cx, |editor, cx| {
+                    editor.set_text(
+                        original.replacen("\"spacing\": 8.0", "\"spacing\": 16.0", 1),
+                        window,
+                        cx,
+                    );
+                });
+            workspace
+                .json_editor
+                .as_ref()
+                .expect("JSON")
+                .update(cx, |editor, cx| {
+                    editor.set_text("{ invalid JSON", window, cx);
+                });
+            workspace.select_file(CodeWorkspaceFile::Fnx, window, cx);
+        });
+        cx.run_until_parked();
+        let save = workspace.update(cx, |workspace, cx| {
+            workspace.save_source_edit(cx).expect("save both")
+        });
+        assert!(
+            save.await.is_err(),
+            "invalid second source must still reject Save"
+        );
+        cx.run_until_parked();
+        let (persisted_before, _) =
+            fanta_format::read_project_tree(temporary.path()).expect("validated source");
+        assert_eq!(
+            persisted_before
+                .scene
+                .get(child)
+                .expect("child")
+                .transform
+                .0
+                .translation
+                .x,
+            28.0
+        );
+        let expected = item.read_with(cx, |item, _| {
+            assert!(item.source_edit_locked());
+            assert!(item.has_unpersisted_source_layout());
+            let doc = item.doc().expect("doc");
+            assert_eq!(
+                doc.scene
+                    .get(child)
+                    .expect("computed child")
+                    .transform
+                    .0
+                    .translation
+                    .x,
+                36.0
+            );
+            serde_json::to_value(doc).expect("computed document")
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.select_file(CodeWorkspaceFile::Json, window, cx)
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        let button = cx
+            .debug_bounds("fanta-source-discard-target")
+            .expect("discard invalid JSON");
+        cx.simulate_click(button.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert!(!item.source_edit_locked());
+            assert!(item.is_dirty());
+            assert!(item.has_unpersisted_source_layout());
+            assert_eq!(
+                serde_json::to_value(item.doc().expect("doc")).expect("doc"),
+                expected
+            );
+        });
+        item.update(cx, |item, cx| {
+            item.save(crate::document::SaveKind::Explicit, cx)
+        })
+        .await
+        .expect("save retained layout");
+        cx.run_until_parked();
+        let (saved, assets) = fanta_format::read_project_tree(temporary.path()).expect("reopen");
+        let mut actual = serde_json::to_value(&saved).expect("saved document");
+        let mut expected_saved = persisted_before;
+        expected_saved
+            .scene
+            .get_mut(child)
+            .expect("expected child")
+            .transform = fanta_doc::Transform2D::translation(36.0, 0.0);
+        let mut expected = serde_json::to_value(&expected_saved).expect("expected saved document");
+        actual["metadata"]
+            .as_object_mut()
+            .expect("metadata")
+            .remove("modified_at");
+        expected["metadata"]
+            .as_object_mut()
+            .expect("metadata")
+            .remove("modified_at");
+        assert_eq!(actual, expected, "only persisted timestamp may change");
+        assert_eq!(assets, baseline_assets);
+        item.read_with(cx, |item, _| {
+            assert!(!item.source_edit_locked());
+            assert!(!item.is_dirty());
+            assert!(!item.has_unpersisted_source_layout());
+        });
     }
 }
