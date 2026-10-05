@@ -190,8 +190,11 @@ Native New Design on `450efc8793` passed picker cancellation with all 30 files
 of the previous project unchanged, project creation and text insertion/save.
 It exposed a dark-canvas/light-inspector background mismatch and repeated local
 image placement rejection while the native picker was open. The canvas background pixel regression passed for default, authored and
-explicitly transparent pages without changing document data. The media fix and
-a rebuild/native recheck are pending. The same new project's invalid-source journey passed:
+explicitly transparent pages without changing document data. The rebuilt native
+app now places PNGs through the system picker and shows the matching light page
+background. One Undo/Save restores all typed document data except the modification
+timestamp; the imported PNG remains unreferenced on disk, so strict file equality
+is explicitly not claimed. The same new project's invalid-source journey passed:
 saving broken FNX showed a parse error and left all 19 files unchanged; the canvas
 retained its text and blocked a drag. Native source Undo/Save cleared the lock,
 and a subsequent drag saved its position. Canvas Undo/Save restored all typed
@@ -200,6 +203,20 @@ content except `metadata.modified_at`. Evidence is in
 PDF exports of the text also passed visual inspection at 87×19; a repeated PDF
 export created `Text-2.pdf` and preserved all original export hashes. Evidence:
 `native-acceptance-20261005/native-text-export-results.json`.
+
+The later native build used `793aa5cb91` plus the resolver change committed as
+`ed4efa03ee` and the unchanged, separate agent-presence working-tree edit. Its
+binary SHA-256 is
+`4ca4c465ae4d6b4b1ad198b34367b4d5984ef5aa0dbbac58dfbd2dba98ad0593`.
+Source provenance and observed results are in
+`native-acceptance-latest-20261005/`. Native two-page Save As preserved exact typed
+document data and asset bytes; two successive Quit/relaunch journeys restored
+both scoped tabs and the latest active tab/page. No fixed delay was inserted
+between navigation and Quit, although native event-delivery latency was not
+measured. All 30 source files, 30 destination files and 24 files in the separate
+media project retained their hashes through both restarts. A long image name
+exposed an Export-button overflow; its component fix and native recheck are
+tracked separately.
 
 A new forced-write-failure regression passed 1/1 and is committed at
 `8b572a41c1`. It pauses a real save, makes newer edits and places an image, then
@@ -431,8 +448,11 @@ against an explicitly isolated QA app/project: it writes a rectangle and can
 reuse a running app. Retain its assertions and screenshot alongside native UI
 evidence. It is intentionally outside the default runner.
 
-The `Check` workflow runs the runner's engine, import, source-order, editor and
-UI stages and uploads their logs/results, including after a failed test stage.
+The `Check` workflow runs the runner's engine, import, source-order, editor,
+workspace and UI stages and uploads their logs/results, including after a failed test stage.
+The default runner also includes build and lint. Workspace coverage exercises
+serialization ordering, immediate Quit, Hot Exit and tab restoration alongside
+the canvas-specific journeys in the editor suite.
 It also covers account/provider, sidebar, Git and Mac App Store execution
 restrictions. Verify both hosted jobs for the exact
 candidate revision; local editor suites do not replace them. Run the optional
