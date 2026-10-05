@@ -113,7 +113,9 @@ or during prototype presentation.
 Flatten is unavailable when it would discard images, mixed text colors or
 decorations, child effects, clipping, layout, bindings, animation or component
 links. Supported simple vector groups and boolean geometry remain convertible.
-This restriction preserves content instead of producing a lossy replacement.
+If another layer uses the node or one of its children as a pattern source,
+Flatten refuses the operation with an explanation and leaves the document
+unchanged. This reference check happens when the command runs.
 
 Implementation: [view_context_menu.rs](../../crates/fig_viewer/src/view_context_menu.rs).
 

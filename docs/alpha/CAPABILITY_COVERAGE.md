@@ -40,31 +40,34 @@ The integrated working tree passed all seven default verification stages.
 The initial evidence is retained under
 `target/release-verification/2026-10-05-release-polish/`, including command output
 and environment records. Final engine evidence is in
-`2026-10-05-engine-final/`; the complete final editor and benchmark-test run is
-in `2026-10-05-candidate-editor/`, and final Clippy is in
-`2026-10-05-candidate-lint/`, all under `target/release-verification/`.
-The final editor run includes Boolean context-menu targeting, Flatten appearance
-and Undo, and the export-label regression found during native QA. Four focused
+`2026-10-05-engine-final/`; the latest complete editor, benchmark-test and
+app/CLI build checks are in `2026-10-05-pattern-guard-final/`, all under
+`target/release-verification/`. The final Clippy rerun passed in
+`2026-10-05-pattern-guard-lint/`. The combined run's earlier failed lint log is
+retained: a redundant clone in a new test was removed before the successful
+lint-only rerun.
+The latest editor run includes Boolean context-menu targeting, Flatten appearance
+and pattern-source guards, Undo, the mounted-pointer regression and the
+export-label regression found during native QA. Four focused
 export checks also wrote page/selection PNGs; their log is retained as
 `native-qa-20261005/export-followup.log`. An earlier lint attempt caught a
 benchmark example compilation error; the corrected example passed the final
-lint and test reruns. A subsequent focused mounted-pointer regression passed
-1/1; this is separate from the full 1,012-library-test run below, not evidence
-of a full 1,013-test rerun.
+lint and test reruns.
 
-These production changes were committed through `b05316fa0b16d5991c8f7a13fcc7d4bb5d36b373`.
-The native QA binary was rebuilt at that revision after the export-label fix. This records local validation;
-it does not claim hosted CI or signed-distribution acceptance.
+Production changes are committed through `55d420ae87`; the full editor and
+app/CLI checks below cover that revision. Native QA evidence still refers to the
+`b05316fa0b` binary while the latest native rebuild/recheck is pending. This
+records local validation, not hosted CI or signed-distribution acceptance.
 
 | Stage | Recorded result |
 | --- | --- |
 | Engine libraries, integration suites and doctests | 1,752 passed, 0 failed, 6 ignored across 35 test targets. |
-| Synthetic Figma importer | 266 passed, 0 failed, 10 ignored. Private fixtures were not exercised. |
+| Synthetic Figma importer | 266 passed, 0 failed, 10 ignored. This synthetic stage excludes private fixtures; the separate Spectrum timing is recorded below. |
 | FNX/format with preserved JSON order | 308 passed, 0 failed. |
-| Editor GPUI/unit suite | Final rerun: 1,012 library/GPUI tests plus 3 benchmark CLI tests passed, 0 failed, 0 ignored; library test execution 56.49 seconds. Includes eight per-node double-click cases, four virtual-text hit guards, both mounted inspector layout checks, context-menu entry activation/ordering/Undo and Flatten appearance/undo checks. |
+| Editor GPUI/unit suite | Latest rerun: 1,016 library/GPUI tests plus 3 benchmark CLI tests passed, 0 failed; 1 projection benchmark ignored in the ordinary suite and run separately. Library test execution 54.94 seconds. Includes eight per-node double-click cases, four virtual-text hit guards, both mounted inspector layout checks, context-menu entry activation/ordering/Undo, mounted blank-click input and Flatten appearance/pattern/undo checks. |
 | UI primitives | 9 passed, 0 failed. |
 | App and CLI compilation | `cargo check --locked -p zed -p cli` passed. |
-| Repository Clippy gate | `./script/clippy --locked` passed for the runner's eleven selected Fanta crates, including all targets/features and denied warnings. |
+| Repository Clippy gate | Final `./script/clippy --locked` rerun passed for the runner's eleven Fanta crates, including all targets/features and denied warnings. Evidence: `2026-10-05-pattern-guard-lint/`. |
 | Native component screenshots | Passed against existing baselines: animation panel 99.973%, timeline 99.989%, inspector 99.956% pixel match (required 99.95%). Images and logs are in `target/release-verification/2026-10-05-native-components/`. No baseline was regenerated; these are component galleries, not full-app inspector screenshots. |
 | Native debug build | Passed with isolated-profile log-path support. Final QA build provenance is recorded separately in `target/release-verification/native-qa-20261005/`. The disposable QA bundle is not a signed-distribution acceptance pass. |
 
@@ -162,6 +165,43 @@ JSON, fixture/build metadata and logs are retained in
 `target/release-verification/spectrum-drag-20261005/`. The benchmark's three
 tests and explicit-index replay passed. Release-profile, native GPUI/Metal
 presentation, drag/drop/undo and the below-16-ms gesture target remain unverified.
+
+A separate ignored `import_timing_diagnostic` passed 1/1 on that unchanged
+Spectrum fixture at revision `49d14072a731`, in the test profile using dev
+settings on the same M3 Max. Container/Kiwi decoding (`read_fig`) took **2.798 s**;
+scene mapping (`fig_to_doc`) took **3.080 s**. It reported 73,896 mapped nodes,
+0 skipped and **28 instance children dropped**, producing 73,897 scene nodes,
+13,785 instances, 9,012 components and 41 assets. The diagnostic does not assert
+complete imported-content fidelity. Its single timing baseline excludes the
+filesystem read, image decoding, layout, persistence and native app opening;
+it establishes no improvement. The fixture hash stayed unchanged at the SHA-256
+recorded above. Command, build/revision metadata, binary hash and raw timings are
+in `target/release-verification/spectrum-import-20261005/`.
+
+The subsequent `55d420ae87` change protects direct and indirect pattern sources
+from destructive Flatten operations. Its focused Flatten-filter run passed eight
+tests, including typed paint-slot/override coverage and pixel preservation when
+refusing a referenced source. Layer adapter tests passed seven cases; the bounded
+benchmark remained ignored in that ordinary run and passed when explicitly run.
+The complete editor, app/CLI build and final lint reruns passed. Native QA
+evidence above remains tied to `b05316fa0b` until the subsequent rebuild/recheck.
+
+Sharing the component-root lookup between layer rows reduced CPU projection work
+on the same synthetic scene: **2,000 visible vectors and 2,000 component
+definitions**, a dev-configured test build, three warmups and eleven measured
+projections. The before state was the intermediate `49d14072a731` polish tree
+with the new pattern-source guard, **not released main**.
+
+| Layer-tree projection | Before shared lookup | After shared lookup |
+| --- | ---: | ---: |
+| Median | 283.149 ms | 5.835 ms |
+| p95 | 296.739 ms | 6.084 ms |
+
+Ordered action lists had the same SHA-256, with generated IDs excluded:
+`595c2a69ad5d2905b413b630aea12a44f6f300ab4db46f8afdb119425cc2a1a2`.
+This demonstrates a scoped layer-projection improvement, not native or Spectrum
+drag latency. Raw before/after and focused test logs are retained in
+`target/release-verification/layer-projection-20261005/`.
 
 ## Capability-to-test map
 

@@ -1634,7 +1634,7 @@ mod tests {
                 strokes: smallvec::smallvec![stroke],
             },
             fanta_doc::OverrideValue::Field {
-                value: serde_json::json!({"fills": [pattern.clone()]}),
+                value: serde_json::json!({"fills": [pattern]}),
             },
         ] {
             let mut instance = instance.clone();
