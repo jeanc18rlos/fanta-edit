@@ -1368,7 +1368,7 @@ impl project::ProjectItem for FigItem {
                                         let session = fanta_format::WorkspaceSession::open(&root)?;
                                         report_load_progress(&progress, "Loading pages and assets…");
                                         let document = load_project_document(&root)?;
-                                        Ok((document, None, Some(session)))
+                                        Ok((document, None, Some(session), None))
                                     }
                                     // First open of a bare `.fig`: parse it AND
                                     // materialize the project directory right
@@ -1380,7 +1380,8 @@ impl project::ProjectItem for FigItem {
                                     // parse is still shown and the first save
                                     // retries the write.
                                     None => {
-                                        let document = load_imported_document(&load_path, &progress)?;
+                                        let (document, import_warning) =
+                                            load_imported_document(&load_path, &progress)?;
                                         report_load_progress(
                                             &progress,
                                             "Creating the editable project…",
@@ -1394,7 +1395,7 @@ impl project::ProjectItem for FigItem {
                                                 fanta_format::WorkspaceSession::open(&project.root)
                                                     .ok()
                                             });
-                                        Ok((document, materialized, session))
+                                        Ok((document, materialized, session, import_warning))
                                     }
                                 }
                             });
@@ -1406,14 +1407,18 @@ impl project::ProjectItem for FigItem {
                         }
                         let load_result = load.await;
 
-                        let (document, materialized, session) = match load_result {
-                            Ok((document, materialized, session)) => {
-                                (Ok(document), materialized, session)
+                        let (document, materialized, session, import_warning) = match load_result {
+                            Ok((document, materialized, session, import_warning)) => {
+                                (Ok(document), materialized, session, import_warning)
                             }
-                            Err(error) => (Err(error), None, None),
+                            Err(error) => (Err(error), None, None, None),
                         };
                         if let Err(error) = this.update(cx, |this: &mut FigItem, cx| {
+                            let adopting_import = this.sync_epoch == 0 && document.is_ok();
                             this.adopt_initial_load(document, materialized, session, cx);
+                            if adopting_import && let Some(warning) = import_warning {
+                                crate::view::show_canvas_notice_deferred(warning, cx);
+                            }
                         }) {
                             log::debug!("dropping loaded update for closed .fig item: {error:#}");
                             return;
@@ -3837,11 +3842,13 @@ fn report_load_progress(progress: &mpsc::UnboundedSender<&'static str>, message:
 fn load_imported_document(
     path: &Path,
     progress: &mpsc::UnboundedSender<&'static str>,
-) -> Result<FigDocument> {
+) -> Result<(FigDocument, Option<String>)> {
     let started = Instant::now();
+    let content_loss_summary = Arc::new(Mutex::new(None));
     let mut formats = fanta_format::FormatRegistry::with_native_formats();
     formats.register(FigImportFormat {
         progress: Some(progress.clone()),
+        content_loss_summary: Some(content_loss_summary.clone()),
     })?;
     report_load_progress(progress, "Reading design file…");
     let imported = formats.import_path(path)?;
@@ -3849,12 +3856,25 @@ fn load_imported_document(
     report_load_progress(progress, "Preparing canvas and image assets…");
     let mut document = FigDocument::from_doc(imported.doc, imported.assets);
     document.prewarm_default_page_assets();
-    Ok(document)
+    let import_warning = content_loss_summary
+        .lock()
+        .map_err(|_| anyhow::anyhow!("the Figma import report could not be read"))?
+        .take()
+        .map(|summary| {
+            format!(
+                "Figma import limitations for {}: {summary}. The original .fig file is unchanged.",
+                path.file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy(),
+            )
+        });
+    Ok((document, import_warning))
 }
 
 #[derive(Default)]
 struct FigImportFormat {
     progress: Option<mpsc::UnboundedSender<&'static str>>,
+    content_loss_summary: Option<Arc<Mutex<Option<String>>>>,
 }
 
 impl fanta_format::FormatHandler for FigImportFormat {
@@ -3885,7 +3905,15 @@ impl fanta_format::FormatHandler for FigImportFormat {
         if let Some(progress) = self.progress.as_ref() {
             report_load_progress(progress, "Importing Figma layers and components…");
         }
-        let (doc, _report, assets) = fig_to_doc(&fig)?;
+        let (doc, report, assets) = fig_to_doc(&fig)?;
+        if let Some(summary) = report.content_loss_summary() {
+            log::warn!("Figma import limitations for {}: {summary}", path.display());
+            if let Some(content_loss_summary) = &self.content_loss_summary {
+                *content_loss_summary.lock().map_err(|_| {
+                    anyhow::anyhow!("the Figma import report could not be retained")
+                })? = Some(summary);
+            }
+        }
         Ok(fanta_format::ImportedDesign {
             doc,
             assets: assets.into_iter().collect(),
@@ -5299,6 +5327,112 @@ mod tests {
         assert!(formats.can_import_path(Path::new("Design.fig")));
         assert!(formats.can_import_path(Path::new("Design.fant")));
         assert!(!formats.can_import_path(Path::new("notes.txt")));
+    }
+
+    #[test]
+    fn fig_import_retains_content_loss_warning_for_loaded_canvas() {
+        use fanta_fig_interop::{Def, DefKind, Field, KiwiType, KiwiValue, Schema};
+
+        let schema = Schema::new(vec![
+            Def::new(
+                "NodeType",
+                DefKind::Enum,
+                vec![
+                    Field::new("CANVAS", KiwiType(0), 0),
+                    Field::new("BOOLEAN_OPERATION", KiwiType(0), 1),
+                    Field::new("RECTANGLE", KiwiType(0), 2),
+                ],
+            ),
+            Def::new(
+                "GUID",
+                DefKind::Struct,
+                vec![
+                    Field::new("sessionID", KiwiType::UINT, 0),
+                    Field::new("localID", KiwiType::UINT, 0),
+                ],
+            ),
+            Def::new(
+                "ParentIndex",
+                DefKind::Message,
+                vec![Field::new("guid", KiwiType::user(1), 1)],
+            ),
+            Def::new(
+                "NodeChange",
+                DefKind::Message,
+                vec![
+                    Field::new("guid", KiwiType::user(1), 1),
+                    Field::new("type", KiwiType::user(0), 2),
+                    Field::new("parentIndex", KiwiType::user(2), 3),
+                ],
+            ),
+            Def::new(
+                "Message",
+                DefKind::Message,
+                vec![Field::array("nodeChanges", KiwiType::user(3), 1)],
+            ),
+        ]);
+        let guid = |id| KiwiValue::Object {
+            type_name: "GUID".into(),
+            fields: [
+                ("sessionID".to_owned(), KiwiValue::Uint(0)),
+                ("localID".to_owned(), KiwiValue::Uint(id)),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let node = |id, kind: &str, parent| {
+            let mut node = KiwiValue::Object {
+                type_name: "NodeChange".into(),
+                fields: [
+                    ("guid".to_owned(), guid(id)),
+                    ("type".to_owned(), KiwiValue::Enum(kind.into())),
+                ]
+                .into_iter()
+                .collect(),
+            };
+            if let Some(parent) = parent {
+                node.set_field(
+                    "parentIndex",
+                    KiwiValue::Object {
+                        type_name: "ParentIndex".into(),
+                        fields: [("guid".to_owned(), guid(parent))].into_iter().collect(),
+                    },
+                );
+            }
+            node
+        };
+        let fig = fanta_fig_interop::FigDocument {
+            version: 0,
+            schema,
+            root: KiwiValue::Object {
+                type_name: "Message".into(),
+                fields: [(
+                    "nodeChanges".to_owned(),
+                    KiwiValue::array(vec![
+                        node(1, "CANVAS", None),
+                        node(2, "BOOLEAN_OPERATION", Some(1)),
+                        node(3, "RECTANGLE", Some(2)),
+                    ]),
+                )]
+                .into_iter()
+                .collect(),
+            },
+            root_type_name: "Message".into(),
+            blobs: Vec::new(),
+            images: HashMap::new(),
+        };
+        let bytes = fanta_fig_interop::write_fig(&fig).expect("encode import fixture");
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let path = directory.path().join("Boolean.fig");
+        std::fs::write(&path, &bytes).expect("write fixture");
+        let (progress, _messages) = mpsc::unbounded();
+        let (document, warning) = load_imported_document(&path, &progress).expect("load canvas");
+        assert_eq!(document.doc.scene.len(), 2);
+        let warning = warning.expect("import limitation reaches foreground load result");
+        assert!(warning.contains("Boolean.fig"));
+        assert!(warning.contains("Boolean operation was flattened to vectors"));
+        assert!(warning.contains("1 operand layer is not editable"));
+        assert_eq!(std::fs::read(path).expect("read original fixture"), bytes);
     }
 
     #[test]

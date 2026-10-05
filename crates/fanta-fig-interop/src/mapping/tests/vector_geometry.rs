@@ -2,6 +2,112 @@
 
 use super::*;
 
+fn import_loss_node(local: u32, kind: &str, parent: Option<u32>) -> KiwiValue {
+    let mut node = o(
+        "NodeChange",
+        vec![
+            ("guid", guid(0, local)),
+            ("type", KiwiValue::Enum(kind.into())),
+            ("size", vector(24.0, 18.0)),
+        ],
+    );
+    if let Some(parent) = parent {
+        node.set_field("parentIndex", parent_index(0, parent));
+    }
+    node
+}
+
+#[test]
+fn boolean_import_reports_flattening_and_operand_loss_without_changing_baked_geometry() {
+    for operation in ["UNION", "SUBTRACT", "INTERSECT", "XOR"] {
+        let mut parent = import_loss_node(1, "BOOLEAN_OPERATION", None);
+        parent.set_field("booleanOperation", KiwiValue::Enum(operation.into()));
+        parent.set_field("fillGeometry", KiwiValue::array(vec![fig_path(0, "ODD")]));
+        let mut triangle = Vec::new();
+        triangle.extend(cmd(1, &[2.0, 2.0]));
+        triangle.extend(cmd(2, &[20.0, 2.0]));
+        triangle.extend(cmd(2, &[11.0, 16.0]));
+        triangle.extend(cmd(0, &[]));
+        let fig = doc_from_with_blobs(
+            vec![
+                parent,
+                import_loss_node(2, "VECTOR", Some(1)),
+                import_loss_node(3, "ROUNDED_RECTANGLE", Some(1)),
+            ],
+            vec![triangle],
+        );
+        let (doc, report, _) = fig_to_doc(&fig).expect("import baked Boolean");
+        assert_eq!(report.boolean_operations_flattened, 1, "{operation}");
+        assert_eq!(report.boolean_operands_dropped, 2, "{operation}");
+        assert_eq!(report.instance_children_dropped, 0, "{operation}");
+        assert_eq!(report.non_container_children_dropped, 0, "{operation}");
+        assert_eq!(report.mapped, 1);
+        assert_eq!(doc.scene.len(), 1);
+        let root = *doc.scene.roots().first().expect("baked parent");
+        let node = doc.scene.get(root).expect("mapped parent");
+        let NodeData::Vector(vector) = &node.data else {
+            panic!("reporting must retain the current baked-vector behavior");
+        };
+        assert_eq!(
+            vector.path.segments,
+            vec![
+                PathSegment::Move { to: [2.0, 2.0] },
+                PathSegment::Line { to: [20.0, 2.0] },
+                PathSegment::Line { to: [11.0, 16.0] },
+                PathSegment::Close,
+            ],
+        );
+        assert_eq!(vector.path.fill_rule, FillRule::EvenOdd);
+        assert!(doc.scene.children_of(Some(root)).is_empty());
+        let warning = report
+            .content_loss_summary()
+            .expect("editable structure loss");
+        assert!(warning.contains("Boolean operation was flattened to vectors"));
+        assert!(warning.contains("2 operand layers are not editable"));
+    }
+}
+
+#[test]
+fn boolean_import_counts_all_discarded_operand_descendants_in_any_stream_order() {
+    for descendants_first in [false, true] {
+        let mut nodes = vec![
+            import_loss_node(1, "BOOLEAN_OPERATION", None),
+            import_loss_node(2, "GROUP", Some(1)),
+            import_loss_node(3, "RECTANGLE", Some(2)),
+        ];
+        if descendants_first {
+            nodes.reverse();
+        }
+        let (doc, report, _) = fig_to_doc(&doc_from(nodes)).expect("import nested operand");
+        assert_eq!(report.boolean_operations_flattened, 1);
+        assert_eq!(report.boolean_operands_dropped, 2);
+        assert_eq!(report.instance_children_dropped, 0);
+        assert_eq!(report.non_container_children_dropped, 0);
+        assert_eq!(report.mapped, doc.scene.len());
+        assert_eq!(doc.scene.len(), 1);
+    }
+}
+
+#[test]
+fn non_container_import_loss_is_not_reported_as_instance_content() {
+    let fig = doc_from(vec![
+        import_loss_node(1, "VECTOR", None),
+        import_loss_node(2, "RECTANGLE", Some(1)),
+    ]);
+    let (doc, report, _) = fig_to_doc(&fig).expect("partial import");
+    assert_eq!(report.non_container_children_dropped, 1);
+    assert_eq!(report.boolean_operations_flattened, 0);
+    assert_eq!(report.boolean_operands_dropped, 0);
+    assert_eq!(report.instance_children_dropped, 0);
+    assert_eq!(report.mapped, doc.scene.len());
+    assert!(
+        report
+            .content_loss_summary()
+            .expect("omitted layer warning")
+            .contains("layers with unsupported parent relationships were omitted")
+    );
+}
+
 // =============================================================================
 // Task 1: VECTOR geometry — bbox fallback (STEP 1)
 // =============================================================================

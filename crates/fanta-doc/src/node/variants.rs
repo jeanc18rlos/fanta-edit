@@ -104,8 +104,9 @@ pub struct GroupNode {
 /// *operands* under [`op`](BooleanNode::op), painted with this node's own
 /// `fills` / `strokes`. The operands are ordinary child nodes in the scene (like
 /// a [`GroupNode`]); the renderer materializes each child's outline to a path
-/// and folds them with path-ops. This is what a Figma UNION / SUBTRACT /
-/// INTERSECT / EXCLUDE node imports to.
+/// and folds them with path-ops. Native Boolean editing supports UNION /
+/// SUBTRACT / INTERSECT / EXCLUDE. The `.fig` importer currently retains baked
+/// vector geometry instead and reports the loss of editable Boolean operands.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BooleanNode {
     /// Which set operation folds the operands.
