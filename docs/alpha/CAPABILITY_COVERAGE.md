@@ -48,7 +48,9 @@ and Undo, and the export-label regression found during native QA. Four focused
 export checks also wrote page/selection PNGs; their log is retained as
 `native-qa-20261005/export-followup.log`. An earlier lint attempt caught a
 benchmark example compilation error; the corrected example passed the final
-lint and test reruns.
+lint and test reruns. A subsequent focused mounted-pointer regression passed
+1/1; this is separate from the full 1,012-library-test run below, not evidence
+of a full 1,013-test rerun.
 
 These production changes were committed through `b05316fa0b16d5991c8f7a13fcc7d4bb5d36b373`.
 The native QA binary was rebuilt at that revision after the export-label fix. This records local validation;
@@ -82,9 +84,36 @@ could retain **Export Instance**. The fix passed its regression and a native
 recheck in `b05316fa0b`: selecting the instance showed **Export Instance**, and
 Escape restored **Page / Export Page** while preserving the existing PNG/1× row.
 Fresh native repetitions of blank-canvas clicks also cleared selection,
-including at the location of an earlier transient failure. No fix was made for
-that transient; pointer capture, repeated select/deselect and drag-release
-acceptance remain open.
+including at the location of an earlier transient failure. The mounted GPUI
+regression `empty_canvas_pointer_click_clears_instance_before_or_after_repaint`
+then passed four actual pointer-input cases: Select and the return from vector
+editing through Escape, each with and without repaint between press and release.
+It checks deselection, pointer-state reset and unchanged document/history. No
+production fix was made for the unreproduced transient; broader native pointer
+capture, repeated select/deselect and drag-release acceptance remain open.
+
+Native instance context-menu checks on `b05316fa0b` also showed distinct **Go to
+main component**, **Detach instance** and **Reset all overrides** entries.
+Activating Detach produced a Frame retaining `EDIT ME`, with the main component
+and sibling intact; Undo restored the Instance. The first file comparison
+against the earlier restart baseline differed in `doc/metadata.json` and
+`pages/group/page.fnx`. Without the earlier file bytes, the reason for that
+difference is unresolved; `detach-undo-comparison.json` retains the failed
+comparison. A repeat using the complete 22-file `detach-before/` snapshot
+restored exact project content except `metadata.modified_at`; no files were
+added or missing. `detach-undo-repeat-comparison.json` records that difference,
+and the snapshot confirms only the timestamp changed in metadata. These
+artifacts are in `target/release-verification/native-qa-20261005/`. The repeat
+supports content restoration for this journey, not identical hashes for all
+files or an explanation of the first comparison.
+
+Native inspector PNG export also passed for the selected instance (700×120)
+and the full page (900×944). Both files were opened and visually inspected: the
+instance retains its yellow background and `EDIT ME` text, while the page retains
+all three banners, the additional rectangles and no review pins or selection
+handles. Files and hashes are retained in `native-qa-20261005/exports/` and
+`native-export-results.json`. The pointer-test follow-up also passed repository
+Clippy for `fig_viewer`; its log is `native-qa-20261005/pointer-followup-lint.log`.
 
 Live MCP against that same isolated app passed **18/18 assertions**, including
 stdio initialization, tool inventory, editor/source reads, a rectangle mutation,

@@ -12953,6 +12953,156 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn empty_canvas_pointer_click_clears_instance_before_or_after_repaint(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::InputEvent as _;
+
+        init_visual_test(cx);
+        cx.update(|cx| {
+            cx.bind_keys([gpui::KeyBinding::new("escape", Cancel, Some("FigViewer"))]);
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (mut doc, _, master) = text_selection_doc(true);
+        let master = master.expect("master frame");
+        doc.scene.get_mut(master).expect("master").transform =
+            Transform2D::translation(1000.0, 1000.0);
+        let component = fanta_doc::ComponentId::new();
+        doc.components.defs.insert(
+            component,
+            fanta_doc::ComponentDef::new(component, master, "Card"),
+        );
+        let mut instance = CanvasNode::new(NodeData::Instance(fanta_doc::InstanceNode {
+            component,
+            overrides: Vec::new(),
+            prop_values: BTreeMap::new(),
+            derived: Vec::new(),
+            local_size: [200.0, 100.0],
+        }));
+        instance.parent = doc.active_page();
+        instance.transform = Transform2D::translation(-100.0, -50.0);
+        let instance_id = instance.id;
+        doc.apply(Operation::create_node(instance))
+            .expect("instance");
+        let mut vector = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            80.0,
+            100.0,
+            Color::WHITE,
+        )));
+        vector.parent = doc.active_page();
+        vector.transform = Transform2D::translation(-250.0, -50.0);
+        doc.apply(Operation::create_node(vector)).expect("vector");
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Instance-deselection.fig"),
+            doc,
+            cx,
+        );
+        let (view, visual) = cx.add_window_view({
+            let item = item.clone();
+            move |window, cx| FigView::new(item, project, window, cx)
+        });
+        visual.simulate_resize(size(px(1400.0), px(900.0)));
+        view.update(visual, |view, cx| {
+            view.set_viewport_silent(Viewport::default());
+            cx.notify();
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+
+        for after_node_edit in [false, true] {
+            if after_node_edit {
+                let bounds = view.read_with(visual, |view, _| {
+                    view.container_bounds.expect("canvas bounds")
+                });
+                let position = bounds.center() + point(px(-210.0), px(0.0));
+                for click_count in [1, 2] {
+                    visual.simulate_event(MouseDownEvent {
+                        position,
+                        button: MouseButton::Left,
+                        modifiers: gpui::Modifiers::none(),
+                        click_count,
+                        first_mouse: false,
+                    });
+                    visual.simulate_event(MouseUpEvent {
+                        position,
+                        button: MouseButton::Left,
+                        modifiers: gpui::Modifiers::none(),
+                        click_count,
+                    });
+                }
+                assert_eq!(
+                    view.read_with(visual, |view, _| view.active_tool()),
+                    ToolKind::NodeEdit
+                );
+                visual.simulate_keystrokes("escape");
+                assert_eq!(
+                    view.read_with(visual, |view, _| view.active_tool()),
+                    ToolKind::Select
+                );
+            }
+            for paint_between_events in [false, true] {
+                let bounds = view.read_with(visual, |view, _| {
+                    view.container_bounds.expect("canvas bounds")
+                });
+                visual.simulate_click(bounds.center(), gpui::Modifiers::none());
+                item.read_with(visual, |item, _| {
+                    assert_eq!(
+                        item.doc().expect("document").selection.as_slice(),
+                        &[instance_id]
+                    );
+                });
+                let position = point(bounds.right() - px(40.0), bounds.top() + px(160.0));
+                // Deliver the complete click before pumping the executor so
+                // an event listener installed only after repaint cannot hide.
+                visual.update(|window, cx| {
+                    window.dispatch_event(
+                        MouseDownEvent {
+                            position,
+                            button: MouseButton::Left,
+                            modifiers: gpui::Modifiers::none(),
+                            click_count: 1,
+                            first_mouse: false,
+                        }
+                        .to_platform_input(),
+                        cx,
+                    );
+                    assert!(view.read(cx).primary_pressed());
+                    if paint_between_events {
+                        window.draw(cx).clear();
+                        assert!(view.read(cx).primary_pressed());
+                    }
+                    window.dispatch_event(
+                        MouseUpEvent {
+                            position,
+                            button: MouseButton::Left,
+                            modifiers: gpui::Modifiers::none(),
+                            click_count: 1,
+                        }
+                        .to_platform_input(),
+                        cx,
+                    );
+                });
+                visual.run_until_parked();
+                view.read_with(visual, |view, _| {
+                    assert!(!view.primary_pressed);
+                    assert!(!view.canvas_pointer_down);
+                    assert_eq!(view.active_tool(), ToolKind::Select);
+                });
+                item.read_with(visual, |item, _| {
+                    let doc = item.doc().expect("document");
+                    assert!(doc.selection.is_empty(), "after_node_edit={after_node_edit}, paint_between_events={paint_between_events}");
+                    assert_eq!(doc.history.undo_depth(), 0);
+                    assert!(!item.is_dirty());
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
     async fn canvas_double_click_read_only_document_does_not_enter_editing(
         cx: &mut TestAppContext,
     ) {
