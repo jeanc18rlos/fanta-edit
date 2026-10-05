@@ -15,9 +15,12 @@ component FNX source, identity sidecars, metadata and assets. See
 [project-schema.md](project-schema.md) for the layout.
 
 - Figma imports warn when known layer structures are flattened or omitted.
-  Imported Boolean operations currently retain baked vector shapes but lose
-  editable operand layers. The original `.fig` remains unchanged. This warning
-  does not cover every possible rendering or component-override difference.
+  Supported Boolean operations retain editable operands and their imported
+  artwork. Changing an operand or operation recomputes the geometry; Undo can
+  restore the imported appearance. Unsupported operations or unavailable
+  operands fall back to a baked vector with an explicit import warning. The
+  original `.fig` remains unchanged. Warnings do not cover every possible
+  rendering or component-override difference.
 - Use the left panel to find and switch pages, rename, reorder, duplicate or
   delete pages, select layers, expand nesting, and drag layers into a different
   parent or position. Page roots and component recursion have edit guards.
@@ -61,6 +64,8 @@ fills and gradients, strokes, effects, corners, typography, auto-layout/grid,
 variables, components and export. Page selection has page-specific properties. Audio and specialist leaves show
 their own type labels and expose supported position, dimensions, appearance,
 effects and export controls; these controls preserve the underlying content.
+Booleans expose operation, fill and stroke controls. Paint recoloring retains
+the imported geometry; geometry or operation changes recompute it from operands.
 Constraint data can be retained by the document, but constraint controls are
 currently disabled in the default Design inspector.
 Mixed values must remain identifiable; controls must neither erase unsupported
@@ -126,6 +131,9 @@ or during prototype presentation.
 Flatten is unavailable when it would discard images, mixed text colors or
 decorations, child effects, clipping, layout, bindings, animation or component
 links. Supported simple vector groups and boolean geometry remain convertible.
+Flattening an imported Boolean preserves its original baked appearance. A live
+Boolean containing another baked Boolean refuses conversion when folding its
+operands would change the artwork.
 If another layer uses the node or one of its children as a pattern source,
 Flatten refuses the operation with an explanation and leaves the document
 unchanged. This reference check happens when the command runs.

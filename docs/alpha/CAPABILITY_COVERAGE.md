@@ -36,9 +36,27 @@ results still require native app acceptance.
 
 ## Local checkpoint — 5 October
 
-The latest full local automated checkpoint is recorded in
+The Boolean/import candidate is `a4adca9570`, followed by the behavior-preserving
+lint cleanup `0bec851a8a`. Its engine, importer and
+source-order checks are in `2026-10-05-preservation-engine/`; the editor and
+remaining assembled-app checks are in `2026-10-05-preservation-app/`, all under
+`target/release-verification/`. The current completed results are 1,764 engine
+tests (6 ignored), 282 importer tests (11 ignored), 310 source-order tests,
+1,040 editor tests (1 ignored), and 3 benchmark CLI tests, with zero failures.
+Eight focused standalone-document tests additionally cover the final JSON
+precision dependency. Source-file hashes are retained with the app run.
+The same app run passed all 234 workspace tests, 9 UI tests and app/CLI
+compilation. Existing component baselines also passed without regeneration:
+animation panel 99.973%, timeline 99.989%, inspector 99.956% (minimum 99.95%).
+The initial lint failure is retained; the result-conversion cleanup passed the
+full repository lint gate in `2026-10-05-preservation-lint/`. The current source
+has a passing result for all eight default stages plus component visuals. The
+final native rebuild is recorded separately; historical native results below
+do not substitute for it.
+
+The previous full local automated checkpoint is recorded in
 `2026-10-05-acceptance-engine/` and `2026-10-05-acceptance-final/`
-under `target/release-verification/`; the table below gives its exact counts.
+under `target/release-verification/`; the historical table below gives its exact counts.
 Native checks then used the isolated QA bundle built at
 `450efc87934aee3d1834b24bc13be37ad3fcc8d4`, SHA-256
 `caa67385097a608c6a7db3b627ec3f86ba0802cfeaf879b68268a5e213e17edb`.
@@ -215,8 +233,23 @@ both scoped tabs and the latest active tab/page. No fixed delay was inserted
 between navigation and Quit, although native event-delivery latency was not
 measured. All 30 source files, 30 destination files and 24 files in the separate
 media project retained their hashes through both restarts. A long image name
-exposed an Export-button overflow; its component fix and native recheck are
-tracked separately.
+exposed an Export-button overflow. The shared UI fix passed all hosted checks
+and merged as Fanta UI PR #7 (`179643a0f4`); the editor pins its tested
+`d4dd5163` revision. Native validation of the rebuilt editor is recorded separately.
+
+The same `4ca4c465` binary passed all **18 live MCP assertions** using the
+isolated profile, including a uniquely named rectangle, its exact node ID in
+the autosaved FNX and a retained 240×160 PNG inspected as the expected red
+rectangle. Evidence: `native-acceptance-latest-20261005/mcp-smoke-strict.log`,
+`mcp-smoke-strict-metadata.json` and `mcp-screenshot-strict.png`. The disposable child project had a committed
+baseline, although its parent project also contained untracked files; the
+original whole-repository Git-status assertion alone was insufficient proof.
+The first run's failures are retained: the harness compared prefixed MCP IDs
+with unprefixed FNX IDs and rejected a valid compact PNG by byte length. The
+harness now compares normalized IDs, checks the exact FNX Git path and validates
+PNG chunks, decompressed scanline lengths and filter bytes. Its retained negative
+checks reject unrelated Git changes and corrupt/incomplete screenshot pixels.
+This is live protocol/persistence evidence, not a complete native UI pass.
 
 A new forced-write-failure regression passed 1/1 and is committed at
 `8b572a41c1`. It pauses a real save, makes newer edits and places an image, then
@@ -334,20 +367,56 @@ not instance expansion copies. The parents retain baked paths, but their
 editable operations and children are flattened away. The parents occur on
 Wireframes and Application Frames & Grids, without instance/component ancestry.
 A reduced projection reproduced 40 source nodes becoming 12 vectors, with 28
-operands removed. This is a confirmed structure-preservation blocker; it does
-not by itself establish missing rendered artwork. Evidence and unchanged source
+operands removed. This reproduced a structure-preservation defect without
+establishing missing rendered artwork. Evidence and unchanged source
 hash are retained in `spectrum-import-20261005/spectrum-preservation-classification.json`.
-The same report has 504 unresolved nested override/derived paths out of 9,342.
-A separate diagnostic reproduced all 9,342/8,838 resolution counts and found
-that every target GUID exists and is mapped. Matching imported component swaps
-prove that 376 paths used the wrong master context: 200 outer component-property
-swaps and 176 inherited nested swaps. Of 120 affected symbol overrides, 118
-carry fill-style changes from the target's black base; 78 have no matching outer
-hidden override. The remaining 128 paths are not certified harmless. Evidence
-is in `spectrum-override-classification-20261005/classification.json`; repair is
-in progress. Converting Boolean parents directly to editable nodes is not yet a
-safe fix: expanded-instance Boolean rendering currently requires a real scene
-identity. Preservation and rendered parity must both be verified.
+The corrected importer retains all 12 Boolean operations and 28 operands.
+Its full synthetic library suite passed 282 tests (11 ignored), and the explicit
+Spectrum structure gate reports zero flattened Booleans, lost operands, other
+child losses or skipped nodes. All 12 isolated local subtrees render to
+byte-identical PNGs at the same recorded viewport and 4× scale before and after
+the change. This comparison excludes outer ancestor effects and is not a Figma
+screenshot or full-page oracle. Evidence is in `boolean-preservation-20261005/`,
+including `interop-final.log`, `pixel-parity.json` and `capture-after-run.json`.
+Direct import → FNX → reopened typed scene → render also preserves all 12
+stored geometry signatures and produces 12 byte-identical PNGs; root independently
+compared their hashes with the original vector baseline. Evidence:
+`direct-fnx-summary.json` and `root-independent-direct-fnx-parity.json` in the
+same directory. Four operand translations change from about `1.69e-13` to zero
+under the existing FNX precision policy, so typed payloads are not all bit-exact.
+The signature now uses that same precision and stable key ordering. A failed
+intermediate JSON harness run is retained separately: its decoder lacked the
+`float_roundtrip` feature already used by the application's FNX/project codecs,
+altering other coordinates by one floating-point unit. That failed run is not
+counted as a successful persistence check.
+The standalone document API had the same precision gap without feature
+unification from those codecs. Its own `float_roundtrip` dependency and a
+compact/pretty JSON regression now preserve exact operand values and active
+baked geometry; all eight focused document Boolean tests pass. The reproduced
+failure and successful rerun are `doc-json-roundtrip-before.log` and
+`doc-json-roundtrip-after.log`.
+Two assembled-inspector regressions pass for normal and stroke-outline Boolean
+paints: the Fill/Stroke sections project their actual values, color edits render,
+geometry edits invalidate the bake, and Undo restores node data and artwork.
+Evidence: `inspector-paints-second.log`.
+Unknown operations and unsupported or unavailable operands still use the
+explicitly reported vector fallback. Native edit/restart acceptance on the
+rebuilt candidate remains separate.
+The initial report also had 504 unresolved nested override/derived paths out of
+9,342. The first resolver fix (`ed4efa03ee`) recovered 376 paths by following
+component-property swaps and inherited nested swaps in the correct master
+context. The second (`6dd4f5192f`) applies component assignments nested inside
+symbol overrides, recovering the remaining 128. The untouched Spectrum import
+and an independent typed-swap checker now both resolve **9,342/9,342 paths**.
+A separate check confirms all 64 affected placements emit the component selected
+by the source assignment. Regressions cover selected component, text, derived
+geometry, source order, precedence and rejection of foreign-component paths.
+Evidence is in `spectrum-override-classification-20261005/`, including
+`nested-assignment-selection-validation.json` and
+`unmodified-report-nested-assignment.log`. The original fixture hash is unchanged.
+These checks establish routing and component choices; they do not claim complete
+rendered fidelity. Boolean preservation and rendered parity are being verified
+separately, including expanded component instances.
 
 The subsequent `55d420ae87` change protects direct and indirect pattern sources
 from destructive Flatten operations. Its focused Flatten-filter run passed eight
@@ -414,7 +483,7 @@ release-candidate journey; the final column highlights the most important gap.
 ./script/verify-fanta-release --stage editor
 # Separate native component screenshot comparison on macOS:
 ./script/verify-fanta-release --stage visual
-# Explicit representative-file node-structure gate (currently fails on Spectrum):
+# Explicit representative-file node-structure gate:
 FANTA_FIG_FIXTURE=/path/to/design.fig ./script/verify-fanta-release --stage import-preservation
 ```
 
@@ -445,7 +514,8 @@ it does not establish rendered parity or complete instance override fidelity.
 
 For live MCP, run `script/smoke-mcp <candidate-binary> <disposable-project>`
 against an explicitly isolated QA app/project: it writes a rectangle and can
-reuse a running app. Retain its assertions and screenshot alongside native UI
+reuse a running app. Set `FANTA_USER_DATA_DIR` to the candidate profile and use
+`--screenshot-path` to retain its PNG. Retain its assertions and screenshot alongside native UI
 evidence. It is intentionally outside the default runner.
 
 The `Check` workflow runs the runner's engine, import, source-order, editor,
