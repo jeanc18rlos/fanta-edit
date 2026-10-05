@@ -10,12 +10,16 @@ use super::types::{
     ArtifactDirty, ArtifactId, ArtifactMeta, ClosePolicy, ConflictResolution, FsEvent, SaveResult,
     SessionEvent, WorkspaceDirty,
 };
+use crate::project::component_dirs::{
+    component_design_dir_of, component_dirs, merge_set_files, scan_component_dirs,
+};
+use crate::project::layout::SET_JSON;
 use crate::project::layout::{
     ACTIVE_MODES_JSON, AUDIO_DIR, COMPONENTS_DIR, DEF_JSON, DOC_DIR, FANTA_JSON, FLOW_START_JSON,
     FLOWS_JSON, GRAPHICS_DIR, GRAPHICS_JSON, METADATA_JSON, MOTION_DIR, MOTION_JSON, PAGE_JSON,
-    PAGES_DIR, PRESENTATION_JSON, PROTOTYPES_DIR, ProjectManifest, SETS_JSON, VARIABLES_JSON,
-    id_from_key, is_project_dir, json_bytes, read_json_file, read_json_or, read_manifest,
-    sorted_entries, write_json_file,
+    PAGES_DIR, PRESENTATION_JSON, PROTOTYPES_DIR, ProjectManifest, VARIABLES_JSON, id_from_key,
+    is_project_dir, json_bytes, read_json_file, read_json_or, read_manifest, sorted_entries,
+    write_json_file,
 };
 use crate::project::read::{component_id_of_dir, page_id_of_dir, select_design_winners};
 use fanta_doc::{
@@ -109,16 +113,7 @@ impl WorkspaceSession {
                 .join(crate::project::media::ASSET_INDEX_FILE),
         )?;
         let workspace_fnx_disk_hash = file_sha256_if_present(&root.join("workspace.fnx"))?;
-        let other_singleton_disk_hashes = [
-            PathBuf::from(DOC_DIR).join(MOTION_JSON),
-            PathBuf::from(DOC_DIR).join(FLOW_START_JSON),
-            PathBuf::from(DOC_DIR).join(FLOWS_JSON),
-            PathBuf::from(DOC_DIR).join(PRESENTATION_JSON),
-            PathBuf::from(COMPONENTS_DIR).join(SETS_JSON),
-        ]
-        .into_iter()
-        .map(|relative| file_sha256_if_present(&root.join(&relative)).map(|hash| (relative, hash)))
-        .collect::<Result<BTreeMap<_, _>, _>>()?;
+        let other_singleton_disk_hashes = singleton_disk_hashes(&root)?;
         if manifest.schema_version > SCHEMA_VERSION {
             return Err(SessionError::Format(
                 crate::error::FormatError::UnsupportedSchema {
@@ -212,33 +207,30 @@ impl WorkspaceSession {
             }
         }
 
-        // Index components
+        // Index components: standalone ones, and v5 variants inside their
+        // set's folder (v4 kept them flat, with every set in `sets.json`).
         let comp_dir = root.join(COMPONENTS_DIR);
         if comp_dir.is_dir() {
-            let sets_path = comp_dir.join(SETS_JSON);
-            if sets_path.is_file() {
-                components.defs.sets = serde_json::from_slice(&std::fs::read(&sets_path)?)
-                    .map_err(|error| {
-                        SessionError::other(format!(
-                            "{}: bad component sets: {error}",
-                            sets_path.display()
-                        ))
-                    })?;
-            }
+            let scanned = scan_component_dirs(&root)?;
+            let set_files = scanned
+                .set_files
+                .iter()
+                .map(|path| Ok((path.clone(), read_json_file(path)?)))
+                .collect::<Result<Vec<_>, SessionError>>()?;
+            components.defs.sets = serde_json::from_value(merge_set_files(&set_files)?)
+                .map_err(|error| SessionError::other(format!("bad component sets: {error}")))?;
             let mut candidates = Vec::new();
-            for entry in sorted_entries(&comp_dir)? {
-                if !entry.is_dir() {
-                    continue;
-                }
+            for entry in scanned.component_dirs {
                 let slug = entry
                     .file_name()
                     .and_then(|s| s.to_str())
                     .unwrap_or("")
                     .to_owned();
+                let design_dir = entry
+                    .strip_prefix(&root)
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|_| PathBuf::from(COMPONENTS_DIR).join(&slug));
                 let def_path = entry.join(DEF_JSON);
-                if !def_path.is_file() {
-                    continue;
-                }
                 let mut def_value: Value = read_json_file(&def_path)?;
                 let id_from_header = def_value.get("id").and_then(Value::as_str).is_some();
                 let cid = if let Some(id) = def_value.get("id").and_then(Value::as_str) {
@@ -260,20 +252,21 @@ impl WorkspaceSession {
                     serde_json::from_value(def_value).map_err(|error| {
                         SessionError::other(format!("{}: {error}", def_path.display()))
                     })?;
-                candidates.push((cid, id_from_header, entry, slug, def));
+                candidates.push((cid, id_from_header, entry, slug, design_dir, def));
             }
             let ranked: Vec<_> = candidates
                 .iter()
-                .map(|(id, from_header, entry, _, _)| (*id, *from_header, entry.as_path()))
+                .map(|(id, from_header, entry, _, _, _)| (*id, *from_header, entry.as_path()))
                 .collect();
             let winners = select_design_winners(&ranked);
-            for (index, (cid, _, entry, slug, def)) in candidates.into_iter().enumerate() {
+            for (index, (cid, _, entry, slug, design_dir, def)) in
+                candidates.into_iter().enumerate()
+            {
                 if !winners.contains(&index) {
                     continue;
                 }
-                components.insert_def(def, PathBuf::from(COMPONENTS_DIR).join(&slug));
+                components.insert_def(def, design_dir.clone());
                 let id = ArtifactId::Component(cid);
-                let design_dir = PathBuf::from(COMPONENTS_DIR).join(&slug);
                 let files = read_indexed_file_set(&entry, ArtifactKind::Component)?;
                 let disk_hash = hash_file_set(
                     &files
@@ -593,6 +586,12 @@ impl WorkspaceSession {
                 )?;
                 (source, ids)
             };
+            let bytes = match id {
+                ArtifactId::Component(component) => {
+                    with_document_root_parent(document, *component, bytes)?
+                }
+                _ => bytes,
+            };
             if rekeyed.insert(projected_dir.clone(), bytes).is_some() {
                 return Err(SessionError::other(
                     "two artifacts have the same projected path",
@@ -759,7 +758,8 @@ impl WorkspaceSession {
                 return Err(SessionError::SaveBlocked(SaveBlocked::DiskChangedAgain));
             }
             if let Some((source, ids)) = source_overrides.get(projected_dir) {
-                for (name, expected) in [(source_name, source), (ids_name, ids)] {
+                let source = crate::project::write::placed_source(projected_dir, source);
+                for (name, expected) in [(source_name, &source), (ids_name, ids)] {
                     if current
                         .iter()
                         .find(|(file_name, _)| file_name == name)
@@ -901,12 +901,10 @@ impl WorkspaceSession {
                 serde_json::to_value(&document.presentation)
                     .map_err(|error| SessionError::other(error.to_string()))?,
             ),
-            (
-                PathBuf::from(COMPONENTS_DIR).join(SETS_JSON),
-                serde_json::to_value(&document.components.sets)
-                    .map_err(|error| SessionError::other(error.to_string()))?,
-            ),
-        ] {
+        ]
+        .into_iter()
+        .chain(set_files_of(document)?)
+        {
             if std::fs::read(self.root.join(&relative))? != json_bytes(&value)? {
                 return Err(SessionError::SaveBlocked(SaveBlocked::DiskChangedAgain));
             }
@@ -949,9 +947,7 @@ impl WorkspaceSession {
         self.manifest = expected_manifest;
         self.manifest_disk_hash = sha256_bytes(&manifest_bytes);
         self.asset_index_disk_hash = Some(expected_asset_index_hash);
-        for (relative, hash) in &mut self.other_singleton_disk_hashes {
-            *hash = file_sha256_if_present(&self.root.join(relative))?;
-        }
+        self.other_singleton_disk_hashes = singleton_disk_hashes(&self.root)?;
         Ok(())
     }
 
@@ -1641,7 +1637,12 @@ fn artifact_location(root: &Path, path: &Path) -> Option<(ArtifactKind, String, 
         })?;
         ancestor.1.join(absolute.strip_prefix(ancestor.0).ok()?)
     };
-    let mut parts = normalized.strip_prefix(root).ok()?.components();
+    let relative = normalized.strip_prefix(root).ok()?;
+    if let Some(design_dir) = component_design_dir_of(root, relative) {
+        let slug = design_dir.file_name()?.to_str()?.to_owned();
+        return Some((ArtifactKind::Component, slug, design_dir));
+    }
+    let mut parts = relative.components();
     let directory = parts.next()?.as_os_str().to_str()?;
     let slug = parts.next()?.as_os_str().to_str()?.to_owned();
     let kind = match directory {
@@ -1739,9 +1740,21 @@ fn artifact_meta_at(
 }
 
 fn find_artifact_by_id(root: &Path, id: &ArtifactId) -> Result<Option<ArtifactMeta>, SessionError> {
+    if let ArtifactId::Component(_) = id {
+        for dir in scan_component_dirs(root)?.component_dirs {
+            let Ok(relative) = dir.strip_prefix(root) else {
+                continue;
+            };
+            if let Some(meta) = artifact_meta_at(root, relative, ArtifactKind::Component)?
+                && &meta.id == id
+            {
+                return Ok(Some(meta));
+            }
+        }
+        return Ok(None);
+    }
     let (directory, kind) = match id {
         ArtifactId::Page(_) => (PAGES_DIR, ArtifactKind::Page),
-        ArtifactId::Component(_) => (COMPONENTS_DIR, ArtifactKind::Component),
         ArtifactId::Graphics(_) => (GRAPHICS_DIR, ArtifactKind::Graphics),
         _ => return Ok(None),
     };
@@ -1764,6 +1777,90 @@ fn find_artifact_by_id(root: &Path, id: &ArtifactId) -> Result<Option<ArtifactMe
         }
     }
     Ok(None)
+}
+
+/// A component's source and sidecar with the sidecar's `root_parent` set to
+/// where `document` has the master. That parent (a page, or a variant set's
+/// frame) is outside the component's scope, so moving the master there marks
+/// no artifact dirty: without this, a save writes back the old sidecar and the
+/// master falls out of its frame on reopening.
+fn with_document_root_parent(
+    document: &fanta_doc::Doc,
+    component: fanta_doc::ComponentId,
+    (source, ids): (Vec<u8>, Vec<u8>),
+) -> Result<(Vec<u8>, Vec<u8>), SessionError> {
+    let Some(root) = document.components.def(component).map(|def| def.root) else {
+        return Ok((source, ids));
+    };
+    let Some(node) = document.scene.get(root) else {
+        return Ok((source, ids));
+    };
+    let parent = node
+        .parent
+        .map(|parent| {
+            serde_json::to_value(parent)
+                .map_err(|error| SessionError::other(error.to_string()))
+                .and_then(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| SessionError::other("a node id is not a string"))
+                })
+        })
+        .transpose()?;
+    let mut sidecar: fanta_fnx::FnxSidecar = serde_json::from_slice(&ids)
+        .map_err(|error| SessionError::other(format!("component sidecar: {error}")))?;
+    if sidecar.root_parent == parent {
+        return Ok((source, ids));
+    }
+    sidecar.root_parent = parent;
+    let ids = json_bytes(
+        &serde_json::to_value(&sidecar).map_err(|error| SessionError::other(error.to_string()))?,
+    )?;
+    Ok((source, ids))
+}
+
+/// Workspace files outside any artifact that a save rewrites and that a
+/// concurrent change must block: the doc singletons and every variant set's
+/// definition on disk (v5 `components/<set>/set.json`, or v4
+/// `components/sets.json`).
+fn singleton_disk_hashes(root: &Path) -> Result<BTreeMap<PathBuf, Option<[u8; 32]>>, SessionError> {
+    let mut paths = vec![
+        PathBuf::from(DOC_DIR).join(MOTION_JSON),
+        PathBuf::from(DOC_DIR).join(FLOW_START_JSON),
+        PathBuf::from(DOC_DIR).join(FLOWS_JSON),
+        PathBuf::from(DOC_DIR).join(PRESENTATION_JSON),
+    ];
+    paths.extend(
+        scan_component_dirs(root)?
+            .set_files
+            .into_iter()
+            .filter_map(|path| path.strip_prefix(root).ok().map(Path::to_path_buf)),
+    );
+    paths
+        .into_iter()
+        .map(|relative| file_sha256_if_present(&root.join(&relative)).map(|hash| (relative, hash)))
+        .collect()
+}
+
+/// Each variant set's `set.json` path and contents, as the writer projects
+/// them for `document`.
+fn set_files_of(document: &fanta_doc::Doc) -> Result<Vec<(PathBuf, Value)>, SessionError> {
+    let dirs = component_dirs(document);
+    document
+        .components
+        .sets
+        .iter()
+        .map(|(id, set)| {
+            let dir = dirs
+                .sets
+                .get(id)
+                .ok_or_else(|| SessionError::other(format!("set {id} has no directory")))?;
+            let value = serde_json::to_value(set)
+                .map_err(|error| SessionError::other(error.to_string()))?;
+            Ok((dir.join(SET_JSON), value))
+        })
+        .collect()
 }
 
 fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {

@@ -19,7 +19,7 @@ use std::time::SystemTime;
 use super::layout::{
     ACTIVE_MODES_JSON, ASSET_LIBRARY_JSON, ASSETS_DIR, COMPONENTS_DIR, DEF_JSON, DOC_DIR,
     FLOW_START_JSON, FLOWS_JSON, LOOSE_DIR, MASTER_FNX, MASTER_IDS, METADATA_JSON, MOTION_JSON,
-    NODES_DIR, PAGE_FNX, PAGE_IDS, PAGE_JSON, PAGES_DIR, PRESENTATION_JSON, SETS_JSON,
+    NODES_DIR, PAGE_FNX, PAGE_IDS, PAGE_JSON, PAGES_DIR, PRESENTATION_JSON, SET_JSON,
     VARIABLES_JSON, id_from_key, is_project_dir, json_key, read_json_file, read_json_or,
     read_manifest, sorted_entries,
 };
@@ -503,21 +503,18 @@ fn scan_components(
     let mut sets = json!({});
     let mut winner_dirs = Vec::new();
     if comp_dir.is_dir() {
+        // v5 keeps a variant set's variants inside its folder beside its
+        // `set.json`; v4 kept them flat with every set in `sets.json`.
+        let scanned = super::component_dirs::scan_component_dirs(dir)?;
+        let set_files = scanned
+            .set_files
+            .iter()
+            .map(|path| Ok((path.clone(), read_project_json(path, json_override)?)))
+            .collect::<Result<Vec<_>>>()?;
+        sets = super::component_dirs::merge_set_files(&set_files)?;
         let mut candidates: Vec<ComponentDir> = Vec::new();
-        for entry in sorted_entries(&comp_dir)? {
-            if entry.is_file() {
-                if entry.file_name().is_some_and(|n| n == SETS_JSON) {
-                    sets = read_project_json(&entry, json_override)?;
-                }
-                continue;
-            }
-            if !entry.is_dir() {
-                continue;
-            }
+        for entry in scanned.component_dirs {
             let name = dir_name(&entry)?;
-            if !entry.join(DEF_JSON).is_file() {
-                continue;
-            }
             let def = read_project_json(&entry.join(DEF_JSON), json_override)?;
             let (id, id_from_header) = match def.get("id").and_then(Value::as_str) {
                 Some(key) => {
@@ -1176,14 +1173,16 @@ pub fn locate_page_source(project_root: &Path, page: NodeId) -> Option<PathBuf> 
 }
 
 /// Find the `master.fnx` source of `component` under `project_root`, whatever
-/// the component's directory is named (v3 slug or v2 id).
+/// the component's directory is named (v3 slug or v2 id), standalone or a
+/// variant inside its set's folder (v5).
 pub fn locate_master_source(project_root: &Path, component: ComponentId) -> Option<PathBuf> {
-    locate_design_source(
-        &project_root.join(COMPONENTS_DIR),
-        MASTER_FNX,
-        component,
-        component_id_of_dir,
-    )
+    super::component_dirs::scan_component_dirs(project_root)
+        .ok()?
+        .component_dirs
+        .into_iter()
+        .find(|dir| component_id_of_dir(dir) == Some(component))
+        .map(|dir| dir.join(MASTER_FNX))
+        .filter(|path| path.is_file())
 }
 
 /// Resolve which project and design a `.fnx` source path belongs to.
@@ -1196,7 +1195,17 @@ pub fn locate_master_source(project_root: &Path, component: ComponentId) -> Opti
 pub fn page_scope_of_source(path: &Path) -> Option<(PathBuf, ScopedDesign)> {
     let file_name = path.file_name()?.to_str()?;
     let design_dir = path.parent()?;
-    let designs_dir = design_dir.parent()?;
+    let mut designs_dir = design_dir.parent()?;
+    // A variant's master sits one folder deeper, in its set's folder (v5).
+    if file_name == MASTER_FNX
+        && designs_dir.join(SET_JSON).is_file()
+        && let Some(components) = designs_dir.parent()
+        && components
+            .file_name()
+            .is_some_and(|name| name == COMPONENTS_DIR)
+    {
+        designs_dir = components;
+    }
     let designs_dir_name = designs_dir.file_name()?.to_str()?;
     let project_root = designs_dir.parent()?;
     let design = match (designs_dir_name, file_name) {

@@ -47,7 +47,7 @@ Mermaid diagrams are automatically color-coded using the user's theme accent pal
 {{#if (contains available_tools 'design_state') }}
 ## Design canvas
 
-Fanta shows a design canvas next to the code. The design is `.fnx` source files (one per page under `pages/<slug>/page.fnx`, one per component master under `components/<slug>/master.fnx`) and a live canvas at once; `design_state` reports each page's source path. You have two editing lanes:
+Fanta shows a design canvas next to the code. The design is `.fnx` source files (one per page under `pages/<slug>/page.fnx`, one per component master under `components/<slug>/master.fnx`, or `components/<set>/<variant>/master.fnx` for a variant of a component set) and a live canvas at once; `design_state` reports each page's source path. You have two editing lanes:
 
 - **Visible progress first**: use `design_edit` to build and adjust scene elements gradually on the live canvas. In source-capable modes, use file tools for small, complete FNX subtrees and typed JSON edits; save each working milestone so the canvas stays current. Preserve existing node, component, variable and asset identities. Read JSON schemas before editing metadata or sidecars, and validate the complete project before continuing. Never rewrite generated previews or exports as design source.
 - **Complete FNX candidates**: FNX attributes use strict JSON: double quote every object key, including nested keys (for example, the JSON object `{"size_px": 16, "weight": 400}`). Save balanced tags and complete JSON values. Build large designs in small, complete frame/component edits so output limits cannot truncate a page. Repair parser diagnostics and retry; never force-save a partial draft.

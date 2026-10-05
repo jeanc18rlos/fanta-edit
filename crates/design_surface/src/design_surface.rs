@@ -1496,8 +1496,9 @@ mode use canvas operations; source file mutation is unavailable.
   component's name ("Button"); the set's frame holds every variant in a grid.
   Grow or shrink a set with add_variants / remove_variant, tidy one with
   arrange_variants, and rename with rename_component. Never edit
-  components/*.json or sets.json by hand: pages name components, and a
-  renamed component breaks every page that names it. Expose the axis on a
+  a component's def.json or set.json by hand, or add a folder per variant:
+  pages name components, and a renamed component breaks every page that
+  names it. Expose the axis on a
   member master, and instance the set id. Read the exact property/axis values before changing
   an instance; invalid types or target bindings roll back the batch.
 - For a centered minimum-size button use `set_auto_layout` with horizontal

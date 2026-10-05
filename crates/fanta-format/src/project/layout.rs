@@ -38,7 +38,14 @@ pub(crate) const FORMAT_TAG: &str = "fanta-project";
 /// v4-tagged project, so a v3-era build never encounters source it cannot
 /// resolve — its manifest gate refuses v4 outright instead of half-loading.
 /// v3 trees still read; the next save upgrades them.
-pub(crate) const PROJECT_VERSION: u32 = 4;
+///
+/// **v5** makes a component with variants one folder: a variant set is
+/// `components/<set>/` with its own `set.json` and one folder per variant
+/// (`components/button/primary-hover/master.fnx`), instead of every variant
+/// in its own top-level `components/<slug>/` and all sets in
+/// `components/sets.json`. v4 trees still read; the next save moves the
+/// variants into their set's folder and removes `components/sets.json`.
+pub(crate) const PROJECT_VERSION: u32 = 5;
 
 pub(crate) const DOC_DIR: &str = "doc";
 pub(crate) const PAGES_DIR: &str = "pages";
@@ -68,8 +75,11 @@ pub(crate) const MASTER_IDS: &str = "master.ids.json";
 pub(crate) const PAGE_JSON: &str = "page.json";
 /// Component master file: the `ComponentDef` JSON.
 pub(crate) const DEF_JSON: &str = "def.json";
-/// Component-set registry (small, rarely edited concurrently).
+/// v4 component-set registry, `components/sets.json`. Read, never written
+/// since v5 (each set keeps its own [`SET_JSON`]).
 pub(crate) const SETS_JSON: &str = "sets.json";
+/// v5: a variant set's definition, `components/<set>/set.json`.
+pub(crate) const SET_JSON: &str = "set.json";
 /// Graphics design header (layout v4); source names live in `fanta_fnx::artifact_file_names`.
 pub(crate) const GRAPHICS_JSON: &str = "graphics.json";
 /// Pseudo-page directory for orphan nodes — nodes whose parent chain reaches
@@ -203,16 +213,26 @@ pages/<page-slug>/
   page.json                      # { "id": "n_…", "name": ..., "order": N }
   page.fnx                       # the page's node tree as readable source  <- edit this
   page.ids.json                  # legacy id/order sidecar kept in sync  — do not hand-edit
-components/<component-slug>/
+components/<component-slug>/     # a component without variants
   def.json                       # component definition (id, root, name)  — do not hand-edit
   master.fnx                     # the component master's tree as source    <- edit this
   master.ids.json                # legacy id/order sidecar kept in sync  — do not hand-edit
-components/sets.json             # component-set (variant) registry       — do not hand-edit
+components/<set-slug>/           # a component WITH variants: one folder
+  set.json                       # its axes, values and default variant    — do not hand-edit
+  <variant-slug>/                # one per variant, named by its values (primary-hover)
+    def.json                     # the variant's definition               — do not hand-edit
+    master.fnx                   # the variant master's tree as source      <- edit this
+    master.ids.json              # legacy id/order sidecar kept in sync  — do not hand-edit
 assets/index.json                # asset sizes and full SHA-256 digests
 assets/<family>/<AssetId>.<ext>  # shared binary assets, one folder per family:
                                  #   images/ video/ audio/ models/ svg/ fonts/ other/
 previews/  exports/              # generated output — git-ignored, never an input
 ```
+
+A component with variants (a component set) is ONE folder: never create a
+top-level `components/<slug>/` per variant. Variants are made, added, removed
+and renamed with the canvas ops (`combine_variants`, `add_variants`,
+`remove_variant`, `rename_component`), and the app places their folders.
 
 Directory names under `pages/` and `components/` are human-readable slugs of
 the design's name (two pages named the same get `-2`, `-3` suffixes). The
@@ -227,7 +247,7 @@ renaming a component in `def.json` breaks every page that names it and the
 whole project stops loading. Rename components, and build or change variant
 sets, with the canvas ops below (`rename_component`, `combine_variants`,
 `add_variants`, `remove_variant`, `arrange_variants`); the app then rewrites
-`def.json`, `sets.json` and every page that names the component together.
+`def.json`, `set.json` and every page that names the component together.
 
 ## The `.fnx` language
 

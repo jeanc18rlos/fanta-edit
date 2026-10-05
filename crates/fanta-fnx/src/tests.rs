@@ -2424,3 +2424,15 @@ fn grid_layout_and_cells_round_trip() {
     ];
     assert_same_nodes(&round_trip(&nodes), &nodes);
 }
+
+#[test]
+fn a_variant_source_one_folder_deeper_imports_fnx_from_the_root() {
+    let printed = print_doc("Primary", &parse_doc("<Frame />").unwrap());
+    let nested = crate::with_module_depth(printed.clone(), 3);
+    assert!(nested.contains("from \"../../../fnx\";"));
+    assert!(!nested.contains("from \"../../fnx\";"));
+    assert_eq!(crate::with_module_depth(printed.clone(), 2), printed);
+    // The deeper import counts as the fnx import: nothing is added.
+    assert_eq!(crate::canonicalize_legacy_source(&nested), None);
+    assert_eq!(parse_doc(&nested).unwrap(), parse_doc(&printed).unwrap());
+}

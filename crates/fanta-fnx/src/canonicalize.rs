@@ -20,6 +20,37 @@ const LEGACY_TAG_IMPORTS: &[&str] = &[
 const FNX_MODULE_PATH: &str = "../../fnx";
 const GENERATED_MARKER: &str = "@generated fanta source";
 
+/// The `fnx` module path from a source `depth` folders below the project root
+/// (`pages/home/page.fnx` is 2 deep, a variant's
+/// `components/button/primary/master.fnx` is 3): `"../../fnx"`.
+fn fnx_module_path(depth: usize) -> String {
+    format!("{}fnx", "../".repeat(depth.max(1)))
+}
+
+/// Whether `path` is the `fnx` module seen from some depth (`../../fnx`).
+fn is_fnx_module_path(path: &str) -> bool {
+    let mut rest = path;
+    let mut levels = 0;
+    while let Some(next) = rest.strip_prefix("../") {
+        rest = next;
+        levels += 1;
+    }
+    levels > 0 && rest == "fnx"
+}
+
+/// Point a printed source's `fnx` import at the project root from a file
+/// `depth` folders deep. The printer writes the 2-deep import (pages, and
+/// standalone components); a variant inside a component set folder is one
+/// deeper. Only the canonical import line is rewritten, so a hand-shaped
+/// import stays the author's.
+pub fn with_module_depth(source: String, depth: usize) -> String {
+    if depth == 2 || !source.contains(FNX_TAG_IMPORT) {
+        return source;
+    }
+    let line = FNX_TAG_IMPORT.replace(FNX_MODULE_PATH, &fnx_module_path(depth));
+    source.replacen(FNX_TAG_IMPORT, &line, 1)
+}
+
 #[derive(Default)]
 struct Inspection {
     looks_like_fnx: bool,
@@ -119,7 +150,7 @@ fn inspect(source: &str) -> Inspection {
                 if in_import
                     && !import_is_type_only
                     && matches!(previous_identifier, Some("import" | "from"))
-                    && quoted_value(source, cursor, end) == Some(FNX_MODULE_PATH)
+                    && quoted_value(source, cursor, end).is_some_and(is_fnx_module_path)
                 {
                     inspection.has_fnx_tag_import = true;
                 }

@@ -725,7 +725,25 @@ impl ArtifactSession {
     }
 
     /// Project working state to file bytes for this artifact's file set.
+    /// This artifact's files as they would be written: the projected source
+    /// with its `fnx` import pointed at the project root from the artifact's
+    /// folder (a variant is a folder deeper than a page), sidecar and header.
     pub fn project_to_files(&self) -> Result<Vec<(String, Vec<u8>)>, SessionError> {
+        let depth = self.meta.design_dir.components().count();
+        let (fnx_name, _, _) = file_names(self.kind);
+        let mut files = self.project_to_files_unplaced()?;
+        for (name, bytes) in &mut files {
+            if name == fnx_name
+                && let Ok(text) = String::from_utf8(std::mem::take(bytes))
+                    .map_err(|error| *bytes = error.into_bytes())
+            {
+                *bytes = fanta_fnx::with_module_depth(text, depth).into_bytes();
+            }
+        }
+        Ok(files)
+    }
+
+    fn project_to_files_unplaced(&self) -> Result<Vec<(String, Vec<u8>)>, SessionError> {
         match &self.state {
             ArtifactDirty::Clean => {
                 // Re-read projection from scene for hash comparison.
@@ -1741,6 +1759,15 @@ impl ArtifactSession {
                 // editable page scene intentionally strips them.
                 object.remove("clip_size");
                 object.remove("local_size");
+            }
+            if self.kind == ArtifactKind::Component
+                && id == self.scoped.root
+                && let Some(object) = normalized.as_object_mut()
+            {
+                // A master's parent (its page, or its variant set's frame) is
+                // outside the component's scope: the source keeps it as
+                // `root_parent`, the scoped scene detaches the root.
+                object.insert("parent".to_owned(), Value::Null);
             }
             nodes.insert(id.0.to_string(), normalized);
         }

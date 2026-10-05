@@ -43,6 +43,7 @@
 //! This module is the projection layer only — git plumbing and app wiring live
 //! upstream (`fanta-app`), per spec 09 §A.1/§A.3.
 
+mod component_dirs;
 mod layout;
 mod media;
 mod merge;
@@ -83,8 +84,8 @@ pub use source_edit::{
     validate_project_source_edit, validate_project_source_edit_with_diagnostics,
 };
 pub use write::{
-    ProjectWriteCache, WriteReport, projected_design_dirs, write_project_tree,
-    write_project_tree_cached, write_project_tree_cached_with_media_registry,
+    ProjectUpgrade, ProjectWriteCache, WriteReport, projected_design_dirs, upgrade_project,
+    write_project_tree, write_project_tree_cached, write_project_tree_cached_with_media_registry,
     write_project_tree_cached_with_sources,
     write_project_tree_cached_with_sources_and_media_registry,
     write_project_tree_cached_with_sources_checked,
@@ -465,7 +466,10 @@ mod tests {
                 "component sidecar missing a node"
             );
         }
-        assert!(p.join("components/sets.json").is_file());
+        assert!(
+            !p.join("components/sets.json").exists(),
+            "v5 keeps each variant set's definition in its own folder"
+        );
         // The components page root is page-owned → its own page source.
         assert!(
             p.join("pages/components/page.fnx").is_file(),
