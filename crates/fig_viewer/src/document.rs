@@ -189,6 +189,17 @@ impl Drop for ProjectWriteLease {
     }
 }
 
+pub(crate) struct SourceWrite {
+    diagnostics: Vec<fanta_format::SourceDiagnostic>,
+    _lease: Arc<ProjectWriteLease>,
+}
+
+impl SourceWrite {
+    pub fn finish_adoption(self) -> Vec<fanta_format::SourceDiagnostic> {
+        self.diagnostics
+    }
+}
+
 #[derive(Clone, Copy)]
 struct ContentPreviewState {
     owner: EntityId,
@@ -1817,6 +1828,16 @@ impl FigItem {
         self.schedule_watcher_check(cx);
     }
 
+    #[cfg(test)]
+    pub(crate) fn queue_watcher_paths_for_test(
+        &mut self,
+        paths: impl IntoIterator<Item = PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_watcher_paths.extend(paths);
+        self.schedule_watcher_check(cx);
+    }
+
     fn schedule_watcher_check(&mut self, cx: &mut Context<Self>) {
         if self.pending_watcher_paths.is_empty()
             || self.watcher_check_in_flight
@@ -2347,6 +2368,69 @@ impl FigItem {
             )));
         }
         self.reload_from_disk_unchecked(cx)
+    }
+
+    pub(crate) fn apply_source_edit(
+        &mut self,
+        source_path: PathBuf,
+        source: String,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<SourceWrite>> {
+        let Some(root) = self.project_root.clone() else {
+            return Task::ready(Err(anyhow::anyhow!(
+                "save the design before editing its source"
+            )));
+        };
+        if self.project_writes.changing_destination() {
+            return Task::ready(Err(anyhow::anyhow!(
+                "wait for Save As to finish before saving source"
+            )));
+        }
+        let lease = self.project_writes.begin();
+        self.reload_task = None;
+        cx.spawn(async move |this, cx| {
+            lease.wait_for_turn().await;
+            let (edit, diagnostics) = cx
+                .background_spawn({
+                    let lease = lease.clone();
+                    async move {
+                        let _lease = lease;
+                        match source_path
+                            .extension()
+                            .and_then(|extension| extension.to_str())
+                        {
+                            Some("fnx") => {
+                                fanta_format::apply_project_source_edit_with_diagnostics(
+                                    &root,
+                                    &source_path,
+                                    &source,
+                                )
+                            }
+                            Some("json") => {
+                                fanta_format::apply_project_json_edit(&root, &source_path, &source)
+                                    .map(|edit| (edit, Vec::new()))
+                            }
+                            _ => Err(fanta_format::FormatError::InvalidProjectTree(
+                                "unsupported source file".into(),
+                            )),
+                        }
+                    }
+                })
+                .await?;
+            this.update(cx, |this, cx| {
+                for (path, hash) in edit.accepted_source_hashes {
+                    this.own_write_removed.remove(&path);
+                    this.own_write_hashes.insert(path, hash);
+                }
+                this.schedule_watcher_check(cx);
+            })?;
+            // The caller keeps this lease through buffer refresh and canvas adoption.
+            // Watchers then compare their delayed events with the exact accepted bytes.
+            Ok(SourceWrite {
+                diagnostics,
+                _lease: lease,
+            })
+        })
     }
 
     pub(crate) fn discard_canvas_edits_for_source_resolution(
@@ -6683,6 +6767,59 @@ mod tests {
             page,
             text: text_id,
         }
+    }
+
+    #[gpui::test]
+    async fn source_recovery_write_lease_defers_watchers_until_adoption(cx: &mut TestAppContext) {
+        let fixture = save_generation_fixture(cx).await;
+        let source =
+            fanta_format::locate_page_source(&fixture.root, fixture.page).expect("page source");
+        let before = std::fs::read_to_string(&source).expect("source");
+        let edited = format!("{before}\n");
+        fixture
+            .item
+            .update(cx, |item, cx| item.set_source_edit_locked(true, cx));
+        let write = fixture
+            .item
+            .update(cx, |item, cx| {
+                item.apply_source_edit(source.clone(), edited.clone(), cx)
+            })
+            .await
+            .expect("source write");
+        fixture.item.update(cx, |item, cx| {
+            assert!(item.project_writes.has_active_writes());
+            assert!(item.project_writes.begin_destination_change().is_err());
+            item.queue_watcher_paths_for_test([source.clone()], cx);
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(RELOAD_DEBOUNCE);
+        cx.run_until_parked();
+        fixture.item.read_with(cx, |item, _| {
+            assert!(item.pending_watcher_paths.contains(&source));
+            assert!(!item.has_conflict());
+        });
+        fixture
+            .item
+            .update(cx, |item, cx| {
+                item.discard_canvas_edits_for_source_resolution(cx)
+            })
+            .await
+            .expect("adopt source");
+        fixture.item.read_with(cx, |item, _| {
+            assert!(item.project_writes.has_active_writes())
+        });
+        assert!(write.finish_adoption().is_empty());
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 2);
+        cx.run_until_parked();
+        fixture.item.read_with(cx, |item, _| {
+            assert!(!item.project_writes.has_active_writes());
+            assert!(item.pending_watcher_paths.is_empty());
+            assert!(!item.has_conflict());
+        });
+        assert_eq!(
+            std::fs::read_to_string(source).expect("accepted source"),
+            edited
+        );
     }
 
     fn pause_next_save(
