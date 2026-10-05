@@ -125,7 +125,11 @@ Native numeric/hex draft cancellation and Export-label checks passed at a 320 px
 inspector width. A two-kind selection's aggregate-opacity display/edit/Undo and
 the visible cross-document paste refusal also passed native checks; see the
 [coverage report](../alpha/CAPABILITY_COVERAGE.md#current-acceptance-status)
-for exact builds and remaining gesture checks.
+for exact builds and remaining gesture checks. A later 320 px fixture passes
+differing 50%/100% values edited to 75%, single Undo/Redo, restoration and exact
+reopening. A fast drag that leaves the numeric readout before its first move
+did not start a scrub in the earlier tested build. The correction now passes
+automated regressions; its native retry remains pending.
 
 Implementation: [tools.rs](../../crates/fig_viewer/src/tools.rs),
 [canvas tools](../../crates/fanta-tools/src),
@@ -300,7 +304,11 @@ Implementation: [timeline](../../crates/fig_viewer/src/timeline.rs),
 Export selections with **PNG, JPG, SVG or PDF** presets. Raster sizing,
 multi-selection batches and multiple presets are supported. Export operates on
 committed artwork, reports completion/failure and refuses an active preview.
-Imported or advanced effects still need format-specific fidelity checks.
+Bounded native Vector/Bitmap exports validate dimensions, PNG/SVG/PDF appearance,
+Vector JPG, collision preservation and two simultaneous presets, including 2×
+PNG. Bitmap JPG has a separate limited flat-block pass; its original four-pixel
+comparison failure remains recorded. Imported or advanced effects, broader
+batches and general JPEG quality still need format-specific checks.
 
 The built-in designer can inspect/edit the canvas, use project `fanta.md`
 instructions, prepare design assets, follow source edits and report agent
@@ -342,9 +350,11 @@ saved and reopened. Neither storage support nor a node enum constitutes a
 finished user workflow.
 
 Large-page rendering work remains incomplete. The opt-in retained renderer API
-passes automated checks, but it is not enabled in canvas dragging. Both sampled
-Spectrum targets safely refused preparation in every attempt, so this API has
-no Spectrum parity or timing result yet. The below-16-ms drag target is unproven.
+now passes bounded Spectrum CPU parity and timing checks after fixed-ancestor
+support. It helps the sampled fit-all views but makes the 100% image case slower
+and does not improve the 100% instance case. It is not enabled in canvas
+dragging. New UI-cost diagnostics pass automated tests but still need native
+log capture. The below-16-ms native drag target remains unproven.
 
 Mac App Store builds restrict local process execution, external agents and
 related inherited editor features; see [MAC_APP_STORE.md](../alpha/MAC_APP_STORE.md).
