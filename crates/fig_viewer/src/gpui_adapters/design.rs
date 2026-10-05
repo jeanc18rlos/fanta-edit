@@ -30,12 +30,12 @@ use fanta_gpui::design::{
     DesignLineHeight, DesignMaskType, DesignMediaCropAction, DesignMediaCropToolState,
     DesignMediaKind, DesignMediaPaintAsset, DesignMediaPaintCapabilities,
     DesignMediaPaintPlacement, DesignMediaPaintView, DesignMediaPaintViewData,
-    DesignMediaQuarterTurn, DesignPaint, DesignPaintCollectionEditMode, DesignPaintKind,
-    DesignPaintPayload, DesignPaintProperty, DesignPaintSource, DesignPaintStyleViewData,
-    DesignPaintTransform, DesignPaintType, DesignPaintValue, DesignPanel, DesignPanelAction,
-    DesignPanelAutoLayoutDirection, DesignPanelAutoLayoutParticipation, DesignPanelAutoLayoutWrap,
-    DesignPanelCollection, DesignPanelEditPhase, DesignPanelNode, DesignPanelNodeCapabilities,
-    DesignPanelNodeKind, DesignPanelParentLayout, DesignPanelProperty,
+    DesignMediaQuarterTurn, DesignPaint, DesignPaintBinding, DesignPaintCollectionEditMode,
+    DesignPaintKind, DesignPaintPayload, DesignPaintProperty, DesignPaintSource,
+    DesignPaintStyleViewData, DesignPaintTransform, DesignPaintType, DesignPaintValue, DesignPanel,
+    DesignPanelAction, DesignPanelAutoLayoutDirection, DesignPanelAutoLayoutParticipation,
+    DesignPanelAutoLayoutWrap, DesignPanelCollection, DesignPanelEditPhase, DesignPanelNode,
+    DesignPanelNodeCapabilities, DesignPanelNodeKind, DesignPanelParentLayout, DesignPanelProperty,
     DesignPanelPropertyValueState, DesignPanelSection, DesignPanelSelection, DesignPanelTarget,
     DesignPanelValue, DesignPatternHorizontalAlignment, DesignPatternPaint, DesignPatternSource,
     DesignPatternTileType, DesignPolygonGeometry, DesignSelectionHeaderCommand,
@@ -76,7 +76,8 @@ use crate::properties_snapshot::PaintKind as EnginePaintKind;
 use crate::properties_snapshot::{
     CornerRadiusValue, HiddenPaintAlpha, InspectorField, NodeSection, NodeSnapshot, PaintKey,
     PaintSnapshot, PropValueSnapshot, TypographySnapshot, multi_section, node_section,
-    opaque_paint_alpha, paint_alpha, paint_alpha_is_visible, set_paint_alpha, zeroed_paint_alpha,
+    opaque_paint_alpha, paint_alpha, paint_alpha_is_visible, paint_snapshot, set_paint_alpha,
+    zeroed_paint_alpha,
 };
 use crate::view::FigView;
 
@@ -544,6 +545,67 @@ fn design_solid_paint(color: FantaColor) -> DesignPaint {
     // lossless because `PaintOpacity` edits write the alpha channel back.
     paint.opacity = f32::from(color.a) / 255.0 * 100.0;
     paint
+}
+
+fn project_paint_bindings(doc: &Doc, id: NodeId, out: &mut DesignPanelNode) {
+    let Some(node) = doc.scene.get(id) else {
+        return;
+    };
+    for (property, variable_id) in &node.bindings {
+        let (is_stroke, index) = match property {
+            BoundProp::FillColor { index } => (false, usize::from(*index)),
+            BoundProp::StrokeColor { index } => (true, usize::from(*index)),
+            _ => continue,
+        };
+        let paint = if is_stroke {
+            out.stroke
+                .as_mut()
+                .and_then(|stroke| stroke.paints.get_mut(index))
+        } else {
+            out.fills.get_mut(index)
+        };
+        let Some(paint) = paint else { continue };
+        if let Some(fanta_doc::ResolvedVarValue::Color { value }) = fanta_doc::resolve_bound_value(
+            &doc.variables,
+            &doc.scene,
+            id,
+            &doc.active_modes,
+            *variable_id,
+        ) {
+            let collection = if is_stroke { "stroke" } else { "fill" };
+            if let Some(authored) = current_paint(doc, id, is_stroke, index) {
+                let mut resolved = authored.clone();
+                resolved.set_solid_color(value);
+                *paint = design_paint(
+                    id,
+                    collection,
+                    index,
+                    &paint_snapshot(&resolved, None),
+                    Some(&resolved),
+                );
+            } else {
+                let paint_id = paint.id.clone();
+                *paint = design_solid_paint(value);
+                paint.id = paint_id;
+                paint.blend_mode = design_blend_mode(node.blend_mode);
+            }
+        }
+        if let DesignPaintPayload::Solid(solid) = &mut paint.payload {
+            let variable = doc.variables.variable(*variable_id);
+            let mut binding = DesignPaintBinding::new(
+                variable_id.to_string(),
+                variable
+                    .map(|variable| variable.name.clone())
+                    .unwrap_or_else(|| "Missing variable".into()),
+            );
+            if let Some(collection) =
+                variable.and_then(|variable| doc.variables.collections.get(&variable.collection))
+            {
+                binding = binding.with_collection(collection.name.clone());
+            }
+            solid.binding = Some(binding);
+        }
+    }
 }
 
 fn design_media_placement(
@@ -1837,6 +1899,7 @@ pub(crate) fn design_node(
     if let Some(strokes) = &section.strokes {
         out.stroke = design_stroke(id, kind, node, strokes);
     }
+    project_paint_bindings(doc, id, &mut out);
     out.effects = design_effects(node);
     out.effect_capabilities.kind_availability = DesignEffectKind::ALL
         .into_iter()
@@ -2147,6 +2210,57 @@ pub(crate) fn bound_states(doc: &Doc, id: NodeId) -> PropertyStates {
     let mut states = Vec::new();
     for (prop, variable_id) in &node.bindings {
         let property = match prop {
+            BoundProp::FillColor { index } | BoundProp::StrokeColor { index } => {
+                let collection = if matches!(prop, BoundProp::StrokeColor { .. }) {
+                    DesignPanelCollection::Stroke
+                } else {
+                    DesignPanelCollection::Fill
+                };
+                // Alpha belongs to the bound RGBA value in this engine, so an
+                // independent paint-opacity edit would only change its fallback.
+                let alpha = match fanta_doc::resolve_bound_value(
+                    &doc.variables,
+                    &doc.scene,
+                    id,
+                    &doc.active_modes,
+                    *variable_id,
+                ) {
+                    Some(fanta_doc::ResolvedVarValue::Color { value }) => Some(value.a),
+                    _ => prop
+                        .read_literal(node)
+                        .as_str()
+                        .and_then(parse_color)
+                        .map(|color| color.a),
+                };
+                let state = alpha.map_or(DesignPanelPropertyValueState::Unset, |alpha| {
+                    DesignPanelPropertyValueState::Uniform(DesignPanelValue::Number(
+                        f32::from(alpha) / 255. * 100.,
+                    ))
+                });
+                states.push((
+                    DesignPanelProperty::PaintOpacity {
+                        collection,
+                        index: usize::from(*index),
+                    },
+                    state.read_only_with_reason("Detach the color variable to edit its opacity"),
+                ));
+                states.push((
+                    DesignPanelProperty::PaintVisible {
+                        collection,
+                        index: usize::from(*index),
+                    },
+                    alpha
+                        .map_or(DesignPanelPropertyValueState::Unset, |alpha| {
+                            DesignPanelPropertyValueState::Uniform(DesignPanelValue::Bool(
+                                alpha > 0,
+                            ))
+                        })
+                        .read_only_with_reason(
+                            "Detach the color variable to change paint visibility",
+                        ),
+                ));
+                continue;
+            }
             BoundProp::Opacity => DesignPanelProperty::Opacity,
             BoundProp::Visible => DesignPanelProperty::Visible,
             BoundProp::CornerRadius => DesignPanelProperty::CornerRadius,
@@ -4186,6 +4300,46 @@ impl FigView {
             } => {
                 self.handle_design_page_background(page_id, *color, *phase, window, cx);
             }
+            DesignPanelAction::PaintColorVariableDetachRequested {
+                node_id: target_node,
+                collection,
+                target,
+                paint_id,
+                index,
+                color_target,
+                variable_id,
+            } => {
+                let Some(id) = node_id(target_node) else {
+                    return;
+                };
+                if !self.design_node_action_is_current(panel, id, cx)
+                    || *target != fanta_gpui::design::DesignPaintTarget::WholeLayer
+                    || *color_target != fanta_gpui::design::DesignPaintColorTarget::Solid
+                {
+                    log::warn!("fig design adapter: rejecting stale paint binding detach target");
+                    return;
+                }
+                self.finish_document_edits_for_external_change(cx);
+                let result = self.item().read(cx).document().map(|document| {
+                    paint_variable_detach_operation(
+                        &document.doc,
+                        id,
+                        *collection,
+                        paint_id,
+                        *index,
+                        variable_id,
+                    )
+                });
+                match result {
+                    Some(Ok(operation)) => {
+                        self.design_apply_ops(operation.into_iter().collect(), cx);
+                    }
+                    Some(Err(error)) => {
+                        crate::view::show_canvas_notice(error.to_string(), window, cx)
+                    }
+                    None => {}
+                }
+            }
             DesignPanelAction::PropertyVariableDetachRequested {
                 node_id: id,
                 target,
@@ -5320,6 +5474,35 @@ impl FigView {
                     && crate::layer_context_ops::editable(&document.doc, id)
             })
         {
+            return;
+        }
+        if phase != DesignPanelEditPhase::Cancel
+            && matches!(
+                edit.property,
+                DesignPaintProperty::Opacity | DesignPaintProperty::Visible
+            )
+            && self.item().read(cx).document().is_some_and(|document| {
+                u16::try_from(index).ok().is_some_and(|index| {
+                    let property = if is_stroke {
+                        BoundProp::StrokeColor { index }
+                    } else {
+                        BoundProp::FillColor { index }
+                    };
+                    document
+                        .doc
+                        .scene
+                        .get(id)
+                        .is_some_and(|node| node.bindings.contains_key(&property))
+                })
+            })
+        {
+            if phase == DesignPanelEditPhase::Commit {
+                crate::view::show_canvas_notice(
+                    "Detach the color variable to edit its opacity or visibility".into(),
+                    window,
+                    cx,
+                );
+            }
             return;
         }
         if let (DesignPaintProperty::Visible, DesignPaintValue::Bool(visible)) =
@@ -6950,6 +7133,37 @@ fn paint_opacity_fraction(fill: &Fill) -> f32 {
         | Fill::Video { opacity, .. }
         | Fill::Shader { opacity, .. } => *opacity,
     }
+}
+
+fn paint_variable_detach_operation(
+    doc: &Doc,
+    id: NodeId,
+    collection: DesignPanelCollection,
+    paint_id: &str,
+    index: usize,
+    variable_id: &str,
+) -> Result<Option<Operation>, &'static str> {
+    let slot = u16::try_from(index).map_err(|_| "The paint no longer exists")?;
+    let (property, collection_name) = match collection {
+        DesignPanelCollection::Fill => (BoundProp::FillColor { index: slot }, "fill"),
+        DesignPanelCollection::Stroke => (BoundProp::StrokeColor { index: slot }, "stroke"),
+        _ => return Err("This collection does not support color variables"),
+    };
+    let node = doc
+        .scene
+        .get(id)
+        .ok_or("The selected layer no longer exists")?;
+    if paint_id != format!("{id}-{collection_name}-{index}") || !property.applies_to(node) {
+        return Err("The paint changed. Open its picker again to detach the variable.");
+    }
+    if node
+        .bindings
+        .get(&property)
+        .is_none_or(|current| current.to_string() != variable_id)
+    {
+        return Err("The color variable changed. Open the paint picker again to detach it.");
+    }
+    crate::variable_binding::unbind_property_operation(doc, id, property)
 }
 
 fn current_paint(doc: &Doc, id: NodeId, is_stroke: bool, index: usize) -> Option<&Fill> {
@@ -10702,6 +10916,378 @@ mod tests {
         });
         let cx = cx.clone();
         (view, panel, cx)
+    }
+
+    fn doc_with_bound_paints() -> (
+        Doc,
+        NodeId,
+        NodeId,
+        fanta_doc::VariableCollectionId,
+        [fanta_doc::ModeId; 2],
+        fanta_doc::VariableId,
+    ) {
+        use fanta_doc::{
+            Mode, ModeId, Variable, VariableCollection, VariableCollectionId, VariableId,
+            VariableType,
+        };
+        let (mut doc, page, rect) = doc_with_rect();
+        let collection = VariableCollectionId::new();
+        let modes = [ModeId::new(), ModeId::new()];
+        let color = VariableId::new();
+        let alias = VariableId::new();
+        doc.variables.collections.insert(
+            collection,
+            VariableCollection {
+                id: collection,
+                name: "Theme".into(),
+                modes: vec![
+                    Mode {
+                        id: modes[0],
+                        name: "Mode 1".into(),
+                    },
+                    Mode {
+                        id: modes[1],
+                        name: "Mode 2".into(),
+                    },
+                ],
+                default_mode: modes[0],
+                variable_order: vec![color, alias],
+            },
+        );
+        doc.variables.variables.insert(
+            color,
+            Variable {
+                id: color,
+                collection,
+                name: "Accent".into(),
+                ty: VariableType::Color,
+                values_by_mode: BTreeMap::from([
+                    (
+                        modes[0],
+                        VarValue::Color {
+                            value: FantaColor::rgb(0xe3, 0x4a, 0x6f),
+                        },
+                    ),
+                    (
+                        modes[1],
+                        VarValue::Color {
+                            value: FantaColor::rgba(0x2f, 0x80, 0xed, 128),
+                        },
+                    ),
+                ]),
+                scopes: vec![],
+            },
+        );
+        doc.variables.variables.insert(
+            alias,
+            Variable {
+                id: alias,
+                collection,
+                name: "Border".into(),
+                ty: VariableType::Color,
+                values_by_mode: BTreeMap::from([
+                    (modes[0], VarValue::Alias { variable: color }),
+                    (modes[1], VarValue::Alias { variable: color }),
+                ]),
+                scopes: vec![],
+            },
+        );
+        let node = doc.scene.get_mut(rect).expect("rectangle");
+        let NodeData::Vector(vector) = &mut node.data else {
+            panic!("vector")
+        };
+        vector.fills = vec![Fill::solid(FantaColor::rgb(0xd9, 0xd9, 0xd9))].into();
+        vector.strokes = vec![fanta_doc::Stroke::solid(FantaColor::BLACK, 2.)].into();
+        node.bindings
+            .insert(BoundProp::FillColor { index: 0 }, color);
+        node.bindings
+            .insert(BoundProp::StrokeColor { index: 0 }, alias);
+        doc.selection.replace_with([rect]);
+        (doc, page, rect, collection, modes, color)
+    }
+
+    #[gpui::test]
+    async fn bound_paint_inspector_resolves_modes_aliases_without_changing_fallback(
+        cx: &mut TestAppContext,
+    ) {
+        let (doc, page, rect, collection, modes, variable) = doc_with_bound_paints();
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        let authored = item.read_with(&cx, |item, _| {
+            item.document()
+                .expect("ready")
+                .doc
+                .scene
+                .get(rect)
+                .expect("rectangle")
+                .clone()
+        });
+        for (mode, pin, expected) in [
+            (modes[0], None, FantaColor::rgb(0xe3, 0x4a, 0x6f)),
+            (modes[1], None, FantaColor::rgba(0x2f, 0x80, 0xed, 128)),
+            (modes[1], Some(modes[0]), FantaColor::rgb(0xe3, 0x4a, 0x6f)),
+        ] {
+            item.update(&mut cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    document.doc.active_modes.insert(collection, mode);
+                    let NodeData::Group(group) =
+                        &mut document.doc.scene.get_mut(page).expect("page").data
+                    else {
+                        panic!("group")
+                    };
+                    group.explicit_modes.clear();
+                    if let Some(pin) = pin {
+                        group.explicit_modes.insert(collection, pin);
+                    }
+                    ((), DocChange::Content)
+                })
+                .expect("ready");
+            });
+            view.update_in(&mut cx, |view, _, cx| view.refresh_gpui_design(cx));
+            cx.run_until_parked();
+            panel.read_with(&cx, |panel, _| {
+                let fill = &panel.node().fills[0];
+                assert_eq!(fill.color, design_color(expected));
+                assert!((fill.opacity - f32::from(expected.a) / 255. * 100.).abs() < 0.001);
+                let DesignPaintPayload::Solid(solid) = &fill.payload else {
+                    panic!("resolved solid")
+                };
+                let binding = solid.binding.as_ref().expect("visible binding");
+                assert_eq!(binding.variable_id.as_ref(), variable.to_string());
+                assert_eq!(binding.variable_name.as_ref(), "Accent");
+                assert_eq!(binding.collection_name.as_deref(), Some("Theme"));
+                let stroke = &panel.node().stroke.as_ref().expect("stroke").paints[0];
+                assert_eq!(
+                    stroke.color,
+                    design_color(expected),
+                    "alias follows the effective mode"
+                );
+                assert!(stroke.is_bound());
+                for collection in [DesignPanelCollection::Fill, DesignPanelCollection::Stroke] {
+                    assert!(
+                        panel
+                            .view_data()
+                            .property_states
+                            .iter()
+                            .any(|(property, state)| *property
+                                == DesignPanelProperty::PaintOpacity {
+                                    collection,
+                                    index: 0
+                                }
+                                && state.is_read_only())
+                    );
+                }
+            });
+            item.read_with(&cx, |item, _| {
+                assert_eq!(
+                    item.document().expect("ready").doc.scene.get(rect),
+                    Some(&authored),
+                    "projection preserves fallback, binding, and all authored node data"
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn bound_paint_inspector_detach_preserves_color_and_undo_rejects_stale_targets(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut doc, page, rect, collection, modes, variable) = doc_with_bound_paints();
+        doc.active_modes.insert(collection, modes[1]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        view.update_in(&mut cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+        let original = item.read_with(&cx, |item, _| {
+            item.document()
+                .expect("ready")
+                .doc
+                .to_json_pretty()
+                .expect("snapshot")
+        });
+        let action = |node: NodeId, paint_id: String, variable_id: String| {
+            DesignPanelAction::PaintColorVariableDetachRequested {
+                node_id: node.to_string().into(),
+                collection: DesignPanelCollection::Fill,
+                target: DesignPaintTarget::WholeLayer,
+                paint_id: paint_id.into(),
+                index: 0,
+                color_target: fanta_gpui::design::DesignPaintColorTarget::Solid,
+                variable_id: variable_id.into(),
+            }
+        };
+        for invalid in [
+            action(page, format!("{page}-fill-0"), variable.to_string()),
+            action(rect, format!("{rect}-fill-1"), variable.to_string()),
+            action(
+                rect,
+                format!("{rect}-fill-0"),
+                fanta_doc::VariableId::new().to_string(),
+            ),
+        ] {
+            panel.update_in(&mut cx, |_, _, cx| cx.emit(invalid));
+            cx.run_until_parked();
+            item.read_with(&cx, |item, _| {
+                let doc = &item.document().expect("ready").doc;
+                assert_eq!(doc.to_json_pretty().expect("snapshot"), original);
+                assert!(!doc.history.can_undo());
+            });
+        }
+        panel.update_in(&mut cx, |_, _, cx| {
+            cx.emit(action(rect, format!("{rect}-fill-0"), variable.to_string()))
+        });
+        cx.run_until_parked();
+        item.read_with(&cx, |item, _| {
+            let doc = &item.document().expect("ready").doc;
+            let node = doc.scene.get(rect).expect("rectangle");
+            assert!(
+                !node
+                    .bindings
+                    .contains_key(&BoundProp::FillColor { index: 0 })
+            );
+            assert!(
+                node.bindings
+                    .contains_key(&BoundProp::StrokeColor { index: 0 })
+            );
+            assert_eq!(
+                current_paint(doc, rect, false, 0),
+                Some(&Fill::solid(FantaColor::rgba(0x2f, 0x80, 0xed, 128)))
+            );
+            assert!(doc.history.can_undo());
+        });
+        panel.read_with(&cx, |panel, _| {
+            assert_eq!(
+                panel.node().fills[0].color,
+                design_color(FantaColor::rgba(0x2f, 0x80, 0xed, 128))
+            );
+            assert!(!panel.node().fills[0].is_bound());
+        });
+        item.update(&mut cx, |item, cx| item.undo(cx).expect("one undo"));
+        cx.run_until_parked();
+        item.read_with(&cx, |item, _| {
+            let doc = &item.document().expect("ready").doc;
+            let restored: serde_json::Value =
+                serde_json::from_str(&doc.to_json_pretty().expect("snapshot")).expect("json");
+            let mut expected: serde_json::Value = serde_json::from_str(&original).expect("json");
+            expected["metadata"]["modified_at"] = restored["metadata"]["modified_at"].clone();
+            assert!(doc.history.can_redo());
+            expected["history"] = restored["history"].clone();
+            assert_eq!(
+                restored, expected,
+                "one undo restores authored fallback and binding"
+            );
+            assert!(!doc.history.can_undo());
+        });
+    }
+
+    #[gpui::test]
+    async fn bound_paint_inspector_rejects_alpha_edits_until_detached(cx: &mut TestAppContext) {
+        let (doc, _, rect, _, _, variable) = doc_with_bound_paints();
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        view.update_in(&mut cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+        let baseline = item.read_with(&cx, |item, _| {
+            item.document()
+                .expect("ready")
+                .doc
+                .to_json_pretty()
+                .expect("snapshot")
+        });
+        for collection in [DesignPanelCollection::Fill, DesignPanelCollection::Stroke] {
+            for (property, value) in [
+                (DesignPaintProperty::Opacity, DesignPaintValue::Number(25.)),
+                (DesignPaintProperty::Visible, DesignPaintValue::Bool(false)),
+            ] {
+                for phase in [
+                    DesignPanelEditPhase::Begin,
+                    DesignPanelEditPhase::Preview,
+                    DesignPanelEditPhase::Commit,
+                    DesignPanelEditPhase::Cancel,
+                ] {
+                    emit_inspector_paint_in_collection(
+                        &panel,
+                        &mut cx,
+                        rect,
+                        collection,
+                        property.clone(),
+                        value.clone(),
+                        phase,
+                    );
+                }
+            }
+        }
+        cx.run_until_parked();
+        item.read_with(&cx, |item, _| {
+            let doc = &item.document().expect("ready").doc;
+            assert_eq!(
+                doc.to_json_pretty().expect("snapshot"),
+                baseline,
+                "bound alpha actions cannot change hidden fallback or history"
+            );
+            assert!(!doc.history.can_undo());
+        });
+        panel.read_with(&cx, |panel, _| {
+            for collection in [DesignPanelCollection::Fill, DesignPanelCollection::Stroke] {
+                for property in [
+                    DesignPanelProperty::PaintOpacity {
+                        collection,
+                        index: 0,
+                    },
+                    DesignPanelProperty::PaintVisible {
+                        collection,
+                        index: 0,
+                    },
+                ] {
+                    assert!(
+                        panel.view_data().property_states.iter().any(
+                            |(candidate, state)| *candidate == property && state.is_read_only()
+                        )
+                    );
+                }
+            }
+        });
+        panel.update_in(&mut cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::PaintColorVariableDetachRequested {
+                node_id: rect.to_string().into(),
+                collection: DesignPanelCollection::Fill,
+                target: DesignPaintTarget::WholeLayer,
+                paint_id: format!("{rect}-fill-0").into(),
+                index: 0,
+                color_target: fanta_gpui::design::DesignPaintColorTarget::Solid,
+                variable_id: variable.to_string().into(),
+            })
+        });
+        cx.run_until_parked();
+        emit_inspector_paint(
+            &panel,
+            &mut cx,
+            rect,
+            DesignPaintProperty::Opacity,
+            DesignPaintValue::Number(25.),
+            DesignPanelEditPhase::Commit,
+        );
+        cx.run_until_parked();
+        item.read_with(&cx, |item, _| {
+            assert_eq!(
+                current_paint(&item.document().expect("ready").doc, rect, false, 0),
+                Some(&Fill::solid(FantaColor::rgba(0xe3, 0x4a, 0x6f, 64)))
+            );
+        });
+        panel.read_with(&cx, |panel, _| {
+            assert!(
+                !panel
+                    .view_data()
+                    .property_states
+                    .iter()
+                    .any(|(property, state)| *property
+                        == DesignPanelProperty::PaintOpacity {
+                            collection: DesignPanelCollection::Fill,
+                            index: 0
+                        }
+                        && state.is_read_only())
+            );
+        });
     }
 
     fn inspector_test_png() -> Vec<u8> {
