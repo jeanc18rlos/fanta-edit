@@ -2,12 +2,13 @@
 //! assignments, derivedSymbolData, nested-instance routing, and swaps.
 
 use super::{
-    BoundProp, ComponentId, ComponentMaps, Doc, HashMap, KiwiValue, MapReport, MasterPathCache,
-    NodeData, NodeId, Override, OverridePath, OverrideValue, PendingInstanceOverrides, PropRefKind,
-    VarValue, apply_text_style_fields, blend_mode, build_content_and_style_runs, build_stroke,
-    build_swap_redirects, corner_radii, corner_smoothing, guid_key, has_stroke_fields,
-    master_root_for, prop_assignment_text, read_blurs, read_derived_override, read_effects,
-    read_fills, read_size, read_transform, resolve_full_guid_path, text_case_of, text_override,
+    BoundProp, ComponentId, ComponentMaps, Doc, HashMap, InstanceSwapRedirects, KiwiValue,
+    MapReport, MasterPathCache, NodeData, NodeId, Override, OverridePath, OverrideValue,
+    PendingInstanceOverrides, PropRefKind, VarValue, apply_text_style_fields, blend_mode,
+    build_content_and_style_runs, build_stroke, build_swap_redirects, corner_radii,
+    corner_smoothing, guid_key, has_stroke_fields, master_root_for, prop_assignment_text,
+    read_blurs, read_derived_override, read_effects, read_fills, read_size, read_transform,
+    resolve_full_guid_path, text_case_of, text_override,
 };
 use fanta_doc::id::ComponentPropId;
 use fanta_doc::{Fill, Stroke};
@@ -125,6 +126,54 @@ pub(crate) fn apply_instance_overrides(
             .push((guid.as_str(), *prop));
     }
 
+    // A parent's path can cross a nested instance that occurs later in the
+    // source stream. Build every swap context before resolving content paths.
+    let mut swap_redirects = InstanceSwapRedirects::new();
+    let mut property_overrides = HashMap::new();
+    for po in pending {
+        let Some(master_root) = instance_component(doc, po.instance)
+            .and_then(|component| master_root_for(doc, component))
+        else {
+            continue;
+        };
+        let mut redirects =
+            build_swap_redirects(po.symbol_overrides, symbol_guid_to_component, |component| {
+                master_root_for(doc, component)
+            });
+        let mut properties = Vec::new();
+        apply_prop_assignments(
+            doc,
+            report,
+            po,
+            master_root,
+            node_prop_refs,
+            symbol_guid_to_component,
+            &mut path_cache,
+            &mut properties,
+        );
+        // Property assignments are emitted after symbol overrides below. Use
+        // that same precedence when choosing the master for a content path.
+        for property in &properties {
+            if let OverrideValue::SwapInstance { component } = &property.value {
+                if let (Some(guid), Some(root)) = (
+                    property
+                        .target_path
+                        .last()
+                        .and_then(|id| path_cache.node_guid(*id)),
+                    master_root_for(doc, *component),
+                ) {
+                    redirects.insert(guid.to_owned(), root);
+                }
+            }
+        }
+        if !redirects.is_empty() {
+            swap_redirects.insert(po.instance, redirects);
+        }
+        if !properties.is_empty() {
+            property_overrides.insert(po.instance, properties);
+        }
+    }
+
     for po in pending {
         // The instance must still exist (not dropped as virtual content).
         let Some(component) = instance_component(doc, po.instance) else {
@@ -138,25 +187,6 @@ pub(crate) fn apply_instance_overrides(
         };
 
         let mut overrides: Vec<Override> = Vec::new();
-
-        // SWAP MAP for the main-vs-published nested duality. A nested instance can
-        // be SWAPPED to a different variant by a sibling `overriddenSymbolID`
-        // override; its *declared* `symbolID` still names the original (published)
-        // master, but the OTHER overrides whose `guidPath` descends THROUGH that
-        // instance address descendants of the SWAPPED master. So when
-        // `resolve_full_guid_path` descends into a nested instance, it must enter
-        // the swapped master — not the declared one — or the segment guid won't be
-        // found and the whole override is dropped (the ~1,854 fixture entries the
-        // duality diagnosis pinned). We key the swap by the joined SOURCE guidPath
-        // prefix (the guids naming the nested instance), mapping it to the swapped
-        // component's master ROOT NodeId, and consult it during descent. The swap
-        // override ITSELF resolves at the level above (its terminal guid is the
-        // instance), so it's emitted as a `SwapInstance` exactly as before; this
-        // map only redirects the descent for the *content* overrides that cross it.
-        let swap_redirects: HashMap<String, NodeId> =
-            build_swap_redirects(&po.symbol_overrides, symbol_guid_to_component, |cid| {
-                master_root_for(doc, cid)
-            });
 
         // The source-guidPath keys `derivedSymbolData` covers (`>`-joined — the
         // same key form the swap-redirect map uses). The generic Field pass
@@ -181,16 +211,9 @@ pub(crate) fn apply_instance_overrides(
         );
         apply_own_surface_fill(doc, po, master_root, &mut overrides);
         apply_own_surface_strokes(doc, po, master_root, &mut overrides);
-        apply_prop_assignments(
-            doc,
-            report,
-            po,
-            master_root,
-            node_prop_refs,
-            symbol_guid_to_component,
-            &mut path_cache,
-            &mut overrides,
-        );
+        if let Some(properties) = property_overrides.remove(&po.instance) {
+            overrides.extend(properties);
+        }
         apply_prop_defaults(
             doc,
             report,
@@ -244,7 +267,7 @@ fn apply_symbol_overrides(
     master_root: NodeId,
     guid_to_node: &HashMap<String, Option<NodeId>>,
     symbol_guid_to_component: &HashMap<String, ComponentId>,
-    swap_redirects: &HashMap<String, NodeId>,
+    swap_redirects: &InstanceSwapRedirects,
     derived_paths: &HashSet<String>,
     path_cache: &mut MasterPathCache<'_>,
     master_json_cache: &mut MasterJsonCache,
@@ -270,6 +293,7 @@ fn apply_symbol_overrides(
             guid_to_node,
             guids,
             swap_redirects,
+            po.instance,
             path_cache,
         );
 
@@ -960,7 +984,7 @@ fn apply_derived_overrides(
     po: &PendingInstanceOverrides<'_>,
     master_root: NodeId,
     guid_to_node: &HashMap<String, Option<NodeId>>,
-    swap_redirects: &HashMap<String, NodeId>,
+    swap_redirects: &InstanceSwapRedirects,
     path_cache: &mut MasterPathCache<'_>,
     blobs: &[Vec<u8>],
 ) -> Vec<fanta_doc::node::DerivedOverride> {
@@ -979,6 +1003,7 @@ fn apply_derived_overrides(
             guid_to_node,
             guids,
             swap_redirects,
+            po.instance,
             path_cache,
         ) else {
             continue;

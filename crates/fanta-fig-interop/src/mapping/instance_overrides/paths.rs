@@ -6,6 +6,8 @@ use super::{
     OverrideValue, guid_key,
 };
 
+pub(crate) type InstanceSwapRedirects = HashMap<NodeId, HashMap<String, NodeId>>;
+
 /// Path-resolution state shared by every instance of one import: the guid of
 /// each mapped node (the inverse of `guid_to_node`, built once) and each
 /// master's `guid → def-local-path` map, built the first time an override
@@ -27,6 +29,10 @@ impl<'a> MasterPathCache<'a> {
             node_to_guid,
             per_master: HashMap::new(),
         }
+    }
+
+    pub(crate) fn node_guid(&self, node: NodeId) -> Option<&str> {
+        self.node_to_guid.get(&node).copied()
     }
 
     /// Borrow (building + caching on first use) the `guid → def-local-path` map
@@ -64,7 +70,8 @@ pub(crate) fn resolve_full_guid_path(
     master_root: NodeId,
     guid_to_node: &HashMap<String, Option<NodeId>>,
     guids: &[KiwiValue],
-    swap_redirects: &HashMap<String, NodeId>,
+    swap_redirects: &InstanceSwapRedirects,
+    instance: NodeId,
     cache: &mut MasterPathCache<'_>,
 ) -> Option<OverridePath> {
     if guids.is_empty() {
@@ -72,17 +79,20 @@ pub(crate) fn resolve_full_guid_path(
     }
     let mut current_root = master_root;
     let mut out: OverridePath = OverridePath::new();
-    // The joined SOURCE guidPath prefix walked so far (guids, '>'-separated),
-    // used to look up a sibling swap that re-points the instance we're about to
-    // descend into (see `swap_redirects` / the nested duality).
-    let mut src_prefix = String::new();
+    // Outer placement overrides are applied after a nested instance's own
+    // overrides during expansion, so they must win when both swap the same slot.
+    let mut contexts: Vec<_> = swap_redirects
+        .get(&instance)
+        .map(|redirects| (redirects, String::new()))
+        .into_iter()
+        .collect();
     for (i, g) in guids.iter().enumerate() {
         let guid = guid_key(g)?;
-        if i == 0 {
-            src_prefix.push_str(&guid);
-        } else {
-            src_prefix.push('>');
-            src_prefix.push_str(&guid);
+        for (_, prefix) in &mut contexts {
+            if !prefix.is_empty() {
+                prefix.push('>');
+            }
+            prefix.push_str(&guid);
         }
         // MAIN-vs-PUBLISHED ROOT CASE. Figma roots a `guidPath` at the SYMBOL the
         // instance references: a path segment whose guid is the *current master's
@@ -108,20 +118,16 @@ pub(crate) fn resolve_full_guid_path(
         out.extend(seg);
         // For every guid but the last, descend into the nested instance it names.
         if i + 1 < guids.len() {
-            // SWAP REDIRECT (the nested main-vs-published duality): if a sibling
-            // `overriddenSymbolID` override swapped THIS nested instance (keyed by
-            // the source-guid prefix up to and including it), descend into the
-            // SWAPPED master's root — the subsequent segments address the swapped
-            // variant's descendants, not the declared symbolID's. Otherwise descend
-            // into the instance's declared component master as before.
-            let next_root = if let Some(&swapped_root) = swap_redirects.get(&src_prefix) {
-                swapped_root
-            } else {
-                match doc.scene.get(last).map(|n| &n.data) {
-                    Some(NodeData::Instance(inst)) => master_root_for(doc, inst.component),
-                    _ => None,
-                }?
+            let NodeData::Instance(nested) = &doc.scene.get(last)?.data else {
+                return None;
             };
+            let next_root = contexts
+                .iter()
+                .find_map(|(redirects, prefix)| redirects.get(prefix).copied())
+                .or_else(|| master_root_for(doc, nested.component))?;
+            if let Some(redirects) = swap_redirects.get(&last) {
+                contexts.push((redirects, String::new()));
+            }
             current_root = next_root;
         }
     }

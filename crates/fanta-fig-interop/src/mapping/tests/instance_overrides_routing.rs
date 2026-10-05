@@ -360,3 +360,295 @@ fn overridden_symbol_id_swaps_the_nested_component_on_import() {
         "overriddenSymbolID re-pointed the nested chip to Alt"
     );
 }
+
+fn swap_context_path(locals: &[u32]) -> KiwiValue {
+    o(
+        "GUIDPath",
+        vec![(
+            "guids",
+            KiwiValue::array(locals.iter().map(|local| guid(0, *local)).collect()),
+        )],
+    )
+}
+
+fn swap_context_override(path: &[u32], component: u32) -> KiwiValue {
+    o(
+        "NodeChange",
+        vec![
+            ("guidPath", swap_context_path(path)),
+            ("overriddenSymbolID", guid(0, component)),
+        ],
+    )
+}
+
+fn swap_context_instance(
+    local: u32,
+    parent: Option<u32>,
+    component: u32,
+    overrides: Vec<KiwiValue>,
+    extra: Vec<(&str, KiwiValue)>,
+) -> KiwiValue {
+    let mut fields = vec![
+        ("guid", guid(0, local)),
+        ("type", KiwiValue::Enum("INSTANCE".into())),
+        ("name", KiwiValue::String(format!("Placement {local}"))),
+        ("size", vector(120.0, 40.0)),
+        (
+            "symbolData",
+            o(
+                "SymbolData",
+                vec![
+                    ("symbolID", guid(0, component)),
+                    ("symbolOverrides", KiwiValue::array(overrides)),
+                ],
+            ),
+        ),
+    ];
+    if let Some(parent) = parent {
+        fields.push(("parentIndex", parent_index(0, parent)));
+    }
+    fields.extend(extra);
+    o("NodeChange", fields)
+}
+
+fn swap_context_components() -> Vec<KiwiValue> {
+    let mut nodes = Vec::new();
+    for (local, name) in [(1, "A"), (21, "B"), (51, "C"), (10, "Card"), (30, "Board")] {
+        nodes.push(o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, local)),
+                ("type", KiwiValue::Enum("SYMBOL".into())),
+                ("name", KiwiValue::String(name.to_owned())),
+                ("size", vector(120.0, 40.0)),
+            ],
+        ));
+    }
+    for (local, parent, content) in [(2, 1, "A"), (22, 21, "B"), (52, 51, "C")] {
+        nodes.push(o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, local)),
+                ("parentIndex", parent_index(0, parent)),
+                ("type", KiwiValue::Enum("TEXT".into())),
+                ("name", KiwiValue::String(content.to_owned())),
+                ("size", vector(60.0, 16.0)),
+                ("textData", text_data(content)),
+                ("fontSize", KiwiValue::Float(12.0)),
+            ],
+        ));
+    }
+    nodes.push(swap_context_instance(
+        11,
+        Some(10),
+        1,
+        Vec::new(),
+        vec![(
+            "componentPropRefs",
+            KiwiValue::array(vec![o(
+                "ComponentPropRef",
+                vec![
+                    ("defID", guid(7, 1)),
+                    (
+                        "componentPropNodeField",
+                        KiwiValue::Enum("OVERRIDDEN_SYMBOL_ID".into()),
+                    ),
+                ],
+            )]),
+        )],
+    ));
+    nodes
+}
+
+fn swap_context_content(path: &[u32], content: &str) -> KiwiValue {
+    o(
+        "NodeChange",
+        vec![
+            ("guidPath", swap_context_path(path)),
+            ("textData", text_data(content)),
+        ],
+    )
+}
+
+fn swap_context_derived(path: &[u32], font_size: f32) -> KiwiValue {
+    o(
+        "NodeChange",
+        vec![
+            ("guidPath", swap_context_path(path)),
+            ("fontSize", KiwiValue::Float(font_size)),
+        ],
+    )
+}
+
+fn assert_swap_context_expansion(doc: &Doc, depth: usize, expected_master: &str) {
+    let mut instance = doc
+        .scene
+        .roots()
+        .iter()
+        .flat_map(|root| doc.scene.descendants_of(*root))
+        .filter_map(|id| doc.scene.get(id))
+        .find_map(|node| match &node.data {
+            NodeData::Instance(instance) if node.name == "Placement 40" => Some(instance.clone()),
+            _ => None,
+        })
+        .expect("outer placement");
+    for _ in 0..depth {
+        let expanded = expand_instance(&doc.scene, &doc.components, &instance);
+        instance = expanded
+            .iter()
+            .find_map(|entry| match &entry.node.data {
+                NodeData::Instance(instance) => Some(instance.clone()),
+                _ => None,
+            })
+            .expect("nested placement");
+    }
+    assert_eq!(
+        doc.components
+            .def(instance.component)
+            .expect("selected master")
+            .name,
+        expected_master,
+    );
+    let expanded = expand_instance(&doc.scene, &doc.components, &instance);
+    let text = expanded
+        .iter()
+        .find_map(|entry| match &entry.node.data {
+            NodeData::Text(text) => Some(text),
+            _ => None,
+        })
+        .expect("expanded text");
+    assert_eq!(text.content, "Authored");
+    assert_eq!(text.style.size_px, 27.0);
+    for node in doc
+        .scene
+        .roots()
+        .iter()
+        .flat_map(|root| doc.scene.descendants_of(*root))
+        .filter_map(|id| doc.scene.get(id))
+    {
+        if let NodeData::Text(text) = &node.data {
+            assert_ne!(text.content, "Authored", "masters remain unchanged");
+            assert_eq!(text.style.size_px, 12.0);
+        }
+    }
+}
+
+#[test]
+fn component_property_swap_routes_nested_content_and_derived_in_any_source_order() {
+    for reverse in [false, true] {
+        for conflicting_symbol_swap in [false, true] {
+            let mut nodes = swap_context_components();
+            let mut overrides = Vec::new();
+            if conflicting_symbol_swap {
+                overrides.push(swap_context_override(&[11], 51));
+            }
+            overrides.extend([
+                swap_context_content(&[11, 22], "Authored"),
+                swap_context_content(&[11, 52], "Foreign component"),
+            ]);
+            nodes.push(swap_context_instance(
+                40,
+                None,
+                10,
+                overrides,
+                vec![
+                    (
+                        "componentPropAssignments",
+                        KiwiValue::array(vec![o(
+                            "ComponentPropAssignment",
+                            vec![("defID", guid(7, 1)), ("value", prop_value_guid(0, 21))],
+                        )]),
+                    ),
+                    (
+                        "derivedSymbolData",
+                        KiwiValue::array(vec![
+                            swap_context_derived(&[11, 22], 27.0),
+                            swap_context_derived(&[11, 52], 99.0),
+                        ]),
+                    ),
+                ],
+            ));
+            if reverse {
+                nodes.reverse();
+            }
+            let (doc, report, _) = fig_to_doc(&doc_from(nodes)).expect("import swap fixture");
+            assert_eq!(report.prop_instance_swap_resolved, 1);
+            assert_eq!(report.override_path_nested, 4);
+            assert_eq!(report.override_nested_resolved, 2);
+            assert_swap_context_expansion(&doc, 1, "B");
+        }
+    }
+}
+
+#[test]
+fn inherited_instance_swap_routes_nested_content_and_derived_in_any_source_order() {
+    for reverse in [false, true] {
+        for outer_swap in [false, true] {
+            let mut nodes = swap_context_components();
+            nodes.push(swap_context_instance(
+                31,
+                Some(30),
+                10,
+                vec![swap_context_override(&[11], 21)],
+                Vec::new(),
+            ));
+            let (target, foreign, expected_master) = if outer_swap {
+                (52, 22, "C")
+            } else {
+                (22, 52, "B")
+            };
+            let mut overrides = Vec::new();
+            if outer_swap {
+                overrides.push(swap_context_override(&[31, 11], 51));
+            }
+            overrides.extend([
+                swap_context_content(&[31, 11, target], "Authored"),
+                swap_context_content(&[31, 11, foreign], "Foreign component"),
+            ]);
+            nodes.push(swap_context_instance(
+                40,
+                None,
+                30,
+                overrides,
+                vec![(
+                    "derivedSymbolData",
+                    KiwiValue::array(vec![
+                        swap_context_derived(&[31, 11, target], 27.0),
+                        swap_context_derived(&[31, 11, foreign], 99.0),
+                    ]),
+                )],
+            ));
+            if reverse {
+                nodes.reverse();
+            }
+            let (doc, report, _) = fig_to_doc(&doc_from(nodes)).expect("import swap fixture");
+            assert_eq!(report.override_path_nested, 4 + usize::from(outer_swap));
+            assert_eq!(report.override_nested_resolved, 2 + usize::from(outer_swap));
+            assert_swap_context_expansion(&doc, 2, expected_master);
+        }
+    }
+}
+
+#[test]
+fn swap_redirect_cannot_cross_a_non_instance_node() {
+    let mut nodes = swap_context_components();
+    nodes.push(swap_context_instance(
+        40,
+        None,
+        10,
+        vec![
+            swap_context_override(&[11], 21),
+            swap_context_override(&[11, 22], 51),
+            swap_context_content(&[11, 22], "Authored"),
+            swap_context_content(&[11, 22, 52], "Foreign component"),
+        ],
+        vec![(
+            "derivedSymbolData",
+            KiwiValue::array(vec![swap_context_derived(&[11, 22], 27.0)]),
+        )],
+    ));
+    let (doc, report, _) = fig_to_doc(&doc_from(nodes)).expect("import swap fixture");
+    assert_eq!(report.override_path_nested, 4);
+    assert_eq!(report.override_nested_resolved, 3);
+    assert_swap_context_expansion(&doc, 1, "B");
+}
