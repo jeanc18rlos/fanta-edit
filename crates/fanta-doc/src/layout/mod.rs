@@ -44,6 +44,7 @@ use crate::style::StrokeAlign;
 use crate::transform::Transform2D;
 use glam::{DMat2, DVec2};
 use size::{LocalBox, local_box, set_size, size_would_change};
+use std::collections::BTreeSet;
 
 /// Measures the text extent `(width, height)`. Auto-width text is unbounded;
 /// auto-height text wraps at its current `local_size[0]`. Injected so the doc
@@ -146,7 +147,19 @@ pub fn solve_expanded(nodes: &mut [crate::resolve::ExpandedNode], measure: &mut 
 /// `measure` supplies single-line text extents for auto-width labels. See
 /// [`Measure`].
 pub fn solve_auto_layout<T: LayoutTree>(tree: &mut T, root: NodeId, measure: &mut Measure) {
-    solve_node(tree, root, measure);
+    solve_node(tree, root, None, measure);
+}
+
+/// Recompute the supplied layout inputs while retaining stored geometry in
+/// unaffected descendants. A parent that changes a child's allocated size still
+/// reflows that child, including nested allocations, as in the full solve.
+pub fn solve_auto_layout_scoped<T: LayoutTree>(
+    tree: &mut T,
+    root: NodeId,
+    affected: &BTreeSet<NodeId>,
+    measure: &mut Measure,
+) {
+    solve_node(tree, root, Some(affected), measure);
 }
 
 /// Solve scene layout with effective typography and text-content tokens while
@@ -230,15 +243,27 @@ impl LayoutTree for VariableTextTree<'_> {
 /// (size/transform) is mutated in place. Children are solved first (so their
 /// extents are final), then, if this node is an auto-layout frame, its flow
 /// children are positioned/sized and the frame is hugged where asked.
-fn solve_node<T: LayoutTree>(tree: &mut T, id: NodeId, measure: &mut Measure) {
+fn solve_node<T: LayoutTree>(
+    tree: &mut T,
+    id: NodeId,
+    affected: Option<&BTreeSet<NodeId>>,
+    measure: &mut Measure,
+) {
+    let needs_layout = affected.is_none_or(|affected| affected.contains(&id));
     // Snap auto-width text to its measured glyph box first — this is the child's
     // own intrinsic size and must be final before a parent flows it.
-    apply_text_autoresize(tree, id, measure);
+    if needs_layout {
+        apply_text_autoresize(tree, id, measure);
+    }
 
     // Bottom-up: solve every child's subtree before laying this node out.
     let children = tree.children(id);
     for &child in &children {
-        solve_node(tree, child, measure);
+        solve_node(tree, child, affected, measure);
+    }
+
+    if !needs_layout {
+        return;
     }
 
     // Only auto-layout frames flow their children. Plain frames/groups keep the

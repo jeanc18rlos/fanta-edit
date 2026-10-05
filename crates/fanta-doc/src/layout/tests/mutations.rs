@@ -105,6 +105,58 @@ fn text_autoresize_records_only_changed_geometry() {
     assert_eq!(measurements, 4);
 }
 
+#[test]
+fn scoped_layout_reaches_changed_text_through_free_groups_without_measuring_other_text() {
+    let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    let page_id = page.id;
+    let mut wrapper = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    wrapper.parent = Some(page_id);
+    let wrapper_id = wrapper.id;
+    let mut changed = TextNode::new("Changed", 71.0, 13.0);
+    changed.auto_resize = TextAutoResize::WidthAndHeight;
+    let mut changed = CanvasNode::new(NodeData::Text(changed));
+    changed.parent = Some(wrapper_id);
+    let changed_id = changed.id;
+    let mut untouched = TextNode::new("Imported", 95.0, 17.0);
+    untouched.auto_resize = TextAutoResize::WidthAndHeight;
+    let mut untouched = CanvasNode::new(NodeData::Text(untouched));
+    untouched.parent = Some(wrapper_id);
+    untouched.index = IndexKey::after(changed.index);
+    let untouched_id = untouched.id;
+    let mut scene = Scene::new();
+    scene
+        .insert_many([page, wrapper, changed, untouched])
+        .expect("text scene");
+    let before = scene.clone();
+    let revision = scene.revision();
+    let mut measured = Vec::new();
+    solve_auto_layout_scoped(
+        &mut scene,
+        page_id,
+        &BTreeSet::from([page_id, changed_id]),
+        &mut |text| {
+            measured.push(text.content.clone());
+            (70.0, 20.0)
+        },
+    );
+    assert_eq!(measured, vec!["Changed"]);
+    assert_eq!(
+        scene
+            .get(changed_id)
+            .expect("changed text")
+            .data
+            .local_size(),
+        Some([70.0, 20.0])
+    );
+    assert_eq!(
+        scene.changes_since(revision).expect("layout delta").nodes,
+        vec![changed_id]
+    );
+    for id in [page_id, wrapper_id, untouched_id] {
+        assert!(scene.shares_node(&before, id), "unaffected geometry {id}");
+    }
+}
+
 fn assert_settled_flow_unchanged(mode: LayoutMode) {
     let mut parent = frame(
         200.0,

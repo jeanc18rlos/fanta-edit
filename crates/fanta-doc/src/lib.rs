@@ -80,7 +80,7 @@ pub use journal::{
     SessionStep,
 };
 pub use layout::{
-    ExpandedTree, LayoutTree, Measure, grid_cells, solve_auto_layout,
+    ExpandedTree, LayoutTree, Measure, grid_cells, solve_auto_layout, solve_auto_layout_scoped,
     solve_auto_layout_with_variables, solve_expanded,
 };
 pub use motion::{

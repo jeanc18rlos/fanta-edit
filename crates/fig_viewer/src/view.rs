@@ -11715,6 +11715,203 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn mounted_saved_instance_drag_undo_redo_preserves_zoomed_viewport(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::InputEvent as _;
+
+        init_visual_test(cx);
+        cx.update(|cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new("cmd-z", Undo, Some("FigViewer")),
+                gpui::KeyBinding::new("cmd-shift-z", Redo, Some("FigViewer")),
+            ]);
+        });
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+        let directory = tempfile::tempdir().expect("viewport project directory");
+        let root = directory.path().join("Saved viewport");
+        let (mut doc, first_page, second_page) = doc_with_two_pages();
+        let mut master = CanvasNode::new(NodeData::Vector(VectorNode {
+            local_size: Some([20.0, 20.0]),
+            ..VectorNode::rect_solid(0.0, 0.0, 20.0, 20.0, Color::BLACK)
+        }));
+        master.parent = Some(first_page);
+        let master_id = master.id;
+        doc.scene.insert(master).expect("component master");
+        let component = fanta_doc::ComponentId::new();
+        doc.components.defs.insert(
+            component,
+            fanta_doc::ComponentDef::new(component, master_id, "ChevronDown"),
+        );
+        let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([20.0, 24.0]),
+            auto_layout: Some(fanta_doc::AutoLayout {
+                counter_align: fanta_doc::CounterAlign::Center,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+        frame.name = "Chevron".into();
+        frame.parent = Some(second_page);
+        frame.transform = Transform2D::translation(7712.0, 2263.0);
+        let frame_id = frame.id;
+        doc.scene.insert(frame).expect("fixed layout parent");
+        let mut instance = CanvasNode::new(NodeData::Instance(fanta_doc::InstanceNode {
+            component,
+            local_size: [20.0, 20.0],
+            overrides: Vec::new(),
+            prop_values: BTreeMap::new(),
+            derived: Vec::new(),
+        }));
+        instance.name = "ChevronDown".into();
+        instance.parent = Some(frame_id);
+        instance.transform = Transform2D::translation(0.0, 1.5);
+        let instance_id = instance.id;
+        doc.scene.insert(instance).expect("placed instance");
+        doc.history = Default::default();
+        crate::document::write_project(&root, &doc, &BTreeMap::new())
+            .expect("write viewport fixture");
+        file_system.insert_tree_from_real_fs(&root, &root).await;
+        let item = crate::document::ready_item_with_root_for_test(
+            &project,
+            root.join("fanta.json"),
+            Some(root.clone()),
+            doc,
+            cx,
+        );
+        let window = cx.add_window({
+            let item = item.clone();
+            move |window, cx| FigView::new(item, project, window, cx)
+        });
+        let view = window.entity(cx).expect("mounted viewport view");
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1400.0), px(900.0)));
+        visual.run_until_parked();
+        let zoomed = Viewport {
+            center: [7722.0, 2274.5],
+            zoom: 2.0,
+        };
+        view.update(&mut visual, |view, cx| {
+            view.select_page(1, cx);
+            view.set_viewport(zoomed, cx);
+        });
+        item.update(&mut visual, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.replace_with([instance_id]);
+                ((), DocChange::Selection)
+            });
+        });
+        visual.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.clone();
+            focus_handle.focus(window, cx);
+            window.draw(cx).clear();
+        });
+        visual.run_until_parked();
+        let baseline = item.read_with(&visual, |item, _| {
+            serde_json::to_value(&item.doc().expect("document").scene).expect("baseline scene")
+        });
+        let assert_camera = |visual: &gpui::VisualTestContext| {
+            view.read_with(visual, |view, cx| {
+                assert_eq!(
+                    view.viewport,
+                    Some(zoomed),
+                    "document edits retain the camera"
+                );
+                assert_eq!(view.selected_page_root, Some(second_page));
+                assert_eq!(view.last_seen_root, Some(second_page));
+                assert_eq!(view.scope, Some(FigScope::Page(second_page)));
+                let doc = item.read(cx).doc().expect("document");
+                assert_eq!(doc.active_page(), Some(second_page));
+                assert_eq!(doc.selection.as_slice(), &[instance_id]);
+                assert_eq!(
+                    doc.scene.get(instance_id).expect("instance").parent,
+                    Some(frame_id)
+                );
+            });
+        };
+        assert_camera(&visual);
+        let start = view.read_with(&visual, |view, _| {
+            view.container_bounds
+                .expect("mounted canvas bounds")
+                .center()
+        });
+        let end = start + point(px(16.0), px(0.0));
+        visual.update(|window, cx| {
+            window.dispatch_event(
+                MouseDownEvent {
+                    position: start,
+                    button: MouseButton::Left,
+                    modifiers: gpui::Modifiers::none(),
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseMoveEvent {
+                    position: end,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: gpui::Modifiers::none(),
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseUpEvent {
+                    position: end,
+                    button: MouseButton::Left,
+                    modifiers: gpui::Modifiers::none(),
+                    click_count: 1,
+                }
+                .to_platform_input(),
+                cx,
+            );
+        });
+        visual.run_until_parked();
+        let moved = item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.history.undo_depth(), 1);
+            assert!(!item.content_preview_active());
+            serde_json::to_value(&doc.scene).expect("moved scene")
+        });
+        assert_ne!(moved, baseline, "the mounted drag must commit geometry");
+        assert_camera(&visual);
+        view.update(&mut visual, |view, cx| view.save_document(cx))
+            .await
+            .expect("save committed drag");
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+        assert!(!item.read_with(&visual, |item, _| item.is_dirty()));
+        assert_camera(&visual);
+        for (keystroke, expected) in [("cmd-z", &baseline), ("cmd-shift-z", &moved)] {
+            visual.simulate_keystrokes(keystroke);
+            visual.update(|window, cx| window.draw(cx).clear());
+            item.read_with(&visual, |item, _| {
+                assert_eq!(
+                    &serde_json::to_value(&item.doc().expect("document").scene)
+                        .expect("history scene"),
+                    expected,
+                );
+            });
+            assert_camera(&visual);
+            view.update(&mut visual, |view, cx| view.save_document(cx))
+                .await
+                .expect("save history result");
+            visual.run_until_parked();
+            visual.update(|window, cx| window.draw(cx).clear());
+            assert_camera(&visual);
+            let (reopened, _) =
+                fanta_format::read_project_tree(&root).expect("reopen history result");
+            assert_eq!(
+                &serde_json::to_value(&reopened.scene).expect("saved scene"),
+                expected
+            );
+        }
+    }
+
+    #[gpui::test]
     async fn selecting_the_current_page_preserves_its_viewport(cx: &mut TestAppContext) {
         init_test(cx);
         let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;

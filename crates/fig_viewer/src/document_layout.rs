@@ -111,7 +111,7 @@ impl LayoutState {
             }
         }
         roots.retain(|root| document.scene.contains(*root));
-        minimal_roots(&document.scene, roots)
+        roots
     }
 
     pub(super) fn refresh(&mut self, document: &Doc) -> Result<()> {
@@ -196,7 +196,7 @@ pub(super) fn pending_roots(document: &Doc) -> BTreeSet<NodeId> {
             add_parent_roots(&document.scene, node, &mut roots);
         }
     }
-    minimal_roots(&document.scene, roots)
+    roots
 }
 
 fn effective_text(
@@ -275,11 +275,11 @@ fn stroke_layout_inputs(strokes: &[fanta_doc::Stroke]) -> Vec<([f64; 4], fanta_d
 
 pub(super) fn geometry_operations(document: &Doc, roots: &BTreeSet<NodeId>) -> Vec<Operation> {
     let mut operations = Vec::new();
-    for root in roots {
-        let Some(mut solved) = document.scene.extract_subtree(*root) else {
+    for root in minimal_roots(&document.scene, roots.clone()) {
+        let Some(mut solved) = document.scene.extract_subtree(root) else {
             continue;
         };
-        let ids: Vec<_> = solved.descendants_of(*root).collect();
+        let ids: Vec<_> = solved.descendants_of(root).collect();
         for id in &document.pending_layout {
             if solved.get(*id).is_some_and(|node| {
                 node.data.as_group().is_some_and(|group| {
@@ -306,7 +306,12 @@ pub(super) fn geometry_operations(document: &Doc, roots: &BTreeSet<NodeId>) -> V
                 node.data = NodeData::Text(text);
             }
         }
-        fanta_render::solve_scene_layout(&mut solved, *root);
+        fanta_doc::solve_auto_layout_scoped(
+            &mut solved,
+            root,
+            roots,
+            &mut fanta_render::measure_text_node,
+        );
         for id in ids {
             let (Some(original), Some(solved)) = (document.scene.get(id), solved.get(id)) else {
                 continue;
