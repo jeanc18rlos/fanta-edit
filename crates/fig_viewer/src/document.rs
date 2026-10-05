@@ -1419,7 +1419,7 @@ impl project::ProjectItem for FigItem {
                                 project_reads.load(|| match load_project_root {
                                     Some(root) => {
                                         report_load_progress(&progress, "Opening project files…");
-                                        let session = fanta_format::WorkspaceSession::open(&root)?;
+                                        let session = open_workspace_session(&root)?;
                                         report_load_progress(&progress, "Loading pages and assets…");
                                         let document = load_project_document(&root)?;
                                         Ok((document, None, Some(session), None))
@@ -1446,7 +1446,7 @@ impl project::ProjectItem for FigItem {
                                         let session = materialized
                                             .as_ref()
                                             .and_then(|project| {
-                                                fanta_format::WorkspaceSession::open(&project.root)
+                                                open_workspace_session(&project.root)
                                                     .ok()
                                             });
                                         Ok((document, materialized, session, import_warning))
@@ -2670,6 +2670,10 @@ impl FigItem {
                 self.mark_edited(false, cx);
             }
             DocChange::ContentPreview => {
+                let _perf_span = crate::gesture_perf::current_ui_span(
+                    owner.map(|owner| owner.as_u64()),
+                    crate::gesture_perf::UiStage::ContentPreviewPostprocess,
+                );
                 let Some(owner) = owner else {
                     log::error!(
                         "content preview used unowned document access; committing the mutation"
@@ -3027,7 +3031,7 @@ impl FigItem {
                                     &raw_assets,
                                     &mut write_cache,
                                 )?;
-                                match fanta_format::WorkspaceSession::open(&target) {
+                                match open_workspace_session(&target) {
                                     Ok(session) => workspace_session = Some(session),
                                     Err(error) => log::error!(
                                         "initializing source session for {} failed after save: {error:#}",
@@ -3037,7 +3041,7 @@ impl FigItem {
                                 return Ok(report);
                             }
                             if workspace_session.is_none() {
-                                workspace_session = Some(fanta_format::WorkspaceSession::open(&target)?);
+                                workspace_session = Some(open_workspace_session(&target)?);
                             }
                             let session = workspace_session
                                 .as_mut()
@@ -4193,7 +4197,7 @@ fn load_changed_project_document(
     incremental: Option<IncrementalProjectLoad>,
 ) -> Result<Option<(FigDocument, fanta_format::WorkspaceSession)>> {
     if let Some((baseline, doc, assets, cached_assets)) = incremental {
-        let mut session = fanta_format::WorkspaceSession::open(root)?;
+        let mut session = open_workspace_session(root)?;
         let report = session.reconcile_from_disk_snapshot(&baseline)?;
         if !report.requires_full_reload {
             if report.changed.is_empty() && report.events.is_empty() {
@@ -4210,7 +4214,7 @@ fn load_changed_project_document(
             }
         }
     }
-    let session = fanta_format::WorkspaceSession::open(root)?;
+    let session = open_workspace_session(root)?;
     let document = load_project_document(root)?;
     Ok(Some((document, session)))
 }
@@ -4463,11 +4467,19 @@ fn image_stroke_asset(stroke: &fanta_doc::Stroke) -> Option<AssetId> {
     image_fill_asset(&stroke.paint)
 }
 
+fn open_workspace_session(
+    root: impl AsRef<Path>,
+) -> Result<fanta_format::WorkspaceSession, fanta_format::SessionError> {
+    let _perf_span = crate::perf_span("document: WorkspaceSession::open");
+    fanta_format::WorkspaceSession::open(root)
+}
+
 /// Wrap every embedded asset GPUI can decode as an [`Image`] behind its content
 /// hash, skipping formats GPUI has no decoder for. Runs on the background load
 /// thread so `Image::from_bytes`'s hash of every asset byte never lands on the
 /// foreground; the Assets panel then clones these `Arc`s per thumbnail row.
 fn decode_gpui_images(assets: &BTreeMap<AssetId, Vec<u8>>) -> HashMap<AssetId, Arc<Image>> {
+    let _perf_span = crate::perf_span("document: decode_gpui_images");
     assets
         .iter()
         .filter_map(|(asset_id, bytes)| {

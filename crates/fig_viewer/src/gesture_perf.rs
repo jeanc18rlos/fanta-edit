@@ -12,6 +12,143 @@ use serde::Serialize;
 
 pub(crate) type SharedGesturePerf = Rc<RefCell<GesturePerf>>;
 
+const UI_STAGE_COUNT: usize = 4;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum UiStage {
+    ToolDispatch,
+    ViewRender,
+    DesignRefresh,
+    ContentPreviewPostprocess,
+}
+
+impl UiStage {
+    fn index(self) -> usize {
+        match self {
+            Self::ToolDispatch => 0,
+            Self::ViewRender => 1,
+            Self::DesignRefresh => 2,
+            Self::ContentPreviewPostprocess => 3,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Serialize)]
+struct UiCost {
+    calls: u64,
+    inclusive_wall_total_us: u64,
+    inclusive_wall_max_us: u64,
+}
+
+impl UiCost {
+    fn record(&mut self, elapsed: Duration) {
+        let micros = duration_micros(elapsed);
+        self.calls = self.calls.saturating_add(1);
+        self.inclusive_wall_total_us = self.inclusive_wall_total_us.saturating_add(micros);
+        self.inclusive_wall_max_us = self.inclusive_wall_max_us.max(micros);
+    }
+}
+
+#[derive(Serialize)]
+struct UiCosts {
+    membership: &'static str,
+    timing: &'static str,
+    tool_dispatch: UiCost,
+    view_render: UiCost,
+    design_refresh: UiCost,
+    content_preview_postprocess: UiCost,
+}
+
+impl UiCosts {
+    fn from_stages(stages: [UiCost; UI_STAGE_COUNT]) -> Self {
+        Self {
+            membership: "synchronous_scopes_started_in_this_gesture; includes_release_dispatch; excludes_initial_press_setup_and_post_release_settling",
+            timing: "inclusive_wall_time; nested_stages_overlap_and_must_not_be_summed; not_cpu_time_or_input_latency; render_is_element_construction_not_layout_or_paint",
+            tool_dispatch: stages[UiStage::ToolDispatch.index()],
+            view_render: stages[UiStage::ViewRender.index()],
+            design_refresh: stages[UiStage::DesignRefresh.index()],
+            content_preview_postprocess: stages[UiStage::ContentPreviewPostprocess.index()],
+        }
+    }
+}
+
+#[derive(Clone)]
+struct UiContext {
+    perf: SharedGesturePerf,
+    owner: u64,
+    gesture: u64,
+}
+
+thread_local! {
+    // Document postprocessing is synchronous and receives its view's owner ID,
+    // so this avoids coupling document entities to a particular view's metrics.
+    static CURRENT_UI_SCOPE: RefCell<Option<UiContext>> = const { RefCell::new(None) };
+}
+
+#[must_use]
+pub(crate) struct UiSpan {
+    context: Option<UiContext>,
+    previous: Option<UiContext>,
+    stage: UiStage,
+    started: Option<Instant>,
+}
+
+impl UiSpan {
+    fn start(context: Option<UiContext>, stage: UiStage, clock: impl FnOnce() -> Instant) -> Self {
+        let context =
+            context.filter(|context| context.perf.borrow_mut().reserve_ui_span(context.gesture));
+        let started = optional_timer_with(context.is_some(), clock);
+        // Even an inactive view masks its caller's scope, so its document work
+        // cannot be charged to a different active view during a nested callback.
+        let previous = CURRENT_UI_SCOPE.with(|current| current.replace(context.clone()));
+        Self {
+            context,
+            previous,
+            stage,
+            started,
+        }
+    }
+}
+
+impl Drop for UiSpan {
+    fn drop(&mut self) {
+        drop(CURRENT_UI_SCOPE.with(|current| current.replace(self.previous.take())));
+        if let Some(context) = self.context.take()
+            && let Some(started) = self.started.take()
+        {
+            context.perf.borrow_mut().complete_ui_span(
+                context.gesture,
+                self.stage,
+                started.elapsed(),
+            );
+        }
+    }
+}
+
+pub(crate) fn ui_span(perf: Option<&SharedGesturePerf>, owner: u64, stage: UiStage) -> UiSpan {
+    let context = perf.and_then(|perf| {
+        let gesture = perf.borrow().active?;
+        Some(UiContext {
+            perf: Rc::clone(perf),
+            owner,
+            gesture,
+        })
+    });
+    UiSpan::start(context, stage, Instant::now)
+}
+
+pub(crate) fn current_ui_span(owner: Option<u64>, stage: UiStage) -> UiSpan {
+    let context = CURRENT_UI_SCOPE.with(|current| {
+        current
+            .borrow()
+            .as_ref()
+            .filter(|context| Some(context.owner) == owner)
+            .cloned()
+    });
+    UiSpan::start(context, stage, Instant::now)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RenderSourceKind {
@@ -145,6 +282,7 @@ struct GestureSummary {
     flush_sync_wall_us: Distribution,
     render_wall_us: Distribution,
     metric_sums: MetricSums,
+    ui_costs: UiCosts,
     frames: Vec<CompletedSample>,
 }
 
@@ -165,6 +303,8 @@ struct GestureRecord {
     failure_counts: BTreeMap<&'static str, u64>,
     metric_sums: MetricSums,
     frames: Vec<CompletedSample>,
+    ui_costs: [UiCost; UI_STAGE_COUNT],
+    pending_ui_spans: usize,
 }
 
 impl GestureRecord {
@@ -186,12 +326,14 @@ impl GestureRecord {
             failure_counts: BTreeMap::new(),
             metric_sums: MetricSums::default(),
             frames: Vec::new(),
+            ui_costs: [UiCost::default(); UI_STAGE_COUNT],
+            pending_ui_spans: 0,
         }
     }
 
     fn summary(self, gesture_id: u64, end_reason: &'static str) -> GestureSummary {
         GestureSummary {
-            version: 1,
+            version: 2,
             gesture_id,
             context: self.context,
             backend: match (self.frames.is_empty(), self.cpu_fallback_paints > 0) {
@@ -224,6 +366,7 @@ impl GestureRecord {
                 self.frames.iter().map(|frame| frame.render_wall_us),
             ),
             metric_sums: self.metric_sums,
+            ui_costs: UiCosts::from_stages(self.ui_costs),
             frames: self.frames,
         }
     }
@@ -259,6 +402,23 @@ impl GesturePerf {
         if let Some(record) = self.records.get_mut(&gesture) {
             record.end_reason = Some(reason);
         }
+        self.finish_ready(gesture);
+    }
+
+    fn reserve_ui_span(&mut self, gesture: u64) -> bool {
+        let Some(record) = self.records.get_mut(&gesture) else {
+            return false;
+        };
+        record.pending_ui_spans += 1;
+        true
+    }
+
+    fn complete_ui_span(&mut self, gesture: u64, stage: UiStage, elapsed: Duration) {
+        let Some(record) = self.records.get_mut(&gesture) else {
+            return;
+        };
+        record.ui_costs[stage.index()].record(elapsed);
+        record.pending_ui_spans = record.pending_ui_spans.saturating_sub(1);
         self.finish_ready(gesture);
     }
 
@@ -368,9 +528,7 @@ impl GesturePerf {
 
     fn finish_ready(&mut self, gesture: u64) {
         let reason = self.records.get(&gesture).and_then(|record| {
-            record
-                .pending
-                .is_empty()
+            (record.pending.is_empty() && record.pending_ui_spans == 0)
                 .then_some(record.end_reason)
                 .flatten()
         });
@@ -390,6 +548,13 @@ impl GesturePerf {
     #[cfg(test)]
     pub fn summary_count(&self) -> usize {
         self.summaries.len()
+    }
+
+    #[cfg(test)]
+    pub fn last_ui_dispatch_calls(&self) -> Option<u64> {
+        self.summaries
+            .last()
+            .map(|summary| summary.ui_costs.tool_dispatch.calls)
     }
 
     #[cfg(test)]
@@ -635,5 +800,197 @@ mod tests {
             None::<usize>
         );
         assert_eq!(optional_timer_with(true, || 42), Some(42));
+    }
+
+    #[test]
+    fn gesture_perf_ui_costs_are_exact_fixed_size_inclusive_aggregates() {
+        let mut record = GestureRecord::new(context());
+        for micros in 1..=10_000 {
+            record.ui_costs[UiStage::ToolDispatch.index()].record(Duration::from_micros(micros));
+        }
+        record.ui_costs[UiStage::ContentPreviewPostprocess.index()]
+            .record(Duration::from_micros(17));
+        let summary = record.summary(1, "released");
+        assert_eq!(
+            summary.ui_costs.tool_dispatch,
+            UiCost {
+                calls: 10_000,
+                inclusive_wall_total_us: 50_005_000,
+                inclusive_wall_max_us: 10_000,
+            }
+        );
+        assert_eq!(summary.ui_costs.content_preview_postprocess.calls, 1);
+        assert_eq!(
+            summary
+                .ui_costs
+                .content_preview_postprocess
+                .inclusive_wall_total_us,
+            17
+        );
+        assert_eq!(summary.ui_costs.view_render, UiCost::default());
+        assert!(summary.ui_costs.timing.contains("must_not_be_summed"));
+        assert_eq!(summary.version, 2);
+    }
+
+    #[test]
+    fn gesture_perf_ui_disabled_and_stale_scopes_never_start_a_clock() {
+        let disabled = UiSpan::start(None, UiStage::ToolDispatch, || panic!("disabled clock"));
+        assert!(disabled.started.is_none());
+        drop(disabled);
+        let perf = GesturePerf::shared();
+        let inactive = ui_span(Some(&perf), 11, UiStage::ViewRender);
+        assert!(inactive.started.is_none());
+        drop(inactive);
+        let stale = UiSpan::start(
+            Some(UiContext {
+                perf: Rc::clone(&perf),
+                owner: 11,
+                gesture: 42,
+            }),
+            UiStage::ToolDispatch,
+            || panic!("stale clock"),
+        );
+        assert!(stale.started.is_none());
+        drop(stale);
+        assert_eq!(Rc::strong_count(&perf), 1);
+        assert!(CURRENT_UI_SCOPE.with(|current| current.borrow().is_none()));
+    }
+
+    #[test]
+    fn gesture_perf_ui_release_waits_for_its_span_and_worker_reply() {
+        let perf = GesturePerf::shared();
+        perf.borrow_mut().begin(context());
+        let tag = perf
+            .borrow_mut()
+            .reserve(RenderSourceKind::Patch)
+            .expect("request");
+        perf.borrow_mut().submitted(tag);
+        let release = ui_span(Some(&perf), 11, UiStage::ToolDispatch);
+        perf.borrow_mut().end("released");
+        assert_eq!(perf.borrow().summary_count(), 0);
+        assert!(perf.borrow_mut().complete(tag, Ok(sample(12))));
+        assert_eq!(
+            perf.borrow().summary_count(),
+            0,
+            "release callback is still running"
+        );
+        drop(release);
+        let perf = perf.borrow();
+        assert_eq!(perf.summary_count(), 1);
+        assert_eq!(perf.summaries[0].ui_costs.tool_dispatch.calls, 1);
+        assert_eq!(perf.summaries[0].completed, 1);
+        assert!(
+            perf.summaries[0]
+                .ui_costs
+                .membership
+                .contains("includes_release_dispatch")
+        );
+    }
+
+    #[test]
+    fn gesture_perf_ui_late_span_stays_with_its_original_gesture() {
+        let perf = GesturePerf::shared();
+        perf.borrow_mut().begin(context());
+        let first = ui_span(Some(&perf), 11, UiStage::ToolDispatch);
+        perf.borrow_mut().end("released");
+        perf.borrow_mut().begin(context());
+        {
+            let _second = ui_span(Some(&perf), 11, UiStage::ViewRender);
+            let _nested = current_ui_span(Some(11), UiStage::ContentPreviewPostprocess);
+        }
+        drop(first);
+        perf.borrow_mut().end("released");
+        let perf = perf.borrow();
+        assert_eq!(perf.summaries.len(), 2);
+        assert_eq!(perf.summaries[0].ui_costs.tool_dispatch.calls, 1);
+        assert_eq!(
+            perf.summaries[0].ui_costs.content_preview_postprocess.calls,
+            0
+        );
+        assert_eq!(perf.summaries[1].ui_costs.view_render.calls, 1);
+        assert_eq!(
+            perf.summaries[1].ui_costs.content_preview_postprocess.calls,
+            1
+        );
+        assert_eq!(perf.summaries[1].ui_costs.tool_dispatch.calls, 0);
+    }
+
+    #[test]
+    fn gesture_perf_ui_nested_views_and_inactive_views_cannot_mix_costs() {
+        let first = GesturePerf::shared();
+        let second = GesturePerf::shared();
+        first.borrow_mut().begin(context());
+        second.borrow_mut().begin(context());
+        {
+            let _outer = ui_span(Some(&first), 11, UiStage::ToolDispatch);
+            {
+                let _own = current_ui_span(Some(11), UiStage::ContentPreviewPostprocess);
+            }
+            {
+                let _other_view = ui_span(Some(&second), 22, UiStage::DesignRefresh);
+                let wrong_owner = current_ui_span(Some(11), UiStage::ContentPreviewPostprocess);
+                assert!(wrong_owner.started.is_none());
+                drop(wrong_owner);
+                let _own = current_ui_span(Some(22), UiStage::ContentPreviewPostprocess);
+            }
+            {
+                let _inactive_view = ui_span(None, 33, UiStage::ViewRender);
+                let masked = current_ui_span(Some(11), UiStage::ContentPreviewPostprocess);
+                assert!(masked.started.is_none());
+            }
+            let _restored = current_ui_span(Some(11), UiStage::ContentPreviewPostprocess);
+        }
+        first.borrow_mut().end("released");
+        second.borrow_mut().end("released");
+        assert_eq!(
+            first.borrow().summaries[0]
+                .ui_costs
+                .content_preview_postprocess
+                .calls,
+            2
+        );
+        assert_eq!(first.borrow().summaries[0].ui_costs.design_refresh.calls, 0);
+        assert_eq!(
+            second.borrow().summaries[0]
+                .ui_costs
+                .content_preview_postprocess
+                .calls,
+            1
+        );
+        assert_eq!(second.borrow().summaries[0].ui_costs.tool_dispatch.calls, 0);
+        assert!(CURRENT_UI_SCOPE.with(|current| current.borrow().is_none()));
+    }
+
+    #[test]
+    fn gesture_perf_ui_early_return_restores_the_callers_scope() {
+        fn stop_early(perf: &SharedGesturePerf) -> Option<()> {
+            let _span = ui_span(Some(perf), 22, UiStage::DesignRefresh);
+            let missing: Option<()> = None;
+            missing?;
+            Some(())
+        }
+        let first = GesturePerf::shared();
+        let second = GesturePerf::shared();
+        first.borrow_mut().begin(context());
+        second.borrow_mut().begin(context());
+        {
+            let _outer = ui_span(Some(&first), 11, UiStage::ToolDispatch);
+            assert_eq!(stop_early(&second), None);
+            let _restored = current_ui_span(Some(11), UiStage::ContentPreviewPostprocess);
+        }
+        first.borrow_mut().end("released");
+        second.borrow_mut().end("released");
+        assert_eq!(
+            first.borrow().summaries[0]
+                .ui_costs
+                .content_preview_postprocess
+                .calls,
+            1
+        );
+        assert_eq!(
+            second.borrow().summaries[0].ui_costs.design_refresh.calls,
+            1
+        );
+        assert!(CURRENT_UI_SCOPE.with(|current| current.borrow().is_none()));
     }
 }

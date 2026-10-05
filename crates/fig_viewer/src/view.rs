@@ -2811,6 +2811,11 @@ impl FigView {
     /// Send one event through the active tool, tracking whether it changed
     /// document content, only the selection, or nothing.
     fn dispatch_tool_event(&mut self, event: ToolEvent, cx: &mut Context<Self>) {
+        let _perf_span = crate::gesture_perf::ui_span(
+            self.gesture_perf.as_ref(),
+            cx.entity_id().as_u64(),
+            crate::gesture_perf::UiStage::ToolDispatch,
+        );
         let owner = cx.entity_id();
         if self.handle_annotation_tool_event(event, cx)
             || self.handle_measurement_tool_event(event, cx)
@@ -7928,6 +7933,11 @@ fn canvas_video_duration_supported(range: [i64; 2], duration: u64) -> bool {
 
 impl Render for FigView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _perf_span = crate::gesture_perf::ui_span(
+            self.gesture_perf.as_ref(),
+            cx.entity_id().as_u64(),
+            crate::gesture_perf::UiStage::ViewRender,
+        );
         let development_read_only = self.is_dev_mode(cx);
         self.code_workspace.update(cx, |workspace, cx| {
             workspace.set_development_read_only(development_read_only, cx)
@@ -15740,6 +15750,7 @@ mod tests {
                 visual.run_until_parked();
                 expected_summaries += 1;
                 assert_eq!(perf.borrow().summary_count(), expected_summaries);
+                assert_eq!(perf.borrow().last_ui_dispatch_calls(), Some(2));
                 assert!(!perf.borrow().has_active_gesture());
                 view.read_with(&visual, |view, _| assert!(!view.primary_pressed));
                 item.read_with(&visual, |item, _| {
@@ -16108,13 +16119,14 @@ mod tests {
                         doc.scene.insert(node).expect("wrapper");
                         id
                     });
-                    let mut instance = CanvasNode::new(NodeData::Instance(fanta_doc::InstanceNode {
-                        component,
-                        overrides: Vec::new(),
-                        prop_values: BTreeMap::new(),
-                        derived: Vec::new(),
-                        local_size: [200.0, 100.0],
-                    }));
+                    let mut instance =
+                        CanvasNode::new(NodeData::Instance(fanta_doc::InstanceNode {
+                            component,
+                            overrides: Vec::new(),
+                            prop_values: BTreeMap::new(),
+                            derived: Vec::new(),
+                            local_size: [200.0, 100.0],
+                        }));
                     instance.parent = wrapper.or(doc.active_page());
                     instance.transform = if wrapped {
                         Transform2D::translation(50.0, 50.0)
