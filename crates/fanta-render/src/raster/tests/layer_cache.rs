@@ -255,6 +255,8 @@ fn any_scene_edit_invalidates_every_cached_layer() {
     }
     let m = r.render(&doc.scene, &vp(0.0, 0.0));
     assert_eq!(m.layer_cache_hits, 0, "edit must drop the cache: {m:?}");
+    assert_eq!(m.layer_cache_misses, 0, "an edit must not refill the cache");
+    assert_eq!(r.layer_cache_stats(), (0, 0));
     assert_eq!(r.copy_rgba(), fresh(&doc, &vp(0.0, 0.0)).0);
 
     // Transform-only edit (no geometry stamp) — still invalidates.
@@ -268,7 +270,50 @@ fn any_scene_edit_invalidates_every_cached_layer() {
         m.layer_cache_hits, 0,
         "transform edit must drop the cache: {m:?}"
     );
+    assert_eq!(m.layer_cache_misses, 0, "a move must not refill the cache");
+    assert_eq!(r.layer_cache_stats(), (0, 0));
     assert_eq!(r.copy_rgba(), fresh(&doc, &vp(0.0, 0.0)).0);
+}
+
+#[test]
+fn drag_frames_render_directly_and_refill_only_after_settling() {
+    let (mut doc, shadowed) = sampler_doc();
+    let viewport = vp(0.0, 0.0);
+    let mut renderer = RasterRenderer::new(W, H).expect("surface");
+    renderer.render(&doc.scene, &viewport);
+    renderer.render(&doc.scene, &viewport);
+    assert!(renderer.layer_cache_stats().0 >= 5);
+
+    for step in 1..=12 {
+        doc.scene
+            .set_transform(
+                shadowed,
+                Transform2D::translation(f64::from(step) * 0.75, f64::from(step) * -0.25),
+            )
+            .expect("move shadowed node");
+        let metrics = renderer.render(&doc.scene, &viewport);
+        assert_eq!(
+            (metrics.layer_cache_hits, metrics.layer_cache_misses),
+            (0, 0),
+            "drag step {step} must not populate disposable layers: {metrics:?}"
+        );
+        assert_eq!(renderer.layer_cache_stats(), (0, 0));
+        assert_eq!(
+            renderer.copy_rgba(),
+            fresh(&doc, &viewport).0,
+            "drag step {step} must match a fresh direct render"
+        );
+    }
+
+    let settled = renderer.render(&doc.scene, &viewport);
+    assert!(settled.layer_cache_misses >= 5, "{settled:?}");
+    assert_eq!(settled.layer_cache_hits, 0);
+    assert_eq!(renderer.copy_rgba(), fresh(&doc, &viewport).0);
+
+    let reused = renderer.render(&doc.scene, &viewport);
+    assert!(reused.layer_cache_hits >= 5, "{reused:?}");
+    assert_eq!(reused.layer_cache_misses, 0);
+    assert_eq!(renderer.copy_rgba(), fresh(&doc, &viewport).0);
 }
 
 /// CLIPPED SUBTREES: a blurred child that pokes past its clipping frame's
