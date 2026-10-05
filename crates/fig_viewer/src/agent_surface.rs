@@ -3785,37 +3785,39 @@ fn apply_one(
         }
         DesignOp::CombineVariants { ids, name } => {
             let ids = parse_content_ids(doc, ids)?;
-            if ids.len() < 2 {
-                bail!("combine_variants requires at least two standalone component masters");
-            }
-            let mut names = HashSet::new();
-            for id in &ids {
-                let def = doc
+            let name = name.as_deref().map(required_name).transpose()?;
+            let edit = crate::variant_sets::combine_variants(doc, &ids, name)?;
+            apply_variant_edit(doc, edit)
+        }
+        DesignOp::AddVariants { set, ids } => {
+            let set = resolve_variant_set(doc, set)?;
+            let ids = parse_content_ids(doc, ids)?;
+            let edit = crate::variant_sets::add_variants(doc, set, &ids)?;
+            apply_variant_edit(doc, edit)
+        }
+        DesignOp::RemoveVariant { id } => {
+            let component = match parse_node_id(id) {
+                Ok(node) => doc
                     .components
                     .defs
                     .values()
-                    .find(|def| def.root == *id)
-                    .context("every member must be a component master node id")?;
-                if def.variant_of.is_some() {
-                    bail!("a member already belongs to a variant set");
-                }
-                if !names.insert(def.name.clone()) {
-                    bail!("variant master names must be unique");
-                }
-            }
-            let mut operations = crate::properties_ops::combine_node_variants_operations(doc, &ids);
-            let Some(Operation::DefineComponentSet { set }) = operations.first_mut() else {
-                bail!("cannot create variant set");
+                    .find(|def| def.root == node)
+                    .map(|def| def.id)
+                    .with_context(|| format!("node {node} is not a component master"))?,
+                Err(_) => resolve_component(doc, id)?,
             };
-            if let Some(name) = name {
-                set.name = required_name(name)?.to_owned();
-            }
-            let set_id = set.id;
-            apply_all(doc, operations)?;
-            Ok(Applied::Content {
-                created: None,
-                detail: Some(json!({"component_set": set_id.to_string()})),
-            })
+            let edit = crate::variant_sets::remove_variant(doc, component)?;
+            apply_variant_edit(doc, edit)
+        }
+        DesignOp::ArrangeVariants { set } => {
+            let set = resolve_variant_set(doc, set)?;
+            let edit = crate::variant_sets::arrange_variants(doc, set)?;
+            apply_variant_edit(doc, edit)
+        }
+        DesignOp::RenameComponent { component, name } => {
+            let component = resolve_component(doc, component)?;
+            let operations = crate::variant_sets::rename_component(doc, component, name)?;
+            apply_all(doc, operations)
         }
         DesignOp::CreateComponentProperty {
             component,
@@ -4208,6 +4210,28 @@ fn resolve_component(doc: &Doc, reference: &str) -> Result<ComponentId> {
         bail!("several components are named `{reference}`; use the component id");
     }
     Ok(first)
+}
+
+/// Apply a variant-set edit and report the set and its frame.
+fn apply_variant_edit(doc: &mut Doc, edit: crate::variant_sets::SetEdit) -> Result<Applied> {
+    for operation in edit.operations {
+        doc.apply(operation)?;
+    }
+    Ok(Applied::Content {
+        created: None,
+        detail: Some(json!({
+            "component_set": edit.set.to_string(),
+            "frame": edit.frame.map(|frame| frame.to_string()),
+        })),
+    })
+}
+
+fn resolve_variant_set(doc: &Doc, reference: &str) -> Result<ComponentId> {
+    let id = resolve_component(doc, reference)?;
+    if !doc.components.sets.contains_key(&id) {
+        bail!("`{reference}` is a component, not a variant set");
+    }
+    Ok(id)
 }
 
 /// The size a new instance takes: the master's frame box, or its content

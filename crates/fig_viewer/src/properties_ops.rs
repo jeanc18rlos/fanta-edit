@@ -818,66 +818,29 @@ pub(crate) fn create_component_operations(doc: &Doc, id: NodeId) -> Vec<Operatio
     }]
 }
 
-/// Merge the selected component masters into one variant set along a single
-/// "Variant" axis whose values are the masters' names. The first selected master
-/// becomes the set's default variant.
+/// Merge the selected standalone component masters into one variant set: a
+/// frame holding every variant in a grid of their values (see
+/// [`crate::variant_sets::combine_variants`]). The first selected master
+/// becomes the set's default variant. Other selected layers are ignored.
 pub(crate) fn combine_as_variants_operations(doc: &Doc) -> Vec<Operation> {
     combine_node_variants_operations(doc, &doc.selection.iter().copied().collect::<Vec<_>>())
 }
 
 pub(crate) fn combine_node_variants_operations(doc: &Doc, nodes: &[NodeId]) -> Vec<Operation> {
     let masters = master_roots(&doc.components);
-    let members: Vec<ComponentId> = nodes
+    let standalone: Vec<NodeId> = nodes
         .iter()
-        .filter_map(|id| masters.get(id).copied())
-        // A master already in a set would need its old set repaired first.
-        .filter(|component| {
-            doc.components
-                .def(*component)
+        .copied()
+        .filter(|node| {
+            masters
+                .get(node)
+                .and_then(|component| doc.components.def(*component))
                 .is_some_and(|def| def.variant_of.is_none())
         })
         .collect();
-    let (Some(default_variant), true) = (members.first().copied(), members.len() >= 2) else {
-        return Vec::new();
-    };
-    const AXIS: &str = "Variant";
-    let values: Vec<String> = members
-        .iter()
-        .filter_map(|component| doc.components.def(*component))
-        .map(|def| def.name.clone())
-        .collect();
-    let set = ComponentSet {
-        id: ComponentId::new(),
-        name: doc
-            .components
-            .def(default_variant)
-            .map(|def| def.name.clone())
-            .unwrap_or_else(|| "Components".to_string()),
-        axes: vec![VariantAxis {
-            name: AXIS.to_string(),
-            values,
-        }],
-        members: members.clone(),
-        default_variant,
-    };
-    let set_id = set.id;
-    let mut operations = vec![Operation::DefineComponentSet { set: Box::new(set) }];
-    for component in members {
-        let Some(def) = doc.components.def(component) else {
-            continue;
-        };
-        let mut axis_values = std::collections::BTreeMap::new();
-        axis_values.insert(AXIS.to_string(), def.name.clone());
-        operations.push(Operation::SetVariantMembership {
-            id: component,
-            old: def.variant_of.clone(),
-            new: Some(ComponentSetMembership {
-                set: set_id,
-                axis_values,
-            }),
-        });
-    }
-    operations
+    crate::variant_sets::combine_variants(doc, &standalone, None)
+        .map(|edit| edit.operations)
+        .unwrap_or_default()
 }
 
 /// Write one screen-axis gap of an auto-layout frame. The horizontal gap is
@@ -2561,6 +2524,7 @@ mod tests {
         doc.components.sets.insert(
             set_id,
             ComponentSet {
+                root: None,
                 id: set_id,
                 name: "Button".to_string(),
                 axes: vec![VariantAxis {
@@ -2767,7 +2731,6 @@ mod tests {
             .replace_with(components.iter().map(|(_, root)| *root));
 
         let operations = combine_as_variants_operations(&doc);
-        assert_eq!(operations.len(), 3, "one DefineComponentSet + two members");
         let Some(Operation::DefineComponentSet { set }) = operations.first() else {
             panic!("expected a DefineComponentSet operation");
         };
@@ -2775,10 +2738,17 @@ mod tests {
         assert_eq!(set.default_variant, components[0].0);
         assert_eq!(set.axes.len(), 1);
         assert_eq!(set.axes[0].values, vec!["Default", "Hover"]);
+        let set_id = set.id;
 
         for operation in operations {
             doc.apply(operation).expect("combining as variants");
         }
+        let frame = doc.components.sets[&set_id].root.expect("the set's frame");
+        assert_eq!(
+            doc.scene.children_of(Some(frame)),
+            components.iter().map(|(_, root)| *root).collect::<Vec<_>>(),
+            "one frame holds every variant"
+        );
         for (component, _) in &components {
             let membership = doc
                 .components

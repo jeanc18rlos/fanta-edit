@@ -466,6 +466,7 @@ mod tests {
         let m1 = ComponentId::from_u128(1);
         let m2 = ComponentId::from_u128(2);
         let old = ComponentSet {
+            root: None,
             id: set_id,
             name: "Button".into(),
             axes: vec![VariantAxis {

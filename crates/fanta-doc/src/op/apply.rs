@@ -250,6 +250,12 @@ impl Operation {
                 }
                 Ok(())
             }
+            Self::SetComponentName { id, old, new } => {
+                if let Some(def) = ctx.components.defs.get_mut(id) {
+                    def.name = dir.pick(old, new).clone();
+                }
+                Ok(())
+            }
             Self::SetComponentSet { id, old, new, .. } => {
                 ctx.components
                     .sets

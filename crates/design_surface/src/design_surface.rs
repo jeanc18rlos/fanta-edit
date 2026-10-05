@@ -370,6 +370,10 @@ pub const DESIGN_OP_CAPABILITIES: &[&str] = &[
     "op:set_auto_layout",
     "op:set_layout_child",
     "op:componentize",
+    "op:add_variants",
+    "op:remove_variant",
+    "op:arrange_variants",
+    "op:rename_component",
     "batch_get:detail",
 ];
 
@@ -807,11 +811,40 @@ pub enum DesignOp {
     CreateComponent {
         id: String,
     },
-    /// Combine two or more standalone component master node ids into a Variant axis set.
+    /// Combine two or more standalone component master node ids into ONE
+    /// variant set: a frame named `name` holding every variant, laid out as a
+    /// grid of their values. Name the masters after their values first
+    /// ("Variant=Primary, State=Hover") to get one axis per property;
+    /// otherwise each name is a value of a single Variant axis. Reports the
+    /// `component_set` and its `frame`.
     CombineVariants {
         ids: Vec<String>,
         #[serde(default)]
         name: Option<String>,
+    },
+    /// Add standalone masters named "Axis=Value, …" to an existing variant
+    /// set (id or name). New axes and values extend the set; existing
+    /// variants take "Default" on a new axis and are renamed to match.
+    AddVariants {
+        set: String,
+        ids: Vec<String>,
+    },
+    /// Take one variant (its master node id or component) out of its set.
+    /// It stays a standalone component beside the set's frame.
+    RemoveVariant {
+        id: String,
+    },
+    /// Put every variant of a set (id or name) inside the set's frame,
+    /// creating it if missing, named after its values and laid out as a grid.
+    ArrangeVariants {
+        set: String,
+    },
+    /// Rename a component or variant set (id or name). Its master or frame
+    /// layer is renamed too, and pages that name it are updated on save.
+    /// Never rename components by editing `components/*` files.
+    RenameComponent {
+        component: String,
+        name: String,
     },
     /// Expose a component property. Variant exposes the next unexposed set axis.
     CreateComponentProperty {
@@ -1457,9 +1490,15 @@ mode use canvas operations; source file mutation is unavailable.
   reuse component instances. Source equivalents are `doc/variables.json`,
   `doc/active_modes.json` and component master FNX; preserve ids.
 - Reusable component APIs include combine_variants, create_component_property,
-  bind_component_property and set_instance_property. Combine standalone
-  master node ids into a Variant axis set, expose the axis on a member master,
-  and instance the set id. Read the exact property/axis values before changing
+  bind_component_property and set_instance_property. A component with
+  variants is ONE variant set: name each master after its values
+  ("Variant=Primary, State=Hover"), then combine_variants them with the
+  component's name ("Button"); the set's frame holds every variant in a grid.
+  Grow or shrink a set with add_variants / remove_variant, tidy one with
+  arrange_variants, and rename with rename_component. Never edit
+  components/*.json or sets.json by hand: pages name components, and a
+  renamed component breaks every page that names it. Expose the axis on a
+  member master, and instance the set id. Read the exact property/axis values before changing
   an instance; invalid types or target bindings roll back the batch.
 - For a centered minimum-size button use `set_auto_layout` with horizontal
   direction, center align_items/justify, Hug primary/counter sizing,

@@ -832,6 +832,7 @@ mod tests {
         let large_root = make_variant(large_id, "Large", "Large");
         doc.apply(Operation::DefineComponentSet {
             set: Box::new(ComponentSet {
+                root: None,
                 id: set_id,
                 name: "Size".into(),
                 axes: vec![VariantAxis {

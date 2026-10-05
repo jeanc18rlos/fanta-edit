@@ -41,9 +41,8 @@ pub(crate) struct LayersTreeKey {
 pub(crate) struct KindContext {
     /// Roots of component masters (`doc.components.defs`).
     pub component_roots: HashSet<NodeId>,
-    /// Frames that hold a variant set: the parent of every set member's
-    /// master root. The engine has no set node of its own, so the set is the
-    /// frame the importer wraps its variants in.
+    /// Frames that hold a variant set: the set's `root`, or, for a set
+    /// without one, the frame (never a page) its members' masters sit in.
     pub component_set_frames: HashSet<NodeId>,
 }
 
@@ -51,14 +50,22 @@ impl KindContext {
     pub(crate) fn from_doc(doc: &Doc) -> Self {
         let component_roots: HashSet<NodeId> =
             doc.components.defs.values().map(|def| def.root).collect();
+        let pages = doc.pages();
         let component_set_frames: HashSet<NodeId> = doc
             .components
             .sets
             .values()
-            .flat_map(|set| set.members.iter())
-            .filter_map(|member| doc.components.defs.get(member))
-            .filter_map(|def| doc.scene.get(def.root))
-            .filter_map(|node| node.parent)
+            .flat_map(|set| match set.root {
+                Some(root) => vec![root],
+                None => set
+                    .members
+                    .iter()
+                    .filter_map(|member| doc.components.defs.get(member))
+                    .filter_map(|def| doc.scene.get(def.root))
+                    .filter_map(|node| node.parent)
+                    .filter(|parent| !pages.contains(parent))
+                    .collect(),
+            })
             .collect();
         Self {
             component_roots,
@@ -463,6 +470,7 @@ mod tests {
         doc.components.sets.insert(
             set,
             ComponentSet {
+                root: None,
                 id: set,
                 name: "Chip".into(),
                 axes: Vec::new(),

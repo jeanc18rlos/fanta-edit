@@ -75,6 +75,7 @@ fn variant_set(
     lib.sets.insert(
         set_id,
         ComponentSet {
+            root: None,
             id: set_id,
             name: "Button".into(),
             axes: vec![VariantAxis {
@@ -193,6 +194,7 @@ fn expand_set_instance_selects_boolean_variant_axis() {
     lib.sets.insert(
         set_id,
         ComponentSet {
+            root: None,
             id: set_id,
             name: "Action Button".into(),
             axes: vec![VariantAxis {
@@ -235,6 +237,7 @@ fn expand_set_with_dangling_default_yields_empty() {
     lib.sets.insert(
         set_id,
         ComponentSet {
+            root: None,
             id: set_id,
             name: "Empty".into(),
             axes: Vec::new(),
@@ -336,6 +339,7 @@ fn two_axis_set(
     lib.sets.insert(
         set_id,
         ComponentSet {
+            root: None,
             id: set_id,
             name: "Btn".into(),
             axes: vec![

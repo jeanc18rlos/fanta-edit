@@ -52,6 +52,7 @@ mod timeline;
 mod tools;
 mod variable_binding;
 mod variables_workspace;
+mod variant_sets;
 #[cfg(target_os = "macos")]
 mod video_playback;
 mod view;

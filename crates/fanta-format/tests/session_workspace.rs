@@ -138,6 +138,7 @@ fn render_snapshot_loads_selected_component_set_member_and_nested_master() {
     doc.components.sets.insert(
         set,
         ComponentSet {
+            root: None,
             id: set,
             name: "Button".into(),
             axes: vec![VariantAxis {

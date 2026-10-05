@@ -2871,6 +2871,7 @@ mod tests {
         doc.components.sets.insert(
             component,
             ComponentSet {
+                root: None,
                 id: component,
                 name: "Button".into(),
                 axes: vec![VariantAxis {

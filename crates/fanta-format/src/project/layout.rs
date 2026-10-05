@@ -204,10 +204,10 @@ pages/<page-slug>/
   page.fnx                       # the page's node tree as readable source  <- edit this
   page.ids.json                  # legacy id/order sidecar kept in sync  — do not hand-edit
 components/<component-slug>/
-  def.json                       # component definition (id, root, name)
+  def.json                       # component definition (id, root, name)  — do not hand-edit
   master.fnx                     # the component master's tree as source    <- edit this
   master.ids.json                # legacy id/order sidecar kept in sync  — do not hand-edit
-components/sets.json             # component-set (variant) registry
+components/sets.json             # component-set (variant) registry       — do not hand-edit
 assets/index.json                # asset sizes and full SHA-256 digests
 assets/<family>/<AssetId>.<ext>  # shared binary assets, one folder per family:
                                  #   images/ video/ audio/ models/ svg/ fonts/ other/
@@ -221,6 +221,13 @@ design's *identity* lives in the JSON header and root source element: `page.json
 same node. Renaming the folder is
 not how you rename a page — edit the root element's `name` attribute and the
 app re-derives the folder name on the next save.
+
+Pages name the components they instance (`<Instance component="Button">`), so
+renaming a component in `def.json` breaks every page that names it and the
+whole project stops loading. Rename components, and build or change variant
+sets, with the canvas ops below (`rename_component`, `combine_variants`,
+`add_variants`, `remove_variant`, `arrange_variants`); the app then rewrites
+`def.json`, `sets.json` and every page that names the component together.
 
 ## The `.fnx` language
 
@@ -497,8 +504,16 @@ Variable values are hex colors, finite numbers, strings, booleans or TextStyle
 objects. Aliases use `{ "alias": "exact variable id or unique name" }`.
 Create foundations before components and prefer returned ids.
 
-Component ops include `combine_variants` (standalone master node `ids`, optional
-`name`), `create_component_property` (`component`, `kind`, optional `name`),
+A component with variants is ONE variant set: a frame named after the
+component holding every variant's master, laid out as a grid of their values,
+like a Figma component set. Name each master after its values
+(`Variant=Primary, State=Hover`), then `combine_variants` them (`ids`, `name`
+such as "Button") to get one axis per property. `add_variants` (`set`, `ids`)
+grows a set (new axes and values extend it; existing variants take `Default`
+on a new axis and are renamed to match), `remove_variant` (`id`) takes one
+out, `arrange_variants` (`set`) puts every variant back in the set's frame and
+re-grids it, and `rename_component` (`component`, `name`) renames a component
+or set. Other component ops: `create_component_property` (`component`, `kind`, optional `name`),
 `bind_component_property` (`component`, descendant `id`, `target` field,
 optional exposed `property`) and `set_instance_property` (`id`, `property`,
 primitive `value`). Variant sets can be instanced by id; Variant property

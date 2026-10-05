@@ -314,6 +314,40 @@ pub struct ComponentSet {
     /// The variant shown when an instance of the *set* is created without an
     /// explicit variant selection.
     pub default_variant: ComponentId,
+    /// The frame that holds the members' masters on the canvas (Figma's
+    /// component set node). `None` for a set whose masters sit wherever
+    /// they were made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root: Option<NodeId>,
+}
+
+/// Parse a Figma-style variant name, `"Variant=Primary, State=Hover"`, into
+/// its axis values. `None` unless every comma-separated part is a non-empty
+/// `Axis=Value` pair.
+pub fn parse_variant_name(name: &str) -> Option<Vec<(String, String)>> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for part in name.split(',') {
+        let (axis, value) = part.split_once('=')?;
+        let (axis, value) = (axis.trim(), value.trim());
+        if axis.is_empty() || value.is_empty() || pairs.iter().any(|(seen, _)| seen == axis) {
+            return None;
+        }
+        pairs.push((axis.to_owned(), value.to_owned()));
+    }
+    (!pairs.is_empty()).then_some(pairs)
+}
+
+/// The canonical name of a variant: its axis values in the set's axis order,
+/// `"Variant=Primary, State=Hover"`.
+pub fn variant_name(axes: &[VariantAxis], values: &BTreeMap<String, String>) -> String {
+    axes.iter()
+        .filter_map(|axis| {
+            values
+                .get(&axis.name)
+                .map(|value| format!("{}={value}", axis.name))
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// One axis of a [`ComponentSet`] and its allowed values.
@@ -344,6 +378,35 @@ mod tests {
     use super::*;
     use crate::color::Color;
     use crate::node::{CanvasNode, GroupNode, NodeData, VectorNode};
+
+    #[test]
+    fn variant_names_parse_and_print_in_axis_order() {
+        assert_eq!(
+            parse_variant_name("Variant=Primary, State = Hover"),
+            Some(vec![
+                ("Variant".to_owned(), "Primary".to_owned()),
+                ("State".to_owned(), "Hover".to_owned()),
+            ])
+        );
+        for not_variant in ["Primary", "Variant=", "=Primary", "A=1, A=2", "A=1, B"] {
+            assert_eq!(parse_variant_name(not_variant), None, "{not_variant}");
+        }
+        let axes = [
+            VariantAxis {
+                name: "Variant".into(),
+                values: vec!["Primary".into()],
+            },
+            VariantAxis {
+                name: "State".into(),
+                values: vec!["Hover".into()],
+            },
+        ];
+        let values = BTreeMap::from([
+            ("State".to_owned(), "Hover".to_owned()),
+            ("Variant".to_owned(), "Primary".to_owned()),
+        ]);
+        assert_eq!(variant_name(&axes, &values), "Variant=Primary, State=Hover");
+    }
 
     #[test]
     fn library_round_trips() {

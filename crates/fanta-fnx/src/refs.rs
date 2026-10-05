@@ -252,7 +252,14 @@ fn edit_distance(a: &str, b: &str) -> usize {
 fn nearest<'a>(candidates: impl Iterator<Item = &'a str>, target: &str) -> Option<&'a str> {
     let target_len = target.chars().count();
     let mut best: Option<(usize, &str)> = None;
+    let mut candidates_with_prefix = Vec::new();
     for candidate in candidates {
+        if candidate
+            .strip_prefix(target)
+            .is_some_and(|rest| rest.starts_with(','))
+        {
+            candidates_with_prefix.push(candidate);
+        }
         if candidate.chars().count().abs_diff(target_len) > 2 {
             continue;
         }
@@ -270,7 +277,13 @@ fn nearest<'a>(candidates: impl Iterator<Item = &'a str>, target: &str) -> Optio
             best = Some((distance, candidate));
         }
     }
-    best.map(|(_, name)| name)
+    best.map(|(_, name)| name).or_else(|| {
+        // A variant renamed to all its values: "Variant=Primary" is now
+        // "Variant=Primary, State=Default" (its default state first).
+        let mut extended: Vec<&str> = candidates_with_prefix.into_iter().collect();
+        extended.sort_by_key(|name| (!name.contains("=Default"), name.len(), *name));
+        extended.first().copied()
+    })
 }
 
 /// `; did you mean "…"?` (with an optional caller-supplied prefix such as `$`),
@@ -635,5 +648,15 @@ mod tests {
         let names = ["Cart", "Card"];
         assert_eq!(nearest(names.iter().copied(), "Carb"), Some("Card"));
         assert_eq!(nearest(names.iter().copied(), "Sidebar"), None);
+        // A variant renamed to all of its values.
+        let names = [
+            "Variant=Primary, State=Hover",
+            "Variant=Primary, State=Default",
+            "Variant=Secondary, State=Default",
+        ];
+        assert_eq!(
+            nearest(names.iter().copied(), "Variant=Primary"),
+            Some("Variant=Primary, State=Default")
+        );
     }
 }
