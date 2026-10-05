@@ -1237,6 +1237,7 @@ impl MacGpuRenderer {
             .map_err(|status| anyhow!("creating CoreVideo Metal texture cache failed: {status}"))?;
         let mut raster_renderer =
             RasterRenderer::new(size.0, size.1).context("creating Skia renderer state")?;
+        raster_renderer.background = crate::properties_ops::DEFAULT_PAGE_BACKGROUND;
         // Trackpad pans are fractional logical pixels; snapping the viewport's
         // device translation to whole pixels (<= 0.5 px) lets the engine's
         // effect-layer cache hit across pans instead of re-rendering every
@@ -2035,6 +2036,7 @@ fn render_fig_canvas(
 ) -> Result<Arc<RenderImage>> {
     let mut renderer =
         RasterRenderer::new(width, height).context("creating Skia raster surface")?;
+    renderer.background = crate::properties_ops::DEFAULT_PAGE_BACKGROUND;
     if let Some(asset_resolver) = document.asset_resolver.clone() {
         renderer.set_asset_resolver(asset_resolver);
     }
@@ -4545,6 +4547,51 @@ mod geometry_tests {
         VectorNode,
     };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn canvas_background_matches_the_inspector_without_changing_the_document() -> anyhow::Result<()>
+    {
+        for (background, expected) in [
+            (None, [245, 245, 245, 255]),
+            (Some(Color::rgb(20, 80, 140)), [140, 80, 20, 255]),
+            (Some(Color::TRANSPARENT), [0, 0, 0, 0]),
+        ] {
+            let mut doc = fanta_doc::Doc::new();
+            let page = CanvasNode::new(NodeData::Group(GroupNode {
+                background: background.map(fanta_doc::Fill::solid),
+                ..GroupNode::default()
+            }));
+            let page_id = page.id;
+            doc.scene.insert(page)?;
+            doc.add_page(page_id);
+            let document = FigDocument::from_doc(doc, BTreeMap::new());
+            let image = render_fig_canvas(
+                &document,
+                Some(page_id),
+                32,
+                24,
+                Viewport::default(),
+                1.,
+                None,
+                None,
+                None,
+            )?;
+            assert!(
+                image
+                    .as_bytes(0)
+                    .expect("rendered canvas pixels")
+                    .chunks_exact(4)
+                    .all(|pixel| pixel == expected),
+                "the entire canvas uses its default or authored page color"
+            );
+            let NodeData::Group(group) = &document.doc.scene.get(page_id).expect("page").data
+            else {
+                panic!("page remains a group");
+            };
+            assert_eq!(group.background, background.map(fanta_doc::Fill::solid));
+        }
+        Ok(())
+    }
 
     #[test]
     fn measurement_clipping_keeps_huge_crossing_segments_in_finite_pixel_bounds() {
