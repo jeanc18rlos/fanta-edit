@@ -1112,8 +1112,10 @@ impl RasterRenderer {
 
     /// Draw one prepared phase onto a transparent surface (Below includes the
     /// normal page clear). Composite Below, Middle and Above at identical
-    /// viewport/size with source-over. Rejected or stale specs leave the target
-    /// untouched. This opt-in API is not used by normal page rendering.
+    /// viewport/size with source-over. Specs with clipped ancestors require
+    /// [`Self::paint_split_to_canvas`] instead: flattening their antialiased
+    /// paint into separate raster phases can change pixels. Rejection leaves
+    /// the target untouched. Normal page rendering does not use this API.
     #[allow(clippy::too_many_arguments)]
     pub fn render_split_to_canvas(
         &mut self,
@@ -1126,7 +1128,53 @@ impl RasterRenderer {
         spec: &super::SplitSpec,
         phase: super::SplitPhase,
     ) -> Result<RenderMetrics, super::SplitError> {
+        self.draw_split_to_canvas(
+            canvas, target_w, target_h, scene, viewport, inputs, spec, phase, true,
+        )
+    }
+
+    /// Paint prepared phases in order onto the same target. Below performs
+    /// the normal page clear; Middle and Above preserve existing pixels.
+    /// They may also be recorded with `PictureRecorder` and replayed in order
+    /// onto Below, without flattening those commands into intermediate images.
+    /// Use the same scene revision, viewport, dimensions and display scale for
+    /// all phases. Each call restores the incoming canvas matrix/clip state;
+    /// rejected or stale specs leave its pixels untouched. This is an opt-in
+    /// renderer API, not a retained-scene or interactive-move cache.
+    #[allow(clippy::too_many_arguments)]
+    pub fn paint_split_to_canvas(
+        &mut self,
+        canvas: &Canvas,
+        target_w: u32,
+        target_h: u32,
+        scene: &Scene,
+        viewport: &Viewport,
+        inputs: &RenderInputs,
+        spec: &super::SplitSpec,
+        phase: super::SplitPhase,
+    ) -> Result<RenderMetrics, super::SplitError> {
+        self.draw_split_to_canvas(
+            canvas, target_w, target_h, scene, viewport, inputs, spec, phase, false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_split_to_canvas(
+        &mut self,
+        canvas: &Canvas,
+        target_w: u32,
+        target_h: u32,
+        scene: &Scene,
+        viewport: &Viewport,
+        inputs: &RenderInputs,
+        spec: &super::SplitSpec,
+        phase: super::SplitPhase,
+        clear_target: bool,
+    ) -> Result<RenderMetrics, super::SplitError> {
         spec.validate(scene, inputs)?;
+        if clear_target && spec.requires_ordered_paint() {
+            return Err(super::SplitError::RequiresOrderedPaint);
+        }
         let scale = viewport.zoom * self.display_scale;
         if target_w == 0
             || target_h == 0
@@ -1157,7 +1205,11 @@ impl RasterRenderer {
             Some(spec.page_root()),
             inputs,
             true,
-            Some(super::split::SplitPass { spec, phase }),
+            Some(super::split::SplitPass {
+                spec,
+                phase,
+                clear_target,
+            }),
         ))
     }
 
@@ -1524,7 +1576,9 @@ impl RasterRenderer {
         } else {
             page_background.unwrap_or(background)
         };
-        canvas.clear(to_sk_color(clear));
+        if split.is_none_or(|split| split.clear_target || split.phase == super::SplitPhase::Below) {
+            canvas.clear(to_sk_color(clear));
+        }
 
         let half_w = target_w as f32 * 0.5;
         let half_h = target_h as f32 * 0.5;

@@ -569,6 +569,12 @@ fn paint_node_body(
     if content_state.restore_child_clip {
         canvas.restore();
     }
+    if ctx
+        .split
+        .is_some_and(|split| !split.spec.paints_foreground(id, split.phase))
+    {
+        return;
+    }
     paint_node_foreground(canvas, node, Some(id), ctx);
 
     // Inner shadows composite over the node's flattened content — fill, border,

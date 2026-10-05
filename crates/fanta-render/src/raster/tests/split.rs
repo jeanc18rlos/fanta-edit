@@ -121,11 +121,23 @@ fn assert_parity(
     viewport: &Viewport,
     resolver: Option<Arc<dyn AssetResolver>>,
 ) -> Vec<u8> {
+    assert_parity_at_scale(doc, page, moving, viewport, resolver, 1.0)
+}
+
+fn assert_parity_at_scale(
+    doc: &Doc,
+    page: NodeId,
+    moving: NodeId,
+    viewport: &Viewport,
+    resolver: Option<Arc<dyn AssetResolver>>,
+    display_scale: f64,
+) -> Vec<u8> {
     let before = serde_json::to_value(doc).expect("before scene");
     let inputs = RenderInputs::empty();
     let spec = SplitSpec::prepare(&doc.scene, page, moving, &inputs, resolver.as_deref())
         .expect("eligible split");
     let mut renderer = RasterRenderer::new(WIDTH, HEIGHT).expect("renderer");
+    renderer.display_scale = display_scale;
     if let Some(resolver) = resolver {
         renderer.set_asset_resolver(resolver);
     }
@@ -143,27 +155,60 @@ fn assert_parity(
     let mut actual = surface();
     actual.canvas().clear(skia_safe::Color::TRANSPARENT);
     for phase in [SplitPhase::Below, SplitPhase::Middle, SplitPhase::Above] {
-        let mut layer = surface();
-        let metrics = renderer
-            .render_split_to_canvas(
-                layer.canvas(),
-                WIDTH,
-                HEIGHT,
-                &doc.scene,
-                viewport,
-                &inputs,
-                &spec,
-                phase,
-            )
+        let metrics = if spec.requires_ordered_paint() && phase != SplitPhase::Below {
+            let mut recorder = skia_safe::PictureRecorder::new();
+            let recording = recorder
+                .begin_recording(skia_safe::Rect::from_wh(WIDTH as f32, HEIGHT as f32), None);
+            let metrics = renderer
+                .paint_split_to_canvas(
+                    recording, WIDTH, HEIGHT, &doc.scene, viewport, &inputs, &spec, phase,
+                )
+                .expect("ordered phase");
+            let picture = recorder.finish_recording_as_picture(None).expect("picture");
+            let matrix = actual.canvas().local_to_device();
+            let clip = actual.canvas().device_clip_bounds();
+            let saves = actual.canvas().save_count();
+            actual.canvas().draw_picture(picture, None, None);
+            assert_eq!(actual.canvas().local_to_device(), matrix);
+            assert_eq!(actual.canvas().device_clip_bounds(), clip);
+            assert_eq!(actual.canvas().save_count(), saves);
+            metrics
+        } else {
+            let mut layer = surface();
+            let metrics = if spec.requires_ordered_paint() {
+                renderer.paint_split_to_canvas(
+                    layer.canvas(),
+                    WIDTH,
+                    HEIGHT,
+                    &doc.scene,
+                    viewport,
+                    &inputs,
+                    &spec,
+                    phase,
+                )
+            } else {
+                renderer.render_split_to_canvas(
+                    layer.canvas(),
+                    WIDTH,
+                    HEIGHT,
+                    &doc.scene,
+                    viewport,
+                    &inputs,
+                    &spec,
+                    phase,
+                )
+            }
             .expect("phase");
+            actual
+                .canvas()
+                .draw_image(layer.image_snapshot(), (0, 0), None);
+            metrics
+        };
         assert!(!metrics.incomplete_artwork && !metrics.effect_failed);
         assert_eq!(
             (metrics.layer_cache_hits, metrics.layer_cache_misses),
             (0, 0)
         );
-        actual
-            .canvas()
-            .draw_image(layer.image_snapshot(), (0, 0), None);
     }
     let expected_pixels = pixels(&mut expected);
     let actual_pixels = pixels(&mut actual);
@@ -173,6 +218,29 @@ fn assert_parity(
         .map(|(left, right)| left.abs_diff(*right))
         .collect();
     let maximum = differences.iter().copied().max().expect("nonempty image");
+    if maximum > 2
+        && let Some(directory) = std::env::var_os("FANTA_SPLIT_FAILURE_DIR")
+    {
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).expect("failure directory");
+        std::fs::write(directory.join("expected.rgba"), &expected_pixels).expect("expected pixels");
+        std::fs::write(directory.join("actual.rgba"), &actual_pixels).expect("actual pixels");
+        std::fs::write(
+            directory.join("scene.json"),
+            serde_json::to_vec_pretty(doc).expect("failure scene"),
+        )
+        .expect("failure scene file");
+        std::fs::write(
+            directory.join("render.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "page": page, "moving": moving, "center": viewport.center,
+                "zoom": viewport.zoom, "display_scale": display_scale,
+                "width": WIDTH, "height": HEIGHT, "maximum": maximum,
+            }))
+            .expect("render parameters"),
+        )
+        .expect("render parameter file");
+    }
     assert!(
         maximum <= 2,
         "max channel difference {maximum}; changed channels {}",
@@ -329,7 +397,7 @@ fn split_rejects_unsafe_ancestors_and_paint_dependencies() {
                 node.data.as_group_mut().expect("group").background =
                     Some(Fill::solid(Color::WHITE))
             }
-            3 => node.data.as_group_mut().expect("group").clip_size = Some([100.0, 100.0]),
+            3 => node.blurs.push(Blur::layer(3.0)),
             4 => node.effects.push(Shadow {
                 kind: ShadowKind::Inner,
                 color: Color::BLACK,
@@ -896,5 +964,690 @@ fn split_rejects_nonfinite_path_effect_paint_and_text_scalars_hidden_by_bounds()
             Err(SplitError::InvalidGeometry(id)) if id == moving),
             "case {case}"
         );
+    }
+}
+
+fn clipped_ancestor_fixture(
+    reverse: bool,
+    translucent: bool,
+    reflected: bool,
+) -> (Doc, NodeId, NodeId, NodeId) {
+    let mut doc = Doc::new();
+    let page = add(
+        &mut doc,
+        None,
+        NodeData::Group(GroupNode {
+            background: Some(Fill::solid(Color::rgba(
+                15,
+                22,
+                35,
+                if translucent { 70 } else { 255 },
+            ))),
+            ..Default::default()
+        }),
+        0.0,
+        0.0,
+    );
+    add(
+        &mut doc,
+        Some(page),
+        rectangle(Color::rgb(35, 60, 210)),
+        -90.0,
+        -70.0,
+    );
+    let frame = |width, height, color, align| {
+        let mut stroke = fanta_doc::Stroke::solid(Color::rgba(240, 110, 30, 210), 3.5);
+        stroke.align = align;
+        NodeData::Group(GroupNode {
+            clip_size: Some([width, height]),
+            background: Some(Fill::solid(color)),
+            corner_radii: Some([16.0, 8.0, 20.0, 11.0]),
+            corner_smoothing: 0.35,
+            strokes: [stroke].into_iter().collect(),
+            auto_layout: Some(AutoLayout {
+                reverse_z: reverse,
+                ..Default::default()
+            }),
+            ..Default::default()
+        })
+    };
+    let outer = add(
+        &mut doc,
+        Some(page),
+        frame(
+            144.0,
+            119.0,
+            Color::rgb(22, 30, 44),
+            fanta_doc::StrokeAlign::Center,
+        ),
+        -72.25,
+        -59.5,
+    );
+    if reflected {
+        doc.scene
+            .set_transform(
+                outer,
+                Transform2D::scale_xy(-1.0, 1.0)
+                    .then(&Transform2D::rotation(0.09))
+                    .then(&Transform2D::translation(70.25, -59.5)),
+            )
+            .expect("reflected ancestor");
+    }
+    add(
+        &mut doc,
+        Some(outer),
+        rectangle(Color::rgba(30, 220, 60, 150)),
+        -6.0,
+        1.0,
+    );
+    let middle = add(
+        &mut doc,
+        Some(outer),
+        frame(
+            108.0,
+            90.0,
+            Color::rgba(45, 30, 75, 190),
+            fanta_doc::StrokeAlign::Inside,
+        ),
+        12.75,
+        9.25,
+    );
+    add(
+        &mut doc,
+        Some(middle),
+        rectangle(Color::rgba(230, 70, 50, 150)),
+        38.0,
+        -8.0,
+    );
+    let inner = add(
+        &mut doc,
+        Some(middle),
+        frame(
+            85.0,
+            66.0,
+            Color::rgba(60, 80, 95, 210),
+            fanta_doc::StrokeAlign::Outside,
+        ),
+        11.5,
+        7.75,
+    );
+    doc.scene
+        .get_mut(inner)
+        .expect("inner")
+        .effects
+        .push(Shadow {
+            kind: ShadowKind::Inner,
+            color: Color::rgba(10, 0, 20, 150),
+            blur: 5.0,
+            spread: 1.5,
+            offset: [2.0, -1.0],
+            show_behind_node: false,
+        });
+    add(
+        &mut doc,
+        Some(inner),
+        rectangle(Color::rgba(20, 110, 230, 170)),
+        -4.0,
+        -4.0,
+    );
+    let moving = add(
+        &mut doc,
+        Some(inner),
+        NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            43.0,
+            37.0,
+            Color::rgba(245, 248, 250, if translucent { 160 } else { 255 }),
+        )),
+        0.0,
+        0.0,
+    );
+    add(
+        &mut doc,
+        Some(inner),
+        rectangle(Color::rgba(240, 40, 110, 100)),
+        30.0,
+        5.0,
+    );
+    let mut text = TextNode::new("Clip", 60.0, 24.0);
+    text.style.size_px = 18.0;
+    text.style.color = Color::rgba(245, 240, 10, 220);
+    add(&mut doc, Some(middle), NodeData::Text(text), 5.0, 65.0);
+    add(
+        &mut doc,
+        Some(outer),
+        rectangle(Color::rgba(40, 210, 210, 190)),
+        -13.0,
+        82.0,
+    );
+    add(
+        &mut doc,
+        Some(page),
+        rectangle(Color::rgba(20, 40, 170, 100)),
+        40.0,
+        20.0,
+    );
+    (doc, page, inner, moving)
+}
+
+#[test]
+fn split_nested_ancestor_background_clip_and_foreground_match_all_pixels() {
+    for reverse in [false, true] {
+        for translucent in [false, true] {
+            for reflected in [false, true] {
+                let (mut doc, page, _, moving) =
+                    clipped_ancestor_fixture(reverse, translucent, reflected);
+                for [x, y] in [
+                    [-12.0, -9.0],
+                    [0.0, 0.0],
+                    [40.0, 1.0],
+                    [60.0, 43.0],
+                    [1.0, 51.0],
+                    [-25.0, 25.0],
+                ] {
+                    doc.scene
+                        .set_transform(moving, Transform2D::translation(x, y))
+                        .expect("move");
+                    for (zoom, display_scale) in
+                        [(0.13, 1.0), (0.73, 1.0), (1.0, 1.0), (1.0, 2.0), (2.0, 2.0)]
+                    {
+                        assert_parity_at_scale(
+                            &doc,
+                            page,
+                            moving,
+                            &Viewport {
+                                center: [0.375, -1.125],
+                                zoom,
+                            },
+                            None,
+                            display_scale,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn split_ancestor_phases_keep_background_border_and_child_clip_separate() {
+    let mut doc = Doc::new();
+    let page = add(
+        &mut doc,
+        None,
+        NodeData::Group(GroupNode::default()),
+        0.0,
+        0.0,
+    );
+    let mut border = fanta_doc::Stroke::solid(Color::rgb(0, 0, 255), 4.0);
+    border.align = fanta_doc::StrokeAlign::Outside;
+    let parent = add(
+        &mut doc,
+        Some(page),
+        NodeData::Group(GroupNode {
+            clip_size: Some([60.0, 40.0]),
+            background: Some(Fill::solid(Color::rgb(255, 0, 0))),
+            strokes: [border].into_iter().collect(),
+            ..Default::default()
+        }),
+        -30.0,
+        -20.0,
+    );
+    let moving = add(
+        &mut doc,
+        Some(parent),
+        rectangle(Color::rgb(0, 255, 0)),
+        -10.0,
+        4.0,
+    );
+    let inputs = RenderInputs::empty();
+    let spec = SplitSpec::prepare(&doc.scene, page, moving, &inputs, None).expect("fixed frame");
+    let mut renderer = RasterRenderer::new(WIDTH, HEIGHT).expect("renderer");
+    for (phase, center, outside_border) in [
+        (SplitPhase::Below, [255, 0, 0, 255], [0, 0, 0, 0]),
+        (SplitPhase::Middle, [0, 255, 0, 255], [0, 0, 0, 0]),
+        (SplitPhase::Above, [0, 0, 0, 0], [0, 0, 255, 255]),
+    ] {
+        let mut target = surface();
+        renderer
+            .paint_split_to_canvas(
+                target.canvas(),
+                WIDTH,
+                HEIGHT,
+                &doc.scene,
+                &Viewport {
+                    center: [0.0, 0.0],
+                    zoom: 1.0,
+                },
+                &inputs,
+                &spec,
+                phase,
+            )
+            .expect("phase");
+        let bytes = pixels(&mut target);
+        assert_eq!(rgba_at(&bytes, WIDTH, 80, 75), center, "{phase:?} interior");
+        assert_eq!(
+            rgba_at(&bytes, WIDTH, 64, 70),
+            outside_border,
+            "{phase:?} own border must escape only own clip"
+        );
+        assert_eq!(
+            rgba_at(&bytes, WIDTH, 58, 75),
+            [0, 0, 0, 0],
+            "{phase:?} child overflow must be clipped"
+        );
+    }
+    assert_parity(
+        &doc,
+        page,
+        moving,
+        &Viewport {
+            center: [0.0, 0.0],
+            zoom: 1.0,
+        },
+        None,
+    );
+}
+
+#[test]
+fn split_ancestor_changes_invalidate_prepared_atoms_and_undo_preserves_pixels() {
+    let (mut doc, page, parent, moving) = clipped_ancestor_fixture(false, false, false);
+    let viewport = Viewport {
+        center: [0.0, 0.0],
+        zoom: 0.73,
+    };
+    let baseline = assert_parity(&doc, page, moving, &viewport, None);
+    let inputs = RenderInputs::empty();
+    let spec = SplitSpec::prepare(&doc.scene, page, moving, &inputs, None).expect("prepare");
+    let old = doc.scene.get(parent).expect("parent").data.clone();
+    let mut new = old.clone();
+    new.as_group_mut().expect("group").corner_radius = Some(4.0);
+    new.as_group_mut().expect("group").corner_radii = None;
+    doc.apply(Operation::ReplaceData {
+        id: parent,
+        old: Box::new(old),
+        new: Box::new(new),
+    })
+    .expect("change ancestor");
+    let mut renderer = RasterRenderer::new(WIDTH, HEIGHT).expect("renderer");
+    let mut target = surface();
+    target.canvas().clear(skia_safe::Color::MAGENTA);
+    let sentinel = pixels(&mut target);
+    assert!(matches!(
+        renderer.render_split_to_canvas(
+            target.canvas(),
+            WIDTH,
+            HEIGHT,
+            &doc.scene,
+            &viewport,
+            &inputs,
+            &spec,
+            SplitPhase::Above
+        ),
+        Err(SplitError::StaleScene)
+    ));
+    assert!(pixels(&mut target) == sentinel, "reject before drawing");
+    assert_parity(&doc, page, moving, &viewport, None);
+    assert!(doc.undo().expect("undo"));
+    assert!(
+        assert_parity(&doc, page, moving, &viewport, None) == baseline,
+        "Undo restores all pixels"
+    );
+}
+
+#[test]
+fn split_ancestor_compositing_and_unbounded_paint_remain_ineligible() {
+    for case in 0..10 {
+        let (mut doc, page, parent, moving) = clipped_ancestor_fixture(false, false, false);
+        let node = doc.scene.get_mut(parent).expect("ancestor");
+        match case {
+            0 => node.opacity = UnitInterval::new(0.5),
+            1 => node.flags.insert(NodeFlags::ISOLATED_BLEND),
+            2 => node.effects.push(Shadow {
+                kind: ShadowKind::Drop,
+                color: Color::BLACK,
+                blur: 4.0,
+                spread: 0.0,
+                offset: [2.0, 1.0],
+                show_behind_node: false,
+            }),
+            3 => node.blurs.push(Blur::layer(4.0)),
+            4 => node.blurs.push(Blur::background(4.0)),
+            5 => node.blend_mode = BlendMode::Multiply,
+            6 => {
+                node.meta = serde_json::json!({"clip_content": false});
+            }
+            7 => node.data.as_group_mut().expect("group").clip_size = None,
+            8 => node.flags.insert(NodeFlags::HIDDEN),
+            _ => {
+                node.bindings
+                    .insert(fanta_doc::BoundProp::Opacity, fanta_doc::VariableId::new());
+            }
+        }
+        assert!(
+            SplitSpec::prepare(&doc.scene, page, moving, &RenderInputs::empty(), None).is_err(),
+            "case{case}"
+        );
+    }
+}
+
+#[test]
+fn split_ancestor_gradient_and_decoded_image_backgrounds_match_full_render() {
+    struct Resolver(fanta_doc::AssetId);
+    impl AssetResolver for Resolver {
+        fn resolve(&self, id: fanta_doc::AssetId) -> Option<crate::DecodedImage> {
+            (id == self.0).then(|| {
+                crate::DecodedImage::new(
+                    Arc::new(vec![
+                        240, 30, 20, 255, 20, 200, 80, 180, 30, 40, 210, 120, 180, 150, 30, 255,
+                    ]),
+                    2,
+                    2,
+                )
+            })
+        }
+    }
+    let (mut doc, page, parent, moving) = clipped_ancestor_fixture(false, true, false);
+    let asset = fanta_doc::AssetId::new();
+    let group = doc
+        .scene
+        .get_mut(parent)
+        .expect("parent")
+        .data
+        .as_group_mut()
+        .expect("group");
+    group.background = Some(Fill::Gradient {
+        gradient: fanta_doc::Gradient::Linear {
+            start: [0.0, 0.0],
+            end: [1.0, 1.0],
+            stops: vec![
+                fanta_doc::GradientStop {
+                    position: 0.0,
+                    color: Color::rgb(20, 60, 100),
+                },
+                fanta_doc::GradientStop {
+                    position: 1.0,
+                    color: Color::rgba(100, 20, 180, 150),
+                },
+            ],
+        },
+        blend: BlendMode::Normal,
+    });
+    group.background_fills.push(Fill::Image {
+        asset,
+        mode: fanta_doc::ImageFitMode::Fill,
+        opacity: 0.7,
+        crop: Some(Box::new([0.0, 0.0, 0.75, 1.0])),
+        scale: None,
+        rotation: None,
+        blend: BlendMode::Normal,
+        adjust: Default::default(),
+    });
+    assert!(
+        matches!(SplitSpec::prepare(&doc.scene, page, moving, &RenderInputs::empty(), None), Err(SplitError::UnresolvedAsset(id)) if id == asset)
+    );
+    let resolver: Arc<dyn AssetResolver> = Arc::new(Resolver(asset));
+    for zoom in [0.73, 1.0, 2.0] {
+        assert_parity_at_scale(
+            &doc,
+            page,
+            moving,
+            &Viewport {
+                center: [0.0, 0.0],
+                zoom,
+            },
+            Some(resolver.clone()),
+            2.0,
+        );
+    }
+}
+
+#[test]
+fn split_ancestor_clip_without_paint_keeps_empty_above_and_rejects_instances() {
+    let mut doc = Doc::new();
+    let page = add(
+        &mut doc,
+        None,
+        NodeData::Group(GroupNode::default()),
+        0.0,
+        0.0,
+    );
+    let parent = add(
+        &mut doc,
+        Some(page),
+        NodeData::Group(GroupNode {
+            clip_size: Some([50.0, 40.0]),
+            corner_radius: Some(8.0),
+            ..Default::default()
+        }),
+        -25.0,
+        -20.0,
+    );
+    let moving = add(&mut doc, Some(parent), rectangle(Color::WHITE), -4.0, -4.0);
+    let inputs = RenderInputs::empty();
+    let spec =
+        SplitSpec::prepare(&doc.scene, page, moving, &inputs, None).expect("clip-only ancestor");
+    let mut target = surface();
+    let mut renderer = RasterRenderer::new(WIDTH, HEIGHT).expect("renderer");
+    let metrics = renderer
+        .paint_split_to_canvas(
+            target.canvas(),
+            WIDTH,
+            HEIGHT,
+            &doc.scene,
+            &Viewport {
+                center: [0.0, 0.0],
+                zoom: 1.0,
+            },
+            &inputs,
+            &spec,
+            SplitPhase::Above,
+        )
+        .expect("Above");
+    assert_eq!(metrics.nodes_drawn, 0);
+    assert!(pixels(&mut target).into_iter().all(|channel| channel == 0));
+    let mut recorder = skia_safe::PictureRecorder::new();
+    let recording =
+        recorder.begin_recording(skia_safe::Rect::from_wh(WIDTH as f32, HEIGHT as f32), None);
+    renderer
+        .paint_split_to_canvas(
+            recording,
+            WIDTH,
+            HEIGHT,
+            &doc.scene,
+            &Viewport {
+                center: [0.0, 0.0],
+                zoom: 1.0,
+            },
+            &inputs,
+            &spec,
+            SplitPhase::Above,
+        )
+        .expect("record empty Above");
+    let picture = recorder
+        .finish_recording_as_picture(None)
+        .expect("empty Above picture");
+    target.canvas().clear(skia_safe::Color::MAGENTA);
+    let before = pixels(&mut target);
+    target.canvas().draw_picture(picture, None, None);
+    assert_eq!(
+        pixels(&mut target),
+        before,
+        "empty Above replay must not clear earlier artwork"
+    );
+    doc.scene.get_mut(moving).expect("moving").data = NodeData::Instance(InstanceNode {
+        component: fanta_doc::ComponentId::new(),
+        overrides: Vec::new(),
+        prop_values: Default::default(),
+        derived: Vec::new(),
+        local_size: [20.0, 20.0],
+    });
+    assert!(
+        matches!(SplitSpec::prepare(&doc.scene, page, moving, &inputs, None), Err(SplitError::UnsupportedNode(id)) if id == moving)
+    );
+}
+
+#[test]
+fn split_ancestor_raster_phases_refuse_before_modifying_the_target() {
+    let (doc, page, _, moving) = clipped_ancestor_fixture(false, false, false);
+    let inputs = RenderInputs::empty();
+    let spec = SplitSpec::prepare(&doc.scene, page, moving, &inputs, None).expect("prepare");
+    assert!(spec.requires_ordered_paint());
+    let mut renderer = RasterRenderer::new(WIDTH, HEIGHT).expect("renderer");
+    let mut target = surface();
+    target.canvas().clear(skia_safe::Color::MAGENTA);
+    let before = pixels(&mut target);
+    for phase in [SplitPhase::Below, SplitPhase::Middle, SplitPhase::Above] {
+        assert!(matches!(
+            renderer.render_split_to_canvas(
+                target.canvas(),
+                WIDTH,
+                HEIGHT,
+                &doc.scene,
+                &Viewport {
+                    center: [0.375, -1.125],
+                    zoom: 0.13
+                },
+                &inputs,
+                &spec,
+                phase,
+            ),
+            Err(SplitError::RequiresOrderedPaint)
+        ));
+        assert_eq!(pixels(&mut target), before);
+    }
+}
+
+#[test]
+fn split_ordered_phases_preserve_incoming_canvas_state_and_reject_stale_scene() {
+    let (mut doc, page, _, moving) = clipped_ancestor_fixture(true, true, true);
+    let inputs = RenderInputs::empty();
+    let spec = SplitSpec::prepare(&doc.scene, page, moving, &inputs, None).expect("prepare");
+    let viewport = Viewport {
+        center: [0.375, -1.125],
+        zoom: 0.13,
+    };
+    let mut renderer = RasterRenderer::new(WIDTH, HEIGHT).expect("renderer");
+    let mut expected = surface();
+    let mut actual = surface();
+    for target in [&mut expected, &mut actual] {
+        target.canvas().clear(skia_safe::Color::MAGENTA);
+        target.canvas().translate((2.5, 1.5));
+        target.canvas().clip_rect(
+            skia_safe::Rect::from_xywh(4.0, 3.0, 170.0, 148.0),
+            None,
+            true,
+        );
+    }
+    renderer.render_to_canvas(
+        expected.canvas(),
+        WIDTH,
+        HEIGHT,
+        &doc.scene,
+        &viewport,
+        Some(page),
+        &inputs,
+    );
+    let matrix = actual.canvas().local_to_device();
+    let clip = actual.canvas().device_clip_bounds();
+    let saves = actual.canvas().save_count();
+    for phase in [SplitPhase::Below, SplitPhase::Middle, SplitPhase::Above] {
+        renderer
+            .paint_split_to_canvas(
+                actual.canvas(),
+                WIDTH,
+                HEIGHT,
+                &doc.scene,
+                &viewport,
+                &inputs,
+                &spec,
+                phase,
+            )
+            .expect("paint phase");
+        assert_eq!(actual.canvas().local_to_device(), matrix);
+        assert_eq!(actual.canvas().device_clip_bounds(), clip);
+        assert_eq!(actual.canvas().save_count(), saves);
+    }
+    assert_eq!(
+        pixels(&mut actual),
+        pixels(&mut expected),
+        "ordered paint keeps original arithmetic and external clip"
+    );
+    doc.scene
+        .set_transform(moving, Transform2D::translation(13.0, 8.0))
+        .expect("change scene");
+    let before = pixels(&mut actual);
+    assert!(matches!(
+        renderer.paint_split_to_canvas(
+            actual.canvas(),
+            WIDTH,
+            HEIGHT,
+            &doc.scene,
+            &viewport,
+            &inputs,
+            &spec,
+            SplitPhase::Middle
+        ),
+        Err(SplitError::StaleScene)
+    ));
+    assert_eq!(pixels(&mut actual), before);
+    assert_eq!(actual.canvas().local_to_device(), matrix);
+    assert_eq!(actual.canvas().device_clip_bounds(), clip);
+    assert_eq!(actual.canvas().save_count(), saves);
+}
+
+#[test]
+fn split_plain_ancestor_raster_phases_keep_low_zoom_parity() {
+    for reverse in [false, true] {
+        for translucent in [false, true] {
+            for reflected in [false, true] {
+                let (mut doc, page, _, moving) =
+                    clipped_ancestor_fixture(reverse, translucent, reflected);
+                let ancestors: Vec<_> = doc
+                    .scene
+                    .ancestors_of(moving)
+                    .map(|node| node.id)
+                    .filter(|id| *id != page)
+                    .collect();
+                for id in ancestors {
+                    let node = doc.scene.get_mut(id).expect("ancestor");
+                    node.effects.clear();
+                    node.data = NodeData::Group(GroupNode {
+                        auto_layout: Some(AutoLayout {
+                            reverse_z: reverse,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    });
+                }
+                let inputs = RenderInputs::empty();
+                let spec = SplitSpec::prepare(&doc.scene, page, moving, &inputs, None)
+                    .expect("plain ancestors");
+                assert!(!spec.requires_ordered_paint());
+                for [x, y] in [
+                    [-12.0, -9.0],
+                    [0.0, 0.0],
+                    [40.0, 1.0],
+                    [60.0, 43.0],
+                    [1.0, 51.0],
+                    [-25.0, 25.0],
+                ] {
+                    doc.scene
+                        .set_transform(moving, Transform2D::translation(x, y))
+                        .expect("move");
+                    assert_parity(
+                        &doc,
+                        page,
+                        moving,
+                        &Viewport {
+                            center: [0.375, -1.125],
+                            zoom: 0.13,
+                        },
+                        None,
+                    );
+                }
+            }
+        }
     }
 }

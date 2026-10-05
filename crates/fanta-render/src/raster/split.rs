@@ -7,7 +7,7 @@ use fanta_doc::{
 
 use crate::asset::{AssetResolver, DecodedImage};
 
-use super::{BlurKind, RenderInputs};
+use super::{BlurKind, RenderInputs, ShadowKind, effects::group_clips_children};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SplitPhase {
@@ -22,7 +22,7 @@ pub enum SplitError {
     InvalidRoots,
     #[error("split rendering does not support node {0}")]
     UnsupportedNode(NodeId),
-    #[error("split rendering does not support painted, clipped, or composited ancestor {0}")]
+    #[error("split rendering does not support composited or unbounded painted ancestor {0}")]
     UnsupportedAncestor(NodeId),
     #[error("split rendering does not support masks ({0})")]
     Mask(NodeId),
@@ -40,13 +40,15 @@ pub enum SplitError {
     DynamicInputs,
     #[error("the scene changed after the split was prepared")]
     StaleScene,
+    #[error("clipped ancestor paint requires ordered phase drawing, not raster phase compositing")]
+    RequiresOrderedPaint,
     #[error("split rendering requires a finite positive viewport and target size")]
     InvalidViewport,
 }
 
 #[derive(Clone, Copy)]
 enum PaintAtom {
-    Traversal,
+    Ancestor,
     Subtree(SplitPhase),
 }
 
@@ -62,11 +64,13 @@ impl AssetResolver for FrozenAssets {
 /// An opt-in paint partition for one immutable scene revision. Prepare again
 /// after any edit. This is not a retained-frame cache or an interactive move.
 /// Images are frozen here so asynchronous decode/eviction cannot change the
-/// artwork between phases; callers composite equal-sized phases source-over.
+/// artwork between phases. Clipped ancestors require ordered command replay;
+/// other specs also permit equal-sized raster phases composited source-over.
 pub struct SplitSpec {
     scene_instance: u64,
     scene_revision: u64,
     page_root: NodeId,
+    requires_ordered_paint: bool,
     atoms: HashMap<NodeId, PaintAtom>,
     assets: FrozenAssets,
 }
@@ -93,6 +97,7 @@ impl SplitSpec {
             scene_instance: scene.instance_id(),
             scene_revision: scene.revision(),
             page_root,
+            requires_ordered_paint: false,
             atoms: HashMap::new(),
             assets: FrozenAssets::default(),
         };
@@ -111,7 +116,9 @@ impl SplitSpec {
             spec.validate_node(node, resolver)?;
             if ancestors.contains(&id) {
                 validate_ancestor(node, id == page_root)?;
-                spec.atoms.insert(id, PaintAtom::Traversal);
+                spec.requires_ordered_paint |=
+                    matches!(&node.data, NodeData::Group(group) if group.clip_size.is_some());
+                spec.atoms.insert(id, PaintAtom::Ancestor);
             } else {
                 spec.atoms.insert(id, PaintAtom::Subtree(phase));
             }
@@ -131,6 +138,12 @@ impl SplitSpec {
         self.page_root
     }
 
+    /// Whether phase commands must be painted/replayed in order instead of
+    /// compositing separately rasterized phase images.
+    pub fn requires_ordered_paint(&self) -> bool {
+        self.requires_ordered_paint
+    }
+
     pub(crate) fn validate(&self, scene: &Scene, inputs: &RenderInputs) -> Result<(), SplitError> {
         if self.scene_instance != scene.instance_id() || self.scene_revision != scene.revision() {
             return Err(SplitError::StaleScene);
@@ -144,7 +157,23 @@ impl SplitSpec {
 
     pub(crate) fn includes(&self, id: NodeId, phase: SplitPhase) -> bool {
         match self.atoms.get(&id) {
-            Some(PaintAtom::Traversal) => true,
+            Some(PaintAtom::Ancestor) => true,
+            Some(PaintAtom::Subtree(assigned)) => *assigned == phase,
+            None => false,
+        }
+    }
+
+    pub(crate) fn paints_background(&self, id: NodeId, phase: SplitPhase) -> bool {
+        match self.atoms.get(&id) {
+            Some(PaintAtom::Ancestor) => phase == SplitPhase::Below,
+            Some(PaintAtom::Subtree(assigned)) => *assigned == phase,
+            None => false,
+        }
+    }
+
+    pub(crate) fn paints_foreground(&self, id: NodeId, phase: SplitPhase) -> bool {
+        match self.atoms.get(&id) {
+            Some(PaintAtom::Ancestor) => phase == SplitPhase::Above,
             Some(PaintAtom::Subtree(assigned)) => *assigned == phase,
             None => false,
         }
@@ -437,25 +466,36 @@ fn validate_ancestor(node: &CanvasNode, page: bool) -> Result<(), SplitError> {
     let NodeData::Group(group) = &node.data else {
         return Err(SplitError::UnsupportedAncestor(node.id));
     };
-    let background_allowed = if page {
-        group.local_size.is_none()
-            && (group.background.is_none()
-                || matches!(
-                    group.background,
-                    Some(Fill::Solid {
-                        blend: BlendMode::Normal,
-                        ..
-                    })
-                ))
-    } else {
-        group.background.is_none()
-    };
-    if !background_allowed
+    let page_clear_only = page
+        && group.local_size.is_none()
+        && group.clip_size.is_none()
+        && (group.background.is_none()
+            || matches!(
+                group.background,
+                Some(Fill::Solid {
+                    blend: BlendMode::Normal,
+                    ..
+                })
+            ))
+        && group.background_fills.is_empty()
+        && group.strokes.is_empty()
+        && node.effects.is_empty();
+    let has_paint = group.background.is_some()
         || !group.background_fills.is_empty()
         || !group.strokes.is_empty()
-        || group.clip_size.is_some()
+        || !node.effects.is_empty();
+    let fixed_clip = group_clips_children(node, group)
+        && group
+            .clip_size
+            .is_some_and(|size| size.into_iter().all(|value| value > 0.0));
+    // A painted ancestor without a fixed child clip can derive its silhouette
+    // from the moving child's union bounds. Its cached paint would then move.
+    if (has_paint && !page_clear_only && !fixed_clip)
         || node.opacity.get() != 1.0
-        || !node.effects.is_empty()
+        || node
+            .effects
+            .iter()
+            .any(|effect| effect.kind != ShadowKind::Inner)
         || !node.blurs.is_empty()
         || node
             .flags
@@ -470,4 +510,5 @@ fn validate_ancestor(node: &CanvasNode, page: bool) -> Result<(), SplitError> {
 pub(crate) struct SplitPass<'a> {
     pub(crate) spec: &'a SplitSpec,
     pub(crate) phase: SplitPhase,
+    pub(crate) clear_target: bool,
 }
