@@ -11,7 +11,7 @@ use fanta_doc::{
 use crate::asset::{AssetResolver, DecodedImage};
 
 use super::renderer::PreparedInstance;
-use super::{BlurKind, RenderInputs, ShadowKind, effects::group_clips_children};
+use super::{BlurKind, RenderInputs, ShadowKind};
 
 const MAX_PREPARED_NODES: usize = 100_000;
 const MAX_PREPARED_DEPTH: usize = 64;
@@ -187,8 +187,7 @@ impl<'inputs> SplitSpec<'inputs> {
             spec.validate_node(node, resolver)?;
             if ancestors.contains(&id) {
                 validate_ancestor(node, id == page_root)?;
-                spec.requires_ordered_paint |=
-                    matches!(&node.data, NodeData::Group(group) if group.clip_size.is_some());
+                spec.requires_ordered_paint |= matches!(&node.data, NodeData::Group(group) if group.clip_size.or(group.local_size).is_some());
                 spec.atoms.insert(id, PaintAtom::Ancestor);
             } else {
                 spec.atoms.insert(id, PaintAtom::Subtree(phase));
@@ -1206,13 +1205,13 @@ fn validate_ancestor(node: &CanvasNode, page: bool) -> Result<(), SplitError> {
         || !group.background_fills.is_empty()
         || !group.strokes.is_empty()
         || !node.effects.is_empty();
-    let fixed_clip = group_clips_children(node, group)
-        && group
-            .clip_size
-            .is_some_and(|size| size.into_iter().all(|value| value > 0.0));
-    // A painted ancestor without a fixed child clip can derive its silhouette
-    // from the moving child's union bounds. Its cached paint would then move.
-    if (has_paint && !page_clear_only && !fixed_clip)
+    let fixed_paint_box = group
+        .clip_size
+        .or(group.local_size)
+        .is_some_and(|size| size.into_iter().all(|value| value > 0.0));
+    // frame_box_bounds uses this explicit box even when children may overflow.
+    // Without it the moving child's union bounds can change cached ancestor paint.
+    if (has_paint && !page_clear_only && !fixed_paint_box)
         || node.opacity.get() != 1.0
         || node
             .effects
