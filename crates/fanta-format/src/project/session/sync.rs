@@ -204,6 +204,7 @@ impl WorkspaceSession {
         }
 
         let mut replacements: Vec<(ArtifactId, NodeId, Vec<CanvasNode>)> = Vec::new();
+        let mut pending_layout = BTreeSet::new();
         for id in &report.changed {
             if !self.artifacts.contains_key(id) {
                 continue;
@@ -226,6 +227,7 @@ impl WorkspaceSession {
                         .map_err(|error| SessionError::DocAssemble(error.to_string()))
                 })
                 .collect::<Result<Vec<CanvasNode>, _>>()?;
+            pending_layout.extend(session.doc().pending_layout.iter().copied());
             replacements.push((id.clone(), session.root(), nodes));
         }
 
@@ -261,6 +263,9 @@ impl WorkspaceSession {
                     .map_err(|error| SessionError::DocAssemble(error.to_string()))?;
             }
         }
+        document
+            .pending_layout
+            .retain(|id| document.scene.contains(*id));
         let replacement_nodes = replacements
             .into_iter()
             .flat_map(|(_, _, nodes)| nodes)
@@ -269,6 +274,7 @@ impl WorkspaceSession {
             .scene
             .insert_many(replacement_nodes)
             .map_err(|error| SessionError::DocAssemble(error.to_string()))?;
+        document.pending_layout.extend(pending_layout);
 
         document.components = self.components.defs.clone();
         document.variables = self.shared.variables.clone();

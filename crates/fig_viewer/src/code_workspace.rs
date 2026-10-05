@@ -2,7 +2,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow};
 use collections::HashSet;
 use editor::{Editor, MultiBufferOffset, SelectionEffects, scroll::Autoscroll};
 use fanta_doc::NodeId;
@@ -156,7 +156,7 @@ impl FantaCodeWorkspace {
                     // have. Preserve the editor when paths stay the same.
                     if this.saved_source_paths_changed(cx) {
                         this.refresh_from_item(window, cx);
-                    } else {
+                    } else if !this.source_save_in_progress {
                         this.reload_saved_sources(window, cx);
                     }
                     this.update_fnx_editability(cx);
@@ -390,6 +390,38 @@ impl FantaCodeWorkspace {
                     item.discard_canvas_edits_for_source_resolution(cx)
                 });
                 reload_canvas.await?;
+                let all_sources_saved = this.update(cx, |this, cx| {
+                    [&this.fnx_source_buffer, &this.json_source_buffer]
+                        .into_iter()
+                        .flatten()
+                        .all(|buffer| {
+                            !buffer.read(cx).is_dirty() && !buffer.read(cx).has_unsaved_edits()
+                        })
+                })?;
+                if all_sources_saved
+                    && item.read_with(cx, |item, _| item.has_unpersisted_source_layout())
+                {
+                    let save_layout =
+                        item.update(cx, |item, cx| item.save_computed_source_layout(cx));
+                    if let Err(error) = save_layout.await {
+                        item.update(cx, |item, cx| item.mark_source_layout_unsaved(cx));
+                        return Err(error);
+                    }
+                    let saved_buffers = this.update(cx, |this, cx| {
+                        [&this.fnx_source_buffer, &this.json_source_buffer]
+                            .into_iter()
+                            .flatten()
+                            .filter(|current| !current.read(cx).has_unsaved_edits())
+                            .cloned()
+                            .collect()
+                    })?;
+                    let reload_buffer = project.update(cx, |project, cx| {
+                        project.reload_buffers(saved_buffers, false, cx)
+                    });
+                    reload_buffer
+                        .await
+                        .context("refreshing computed source geometry")?;
+                }
                 if !diagnostics.is_empty() {
                     log::warn!("FNX saved with {} source diagnostics", diagnostics.len());
                 }
@@ -437,10 +469,21 @@ impl FantaCodeWorkspace {
         let item = self.item.clone();
         cx.spawn(async move |this, cx| {
             reload.await?;
-            let still_dirty = buffers
-                .iter()
-                .any(|buffer| buffer.read_with(cx, |buffer, _| buffer.is_dirty()));
-            item.update(cx, |item, cx| item.set_source_edit_locked(still_dirty, cx));
+            let still_dirty = this.update(cx, |this, cx| {
+                [&this.fnx_source_buffer, &this.json_source_buffer]
+                    .into_iter()
+                    .flatten()
+                    .any(|buffer| {
+                        let buffer = buffer.read(cx);
+                        buffer.is_dirty() || buffer.has_unsaved_edits()
+                    })
+            })?;
+            item.update(cx, |item, cx| {
+                item.set_source_edit_locked(still_dirty, cx);
+                if !still_dirty {
+                    item.mark_source_layout_unsaved(cx);
+                }
+            });
             this.update(cx, |this, cx| {
                 this.error_message = None;
                 cx.notify();
@@ -2125,6 +2168,434 @@ mod tests {
                 );
             })
             .expect("read code workspace");
+    }
+
+    fn write_layout_project(root: &Path) -> (NodeId, Vec<NodeId>, Doc) {
+        let page = write_project(root);
+        let (mut document, assets) = fanta_format::read_project_tree(root).expect("read project");
+        let mut text_ids = Vec::new();
+        for index in 0..2 {
+            let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+                clip_size: Some([220.0, 100.0]),
+                auto_layout: Some(fanta_doc::AutoLayout::default()),
+                ..Default::default()
+            }));
+            frame.parent = Some(page);
+            frame.name = format!("Layout island {index}");
+            let parent = frame.id;
+            document.scene.insert(frame).expect("frame");
+            let mut text =
+                fanta_doc::TextNode::new(format!("Original layout label {index}"), 200.0, 18.0);
+            text.auto_resize = fanta_doc::TextAutoResize::WidthAndHeight;
+            let mut node = CanvasNode::new(NodeData::Text(text));
+            node.parent = Some(parent);
+            node.transform = fanta_doc::Transform2D::translation(12.0, 36.0);
+            text_ids.push(node.id);
+            document.scene.insert(node).expect("text");
+        }
+        fanta_format::write_project_tree(root, &document, &assets).expect("write computed project");
+        (page, text_ids, document)
+    }
+
+    #[gpui::test]
+    async fn loaded_layout_fnx_edit_saves_computed_geometry_and_preserves_other_islands(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("temporary project");
+        let (page, text_ids, document) = write_layout_project(temporary.path());
+        let original_other = document
+            .scene
+            .get(text_ids[1])
+            .expect("untouched text")
+            .clone();
+        let source_path = page_source_path(temporary.path(), page);
+        let original_source = std::fs::read_to_string(&source_path).expect("FNX");
+        let changed = original_source.replace(
+            "Original layout label 0",
+            "An intentionally wider authored source label",
+        );
+        assert_ne!(changed, original_source);
+        let (_project, item, workspace) = open_code_workspace(temporary.path(), cx).await;
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.doc().expect("document").scene.get(text_ids[1]),
+                Some(&original_other)
+            );
+        });
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace
+                    .fnx_editor
+                    .as_ref()
+                    .expect("FNX editor")
+                    .update(cx, |editor, cx| {
+                        editor.set_text(changed, window, cx);
+                    });
+            })
+            .expect("edit source");
+        cx.run_until_parked();
+        let (arrived, resume) = item.read_with(cx, |item, _| item.pause_next_save_for_test());
+        let save = workspace
+            .update(cx, |workspace, _, cx| {
+                workspace.save_source_edit(cx).expect("source save")
+            })
+            .expect("start save");
+        arrived
+            .await
+            .expect("computed layout writer reached barrier");
+        item.update(cx, |item, cx| {
+            assert!(
+                item.source_edit_locked(),
+                "source Save retains its canvas edit barrier"
+            );
+            assert!(
+                item.apply(
+                    fanta_doc::Operation::SetName {
+                        id: page,
+                        old: "Original".into(),
+                        new: "Rejected concurrent edit".into()
+                    },
+                    cx
+                )
+                .is_err()
+            );
+        });
+        resume.send(()).expect("resume computed write");
+        save.await.expect("save computed source geometry");
+        cx.run_until_parked();
+        let final_scene = item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let NodeData::Text(text) = &doc.scene.get(text_ids[0]).expect("edited text").data
+            else {
+                panic!("text fixture")
+            };
+            assert_ne!(text.local_size, [200.0, 18.0]);
+            assert_eq!(
+                doc.scene.get(text_ids[1]),
+                Some(&original_other),
+                "the other island remains authoritative"
+            );
+            assert!(!item.source_edit_locked());
+            assert!(!item.is_dirty());
+            assert!(!item.has_unpersisted_source_layout());
+            serde_json::to_value(&doc.scene).expect("canvas scene")
+        });
+        let (saved, _) =
+            fanta_format::read_project_tree(temporary.path()).expect("reopen saved project");
+        assert_eq!(
+            serde_json::to_value(&saved.scene).expect("saved scene"),
+            final_scene,
+            "computed coordinates must be persisted by the same explicit FNX Save"
+        );
+        workspace
+            .read_with(cx, |workspace, cx| {
+                assert!(!workspace.source_is_dirty(cx));
+                let actual = workspace
+                    .fnx_source_buffer
+                    .as_ref()
+                    .expect("source buffer")
+                    .read(cx)
+                    .text();
+                assert_eq!(
+                    actual,
+                    std::fs::read_to_string(&source_path).expect("saved FNX")
+                );
+            })
+            .expect("clean editor displays persisted geometry");
+
+        let saved_source = std::fs::read_to_string(&source_path).expect("saved source");
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace
+                    .fnx_editor
+                    .as_ref()
+                    .expect("editor")
+                    .update(cx, |editor, cx| {
+                        editor.set_text("<Frame name={ />", window, cx)
+                    });
+            })
+            .expect("invalid edit");
+        cx.run_until_parked();
+        let invalid = workspace
+            .update(cx, |workspace, _, cx| {
+                workspace.save_source_edit(cx).expect("dirty source")
+            })
+            .expect("invalid save");
+        assert!(invalid.await.is_err());
+        assert_eq!(
+            std::fs::read_to_string(&source_path).expect("saved source"),
+            saved_source
+        );
+        item.read_with(cx, |item, _| {
+            assert!(item.source_edit_locked());
+            assert_eq!(
+                serde_json::to_value(&item.doc().expect("document").scene).expect("canvas"),
+                final_scene
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn loaded_layout_two_source_drafts_keep_canvas_locked_until_both_save(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("temporary project");
+        let (page, text_ids, _) = write_layout_project(temporary.path());
+        let source_path = page_source_path(temporary.path(), page);
+        let original = std::fs::read_to_string(&source_path).expect("FNX");
+        let changed = original.replace(
+            "Original layout label 0",
+            "A changed source label that needs reflow",
+        );
+        let json_path = page_json_path(temporary.path(), page);
+        let header = std::fs::read_to_string(&json_path).expect("header");
+        let (_project, item, workspace) = open_code_workspace(temporary.path(), cx).await;
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace.selected_file = CodeWorkspaceFile::Fnx;
+                workspace
+                    .fnx_editor
+                    .as_ref()
+                    .expect("FNX")
+                    .update(cx, |editor, cx| editor.set_text(changed, window, cx));
+                workspace
+                    .json_editor
+                    .as_ref()
+                    .expect("JSON")
+                    .update(cx, |editor, cx| {
+                        editor.set_text("{ invalid header", window, cx)
+                    });
+            })
+            .expect("edit both buffers");
+        cx.run_until_parked();
+        let lock_violations = std::rc::Rc::new(std::cell::Cell::new(0));
+        let json_buffer = workspace
+            .read_with(cx, |workspace, _| {
+                workspace.json_source_buffer.as_ref().expect("JSON").clone()
+            })
+            .expect("buffer");
+        let _subscription = cx.update(|cx| {
+            cx.observe(&item, {
+                let violations = lock_violations.clone();
+                move |item, cx| {
+                    if json_buffer.read(cx).is_dirty() && !item.read(cx).source_edit_locked() {
+                        violations.set(violations.get() + 1);
+                    }
+                }
+            })
+        });
+        let save = workspace
+            .update(cx, |workspace, _, cx| {
+                workspace.save_source_edit(cx).expect("save both")
+            })
+            .expect("start save");
+        assert!(
+            save.await.is_err(),
+            "invalid second buffer remains rejected"
+        );
+        cx.run_until_parked();
+        assert_eq!(
+            lock_violations.get(),
+            0,
+            "no unlock while the other source draft is dirty"
+        );
+        item.read_with(cx, |item, _| {
+            assert!(item.source_edit_locked());
+            assert!(
+                item.has_unpersisted_source_layout(),
+                "geometry awaits the final valid source save"
+            );
+            assert!(
+                !item.is_dirty(),
+                "a rejected source draft does not manufacture canvas conflict"
+            );
+        });
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace
+                    .json_editor
+                    .as_ref()
+                    .expect("JSON")
+                    .update(cx, |editor, cx| {
+                        let mut valid: serde_json::Value =
+                            serde_json::from_str(&header).expect("header JSON");
+                        valid["order"] = serde_json::json!(9);
+                        editor.set_text(valid.to_string(), window, cx);
+                    });
+            })
+            .expect("repair header");
+        cx.run_until_parked();
+        workspace
+            .update(cx, |workspace, _, cx| {
+                workspace.save_source_edit(cx).expect("retry source")
+            })
+            .expect("start retry")
+            .await
+            .expect("both sources and layout save");
+        cx.run_until_parked();
+        let (saved, _) = fanta_format::read_project_tree(temporary.path()).expect("reopen");
+        item.read_with(cx, |item, _| {
+            assert!(!item.source_edit_locked());
+            assert!(!item.is_dirty());
+            assert!(!item.has_unpersisted_source_layout());
+            assert_eq!(
+                saved.scene.get(text_ids[0]),
+                item.doc().expect("document").scene.get(text_ids[0])
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn loaded_layout_failed_geometry_write_retains_retryable_canvas_state(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let directory = tempfile::tempdir().expect("project");
+        let (page, _, _) = write_layout_project(directory.path());
+        let source_path = page_source_path(directory.path(), page);
+        let original = std::fs::read_to_string(&source_path).expect("FNX");
+        let (_project, item, workspace) = open_code_workspace(directory.path(), cx).await;
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace
+                    .fnx_editor
+                    .as_ref()
+                    .expect("FNX")
+                    .update(cx, |editor, cx| {
+                        editor.set_text(
+                            original.replace(
+                                "Original layout label 0",
+                                "A source edit that needs a wider layout",
+                            ),
+                            window,
+                            cx,
+                        );
+                    });
+            })
+            .expect("edit source");
+        cx.run_until_parked();
+        let (arrived, resume) = item.read_with(cx, |item, _| item.pause_next_save_for_test());
+        let save = workspace
+            .update(cx, |workspace, _, cx| {
+                workspace.save_source_edit(cx).expect("save source")
+            })
+            .expect("start source save");
+        arrived.await.expect("layout writer paused");
+        let manifest = directory.path().join("fanta.json");
+        let manifest_bytes = std::fs::read(&manifest).expect("manifest");
+        std::fs::remove_file(&manifest).expect("simulate unavailable manifest");
+        std::fs::create_dir(&manifest).expect("manifest path cannot be read as a file");
+        resume.send(()).expect("resume writer");
+        assert!(save.await.is_err(), "computed layout write fails visibly");
+        cx.run_until_parked();
+        let expected = item.read_with(cx, |item, _| {
+            assert!(
+                item.is_dirty(),
+                "failed derived persistence must offer Save retry"
+            );
+            assert!(item.has_unpersisted_source_layout());
+            assert!(
+                !item.source_edit_locked(),
+                "the validated source buffer is clean"
+            );
+            serde_json::to_value(&item.doc().expect("document").scene).expect("retained scene")
+        });
+        workspace
+            .read_with(cx, |workspace, _| {
+                assert!(workspace.error_message.is_some())
+            })
+            .expect("visible error");
+        std::fs::remove_dir(&manifest).expect("remove simulated failure");
+        std::fs::write(&manifest, manifest_bytes).expect("restore manifest");
+        item.update(cx, |item, cx| {
+            item.save(crate::document::SaveKind::Explicit, cx)
+        })
+        .await
+        .expect("retry computed persistence");
+        let (saved, _) =
+            fanta_format::read_project_tree(directory.path()).expect("reopen retried save");
+        assert_eq!(
+            serde_json::to_value(&saved.scene).expect("saved scene"),
+            expected
+        );
+        item.read_with(cx, |item, _| {
+            assert!(!item.is_dirty());
+            assert!(!item.has_unpersisted_source_layout());
+        });
+    }
+
+    #[gpui::test]
+    async fn loaded_layout_discarding_invalid_second_source_retains_pending_geometry(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let directory = tempfile::tempdir().expect("project");
+        let (page, _, _) = write_layout_project(directory.path());
+        let source_path = page_source_path(directory.path(), page);
+        let original = std::fs::read_to_string(&source_path).expect("FNX");
+        let (_project, item, workspace) = open_code_workspace(directory.path(), cx).await;
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace.selected_file = CodeWorkspaceFile::Fnx;
+                workspace
+                    .fnx_editor
+                    .as_ref()
+                    .expect("FNX")
+                    .update(cx, |editor, cx| {
+                        editor.set_text(
+                            original.replace(
+                                "Original layout label 0",
+                                "A validated source label awaiting its geometry write",
+                            ),
+                            window,
+                            cx,
+                        );
+                    });
+                workspace
+                    .json_editor
+                    .as_ref()
+                    .expect("JSON")
+                    .update(cx, |editor, cx| {
+                        editor.set_text("{ invalid header", window, cx)
+                    });
+            })
+            .expect("edit both source drafts");
+        cx.run_until_parked();
+        let save = workspace
+            .update(cx, |workspace, _, cx| {
+                workspace.save_source_edit(cx).expect("source save")
+            })
+            .expect("start source save");
+        assert!(save.await.is_err());
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| assert!(item.has_unpersisted_source_layout()));
+        workspace
+            .update(cx, |workspace, _, cx| workspace.discard_source_edit(cx))
+            .expect("discard invalid draft")
+            .await
+            .expect("discard second buffer only");
+        cx.run_until_parked();
+        let expected = item.read_with(cx, |item, _| {
+            assert!(!item.source_edit_locked());
+            assert!(
+                item.is_dirty(),
+                "computed geometry from the validated first source remains unsaved"
+            );
+            assert!(item.has_unpersisted_source_layout());
+            serde_json::to_value(&item.doc().expect("document").scene).expect("retained geometry")
+        });
+        item.update(cx, |item, cx| {
+            item.save(crate::document::SaveKind::Explicit, cx)
+        })
+        .await
+        .expect("persist retained geometry");
+        let (saved, _) = fanta_format::read_project_tree(directory.path()).expect("reopen");
+        assert_eq!(
+            serde_json::to_value(&saved.scene).expect("saved geometry"),
+            expected
+        );
     }
 
     #[gpui::test]

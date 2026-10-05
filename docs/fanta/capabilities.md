@@ -40,6 +40,13 @@ component FNX source, identity sidecars, metadata and assets. See
   project. Bundled Git and distribution-specific restrictions are covered by
   the separate release workflow.
 
+Large imported projects still have an open release blocker: a native Save check
+recorded unrelated layout changes, and Undo did not restore all of them. The
+layout and nested-drag corrections pass their automated checks; the corrected
+native open/edit/Save/Undo/restart journey remains pending. See the
+[coverage report](../alpha/CAPABILITY_COVERAGE.md) for the exact build, retained
+failure evidence and pending native retest.
+
 Implementation: [document.rs](../../crates/fig_viewer/src/document.rs),
 [design_panel.rs](../../crates/fig_viewer/src/design_panel.rs),
 [code_workspace.rs](../../crates/fig_viewer/src/code_workspace.rs), and

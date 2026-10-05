@@ -68,6 +68,8 @@ pub struct History {
     /// on clone.
     #[serde(skip)]
     sink: Option<JournalSink>,
+    #[serde(skip)]
+    edit_generation: u64,
 }
 
 impl Clone for History {
@@ -79,6 +81,7 @@ impl Clone for History {
             open: self.open.clone(),
             // A clone must not record to the original's channel.
             sink: None,
+            edit_generation: self.edit_generation,
         }
     }
 }
@@ -91,6 +94,7 @@ impl Default for History {
             max_depth: 500,
             open: None,
             sink: None,
+            edit_generation: 0,
         }
     }
 }
@@ -123,6 +127,10 @@ impl History {
         if let Some(sink) = &self.sink {
             sink.emit(event);
         }
+    }
+
+    pub fn edit_generation(&self) -> u64 {
+        self.edit_generation
     }
 
     pub fn can_undo(&self) -> bool {
@@ -236,6 +244,9 @@ impl History {
     /// an open transaction.
     pub fn abort_with(&mut self, ctx: &mut OpCtx) -> Result<(), SceneError> {
         if let Some(mut tx) = self.open.take() {
+            if !tx.is_empty() {
+                self.edit_generation = self.edit_generation.wrapping_add(1);
+            }
             while let Some(op) = tx.ops.pop() {
                 op.revert(ctx)?;
                 ctx.bump_revs(&op);
@@ -255,6 +266,7 @@ impl History {
     pub fn apply(&mut self, op: Operation, ctx: &mut OpCtx) -> Result<(), SceneError> {
         op.apply(ctx)?;
         ctx.bump_revs(&op);
+        self.edit_generation = self.edit_generation.wrapping_add(1);
         match &mut self.open {
             Some(tx) => tx.push(op),
             None => {
@@ -299,6 +311,9 @@ impl History {
     /// the scene and document registries. Unlike cloning [`History`], it keeps
     /// the live journal sink attached.
     pub fn record_applied_transaction(&mut self, tx: Transaction) {
+        if !tx.is_empty() {
+            self.edit_generation = self.edit_generation.wrapping_add(1);
+        }
         if let Some(open) = self.open.take()
             && !open.is_empty()
         {
@@ -315,6 +330,64 @@ impl History {
     }
 
     // ---- undo / redo --------------------------------------------------------
+
+    /// Apply computed consequences of the latest edit as part of that same
+    /// transaction. Recording the inverse geometry makes undo independent of
+    /// the fonts or layout implementation available when it is replayed.
+    pub fn apply_derived_operations(
+        &mut self,
+        operations: Vec<Operation>,
+        expected_generation: u64,
+        ctx: &mut OpCtx,
+    ) -> Result<(), SceneError> {
+        if operations.is_empty() {
+            return Ok(());
+        }
+        let authored = self.open.as_ref().or_else(|| self.undo.last());
+        if self.edit_generation != expected_generation
+            || authored.is_none_or(Transaction::is_empty)
+            || (self.open.is_none() && !self.redo.is_empty())
+        {
+            return Err(SceneError::InvariantViolated(
+                "derived geometry requires the current authored edit transaction".into(),
+            ));
+        }
+        // These non-structural writes cannot fail after all targets and inverse
+        // values are checked. Validate the entire set first so a rejected plan
+        // changes neither geometry, component revisions, history, nor journal.
+        for operation in &operations {
+            let valid = match operation {
+                Operation::SetTransform { id, old, .. } => ctx
+                    .scene
+                    .get(*id)
+                    .is_some_and(|node| node.transform == *old),
+                Operation::ReplaceData { id, old, new } => {
+                    ctx.scene.get(*id).is_some_and(|node| node.data == **old)
+                        && std::mem::discriminant(old.as_ref())
+                            == std::mem::discriminant(new.as_ref())
+                }
+                _ => false,
+            };
+            if !valid {
+                return Err(SceneError::InvariantViolated(
+                    "derived geometry no longer matches its source scene".into(),
+                ));
+            }
+        }
+        for operation in &operations {
+            operation.apply(ctx)?;
+            ctx.bump_revs(operation);
+        }
+        if let Some(transaction) = &mut self.open {
+            transaction.ops.extend(operations);
+        } else if let Some(transaction) = self.undo.last_mut() {
+            transaction.ops.extend(operations);
+            let transaction = transaction.clone();
+            self.emit(JournalEvent::Amend(transaction));
+        }
+        self.edit_generation = self.edit_generation.wrapping_add(1);
+        Ok(())
+    }
 
     pub fn undo(&mut self, ctx: &mut OpCtx) -> Result<bool, SceneError> {
         if self.open.is_some() {
@@ -334,6 +407,7 @@ impl History {
         // We swap-and-restore the ops vector to avoid double-clone.
         let label = std::mem::take(&mut tx.label);
         let tx = Transaction { label, ops: tx.ops };
+        self.edit_generation = self.edit_generation.wrapping_add(1);
         self.emit(JournalEvent::Undo(tx.clone()));
         self.redo.push(tx);
         Ok(true)
@@ -347,6 +421,7 @@ impl History {
             op.apply(ctx)?;
             ctx.bump_revs(op);
         }
+        self.edit_generation = self.edit_generation.wrapping_add(1);
         self.emit(JournalEvent::Redo(tx.clone()));
         self.push_undo(tx);
         Ok(true)
@@ -426,6 +501,251 @@ mod tests {
             10.0,
             Color::WHITE,
         )))
+    }
+
+    fn derived_transform(document: &TestDoc, id: NodeId, x: f64) -> Operation {
+        Operation::SetTransform {
+            id,
+            old: document.scene.get(id).expect("target").transform,
+            new: Transform2D::translation(x, 12.0),
+        }
+    }
+
+    fn rename_for_derived(history: &mut History, document: &mut TestDoc, id: NodeId, name: &str) {
+        let old = document.scene.get(id).expect("target").name.clone();
+        history
+            .apply(
+                Operation::SetName {
+                    id,
+                    old,
+                    new: name.into(),
+                },
+                &mut document.ctx(),
+            )
+            .expect("authored edit");
+    }
+
+    #[test]
+    fn derived_geometry_prevalidates_the_whole_batch_without_side_effects() {
+        let mut document = TestDoc::new();
+        let master = CanvasNode::new(NodeData::Group(crate::GroupNode::default()));
+        let master_id = master.id;
+        let mut node = rect_node();
+        node.parent = Some(master_id);
+        let id = node.id;
+        document.scene.insert_many([master, node]).expect("master");
+        let definition = crate::ComponentDef::new(crate::ComponentId::new(), master_id, "Master");
+        document.components.defs.insert(definition.id, definition);
+        let mut history = History::new();
+        rename_for_derived(&mut history, &mut document, id, "Authored");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        history.set_journal_sink(Some(JournalSink::new(sender)));
+        let scene = serde_json::to_value(&document.scene).expect("scene");
+        let components = document.components.clone();
+        let undo = serde_json::to_value(&history).expect("history");
+        let revision = document.scene.revision();
+        let generation = history.edit_generation();
+        let shared = document.scene.clone();
+        let invalid = Operation::SetTransform {
+            id: NodeId::new(),
+            old: Transform2D::IDENTITY,
+            new: Transform2D::translation(20.0, 20.0),
+        };
+        let valid = derived_transform(&document, id, 10.0);
+        assert!(
+            history
+                .apply_derived_operations(vec![valid, invalid], generation, &mut document.ctx())
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(&document.scene).expect("scene"), scene);
+        assert_eq!(document.components, components);
+        assert_eq!(serde_json::to_value(&history).expect("history"), undo);
+        assert_eq!(document.scene.revision(), revision);
+        assert_eq!(history.edit_generation(), generation);
+        assert!(document.scene.shares_node(&shared, id));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn derived_geometry_rejects_stale_empty_and_history_navigation_targets() {
+        let mut document = TestDoc::new();
+        let id = document.scene.insert(rect_node()).expect("node");
+        let mut history = History::new();
+        let no_authored_edit = derived_transform(&document, id, 10.0);
+        assert!(
+            history
+                .apply_derived_operations(
+                    vec![no_authored_edit],
+                    history.edit_generation(),
+                    &mut document.ctx()
+                )
+                .is_err()
+        );
+        rename_for_derived(&mut history, &mut document, id, "First");
+        let stale = history.edit_generation();
+        rename_for_derived(&mut history, &mut document, id, "Second");
+        let operation = derived_transform(&document, id, 10.0);
+        assert!(
+            history
+                .apply_derived_operations(vec![operation.clone()], stale, &mut document.ctx())
+                .is_err()
+        );
+        history.begin("Empty", &mut document.scene);
+        assert!(
+            history
+                .apply_derived_operations(
+                    vec![operation.clone()],
+                    history.edit_generation(),
+                    &mut document.ctx()
+                )
+                .is_err()
+        );
+        history
+            .abort_with(&mut document.ctx())
+            .expect("empty abort");
+        assert!(history.undo(&mut document.ctx()).expect("undo second"));
+        let before_redo = history.edit_generation();
+        assert!(
+            history
+                .apply_derived_operations(vec![operation.clone()], before_redo, &mut document.ctx())
+                .is_err()
+        );
+        assert!(history.redo(&mut document.ctx()).expect("redo second"));
+        let scene = serde_json::to_value(&document.scene).expect("scene");
+        let undo = serde_json::to_value(&history).expect("history");
+        assert!(
+            history
+                .apply_derived_operations(vec![operation], before_redo, &mut document.ctx())
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(&document.scene).expect("scene"), scene);
+        assert_eq!(serde_json::to_value(&history).expect("history"), undo);
+    }
+
+    #[test]
+    fn derived_geometry_abort_invalidates_token_without_amending_prior_edit() {
+        let mut document = TestDoc::new();
+        let id = document.scene.insert(rect_node()).expect("node");
+        let mut history = History::new();
+        rename_for_derived(&mut history, &mut document, id, "Previous edit");
+        let prior = serde_json::to_value(&document.scene).expect("prior scene");
+        let prior_history = serde_json::to_value(&history).expect("prior history");
+        history.begin("Cancelled edit", &mut document.scene);
+        rename_for_derived(&mut history, &mut document, id, "Cancelled name");
+        let stale = history.edit_generation();
+        history.abort_with(&mut document.ctx()).expect("abort");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        history.set_journal_sink(Some(JournalSink::new(sender)));
+        let geometry = derived_transform(&document, id, 80.0);
+        assert!(
+            history
+                .apply_derived_operations(vec![geometry], stale, &mut document.ctx())
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(&document.scene).expect("scene"), prior);
+        assert_eq!(
+            serde_json::to_value(&history).expect("history"),
+            prior_history
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn derived_geometry_in_new_open_edit_after_undo_preserves_redo_on_abort() {
+        let mut document = TestDoc::new();
+        let id = document.scene.insert(rect_node()).expect("node");
+        let mut history = History::new();
+        rename_for_derived(&mut history, &mut document, id, "Kept");
+        rename_for_derived(&mut history, &mut document, id, "Redo candidate");
+        assert!(history.undo(&mut document.ctx()).expect("undo"));
+        let before = serde_json::to_value(&document.scene).expect("before scene");
+        let before_history = serde_json::to_value(&history).expect("before history");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        history.set_journal_sink(Some(JournalSink::new(sender)));
+        history.begin("New gesture", &mut document.scene);
+        rename_for_derived(&mut history, &mut document, id, "New branch");
+        let geometry = derived_transform(&document, id, 80.0);
+        history
+            .apply_derived_operations(
+                vec![geometry],
+                history.edit_generation(),
+                &mut document.ctx(),
+            )
+            .expect("derived geometry in an open edit after Undo");
+        assert_eq!(history.redo_depth(), 1);
+        assert!(receiver.try_recv().is_err());
+        history
+            .abort_with(&mut document.ctx())
+            .expect("abort authored and derived");
+        assert_eq!(
+            serde_json::to_value(&document.scene).expect("scene"),
+            before
+        );
+        assert_eq!(
+            serde_json::to_value(&history).expect("history"),
+            before_history
+        );
+        assert!(receiver.try_recv().is_err());
+        assert!(
+            history
+                .redo(&mut document.ctx())
+                .expect("original redo remains")
+        );
+        assert_eq!(document.scene.get(id).expect("node").name, "Redo candidate");
+        assert_eq!(
+            document.scene.get(id).expect("node").transform,
+            Transform2D::IDENTITY
+        );
+    }
+
+    #[test]
+    fn derived_geometry_in_new_open_edit_after_undo_commits_as_one_branch() {
+        let mut document = TestDoc::new();
+        let id = document.scene.insert(rect_node()).expect("node");
+        let mut history = History::new();
+        rename_for_derived(&mut history, &mut document, id, "Kept");
+        rename_for_derived(&mut history, &mut document, id, "Discarded redo");
+        assert!(history.undo(&mut document.ctx()).expect("undo"));
+        let before = serde_json::to_value(&document.scene).expect("before");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        history.set_journal_sink(Some(JournalSink::new(sender)));
+        history.begin("New gesture", &mut document.scene);
+        rename_for_derived(&mut history, &mut document, id, "Committed branch");
+        let geometry = derived_transform(&document, id, 80.0);
+        history
+            .apply_derived_operations(
+                vec![geometry],
+                history.edit_generation(),
+                &mut document.ctx(),
+            )
+            .expect("derived geometry");
+        history.commit(&mut document.scene);
+        assert_eq!(history.undo_depth(), 2);
+        assert_eq!(history.redo_depth(), 0);
+        let after = serde_json::to_value(&document.scene).expect("after");
+        let JournalEvent::Commit(transaction) = receiver.try_recv().expect("single commit") else {
+            panic!("expected authored commit")
+        };
+        assert_eq!(transaction.ops.len(), 2);
+        assert!(receiver.try_recv().is_err());
+        assert!(
+            history
+                .undo(&mut document.ctx())
+                .expect("undo whole branch")
+        );
+        assert_eq!(
+            serde_json::to_value(&document.scene).expect("undone"),
+            before
+        );
+        assert!(
+            history
+                .redo(&mut document.ctx())
+                .expect("redo whole branch")
+        );
+        assert_eq!(
+            serde_json::to_value(&document.scene).expect("redone"),
+            after
+        );
     }
 
     #[test]

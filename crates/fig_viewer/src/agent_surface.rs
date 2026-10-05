@@ -2204,10 +2204,7 @@ impl StreamedDesignBatch {
 }
 
 fn refresh_streamed_layout(document: &mut FigDocument) {
-    if let Some(root) = document.doc.active_page() {
-        document.solved_pages.remove(&root);
-        document.ensure_root_solved(root);
-    }
+    document.refresh_layout_baseline();
     document.mark_variables_changed();
 }
 

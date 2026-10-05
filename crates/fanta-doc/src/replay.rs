@@ -178,7 +178,7 @@ fn diff_node(i: usize, e: &NodeSnapshot, g: &NodeSnapshot, out: &mut Vec<Diverge
 mod tests {
     use super::*;
     use crate::color::Color;
-    use crate::journal::{JournalEvent, JournalSink, SessionStep, now_ms};
+    use crate::journal::{JournalSink, now_ms};
     use crate::node::{CanvasNode, GroupNode, NodeData, VectorNode};
     use crate::op::Operation;
     use crate::style::Fill;
@@ -234,20 +234,9 @@ mod tests {
 
         let mut steps = Vec::new();
         for (seq, event) in rx.try_iter().enumerate() {
-            let seq = seq as u64;
-            let (provenance, transaction) = match event {
-                JournalEvent::Commit(t) => (Provenance::Unknown, t),
-                JournalEvent::Undo(t) => (Provenance::Undo, t),
-                JournalEvent::Redo(t) => (Provenance::Redo, t),
-            };
-            steps.push(SessionStep {
-                seq,
-                revision: seq,
-                provenance,
-                label: transaction.label.clone(),
-                ops: transaction.ops.clone(),
-                ts_ms: now_ms(),
-            });
+            event
+                .record(&mut steps, Provenance::Unknown, seq as u64, now_ms())
+                .expect("record journal event");
         }
 
         SessionJournal {
