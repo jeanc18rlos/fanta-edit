@@ -106,6 +106,37 @@ asserted selection/history. The combined editor suite passed **1,055 tests
 `target/release-verification/canvas-duplicate-components-20261005/`.
 This correction also postdates the native binary above.
 
+The large Spectrum native journey on `0a0d3cd1c4` is **failed/open**. At 100%
+zoom, the image-filled master at page index 9 / traversal index 2110 moved from
+(17548, 1105) to (17580, 1121), retaining its visible image and 40 × 40 size.
+Save remained dirty for several minutes. A process sample confirmed an active
+save worker opening component sources and cloning their reference context;
+component revision changes had selected every artifact. Repeated Save requests
+were queued during diagnosis, so this is not a controlled single-save timing.
+The disposable QA process was stopped after capturing evidence. The original
+`.fig` was never edited. The post-stop snapshot is byte-for-byte identical to
+the current-reader baseline: all 73,925 nodes, 41 assets and 12 Boolean bakes
+remain intact (`aborted-save-disk-comparison.json`). Evidence, typed snapshots
+and target identities are in
+`target/release-verification/native-spectrum-20261005/`. A corrected build must
+repeat edit/Save/Undo/Save/restart before this journey can pass.
+
+The component-save invalidation fix now treats revision-only definition changes
+as edits to those masters, unioned with scene-delta owners. Nested master edits
+include every bumped definition. Name/schema/set/registry changes, structural
+edits and unavailable deltas retain the conservative all-artifact fallback.
+The regression-only run reproduced four failures; all **6 focused tests pass**
+with the fix, including a 128-master fixture, actual Save/readback that opens
+only the edited source, preserved unrelated FNX comments, and rejected external
+edits to unopened FNX and component headers. The broader run passed **1,061
+editor tests (1 ignored), 3 benchmark CLI tests, 98 FNX tests and 212 format
+tests with source-order preservation**. `./script/clippy --locked -p fig_viewer`
+also passed after a test-only local-variable cleanup. Logs, source hashes and
+`validation.json` are in
+`target/release-verification/master-save-invalidation-20261005/`. These checks
+validate artifact selection and conflict handling; the large native save retry
+and the separate reference-table retention correction remain pending.
+
 The inspector/menu native follow-up used `85fc694b67c78f616401def73506e515594f52d7`,
 binary SHA-256 `d42e94c0febfa6c701c257485a470779b5c991c7e3567b856f6e5b6fb7dced99`.
 Build/source fingerprints and observations are in
