@@ -35,6 +35,26 @@ const RELOAD_DEBOUNCE: Duration = Duration::from_millis(300);
 pub(crate) const MAX_IMAGE_SOURCE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Default)]
+struct ProjectReads {
+    queue: futures::lock::Mutex<()>,
+    #[cfg(test)]
+    started: std::sync::atomic::AtomicUsize,
+}
+
+impl ProjectReads {
+    async fn load<T>(&self, load: impl FnOnce() -> T) -> T {
+        // Dropping a reload task cannot interrupt an already-running synchronous
+        // parser. Keep its gate in the worker so replacement tasks wait without
+        // entering another full project read; canceled waiters never parse.
+        let _guard = self.queue.lock().await;
+        #[cfg(test)]
+        self.started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        load()
+    }
+}
+
+#[derive(Default)]
 struct ProjectWrites {
     state: Mutex<ProjectWriteState>,
     #[cfg(test)]
@@ -205,6 +225,7 @@ pub struct FigItem {
     // canceled. Its shared lease keeps watcher checks queued until both
     // sides have released that save, including overlapping or failed saves.
     project_writes: Arc<ProjectWrites>,
+    project_reads: Arc<ProjectReads>,
     /// The last document state both the canvas and the disk agreed on (as of
     /// the last load, reload, or save). The common ancestor for the
     /// three-way merge that reconciles concurrent canvas edits with external
@@ -1334,8 +1355,10 @@ impl project::ProjectItem for FigItem {
             let item = cx.new(|cx| {
                 let load_path = abs_path.clone();
                 let load_project_root = project_root.clone();
+                let project_reads = Arc::new(ProjectReads::default());
                 let load_task = cx.spawn({
                     let project = project.downgrade();
+                    let project_reads = project_reads.clone();
                     async move |this, cx| {
                         let set_loading = |message: &'static str| {
                             let message = SharedString::from(message);
@@ -1362,7 +1385,7 @@ impl project::ProjectItem for FigItem {
                         let (progress, mut loading_messages) = mpsc::unbounded();
                         let load = cx
                             .background_spawn(async move {
-                                match load_project_root {
+                                project_reads.load(|| match load_project_root {
                                     Some(root) => {
                                         report_load_progress(&progress, "Opening project files…");
                                         let session = fanta_format::WorkspaceSession::open(&root)?;
@@ -1397,7 +1420,7 @@ impl project::ProjectItem for FigItem {
                                             });
                                         Ok((document, materialized, session, import_warning))
                                     }
-                                }
+                                }).await
                             });
                         while let Some(message) = loading_messages.next().await {
                             if let Err(error) = this.update(cx, set_loading(message)) {
@@ -1501,6 +1524,7 @@ impl project::ProjectItem for FigItem {
                     own_write_removed: BTreeSet::new(),
                     watcher_check_task: None,
                     project_writes: Arc::default(),
+                    project_reads,
                     merge_base: None,
                     last_saved_assets: None,
                     last_saved_scene: None,
@@ -1733,7 +1757,10 @@ impl FigItem {
     }
 
     fn schedule_watcher_check(&mut self, cx: &mut Context<Self>) {
-        if self.pending_watcher_paths.is_empty() || self.watcher_check_in_flight {
+        if self.pending_watcher_paths.is_empty()
+            || self.watcher_check_in_flight
+            || matches!(self.document, FigDocumentState::Loading { .. })
+        {
             return;
         }
         self.watcher_check_in_flight = true;
@@ -1824,6 +1851,7 @@ impl FigItem {
             return;
         }
         let epoch = self.sync_epoch;
+        let project_reads = self.project_reads.clone();
         self.reload_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(RELOAD_DEBOUNCE).await;
             let snapshot = this.update(cx, |this, cx| {
@@ -1858,7 +1886,11 @@ impl FigItem {
             let loaded = cx
                 .background_spawn({
                     let root = root.clone();
-                    async move { load_changed_project_document(&root, incremental) }
+                    async move {
+                        project_reads
+                            .load(|| load_changed_project_document(&root, incremental))
+                            .await
+                    }
                 })
                 .await;
             let (theirs, session) = match loaded {
@@ -2077,6 +2109,7 @@ impl FigItem {
         self.external_change_pending = true;
         let force_full = self.pending_external_full_reload;
         let epoch = self.sync_epoch;
+        let project_reads = self.project_reads.clone();
         self.reload_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(RELOAD_DEBOUNCE).await;
             let snapshot = this.update(cx, |this, cx| {
@@ -2108,7 +2141,11 @@ impl FigItem {
                 return;
             };
             let loaded = cx
-                .background_spawn(async move { load_changed_project_document(&root, incremental) })
+                .background_spawn(async move {
+                    project_reads
+                        .load(|| load_changed_project_document(&root, incremental))
+                        .await
+                })
                 .await;
             if let Err(error) = this.update(cx, |this, cx| {
                 if this.sync_epoch != epoch {
@@ -2244,9 +2281,12 @@ impl FigItem {
         };
         self.reload_task = None;
         let epoch = self.sync_epoch;
+        let project_reads = self.project_reads.clone();
         cx.spawn(async move |this, cx| {
             let document = match cx
-                .background_spawn(async move { load_project_document(&root) })
+                .background_spawn(async move {
+                    project_reads.load(|| load_project_document(&root)).await
+                })
                 .await
             {
                 Ok(document) => document,
@@ -2681,6 +2721,10 @@ impl FigItem {
         });
         cx.emit(FigItemEvent::StateChanged);
         cx.notify();
+        // Initial worktree scans can arrive before the initial disk baseline.
+        // Retain those paths until adoption, including failed loads, so actual
+        // edits during startup are checked without launching competing parses.
+        self.schedule_watcher_check(cx);
     }
 
     /// Persist the current document state, materializing an on-disk Fanta
@@ -3180,6 +3224,7 @@ pub(crate) fn ready_item_with_root_for_test(
         own_write_removed: BTreeSet::new(),
         watcher_check_task: None,
         project_writes: Arc::default(),
+        project_reads: Arc::default(),
         merge_base: None,
         last_saved_assets: None,
         last_saved_scene: None,
@@ -6122,6 +6167,345 @@ mod tests {
         });
     }
 
+    #[gpui::test]
+    async fn project_reload_queue_holds_gate_during_parse_and_releases_on_error(
+        _cx: &mut TestAppContext,
+    ) {
+        let reads = ProjectReads::default();
+        let result = reads
+            .load(|| {
+                assert!(
+                    reads.queue.try_lock().is_none(),
+                    "the synchronous parser must retain the read gate"
+                );
+                Err::<(), _>(anyhow::anyhow!("parse failed"))
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(
+            reads.queue.try_lock().is_some(),
+            "parse failure must release the gate"
+        );
+        assert_eq!(
+            reads
+                .load(|| {
+                    assert!(reads.queue.try_lock().is_none());
+                    42
+                })
+                .await,
+            42
+        );
+        assert!(reads.queue.try_lock().is_some());
+    }
+
+    async fn reload_queue_fixture(
+        cx: &mut TestAppContext,
+    ) -> (tempfile::TempDir, Entity<FigItem>, Doc, NodeId) {
+        let project = empty_project(cx).await;
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().expect("reload project");
+        let doc = doc_with_one_page();
+        let page = doc.active_page().expect("page");
+        write_project(directory.path(), &doc, &BTreeMap::new()).expect("initial project");
+        let session = fanta_format::WorkspaceSession::open(directory.path()).expect("session");
+        let item = ready_item(
+            &project,
+            directory.path().join("fanta.json"),
+            Some(directory.path().to_path_buf()),
+            doc.clone_for_persist(),
+            cx,
+        );
+        item.update(cx, |item, _| {
+            item.workspace_session = Some(session);
+            item.merge_base = Some(doc.clone_for_persist());
+            item.last_saved_assets = Some(Arc::new(BTreeMap::new()));
+        });
+        (directory, item, doc, page)
+    }
+
+    fn reload_queue_started(reads: &ProjectReads) -> usize {
+        reads.started.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[gpui::test]
+    async fn project_reload_queue_coalesces_replacements_and_retains_asset_refresh(
+        cx: &mut TestAppContext,
+    ) {
+        let (directory, item, mut external, page) = reload_queue_fixture(cx).await;
+        let reads = item.read_with(cx, |item, _| item.project_reads.clone());
+        let active_read = reads.queue.lock().await;
+        let asset = AssetId::new();
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(2, 2)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("encode asset");
+        let bytes = encoded.into_inner();
+        let assets = BTreeMap::from([(asset, bytes.clone())]);
+        for iteration in 0..8 {
+            external.scene.get_mut(page).expect("page").name = format!("External {iteration}");
+            write_project(directory.path(), &external, &assets).expect("external batch");
+            item.update(cx, |item, cx| {
+                item.schedule_reload_with_full(iteration == 0, cx);
+            });
+            cx.executor().advance_clock(RELOAD_DEBOUNCE * 2);
+            cx.run_until_parked();
+        }
+        assert_eq!(
+            reload_queue_started(&reads),
+            0,
+            "replacement reloads must wait for the running parser, rather than entering the synchronous project lock"
+        );
+        item.read_with(cx, |item, _| {
+            assert!(item.external_change_pending);
+            assert!(
+                item.pending_external_full_reload,
+                "the first asset event must survive source-only replacements"
+            );
+            assert_eq!(
+                item.doc().expect("doc").scene.get(page).expect("page").name,
+                "Page 1"
+            );
+        });
+        drop(active_read);
+        cx.run_until_parked();
+        assert_eq!(
+            reload_queue_started(&reads),
+            1,
+            "only the newest queued snapshot may parse"
+        );
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.doc().expect("doc").scene.get(page).expect("page").name,
+                "External 7"
+            );
+            assert_eq!(
+                item.document().expect("document").raw_assets.get(&asset),
+                Some(&bytes)
+            );
+            assert!(!item.external_change_pending);
+            assert!(!item.has_conflict());
+        });
+        item.update(cx, |item, cx| {
+            item.apply(
+                Operation::SetName {
+                    id: page,
+                    old: "External 7".into(),
+                    new: "Saved after reconciliation".into(),
+                },
+                cx,
+            )
+        })
+        .expect("local edit");
+        item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect("save is unblocked");
+        let (reopened, reopened_assets) =
+            fanta_format::read_project_tree(directory.path()).expect("reopen saved result");
+        assert_eq!(
+            reopened.scene.get(page).expect("page").name,
+            "Saved after reconciliation"
+        );
+        assert_eq!(reopened_assets.get(&asset), Some(&bytes));
+    }
+
+    #[gpui::test]
+    async fn project_reload_queue_defers_startup_events_until_initial_baseline(
+        cx: &mut TestAppContext,
+    ) {
+        for initial_failure in [false, true] {
+            let (directory, item, initial, page) = reload_queue_fixture(cx).await;
+            let initial_session =
+                fanta_format::WorkspaceSession::open(directory.path()).expect("initial snapshot");
+            let mut external = initial.clone_for_persist();
+            external.scene.get_mut(page).expect("page").name = "Changed while opening".into();
+            write_project(directory.path(), &external, &BTreeMap::new())
+                .expect("external edit during load");
+            let source = directory
+                .path()
+                .join(
+                    &fanta_format::WorkspaceSession::open(directory.path())
+                        .expect("current layout")
+                        .artifacts
+                        .get(&fanta_format::ArtifactId::Page(page))
+                        .expect("page source")
+                        .design_dir,
+                )
+                .join("page.fnx");
+            let reads = item.read_with(cx, |item, _| item.project_reads.clone());
+            item.update(cx, |item, cx| {
+                item.document = FigDocumentState::Loading {
+                    message: "Loading test".into(),
+                };
+                item.workspace_session = None;
+                item.merge_base = None;
+                item.pending_watcher_paths.insert(source.clone());
+                item.schedule_watcher_check(cx);
+            });
+            cx.executor().advance_clock(RELOAD_DEBOUNCE * 4);
+            cx.run_until_parked();
+            assert_eq!(
+                reload_queue_started(&reads),
+                0,
+                "startup events must not parse in parallel with the initial load"
+            );
+            item.read_with(cx, |item, _| {
+                assert!(matches!(item.document, FigDocumentState::Loading { .. }));
+                assert!(item.pending_watcher_paths.contains(&source));
+            });
+            item.update(cx, |item, cx| {
+                let loaded = if initial_failure {
+                    Err(anyhow::anyhow!("transient initial parse failure"))
+                } else {
+                    Ok(FigDocument::from_doc(initial, BTreeMap::new()))
+                };
+                item.adopt_initial_load(loaded, None, Some(initial_session), cx);
+            });
+            cx.executor().advance_clock(RELOAD_DEBOUNCE * 4);
+            cx.run_until_parked();
+            cx.executor().advance_clock(RELOAD_DEBOUNCE * 4);
+            cx.run_until_parked();
+            item.read_with(cx, |item, _| {
+                assert_eq!(
+                    item.doc()
+                        .expect("repaired document")
+                        .scene
+                        .get(page)
+                        .expect("page")
+                        .name,
+                    "Changed while opening"
+                );
+                assert!(!item.external_change_pending);
+                assert!(item.pending_watcher_paths.is_empty());
+            });
+            assert_eq!(reload_queue_started(&reads), 1);
+        }
+    }
+
+    #[gpui::test]
+    async fn project_reload_queue_explicit_discard_cancels_waiters_and_releases_after_error(
+        cx: &mut TestAppContext,
+    ) {
+        let (directory, item, initial, page) = reload_queue_fixture(cx).await;
+        let reads = item.read_with(cx, |item, _| item.project_reads.clone());
+        let active_read = reads.queue.lock().await;
+        item.update(cx, |item, cx| item.schedule_reload(cx));
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 2);
+        cx.run_until_parked();
+        let reload = item.update(cx, |item, cx| item.reload_from_disk(cx));
+        cx.run_until_parked();
+        assert_eq!(
+            reload_queue_started(&reads),
+            0,
+            "explicit discard must use the same reader gate"
+        );
+        drop(active_read);
+        reload.await.expect("discard reload");
+        cx.run_until_parked();
+        assert_eq!(
+            reload_queue_started(&reads),
+            1,
+            "the superseded watcher read must stay canceled"
+        );
+        assert!(!item.read_with(cx, |item, _| item.external_change_pending));
+
+        let source = directory
+            .path()
+            .join(
+                &fanta_format::WorkspaceSession::open(directory.path())
+                    .expect("current layout")
+                    .artifacts
+                    .get(&fanta_format::ArtifactId::Page(page))
+                    .expect("page source")
+                    .design_dir,
+            )
+            .join("page.fnx");
+        std::fs::write(&source, "<Frame broken").expect("malformed external source");
+        assert!(
+            item.update(cx, |item, cx| item.reload_from_disk(cx))
+                .await
+                .is_err()
+        );
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.doc().expect("last good canvas").scene.get(page),
+                initial.scene.get(page)
+            );
+            assert!(item.has_conflict());
+        });
+        write_project(directory.path(), &initial, &BTreeMap::new()).expect("repair source");
+        item.update(cx, |item, cx| item.reload_from_disk(cx))
+            .await
+            .expect("retry after failure");
+        item.read_with(cx, |item, _| assert!(!item.has_conflict()));
+        assert_eq!(
+            reload_queue_started(&reads),
+            3,
+            "a failed read must release its gate"
+        );
+    }
+
+    #[gpui::test]
+    async fn project_reload_queue_preserves_dirty_canvas_and_latest_external_merge(
+        cx: &mut TestAppContext,
+    ) {
+        let (directory, item, mut external, page) = reload_queue_fixture(cx).await;
+        item.update(cx, |item, cx| {
+            item.apply(
+                Operation::SetOpacity {
+                    id: page,
+                    old: 1.0.into(),
+                    new: 0.5.into(),
+                },
+                cx,
+            )
+        })
+        .expect("unsaved canvas edit");
+        let reads = item.read_with(cx, |item, _| item.project_reads.clone());
+        let active_read = reads.queue.lock().await;
+        for iteration in 0..4 {
+            external.scene.get_mut(page).expect("page").name = format!("External {iteration}");
+            write_project(directory.path(), &external, &BTreeMap::new()).expect("external edit");
+            item.update(cx, |item, cx| item.schedule_merge(cx));
+            cx.executor().advance_clock(RELOAD_DEBOUNCE * 2);
+            cx.run_until_parked();
+        }
+        assert_eq!(reload_queue_started(&reads), 0);
+        let save_error = item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect_err("save must not overwrite pending external edits");
+        assert!(save_error.to_string().contains("being reconciled"));
+        assert_eq!(
+            item.read_with(cx, |item, _| item
+                .doc()
+                .expect("doc")
+                .scene
+                .get(page)
+                .expect("page")
+                .opacity),
+            0.5.into()
+        );
+        drop(active_read);
+        cx.run_until_parked();
+        assert_eq!(reload_queue_started(&reads), 1);
+        item.read_with(cx, |item, _| {
+            let page = item.doc().expect("doc").scene.get(page).expect("page");
+            assert_eq!(page.name, "External 3");
+            assert_eq!(page.opacity, 0.5.into());
+            assert!(item.is_dirty());
+            assert!(!item.has_conflict());
+            assert!(!item.external_change_pending);
+        });
+        item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect("save merged result");
+        let (reopened, _) =
+            fanta_format::read_project_tree(directory.path()).expect("reopen merge");
+        let page = reopened.scene.get(page).expect("page");
+        assert_eq!(page.name, "External 3");
+        assert_eq!(page.opacity, 0.5.into());
+    }
+
     #[test]
     fn project_dir_avoids_a_non_project_collision_but_reuses_a_project() {
         let dir = tempfile::tempdir().unwrap();
@@ -7516,6 +7900,7 @@ mod tests {
             own_write_removed: BTreeSet::new(),
             watcher_check_task: None,
             project_writes: Arc::default(),
+            project_reads: Arc::default(),
             merge_base: None,
             last_saved_assets: None,
             last_saved_scene: None,
