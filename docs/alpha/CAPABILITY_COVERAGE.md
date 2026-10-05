@@ -54,6 +54,41 @@ has a passing result for all eight default stages plus component visuals. The
 final native rebuild is recorded separately; historical native results below
 do not substitute for it.
 
+The current isolated native QA bundle was built at
+`6fd579b408860b0d09ec44d3260c4ae1a1b66d1d`, binary SHA-256
+`226082debcbb88f462eab356e402b04fe1d9ae0a691d5f62ed5abb8dd9572d9a`.
+Build and working-tree fingerprints are retained in
+`native-preservation-20261005/provenance.json`. Live MCP passed **18/18 assertions
+over stdio and 18/18 over the Unix socket** on this bundle, including exact
+created-node persistence in FNX, the active file's Git status and valid PNG pixel
+data. Logs, commands and screenshots are `mcp-stdio.log`, `mcp-socket.log`,
+`mcp-metadata.json`, `mcp-stdio.png` and `mcp-socket.png` in that directory.
+These passes establish protocol and persistence behavior, not native control
+coverage. Native Boolean journeys below are separate from these MCP results.
+
+Native Boolean acceptance on this same bundle passed on the isolated 53-node
+project built from all 12 Spectrum Boolean subtrees. Recolor changed only the
+selected fill; Flatten produced the exact preserved vector and removed only its
+two operands; double-click selected the rectangle operand, whose one-step move
+changed only its local X and invalidated only its parent’s baked appearance. Each
+Undo and Save restored the full typed baseline except the save timestamp, with
+all 12 bakes active. Quit/relaunch restored the page and all 19 non-Git files were
+byte-identical; typed data exactly matched the pre-quit snapshot. Evidence:
+`native-preservation-20261005/boolean-native-journey-provenance.json` and its
+referenced snapshots/comparisons. This is complete acceptance for those sampled
+Boolean journeys, not every Boolean operation or the entire Spectrum project.
+
+The same native pass found that Escape did not dismiss the canvas context menu
+and instead cleared the underlying selection. A mounted right-click/keyboard
+regression reproduces that failure; the focus correction still requires a new
+native build before acceptance.
+
+Native inspection on `6fd579b408` also caught an Export-label defect: the label
+could collapse to an ellipsis despite the passing component visual baselines.
+The upstream Fanta UI PR #8 correction still needs integration and a native
+recheck of the assembled inspector. The earlier long-name overflow fix and
+component screenshot pass do not close this defect.
+
 The previous full local automated checkpoint is recorded in
 `2026-10-05-acceptance-engine/` and `2026-10-05-acceptance-final/`
 under `target/release-verification/`; the historical table below gives its exact counts.
@@ -473,6 +508,19 @@ release-candidate journey; the final column highlights the most important gap.
 | Generation/recovery | Viewer `generation_workspace`, `generation_journal`, `generation_media`; account/provider CI tests | Signed-in final build with a real provider: submit/poll/save/place, timeout/retry, restart, sign-out/account switch and exactly-once recovery. Mock responses do not prove production availability. |
 | App shell/distribution/accounts | Existing `Check` jobs: sidebar, path prompt, agent toggle, Git, auth, Store restrictions; release packaging workflow | Menu/keyboard discovery, clean-profile launch, install/quarantine, signature/notarization, Keychain, sandbox file access, billing/restore and backend release compatibility. |
 | Large-page performance | Import scaling tests, renderer cache/culling tests, ignored format latency gate and profiling examples | Matched before/after import, save and gesture timings on Spectrum plus a synthetic scene. Measure frame p50/p95/max and memory, not just load completion. |
+
+## Next bounded native checks
+
+These four checks remain pending. Use fresh disposable copies of the fixtures
+below, preserving their existing evidence. Record the exact candidate binary,
+initial typed document and asset hashes, native inputs and final comparison.
+
+| Priority | Fixture and bounded journey | Required evidence and limit |
+| --- | --- | --- |
+| 1 — Inspector drafts | Copy `/tmp/fanta-release-node-matrix-20261005`. Cancel a numeric scrub and color preview with Escape; edit a mixed selection and Undo; attempt a page switch with an invalid numeric draft. Repeat the relevant controls at minimum panel width. | Cancelled edits leave typed content unchanged; the committed edit takes one Undo; invalid input is retained or explicitly rejected without applying to another selection. Save/reopen and compare all unrelated nodes and asset bytes. Include the collapsed Export-label recheck after its fix is integrated. |
+| 2 — Clipboard and structure | Copy `/tmp/fanta-release-qa-20261005` for its main component and instances, and `/tmp/fanta-release-node-matrix-20261005` for its bitmap. In each copy, copy/paste across pages, then Undo/Redo; attempt a cross-project paste. | Verify supported insertion or a visible refusal, correct active-page placement, one history step and preserved component/asset dependencies. Save/reopen and compare original masters, source nodes and asset bytes. A rejected unsupported transfer is not a successful cross-project-copy capability. |
+| 3 — Large-page save and drag | Import the unchanged `/Users/jeanrojas/Desktop/untitled folder/Adobe Spectrum Design System .fig` into a new disposable project. On page index 9, move instance index 4358 and image-filled frame index 2110, then Save, Undo, Save and restart. | Compare the full typed document and every asset byte, accounting only for intended edits and documented persistence normalization. Record native pointer/frame timing and first/subsequent saves on a quiet machine. `fig_to_project` checks only page/asset counts; the 12-Boolean subtree oracle and CPU `drag_bench` do not establish whole-project preservation or native drag latency. |
+| 4 — Variables, Motion and Prototype | In another copy of `/tmp/fanta-release-node-matrix-20261005`, create one color variable with two modes and bind a shape; switch modes, unbind and Undo. Add two small frames, one motion track and one prototype navigation link through the UI. | Verify the displayed bound values, undoable edits, scrub/play and navigation/restart/exit with restored editor viewport. Save/reopen and compare bindings, track/keyframes and reactions. This is one representative native journey per subsystem, not all triggers, easing types, aliases or variant combinations. |
 
 ## Reproducible local verification
 
