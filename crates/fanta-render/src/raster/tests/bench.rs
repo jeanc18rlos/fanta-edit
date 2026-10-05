@@ -2,6 +2,72 @@
 use super::*;
 use fanta_doc::{Doc, Operation, VectorNode};
 
+#[test]
+#[ignore = "perf benchmark; run explicitly with --ignored --nocapture"]
+fn drag_shadowed_page_bench() {
+    let mut doc = Doc::new();
+    let mut moving = None;
+    for row in 0..16 {
+        for column in 0..16 {
+            let mut node = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                f64::from(column) * 40.0 - 320.0,
+                f64::from(row) * 40.0 - 320.0,
+                28.0,
+                28.0,
+                Color::rgb(220, 80, 80),
+            )));
+            node.effects.push(Shadow {
+                kind: ShadowKind::Drop,
+                color: Color::rgba(0, 0, 0, 160),
+                blur: 16.0,
+                spread: 2.0,
+                offset: [4.0, 6.0],
+                show_behind_node: false,
+            });
+            moving.get_or_insert(node.id);
+            doc.scene.insert(node).expect("insert shadowed rectangle");
+        }
+    }
+    let moving = moving.expect("benchmark has a moving rectangle");
+    let mut renderer = RasterRenderer::new(1024, 768).expect("benchmark surface");
+    for _ in 0..3 {
+        renderer.render(&doc.scene, &doc.viewport);
+    }
+
+    let mut frame_times = Vec::with_capacity(120);
+    let mut hits = 0_u64;
+    let mut misses = 0_u64;
+    let mut nodes_visited = 0_u64;
+    for step in 1..=120 {
+        doc.scene
+            .set_transform(
+                moving,
+                Transform2D::translation(f64::from(step) * 0.25, 0.0),
+            )
+            .expect("move benchmark rectangle");
+        let metrics = renderer.render(&doc.scene, &doc.viewport);
+        frame_times.push(metrics.frame_micros);
+        hits += u64::from(metrics.layer_cache_hits);
+        misses += u64::from(metrics.layer_cache_misses);
+        nodes_visited += u64::from(metrics.nodes_visited);
+    }
+    frame_times.sort_unstable();
+    let percentile = |percent: usize| {
+        frame_times
+            .get((frame_times.len() * percent).div_ceil(100) - 1)
+            .copied()
+            .expect("benchmark records frame times")
+    };
+    eprintln!(
+        "256 shadowed rectangles, one moved for 120 CPU frames at 1024x768: \
+         p50={} us, p95={} us, max={} us; layer hits={hits}, refill misses={misses}, \
+         nodes visited={nodes_visited}",
+        percentile(50),
+        percentile(95),
+        percentile(100),
+    );
+}
+
 // -----------------------------------------------------------------------
 // Drop-shadow blur cost vs zoom (perf bench, run with --ignored --nocapture)
 // -----------------------------------------------------------------------

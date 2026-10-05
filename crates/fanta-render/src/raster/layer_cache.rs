@@ -59,9 +59,10 @@
 //! zoom — or a host that pans by fractional device pixels — from paying the
 //! (costlier) populate path on every frame only to throw the entries away,
 //! populating is enabled only on a frame that repeats the previous frame's
-//! scale and moves the viewport by whole device pixels (see
+//! content epoch and scale and moves the viewport by whole device pixels (see
 //! [`LayerCache::begin_frame`]): the first frame at a new zoom renders
-//! directly, the following whole-pixel frames (a pan, or a settle repaint)
+//! directly, as does each frame of a content edit. The following stable
+//! whole-pixel frames (a pan, or a settle repaint)
 //! fill the cache at most [`LAYER_CACHE_POPULATE_PER_FRAME`] layers per
 //! frame, and pans from then on hit.
 use super::effects::EffectsLayerPaint;
@@ -186,7 +187,7 @@ impl LayerCache {
     /// Populating is worth its cost (an offscreen per layer, ~2× a direct
     /// save-layer) only when later frames can hit, i.e. when the viewport is
     /// moving by whole device pixels at a fixed zoom. So a frame populates
-    /// only if it repeats the previous frame's `effective_scale` AND its root
+    /// only if it repeats the previous frame's epoch and `effective_scale`, and its root
     /// device translation `(root_tx, root_ty)` differs from the previous
     /// frame's by an integer (a whole-pixel pan, or no pan). A continuous
     /// zoom, or a host panning by fractional device pixels without
@@ -200,7 +201,8 @@ impl LayerCache {
         root_tx: f64,
         root_ty: f64,
     ) -> bool {
-        if self.epoch != Some(epoch) {
+        let epoch_changed = self.epoch != Some(epoch);
+        if epoch_changed {
             self.clear();
             self.epoch = Some(epoch);
         }
@@ -212,6 +214,7 @@ impl LayerCache {
             (d - d.round()).abs() <= f64::from(INTEGER_PAN_EPS)
         };
         let populate = self.enabled
+            && !epoch_changed
             && self.last_frame.is_some_and(|(bits, tx, ty)| {
                 bits == scale_bits && whole_pixel_pan(root_tx, tx) && whole_pixel_pan(root_ty, ty)
             });
