@@ -1,13 +1,19 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use fanta_doc::{
-    AssetId, BlendMode, CanvasNode, Fill, Gradient, NodeData, NodeFlags, NodeId, PathSegment,
-    Scene, Stroke, TextStyle,
+    AssetId, BlendMode, CanvasNode, ComponentId, ComponentLibrary, Fill, Gradient,
+    InstanceExpansionContext, InstanceNode, ModeId, NodeData, NodeFlags, NodeId, PathSegment,
+    Scene, Stroke, TextStyle, VariableCollectionId, VariableRegistry,
 };
 
 use crate::asset::{AssetResolver, DecodedImage};
 
+use super::renderer::PreparedInstance;
 use super::{BlurKind, RenderInputs, ShadowKind, effects::group_clips_children};
+
+const MAX_PREPARED_NODES: usize = 100_000;
+const MAX_PREPARED_DEPTH: usize = 64;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SplitPhase {
@@ -16,7 +22,7 @@ pub enum SplitPhase {
     Above,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum SplitError {
     #[error("split rendering requires a root group and one descendant moving subtree")]
     InvalidRoots,
@@ -40,7 +46,26 @@ pub enum SplitError {
     DynamicInputs,
     #[error("the scene changed after the split was prepared")]
     StaleScene,
-    #[error("clipped ancestor paint requires ordered phase drawing, not raster phase compositing")]
+    #[error("the component or variable inputs changed after the split was prepared")]
+    StaleInputs,
+    #[error("instance {instance} references missing component {component}")]
+    MissingInstance {
+        instance: NodeId,
+        component: ComponentId,
+    },
+    #[error("recursive instance dependency on component {0}")]
+    RecursiveInstance(ComponentId),
+    #[error("instance {0} exceeds the prepared node/depth budget")]
+    ExpansionLimit(NodeId),
+    #[error("instance {instance} at definition path {path:?}: {source}")]
+    InstanceContents {
+        instance: NodeId,
+        path: Vec<NodeId>,
+        source: Box<SplitError>,
+    },
+    #[error(
+        "prepared instance or ancestor paint requires ordered phase drawing, not raster phase compositing"
+    )]
     RequiresOrderedPaint,
     #[error("split rendering requires a finite positive viewport and target size")]
     InvalidViewport,
@@ -64,24 +89,56 @@ impl AssetResolver for FrozenAssets {
 /// An opt-in paint partition for one immutable scene revision. Prepare again
 /// after any edit. This is not a retained-frame cache or an interactive move.
 /// Images are frozen here so asynchronous decode/eviction cannot change the
-/// artwork between phases. Clipped ancestors require ordered command replay;
-/// other specs also permit equal-sized raster phases composited source-over.
-pub struct SplitSpec {
+/// artwork between phases. Clipped ancestors and instances require ordered
+/// command replay; remaining specs also permit raster phases composited source-over.
+/// Input registries are immutably borrowed for the plan lifetime, so public
+/// map edits require dropping/repreparing it. Rendering with another registry
+/// identity rejects conservatively even if its values happen to be equal.
+pub struct SplitSpec<'inputs> {
     scene_instance: u64,
     scene_revision: u64,
     page_root: NodeId,
     requires_ordered_paint: bool,
     atoms: HashMap<NodeId, PaintAtom>,
     assets: FrozenAssets,
+    components: &'inputs ComponentLibrary,
+    variables: &'inputs VariableRegistry,
+    active_modes: &'inputs BTreeMap<VariableCollectionId, ModeId>,
+    mode_generation: u64,
+    dark_ui: bool,
+    instances: HashMap<NodeId, Arc<PreparedInstance>>,
+    prepared_nodes: usize,
+    max_prepared_nodes: usize,
+    max_prepared_depth: usize,
 }
 
-impl SplitSpec {
+impl<'inputs> SplitSpec<'inputs> {
     pub fn prepare(
         scene: &Scene,
         page_root: NodeId,
         moving: NodeId,
-        inputs: &RenderInputs,
+        inputs: &RenderInputs<'inputs>,
         resolver: Option<&dyn AssetResolver>,
+    ) -> Result<Self, SplitError> {
+        Self::prepare_with_budget(
+            scene,
+            page_root,
+            moving,
+            inputs,
+            resolver,
+            MAX_PREPARED_NODES,
+            MAX_PREPARED_DEPTH,
+        )
+    }
+
+    fn prepare_with_budget(
+        scene: &Scene,
+        page_root: NodeId,
+        moving: NodeId,
+        inputs: &RenderInputs<'inputs>,
+        resolver: Option<&dyn AssetResolver>,
+        max_prepared_nodes: usize,
+        max_prepared_depth: usize,
     ) -> Result<Self, SplitError> {
         validate_inputs(inputs)?;
         let page = scene.get(page_root).ok_or(SplitError::InvalidRoots)?;
@@ -100,6 +157,15 @@ impl SplitSpec {
             requires_ordered_paint: false,
             atoms: HashMap::new(),
             assets: FrozenAssets::default(),
+            components: inputs.components,
+            variables: inputs.variables,
+            active_modes: inputs.active_modes,
+            mode_generation: inputs.mode_generation,
+            dark_ui: inputs.dark_ui,
+            instances: HashMap::new(),
+            prepared_nodes: 0,
+            max_prepared_nodes,
+            max_prepared_depth,
         };
         let mut phase = SplitPhase::Below;
         let mut pending = vec![(page_root, false)];
@@ -121,6 +187,11 @@ impl SplitSpec {
                 spec.atoms.insert(id, PaintAtom::Ancestor);
             } else {
                 spec.atoms.insert(id, PaintAtom::Subtree(phase));
+            }
+            if let NodeData::Instance(instance) = &node.data {
+                spec.requires_ordered_paint = true;
+                spec.prepare_instance(scene, id, instance, id, 0, &mut Vec::new(), resolver)?;
+                continue;
             }
             let children = scene.children_of(Some(id));
             let reverse_z = matches!(&node.data, NodeData::Group(group)
@@ -148,7 +219,28 @@ impl SplitSpec {
         if self.scene_instance != scene.instance_id() || self.scene_revision != scene.revision() {
             return Err(SplitError::StaleScene);
         }
-        validate_inputs(inputs)
+        validate_inputs(inputs)?;
+        if !std::ptr::eq(self.components, inputs.components)
+            || !std::ptr::eq(self.variables, inputs.variables)
+            || !std::ptr::eq(self.active_modes, inputs.active_modes)
+            || self.mode_generation != inputs.mode_generation
+            || self.dark_ui != inputs.dark_ui
+        {
+            return Err(SplitError::StaleInputs);
+        }
+        Ok(())
+    }
+
+    pub fn prepared_instance_count(&self) -> usize {
+        self.instances.len()
+    }
+
+    pub fn prepared_node_count(&self) -> usize {
+        self.prepared_nodes
+    }
+
+    pub(crate) fn prepared_instance(&self, id: NodeId) -> Option<&Arc<PreparedInstance>> {
+        self.instances.get(&id)
     }
 
     pub(crate) fn resolver(&self) -> &dyn AssetResolver {
@@ -177,6 +269,98 @@ impl SplitSpec {
             Some(PaintAtom::Subtree(assigned)) => *assigned == phase,
             None => false,
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_instance(
+        &mut self,
+        scene: &Scene,
+        instance_id: NodeId,
+        instance: &InstanceNode,
+        mode_anchor: NodeId,
+        depth: usize,
+        components_on_path: &mut Vec<ComponentId>,
+        resolver: Option<&dyn AssetResolver>,
+    ) -> Result<(), SplitError> {
+        let context = InstanceExpansionContext::new(self.variables, self.active_modes, mode_anchor);
+        let selected =
+            fanta_doc::resolved_component_with_context(scene, self.components, instance, &context)
+                .ok_or(SplitError::MissingInstance {
+                    instance: instance_id,
+                    component: instance.component,
+                })?;
+        if components_on_path.contains(&selected.resolved_component) {
+            return Err(SplitError::RecursiveInstance(selected.resolved_component));
+        }
+        if !scene.contains(selected.resolved_root) {
+            return Err(SplitError::MissingInstance {
+                instance: instance_id,
+                component: instance.component,
+            });
+        }
+        // Reserve before cloning or layout: a wide master otherwise allocates before its budget is checked.
+        let mut pending = vec![(selected.resolved_root, depth)];
+        while let Some((node, node_depth)) = pending.pop() {
+            if self.prepared_nodes >= self.max_prepared_nodes
+                || node_depth >= self.max_prepared_depth
+            {
+                return Err(SplitError::ExpansionLimit(instance_id));
+            }
+            self.prepared_nodes += 1;
+            pending.extend(
+                scene
+                    .children_of(Some(node))
+                    .iter()
+                    .copied()
+                    .map(|child| (child, node_depth + 1)),
+            );
+        }
+        let nodes =
+            fanta_doc::expand_instance_with_context(scene, self.components, instance, &context);
+        // Reject invalid resolved geometry before it can reach text shaping or layout.
+        for entry in &nodes {
+            self.validate_node(&entry.node, resolver)
+                .map_err(|source| SplitError::InstanceContents {
+                    instance: mode_anchor,
+                    path: entry.def_path.to_vec(),
+                    source: Box::new(source),
+                })?;
+        }
+        let expanded = Arc::new(super::instance::prepare_instance_nodes(instance, nodes));
+        if expanded.nodes.is_empty() || expanded.root.is_none() {
+            return Err(SplitError::MissingInstance {
+                instance: instance_id,
+                component: instance.component,
+            });
+        }
+        components_on_path.push(selected.resolved_component);
+        for entry in &expanded.nodes {
+            self.validate_node(&entry.node, resolver)
+                .map_err(|source| SplitError::InstanceContents {
+                    instance: mode_anchor,
+                    path: entry.def_path.to_vec(),
+                    source: Box::new(source),
+                })?;
+            if let NodeData::Instance(nested) = &entry.node.data {
+                self.prepare_instance(
+                    scene,
+                    entry.node.id,
+                    nested,
+                    mode_anchor,
+                    depth + entry.def_path.len() + 1,
+                    components_on_path,
+                    resolver,
+                )
+                .map_err(|source| SplitError::InstanceContents {
+                    instance: mode_anchor,
+                    path: entry.def_path.to_vec(),
+                    source: Box::new(source),
+                })?;
+            }
+        }
+        components_on_path.pop();
+        self.instances.insert(instance_id, expanded);
+        Ok(())
     }
 
     fn validate_node(
@@ -262,6 +446,9 @@ impl SplitSpec {
                 {
                     self.validate_fill(node.id, fill, resolver)?;
                 }
+            }
+            NodeData::Instance(instance) => {
+                require_geometry(node.id, instance.local_size.into_iter().all(finite_scalar))?;
             }
             NodeData::Bitmap(bitmap) => {
                 require_geometry(
@@ -508,7 +695,88 @@ fn validate_ancestor(node: &CanvasNode, page: bool) -> Result<(), SplitError> {
 
 #[derive(Clone, Copy)]
 pub(crate) struct SplitPass<'a> {
-    pub(crate) spec: &'a SplitSpec,
+    pub(crate) spec: &'a SplitSpec<'a>,
     pub(crate) phase: SplitPhase,
     pub(crate) clear_target: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fanta_doc::{BitmapNode, ComponentDef, GroupNode, ImageFitMode};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn split_whole_instance_wide_budget_reserves_before_decoding_and_accepts_the_boundary() {
+        struct Resolver(AtomicUsize);
+        impl AssetResolver for Resolver {
+            fn resolve(&self, _: AssetId) -> Option<DecodedImage> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Some(DecodedImage::new(Arc::new(vec![255; 4]), 1, 1))
+            }
+        }
+        let mut scene = Scene::new();
+        let page = scene
+            .insert(CanvasNode::new(NodeData::Group(GroupNode::default())))
+            .expect("page");
+        let master = scene
+            .insert(CanvasNode::new(NodeData::Group(GroupNode {
+                clip_size: Some([20.0, 20.0]),
+                ..Default::default()
+            })))
+            .expect("master");
+        let asset = AssetId::new();
+        for _ in 0..4 {
+            let mut child = CanvasNode::new(NodeData::Bitmap(BitmapNode {
+                asset,
+                natural_size: [1, 1],
+                local_size: [20.0, 20.0],
+                crop: None,
+                fit: ImageFitMode::Fill,
+                tint: None,
+            }));
+            child.parent = Some(master);
+            scene.insert(child).expect("child");
+        }
+        let component = ComponentId::new();
+        let mut components = ComponentLibrary::new();
+        components.defs.insert(
+            component,
+            ComponentDef::new(component, master, "Wide master"),
+        );
+        let mut placed = CanvasNode::new(NodeData::Instance(InstanceNode {
+            component,
+            overrides: Vec::new(),
+            prop_values: BTreeMap::new(),
+            derived: Vec::new(),
+            local_size: [20.0, 20.0],
+        }));
+        placed.parent = Some(page);
+        let moving = scene.insert(placed).expect("placed");
+        let inputs = RenderInputs {
+            components: &components,
+            ..RenderInputs::empty()
+        };
+        let resolver = Resolver(AtomicUsize::new(0));
+        let revision = scene.revision();
+        assert!(
+            matches!(SplitSpec::prepare_with_budget(&scene, page, moving, &inputs, Some(&resolver), 4, 64), Err(SplitError::ExpansionLimit(id)) if id == moving)
+        );
+        assert_eq!(
+            resolver.0.load(Ordering::Relaxed),
+            0,
+            "reject the whole wide master before resolving even its first image"
+        );
+        let accepted =
+            SplitSpec::prepare_with_budget(&scene, page, moving, &inputs, Some(&resolver), 5, 64)
+                .expect("exact five-node budget");
+        assert_eq!(accepted.prepared_node_count(), 5);
+        assert_eq!(accepted.prepared_instance_count(), 1);
+        assert_eq!(
+            resolver.0.load(Ordering::Relaxed),
+            1,
+            "shared asset is frozen once across four retained children"
+        );
+        assert_eq!(scene.revision(), revision);
+    }
 }
