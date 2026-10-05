@@ -234,10 +234,12 @@ fn matching_design_layers<'a>(
     page: Option<NodeId>,
 ) -> impl Iterator<Item = NodeId> + 'a {
     let masters = crate::properties_snapshot::master_roots(&doc.components);
-    let kind = doc
-        .scene
-        .get(id)
-        .map(|node| design_kind(id, &node.data, &masters));
+    let inspected = doc.scene.get(id).map(|node| {
+        (
+            design_kind(id, &node.data, &masters),
+            std::mem::discriminant(&node.data),
+        )
+    });
     let roots = page
         .map(|page| doc.scene.children_of(Some(page)))
         .unwrap_or_else(|| doc.scene.children_of(None));
@@ -246,9 +248,11 @@ fn matching_design_layers<'a>(
         .copied()
         .flat_map(|root| doc.scene.descendants_of(root))
         .filter(move |candidate| {
-            kind.as_ref().is_some_and(|kind| {
+            inspected.is_some_and(|(kind, discriminant)| {
                 doc.scene.get(*candidate).is_some_and(|candidate_node| {
-                    design_kind(*candidate, &candidate_node.data, &masters) == *kind
+                    design_kind(*candidate, &candidate_node.data, &masters) == kind
+                        && (kind != DesignPanelNodeKind::Other
+                            || discriminant == std::mem::discriminant(&candidate_node.data))
                 })
             })
         })
@@ -314,6 +318,8 @@ pub(crate) fn selection_header_for_doc(
         format!("{} layers", selection.len())
     } else if crate::layer_context_ops::is_section(node) {
         "Section".to_string()
+    } else if kind == DesignPanelNodeKind::Other {
+        node.data.default_name().to_string()
     } else {
         kind.label().to_string()
     };
@@ -1647,10 +1653,17 @@ fn gate_capabilities(
     if kind == DesignPanelNodeKind::Other {
         // The engine can move, hide, and re-composite these nodes but cannot
         // edit their content: wrapper-level surfaces only.
-        capabilities.sections = vec![DesignPanelSection::Position, DesignPanelSection::Layer];
+        capabilities.sections = vec![
+            DesignPanelSection::Position,
+            DesignPanelSection::Layout,
+            DesignPanelSection::Layer,
+            DesignPanelSection::Effects,
+            DesignPanelSection::Export,
+        ];
+        capabilities.dimensions = true;
         capabilities.fill = false;
         capabilities.stroke = false;
-        capabilities.effects = false;
+        capabilities.effects = true;
         capabilities.auto_layout_container = false;
         capabilities.layer_appearance = true;
         capabilities.visibility = true;
@@ -11965,6 +11978,188 @@ mod tests {
             assert!(adapter.crop_session.is_none());
             assert!(adapter.last_echo.is_none());
         });
+    }
+
+    #[gpui::test]
+    async fn specialized_wrapper_inspector_edits_undo_and_exports_without_changing_content(
+        cx: &mut TestAppContext,
+    ) {
+        use fanta_doc::{AiArtifactNode, AudioNode, EmbedNode, Model3dNode, NodeGraphNode};
+
+        let cases = [
+            NodeData::Audio(AudioNode {
+                asset: AssetId::new(),
+                local_size: [120.0, 80.0],
+                time_range_us: [0, 3_000_000],
+                volume: 0.5,
+                muted: false,
+                waveform_color: FantaColor::BLACK,
+            }),
+            NodeData::NodeGraph(NodeGraphNode {
+                local_size: [120.0, 80.0],
+                graph: Default::default(),
+                preview: None,
+            }),
+            NodeData::Model3d(Model3dNode {
+                asset: AssetId::new(),
+                local_size: [120.0, 80.0],
+                camera: Default::default(),
+                overrides: serde_json::json!({"retained": true}),
+            }),
+            NodeData::AiArtifact(AiArtifactNode {
+                local_size: [120.0, 80.0],
+                prompt: "Retain the generation source".into(),
+                model: "local-fixture".into(),
+                params: serde_json::json!({"retained": true}),
+                inputs: Vec::new(),
+                lineage_parent: None,
+                output: None,
+                status: Default::default(),
+                seed: Some(42),
+            }),
+            NodeData::Embed(EmbedNode {
+                local_size: [120.0, 80.0],
+                kind: "local.fixture".into(),
+                payload: serde_json::json!({"retained": true}),
+            }),
+        ];
+        for data in cases {
+            let title = data.default_name();
+            let (mut doc, page, _) = doc_with_rect();
+            let mut node = CanvasNode::new(data);
+            node.name = "Wrapper".into();
+            node.parent = Some(page);
+            let original = node.clone();
+            let id = doc.scene.insert(node).expect("wrapper node");
+            doc.selection.replace_with([id]);
+            doc.history = Default::default();
+            let (view, panel, mut context) = setup_view(doc, cx).await;
+            let context = &mut context;
+            let item = view.read_with(context, |view, _| view.item().clone());
+            panel.read_with(context, |panel, _| {
+                let snapshot = panel.view_data();
+                let header = snapshot.projections.selection_header.expect("header");
+                assert_eq!(header.view_data.title.as_ref(), title);
+                let node = panel.node();
+                for section in [
+                    DesignPanelSection::Layout,
+                    DesignPanelSection::Effects,
+                    DesignPanelSection::Export,
+                ] {
+                    assert!(node.supports_section(section), "{title}: {section:?}");
+                }
+                let capabilities = node.capabilities.as_ref().expect("capabilities");
+                assert!(!capabilities.fill);
+                assert!(!capabilities.stroke);
+                assert!(!capabilities.add_auto_layout);
+                assert!(!capabilities.auto_layout_container);
+                assert!(!capabilities.clip_content);
+                assert!(node.typography.is_none());
+            });
+            for property in [DesignPanelProperty::Width, DesignPanelProperty::Height] {
+                panel.update_in(context, |_, _, cx| {
+                    cx.emit(DesignPanelAction::PropertyChangeRequested {
+                        node_id: id.to_string().into(),
+                        property,
+                        value: DesignPanelValue::Number(180.0),
+                    });
+                });
+                context.run_until_parked();
+                panel.read_with(context, |panel, _| {
+                    let actual = if property == DesignPanelProperty::Width {
+                        panel.node().width
+                    } else {
+                        panel.node().height
+                    };
+                    assert!((actual - 180.0).abs() < 0.01, "{title}: {property:?}");
+                });
+                item.read_with(context, |item, _| {
+                    let node = item.doc().expect("document").scene.get(id).expect("node");
+                    assert_eq!(node.data, original.data, "{title}: content retained");
+                });
+                assert!(
+                    item.update(context, |item, cx| item.undo(cx))
+                        .expect("undo size")
+                );
+                context.run_until_parked();
+                item.read_with(context, |item, _| {
+                    assert_eq!(item.doc().expect("document").scene.get(id), Some(&original));
+                });
+            }
+            for kind in [DesignEffectKind::DropShadow, DesignEffectKind::LayerBlur] {
+                panel.update_in(context, |_, _, cx| {
+                    cx.emit(DesignPanelAction::EffectAddRequested {
+                        node_id: id.to_string().into(),
+                        kind,
+                    });
+                });
+                context.run_until_parked();
+                item.read_with(context, |item, _| {
+                    let node = item.doc().expect("document").scene.get(id).expect("node");
+                    assert_eq!(node.data, original.data, "{title}: content retained");
+                    assert_eq!(
+                        node.effects.len() + node.blurs.len(),
+                        1,
+                        "{title}: {kind:?}"
+                    );
+                });
+                assert!(
+                    item.update(context, |item, cx| item.undo(cx))
+                        .expect("undo effect")
+                );
+                context.run_until_parked();
+                item.read_with(context, |item, _| {
+                    assert_eq!(item.doc().expect("document").scene.get(id), Some(&original));
+                });
+            }
+            panel.update_in(context, |_, _, cx| {
+                cx.emit(DesignPanelAction::ExportAllRequested {
+                    target: DesignPanelTarget::Nodes {
+                        node_ids: vec![id.to_string().into()],
+                    },
+                });
+            });
+            assert!(context.did_prompt_for_paths());
+            let output = tempfile::tempdir().expect("export destination");
+            let directory = output.path().to_path_buf();
+            context.simulate_path_prompt_response(move |_| Some(vec![directory]));
+            context.run_until_parked();
+            let exported = image::open(output.path().join("Wrapper.png")).expect("wrapper PNG");
+            assert_eq!(exported.dimensions(), (120, 80), "{title}");
+            item.read_with(context, |item, _| {
+                assert_eq!(item.doc().expect("document").scene.get(id), Some(&original));
+            });
+        }
+    }
+
+    #[test]
+    fn specialized_wrapper_matching_keeps_distinct_content_types_separate() {
+        let (mut doc, page, _) = doc_with_rect();
+        let data = NodeData::Audio(fanta_doc::AudioNode {
+            asset: AssetId::new(),
+            local_size: [120.0, 80.0],
+            time_range_us: [0, 3_000_000],
+            volume: 0.5,
+            muted: false,
+            waveform_color: FantaColor::BLACK,
+        });
+        let mut audio = CanvasNode::new(data);
+        audio.parent = Some(page);
+        let mut second_audio = audio.clone();
+        second_audio.id = NodeId::new();
+        let first = doc.scene.insert(audio).expect("first audio");
+        let second = doc.scene.insert(second_audio).expect("second audio");
+        let mut embed = CanvasNode::new(NodeData::Embed(fanta_doc::EmbedNode {
+            local_size: [120.0, 80.0],
+            kind: "local.fixture".into(),
+            payload: Default::default(),
+        }));
+        embed.parent = Some(page);
+        doc.scene.insert(embed).expect("embed");
+        assert_eq!(
+            matching_design_layers(&doc, first, Some(page)).collect::<HashSet<_>>(),
+            HashSet::from([first, second])
+        );
     }
 
     #[gpui::test]

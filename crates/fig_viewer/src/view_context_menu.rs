@@ -47,7 +47,11 @@ pub(crate) enum MenuTarget {
     Bitmap(NodeId),
     Video(NodeId),
     Audio(NodeId),
-    Layer(NodeId),
+    Boolean(NodeId),
+    NodeGraph(NodeId),
+    Model3d(NodeId),
+    AiArtifact(NodeId),
+    Embed(NodeId),
 }
 
 impl MenuTarget {
@@ -66,13 +70,11 @@ impl MenuTarget {
             Some(NodeData::Bitmap(_)) => Self::Bitmap(node),
             Some(NodeData::Video(_)) => Self::Video(node),
             Some(NodeData::Audio(_)) => Self::Audio(node),
-            Some(
-                NodeData::Boolean(_)
-                | NodeData::NodeGraph(_)
-                | NodeData::Model3d(_)
-                | NodeData::AiArtifact(_)
-                | NodeData::Embed(_),
-            ) => Self::Layer(node),
+            Some(NodeData::Boolean(_)) => Self::Boolean(node),
+            Some(NodeData::NodeGraph(_)) => Self::NodeGraph(node),
+            Some(NodeData::Model3d(_)) => Self::Model3d(node),
+            Some(NodeData::AiArtifact(_)) => Self::AiArtifact(node),
+            Some(NodeData::Embed(_)) => Self::Embed(node),
             None => Self::Canvas,
         }
     }
@@ -88,7 +90,11 @@ impl MenuTarget {
             | Self::Bitmap(node)
             | Self::Video(node)
             | Self::Audio(node)
-            | Self::Layer(node) => Some(node),
+            | Self::Boolean(node)
+            | Self::NodeGraph(node)
+            | Self::Model3d(node)
+            | Self::AiArtifact(node)
+            | Self::Embed(node) => Some(node),
         }
     }
 
@@ -99,7 +105,11 @@ impl MenuTarget {
             Self::Bitmap(_) => Some("Crop image"),
             Self::Video(_) => Some("Video properties"),
             Self::Audio(_) => Some("Audio properties"),
-            Self::Layer(_) => Some("Layer properties"),
+            Self::Boolean(_) => Some("Boolean properties"),
+            Self::NodeGraph(_) => Some("Node graph properties"),
+            Self::Model3d(_) => Some("3D properties"),
+            Self::AiArtifact(_) => Some("AI artifact properties"),
+            Self::Embed(_) => Some("Embed properties"),
             _ => None,
         }
     }
@@ -614,7 +624,10 @@ mod tests {
     }
 
     fn leaf_menu_cases() -> Vec<(NodeData, &'static str)> {
-        use fanta_doc::{AssetId, AudioNode, BitmapNode, TextNode, VectorNode, VideoNode};
+        use fanta_doc::{
+            AiArtifactNode, AssetId, AudioNode, BitmapNode, EmbedNode, Model3dNode, NodeGraphNode,
+            TextNode, VectorNode, VideoNode,
+        };
         vec![
             (
                 NodeData::Text(TextNode::new("Title", 100.0, 30.0)),
@@ -667,6 +680,45 @@ mod tests {
                 }),
                 "Audio properties",
             ),
+            (
+                NodeData::NodeGraph(NodeGraphNode {
+                    local_size: [100.0, 100.0],
+                    graph: Default::default(),
+                    preview: None,
+                }),
+                "Node graph properties",
+            ),
+            (
+                NodeData::Model3d(Model3dNode {
+                    asset: AssetId::new(),
+                    local_size: [100.0, 100.0],
+                    camera: Default::default(),
+                    overrides: serde_json::json!({"retained": true}),
+                }),
+                "3D properties",
+            ),
+            (
+                NodeData::AiArtifact(AiArtifactNode {
+                    local_size: [100.0, 100.0],
+                    prompt: "Existing generation".into(),
+                    model: "local.fixture".into(),
+                    params: Default::default(),
+                    inputs: Vec::new(),
+                    lineage_parent: None,
+                    output: None,
+                    status: Default::default(),
+                    seed: Some(42),
+                }),
+                "AI artifact properties",
+            ),
+            (
+                NodeData::Embed(EmbedNode {
+                    local_size: [100.0, 100.0],
+                    kind: "local.fixture".into(),
+                    payload: serde_json::json!({"retained": true}),
+                }),
+                "Embed properties",
+            ),
         ]
     }
 
@@ -689,6 +741,16 @@ mod tests {
         assert_eq!(
             MenuTarget::of(&doc, Some(NodeId::new())),
             MenuTarget::Canvas
+        );
+        let boolean = doc
+            .scene
+            .insert(CanvasNode::new(NodeData::Boolean(
+                fanta_doc::BooleanNode::default(),
+            )))
+            .expect("boolean");
+        assert_eq!(
+            MenuTarget::of(&doc, Some(boolean)).editor_label(),
+            Some("Boolean properties")
         );
     }
 
