@@ -135,7 +135,25 @@ also passed after a test-only local-variable cleanup. Logs, source hashes and
 `validation.json` are in
 `target/release-verification/master-save-invalidation-20261005/`. These checks
 validate artifact selection and conflict handling; the large native save retry
-and the separate reference-table retention correction remain pending.
+remains pending.
+
+Opened source artifacts now reuse an immutable reference table when the actual
+component IDs/names and variable IDs/paths are unchanged. Component loads borrow
+the full library and retain only their own definition. **5 focused regressions
+pass**, covering shared ownership, nested named component/variable references,
+public registry changes without generation bumps, duplicate-name ambiguity and
+recovery, restored source vocabulary, clean reload, dirty identity preservation,
+conflicts and asset-index guards. The baseline reproduced three sharing failures;
+two existing-behavior controls already passed. The broader checks passed **217
+format tests, 98 FNX tests with source-order preservation, 1,061 editor tests
+(1 ignored), 3 benchmark CLI tests**, and the format/editor repository lint gate.
+Production hashes stayed unchanged through validation; final focused tests and
+lint passed after removing a redundant test-only clone. Evidence and retained
+failure logs are in `target/release-verification/shared-reference-tables-20261005/`.
+Each cache lookup still scans the vocabulary, scoped variable registries retain
+their existing ownership, and separate parse/conflict paths can still build
+tables. This proves bounded sharing and preservation, not measured native memory
+or save latency; the corrected Spectrum native journey remains open.
 
 The inspector/menu native follow-up used `85fc694b67c78f616401def73506e515594f52d7`,
 binary SHA-256 `d42e94c0febfa6c701c257485a470779b5c991c7e3567b856f6e5b6fb7dced99`.

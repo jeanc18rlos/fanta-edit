@@ -2474,3 +2474,633 @@ fn reading_repairs_null_geometry_written_by_older_builds() {
     assert_eq!(node["path"]["segments"][1]["to"], json!([0.0, 0.0]));
     assert!(!crate::project::read::repair_non_finite_geometry(&mut node));
 }
+
+struct SharedReferenceFixture {
+    directory: tempfile::TempDir,
+    document: Doc,
+    page: NodeId,
+    components: Vec<fanta_doc::ComponentId>,
+    collection: fanta_doc::VariableCollectionId,
+    variable: fanta_doc::VariableId,
+    modes: [fanta_doc::ModeId; 2],
+    nested: NodeId,
+}
+
+fn shared_reference_fixture() -> SharedReferenceFixture {
+    let directory = tempdir().expect("fixture directory");
+    let mut document = Doc::new();
+    let mut page_node = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    page_node.name = "Reference page".into();
+    let page = document.scene.insert(page_node).expect("page");
+    document.add_page(page);
+    let mut components = Vec::new();
+    for index in 0..16 {
+        let mut master = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([40.0, 20.0]),
+            ..Default::default()
+        }));
+        master.name = format!("Button {index}");
+        let root = document.scene.insert(master).expect("master");
+        let component = fanta_doc::ComponentId::new();
+        document.components.defs.insert(
+            component,
+            fanta_doc::ComponentDef::new(component, root, format!("Button {index}")),
+        );
+        components.push(component);
+    }
+    let mut instance = CanvasNode::new(NodeData::Instance(fanta_doc::InstanceNode {
+        component: components[0],
+        overrides: Vec::new(),
+        prop_values: Default::default(),
+        derived: Vec::new(),
+        local_size: [40.0, 20.0],
+    }));
+    instance.name = "Placement".into();
+    instance.parent = Some(page);
+    document.scene.insert(instance).expect("instance");
+    let collection = fanta_doc::VariableCollectionId::new();
+    let variable = fanta_doc::VariableId::new();
+    let modes = [fanta_doc::ModeId::new(), fanta_doc::ModeId::new()];
+    document.variables.collections.insert(
+        collection,
+        fanta_doc::VariableCollection {
+            id: collection,
+            name: "Theme".into(),
+            modes: vec![
+                fanta_doc::Mode {
+                    id: modes[0],
+                    name: "Light".into(),
+                },
+                fanta_doc::Mode {
+                    id: modes[1],
+                    name: "Dark".into(),
+                },
+            ],
+            default_mode: modes[0],
+            variable_order: vec![variable],
+        },
+    );
+    document.variables.variables.insert(
+        variable,
+        fanta_doc::Variable {
+            id: variable,
+            collection,
+            name: "Opacity".into(),
+            ty: fanta_doc::VariableType::Float,
+            values_by_mode: [
+                (modes[0], fanta_doc::VarValue::Float { value: 1.0 }),
+                (modes[1], fanta_doc::VarValue::Float { value: 0.5 }),
+            ]
+            .into_iter()
+            .collect(),
+            scopes: Vec::new(),
+        },
+    );
+    document.active_modes.insert(collection, modes[0]);
+    let mut nested_node = CanvasNode::new(NodeData::Instance(fanta_doc::InstanceNode {
+        component: components[1],
+        overrides: Vec::new(),
+        prop_values: Default::default(),
+        derived: Vec::new(),
+        local_size: [40.0, 20.0],
+    }));
+    nested_node.name = "Nested named component".into();
+    nested_node.parent = Some(document.components.defs[&components[0]].root);
+    nested_node
+        .bindings
+        .insert(fanta_doc::BoundProp::Opacity, variable);
+    let nested = document
+        .scene
+        .insert(nested_node)
+        .expect("bound nested instance");
+    crate::write_project_tree(directory.path(), &document, &BTreeMap::new())
+        .expect("write fixture");
+    SharedReferenceFixture {
+        directory,
+        document,
+        page,
+        components,
+        collection,
+        variable,
+        modes,
+        nested,
+    }
+}
+
+fn open_component_reference_table(
+    workspace: &mut WorkspaceSession,
+    component: fanta_doc::ComponentId,
+) -> Arc<fanta_fnx::RefTable> {
+    let artifact = ArtifactId::Component(component);
+    workspace
+        .close_artifact(artifact.clone(), ClosePolicy::Discard)
+        .expect("close clean fixture");
+    workspace
+        .open_artifact(artifact.clone())
+        .expect("open component");
+    Arc::clone(&workspace.artifact(&artifact).expect("component").ref_table)
+}
+
+#[test]
+fn shared_reference_table_survives_open_close_and_source_reload() {
+    let fixture = shared_reference_fixture();
+    let mut workspace = WorkspaceSession::open(fixture.directory.path()).expect("workspace");
+    let page = ArtifactId::Page(fixture.page);
+    workspace.open_artifact(page.clone()).expect("open page");
+    let shared = Arc::clone(&workspace.artifact(&page).expect("page").ref_table);
+    for component in &fixture.components {
+        let table = open_component_reference_table(&mut workspace, *component);
+        assert!(
+            Arc::ptr_eq(&shared, &table),
+            "opening an artifact must reuse the workspace vocabulary"
+        );
+        assert_eq!(
+            workspace
+                .artifact(&ArtifactId::Component(*component))
+                .expect("component")
+                .doc()
+                .components
+                .defs
+                .len(),
+            1
+        );
+        if *component == fixture.components[0] {
+            let artifact = workspace
+                .artifact(&ArtifactId::Component(*component))
+                .expect("component with foreign references");
+            assert!(artifact.source_text().contains("Button 1"));
+            assert!(artifact.source_text().contains("$Theme/Opacity"));
+            let nested = artifact
+                .doc()
+                .scene
+                .get(fixture.nested)
+                .expect("nested instance identity retained");
+            let NodeData::Instance(instance) = &nested.data else {
+                panic!("nested instance")
+            };
+            assert_eq!(instance.component, fixture.components[1]);
+            assert_eq!(
+                nested.bindings.get(&fanta_doc::BoundProp::Opacity),
+                Some(&fixture.variable)
+            );
+            assert!(
+                !artifact
+                    .doc()
+                    .components
+                    .defs
+                    .contains_key(&fixture.components[1]),
+                "foreign definitions resolve without being cloned into the local scope"
+            );
+        }
+    }
+    for component in &fixture.components {
+        workspace
+            .close_artifact(ArtifactId::Component(*component), ClosePolicy::Discard)
+            .expect("close component");
+    }
+    let reopened = open_component_reference_table(&mut workspace, fixture.components[0]);
+    assert!(Arc::ptr_eq(&shared, &reopened));
+    let source =
+        crate::locate_page_source(fixture.directory.path(), fixture.page).expect("page source");
+    let original = std::fs::read_to_string(&source).expect("source");
+    assert!(original.contains("Placement"));
+    let changed = format!(
+        "// external source fragment is preserved\n{}",
+        original.replacen("Placement", "External placement", 1)
+    );
+    std::fs::write(&source, &changed).expect("external source edit");
+    let events = workspace.notify_fs_event(FsEvent::Modified { path: source });
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::Reloaded { id } if id == &page)),
+        "{events:?}"
+    );
+    let artifact = workspace.artifact(&page).expect("reloaded page");
+    assert!(Arc::ptr_eq(&shared, &artifact.ref_table));
+    assert_eq!(artifact.source_text(), changed);
+    assert_eq!(artifact.root(), fixture.page);
+    assert!(artifact.doc().scene.descendants_of(fixture.page).any(|id| {
+        artifact
+            .doc()
+            .scene
+            .get(id)
+            .is_some_and(|node| node.name == "External placement")
+    }));
+    let mut fresh = WorkspaceSession::open(fixture.directory.path()).expect("fresh source session");
+    fresh.open_artifact(page.clone()).expect("fresh page");
+    let freshly_loaded = fresh.artifact(&page).expect("freshly loaded page");
+    assert!(matches!(
+        artifact.state(),
+        ArtifactDirty::Clean | ArtifactDirty::DirtyCanvas
+    ));
+    assert_eq!(
+        std::mem::discriminant(artifact.state()),
+        std::mem::discriminant(freshly_loaded.state())
+    );
+    assert_eq!(
+        serde_json::to_value(&artifact.doc().scene).expect("reloaded scene"),
+        serde_json::to_value(&freshly_loaded.doc().scene).expect("fresh scene")
+    );
+    let asset_index = fixture.directory.path().join("assets/index.json");
+    let mut bytes = std::fs::read(&asset_index).expect("asset index");
+    bytes.push(b'\n');
+    std::fs::write(&asset_index, &bytes).expect("external asset index edit");
+    assert!(matches!(
+        workspace.source_write_preconditions(&fixture.document),
+        Err(SessionError::SaveBlocked(SaveBlocked::DiskChangedAgain))
+    ));
+    assert_eq!(std::fs::read(&asset_index).expect("preserved index"), bytes);
+}
+
+#[test]
+fn shared_reference_table_checks_public_registry_changes_without_generation_bumps() {
+    let fixture = shared_reference_fixture();
+    let mut workspace = WorkspaceSession::open(fixture.directory.path()).expect("workspace");
+    let first = fixture.components[0];
+    let reopen = fixture.components[1];
+    let original_name = workspace.components.defs.defs[&first].name.clone();
+    let original_collection = workspace.shared.variables.collections[&fixture.collection].clone();
+    let new_component = fanta_doc::ComponentId::new();
+    let new_variable = fanta_doc::VariableId::new();
+    let generation = workspace.workspace_generation;
+    let mut previous = open_component_reference_table(&mut workspace, reopen);
+    let untouched = Arc::clone(&previous);
+    let original_table = (*untouched).clone();
+    for change in 0..11 {
+        match change {
+            0 => {
+                workspace
+                    .components
+                    .defs
+                    .defs
+                    .get_mut(&first)
+                    .expect("component")
+                    .name = "Renamed".into()
+            }
+            1 => {
+                workspace
+                    .components
+                    .defs
+                    .defs
+                    .get_mut(&first)
+                    .expect("component")
+                    .name = original_name.clone()
+            }
+            2 => {
+                let mut duplicate = workspace.components.defs.defs[&first].clone();
+                duplicate.id = new_component;
+                workspace
+                    .components
+                    .defs
+                    .defs
+                    .insert(new_component, duplicate);
+            }
+            3 => {
+                workspace.components.defs.defs.remove(&new_component);
+            }
+            4 => {
+                workspace
+                    .shared
+                    .variables
+                    .variables
+                    .get_mut(&fixture.variable)
+                    .expect("variable")
+                    .name = "Renamed opacity".into()
+            }
+            5 => {
+                workspace
+                    .shared
+                    .variables
+                    .collections
+                    .get_mut(&fixture.collection)
+                    .expect("collection")
+                    .name = "Renamed theme".into()
+            }
+            6 => {
+                workspace
+                    .shared
+                    .variables
+                    .variables
+                    .get_mut(&fixture.variable)
+                    .expect("variable")
+                    .id = new_variable
+            }
+            7 => {
+                workspace
+                    .shared
+                    .variables
+                    .collections
+                    .remove(&fixture.collection);
+            }
+            8 => {
+                workspace
+                    .shared
+                    .variables
+                    .collections
+                    .insert(fixture.collection, original_collection.clone());
+            }
+            9 => workspace.manifest.version = 3,
+            10 => workspace.manifest.version = crate::project::layout::PROJECT_VERSION,
+            _ => unreachable!(),
+        }
+        let current = open_component_reference_table(&mut workspace, reopen);
+        assert_eq!(workspace.workspace_generation, generation);
+        assert!(
+            !Arc::ptr_eq(&previous, &current),
+            "changed vocabulary/policy {change} must replace the table"
+        );
+        assert_eq!(
+            *current,
+            crate::project::refs_ctx::build_ref_table(
+                &workspace.components.defs,
+                &workspace.shared.variables,
+                workspace.manifest.version >= 4
+            ),
+            "change {change}"
+        );
+        assert_eq!(
+            *untouched, original_table,
+            "an existing immutable table cannot be changed in place"
+        );
+        previous = current;
+    }
+}
+
+#[test]
+fn shared_reference_table_reuses_values_and_restores_an_open_sources_vocabulary() {
+    let mut fixture = shared_reference_fixture();
+    let mut workspace = WorkspaceSession::open(fixture.directory.path()).expect("workspace");
+    let page = ArtifactId::Page(fixture.page);
+    workspace.open_artifact(page.clone()).expect("page");
+    let original_source = workspace.artifact(&page).expect("page").source_text();
+    let original_table = Arc::clone(&workspace.artifact(&page).expect("page").ref_table);
+    open_component_reference_table(&mut workspace, fixture.components[0]);
+    fixture
+        .document
+        .components
+        .defs
+        .get_mut(&fixture.components[0])
+        .expect("component")
+        .rev += 1;
+    fixture
+        .document
+        .variables
+        .variables
+        .get_mut(&fixture.variable)
+        .expect("variable")
+        .values_by_mode
+        .insert(fixture.modes[0], fanta_doc::VarValue::Float { value: 0.25 });
+    fixture
+        .document
+        .active_modes
+        .insert(fixture.collection, fixture.modes[1]);
+    assert!(workspace.adopt_document_shared(&fixture.document));
+    for artifact in workspace.open.values() {
+        assert!(Arc::ptr_eq(&original_table, &artifact.ref_table));
+        assert_eq!(artifact.doc().variables, fixture.document.variables);
+        assert_eq!(artifact.doc().active_modes, fixture.document.active_modes);
+        assert_eq!(artifact.vars_generation, workspace.workspace_generation);
+    }
+    let original_name = fixture.document.components.defs[&fixture.components[0]]
+        .name
+        .clone();
+    fixture
+        .document
+        .components
+        .defs
+        .get_mut(&fixture.components[0])
+        .expect("component")
+        .name = "Temporary name".into();
+    assert!(workspace.adopt_document_shared(&fixture.document));
+    let renamed = Arc::clone(&workspace.artifact(&page).expect("page").ref_table);
+    assert!(!Arc::ptr_eq(&original_table, &renamed));
+    assert_eq!(
+        workspace.artifact(&page).expect("page").source_text(),
+        original_source
+    );
+    fixture
+        .document
+        .components
+        .defs
+        .get_mut(&fixture.components[0])
+        .expect("component")
+        .name = original_name;
+    assert!(workspace.adopt_document_shared(&fixture.document));
+    let restored = Arc::clone(&workspace.artifact(&page).expect("page").ref_table);
+    assert_eq!(*restored, *original_table);
+    assert!(!Arc::ptr_eq(&restored, &renamed));
+    assert_eq!(
+        workspace.artifact(&page).expect("page").source_text(),
+        original_source
+    );
+    let instance = *workspace
+        .artifact(&page)
+        .expect("page")
+        .doc()
+        .scene
+        .children_of(Some(fixture.page))
+        .first()
+        .expect("instance");
+    workspace
+        .apply(
+            &page,
+            Operation::SetName {
+                id: instance,
+                old: "Placement".into(),
+                new: "After restore".into(),
+            },
+        )
+        .expect("patch retained source with restored vocabulary");
+    let artifact = workspace.artifact(&page).expect("page");
+    let NodeData::Instance(instance_data) =
+        &artifact.doc().scene.get(instance).expect("instance").data
+    else {
+        panic!("instance fixture")
+    };
+    assert_eq!(instance_data.component, fixture.components[0]);
+    assert!(artifact.source_text().contains("After restore"));
+    assert!(Arc::ptr_eq(&restored, &artifact.ref_table));
+}
+
+#[test]
+fn shared_reference_table_preserves_dirty_identity_and_conflict_guards() {
+    let fixture = shared_reference_fixture();
+    let mut workspace = WorkspaceSession::open(fixture.directory.path()).expect("workspace");
+    let page = ArtifactId::Page(fixture.page);
+    workspace.open_artifact(page.clone()).expect("page");
+    let component = ArtifactId::Component(fixture.components[0]);
+    workspace
+        .open_artifact(component.clone())
+        .expect("component");
+    assert!(Arc::ptr_eq(
+        &workspace.artifact(&page).expect("page").ref_table,
+        &workspace.artifact(&component).expect("component").ref_table
+    ));
+    let source_path =
+        crate::locate_page_source(fixture.directory.path(), fixture.page).expect("source");
+    let disk = std::fs::read_to_string(&source_path).expect("disk source");
+    workspace
+        .apply(
+            &page,
+            Operation::SetName {
+                id: fixture.page,
+                old: "Reference page".into(),
+                new: "Canvas title".into(),
+            },
+        )
+        .expect("canvas edit");
+    let external = disk.replacen("Reference page", "External title", 1);
+    assert_ne!(disk, external);
+    std::fs::write(&source_path, &external).expect("external competing edit");
+    let events = workspace.notify_fs_event(FsEvent::Modified {
+        path: source_path.clone(),
+    });
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::EnteredConflict { id, .. } if id == &page)),
+        "{events:?}"
+    );
+    open_component_reference_table(&mut workspace, fixture.components[1]);
+    assert!(
+        workspace
+            .artifact(&page)
+            .expect("conflicted page")
+            .state()
+            .is_conflict()
+    );
+    assert!(matches!(
+        workspace.save_artifact(page.clone()),
+        Err(SessionError::SaveBlocked(SaveBlocked::InConflict))
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&source_path).expect("external source retained"),
+        external
+    );
+
+    let draft = format!(
+        "// unfinished work must remain\n{}",
+        workspace
+            .artifact(&component)
+            .expect("component")
+            .source_text()
+    );
+    workspace
+        .artifact_mut(&component)
+        .expect("component")
+        .set_text(draft.clone())
+        .expect("source draft");
+    let header_path = fixture
+        .directory
+        .path()
+        .join(&workspace.artifacts[&component].design_dir)
+        .join("def.json");
+    let mut header: Value =
+        serde_json::from_slice(&std::fs::read(&header_path).expect("header")).expect("header JSON");
+    let replacement = fanta_doc::ComponentId::new();
+    header["id"] = serde_json::to_value(replacement).expect("replacement id");
+    std::fs::write(
+        &header_path,
+        serde_json::to_vec_pretty(&header).expect("header bytes"),
+    )
+    .expect("external identity edit");
+    let events = workspace.notify_fs_event(FsEvent::Modified { path: header_path });
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::Invalidated { id, .. } if id == &component)),
+        "{events:?}"
+    );
+    let original = workspace
+        .artifact(&component)
+        .expect("dirty old identity retained");
+    assert!(matches!(original.state(), ArtifactDirty::Invalid { .. }));
+    assert_eq!(original.text_buffer(), Some(draft.as_str()));
+    assert!(!workspace.artifacts.contains_key(&component));
+    workspace
+        .open_artifact(ArtifactId::Component(replacement))
+        .expect("new identity opens separately");
+    let replaced = workspace
+        .artifact(&ArtifactId::Component(replacement))
+        .expect("replacement");
+    assert_eq!(
+        *replaced.ref_table,
+        crate::project::refs_ctx::build_ref_table(
+            &workspace.components.defs,
+            &workspace.shared.variables,
+            workspace.manifest.version >= 4
+        )
+    );
+    assert_eq!(
+        workspace
+            .artifact(&component)
+            .expect("retained draft")
+            .text_buffer(),
+        Some(draft.as_str())
+    );
+}
+
+#[test]
+fn shared_reference_table_rejects_and_recovers_duplicate_variable_paths() {
+    let fixture = shared_reference_fixture();
+    let mut workspace = WorkspaceSession::open(fixture.directory.path()).expect("workspace");
+    let page = ArtifactId::Page(fixture.page);
+    workspace
+        .open_artifact(page.clone())
+        .expect("existing page");
+    let source = workspace.artifact(&page).expect("page").source_text();
+    let old_table = Arc::clone(&workspace.artifact(&page).expect("page").ref_table);
+    let old_document = serde_json::to_value(workspace.artifact(&page).expect("page").doc())
+        .expect("existing page snapshot");
+    let generation = workspace.workspace_generation;
+    let duplicate_id = fanta_doc::VariableId::new();
+    let mut duplicate = workspace.shared.variables.variables[&fixture.variable].clone();
+    duplicate.id = duplicate_id;
+    workspace
+        .shared
+        .variables
+        .variables
+        .insert(duplicate_id, duplicate);
+    let component = ArtifactId::Component(fixture.components[0]);
+    let error = workspace
+        .open_artifact(component.clone())
+        .expect_err("ambiguous named binding cannot resolve to an arbitrary variable");
+    assert!(error.to_string().contains("ambiguous"), "{error}");
+    assert!(
+        !workspace.open.contains_key(&component),
+        "failed load cannot install a partial artifact"
+    );
+    assert_eq!(workspace.workspace_generation, generation);
+    let existing = workspace.artifact(&page).expect("existing page retained");
+    assert_eq!(existing.source_text(), source);
+    assert_eq!(
+        serde_json::to_value(existing.doc()).expect("current page snapshot"),
+        old_document
+    );
+    assert!(Arc::ptr_eq(&existing.ref_table, &old_table));
+    workspace.shared.variables.variables.remove(&duplicate_id);
+    workspace
+        .open_artifact(component.clone())
+        .expect("binding loads after ambiguity is removed");
+    let recovered = workspace.artifact(&component).expect("recovered component");
+    assert_eq!(*recovered.ref_table, *old_table);
+    assert_eq!(recovered.doc().components.defs.len(), 1);
+    assert_eq!(
+        recovered
+            .doc()
+            .scene
+            .get(fixture.nested)
+            .expect("nested instance")
+            .bindings
+            .get(&fanta_doc::BoundProp::Opacity),
+        Some(&fixture.variable)
+    );
+    assert_eq!(
+        workspace
+            .artifact(&page)
+            .expect("existing source")
+            .source_text(),
+        source
+    );
+}

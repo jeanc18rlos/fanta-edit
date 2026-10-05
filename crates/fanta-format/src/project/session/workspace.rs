@@ -23,13 +23,14 @@ use crate::project::layout::{
 };
 use crate::project::read::{component_id_of_dir, page_id_of_dir, select_design_winners};
 use fanta_doc::{
-    ComponentId, ComponentLibrary, DocId, Operation, SCHEMA_VERSION, VariableRegistry,
+    ComponentId, ComponentLibrary, DocId, Operation, SCHEMA_VERSION, VariableId, VariableRegistry,
 };
-use fanta_fnx::{ArtifactKind, artifact_file_names};
+use fanta_fnx::{ArtifactKind, RefTable, artifact_file_names};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Shared workspace state: variables/modes + dirty flag (N16/N19).
 #[derive(Debug, Clone)]
@@ -70,6 +71,65 @@ pub(super) fn decode_shared_json<T: serde::de::DeserializeOwned>(
         .map_err(|error| SessionError::InvalidSource(format!("{}: {error}", path.display())))
 }
 
+#[derive(Debug)]
+struct CachedReferenceTable {
+    component_names: Vec<(ComponentId, String)>,
+    variable_names: Vec<(VariableId, String, String)>,
+    table: Arc<RefTable>,
+}
+
+impl CachedReferenceTable {
+    fn matches(
+        &self,
+        components: &ComponentLibrary,
+        variables: &VariableRegistry,
+        emit_names: bool,
+    ) -> bool {
+        self.table.emit_names() == emit_names
+            && self
+                .component_names
+                .iter()
+                .map(|(id, name)| (*id, name.as_str()))
+                .eq(components
+                    .defs
+                    .iter()
+                    .map(|(id, def)| (*id, def.name.as_str())))
+            && self
+                .variable_names
+                .iter()
+                .map(|(id, collection, name)| (*id, collection.as_str(), name.as_str()))
+                .eq(variables.variables.values().filter_map(|variable| {
+                    let collection = variables.collections.get(&variable.collection)?;
+                    Some((
+                        variable.id,
+                        collection.name.as_str(),
+                        variable.name.as_str(),
+                    ))
+                }))
+    }
+
+    fn new(components: &ComponentLibrary, variables: &VariableRegistry, emit_names: bool) -> Self {
+        Self {
+            component_names: components
+                .defs
+                .iter()
+                .map(|(id, def)| (*id, def.name.clone()))
+                .collect(),
+            variable_names: variables
+                .variables
+                .values()
+                .filter_map(|variable| {
+                    let collection = variables.collections.get(&variable.collection)?;
+                    Some((variable.id, collection.name.clone(), variable.name.clone()))
+                })
+                .collect(),
+            table: Arc::new(crate::project::refs_ctx::build_ref_table(
+                components, variables, emit_names,
+            )),
+        }
+    }
+}
+
 /// Live editor session for one project directory.
 #[derive(Debug)]
 pub struct WorkspaceSession {
@@ -86,6 +146,7 @@ pub struct WorkspaceSession {
     pub components: ComponentCatalog,
     pub artifacts: BTreeMap<ArtifactId, ArtifactMeta>,
     pub open: BTreeMap<ArtifactId, ArtifactSession>,
+    reference_table_cache: Option<CachedReferenceTable>,
     pub file_index: BTreeMap<ArtifactId, ContentHash>,
     file_hash_index: BTreeMap<ArtifactId, BTreeMap<String, [u8; 32]>>,
     /// Optional workspace.fnx + dependency graph.
@@ -374,6 +435,7 @@ impl WorkspaceSession {
             components,
             artifacts,
             open: BTreeMap::new(),
+            reference_table_cache: None,
             file_index,
             file_hash_index,
             workspace_ir,
@@ -390,15 +452,16 @@ impl WorkspaceSession {
             .get(&id)
             .cloned()
             .ok_or_else(|| SessionError::ArtifactNotFound(id.debug_label()))?;
+        let ref_table = self.reference_table();
         let session = load_artifact_session(
             &self.root,
             &meta,
             self.project_id,
-            self.components.defs.clone(),
+            &self.components.defs,
             self.shared.variables.clone(),
             self.shared.active_modes.clone(),
             self.workspace_generation,
-            self.emit_names(),
+            ref_table,
         )?;
         self.open.insert(id.clone(), session);
         Ok(id)
@@ -1091,14 +1154,7 @@ impl WorkspaceSession {
         let vars = self.shared.variables.clone();
         let modes = self.shared.active_modes.clone();
         let generation = self.workspace_generation;
-        // One table per generation: every open session (and its retained
-        // source mirror) shares the same Arc, so a variable rename updates
-        // the `$Collection/Name` vocabulary everywhere at once.
-        let ref_table = std::sync::Arc::new(crate::project::refs_ctx::build_ref_table(
-            &self.components.defs,
-            &vars,
-            self.emit_names(),
-        ));
+        let ref_table = self.reference_table();
         for session in self.open.values_mut() {
             session.sync_variables(
                 vars.clone(),
@@ -1107,6 +1163,23 @@ impl WorkspaceSession {
                 std::sync::Arc::clone(&ref_table),
             );
         }
+    }
+
+    fn reference_table(&mut self) -> Arc<RefTable> {
+        let emit_names = self.emit_names();
+        // The registries are public and can change without a generation bump.
+        // Compare the exact name/id inputs, including ambiguous names, before
+        // sharing a table; revision-only and variable-value edits reuse it.
+        if let Some(cached) = &self.reference_table_cache
+            && cached.matches(&self.components.defs, &self.shared.variables, emit_names)
+        {
+            return Arc::clone(&cached.table);
+        }
+        let cached =
+            CachedReferenceTable::new(&self.components.defs, &self.shared.variables, emit_names);
+        let table = Arc::clone(&cached.table);
+        self.reference_table_cache = Some(cached);
+        table
     }
 
     /// Layout-version policy for name-based reference EMISSION: v4 is the
@@ -1349,21 +1422,27 @@ impl WorkspaceSession {
             return Ok(()); // no-op
         }
 
-        // Read the layout policy before the mutable borrow of the open map.
-        let emit_names = self.emit_names();
+        let reloaded = if self
+            .open
+            .get(id)
+            .is_some_and(|session| matches!(session.state, ArtifactDirty::Clean))
+        {
+            let ref_table = self.reference_table();
+            Some(load_artifact_session(
+                &self.root,
+                &meta,
+                self.project_id,
+                &self.components.defs,
+                self.shared.variables.clone(),
+                self.shared.active_modes.clone(),
+                self.workspace_generation,
+                ref_table,
+            )?)
+        } else {
+            None
+        };
         if let Some(session) = self.open.get_mut(id) {
-            if matches!(session.state, ArtifactDirty::Clean) {
-                // Silent reload
-                let reloaded = load_artifact_session(
-                    &self.root,
-                    &meta,
-                    self.project_id,
-                    self.components.defs.clone(),
-                    self.shared.variables.clone(),
-                    self.shared.active_modes.clone(),
-                    self.workspace_generation,
-                    emit_names,
-                )?;
+            if let Some(reloaded) = reloaded {
                 let viewport = session.viewport;
                 *session = reloaded;
                 session.viewport = viewport;

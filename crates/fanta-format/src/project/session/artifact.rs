@@ -1498,8 +1498,8 @@ impl ArtifactSession {
     }
 
     /// Sync variables replica from workspace (N13). `ref_table` is the
-    /// workspace's rebuilt name↔id context for the new registry (built once
-    /// per generation, shared across every open session); the retained source
+    /// workspace's name↔id context for the current registry (shared across
+    /// every open session); the retained source
     /// mirror receives the same `Arc` so future canvas patches spell
     /// references with the fresh vocabulary.
     pub fn sync_variables(
@@ -1866,11 +1866,11 @@ pub fn load_artifact_session(
     project_root: &Path,
     meta: &ArtifactMeta,
     project_id: fanta_doc::DocId,
-    components: ComponentLibrary,
+    components: &ComponentLibrary,
     variables: VariableRegistry,
     active_modes: BTreeMap<fanta_doc::VariableCollectionId, fanta_doc::ModeId>,
     workspace_generation: u64,
-    emit_names: bool,
+    ref_table: Arc<RefTable>,
 ) -> Result<ArtifactSession, SessionError> {
     let design_dir = project_root.join(&meta.design_dir);
     let files = read_file_set(&design_dir, meta.kind)?;
@@ -1880,11 +1880,6 @@ pub fn load_artifact_session(
             design_dir.display()
         )));
     }
-    let ref_table = Arc::new(crate::project::refs_ctx::build_ref_table(
-        &components,
-        &variables,
-        emit_names,
-    ));
     let disk_hash = hash_pairs(&files);
     let fn_name = meta.slug.replace('-', "_");
     let (ir, node_map) = load_ir_and_map(meta.kind, &files, &fn_name, &ref_table)?;
@@ -1900,7 +1895,7 @@ pub fn load_artifact_session(
     let needs_migration = missing_ids || persisted_sidecar.as_ref() != Some(ir.sidecar());
     let scoped = match meta.kind {
         ArtifactKind::Page => {
-            materialize_page(&ir, project_id, components, variables, active_modes)?
+            materialize_page(&ir, project_id, components.clone(), variables, active_modes)?
         }
         ArtifactKind::Component => {
             let def = serde_json::from_value(node_map.header.clone()).unwrap_or_else(|_| {
