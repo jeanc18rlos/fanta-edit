@@ -1385,5 +1385,44 @@ overrides.
 
 Evidence: `resolved-instance-text-20261005/integration/final-validation.json`
 and its retained red, green, full-editor and lint logs. These two source changes
-are newer than the native `100fe26921` binary above. Native verification of the
-new instance-text behavior and any future renderer integration remains pending.
+are newer than the native `100fe26921` binary above. Instance-text native
+acceptance is recorded next; future native renderer integration remains pending.
+
+
+## Native resolved instance text — a3a51b084b
+
+The dev candidate `a3a51b084b094dc9cf0f3c78fdd5cf0bb7e59120`, binary SHA-256
+`6f292ee25db180df73c9d2ac6d8937d3ddd6e32e4c40dc641329110e92420046`, passes
+three bounded instance-text journeys. Its source fingerprints stayed unchanged
+through the build, including the retained user-owned source diff. The disposable
+fixture contains 24 nodes, four definitions, seven variables, two modes, no
+assets and 34 project files. Its master roots pin Mode A while the placed and
+derived rows pin Mode B, deliberately testing the placed context.
+
+| Journey | Native observation and saved result |
+| --- | --- |
+| Default property alias | Double-click seeds Default A; replacing it with QA default changes only A01's exact text-content override. Single Undo/Save restores the baseline; Redo/Save restores the captured edited content. A02 stays Default A. |
+| Placed property-value alias | Double-click seeds Placed B despite the master pin. QA placed, single Undo/Save and Redo/Save each match the expected complete document. Other text and the hidden control stay unchanged. |
+| Derived text | Double-click seeds Derived B at the displayed derived position/baseline. QA derived, single Undo/Save and Redo/Save preserve its derived box, transform and typography, with C02 unchanged. |
+| Hidden virtual text | Double-clicking B02's blank text location opens no inline editor or caret. Its properties remain available; Save preserves all typed content, timestamp and 34 file bytes exactly. |
+| Quit/relaunch | PID 57120 exited before the same bundle/profile/binary relaunched as PID 61631. The final derived-Redo state reopened with QA derived on C01, Derived B on C02 and the other labels intact. No post-launch Save was performed; all typed fields, timestamp and 34 files match the saved state exactly. |
+
+Each content edit permits only the declared single sparse text-content override
+on its target instance and a present, nondecreasing `modified_at`. Masters,
+siblings, component definitions/revisions, variable values, modes/pins, geometry,
+styles, child order and empty asset manifests remain exact. No format or numeric
+normalization exemption was used. Initial Open also preserves all 34 files.
+Independent review recomputed all 14 stored checkpoints: initial Open, nine
+Save/Undo/Redo states, two intermediate baseline restorations, hidden no-op and
+cold restart. The frozen oracle's 37 sensitivity cases and an independent
+32-case review remain distinct from native acceptance.
+
+Evidence: `target/release-verification/native-resolved-instance-text-20261005/`
+(`native-*`, `native-acceptance-review.json`, `independent-review.json`) and
+`native-resolved-text-candidate-20261005/` (`provenance.json`, `runtime.json`,
+`runtime-restart.json`). Root's capture records contain the native observations;
+the snapshot helper supplies no input. Only the final derived-Redo state was
+restarted. Native mode-changing actions, rich-text/IME input, true nested
+instances, virtual TextPath and direct text-content binding edit/refusal remain
+outside this fixture. This does not establish native rendering speed, all-node
+coverage or signed-installation readiness.
