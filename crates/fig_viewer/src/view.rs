@@ -381,6 +381,7 @@ pub struct FigView {
     pub(crate) viewport: Option<Viewport>,
     pan_last_position: Option<Point<Pixels>>,
     primary_pressed: bool,
+    pub(crate) gesture_perf: Option<crate::gesture_perf::SharedGesturePerf>,
     /// A pointer button is down on the canvas, from the press until the
     /// release (wherever it lands). Broader than `primary_pressed`, which the
     /// tool paths only set once an event reaches a tool: the autosave must
@@ -786,6 +787,7 @@ impl FigView {
             viewport: None,
             pan_last_position: None,
             primary_pressed: false,
+            gesture_perf: crate::perf_enabled().then(crate::gesture_perf::GesturePerf::shared),
             canvas_pointer_down: false,
             autosave_task: None,
             reported_save_failure: None,
@@ -883,6 +885,9 @@ impl FigView {
 
     fn subscribe_to_item(item: &Entity<FigItem>, cx: &mut Context<Self>) -> Subscription {
         cx.subscribe(item, |this, _, event: &FigItemEvent, cx| {
+            if matches!(event, FigItemEvent::StateChanged) {
+                this.end_gesture_perf("document_state_changed");
+            }
             #[cfg(target_os = "macos")]
             if this.canvas_video.as_ref().is_some_and(|session| {
                 this.selected_canvas_video_source(cx).map(|source| source.0)
@@ -1180,6 +1185,7 @@ impl FigView {
         }
         if self.measurement_controller.has_pending_authoring() {
             self.measurement_controller.freeze_after_release_error();
+            self.end_gesture_perf("pointer_state_reset");
             self.primary_pressed = false;
             self.canvas_pointer_down = false;
             show_canvas_notice_deferred("The document became read-only. The measurement draft was kept; cancel it before starting again.".into(), cx);
@@ -1198,6 +1204,7 @@ impl FigView {
         self.cancel_motion_keyframe_drag(cx);
         self.timeline_shell
             .update(cx, |timeline, cx| timeline.set_authoring_enabled(false, cx));
+        self.end_gesture_perf("pointer_state_reset");
         self.primary_pressed = false;
         self.pending_text_edit = None;
         let text_session = self.text_edit.take().map(|edit| edit.session);
@@ -1369,6 +1376,7 @@ impl FigView {
         });
         if restored {
             self.viewport = viewport;
+            self.end_gesture_perf("pointer_state_reset");
             self.primary_pressed = false;
             self.canvas_pointer_down = false;
             self.remember_tool_face(ToolKind::Select);
@@ -2513,6 +2521,7 @@ impl FigView {
         {
             self.annotation_state.controller.freeze_move();
             self.measurement_controller.freeze_after_release_error();
+            self.end_gesture_perf("pointer_state_reset");
             self.primary_pressed = false;
             self.canvas_pointer_down = false;
         }
@@ -2528,6 +2537,7 @@ impl FigView {
         {
             self.annotation_state.controller.freeze_move();
             self.measurement_controller.freeze_after_release_error();
+            self.end_gesture_perf("pointer_state_reset");
             self.primary_pressed = false;
             self.canvas_pointer_down = false;
         }
@@ -2557,6 +2567,7 @@ impl FigView {
         {
             self.annotation_state.controller.freeze_move();
             self.measurement_controller.freeze_after_release_error();
+            self.end_gesture_perf("pointer_state_reset");
             self.primary_pressed = false;
             self.canvas_pointer_down = false;
         }
@@ -2985,6 +2996,12 @@ impl FigView {
         });
 
         self.viewport = Some(viewport);
+        if is_preview_move
+            && content_changed
+            && let Some(perf) = &self.gesture_perf
+        {
+            perf.borrow_mut().content_preview_move();
+        }
         if content_changed {
             self.invalidate_canvas_cache();
         }
@@ -3186,6 +3203,7 @@ impl FigView {
             self.measurement_selection = None;
             self.invalidate_local_media_origin();
             self.comment_state.close_thread();
+            self.end_gesture_perf("tool_change");
             self.tools.activate_without_context(kind);
             self.remember_tool_face(kind);
             self.hovered_node = None;
@@ -3221,6 +3239,7 @@ impl FigView {
             }
             self.invalidate_local_media_origin();
             self.comment_state.close_thread();
+            self.end_gesture_perf("tool_change");
             self.tools.activate_without_context(kind);
             self.remember_tool_face(kind);
             self.hovered_node = None;
@@ -3238,6 +3257,7 @@ impl FigView {
         if kind.requires_editing() && !self.item.read(cx).is_editable() {
             return;
         }
+        self.end_gesture_perf("tool_change");
         self.measurement_selection = None;
         self.annotation_state.selection = None;
         if kind != ToolKind::Comment {
@@ -3490,6 +3510,33 @@ impl FigView {
         true
     }
 
+    fn begin_gesture_perf(&self, window: &Window, cx: &Context<Self>) {
+        let Some(perf) = &self.gesture_perf else {
+            return;
+        };
+        let document = self.item.read(cx).doc();
+        let context = crate::gesture_perf::GestureContext {
+            view_id: format!("{:?}", cx.entity_id()),
+            page_root: document
+                .and_then(|doc| doc.active_page())
+                .map(|id| id.to_string()),
+            tool: self.tools.kind().label().to_owned(),
+            selected_nodes: document
+                .map(|doc| doc.selection.iter().map(ToString::to_string).collect())
+                .unwrap_or_default(),
+            viewport_zoom: self.viewport.map(|viewport| viewport.zoom),
+            logical_canvas_size: self.container_bounds.map(bounds_size),
+            display_scale: window.scale_factor(),
+        };
+        perf.borrow_mut().begin(context);
+    }
+
+    fn end_gesture_perf(&self, reason: &'static str) {
+        if let Some(perf) = &self.gesture_perf {
+            perf.borrow_mut().end(reason);
+        }
+    }
+
     fn handle_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -3500,6 +3547,7 @@ impl FigView {
             // Set before any of the branches below can return early: the
             // autosave stands down for the whole gesture, including the text
             // and comment paths that never reach a tool.
+            self.end_gesture_perf("superseded_by_press");
             self.canvas_pointer_down = true;
         }
         if self.prototype_player.is_some() {
@@ -3575,6 +3623,9 @@ impl FigView {
             press_event(screen, button, event.modifiers, event.click_count),
             cx,
         );
+        if button == ToolButton::Primary && self.primary_pressed {
+            self.begin_gesture_perf(window, cx);
+        }
     }
 
     /// Track the space bar for hold-to-pan. Returns whether the key was the
@@ -3667,6 +3718,7 @@ impl FigView {
             return;
         }
         let Some(bounds) = self.container_bounds else {
+            self.end_gesture_perf("released_without_canvas_bounds");
             return;
         };
         self.primary_pressed = false;
@@ -3675,6 +3727,7 @@ impl FigView {
             release_event(screen, ToolButton::Primary, event.modifiers),
             cx,
         );
+        self.end_gesture_perf("released");
     }
 
     pub(crate) fn handle_window_mouse_move(
@@ -3702,6 +3755,14 @@ impl FigView {
         let Some(bounds) = self.container_bounds else {
             return;
         };
+        if let Some(perf) = &self.gesture_perf {
+            let mut perf = perf.borrow_mut();
+            if event.pressed_button != Some(MouseButton::Left) {
+                perf.end("pointer_button_lost");
+            } else {
+                perf.pointer_move();
+            }
+        }
         let screen = screen_position_in_bounds(event.position, bounds);
         self.dispatch_tool_event(move_event(screen, event.modifiers), cx);
     }
@@ -4120,6 +4181,7 @@ impl FigView {
     }
 
     fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
+        self.end_gesture_perf("escape");
         if self.cancel_annotation(None, cx) {
             return;
         }
@@ -5099,6 +5161,7 @@ impl FigView {
         self.prototype_drag_fired = false;
         self.prototype_suppress_click = false;
         self.prototype_link_notice = None;
+        self.end_gesture_perf("pointer_state_reset");
         self.primary_pressed = false;
         self.pan_last_position = None;
         self.hovered_node = None;
@@ -5392,6 +5455,7 @@ impl FigView {
         if item.source_edit_locked() && document.doc.active_page() != page.root {
             return;
         }
+        self.end_gesture_perf("page_change");
         // The edited node stays behind on the old page; end the session
         // before the canvas stops rendering it.
         self.finish_document_edits(cx);
@@ -9125,6 +9189,7 @@ impl Item for FigView {
                 viewport,
                 pan_last_position: None,
                 primary_pressed: false,
+                gesture_perf: crate::perf_enabled().then(crate::gesture_perf::GesturePerf::shared),
                 canvas_pointer_down: false,
                 autosave_task: None,
                 reported_save_failure: None,
@@ -14249,6 +14314,90 @@ mod tests {
                     );
                     assert_eq!(doc.history.undo_depth(), 0, "{guard}");
                     assert!(!item.is_dirty(), "{guard}");
+                });
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn mounted_gesture_perf_finishes_once_for_canvas_and_window_release(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::InputEvent as _;
+
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, _, images) = bitmap_canvas_doc();
+        let (item, view, mut visual) =
+            mounted_canvas_interaction_fixture(&project, doc, images, cx);
+        let before = item.read_with(&visual, |item, _| {
+            serde_json::to_value(&item.doc().expect("document").scene).expect("scene")
+        });
+        let perf = crate::gesture_perf::GesturePerf::shared();
+        view.update(&mut visual, |view, _| {
+            view.gesture_perf = Some(perf.clone())
+        });
+        let mut expected_summaries = 0;
+        for release_outside in [false, true] {
+            for repaint in [false, true] {
+                let bounds =
+                    view.read_with(&visual, |view, _| view.container_bounds.expect("canvas"));
+                let start = bounds.origin + point(px(45.0), px(45.0));
+                let end = if release_outside {
+                    bounds.origin - point(px(5.0), px(5.0))
+                } else {
+                    start + point(px(5.0), px(5.0))
+                };
+                visual.update(|window, cx| {
+                    window.dispatch_event(
+                        MouseDownEvent {
+                            position: start,
+                            button: MouseButton::Left,
+                            modifiers: gpui::Modifiers::none(),
+                            click_count: 1,
+                            first_mouse: false,
+                        }
+                        .to_platform_input(),
+                        cx,
+                    );
+                    assert!(perf.borrow().has_active_gesture());
+                    window.dispatch_event(
+                        MouseMoveEvent {
+                            position: end,
+                            pressed_button: Some(MouseButton::Left),
+                            modifiers: gpui::Modifiers::none(),
+                        }
+                        .to_platform_input(),
+                        cx,
+                    );
+                    if repaint {
+                        window.draw(cx).clear();
+                    }
+                    for _ in 0..2 {
+                        window.dispatch_event(
+                            MouseUpEvent {
+                                position: end,
+                                button: MouseButton::Left,
+                                modifiers: gpui::Modifiers::none(),
+                                click_count: 1,
+                            }
+                            .to_platform_input(),
+                            cx,
+                        );
+                    }
+                });
+                visual.run_until_parked();
+                expected_summaries += 1;
+                assert_eq!(perf.borrow().summary_count(), expected_summaries);
+                assert!(!perf.borrow().has_active_gesture());
+                view.read_with(&visual, |view, _| assert!(!view.primary_pressed));
+                item.read_with(&visual, |item, _| {
+                    let document = item.doc().expect("document");
+                    assert_eq!(
+                        serde_json::to_value(&document.scene).expect("scene"),
+                        before
+                    );
+                    assert_eq!(document.history.undo_depth(), 0);
                 });
             }
         }
