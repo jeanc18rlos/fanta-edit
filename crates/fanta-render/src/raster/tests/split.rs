@@ -3477,3 +3477,649 @@ fn split_atomic_instances_preserve_internal_masks_blends_and_wrapper_effects() {
         }
     }
 }
+
+fn retained_image_pixels(image: &skia_safe::Image) -> Vec<u8> {
+    let mut output = surface();
+    output.canvas().draw_image(image, (0, 0), None);
+    pixels(&mut output)
+}
+
+fn assert_retained_frame(
+    session: &mut RetainedTranslationSession,
+    renderer: &mut RasterRenderer,
+    normal: &mut RasterRenderer,
+    doc: &Doc,
+    page: NodeId,
+    viewport: &Viewport,
+    resolver: Option<&dyn AssetResolver>,
+) -> RetainedFrameMetrics {
+    let before = serde_json::to_value(doc).expect("source before render");
+    let frame = session
+        .render(
+            renderer,
+            &doc.scene,
+            viewport,
+            &RenderInputs::for_doc(doc),
+            resolver,
+            0,
+        )
+        .expect("eligible retained translation");
+    let actual = retained_image_pixels(&frame.image);
+    let mut expected = surface();
+    let normal_metrics = normal.render_to_canvas(
+        expected.canvas(),
+        WIDTH,
+        HEIGHT,
+        &doc.scene,
+        viewport,
+        Some(page),
+        &RenderInputs::for_doc(doc),
+    );
+    assert!(!normal_metrics.incomplete_artwork && !normal_metrics.effect_failed);
+    let expected = pixels(&mut expected);
+    let maximum = actual
+        .iter()
+        .zip(&expected)
+        .map(|(left, right)| left.abs_diff(*right))
+        .max()
+        .expect("pixels");
+    assert!(maximum <= 2, "retained/full maximum difference {maximum}");
+    assert_eq!(
+        serde_json::to_value(doc).expect("source after render"),
+        before
+    );
+    assert_eq!(frame.metrics.middle.instance_indexes_built, 0);
+    frame.metrics
+}
+
+#[test]
+fn retained_translations_match_full_render_with_atomic_screen_and_closed_masks() {
+    for scale in [1.0, 2.0] {
+        for zoom in [0.13, 0.73, 1.0] {
+            let (mut doc, page, parent, moving) = fixture(false, Color::rgb(35, 10, 60));
+            let above = add(
+                &mut doc,
+                Some(parent),
+                rectangle(Color::rgba(20, 180, 220, 190)),
+                6.0,
+                1.0,
+            );
+            doc.scene.get_mut(above).expect("screen").blend_mode = BlendMode::Screen;
+            let mask_group = add(
+                &mut doc,
+                Some(page),
+                NodeData::Group(GroupNode::default()),
+                12.0,
+                12.0,
+            );
+            let mask = add(
+                &mut doc,
+                Some(mask_group),
+                rectangle(Color::WHITE),
+                0.0,
+                0.0,
+            );
+            doc.scene.get_mut(mask).expect("mask").is_mask = true;
+            add(
+                &mut doc,
+                Some(mask_group),
+                rectangle(Color::rgba(240, 80, 20, 100)),
+                8.0,
+                8.0,
+            );
+            let viewport = Viewport {
+                center: [0.375, -0.625],
+                zoom,
+            };
+            let mut renderer = RasterRenderer::new(WIDTH, HEIGHT).expect("renderer");
+            let mut normal = RasterRenderer::new(WIDTH, HEIGHT).expect("normal");
+            renderer.display_scale = scale;
+            normal.display_scale = scale;
+            let before = serde_json::to_value(&doc).expect("before prepare");
+            let mut session = RetainedTranslationSession::prepare(
+                &mut renderer,
+                &doc.scene,
+                page,
+                moving,
+                &viewport,
+                &RenderInputs::for_doc(&doc),
+                None,
+                0,
+            )
+            .expect("retained plan");
+            assert_eq!(serde_json::to_value(&doc).expect("after prepare"), before);
+            for (index, [x, y]) in [
+                [-10.0, -12.0],
+                [12.25, -4.75],
+                [-21.5, 11.125],
+                [-10.0, -12.0],
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                doc.scene
+                    .set_transform(moving, Transform2D::translation(x, y))
+                    .expect("translate");
+                let metrics = assert_retained_frame(
+                    &mut session,
+                    &mut renderer,
+                    &mut normal,
+                    &doc,
+                    page,
+                    &viewport,
+                    None,
+                );
+                if index > 0 {
+                    assert_eq!(metrics.middle.paths_built, 0, "translation reuses geometry");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn retained_translations_accept_unused_master_and_placed_instance_preview_revisions() {
+    for selected_is_master in [false, true] {
+        let (mut doc, page) = instance_page();
+        let owner = add(
+            &mut doc,
+            Some(page),
+            NodeData::Group(GroupNode {
+                clip_size: Some([80.0, 60.0]),
+                ..Default::default()
+            }),
+            -40.0,
+            -30.0,
+        );
+        let (leaf, _) = solid_master(&mut doc, Color::rgb(240, 30, 90));
+        let placed = add(
+            &mut doc,
+            Some(owner),
+            NodeData::Instance(whole_instance(leaf, [20.0, 20.0])),
+            5.0,
+            7.0,
+        );
+        let owner_component = fanta_doc::ComponentId::new();
+        doc.components.defs.insert(
+            owner_component,
+            fanta_doc::ComponentDef::new(owner_component, owner, "Unused owner"),
+        );
+        let moving = if selected_is_master { owner } else { placed };
+        let initial = doc.scene.get(moving).expect("moving").transform;
+        let viewport = Viewport::default();
+        let mut renderer = RasterRenderer::new(WIDTH, HEIGHT).expect("renderer");
+        let mut normal = RasterRenderer::new(WIDTH, HEIGHT).expect("normal");
+        let mut session = RetainedTranslationSession::prepare(
+            &mut renderer,
+            &doc.scene,
+            page,
+            moving,
+            &viewport,
+            &RenderInputs::for_doc(&doc),
+            None,
+            0,
+        )
+        .expect("unused master is eligible");
+        for offset in [0.0, 4.25, -12.5, 0.0] {
+            doc.scene
+                .set_transform(
+                    moving,
+                    initial.then(&Transform2D::translation(offset, 3.5 * offset)),
+                )
+                .expect("move");
+            assert_eq!(doc.components.bump_preview_for_node(&doc.scene, moving), 1);
+            assert_retained_frame(
+                &mut session,
+                &mut renderer,
+                &mut normal,
+                &doc,
+                page,
+                &viewport,
+                None,
+            );
+        }
+        assert_eq!(doc.components.defs[&owner_component].rev, 0);
+    }
+}
+
+#[test]
+fn retained_translations_reject_static_direct_and_nested_component_consumers() {
+    for nested in [false, true] {
+        let (mut doc, page) = instance_page();
+        let master = add(
+            &mut doc,
+            Some(page),
+            NodeData::Group(GroupNode {
+                clip_size: Some([50.0, 45.0]),
+                ..Default::default()
+            }),
+            -75.0,
+            -30.0,
+        );
+        let moving = add(
+            &mut doc,
+            Some(master),
+            rectangle(Color::rgb(220, 50, 20)),
+            0.0,
+            0.0,
+        );
+        let component = fanta_doc::ComponentId::new();
+        doc.components.defs.insert(
+            component,
+            fanta_doc::ComponentDef::new(component, master, "Consumed master"),
+        );
+        let consumer = if nested {
+            let outer_root = add(
+                &mut doc,
+                None,
+                NodeData::Group(GroupNode {
+                    clip_size: Some([50.0, 45.0]),
+                    ..Default::default()
+                }),
+                5000.0,
+                5000.0,
+            );
+            add(
+                &mut doc,
+                Some(outer_root),
+                NodeData::Instance(whole_instance(component, [50.0, 45.0])),
+                0.0,
+                0.0,
+            );
+            let outer = fanta_doc::ComponentId::new();
+            doc.components.defs.insert(
+                outer,
+                fanta_doc::ComponentDef::new(outer, outer_root, "Nested consumer"),
+            );
+            outer
+        } else {
+            component
+        };
+        add(
+            &mut doc,
+            Some(page),
+            NodeData::Instance(whole_instance(consumer, [50.0, 45.0])),
+            20.0,
+            -30.0,
+        );
+        let before = serde_json::to_value(&doc).expect("before");
+        let mut renderer = RasterRenderer::new(WIDTH, HEIGHT).expect("renderer");
+        assert!(matches!(RetainedTranslationSession::prepare(
+            &mut renderer, &doc.scene, page, moving, &Viewport::default(), &RenderInputs::for_doc(&doc), None, 0,
+        ), Err(RetainedError::DependentComponent(id)) if id == component));
+        assert_eq!(serde_json::to_value(&doc).expect("after"), before);
+        let mut first = surface();
+        renderer.render_to_canvas(
+            first.canvas(),
+            WIDTH,
+            HEIGHT,
+            &doc.scene,
+            &Viewport::default(),
+            Some(page),
+            &RenderInputs::for_doc(&doc),
+        );
+        let first = pixels(&mut first);
+        doc.scene
+            .set_transform(moving, Transform2D::translation(14.0, 9.0))
+            .expect("edit master");
+        doc.components.bump_preview_for_node(&doc.scene, moving);
+        let mut second = surface();
+        renderer.render_to_canvas(
+            second.canvas(),
+            WIDTH,
+            HEIGHT,
+            &doc.scene,
+            &Viewport::default(),
+            Some(page),
+            &RenderInputs::for_doc(&doc),
+        );
+        let second = pixels(&mut second);
+        let right_half_changed = first
+            .chunks_exact(4)
+            .zip(second.chunks_exact(4))
+            .enumerate()
+            .any(|(index, (left, right))| {
+                index % WIDTH as usize > WIDTH as usize / 2 && left != right
+            });
+        assert!(
+            right_half_changed,
+            "static consumer's artwork really changes"
+        );
+    }
+}
+
+#[test]
+fn retained_translations_refuse_semantic_registry_edits_and_disable_after_failure() {
+    for mutation in [
+        "name",
+        "committed_rev",
+        "unrelated_preview",
+        "mode_generation",
+        "payload",
+        "other_transform",
+        "resize",
+        "font",
+        "viewport",
+        "linear",
+        "clone",
+    ] {
+        let (mut doc, page, parent, moving) = fixture(false, Color::BLACK);
+        let (component, _) = solid_master(&mut doc, Color::WHITE);
+        let viewport = Viewport::default();
+        let mut renderer = RasterRenderer::new(WIDTH, HEIGHT).expect("renderer");
+        let mut session = RetainedTranslationSession::prepare(
+            &mut renderer,
+            &doc.scene,
+            page,
+            moving,
+            &viewport,
+            &RenderInputs::for_doc(&doc),
+            None,
+            0,
+        )
+        .expect("prepare");
+        let mut mode_generation = 0;
+        let mut font_generation = 0;
+        let mut changed_viewport = viewport;
+        match mutation {
+            "name" => doc
+                .components
+                .defs
+                .get_mut(&component)
+                .expect("def")
+                .name
+                .push('!'),
+            "committed_rev" => doc.components.defs.get_mut(&component).expect("def").rev += 1,
+            "unrelated_preview" => {
+                doc.components
+                    .defs
+                    .get_mut(&component)
+                    .expect("def")
+                    .preview_rev += 1
+            }
+            "mode_generation" => mode_generation = 1,
+            "payload" => doc.scene.get_mut(moving).expect("node").opacity = UnitInterval::new(0.5),
+            "other_transform" => doc
+                .scene
+                .set_transform(parent, Transform2D::translation(1.0, 2.0))
+                .expect("parent"),
+            "resize" => renderer.resize(WIDTH + 1, HEIGHT).expect("resize"),
+            "font" => font_generation = 1,
+            "viewport" => changed_viewport.zoom = 1.01,
+            "linear" => doc
+                .scene
+                .set_transform(moving, Transform2D::scale(1.1))
+                .expect("scale"),
+            "clone" => doc.scene = doc.scene.clone(),
+            _ => unreachable!("table"),
+        }
+        let mut inputs = RenderInputs::for_doc(&doc);
+        inputs.mode_generation = mode_generation;
+        assert!(
+            session
+                .render(
+                    &mut renderer,
+                    &doc.scene,
+                    &changed_viewport,
+                    &inputs,
+                    None,
+                    font_generation
+                )
+                .is_err(),
+            "{mutation}"
+        );
+        assert!(
+            matches!(
+                session.render(
+                    &mut renderer,
+                    &doc.scene,
+                    &changed_viewport,
+                    &inputs,
+                    None,
+                    font_generation
+                ),
+                Err(RetainedError::Disabled)
+            ),
+            "{mutation}"
+        );
+    }
+}
+
+#[test]
+fn retained_translations_validate_asset_pixel_identity_even_with_the_same_resolver() {
+    use std::sync::Mutex;
+    struct Resolver {
+        image: Mutex<Option<crate::DecodedImage>>,
+    }
+    impl AssetResolver for Resolver {
+        fn resolve(&self, _id: fanta_doc::AssetId) -> Option<crate::DecodedImage> {
+            self.image.lock().expect("resolver").clone()
+        }
+    }
+    let (mut doc, page) = instance_page();
+    let asset = fanta_doc::AssetId::new();
+    let moving = add(
+        &mut doc,
+        Some(page),
+        NodeData::Bitmap(BitmapNode {
+            asset,
+            natural_size: [1, 1],
+            local_size: [40.0, 30.0],
+            crop: None,
+            fit: fanta_doc::ImageFitMode::Fill,
+            tint: None,
+        }),
+        -20.0,
+        -15.0,
+    );
+    let original = crate::DecodedImage::new(Arc::new(vec![230, 20, 80, 255]), 1, 1);
+    let resolver = Arc::new(Resolver {
+        image: Mutex::new(Some(original)),
+    });
+    let viewport = Viewport::default();
+    let mut renderer = RasterRenderer::new(WIDTH, HEIGHT).expect("renderer");
+    renderer.set_asset_resolver(resolver.clone());
+    let mut normal = RasterRenderer::new(WIDTH, HEIGHT).expect("normal");
+    normal.set_asset_resolver(resolver.clone());
+    let mut session = RetainedTranslationSession::prepare(
+        &mut renderer,
+        &doc.scene,
+        page,
+        moving,
+        &viewport,
+        &RenderInputs::for_doc(&doc),
+        Some(resolver.as_ref()),
+        0,
+    )
+    .expect("prepare");
+    doc.scene
+        .set_transform(moving, Transform2D::translation(5.0, 6.0))
+        .expect("move");
+    assert_retained_frame(
+        &mut session,
+        &mut renderer,
+        &mut normal,
+        &doc,
+        page,
+        &viewport,
+        Some(resolver.as_ref()),
+    );
+    *resolver.image.lock().expect("resolver") = Some(crate::DecodedImage::new(
+        Arc::new(vec![20, 230, 80, 255]),
+        1,
+        1,
+    ));
+    assert!(
+        matches!(session.render(&mut renderer,&doc.scene,&viewport,&RenderInputs::for_doc(&doc),Some(resolver.as_ref()),0),Err(RetainedError::ChangedAsset(id)) if id==asset)
+    );
+}
+
+#[test]
+fn retained_translations_keep_resolved_mode_bindings_and_reject_unversioned_changes() {
+    for pinned_dark in [false, true] {
+        let (mut doc, page) = instance_page();
+        let theme = add_instance_theme(&mut doc);
+        let (component, master) = solid_master(&mut doc, Color::rgb(220, 30, 90));
+        doc.scene
+            .get_mut(master)
+            .expect("master")
+            .bindings
+            .insert(fanta_doc::BoundProp::FillColor { index: 0 }, theme.color);
+        let mut group = GroupNode::default();
+        if pinned_dark {
+            group.explicit_modes.insert(theme.collection, theme.dark);
+        }
+        let parent = add(&mut doc, Some(page), NodeData::Group(group), 0.0, 0.0);
+        let moving = add(
+            &mut doc,
+            Some(parent),
+            NodeData::Instance(whole_instance(component, [20.0, 20.0])),
+            -10.0,
+            -10.0,
+        );
+        let viewport = Viewport::default();
+        let mut renderer = RasterRenderer::new(WIDTH, HEIGHT).expect("renderer");
+        let mut normal = RasterRenderer::new(WIDTH, HEIGHT).expect("normal");
+        let mut session = RetainedTranslationSession::prepare(
+            &mut renderer,
+            &doc.scene,
+            page,
+            moving,
+            &viewport,
+            &RenderInputs::for_doc(&doc),
+            None,
+            0,
+        )
+        .expect("bound instance");
+        doc.scene
+            .set_transform(moving, Transform2D::translation(-5.0, -10.0))
+            .expect("move");
+        assert_retained_frame(
+            &mut session,
+            &mut renderer,
+            &mut normal,
+            &doc,
+            page,
+            &viewport,
+            None,
+        );
+        let frame = session
+            .render(
+                &mut renderer,
+                &doc.scene,
+                &viewport,
+                &RenderInputs::for_doc(&doc),
+                None,
+                0,
+            )
+            .expect("same frame");
+        let pixels = retained_image_pixels(&frame.image);
+        let offset = ((HEIGHT / 2 * WIDTH + WIDTH / 2) * 4) as usize;
+        assert_eq!(
+            &pixels[offset..offset + 4],
+            if pinned_dark {
+                &[0, 0, 255, 255]
+            } else {
+                &[255, 255, 255, 255]
+            }
+        );
+        doc.variables
+            .variables
+            .get_mut(&theme.color)
+            .expect("variable")
+            .values_by_mode
+            .insert(
+                if pinned_dark { theme.dark } else { theme.light },
+                fanta_doc::VarValue::Color {
+                    value: Color::rgb(10, 230, 50),
+                },
+            );
+        assert!(
+            matches!(
+                session.render(
+                    &mut renderer,
+                    &doc.scene,
+                    &viewport,
+                    &RenderInputs::for_doc(&doc),
+                    None,
+                    0
+                ),
+                Err(RetainedError::ChangedInputs)
+            ),
+            "unchanged generation is not enough"
+        );
+    }
+}
+
+#[test]
+fn retained_frame_images_stay_immutable_after_later_success_and_refusal() {
+    let (mut doc, page, parent, moving) = fixture(false, Color::BLACK);
+    let viewport = Viewport::default();
+    let mut renderer = RasterRenderer::new(WIDTH, HEIGHT).expect("renderer");
+    let mut session = RetainedTranslationSession::prepare(
+        &mut renderer,
+        &doc.scene,
+        page,
+        moving,
+        &viewport,
+        &RenderInputs::for_doc(&doc),
+        None,
+        0,
+    )
+    .expect("prepare");
+    let first = session
+        .render(
+            &mut renderer,
+            &doc.scene,
+            &viewport,
+            &RenderInputs::for_doc(&doc),
+            None,
+            0,
+        )
+        .expect("first");
+    let first_pixels = retained_image_pixels(&first.image);
+    doc.scene
+        .set_transform(moving, Transform2D::translation(45.0, 30.0))
+        .expect("move");
+    let second = session
+        .render(
+            &mut renderer,
+            &doc.scene,
+            &viewport,
+            &RenderInputs::for_doc(&doc),
+            None,
+            0,
+        )
+        .expect("second");
+    let second_pixels = retained_image_pixels(&second.image);
+    assert_ne!(
+        first_pixels, second_pixels,
+        "the move produces different artwork"
+    );
+    assert_eq!(
+        retained_image_pixels(&first.image),
+        first_pixels,
+        "successful reuse cannot overwrite a returned snapshot"
+    );
+    doc.scene
+        .set_transform(parent, Transform2D::translation(90.0, 0.0))
+        .expect("invalidate ancestor");
+    assert!(
+        session
+            .render(
+                &mut renderer,
+                &doc.scene,
+                &viewport,
+                &RenderInputs::for_doc(&doc),
+                None,
+                0
+            )
+            .is_err()
+    );
+    assert_eq!(retained_image_pixels(&first.image), first_pixels);
+    assert_eq!(
+        retained_image_pixels(&second.image),
+        second_pixels,
+        "refusal preserves the last published image"
+    );
+}

@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -103,12 +104,13 @@ pub struct SplitSpec<'inputs> {
     requires_ordered_paint: bool,
     atoms: HashMap<NodeId, PaintAtom>,
     assets: FrozenAssets,
-    components: &'inputs ComponentLibrary,
-    variables: &'inputs VariableRegistry,
-    active_modes: &'inputs BTreeMap<VariableCollectionId, ModeId>,
+    components: Cow<'inputs, ComponentLibrary>,
+    variables: Cow<'inputs, VariableRegistry>,
+    active_modes: Cow<'inputs, BTreeMap<VariableCollectionId, ModeId>>,
     mode_generation: u64,
     dark_ui: bool,
     instances: HashMap<NodeId, Arc<PreparedInstance>>,
+    used_components: HashSet<ComponentId>,
     prepared_nodes: usize,
     max_prepared_nodes: usize,
     max_prepared_depth: usize,
@@ -159,12 +161,13 @@ impl<'inputs> SplitSpec<'inputs> {
             requires_ordered_paint: false,
             atoms: HashMap::new(),
             assets: FrozenAssets::default(),
-            components: inputs.components,
-            variables: inputs.variables,
-            active_modes: inputs.active_modes,
+            components: Cow::Borrowed(inputs.components),
+            variables: Cow::Borrowed(inputs.variables),
+            active_modes: Cow::Borrowed(inputs.active_modes),
             mode_generation: inputs.mode_generation,
             dark_ui: inputs.dark_ui,
             instances: HashMap::new(),
+            used_components: HashSet::new(),
             prepared_nodes: 0,
             max_prepared_nodes,
             max_prepared_depth,
@@ -208,6 +211,40 @@ impl<'inputs> SplitSpec<'inputs> {
         Ok(spec)
     }
 
+    fn into_owned(self) -> SplitSpec<'static> {
+        SplitSpec {
+            scene_instance: self.scene_instance,
+            scene_revision: self.scene_revision,
+            page_root: self.page_root,
+            requires_ordered_paint: self.requires_ordered_paint,
+            atoms: self.atoms,
+            assets: self.assets,
+            components: Cow::Owned(self.components.into_owned()),
+            variables: Cow::Owned(self.variables.into_owned()),
+            active_modes: Cow::Owned(self.active_modes.into_owned()),
+            mode_generation: self.mode_generation,
+            dark_ui: self.dark_ui,
+            instances: self.instances,
+            used_components: self.used_components,
+            prepared_nodes: self.prepared_nodes,
+            max_prepared_nodes: self.max_prepared_nodes,
+            max_prepared_depth: self.max_prepared_depth,
+        }
+    }
+
+    fn owned_inputs(&self) -> RenderInputs<'_> {
+        RenderInputs {
+            components: self.components.as_ref(),
+            variables: self.variables.as_ref(),
+            active_modes: self.active_modes.as_ref(),
+            mode_generation: self.mode_generation,
+            dark_ui: self.dark_ui,
+            motion: None,
+            playback: None,
+            video_fill_frames: None,
+        }
+    }
+
     pub fn page_root(&self) -> NodeId {
         self.page_root
     }
@@ -223,9 +260,9 @@ impl<'inputs> SplitSpec<'inputs> {
             return Err(SplitError::StaleScene);
         }
         validate_inputs(inputs)?;
-        if !std::ptr::eq(self.components, inputs.components)
-            || !std::ptr::eq(self.variables, inputs.variables)
-            || !std::ptr::eq(self.active_modes, inputs.active_modes)
+        if !std::ptr::eq(self.components.as_ref(), inputs.components)
+            || !std::ptr::eq(self.variables.as_ref(), inputs.variables)
+            || !std::ptr::eq(self.active_modes.as_ref(), inputs.active_modes)
             || self.mode_generation != inputs.mode_generation
             || self.dark_ui != inputs.dark_ui
         {
@@ -285,13 +322,22 @@ impl<'inputs> SplitSpec<'inputs> {
         components_on_path: &mut Vec<ComponentId>,
         resolver: Option<&dyn AssetResolver>,
     ) -> Result<(), SplitError> {
-        let context = InstanceExpansionContext::new(self.variables, self.active_modes, mode_anchor);
-        let selected =
-            fanta_doc::resolved_component_with_context(scene, self.components, instance, &context)
-                .ok_or(SplitError::MissingInstance {
-                    instance: instance_id,
-                    component: instance.component,
-                })?;
+        let context = InstanceExpansionContext::new(
+            self.variables.as_ref(),
+            self.active_modes.as_ref(),
+            mode_anchor,
+        );
+        let selected = fanta_doc::resolved_component_with_context(
+            scene,
+            self.components.as_ref(),
+            instance,
+            &context,
+        )
+        .ok_or(SplitError::MissingInstance {
+            instance: instance_id,
+            component: instance.component,
+        })?;
+        self.used_components.insert(selected.resolved_component);
         if components_on_path.contains(&selected.resolved_component) {
             return Err(SplitError::RecursiveInstance(selected.resolved_component));
         }
@@ -318,8 +364,12 @@ impl<'inputs> SplitSpec<'inputs> {
                     .map(|child| (child, node_depth + 1)),
             );
         }
-        let nodes =
-            fanta_doc::expand_instance_with_context(scene, self.components, instance, &context);
+        let nodes = fanta_doc::expand_instance_with_context(
+            scene,
+            self.components.as_ref(),
+            instance,
+            &context,
+        );
         // Reject invalid resolved geometry before it can reach text shaping or layout.
         for entry in &nodes {
             self.validate_node(&entry.node, resolver)
@@ -612,6 +662,415 @@ impl<'inputs> SplitSpec<'inputs> {
     }
 }
 
+const RETAINED_PIXEL_AND_PICTURE_BUDGET: usize = 256 * 1024 * 1024;
+
+#[derive(Clone, Debug, thiserror::Error)]
+pub enum RetainedError {
+    #[error(transparent)]
+    Split(#[from] SplitError),
+    #[error("retained translation has already been disabled after a failed frame")]
+    Disabled,
+    #[error("retained translation requires only the selected root's finite translation to change")]
+    ChangedScene,
+    #[error("moving this master changes prepared component {0}")]
+    DependentComponent(ComponentId),
+    #[error("retained translation requires unchanged component definitions, modes and variables")]
+    ChangedInputs,
+    #[error(
+        "retained translation requires unchanged viewport, dimensions, scale, background and fonts"
+    )]
+    ChangedFrame,
+    #[error("retained image {0} changed or became unavailable")]
+    ChangedAsset(AssetId),
+    #[error("retained pixel and picture storage exceeds its {limit} byte budget")]
+    MemoryLimit { limit: usize },
+    #[error("could not allocate or record a retained frame")]
+    Allocation,
+    #[error("retained painting reported incomplete artwork or an effect failure")]
+    IncompleteArtwork,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RetainedBuildMetrics {
+    pub prepare_micros: u64,
+    pub below_micros: u64,
+    pub above_record_micros: u64,
+    pub surface_bytes: usize,
+    pub frozen_pixel_bytes: usize,
+    pub picture_bytes: usize,
+    pub prepared_nodes: usize,
+    pub prepared_instances: usize,
+    pub below: super::RenderMetrics,
+    pub above: super::RenderMetrics,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct RetainedFrameMetrics {
+    pub validation_micros: u64,
+    pub below_copy_micros: u64,
+    pub middle_micros: u64,
+    pub above_replay_micros: u64,
+    pub frame_micros: u64,
+    pub middle: super::RenderMetrics,
+}
+
+pub struct RetainedFrame {
+    pub image: skia_safe::Image,
+    pub metrics: RetainedFrameMetrics,
+}
+
+/// An opt-in CPU experiment for one fixed-view translation gesture. It owns
+/// its frame canvas so cached device-space paint cannot be replayed under a
+/// different caller matrix or clip. It is not connected to the live worker.
+/// Any failed frame disables reuse until the caller prepares a new session.
+///
+/// `font_generation` must change whenever the caller's font environment does.
+/// The storage budget covers two pixel surfaces, retained decoded images and
+/// recorded Picture bytes; the existing prepared node/depth limits apply too.
+/// Picture accounting is approximate and does not bound total Skia scratch
+/// memory. Callers must release old frame images to avoid snapshot copies.
+pub struct RetainedTranslationSession {
+    spec: SplitSpec<'static>,
+    moving: NodeId,
+    original_transform: fanta_doc::Transform2D,
+    preview_components: HashSet<ComponentId>,
+    viewport: fanta_doc::Viewport,
+    size: (u32, u32),
+    display_scale: f64,
+    background: fanta_doc::Color,
+    pixel_snap_pan: bool,
+    font_generation: u64,
+    below: skia_safe::Image,
+    above: skia_safe::Picture,
+    output: skia_safe::Surface,
+    build_metrics: RetainedBuildMetrics,
+    disabled: bool,
+}
+
+impl RetainedTranslationSession {
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare(
+        renderer: &mut super::RasterRenderer,
+        scene: &Scene,
+        page_root: NodeId,
+        moving: NodeId,
+        viewport: &fanta_doc::Viewport,
+        inputs: &RenderInputs,
+        resolver: Option<&dyn AssetResolver>,
+        font_generation: u64,
+    ) -> Result<Self, RetainedError> {
+        Self::prepare_with_budget(
+            renderer,
+            scene,
+            page_root,
+            moving,
+            viewport,
+            inputs,
+            resolver,
+            font_generation,
+            RETAINED_PIXEL_AND_PICTURE_BUDGET,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_with_budget(
+        renderer: &mut super::RasterRenderer,
+        scene: &Scene,
+        page_root: NodeId,
+        moving: NodeId,
+        viewport: &fanta_doc::Viewport,
+        inputs: &RenderInputs,
+        resolver: Option<&dyn AssetResolver>,
+        font_generation: u64,
+        byte_limit: usize,
+    ) -> Result<Self, RetainedError> {
+        let started = std::time::Instant::now();
+        let size = (renderer.width(), renderer.height());
+        let surface_bytes = (size.0 as usize)
+            .checked_mul(size.1 as usize)
+            .and_then(|pixels| pixels.checked_mul(8))
+            .filter(|bytes| *bytes <= byte_limit)
+            .ok_or(RetainedError::MemoryLimit { limit: byte_limit })?;
+        if size.0 == 0 || size.1 == 0 || size.0 > i32::MAX as u32 || size.1 > i32::MAX as u32 {
+            return Err(SplitError::InvalidViewport.into());
+        }
+        let spec = SplitSpec::prepare(scene, page_root, moving, inputs, resolver)?.into_owned();
+        let original_transform = scene.get(moving).ok_or(SplitError::InvalidRoots)?.transform;
+        let mut chain: HashSet<_> = scene.ancestors_of(moving).map(|node| node.id).collect();
+        chain.insert(moving);
+        let preview_components: HashSet<_> = inputs
+            .components
+            .defs
+            .iter()
+            .filter_map(|(id, definition)| chain.contains(&definition.root).then_some(*id))
+            .collect();
+        if let Some(dependency) = preview_components
+            .intersection(&spec.used_components)
+            .next()
+        {
+            return Err(RetainedError::DependentComponent(*dependency));
+        }
+        let frozen_pixel_bytes = spec
+            .assets
+            .0
+            .values()
+            .try_fold(0usize, |total, image| {
+                total.checked_add(image.pixels_rgba.len())
+            })
+            .ok_or(RetainedError::MemoryLimit { limit: byte_limit })?;
+        let retained_bytes = surface_bytes
+            .checked_add(frozen_pixel_bytes)
+            .filter(|bytes| *bytes <= byte_limit)
+            .ok_or(RetainedError::MemoryLimit { limit: byte_limit })?;
+        let prepared_nodes = spec.prepared_node_count();
+        let prepared_instances = spec.prepared_instance_count();
+        let prepare_micros = elapsed_micros(started);
+        let owned_inputs = spec.owned_inputs();
+        let mut below_surface =
+            skia_safe::surfaces::raster_n32_premul((size.0 as i32, size.1 as i32))
+                .ok_or(RetainedError::Allocation)?;
+        let below_started = std::time::Instant::now();
+        let below_metrics = renderer.paint_split_to_canvas(
+            below_surface.canvas(),
+            size.0,
+            size.1,
+            scene,
+            viewport,
+            &owned_inputs,
+            &spec,
+            SplitPhase::Below,
+        )?;
+        require_complete(&below_metrics)?;
+        let below = below_surface.image_snapshot();
+        let below_micros = elapsed_micros(below_started);
+        let mut recorder = skia_safe::PictureRecorder::new();
+        let recording =
+            recorder.begin_recording(skia_safe::Rect::from_wh(size.0 as f32, size.1 as f32), None);
+        let above_started = std::time::Instant::now();
+        let above_metrics = renderer.paint_split_to_canvas(
+            recording,
+            size.0,
+            size.1,
+            scene,
+            viewport,
+            &owned_inputs,
+            &spec,
+            SplitPhase::Above,
+        )?;
+        require_complete(&above_metrics)?;
+        let above = recorder
+            .finish_recording_as_picture(None)
+            .ok_or(RetainedError::Allocation)?;
+        let above_record_micros = elapsed_micros(above_started);
+        let picture_bytes = above.approximate_bytes_used();
+        retained_bytes
+            .checked_add(picture_bytes)
+            .filter(|bytes| *bytes <= byte_limit)
+            .ok_or(RetainedError::MemoryLimit { limit: byte_limit })?;
+        let output = skia_safe::surfaces::raster_n32_premul((size.0 as i32, size.1 as i32))
+            .ok_or(RetainedError::Allocation)?;
+        Ok(Self {
+            spec,
+            moving,
+            original_transform,
+            preview_components,
+            viewport: *viewport,
+            size,
+            display_scale: renderer.display_scale,
+            background: renderer.background,
+            pixel_snap_pan: renderer.pixel_snap_pan(),
+            font_generation,
+            below,
+            above,
+            output,
+            build_metrics: RetainedBuildMetrics {
+                prepare_micros,
+                below_micros,
+                above_record_micros,
+                surface_bytes,
+                frozen_pixel_bytes,
+                picture_bytes,
+                prepared_nodes,
+                prepared_instances,
+                below: below_metrics,
+                above: above_metrics,
+            },
+            disabled: false,
+        })
+    }
+
+    pub fn build_metrics(&self) -> &RetainedBuildMetrics {
+        &self.build_metrics
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn render(
+        &mut self,
+        renderer: &mut super::RasterRenderer,
+        scene: &Scene,
+        viewport: &fanta_doc::Viewport,
+        inputs: &RenderInputs,
+        resolver: Option<&dyn AssetResolver>,
+        font_generation: u64,
+    ) -> Result<RetainedFrame, RetainedError> {
+        if self.disabled {
+            return Err(RetainedError::Disabled);
+        }
+        let result =
+            self.render_checked(renderer, scene, viewport, inputs, resolver, font_generation);
+        if result.is_err() {
+            self.disabled = true;
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_checked(
+        &mut self,
+        renderer: &mut super::RasterRenderer,
+        scene: &Scene,
+        viewport: &fanta_doc::Viewport,
+        inputs: &RenderInputs,
+        resolver: Option<&dyn AssetResolver>,
+        font_generation: u64,
+    ) -> Result<RetainedFrame, RetainedError> {
+        let started = std::time::Instant::now();
+        validate_inputs(inputs)?;
+        if self.size != (renderer.width(), renderer.height())
+            || self.viewport.center != viewport.center
+            || self.viewport.zoom != viewport.zoom
+            || self.display_scale != renderer.display_scale
+            || self.background != renderer.background
+            || self.pixel_snap_pan != renderer.pixel_snap_pan()
+            || self.font_generation != font_generation
+        {
+            return Err(RetainedError::ChangedFrame);
+        }
+        if self.spec.scene_instance != scene.instance_id() {
+            return Err(RetainedError::ChangedScene);
+        }
+        let delta = scene
+            .changes_since(self.spec.scene_revision)
+            .ok_or(RetainedError::ChangedScene)?;
+        if !delta.nodes.is_empty() || delta.transforms.iter().any(|id| *id != self.moving) {
+            return Err(RetainedError::ChangedScene);
+        }
+        let transform = scene
+            .get(self.moving)
+            .ok_or(RetainedError::ChangedScene)?
+            .transform;
+        if !transform.is_finite()
+            || !transform.to_components().into_iter().all(finite_scalar)
+            || transform.0.matrix2 != self.original_transform.0.matrix2
+        {
+            return Err(RetainedError::ChangedScene);
+        }
+        if !retained_components_equal(
+            self.spec.components.as_ref(),
+            inputs.components,
+            &self.preview_components,
+        ) || self.spec.variables.as_ref() != inputs.variables
+            || self.spec.active_modes.as_ref() != inputs.active_modes
+            || self.spec.mode_generation != inputs.mode_generation
+            || self.spec.dark_ui != inputs.dark_ui
+        {
+            return Err(RetainedError::ChangedInputs);
+        }
+        for (asset, frozen) in &self.spec.assets.0 {
+            let current = resolver
+                .and_then(|resolver| resolver.resolve(*asset))
+                .ok_or(RetainedError::ChangedAsset(*asset))?;
+            if current.width != frozen.width
+                || current.height != frozen.height
+                || !Arc::ptr_eq(&current.pixels_rgba, &frozen.pixels_rgba)
+            {
+                return Err(RetainedError::ChangedAsset(*asset));
+            }
+        }
+        let validation_micros = elapsed_micros(started);
+        // This is the only revision advance: every dependency and every intervening scene edit was checked above.
+        self.spec.scene_revision = scene.revision();
+        let owned_inputs = self.spec.owned_inputs();
+        let canvas = self.output.canvas();
+        let copy_started = std::time::Instant::now();
+        let mut copy_paint = skia_safe::Paint::default();
+        copy_paint.set_blend_mode(skia_safe::BlendMode::Src);
+        canvas.draw_image(&self.below, (0, 0), Some(&copy_paint));
+        let below_copy_micros = elapsed_micros(copy_started);
+        let middle_started = std::time::Instant::now();
+        let middle = renderer.paint_split_to_canvas(
+            canvas,
+            self.size.0,
+            self.size.1,
+            scene,
+            viewport,
+            &owned_inputs,
+            &self.spec,
+            SplitPhase::Middle,
+        )?;
+        require_complete(&middle)?;
+        let middle_micros = elapsed_micros(middle_started);
+        let above_started = std::time::Instant::now();
+        canvas.draw_picture(&self.above, None, None);
+        let above_replay_micros = elapsed_micros(above_started);
+        let image = self.output.image_snapshot();
+        Ok(RetainedFrame {
+            image,
+            metrics: RetainedFrameMetrics {
+                validation_micros,
+                below_copy_micros,
+                middle_micros,
+                above_replay_micros,
+                frame_micros: elapsed_micros(started),
+                middle,
+            },
+        })
+    }
+}
+
+fn require_complete(metrics: &super::RenderMetrics) -> Result<(), RetainedError> {
+    if metrics.incomplete_artwork || metrics.effect_failed || metrics.non_artwork_content {
+        Err(RetainedError::IncompleteArtwork)
+    } else {
+        Ok(())
+    }
+}
+
+fn elapsed_micros(started: std::time::Instant) -> u64 {
+    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64
+}
+
+fn retained_components_equal(
+    baseline: &ComponentLibrary,
+    current: &ComponentLibrary,
+    preview_components: &HashSet<ComponentId>,
+) -> bool {
+    if baseline.sets != current.sets || baseline.defs.len() != current.defs.len() {
+        return false;
+    }
+    baseline.defs.iter().all(|(id, before)| {
+        let Some(after) = current.defs.get(id) else {
+            return false;
+        };
+        let fanta_doc::ComponentDef {
+            id: before_id,
+            root,
+            name,
+            variant_of,
+            props,
+            rev,
+            preview_rev,
+        } = before;
+        before_id == &after.id
+            && root == &after.root
+            && name == &after.name
+            && variant_of == &after.variant_of
+            && props == &after.props
+            && rev == &after.rev
+            && (preview_rev == &after.preview_rev || preview_components.contains(id))
+    })
+}
+
 fn require_geometry(node: NodeId, valid: bool) -> Result<(), SplitError> {
     if valid {
         Ok(())
@@ -854,5 +1313,85 @@ mod tests {
             "shared asset is frozen once across four retained children"
         );
         assert_eq!(scene.revision(), revision);
+    }
+}
+
+#[cfg(test)]
+mod retained_storage_tests {
+    use super::*;
+
+    #[test]
+    fn retained_storage_budget_rejects_before_pixels_and_accepts_the_exact_accounted_boundary() {
+        let mut scene = Scene::new();
+        let page = CanvasNode::new(NodeData::Group(fanta_doc::GroupNode::default()));
+        let page_id = page.id;
+        scene.insert(page).expect("page");
+        let mut moving = CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode::rect_solid(
+            0.0,
+            0.0,
+            8.0,
+            8.0,
+            fanta_doc::Color::WHITE,
+        )));
+        moving.parent = Some(page_id);
+        let moving_id = moving.id;
+        scene.insert(moving).expect("moving");
+        let mut renderer = super::super::RasterRenderer::new(32, 32).expect("renderer");
+        let viewport = fanta_doc::Viewport::default();
+        let inputs = RenderInputs::empty();
+        assert!(matches!(
+            RetainedTranslationSession::prepare_with_budget(
+                &mut renderer,
+                &scene,
+                page_id,
+                moving_id,
+                &viewport,
+                &inputs,
+                None,
+                0,
+                32 * 32 * 8 - 1,
+            ),
+            Err(RetainedError::MemoryLimit { .. })
+        ));
+        let initial = RetainedTranslationSession::prepare(
+            &mut renderer,
+            &scene,
+            page_id,
+            moving_id,
+            &viewport,
+            &inputs,
+            None,
+            0,
+        )
+        .expect("initial");
+        let metrics = initial.build_metrics();
+        let exact = metrics.surface_bytes + metrics.frozen_pixel_bytes + metrics.picture_bytes;
+        drop(initial);
+        assert!(matches!(
+            RetainedTranslationSession::prepare_with_budget(
+                &mut renderer,
+                &scene,
+                page_id,
+                moving_id,
+                &viewport,
+                &inputs,
+                None,
+                0,
+                exact - 1,
+            ),
+            Err(RetainedError::MemoryLimit { .. })
+        ));
+        RetainedTranslationSession::prepare_with_budget(
+            &mut renderer,
+            &scene,
+            page_id,
+            moving_id,
+            &viewport,
+            &inputs,
+            None,
+            0,
+            exact,
+        )
+        .expect("exact accounted boundary");
     }
 }

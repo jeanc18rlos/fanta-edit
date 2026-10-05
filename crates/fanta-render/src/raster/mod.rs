@@ -111,7 +111,10 @@ pub use renderer::{
     MediaPlayback, RasterRenderer, RenderError, RenderInputs, RenderMetrics, SvgRenderOptions,
     SvgRenderOutput,
 };
-pub use split::{SplitError, SplitPhase, SplitSpec};
+pub use split::{
+    RetainedBuildMetrics, RetainedError, RetainedFrame, RetainedFrameMetrics,
+    RetainedTranslationSession, SplitError, SplitPhase, SplitSpec,
+};
 pub use text::{
     text_caret_rect, text_first_baseline, text_hit_test, text_line_height, text_node_outline,
     text_selection_rects,
