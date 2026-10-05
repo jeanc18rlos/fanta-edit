@@ -571,12 +571,6 @@ impl FigDocument {
         let started = Instant::now();
         fanta_doc::strip_redundant_instance_overrides(&mut doc.scene, &doc.components);
         crate::report_slow("document load: strip redundant overrides", started);
-        // Legacy migration: projects saved before vectors carried an SVG viewport
-        // get one inferred from geometry, so a stroke thickened past the box is
-        // clipped like a freshly imported file. A no-op once the doc is viewport-aware.
-        let started = Instant::now();
-        fanta_doc::backfill_vector_viewports(&mut doc.scene);
-        crate::report_slow("document load: backfill vector viewports", started);
         let visible_page_roots = visible_page_roots(&doc);
         let default_page_root = default_page_root(&doc, &visible_page_roots);
         let solved_pages = doc
@@ -4157,7 +4151,11 @@ impl fanta_format::FormatHandler for FigImportFormat {
         if let Some(progress) = self.progress.as_ref() {
             report_load_progress(progress, "Importing Figma layers and components…");
         }
-        let (doc, report, assets) = fig_to_doc(&fig)?;
+        let (mut doc, report, assets) = fig_to_doc(&fig)?;
+        // Only the decoder establishes Figma provenance. An omitted viewport in
+        // native FNX/JSON is authored state, including after an earlier import;
+        // inferring it on every open silently changes unrelated saved vectors.
+        fanta_doc::backfill_vector_viewports(&mut doc.scene);
         if let Some(summary) = report.content_loss_summary() {
             log::warn!("Figma import limitations for {}: {summary}", path.display());
             if let Some(content_loss_summary) = &self.content_loss_summary {
@@ -6026,6 +6024,366 @@ mod tests {
     fn project_dir_prefers_the_fig_files_stem() {
         let dir = available_project_dir(Path::new("/tmp/definitely-missing-dir/Design.fig"));
         assert_eq!(dir, Path::new("/tmp/definitely-missing-dir/Design"));
+    }
+
+    fn native_vector_viewport_fixture() -> (Doc, NodeId, BTreeMap<AssetId, Vec<u8>>) {
+        use fanta_doc::{CanvasNode, Color, Fill, NodeData, NodeFlags, VectorNode};
+        let mut doc = doc_with_one_page();
+        let page = doc.active_page().expect("page");
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(2, 2)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("encode image");
+        let asset = fanta_format::asset_id_for_bytes(encoded.get_ref());
+        let mut copied = None;
+        for (index, (name, size, viewport, flags)) in [
+            ("Copy image fill", [96.0, 80.0], None, NodeFlags::empty()),
+            (
+                "Untouched blue control",
+                [240.0, 24.0],
+                None,
+                NodeFlags::empty(),
+            ),
+            (
+                "Explicit viewport",
+                [40.0, 30.0],
+                Some([20.0, 15.0]),
+                NodeFlags::empty(),
+            ),
+            (
+                "Explicit overflow",
+                [48.0, 32.0],
+                None,
+                NodeFlags::UNCLIPPED_VECTOR,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut vector =
+                VectorNode::rect_solid(0.0, 0.0, size[0], size[1], Color::rgb(47, 128, 237));
+            vector.local_size = viewport;
+            if index == 0 {
+                vector.fills = [Fill::Image {
+                    asset,
+                    mode: fanta_doc::ImageFitMode::Fill,
+                    opacity: 0.75,
+                    crop: Some(Box::new([0.0, 0.125, 1.0, 0.75])),
+                    scale: Some(1.25),
+                    rotation: Some(15.0),
+                    blend: fanta_doc::BlendMode::Multiply,
+                    adjust: Default::default(),
+                }]
+                .into_iter()
+                .collect();
+            }
+            let mut node = CanvasNode::new(NodeData::Vector(vector));
+            node.parent = Some(page);
+            node.index = doc.scene.next_child_index(Some(page));
+            node.name = name.into();
+            node.transform = fanta_doc::Transform2D::translation(16.0, index as f64 * 100.0);
+            node.flags = flags;
+            // Saved imported provenance does not make later authored geometry a new import.
+            node.meta =
+                serde_json::json!({"figma_id": format!("1:{index}"), "figma_type": "RECTANGLE"});
+            if index == 0 {
+                copied = Some(node.id);
+            }
+            doc.scene.insert(node).expect("vector");
+        }
+        (
+            doc,
+            copied.expect("copied vector"),
+            BTreeMap::from([(asset, encoded.into_inner())]),
+        )
+    }
+
+    #[test]
+    fn native_vector_viewports_preserve_project_and_snapshot_loads() {
+        let (doc, _, assets) = native_vector_viewport_fixture();
+        let expected = serde_json::to_value(&doc.scene).expect("authored scene");
+        let directory = tempfile::tempdir().expect("project");
+        fanta_format::write_project_tree(directory.path(), &doc, &assets).expect("write project");
+        let loaded = load_project_document(directory.path()).expect("native project load");
+        assert_eq!(
+            serde_json::to_value(&loaded.doc.scene).expect("loaded scene"),
+            expected,
+            "native FNX is authoritative even when a vector omits its optional viewport"
+        );
+        assert_eq!(loaded.raw_assets.as_ref(), &assets);
+        let parsed = Doc::from_json_str(&doc.to_json_pretty().expect("JSON")).expect("native JSON");
+        let loaded = FigDocument::from_doc(parsed, assets.clone());
+        assert_eq!(
+            serde_json::to_value(&loaded.doc.scene).expect("JSON scene"),
+            expected
+        );
+        let path = directory.path().join("Snapshot.fant");
+        let mut archive = fanta_format::FantaFile::create(&path).expect("native archive");
+        archive.save_doc(&doc).expect("save snapshot");
+        for (id, bytes) in &assets {
+            assert_eq!(archive.put_asset(bytes).expect("snapshot asset"), *id);
+        }
+        let (progress, _messages) = mpsc::unbounded();
+        let (loaded, warning) =
+            load_imported_document(&path, &progress).expect("load native snapshot");
+        assert!(warning.is_none());
+        assert_eq!(loaded.raw_assets.as_ref(), &assets);
+        assert_eq!(
+            serde_json::to_value(&loaded.doc.scene).expect("snapshot scene"),
+            expected,
+            "the import registry also handles native snapshots; it must not infer Figma geometry"
+        );
+    }
+
+    #[gpui::test]
+    async fn native_vector_viewports_duplicate_save_undo_preserves_originals(
+        cx: &mut TestAppContext,
+    ) {
+        let project = empty_project(cx).await;
+        let directory = tempfile::tempdir().expect("project");
+        let (doc, copied, assets) = native_vector_viewport_fixture();
+        fanta_format::write_project_tree(directory.path(), &doc, &assets).expect("write baseline");
+        let baseline = serde_json::to_value(&doc.scene).expect("baseline");
+        let loaded = load_project_document(directory.path()).expect("cold load");
+        let item = ready_item(
+            &project,
+            directory.path().join("fanta.json"),
+            Some(directory.path().to_path_buf()),
+            doc.clone(),
+            cx,
+        );
+        item.update(cx, |item, _| {
+            item.last_saved_scene =
+                Some((loaded.doc.scene.instance_id(), loaded.doc.scene.revision()));
+            item.last_saved_assets = Some(loaded.raw_assets.clone());
+            item.merge_base = Some(loaded.doc.clone_for_persist());
+            item.workspace_session =
+                Some(fanta_format::WorkspaceSession::open(directory.path()).expect("session"));
+            item.document = FigDocumentState::Ready(loaded);
+        });
+        let copied_data = doc.scene.get(copied).expect("copied vector").data.clone();
+        let created = item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let pasted =
+                    crate::clipboard::duplicate_operations(&document.doc, &[copied], (16.0, 16.0))
+                        .expect("duplicate");
+                let created = pasted.roots[0];
+                crate::clipboard::apply_transaction(
+                    &mut document.doc,
+                    "Duplicate",
+                    crate::clipboard::create_operations(&pasted),
+                )
+                .expect("transaction");
+                (created, DocChange::Content)
+            })
+            .expect("ready document")
+        });
+        item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect("save duplicate");
+        let (saved, saved_assets) =
+            fanta_format::read_project_tree(directory.path()).expect("read duplicate");
+        assert_eq!(saved_assets, assets);
+        for root in doc.scene.roots() {
+            for id in doc.scene.descendants_of(*root) {
+                assert_eq!(
+                    saved.scene.get(id),
+                    doc.scene.get(id),
+                    "unrelated/original {id} must remain exact after Duplicate and Save"
+                );
+            }
+        }
+        assert_eq!(saved.scene.get(created).expect("clone").data, copied_data);
+        assert_eq!(saved.scene.len(), doc.scene.len() + 1);
+        item.update(cx, |item, cx| item.undo(cx))
+            .expect("undo duplicate");
+        item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect("save undo");
+        let reopened = load_project_document(directory.path()).expect("cold reopen undo");
+        assert_eq!(
+            serde_json::to_value(&reopened.doc.scene).expect("undo scene"),
+            baseline
+        );
+        assert_eq!(reopened.raw_assets.as_ref(), &assets);
+    }
+
+    #[test]
+    fn native_vector_viewports_infer_only_during_fig_decoding() {
+        use fanta_fig_interop::{Def, DefKind, Field, KiwiType, KiwiValue, Schema};
+        let schema = Schema::new(vec![
+            Def::new(
+                "NodeType",
+                DefKind::Enum,
+                vec![
+                    Field::new("CANVAS", KiwiType(0), 0),
+                    Field::new("VECTOR", KiwiType(0), 1),
+                ],
+            ),
+            Def::new(
+                "GUID",
+                DefKind::Struct,
+                vec![
+                    Field::new("sessionID", KiwiType::UINT, 0),
+                    Field::new("localID", KiwiType::UINT, 0),
+                ],
+            ),
+            Def::new(
+                "ParentIndex",
+                DefKind::Message,
+                vec![Field::new("guid", KiwiType::user(1), 1)],
+            ),
+            Def::new(
+                "Vector",
+                DefKind::Struct,
+                vec![
+                    Field::new("x", KiwiType::FLOAT, 0),
+                    Field::new("y", KiwiType::FLOAT, 0),
+                ],
+            ),
+            Def::new(
+                "Path",
+                DefKind::Message,
+                vec![Field::new("commandsBlob", KiwiType::UINT, 1)],
+            ),
+            Def::new(
+                "NodeChange",
+                DefKind::Message,
+                vec![
+                    Field::new("guid", KiwiType::user(1), 1),
+                    Field::new("type", KiwiType::user(0), 2),
+                    Field::new("parentIndex", KiwiType::user(2), 3),
+                    Field::new("size", KiwiType::user(3), 4),
+                    Field::array("fillGeometry", KiwiType::user(4), 5),
+                ],
+            ),
+            Def::new(
+                "Blob",
+                DefKind::Struct,
+                vec![Field::array("bytes", KiwiType::BYTE, 0)],
+            ),
+            Def::new(
+                "Message",
+                DefKind::Message,
+                vec![
+                    Field::array("nodeChanges", KiwiType::user(5), 1),
+                    Field::array("blobs", KiwiType::user(6), 2),
+                ],
+            ),
+        ]);
+        let object = |name: &str, fields: Vec<(&str, KiwiValue)>| KiwiValue::Object {
+            type_name: name.into(),
+            fields: fields
+                .into_iter()
+                .map(|(key, value)| (key.to_owned(), value))
+                .collect(),
+        };
+        let guid = |id| {
+            object(
+                "GUID",
+                vec![
+                    ("sessionID", KiwiValue::Uint(0)),
+                    ("localID", KiwiValue::Uint(id)),
+                ],
+            )
+        };
+        let mut nodes = vec![object(
+            "NodeChange",
+            vec![
+                ("guid", guid(1)),
+                ("type", KiwiValue::Enum("CANVAS".into())),
+            ],
+        )];
+        for (id, width, height) in [(2, 0.0, 0.0), (3, 8.0, 6.0)] {
+            nodes.push(object(
+                "NodeChange",
+                vec![
+                    ("guid", guid(id)),
+                    ("type", KiwiValue::Enum("VECTOR".into())),
+                    (
+                        "parentIndex",
+                        object("ParentIndex", vec![("guid", guid(1))]),
+                    ),
+                    (
+                        "size",
+                        object(
+                            "Vector",
+                            vec![
+                                ("x", KiwiValue::Float(width)),
+                                ("y", KiwiValue::Float(height)),
+                            ],
+                        ),
+                    ),
+                    (
+                        "fillGeometry",
+                        KiwiValue::array(vec![object(
+                            "Path",
+                            vec![("commandsBlob", KiwiValue::Uint(0))],
+                        )]),
+                    ),
+                ],
+            ));
+        }
+        let mut geometry = Vec::new();
+        for (verb, coordinates) in [
+            (1, [0.0_f32, 0.0]),
+            (2, [24.0, 0.0]),
+            (2, [24.0, 18.0]),
+            (2, [0.0, 18.0]),
+        ] {
+            geometry.push(verb);
+            for value in coordinates {
+                geometry.extend(value.to_le_bytes());
+            }
+        }
+        geometry.push(0);
+        let fig = fanta_fig_interop::FigDocument {
+            version: 0,
+            schema,
+            root: object(
+                "Message",
+                vec![
+                    ("nodeChanges", KiwiValue::array(nodes)),
+                    (
+                        "blobs",
+                        KiwiValue::array(vec![object(
+                            "Blob",
+                            vec![("bytes", KiwiValue::Bytes(geometry.clone()))],
+                        )]),
+                    ),
+                ],
+            ),
+            root_type_name: "Message".into(),
+            blobs: vec![geometry],
+            images: HashMap::new(),
+        };
+        let directory = tempfile::tempdir().expect("import fixture");
+        let path = directory.path().join("Legacy.fig");
+        let bytes = fanta_fig_interop::write_fig(&fig).expect("encode Figma file");
+        std::fs::write(&path, &bytes).expect("write Figma file");
+        let (progress, _messages) = mpsc::unbounded();
+        let (document, _) = load_imported_document(&path, &progress).expect("decode Figma file");
+        let vectors: Vec<_> = document
+            .doc
+            .scene
+            .roots()
+            .iter()
+            .flat_map(|root| document.doc.scene.descendants_of(*root))
+            .filter_map(|id| {
+                document
+                    .doc
+                    .scene
+                    .get(id)
+                    .and_then(|node| node.data.as_vector())
+                    .map(|vector| vector.local_size)
+            })
+            .collect();
+        assert_eq!(
+            vectors,
+            [Some([24.0, 18.0]), Some([8.0, 6.0])],
+            "legacy Figma geometry can infer a box; an explicit authored Figma box always wins"
+        );
+        assert_eq!(std::fs::read(path).expect("original source"), bytes);
     }
 
     #[test]
