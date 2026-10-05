@@ -31,8 +31,11 @@ component FNX source, identity sidecars, metadata and assets. See
   canvas or source content still requires the normal close/save decision.
 - The **Code** workspace edits FNX and supported JSON sources. Saving valid
   source updates the canvas; invalid drafts preserve the last valid file and
-  scene. An unsaved source buffer locks conflicting visual edits. Selecting a
-  layer reveals its source; agent source-follow can be paused.
+  scene. Embedded Find searches the active FNX/JSON editor; **Discard draft**
+  discards only the selected buffer. Source Save preserves authored Undo, and
+  ordinary saved-canvas source refresh remains its own undoable text transaction.
+  An unsaved source buffer locks conflicting visual edits. Selecting a layer
+  reveals its source; agent source-follow can be paused.
 - External source changes reload through the project watcher. Conflicting
   previews, pending saves and changed files are guarded rather than blindly
   overwritten. These protections still require full release-candidate testing.
@@ -40,12 +43,35 @@ component FNX source, identity sidecars, metadata and assets. See
   project. Bundled Git and distribution-specific restrictions are covered by
   the separate release workflow.
 
-Large imported projects still have an open release blocker: a native Save check
-recorded unrelated layout changes, and Undo did not restore all of them. The
-layout and nested-drag corrections pass their automated checks; the corrected
-native open/edit/Save/Undo/restart journey remains pending. See the
-[coverage report](../alpha/CAPABILITY_COVERAGE.md) for the exact build, retained
-failure evidence and pending native retest.
+Corrected native checks on a large imported project now preserve page visits,
+an isolated nested image move/Save, Undo/Save and restart of the saved Undo state.
+A separate instance flow-child move/Save and single Undo/Save also pass; its
+restart is inconclusive after an interrupted native attempt. The checks compare
+all persisted content and assets. [PR 52](https://github.com/jeanc18rlos/fanta-edit/pull/52)
+corrects two further layout defects with automated regressions: preserving
+unaffected fixed nested layouts and keeping external source-computed geometry
+saveable. Those fixes still require native retests.
+
+The native Code workspace can save a source spacing change and its computed
+geometry, retain an invalid JSON draft, and save a repaired draft. Manual
+restoration and restart matched the baseline strictly. However, embedded Find,
+source Undo after Save, and selected-only Discard draft failed or were missing
+in that tested build. Their corrections now pass automated validation: 1,089
+editor tests and 3 benchmark tests, with focused Code workspace cases across
+five scheduler seeds. Native checks on `3e3f275fcd` now pass Find in both formats
+and Save/repeat Save/single Undo/Redo with exact persisted content. Draft recovery
+still has an open native issue: after discarding invalid JSON, Save requires
+canvas focus and then reports a stale-file warning without an external edit.
+That failed route remains under investigation.
+
+Explicit Prototype Remove/Save and one Undo/Save also pass complete four-node
+comparisons on `a82f90f87b`. The user confirmed that later Start/End position
+changes were their edits: the retained restart comparison is a stale-baseline
+mismatch, not evidence of an app regression. Restart against a matching baseline
+is still unverified. Complete native Save/drag performance and broader acceptance
+remain open. See the
+[coverage report](../alpha/CAPABILITY_COVERAGE.md) for the exact build, bounded
+results and remaining release gates.
 
 Implementation: [document.rs](../../crates/fig_viewer/src/document.rs),
 [design_panel.rs](../../crates/fig_viewer/src/design_panel.rs),
@@ -57,13 +83,22 @@ Implementation: [document.rs](../../crates/fig_viewer/src/document.rs),
 | Capability | How it works and its scope |
 | --- | --- |
 | Navigation | Pan with Hand; zoom, fit content/selection, and use page-specific viewports. Selection, hover and editing overlays follow the active page. |
-| Selection and transforms | Move, resize, rotate, proportional Scale, multi-selection, marquee and nested selection. Snapping and guides assist placement. Locked/hidden content and read-only modes constrain edits. |
+| Selection and transforms | Move, resize, rotate, proportional Scale, multi-selection, marquee and nested selection. The inspector also offers rotate 90° and horizontal/vertical flip. Multi-selection enables align, distribute and Tidy up; distribution needs at least three nodes. Snapping and guides assist placement. Locked/hidden content and read-only modes constrain edits. |
 | Shapes and drawing | Rectangle, ellipse, line, arrow, polygon, star, Pen, Pencil, Brush and Eraser. Edit Path exposes vector anchors/handles; Path Selection operates on paths. Shape parameters appear for compatible nodes. |
 | Containers and structure | Frames, sections, groups, slices; reparenting, z-order, duplicate, delete, group/ungroup, frame selection and boolean operations. Canvas clipboard operations work within the same document, including across pages. Cross-document canvas paste is unsupported and rejected before dependencies can dangle. |
-| Region selection and crop | Rectangle/ellipse selection, lasso, polygonal lasso and Magic Wand produce a drawing selection. Crop commits an undoable crop; these controls are not a general bitmap pixel editor. |
+| Region selection and crop | Rectangle/ellipse selection, lasso, polygonal lasso and Magic Wand produce a drawing selection. Draw options expose replace/add/subtract/intersect selection, inversion, applicable wand tolerance/contiguity and crop ratio. Crop commits an undoable crop; these controls are not a general bitmap pixel editor. |
 | Text | Create and edit inline text, select ranges, apply typography and text paints, and convert text to outlines. Instance text editing creates an override. |
 | Text on Path | Convert one eligible vector baseline, then edit its text and path text properties. Rounded/clipped geometry, zero-length paths and unsupported paints are rejected with a message. |
 | Media | Place supported local images, editable SVG, MP4 video and MP3 audio, or generation results. Files are validated before placement. Canvas media controls include playback and seek; video trim preserves the original asset and supports Undo/Redo. |
+
+Draw exposes tool-specific size, opacity, smoothing and blend controls. Brush
+also supports tip, hardness and flow settings; Pencil and Eraser expose their
+applicable subsets. The toolbar Color picker opens the selected fill or page
+background picker.
+
+The project **Assets** list shows saved/imported media, thumbnails and file sizes.
+Choose a visible target page to place a supported asset again; missing files or
+unsupported formats show a reason and cannot be placed.
 
 Canvas, keyboard and toolbar Duplicate preserve copied component masters and
 complete variant sets using the same rules as Layers menu Duplicate. References
@@ -208,6 +243,10 @@ Implementation: [component actions](../../crates/fig_viewer/src/component_action
   disabled. Read-only barriers also apply to shortcuts and agent/source paths;
   changing mode must preserve or explicitly finish a pending edit.
 
+In Dev, **Saved Code** is read-only. Measurements and annotations can still be
+authored on an editable page, and Undo/Redo is limited to those review marks;
+artwork edits remain blocked. **Readiness unavailable** is a disabled control.
+
 The timeline's **Current time** field accepts a typed time and seeks on Return.
 The interaction detail's **X** closes the detail while retaining its interaction;
 **Remove** is the separate deletion action.
@@ -215,10 +254,12 @@ The interaction detail's **X** closes the detail while retaining its interaction
 Representative native checks passed Motion playback, ruler seeking and keyframe
 drag/Undo, plus prototype click navigation, Restart, Escape and saved-project
 reopening. The corrected time field and non-destructive detail X also passed
-native checks with strict saved-content equality after restart. Explicit
-Remove/Undo has mounted regression coverage but was not repeated natively on
-that build. The [coverage report](../alpha/CAPABILITY_COVERAGE.md) records exact
-provenance and remaining cases.
+native checks with strict saved-content equality after restart. A later native
+explicit Remove/Save and single Undo/Save also passed complete comparisons.
+That journey's restart was compared with an outdated baseline after confirmed
+user position edits; no matching-baseline restart pass is claimed. The
+[coverage report](../alpha/CAPABILITY_COVERAGE.md) records exact provenance and
+remaining cases.
 
 Implementation: [timeline](../../crates/fig_viewer/src/timeline.rs),
 [motion](../../crates/fig_viewer/src/motion_panel.rs),
@@ -240,6 +281,10 @@ The built-in designer can inspect/edit the canvas, use project `fanta.md`
 instructions, prepare design assets, follow source edits and report agent
 activity. Plan/Review and editing modes have distinct write permissions. See
 [AI_DESIGNER.md](../alpha/AI_DESIGNER.md).
+
+The toolbar's **Replace content**, **Rewrite text**, **Translate text** and
+**Rename layers** commands open a draft in the Agent Panel with the current page
+and selection context. Review and send that prompt to request the edit.
 
 External agents connect to the local live MCP surface. Core tools include
 `get_editor_state`, `batch_get`, `batch_design`, `get_screenshot`,
