@@ -8646,7 +8646,11 @@ impl Item for FigView {
     }
 
     fn workspace_deactivated(&mut self, _: &mut Window, cx: &mut Context<Self>) {
-        self.invalidate_local_media_origin();
+        // The native media picker deactivates its own workspace window. Page,
+        // tab, and document changes still invalidate the pending destination.
+        if self.media_import_task.is_none() {
+            self.invalidate_local_media_origin();
+        }
         self.freeze_annotation_move(cx);
         self.freeze_measurement_drag(cx);
         self.finish_document_edits(cx);
@@ -10461,6 +10465,185 @@ mod tests {
                 ((), DocChange::Content)
             });
         });
+    }
+
+    async fn local_media_picker_fixture(
+        cx: &mut TestAppContext,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        Entity<workspace::Workspace>,
+        Entity<FigItem>,
+        Entity<FigView>,
+        &mut gpui::VisualTestContext,
+    ) {
+        init_visual_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+        let directory = tempfile::tempdir().expect("media directory");
+        let path = directory.path().join("Placed image.png");
+        image::RgbaImage::from_pixel(8, 4, image::Rgba([24, 96, 192, 255]))
+            .save(&path)
+            .expect("write picker image");
+        let (mut doc, first_page, _) = doc_with_two_pages();
+        let mut text = CanvasNode::new(NodeData::Text(TextNode::new("Saved text", 120., 40.)));
+        text.parent = Some(first_page);
+        doc.scene.insert(text).expect("initial text");
+        let root = directory.path().join("New design");
+        crate::document::write_project(&root, &doc, &BTreeMap::new()).expect("saved new design");
+        file_system.insert_tree_from_real_fs(&root, &root).await;
+        let item = crate::document::ready_item_with_root_for_test(
+            &project,
+            root.join("fanta.json"),
+            Some(root),
+            doc,
+            cx,
+        );
+        let (workspace, cx) = cx.add_window_view(|window, cx| {
+            workspace::Workspace::test_new(project.clone(), window, cx)
+        });
+        let view = cx.update(|window, cx| {
+            let view = cx.new(|cx| FigView::new(item.clone(), project, window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            });
+            window.activate_window();
+            view
+        });
+        cx.run_until_parked();
+        (directory, path, workspace, item, view, cx)
+    }
+
+    #[gpui::test]
+    async fn local_media_picker_survives_native_window_deactivation(cx: &mut TestAppContext) {
+        let (_directory, path, _workspace, item, view, cx) = local_media_picker_fixture(cx).await;
+        let baseline = item.read_with(cx, |item, _| item.doc().expect("document").scene.clone());
+        view.update(cx, |view, cx| view.choose_local_media(cx));
+        assert!(cx.did_prompt_for_paths());
+        cx.deactivate_window();
+        cx.simulate_path_prompt_response(move |_| Some(vec![path]));
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("document");
+            assert_eq!(document.doc.scene.len(), baseline.len() + 1);
+            let bitmap = document
+                .doc
+                .scene
+                .roots()
+                .iter()
+                .flat_map(|root| document.doc.scene.descendants_of(*root))
+                .filter_map(|id| document.doc.scene.get(id))
+                .find(|node| matches!(node.data, NodeData::Bitmap(_)))
+                .expect("picker places its image after focus returns");
+            assert_eq!(bitmap.parent, document.doc.active_page());
+            assert_eq!(bitmap.name, "Placed image.png");
+            assert_eq!(document.raw_assets.len(), 1);
+        });
+        view.read_with(cx, |view, _| assert!(view.media_import_task.is_none()));
+        item.update(cx, |item, cx| item.undo(cx))
+            .expect("undo placement");
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("document");
+            assert_eq!(document.doc.scene.len(), baseline.len());
+            for id in baseline
+                .roots()
+                .iter()
+                .flat_map(|root| baseline.descendants_of(*root))
+            {
+                assert_eq!(document.doc.scene.get(id), baseline.get(id));
+            }
+        });
+    }
+
+    #[gpui::test]
+    async fn local_media_picker_rejects_page_round_trip_during_preparation(
+        cx: &mut TestAppContext,
+    ) {
+        let (_directory, path, _workspace, item, view, cx) = local_media_picker_fixture(cx).await;
+        let prepared = crate::generation_media::prepare_local_media(&path)
+            .await
+            .expect("prepare image");
+        let baseline_count =
+            item.read_with(cx, |item, _| item.doc().expect("document").scene.len());
+        let (prepared_sender, prepared_receiver) = futures::channel::oneshot::channel();
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let preparation_started = started.clone();
+        view.update(cx, |view, cx| {
+            view.choose_local_media_with(
+                move |_| async move {
+                    preparation_started.store(true, std::sync::atomic::Ordering::SeqCst);
+                    prepared_receiver.await.context("preparation canceled")
+                },
+                cx,
+            );
+        });
+        cx.deactivate_window();
+        cx.simulate_path_prompt_response(move |_| Some(vec![path]));
+        cx.run_until_parked();
+        assert!(
+            started.load(std::sync::atomic::Ordering::SeqCst),
+            "unchanged document reaches preparation"
+        );
+        view.update(cx, |view, cx| {
+            view.select_page(1, cx);
+            view.select_page(0, cx);
+        });
+        assert!(prepared_sender.send(prepared).is_ok());
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("document");
+            assert_eq!(document.doc.scene.len(), baseline_count);
+            assert!(document.raw_assets.is_empty());
+        });
+        view.read_with(cx, |view, _| assert!(view.media_import_task.is_none()));
+    }
+
+    #[gpui::test]
+    async fn local_media_picker_rejects_switching_to_another_document(cx: &mut TestAppContext) {
+        let (_directory, path, workspace, item, view, cx) = local_media_picker_fixture(cx).await;
+        let baseline_count =
+            item.read_with(cx, |item, _| item.doc().expect("document").scene.len());
+        view.update(cx, |view, cx| view.choose_local_media(cx));
+        cx.deactivate_window();
+        let project = view.read_with(cx, |view, _| view.project.clone());
+        let other_item = crate::document::ready_item_for_test(
+            &project,
+            "/tmp/Other-media-design.fig".into(),
+            doc_with_one_page(),
+            cx,
+        );
+        let other_view = cx.update(|window, cx| {
+            let other_view = cx.new(|cx| FigView::new(other_item.clone(), project, window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(
+                    Box::new(other_view.clone()),
+                    None,
+                    true,
+                    window,
+                    cx,
+                );
+            });
+            window.activate_window();
+            other_view
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .active_item(cx)
+                .map(|item| item.item_id())),
+            Some(other_view.entity_id())
+        );
+        cx.simulate_path_prompt_response(move |_| Some(vec![path]));
+        cx.run_until_parked();
+        for (item, expected_count) in [(item, baseline_count), (other_item, 1)] {
+            item.read_with(cx, |item, _| {
+                let document = item.document().expect("document");
+                assert_eq!(document.doc.scene.len(), expected_count);
+                assert!(document.raw_assets.is_empty());
+            });
+        }
+        view.read_with(cx, |view, _| assert!(view.media_import_task.is_none()));
     }
 
     #[gpui::test]
