@@ -54,10 +54,17 @@ export checks also wrote page/selection PNGs; their log is retained as
 benchmark example compilation error; the corrected example passed the final
 lint and test reruns.
 
-Production changes are committed through `55d420ae87`; the full editor and
-app/CLI checks below cover that revision. Native QA evidence still refers to the
-`b05316fa0b` binary while the latest native rebuild/recheck is pending. This
-records local validation, not hosted CI or signed-distribution acceptance.
+The full editor and app/CLI checks below cover the final production changes
+from `55d420ae87`. The QA binary was then rebuilt at
+`02f33b7f789bc313de689d4d28400d1cbb991894` and opened successfully through the
+native app. On 5 October at 04:14 UTC, all 24 recorded project files matched
+their pre-restart hashes, with none changed, missing or added; see
+`target/release-verification/native-qa-20261005/final-restart-comparison.json`.
+The binary SHA-256 is
+`bc18712dcdc77a6bf8239f35eaf7d9a917f4c9a70c0347650e339c6902f72b2f`.
+The detailed earlier native journeys below retain their `b05316fa0b` provenance;
+they were not all repeated on this final binary. These are local checks, not
+complete capability coverage or signed-distribution acceptance.
 
 | Stage | Recorded result |
 | --- | --- |
@@ -183,8 +190,10 @@ from destructive Flatten operations. Its focused Flatten-filter run passed eight
 tests, including typed paint-slot/override coverage and pixel preservation when
 refusing a referenced source. Layer adapter tests passed seven cases; the bounded
 benchmark remained ignored in that ordinary run and passed when explicitly run.
-The complete editor, app/CLI build and final lint reruns passed. Native QA
-evidence above remains tied to `b05316fa0b` until the subsequent rebuild/recheck.
+The complete editor, app/CLI build and final lint reruns passed. The subsequent
+`02f33b7f789b` native rebuild opened successfully and preserved all 24 recorded
+project files across restart, as recorded above; the earlier detailed native
+journeys remain scoped to `b05316fa0b`.
 
 Sharing the component-root lookup between layer rows reduced CPU projection work
 on the same synthetic scene: **2,000 visible vectors and 2,000 component
