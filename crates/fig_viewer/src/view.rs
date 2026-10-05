@@ -1381,6 +1381,11 @@ impl FigView {
         self.finish_document_edits(cx);
     }
 
+    #[cfg(test)]
+    pub(crate) fn code_workspace_for_test(&self) -> Entity<FantaCodeWorkspace> {
+        self.code_workspace.clone()
+    }
+
     pub fn set_editor_workspace(&mut self, workspace: EditorWorkspace, cx: &mut Context<Self>) {
         if self.is_dev_mode(cx) {
             self.set_dev_workspace(workspace, cx);
@@ -13100,8 +13105,7 @@ mod tests {
             item.with_document(cx, |document| {
                 Arc::make_mut(&mut document.raw_assets).insert(
                     asset,
-                    br#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>"#
-                        .to_vec(),
+                    br#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"/>"#.to_vec(),
                 );
                 ((), DocChange::None)
             });

@@ -1,5 +1,6 @@
 use crate::error::{FormatError, Result};
 use fanta_doc::{AssetId, Doc};
+use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
@@ -21,6 +22,10 @@ pub struct ProjectSourceEdit {
     pub document: Doc,
     pub assets: BTreeMap<AssetId, Vec<u8>>,
     pub source_path: PathBuf,
+    /// Exact accepted bytes from a successful apply, relative to the project root.
+    /// Validation alone leaves this empty; callers must not trust a later disk read
+    /// as proof that a watcher event came from their own write.
+    pub accepted_source_hashes: BTreeMap<PathBuf, [u8; 32]>,
 }
 
 /// Parse one edited page/component source in the context of all its unchanged
@@ -59,6 +64,7 @@ pub fn validate_project_source_edit_with_diagnostics(
             document,
             assets,
             source_path,
+            accepted_source_hashes: BTreeMap::new(),
         },
         diagnostics,
     ))
@@ -108,7 +114,7 @@ pub fn apply_project_source_edit_with_diagnostics(
         .as_ref()
         .and_then(|bytes| serde_json::from_slice::<fanta_fnx::FnxSidecar>(bytes).ok());
     let sidecar_changed = persisted_sidecar.as_ref() != Some(&sidecar);
-    let (edit, diagnostics) =
+    let (mut edit, diagnostics) =
         validate_project_source_edit_with_diagnostics(project_root, source_path, source)?;
     let current = fs::read(&edit.source_path)?;
     if current != original {
@@ -123,13 +129,30 @@ pub fn apply_project_source_edit_with_diagnostics(
             checked_sidecar_path.display()
         )));
     }
+    let root = project_root.canonicalize()?;
+    let sidecar_bytes = if sidecar_changed {
+        super::layout::json_bytes(&serde_json::to_value(&sidecar)?)?
+    } else {
+        original_sidecar.clone().ok_or_else(|| {
+            FormatError::InvalidProjectTree("accepted FNX sidecar is missing".into())
+        })?
+    };
+    for (path, bytes) in [
+        (&edit.source_path, source.as_bytes()),
+        (&checked_sidecar_path, sidecar_bytes.as_slice()),
+    ] {
+        let relative = path.strip_prefix(&root).map_err(|error| {
+            FormatError::InvalidProjectTree(format!("source path outside project: {error}"))
+        })?;
+        edit.accepted_source_hashes
+            .insert(relative.to_path_buf(), Sha256::digest(bytes).into());
+    }
     let source_changed = current != source.as_bytes();
     if !source_changed && !sidecar_changed {
         return Ok((edit, diagnostics));
     }
 
     if sidecar_changed {
-        let sidecar_bytes = super::layout::json_bytes(&serde_json::to_value(&sidecar)?)?;
         atomic_write(&checked_sidecar_path, &sidecar_bytes)?;
     }
     if source_changed && let Err(source_error) = atomic_write(&edit.source_path, source.as_bytes())
@@ -245,6 +268,7 @@ pub fn validate_project_json_edit(
         document,
         assets,
         source_path,
+        accepted_source_hashes: BTreeMap::new(),
     })
 }
 
@@ -259,13 +283,21 @@ pub fn apply_project_json_edit(
         project_root.join(source_path)
     };
     let original = fs::read(&original_path)?;
-    let edit = validate_project_json_edit(project_root, source_path, source)?;
+    let mut edit = validate_project_json_edit(project_root, source_path, source)?;
     if fs::read(&edit.source_path)? != original {
         return Err(FormatError::InvalidProjectTree(format!(
             "{} changed while the JSON edit was being validated",
             edit.source_path.display()
         )));
     }
+    let root = project_root.canonicalize()?;
+    let relative = edit.source_path.strip_prefix(&root).map_err(|error| {
+        FormatError::InvalidProjectTree(format!("source path outside project: {error}"))
+    })?;
+    edit.accepted_source_hashes.insert(
+        relative.to_path_buf(),
+        Sha256::digest(source.as_bytes()).into(),
+    );
     atomic_write(&edit.source_path, source.as_bytes())?;
     Ok(edit)
 }
@@ -664,5 +696,83 @@ mod tests {
             validate_project_source_edit(directory.path(), Path::new("fanta.json"), &source)
                 .expect_err("manifest is not an FNX source");
         assert!(matches!(manifest_error, FormatError::InvalidProjectTree(_)));
+    }
+    #[test]
+    fn accepted_source_hashes_cover_exact_fnx_and_sidecar_bytes() {
+        let (directory, path) = project();
+        let root = directory.path().canonicalize().expect("root");
+        let path = path.canonicalize().expect("source path");
+        let original = fs::read_to_string(&path).expect("source");
+        let sidecar_path = path.with_file_name("page.ids.json");
+        let sidecar = fs::read_to_string(&sidecar_path).expect("sidecar");
+        let noncanonical_sidecar = format!(" {sidecar}\n\n");
+        fs::write(&sidecar_path, &noncanonical_sidecar).expect("unchanged semantic sidecar");
+        let validated = validate_project_source_edit(&root, &path, &original).expect("validate");
+        assert!(validated.accepted_source_hashes.is_empty());
+        for repair in [false, true] {
+            if repair {
+                fs::remove_file(&sidecar_path).expect("missing sidecar");
+            }
+            let changed = if repair {
+                original.replace("name=\"Original\"", "name=\"Accepted\"")
+            } else {
+                format!("{original}\n")
+            };
+            let edit = apply_project_source_edit(&root, &path, &changed).expect("save");
+            assert_eq!(edit.accepted_source_hashes.len(), 2);
+            for accepted_path in [&path, &sidecar_path] {
+                let relative = accepted_path.strip_prefix(&root).expect("relative");
+                let bytes = fs::read(accepted_path).expect("accepted bytes");
+                let digest: [u8; 32] = Sha256::digest(&bytes).into();
+                assert_eq!(edit.accepted_source_hashes.get(relative), Some(&digest));
+            }
+            if !repair {
+                assert_eq!(
+                    fs::read_to_string(&sidecar_path).expect("sidecar"),
+                    noncanonical_sidecar
+                );
+            }
+            let unchanged =
+                apply_project_source_edit(&root, &path, &changed).expect("no-op source save");
+            assert_eq!(
+                unchanged.accepted_source_hashes,
+                edit.accepted_source_hashes
+            );
+            fs::write(&path, format!("{changed}\n ")).expect("later external edit");
+            let external_hash: [u8; 32] = Sha256::digest(fs::read(&path).expect("external")).into();
+            assert_ne!(
+                edit.accepted_source_hashes
+                    .get(path.strip_prefix(&root).expect("relative")),
+                Some(&external_hash)
+            );
+        }
+    }
+
+    #[test]
+    fn accepted_source_hashes_cover_json_and_exclude_validation_only() {
+        let (directory, source_path) = project();
+        let root = directory.path().canonicalize().expect("root");
+        let path = source_path
+            .with_file_name("page.json")
+            .canonicalize()
+            .expect("header path");
+        let original = fs::read_to_string(&path).expect("header");
+        let source = format!(" {original}\n ");
+        let validated = validate_project_json_edit(&root, &path, &source).expect("validate");
+        assert!(validated.accepted_source_hashes.is_empty());
+        let applied = apply_project_json_edit(&root, &path, &source).expect("apply");
+        let expected: [u8; 32] = Sha256::digest(source.as_bytes()).into();
+        assert_eq!(
+            applied.accepted_source_hashes,
+            BTreeMap::from([(
+                path.strip_prefix(&root).expect("relative").to_path_buf(),
+                expected
+            )])
+        );
+        fs::write(&path, &original).expect("later external change");
+        assert_ne!(
+            Sha256::digest(fs::read(path).expect("external")).as_slice(),
+            expected
+        );
     }
 }
