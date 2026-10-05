@@ -504,15 +504,17 @@ pub(crate) fn editable_selection_roots(doc: &Doc) -> Vec<NodeId> {
 
 fn remap_node_references(node: &mut CanvasNode, remap: &HashMap<NodeId, NodeId>) {
     for reaction in &mut node.reactions {
-        match &mut reaction.action {
-            Action::Navigate { to } => remap_reference(to, remap),
-            Action::OpenOverlay { frame, .. } => remap_reference(frame, remap),
-            Action::ScrollTo { target } => remap_reference(target, remap),
-            Action::Back
-            | Action::Close
-            | Action::SetVariable { .. }
-            | Action::UpdateVariant { .. }
-            | Action::OpenLink { .. } => {}
+        for action in std::iter::once(&mut reaction.action).chain(&mut reaction.extra_actions) {
+            match action {
+                Action::Navigate { to } => remap_reference(to, remap),
+                Action::OpenOverlay { frame, .. } => remap_reference(frame, remap),
+                Action::ScrollTo { target } => remap_reference(target, remap),
+                Action::Back
+                | Action::Close
+                | Action::SetVariable { .. }
+                | Action::UpdateVariant { .. }
+                | Action::OpenLink { .. } => {}
+            }
         }
     }
     if let NodeData::AiArtifact(artifact) = &mut node.data {
@@ -576,6 +578,218 @@ mod tests {
         doc.apply(Operation::create_node(second)).unwrap();
         doc.history = Default::default();
         (doc, frame_id, first_id, second_id)
+    }
+
+    fn prototype_reference_actions(
+        frame: NodeId,
+        scroll_target: NodeId,
+        external_target: NodeId,
+    ) -> Vec<Action> {
+        let overlay = fanta_doc::OverlaySettings {
+            position: fanta_doc::OverlayPosition::Manual {
+                offset: [12.0, 34.0],
+            },
+            background_dim: true,
+            close_on_click_outside: true,
+        };
+        vec![
+            Action::Navigate { to: frame },
+            Action::OpenOverlay {
+                frame,
+                overlay: overlay.clone(),
+            },
+            Action::ScrollTo {
+                target: scroll_target,
+            },
+            Action::Navigate {
+                to: external_target,
+            },
+            Action::OpenOverlay {
+                frame: external_target,
+                overlay,
+            },
+            Action::ScrollTo {
+                target: external_target,
+            },
+        ]
+    }
+
+    fn prototype_subtree_doc() -> (Doc, NodeId, NodeId, NodeId) {
+        let (mut doc, frame, trigger, scroll_target) = subtree_doc();
+        let external_page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let external_page_id = external_page.id;
+        doc.apply(Operation::create_node(external_page))
+            .expect("external page");
+        doc.add_page(external_page_id);
+        let mut external = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([100.0, 100.0]),
+            ..Default::default()
+        }));
+        external.parent = Some(external_page_id);
+        let external_target = external.id;
+        doc.apply(Operation::create_node(external))
+            .expect("external target");
+        let actions = prototype_reference_actions(frame, scroll_target, external_target);
+        let mut extra_actions = actions.clone();
+        extra_actions.extend([
+            Action::Back,
+            Action::Close,
+            Action::OpenLink {
+                url: "https://example.com/unchanged".into(),
+            },
+            Action::SetVariable {
+                variable: fanta_doc::VariableId::new(),
+                value: fanta_doc::VarValue::Boolean { value: true },
+            },
+            Action::UpdateVariant {
+                component: ComponentId::new(),
+                variant: "Pressed".into(),
+            },
+        ]);
+        doc.scene.get_mut(trigger).expect("trigger").reactions = actions
+            .into_iter()
+            .map(|action| fanta_doc::Reaction {
+                id: fanta_doc::ReactionId::new(),
+                trigger: fanta_doc::Trigger::Click,
+                action,
+                extra_actions: extra_actions.clone(),
+                transition: Some(fanta_doc::Transition {
+                    style: fanta_doc::TransitionStyle::Dissolve,
+                    duration_ms: 175,
+                    easing: fanta_doc::Easing::EaseIn,
+                }),
+                animation: None,
+            })
+            .collect();
+        doc.history = Default::default();
+        (doc, frame, trigger, external_target)
+    }
+
+    fn assert_copied_prototype_reactions(
+        doc: &Doc,
+        original_trigger: NodeId,
+        copied_frame: NodeId,
+        external_target: NodeId,
+    ) {
+        let children = doc.scene.children_of(Some(copied_frame));
+        let copied_trigger = children
+            .iter()
+            .filter_map(|id| doc.scene.get(*id))
+            .find(|node| matches!(node.data, NodeData::Text(_)))
+            .expect("copied text trigger");
+        let copied_scroll_target = children
+            .iter()
+            .filter_map(|id| doc.scene.get(*id))
+            .find(|node| matches!(node.data, NodeData::Vector(_)))
+            .expect("copied scroll target");
+        let source = doc.scene.get(original_trigger).expect("source trigger");
+        let expected_actions =
+            prototype_reference_actions(copied_frame, copied_scroll_target.id, external_target);
+        assert_eq!(source.reactions.len(), expected_actions.len());
+        assert_eq!(copied_trigger.reactions.len(), source.reactions.len());
+        for ((source, copied), expected_action) in source
+            .reactions
+            .iter()
+            .zip(&copied_trigger.reactions)
+            .zip(&expected_actions)
+        {
+            let mut expected = source.clone();
+            expected.action = expected_action.clone();
+            expected.extra_actions = expected_actions.clone();
+            expected.extra_actions.extend(
+                source
+                    .extra_actions
+                    .iter()
+                    .skip(expected_actions.len())
+                    .cloned(),
+            );
+            assert_eq!(copied, &expected);
+        }
+    }
+
+    #[test]
+    fn paste_and_subtree_duplicate_remap_all_prototype_actions_and_undo() {
+        for placement in [ClipboardPlacement::Paste, ClipboardPlacement::Duplicate] {
+            let (mut doc, frame, trigger, external_target) = prototype_subtree_doc();
+            doc.selection.select_only(frame);
+            let original_scene = serde_json::to_value(&doc.scene).expect("original scene");
+            let original_pages = doc.pages().to_vec();
+            let original_active_page = doc.active_page();
+            let source_trigger = doc.scene.get(trigger).expect("source trigger").clone();
+            let external = doc.scene.get(external_target).expect("external").clone();
+            let pasted = match placement {
+                ClipboardPlacement::Paste => CanvasClipboard::capture(&doc)
+                    .expect("capture")
+                    .instantiate(&doc, 16.0, placement)
+                    .expect("paste"),
+                ClipboardPlacement::Duplicate => {
+                    duplicate_operations(&doc, &[frame], (16.0, 16.0)).expect("duplicate")
+                }
+            };
+            let copy = *pasted.roots.first().expect("copied frame");
+            assert!(
+                apply_transaction(&mut doc, "Copy subtree", create_operations(&pasted))
+                    .expect("apply copy")
+            );
+            assert_copied_prototype_reactions(&doc, trigger, copy, external_target);
+            assert_eq!(doc.scene.get(trigger), Some(&source_trigger));
+            assert_eq!(doc.scene.get(external_target), Some(&external));
+            assert_eq!(doc.history.undo_depth(), 1);
+            let copied_scene = serde_json::to_value(&doc.scene).expect("copied scene");
+            assert!(doc.undo().expect("undo copy"));
+            assert_eq!(
+                serde_json::to_value(&doc.scene).expect("undone scene"),
+                original_scene
+            );
+            assert_eq!(doc.pages(), original_pages);
+            assert_eq!(doc.active_page(), original_active_page);
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert!(doc.redo().expect("redo copy"));
+            assert_eq!(
+                serde_json::to_value(&doc.scene).expect("redone scene"),
+                copied_scene
+            );
+        }
+    }
+
+    #[test]
+    fn page_duplicate_remaps_all_prototype_actions_and_undo() {
+        let (mut doc, frame, trigger, external_target) = prototype_subtree_doc();
+        let page = doc.active_page().expect("source page");
+        let original_scene = serde_json::to_value(&doc.scene).expect("original scene");
+        let original_pages = doc.pages().to_vec();
+        let original_trigger = doc.scene.get(trigger).expect("source trigger").clone();
+        let external = doc.scene.get(external_target).expect("external").clone();
+        let operations = duplicate_page_operations(&doc, page).expect("duplicate page");
+        assert!(apply_transaction(&mut doc, "Duplicate page", operations).expect("apply copy"));
+        let copied_page = *doc.pages().get(1).expect("copied page");
+        let copied_frame = *doc
+            .scene
+            .children_of(Some(copied_page))
+            .first()
+            .expect("copied frame");
+        assert_ne!(copied_frame, frame);
+        assert_copied_prototype_reactions(&doc, trigger, copied_frame, external_target);
+        assert_eq!(doc.scene.get(trigger), Some(&original_trigger));
+        assert_eq!(doc.scene.get(external_target), Some(&external));
+        assert_eq!(doc.history.undo_depth(), 1);
+        let copied_scene = serde_json::to_value(&doc.scene).expect("copied scene");
+        let copied_pages = doc.pages().to_vec();
+        assert!(doc.undo().expect("undo page copy"));
+        assert_eq!(
+            serde_json::to_value(&doc.scene).expect("undone scene"),
+            original_scene
+        );
+        assert_eq!(doc.pages(), original_pages);
+        assert_eq!(doc.active_page(), Some(page));
+        assert_eq!(doc.history.undo_depth(), 0);
+        assert!(doc.redo().expect("redo page copy"));
+        assert_eq!(
+            serde_json::to_value(&doc.scene).expect("redone scene"),
+            copied_scene
+        );
+        assert_eq!(doc.pages(), copied_pages);
+        assert_eq!(doc.active_page(), Some(page));
     }
 
     #[test]
@@ -850,6 +1064,405 @@ mod tests {
         assert_eq!(doc.components.sets[&edit.set].root, Some(frame));
     }
 
+    fn component_variant_actions(
+        set: ComponentId,
+        member: ComponentId,
+        external: ComponentId,
+        member_first: bool,
+    ) -> Vec<Action> {
+        let (first, second) = if member_first {
+            (member, set)
+        } else {
+            (set, member)
+        };
+        vec![
+            Action::UpdateVariant {
+                component: first,
+                variant: "Hover".into(),
+            },
+            Action::OpenLink {
+                url: "https://example.com/unchanged".into(),
+            },
+            Action::UpdateVariant {
+                component: second,
+                variant: "Default".into(),
+            },
+            Action::UpdateVariant {
+                component: external,
+                variant: "External".into(),
+            },
+            Action::Close,
+        ]
+    }
+
+    fn component_variant_reference_doc()
+    -> (Doc, NodeId, NodeId, ComponentId, ComponentId, ComponentId) {
+        let mut doc = Doc::new();
+        let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page.name = "Component page".into();
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page)).expect("page");
+        doc.add_page(page_id);
+        doc.set_active_page(Some(page_id));
+        let mut section = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        section.name = "Component section".into();
+        section.parent = Some(page_id);
+        let section_id = section.id;
+        doc.apply(Operation::create_node(section)).expect("section");
+        let mut frame = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        frame.name = "Variant set".into();
+        frame.parent = Some(section_id);
+        let frame_id = frame.id;
+        doc.apply(Operation::create_node(frame)).expect("set frame");
+        let set = ComponentId::new();
+        let member = ComponentId::new();
+        let hover = ComponentId::new();
+        let external = ComponentId::new();
+        let mut external_master = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        external_master.name = "External master".into();
+        let external_root = external_master.id;
+        doc.apply(Operation::create_node(external_master))
+            .expect("external master");
+        doc.apply(Operation::DefineComponent {
+            def: Box::new(ComponentDef::new(external, external_root, "External")),
+        })
+        .expect("external definition");
+        for (component, state) in [(member, "Default"), (hover, "Hover")] {
+            let mut master = CanvasNode::new(NodeData::Group(GroupNode {
+                clip_size: Some([40.0, 20.0]),
+                ..Default::default()
+            }));
+            master.name = format!("State={state}");
+            master.parent = Some(frame_id);
+            master.index = doc.scene.next_child_index(Some(frame_id));
+            let actions = component_variant_actions(set, member, external, false);
+            master.reactions.push(fanta_doc::Reaction {
+                id: fanta_doc::ReactionId::new(),
+                trigger: fanta_doc::Trigger::Click,
+                action: actions[0].clone(),
+                extra_actions: actions[1..].to_vec(),
+                transition: None,
+                animation: None,
+            });
+            let root = master.id;
+            doc.apply(Operation::create_node(master))
+                .expect("variant master");
+            let mut definition = ComponentDef::new(component, root, format!("State={state}"));
+            definition.variant_of = Some(fanta_doc::ComponentSetMembership {
+                set,
+                axis_values: [("State".into(), state.into())].into_iter().collect(),
+            });
+            doc.apply(Operation::DefineComponent {
+                def: Box::new(definition),
+            })
+            .expect("member definition");
+        }
+        doc.apply(Operation::DefineComponentSet {
+            set: Box::new(fanta_doc::ComponentSet {
+                id: set,
+                name: "Button".into(),
+                axes: vec![fanta_doc::VariantAxis {
+                    name: "State".into(),
+                    values: vec!["Default".into(), "Hover".into()],
+                }],
+                members: vec![member, hover],
+                default_variant: member,
+                root: Some(frame_id),
+            }),
+        })
+        .expect("component set");
+        let mut external_nested = CanvasNode::new(NodeData::Instance(fanta_doc::InstanceNode {
+            component: member,
+            overrides: Vec::new(),
+            prop_values: Default::default(),
+            derived: Vec::new(),
+            local_size: [40.0, 20.0],
+        }));
+        external_nested.name = "External override target".into();
+        external_nested.parent = Some(external_root);
+        let external_nested_id = external_nested.id;
+        doc.apply(Operation::create_node(external_nested))
+            .expect("external nested instance");
+        for (name, component) in [
+            ("Set placement", set),
+            ("Member placement", member),
+            ("External placement", external),
+        ] {
+            let mut instance = CanvasNode::new(NodeData::Instance(fanta_doc::InstanceNode {
+                component,
+                overrides: Vec::new(),
+                prop_values: Default::default(),
+                derived: Vec::new(),
+                local_size: [40.0, 20.0],
+            }));
+            if component == external {
+                let NodeData::Instance(placement) = &mut instance.data else {
+                    panic!("fixture instance")
+                };
+                placement.overrides.push(fanta_doc::Override {
+                    target_path: [external_nested_id].into_iter().collect(),
+                    target_prop: fanta_doc::BoundProp::Visible,
+                    value: fanta_doc::OverrideValue::SwapInstance { component: set },
+                });
+            }
+            instance.name = name.into();
+            instance.parent = Some(section_id);
+            instance.index = doc.scene.next_child_index(Some(section_id));
+            let actions = component_variant_actions(set, member, external, true);
+            instance.reactions.push(fanta_doc::Reaction {
+                id: fanta_doc::ReactionId::new(),
+                trigger: fanta_doc::Trigger::Hover,
+                action: actions[0].clone(),
+                extra_actions: actions[1..].to_vec(),
+                transition: None,
+                animation: None,
+            });
+            doc.apply(Operation::create_node(instance))
+                .expect("placement");
+        }
+        let container = ComponentId::new();
+        let mut master = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        master.name = "Swap container".into();
+        master.parent = Some(section_id);
+        master.index = doc.scene.next_child_index(Some(section_id));
+        let master_id = master.id;
+        doc.apply(Operation::create_node(master))
+            .expect("swap master");
+        let mut overrides = Vec::new();
+        for (index, component) in [set, member, external].into_iter().enumerate() {
+            let mut nested = CanvasNode::new(NodeData::Instance(fanta_doc::InstanceNode {
+                component: external,
+                overrides: Vec::new(),
+                prop_values: Default::default(),
+                derived: Vec::new(),
+                local_size: [40.0, 20.0],
+            }));
+            nested.name = format!("Nested swap {index}");
+            nested.parent = Some(master_id);
+            nested.index = doc.scene.next_child_index(Some(master_id));
+            overrides.push(fanta_doc::Override {
+                target_path: [nested.id].into_iter().collect(),
+                target_prop: fanta_doc::BoundProp::Visible,
+                value: fanta_doc::OverrideValue::SwapInstance { component },
+            });
+            doc.apply(Operation::create_node(nested))
+                .expect("nested instance");
+        }
+        doc.apply(Operation::DefineComponent {
+            def: Box::new(ComponentDef::new(container, master_id, "Swap container")),
+        })
+        .expect("swap container definition");
+        let mut placement = CanvasNode::new(NodeData::Instance(fanta_doc::InstanceNode {
+            component: container,
+            overrides,
+            prop_values: Default::default(),
+            derived: Vec::new(),
+            local_size: [120.0, 20.0],
+        }));
+        placement.name = "Swap placement".into();
+        placement.parent = Some(section_id);
+        placement.index = doc.scene.next_child_index(Some(section_id));
+        doc.apply(Operation::create_node(placement))
+            .expect("swap placement");
+        doc.selection.select_only(section_id);
+        doc.history = Default::default();
+        (doc, page_id, section_id, set, member, external)
+    }
+
+    fn component_copy_state(doc: &Doc) -> serde_json::Value {
+        serde_json::json!({
+            "scene": doc.scene, "components": doc.components,
+            "pages": doc.pages(), "active_page": doc.active_page(), "selection": doc.selection,
+        })
+    }
+
+    #[test]
+    fn component_aware_copy_remaps_variant_actions_and_set_instances_with_undo() {
+        for duplicate_page in [true, false] {
+            let (mut doc, page, section, set, member, external) = component_variant_reference_doc();
+            let before = component_copy_state(&doc);
+            let source = doc.clone();
+            let operations = if duplicate_page {
+                duplicate_page_operations(&doc, page).expect("duplicate page")
+            } else {
+                duplicate_layer_operations(&doc, section).expect("duplicate component section")
+            };
+            assert!(
+                apply_transaction(&mut doc, "Duplicate component content", operations)
+                    .expect("apply duplicate")
+            );
+            assert_eq!(
+                doc.components.defs.len(),
+                source.components.defs.len() * 2 - 1,
+                "the external component dependency is not cloned"
+            );
+            assert_eq!(doc.components.sets.len(), 2);
+            let copied_set = doc
+                .components
+                .sets
+                .values()
+                .find(|candidate| candidate.id != set)
+                .expect("copied set");
+            let copied_member = copied_set.default_variant;
+            let copied_root = if duplicate_page {
+                doc.pages()[1]
+            } else {
+                *doc.scene
+                    .children_of(Some(page))
+                    .iter()
+                    .find(|id| **id != section)
+                    .expect("copied section")
+            };
+            let copy_nodes: Vec<_> = doc
+                .scene
+                .descendants_of(copied_root)
+                .filter_map(|id| doc.scene.get(id))
+                .collect();
+            for source_id in source.scene.descendants_of(section) {
+                let original = source.scene.get(source_id).expect("original node");
+                assert_eq!(
+                    doc.scene.get(source_id),
+                    Some(original),
+                    "copy must not retarget the original"
+                );
+                if original.reactions.is_empty() {
+                    continue;
+                }
+                let copy = copy_nodes
+                    .iter()
+                    .find(|node| node.name == original.name)
+                    .expect("copied interactive node");
+                let expected = component_variant_actions(
+                    copied_set.id,
+                    copied_member,
+                    external,
+                    matches!(&original.data, NodeData::Instance(_)),
+                );
+                let mut expected_reaction = original.reactions[0].clone();
+                expected_reaction.action = expected[0].clone();
+                expected_reaction.extra_actions = expected[1..].to_vec();
+                assert_eq!(
+                    copy.reactions.as_slice(),
+                    &[expected_reaction],
+                    "{}",
+                    original.name
+                );
+                if let NodeData::Instance(instance) = &copy.data {
+                    let expected_component = match original.name.as_str() {
+                        "Set placement" => copied_set.id,
+                        "Member placement" => copied_member,
+                        "External placement" => external,
+                        _ => panic!("unexpected fixture instance"),
+                    };
+                    assert_eq!(instance.component, expected_component, "{}", original.name);
+                    if original.name == "External placement" {
+                        let NodeData::Instance(original_instance) = &original.data else {
+                            panic!("fixture instance")
+                        };
+                        let mut expected_override = original_instance.overrides[0].clone();
+                        expected_override.value = fanta_doc::OverrideValue::SwapInstance {
+                            component: copied_set.id,
+                        };
+                        assert_eq!(
+                            instance.overrides,
+                            vec![expected_override],
+                            "the external master path is retained while the copied swap destination changes"
+                        );
+                    }
+                }
+            }
+            let copied_container = doc
+                .components
+                .defs
+                .values()
+                .find(|definition| {
+                    !source.components.defs.contains_key(&definition.id)
+                        && definition.name == "Swap container"
+                })
+                .expect("copied swap container");
+            let copy = copy_nodes
+                .iter()
+                .find(|node| node.name == "Swap placement")
+                .expect("copied swap placement");
+            let NodeData::Instance(instance) = &copy.data else {
+                panic!("fixture instance")
+            };
+            assert_eq!(instance.component, copied_container.id);
+            assert_eq!(instance.overrides.len(), 3);
+            for (index, component) in [copied_set.id, copied_member, external]
+                .into_iter()
+                .enumerate()
+            {
+                let nested = copy_nodes
+                    .iter()
+                    .find(|node| node.name == format!("Nested swap {index}"))
+                    .expect("copied override target");
+                assert_eq!(
+                    instance.overrides[index].target_path.as_slice(),
+                    &[nested.id]
+                );
+                assert_eq!(
+                    instance.overrides[index].value,
+                    fanta_doc::OverrideValue::SwapInstance { component }
+                );
+            }
+            assert_eq!(
+                doc.components.defs.get(&member),
+                source.components.defs.get(&member)
+            );
+            assert_eq!(
+                doc.components.defs.get(&external),
+                source.components.defs.get(&external)
+            );
+            let after = component_copy_state(&doc);
+            assert!(doc.undo().expect("undo duplicate"));
+            assert_eq!(
+                component_copy_state(&doc),
+                before,
+                "one Undo restores all content and references"
+            );
+            assert!(!doc.undo().expect("no second duplicate transaction"));
+            assert!(doc.redo().expect("redo duplicate"));
+            assert_eq!(
+                component_copy_state(&doc),
+                after,
+                "Redo restores the same copied IDs and references"
+            );
+        }
+    }
+
+    #[test]
+    fn component_aware_copy_keeps_uncopied_variant_sets_and_external_targets() {
+        let (mut doc, _, _, set, member, external) = component_variant_reference_doc();
+        let master = doc.components.def(member).expect("original member").root;
+        doc.selection.select_only(master);
+        let before = component_copy_state(&doc);
+        let operations = duplicate_layer_operations(&doc, master).expect("copy only one variant");
+        assert!(apply_transaction(&mut doc, "Duplicate variant", operations).expect("apply"));
+        assert_eq!(
+            doc.components.sets.len(),
+            1,
+            "a partial variant set is not copied"
+        );
+        let copied_member = doc
+            .components
+            .defs
+            .values()
+            .find(|definition| definition.id != member && definition.name == "State=Default")
+            .expect("copied member");
+        assert!(copied_member.variant_of.is_none());
+        let copy = doc.scene.get(copied_member.root).expect("copied master");
+        assert_eq!(
+            copy.reactions[0].actions().cloned().collect::<Vec<_>>(),
+            component_variant_actions(set, copied_member.id, external, false)
+        );
+        let after = component_copy_state(&doc);
+        assert!(doc.undo().expect("undo"));
+        assert_eq!(component_copy_state(&doc), before);
+        assert!(doc.redo().expect("redo"));
+        assert_eq!(component_copy_state(&doc), after);
+    }
+
     #[test]
     fn page_duplicate_preserves_component_masters_and_local_instances() {
         let mut doc = Doc::new();
@@ -1052,24 +1665,42 @@ fn clone_component_operations(
         })
         .map(|set| (set.id, fanta_doc::ComponentId::new()))
         .collect();
+    let copied_component = |component| {
+        components
+            .get(&component)
+            .or_else(|| sets.get(&component))
+            .copied()
+    };
     for node in &mut pasted.nodes {
-        if let NodeData::Instance(instance) = &mut node.data
-            && let Some(component) = components.get(&instance.component)
-        {
-            instance.component = *component;
-            for replacement in &mut instance.overrides {
-                for node in &mut replacement.target_path {
-                    remap_reference(node, &nodes);
-                }
-                if let fanta_doc::OverrideValue::SwapInstance { component } = &mut replacement.value
-                    && let Some(copy) = components.get(component)
-                {
-                    *component = *copy;
+        if let NodeData::Instance(instance) = &mut node.data {
+            let copied_master = copied_component(instance.component);
+            if let Some(component) = copied_master {
+                instance.component = component;
+                for derived in &mut instance.derived {
+                    for node in &mut derived.path {
+                        remap_reference(node, &nodes);
+                    }
                 }
             }
-            for derived in &mut instance.derived {
-                for node in &mut derived.path {
-                    remap_reference(node, &nodes);
+            for replacement in &mut instance.overrides {
+                if copied_master.is_some() {
+                    for node in &mut replacement.target_path {
+                        remap_reference(node, &nodes);
+                    }
+                }
+                if let fanta_doc::OverrideValue::SwapInstance { component } = &mut replacement.value
+                    && let Some(copy) = copied_component(*component)
+                {
+                    *component = copy;
+                }
+            }
+        }
+        for reaction in &mut node.reactions {
+            for action in std::iter::once(&mut reaction.action).chain(&mut reaction.extra_actions) {
+                if let Action::UpdateVariant { component, .. } = action
+                    && let Some(copy) = copied_component(*component)
+                {
+                    *component = copy;
                 }
             }
         }
