@@ -5767,6 +5767,146 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn save_generation_failed_write_preserves_newer_edits_and_assets_for_retry(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = save_generation_fixture(cx).await;
+        fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect("establish saved baseline");
+        let (baseline, baseline_assets) =
+            fanta_format::read_project_tree(&fixture.root).expect("read baseline");
+        let baseline = serde_json::to_value(baseline).expect("baseline snapshot");
+        let events = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&fixture.item, {
+                let events = events.clone();
+                move |_, event: &FigItemEvent, _| events.borrow_mut().push(*event)
+            })
+        });
+
+        rename_saved_page(&fixture, "Failed snapshot", cx);
+        let (arrived, resume) = pause_next_save(&fixture.item, cx);
+        let save = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Auto, cx));
+        arrived.await.expect("save reached background writer");
+        rename_saved_page(&fixture, "Latest edit after failed snapshot", cx);
+        let (node, asset, bytes) = place_image_during_save(&fixture, cx);
+        let (live, undo_depth, merge_base) = fixture.item.read_with(cx, |item, _| {
+            let document = item.document().expect("live document");
+            (
+                serde_json::to_value(&document.doc).expect("live snapshot"),
+                document.doc.history.undo_depth(),
+                serde_json::to_value(item.merge_base.as_ref()).expect("merge baseline"),
+            )
+        });
+        // A file at an output-directory slot fails the real writer without
+        // changing any source files or relying on platform permission rules.
+        let blocker = fixture.root.join("previews");
+        std::fs::remove_dir(&blocker).expect("empty previews directory");
+        std::fs::write(&blocker, b"preserve this file").expect("block the writer");
+        resume.send(()).expect("resume failing save");
+        save.await
+            .expect_err("directory collision must fail the save");
+        cx.run_until_parked();
+
+        fixture.item.read_with(cx, |item, _| {
+            let document = item.document().expect("document after failure");
+            assert!(item.is_dirty(), "failed save cannot mark newer edits clean");
+            assert_eq!(
+                serde_json::to_value(&document.doc).expect("live document"),
+                live
+            );
+            assert_eq!(document.doc.history.undo_depth(), undo_depth);
+            assert_eq!(document.raw_assets.get(&asset), Some(&bytes));
+            assert_eq!(
+                serde_json::to_value(item.merge_base.as_ref()).expect("merge baseline"),
+                merge_base,
+            );
+            assert!(!item.project_writes.has_active_writes());
+        });
+        assert!(!events.borrow().contains(&FigItemEvent::Saved));
+        let (on_disk, on_disk_assets) =
+            fanta_format::read_project_tree(&fixture.root).expect("baseline remains readable");
+        assert_eq!(
+            serde_json::to_value(on_disk).expect("disk snapshot"),
+            baseline
+        );
+        assert_eq!(on_disk_assets, baseline_assets);
+        assert_eq!(
+            std::fs::read(&blocker).expect("preserved blocker"),
+            b"preserve this file"
+        );
+
+        std::fs::remove_file(&blocker).expect("remove writer obstruction");
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 2);
+        cx.run_until_parked();
+        fixture.item.read_with(cx, |item, _| {
+            assert!(!item.external_reconciliation_pending());
+            assert!(!item.has_conflict());
+            assert!(item.is_dirty());
+            assert_eq!(
+                serde_json::to_value(item.doc()).expect("reconciled live document"),
+                live
+            );
+            assert_eq!(
+                item.doc().expect("document").history.undo_depth(),
+                undo_depth
+            );
+        });
+        fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect("retry latest content");
+        assert!(!fixture.item.read_with(cx, |item, _| item.is_dirty()));
+        assert!(events.borrow().contains(&FigItemEvent::Saved));
+        let (reopened, reopened_assets) =
+            fanta_format::read_project_tree(&fixture.root).expect("reopen successful retry");
+        assert_eq!(
+            reopened.scene.get(fixture.page).expect("page").name,
+            "Latest edit after failed snapshot"
+        );
+        let fanta_doc::NodeData::Bitmap(bitmap) = &reopened
+            .scene
+            .get(node)
+            .expect("new image survives retry")
+            .data
+        else {
+            panic!("placed image must reopen as a bitmap");
+        };
+        assert_eq!(bitmap.asset, asset);
+        assert_eq!(reopened_assets.get(&asset), Some(&bytes));
+        assert!(
+            FigDocument::from_doc(reopened, reopened_assets)
+                .gpui_images
+                .contains_key(&asset),
+            "the retried image is decodable after reopen"
+        );
+        assert!(
+            fixture
+                .item
+                .update(cx, |item, cx| item.undo(cx))
+                .expect("undo image")
+        );
+        assert!(!fixture.item.read_with(cx, |item, _| {
+            item.doc().expect("document").scene.contains(node)
+        }));
+        assert!(
+            fixture
+                .item
+                .update(cx, |item, cx| item.redo(cx))
+                .expect("redo image")
+        );
+        assert!(fixture.item.read_with(cx, |item, _| {
+            item.doc().expect("document").scene.contains(node)
+        }));
+    }
+
+    #[gpui::test]
     async fn save_generation_preserves_text_input_started_after_its_snapshot(
         cx: &mut TestAppContext,
     ) {
