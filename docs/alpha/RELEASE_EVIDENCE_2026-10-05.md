@@ -1134,3 +1134,159 @@ Ordered action lists had the same SHA-256, with generated IDs excluded:
 This demonstrates a scoped layer-projection improvement, not native or Spectrum
 drag latency. Raw before/after and focused test logs are retained in
 `target/release-verification/layer-projection-20261005/`.
+
+## Combined automated checkpoint — 938807f801
+
+On 5 October, 15:15–15:20 UTC, the complete default
+`script/verify-fanta-release` run passed all eight stages at
+`938807f801ac249b5ec7418ef0473eb794a11413`. The retained working-source diff
+SHA-256 `b7d3a89e6cdcfaf0dbba84ef973cc9c81283ea3b3309d8d6650d6a19ebe253ca`
+was unchanged before/after; there were no untracked source files. This records
+stable tested source, not a clean working tree. The driver elapsed time was
+314.71 seconds and is a verification duration, not an application benchmark.
+
+| Stage | Passing tests / result | Ignored or excluded |
+| --- | --- | --- |
+| Engine | 1,817 unit, integration and doc tests; includes 400 document, 353 renderer and 346 tool unit tests | 7 ignored: profiling/timing gates, network font fetch and one documentation example |
+| Import | 282 library tests | 11 private real-`.fig` fixture/diagnostic checks |
+| Source order | 325 library tests: 98 FNX + 227 format with `serde_json/preserve_order` | 1 acceptance-hashing benchmark |
+| Editor | 1,131 library tests + 3 `drag_bench` CLI tests | 1 component-heavy layer-projection benchmark |
+| Workspace | 234 tests | None ignored |
+| UI | 9 tests | This is the local UI unit stage, not the optional native component screenshot stage |
+| Build | App and CLI `cargo check --locked` | Does not build or verify a signed installer |
+| Lint | Twelve-crate `script/clippy` gate and dependency check | No native acceptance implied |
+
+All executed tests report zero failures. Source-order intentionally reruns
+FNX/format library cases under a feature configuration, so summing stage totals
+would not count unique tests. The optional `visual` and `import-preservation`
+stages were not selected. Private fixture checks, the ignored timing/network
+checks, authenticated live services, native UI journeys and signed-DMG
+installation are not established by this run.
+
+The full editor run includes the new asset-bearing clipboard lock guards,
+master/final-variant deletion preservation, missing component/set restoration,
+repeated independent Paste, post-delete dependency checks and visible atomic
+refusals. It also includes source recovery, pointer-scrub and gesture-metrics
+regressions. Renderer checks include the twelve opt-in split-render cases;
+this does not prove an interactive cached-drag path or native latency. The
+subsequent ancestor-splitting extension was external/uncompiled at this
+checkpoint and is not part of this result. Original failing reproductions and
+the narrower clipboard five-seed validation remain preserved separately.
+
+Evidence: `target/release-verification/combined-938807-20261005/`
+(`results.tsv`, `driver-provenance.json`, per-stage logs and independently
+extracted `independent-review/counts.json`). Native clipboard journeys were
+still in progress when this automated checkpoint was recorded; later results
+must retain their own exact binary and saved-document evidence.
+
+## Native clipboard guards and refusal checkpoint — 938807f801
+
+The isolated **Fanta Preservation QA** development bundle was built from stable
+`938807f801ac249b5ec7418ef0473eb794a11413` source with the retained protected
+working-tree patch. Binary SHA-256 is
+`a6684a7e927d27fdc52e18143cbb050712f721b5162fb8d229e46554f5970b8a`.
+Bundle ID is `dev.fanta.preservation-qa`; its isolated profile is
+`/tmp/fanta-preservation-qa-profile-20261005`. Native actions used the actual
+Layers panel, keyboard shortcuts and canvas context menu.
+
+- **PASS:** select the directly locked photo, send Duplicate, Cut, Delete and
+  Save; repeat on the image child of a locked frame. Both checkpoints match
+  every typed field, timestamp and all 39 project files byte-for-byte.
+- **PASS:** select one member of a two-variant set and Cut. The visible notice
+  explains that every variant must be selected because Paste cannot restore
+  a partial set. Save leaves all typed fields and 33 project files unchanged.
+- **PASS:** use the instance-specific canvas context menu's Detach command on
+  an instance with variable-bound opacity 0.4 and main-component opacity 0.5.
+  The visible notice explains that detachment would change appearance. The
+  operation and Save leave the same complete document and 33 files unchanged.
+- **PASS:** Delete that main component through the keyboard. The same
+  appearance limitation is visibly reported, and the original document and
+  files remain unchanged. Quit/relaunch of the exact bundle also preserves
+  those files; PID 21152 exited and PID 29984 restored the correct project.
+
+These checks do not directly assert the system clipboard contents. The
+mounted tests separately cover clipboard preservation on refusal. Restart
+compares persisted content and restored project identity, not an in-memory
+snapshot. The instance context menu visibly includes Go to main component,
+Detach instance and Reset all overrides.
+
+**Failures retained:** in the asset fixture, Duplicate creates the expected
+three nodes and preserves the image bytes, but Save adds `local_size` to two
+existing vector shapes and the cloned vector. Undo restores the original
+node count but retains the two added values. Redo equals the saved duplicate
+state with the same IDs; that narrower result does not clear the first
+failure. Deleting the three-node master preserves both images of its surviving
+instance, but Save adds `local_size` to the detached vector. Undo restores the
+master with that extra field. These are strict preservation failures.
+
+Source inspection traces the additions to the unconditional
+`backfill_vector_viewports` call in generic `FigDocument` construction, before
+any clipboard command. Native authored shapes legitimately omit this field;
+the conversion must be restricted to its supported import boundary. A fix and
+new native acceptance are pending. The original fixtures and failed verdicts
+remain unchanged. A further inspector issue was observed: the bound-opacity
+instance displays its raw saved 100% value, although the binding resolves to
+40%; that display correction is also pending.
+
+Evidence: `target/release-verification/native-clipboard-candidate-20261005/`,
+`native-asset-clipboard-20261005/` (including `root-native-actions-v1.json` and
+all failed verdicts), and `native-clipboard-refusals-20261005/`
+(`root-native-actions.json`, four strict native checkpoints). These bounded
+results do not establish successful asset clipboard persistence, exhaustive
+node acceptance, performance or signed-DMG readiness.
+
+## Automated viewport and bound-value corrections — 1d03cb877b / a5ab8d436b
+
+The original `938807f801` native failures above are unchanged. The viewport
+correction in `1d03cb877bc80328687bedc399210261b5cd41ce` restricts missing
+vector viewport inference to the Figma decode boundary. Generic native-document
+construction preserves omitted `local_size` fields. Two real regressions failed
+before the correction; all three final cases pass, including encoded Figma
+import controls and actual Duplicate/Save/Undo/reopen with asset preservation.
+The mounted case passed five scheduler seeds, and the document suite passed
+91 tests. Test-harness construction failures are retained separately from the
+two original product failures.
+
+The inspector correction in `a5ab8d436b9174ba97f2a360b3d66ca52e7356eb`
+resolves the three existing whole-node opacity, visibility and uniform-radius
+bindings in their effective modes. A selected wrapper bound to 0.4 displays
+40%; its main root's separate 0.5 opacity is not multiplied into that property.
+Explicit corner arrays retain precedence, unsupported Group radius bindings use
+the real fallback, and unresolved bindings remain detachable with a fallback
+label. No literal, binding or document history is changed by projection. All
+six new regressions failed before the correction and pass afterward, including
+three mounted inspector tests across five scheduler seeds.
+
+The combined final source passed **1,140 editor tests, one ignored projection
+benchmark, three benchmark CLI tests, viewer lint/machete and formatting**.
+The run was performed on `938807f801` plus the then-uncommitted viewport and
+binding changes; those exact files were subsequently committed above. Their
+hashes stayed unchanged during the run: `document.rs` SHA-256
+`753a5bae165301012a2872aa97e5619dd57512d999005092ab0093ab69c461c7`,
+`gpui_adapters/design.rs` SHA-256
+`f1fbd9339ffe5638c184da4fa11415d39517e7f07b13d9ded2c8ed27dae1d226`.
+The retained protected source file also stayed unchanged. This checkpoint did
+not repeat all eight runner stages, visual/private-fixture checks, native
+journeys or signed-artifact checks. Both corrected native journeys remain
+pending a new binary; the original failures are not reclassified as passing.
+
+Evidence: `target/release-verification/vector-viewport-load-20261005/validation.json`
+and `bound-opacity-inspector-20261005/` (`validation.json`,
+`final-validation.json`, original red logs and final editor/lint logs).
+
+## Inspector success-label contrast correction
+
+The component card's “Available” text inherited a dark button-fill color from
+the UI defaults. The local theme bridge now seeds the complete success palette
+from the active application theme. It preserves an authored success color that
+already reaches 4.5:1 against the panel-field background and minimally adjusts
+one that does not. Filled controls receive a matching foreground and readable
+hover/pressed colors; other semantic palettes are unchanged.
+
+Three focused Rust tests pass for the actual One Dark and One Light colors and
+translucent inputs. The affected crate passes the repository lint and dependency
+checks, and the changed file passes formatting. Computed status contrast is
+5.10:1 in One Dark and at least 4.5:1 in One Light; these are palette calculations,
+not native screenshot measurements. Native verification on the new bundle is
+pending. Evidence: `target/release-verification/inspector-success-contrast-20261005/`
+(`success-contrast.patch`, `review.json`, `validation.json`, test and lint logs).
