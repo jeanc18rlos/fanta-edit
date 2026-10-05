@@ -6,6 +6,7 @@ use fanta_doc::{
 };
 use fanta_gpui::layers::LayersPanelContextAction as Action;
 use smallvec::SmallVec;
+use std::collections::HashSet;
 
 pub(crate) fn replace_data(node: &CanvasNode, data: NodeData) -> Operation {
     Operation::ReplaceData {
@@ -435,11 +436,34 @@ fn local_outline(doc: &Doc, id: NodeId) -> Result<skia_safe::Path> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn can_flatten(doc: &Doc, id: NodeId) -> bool {
     validate_flatten(doc, id).is_ok()
 }
 
+pub(crate) fn can_flatten_with_component_roots(
+    doc: &Doc,
+    id: NodeId,
+    component_roots: &HashSet<NodeId>,
+) -> bool {
+    validate_flatten_with_component_roots(doc, id, component_roots).is_ok()
+}
+
 fn validate_flatten(doc: &Doc, id: NodeId) -> Result<()> {
+    let component_roots = doc
+        .components
+        .defs
+        .values()
+        .map(|definition| definition.root)
+        .collect();
+    validate_flatten_with_component_roots(doc, id, &component_roots)
+}
+
+fn validate_flatten_with_component_roots(
+    doc: &Doc,
+    id: NodeId,
+    component_roots: &HashSet<NodeId>,
+) -> Result<()> {
     let node = doc.scene.get(id).context("Missing layer")?;
     ensure!(
         node.bindings.is_empty(),
@@ -448,7 +472,7 @@ fn validate_flatten(doc: &Doc, id: NodeId) -> Result<()> {
     ensure!(
         !doc.scene
             .descendants_of(id)
-            .any(|child| doc.is_component_root(child)),
+            .any(|child| component_roots.contains(&child)),
         "Detach component content before flattening"
     );
     for child in doc.scene.descendants_of(id).filter(|child| *child != id) {
@@ -509,6 +533,82 @@ fn validate_flatten(doc: &Doc, id: NodeId) -> Result<()> {
         _ => bail!("This layer cannot be flattened without changing its appearance"),
     }
     Ok(())
+}
+
+fn validate_flatten_pattern_sources(doc: &Doc, id: NodeId) -> Result<()> {
+    let node = doc.scene.get(id).context("Missing layer")?;
+    if !matches!(node.data, NodeData::Vector(_)) || !doc.scene.children_of(Some(id)).is_empty() {
+        let affected: HashSet<_> = doc.scene.descendants_of(id).collect();
+        // Flatten deletes descendants and can change the retained node's
+        // tile bounds. Either change would alter another node's live pattern.
+        ensure!(
+            !doc.scene
+                .roots()
+                .iter()
+                .flat_map(|root| doc.scene.descendants_of(*root))
+                .filter(|node| *node == id || !affected.contains(node))
+                .filter_map(|node| doc.scene.get(node))
+                .any(|node| references_pattern_source(&node.data, &affected)),
+            "Flatten would change a pattern source used by another layer"
+        );
+    }
+    Ok(())
+}
+
+fn references_pattern_source(data: &NodeData, affected: &HashSet<NodeId>) -> bool {
+    let references = |paint: &Fill| matches!(paint, Fill::Pattern { pattern, .. } if affected.contains(&pattern.source_node_id));
+    if data
+        .strokes()
+        .is_some_and(|strokes| strokes.iter().any(|stroke| references(&stroke.paint)))
+    {
+        return true;
+    }
+    match data {
+        NodeData::Vector(vector) => vector.fills.iter().any(references),
+        NodeData::Boolean(boolean) => boolean.fills.iter().any(references),
+        NodeData::Group(group) => group
+            .background
+            .iter()
+            .chain(&group.background_fills)
+            .any(references),
+        NodeData::Instance(instance) => {
+            instance.overrides.iter().any(|entry| match &entry.value {
+                fanta_doc::OverrideValue::Fills { fills } => fills.iter().any(references),
+                fanta_doc::OverrideValue::Strokes { strokes } => {
+                    strokes.iter().any(|stroke| references(&stroke.paint))
+                }
+                fanta_doc::OverrideValue::Field { value } => {
+                    field_references_pattern_source(value, affected)
+                }
+                _ => false,
+            }) || instance.derived.iter().any(|entry| {
+                entry
+                    .fills
+                    .as_ref()
+                    .is_some_and(|fills| fills.iter().any(references))
+            })
+        }
+        _ => false,
+    }
+}
+
+fn field_references_pattern_source(value: &serde_json::Value, affected: &HashSet<NodeId>) -> bool {
+    match value {
+        serde_json::Value::Object(fields) => {
+            (value.get("kind").and_then(serde_json::Value::as_str) == Some("pattern")
+                && value
+                    .pointer("/pattern/source_node_id")
+                    .and_then(|source| serde_json::from_value::<NodeId>(source.clone()).ok())
+                    .is_some_and(|source| affected.contains(&source)))
+                || fields
+                    .values()
+                    .any(|field| field_references_pattern_source(field, affected))
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|field| field_references_pattern_source(field, affected)),
+        _ => false,
+    }
 }
 
 fn validate_flatten_group(doc: &Doc, id: NodeId, paint: &mut Option<Fill>) -> Result<()> {
@@ -588,6 +688,7 @@ fn validate_boolean_flatten_geometry(doc: &Doc, id: NodeId) -> Result<()> {
 
 fn flatten(doc: &Doc, id: NodeId) -> Result<Vec<Operation>> {
     validate_flatten(doc, id)?;
+    validate_flatten_pattern_sources(doc, id)?;
     let node = doc.scene.get(id).context("Missing layer")?;
     let outline = local_outline(doc, id)?;
     let mut path =
@@ -1387,6 +1488,185 @@ mod tests {
         let mut renderer = fanta_render::RasterRenderer::new(128, 128).expect("renderer");
         renderer.render(&doc.scene, &doc.viewport);
         renderer.copy_rgba()
+    }
+
+    fn node_pattern(source_node_id: NodeId) -> Fill {
+        Fill::Pattern {
+            pattern: Box::new(fanta_doc::PatternFill {
+                source_node_id,
+                tile_type: Default::default(),
+                scaling_factor: 1.,
+                spacing: Default::default(),
+                horizontal_alignment: Default::default(),
+            }),
+            opacity: 1.,
+            blend: fanta_doc::BlendMode::Normal,
+        }
+    }
+
+    #[test]
+    fn flatten_refuses_direct_and_indirect_pattern_sources_without_changing_pixels() {
+        for source_kind in [
+            "child",
+            "nested-child",
+            "container",
+            "indirect",
+            "boolean-child",
+            "text",
+        ] {
+            let mut doc = Doc::new();
+            let mut container = CanvasNode::new(if source_kind == "text" {
+                NodeData::Text(fanta_doc::TextNode::new("Pattern", 100., 40.))
+            } else if source_kind == "boolean-child" {
+                NodeData::Boolean(fanta_doc::BooleanNode::default())
+            } else {
+                NodeData::Group(GroupNode {
+                    local_size: Some([100., 100.]),
+                    ..Default::default()
+                })
+            });
+            container.transform = Transform2D::translation(200., 200.);
+            let root = insert(&mut doc, container, None);
+            let parent = if source_kind == "nested-child" {
+                insert(
+                    &mut doc,
+                    CanvasNode::new(NodeData::Group(GroupNode::default())),
+                    Some(root),
+                )
+            } else {
+                root
+            };
+            let child = if source_kind == "text" {
+                root
+            } else {
+                insert(&mut doc, rect(), Some(parent))
+            };
+            assert!(can_flatten(&doc, root));
+            let mut source = if source_kind == "container" {
+                root
+            } else {
+                child
+            };
+            if source_kind == "indirect" {
+                let mut intermediary = VectorNode::rect_solid(0., 0., 40., 20., Color::WHITE);
+                intermediary.fills = smallvec::smallvec![node_pattern(source)];
+                let mut intermediary = CanvasNode::new(NodeData::Vector(intermediary));
+                intermediary.transform = Transform2D::translation(400., 400.);
+                source = insert(&mut doc, intermediary, None);
+            }
+            let mut target = VectorNode::rect_solid(-20., -20., 40., 40., Color::WHITE);
+            target.fills = smallvec::smallvec![node_pattern(source)];
+            insert(&mut doc, CanvasNode::new(NodeData::Vector(target)), None);
+            let before = serde_json::to_value(&doc).expect("snapshot");
+            let pixels = flatten_pixels(&doc);
+            assert!(
+                pixels.chunks_exact(4).any(|pixel| pixel[3] > 0),
+                "visible pattern {source_kind}"
+            );
+            let history = doc.history.undo_depth();
+            assert!(
+                can_flatten(&doc, root),
+                "appearance-only menu eligibility: {source_kind}"
+            );
+            let error =
+                simple(&doc, root, Action::Flatten).expect_err("refuse pattern source deletion");
+            assert!(
+                error.to_string().contains("pattern source"),
+                "{source_kind}: {error}"
+            );
+            assert_eq!(
+                serde_json::to_value(&doc).expect("unchanged document"),
+                before
+            );
+            assert_eq!(flatten_pixels(&doc), pixels);
+            assert_eq!(doc.history.undo_depth(), history);
+        }
+    }
+
+    #[test]
+    fn flatten_pattern_guard_covers_every_typed_paint_slot_and_field_overrides() {
+        let source = NodeId::new();
+        let pattern = node_pattern(source);
+        let mut stroke = Stroke::solid(Color::BLACK, 2.);
+        stroke.paint = pattern.clone();
+        let mut cases = vec![
+            NodeData::Vector(VectorNode {
+                fills: smallvec::smallvec![pattern.clone()],
+                ..Default::default()
+            }),
+            NodeData::Vector(VectorNode {
+                strokes: smallvec::smallvec![stroke.clone()],
+                ..Default::default()
+            }),
+            NodeData::Group(GroupNode {
+                background: Some(pattern.clone()),
+                ..Default::default()
+            }),
+            NodeData::Group(GroupNode {
+                background_fills: smallvec::smallvec![pattern.clone()],
+                ..Default::default()
+            }),
+            NodeData::Group(GroupNode {
+                strokes: smallvec::smallvec![stroke.clone()],
+                ..Default::default()
+            }),
+            NodeData::Boolean(fanta_doc::BooleanNode {
+                fills: smallvec::smallvec![pattern.clone()],
+                ..Default::default()
+            }),
+            NodeData::Boolean(fanta_doc::BooleanNode {
+                strokes: smallvec::smallvec![stroke.clone()],
+                ..Default::default()
+            }),
+        ];
+        let instance = InstanceNode {
+            component: ComponentId::new(),
+            overrides: Vec::new(),
+            prop_values: Default::default(),
+            derived: Vec::new(),
+            local_size: [40., 20.],
+        };
+        for value in [
+            fanta_doc::OverrideValue::Fills {
+                fills: smallvec::smallvec![pattern.clone()],
+            },
+            fanta_doc::OverrideValue::Strokes {
+                strokes: smallvec::smallvec![stroke],
+            },
+            fanta_doc::OverrideValue::Field {
+                value: serde_json::json!({"fills": [pattern.clone()]}),
+            },
+        ] {
+            let mut instance = instance.clone();
+            instance.overrides.push(fanta_doc::Override {
+                target_path: Default::default(),
+                target_prop: fanta_doc::BoundProp::FillColor { index: 0 },
+                value,
+            });
+            cases.push(NodeData::Instance(instance));
+        }
+        let mut instance = instance;
+        instance.derived.push(fanta_doc::DerivedOverride {
+            path: Default::default(),
+            transform: None,
+            size: None,
+            fills: Some(smallvec::smallvec![pattern]),
+            path_data: None,
+            stroke_path: None,
+            stroke_weight: None,
+            text: None,
+        });
+        cases.push(NodeData::Instance(instance));
+        let affected = HashSet::from([source]);
+        let unrelated = HashSet::from([NodeId::new()]);
+        for data in cases {
+            assert!(references_pattern_source(&data, &affected), "{data:?}");
+            assert!(!references_pattern_source(&data, &unrelated));
+        }
+        assert!(!field_references_pattern_source(
+            &serde_json::json!({"fills": [{"kind": "pattern", "pattern": {"source_node_id": "invalid"}}]}),
+            &affected,
+        ));
     }
 
     #[test]
