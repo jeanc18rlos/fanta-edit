@@ -52,7 +52,7 @@ Implementation: [document.rs](../../crates/fig_viewer/src/document.rs),
 | Navigation | Pan with Hand; zoom, fit content/selection, and use page-specific viewports. Selection, hover and editing overlays follow the active page. |
 | Selection and transforms | Move, resize, rotate, proportional Scale, multi-selection, marquee and nested selection. Snapping and guides assist placement. Locked/hidden content and read-only modes constrain edits. |
 | Shapes and drawing | Rectangle, ellipse, line, arrow, polygon, star, Pen, Pencil, Brush and Eraser. Edit Path exposes vector anchors/handles; Path Selection operates on paths. Shape parameters appear for compatible nodes. |
-| Containers and structure | Frames, sections, groups, slices; reparenting, z-order, duplicate, delete, group/ungroup, frame selection and boolean operations. Clipboard operations preserve supported dependencies and reject unsafe cross-document copies. |
+| Containers and structure | Frames, sections, groups, slices; reparenting, z-order, duplicate, delete, group/ungroup, frame selection and boolean operations. Canvas clipboard operations work within the same document, including across pages. Cross-document canvas paste is unsupported and rejected before dependencies can dangle. |
 | Region selection and crop | Rectangle/ellipse selection, lasso, polygonal lasso and Magic Wand produce a drawing selection. Crop commits an undoable crop; these controls are not a general bitmap pixel editor. |
 | Text | Create and edit inline text, select ranges, apply typography and text paints, and convert text to outlines. Instance text editing creates an override. |
 | Text on Path | Convert one eligible vector baseline, then edit its text and path text properties. Rounded/clipped geometry, zero-length paths and unsupported paints are rejected with a message. |
@@ -71,6 +71,11 @@ currently disabled in the default Design inspector.
 Mixed values must remain identifiable; controls must neither erase unsupported
 data nor silently apply to a stale selection. Numeric and color gestures preview
 live, commit as one history step, and restore the previous value when cancelled.
+Native numeric/hex draft cancellation and Export-label checks passed at a 320 px
+inspector width. A two-kind selection's aggregate-opacity display/edit/Undo and
+the visible cross-document paste refusal also passed native checks; see the
+[coverage report](../alpha/CAPABILITY_COVERAGE.md#local-checkpoint--5-october)
+for exact builds and remaining gesture checks.
 
 Implementation: [tools.rs](../../crates/fig_viewer/src/tools.rs),
 [canvas tools](../../crates/fanta-tools/src),
@@ -109,6 +114,8 @@ verification remains tracked in the release report.
 Right-click targets the visible layer under the pointer, retaining an existing
 selection when the target is already inside it. Pending inspector/text edits are
 handled before changing the target; protected drafts are preserved.
+Escape dismisses the menu without clearing the selected layer; clicking an
+inspector field transfers input to that field.
 
 | Target | Relevant commands |
 | --- | --- |
