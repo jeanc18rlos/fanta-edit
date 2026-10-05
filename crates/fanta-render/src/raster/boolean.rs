@@ -186,10 +186,7 @@ fn sk_op(op: BooleanOp) -> PathOp {
 }
 
 pub(crate) fn fold_operands(scene: &Scene, id: NodeId, op: BooleanOp) -> Option<Path> {
-    match fold_checked(scene, id, op, 0) {
-        Ok(path) => Some(path),
-        Err(()) => None,
-    }
+    fold_checked(scene, id, op, 0).ok()
 }
 
 fn fold_checked(scene: &Scene, id: NodeId, op: BooleanOp, depth: usize) -> Result<Path, ()> {
