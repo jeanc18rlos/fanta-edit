@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: script/verify-fanta-release [--list] [--stage NAME] [--output-dir PATH]
+
+Runs the engine, import, source-order, editor, ui, build, and lint stages.
+Use --stage more than once to select stages; --list prints commands without running.
+The optional visual stage requires a macOS desktop and compares UI component images.
+Logs and results.tsv are written below target/release-verification by default.
+
+This does not validate an installer, operate the full app UI, contact production
+services, or run ignored benchmarks, network tests, or private Figma fixtures.
+EOF
+}
+
+list_only=false
+selected_stages=()
+output_directory=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --list)
+            list_only=true
+            shift
+            ;;
+        --stage|--output-dir)
+            if [[ $# -lt 2 || -z "$2" ]]; then
+                usage >&2
+                exit 2
+            fi
+            if [[ "$1" == --stage ]]; then
+                case "$2" in
+                    engine|import|source-order|editor|ui|build|lint|visual)
+                        if [[ " ${selected_stages[*]-} " == *" $2 "* ]]; then
+                            printf 'Stage selected more than once: %s\n' "$2" >&2
+                            exit 2
+                        fi
+                        selected_stages+=("$2")
+                        ;;
+                    *)
+                        printf 'Unknown stage: %s\n' "$2" >&2
+                        exit 2
+                        ;;
+                esac
+            else
+                output_directory="$2"
+            fi
+            shift 2
+            ;;
+        --help|-h)
+            usage
+            exit 0
+            ;;
+        *)
+            usage >&2
+            exit 2
+            ;;
+    esac
+done
+
+if [[ ${#selected_stages[@]} -eq 0 ]]; then
+    selected_stages=(engine import source-order editor ui build lint)
+fi
+
+repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repository_root"
+cargo_binary="${CARGO:-cargo}"
+overall_status=0
+
+if [[ "$list_only" == false ]]; then
+    # Baseline regeneration would turn a visual regression into a passing check.
+    if [[ -n ${FANTA_REGEN_GOLDEN+x} || -n ${UPDATE_BASELINE+x} || -n ${UPDATE_BASELINES+x} ]]; then
+        printf 'Unset FANTA_REGEN_GOLDEN, UPDATE_BASELINE and UPDATE_BASELINES before verification.\n' >&2
+        exit 2
+    fi
+    if [[ -z "$output_directory" ]]; then
+        output_directory="target/release-verification/$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    fi
+    mkdir -p "$output_directory"
+    output_directory="$(cd "$output_directory" && pwd)"
+    if [[ -e "$output_directory/results.tsv" ]]; then
+        printf 'Existing results at %s; choose a new output directory.\n' "$output_directory" >&2
+        exit 2
+    fi
+    printf 'stage\tresult\texit_code\tseconds\tlog\n' > "$output_directory/results.tsv"
+    {
+        printf 'Started (UTC): %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        printf 'Revision: '
+        git rev-parse HEAD
+        printf 'Working tree:\n'
+        git status --short
+        uname -a
+        rustc --version
+        printf 'Stages: %s\n' "${selected_stages[*]}"
+        printf 'Scope: automated local suites only; ignored tests and private fixtures are not release evidence.\n'
+    } > "$output_directory/environment.txt"
+    printf 'Verification results: %s\n' "$output_directory"
+fi
+
+run_stage() {
+    local stage="$1"
+    shift
+    printf '%s:' "$stage"
+    printf ' %q' "$@"
+    printf '\n'
+    if [[ "$list_only" == true ]]; then
+        return
+    fi
+    local log_path="$output_directory/$stage.log"
+    local started=$SECONDS
+    local status=0
+    local pipeline_status
+    set +e
+    "$@" 2>&1 | tee "$log_path"
+    pipeline_status=("${PIPESTATUS[@]}")
+    set -e
+    if [[ ${pipeline_status[0]} -ne 0 ]]; then
+        status=${pipeline_status[0]}
+    elif [[ ${pipeline_status[1]} -ne 0 ]]; then
+        status=${pipeline_status[1]}
+    fi
+    local result=PASS
+    if [[ "$status" -ne 0 ]]; then
+        result=FAIL
+        overall_status=1
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+        "$stage" "$result" "$status" "$((SECONDS - started))" "$log_path" \
+        >> "$output_directory/results.tsv"
+    printf '%s %s\n' "$result" "$stage"
+    if [[ "$status" -eq 130 || "$status" -eq 143 ]]; then
+        exit "$status"
+    fi
+}
+
+for stage in "${selected_stages[@]}"; do
+    case "$stage" in
+        engine)
+            run_stage "$stage" "$cargo_binary" test --locked \
+                -p fanta-doc -p fanta-fnx -p fanta-format -p fanta-canvas \
+                -p fanta-tools -p fanta-render -p fanta-present -p fanta-text
+            ;;
+        import)
+            # Spectrum integration binaries return success without a fixture;
+            # keep those opt-in checks separate from reproducible synthetic tests.
+            run_stage "$stage" "$cargo_binary" test --locked -p fanta-fig-interop --lib
+            ;;
+        source-order)
+            run_stage "$stage" "$cargo_binary" test --locked \
+                -p fanta-fnx -p fanta-format --lib --features serde_json/preserve_order
+            ;;
+        editor)
+            run_stage "$stage" "$cargo_binary" test --locked -p fig_viewer --lib --example drag_bench
+            ;;
+        ui)
+            run_stage "$stage" "$cargo_binary" test --locked -p fanta_ui --lib --features test-support
+            ;;
+        build)
+            run_stage "$stage" "$cargo_binary" check --locked -p zed -p cli
+            ;;
+        lint)
+            run_stage "$stage" ./script/clippy --locked \
+                -p fanta-doc -p fanta-fnx -p fanta-format -p fanta-canvas \
+                -p fanta-tools -p fanta-render -p fanta-fig-interop \
+                -p fanta-present -p fanta-text -p fig_viewer -p fanta_ui
+            ;;
+        visual)
+            if [[ "$list_only" == false && "$(uname -s)" != Darwin ]]; then
+                printf 'The visual stage requires macOS.\n' >&2
+                exit 2
+            fi
+            run_stage "$stage" "$cargo_binary" run --locked -p fanta_ui \
+                --features visual-tests --bin fanta_ui_visual_test_runner
+            ;;
+    esac
+done
+
+if [[ "$list_only" == false ]]; then
+    printf 'Results: %s/results.tsv\n' "$output_directory"
+    printf 'Installer, full-app pointer journeys, live services and performance gates remain separate.\n'
+fi
+exit "$overall_status"

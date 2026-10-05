@@ -1,0 +1,208 @@
+# Fanta capability guide
+
+Source inventory updated **5 October 2026**. This describes the current editor
+implementation; release verification is tracked separately in
+[the capability coverage report](../alpha/CAPABILITY_COVERAGE.md). Earlier alpha
+reports describe their dated builds and can contain controls that have since
+changed. A feature listed here is not a claim that its complete installed-app
+journey has passed.
+
+## Projects, pages and source
+
+Create a design from **New Design**, open a Fanta project folder, or import a
+`.fig` file or `.fant` snapshot. A saved project contains `fanta.json`, page and
+component FNX source, identity sidecars, metadata and assets. See
+[project-schema.md](project-schema.md) for the layout.
+
+- Use the left panel to find and switch pages, rename, reorder, duplicate or
+  delete pages, select layers, expand nesting, and drag layers into a different
+  parent or position. Page roots and component recursion have edit guards.
+- Canvas edits support Undo/Redo and debounced autosave. Save commits active
+  valid property edits; failures remain visible. Save As creates a separate
+  project and rejects occupied or unsafe destinations.
+- The **Code** workspace edits FNX and supported JSON sources. Saving valid
+  source updates the canvas; invalid drafts preserve the last valid file and
+  scene. An unsaved source buffer locks conflicting visual edits. Selecting a
+  layer reveals its source; agent source-follow can be paused.
+- External source changes reload through the project watcher. Conflicting
+  previews, pending saves and changed files are guarded rather than blindly
+  overwritten. These protections still require full release-candidate testing.
+- Review Changes and the Git commit/sync surfaces operate on the design
+  project. Bundled Git and distribution-specific restrictions are covered by
+  the separate release workflow.
+
+Implementation: [document.rs](../../crates/fig_viewer/src/document.rs),
+[design_panel.rs](../../crates/fig_viewer/src/design_panel.rs),
+[code_workspace.rs](../../crates/fig_viewer/src/code_workspace.rs), and
+[project sessions](../../crates/fanta-format/src/project/session).
+
+## Canvas and authoring
+
+| Capability | How it works and its scope |
+| --- | --- |
+| Navigation | Pan with Hand; zoom, fit content/selection, and use page-specific viewports. Selection, hover and editing overlays follow the active page. |
+| Selection and transforms | Move, resize, rotate, proportional Scale, multi-selection, marquee and nested selection. Snapping and guides assist placement. Locked/hidden content and read-only modes constrain edits. |
+| Shapes and drawing | Rectangle, ellipse, line, arrow, polygon, star, Pen, Pencil, Brush and Eraser. Edit Path exposes vector anchors/handles; Path Selection operates on paths. Shape parameters appear for compatible nodes. |
+| Containers and structure | Frames, sections, groups, slices; reparenting, z-order, duplicate, delete, group/ungroup, frame selection and boolean operations. Clipboard operations preserve supported dependencies and reject unsafe cross-document copies. |
+| Region selection and crop | Rectangle/ellipse selection, lasso, polygonal lasso and Magic Wand produce a drawing selection. Crop commits an undoable crop; these controls are not a general bitmap pixel editor. |
+| Text | Create and edit inline text, select ranges, apply typography and text paints, and convert text to outlines. Instance text editing creates an override. |
+| Text on Path | Convert one eligible vector baseline, then edit its text and path text properties. Rounded/clipped geometry, zero-length paths and unsupported paints are rejected with a message. |
+| Media | Place supported local images, editable SVG, MP4 video and MP3 audio, or generation results. Files are validated before placement. Canvas media controls include playback and seek; video trim preserves the original asset and supports Undo/Redo. |
+
+The properties inspector adapts to the selected kind and selection count. Its
+supported sections include position, size, rotation, constraints, opacity/blend,
+fills and gradients, strokes, effects, corners, typography, auto-layout/grid,
+variables, components and export. Page selection has page-specific properties.
+Mixed values must remain identifiable; controls must neither erase unsupported
+data nor silently apply to a stale selection. Numeric and color gestures preview
+live, commit as one history step, and restore the previous value when cancelled.
+
+Implementation: [tools.rs](../../crates/fig_viewer/src/tools.rs),
+[canvas tools](../../crates/fanta-tools/src),
+[design inspector adapter](../../crates/fig_viewer/src/gpui_adapters/design.rs),
+[inline text](../../crates/fig_viewer/src/text_edit.rs), and
+[media placement](../../crates/fig_viewer/src/generation_media.rs).
+
+### Double-click behavior by node
+
+Use Move in Design mode. The first click selects; the second activates the
+selected, visible target under the pointer. Nested content may need a first
+double-click to drill into its container before another pair enters editing.
+
+| Selected target | Double-click action | Finish or cancel |
+| --- | --- | --- |
+| Text or Text on Path | Open inline text editing at the clicked word. | Click away, Escape or Command+Enter commits and exits; Undo reverses the edit. |
+| Vector, including primitive shapes and vectors with image fills | Open Edit Path for anchors and handles. | Escape leaves path editing; Undo reverses a committed edit. |
+| Bitmap/image node | Activate Crop. Draw the crop region. | Enter applies; Escape cancels the pending crop. |
+| Group, frame, section or boolean | Drill into the next selectable child level. | A subsequent double-click can activate the selected leaf. |
+| Component instance | Edit a virtual text override when the pointer hits editable instance text; otherwise reveal its properties inspector. | Finish text editing or inspect instance properties. |
+| Video or audio | Reveal the properties inspector. | Playback remains in the appropriate Motion/Prototype controls; double-click does not change mode. |
+| Node graph, 3D, AI artifact or embed | Reveal the properties inspector. | No specialized editor is implied for placeholder types. |
+
+Locked, hidden, obscured and other-page scene nodes do not enter editing. Shift,
+Command or Control keep their selection meaning; Space panning does not activate
+an editor. Only the even click in each pair activates or drills in, preventing a
+triple-click from accidentally descending another level. Instance text also
+respects locked ancestors, overlapping virtual content and clipping, including
+rounded corners. Automated regressions cover these cases; native input
+verification remains tracked in the release report.
+
+### Canvas context menu
+
+Right-click targets the visible layer under the pointer, retaining an existing
+selection when the target is already inside it. Pending inspector/text edits are
+handled before changing the target; protected drafts are preserved.
+
+| Target | Relevant commands |
+| --- | --- |
+| Text or Text on Path | **Edit text** opens inline editing with its text selected. |
+| Vector | **Edit vector** opens Edit Path. |
+| Bitmap | **Crop image** activates Crop. |
+| Video, audio or other leaf | **Video properties**, **Audio properties** or **Layer properties** reveals the inspector. |
+| Main component or instantiable variant-set frame | **Create instance** places an instance beside the component. |
+| Instance with an available main component | **Go to main component**, **Detach instance** and **Reset all overrides**. Detach preserves the expanded content and can be undone. |
+| Eligible node | **Create component**, **Add auto layout**, **Outline stroke**, **Flatten** and **Use as mask** appear only when applicable, using the same operations as the layers panel. |
+| Selection or canvas | Clipboard commands, Duplicate/Delete, Group/Frame selection, Bring to front/Send to back; **Ungroup** appears for a supported container. Empty canvas offers Paste. |
+
+Single-node editor/component commands are hidden for multi-selection. Writes
+are disabled in read-only mode or when selected layers are locked; read-only
+properties and applicable navigation remain available. Reordering applies to
+the selected roots and is undoable. The canvas menu is not shown in Draw mode
+or during prototype presentation.
+
+Flatten is unavailable when it would discard images, mixed text colors or
+decorations, child effects, clipping, layout, bindings, animation or component
+links. Supported simple vector groups and boolean geometry remain convertible.
+This restriction preserves content instead of producing a lossy replacement.
+
+Implementation: [view_context_menu.rs](../../crates/fig_viewer/src/view_context_menu.rs).
+
+## Components, variables and reusable styles
+
+Create a main component, create/navigate instances, edit supported instance
+overrides, define typed component properties and bind them to descendants.
+Variant sets support axes, member names and arrangement. Component recursion
+and incompatible bindings are rejected.
+
+The Variables workspace supports collections, modes, typed values, aliases,
+rename/delete and compatible property bindings. Modes can apply at project,
+page and parent scopes. Unbinding bakes the resolved value. Shared styles and
+imported bindings participate in rendering and source persistence.
+
+Implementation: [component actions](../../crates/fig_viewer/src/component_actions.rs),
+[component properties](../../crates/fig_viewer/src/component_properties.rs),
+[variants](../../crates/fig_viewer/src/variant_sets.rs), and
+[variables](../../crates/fig_viewer/src/variables_workspace.rs).
+
+## Motion, prototypes and design review
+
+- **Motion:** clips, node/property tracks, keyframes, scrubbing, playback,
+  looping, timeline zoom, animation presets and custom easing. Live keyframe
+  and numeric edits retain their identity and become undoable transactions.
+- **Prototype:** starting frames, interactions, destinations, transitions,
+  overlays, supported links and property-animation bindings. Presentation
+  provides frame navigation/restart and restores the editor viewport on exit.
+- **Comments:** canvas pins, threads/replies, resolve and motion anchors;
+  supported rich messages and agent attribution persist in the project.
+- **Measurements and annotations:** persistent review metadata, editing and
+  undo, with unsent annotation drafts preserved through navigation. Review
+  overlays do not become artwork in exports.
+- **Inspect/Dev:** inspect content and review information with artwork editing
+  disabled. Read-only barriers also apply to shortcuts and agent/source paths;
+  changing mode must preserve or explicitly finish a pending edit.
+
+Implementation: [timeline](../../crates/fig_viewer/src/timeline.rs),
+[motion](../../crates/fig_viewer/src/motion_panel.rs),
+[prototype authoring](../../crates/fig_viewer/src/prototype_panel.rs),
+[prototype runtime](../../crates/fanta-present/src/fanta_present.rs),
+[comments](../../crates/fig_viewer/src/comments_ui.rs),
+[measurements](../../crates/fig_viewer/src/view_measurements.rs),
+[annotations](../../crates/fig_viewer/src/view_annotations.rs), and
+[Dev mode](../../crates/fig_viewer/src/view_dev_mode.rs).
+
+## Export and automation
+
+Export selections with **PNG, JPG, SVG or PDF** presets. Raster sizing,
+multi-selection batches and multiple presets are supported. Export operates on
+committed artwork, reports completion/failure and refuses an active preview.
+Imported or advanced effects still need format-specific fidelity checks.
+
+The built-in designer can inspect/edit the canvas, use project `fanta.md`
+instructions, prepare design assets, follow source edits and report agent
+activity. Plan/Review and editing modes have distinct write permissions. See
+[AI_DESIGNER.md](../alpha/AI_DESIGNER.md).
+
+External agents connect to the local live MCP surface. Core tools include
+`get_editor_state`, `batch_get`, `batch_design`, `get_screenshot`,
+`get_guidelines`, `read_fnx_source` and `validate_fnx_source`; design-system,
+asset-import/preparation, comments and activity tools extend that surface.
+Batches are transactional: failure preserves document state, assets, selection
+and history. A successful batch is a single undoable edit. Tool screenshots
+verify rendered output; they do not prove that a mouse or keyboard control works.
+
+The generation workspace offers image, video, audio and vector creation, plus
+supported source/mask workflows, preview, save, placement and durable recovery.
+Vector creation and image tracing can yield editable paths. Available models
+come from the signed-in account's catalog; network failures and uncertain jobs
+have recovery paths. Live provider availability, credits and payment behavior
+require separate service validation.
+
+Implementation: [export](../../crates/fig_viewer/src/export.rs),
+[agent operations](../../crates/fig_viewer/src/agent_surface.rs),
+[live MCP tools](../../crates/fig_viewer/src/live_mcp.rs),
+[generation workspace](../../crates/fig_viewer/src/generation_workspace.rs), and
+[recovery journal](../../crates/fig_viewer/src/generation_journal.rs).
+
+## Boundaries
+
+Node-graph, generic AI-artifact and embed node types exist in the format, but the
+canvas renderer currently draws placeholders for those types. A 3D node has a
+renderer hook; this inventory does not establish a complete shipped 3D editor.
+Neither storage support nor a node enum constitutes a finished user workflow.
+
+Mac App Store builds restrict local process execution, external agents and
+related inherited editor features; see [MAC_APP_STORE.md](../alpha/MAC_APP_STORE.md).
+Account sign-in, billing, cloud generation and distribution have separate
+release gates. This guide makes no current production-status claim. Deliberately
+disabled inherited services are recorded in
+[disabled-services-binnacle.md](disabled-services-binnacle.md).
