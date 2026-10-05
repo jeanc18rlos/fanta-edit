@@ -58,7 +58,7 @@ use crate::canvas::{
 };
 use crate::clipboard::{
     CanvasClipboard, ClipboardPlacement, apply_transaction as apply_canvas_transaction,
-    clone_component_operations, create_operations, delete_operations,
+    clone_component_operations, paste_operations,
 };
 use crate::code_workspace::FantaCodeWorkspace;
 use crate::comments::MotionCommentAnchor;
@@ -4588,12 +4588,32 @@ impl FigView {
         }
     }
 
+    fn selected_nodes_are_editable(&self, cx: &App) -> bool {
+        self.is_editable(cx)
+            && self.item.read(cx).doc().is_some_and(|doc| {
+                doc.selection
+                    .iter()
+                    .all(|id| crate::layer_context_ops::editable(doc, *id))
+            })
+    }
+
     pub(crate) fn cut_selected_nodes(&mut self, cx: &mut Context<Self>) {
         if !self.is_editable(cx) {
             return;
         }
-        self.copy_selected_nodes(cx);
-        self.delete_selected_nodes(cx);
+        if self.selected_annotation(cx).is_some() || self.selected_measurement(cx).is_some() {
+            self.copy_selected_nodes(cx);
+            self.delete_selected_nodes(cx);
+            return;
+        }
+        if self.annotation_state.controller.has_pending_authoring()
+            || self.tools.kind() == ToolKind::Annotation
+            || self.tools.kind() == ToolKind::Measure
+            || self.measurement_controller.has_pending_authoring()
+        {
+            return;
+        }
+        self.remove_selected_nodes(true, cx);
     }
 
     pub(crate) fn delete_selected_nodes(&mut self, cx: &mut Context<Self>) {
@@ -4605,27 +4625,62 @@ impl FigView {
             self.delete_measurement(&record, cx);
             return;
         }
+        self.remove_selected_nodes(false, cx);
+    }
 
-        if !self.is_editable(cx) {
+    fn remove_selected_nodes(&mut self, cut: bool, cx: &mut Context<Self>) {
+        if !self.selected_nodes_are_editable(cx) {
             return;
         }
         self.finish_document_edits(cx);
-        let result = self.item.update(cx, |item, cx| {
+        let label = if cut { "Cut" } else { "Delete" };
+        let result: Result<Option<CanvasClipboard>> = self.item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
-                let operations = delete_operations(&document.doc);
-                match apply_canvas_transaction(&mut document.doc, "Delete", operations) {
+                let Some(target) = crate::clipboard::editable_selection_roots(&document.doc)
+                    .first()
+                    .copied()
+                else {
+                    return (Ok(None), DocChange::None);
+                };
+                let operations =
+                    match crate::layer_context_ops::delete_layers(&document.doc, target) {
+                        Ok(operations) => operations,
+                        Err(error) => return (Err(error), DocChange::None),
+                    };
+                let payload = if cut {
+                    let Some(payload) = CanvasClipboard::capture(&document.doc) else {
+                        return (Ok(None), DocChange::None);
+                    };
+                    if let Err(error) = payload.validate_cut() {
+                        return (Err(error), DocChange::None);
+                    }
+                    Some(payload)
+                } else {
+                    None
+                };
+                match apply_canvas_transaction(&mut document.doc, label, operations) {
                     Ok(true) => {
                         document.doc.selection.clear();
-                        (Ok(true), DocChange::Content)
+                        (Ok(payload), DocChange::Content)
                     }
-                    Ok(false) => (Ok(false), DocChange::None),
+                    Ok(false) => (Ok(None), DocChange::None),
                     Err(error) => (Err(error), DocChange::None),
                 }
             })
             .unwrap_or_else(|| Err(anyhow::anyhow!("the document is no longer available")))
         });
-        if let Err(error) = result {
-            log::error!("deleting canvas selection failed: {error:#}");
+        match result {
+            Ok(Some(payload)) => {
+                cx.write_to_clipboard(ClipboardItem::new_string_with_json_metadata(
+                    payload.display_text(),
+                    payload,
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                log::error!("{label} canvas selection failed: {error:#}");
+                show_canvas_notice_deferred(format!("{label} failed: {error:#}"), cx);
+            }
         }
     }
 
@@ -5010,7 +5065,7 @@ impl FigView {
     }
 
     pub(crate) fn duplicate_selected_nodes(&mut self, cx: &mut Context<Self>) {
-        if !self.is_editable(cx) {
+        if !self.selected_nodes_are_editable(cx) {
             return;
         }
         self.finish_document_edits(cx);
@@ -5048,7 +5103,12 @@ impl FigView {
                     Err(error) => return (Err(error), DocChange::None),
                 };
                 let operations = match placement {
-                    ClipboardPlacement::Paste => create_operations(&pasted),
+                    ClipboardPlacement::Paste => {
+                        match paste_operations(&document.doc, payload, &mut pasted) {
+                            Ok(operations) => operations,
+                            Err(error) => return (Err(error), DocChange::None),
+                        }
+                    }
                     ClipboardPlacement::Duplicate => {
                         match clone_component_operations(&document.doc, payload, &mut pasted) {
                             Ok(operations) => operations,
@@ -12769,6 +12829,886 @@ mod tests {
         });
     }
 
+    fn asset_clipboard_subtree() -> (Doc, NodeId, NodeId, BTreeMap<AssetId, Vec<u8>>) {
+        let (mut doc, bitmap, images) = bitmap_canvas_doc();
+        let page = doc.active_page().expect("page");
+        let asset = *images.keys().next().expect("PNG asset");
+        let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([240.0, 140.0]),
+            ..Default::default()
+        }));
+        frame.name = "Asset subtree".into();
+        frame.parent = Some(page);
+        frame.index = doc.scene.next_child_index(Some(page));
+        frame.transform = Transform2D::translation(-120.0, -70.0);
+        let root = frame.id;
+        doc.scene.insert(frame).expect("frame");
+        let mut bitmap_node = doc.scene.get(bitmap).expect("bitmap").clone();
+        doc.scene
+            .remove(bitmap)
+            .expect("remove old bitmap position");
+        bitmap_node.parent = Some(root);
+        bitmap_node.index = doc.scene.next_child_index(Some(root));
+        bitmap_node.transform = Transform2D::translation(10.0, 10.0);
+        doc.scene
+            .insert(bitmap_node)
+            .expect("reparent bitmap fixture");
+        let mut image_vector = VectorNode::rect_solid(0.0, 0.0, 20.0, 30.0, Color::BLACK);
+        image_vector.fills = [Fill::Image {
+            asset,
+            mode: fanta_doc::ImageFitMode::Fit,
+            opacity: 0.7,
+            crop: Some(Box::new([0.1, 0.2, 0.6, 0.5])),
+            scale: Some(1.25),
+            rotation: Some(30.0),
+            blend: fanta_doc::BlendMode::Multiply,
+            adjust: Default::default(),
+        }]
+        .into_iter()
+        .collect();
+        let mut vector = CanvasNode::new(NodeData::Vector(image_vector));
+        vector.parent = Some(root);
+        vector.index = doc.scene.next_child_index(Some(root));
+        vector.transform = Transform2D::translation(210.0, 90.0);
+        doc.scene.insert(vector).expect("image fill vector");
+        let mut control =
+            CanvasNode::new(NodeData::Text(TextNode::new("Do not modify", 100.0, 30.0)));
+        control.parent = Some(page);
+        control.index = doc.scene.next_child_index(Some(page));
+        control.transform = Transform2D::translation(350.0, 150.0);
+        doc.scene.insert(control).expect("unselected control");
+        doc.selection.select_only(root);
+        doc.history = Default::default();
+        (doc, root, bitmap, images)
+    }
+
+    fn asset_clipboard_content(doc: &Doc) -> serde_json::Value {
+        let mut snapshot = doc.clone_for_persist();
+        snapshot.history = Default::default();
+        snapshot.selection.clear();
+        snapshot.metadata.modified_at = 0;
+        serde_json::to_value(snapshot).expect("complete clipboard content")
+    }
+
+    fn bind_asset_clipboard_commands(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new("cmd-x", CutSelection, Some("FigViewer")),
+                gpui::KeyBinding::new("cmd-d", DuplicateSelection, Some("FigViewer")),
+                gpui::KeyBinding::new("backspace", DeleteSelection, Some("FigViewer")),
+            ]);
+        });
+    }
+
+    async fn assert_asset_clipboard_lock_guards(command: &str, cx: &mut TestAppContext) {
+        init_visual_test(cx);
+        bind_asset_clipboard_commands(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        for guard in ["node", "ancestor", "mixed parent", "source draft"] {
+            let (mut doc, root, bitmap, images) = asset_clipboard_subtree();
+            doc.selection.select_only(bitmap);
+            if guard != "source draft" {
+                let locked = if guard == "ancestor" { root } else { bitmap };
+                doc.scene
+                    .get_mut(locked)
+                    .expect("locked node")
+                    .flags
+                    .insert(fanta_doc::NodeFlags::LOCKED);
+            }
+            if guard == "mixed parent" {
+                doc.selection.replace_with([root, bitmap]);
+            }
+            let selection = doc.selection.as_slice().to_vec();
+            let (item, view, mut visual) =
+                mounted_canvas_interaction_fixture(&project, doc, images.clone(), cx);
+            if guard == "source draft" {
+                item.update(&mut visual, |item, cx| {
+                    item.set_source_edit_locked(true, cx)
+                });
+            }
+            visual.update(|window, cx| {
+                view.update(cx, |view, cx| view.focus_handle.focus(window, cx));
+                window.draw(cx).clear();
+                cx.write_to_clipboard(ClipboardItem::new_string("untouched clipboard".into()));
+            });
+            let before = item.read_with(&visual, |item, _| {
+                asset_clipboard_content(item.doc().expect("document"))
+            });
+            visual.simulate_keystrokes(command);
+            visual.run_until_parked();
+            item.read_with(&visual, |item, _| {
+                let document = item.document().expect("document");
+                assert_eq!(
+                    asset_clipboard_content(&document.doc),
+                    before,
+                    "{command} must respect {guard} protection"
+                );
+                assert_eq!(document.doc.selection.as_slice(), selection);
+                assert_eq!(document.raw_assets.as_ref(), &images);
+                assert_eq!(document.doc.history.undo_depth(), 0);
+                assert!(!item.is_dirty());
+            });
+            if command == "cmd-x" {
+                let clipboard = visual.read_from_clipboard().expect("original clipboard");
+                assert_eq!(
+                    clipboard.text().as_deref(),
+                    Some("untouched clipboard"),
+                    "a refused Cut must not replace the clipboard"
+                );
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn mounted_asset_clipboard_cut_respects_node_ancestor_and_source_locks(
+        cx: &mut TestAppContext,
+    ) {
+        assert_asset_clipboard_lock_guards("cmd-x", cx).await;
+    }
+
+    #[gpui::test]
+    async fn mounted_asset_clipboard_duplicate_respects_node_ancestor_and_source_locks(
+        cx: &mut TestAppContext,
+    ) {
+        assert_asset_clipboard_lock_guards("cmd-d", cx).await;
+    }
+
+    #[gpui::test]
+    async fn mounted_asset_clipboard_delete_respects_node_ancestor_and_source_locks(
+        cx: &mut TestAppContext,
+    ) {
+        assert_asset_clipboard_lock_guards("backspace", cx).await;
+    }
+
+    async fn assert_asset_clipboard_remove_master(
+        set_reference: bool,
+        command: &str,
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        bind_asset_clipboard_commands(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (mut doc, root, bitmap, images) = asset_clipboard_subtree();
+        let component = fanta_doc::ComponentId::new();
+        doc.components.defs.insert(
+            component,
+            fanta_doc::ComponentDef::new(component, root, "Asset master"),
+        );
+        if set_reference {
+            let collection = VariableCollectionId::new();
+            let mode = ModeId::new();
+            let variable = VariableId::new();
+            doc.variables.collections.insert(
+                collection,
+                VariableCollection {
+                    id: collection,
+                    name: "Opacity".into(),
+                    modes: vec![Mode {
+                        id: mode,
+                        name: "Default".into(),
+                    }],
+                    default_mode: mode,
+                    variable_order: vec![variable],
+                },
+            );
+            doc.variables.variables.insert(
+                variable,
+                Variable {
+                    id: variable,
+                    collection,
+                    name: "Photo opacity".into(),
+                    ty: VariableType::Float,
+                    values_by_mode: BTreeMap::from([(mode, VarValue::Float { value: 0.4 })]),
+                    scopes: Vec::new(),
+                },
+            );
+            doc.components
+                .defs
+                .get_mut(&component)
+                .expect("master definition")
+                .props
+                .push(fanta_doc::ComponentPropDef {
+                    id: fanta_doc::ComponentPropId::new(),
+                    name: "Photo opacity".into(),
+                    kind: fanta_doc::ComponentPropKind::Number,
+                    formatter: Default::default(),
+                    default: VarValue::Alias { variable },
+                    bindings: vec![fanta_doc::PropBindingTarget {
+                        path: [bitmap].into_iter().collect(),
+                        prop: fanta_doc::BoundProp::Opacity,
+                    }],
+                });
+        }
+        let instance_component = if set_reference {
+            let set = fanta_doc::ComponentId::new();
+            doc.components
+                .defs
+                .get_mut(&component)
+                .expect("master definition")
+                .variant_of = Some(fanta_doc::ComponentSetMembership {
+                set,
+                axis_values: Default::default(),
+            });
+            doc.components.sets.insert(
+                set,
+                fanta_doc::ComponentSet {
+                    id: set,
+                    name: "Asset variants".into(),
+                    axes: Vec::new(),
+                    members: vec![component],
+                    default_variant: component,
+                    root: None,
+                },
+            );
+            set
+        } else {
+            component
+        };
+        let mut instance = CanvasNode::new(NodeData::Instance(fanta_doc::InstanceNode {
+            component: instance_component,
+            overrides: Vec::new(),
+            prop_values: Default::default(),
+            derived: Vec::new(),
+            local_size: [240.0, 140.0],
+        }));
+        instance.parent = doc.active_page();
+        instance.index = doc.scene.next_child_index(instance.parent);
+        instance.transform = Transform2D::translation(350.0, -70.0);
+        let survivor = instance.id;
+        doc.scene.insert(instance).expect("surviving instance");
+        let (item, view, mut visual) =
+            mounted_canvas_interaction_fixture(&project, doc, images.clone(), cx);
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| view.focus_handle.focus(window, cx));
+            window.draw(cx).clear();
+            cx.write_to_clipboard(ClipboardItem::new_string("original clipboard".into()));
+        });
+        let before = item.read_with(&visual, |item, _| {
+            asset_clipboard_content(item.doc().expect("document"))
+        });
+        visual.simulate_keystrokes(command);
+        visual.run_until_parked();
+        if command == "backspace" {
+            assert_eq!(
+                visual
+                    .read_from_clipboard()
+                    .expect("clipboard")
+                    .text()
+                    .as_deref(),
+                Some("original clipboard"),
+                "Delete does not replace clipboard contents"
+            );
+        }
+
+        let after = item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            let doc = &document.doc;
+            assert!(!doc.scene.contains(root), "Cut removes its selected master subtree");
+            assert!(doc.scene.contains(survivor), "unselected placed content survives Cut");
+            for definition in doc.components.defs.values() {
+                assert!(doc.scene.contains(definition.root), "Cut must not leave a component definition pointing at deleted content");
+            }
+            let node = doc.scene.get(survivor).expect("survivor");
+            let surviving_nodes = match &node.data {
+                NodeData::Instance(instance) => fanta_doc::expand_instance(&doc.scene, &doc.components, instance).into_iter().map(|expanded| expanded.node).collect::<Vec<_>>(),
+                _ => doc.scene.descendants_of(survivor).filter_map(|id| doc.scene.get(id).cloned()).collect(),
+            };
+            assert!(surviving_nodes.iter().any(|node| matches!(&node.data, NodeData::Bitmap(bitmap) if images.contains_key(&bitmap.asset))), "the unselected instance must still display its actual asset-bearing content");
+            if set_reference {
+                let photo = surviving_nodes.iter().find(|node| matches!(node.data, NodeData::Bitmap(_))).expect("surviving photo");
+                assert!((photo.opacity.get() - 0.4).abs() < 1e-6, "detachment must preserve the variable-resolved instance appearance, got {}", photo.opacity.get());
+            }
+            assert_eq!(document.raw_assets.as_ref(), &images);
+            assert_eq!(doc.history.undo_depth(), 1);
+            asset_clipboard_content(doc)
+        });
+        visual.simulate_keystrokes("cmd-z");
+        visual.run_until_parked();
+        item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            assert_eq!(
+                asset_clipboard_content(&document.doc),
+                before,
+                "one Undo restores master and original instance references"
+            );
+            assert_eq!(document.raw_assets.as_ref(), &images);
+            assert_eq!(document.doc.history.undo_depth(), 0);
+        });
+        visual.simulate_keystrokes("cmd-shift-z");
+        visual.run_until_parked();
+        item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            assert_eq!(
+                asset_clipboard_content(&document.doc),
+                after,
+                "Redo restores the exact safe Cut result"
+            );
+            assert_eq!(document.raw_assets.as_ref(), &images);
+            assert_eq!(document.doc.history.undo_depth(), 1);
+        });
+    }
+
+    #[gpui::test]
+    async fn mounted_asset_clipboard_cut_master_preserves_surviving_instance_and_undo(
+        cx: &mut TestAppContext,
+    ) {
+        assert_asset_clipboard_remove_master(false, "cmd-x", cx).await;
+    }
+
+    #[gpui::test]
+    async fn mounted_asset_clipboard_cut_last_variant_preserves_set_instance_and_undo(
+        cx: &mut TestAppContext,
+    ) {
+        assert_asset_clipboard_remove_master(true, "cmd-x", cx).await;
+    }
+
+    #[gpui::test]
+    async fn mounted_asset_clipboard_delete_last_variant_preserves_set_instance_and_undo(
+        cx: &mut TestAppContext,
+    ) {
+        assert_asset_clipboard_remove_master(true, "backspace", cx).await;
+    }
+
+    async fn assert_asset_clipboard_cut_paste_restores_components(
+        include_local_instance: bool,
+        set_reference: bool,
+        copy_then_delete: bool,
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        bind_asset_clipboard_commands(cx);
+        cx.update(|cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new("cmd-v", PasteSelection, Some("FigViewer")),
+                gpui::KeyBinding::new("cmd-c", CopySelection, Some("FigViewer")),
+            ])
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (mut doc, master, bitmap, images) = asset_clipboard_subtree();
+        let component = fanta_doc::ComponentId::new();
+        doc.components.defs.insert(
+            component,
+            fanta_doc::ComponentDef::new(component, master, "Movable asset master"),
+        );
+        let opacity_property = fanta_doc::ComponentPropId::new();
+        doc.components
+            .defs
+            .get_mut(&component)
+            .expect("master")
+            .props
+            .push(fanta_doc::ComponentPropDef {
+                id: opacity_property,
+                name: "Photo opacity".into(),
+                kind: fanta_doc::ComponentPropKind::Number,
+                formatter: Default::default(),
+                default: VarValue::Float { value: 0.6 },
+                bindings: vec![fanta_doc::PropBindingTarget {
+                    path: [bitmap].into_iter().collect(),
+                    prop: fanta_doc::BoundProp::Opacity,
+                }],
+            });
+        let reference = if set_reference {
+            let set = fanta_doc::ComponentId::new();
+            doc.components
+                .defs
+                .get_mut(&component)
+                .expect("master")
+                .variant_of = Some(fanta_doc::ComponentSetMembership {
+                set,
+                axis_values: Default::default(),
+            });
+            doc.components.sets.insert(
+                set,
+                fanta_doc::ComponentSet {
+                    id: set,
+                    name: "Movable asset variants".into(),
+                    axes: Vec::new(),
+                    members: vec![component],
+                    default_variant: component,
+                    root: None,
+                },
+            );
+            set
+        } else {
+            component
+        };
+        let root = if include_local_instance {
+            let page = doc.active_page().expect("page");
+            let mut section = CanvasNode::new(NodeData::Group(GroupNode {
+                clip_size: Some([640.0, 300.0]),
+                ..Default::default()
+            }));
+            section.parent = Some(page);
+            section.index = doc.scene.next_child_index(Some(page));
+            let section_id = section.id;
+            doc.scene.insert(section).expect("selection container");
+            let mut master_node = doc.scene.get(master).expect("master").clone();
+            let children = doc
+                .scene
+                .descendants_of(master)
+                .filter_map(|id| doc.scene.get(id).cloned())
+                .collect::<Vec<_>>();
+            doc.scene
+                .remove(master)
+                .expect("remove old master placement");
+            master_node.parent = Some(section_id);
+            master_node.index = doc.scene.next_child_index(Some(section_id));
+            doc.scene
+                .insert(master_node)
+                .expect("move master into selection");
+            for node in children.into_iter().filter(|node| node.id != master) {
+                doc.scene.insert(node).expect("restore master child");
+            }
+            let mut instance = CanvasNode::new(NodeData::Instance(fanta_doc::InstanceNode {
+                component: reference,
+                overrides: Vec::new(),
+                prop_values: BTreeMap::from([(opacity_property, VarValue::Float { value: 0.4 })]),
+                derived: vec![fanta_doc::DerivedOverride {
+                    path: [bitmap].into_iter().collect(),
+                    transform: Some(Transform2D::translation(23.0, 17.0)),
+                    size: None,
+                    fills: None,
+                    path_data: None,
+                    stroke_path: None,
+                    stroke_weight: None,
+                    text: None,
+                }],
+                local_size: [240.0, 140.0],
+            }));
+            instance.parent = Some(section_id);
+            instance.index = doc.scene.next_child_index(Some(section_id));
+            instance.transform = Transform2D::translation(300.0, 0.0);
+            doc.scene.insert(instance).expect("selected local instance");
+            section_id
+        } else {
+            master
+        };
+        doc.selection.select_only(root);
+        doc.history = Default::default();
+        let (item, view, mut visual) =
+            mounted_canvas_interaction_fixture(&project, doc, images.clone(), cx);
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| view.focus_handle.focus(window, cx));
+            window.draw(cx).clear();
+        });
+        let before = item.read_with(&visual, |item, _| item.doc().expect("document").clone());
+        visual.simulate_keystrokes(if copy_then_delete {
+            "cmd-c backspace"
+        } else {
+            "cmd-x"
+        });
+        visual.run_until_parked();
+        let after_cut = item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            assert!(!document.doc.scene.contains(root));
+            assert!(document.doc.components.def(component).is_none());
+            assert_eq!(document.raw_assets.as_ref(), &images);
+            assert_eq!(document.doc.history.undo_depth(), 1);
+            asset_clipboard_content(&document.doc)
+        });
+        visual.simulate_keystrokes("cmd-v");
+        visual.run_until_parked();
+        let after_paste = item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            let doc = &document.doc;
+            let pasted = *doc.selection.as_slice().first().expect("selected pasted subtree");
+            let nodes = doc.scene.descendants_of(pasted).collect::<Vec<_>>();
+            let definitions = doc.components.defs.values().filter(|definition| nodes.contains(&definition.root)).collect::<Vec<_>>();
+            assert_eq!(definitions.len(), 1, "Cut then Paste restores a functional component master, not an ordinary group");
+            let definition = definitions.first().expect("restored definition");
+            assert_eq!(definition.name, "Movable asset master");
+            let instances = nodes.iter().filter_map(|id| match &doc.scene.get(*id).expect("pasted node").data { NodeData::Instance(instance) => Some(instance), _ => None }).collect::<Vec<_>>();
+            assert_eq!(instances.len(), usize::from(include_local_instance), "placed instances retain component semantics");
+            for instance in instances {
+                let expected = if set_reference {
+                    let set = doc.components.sets.values().next().expect("restored set");
+                    assert_eq!(set.members, vec![definition.id]);
+                    assert_eq!(set.default_variant, definition.id);
+                    assert_eq!(definition.variant_of.as_ref().expect("membership").set, set.id);
+                    set.id
+                } else { definition.id };
+                assert_eq!(instance.component, expected, "local instance points at the restored master or set");
+                let expanded = fanta_doc::expand_instance(&doc.scene, &doc.components, instance);
+                let photo = expanded.iter().find(|entry| matches!(entry.node.data, NodeData::Bitmap(_))).expect("resolved photo");
+                assert!((photo.node.opacity.get() - 0.4).abs() < 1e-6, "restored property binding targets the pasted bitmap");
+                assert_eq!(photo.node.transform, Transform2D::translation(23.0, 17.0), "restored derived path targets the pasted bitmap");
+                assert!(expanded.iter().any(|entry| matches!(&entry.node.data, NodeData::Bitmap(bitmap) if images.contains_key(&bitmap.asset))), "pasted instance still paints the actual bitmap");
+            }
+            for id in before.scene.roots().iter().flat_map(|id| before.scene.descendants_of(*id)).filter(|id| !before.scene.descendants_of(root).any(|removed| removed == *id)) {
+                assert_eq!(doc.scene.get(id), before.scene.get(id), "unselected originals stay exact");
+            }
+            assert_eq!(document.raw_assets.as_ref(), &images);
+            assert_eq!(doc.history.undo_depth(), 2);
+            asset_clipboard_content(doc)
+        });
+        item.update(&mut visual, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.clear();
+                ((), DocChange::Selection)
+            })
+        });
+        visual.simulate_keystrokes("cmd-v");
+        visual.run_until_parked();
+        let after_second_paste = item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(
+                doc.components.defs.len(),
+                2,
+                "each Paste restores an independent definition instead of rebinding the first copy"
+            );
+            assert_eq!(doc.components.sets.len(), if set_reference { 2 } else { 0 });
+            for definition in doc.components.defs.values() {
+                assert!(doc.scene.contains(definition.root));
+            }
+            for node in doc
+                .scene
+                .roots()
+                .iter()
+                .flat_map(|root| doc.scene.descendants_of(*root))
+                .filter_map(|id| doc.scene.get(id))
+            {
+                if let NodeData::Instance(instance) = &node.data {
+                    assert!(
+                        !fanta_doc::expand_instance(&doc.scene, &doc.components, instance)
+                            .is_empty()
+                    );
+                }
+            }
+            asset_clipboard_content(doc)
+        });
+        visual.simulate_keystrokes("cmd-z");
+        visual.run_until_parked();
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                asset_clipboard_content(item.doc().expect("document")),
+                after_paste,
+                "Undo second Paste leaves first copy exact"
+            )
+        });
+        visual.simulate_keystrokes("cmd-z");
+        visual.run_until_parked();
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                asset_clipboard_content(item.doc().expect("document")),
+                after_cut,
+                "Undo Paste restores exact cut state"
+            )
+        });
+        visual.simulate_keystrokes("cmd-z");
+        visual.run_until_parked();
+        item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            assert_eq!(
+                asset_clipboard_content(&document.doc),
+                asset_clipboard_content(&before),
+                "Undo Cut restores original component IDs and local instances"
+            );
+            assert_eq!(document.raw_assets.as_ref(), &images);
+            assert!(!document.doc.history.can_undo());
+        });
+        visual.simulate_keystrokes("cmd-shift-z cmd-shift-z cmd-shift-z");
+        visual.run_until_parked();
+        item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            assert_eq!(
+                asset_clipboard_content(&document.doc),
+                after_second_paste,
+                "Redo restores the same pasted IDs, definitions and relationships"
+            );
+            assert_eq!(document.raw_assets.as_ref(), &images);
+            assert!(!document.doc.history.can_redo());
+        });
+    }
+
+    #[gpui::test]
+    async fn mounted_asset_clipboard_cut_paste_restores_direct_master(cx: &mut TestAppContext) {
+        assert_asset_clipboard_cut_paste_restores_components(false, false, false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn mounted_asset_clipboard_cut_paste_preserves_master_and_local_instance(
+        cx: &mut TestAppContext,
+    ) {
+        assert_asset_clipboard_cut_paste_restores_components(true, false, false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn mounted_asset_clipboard_cut_paste_restores_complete_variant_set(
+        cx: &mut TestAppContext,
+    ) {
+        assert_asset_clipboard_cut_paste_restores_components(true, true, false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn mounted_asset_clipboard_copy_delete_paste_restores_components(
+        cx: &mut TestAppContext,
+    ) {
+        assert_asset_clipboard_cut_paste_restores_components(true, false, true, cx).await;
+    }
+
+    #[gpui::test]
+    async fn mounted_asset_clipboard_partial_variant_cut_preserves_content_and_clipboard_with_notice(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        bind_asset_clipboard_commands(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system.clone(), [], cx).await;
+        cx.update(|cx| {
+            client::Client::set_global(project.read(cx).client(), cx);
+            <dyn fs::Fs>::set_global(file_system, cx);
+        });
+        let (mut doc, master, _, images) = asset_clipboard_subtree();
+        let mut other = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([40.0, 20.0]),
+            ..Default::default()
+        }));
+        other.parent = doc.active_page();
+        other.index = doc.scene.next_child_index(other.parent);
+        let other_root = other.id;
+        doc.scene.insert(other).expect("other variant root");
+        let set = fanta_doc::ComponentId::new();
+        let member = fanta_doc::ComponentId::new();
+        let other_member = fanta_doc::ComponentId::new();
+        for (id, root) in [(member, master), (other_member, other_root)] {
+            let mut definition = fanta_doc::ComponentDef::new(id, root, "Variant");
+            definition.variant_of = Some(fanta_doc::ComponentSetMembership {
+                set,
+                axis_values: Default::default(),
+            });
+            doc.components.defs.insert(id, definition);
+        }
+        doc.components.sets.insert(
+            set,
+            fanta_doc::ComponentSet {
+                id: set,
+                name: "Partial selection".into(),
+                axes: Vec::new(),
+                members: vec![member, other_member],
+                default_variant: member,
+                root: None,
+            },
+        );
+        doc.selection.select_only(master);
+        doc.history = Default::default();
+        let payload = CanvasClipboard::capture(&doc).expect("partial copy");
+        assert!(
+            payload
+                .validate_cut()
+                .expect_err("partial set rejected")
+                .to_string()
+                .contains("Select every variant")
+        );
+        let item = crate::document::ready_item_for_test(
+            &project,
+            "/tmp/PartialVariantCut.fig".into(),
+            doc,
+            cx,
+        );
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                *Arc::make_mut(&mut document.raw_assets) = images.clone();
+                ((), DocChange::None)
+            })
+        });
+        let (multi_workspace, visual) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(visual, |multi_workspace, _| {
+            multi_workspace.workspace().clone()
+        });
+        let view = visual.update(|window, cx| {
+            let view = cx.new(|cx| FigView::new(item.clone(), project, window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx)
+            });
+            window.activate_window();
+            view.update(cx, |view, cx| view.focus_handle.focus(window, cx));
+            cx.write_to_clipboard(ClipboardItem::new_string("Kept clipboard".into()));
+            view
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| view.focus_handle.focus(window, cx));
+            window.draw(cx).clear();
+        });
+        let before = item.read_with(visual, |item, _| {
+            asset_clipboard_content(item.doc().expect("mounted document"))
+        });
+        visual.simulate_keystrokes("cmd-x");
+        visual.run_until_parked();
+        assert_eq!(
+            visual
+                .read_from_clipboard()
+                .expect("clipboard")
+                .text()
+                .as_deref(),
+            Some("Kept clipboard")
+        );
+        item.read_with(visual, |item, _| {
+            let document = item.document().expect("document");
+            assert_eq!(asset_clipboard_content(&document.doc), before);
+            assert_eq!(document.doc.selection.as_slice(), &[master]);
+            assert!(!document.doc.history.can_undo());
+            assert!(!item.is_dirty());
+            assert_eq!(document.raw_assets.as_ref(), &images);
+        });
+        workspace.read_with(visual, |workspace, _| {
+            assert!(workspace.notification_ids().contains(&NotificationId::named(CANVAS_NOTICE_ID.into())), "rejected Cut must visibly explain the supported selection without deleting anything");
+        });
+    }
+
+    #[gpui::test]
+    async fn mounted_asset_clipboard_menu_duplicate_and_cut_preserve_bytes_and_subtree(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        cx.update(|cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new("home", menu::SelectFirst, Some("menu")),
+                gpui::KeyBinding::new("down", menu::SelectNext, Some("menu")),
+                gpui::KeyBinding::new("enter", menu::Confirm, Some("menu")),
+            ]);
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, root, _, images) = asset_clipboard_subtree();
+        let (item, view, mut visual) =
+            mounted_canvas_interaction_fixture(&project, doc, images.clone(), cx);
+        let before = item.read_with(&visual, |item, _| item.doc().expect("document").clone());
+        let invoke_menu = |visual: &mut gpui::VisualTestContext, entry: usize| {
+            let position = view.read_with(visual, |view, _| {
+                view.container_bounds.expect("canvas bounds").center()
+            });
+            visual.simulate_mouse_down(position, MouseButton::Right, gpui::Modifiers::none());
+            visual.simulate_mouse_up(position, MouseButton::Right, gpui::Modifiers::none());
+            visual.run_until_parked();
+            assert!(
+                view.read_with(visual, |view, _| view.canvas_context_menu.is_some()),
+                "actual canvas context menu opens"
+            );
+            visual.simulate_keystrokes("home");
+            for _ in 0..entry {
+                visual.simulate_keystrokes("down");
+            }
+            visual.simulate_keystrokes("enter");
+            visual.run_until_parked();
+        };
+        invoke_menu(&mut visual, 3);
+        let (copy, after_duplicate) = item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            let doc = &document.doc;
+            let copy = *doc
+                .selection
+                .as_slice()
+                .first()
+                .expect("selected duplicate");
+            assert_ne!(copy, root);
+            assert_eq!(doc.history.undo_depth(), 1);
+            let originals = before.scene.descendants_of(root).collect::<Vec<_>>();
+            let copies = doc.scene.descendants_of(copy).collect::<Vec<_>>();
+            assert_eq!(copies.len(), originals.len());
+            for (original, copied) in originals.iter().zip(&copies) {
+                let original = before.scene.get(*original).expect("original node");
+                let copied = doc.scene.get(*copied).expect("copied node");
+                assert_ne!(original.id, copied.id);
+                assert_eq!(
+                    original.data, copied.data,
+                    "Bitmap crop/tint and image-fill asset ID/transform stay exact"
+                );
+            }
+            for id in before
+                .scene
+                .roots()
+                .iter()
+                .flat_map(|id| before.scene.descendants_of(*id))
+            {
+                assert_eq!(
+                    doc.scene.get(id),
+                    before.scene.get(id),
+                    "all original nodes remain exact"
+                );
+            }
+            assert_eq!(document.raw_assets.as_ref(), &images);
+            (copy, asset_clipboard_content(doc))
+        });
+        visual.simulate_keystrokes("cmd-z");
+        visual.run_until_parked();
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                asset_clipboard_content(item.doc().expect("document")),
+                asset_clipboard_content(&before)
+            )
+        });
+        visual.simulate_keystrokes("cmd-shift-z");
+        visual.run_until_parked();
+        item.update(&mut visual, |item, cx| {
+            item.with_document(cx, |document| {
+                assert_eq!(asset_clipboard_content(&document.doc), after_duplicate);
+                document.doc.selection.select_only(copy);
+                ((), DocChange::Selection)
+            });
+        });
+        invoke_menu(&mut visual, 1);
+        let cut_payload = visual
+            .read_from_clipboard()
+            .and_then(|clipboard| {
+                clipboard.entries.into_iter().find_map(|entry| match entry {
+                    ClipboardEntry::String(string) => string.metadata_json::<CanvasClipboard>(),
+                    ClipboardEntry::Image(_) | ClipboardEntry::ExternalPaths(_) => None,
+                })
+            })
+            .expect("Cut places an actual canvas payload on the clipboard");
+        assert_eq!(cut_payload.display_text(), "Asset subtree");
+        item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            let pasted = cut_payload
+                .instantiate(&document.doc, 0.0, ClipboardPlacement::Paste)
+                .expect("Cut payload remains usable in the same document");
+            let expected = before
+                .scene
+                .descendants_of(root)
+                .map(|id| before.scene.get(id).expect("original subtree").data.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                pasted
+                    .nodes
+                    .iter()
+                    .map(|node| node.data.clone())
+                    .collect::<Vec<_>>(),
+                expected,
+                "Cut retains Bitmap/image-fill asset references and exact payloads"
+            );
+        });
+        item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            assert_eq!(
+                asset_clipboard_content(&document.doc),
+                asset_clipboard_content(&before),
+                "Cut removes only the copied subtree"
+            );
+            assert_eq!(document.raw_assets.as_ref(), &images);
+            assert_eq!(document.doc.history.undo_depth(), 2);
+        });
+        visual.simulate_keystrokes("cmd-z");
+        visual.run_until_parked();
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                asset_clipboard_content(item.doc().expect("document")),
+                after_duplicate
+            )
+        });
+        visual.simulate_keystrokes("cmd-shift-z");
+        visual.run_until_parked();
+        item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            assert_eq!(
+                asset_clipboard_content(&document.doc),
+                asset_clipboard_content(&before)
+            );
+            assert_eq!(document.raw_assets.as_ref(), &images);
+        });
+    }
+
     #[gpui::test]
     async fn canvas_copy_cut_paste_and_duplicate_preserve_subtrees_and_history(
         cx: &mut TestAppContext,
@@ -15428,7 +16368,7 @@ impl FigView {
                     crate::layer_context_ops::editable(doc, id),
                     "the selected instance is locked"
                 );
-                let operations = crate::properties_ops::detach_instance_operations(doc, id);
+                let operations = crate::properties_ops::detach_instance_operations(doc, id)?;
                 anyhow::ensure!(!operations.is_empty(), "the instance cannot be detached");
                 Ok((operations, vec![id]))
             },

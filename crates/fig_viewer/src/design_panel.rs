@@ -3592,13 +3592,12 @@ impl FantaDesignPanel {
                 window,
                 cx,
             ),
-            LayersPanelContextAction::DetachInstance => {
-                self.apply_document_ops(
-                    "Detach instance",
-                    |doc| crate::properties_ops::detach_instance_operations(doc, id),
-                    cx,
-                );
-            }
+            LayersPanelContextAction::DetachInstance => self.apply_layer_command(
+                "Detach instance",
+                |doc| crate::properties_ops::detach_instance_operations(doc, id),
+                window,
+                cx,
+            ),
             LayersPanelContextAction::GoToMainComponent => {
                 // An instance of a variant set lands on the variant it shows.
                 let master = self.active_view(cx).and_then(|view| {

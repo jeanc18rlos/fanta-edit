@@ -139,7 +139,7 @@ fn canvas_layer_operations(
                 ),
                 "Choose a component instance"
             );
-            let operations = crate::properties_ops::detach_instance_operations(doc, node);
+            let operations = crate::properties_ops::detach_instance_operations(doc, node)?;
             anyhow::ensure!(!operations.is_empty(), "The main component is unavailable");
             Ok(operations)
         }
