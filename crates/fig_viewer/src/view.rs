@@ -15928,6 +15928,154 @@ mod tests {
         }
     }
 
+    async fn assert_mounted_node_edit_activation_shows_anchors(
+        cx: &mut TestAppContext,
+        context_menu: bool,
+    ) {
+        use gpui::InputEvent as _;
+        init_visual_test(cx);
+        cx.update(|cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new("home", menu::SelectFirst, Some("menu")),
+                gpui::KeyBinding::new("down", menu::SelectNext, Some("menu")),
+                gpui::KeyBinding::new("enter", menu::Confirm, Some("menu")),
+            ]);
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let mut doc = doc_with_one_page();
+        let mut vector = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            120.0,
+            80.0,
+            Color::BLACK,
+        )));
+        vector.parent = doc.active_page();
+        vector.transform = Transform2D::translation(-60.0, -40.0);
+        let vector_id = vector.id;
+        doc.apply(Operation::create_node(vector)).expect("vector");
+        doc.history = Default::default();
+        let (item, view, mut visual) =
+            mounted_canvas_interaction_fixture(&project, doc, BTreeMap::new(), cx);
+        let expected = item.read_with(&visual, |item, _| {
+            let mut expected = item.doc().expect("document").clone();
+            expected.selection.select_only(vector_id);
+            serde_json::to_value(expected).expect("expected selected document")
+        });
+        let position = view.read_with(&visual, |view, _| {
+            view.container_bounds.expect("canvas").center()
+        });
+        let assert_anchors = |view: &FigView| {
+            assert_eq!(view.active_tool(), ToolKind::NodeEdit);
+            let anchors: Vec<_> = view
+                .tools
+                .overlays
+                .iter()
+                .filter_map(|overlay| match overlay {
+                    fanta_tools::ToolOverlay::PathAnchor { world, selected } => {
+                        assert!(!selected, "activation must not select arbitrary anchors");
+                        Some(*world)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                anchors.len(),
+                4,
+                "context_menu={context_menu}: anchors must be visible before any hover or additional pointer event"
+            );
+            for expected in [[-60.0, -40.0], [60.0, -40.0], [60.0, 40.0], [-60.0, 40.0]] {
+                assert!(
+                    anchors.contains(&expected),
+                    "missing world-space anchor {expected:?}"
+                );
+            }
+        };
+        if context_menu {
+            visual.simulate_event(MouseDownEvent {
+                position,
+                button: MouseButton::Right,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            });
+            visual.simulate_event(MouseUpEvent {
+                position,
+                button: MouseButton::Right,
+                modifiers: Default::default(),
+                click_count: 1,
+            });
+            visual.run_until_parked();
+            view.read_with(&visual, |view, _| {
+                assert!(view.canvas_context_menu.is_some())
+            });
+            visual.simulate_keystrokes("home down down down down down enter");
+            view.read_with(&visual, |view, _| assert_anchors(view));
+        } else {
+            mounted_canvas_click(&mut visual, position, 1);
+            visual.run_until_parked();
+            visual.update(|window, cx| window.draw(cx).clear());
+            visual.update(|window, cx| {
+                window.dispatch_event(
+                    MouseDownEvent {
+                        position,
+                        button: MouseButton::Left,
+                        modifiers: Default::default(),
+                        click_count: 2,
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                assert_anchors(view.read(cx));
+            });
+            visual.simulate_event(MouseUpEvent {
+                position,
+                button: MouseButton::Left,
+                modifiers: Default::default(),
+                click_count: 2,
+            });
+        }
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                serde_json::to_value(item.doc().expect("document")).expect("after activation"),
+                expected
+            );
+            assert!(!item.content_preview_active());
+            assert!(!item.is_dirty());
+        });
+        visual.simulate_keystrokes("escape");
+        view.read_with(&visual, |view, _| {
+            assert_eq!(view.active_tool(), ToolKind::Select);
+            assert!(
+                !view
+                    .tools
+                    .overlays
+                    .iter()
+                    .any(|overlay| matches!(overlay, fanta_tools::ToolOverlay::PathAnchor { .. }))
+            );
+        });
+        item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert_eq!(
+                serde_json::to_value(&doc.scene).expect("scene after exit"),
+                expected["scene"]
+            );
+            assert!(!item.is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    async fn mounted_node_edit_double_click_shows_anchors_immediately(cx: &mut TestAppContext) {
+        assert_mounted_node_edit_activation_shows_anchors(cx, false).await;
+    }
+
+    #[gpui::test]
+    async fn mounted_node_edit_context_menu_shows_anchors_immediately(cx: &mut TestAppContext) {
+        assert_mounted_node_edit_activation_shows_anchors(cx, true).await;
+    }
+
     #[gpui::test]
     async fn mounted_canvas_pairs_drill_group_then_boolean_before_vector_editing(
         cx: &mut TestAppContext,
