@@ -87,6 +87,7 @@ fn maximal_node(data: NodeData) -> CanvasNode {
         animation: None,
     });
     node.layout_child = Some(LayoutChild {
+        grid: None,
         grow: 1.0,
         absolute: true,
         align_self: Some(super::CounterAlign::Center),

@@ -138,7 +138,8 @@ declare global {
   }
 
   interface FnxAutoLayout {
-    mode: "horizontal" | "vertical";
+    /** `grid` places children in the frame's `grid` tracks. */
+    mode: "horizontal" | "vertical" | "grid";
     spacing?: number;
     counter_spacing?: number;
     counter_auto_spacing?: boolean;
@@ -160,6 +161,32 @@ declare global {
     grow?: number;
     absolute?: boolean;
     align_self?: "start" | "center" | "end" | "stretch" | "baseline";
+    /** The child's cell in a `grid` parent; absent ⇒ the next free cell. */
+    grid?: FnxGridCell;
+  }
+
+  type FnxGridTrack =
+    | { kind: "fixed"; size: number }
+    | { kind: "flex"; fr: number }
+    | { kind: "hug" };
+
+  /** The tracks of an `auto_layout={{mode: "grid"}}` frame. */
+  interface FnxGridLayout {
+    columns: readonly FnxGridTrack[];
+    /** Rows the children need beyond these are added as `hug` rows. */
+    rows: readonly FnxGridTrack[];
+    column_gap?: number;
+    row_gap?: number;
+  }
+
+  /** 0-based column/row; spans default to 1, alignments to `start`. */
+  interface FnxGridCell {
+    column: number;
+    row: number;
+    column_span?: number;
+    row_span?: number;
+    horizontal?: "start" | "center" | "end";
+    vertical?: "start" | "center" | "end";
   }
 
   interface FnxFontVariation {
@@ -263,6 +290,7 @@ declare global {
     /** Authored initial scroll offset `[x, y]`. */
     scroll_offset?: readonly [number, number];
     auto_layout?: FnxAutoLayout;
+    grid?: FnxGridLayout;
     explicit_modes?: Readonly<Record<string, string>>;
   }
 

@@ -185,6 +185,7 @@ fn per_child_align_self_overrides_frame_counter_align() {
     let a = t.push(rect_child(f, 20.0, 10.0)); // inherits Start → y 0
     let mut b_node = rect_child(f, 20.0, 10.0);
     b_node.layout_child = Some(LayoutChild {
+        grid: None,
         grow: 0.0,
         absolute: false,
         align_self: Some(CounterAlign::End), // overrides → y 40
@@ -272,6 +273,7 @@ fn per_child_align_self_baseline_overrides_to_end() {
     let a = t.push(rect_child(f, 20.0, 10.0)); // inherits Start → y 0
     let mut b_node = rect_child(f, 20.0, 10.0);
     b_node.layout_child = Some(LayoutChild {
+        grid: None,
         grow: 0.0,
         absolute: false,
         align_self: Some(CounterAlign::Baseline), // overrides → end → y 40

@@ -675,6 +675,15 @@ fn scale_data(data: &mut NodeData, factor: f64) -> Option<()> {
                     scale_optional(value, factor)?;
                 }
             }
+            if let Some(grid) = &mut group.grid {
+                scale_number(&mut grid.column_gap, factor)?;
+                scale_number(&mut grid.row_gap, factor)?;
+                for track in grid.columns.iter_mut().chain(&mut grid.rows) {
+                    if let fanta_doc::GridTrack::Fixed { size } = track {
+                        scale_number(size, factor)?;
+                    }
+                }
+            }
         }
         NodeData::Text(text) => {
             scale_array(&mut text.local_size, factor)?;

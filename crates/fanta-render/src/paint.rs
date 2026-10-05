@@ -30,7 +30,7 @@ pub fn fill_to_paint(fill: &Fill, local_bounds: [f32; 4]) -> Paint {
         Fill::Solid { color, blend } => {
             paint.set_color(to_sk_color(*color));
             if !blend.is_normal() {
-                paint.set_blend_mode(to_sk_blend_mode(*blend));
+                apply_blend_mode(&mut paint, *blend);
             }
         }
         Fill::Gradient { gradient, blend } => {
@@ -40,7 +40,7 @@ pub fn fill_to_paint(fill: &Fill, local_bounds: [f32; 4]) -> Paint {
                 paint.set_color(to_sk_color(color.color));
             }
             if !blend.is_normal() {
-                paint.set_blend_mode(to_sk_blend_mode(*blend));
+                apply_blend_mode(&mut paint, *blend);
             }
         }
         Fill::Image { .. } | Fill::Video { .. } | Fill::Pattern { .. } | Fill::Shader { .. } => {
@@ -54,15 +54,14 @@ pub fn fill_to_paint(fill: &Fill, local_bounds: [f32; 4]) -> Paint {
     paint
 }
 
-/// Map a [`fanta_doc::BlendMode`] to its [`skia_safe::BlendMode`] equivalent.
-///
-/// `fanta_doc::BlendMode` is the CSS Compositing Level 1 / `SkBlendMode` set, so
-/// each separable + non-separable mode has an exact Skia counterpart. `Normal`
-/// maps to Skia `SrcOver` (regular alpha-over). Owned here so the node-level
-/// effects layer and the per-paint fill/image blends share one mapping.
-pub(crate) fn to_sk_blend_mode(mode: BlendMode) -> skia_safe::BlendMode {
+/// Composite `paint` with `mode`. The CSS Compositing Level 1 modes map to
+/// their exact `SkBlendMode` (`Normal` is `SrcOver`), Linear Dodge to Skia's
+/// `Plus`, and Linear Burn, which has no `SkBlendMode`, to an SkSL blender.
+/// Owned here so the node-level effects layer and the per-paint fill/image
+/// blends share one mapping.
+pub(crate) fn apply_blend_mode(paint: &mut Paint, mode: BlendMode) {
     use skia_safe::BlendMode as Sk;
-    match mode {
+    let sk = match mode {
         BlendMode::Normal => Sk::SrcOver,
         BlendMode::Multiply => Sk::Multiply,
         BlendMode::Screen => Sk::Screen,
@@ -79,7 +78,50 @@ pub(crate) fn to_sk_blend_mode(mode: BlendMode) -> skia_safe::BlendMode {
         BlendMode::Saturation => Sk::Saturation,
         BlendMode::Color => Sk::Color,
         BlendMode::Luminosity => Sk::Luminosity,
+        BlendMode::LinearDodge => Sk::Plus,
+        BlendMode::LinearBurn => {
+            paint.set_blender(LINEAR_BURN.with(Clone::clone));
+            return;
+        }
+    };
+    paint.set_blend_mode(sk);
+}
+
+/// `RuntimeEffect::make_for_*` in skia-safe 0.84 take their options as
+/// `impl for<'a, 'b> Into<Option<&'a Options<'b>>>`, which no concrete
+/// `Option<&Options>` satisfies (see the diamond-gradient note below). A local
+/// marker with a lifetime-generic `From` does: it always means "no options".
+struct DefaultRuntimeEffectOptions;
+
+impl<'a, 'b> From<DefaultRuntimeEffectOptions>
+    for Option<&'a skia_safe::runtime_effect::Options<'b>>
+{
+    fn from(_: DefaultRuntimeEffectOptions) -> Self {
+        None
     }
+}
+
+thread_local! {
+    /// Linear Burn as a separable blend, composited with the W3C formula on
+    /// Skia's premultiplied inputs: `B(cs, cb) = max(0, cs + cb - 1)` on
+    /// unpremultiplied colors, then
+    /// `co = cs·(1 - ab) + cb·(1 - as) + as·ab·B`, `ao = as + ab·(1 - as)`.
+    static LINEAR_BURN: skia_safe::Blender = skia_safe::RuntimeEffect::make_for_blender(
+        r#"
+        half4 main(half4 src, half4 dst) {
+            half3 cs = src.a > 0.0 ? src.rgb / src.a : half3(0.0);
+            half3 cb = dst.a > 0.0 ? dst.rgb / dst.a : half3(0.0);
+            half3 burned = max(cs + cb - 1.0, half3(0.0));
+            return half4(
+                src.rgb * (1.0 - dst.a) + dst.rgb * (1.0 - src.a) + src.a * dst.a * burned,
+                src.a + dst.a * (1.0 - src.a));
+        }
+        "#,
+        DefaultRuntimeEffectOptions,
+    )
+    .expect("the Linear Burn blender compiles")
+    .make_blender(skia_safe::Data::new_empty(), None)
+    .expect("the Linear Burn blender instantiates");
 }
 
 /// Multiply `alpha` into a fill/stroke paint's own alpha. Skia modulates a

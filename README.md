@@ -139,8 +139,8 @@ meet first:
 
 - Parts of the toolbar and inspector are visible but not wired up. They say so
   when clicked rather than failing silently.
-- Grid auto-layout, three blend modes, and most effect kinds beyond shadows and
-  blurs do nothing.
+- The Pass Through blend mode and most effect kinds beyond shadows and blurs do
+  nothing.
 - Canvas copy and paste works within one document only. Pasting an image works;
   pasting any other kind of file still does nothing.
 - Nothing in this build has been clicked. The agent operations behind Group,

@@ -2402,3 +2402,25 @@ fn integer_attributes_keep_their_own_spelling() {
     assert_eq!(render_attr(&json!(0)), "{0}");
     assert_eq!(render_attr(&json!(-7)), "{-7}");
 }
+
+#[test]
+fn grid_layout_and_cells_round_trip() {
+    let nodes = vec![
+        json!({
+            "type": "group", "id": "GRID0000000000000000000000", "parent": null, "index": 1.0,
+            "name": "Gallery",
+            "auto_layout": { "mode": "grid", "spacing": 0.0 },
+            "grid": {
+                "columns": [{ "kind": "fixed", "size": 120.0 }, { "kind": "flex", "fr": 2.0 }],
+                "rows": [{ "kind": "hug" }],
+                "column_gap": 8.0, "row_gap": 4.0
+            }
+        }),
+        json!({
+            "type": "vector", "id": "CELL0000000000000000000000", "parent": "GRID0000000000000000000000",
+            "index": 1.0, "name": "Tile",
+            "layout_child": { "grid": { "column": 1, "row": 0, "column_span": 2, "horizontal": "center" } }
+        }),
+    ];
+    assert_same_nodes(&round_trip(&nodes), &nodes);
+}

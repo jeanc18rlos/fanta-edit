@@ -448,8 +448,8 @@ tagged by `"op"`:
 - `set_text_style` — `id` plus optional `font_family`, `font_weight`
   (100–900), `font_size`, `line_height` (multiple of the size),
   `letter_spacing`, `align` (`left|center|right|justify`), `color`.
-- `set_auto_layout` — `id`, `direction` (`"horizontal"`, `"vertical"` or
-  `"none"` to turn it off), optional `gap`, `padding` (`[all]`,
+- `set_auto_layout` — `id`, `direction` (`"horizontal"`, `"vertical"`,
+  `"grid"` or `"none"` to turn it off), optional `gap`, `padding` (`[all]`,
   `[vertical, horizontal]` or `[top, right, bottom, left]`), `align_items`
   (`start|center|end|stretch|baseline`) and `justify`
   (`start|center|end|space_between|space_evenly`).
@@ -468,6 +468,10 @@ tagged by `"op"`:
   the original; the copy's id is in `created`.
 - `create_component` — `id` of a frame or group: makes it a component master
   in place and reports the `component` id.
+- `componentize` — `ids` of look-alike layers: the first becomes the master
+  and the others are replaced in place by instances that override whatever
+  they changed (text, fills, hidden layers, other properties). Copies must have
+  the master's structure. Reports the `component` and the new `instances`.
 - `reparent` — `id`, optional `parent` (omit to move to the active page root)
   and optional `index` among the new siblings (0 = bottom; omit to append on
   top). The node keeps its world position.
@@ -503,7 +507,12 @@ values select the named member. Inspect the returned property schema.
 `set_auto_layout` also accepts primary/counter `*_sizing` (`fixed`/`hug`),
 `min_size`/`max_size` ([width,height], null clears an axis), `wrap` and `counter_gap`.
 `set_layout_child` accepts `grow`, `align_self`, `absolute`; positive grow fills
-the parent’s primary axis. `set_text_style.sizing` is `fixed`, `auto_height` or
+the parent’s primary axis. `set_grid_layout` — `id`, `columns` and optional
+`rows` (tracks: a px number, `"1fr"`/`"2fr"`, or `"auto"` to hug), `gap`,
+`row_gap` — makes the frame a grid; children fill cells row by row, and
+`set_layout_child` `column`/`row` (0-based), `column_span`/`row_span`,
+`cell_horizontal`/`cell_vertical` (`start|center|end`) pin one, `auto_place`
+unpins it. `set_text_style.sizing` is `fixed`, `auto_height` or
 `auto_width`. A centered button: horizontal layout, center justify/align_items,
 Hug axes, padding [8,16], min_size [128,48], auto-width label. A wrapping card:
 vertical Hug height, fixed width, Stretch children and auto-height paragraphs.

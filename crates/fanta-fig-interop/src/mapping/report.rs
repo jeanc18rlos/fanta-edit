@@ -293,6 +293,11 @@ pub struct MapReport {
     pub auto_layout_horizontal: usize,
     /// Nodes given a VERTICAL [`fanta_doc::node::AutoLayout`].
     pub auto_layout_vertical: usize,
+    /// Nodes given a GRID [`fanta_doc::node::AutoLayout`] (`stackMode == GRID`).
+    pub auto_layout_grid: usize,
+    /// Grid children whose `gridColumnAnchor`/`gridRowAnchor` resolved to a
+    /// cell of their parent's tracks (the rest are auto-placed).
+    pub grid_cells_resolved: usize,
     /// Of the auto-layout frames, how many HUG (RESIZE_TO_FIT) on their primary
     /// axis — the extent a layout pass would have to compute from content.
     pub auto_layout_primary_hug: usize,

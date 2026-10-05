@@ -548,9 +548,9 @@ pub enum BlurKind {
     Background,
 }
 
-/// Standard blend modes — matches the CSS Compositing Level 1 spec and Skia's
-/// `SkBlendMode`. The doc only stores the enum; conversion to Skia happens in
-/// `fanta-render`.
+/// Blend modes: the CSS Compositing Level 1 set (Skia's `SkBlendMode`) plus
+/// Figma's Linear Burn and Linear Dodge. The doc only stores the enum;
+/// conversion to Skia happens in `fanta-render`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlendMode {
@@ -571,6 +571,11 @@ pub enum BlendMode {
     Saturation,
     Color,
     Luminosity,
+    /// Figma's Linear Burn: `max(0, src + dst - 1)` per channel (darker than
+    /// Multiply). Not an `SkBlendMode`; `fanta-render` draws it with a blender.
+    LinearBurn,
+    /// Figma's Linear Dodge (Add): `min(1, src + dst)`, Skia's `Plus`.
+    LinearDodge,
 }
 
 impl BlendMode {

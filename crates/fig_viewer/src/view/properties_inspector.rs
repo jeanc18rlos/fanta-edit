@@ -22,7 +22,9 @@ pub(super) struct PropertiesAdapter {
 
 fn inspector_tab(mode: EditorMode) -> PropertiesInspectorTab {
     match mode {
-        EditorMode::Design => PropertiesInspectorTab::Design,
+        // The floating inspector has no Build tab; Build sits on the canvas
+        // like Design.
+        EditorMode::Design | EditorMode::Build => PropertiesInspectorTab::Design,
         EditorMode::Motion => PropertiesInspectorTab::Motion,
         EditorMode::Draw => PropertiesInspectorTab::Draw,
         EditorMode::Code | EditorMode::Dev => PropertiesInspectorTab::Code,
@@ -41,6 +43,7 @@ impl FigView {
             EditorMode::Motion => self.motion_sidebar.clone().into_any_element(),
             EditorMode::Prototype => self.prototype_sidebar.clone().into_any_element(),
             EditorMode::Comments => adapter.comments.clone().into_any_element(),
+            EditorMode::Build => self.plan_build_sidebar.clone().into_any_element(),
         })
     }
 

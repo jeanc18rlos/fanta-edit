@@ -109,7 +109,37 @@ pub enum VariableBindingProperty {
 pub enum LayoutDirection {
     Horizontal,
     Vertical,
+    /// Children sit in grid cells. A frame that was not a grid starts with
+    /// ⌈√n⌉ equal columns; `set_grid_layout` sets its tracks.
+    Grid,
     None,
+}
+
+/// How wrapped lines share the cross axis: `auto` packs them `counter_gap`
+/// apart, `space_between` spreads them across the frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AlignContent {
+    Auto,
+    SpaceBetween,
+}
+
+/// One grid track: a number is a fixed size in px, `"<n>fr"` (or `"fr"`) a
+/// share of the space the other tracks leave, `"auto"` hugs its content.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum GridTrackSpec {
+    Px(f64),
+    Keyword(String),
+}
+
+/// Where a grid child sits inside its cell area.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum CellAlignment {
+    Start,
+    Center,
+    End,
 }
 
 /// Cross-axis alignment of auto-layout children (CSS `align-items`).
@@ -328,14 +358,18 @@ pub enum DesignShape {
 /// What this build's design ops can do beyond the original set, advertised in
 /// `get_editor_state` so a planner never sends an op the editor lacks. Each op
 /// is named on its own (`op:<name>`; `op:set_stroke` covers `sides`, `dash`,
-/// `cap` and `join`). The blanket `design-ops/2` would also promise grid
-/// layout and componentize, which this build does not implement.
+/// `cap` and `join`; `op:set_auto_layout` the `grid` direction and
+/// `align_content`; `op:set_layout_child` the grid cell fields).
 pub const DESIGN_OP_CAPABILITIES: &[&str] = &[
     "op:set_effects",
     "op:set_fill",
     "op:set_constraints",
     "op:create_shape",
     "op:set_stroke",
+    "op:set_grid_layout",
+    "op:set_auto_layout",
+    "op:set_layout_child",
+    "op:componentize",
     "batch_get:detail",
 ];
 
@@ -616,8 +650,28 @@ pub enum DesignOp {
         wrap: Option<bool>,
         #[serde(default)]
         counter_gap: Option<f64>,
+        /// How wrapped lines share the cross axis.
+        #[serde(default)]
+        align_content: Option<AlignContent>,
     },
-    /// Change a child's participation in its parent's auto layout. Positive grow fills the primary axis.
+    /// Lay a frame's children in a grid (its auto layout becomes a grid).
+    /// Tracks: a number is px, "1fr"/"2fr" share the leftover space, "auto"
+    /// hugs the content. Omitted rows are added as "auto" rows as the
+    /// children need them. `gap` sets both gaps unless `row_gap` is given.
+    SetGridLayout {
+        id: String,
+        columns: Vec<GridTrackSpec>,
+        #[serde(default)]
+        rows: Option<Vec<GridTrackSpec>>,
+        #[serde(default)]
+        gap: Option<f64>,
+        #[serde(default)]
+        row_gap: Option<f64>,
+    },
+    /// Change a child's participation in its parent's auto layout. Positive grow fills the primary axis
+    /// (a grid cell's width); `align_self: stretch` fills the counter axis (a grid cell's height).
+    /// In a grid, `column`/`row` (0-based) and the spans pin the child's cell; `auto_place: true`
+    /// unpins it so it takes the next free cell.
     SetLayoutChild {
         id: String,
         #[serde(default)]
@@ -626,6 +680,28 @@ pub enum DesignOp {
         align_self: Option<CrossAxisAlignment>,
         #[serde(default)]
         absolute: Option<bool>,
+        #[serde(default)]
+        column: Option<u16>,
+        #[serde(default)]
+        row: Option<u16>,
+        #[serde(default)]
+        column_span: Option<u16>,
+        #[serde(default)]
+        row_span: Option<u16>,
+        #[serde(default)]
+        cell_horizontal: Option<CellAlignment>,
+        #[serde(default)]
+        cell_vertical: Option<CellAlignment>,
+        #[serde(default)]
+        auto_place: Option<bool>,
+    },
+    /// Turn look-alike layers into one component: the first id becomes the
+    /// master and every other one is replaced, in place, by an instance of it
+    /// that overrides whatever it changed (text, fills, hidden layers, …).
+    /// Copies must have the master's structure: the same kinds of layers in
+    /// the same order. Reports the `component` and the new `instances`.
+    Componentize {
+        ids: Vec<String>,
     },
     /// Create reusable variable foundations. Modes default to ["Default"]. Names must be unique.
     CreateVariableCollection {
@@ -1370,8 +1446,10 @@ mode use canvas operations; source file mutation is unavailable.
 - Name layers by role in Title Case: "Header", "Primary Button", "Card /
   Title". Never leave "Rectangle 12" behind in finished work.
 - Repeated elements are components: build one instance right, `create_component`
-  it, then `create_instance` the rest. Reference an existing component by its
-  id (or unique name) from `design_state` `components`.
+  it, then `create_instance` the rest. When the copies already exist,
+  `componentize` them (master id first): they become instances that keep
+  their own text and colors. Reference an existing component by its id (or
+  unique name) from `design_state` `components`.
 - Inspect `design_system` / `get_design_system` before inventing tokens or
   components. Collections own named modes; variables have typed values per
   mode. Create foundations with `create_variable_collection` and
@@ -1390,6 +1468,10 @@ mode use canvas operations; source file mutation is unavailable.
   padding/gap, Stretch children and auto_height paragraphs. SetLayoutChild
   grow fills the parent primary axis; align_self controls its cross axis.
   Keep other requested alignments explicit; do not center every container.
+- For galleries, dashboards and card grids use `set_grid_layout` (e.g.
+  columns ["1fr","1fr","1fr"], gap 16) instead of nested rows. Children fill
+  cells in order; pin one with set_layout_child column/row/column_span and
+  make it fill its cell with grow 1 and align_self stretch.
 
 ## Visual language
 - Type scale (px): 12 caption, 14 body-small, 16 body, 20 heading-3, 24

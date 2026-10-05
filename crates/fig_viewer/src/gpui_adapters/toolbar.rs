@@ -305,7 +305,9 @@ pub(crate) fn toolbar_mode(mode: EditorMode) -> ToolbarMode {
         EditorMode::Motion => ToolbarMode::Motion,
         EditorMode::Draw => ToolbarMode::Draw,
         EditorMode::Code | EditorMode::Dev => ToolbarMode::Dev,
-        EditorMode::Design | EditorMode::Prototype | EditorMode::Comments => ToolbarMode::Design,
+        EditorMode::Design | EditorMode::Prototype | EditorMode::Comments | EditorMode::Build => {
+            ToolbarMode::Design
+        }
     }
 }
 

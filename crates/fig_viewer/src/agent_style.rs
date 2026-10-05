@@ -62,6 +62,22 @@ pub(crate) fn node_style(doc: &Doc, id: NodeId) -> Value {
                 "absolute": child.absolute,
             }),
         );
+        if let Some(cell) = child.grid
+            && let Some(Value::Object(projected)) = style.get_mut("layout_child")
+        {
+            projected.insert("column".into(), json!(cell.column));
+            projected.insert("row".into(), json!(cell.row));
+            projected.insert("column_span".into(), json!(cell.column_span));
+            projected.insert("row_span".into(), json!(cell.row_span));
+            projected.insert(
+                "cell_horizontal".into(),
+                json!(cell_alignment_name(cell.horizontal)),
+            );
+            projected.insert(
+                "cell_vertical".into(),
+                json!(cell_alignment_name(cell.vertical)),
+            );
+        }
     }
     if let Some(constraints) = node.constraints {
         style.insert(
@@ -142,6 +158,7 @@ fn data_style(doc: &Doc, node: &CanvasNode, style: &mut Map<String, Value>) {
                         "direction": match layout.mode {
                             LayoutMode::Horizontal => "horizontal",
                             LayoutMode::Vertical => "vertical",
+                            LayoutMode::Grid => "grid",
                         },
                         "gap": layout.spacing,
                         "counter_gap": layout.counter_spacing,
@@ -155,6 +172,18 @@ fn data_style(doc: &Doc, node: &CanvasNode, style: &mut Map<String, Value>) {
                         "max_size": layout.max_size,
                     }),
                 );
+                if layout.mode == LayoutMode::Grid {
+                    let grid = group.grid.clone().unwrap_or_default();
+                    style.insert(
+                        "grid".into(),
+                        json!({
+                            "columns": grid.columns.iter().map(grid_track_spec).collect::<Vec<_>>(),
+                            "rows": grid.rows.iter().map(grid_track_spec).collect::<Vec<_>>(),
+                            "gap": grid.column_gap,
+                            "row_gap": grid.row_gap,
+                        }),
+                    );
+                }
             }
             if !group.explicit_modes.is_empty() {
                 let modes: Map<String, Value> = group
@@ -426,4 +455,22 @@ fn vertical_name(constraint: ConstraintV) -> &'static str {
 
 fn round(value: f64) -> f64 {
     (value * 1000.0).round() / 1000.0
+}
+
+/// A grid track in `set_grid_layout`'s vocabulary: px as a number, `"<n>fr"`,
+/// or `"auto"` for a hug track.
+fn grid_track_spec(track: &fanta_doc::GridTrack) -> Value {
+    match track {
+        fanta_doc::GridTrack::Fixed { size } => json!(size),
+        fanta_doc::GridTrack::Flex { fr } => json!(format!("{fr}fr")),
+        fanta_doc::GridTrack::Hug => json!("auto"),
+    }
+}
+
+fn cell_alignment_name(align: fanta_doc::GridAlign) -> &'static str {
+    match align {
+        fanta_doc::GridAlign::Start => "start",
+        fanta_doc::GridAlign::Center => "center",
+        fanta_doc::GridAlign::End => "end",
+    }
 }

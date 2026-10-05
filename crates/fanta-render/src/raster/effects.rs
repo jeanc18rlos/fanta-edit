@@ -5,9 +5,9 @@
 use super::boolean::fold_operands;
 use super::{
     BlendMode, Blur, BlurKind, Bounds, Canvas, CanvasNode, Fill, GroupNode, NodeData, NodeFlags,
-    NodeId, Paint, RenderCtx, Scene, Shadow, ShadowKind, bounds_to_f32, frame_box_bounds,
-    path_is_rect, rounded_rect_path, text_node_outline, text_path_bounds, text_path_outline,
-    to_sk_blend_mode, to_sk_color, to_sk_fill_path,
+    NodeId, Paint, RenderCtx, Scene, Shadow, ShadowKind, apply_blend_mode, bounds_to_f32,
+    frame_box_bounds, path_is_rect, rounded_rect_path, text_node_outline, text_path_bounds,
+    text_path_outline, to_sk_color, to_sk_fill_path,
 };
 
 /// Which of a node's authored effects actually PAINT at the frame's
@@ -210,7 +210,7 @@ pub(crate) fn opacity_folds_into_paint(
 /// The layer's `Paint` carries all three at once: `alpha_f` for opacity, the
 /// merged drop-shadow `ImageFilter` (see [`build_drop_shadow_filter`]) so the
 /// shadow follows the WHOLE composited node + its subtree, and the mapped Skia
-/// blend mode (see [`to_sk_blend_mode`]). Because the filter and blend live on
+/// blend mode (see [`apply_blend_mode`]). Because the filter and blend live on
 /// the layer paint, the shadow is computed from the node's full silhouette and
 /// then the silhouette + shadow blend against the backdrop together — exactly
 /// Figma's node-level effect semantics.
@@ -311,7 +311,7 @@ impl EffectsLayerPaint {
             paint.set_alpha_f(self.opacity);
         }
         if self.blend_mode != BlendMode::Normal {
-            paint.set_blend_mode(to_sk_blend_mode(self.blend_mode));
+            apply_blend_mode(&mut paint, self.blend_mode);
         }
         paint
     }

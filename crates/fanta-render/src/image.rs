@@ -9,7 +9,7 @@
 
 use crate::asset::DecodedImage;
 use crate::color::to_sk_color;
-use crate::paint::to_sk_blend_mode;
+use crate::paint::apply_blend_mode;
 use fanta_doc::{AssetId, BlendMode, Color, ImageAdjust, ImageFitMode};
 use skia_safe::{
     AlphaType, Canvas, ColorFilter, ColorType, Data, FilterMode, ImageInfo, Matrix, MipmapMode,
@@ -470,7 +470,7 @@ fn tinted_paint(
         paint.set_color_filter(cf);
     }
     if !blend.is_normal() {
-        paint.set_blend_mode(to_sk_blend_mode(blend));
+        apply_blend_mode(&mut paint, blend);
     }
     paint
 }

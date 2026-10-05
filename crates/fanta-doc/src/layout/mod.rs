@@ -30,7 +30,10 @@
 //! (children laid out / hug-sized before parents) so nested hug frames resolve
 //! before the frames that contain them.
 
+mod grid;
 mod size;
+
+pub use grid::grid_cells;
 
 use crate::id::NodeId;
 use crate::node::{
@@ -234,7 +237,27 @@ fn solve_node<T: LayoutTree>(tree: &mut T, id: NodeId, measure: &mut Measure) {
     let Some(al) = auto_layout_of(tree, id) else {
         return;
     };
-    layout_frame(tree, id, &al, &children, measure);
+    layout_auto(tree, id, &al, &children, measure);
+}
+
+/// Flow an auto-layout frame's children: the grid pass for a
+/// [`LayoutMode::Grid`] frame, the flex pass otherwise.
+fn layout_auto<T: LayoutTree>(
+    tree: &mut T,
+    id: NodeId,
+    al: &AutoLayout,
+    children: &[NodeId],
+    measure: &mut Measure,
+) {
+    if al.mode == LayoutMode::Grid {
+        let grid = match tree.node(id).map(|node| &node.data) {
+            Some(NodeData::Group(group)) => group.grid.clone().unwrap_or_default(),
+            _ => return,
+        };
+        grid::layout_frame_grid(tree, id, al, &grid, children, measure);
+    } else {
+        layout_frame(tree, id, al, children, measure);
+    }
 }
 
 /// The [`AutoLayout`] config of `id` if it is an auto-layout frame, else `None`.
@@ -316,7 +339,8 @@ fn reflow_after_resize<T: LayoutTree>(
     let Some(mut al) = auto_layout_of(tree, id) else {
         return;
     };
-    let horizontal = al.mode == LayoutMode::Horizontal;
+    // A grid's primary axis is its width, as for a horizontal stack.
+    let horizontal = al.mode != LayoutMode::Vertical;
     if changed[usize::from(!horizontal)] {
         al.primary_sizing = AxisSizing::Fixed;
     }
@@ -324,7 +348,7 @@ fn reflow_after_resize<T: LayoutTree>(
         al.counter_sizing = AxisSizing::Fixed;
     }
     let children = tree.children(id);
-    layout_frame(tree, id, &al, &children, measure);
+    layout_auto(tree, id, &al, &children, measure);
 }
 
 /// Auto-width labels hug unwrapped glyphs; auto-height paragraphs keep their

@@ -13,20 +13,22 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, anyhow, bail};
 use base64::Engine as _;
 use design_surface::{
-    AlignEdge, CrossAxisAlignment, DEFAULT_CHILD_LIMIT, DesignComponentPropertyKind, DesignEffect,
-    DesignImageFit, DesignNodeType, DesignOp, DesignPaint, DesignShadow, DesignShape,
-    DesignStrokeCap, DesignStrokeJoin, DesignSurface, DesignSystemQuery, DesignVariableType,
-    DistributeAxis, HorizontalConstraint, LayerPosition, LayoutDirection, LayoutSizing,
-    MainAxisAlignment, NamedLayerPosition, NodeDetail, NodeQuery, ScreenshotTarget,
-    StrokeAlignment, TextAlignment, TextSizing, VariableBindingProperty, VerticalConstraint,
+    AlignContent, AlignEdge, CellAlignment, CrossAxisAlignment, DEFAULT_CHILD_LIMIT,
+    DesignComponentPropertyKind, DesignEffect, DesignImageFit, DesignNodeType, DesignOp,
+    DesignPaint, DesignShadow, DesignShape, DesignStrokeCap, DesignStrokeJoin, DesignSurface,
+    DesignSystemQuery, DesignVariableType, DistributeAxis, GridTrackSpec, HorizontalConstraint,
+    LayerPosition, LayoutDirection, LayoutSizing, MainAxisAlignment, NamedLayerPosition,
+    NodeDetail, NodeQuery, ScreenshotTarget, StrokeAlignment, TextAlignment, TextSizing,
+    VariableBindingProperty, VerticalConstraint,
 };
 use fanta_doc::{
     AssetId, AutoLayout, AxisSizing, BitmapNode, BoundProp, Bounds, CanvasNode, Color, ComponentId,
-    CounterAlign, Doc, Fill, GroupNode, ImageFitMode, IndexKey, InstanceNode, LayoutMode, Mode,
-    ModeId, ModeScope, NodeData, NodeFlags, NodeId, Operation, PathData, PrimaryAlign,
-    ProjectAsset, ProjectAssetKind, Shadow, ShadowKind, Stroke, StrokeAlign, StrokeCap, StrokeJoin,
-    TextAlign, TextAutoResize, TextNode, Transform2D, UnitInterval, VarValue, Variable,
-    VariableCollection, VariableCollectionId, VariableId, VariableType, VectorNode, Viewport,
+    CounterAlign, Doc, Fill, GridAlign, GridLayout, GridTrack, GroupNode, ImageFitMode, IndexKey,
+    InstanceNode, LayoutMode, Mode, ModeId, ModeScope, NodeData, NodeFlags, NodeId, Operation,
+    PathData, PrimaryAlign, ProjectAsset, ProjectAssetKind, Shadow, ShadowKind, Stroke,
+    StrokeAlign, StrokeCap, StrokeJoin, TextAlign, TextAutoResize, TextNode, Transform2D,
+    UnitInterval, VarValue, Variable, VariableCollection, VariableCollectionId, VariableId,
+    VariableType, VectorNode, Viewport,
 };
 use fanta_render::{AssetResolver, RasterRenderer, visual_world_bounds};
 use gpui::{App, AppContext as _, Entity, Global, Task, WeakEntity};
@@ -67,6 +69,52 @@ pub(crate) fn set_active_item(item: WeakEntity<FigItem>, cx: &mut App) {
     if let Some(state) = cx.try_global::<ActiveDesignItem>() {
         *state.0.borrow_mut() = Some(item);
     }
+}
+
+/// Apply `ops` to `item`'s document as one undoable batch, exactly as the
+/// `batch_design` tool does. The result reports `applied` and, on a failure,
+/// the failing op (the batch is then rolled back).
+pub(crate) fn apply_ops_to_item(
+    item: &Entity<FigItem>,
+    ops: &[DesignOp],
+    label: &str,
+    cx: &mut App,
+) -> Result<Value> {
+    if ops.is_empty() {
+        bail!("the ops list is empty");
+    }
+    item.update(cx, |item, cx| {
+        if !item.is_editable() {
+            if item.source_edit_locked() {
+                bail!(
+                    "the FNX source has unsaved edits; save or discard them before editing the canvas"
+                );
+            }
+            bail!("the design document is still loading");
+        }
+        item.with_document(cx, |document| {
+            let (doc, mut assets) = document.doc_and_assets();
+            let outcome = apply_batch(doc, &mut assets, ops, label);
+            (Ok(outcome.value), outcome.change)
+        })
+        .unwrap_or_else(|| Err(anyhow!("the document is no longer available")))
+    })
+}
+
+/// The active page's top-level layers (up to `limit`, `depth` levels deep) in
+/// the style projection with world bounds: what `batch_get` returns for a page
+/// listing with `detail: "style"`, and what the v2 agent sessions read.
+pub(crate) fn page_scene(item: &FigItem, depth: u32, limit: usize) -> Result<Vec<Value>> {
+    let document = ready_document(item)?;
+    let doc = &document.doc;
+    let page = &document.pages[resolve_page_index(document, None)?];
+    let root = page.root.context("the page has no root node")?;
+    let mut listing = paginated_node_summary(doc, root, Some(depth), true, 0, limit);
+    crate::agent_style::attach_styles(doc, &mut listing);
+    Ok(match listing.get_mut("children").map(Value::take) {
+        Some(Value::Array(children)) => children,
+        _ => Vec::new(),
+    })
 }
 
 struct FigDesignSurface {
@@ -554,26 +602,7 @@ impl DesignSurface for FigDesignSurface {
     }
 
     fn apply(&self, ops: Vec<DesignOp>, label: String, cx: &mut App) -> Result<Value> {
-        if ops.is_empty() {
-            bail!("the ops list is empty");
-        }
-        let item = self.item()?;
-        item.update(cx, |item, cx| {
-            if !item.is_editable() {
-                if item.source_edit_locked() {
-                    bail!(
-                        "the FNX source has unsaved edits; save or discard them before editing the canvas"
-                    );
-                }
-                bail!("the design document is still loading");
-            }
-            item.with_document(cx, |document| {
-                let (doc, mut assets) = document.doc_and_assets();
-                let outcome = apply_batch(doc, &mut assets, &ops, &label);
-                (Ok(outcome.value), outcome.change)
-            })
-            .unwrap_or_else(|| Err(anyhow!("the document is no longer available")))
-        })
+        apply_ops_to_item(&self.item()?, &ops, &label, cx)
     }
 
     fn apply_streamed(
@@ -1360,6 +1389,58 @@ fn layout_sizing(sizing: LayoutSizing) -> AxisSizing {
     }
 }
 
+/// A `set_grid_layout` track: px, `"<n>fr"` (or `"fr"`), `"<n>px"`, or
+/// `"auto"`/`"hug"`.
+fn grid_track(spec: &GridTrackSpec) -> Result<GridTrack> {
+    let fixed = |size: f64| {
+        if size.is_finite() && size >= 0.0 {
+            Ok(GridTrack::Fixed { size })
+        } else {
+            Err(anyhow!("a px track must be finite and non-negative"))
+        }
+    };
+    match spec {
+        GridTrackSpec::Px(size) => fixed(*size),
+        GridTrackSpec::Keyword(word) => {
+            let word = word.trim().to_ascii_lowercase();
+            if matches!(word.as_str(), "auto" | "hug") {
+                return Ok(GridTrack::Hug);
+            }
+            if let Some(fr) = word.strip_suffix("fr") {
+                let fr = match fr.trim() {
+                    "" => 1.0,
+                    fr => fr
+                        .parse::<f64>()
+                        .map_err(|_| anyhow!("bad fr track {word:?}"))?,
+                };
+                if !(fr.is_finite() && fr > 0.0) {
+                    bail!("an fr track must be positive");
+                }
+                return Ok(GridTrack::Flex { fr });
+            }
+            match word
+                .strip_suffix("px")
+                .unwrap_or(&word)
+                .trim()
+                .parse::<f64>()
+            {
+                Ok(size) => fixed(size),
+                Err(_) => {
+                    bail!("unknown grid track {word:?}: use a px number, \"<n>fr\" or \"auto\"")
+                }
+            }
+        }
+    }
+}
+
+fn grid_alignment(alignment: CellAlignment) -> GridAlign {
+    match alignment {
+        CellAlignment::Start => GridAlign::Start,
+        CellAlignment::Center => GridAlign::Center,
+        CellAlignment::End => GridAlign::End,
+    }
+}
+
 fn counter_alignment(alignment: CrossAxisAlignment) -> CounterAlign {
     match alignment {
         CrossAxisAlignment::Start => CounterAlign::Start,
@@ -1628,6 +1709,7 @@ fn summarize_kind(doc: &Doc, node: &CanvasNode, object: &mut serde_json::Map<Str
                 let mode = match layout.mode {
                     LayoutMode::Horizontal => "horizontal",
                     LayoutMode::Vertical => "vertical",
+                    LayoutMode::Grid => "grid",
                 };
                 object.insert("auto_layout".into(), json!(mode));
             }
@@ -2119,6 +2201,7 @@ fn design_operation_node(doc: &Doc, operation: &DesignOp) -> Option<NodeId> {
         | DesignOp::Group { ids, .. }
         | DesignOp::FrameSelection { ids, .. }
         | DesignOp::CombineVariants { ids, .. }
+        | DesignOp::Componentize { ids }
         | DesignOp::Select { ids } => ids.first(),
         DesignOp::CreateComponentProperty { component, .. } => {
             return resolve_component(doc, component)
@@ -2982,6 +3065,7 @@ fn apply_one(
             max_size,
             wrap,
             counter_gap,
+            align_content,
         } => {
             let id = parse_node_id(id)?;
             let node = existing_node(doc, id)?;
@@ -2991,6 +3075,7 @@ fn apply_one(
                     node.data.kind_tag()
                 );
             }
+            let child_count = doc.scene.children_of(Some(id)).len();
             if let Some(gap) = gap
                 && !(gap.is_finite() && *gap >= 0.0)
             {
@@ -3018,13 +3103,34 @@ fn apply_one(
                     let mode = match direction {
                         LayoutDirection::Horizontal => LayoutMode::Horizontal,
                         LayoutDirection::Vertical => LayoutMode::Vertical,
+                        LayoutDirection::Grid => LayoutMode::Grid,
                         LayoutDirection::None => {
                             group.auto_layout = None;
+                            group.grid = None;
                             return;
                         }
                     };
                     let layout = group.auto_layout.get_or_insert_with(AutoLayout::default);
                     layout.mode = mode;
+                    if mode == LayoutMode::Grid {
+                        // A grid's gaps live on its tracks: `gap` sets both,
+                        // `counter_gap` the row gap.
+                        let grid = group.grid.get_or_insert_with(|| {
+                            GridLayout::for_children(child_count, layout.spacing)
+                        });
+                        if let Some(gap) = gap {
+                            grid.column_gap = *gap;
+                            grid.row_gap = *gap;
+                        }
+                        if let Some(gap) = counter_gap {
+                            grid.row_gap = *gap;
+                        }
+                    } else {
+                        group.grid = None;
+                    }
+                    if let Some(align_content) = align_content {
+                        layout.counter_auto_spacing = *align_content == AlignContent::SpaceBetween;
+                    }
                     if let Some(sizing) = primary_sizing {
                         layout.primary_sizing = layout_sizing(*sizing);
                     }
@@ -3070,23 +3176,138 @@ fn apply_one(
                 }),
             )
         }
+        DesignOp::SetGridLayout {
+            id,
+            columns,
+            rows,
+            gap,
+            row_gap,
+        } => {
+            let id = parse_node_id(id)?;
+            let node = existing_node(doc, id)?;
+            if !matches!(node.data, NodeData::Group(_)) {
+                bail!(
+                    "grid layout applies to frames and groups, not a {} node",
+                    node.data.kind_tag()
+                );
+            }
+            if columns.is_empty() {
+                bail!("columns needs at least one track");
+            }
+            let columns = columns.iter().map(grid_track).collect::<Result<Vec<_>>>()?;
+            let rows = rows
+                .as_ref()
+                .map(|rows| rows.iter().map(grid_track).collect::<Result<Vec<_>>>())
+                .transpose()?;
+            if [gap, row_gap]
+                .into_iter()
+                .flatten()
+                .any(|gap| !gap.is_finite() || *gap < 0.0)
+            {
+                bail!("gap and row_gap must be finite and non-negative");
+            }
+            apply_all(
+                doc,
+                replace_data_operation(doc, id, |data| {
+                    let NodeData::Group(group) = data else {
+                        return;
+                    };
+                    group
+                        .auto_layout
+                        .get_or_insert_with(AutoLayout::default)
+                        .mode = LayoutMode::Grid;
+                    let grid = group.grid.get_or_insert_with(GridLayout::default);
+                    grid.columns = columns;
+                    if let Some(rows) = rows {
+                        grid.rows = rows;
+                    }
+                    if let Some(gap) = gap {
+                        grid.column_gap = *gap;
+                        grid.row_gap = *gap;
+                    }
+                    if let Some(gap) = row_gap {
+                        grid.row_gap = *gap;
+                    }
+                }),
+            )
+        }
         DesignOp::SetLayoutChild {
             id,
             grow,
             align_self,
             absolute,
+            column,
+            row,
+            column_span,
+            row_span,
+            cell_horizontal,
+            cell_vertical,
+            auto_place,
         } => {
             let id = parse_node_id(id)?;
             let node = existing_node(doc, id)?;
             if grow.is_some_and(|grow| !grow.is_finite() || grow < 0.0) {
                 bail!("grow must be finite and non-negative");
             }
+            let pins_cell = column.is_some()
+                || row.is_some()
+                || column_span.is_some()
+                || row_span.is_some()
+                || cell_horizontal.is_some()
+                || cell_vertical.is_some();
+            if pins_cell || auto_place.is_some() {
+                let parent_is_grid = node
+                    .parent
+                    .and_then(|parent| doc.scene.get(parent))
+                    .is_some_and(|parent| {
+                        matches!(&parent.data, NodeData::Group(group)
+                            if group.auto_layout.is_some_and(|layout| layout.mode == LayoutMode::Grid))
+                    });
+                if !parent_is_grid {
+                    bail!(
+                        "column, row, spans, cell alignment and auto_place apply to children of a grid frame"
+                    );
+                }
+            }
+            if pins_cell && *auto_place == Some(true) {
+                bail!(
+                    "auto_place unpins the cell; send it without column, row, spans or cell alignment"
+                );
+            }
+            if [column_span, row_span]
+                .into_iter()
+                .flatten()
+                .any(|span| *span == 0)
+            {
+                bail!("column_span and row_span must be at least 1");
+            }
             let old = node.layout_child;
-            let mut new = old.unwrap_or(fanta_doc::LayoutChild {
-                grow: 0.0,
-                absolute: false,
-                align_self: None,
-            });
+            let mut new = old.unwrap_or_default();
+            if *auto_place == Some(true) {
+                new.grid = None;
+            }
+            if pins_cell {
+                let mut cell = new.grid.unwrap_or_default();
+                if let Some(column) = column {
+                    cell.column = *column;
+                }
+                if let Some(row) = row {
+                    cell.row = *row;
+                }
+                if let Some(span) = column_span {
+                    cell.column_span = *span;
+                }
+                if let Some(span) = row_span {
+                    cell.row_span = *span;
+                }
+                if let Some(align) = cell_horizontal {
+                    cell.horizontal = grid_alignment(*align);
+                }
+                if let Some(align) = cell_vertical {
+                    cell.vertical = grid_alignment(*align);
+                }
+                new.grid = Some(cell);
+            }
             if let Some(grow) = grow {
                 new.grow = *grow;
             }
@@ -3465,6 +3686,101 @@ fn apply_one(
             Ok(Applied::Content {
                 created: None,
                 detail: Some(json!({ "component": component.to_string() })),
+            })
+        }
+        DesignOp::Componentize { ids } => {
+            let ids = parse_content_ids(doc, ids)?;
+            let Some((&master, copies)) =
+                ids.split_first().filter(|(_, copies)| !copies.is_empty())
+            else {
+                bail!("componentize needs the master's id and at least one copy");
+            };
+            let related = |a: NodeId, b: NodeId| {
+                doc.scene.ancestors_of(a).any(|ancestor| ancestor.id == b)
+                    || doc.scene.ancestors_of(b).any(|ancestor| ancestor.id == a)
+            };
+            for (index, &copy) in copies.iter().enumerate() {
+                if related(master, copy)
+                    || copies[..index].iter().any(|&other| related(other, copy))
+                {
+                    bail!(
+                        "node {copy} is inside another of the ids; componentize layers side by side"
+                    );
+                }
+                if doc.components.defs.values().any(|def| def.root == copy) {
+                    bail!("node {copy} is already a component master");
+                }
+            }
+            // Check every copy before changing anything.
+            let plans = copies
+                .iter()
+                .map(|&copy| {
+                    Ok((
+                        copy,
+                        crate::componentize::overrides_for_copy(doc, master, copy)?,
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+
+            let component = match doc.components.defs.values().find(|def| def.root == master) {
+                Some(def) if def.variant_of.is_some() => {
+                    bail!("node {master} is a variant; componentize a standalone layer")
+                }
+                Some(def) => def.id,
+                None => {
+                    let operations = create_component_operations(doc, master);
+                    let Some(Operation::DefineComponent { def }) = operations.first() else {
+                        bail!(
+                            "only frames and groups can become components, not a {} node",
+                            existing_node(doc, master)?.data.kind_tag()
+                        );
+                    };
+                    let component = def.id;
+                    for operation in operations {
+                        doc.apply(operation)?;
+                    }
+                    component
+                }
+            };
+
+            let mut instances = Vec::with_capacity(plans.len());
+            for (copy, overrides) in plans {
+                let original = existing_node(doc, copy)?.clone();
+                let size = master_size(doc, copy).unwrap_or([100.0, 100.0]);
+                let snapshot: Vec<CanvasNode> = doc
+                    .scene
+                    .descendants_of(copy)
+                    .filter_map(|descendant| doc.scene.get(descendant).cloned())
+                    .collect();
+                removed_nodes.extend(snapshot.iter().map(|node| node.id));
+                doc.apply(Operation::DeleteSubtree { snapshot })?;
+
+                let mut node = CanvasNode::new(NodeData::Instance(InstanceNode {
+                    component,
+                    overrides,
+                    prop_values: Default::default(),
+                    derived: Vec::new(),
+                    local_size: size,
+                }));
+                node.name = original.name;
+                node.parent = original.parent;
+                node.index = original.index;
+                node.transform = original.transform;
+                node.layout_child = original.layout_child;
+                node.constraints = original.constraints;
+                node.flags = original.flags;
+                instances.push(node.id.to_string());
+                doc.apply(Operation::CreateInstance {
+                    node: Box::new(node),
+                })
+                .context("replacing a copy with an instance")?;
+            }
+            Ok(Applied::Content {
+                created: None,
+                detail: Some(json!({
+                    "component": component.to_string(),
+                    "instances": instances,
+                })),
             })
         }
         DesignOp::CombineVariants { ids, name } => {
@@ -5640,6 +5956,123 @@ mod tests {
     }
 
     #[test]
+    fn set_grid_layout_builds_tracks_and_pins_cells() {
+        let (mut doc, _) = doc_with_page();
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "frame",
+                 "x": 0.0, "y": 0.0, "width": 300.0, "height": 200.0},
+            ])),
+            "Frame",
+        );
+        let frame = created_id(&outcome, 0);
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "rectangle", "parent": frame.to_string(),
+                 "x": 0.0, "y": 0.0, "width": 10.0, "height": 10.0},
+                {"op": "create_node", "node_type": "rectangle", "parent": frame.to_string(),
+                 "x": 0.0, "y": 0.0, "width": 10.0, "height": 10.0},
+            ])),
+            "Cells",
+        );
+        let second = created_id(&outcome, 1);
+
+        // `direction: grid` on a frame with two children starts with
+        // ⌈√2⌉ = 2 equal columns.
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "set_auto_layout", "id": frame.to_string(), "direction": "grid", "gap": 12.0},
+            ])),
+            "Grid",
+        );
+        assert_applied(&outcome);
+        let grid = |doc: &Doc| match &doc.scene.get(frame).unwrap().data {
+            NodeData::Group(group) => group.grid.clone().expect("grid tracks"),
+            _ => panic!("expected a frame"),
+        };
+        assert_eq!(grid(&doc).columns, vec![GridTrack::Flex { fr: 1.0 }; 2]);
+        assert_eq!((grid(&doc).column_gap, grid(&doc).row_gap), (12.0, 12.0));
+
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "set_grid_layout", "id": frame.to_string(),
+                 "columns": [120, "2fr", "auto"], "rows": ["1fr"], "gap": 8.0, "row_gap": 4.0},
+                {"op": "set_layout_child", "id": second.to_string(), "column": 1, "row": 0,
+                 "column_span": 2, "cell_horizontal": "center"},
+            ])),
+            "Tracks",
+        );
+        assert_applied(&outcome);
+        let tracks = grid(&doc);
+        assert_eq!(
+            tracks.columns,
+            vec![
+                GridTrack::Fixed { size: 120.0 },
+                GridTrack::Flex { fr: 2.0 },
+                GridTrack::Hug,
+            ]
+        );
+        assert_eq!(tracks.rows, vec![GridTrack::Flex { fr: 1.0 }]);
+        assert_eq!((tracks.column_gap, tracks.row_gap), (8.0, 4.0));
+        let cell = doc
+            .scene
+            .get(second)
+            .unwrap()
+            .layout_child
+            .unwrap()
+            .grid
+            .unwrap();
+        assert_eq!((cell.column, cell.row, cell.column_span), (1, 0, 2));
+        assert_eq!(cell.horizontal, GridAlign::Center);
+
+        let style = crate::agent_style::node_style(&doc, frame);
+        assert_eq!(style["auto_layout"]["direction"], json!("grid"));
+        assert_eq!(style["grid"]["columns"], json!([120.0, "2fr", "auto"]));
+        let child = crate::agent_style::node_style(&doc, second);
+        assert_eq!(child["layout_child"]["column_span"], json!(2));
+
+        // Cells only exist inside a grid, and `auto_place` unpins one.
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "set_layout_child", "id": frame.to_string(), "column": 0},
+            ])),
+            "Not a grid child",
+        );
+        assert_eq!(outcome.value["applied"], json!(false));
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "set_layout_child", "id": second.to_string(), "auto_place": true},
+            ])),
+            "Unpin",
+        );
+        assert_applied(&outcome);
+        assert!(
+            doc.scene
+                .get(second)
+                .unwrap()
+                .layout_child
+                .is_none_or(|child| child.grid.is_none())
+        );
+
+        for bad in [json!(["wide"]), json!([]), json!(["0fr"]), json!([-4])] {
+            let outcome = run_batch(
+                &mut doc,
+                &ops(json!([
+                    {"op": "set_grid_layout", "id": frame.to_string(), "columns": bad},
+                ])),
+                "Bad tracks",
+            );
+            assert_eq!(outcome.value["applied"], json!(false), "{bad}");
+        }
+    }
+
+    #[test]
     fn set_index_moves_a_node_through_its_siblings() {
         let (mut doc, page_id) = doc_with_page();
         let bottom = create_rect(&mut doc, 0.0, 0.0, 10.0, 10.0);
@@ -5760,6 +6193,147 @@ mod tests {
         assert_eq!((bounds.min_x, bounds.min_y), (60.0, 10.0));
         assert_eq!(doc.scene.children_of(Some(page_id)), &[rect, copy]);
         assert_eq!(doc.history.undo_depth(), 2);
+    }
+
+    #[test]
+    fn componentize_replaces_copies_with_instances_that_keep_their_differences() {
+        let (mut doc, page_id) = doc_with_page();
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "frame", "name": "Card",
+                 "x": 0.0, "y": 0.0, "width": 100.0, "height": 60.0},
+            ])),
+            "Frame",
+        );
+        let card = created_id(&outcome, 0);
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "text", "text": "Title", "parent": card.to_string(),
+                 "x": 8.0, "y": 8.0, "width": 80.0, "height": 20.0},
+                {"op": "create_node", "node_type": "rectangle", "parent": card.to_string(), "fill": "#00ff00",
+                 "x": 8.0, "y": 32.0, "width": 20.0, "height": 20.0},
+            ])),
+            "Contents",
+        );
+        assert_applied(&outcome);
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([{"op": "duplicate", "id": card.to_string(), "dx": 150.0, "dy": 0.0}])),
+            "Copy",
+        );
+        let copy = created_id(&outcome, 0);
+        let copy_children = doc.scene.children_of(Some(copy)).to_vec();
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "set_props", "id": copy_children[0].to_string(), "text": "Other"},
+                {"op": "set_props", "id": copy_children[1].to_string(), "fill": "#ff0000"},
+                {"op": "set_props", "id": copy.to_string(), "opacity": 0.5},
+            ])),
+            "Edit the copy",
+        );
+        assert_applied(&outcome);
+        let copy_node = doc.scene.get(copy).unwrap().clone();
+        let copy_index = doc
+            .scene
+            .children_of(Some(page_id))
+            .iter()
+            .position(|id| *id == copy);
+
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([{"op": "componentize", "ids": [card.to_string(), copy.to_string()]}])),
+            "Componentize",
+        );
+        assert_applied(&outcome);
+        let detail = &outcome.value["ops"][0];
+        let instance: NodeId = detail["instances"][0].as_str().unwrap().parse().unwrap();
+        assert!(!doc.scene.contains(copy));
+        assert!(
+            doc.components
+                .defs
+                .values()
+                .any(|def| def.root == card && def.id.to_string() == detail["component"])
+        );
+        let node = doc
+            .scene
+            .get(instance)
+            .expect("the instance replaced the copy");
+        assert_eq!(node.parent, copy_node.parent);
+        assert_eq!(node.transform, copy_node.transform);
+        assert_eq!(node.name, copy_node.name);
+        assert_eq!(
+            doc.scene
+                .children_of(Some(page_id))
+                .iter()
+                .position(|id| *id == instance),
+            copy_index,
+            "the instance keeps the copy's z-order"
+        );
+
+        let NodeData::Instance(data) = &node.data else {
+            panic!("expected an instance");
+        };
+        // Only what the copy changed: its text, its rectangle's fill, its
+        // root's opacity.
+        let overridden: Vec<_> = data
+            .overrides
+            .iter()
+            .map(|o| match &o.value {
+                fanta_doc::OverrideValue::Field { value } => format!("field {value}"),
+                fanta_doc::OverrideValue::Text { .. } => "text".to_owned(),
+                fanta_doc::OverrideValue::Fills { .. } => "fills".to_owned(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            overridden,
+            vec!["field {\"opacity\":0.5}", "text", "fills"],
+            "{:?}",
+            data.overrides
+        );
+        let expanded = fanta_doc::expand_instance(&doc.scene, &doc.components, data);
+        let text = expanded
+            .iter()
+            .find_map(|clone| match &clone.node.data {
+                NodeData::Text(text) => Some(text.content.clone()),
+                _ => None,
+            })
+            .expect("text clone");
+        assert_eq!(text, "Other");
+        let fill = expanded
+            .iter()
+            .find_map(|clone| match &clone.node.data {
+                NodeData::Vector(vector) => vector.fills.first().and_then(Fill::solid_color),
+                _ => None,
+            })
+            .expect("rectangle clone");
+        assert_eq!(fill.to_hex(), "#FF0000");
+        let root = expanded
+            .iter()
+            .find(|clone| clone.def_path.is_empty())
+            .unwrap();
+        assert_eq!(root.node.opacity.get(), 0.5);
+
+        // A copy whose structure differs is refused, and nothing changes.
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op": "create_node", "node_type": "frame", "name": "Odd",
+                 "x": 0.0, "y": 200.0, "width": 100.0, "height": 60.0},
+            ])),
+            "Odd frame",
+        );
+        let odd = created_id(&outcome, 0);
+        let outcome = run_batch(
+            &mut doc,
+            &ops(json!([{"op": "componentize", "ids": [card.to_string(), odd.to_string()]}])),
+            "Mismatch",
+        );
+        assert_eq!(outcome.value["applied"], json!(false));
+        assert!(doc.scene.contains(odd));
     }
 
     #[test]
