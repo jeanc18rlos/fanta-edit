@@ -13,7 +13,7 @@ use std::{
 use anyhow::{Context as _, Result};
 use fanta_doc::{AssetId, Doc, NodeId, Operation, Viewport};
 use fanta_fig_interop::{fig_to_doc, read_fig};
-use fanta_render::{AssetResolver, DecodedImage, asset::LazyAssetResolver, solve_doc_layout};
+use fanta_render::{AssetResolver, DecodedImage, asset::LazyAssetResolver};
 use futures::{FutureExt as _, StreamExt as _, channel::mpsc};
 use gpui::{
     App, AppContext as _, Context, Entity, EntityId, EventEmitter, Image, ImageFormat,
@@ -22,6 +22,9 @@ use gpui::{
 use project::{Project, ProjectPath};
 use sha2::{Digest as _, Sha256};
 use worktree::{PathChange, ProjectEntryId, UpdatedEntriesSet, WorktreeId};
+
+#[path = "document_layout.rs"]
+mod layout;
 
 /// How long to let a burst of external writes (an agent rewriting several
 /// project files) settle before reloading from disk.
@@ -446,6 +449,8 @@ pub struct FigDocument {
     pub pages: Vec<FigPage>,
     pub default_page_index: usize,
     pub(crate) solved_pages: HashSet<NodeId>,
+    layout_state: layout::LayoutState,
+    pending_layout_output_nodes: BTreeSet<NodeId>,
     pub asset_resolver: Option<Arc<dyn AssetResolver>>,
     /// The load-time resolver behind [`asset_resolver`](Self::asset_resolver):
     /// decodes an embedded image the first time it is drawn and keeps the
@@ -467,11 +472,6 @@ pub struct FigDocument {
     /// asset set. Created lazily on the first ingestion; reset by reload
     /// (which rebuilds the resolver from disk anyway).
     agent_asset_overlay: Option<Arc<OverlayAssetResolver>>,
-    /// Whether any node in the scene uses auto layout. Computed once at load;
-    /// documents without it skip the whole-page layout re-solve after every
-    /// edit, which includes text measurement and is far too slow to run per
-    /// interaction on large pages.
-    uses_auto_layout: bool,
     /// Monotonic render epoch for every persistent or transient document
     /// mutation, including variables and motion edits that do not change the
     /// scene graph's own revision.
@@ -568,14 +568,31 @@ impl FigDocument {
         crate::report_slow("document load: backfill vector viewports", started);
         let visible_page_roots = visible_page_roots(&doc);
         let default_page_root = default_page_root(&doc, &visible_page_roots);
-        let uses_auto_layout = scene_uses_auto_layout(&doc.scene);
-        let mut solved_pages = HashSet::new();
-        if let Some(page_root) = default_page_root {
-            let started = Instant::now();
-            solve_doc_layout(&mut doc, page_root);
-            crate::report_slow("document load: solve default page layout", started);
-            solved_pages.insert(page_root);
-        }
+        let solved_pages = doc
+            .pages()
+            .iter()
+            .copied()
+            .chain(
+                doc.components
+                    .defs
+                    .values()
+                    .map(|definition| definition.root),
+            )
+            .collect();
+        let roots = layout::pending_roots(&doc);
+        let operations = layout::geometry_operations(&doc, &roots);
+        let pending_layout_output_nodes = match layout::apply_without_history(&mut doc, operations)
+        {
+            Ok(changed) => {
+                doc.pending_layout.clear();
+                changed
+            }
+            Err(error) => {
+                log::error!("computing omitted source geometry: {error:#}");
+                BTreeSet::new()
+            }
+        };
+        let layout_state = layout::LayoutState::new(&doc);
         let (gpui_images, embedded_assets, asset_resolver, agent_asset_overlay) =
             if let Some(cached) = cached_assets {
                 (
@@ -626,12 +643,13 @@ impl FigDocument {
             pages,
             default_page_index,
             solved_pages,
+            layout_state,
+            pending_layout_output_nodes,
             asset_resolver,
             embedded_assets,
             raw_assets,
             gpui_images,
             agent_asset_overlay,
-            uses_auto_layout,
             render_generation: 0,
             variables_generation: next_variables_generation(),
             prewarmed_pages: HashSet::new(),
@@ -657,21 +675,6 @@ impl FigDocument {
     /// writes that touch the registry.
     pub(crate) fn mark_variables_changed(&mut self) {
         self.variables_generation = next_variables_generation();
-        if self.doc.variables.variables.values().any(|variable| {
-            matches!(
-                variable.ty,
-                fanta_doc::VariableType::Typography | fanta_doc::VariableType::String
-            )
-        }) {
-            self.solved_pages.clear();
-            if let Some(root) = self.doc.active_page() {
-                if let Some(index) = self.pages.iter().position(|page| page.root == Some(root)) {
-                    self.ensure_page_solved(index);
-                } else {
-                    self.ensure_root_solved(root);
-                }
-            }
-        }
     }
 
     pub(crate) fn render_generation(&self) -> u64 {
@@ -809,9 +812,9 @@ impl FigDocument {
             return;
         };
         if self.solved_pages.insert(page_root) {
-            solve_doc_layout(&mut self.doc, page_root);
-            self.refresh_page_bounds(page_index);
+            self.resolve_after_edit(Some(page_root));
         }
+        self.refresh_page_bounds(page_index);
     }
 
     /// Lazily solve layout for an arbitrary subtree root — a component master
@@ -820,7 +823,7 @@ impl FigDocument {
     /// solved-once tracking, keyed by root id.
     pub fn ensure_root_solved(&mut self, root: NodeId) {
         if self.doc.scene.get(root).is_some() && self.solved_pages.insert(root) {
-            solve_doc_layout(&mut self.doc, root);
+            self.resolve_after_edit(Some(root));
         }
     }
 
@@ -1000,10 +1003,6 @@ impl FigDocument {
                 .get(self.default_page_index)
                 .and_then(|page| page.root);
             self.doc.set_active_page(root);
-            if let Some(root) = root {
-                self.solved_pages.remove(&root);
-                self.ensure_root_solved(root);
-            }
         }
         self.solved_pages
             .retain(|root| self.doc.scene.contains(*root));
@@ -1033,27 +1032,54 @@ impl FigDocument {
         }
     }
 
-    /// Re-solve layout for a page after an edit. Skipped entirely for
-    /// documents without auto layout: nothing there depends on the solver,
-    /// and running it (with its text measurement) after every interaction
-    /// dominates the frame budget on large pages.
+    /// Recompute only the layout islands whose inputs changed, retaining the
+    /// imported geometry of every unaffected island.
     fn resolve_after_edit(&mut self, page_root: Option<NodeId>) {
-        self.sync_page_registry();
-        if !self.uses_auto_layout {
-            return;
+        let roots = self.layout_state.changed_roots(&self.doc);
+        let operations = layout::geometry_operations(&self.doc, &roots);
+        if !operations.is_empty() {
+            let generation = self.doc.history.edit_generation();
+            let result = if generation != self.layout_state.history_generation {
+                self.doc
+                    .apply_derived_operations(operations, generation)
+                    .map_err(anyhow::Error::from)
+            } else {
+                layout::apply_without_history(&mut self.doc, operations).map(|_| ())
+            };
+            if let Err(error) = result {
+                log::error!("applying computed layout: {error:#}");
+                return;
+            }
         }
-        let Some(page_root) = page_root else {
-            return;
-        };
-        solve_doc_layout(&mut self.doc, page_root);
-        self.solved_pages.insert(page_root);
+        self.refresh_layout_baseline();
+        if let Some(index) = self.pages.iter().position(|page| page.root == page_root) {
+            self.refresh_page_bounds(index);
+        }
+    }
+
+    pub(crate) fn refresh_layout_baseline(&mut self) {
+        if let Err(error) = self.layout_state.refresh(&self.doc) {
+            log::error!("refreshing layout inputs: {error:#}");
+            self.layout_state = layout::LayoutState::new(&self.doc);
+        }
         if let Some(index) = self
             .pages
             .iter()
-            .position(|page| page.root == Some(page_root))
+            .position(|page| page.root == self.doc.active_page())
         {
             self.refresh_page_bounds(index);
         }
+    }
+
+    fn resolve_source_changes(&mut self, previous: &Doc) {
+        let baseline = layout::LayoutState::new(previous);
+        let roots = baseline.changed_roots(&self.doc);
+        let operations = layout::geometry_operations(&self.doc, &roots);
+        match layout::apply_without_history(&mut self.doc, operations) {
+            Ok(changed) => self.pending_layout_output_nodes.extend(changed),
+            Err(error) => log::error!("computing changed source layout: {error:#}"),
+        }
+        self.refresh_layout_baseline();
     }
 
     /// Split the document into the scene [`Doc`] and mutable views of the
@@ -1600,6 +1626,41 @@ impl FigItem {
         self.document.ready().is_some()
     }
 
+    pub(crate) fn has_unpersisted_source_layout(&self) -> bool {
+        self.document
+            .ready()
+            .is_some_and(|document| !document.pending_layout_output_nodes.is_empty())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_save_for_test(
+        &self,
+    ) -> (
+        futures::channel::oneshot::Receiver<()>,
+        futures::channel::oneshot::Sender<()>,
+    ) {
+        let (reached, arrived) = futures::channel::oneshot::channel();
+        let (resume, wait) = futures::channel::oneshot::channel();
+        let previous = self
+            .project_writes
+            .next_save_barrier
+            .lock()
+            .expect("save barrier")
+            .replace(SaveTestBarrier {
+                reached,
+                resume: wait,
+                after_write: false,
+            });
+        assert!(previous.is_none());
+        (arrived, resume)
+    }
+
+    pub(crate) fn mark_source_layout_unsaved(&mut self, cx: &mut Context<Self>) {
+        if self.has_unpersisted_source_layout() {
+            self.mark_edited(false, cx);
+        }
+    }
+
     pub fn source_edit_locked(&self) -> bool {
         self.source_edit_locked
     }
@@ -2025,8 +2086,25 @@ impl FigItem {
                 raw_assets.entry(*id).or_insert_with(|| bytes.clone());
             }
         }
+        let mut merged = merged;
+        merged.pending_layout.extend(
+            disk.doc
+                .pending_layout
+                .iter()
+                .copied()
+                .filter(|id| merged.scene.contains(*id)),
+        );
         let active_page = merged.active_page();
         let mut document = FigDocument::from_doc(merged, raw_assets);
+        document.pending_layout_output_nodes.extend(
+            disk.pending_layout_output_nodes
+                .iter()
+                .copied()
+                .filter(|id| document.doc.scene.contains(*id)),
+        );
+        if let Some(previous) = self.document.ready() {
+            document.resolve_source_changes(&previous.doc);
+        }
         if let Some(root) = active_page
             && !document.restore_active_root(root)
         {
@@ -2219,6 +2297,9 @@ impl FigItem {
         session: Option<fanta_format::WorkspaceSession>,
         cx: &mut Context<Self>,
     ) {
+        if let Some(previous) = self.merge_base.as_ref() {
+            document.resolve_source_changes(previous);
+        }
         let previous_page_root = self
             .document
             .ready()
@@ -2420,22 +2501,10 @@ impl FigItem {
             .document
             .ready_mut()
             .context("the document is still loading")?;
-        let target = operation.primary_target();
         document
             .doc
             .apply(operation)
             .context("applying canvas operation")?;
-        // `uses_auto_layout` gates the whole-page re-solve and is computed once
-        // at load. An edit that introduces the document's FIRST auto layout must
-        // flip it on, or that frame would never be solved. Checking only the op's
-        // primary target keeps this O(1); the flag is sticky (clearing the last
-        // auto layout only costs a redundant solve, never a stale layout).
-        if !document.uses_auto_layout
-            && let Some(target) = target
-            && node_uses_auto_layout(&document.doc.scene, target)
-        {
-            document.uses_auto_layout = true;
-        }
         let active_page = document.doc.active_page();
         if document.sync_page_registry() {
             self.last_scope = self.last_scope.filter(|scope| document.valid_scope(*scope));
@@ -2506,13 +2575,6 @@ impl FigItem {
                 cx.notify();
             }
             DocChange::Content => {
-                // A multi-op transaction (which bypasses `apply`'s per-op gate
-                // check) could introduce the document's first auto layout; keep
-                // the re-solve gate honest. The scan runs only while the gate is
-                // closed, and the flag is sticky, so this is a one-time cost.
-                if !document.uses_auto_layout && scene_uses_auto_layout(&document.doc.scene) {
-                    document.uses_auto_layout = true;
-                }
                 let active_page = document.doc.active_page();
                 if document.sync_page_registry() {
                     self.last_scope = self.last_scope.filter(|scope| document.valid_scope(*scope));
@@ -2582,12 +2644,11 @@ impl FigItem {
                 .filter(|id| document.doc.scene.contains(*id))
                 .collect::<Vec<_>>();
             document.doc.selection.replace_with(surviving_selection);
-            let active_page = document.doc.active_page();
             if document.sync_page_registry() {
                 self.last_scope = self.last_scope.filter(|scope| document.valid_scope(*scope));
                 cx.emit(FigItemEvent::PageRegistryChanged);
             }
-            document.resolve_after_edit(active_page);
+            document.refresh_layout_baseline();
             document.advance_render_generation();
             document.mark_variables_changed();
             self.content_preview = None;
@@ -2617,12 +2678,11 @@ impl FigItem {
                 .filter(|id| document.doc.scene.contains(*id))
                 .collect::<Vec<_>>();
             document.doc.selection.replace_with(surviving_selection);
-            let active_page = document.doc.active_page();
             if document.sync_page_registry() {
                 self.last_scope = self.last_scope.filter(|scope| document.valid_scope(*scope));
                 cx.emit(FigItemEvent::PageRegistryChanged);
             }
-            document.resolve_after_edit(active_page);
+            document.refresh_layout_baseline();
             document.advance_render_generation();
             document.mark_variables_changed();
             self.content_preview = None;
@@ -2747,6 +2807,22 @@ impl FigItem {
         kind: SaveKind,
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<PathBuf>>> {
+        self.save_inner(kind, false, cx)
+    }
+
+    pub(crate) fn save_computed_source_layout(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<PathBuf>>> {
+        self.save_inner(SaveKind::Explicit, true, cx)
+    }
+
+    fn save_inner(
+        &mut self,
+        kind: SaveKind,
+        computed_source_layout: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Option<PathBuf>>> {
         if self.project_writes.changing_destination() {
             return Task::ready(match kind {
                 SaveKind::Auto => Ok(None),
@@ -2771,7 +2847,7 @@ impl FigItem {
                 )),
             });
         }
-        if self.source_edit_locked {
+        if self.source_edit_locked && !computed_source_layout {
             return Task::ready(Err(anyhow::anyhow!(
                 "the FNX source is dirty; save it through the code workspace before saving the canvas"
             )));
@@ -2780,10 +2856,15 @@ impl FigItem {
             return Task::ready(Err(anyhow::anyhow!("the document is still loading")));
         };
 
-        let changed_artifacts = changed_artifact_ids(
+        let mut changed_artifacts = changed_artifact_ids(
             &document.doc,
             self.merge_base.as_ref(),
             self.last_saved_scene,
+        );
+        extend_artifact_owners(
+            &document.doc,
+            &mut changed_artifacts,
+            document.pending_layout_output_nodes.iter().copied(),
         );
         // The write needs the content, not the presence state: the undo
         // stack's subtree snapshots can outweigh the scene, and cloning them
@@ -2815,7 +2896,7 @@ impl FigItem {
             write_lease.wait_for_turn().await;
             let (target, materializing, write_cache, workspace_session) = this.update(cx, |this, _| {
                 anyhow::ensure!(
-                    !this.source_edit_locked,
+                    !this.source_edit_locked || computed_source_layout,
                     "the FNX source is dirty; save it through the code workspace before saving the canvas"
                 );
                 anyhow::ensure!(this.document.ready().is_some(), "the document is still loading");
@@ -2971,6 +3052,9 @@ impl FigItem {
                         .is_none_or(|document| document.render_generation() != generation);
                     if !this.dirty {
                         this.content_preview = None;
+                        if let Some(document) = this.document.ready_mut() {
+                            document.pending_layout_output_nodes.clear();
+                        }
                     }
                     this.sync_epoch += 1;
                     this.set_conflict(false, cx);
@@ -3108,6 +3192,9 @@ impl FigItem {
                         .document
                         .ready()
                         .is_none_or(|document| document.render_generation() != generation);
+                    if !this.dirty && let Some(document) = this.document.ready_mut() {
+                        document.pending_layout_output_nodes.clear();
+                    }
                     this.content_preview = None;
                     this.sync_epoch += 1;
                     this.set_conflict(false, cx);
@@ -3756,14 +3843,27 @@ fn changed_artifact_ids(
     let Some(delta) = document.scene.changes_since(revision) else {
         return all();
     };
+    extend_artifact_owners(
+        document,
+        &mut changed,
+        delta.nodes.into_iter().chain(delta.transforms),
+    );
+    changed
+}
+
+fn extend_artifact_owners(
+    document: &Doc,
+    changed: &mut BTreeSet<fanta_format::ArtifactId>,
+    nodes: impl IntoIterator<Item = NodeId>,
+) {
     let component_roots: HashMap<NodeId, fanta_doc::ComponentId> = document
         .components
         .defs
         .iter()
-        .map(|(id, def)| (def.root, *id))
+        .map(|(id, definition)| (definition.root, *id))
         .collect();
     let page_roots: HashSet<NodeId> = document.pages().iter().copied().collect();
-    for node in delta.nodes.into_iter().chain(delta.transforms) {
+    for node in nodes {
         let mut current = Some(node);
         while let Some(id) = current {
             if let Some(component) = component_roots.get(&id) {
@@ -3777,7 +3877,6 @@ fn changed_artifact_ids(
             current = document.scene.get(id).and_then(|node| node.parent);
         }
     }
-    changed
 }
 
 fn is_fanta_manifest(path: &Path) -> bool {
@@ -4027,24 +4126,6 @@ fn load_changed_project_document(
     let session = fanta_format::WorkspaceSession::open(root)?;
     let document = load_project_document(root)?;
     Ok(Some((document, session)))
-}
-
-/// Whether this single node carries an auto layout. O(1) — the incremental
-/// check [`FigItem::apply`] runs against an op's primary target.
-fn node_uses_auto_layout(scene: &fanta_doc::Scene, id: NodeId) -> bool {
-    scene.get(id).is_some_and(|node| match &node.data {
-        fanta_doc::NodeData::Group(group) => group.auto_layout.is_some(),
-        _ => false,
-    })
-}
-
-fn scene_uses_auto_layout(scene: &fanta_doc::Scene) -> bool {
-    let roots: Vec<NodeId> = scene.roots().to_vec();
-    roots.into_iter().any(|root| {
-        scene
-            .descendants_of(root)
-            .any(|id| node_uses_auto_layout(scene, id))
-    })
 }
 
 fn visible_page_roots(doc: &Doc) -> Vec<NodeId> {
@@ -8115,63 +8196,587 @@ mod tests {
         });
     }
 
-    #[gpui::test]
-    async fn introducing_an_auto_layout_opens_the_resolve_gate(cx: &mut TestAppContext) {
-        use fanta_doc::{AutoLayout, NodeData};
+    fn imported_layout_preservation_fixture() -> (Doc, Vec<NodeId>, NodeId, NodeId) {
+        use fanta_doc::{AutoLayout, CanvasNode, GroupNode, NodeData, TextAutoResize, TextNode};
+        let mut document = Doc::new();
+        let mut pages = Vec::new();
+        let mut texts = Vec::new();
+        for page_index in 0..2 {
+            let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+            let root = page.id;
+            document.scene.insert(page).expect("page");
+            document.add_page(root);
+            pages.push(root);
+            let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+                clip_size: Some([220.0, 100.0]),
+                auto_layout: Some(AutoLayout::default()),
+                ..Default::default()
+            }));
+            frame.parent = Some(root);
+            let parent = frame.id;
+            document.scene.insert(frame).expect("layout frame");
+            let mut text = TextNode::new(format!("Imported label {page_index}"), 200.0, 18.0);
+            text.auto_resize = TextAutoResize::WidthAndHeight;
+            let mut text = CanvasNode::new(NodeData::Text(text));
+            text.parent = Some(parent);
+            text.transform = fanta_doc::Transform2D::translation(12.0, 36.0);
+            texts.push(text.id);
+            document.scene.insert(text).expect("text");
+        }
+        let mut free = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
+        free.parent = pages.first().copied();
+        let free_id = free.id;
+        document.scene.insert(free).expect("free node");
+        (document, pages, texts[0], free_id)
+    }
 
-        // `uses_auto_layout` gates the whole-page re-solve and is cached at load.
-        // A frame that gains its FIRST auto layout (the inspector's toggle) must
-        // flip the gate on, or its children would never be laid out.
+    #[test]
+    fn loaded_layout_preserves_explicit_geometry_on_open_and_page_visits() {
+        let (doc, pages, _, _) = imported_layout_preservation_fixture();
+        let before = serde_json::to_value(&doc.scene).expect("baseline scene");
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        assert_eq!(
+            serde_json::to_value(&document.doc.scene).expect("loaded scene"),
+            before,
+            "opening a computed project must not reinterpret its text metrics or stack positions"
+        );
+        for root in pages {
+            let index = document
+                .pages
+                .iter()
+                .position(|page| page.root == Some(root))
+                .expect("page");
+            document.ensure_page_solved(index);
+        }
+        assert_eq!(
+            serde_json::to_value(&document.doc.scene).expect("visited scene"),
+            before,
+            "visiting a page must not mutate stored geometry"
+        );
+    }
+
+    #[gpui::test]
+    async fn loaded_layout_free_edits_and_undo_preserve_unrelated_geometry(
+        cx: &mut TestAppContext,
+    ) {
         let project = empty_project(cx).await;
-        let doc = doc_with_one_page();
-        let page_root = doc.pages().first().copied().expect("one page");
+        let (doc, _, _, free) = imported_layout_preservation_fixture();
+        let before = serde_json::to_value(&doc.scene).expect("baseline scene");
         let item = ready_item(
             &project,
-            PathBuf::from("/tmp/nowhere/Design.fig"),
+            PathBuf::from("/tmp/layout-preservation/Design.fig"),
             None,
             doc,
             cx,
         );
-
-        item.read_with(cx, |item, _| {
-            assert!(
-                !item.document().expect("ready").uses_auto_layout,
-                "a document with no auto layout starts with the gate closed"
-            );
-        });
-
-        let (old, new) = item.read_with(cx, |item, _| {
-            let data = item
-                .document()
-                .expect("ready")
-                .doc
-                .scene
-                .get(page_root)
-                .expect("page node")
-                .data
-                .clone();
-            let mut updated = data.clone();
-            if let NodeData::Group(group) = &mut updated {
-                group.auto_layout = Some(AutoLayout::default());
-            }
-            (data, updated)
-        });
         item.update(cx, |item, cx| {
             item.apply(
+                Operation::SetTransform {
+                    id: free,
+                    old: fanta_doc::Transform2D::IDENTITY,
+                    new: fanta_doc::Transform2D::translation(32.0, 16.0),
+                },
+                cx,
+            )
+            .expect("free move");
+            item.undo(cx).expect("undo move");
+        });
+        item.read_with(cx, |item, _| {
+            assert_eq!(serde_json::to_value(&item.doc().expect("document").scene).expect("scene"), before,
+                "a free-node move and one Undo must leave every unrelated imported coordinate intact");
+        });
+    }
+
+    #[test]
+    fn loaded_layout_page_visit_refreshes_bounds_after_off_page_resize_without_reflow() {
+        let (doc, pages, _, _) = imported_layout_preservation_fixture();
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        let page = pages[1];
+        let index = document
+            .pages
+            .iter()
+            .position(|entry| entry.root == Some(page))
+            .expect("other page");
+        let original_bounds = document.pages[index].bounds;
+        let frame = document.doc.scene.children_of(Some(page))[0];
+        let old = document
+            .doc
+            .scene
+            .get(frame)
+            .expect("layout frame")
+            .data
+            .clone();
+        let mut new = old.clone();
+        if let fanta_doc::NodeData::Group(group) = &mut new {
+            group.clip_size = Some([420.0, 200.0]);
+        }
+        document
+            .doc
+            .apply(Operation::ReplaceData {
+                id: frame,
+                old: Box::new(old),
+                new: Box::new(new),
+            })
+            .expect("off-page resize");
+        document.resolve_after_edit(Some(pages[0]));
+        let expected = page_bounds(&document.doc, Some(page));
+        assert_ne!(
+            expected, original_bounds,
+            "the off-page resize changed fit bounds"
+        );
+        let scene_before_visit =
+            serde_json::to_value(&document.doc.scene).expect("scene before visit");
+        document.ensure_page_solved(index);
+        assert_eq!(
+            document.pages[index].bounds, expected,
+            "page navigation must use current geometry for fit"
+        );
+        assert_eq!(
+            serde_json::to_value(&document.doc.scene).expect("scene after visit"),
+            scene_before_visit,
+            "refreshing fit bounds must not recompute stored layout"
+        );
+    }
+
+    fn changed_layout_text(document: &Doc, id: NodeId) -> Operation {
+        let old = document.scene.get(id).expect("text").data.clone();
+        let mut new = old.clone();
+        let fanta_doc::NodeData::Text(text) = &mut new else {
+            panic!("text fixture");
+        };
+        text.content = "An authored label that now needs a substantially wider layout box".into();
+        Operation::ReplaceData {
+            id,
+            old: Box::new(old),
+            new: Box::new(new),
+        }
+    }
+
+    #[gpui::test]
+    async fn loaded_layout_text_edit_undo_redo_and_journal_preserve_other_islands(
+        cx: &mut TestAppContext,
+    ) {
+        use fanta_doc::journal::{JournalSink, Provenance, SessionJournal};
+        use fanta_doc::snapshot::SceneSnapshot;
+        let project = empty_project(cx).await;
+        let (mut doc, pages, text, _) = imported_layout_preservation_fixture();
+        let before = serde_json::to_value(&doc.scene).expect("initial scene");
+        let initial_json = doc.to_json_string().expect("initial document");
+        let initial_snapshot = SceneSnapshot::of_active_page(&doc);
+        let untouched = doc.scene.extract_subtree(pages[1]).expect("untouched page");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        doc.set_journal_sink(Some(JournalSink::new(sender)));
+        let item = ready_item(
+            &project,
+            PathBuf::from("/tmp/layout-text/Design.fig"),
+            None,
+            doc,
+            cx,
+        );
+        let after = item.update(cx, |item, cx| {
+            let operation = changed_layout_text(item.doc().expect("document"), text);
+            item.apply(operation, cx).expect("text edit");
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.history.undo_depth(), 1);
+            let fanta_doc::NodeData::Text(edited) = &doc.scene.get(text).expect("text").data else {
+                panic!("text fixture");
+            };
+            assert_ne!(
+                edited.local_size,
+                [200.0, 18.0],
+                "real text edits recompute geometry"
+            );
+            assert_eq!(
+                serde_json::to_value(doc.scene.extract_subtree(pages[1]).expect("other page"))
+                    .expect("scene"),
+                serde_json::to_value(&untouched).expect("initial other page")
+            );
+            let after = serde_json::to_value(&doc.scene).expect("edited scene");
+            assert!(item.undo(cx).expect("one undo"));
+            assert_eq!(
+                serde_json::to_value(&item.doc().expect("document").scene).expect("undone scene"),
+                before
+            );
+            assert!(!item.undo(cx).expect("no additional authored transaction"));
+            assert!(item.redo(cx).expect("one redo"));
+            assert_eq!(
+                serde_json::to_value(&item.doc().expect("document").scene).expect("redone scene"),
+                after
+            );
+            after
+        });
+        let mut steps = Vec::new();
+        for (index, event) in receiver.try_iter().enumerate() {
+            event
+                .record(&mut steps, Provenance::Unknown, index as u64, 0)
+                .expect("record journal");
+        }
+        assert_eq!(
+            steps.len(),
+            3,
+            "authored edit with derived geometry, Undo, Redo"
+        );
+        assert!(
+            steps[0].ops.len() > 1,
+            "computed coordinates are durable operations"
+        );
+        let journal = SessionJournal {
+            session_id: "layout-undo-replay".into(),
+            init_doc_json: initial_json,
+            init_snapshot: initial_snapshot,
+            steps,
+            final_snapshot: Some(item.read_with(cx, |item, _| {
+                SceneSnapshot::of_active_page(item.doc().expect("document"))
+            })),
+            viewport: None,
+            input_events: Vec::new(),
+        };
+        let replay = fanta_doc::replay::replay_ops(&journal)
+            .expect("replay authored and derived operations");
+        assert!(replay.ok, "{:?}", replay.divergences);
+        let replayed = Doc::from_json_str(&replay.replayed_doc_json).expect("replayed document");
+        assert_eq!(
+            serde_json::to_value(&replayed.scene).expect("replayed scene"),
+            after,
+            "replay must preserve exact geometry, including the untouched imported page"
+        );
+    }
+
+    #[test]
+    fn loaded_layout_open_gesture_cancel_restores_original_geometry() {
+        let (doc, _, text, _) = imported_layout_preservation_fixture();
+        let before = serde_json::to_value(&doc.scene).expect("initial scene");
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        document
+            .doc
+            .history
+            .begin("Text gesture", &mut document.doc.scene);
+        document
+            .doc
+            .apply(changed_layout_text(&document.doc, text))
+            .expect("authored text");
+        document.resolve_after_edit(document.doc.active_page());
+        assert_ne!(
+            serde_json::to_value(&document.doc.scene).expect("preview scene"),
+            before
+        );
+        document.doc.abort_transaction().expect("cancel gesture");
+        document.refresh_layout_baseline();
+        assert_eq!(
+            serde_json::to_value(&document.doc.scene).expect("canceled scene"),
+            before
+        );
+        assert_eq!(document.doc.history.undo_depth(), 0);
+        assert_eq!(document.doc.history.redo_depth(), 0);
+    }
+
+    #[gpui::test]
+    async fn loaded_layout_paint_only_edit_preserves_geometry(cx: &mut TestAppContext) {
+        let project = empty_project(cx).await;
+        let (doc, _, text, _) = imported_layout_preservation_fixture();
+        let before = doc.scene.get(text).expect("text").clone();
+        let item = ready_item(
+            &project,
+            PathBuf::from("/tmp/layout-paint/Design.fig"),
+            None,
+            doc,
+            cx,
+        );
+        item.update(cx, |item, cx| {
+            let old = before.data.clone();
+            let mut new = old.clone();
+            let fanta_doc::NodeData::Text(value) = &mut new else {
+                panic!("text fixture")
+            };
+            value.style.color = fanta_doc::Color::rgba(227, 74, 111, 255);
+            item.apply(
                 Operation::ReplaceData {
-                    id: page_root,
+                    id: text,
+                    old: Box::new(old),
+                    new: Box::new(new.clone()),
+                },
+                cx,
+            )
+            .expect("recolor");
+            let actual = item.doc().expect("document").scene.get(text).expect("text");
+            assert_eq!(actual.data, new, "recolor must not resize imported text");
+            assert_eq!(actual.transform, before.transform);
+            assert_eq!(
+                item.doc()
+                    .expect("document")
+                    .history
+                    .next_undo_transaction()
+                    .expect("recolor transaction")
+                    .ops
+                    .len(),
+                1
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn loaded_layout_discard_restores_saved_geometry_without_reflow(cx: &mut TestAppContext) {
+        let project = empty_project(cx).await;
+        let directory = tempfile::tempdir().expect("project");
+        let (doc, _, text, _) = imported_layout_preservation_fixture();
+        fanta_format::write_project_tree(directory.path(), &doc, &BTreeMap::new())
+            .expect("save baseline");
+        let (doc, _) = fanta_format::read_project_tree(directory.path()).expect("read baseline");
+        let before = serde_json::to_value(&doc.scene).expect("saved geometry");
+        let base = doc.clone();
+        let item = ready_item(
+            &project,
+            directory.path().join("fanta.json"),
+            Some(directory.path().to_path_buf()),
+            doc,
+            cx,
+        );
+        item.update(cx, |item, cx| {
+            item.merge_base = Some(base);
+            item.apply(changed_layout_text(item.doc().expect("document"), text), cx)
+                .expect("edit text");
+            assert!(item.is_dirty());
+        });
+        item.update(cx, |item, cx| item.reload_from_disk_unchecked(cx))
+            .await
+            .expect("discard");
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                serde_json::to_value(&item.doc().expect("document").scene).expect("restored scene"),
+                before
+            );
+            assert!(!item.is_dirty());
+            assert!(!item.has_unpersisted_source_layout());
+        });
+    }
+
+    #[gpui::test]
+    async fn loaded_layout_external_merge_saves_layout_and_local_edit(cx: &mut TestAppContext) {
+        let project = empty_project(cx).await;
+        let directory = tempfile::tempdir().expect("project");
+        let (doc, pages, text, free) = imported_layout_preservation_fixture();
+        fanta_format::write_project_tree(directory.path(), &doc, &BTreeMap::new())
+            .expect("baseline");
+        let (base, _) = fanta_format::read_project_tree(directory.path()).expect("read baseline");
+        let untouched =
+            serde_json::to_value(base.scene.extract_subtree(pages[1]).expect("other page"))
+                .expect("other page");
+        let item = ready_item(
+            &project,
+            directory.path().join("fanta.json"),
+            Some(directory.path().to_path_buf()),
+            base.clone(),
+            cx,
+        );
+        item.update(cx, |item, cx| {
+            item.merge_base = Some(base.clone());
+            item.apply(
+                Operation::SetTransform {
+                    id: free,
+                    old: fanta_doc::Transform2D::IDENTITY,
+                    new: fanta_doc::Transform2D::translation(32.0, 16.0),
+                },
+                cx,
+            )
+            .expect("local edit");
+        });
+        let mut external = base.clone();
+        external
+            .apply(changed_layout_text(&external, text))
+            .expect("external source edit");
+        fanta_format::write_project_tree(directory.path(), &external, &BTreeMap::new())
+            .expect("write external edit");
+        let disk = load_project_document(directory.path()).expect("load edited source");
+        let ours = item.read_with(cx, |item, _| item.doc().expect("document").clone());
+        let merge = fanta_format::merge_docs(&base, &ours, &disk.doc).expect("three-way merge");
+        assert!(merge.conflicts.is_empty());
+        let session =
+            fanta_format::WorkspaceSession::open(directory.path()).expect("source session");
+        item.update(cx, |item, cx| {
+            item.adopt_merged_document(merge.doc, disk, session, cx)
+        });
+        let expected = item.read_with(cx, |item, _| {
+            assert!(item.is_dirty());
+            assert!(item.has_unpersisted_source_layout());
+            let doc = item.doc().expect("document");
+            assert_eq!(
+                doc.scene.get(free).expect("local node").transform,
+                fanta_doc::Transform2D::translation(32.0, 16.0)
+            );
+            assert_eq!(
+                serde_json::to_value(doc.scene.extract_subtree(pages[1]).expect("other page"))
+                    .expect("other scene"),
+                untouched
+            );
+            serde_json::to_value(&doc.scene).expect("merged scene")
+        });
+        item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect("save merged layout");
+        let (saved, _) =
+            fanta_format::read_project_tree(directory.path()).expect("reopen merged scene");
+        assert_eq!(
+            serde_json::to_value(&saved.scene).expect("saved geometry"),
+            expected
+        );
+    }
+
+    #[test]
+    fn loaded_layout_omitted_geometry_honors_parent_child_layout_policy() {
+        use fanta_doc::{AxisSizing, CanvasNode, GroupNode, LayoutChild, NodeData};
+        for child_layout in [false, true] {
+            let mut doc = Doc::new();
+            let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+            let page_id = page.id;
+            doc.scene.insert(page).expect("page");
+            doc.add_page(page_id);
+            let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+                auto_layout: Some(fanta_doc::AutoLayout {
+                    child_layout,
+                    primary_sizing: AxisSizing::Hug,
+                    counter_sizing: AxisSizing::Hug,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }));
+            frame.parent = Some(page_id);
+            let frame_id = frame.id;
+            doc.scene.insert(frame).expect("frame");
+            let mut child = CanvasNode::new(NodeData::Group(GroupNode {
+                clip_size: Some([40.0, 30.0]),
+                ..Default::default()
+            }));
+            child.parent = Some(frame_id);
+            child.transform = fanta_doc::Transform2D::translation(123.0, 234.0);
+            child.layout_child = Some(LayoutChild {
+                absolute: true,
+                ..Default::default()
+            });
+            let child_id = child.id;
+            doc.scene.insert(child).expect("child");
+            doc.pending_layout.extend([frame_id, child_id]);
+            let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+            let frame = document.doc.scene.get(frame_id).expect("computed frame");
+            if child_layout {
+                assert_eq!(
+                    document
+                        .doc
+                        .scene
+                        .get(child_id)
+                        .expect("absolute child")
+                        .transform,
+                    fanta_doc::Transform2D::translation(123.0, 234.0)
+                );
+            } else {
+                assert_eq!(frame.data.local_size(), Some([40.0, 30.0]));
+                assert_eq!(
+                    document
+                        .doc
+                        .scene
+                        .get(child_id)
+                        .expect("flow child")
+                        .transform,
+                    fanta_doc::Transform2D::IDENTITY
+                );
+                let old = document
+                    .doc
+                    .scene
+                    .get(child_id)
+                    .expect("flow child")
+                    .data
+                    .clone();
+                let mut new = old.clone();
+                if let NodeData::Group(group) = &mut new {
+                    group.clip_size = Some([70.0, 50.0]);
+                }
+                document
+                    .doc
+                    .apply(Operation::ReplaceData {
+                        id: child_id,
+                        old: Box::new(old),
+                        new: Box::new(new),
+                    })
+                    .expect("resize child");
+                document.resolve_after_edit(Some(page_id));
+                assert_eq!(
+                    document
+                        .doc
+                        .scene
+                        .get(frame_id)
+                        .expect("resized frame")
+                        .data
+                        .local_size(),
+                    Some([70.0, 50.0])
+                );
+            }
+            assert!(document.doc.pending_layout.is_empty());
+        }
+    }
+
+    #[gpui::test]
+    async fn introducing_an_auto_layout_positions_existing_children(cx: &mut TestAppContext) {
+        use fanta_doc::{AutoLayout, CanvasNode, GroupNode, NodeData};
+        let project = empty_project(cx).await;
+        let mut doc = doc_with_one_page();
+        let page = doc.pages()[0];
+        let mut child = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([40.0, 30.0]),
+            ..Default::default()
+        }));
+        child.parent = Some(page);
+        child.transform = fanta_doc::Transform2D::translation(70.0, 80.0);
+        let child_id = child.id;
+        doc.scene.insert(child).expect("child");
+        let item = ready_item(
+            &project,
+            PathBuf::from("/tmp/new-layout/Design.fig"),
+            None,
+            doc,
+            cx,
+        );
+        item.update(cx, |item, cx| {
+            let old = item
+                .doc()
+                .expect("document")
+                .scene
+                .get(page)
+                .expect("page")
+                .data
+                .clone();
+            let mut new = old.clone();
+            if let NodeData::Group(group) = &mut new {
+                group.auto_layout = Some(AutoLayout {
+                    padding: [11.0, 12.0, 13.0, 14.0],
+                    ..Default::default()
+                });
+            }
+            item.apply(
+                Operation::ReplaceData {
+                    id: page,
                     old: Box::new(old),
                     new: Box::new(new),
                 },
                 cx,
             )
-        })
-        .expect("applying an auto layout");
-
-        item.read_with(cx, |item, _| {
-            assert!(
-                item.document().expect("ready").uses_auto_layout,
-                "introducing the first auto layout must open the re-solve gate"
+            .expect("enable auto layout");
+            assert_eq!(
+                item.doc()
+                    .expect("document")
+                    .scene
+                    .get(child_id)
+                    .expect("positioned child")
+                    .transform,
+                fanta_doc::Transform2D::translation(14.0, 11.0)
+            );
+            item.undo(cx).expect("undo auto layout");
+            assert_eq!(
+                item.doc()
+                    .expect("document")
+                    .scene
+                    .get(child_id)
+                    .expect("restored child")
+                    .transform,
+                fanta_doc::Transform2D::translation(70.0, 80.0)
             );
         });
     }

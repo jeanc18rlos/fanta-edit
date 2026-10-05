@@ -251,6 +251,62 @@ passed. Evidence is in `layout-noop-mutations-20261005/validation.json` under th
 release-verification directory. This prevents false dirtying; it does not yet
 prove native layout preservation on load or repair the recorded Spectrum failure.
 
+The source reader now records runtime-only layout hints when authored FNX omits
+required text/frame geometry or a flowing child's position, before defaults
+erase that distinction. Cold project reads, scoped page/component reads and
+incremental source replacement retain those hints. Explicit complete geometry,
+including zero values and width/height sugar, does not request reflow. Three
+baseline regressions failed; the first **4 focused tests**, **221 format unit
+tests, 52 integration tests and 1 doctest** passed with the correction, with
+1 integration test and 1 doctest ignored. The format repository lint gate also
+passed. The subsequent focused run passed **5/5**, including intentionally
+unsized page roots with complete children and an omitted flowing-child position.
+Evidence is in
+`target/release-verification/source-layout-omissions-20261005/validation.json`.
+The fifth-test result is in
+`loaded-layout-preservation-20261005/format-pending.log` under the same evidence
+root.
+A read-only check using the updated reader found **zero layout hints** in the
+fresh canonical Spectrum project: 73,925 nodes, 23 pages, 9,012 component
+definitions and 41 assets. This is a reader check, not native layout or latency
+acceptance.
+
+The viewer's **13 focused layout tests passed**, with five scheduler seeds for
+the GPUI cases.
+They cover preserved geometry on open/page visits, isolated edits and Undo/Redo,
+paint-only edits, gesture cancellation, authored omissions, discard, external
+merge and actual FNX Save/readback. Source-save cases retain the canvas lock
+while computed geometry is written/refreshed, preserve an invalid second source
+draft, and keep failed geometry writes visible and retryable. They also check
+that discarding an invalid second draft retains the first saved draft's computed
+geometry as dirty/saveable, and page visits refresh stale bounds without
+changing geometry. The first full editor run found one component-registry
+notification ownership regression (1,076 passed, 1 failed, 1 ignored); the fix
+retains the existing assertion and the four streamed-update tests now pass.
+The final combined run passed **1,079 editor tests (1 ignored), 3 benchmark CLI
+tests, 320 source-order tests (98 FNX + 222 format)** and
+`./script/clippy --locked -p fanta-doc -p fanta-format -p fig_viewer`. All twelve
+implementation file hashes stayed unchanged through final validation. Logs,
+the retained intermediate failures, `validation.json`,
+`implementation-evidence.json` and `final-tested-source-hashes.json` are in
+`target/release-verification/loaded-layout-preservation-20261005/`.
+
+Derived layout now joins the authored history transaction and its journal
+record, while cancelled edits invalidate stale amendment tokens and edits after
+Undo preserve Redo until commit. Three guard regressions failed before the
+correction; **19 focused history tests**, the complete **399-test document suite
+(1 ignored)** and its repository lint gate passed. Evidence is in
+`target/release-verification/derived-layout-history-20261005/validation.json`.
+These document and GPUI checks do not close the native Spectrum
+geometry-preservation gate or establish native performance.
+
+For the next native retry, `/tmp/fanta-spectrum-layout-acceptance-20261005` is a
+fresh reconstruction that matches the immutable current-reader baseline
+strictly, including timestamps and assets. Preserve both the pristine copy at
+`/tmp/fanta-spectrum-pristine-20261005` and the earlier failure project at
+`/tmp/fanta-spectrum-release-save-check-20261005`; the latter retains the
+unintended geometry changes and must not become the next baseline.
+
 The inspector/menu native follow-up used `85fc694b67c78f616401def73506e515594f52d7`,
 binary SHA-256 `d42e94c0febfa6c701c257485a470779b5c991c7e3567b856f6e5b6fb7dced99`.
 Build/source fingerprints and observations are in
@@ -840,7 +896,7 @@ coverage. The final column highlights the remaining acceptance work.
 | Properties inspector | `fig_viewer::gpui_adapters::design::tests`, `properties_panel::tests`, `properties_ops::tests`, `properties_snapshot::tests`; mounted `view/properties_inspector.rs::layout_tests` checks geometry fields at minimum width and the composed inspector with annotation/measurement lists | Actual scrub/drag cancellation; differing-value mixed selection, themes, scrolling and popovers. Numeric/hex draft cancellation, invalid-draft page switching, Export labels and two-kind aggregate-opacity display/edit/Undo passed natively. Mounted layout bounds are not a full visual baseline. |
 | Drawing/path/region/crop | `fanta-tools` full suite, including `tests/end_to_end.rs` and `ink_oracle.rs`; viewer toolbar adapter tests | Every visible tool, path/anchor editing, brush/eraser, region operation, crop Apply/Cancel and their keyboard shortcuts. |
 | Text/text on path | `fanta-text`, `fanta-tools::text_path::tests`, renderer text/text-path tests; viewer `text_edit`, `instance_text` and design adapter tests | Inline range selection, rich styles, multiline/Unicode/IME input, fonts, path conversion errors, instance overrides, save/reopen and exports. |
-| Layout/paints/effects/rendering | `fanta-doc` layout tests; complete `fanta-render` library and bitmap/SVG/compose/golden integration suites | Visual parity for gradients, masks, booleans, clipping, shadows/blur, blend modes, auto-layout/grid and imported instances under edits. |
+| Layout/paints/effects/rendering | `fanta-doc` layout tests; format omission/complete-geometry roundtrips; complete `fanta-render` library and bitmap/SVG/compose/golden integration suites | Native imported geometry preservation through page visits, Save, edit/Undo and restart remains blocked by the recorded Spectrum changes. Also verify visual parity for gradients, masks, booleans, clipping, shadows/blur, blend modes, auto-layout/grid and imported instances under edits. |
 | Variables/styles | `fig_viewer::variables_workspace::tests`, `variable_binding::tests`, `agent_surface::tests`; document resolve/render tests | Rename/delete, aliases and other types/bindings. One two-mode color binding/unbind/Undo/restart passed on `ee80ec48c6`; header containment/toggle, resolved bound row/picker, read-only alpha explanation, picker Detach/Undo and strict restart passed on `0a0d3cd1c4`. |
 | Components/variants | Viewer component-property, variant-set, clipboard and agent tests; `fanta-doc` instance resolution tests; importer overrides tests | Master ↔ instance updates, virtual text edit, typed properties, variant switching, detach/duplicate and nested components without disappearing descendants. |
 | Motion/timeline | Viewer `motion_panel`, `motion_edit`, `timeline`, toolbar adapter tests; document/render motion tests | Easing edit/cancel, clip switching, duration and mode changes. Representative playback/ruler seek and keyframe drag/Undo passed on `ee80ec48c6`; time-field typing/seek with retained selection and strict restart passed on `0a0d3cd1c4`. Broader property coverage remains open. |
@@ -864,7 +920,7 @@ native inputs and final comparison.
 | --- | --- | --- |
 | 1 — Inspector drafts | Continue on `/tmp/fanta-release-inspector-acceptance-20261005` or a fresh node-matrix copy. Test a selection whose starting values differ, edit/Undo, and an actual scrub/drag cancellation. | Numeric/hex draft Escape, invalid-draft page switching and Export labels passed at 320 px on `85fc694b67`; two-kind opacity display/edit/Undo passed on `ee80ec48c6`. Compare all unrelated typed content/assets after Save/reopen; keyboard draft cancellation does not prove drag cancellation. |
 | 2 — Clipboard and structure | Preserve `/tmp/fanta-clipboard-native-20261005`; use a fresh copy for Cut, page/menu Duplicate, asset-bearing subtrees and Duplicate-state restart. | The 15-node complete-set keyboard Duplicate/Paste journey, saved Undo/Redo, external-reference preservation and Paste restart passed on `9ca127c1be`. Bitmap cross-page checks and visible cross-document refusal passed earlier. Compare complete content/assets and original masters in the remaining journeys; prototype playback and successful cross-project transfer are not established here. |
-| 3 — Large-page save and drag | Open `/tmp/fanta-spectrum-release-save-check-20261005`, generated from the unchanged Spectrum `.fig`. On page index 9, move the instance corresponding to import index 4358 and image-filled frame index 2110, then Save, Undo, Save and restart. | Full offline write/readback preserves inventories/assets with only the 15,278 explicitly recorded FNX normalizations above; strict equality fails. Native edit/save/restart and quiet-machine pointer/frame timings remain open. Reconfirm the target nodes after opening; imported IDs are not stable. CPU `drag_bench` and isolated Boolean images do not establish native latency or whole-page visual fidelity. |
+| 3 — Large-page save and drag | Use `/tmp/fanta-spectrum-layout-acceptance-20261005`, the fresh strict reconstruction. First visit pages and Save without an edit. Then on page index 9 move the instance corresponding to import index 4358 and image-filled frame index 2110; Save, Undo, Save and restart. Preserve the earlier failure project and pristine copy. | Compare every persisted field and asset to the canonical current-reader baseline: no geometry drift on page visits, only the intended edit afterward, correct parent/order, and exact Undo restoration apart from individually reviewed revision/timestamp changes. Do not waive geometry or numeric differences. The earlier offline conversion's 15,278 normalizations are historical evidence, not an exception for this native retry. Reconfirm target identities from the retained map; fresh-import IDs are not stable. Quiet-machine pointer/frame timings and whole-page visual fidelity remain separate gates. |
 | 4 — Variables, Motion and Prototype | Continue on `/tmp/fanta-release-variables-prototype-20261005`, preserving its evidence. Sample explicit interaction Remove/Undo, easing cancellation and another prototype trigger; separately exercise aliases or a different binding type. | The earlier two-mode, Motion and prototype samples passed on `ee80ec48c6`. Corrected title containment/toggle, bound row/picker/Detach/Undo, time-field seek and non-destructive detail X passed on `0a0d3cd1c4`, with strict restart equality. Compare complete typed content and assets; these samples do not cover all triggers, easing types, aliases or variant combinations. |
 
 ## Reproducible local verification

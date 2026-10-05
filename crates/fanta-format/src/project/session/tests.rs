@@ -3104,3 +3104,269 @@ fn shared_reference_table_rejects_and_recovers_duplicate_variable_paths() {
         source
     );
 }
+
+fn pending_layout_fixture_nodes(page: NodeId) -> (Vec<Value>, std::collections::BTreeSet<NodeId>) {
+    let frame = NodeId::new();
+    let flow_child = NodeId::new();
+    let text = NodeId::new();
+    let complete_text = NodeId::new();
+    let absolute_child = NodeId::new();
+    let free_group = NodeId::new();
+    let mut nodes = vec![
+        group_json(page, "Page", None),
+        group_json(frame, "Authored layout", Some(page)),
+        group_json(flow_child, "Omitted flow position", Some(frame)),
+        group_json(absolute_child, "Absolute identity", Some(frame)),
+        group_json(free_group, "Free identity", Some(page)),
+    ];
+    nodes[1]["auto_layout"] = json!({"mode": "horizontal"});
+    nodes[2]
+        .as_object_mut()
+        .expect("flow node")
+        .remove("transform");
+    nodes[2]["clip_size"] = json!([30.0, 40.0]);
+    nodes[3]
+        .as_object_mut()
+        .expect("absolute node")
+        .remove("transform");
+    nodes[3]["layout_child"] = json!({"absolute": true});
+    nodes[4]
+        .as_object_mut()
+        .expect("free node")
+        .remove("transform");
+    let mut omitted = CanvasNode::new(NodeData::Text(fanta_doc::TextNode::new(
+        "Authored", 90.0, 20.0,
+    )));
+    omitted.id = text;
+    omitted.parent = Some(page);
+    let mut omitted = serde_json::to_value(omitted).expect("text JSON");
+    omitted.as_object_mut().expect("text").remove("local_size");
+    omitted["auto_resize"] = json!("width_and_height");
+    nodes.push(omitted);
+    let mut complete = CanvasNode::new(NodeData::Text(fanta_doc::TextNode::new(
+        "Saved", 97.0, 23.0,
+    )));
+    complete.id = complete_text;
+    complete.parent = Some(frame);
+    complete.transform = Transform2D::translation(79.0, 31.0);
+    let mut complete = serde_json::to_value(complete).expect("complete text JSON");
+    complete["auto_resize"] = json!("width_and_height");
+    nodes.push(complete);
+    (nodes, [frame, flow_child, text].into_iter().collect())
+}
+
+fn write_pending_layout_source(directory: &std::path::Path, page: NodeId, nodes: &[Value]) {
+    let source = crate::locate_page_source(directory, page).expect("page source");
+    let (text, sidecar) = fanta_fnx::encode_subtree(nodes, "Page").expect("encode source");
+    std::fs::write(&source, text).expect("write authored FNX");
+    std::fs::write(
+        source.with_file_name("page.ids.json"),
+        serde_json::to_vec(&sidecar).expect("sidecar JSON"),
+    )
+    .expect("write sidecar");
+}
+
+#[test]
+fn pending_layout_cold_read_marks_only_authored_geometry_omissions() {
+    let (directory, page) = page_fixture();
+    let (nodes, expected) = pending_layout_fixture_nodes(page);
+    write_pending_layout_source(directory.path(), page, &nodes);
+    let (mut document, assets) =
+        crate::read_project_tree(directory.path()).expect("authored project");
+    assert_eq!(document.pending_layout, expected);
+    assert_eq!(document.clone_for_persist().pending_layout, expected);
+    let serialized = document.to_json_string().expect("document JSON");
+    assert!(!serialized.contains("pending_layout"));
+    assert!(
+        Doc::from_json_str(&serialized)
+            .expect("reload JSON")
+            .pending_layout
+            .is_empty()
+    );
+    for identifier in &expected {
+        if let Some(CanvasNode {
+            data: NodeData::Group(group),
+            ..
+        }) = document.scene.get_mut(*identifier)
+            && group.auto_layout.is_some()
+        {
+            group.local_size = Some([120.0, 40.0]);
+        }
+    }
+    crate::write_project_tree(directory.path(), &document, &assets)
+        .expect("write complete geometry");
+    let (reopened, _) = crate::read_project_tree(directory.path()).expect("complete project");
+    assert!(
+        reopened.pending_layout.is_empty(),
+        "saved complete geometry is authoritative"
+    );
+}
+
+#[test]
+fn pending_layout_scoped_page_and_component_preserve_omission_seeds() {
+    let root = NodeId::new();
+    let (nodes, expected) = pending_layout_fixture_nodes(root);
+    let page_ir = ArtifactIr::from_nodes(ArtifactKind::Page, "Page", &nodes).expect("page IR");
+    let page = materialize_page(
+        &page_ir,
+        fanta_doc::DocId::new(),
+        fanta_doc::ComponentLibrary::new(),
+        VariableRegistry::new(),
+        BTreeMap::new(),
+    )
+    .expect("scoped page");
+    assert_eq!(page.doc.pending_layout, expected);
+    let component_ir =
+        ArtifactIr::from_nodes(ArtifactKind::Component, "Master", &nodes).expect("component IR");
+    let definition = fanta_doc::ComponentDef::new(fanta_doc::ComponentId::new(), root, "Master");
+    let component = materialize_component(
+        &component_ir,
+        page.doc.id,
+        definition.clone(),
+        VariableRegistry::new(),
+        BTreeMap::new(),
+    )
+    .expect("scoped component");
+    assert_eq!(component.doc.pending_layout, expected);
+    let scoped = super::materialize::scope_from_document(
+        &component.doc,
+        ArtifactKind::Component,
+        root,
+        Some(&definition),
+    )
+    .expect("component supported")
+    .expect("scope from document");
+    assert_eq!(scoped.doc.pending_layout, expected);
+}
+
+#[test]
+fn pending_layout_incremental_source_replacement_transfers_and_clears_seeds() {
+    let (directory, page) = page_fixture();
+    let (mut document, _) = crate::read_project_tree(directory.path()).expect("initial project");
+    let old_child = document.scene.children_of(Some(page))[0];
+    document.pending_layout.insert(old_child);
+    let (nodes, expected) = pending_layout_fixture_nodes(page);
+    write_pending_layout_source(directory.path(), page, &nodes);
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("changed workspace");
+    let report = ApplyReport {
+        changed: vec![ArtifactId::Page(page)],
+        ..ApplyReport::default()
+    };
+    let (result, mut document) = workspace
+        .apply_report_to_owned_doc(document, &report)
+        .expect("incremental adoption");
+    assert_eq!(result, IncrementalDocApply::Applied);
+    assert_eq!(document.pending_layout, expected);
+    assert!(!document.scene.contains(old_child));
+    for identifier in &expected {
+        if let Some(CanvasNode {
+            data: NodeData::Group(group),
+            ..
+        }) = document.scene.get_mut(*identifier)
+            && group.auto_layout.is_some()
+        {
+            group.local_size = Some([120.0, 40.0]);
+        }
+    }
+    crate::write_project_tree(directory.path(), &document, &BTreeMap::new())
+        .expect("save complete geometry");
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("complete workspace");
+    let (result, document) = workspace
+        .apply_report_to_owned_doc(document, &report)
+        .expect("complete adoption");
+    assert_eq!(result, IncrementalDocApply::Applied);
+    assert!(document.pending_layout.is_empty());
+}
+
+#[test]
+fn pending_layout_saved_zero_geometry_does_not_request_relayout() {
+    let (directory, page) = page_fixture();
+    let (mut document, assets) = crate::read_project_tree(directory.path()).expect("project");
+    let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+        auto_layout: Some(fanta_doc::AutoLayout::default()),
+        clip_size: Some([0.0, 0.0]),
+        ..GroupNode::default()
+    }));
+    frame.parent = Some(page);
+    let frame = document.scene.insert(frame).expect("zero frame");
+    let mut text = fanta_doc::TextNode::new("Zero box is explicit", 0.0, 0.0);
+    text.auto_resize = fanta_doc::TextAutoResize::WidthAndHeight;
+    let mut text = CanvasNode::new(NodeData::Text(text));
+    text.parent = Some(frame);
+    document.scene.insert(text).expect("zero text");
+    crate::write_project_tree(directory.path(), &document, &assets).expect("write zero geometry");
+    let (reopened, _) = crate::read_project_tree(directory.path()).expect("read zero geometry");
+    assert!(reopened.pending_layout.is_empty());
+    assert_eq!(
+        serde_json::to_value(&document.scene).expect("before"),
+        serde_json::to_value(&reopened.scene).expect("after")
+    );
+    fn use_size_sugar(element: &mut fanta_fnx::FnxElement) {
+        if let Some(size) = element
+            .attrs
+            .remove("clip_size")
+            .or_else(|| element.attrs.remove("local_size"))
+        {
+            let dimensions = size.as_array().expect("fixture size");
+            element
+                .attrs
+                .insert("width".into(), dimensions.first().expect("width").clone());
+            element
+                .attrs
+                .insert("height".into(), dimensions.get(1).expect("height").clone());
+        }
+        for child in &mut element.children {
+            use_size_sugar(child);
+        }
+    }
+    let source_path = crate::locate_page_source(directory.path(), page).expect("source");
+    let source = std::fs::read_to_string(&source_path).expect("complete FNX");
+    let mut tree = fanta_fnx::parse_doc(&source).expect("source tree");
+    use_size_sugar(&mut tree);
+    std::fs::write(&source_path, fanta_fnx::print_doc("Page", &tree)).expect("author size sugar");
+    let (sugared, _) = crate::read_project_tree(directory.path()).expect("read size sugar");
+    assert!(sugared.pending_layout.is_empty());
+    assert_eq!(
+        serde_json::to_value(&document.scene).expect("before sugar"),
+        serde_json::to_value(&sugared.scene).expect("after sugar")
+    );
+}
+
+#[test]
+fn pending_layout_unsized_page_root_preserves_complete_child_geometry() {
+    let (directory, page) = page_fixture();
+    let (mut document, assets) = crate::read_project_tree(directory.path()).expect("project");
+    let root = document.scene.get_mut(page).expect("page root");
+    let NodeData::Group(group) = &mut root.data else {
+        panic!("page is a group");
+    };
+    group.auto_layout = Some(fanta_doc::AutoLayout {
+        primary_sizing: fanta_doc::AxisSizing::Hug,
+        counter_sizing: fanta_doc::AxisSizing::Hug,
+        ..Default::default()
+    });
+    crate::write_project_tree(directory.path(), &document, &assets)
+        .expect("write auto-layout page");
+    let (complete, _) = crate::read_project_tree(directory.path()).expect("read auto-layout page");
+    assert!(complete.pending_layout.is_empty());
+    assert_eq!(
+        serde_json::to_value(&document.scene).expect("authored geometry"),
+        serde_json::to_value(&complete.scene).expect("reopened geometry")
+    );
+    let child = *complete
+        .scene
+        .children_of(Some(page))
+        .first()
+        .expect("flow child");
+    let source_path = crate::locate_page_source(directory.path(), page).expect("source path");
+    let mut tree = fanta_fnx::parse_doc(&std::fs::read_to_string(&source_path).expect("source"))
+        .expect("source tree");
+    tree.children
+        .first_mut()
+        .expect("flow child element")
+        .attrs
+        .remove("transform");
+    std::fs::write(&source_path, fanta_fnx::print_doc("Page", &tree)).expect("omit child position");
+    let (authored, _) = crate::read_project_tree(directory.path()).expect("read omission");
+    assert_eq!(authored.pending_layout, [child].into_iter().collect());
+}

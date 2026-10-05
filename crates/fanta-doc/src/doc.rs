@@ -15,7 +15,7 @@ use crate::selection::Selection;
 use crate::value::{VarValue, VariableType};
 use crate::variables::{Mode, VariableRegistry};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Current canonical JSON schema version. Bump when the on-disk shape changes;
 /// `fanta-format` owns the migration table.
@@ -47,6 +47,11 @@ pub struct Doc {
     pub asset_library: BTreeMap<AssetId, ProjectAsset>,
 
     pub scene: Scene,
+
+    /// FNX nodes whose omitted geometry needs layout after source adoption.
+    /// Runtime-only so reopening complete saved geometry cannot reschedule it.
+    #[serde(skip)]
+    pub pending_layout: BTreeSet<NodeId>,
 
     #[serde(default)]
     pub selection: Selection,
@@ -172,6 +177,7 @@ impl Doc {
             },
             asset_library: BTreeMap::new(),
             scene: Scene::new(),
+            pending_layout: BTreeSet::new(),
             selection: Selection::new(),
             history: History::new(),
             viewport: Viewport::default(),
@@ -328,6 +334,27 @@ impl Doc {
         self.history.apply_transaction(tx, &mut ctx)?;
         self.metadata.modified_at = unix_seconds_now();
         Ok(())
+    }
+
+    pub fn apply_derived_operations(
+        &mut self,
+        operations: Vec<Operation>,
+        expected_generation: u64,
+    ) -> Result<(), SceneError> {
+        let mut context = OpCtx {
+            scene: &mut self.scene,
+            pages: &mut self.pages,
+            active_page: &mut self.active_page,
+            components: &mut self.components,
+            variables: &mut self.variables,
+            active_modes: &mut self.active_modes,
+            motion: &mut self.motion,
+            flow_start: &mut self.flow_start,
+            flows: &mut self.flows,
+            presentation: &mut self.presentation,
+        };
+        self.history
+            .apply_derived_operations(operations, expected_generation, &mut context)
     }
 
     /// Add a mode with usable values for every existing variable in its
@@ -713,6 +740,7 @@ impl Doc {
             metadata: self.metadata.clone(),
             asset_library: self.asset_library.clone(),
             scene: self.scene.clone(),
+            pending_layout: self.pending_layout.clone(),
             selection: Selection::new(),
             history: History::new(),
             viewport: self.viewport,

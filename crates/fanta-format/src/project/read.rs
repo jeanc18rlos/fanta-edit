@@ -12,7 +12,7 @@ use crate::migrate::migrate;
 use fanta_doc::{AssetId, ComponentId, Doc, DocId, NodeId, SCHEMA_VERSION};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -201,6 +201,7 @@ fn read_project_tree_with_source_override_locked(
     );
 
     let mut nodes = Map::new();
+    let mut pending_layout = BTreeSet::new();
     root.insert(
         "pages".to_owned(),
         read_pages(
@@ -210,6 +211,7 @@ fn read_project_tree_with_source_override_locked(
             json_override,
             &refs,
             &mut nodes,
+            &mut pending_layout,
         )?,
     );
     read_component_masters(
@@ -219,6 +221,7 @@ fn read_project_tree_with_source_override_locked(
         json_override,
         &refs,
         &mut nodes,
+        &mut pending_layout,
     )?;
     root.insert(
         "components".to_owned(),
@@ -231,13 +234,14 @@ fn read_project_tree_with_source_override_locked(
         value = migrate(value, manifest.schema_version, SCHEMA_VERSION)?;
     }
     let assets = read_assets(dir, json_override)?;
-    let doc = Doc::from_json_str(&value.to_string()).map_err(|error| {
+    let mut doc = Doc::from_json_str(&value.to_string()).map_err(|error| {
         let error = match serde_path_to_error::deserialize::<_, Doc>(&value) {
             Err(error) => error.to_string(),
             Ok(_) => error.to_string(),
         };
         FormatError::InvalidProjectTree(format!("{}: {error}", dir.display()))
     })?;
+    doc.pending_layout = pending_layout;
     Ok((doc, assets))
 }
 
@@ -262,6 +266,7 @@ fn read_pages(
     json_override: Option<&JsonSourceOverride<'_>>,
     refs: &fanta_fnx::RefTable,
     nodes: &mut Map<String, Value>,
+    pending_layout: &mut BTreeSet<NodeId>,
 ) -> Result<Value> {
     struct PageDir {
         id: NodeId,
@@ -281,7 +286,7 @@ fn read_pages(
             let name = dir_name(&entry)?;
             if name == LOOSE_DIR {
                 // Orphans are kept as per-node JSON (they need not form a tree).
-                read_nodes_into(&entry.join(NODES_DIR), json_override, nodes)?;
+                read_nodes_into(&entry.join(NODES_DIR), json_override, nodes, pending_layout)?;
                 continue;
             }
             if !entry.join(PAGE_JSON).is_file() {
@@ -350,6 +355,7 @@ fn read_pages(
                 json_override,
                 refs,
                 nodes,
+                pending_layout,
             )?;
             if let Some(decoded_root) = decoded_root
                 && decoded_root != candidate.id
@@ -590,6 +596,7 @@ fn read_component_masters(
     json_override: Option<&JsonSourceOverride<'_>>,
     refs: &fanta_fnx::RefTable,
     nodes: &mut Map<String, Value>,
+    pending_layout: &mut BTreeSet<NodeId>,
 ) -> Result<()> {
     for (entry, expected_root) in &scan.winner_dirs {
         // A component master can be legitimately absent (a dangling def whose
@@ -605,6 +612,7 @@ fn read_component_masters(
             json_override,
             refs,
             nodes,
+            pending_layout,
         )?;
         if let (Some(expected_root), Some(decoded_root)) = (expected_root, decoded_root)
             && *expected_root != decoded_root
@@ -635,6 +643,7 @@ fn read_design_nodes(
     json_override: Option<&JsonSourceOverride<'_>>,
     refs: &fanta_fnx::RefTable,
     nodes: &mut Map<String, Value>,
+    pending_layout: &mut BTreeSet<NodeId>,
 ) -> Result<Option<NodeId>> {
     let fnx_path = design_dir.join(fnx_name);
     let source_override = source_override.filter(|source| source.path == fnx_path);
@@ -646,7 +655,7 @@ fn read_design_nodes(
         // NOT a silently-empty page that the next save would erase forever.
         let nodes_dir = design_dir.join(NODES_DIR);
         if nodes_dir.is_dir() {
-            read_nodes_into(&nodes_dir, json_override, nodes)?;
+            read_nodes_into(&nodes_dir, json_override, nodes, pending_layout)?;
             return Ok(None);
         }
         if required && version >= 2 {
@@ -695,6 +704,8 @@ fn read_design_nodes(
             fnx_path.display()
         ))
     })?;
+    let omissions =
+        pending_layout_from_nodes(&decoded, (fnx_name == PAGE_FNX).then_some(decoded_root))?;
     for mut node in decoded {
         backfill_required_geometry(&mut node);
         let key = node
@@ -707,9 +718,60 @@ fn read_design_nodes(
                 ))
             })?
             .to_owned();
+        pending_layout.remove(&serde_json::from_value::<NodeId>(Value::String(
+            key.clone(),
+        ))?);
         nodes.insert(key, node);
     }
+    pending_layout.extend(omissions);
     Ok(Some(decoded_root))
+}
+
+pub(crate) fn pending_layout_from_nodes(
+    nodes: &[Value],
+    unsized_root: Option<NodeId>,
+) -> Result<BTreeSet<NodeId>> {
+    let by_id: BTreeMap<_, _> = nodes
+        .iter()
+        .filter_map(|node| Some((node.get("id")?.as_str()?, node)))
+        .collect();
+    let mut pending = BTreeSet::new();
+    for node in nodes {
+        let identifier: NodeId =
+            serde_json::from_value(node.get("id").cloned().ok_or_else(|| {
+                FormatError::InvalidProjectTree("source node missing id".into())
+            })?)?;
+        let missing = |key| node.get(key).is_none_or(Value::is_null);
+        let missing_size = match node.get("type").and_then(Value::as_str) {
+            Some("text") => missing("local_size"),
+            Some("group") => {
+                Some(identifier) != unsized_root
+                    && node.get("auto_layout").is_some_and(Value::is_object)
+                    && missing("clip_size")
+                    && missing("local_size")
+            }
+            _ => false,
+        };
+        let missing_flow_position = missing("transform")
+            && node
+                .get("parent")
+                .and_then(Value::as_str)
+                .and_then(|parent| by_id.get(parent))
+                .and_then(|parent| parent.get("auto_layout"))
+                .filter(|layout| layout.is_object())
+                .is_some_and(|layout| {
+                    layout.get("child_layout").and_then(Value::as_bool) == Some(false)
+                        || node
+                            .get("layout_child")
+                            .and_then(|child| child.get("absolute"))
+                            .and_then(Value::as_bool)
+                            != Some(true)
+                });
+        if missing_size || missing_flow_position {
+            pending.insert(identifier);
+        }
+    }
+    Ok(pending)
 }
 
 /// Backfill `local_size` on decoded nodes whose payload struct requires it.
@@ -976,6 +1038,7 @@ fn read_nodes_into(
     nodes_dir: &Path,
     json_override: Option<&JsonSourceOverride<'_>>,
     nodes: &mut Map<String, Value>,
+    pending_layout: &mut BTreeSet<NodeId>,
 ) -> Result<()> {
     if !nodes_dir.is_dir() {
         return Ok(());
@@ -990,6 +1053,7 @@ fn read_nodes_into(
         let id: NodeId = stem.parse().map_err(|e| {
             FormatError::InvalidProjectTree(format!("node file {stem:?} is not a NodeId: {e}"))
         })?;
+        pending_layout.remove(&id);
         nodes.insert(json_key(&id)?, read_project_json(&path, json_override)?);
     }
     Ok(())

@@ -23,6 +23,7 @@ pub fn materialize_page(
     let root = root_id_from_nodes(&nodes)?;
     ensure_page_root_is_group(&nodes, root)?;
     let mut doc = empty_scoped_doc(project_id);
+    doc.pending_layout = crate::project::read::pending_layout_from_nodes(&nodes, Some(root))?;
     doc.components = components;
     doc.variables = variables;
     doc.active_modes = active_modes;
@@ -89,6 +90,12 @@ pub(crate) fn scope_from_document(
                 doc.components = components;
             }
         }
+        doc.pending_layout = document
+            .pending_layout
+            .iter()
+            .copied()
+            .filter(|id| scene.contains(*id))
+            .collect();
         doc.scene = scene;
         doc.pages = vec![root];
         doc.active_page = Some(root);
@@ -112,6 +119,7 @@ pub fn materialize_component(
         // If they diverge, trust the source tree and keep def metadata otherwise.
     }
     let mut doc = empty_scoped_doc(project_id);
+    doc.pending_layout = crate::project::read::pending_layout_from_nodes(&nodes, None)?;
     let mut components = ComponentLibrary::new();
     let mut def = def;
     def.root = root;

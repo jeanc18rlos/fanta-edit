@@ -33,10 +33,59 @@ use std::sync::mpsc::Sender;
 pub enum JournalEvent {
     /// A fresh edit committed (single-op apply, or a begin/…/commit gesture).
     Commit(Transaction),
+    /// Replace the preceding committed transaction with its complete authored
+    /// and computed operations. A recorder folds this into the preceding step;
+    /// it is not a second edit or an additional undo entry.
+    Amend(Transaction),
     /// An undo reverted this previously-committed transaction.
     Undo(Transaction),
     /// A redo re-applied this transaction.
     Redo(Transaction),
+}
+
+impl JournalEvent {
+    /// Record an edit, folding derived geometry into its authored commit so
+    /// replay has the same transaction boundaries as the live undo stack.
+    pub fn record(
+        self,
+        steps: &mut Vec<SessionStep>,
+        provenance: Provenance,
+        revision: u64,
+        ts_ms: u64,
+    ) -> Result<(), String> {
+        let (provenance, transaction) = match self {
+            Self::Commit(transaction) => (provenance, transaction),
+            Self::Undo(transaction) => (Provenance::Undo, transaction),
+            Self::Redo(transaction) => (Provenance::Redo, transaction),
+            Self::Amend(transaction) => {
+                let previous = steps
+                    .last_mut()
+                    .ok_or("layout amendment has no preceding commit")?;
+                if matches!(previous.provenance, Provenance::Undo | Provenance::Redo)
+                    || previous.label != transaction.label
+                    || transaction.ops.len() < previous.ops.len()
+                    || serde_json::to_value(&previous.ops).map_err(|error| error.to_string())?
+                        != serde_json::to_value(&transaction.ops[..previous.ops.len()])
+                            .map_err(|error| error.to_string())?
+                {
+                    return Err("layout amendment does not extend the preceding commit".into());
+                }
+                previous.ops = transaction.ops;
+                previous.revision = revision;
+                return Ok(());
+            }
+        };
+        let seq = steps.last().map_or(0, |step| step.seq.saturating_add(1));
+        steps.push(SessionStep {
+            seq,
+            revision,
+            provenance,
+            label: transaction.label,
+            ops: transaction.ops,
+            ts_ms,
+        });
+        Ok(())
+    }
 }
 
 /// The sender half installed on a [`History`](crate::history::History). A thin
@@ -155,4 +204,121 @@ pub fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{NodeId, Transform2D};
+
+    fn authored_transaction() -> Transaction {
+        let mut transaction = Transaction::new("Move");
+        transaction.push(Operation::SetTransform {
+            id: NodeId::new(),
+            old: Transform2D::IDENTITY,
+            new: Transform2D::translation(20.0, 10.0),
+        });
+        transaction
+    }
+
+    fn with_derived(mut transaction: Transaction) -> Transaction {
+        transaction.push(Operation::SetTransform {
+            id: NodeId::new(),
+            old: Transform2D::IDENTITY,
+            new: Transform2D::translation(40.0, 10.0),
+        });
+        transaction
+    }
+
+    #[test]
+    fn derived_journal_amendment_folds_without_changing_step_or_provenance() {
+        let authored = authored_transaction();
+        let first = with_derived(authored.clone());
+        let final_transaction = with_derived(first.clone());
+        let provenance = Provenance::Gesture {
+            kind: "move".into(),
+            detail: serde_json::json!({"source": "canvas"}),
+        };
+        let mut steps = Vec::new();
+        JournalEvent::Commit(authored)
+            .record(&mut steps, provenance.clone(), 11, 100)
+            .expect("record authored edit");
+        JournalEvent::Amend(first)
+            .record(&mut steps, Provenance::Unknown, 12, 200)
+            .expect("record first layout result");
+        JournalEvent::Amend(final_transaction.clone())
+            .record(&mut steps, Provenance::Unknown, 13, 300)
+            .expect("record final layout result");
+        assert_eq!(steps.len(), 1);
+        let step = steps.first().expect("authored step");
+        assert_eq!(step.seq, 0);
+        assert_eq!(step.revision, 13);
+        assert_eq!(step.ts_ms, 100);
+        assert_eq!(step.provenance, provenance);
+        assert_eq!(
+            serde_json::to_value(&step.ops).expect("step"),
+            serde_json::to_value(&final_transaction.ops).expect("final operations")
+        );
+        JournalEvent::Undo(final_transaction.clone())
+            .record(&mut steps, Provenance::Unknown, 14, 400)
+            .expect("record undo");
+        JournalEvent::Redo(final_transaction)
+            .record(&mut steps, Provenance::Unknown, 15, 500)
+            .expect("record redo");
+        assert_eq!(
+            steps.iter().map(|step| step.seq).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(steps.get(1).expect("undo").provenance, Provenance::Undo);
+        assert_eq!(steps.get(2).expect("redo").provenance, Provenance::Redo);
+    }
+
+    #[test]
+    fn derived_journal_amendment_rejects_history_navigation_and_unrelated_commits() {
+        let authored = authored_transaction();
+        for preceding in [
+            JournalEvent::Undo(authored.clone()),
+            JournalEvent::Redo(authored.clone()),
+            JournalEvent::Commit(authored_transaction()),
+        ] {
+            let mut steps = Vec::new();
+            preceding
+                .record(&mut steps, Provenance::Unknown, 1, 1)
+                .expect("preceding step");
+            let before = serde_json::to_value(&steps).expect("before");
+            assert!(
+                JournalEvent::Amend(with_derived(authored.clone()))
+                    .record(&mut steps, Provenance::Unknown, 2, 2)
+                    .is_err()
+            );
+            assert_eq!(serde_json::to_value(&steps).expect("after"), before);
+        }
+    }
+
+    #[test]
+    fn derived_journal_amendment_rejects_missing_shortened_and_renamed_prefixes() {
+        let authored = authored_transaction();
+        let mut empty = Vec::new();
+        assert!(
+            JournalEvent::Amend(with_derived(authored.clone()))
+                .record(&mut empty, Provenance::Unknown, 2, 2)
+                .is_err()
+        );
+        assert!(empty.is_empty());
+        let mut renamed = with_derived(authored.clone());
+        renamed.label = "Different edit".into();
+        for invalid in [Transaction::new("Move"), renamed] {
+            let mut steps = Vec::new();
+            JournalEvent::Commit(authored.clone())
+                .record(&mut steps, Provenance::Unknown, 1, 1)
+                .expect("authored");
+            let before = serde_json::to_value(&steps).expect("before");
+            assert!(
+                JournalEvent::Amend(invalid)
+                    .record(&mut steps, Provenance::Unknown, 2, 2)
+                    .is_err()
+            );
+            assert_eq!(serde_json::to_value(&steps).expect("after"), before);
+        }
+    }
 }
