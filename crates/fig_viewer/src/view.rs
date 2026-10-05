@@ -14,6 +14,7 @@ mod measurements_host;
 mod media_host;
 #[cfg(feature = "fanta-gpui-ui")]
 mod properties_inspector;
+mod serialization;
 #[cfg(feature = "fanta-gpui-ui")]
 mod timeline_adapter;
 
@@ -5425,6 +5426,9 @@ impl FigView {
             self.invalidate_canvas_cache();
         }
         self.sync_measurement_edit_barrier(cx);
+        if changed_for_view {
+            cx.emit(FigViewEvent::TitleChanged);
+        }
         cx.notify();
     }
 

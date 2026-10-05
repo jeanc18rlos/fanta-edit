@@ -14,14 +14,14 @@
 //! `fig_viewer::init` runs after `editor::init`, so `fanta.json` resolves to
 //! the canvas rather than to a JSON buffer.
 //!
-//! `FigView` is not a `SerializableItem`, so a restored session brings the
-//! folder back but never the tab; this hook is what puts it on screen again.
+//! Saved canvas tabs restore through `SerializableItem`. This hook also opens
+//! newly added project folders and sessions saved before canvas serialization.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
-use gpui::{App, AppContext as _, Context, Entity, TaskExt as _, Window};
-use project::{Project, ProjectPath, WorktreeId};
+use gpui::{App, AppContext as _, Context, Entity, Task, TaskExt as _, Window};
+use project::{Project, ProjectItem as _, ProjectPath, WorktreeId};
 use util::rel_path::RelPath;
 use workspace::Workspace;
 use worktree::PathChange;
@@ -77,7 +77,8 @@ pub fn init(cx: &mut App) {
             window,
             |workspace, _project, event, window, cx| match event {
                 project::Event::WorktreeAdded(worktree_id) => {
-                    open_design_for_worktree(workspace, *worktree_id, window, cx);
+                    open_design_for_worktree(workspace, *worktree_id, window, cx)
+                        .detach_and_log_err(cx);
                 }
                 project::Event::WorktreeUpdatedEntries(worktree_id, changes)
                     if changes.iter().any(|(path, _, change)| {
@@ -85,7 +86,8 @@ pub fn init(cx: &mut App) {
                             && !matches!(change, PathChange::Loaded)
                     }) =>
                 {
-                    open_design_for_worktree(workspace, *worktree_id, window, cx);
+                    open_design_for_worktree(workspace, *worktree_id, window, cx)
+                        .detach_and_log_err(cx);
                 }
                 _ => {}
             },
@@ -102,7 +104,7 @@ pub fn init(cx: &mut App) {
             .map(|worktree| worktree.read(cx).id())
             .collect();
         for worktree_id in existing {
-            open_design_for_worktree(workspace, worktree_id, window, cx);
+            open_design_for_worktree(workspace, worktree_id, window, cx).detach_and_log_err(cx);
         }
     })
     .detach();
@@ -110,20 +112,20 @@ pub fn init(cx: &mut App) {
 
 /// Open the canvas for `worktree_id` when it is a Fanta project that is not
 /// already on screen.
-fn open_design_for_worktree(
+pub(crate) fn open_design_for_worktree(
     workspace: &mut Workspace,
     worktree_id: WorktreeId,
     window: &mut Window,
     cx: &mut Context<Workspace>,
-) {
+) -> Task<anyhow::Result<()>> {
     let project = workspace.project().clone();
     let Some(root) = worktree_root(&project, worktree_id, cx) else {
-        return;
+        return Task::ready(Ok(()));
     };
     // The cheap, synchronous half of the dedupe: bail before spawning anything
     // when this project is plainly already open.
     if design_is_open(workspace, &root, cx) {
-        return;
+        return Task::ready(Ok(()));
     }
 
     cx.spawn_in(window, async move |workspace, cx| {
@@ -140,7 +142,7 @@ fn open_design_for_worktree(
             return anyhow::Ok(());
         }
 
-        let open = workspace.update_in(cx, |workspace, window, cx| {
+        let open = workspace.update_in(cx, |workspace, _, cx| {
             // Re-check after the await. Two worktree events for the same
             // project (the initial sweep racing the subscription, or a
             // `.fig` load adopting the directory it just materialized) both
@@ -155,14 +157,48 @@ fn open_design_for_worktree(
                     .context("building the fanta.json project path")?
                     .into(),
             };
-            anyhow::Ok(Some(workspace.open_path(path, None, true, window, cx)))
+            anyhow::Ok(crate::FigItem::try_open(&project, &path, cx).map(|open| (path, open)))
         })??;
-        if let Some(open) = open {
-            open.await?;
+        if let Some((path, open)) = open {
+            let item = open.await?;
+            workspace.update_in(cx, |workspace, window, cx| {
+                if design_is_open(workspace, &root, cx)
+                    || worktree_root(&project, worktree_id, cx).as_ref() != Some(&root)
+                {
+                    crate::document::take_pending_view_descriptor(cx);
+                    return;
+                }
+                let entry_id = project
+                    .read(cx)
+                    .entry_for_path(&path, cx)
+                    .map(|entry| entry.id);
+                crate::document::set_pending_view_descriptor(
+                    crate::document::FigViewDescriptor {
+                        entry_id,
+                        scope: None,
+                    },
+                    cx,
+                );
+                let view = cx.new(|cx| FigView::new(item, project.clone(), window, cx));
+                let pane = workspace.active_pane().clone();
+                pane.update(cx, |pane, cx| {
+                    // Resolve activation after loading: restored tabs or an
+                    // explicit Open may have become active during the await.
+                    let activate = pane.active_item().is_none();
+                    pane.add_item_inner(
+                        Box::new(view),
+                        activate,
+                        activate,
+                        activate,
+                        None,
+                        window,
+                        cx,
+                    );
+                });
+            })?;
         }
         anyhow::Ok(())
     })
-    .detach_and_log_err(cx);
 }
 
 fn worktree_root(project: &Entity<Project>, worktree_id: WorktreeId, cx: &App) -> Option<PathBuf> {
