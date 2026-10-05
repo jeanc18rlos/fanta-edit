@@ -152,17 +152,27 @@ Implementation: [view_context_menu.rs](../../crates/fig_viewer/src/view_context_
 Create a main component, create/navigate instances, edit supported instance
 overrides, define typed component properties and bind them to descendants.
 Variant sets support axes, member names and arrangement. Component recursion
-and incompatible bindings are rejected.
+and incompatible bindings are rejected. Page and layer duplication clone included
+component definitions and complete variant sets, retaining outside references
+and redirecting supported internal prototype/variant links to the copies.
+Ordinary same-document paste keeps the existing component definitions. These
+copy-reference cases have operation and Undo/Redo coverage; their native
+acceptance remains tracked in the release report.
 
 The Variables workspace supports collections, modes, typed values, aliases,
 rename/delete and compatible property bindings. Modes can apply at project,
 page and parent scopes. Unbinding bakes the resolved value. Shared styles and
 imported bindings participate in rendering and source persistence.
 
-The release-candidate check passed two-mode color binding, project-mode switching,
-unbind/Undo and reopening. The long Variables title and bound-fill inspector
-display still have UI corrections awaiting native verification; see the
-[coverage report](../alpha/CAPABILITY_COVERAGE.md).
+Bound solid fills show their resolved mode color and variable name in the
+inspector and picker. Alpha is read-only while the variable controls the full
+color; **Detach** bakes the active value and makes it directly editable. Undo
+restores the binding.
+
+Representative native checks passed two-mode color binding, project-mode
+switching, unbind/Undo and reopening, followed by long-title containment/sidebar
+toggling and the resolved picker, Detach/Undo and strict restart. See the
+[coverage report](../alpha/CAPABILITY_COVERAGE.md) for exact builds and limits.
 
 Implementation: [component actions](../../crates/fig_viewer/src/component_actions.rs),
 [component properties](../../crates/fig_viewer/src/component_properties.rs),
@@ -186,15 +196,17 @@ Implementation: [component actions](../../crates/fig_viewer/src/component_action
   disabled. Read-only barriers also apply to shortcuts and agent/source paths;
   changing mode must preserve or explicitly finish a pending edit.
 
+The timeline's **Current time** field accepts a typed time and seeks on Return.
+The interaction detail's **X** closes the detail while retaining its interaction;
+**Remove** is the separate deletion action.
+
 Representative native checks passed Motion playback, ruler seeking and keyframe
 drag/Undo, plus prototype click navigation, Restart, Escape and saved-project
-reopening. Two candidate defects are still being corrected: the timeline's
-Current time field loses editing shortcuts after a keymap reload, and the
-interaction detail's X deletes its interaction instead of closing the detail.
-Ruler seeking works; Undo restores an interaction deleted by that X. Native
-verification of both corrections is pending. The
-[coverage report](../alpha/CAPABILITY_COVERAGE.md) records the tested build and
-remaining cases.
+reopening. The corrected time field and non-destructive detail X also passed
+native checks with strict saved-content equality after restart. Explicit
+Remove/Undo has mounted regression coverage but was not repeated natively on
+that build. The [coverage report](../alpha/CAPABILITY_COVERAGE.md) records exact
+provenance and remaining cases.
 
 Implementation: [timeline](../../crates/fig_viewer/src/timeline.rs),
 [motion](../../crates/fig_viewer/src/motion_panel.rs),

@@ -47,8 +47,52 @@ run. Evidence is in
 `target/release-verification/2026-10-05-variables-timeline-prototype/`.
 Mounted tests include real timeline typing after shipped keymap reload and
 prototype Add/Save/Close/reopen, explicit Remove/Undo, invalid-draft preservation,
-valid-draft commit and read-only dismissal. Native checks of this rebuilt
-candidate are pending; the older native observations below explain the failures.
+valid-draft commit and read-only dismissal. The targeted native follow-up below
+verifies the corrected controls; the older observations retain the original
+failures and their build provenance.
+
+Native acceptance used `0a0d3cd1c4c9cf825c13e8cc50f5bbc9c7bdaf8c`, binary
+SHA-256 `2e839e194323fcadadd6b5ec99ca7f72b78ae7778ded1eae5ba7c7a783bfef2d`,
+on the disposable four-node Variables/Motion/Prototype fixture. The bound fill
+row and picker showed resolved Mode 2 blue (`2F80ED`) and the variable label;
+bound opacity was read-only with a visible explanation and Detach control.
+Detach removed only the first fill's binding and baked RGB 47/128/237, plus the
+save timestamp. Undo restored the entire typed baseline except that timestamp.
+The long Variables project title stayed within its header, and the sidebar
+toggle collapsed and expanded the panel. In **Current time**, Command+A, `0.5`, Return
+sought to 0.50 s, displayed Start at X = −96, and retained the selection.
+
+The prototype detail **X** closed the detail while retaining its interaction
+card and wire. Save left the typed snapshot entirely unchanged, including the
+timestamp. A complete process stop and relaunch used the same binary hash,
+reopened the scene and preserved the typed snapshot strictly. Evidence is in
+`target/release-verification/native-bound-controls-20261005/`:
+`native-verdict.json`, `provenance.json`, and the before, picker-detached,
+picker-undo, prototype-close and restart typed snapshots. Explicit **Remove**
+was not repeated natively on this build; its mounted Remove/Undo regression is
+separate evidence. This pass does not cover every node, interaction or installed
+release configuration.
+
+A separate clipboard correction now remaps internal node targets in every
+primary and secondary Navigate/OpenOverlay/ScrollTo action when pasting or
+duplicating content. Both new regressions failed before the fix and passed
+afterward; the full clipboard operation suite passed **15/15**. The cases check
+subtree/page copies, unchanged external targets and source content, action order,
+and one-transaction Undo/Redo. Evidence is in
+`target/release-verification/clipboard-prototype-references-20261005/`.
+The subsequent component-aware correction also remaps copied component and
+complete variant-set references in instances, swap overrides and primary or
+secondary UpdateVariant actions. Partial sets and references outside the copy
+remain unchanged. Its two new regressions failed before the fix and passed
+afterward; the combined clipboard suite passed **17/17**, including action order
+and single-transaction Undo/Redo. The final source passed **1,054 editor tests
+(1 ignored)** and `./script/clippy --locked -p fig_viewer`, including the dependency
+check. Logs, exact source hashes and `combined-root-verification.json` are in
+`target/release-verification/component-prototype-copy-references-20261005/`.
+These are typed-reference/operation tests, not native prototype playback proof;
+arbitrary string-valued component properties are outside the remapping scope.
+Both clipboard corrections postdate the native binary above, so their native
+clipboard acceptance remains open.
 
 The inspector/menu native follow-up used `85fc694b67c78f616401def73506e515594f52d7`,
 binary SHA-256 `d42e94c0febfa6c701c257485a470779b5c991c7e3567b856f6e5b6fb7dced99`.
@@ -124,10 +168,10 @@ claims. Evidence: `mode-unbind-verdict.json`, `unbind-undo-compare.json`,
 `restart-verdict.json` and the before/after typed snapshots in
 `target/release-verification/native-variables-prototype-20261005/`.
 
-This journey also exposed two visible defects: the long project title overlaps
-the collection header, and the bound Design fill row displays its gray authored
-fallback without indicating the binding even while the canvas resolves blue.
-Corrections are in progress and **have not yet passed native acceptance**.
+This earlier journey exposed two visible defects: the long project title
+overlapped the collection header, and the bound Design fill row displayed its
+gray authored fallback without indicating the binding while the canvas resolved
+blue. Both corrections passed the `0a0d3cd1c4` native follow-up recorded above.
 `observations.json` preserves the initial failures; its then-pending mode,
 unbind/Undo and restart checks are superseded by the verdicts above. Aliases,
 renaming/deletion and other variable types/bindings remain outside this sample.
@@ -145,14 +189,14 @@ process restart preserved all typed project content except `modified_at`.
 confirm that comparison. The consolidated verdict is
 `native-variables-prototype-20261005/motion-prototype-native-verdict.json`.
 
-Two further native defects remain open for candidate revalidation. Typing into
-the timeline's **Current time** field loses editing shortcuts after host keymap
-reload; ruler seeking works. The timeline input-fallback correction passed
-three focused upstream tests, but its assembled-editor/native check is pending.
-The interaction detail's **X deletes the reaction instead of closing the
-detail**, reproduced twice. That deletion dirties the document; Undo restores
-it, and ordinary Save retains the reaction. The close/delete correction is in
-progress. An empty `flows.json` after setting a starting point is expected:
+That earlier build exposed two further native defects: the timeline's
+**Current time** field lost editing shortcuts after host keymap reload, and the
+interaction detail's **X deleted the reaction instead of closing the detail**.
+The latter reproduced twice, dirtied the document, and was reversible with Undo;
+ordinary Save retained the reaction. The input and close corrections passed the
+combined mounted tests and the `0a0d3cd1c4` native follow-up above. Native explicit
+Remove/Undo on that corrected build remains unverified. An empty `flows.json`
+after setting a starting point is expected:
 `flow_start.json` stores that choice, while `flows.json` holds named flows.
 These samples do not cover every motion property/easing, prototype trigger,
 overlay or transition.
@@ -640,10 +684,10 @@ coverage. The final column highlights the remaining acceptance work.
 | Drawing/path/region/crop | `fanta-tools` full suite, including `tests/end_to_end.rs` and `ink_oracle.rs`; viewer toolbar adapter tests | Every visible tool, path/anchor editing, brush/eraser, region operation, crop Apply/Cancel and their keyboard shortcuts. |
 | Text/text on path | `fanta-text`, `fanta-tools::text_path::tests`, renderer text/text-path tests; viewer `text_edit`, `instance_text` and design adapter tests | Inline range selection, rich styles, multiline/Unicode/IME input, fonts, path conversion errors, instance overrides, save/reopen and exports. |
 | Layout/paints/effects/rendering | `fanta-doc` layout tests; complete `fanta-render` library and bitmap/SVG/compose/golden integration suites | Visual parity for gradients, masks, booleans, clipping, shadows/blur, blend modes, auto-layout/grid and imported instances under edits. |
-| Variables/styles | `fig_viewer::variables_workspace::tests`, `variable_binding::tests`, `agent_surface::tests`; document resolve/render tests | Recheck header layout and bound inspector display after their fixes; rename/delete, aliases and other types/bindings. One color variable with two modes, project-mode switching, fill binding/unbind/Undo and strict restart passed natively on `ee80ec48c6`. |
+| Variables/styles | `fig_viewer::variables_workspace::tests`, `variable_binding::tests`, `agent_surface::tests`; document resolve/render tests | Rename/delete, aliases and other types/bindings. One two-mode color binding/unbind/Undo/restart passed on `ee80ec48c6`; header containment/toggle, resolved bound row/picker, read-only alpha explanation, picker Detach/Undo and strict restart passed on `0a0d3cd1c4`. |
 | Components/variants | Viewer component-property, variant-set, clipboard and agent tests; `fanta-doc` instance resolution tests; importer overrides tests | Master ↔ instance updates, virtual text edit, typed properties, variant switching, detach/duplicate and nested components without disappearing descendants. |
-| Motion/timeline | Viewer `motion_panel`, `motion_edit`, `timeline`, toolbar adapter tests; document/render motion tests | Recheck time-field editing after the fallback fix; easing edit/cancel, clip switching, duration and mode changes. Representative playback/ruler seek, keyframe drag/Undo and persisted restart passed on `ee80ec48c6`; broader property coverage remains open. |
-| Prototypes | `fanta-present`; viewer `prototype_panel`, `prototype_player` and view tests | Recheck separate detail-close/delete behavior after its fix; other pointer/key/time triggers, overlays, transitions and safe links. One click navigation, Restart, Escape with viewport restoration, and saved-reaction restart passed on `ee80ec48c6`. |
+| Motion/timeline | Viewer `motion_panel`, `motion_edit`, `timeline`, toolbar adapter tests; document/render motion tests | Easing edit/cancel, clip switching, duration and mode changes. Representative playback/ruler seek and keyframe drag/Undo passed on `ee80ec48c6`; time-field typing/seek with retained selection and strict restart passed on `0a0d3cd1c4`. Broader property coverage remains open. |
+| Prototypes | `fanta-present`; viewer `prototype_panel`, `prototype_player` and view tests | Native explicit Remove/Undo on the corrected build; other pointer/key/time triggers, overlays, transitions and safe links. Click navigation/Restart/Escape passed on `ee80ec48c6`; detail X retained the reaction/card/wire with strictly unchanged Save/restart snapshots on `0a0d3cd1c4`. |
 | Comments/review/Dev | Viewer `comments`, `comments_ui`, `view_annotations`, `view_measurements`, `view_dev_mode` and export tests | Pin/reply/resolve, draft preservation, mode transitions, keyboard ownership and read-only protection; no review overlays in artwork exports. |
 | Local image/SVG/video/audio | Viewer `generation_media`, `video_playback`, document/view and media tests; renderer live-media tests | Place/play/seek/trim/replay, corrupted files, missing source, poster/orientation, audible output and saved asset bytes after restart. |
 | Export | Viewer `export::tests` and inspector export tests; renderer integration suites | PNG/JPG/SVG/PDF from UI, multiple presets/selections, names/dimensions, layout fidelity, visible failures and opening the resulting files. |
@@ -664,7 +708,7 @@ native inputs and final comparison.
 | 1 — Inspector drafts | Continue on `/tmp/fanta-release-inspector-acceptance-20261005` or a fresh node-matrix copy. Test a selection whose starting values differ, edit/Undo, and an actual scrub/drag cancellation. | Numeric/hex draft Escape, invalid-draft page switching and Export labels passed at 320 px on `85fc694b67`; two-kind opacity display/edit/Undo passed on `ee80ec48c6`. Compare all unrelated typed content/assets after Save/reopen; keyboard draft cancellation does not prove drag cancellation. |
 | 2 — Clipboard and structure | Use a copy of `/tmp/fanta-release-qa-20261005` for component/subtree copy/paste, Cut, Undo/Redo and restart. | Bitmap cross-page placement, Save and Undo/Redo passed on `85fc694b67`; strict bitmap-state restart and visible cross-document refusal passed on `ee80ec48c6`. Verify component dependencies and original masters in the remaining subtree journeys. A rejected unsupported transfer is not a successful cross-project-copy capability. |
 | 3 — Large-page save and drag | Open `/tmp/fanta-spectrum-release-save-check-20261005`, generated from the unchanged Spectrum `.fig`. On page index 9, move the instance corresponding to import index 4358 and image-filled frame index 2110, then Save, Undo, Save and restart. | Full offline write/readback preserves inventories/assets with only the 15,278 explicitly recorded FNX normalizations above; strict equality fails. Native edit/save/restart and quiet-machine pointer/frame timings remain open. Reconfirm the target nodes after opening; imported IDs are not stable. CPU `drag_bench` and isolated Boolean images do not establish native latency or whole-page visual fidelity. |
-| 4 — Variables, Motion and Prototype | Continue on `/tmp/fanta-release-variables-prototype-20261005`, preserving its evidence. Recheck title/bound-fill display, timeline text entry and separate interaction close/delete controls on the rebuilt candidate. Then sample easing cancellation and another prototype trigger. | Two-mode binding/unbind/Undo/restart, Motion play/ruler seek/keyframe drag/Undo, and prototype click navigation/Restart/Escape/save/reopen passed on `ee80ec48c6`. The four UI corrections remain unverified natively. Compare complete typed content and assets; these samples do not cover all triggers, easing types, aliases or variant combinations. |
+| 4 — Variables, Motion and Prototype | Continue on `/tmp/fanta-release-variables-prototype-20261005`, preserving its evidence. Sample explicit interaction Remove/Undo, easing cancellation and another prototype trigger; separately exercise aliases or a different binding type. | The earlier two-mode, Motion and prototype samples passed on `ee80ec48c6`. Corrected title containment/toggle, bound row/picker/Detach/Undo, time-field seek and non-destructive detail X passed on `0a0d3cd1c4`, with strict restart equality. Compare complete typed content and assets; these samples do not cover all triggers, easing types, aliases or variant combinations. |
 
 ## Reproducible local verification
 
