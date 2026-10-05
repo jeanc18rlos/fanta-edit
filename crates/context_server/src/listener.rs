@@ -99,16 +99,12 @@ impl McpServer {
     }
 
     pub fn add_tool<T: McpServerTool + Clone + 'static>(&mut self, tool: T) {
-        let mut settings = schemars::generate::SchemaSettings::draft07();
-        settings.inline_subschemas = true;
-        let mut generator = settings.into_generator();
-
-        let input_schema = generator.root_schema_for::<T::Input>();
-
-        let description = input_schema
-            .get("description")
-            .and_then(|desc| desc.as_str())
-            .map(|desc| desc.to_string());
+        let input_schema = tool_input_schema::<T>();
+        let description = schema_description(&input_schema);
+        if description.is_none() {
+            // An agent only learns what a tool does from this text.
+            log::error!("MCP tool `{}` has no description", T::NAME);
+        }
         debug_assert!(
             description.is_some(),
             "Input schema struct must include a doc comment for the tool description"
@@ -123,7 +119,7 @@ impl McpServer {
                 output_schema: if TypeId::of::<T::Output>() == TypeId::of::<()>() {
                     None
                 } else {
-                    Some(generator.root_schema_for::<T::Output>().into())
+                    Some(schema_generator().root_schema_for::<T::Output>().into())
                 },
                 annotations: Some(tool.annotations()),
             },
@@ -431,6 +427,31 @@ impl McpServer {
         }
         Ok(())
     }
+}
+
+fn schema_generator() -> schemars::SchemaGenerator {
+    let mut settings = schemars::generate::SchemaSettings::draft07();
+    settings.inline_subschemas = true;
+    settings.into_generator()
+}
+
+fn tool_input_schema<T: McpServerTool>() -> schemars::Schema {
+    schema_generator().root_schema_for::<T::Input>()
+}
+
+fn schema_description(schema: &schemars::Schema) -> Option<String> {
+    schema
+        .get("description")
+        .and_then(|description| description.as_str())
+        .map(str::trim)
+        .filter(|description| !description.is_empty())
+        .map(str::to_string)
+}
+
+/// The description a tool is advertised with: its input type's doc comment.
+/// Exposed so servers can test that none of their tools ships without one.
+pub fn tool_description<T: McpServerTool>() -> Option<String> {
+    schema_description(&tool_input_schema::<T>())
 }
 
 pub trait McpServerTool {

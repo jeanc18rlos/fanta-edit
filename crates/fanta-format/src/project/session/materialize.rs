@@ -8,7 +8,7 @@ use fanta_doc::{
 };
 use fanta_fnx::{ArtifactIr, ArtifactKind, ImportTarget, import_allowed};
 use serde_json::{Map, Value};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// Materialize a page IR into a scoped `Doc` (page nodes only; no masters in scene).
 pub fn materialize_page(
@@ -171,9 +171,25 @@ pub(crate) fn scoped_nodes(ir: &ArtifactIr) -> Result<Vec<Value>, SessionError> 
 }
 
 fn root_id_from_nodes(nodes: &[Value]) -> Result<NodeId, SessionError> {
+    subtree_root(nodes)
+}
+
+/// A subtree's root: its one node whose parent lies outside the subtree. This
+/// is FNX's rule (`fanta_fnx` decodes a subtree the same way), so every
+/// session path agrees with the format on which node is the root, whether or
+/// not that node still records an external parent.
+pub(crate) fn subtree_root(nodes: &[Value]) -> Result<NodeId, SessionError> {
+    let ids: HashSet<&str> = nodes
+        .iter()
+        .filter_map(|node| node.get("id").and_then(Value::as_str))
+        .collect();
     let roots: Vec<&Value> = nodes
         .iter()
-        .filter(|n| n.get("parent").map_or(true, Value::is_null))
+        .filter(|node| {
+            node.get("parent")
+                .and_then(Value::as_str)
+                .is_none_or(|parent| !ids.contains(parent))
+        })
         .collect();
     if roots.len() != 1 {
         return Err(SessionError::other(format!(
@@ -222,11 +238,6 @@ pub(crate) fn insert_nodes_public(scene: &mut Scene, nodes: &[Value]) -> Result<
     insert_nodes(scene, nodes)
 }
 
-/// Parse a node id from JSON (bare ULID string) or display form.
-pub(crate) fn parse_node_id_value(value: &Value) -> Result<NodeId, SessionError> {
-    parse_node_id(value)
-}
-
 /// Reject live instances / model3d for the given kind.
 pub(crate) fn validate_no_live_instance(
     kind: ArtifactKind,
@@ -235,58 +246,71 @@ pub(crate) fn validate_no_live_instance(
     validate_import_matrix(kind, nodes)
 }
 
+/// Insert a subtree's nodes into `scene`, parents before children, parsing each
+/// node once. A node whose parent lies outside `nodes` hangs off that parent
+/// when the scene already holds it (baking under an existing frame) and
+/// otherwise becomes a root: FNX keeps a subtree root's external parent (the
+/// page a component master sits on), which a scoped or side scene does not
+/// contain. Every node is inserted or the call fails; none is dropped.
 fn insert_nodes(scene: &mut Scene, nodes: &[Value]) -> Result<(), SessionError> {
-    // Insert parents before children: sort so roots first, then by depth.
-    let mut ordered = nodes.to_vec();
-    // The same authoring leniency the monodoc reader applies: a hand-written
-    // `<Text>`/media element that omits `local_size` (and the width/height
-    // sugar) must materialize with an estimated/placeholder box instead of
-    // failing the artifact. The session path is the FLAGSHIP authoring path —
-    // it cannot be stricter than batch load.
-    for value in &mut ordered {
-        crate::project::read::backfill_required_geometry(value);
+    let assemble = |message: String| SessionError::DocAssemble(message);
+    let mut parsed: Vec<CanvasNode> = Vec::with_capacity(nodes.len());
+    for value in nodes {
+        // The same authoring leniency the monodoc reader applies: a hand-written
+        // `<Text>`/media element that omits `local_size` (and the width/height
+        // sugar) must materialize with an estimated/placeholder box instead of
+        // failing the artifact. The session path is the FLAGSHIP authoring path —
+        // it cannot be stricter than batch load.
+        let mut value = value.clone();
+        crate::project::read::backfill_required_geometry(&mut value);
+        let node: CanvasNode = serde_json::from_value(value)
+            .map_err(|e| assemble(format!("node deserialize: {e}")))?;
+        parsed.push(node);
     }
-    ordered.sort_by_key(|n| {
-        // crude: null parent first
-        if n.get("parent").map_or(true, Value::is_null) {
-            0u8
-        } else {
-            1
+    let mut in_set = HashSet::with_capacity(parsed.len());
+    for node in &parsed {
+        if !in_set.insert(node.id) {
+            return Err(assemble(format!("duplicate node id {}", node.id)));
         }
-    });
-    // Multi-pass until all inserted (handles deeper trees).
-    let mut pending = ordered;
-    let mut guard = 0;
-    while !pending.is_empty() && guard < 64 {
-        guard += 1;
-        let batch_len = pending.len();
-        let mut next = Vec::new();
-        for value in pending {
-            let node: CanvasNode = serde_json::from_value(value.clone())
-                .map_err(|e| SessionError::DocAssemble(format!("node deserialize: {e}")))?;
-            let parent_ok = match node.parent {
-                None => true,
-                Some(p) => scene.get(p).is_some(),
-            };
-            if parent_ok {
-                // insert with fixed id: Scene::insert uses node's id
-                scene
-                    .insert(node)
-                    .map_err(|e| SessionError::DocAssemble(format!("scene insert: {e}")))?;
-            } else {
-                next.push(value);
+    }
+    let mut children: HashMap<NodeId, Vec<usize>> = HashMap::new();
+    let mut roots = Vec::new();
+    for (ix, node) in parsed.iter_mut().enumerate() {
+        match node.parent {
+            Some(parent) if in_set.contains(&parent) => {
+                children.entry(parent).or_default().push(ix)
             }
-        }
-        if next.len() == batch_len && !next.is_empty() {
-            // force insert remaining (parent missing — still insert for recovery)
-            for value in next {
-                let node: CanvasNode = serde_json::from_value(value)
-                    .map_err(|e| SessionError::DocAssemble(format!("node deserialize: {e}")))?;
-                let _ = scene.insert(node);
+            Some(parent) if scene.get(parent).is_some() => roots.push(ix),
+            Some(_) => {
+                node.parent = None;
+                roots.push(ix);
             }
-            break;
+            None => roots.push(ix),
         }
-        pending = next;
+    }
+    let mut order = Vec::with_capacity(parsed.len());
+    let mut stack: Vec<usize> = roots.into_iter().rev().collect();
+    while let Some(ix) = stack.pop() {
+        order.push(ix);
+        if let Some(kids) = children.get(&parsed[ix].id) {
+            stack.extend(kids.iter().rev());
+        }
+    }
+    if order.len() != parsed.len() {
+        return Err(assemble(format!(
+            "{} of {} nodes are unreachable from a root (their parents form a cycle)",
+            parsed.len() - order.len(),
+            parsed.len()
+        )));
+    }
+    let mut slots: Vec<Option<CanvasNode>> = parsed.into_iter().map(Some).collect();
+    for ix in order {
+        let node = slots[ix]
+            .take()
+            .ok_or_else(|| assemble("node visited twice".into()))?;
+        scene
+            .insert(node)
+            .map_err(|e| assemble(format!("scene insert: {e}")))?;
     }
     Ok(())
 }

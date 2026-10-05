@@ -2123,3 +2123,66 @@ fn canvas_save_adopts_a_component_master_placed_on_a_page() {
     );
     assert_eq!(scoped.scene.children_of(Some(master_id)).len(), 1);
 }
+
+#[test]
+fn master_side_scene_keeps_a_master_that_sits_on_a_page() {
+    let page = NodeId::new();
+    let master = NodeId::new();
+    let label = NodeId::new();
+    let nodes = vec![
+        group_json(master, "Button", Some(page)),
+        group_json(label, "Label", Some(master)),
+    ];
+    let scene = super::graphics::load_master_scene_from_nodes(&nodes).expect("side scene");
+    assert_eq!(scene.len(), 2, "no node is dropped");
+    assert!(scene.get(master).expect("master").parent.is_none());
+    assert_eq!(scene.children_of(Some(master)), &[label]);
+}
+
+#[test]
+fn inserting_nodes_hangs_a_subtree_off_an_existing_parent() {
+    let mut scene = fanta_doc::Scene::new();
+    let frame = scene
+        .insert(CanvasNode::new(NodeData::Group(GroupNode::default())))
+        .expect("existing frame");
+    let baked = NodeId::new();
+    let child = NodeId::new();
+    // Children before parents: the order must not matter.
+    let nodes = vec![
+        group_json(child, "Child", Some(baked)),
+        group_json(baked, "Baked", Some(frame)),
+    ];
+    super::materialize::insert_nodes_public(&mut scene, &nodes).expect("insert");
+    assert_eq!(scene.get(baked).expect("baked").parent, Some(frame));
+    assert_eq!(scene.children_of(Some(baked)), &[child]);
+}
+
+#[test]
+fn inserting_nodes_rejects_cycles_and_duplicates_instead_of_dropping_them() {
+    let a = NodeId::new();
+    let b = NodeId::new();
+    let mut scene = fanta_doc::Scene::new();
+    let cycle = vec![group_json(a, "A", Some(b)), group_json(b, "B", Some(a))];
+    assert!(super::materialize::insert_nodes_public(&mut scene, &cycle).is_err());
+    assert_eq!(scene.len(), 0);
+
+    let duplicate = vec![group_json(a, "A", None), group_json(a, "A again", None)];
+    assert!(super::materialize::insert_nodes_public(&mut scene, &duplicate).is_err());
+}
+
+#[test]
+fn subtree_root_follows_the_fnx_rule() {
+    let page = NodeId::new();
+    let master = NodeId::new();
+    let label = NodeId::new();
+    let nodes = vec![
+        group_json(label, "Label", Some(master)),
+        group_json(master, "Button", Some(page)),
+    ];
+    assert_eq!(
+        super::materialize::subtree_root(&nodes).expect("root"),
+        master
+    );
+    let two_roots = vec![group_json(master, "A", None), group_json(label, "B", None)];
+    assert!(super::materialize::subtree_root(&two_roots).is_err());
+}

@@ -3,7 +3,7 @@
 use super::artifact::ArtifactSession;
 use super::catalog::ComponentCatalog;
 use super::error::SessionError;
-use super::materialize::{insert_nodes_public, parse_node_id_value, validate_no_live_instance};
+use super::materialize::{insert_nodes_public, validate_no_live_instance};
 use super::types::{ArtifactDirty, ScopedDoc};
 use fanta_doc::{
     CanvasNode, ComponentId, Doc, DocId, GroupNode, History, IndexKey, InstanceNode, NodeData,
@@ -38,17 +38,8 @@ pub fn materialize_graphics(
 }
 
 fn root_id(nodes: &[Value]) -> Result<NodeId, SessionError> {
-    let roots: Vec<&Value> = nodes
-        .iter()
-        .filter(|n| n.get("parent").map_or(true, Value::is_null))
-        .collect();
-    if roots.len() != 1 {
-        return Err(SessionError::other(format!(
-            "graphics expected single root, found {}",
-            roots.len()
-        )));
-    }
-    parse_node_id_value(roots[0].get("id").unwrap_or(&Value::Null))
+    super::materialize::subtree_root(nodes)
+        .map_err(|error| SessionError::other(format!("graphics {error}")))
 }
 
 /// Bake a component master into static nodes under `parent` (no live Instance).

@@ -65,8 +65,39 @@ struct LiveMcpState {
 
 impl gpui::Global for LiveMcpState {}
 
+/// The live server's tools, listed once: registration expands it with
+/// `add_tools!` and the tests with a description check, so a tool can't be
+/// registered without being checked.
+macro_rules! live_tools {
+    ($apply:ident!($($arg:tt)*)) => {
+        $apply!(
+            $($arg)*
+            GetEditorStateTool,
+            GetDesignSystemTool,
+            PrepareDesignAssetTool,
+            BatchGetTool,
+            BatchDesignTool,
+            GetScreenshotTool,
+            ReadFnxSourceTool,
+            ValidateFnxSourceTool,
+            GetGuidelinesTool,
+            ImportImageTool,
+            ListCommentsTool,
+            ReplyCommentTool,
+            ReportActivityTool
+        )
+    };
+}
+
+macro_rules! add_tools {
+    ($server:ident, $($tool:ident),+) => {
+        $($server.add_tool($tool);)+
+    };
+}
+
 pub(crate) fn init(cx: &mut App) {
     cx.set_global(LiveMcpState::default());
+
     let quit_subscription = cx.on_app_quit(|cx| {
         let state = cx.global_mut::<LiveMcpState>();
         state.epoch += 1;
@@ -115,19 +146,7 @@ fn apply_setting(cx: &mut App) {
     cx.spawn(async move |cx| {
         let server = async {
             let mut server = McpServer::new(cx).await?;
-            server.add_tool(GetEditorStateTool);
-            server.add_tool(GetDesignSystemTool);
-            server.add_tool(PrepareDesignAssetTool);
-            server.add_tool(BatchGetTool);
-            server.add_tool(BatchDesignTool);
-            server.add_tool(GetScreenshotTool);
-            server.add_tool(ReadFnxSourceTool);
-            server.add_tool(ValidateFnxSourceTool);
-            server.add_tool(GetGuidelinesTool);
-            server.add_tool(ImportImageTool);
-            server.add_tool(ListCommentsTool);
-            server.add_tool(ReplyCommentTool);
-            server.add_tool(ReportActivityTool);
+            live_tools!(add_tools!(server,));
             server.handle_request::<requests::Initialize>(|params, cx| {
                 let client_name = params.client_info.name;
                 // The handler only holds `&App`, and the connecting agent is
@@ -1249,6 +1268,29 @@ impl McpServerTool for ValidateFnxSourceTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An agent learns what a tool does only from its description; release
+    /// builds would otherwise advertise an undescribed tool silently.
+    #[test]
+    fn every_live_tool_is_described() {
+        macro_rules! descriptions {
+            ($($tool:ident),+) => {
+                vec![$((
+                    <$tool as McpServerTool>::NAME,
+                    context_server::listener::tool_description::<$tool>(),
+                )),+]
+            };
+        }
+        let tools = live_tools!(descriptions!());
+        assert_eq!(tools.len(), 13);
+        for (name, description) in tools {
+            let description = description.unwrap_or_default();
+            assert!(
+                description.len() >= 20,
+                "`{name}` needs a doc comment on its input type describing the tool"
+            );
+        }
+    }
 
     #[test]
     fn batch_design_activity_is_optional_and_preserves_agent_identity() {

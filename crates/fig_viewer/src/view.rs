@@ -33,10 +33,11 @@ use fanta_tools::{Button as ToolButton, LogicalKey, ToolEvent};
 use file_icons::FileIcons;
 use glam::DVec2;
 use gpui::{
-    Action, Anchor, AnyElement, App, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle,
-    DragMoveEvent, Empty, Entity, EventEmitter, FocusHandle, Focusable, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Pixels, Point, Render, RenderImage,
-    ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Task, Window, actions, div, px,
+    Action, Anchor, AnyElement, AnyWindowHandle, App, Bounds, ClipboardEntry, ClipboardItem,
+    Context, CursorStyle, DragMoveEvent, Empty, Entity, EventEmitter, FocusHandle, Focusable,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Pixels, Point, Render,
+    RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Task, Window, actions,
+    div, px,
 };
 use language::Capability;
 use project::{Project, ProjectEntryId};
@@ -381,6 +382,8 @@ pub struct FigView {
     canvas_pointer_down: bool,
     /// The debounced autosave armed by the last committing edit.
     autosave_task: Option<Task<()>>,
+    /// The save error the user has been shown and not yet seen cleared.
+    reported_save_failure: Option<String>,
     /// The selection handle the cursor is over, resolved on hover so
     /// `render` only reads it — hit-testing eight handles per redraw would
     /// run on every window frame, not just on pointer movement.
@@ -768,6 +771,7 @@ impl FigView {
             primary_pressed: false,
             canvas_pointer_down: false,
             autosave_task: None,
+            reported_save_failure: None,
             hover_resize_handle: None,
             space_pan: false,
             container_bounds: None,
@@ -958,6 +962,7 @@ impl FigView {
                 // in-flight sessions.
                 FigItemEvent::Saved => {
                     this.reconcile_opened_entry_with_project_root(cx);
+                    this.clear_save_failure(cx);
                     cx.emit(FigViewEvent::TitleChanged);
                 }
                 FigItemEvent::StateChanged => {
@@ -5422,6 +5427,24 @@ impl FigView {
     /// half-typed inspector values through `finish_panel_edits`. Any in-flight
     /// panel edit emits its own `Edited` when the user commits it, which
     /// re-arms this timer.
+    /// Tell the user their work is not on disk. The notice is raised once and
+    /// stays up until a save succeeds ([`Self::clear_save_failure`]); debounced
+    /// retries that keep failing do not raise it again (their errors differ
+    /// only in details such as the transaction's temp directory).
+    fn report_save_failure(&mut self, error: String, cx: &mut Context<Self>) {
+        if self.reported_save_failure.is_some() {
+            return;
+        }
+        show_save_failure_notice_deferred(format!("Your design is not being saved: {error}"), cx);
+        self.reported_save_failure = Some(error);
+    }
+
+    fn clear_save_failure(&mut self, cx: &mut Context<Self>) {
+        if self.reported_save_failure.take().is_some() {
+            dismiss_save_failure_notice_deferred(cx);
+        }
+    }
+
     fn autosave_now(&mut self, cx: &mut Context<Self>) {
         self.autosave_task = None;
         if self.canvas_pointer_down {
@@ -5441,8 +5464,8 @@ impl FigView {
         cx.spawn(async move |view, cx| {
             if let Err(error) = save.await {
                 log::error!("autosaving the canvas failed: {error:#}");
-                view.update(cx, |_, cx| {
-                    show_canvas_notice_deferred(format!("Autosave failed: {error:#}"), cx);
+                view.update(cx, |this, cx| {
+                    this.report_save_failure(format!("{error:#}"), cx);
                 })
                 .log_err();
             }
@@ -9015,6 +9038,7 @@ impl Item for FigView {
                 primary_pressed: false,
                 canvas_pointer_down: false,
                 autosave_task: None,
+                reported_save_failure: None,
                 hover_resize_handle: None,
                 space_pan: false,
                 container_bounds: None,
@@ -10529,6 +10553,73 @@ mod tests {
             "the project tree was written to disk"
         );
         view.read_with(cx, |view, _| assert!(view.autosave_task.is_none()));
+    }
+
+    /// A failing autosave is reported once, however many debounced retries
+    /// keep failing, and the report clears when a save succeeds.
+    #[gpui::test]
+    async fn a_failing_autosave_is_reported_until_a_save_succeeds(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let (_dir, root, item, view) = autosave_fixture(cx).await;
+        // A loaded project knows the disk it came from; a failed save resyncs
+        // against it.
+        let on_disk = fanta_format::read_project_tree(&root)
+            .expect("project on disk")
+            .0;
+        item.update(cx, |item, _| item.set_merge_base_for_test(on_disk));
+        // Every directory, so no write (temp file plus rename) can land anywhere.
+        fn collect_directories(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            out.push(dir.to_path_buf());
+            for entry in std::fs::read_dir(dir)
+                .expect("read project directory")
+                .flatten()
+            {
+                if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                    collect_directories(&entry.path(), out);
+                }
+            }
+        }
+        let mut directories = Vec::new();
+        collect_directories(&root, &mut directories);
+        let set_mode = |mode| {
+            for directory in &directories {
+                std::fs::set_permissions(directory, std::fs::Permissions::from_mode(mode))
+                    .expect("set directory permissions");
+            }
+        };
+        set_mode(0o555);
+
+        add_rect(&item, cx);
+        cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+        cx.run_until_parked();
+        let reported = view.read_with(cx, |view, _| view.reported_save_failure.clone());
+        assert!(reported.is_some(), "a read-only project fails the autosave");
+        item.read_with(cx, |item, _| assert!(item.is_dirty()));
+
+        add_rect(&item, cx);
+        cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.reported_save_failure, reported,
+                "a retry that keeps failing does not raise the notice again"
+            )
+        });
+
+        set_mode(0o755);
+        add_rect(&item, cx);
+        cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert!(!item.is_dirty(), "the save went through")
+        });
+        view.read_with(cx, |view, _| {
+            assert!(
+                view.reported_save_failure.is_none(),
+                "a successful save clears the report"
+            )
+        });
     }
 
     /// A drag longer than the debounce must not have an intermediate position
@@ -13315,6 +13406,7 @@ impl FigView {
 /// One id shared by every canvas notice, so a second click replaces the
 /// standing message instead of stacking a queue of them.
 const CANVAS_NOTICE_ID: &str = "fanta-canvas-notice";
+const SAVE_FAILURE_NOTICE_ID: &str = "fanta-save-failure";
 
 /// How many selected layers a toolbar Agent prompt lists by id.
 #[cfg(feature = "fanta-gpui-ui")]
@@ -13358,6 +13450,16 @@ fn toolbar_agent_prompt_template(
 /// Every one of those routes through here, because a click that only produces
 /// a log line is indistinguishable from a broken button.
 pub(crate) fn show_canvas_notice(message: String, window: &mut Window, cx: &mut App) {
+    show_workspace_toast(CANVAS_NOTICE_ID, message, true, window, cx);
+}
+
+fn show_workspace_toast(
+    id: &'static str,
+    message: String,
+    autohide: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
     let Some(workspace) = window
         .root::<MultiWorkspace>()
         .flatten()
@@ -13367,25 +13469,65 @@ pub(crate) fn show_canvas_notice(message: String, window: &mut Window, cx: &mut 
         return;
     };
     workspace.update(cx, |workspace, cx| {
-        workspace.show_toast(
-            Toast::new(NotificationId::named(CANVAS_NOTICE_ID.into()), message).autohide(),
-            cx,
-        );
+        let toast = Toast::new(NotificationId::named(id.into()), message);
+        workspace.show_toast(if autohide { toast.autohide() } else { toast }, cx);
+    });
+}
+
+/// The window a notice raised without a `Window` lands in: the active one,
+/// or — when Fanta is in the background, which is exactly when a debounced
+/// save finishes unwatched — the first workspace window.
+fn notice_window(cx: &App) -> Option<AnyWindowHandle> {
+    cx.active_window()
+        .filter(|window| window.downcast::<MultiWorkspace>().is_some())
+        .or_else(|| {
+            cx.windows()
+                .into_iter()
+                .find(|window| window.downcast::<MultiWorkspace>().is_some())
+        })
+}
+
+fn show_toast_deferred(id: &'static str, message: String, autohide: bool, cx: &mut App) {
+    cx.defer(move |cx| {
+        let Some(window) = notice_window(cx) else {
+            log::warn!("fanta: no workspace window to show a notice in: {message}");
+            return;
+        };
+        window
+            .update(cx, |_, window, cx| {
+                show_workspace_toast(id, message, autohide, window, cx)
+            })
+            .log_err();
     });
 }
 
 /// Show a canvas notice from a place that holds no `Window` — an item event
-/// subscription. The notice lands on the active window at the next effect
-/// flush, which is also when the reload it announces has finished applying.
+/// subscription. The notice lands at the next effect flush, which is also
+/// when the reload it announces has finished applying.
 pub(crate) fn show_canvas_notice_deferred(message: String, cx: &mut App) {
-    cx.defer(move |cx| {
-        let Some(window) = cx.active_window() else {
-            log::warn!("fanta: no active window to show a canvas notice in: {message}");
-            return;
-        };
-        window
-            .update(cx, |_, window, cx| show_canvas_notice(message, window, cx))
-            .log_err();
+    show_toast_deferred(CANVAS_NOTICE_ID, message, true, cx);
+}
+
+/// A save failure stays on screen until a save succeeds: an autohiding toast
+/// would let the user keep editing a document that never reaches disk.
+fn show_save_failure_notice_deferred(message: String, cx: &mut App) {
+    show_toast_deferred(SAVE_FAILURE_NOTICE_ID, message, false, cx);
+}
+
+fn dismiss_save_failure_notice_deferred(cx: &mut App) {
+    cx.defer(|cx| {
+        let id = NotificationId::named(SAVE_FAILURE_NOTICE_ID.into());
+        for window in cx.windows() {
+            if let Some(multi_workspace) = window.downcast::<MultiWorkspace>() {
+                multi_workspace
+                    .update(cx, |multi_workspace, _, cx| {
+                        for workspace in multi_workspace.workspaces() {
+                            workspace.update(cx, |workspace, cx| workspace.dismiss_toast(&id, cx));
+                        }
+                    })
+                    .log_err();
+            }
+        }
     });
 }
 

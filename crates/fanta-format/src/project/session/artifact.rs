@@ -694,13 +694,7 @@ impl ArtifactSession {
                         },
                         ir.to_nodes()
                             .ok()
-                            .and_then(|ns| {
-                                ns.iter()
-                                    .find(|n| n.get("parent").map_or(true, Value::is_null))
-                                    .and_then(|n| n.get("id"))
-                                    .and_then(Value::as_str)
-                                    .and_then(|s| s.parse().ok())
-                            })
+                            .and_then(|nodes| super::materialize::subtree_root(&nodes).ok())
                             .unwrap_or_else(fanta_doc::NodeId::new),
                         self.fn_name.clone(),
                     )
