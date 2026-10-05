@@ -1098,6 +1098,11 @@ struct SerializableItemDescriptor {
     view_to_serializable_item: fn(AnyView) -> Box<dyn SerializableItemHandle>,
 }
 
+enum ItemSerializationRequest {
+    Item(Box<dyn SerializableItemHandle>),
+    Flush(oneshot::Sender<()>),
+}
+
 #[derive(Default)]
 struct SerializableItemRegistry {
     descriptors_by_kind: HashMap<Arc<str>, SerializableItemDescriptor>,
@@ -1479,7 +1484,7 @@ pub struct Workspace {
     on_prompt_for_open_path: Option<PromptForOpenPath>,
     terminal_provider: Option<Box<dyn TerminalProvider>>,
     debugger_provider: Option<Arc<dyn DebuggerProvider>>,
-    serializable_items_tx: UnboundedSender<Box<dyn SerializableItemHandle>>,
+    serializable_items_tx: UnboundedSender<ItemSerializationRequest>,
     _items_serializer: Task<Result<()>>,
     session_id: Option<String>,
     scheduled_tasks: Vec<Task<()>>,
@@ -1833,7 +1838,7 @@ impl Workspace {
         }
 
         let (serializable_items_tx, serializable_items_rx) =
-            mpsc::unbounded::<Box<dyn SerializableItemHandle>>();
+            mpsc::unbounded::<ItemSerializationRequest>();
         let _items_serializer = cx.spawn_in(window, async move |this, cx| {
             Self::serialize_items(&this, serializable_items_rx, cx).await
         });
@@ -7153,7 +7158,12 @@ impl Workspace {
 
         let bounds_task = self.save_window_bounds(window, cx);
         let serialize_task = self.serialize_workspace_internal(window, cx);
+        let (flushed, item_flush) = oneshot::channel();
+        self.serializable_items_tx
+            .unbounded_send(ItemSerializationRequest::Flush(flushed))
+            .log_err();
         cx.spawn(async move |_| {
+            item_flush.await.log_err();
             bounds_task.await;
             serialize_task.await;
         })
@@ -7414,38 +7424,93 @@ impl Workspace {
 
     async fn serialize_items(
         this: &WeakEntity<Self>,
-        items_rx: UnboundedReceiver<Box<dyn SerializableItemHandle>>,
+        items_rx: UnboundedReceiver<ItemSerializationRequest>,
         cx: &mut AsyncWindowContext,
     ) -> Result<()> {
         const CHUNK_SIZE: usize = 200;
 
         let mut serializable_items = items_rx.ready_chunks(CHUNK_SIZE);
+        let mut pending_items = HashMap::default();
+        let mut pending_writes = Vec::new();
+        let mut throttle: Option<futures::future::BoxFuture<'static, ()>> = None;
 
-        while let Some(items_received) = serializable_items.next().await {
-            let unique_items =
-                items_received
-                    .into_iter()
-                    .fold(HashMap::default(), |mut acc, item| {
-                        acc.entry(item.item_id()).or_insert(item);
-                        acc
-                    });
-
-            // We use into_iter() here so that the references to the items are moved into
-            // the tasks and not kept alive while we're sleeping.
-            for (_, item) in unique_items.into_iter() {
-                if let Ok(Some(task)) = this.update_in(cx, |workspace, window, cx| {
-                    item.serialize(workspace, false, window, cx)
-                }) {
-                    cx.background_spawn(async move { task.await.log_err() })
-                        .detach();
+        loop {
+            let requests = if let Some(timer) = throttle.as_mut() {
+                match futures::future::select(timer, serializable_items.next()).await {
+                    futures::future::Either::Left(_) => {
+                        throttle = None;
+                        Some(Vec::new())
+                    }
+                    futures::future::Either::Right((requests, _)) => requests,
+                }
+            } else {
+                serializable_items.next().await
+            };
+            let Some(requests) = requests else {
+                break;
+            };
+            for request in requests {
+                match request {
+                    ItemSerializationRequest::Item(item) => {
+                        pending_items.entry(item.item_id()).or_insert(item);
+                    }
+                    ItemSerializationRequest::Flush(flushed) => {
+                        // Finish older writes before the queued latest state
+                        // can replace them in storage.
+                        futures::future::join_all(std::mem::take(&mut pending_writes)).await;
+                        Self::start_item_serialization(
+                            this,
+                            std::mem::take(&mut pending_items),
+                            &mut pending_writes,
+                            cx,
+                        )?;
+                        futures::future::join_all(std::mem::take(&mut pending_writes)).await;
+                        if flushed.send(()).is_err() {
+                            log::debug!("Item serialization flush was canceled");
+                        }
+                        throttle = None;
+                    }
                 }
             }
-
-            cx.background_executor()
-                .timer(SERIALIZATION_THROTTLE_TIME)
-                .await;
+            if throttle.is_none() && !pending_items.is_empty() {
+                futures::future::join_all(std::mem::take(&mut pending_writes)).await;
+                Self::start_item_serialization(
+                    this,
+                    std::mem::take(&mut pending_items),
+                    &mut pending_writes,
+                    cx,
+                )?;
+                throttle = Some(
+                    cx.background_executor()
+                        .timer(SERIALIZATION_THROTTLE_TIME)
+                        .boxed(),
+                );
+            }
+            pending_writes.retain(|write| write.peek().is_none());
         }
 
+        Ok(())
+    }
+
+    fn start_item_serialization(
+        this: &WeakEntity<Self>,
+        items: HashMap<EntityId, Box<dyn SerializableItemHandle>>,
+        pending_writes: &mut Vec<Shared<Task<Option<()>>>>,
+        cx: &mut AsyncWindowContext,
+    ) -> Result<()> {
+        for item in items.into_values() {
+            if let Some(task) = this.update_in(cx, |workspace, window, cx| {
+                item.serialize(workspace, false, window, cx)
+            })? {
+                let write = cx
+                    .background_spawn(async move { task.await.log_err() })
+                    .shared();
+                // Writes already outlive the workspace. Keep that behavior
+                // while retaining a completion handle for an explicit flush.
+                cx.background_spawn(write.clone()).detach();
+                pending_writes.push(write);
+            }
+        }
         Ok(())
     }
 
@@ -7454,7 +7519,7 @@ impl Workspace {
         item: Box<dyn SerializableItemHandle>,
     ) -> Result<()> {
         self.serializable_items_tx
-            .unbounded_send(item)
+            .unbounded_send(ItemSerializationRequest::Item(item))
             .map_err(|err| anyhow!("failed to send serializable item over channel: {err}"))
     }
 
@@ -12019,6 +12084,107 @@ mod tests {
         cx.executor().run_until_parked();
 
         assert!(task.await.unwrap());
+    }
+
+    #[gpui::test]
+    async fn test_flush_serialization_waits_for_in_flight_writes_and_queued_latest_state(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(|cx| register_serializable_item::<TestItem>(cx));
+        for after_throttle in [false, true] {
+            assert_item_serialization_flush_orders_writes(cx, after_throttle).await;
+        }
+    }
+
+    async fn assert_item_serialization_flush_orders_writes(
+        cx: &mut TestAppContext,
+        after_throttle: bool,
+    ) {
+        let project = Project::test(FakeFs::new(cx.executor()), None, cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let writes = Rc::new(RefCell::new(Vec::new()));
+        let (release, blocked) = oneshot::channel::<()>();
+        let first_write = cx.spawn({
+            let writes = writes.clone();
+            async move |_| {
+                blocked.await?;
+                writes.borrow_mut().push(0);
+                anyhow::Ok(())
+            }
+        });
+        let first_write = Rc::new(RefCell::new(Some(first_write)));
+        let serializations = Rc::new(Cell::new(0));
+        let latest_state = Rc::new(Cell::new(0));
+        let item = cx.new(|cx| {
+            let writes = writes.clone();
+            let serializations = serializations.clone();
+            let latest_state = latest_state.clone();
+            TestItem::new(cx).with_dirty(true).with_serialize(move || {
+                serializations.set(serializations.get() + 1);
+                if let Some(first_write) = first_write.borrow_mut().take() {
+                    Some(first_write)
+                } else {
+                    writes.borrow_mut().push(latest_state.get());
+                    Some(Task::ready(Ok(())))
+                }
+            })
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(serializations.get(), 1);
+        for state in [1, 2] {
+            latest_state.set(state);
+            workspace
+                .update(cx, |workspace, _| {
+                    workspace.enqueue_item_serialization(Box::new(item.clone()))
+                })
+                .expect("queue latest state");
+        }
+        if after_throttle {
+            cx.executor().advance_clock(SERIALIZATION_THROTTLE_TIME);
+            cx.run_until_parked();
+        }
+        let flush = workspace.update_in(cx, |workspace, window, cx| {
+            workspace.flush_serialization(window, cx)
+        });
+        let completed = Rc::new(Cell::new(false));
+        let completion = cx.spawn({
+            let completed = completed.clone();
+            async move |_| {
+                flush.await;
+                completed.set(true);
+            }
+        });
+        cx.run_until_parked();
+        assert!(!completed.get(), "flush must await the older blocked write");
+        assert!(
+            writes.borrow().is_empty(),
+            "new state must not race the older write (after_throttle={after_throttle})"
+        );
+        release.send(()).expect("release previous write");
+        completion.await;
+        assert_eq!(*writes.borrow(), [0, 2]);
+        assert_eq!(
+            serializations.get(),
+            2,
+            "queued duplicate events are coalesced"
+        );
+        assert!(item.read_with(cx, |item, _| item.is_dirty));
+        assert!(!cx.has_pending_prompt());
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.flush_serialization(window, cx)
+            })
+            .await;
+        assert_eq!(
+            serializations.get(),
+            2,
+            "flush only serializes queued items"
+        );
     }
 
     #[gpui::test]

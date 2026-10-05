@@ -114,6 +114,11 @@ impl SerializableItem for FigView {
                 .get_view(item_id, workspace_id)?
                 .context("No saved canvas path found")?;
             let scope: Option<SavedScope> = serde_json::from_str(&scope)?;
+            let scope = scope.map(FigScope::from);
+            let project_root = abs_path
+                .parent()
+                .filter(|_| abs_path.ends_with("fanta.json"))
+                .map(std::path::Path::to_path_buf);
             let path = cx
                 .background_spawn(async move {
                     anyhow::ensure!(
@@ -124,15 +129,54 @@ impl SerializableItem for FigView {
                     Ok::<_, anyhow::Error>(
                         source_path
                             .filter(|path| path.is_file())
+                            .or_else(|| {
+                                // Save As invalidates the old source entry. Keep
+                                // scoped tabs distinct instead of opening every
+                                // copied tab from the same manifest entry.
+                                let root = abs_path
+                                    .parent()
+                                    .filter(|_| abs_path.ends_with("fanta.json"))?;
+                                match scope? {
+                                    FigScope::Page(page) => {
+                                        fanta_format::locate_page_source(root, page)
+                                    }
+                                    FigScope::Component(component) => {
+                                        fanta_format::locate_master_source(root, component)
+                                    }
+                                    FigScope::Variables => Some(root.join("doc/variables.json")),
+                                }
+                                .filter(|path| path.is_file())
+                            })
                             .unwrap_or(abs_path),
                     )
                 })
                 .await?;
+            // A source-only worktree can disappear when the project folder
+            // loads later, invalidating the restored tab's entry identity.
+            if let Some(root) = project_root {
+                project
+                    .update(cx, |project, cx| {
+                        project.find_or_create_worktree(root, true, cx)
+                    })
+                    .await?;
+            }
             let (worktree, relative_path) = project
                 .update(cx, |project, cx| {
                     project.find_or_create_worktree(path, false, cx)
                 })
                 .await?;
+            let refresh = worktree.update(cx, |worktree, cx| {
+                if worktree.entry_for_path(&relative_path).is_some() {
+                    None
+                } else {
+                    worktree
+                        .as_local()
+                        .map(|local| local.refresh_entry(relative_path.clone(), None, cx))
+                }
+            });
+            if let Some(refresh) = refresh {
+                refresh.await?;
+            }
             let path = ProjectPath {
                 worktree_id: worktree.read_with(cx, |worktree, _| worktree.id()),
                 path: relative_path,
@@ -149,10 +193,7 @@ impl SerializableItem for FigView {
                     .entry_for_path(&path, cx)
                     .map(|entry| entry.id);
                 crate::document::set_pending_view_descriptor(
-                    crate::document::FigViewDescriptor {
-                        entry_id,
-                        scope: scope.map(FigScope::from),
-                    },
+                    crate::document::FigViewDescriptor { entry_id, scope },
                     cx,
                 );
                 cx.new(|cx| Self::new(item, project, window, cx))
@@ -302,9 +343,22 @@ mod tests {
     }
 
     async fn open(fixture: &Fixture, name: &str, cx: &mut TestAppContext) -> Entity<FigView> {
+        open_path(
+            fixture,
+            fixture.directory.path().join(name).join("fanta.json"),
+            cx,
+        )
+        .await
+    }
+
+    async fn open_path(
+        fixture: &Fixture,
+        absolute_path: PathBuf,
+        cx: &mut TestAppContext,
+    ) -> Entity<FigView> {
         let path = fixture.project.read_with(cx, |project, cx| {
             project
-                .find_project_path(fixture.directory.path().join(name).join("fanta.json"), cx)
+                .find_project_path(absolute_path, cx)
                 .expect("project path")
         });
         let task = fixture
@@ -553,6 +607,215 @@ mod tests {
             active_root(&restored, cx),
             original,
             "explicit Open still activates its target"
+        );
+    }
+
+    #[gpui::test]
+    async fn canvas_session_save_as_preserves_two_page_tabs_and_active_scope(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = fixture(cx).await;
+        let original = fixture.directory.path().join("Original");
+        let mut views = Vec::new();
+        for page in fixture.pages {
+            let source = fanta_format::locate_page_source(&original, page).expect("page source");
+            views.push(open_path(&fixture, source, cx).await);
+        }
+        let view = views.last().expect("active second page");
+        let item = view.read_with(cx, |view, _| view.item.clone());
+        assert!(views.iter().all(|view| {
+            view.read_with(cx, |view, _| view.item.entity_id()) == item.entity_id()
+        }));
+        let destination = fixture.directory.path().join("SavedCopy");
+        let (worktree, path) = fixture
+            .project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(destination.clone(), true, cx)
+            })
+            .await
+            .expect("destination worktree");
+        let path = ProjectPath {
+            worktree_id: worktree.read_with(cx, |worktree, _| worktree.id()),
+            path,
+        };
+        fixture
+            .window
+            .update(cx, |_, window, cx| {
+                view.update(cx, |view, cx| {
+                    Item::save_as(view, fixture.project.clone(), path, window, cx)
+                })
+            })
+            .expect("Save As")
+            .await
+            .expect("save copied project");
+        fixture
+            .file_system
+            .insert_tree_from_real_fs(&destination, &destination)
+            .await;
+        cx.run_until_parked();
+        assert!(
+            views
+                .iter()
+                .all(|view| { view.read_with(cx, |view, _| view.opened_entry_id.is_none()) })
+        );
+        cx.executor()
+            .advance_clock(workspace::SERIALIZATION_THROTTLE_TIME * 2);
+        cx.run_until_parked();
+        fixture
+            .window
+            .update(cx, |_, window, cx| {
+                fixture.workspace.update(cx, |workspace, cx| {
+                    workspace.flush_serialization(window, cx)
+                })
+            })
+            .expect("flush copied session")
+            .await;
+        let app_state = fixture
+            .workspace
+            .read_with(cx, |workspace, _| workspace.app_state().clone());
+        let _directory = fixture.directory;
+        let weak_views = views.iter().map(Entity::downgrade).collect::<Vec<_>>();
+        let weak_workspace = fixture.workspace.downgrade();
+        fixture
+            .window
+            .update(cx, |_, window, _| window.remove_window())
+            .expect("close original window");
+        drop(views);
+        drop(item);
+        cx.update(|_| {
+            drop(fixture.workspace);
+            drop(fixture.project);
+        });
+        cx.run_until_parked();
+        assert!(weak_workspace.upgrade().is_none(), "old workspace retained");
+        assert!(
+            weak_views.iter().all(|view| view.upgrade().is_none()),
+            "old scoped view retained"
+        );
+        let restored_window = cx
+            .update(|cx| workspace::open_workspace_by_id(fixture.workspace_id, app_state, None, cx))
+            .await
+            .expect("restore copied workspace");
+        let restored = restored_window
+            .update(cx, |window, _, _| window.workspace().clone())
+            .expect("restored workspace");
+        cx.run_until_parked();
+        restored.read_with(cx, |workspace, cx| {
+            let views = workspace.items_of_type::<FigView>(cx).collect::<Vec<_>>();
+            assert_eq!(views.len(), 2, "Save As must preserve both scoped tabs");
+            let scopes = views
+                .iter()
+                .map(|view| view.read(cx).scope)
+                .collect::<Vec<_>>();
+            for page in fixture.pages {
+                assert!(scopes.contains(&Some(FigScope::Page(page))));
+            }
+            let entries = views
+                .iter()
+                .map(|view| {
+                    let view = view.read(cx);
+                    assert_eq!(
+                        view.item.read(cx).project_root(),
+                        Some(destination.as_path())
+                    );
+                    let Some(FigScope::Page(page)) = view.scope else {
+                        panic!("restored page scope");
+                    };
+                    let source = fanta_format::locate_page_source(&destination, page)
+                        .expect("copied page source");
+                    let project = workspace.project().read(cx);
+                    let path = project
+                        .find_project_path(&source, cx)
+                        .expect("copied source path");
+                    let entry = project
+                        .entry_for_path(&path, cx)
+                        .expect("copied source indexed");
+                    assert_eq!(
+                        view.opened_entry_id,
+                        Some(entry.id),
+                        "restored source {source:?}"
+                    );
+                    entry.id
+                })
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(
+                entries.len(),
+                2,
+                "tabs need distinct deduplication identities"
+            );
+            let active = workspace
+                .active_item_as::<FigView>(cx)
+                .expect("active canvas");
+            assert_eq!(
+                active.read(cx).scope,
+                Some(FigScope::Page(fixture.pages[1]))
+            );
+            assert_eq!(
+                active
+                    .read(cx)
+                    .item
+                    .read(cx)
+                    .doc()
+                    .expect("document")
+                    .active_page(),
+                Some(fixture.pages[1]),
+                "the restored active tab must apply its own page"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn canvas_session_immediate_flush_restores_latest_clean_page(cx: &mut TestAppContext) {
+        let fixture = fixture(cx).await;
+        let view = open(&fixture, "Original", cx).await;
+        view.update(cx, |view, cx| view.select_page(0, cx));
+        fixture
+            .window
+            .update(cx, |_, window, cx| {
+                fixture.workspace.update(cx, |workspace, cx| {
+                    view.update(cx, |view, cx| {
+                        view.serialize(workspace, cx.entity_id().as_u64(), false, window, cx)
+                    })
+                })
+            })
+            .expect("initial serialization")
+            .expect("serializable canvas")
+            .await
+            .expect("persist initial page");
+        cx.run_until_parked();
+        view.update(cx, |view, cx| view.select_page(1, cx));
+        cx.run_until_parked();
+        assert!(!view.read_with(cx, |view, cx| view.is_dirty(cx)));
+        // Quit flushes immediately, without waiting for the item queue's
+        // serialization throttle to expire.
+        fixture
+            .window
+            .update(cx, |_, window, cx| {
+                fixture.workspace.update(cx, |workspace, cx| {
+                    workspace.flush_serialization(window, cx)
+                })
+            })
+            .expect("immediate session flush")
+            .await;
+        let restored = fixture
+            .window
+            .update(cx, |_, window, cx| {
+                FigView::deserialize(
+                    fixture.project.clone(),
+                    fixture.workspace.downgrade(),
+                    fixture.workspace_id,
+                    view.entity_id().as_u64(),
+                    window,
+                    cx,
+                )
+            })
+            .expect("restore immediately flushed canvas")
+            .await
+            .expect("restored canvas");
+        assert_eq!(
+            restored.read_with(cx, |view, _| view.scope),
+            Some(FigScope::Page(fixture.pages[1])),
+            "Quit must persist the latest clean navigation before returning"
         );
     }
 
