@@ -652,3 +652,209 @@ fn swap_redirect_cannot_cross_a_non_instance_node() {
     assert_eq!(report.override_nested_resolved, 3);
     assert_swap_context_expansion(&doc, 1, "B");
 }
+
+fn swap_context_nested_assignment(path: &[u32], component: u32) -> KiwiValue {
+    o(
+        "NodeChange",
+        vec![
+            ("guidPath", swap_context_path(path)),
+            (
+                "componentPropAssignments",
+                KiwiValue::array(vec![o(
+                    "ComponentPropAssignment",
+                    vec![
+                        ("defID", guid(7, 1)),
+                        ("value", prop_value_guid(0, component)),
+                    ],
+                )]),
+            ),
+        ],
+    )
+}
+
+#[test]
+fn nested_property_assignment_preserves_selected_component_and_content_in_source_order() {
+    for root_target in [false, true] {
+        for reverse in [false, true] {
+            for assignment_last in [false, true] {
+                let mut nodes = swap_context_components();
+                nodes.push(swap_context_instance(
+                    31,
+                    Some(30),
+                    10,
+                    Vec::new(),
+                    Vec::new(),
+                ));
+                let assignment =
+                    swap_context_nested_assignment(if root_target { &[31, 10] } else { &[31] }, 21);
+                let swap = swap_context_override(&[31, 11], 51);
+                let (mut overrides, target, foreign, expected_master) = if assignment_last {
+                    (vec![swap, assignment], 22, 52, "B")
+                } else {
+                    (vec![assignment, swap], 52, 22, "C")
+                };
+                overrides.extend([
+                    swap_context_content(&[31, 11, target], "Authored"),
+                    swap_context_content(&[31, 11, foreign], "Foreign component"),
+                ]);
+                nodes.push(swap_context_instance(
+                    40,
+                    None,
+                    30,
+                    overrides,
+                    vec![(
+                        "derivedSymbolData",
+                        KiwiValue::array(vec![
+                            swap_context_derived(&[31, 11, target], 27.0),
+                            swap_context_derived(&[31, 11, foreign], 99.0),
+                        ]),
+                    )],
+                ));
+                if reverse {
+                    nodes.reverse();
+                }
+                let (doc, report, _) =
+                    fig_to_doc(&doc_from(nodes)).expect("import nested assignment");
+                assert_eq!(report.prop_instance_swap_resolved, 1);
+                assert_eq!(report.override_path_nested, 5 + usize::from(root_target));
+                assert_eq!(
+                    report.override_nested_resolved,
+                    3 + usize::from(root_target)
+                );
+                assert_swap_context_expansion(&doc, 2, expected_master);
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_property_assignment_binds_only_inside_the_selected_component() {
+    let mut nodes = swap_context_components();
+    nodes.push(o(
+        "NodeChange",
+        vec![
+            ("guid", guid(0, 70)),
+            ("type", KiwiValue::Enum("SYMBOL".into())),
+            ("name", KiwiValue::String("Alternate card".to_owned())),
+            ("size", vector(120.0, 40.0)),
+        ],
+    ));
+    nodes.push(swap_context_instance(
+        71,
+        Some(70),
+        1,
+        Vec::new(),
+        vec![(
+            "componentPropRefs",
+            KiwiValue::array(vec![o(
+                "ComponentPropRef",
+                vec![
+                    ("defID", guid(7, 1)),
+                    (
+                        "componentPropNodeField",
+                        KiwiValue::Enum("OVERRIDDEN_SYMBOL_ID".into()),
+                    ),
+                ],
+            )]),
+        )],
+    ));
+    nodes.push(swap_context_instance(
+        31,
+        Some(30),
+        10,
+        Vec::new(),
+        Vec::new(),
+    ));
+    nodes.push(swap_context_instance(
+        40,
+        None,
+        30,
+        vec![
+            swap_context_nested_assignment(&[31], 21),
+            swap_context_override(&[31], 70),
+            swap_context_content(&[31, 71, 22], "Authored"),
+            swap_context_content(&[31, 11, 22], "Old component"),
+        ],
+        vec![(
+            "derivedSymbolData",
+            KiwiValue::array(vec![swap_context_derived(&[31, 71, 22], 27.0)]),
+        )],
+    ));
+    let (doc, report, _) = fig_to_doc(&doc_from(nodes)).expect("import nested assignment");
+    assert_eq!(report.prop_instance_swap_resolved, 1);
+    assert_eq!(report.override_path_nested, 3);
+    assert_eq!(report.override_nested_resolved, 2);
+    assert_swap_context_expansion(&doc, 2, "B");
+}
+
+#[test]
+fn nested_property_assignment_resolves_ancestor_root_before_child_properties() {
+    let mut nodes = swap_context_components();
+    let text = nodes
+        .iter_mut()
+        .find(|node| node.get("guid") == Some(&guid(0, 22)))
+        .expect("B text");
+    text.set_field(
+        "componentPropRefs",
+        KiwiValue::array(
+            [(2, "TEXT_DATA"), (3, "VISIBLE")]
+                .into_iter()
+                .map(|(property, field)| {
+                    o(
+                        "ComponentPropRef",
+                        vec![
+                            ("defID", guid(7, property)),
+                            ("componentPropNodeField", KiwiValue::Enum(field.into())),
+                        ],
+                    )
+                })
+                .collect(),
+        ),
+    );
+    nodes.push(swap_context_instance(
+        31,
+        Some(30),
+        10,
+        Vec::new(),
+        Vec::new(),
+    ));
+    nodes.push(swap_context_instance(
+        40,
+        None,
+        30,
+        vec![
+            o(
+                "NodeChange",
+                vec![
+                    ("guidPath", swap_context_path(&[31, 11])),
+                    (
+                        "componentPropAssignments",
+                        KiwiValue::array(vec![
+                            o(
+                                "ComponentPropAssignment",
+                                vec![
+                                    ("defID", guid(7, 2)),
+                                    ("value", prop_value_text("Authored")),
+                                ],
+                            ),
+                            o(
+                                "ComponentPropAssignment",
+                                vec![("defID", guid(7, 3)), ("value", prop_value_bool(false))],
+                            ),
+                        ]),
+                    ),
+                ],
+            ),
+            swap_context_nested_assignment(&[31, 10], 21),
+        ],
+        vec![(
+            "derivedSymbolData",
+            KiwiValue::array(vec![swap_context_derived(&[31, 11, 22], 27.0)]),
+        )],
+    ));
+    let (doc, report, _) = fig_to_doc(&doc_from(nodes)).expect("import nested properties");
+    assert_eq!(report.prop_instance_swap_resolved, 1);
+    assert_eq!(report.prop_visible_resolved, 1);
+    assert_eq!(report.override_nested_resolved, 3);
+    assert_swap_context_expansion(&doc, 2, "B");
+}
