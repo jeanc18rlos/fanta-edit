@@ -16,24 +16,29 @@ recorded there.
 ## Current acceptance status
 
 These results apply to the named builds and bounded journeys. Earlier
-native journeys below used `a82f90f87b`. The new source-recovery candidate
+native journeys below used `a82f90f87b`. The source-editor candidate
 `3e3f275fcd9d721dfdca7de715ccf350166caec6` builds successfully with stable source
 fingerprints and binary SHA-256
 `68b8f94d837361c6fb689dcd8b572fbbf39e0d055ec54be72b4919fc4d58b38c`;
-its source Find and Save/Undo native checks pass, while draft recovery and broader
-acceptance remain open. It includes the scoped-layout correction in
+its source Find, Save/Undo and scoped-layout native checks pass. Its draft
+recovery failure is retained below. It includes the scoped-layout correction in
 [PR 52](https://github.com/jeanc18rlos/fanta-edit/pull/52), production commit
 `e6362d8a1f` with the viewport regression added in `6e97d01eed`.
-Passing older checks does not validate the combined release artifact.
+The later recovery candidate `ac038333e39fffb908093b64951a10847f10316d`, binary
+SHA-256 `7c77bfed9fdbc89644be6c6a0d624759d17577fe95ef8725b559a9e0e1ff8e4b`,
+passes the partial-source-save/discard/canvas-save journey and strict restart.
+New clipboard guard failures and the remaining native/service gates are still
+open. Passing these checks does not validate the combined release artifact.
 
 | Gate | Confirmed result | Still required |
 | --- | --- | --- |
 | Large-project content preservation | **Bounded native PASS:** page visits/Save, image move/Save, single Undo/Save and restart of the saved image Undo state. Instance flow-child move/Save and Undo/Save also pass complete typed comparisons. | **Instance restart INCONCLUSIVE** after possible concurrent input; repeat against its exact saved Undo snapshot. Broader node/layout/visual journeys remain unverified. |
-| Scoped layout and external reload | **Automated correction PASS in PR 52:** unchanged fixed nested geometry is preserved; real allocation changes still reflow; clean watcher-computed output remains dirty/saveable. | Natively retest those corrections on the built `3e3f275fcd` candidate; they are absent from `a82f90f87b`. |
-| Code source editing | **Bounded native PASS on `3e3f275fcd`:** embedded FNX/JSON Find and source Save/repeat Save/single Undo/Redo. Final editor suite passes 1,089 tests plus 3 benchmark tests. Earlier repair/restoration/restart checks remain scoped to `a82f90f87b`. | **Draft recovery remains open:** after selected JSON Discard, Save requires canvas focus and then shows an unexpected stale-file warning. The failed readback and earlier source failures remain retained. |
-| Prototype interaction removal | **Bounded native PASS:** exact open, explicit Remove/Save and single Undo/Save on the four-node fixture. The user confirmed that the later Start/End position changes were their edits. | The strict restart comparison failed against the older baseline; this is a **confirmed user-edit baseline mismatch**, not evidence of an app regression. Preserve that result and repeat against a matching baseline; no restart pass is claimed. |
+| Scoped layout and external reload | **Bounded native PASS on `3e3f275fcd`:** fixed nested geometry survives outer spacing edits; actual allocation changes reflow; Save and single Undo/Redo pass. External reload automatically persists computed output. All three fixtures reopen identically in a separate same-binary process/fresh profile. | The transient dirty/manual-only checkpoint was not observed before autosave; its strict failure remains retained. This is cold-process reopening, not restarting the original app. Broader layout combinations remain open. |
+| Code source editing | **Bounded native PASS:** Find and source Save/repeat Save/single Undo/Redo on `3e3f275fcd`; partial FNX Save with invalid JSON → selected Discard → Canvas Save, repeat Save and strict quit/relaunch on `ac038333e3`. The later full editor run passes 1,095 library tests (1 ignored) plus 3 benchmark tests. | Native recovery Undo, deliberately delayed own-write events, genuine concurrent external changes and multiwindow source editing remain unverified. The original false-conflict failure is retained; no focus production change is claimed. |
+| Clipboard guards and master preservation | **Mounted failures reproduced.** Keyboard Cut/Duplicate modify locked nodes; deleting a master or final variant can break surviving instances, and detachment can lose variable-resolved appearance. | Corrections, full validation and native asset-bearing Cut/Duplicate/Paste Save/reopen remain open. The passing menu subtree control and earlier copy journeys do not close these failures. |
+| Prototype interaction removal | **Bounded native PASS:** explicit Remove/Save and single Undo/Save on `a82f90f87b`; a fresh matching user-edited baseline passes Save and verified process restart with exact typed content and all 19 files on `ac038333e3`. | The older strict restart failed against a stale baseline after confirmed user position edits and remains retained. Remove/Undo and playback were not repeated on the newer build; broader triggers/overlays remain open. |
 | Inspector and per-node actions | Corrected bound-paint display, picker detachment, mixed opacity, Export labels, representative double-clicks and context actions have recorded native samples and mounted regressions. | Complete the remaining per-kind, mixed-selection, scrub/cancel, clipping and keyboard matrix on the final build. |
-| Large-page responsiveness | Correctness tests and bounded CPU diagnostics pass; the new Save acceptance hashing diagnostic improves one measured phase. | Native full Save remains slow in the development candidate; matched complete Save, pointer/frame p50/p95 and memory measurements on the final build are open. No result establishes the drag p95 target below 16 ms. |
+| Large-page responsiveness | Correctness tests and bounded CPU diagnostics pass; Save acceptance hashing improves one measured phase. Gesture instrumentation passes focused worker-time/lifecycle tests only. | Native full Save remains slow in the development candidate; matched complete Save, pointer/frame p50/p95 and memory measurements on the final build are open. Instrumentation is not native input-latency evidence. No result establishes the drag p95 target below 16 ms. |
 | Final artifact and services | Earlier automated, component visual, MCP and distribution evidence is retained with its build identity. | Combined candidate full suite, native journeys, live services, signed/notarized installer and clean-account/Mac checks remain open. |
 
 ## Evidence levels
@@ -147,6 +152,23 @@ identity, and scope below `target/release-verification/`. Duplicate restart,
 prototype playback, Cut, page/menu Duplicate and asset-bearing component/subtree
 copies remain separate checks; the bounded Spectrum image results are recorded
 below and do not establish broader release readiness.
+
+New mounted asset-bearing checks expose **three product failures and one passing
+control**. Command+X deletes a directly locked Bitmap, Command+D duplicates it
+despite the disabled canvas-menu policy, and Command+X on a component master
+leaves its definition pointing at deleted content while an instance survives.
+The actual canvas-menu Duplicate→Cut control passes for a PNG Bitmap plus
+image-filled Vector subtree, retaining all original nodes, payloads, shared
+asset IDs/bytes and Undo/Redo. These guards are being corrected; no green or
+native acceptance is claimed yet. The meaningful red result is
+`target/release-verification/asset-clipboard-guards-20261005/red-2.log`;
+`first-red.log` is an earlier test-harness compile failure, not a product result.
+Additional mounted regressions in `set-reference-red.log` reproduce an empty
+surviving set instance after Cut or Delete removes the last variant. The
+strengthened `variable-appearance-red.log` then catches opacity changing from
+0.4 to 1.0 during detachment. Corrections and Cut→Paste component-dependency
+coverage are in progress. Asset-bearing Save/reopen and remaining native routes
+are still required.
 
 The large Spectrum native journey on `0a0d3cd1c4` is **failed/open**. At 100%
 zoom, the image-filled master at page index 9 / traversal index 2110 moved from
@@ -263,8 +285,9 @@ the frame completely, and legitimate sibling/deeper targets, including exact
 scene Undo/Redo. Evidence is in
 `target/release-verification/nested-drag-parent-20261005/validation.json`.
 The corrected native image journey and instance flow-child move/Undo pass as
-recorded below. Instance restart is inconclusive; source Undo/current-draft
-recovery and native retests of the newer layout corrections remain open.
+recorded below. Instance restart is inconclusive. Later source Undo, draft
+recovery and small scoped-layout native passes are recorded with their separate
+build identities below; they do not close the remaining dense-page gates.
 
 The layout engine also stopped recording mutations when calculated geometry is
 unchanged. A 2,051-node regression previously recorded 18,459 false mutations
@@ -399,8 +422,34 @@ across five scheduler seeds; 73 engine layout tests and repository lint for
 `fanta-doc`/`fig_viewer` passed.** The tests verify single Undo/Redo and actual
 watcher edit→Save→cold reopen. Baseline failures, controls, commands and tested
 hashes are in `target/release-verification/scoped-layout-followup-20261005/`.
-These are automated passes; neither correction is present in the tested
-`a82f90f87b` native binary, and native retests remain required.
+The later `3e3f275fcd` native candidate now passes these bounded corrections.
+On the eight-node fixed fixture, inspector Gap 8→16 and Save change only outer
+spacing and sibling X 128→136; the imported nested child stays at (12, 7).
+Single canvas Undo/Save restores baseline content; Redo/Save restores the edit.
+On the allocation fixture, outer width 148→188 changes nested width 120→160,
+its End-aligned child (12, 7)→(140, 0), and sibling X 128→168. Single Undo/Redo
+and Save pass exact complete typed comparisons.
+
+The external fixture's trigger changes only source spacing 8→16. The native
+watcher updates the UI and the existing one-second canvas autosave persists
+sibling X 136 before the manual Save checkpoint. The original
+`external-source-only` oracle **fails and remains retained** because it expected
+the earlier on-disk X 128. The trigger report and reconstructed source hash,
+followed by FNX/sidecar mtimes about 1.85 seconds later, support this autosave
+sequence. A separate completed-state comparison and subsequent explicit Save
+both pass with only the intended spacing/position changes. The transient dirty
+indicator was not observed; this is not a manual-Save-only assertion.
+
+A separate **Fanta Cold QA** process (PID 97065, launched 13:37:32 UTC) uses the
+identical `3e3f275fcd` binary SHA-256 shown above and a fresh profile. Its first
+loads of external, growth and fixed fixtures retain the preceding saved
+snapshots exactly, including timestamps. Only outer selection changed; no
+content edit or Save was performed. The original Candidate process retained its
+source-recovery failure window and was not restarted. Independent evidence in
+`target/release-verification/native-scoped-layout-20261005/` includes
+`native-journey.json`, `aggregate.json`, cold bundle/runtime provenance,
+14 passing checkpoints and the unobserved transient checkpoint's strict failure.
+These small fixtures do not establish whole-Spectrum visual fidelity or timing.
 
 One native instance Undo also coincided with an unexplained zoom change from
 200% to 15%. Possible concurrent input prevents attributing that observation to
@@ -456,13 +505,55 @@ The subsequent native `3e3f275fcd` retry passes Find in FNX (`spacing`, five
 matches) and JSON (`order`, one match), with all 19 project files unchanged.
 One source spacing edit followed by Save, repeat Save, one Undo/Save and
 Redo/Save passes complete typed comparisons. The repeated Save is byte-identical.
-The valid-FNX/invalid-JSON journey still exposes two recovery issues: after
+The valid-FNX/invalid-JSON journey on `3e3f275fcd` exposed two recovery symptoms: after
 Discard restores JSON and retains pending geometry, switching to Canvas and
 pressing Save leaves the old child position on disk; focusing the canvas and
 retrying Save shows a stale-file overwrite warning despite no external edit.
 The failed comparison is retained in
 `target/release-verification/native-candidate-source-layout-20261005/discard-saved/`.
-This route remains open; successful Find and Undo do not close draft recovery.
+This failure remains retained separately from the corrected-build pass below.
+
+The own-write race now has a meaningful mounted reproduction: delayed FNX and
+identity-sidecar notifications were treated as external changes while invalid
+JSON retained the source lock. The correction records exact accepted writer
+bytes and keeps the shared write lease through source-buffer refresh and canvas
+adoption. Three mounted controls and one lease control pass across five
+scheduler seeds; two format tests check exact FNX/sidecar/JSON hashes, including
+unchanged noncanonical sidecars and later external changes. Actual external
+FNX, sidecar and unrelated metadata changes still prompt, and Cancel preserves
+disk bytes, typed content and assets. No focus production change was made: the
+real Code→Canvas keyboard Save route passes as a control. Final validation passed
+**1,095 editor library tests (1 ignored), 3 benchmark tests, 280 format tests
+across its targets (3 ignored), 325 FNX/format source-order tests (1 ignored),
+repository lint and formatting**. Evidence and exact source hashes are in
+`target/release-verification/source-recovery-watchers-20261005/validation.json`.
+The editor run also includes the two mounted mixed-opacity pointer tests; they
+pass across five scheduler seeds, including Escape/outside release, but do not
+replace native pointer-cancellation acceptance.
+
+Native recovery now passes on `ac038333e3`, with the exact binary hash recorded
+at the top of this report. A fresh seven-node, two-row, asset-free project first
+matches its immutable baseline. Valid FNX spacing 8→16 plus an invalid JSON
+draft saves only the FNX: disk spacing is 16 and the second child's X remains
+28, while the draft and canvas lock remain. **Discard draft** on JSON, switch
+to Canvas and Command+S then persist X 36 without a stale-file overwrite prompt.
+The control row, parent/order and all other typed content remain unchanged.
+Repeated Save preserves the entire saved snapshot and all 19 project files.
+
+The clean quit exited PID 3491 before the same Recovery QA bundle relaunched
+as PID 4820 at 13:57:24 UTC. It automatically reopened the correct project;
+no Save followed launch. Readback is strictly identical to repeated Save,
+including `modified_at`, and all 19 project files are byte-identical. The native
+canvas showed both rows, the intended larger gap and clean state. Independent
+full-field comparisons, the five passing checkpoints, runtime/build/source
+fingerprints and original reports are retained in
+`target/release-verification/native-recovery-source-layout-20261005/`
+(`independent-review.json`, `native-journey.json`, `aggregate.json`).
+Only snapshot `project_path` and reader-presence defaults are excluded; no
+numeric, geometry or revision exceptions are allowed. This bounded pass does
+not establish recovery Undo, forced native watcher-race handling, concurrent
+external edits, multiple windows or performance. The failed `3e3f275fcd`
+checkpoint has not been relabeled.
 
 On a fresh four-node prototype copy, the same `a82f90f87b` Source QA build
 **passed three persisted checks**: open matched the baseline exactly; explicit
@@ -476,12 +567,26 @@ Undo checkpoint and before the 13:00 restart. The user subsequently confirmed
 that the Start/End position changes were their edits. This is a **confirmed
 user-edit baseline mismatch**, not evidence of an app regression. The original
 strict FAIL remains valid against the older baseline and is not converted into
-a pass; matching-baseline native restart acceptance remains unverified.
+a pass. A later matching-baseline native pass is recorded separately below.
 The confirmation, fixture and failed comparison remain preserved in
 `target/release-verification/native-source-prototype-20261005/`, alongside
 `native-open-verdict.json`, `native-remove-verdict.json`,
 `native-remove-undo-verdict.json`, `native-restart-verdict.json`,
 `user-position-edit-confirmation.json` and the updated journey/aggregate.
+
+On `ac038333e3`, a fresh four-node copy includes those confirmed user position
+edits. Native Command+S leaves all typed fields, including the timestamp, and
+all 19 project files unchanged. Selecting Start shows its **On click → End**
+card and wire. PID 4820 then exits before the same Recovery QA bundle relaunches
+as PID 6244 at 14:04:49 UTC and automatically reopens the copied project, with
+no Save after launch. The complete typed snapshot and 19-file manifest again
+match the new baseline exactly. The original project was unchanged during the
+copy and was not edited. The two passing checkpoints and independent equality
+review are in
+`target/release-verification/native-prototype-current-baseline-20261005/`.
+This closes matching-baseline Save/restart preservation only; explicit Remove,
+Undo and playback were not repeated on this build, and the original failed
+comparison against the older baseline remains intact.
 
 The Save acceptance correction in commit `b433e7d28f` reuses an aggregate
 artifact hash only when its paired
@@ -501,6 +606,18 @@ retry/rejection checks and commands are in
 The earlier native image Save completed about two minutes after the single
 request, an observation bound rather than a standardized latency result. The `3e3f275fcd` candidate includes this optimization; complete native
 Save/gesture performance acceptance remains required.
+
+The later gesture instrumentation has **10 focused passes (9 pure and 1 mounted),
+the mounted pointer-lifecycle case across five scheduler seeds, and 42 canvas
+policy passes** in
+`target/release-verification/native-gesture-metrics-20261005/focused-validation.json`.
+These are source checks after the `ac038333e3` bundle was built; full combined
+validation and native measurements are pending. The intended measurements are
+completed Metal-worker scene walk/encode, synchronous flush wait and encompassing
+render wall time. They are not displayed FPS, process CPU time, GPU timestamps,
+OS input latency or post-release settling time. Atomic native drags may produce
+too few completed frames for sustained-gesture percentiles. No native performance
+pass or below-16-ms result is claimed.
 
 The inspector/menu native follow-up used `85fc694b67c78f616401def73506e515594f52d7`,
 binary SHA-256 `d42e94c0febfa6c701c257485a470779b5c991c7e3567b856f6e5b6fb7dced99`.
@@ -1084,25 +1201,25 @@ coverage. The final column highlights the remaining acceptance work.
 | --- | --- | --- |
 | Create/open/import | `fig_viewer::new_design::tests`, `document::tests`; `fanta-fig-interop` mapping/parser tests | New project and `.fig`/`.fant` import, collision handling, malformed file and missing asset UI; compare representative imported pages with reference renders. |
 | Save/autosave/Save As/reopen | `fanta-format` full suite; `fig_viewer::document::tests`, `view::tests`, `view::serialization::tests` (`canvas_session_*`, `save_generation_*`, `a_failing_autosave_is_reported_until_a_save_succeeds`, `save_as_*`) | Verify file hashes and node/assets inventory across edit, cancel, save, restart and Save As. Inject write failures and concurrent edits; original content must survive. |
-| Source ↔ canvas | `fig_viewer::code_workspace::tests`, `editor_session::tests`; FNX/format source-order tests; PR 52 watcher-output Save/reopen regression | Native FNX spacing/derived geometry, invalid JSON retention/lock, repair, manual strict restoration and restored-state restart pass on `a82f90f87b`. Embedded Find, source Save→Undo and visible current-draft Discard failed or were unavailable; their fixes now pass automated validation in `3e3f275fcd`, with native retests pending. Also verify multiple tabs/windows, external watcher flows and agent source-follow. |
-| Pages/layers/structure | Viewer design-panel, structure, layer-context and clipboard tests; `canvas_menu_reorder_entries_execute_and_undo` confirms both ordering entries. Other menu GPUI cases confirm primary text/vector/bitmap/video/audio entries and retain a selected boolean operand. | Layer drag/drop, all per-kind context actions, page deletion/duplication, Cut and asset-bearing component/subtree copies remain. The asset-free keyboard Duplicate/Paste, Save/Undo/Redo and Paste restart journey passed on `9ca127c1be`; bitmap cross-page Save/Undo/Redo/restart and visible cross-document refusal also passed as recorded above. Test hidden/locked rules in the native app. |
+| Source ↔ canvas | `fig_viewer::code_workspace::tests`, `editor_session::tests`; FNX/format source-order tests; PR 52 watcher-output Save/reopen and own-write ownership regressions | Earlier Save/repair/restoration/restart pass on `a82f90f87b`; Find and source Save→Undo/Redo pass on `3e3f275fcd`. The false own-write conflict in that build is retained; partial Save → selected Discard → Canvas Save/repeat Save/strict process restart now passes on `ac038333e3`. Small clean external reload/autosave/cold-process checks pass separately. Recovery Undo, multiple tabs/windows, concurrent external edits and agent source-follow remain. |
+| Pages/layers/structure | Viewer design-panel, structure, layer-context and clipboard tests; `canvas_menu_reorder_entries_execute_and_undo` confirms both ordering entries. Primary menu cases retain a selected boolean operand; mounted asset-subtree menu Duplicate/Cut control passes. | **Open reproduced failures:** keyboard Cut/Duplicate bypass a locked bitmap guard; Cut/Delete can break surviving direct or set instances, including resolved appearance during detachment. Fix/retest before native asset-bearing Cut/Duplicate/Paste, Save/reopen and layer/page operations. Earlier asset-free keyboard Duplicate/Paste/Undo/Redo and Paste restart passed on `9ca127c1be`; bitmap cross-page and visible cross-document refusal passed separately. |
 | Navigation/selection/transforms | `fanta-canvas` hit-test/snap tests and `tests/end_to_end.rs`; `fanta-tools::select::tests`, `scale::tests`; viewer toolbar adapter tests | Pan, zoom, nested selection, rapid drag/release, resizing and scaling in a dense imported page. Check focus and pointer capture. |
 | Double-click by node | Viewer `canvas_double_click_*`, `mounted_curved_text_path_*` and mounted crop/drill/guard cases, existing standalone/wrapped text cases; tools `rapid_clicks_drill_once_per_pair_and_do_not_enter_leaf_nodes`, `extending_double_click_toggles_the_container_without_drilling`, `double_click_at_container_resize_handle_still_drills_into_child` | Native pass of the [per-kind contract](../fanta/capabilities.md#double-click-behavior-by-node), including selected/unselected, nested, locked/Inspect states. Check entry, feedback, Escape, Undo and unrelated content. |
 | Properties inspector | `fig_viewer::gpui_adapters::design::tests`, `properties_panel::tests`, `properties_ops::tests`, `properties_snapshot::tests`; mounted `view/properties_inspector.rs::layout_tests` checks geometry fields at minimum width and the composed inspector with annotation/measurement lists | Actual scrub/drag cancellation; differing-value mixed selection, themes, scrolling and popovers. Numeric/hex draft cancellation, invalid-draft page switching, Export labels and two-kind aggregate-opacity display/edit/Undo passed natively. Mounted layout bounds are not a full visual baseline. |
 | Drawing/path/region/crop | `fanta-tools` full suite, including `tests/end_to_end.rs` and `ink_oracle.rs`; viewer toolbar adapter tests | Every visible tool, path/anchor editing, brush/eraser, region operation, crop Apply/Cancel and their keyboard shortcuts. |
 | Text/text on path | `fanta-text`, `fanta-tools::text_path::tests`, renderer text/text-path tests; viewer `text_edit`, `instance_text` and design adapter tests | Inline range selection, rich styles, multiline/Unicode/IME input, fonts, path conversion errors, instance overrides, save/reopen and exports. |
-| Layout/paints/effects/rendering | `fanta-doc` layout tests; format omission/complete-geometry roundtrips; complete `fanta-render` library and bitmap/SVG/compose/golden integration suites | The corrected Spectrum image journey passes page visits/Save, an isolated nested image move/Save, Undo/Save and strict restart of the saved Undo state. Instance flow-child move/Undo and one source-spacing Save/repair journey also pass; instance restart remains inconclusive and current-draft Discard unverified. PR 52 corrects nested fixed layout and clean watcher-output persistence with automated passes; native retests remain open. Also verify visual parity for gradients, masks, booleans, clipping, shadows/blur, blend modes, auto-layout/grid and imported instances under edits. |
+| Layout/paints/effects/rendering | `fanta-doc` layout tests; format omission/complete-geometry roundtrips; complete `fanta-render` library and bitmap/SVG/compose/golden integration suites | The corrected Spectrum image journey passes page visits/Save, an isolated nested image move/Save, Undo/Save and strict restart of the saved Undo state. Instance flow-child move/Undo and one source-spacing Save/repair journey also pass; instance restart remains inconclusive. The separate seven-node draft recovery Save/restart passes on `ac038333e3`. PR 52 now has bounded native fixed-layout/allocation Save/Undo/Redo and clean external reload/autosave passes, with identical cold-process reopen of all three small fixtures. The transient dirty state was not observed before autosave. Also verify visual parity for gradients, masks, booleans, clipping, shadows/blur, blend modes, auto-layout/grid and imported instances under edits. |
 | Variables/styles | `fig_viewer::variables_workspace::tests`, `variable_binding::tests`, `agent_surface::tests`; document resolve/render tests | Rename/delete, aliases and other types/bindings. One two-mode color binding/unbind/Undo/restart passed on `ee80ec48c6`; header containment/toggle, resolved bound row/picker, read-only alpha explanation, picker Detach/Undo and strict restart passed on `0a0d3cd1c4`. |
-| Components/variants | Viewer component-property, variant-set, clipboard and agent tests; `fanta-doc` instance resolution tests; importer overrides tests | Master ↔ instance updates, virtual text edit, typed properties, variant switching, detach/duplicate and nested components without disappearing descendants. |
+| Components/variants | Viewer component-property, variant-set, clipboard and agent tests; `fanta-doc` instance resolution tests; importer overrides tests | Correct the reproduced master/final-variant deletion and resolved-appearance failures, then verify master ↔ instance updates, virtual text edit, typed properties, variant switching, detach/duplicate and nested components without disappearing descendants. |
 | Motion/timeline | Viewer `motion_panel`, `motion_edit`, `timeline`, toolbar adapter tests; document/render motion tests | Easing edit/cancel, clip switching, duration and mode changes. Representative playback/ruler seek and keyframe drag/Undo passed on `ee80ec48c6`; time-field typing/seek with retained selection and strict restart passed on `0a0d3cd1c4`. Broader property coverage remains open. |
-| Prototypes | `fanta-present`; viewer `prototype_panel`, `prototype_player` and view tests | Native open, explicit Remove/Save and single Undo/Save pass complete comparisons on `a82f90f87b`; the user confirmed the later position changes were their edits. The strict restart mismatch is retained against the stale baseline; repeat with a matching baseline, then other pointer/key/time triggers, overlays, transitions and safe links. Click navigation/Restart/Escape passed on `ee80ec48c6`; detail X retained the reaction/card/wire with strictly unchanged Save/restart snapshots on `0a0d3cd1c4`. |
+| Prototypes | `fanta-present`; viewer `prototype_panel`, `prototype_player` and view tests | Native explicit Remove/Save and single Undo/Save pass on `a82f90f87b`; its restart mismatch is retained against a stale baseline after confirmed user position edits. A fresh matching baseline passes Save/strict process restart on `ac038333e3`. Other pointer/key/time triggers, overlays, transitions and safe links remain. Click navigation/Restart/Escape passed on `ee80ec48c6`; detail X retained reaction/card/wire with unchanged Save/restart snapshots on `0a0d3cd1c4`. |
 | Comments/review/Dev | Viewer `comments`, `comments_ui`, `view_annotations`, `view_measurements`, `view_dev_mode` and export tests | Pin/reply/resolve, draft preservation, mode transitions, keyboard ownership and read-only protection; no review overlays in artwork exports. |
 | Local image/SVG/video/audio | Viewer `generation_media`, `video_playback`, document/view and media tests; renderer live-media tests | Place/play/seek/trim/replay, corrupted files, missing source, poster/orientation, audible output and saved asset bytes after restart. |
 | Export | Viewer `export::tests` and inspector export tests; renderer integration suites | PNG/JPG/SVG/PDF from UI, multiple presets/selections, names/dimensions, layout fidelity, visible failures and opening the resulting files. |
 | Designer/MCP | Viewer `agent_surface` (including style projection), `live_mcp` and `plan_build` tests; `script/smoke-mcp` | Final app stdio/socket connection, real agent tool selection, one undo per successful batch, rollback on failure, source validation and screenshot inspection. |
 | Generation/recovery | Viewer `generation_workspace`, `generation_journal`, `generation_media`; account/provider CI tests | Signed-in final build with a real provider: submit/poll/save/place, timeout/retry, restart, sign-out/account switch and exactly-once recovery. Mock responses do not prove production availability. |
 | App shell/distribution/accounts | Existing `Check` jobs: sidebar, path prompt, agent toggle, Git, auth, Store restrictions; release packaging workflow | Menu/keyboard discovery, clean-profile launch, install/quarantine, signature/notarization, Keychain, sandbox file access, billing/restore and backend release compatibility. |
-| Large-page performance | Import scaling, renderer cache/culling, ignored latency/acceptance benchmarks and profiling examples; matched synthetic acceptance median 546.673→292.797 ms | Full native Save and gesture timings on Spectrum remain required; the acceptance-only development result does not establish application latency. Measure frame p50/p95/max and memory; the drag p95 target below 16 ms is unproven. |
+| Large-page performance | Import scaling, renderer cache/culling, ignored latency/acceptance benchmarks and profiling examples; matched synthetic acceptance median 546.673→292.797 ms; focused gesture worker-time/lifecycle tests | Full native Save and gesture timings on Spectrum remain required; acceptance-only development timing and mounted instrumentation tests do not establish application latency. Measure frame p50/p95/max and memory; the drag p95 target below 16 ms is unproven. |
 
 ## Next bounded native checks
 
@@ -1114,10 +1231,10 @@ native inputs and final comparison.
 | Priority | Fixture and bounded journey | Required evidence and limit |
 | --- | --- | --- |
 | 1 — Inspector drafts | Continue on `/tmp/fanta-release-inspector-acceptance-20261005` or a fresh node-matrix copy. Test a selection whose starting values differ, edit/Undo, and an actual scrub/drag cancellation. | Numeric/hex draft Escape, invalid-draft page switching and Export labels passed at 320 px on `85fc694b67`; two-kind opacity display/edit/Undo passed on `ee80ec48c6`. Compare all unrelated typed content/assets after Save/reopen; keyboard draft cancellation does not prove drag cancellation. |
-| 2 — Clipboard and structure | Preserve `/tmp/fanta-clipboard-native-20261005`; use a fresh copy for Cut, page/menu Duplicate, asset-bearing subtrees and Duplicate-state restart. | The 15-node complete-set keyboard Duplicate/Paste journey, saved Undo/Redo, external-reference preservation and Paste restart passed on `9ca127c1be`. Bitmap cross-page checks and visible cross-document refusal passed earlier. Compare complete content/assets and original masters in the remaining journeys; prototype playback and successful cross-project transfer are not established here. |
-| 3 — Large-page save and drag | Preserve `/tmp/fanta-spectrum-layout-acceptance-20261005`, its post-image-Undo state, the pristine reconstruction and the earlier failure project. The page-visit and image-filled frame (import index 2110) journey passed on `a82f90f87b`. Instance index 4358 move/Save and one Undo/Save also passed against the post-image-restart baseline. Next repeat its inconclusive strict saved-Undo restart and natively verify PR 52's layout/reload corrections. | The image journey retained parent/order and all unrelated geometry/assets, with only exact predicted revision/timestamp changes; its saved Undo state survived restart strictly. The instance check allowed only predicted local Y1.5→2 and exact revisions2/4 plus timestamp; restart must have zero differences against its saved Undo state. Do not waive geometry/numeric differences or reuse the earlier offline conversion's 15,278 normalizations as exceptions. Reconfirm persisted target IDs; fresh-import IDs are not stable. Quiet-machine timings and whole-page visual fidelity remain separate gates. |
-| 4 — Variables, Motion and Prototype | Continue on `/tmp/fanta-release-variables-prototype-20261005`, preserving its evidence. Preserve the separate four-node source-prototype fixture and its passing Remove/Undo snapshots; repeat restart against a baseline that includes any intended user edits. Then sample easing cancellation and another prototype trigger; separately exercise aliases or a different binding type. | The earlier two-mode, Motion and prototype samples passed on `ee80ec48c6`. Corrected title containment/toggle, bound row/picker/Detach/Undo, time-field seek and non-destructive detail X passed on `0a0d3cd1c4`, with strict restart equality. Explicit Remove/Save and one Undo/Save also pass on `a82f90f87b`; its restart mismatch is retained as confirmed user edits against a stale baseline, with no matching-baseline pass claimed. Compare complete typed content and assets; these samples do not cover all triggers, easing types, aliases or variant combinations. |
-| 5 — Source editing and recovery | Preserve `/tmp/fanta-release-source-layout-20261005` and its strict restored baseline. On the corrected build, test embedded Find, source edit→Save→one editor Undo→Save, and valid FNX plus invalid JSON followed by visible discard of only the invalid draft. | The earlier valid FNX/repair/manual restore/restart passes remain separate from Undo FAIL and missing Discard. Confirm canvas lock, pending computed geometry remains saveable, exact complete readback and no unexpected buffer focus/history reset. Repeat clean external watcher persistence with PR 52. |
+| 2 — Clipboard and structure | Preserve `/tmp/fanta-clipboard-native-20261005`; use a fresh asset-bearing copy for locked-node keyboard Cut/Duplicate, cutting a master with surviving instances, menu/page Duplicate, Cut/Paste and Duplicate-state restart after the reproduced guard fixes. | Require no mutation for protected nodes and no surviving instance with a deleted master; compare every typed field, asset ID and byte across Save/Undo/Redo/reopen. Earlier asset-free 15-node subtree Duplicate/Paste and Paste restart passed on `9ca127c1be`. Mounted asset-subtree menu Duplicate/Cut is a control, not complete native or persistence coverage. |
+| 3 — Large-page save and drag | Preserve `/tmp/fanta-spectrum-layout-acceptance-20261005`, its post-image-Undo state, the pristine reconstruction and the earlier failure project. The page-visit and image-filled frame (import index 2110) journey passed on `a82f90f87b`. Instance index 4358 move/Save and one Undo/Save also passed against the post-image-restart baseline. Next repeat its inconclusive strict saved-Undo restart. PR 52's three small layout/reload fixtures now pass native checks and separate cold-process reopening; this does not replace dense-page acceptance. | The image journey retained parent/order and all unrelated geometry/assets, with only exact predicted revision/timestamp changes; its saved Undo state survived restart strictly. The instance check allowed only predicted local Y1.5→2 and exact revisions2/4 plus timestamp; restart must have zero differences against its saved Undo state. Do not waive geometry/numeric differences or reuse the earlier offline conversion's 15,278 normalizations as exceptions. Reconfirm persisted target IDs; fresh-import IDs are not stable. Quiet-machine timings and whole-page visual fidelity remain separate gates. |
+| 4 — Variables, Motion and Prototype | Preserve `/tmp/fanta-release-variables-prototype-20261005`, the original source-prototype evidence and `/tmp/fanta-release-prototype-current-baseline-20261005`. Next sample easing cancellation, another prototype trigger and overlays, then aliases or a different binding type. | Earlier two-mode, Motion and prototype samples passed on `ee80ec48c6`; bound controls, title, time-field seek and detail X passed on `0a0d3cd1c4`. Explicit Remove/Undo passed on `a82f90f87b`; matching user-edited baseline Save/restart now passes on `ac038333e3`. Its earlier stale-baseline failure remains retained. Compare complete typed content/assets; none proves all triggers, easing, aliases or variants. |
+| 5 — Source editing and recovery | Preserve `/tmp/fanta-release-source-layout-20261005` and `/tmp/fanta-recovery-source-layout-20261005` with their evidence. Find/Save/Undo/Redo pass on `3e3f275fcd`; partial FNX Save, invalid JSON Discard, Canvas Save/repeat Save and strict restart pass on `ac038333e3`. Next test recovery Undo and a genuine external same-path edit during a pending source draft, including Cancel, then tabs/windows during async Save. | Retain canvas lock and visible errors; Cancel must preserve the external bytes, last valid scene and draft. Require exact complete readback and unchanged unrelated files/assets. Delayed owned-event and genuine external-conflict cases pass mounted tests; they are not independent native race-injection evidence. Clean external reload/autosave/cold-process reopening passes separately on the small PR 52 fixture. |
 
 ## Reproducible local verification
 

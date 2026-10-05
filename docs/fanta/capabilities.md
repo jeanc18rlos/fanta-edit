@@ -43,35 +43,12 @@ component FNX source, identity sidecars, metadata and assets. See
   project. Bundled Git and distribution-specific restrictions are covered by
   the separate release workflow.
 
-Corrected native checks on a large imported project now preserve page visits,
-an isolated nested image move/Save, Undo/Save and restart of the saved Undo state.
-A separate instance flow-child move/Save and single Undo/Save also pass; its
-restart is inconclusive after an interrupted native attempt. The checks compare
-all persisted content and assets. [PR 52](https://github.com/jeanc18rlos/fanta-edit/pull/52)
-corrects two further layout defects with automated regressions: preserving
-unaffected fixed nested layouts and keeping external source-computed geometry
-saveable. Those fixes still require native retests.
-
-The native Code workspace can save a source spacing change and its computed
-geometry, retain an invalid JSON draft, and save a repaired draft. Manual
-restoration and restart matched the baseline strictly. However, embedded Find,
-source Undo after Save, and selected-only Discard draft failed or were missing
-in that tested build. Their corrections now pass automated validation: 1,089
-editor tests and 3 benchmark tests, with focused Code workspace cases across
-five scheduler seeds. Native checks on `3e3f275fcd` now pass Find in both formats
-and Save/repeat Save/single Undo/Redo with exact persisted content. Draft recovery
-still has an open native issue: after discarding invalid JSON, Save requires
-canvas focus and then reports a stale-file warning without an external edit.
-That failed route remains under investigation.
-
-Explicit Prototype Remove/Save and one Undo/Save also pass complete four-node
-comparisons on `a82f90f87b`. The user confirmed that later Start/End position
-changes were their edits: the retained restart comparison is a stale-baseline
-mismatch, not evidence of an app regression. Restart against a matching baseline
-is still unverified. Complete native Save/drag performance and broader acceptance
-remain open. See the
-[coverage report](../alpha/CAPABILITY_COVERAGE.md) for the exact build, bounded
-results and remaining release gates.
+Representative native checks cover large-project image edits, scoped layout,
+source Find and Undo/Redo, invalid-draft recovery, prototype interaction removal,
+and saved-content preservation after reopening. These checks apply to specific
+builds and fixtures. The [coverage report](../alpha/CAPABILITY_COVERAGE.md) records
+those results, retained failures and remaining release gates, including clipboard
+preservation and native performance.
 
 Implementation: [document.rs](../../crates/fig_viewer/src/document.rs),
 [design_panel.rs](../../crates/fig_viewer/src/design_panel.rs),
@@ -104,6 +81,12 @@ Canvas, keyboard and toolbar Duplicate preserve copied component masters and
 complete variant sets using the same rules as Layers menu Duplicate. References
 to components outside the copied content remain unchanged. Ordinary Paste keeps
 its existing component references instead of creating new definitions.
+
+Clipboard release checks have exposed open command-guard defects: keyboard Cut
+can delete a locked bitmap, keyboard Duplicate can copy it despite the disabled
+menu policy, and cutting a component master can leave surviving instances with
+a missing master. Corrections are in progress; the earlier bounded Copy/Paste
+checks do not establish that every Cut or Duplicate route is safe.
 
 The properties inspector adapts to the selected kind and selection count. Its
 supported sections include position, size, rotation, opacity/blend,
