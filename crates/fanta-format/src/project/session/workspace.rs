@@ -72,6 +72,37 @@ pub(super) fn decode_shared_json<T: serde::de::DeserializeOwned>(
 }
 
 #[derive(Debug)]
+struct IndexedFileHashes {
+    files: BTreeMap<String, [u8; 32]>,
+    content_hash: ContentHash,
+    order: Vec<String>,
+}
+
+impl IndexedFileHashes {
+    fn new(files: &[(String, Vec<u8>)], previous: Option<&Self>) -> Self {
+        let file_hashes = hash_files(files);
+        // The reconciliation base can lag behind disk during a conflict. Reuse
+        // only an aggregate recorded alongside these exact per-file hashes.
+        let content_hash = previous
+            .filter(|previous| {
+                previous.files == file_hashes
+                    && previous
+                        .order
+                        .iter()
+                        .map(String::as_str)
+                        .eq(files.iter().map(|(name, _)| name.as_str()))
+            })
+            .map(|previous| previous.content_hash)
+            .unwrap_or_else(|| hash_file_set(files));
+        Self {
+            files: file_hashes,
+            content_hash,
+            order: files.iter().map(|(name, _)| name.clone()).collect(),
+        }
+    }
+}
+
+#[derive(Debug)]
 struct CachedReferenceTable {
     component_names: Vec<(ComponentId, String)>,
     variable_names: Vec<(VariableId, String, String)>,
@@ -148,7 +179,7 @@ pub struct WorkspaceSession {
     pub open: BTreeMap<ArtifactId, ArtifactSession>,
     reference_table_cache: Option<CachedReferenceTable>,
     pub file_index: BTreeMap<ArtifactId, ContentHash>,
-    file_hash_index: BTreeMap<ArtifactId, BTreeMap<String, [u8; 32]>>,
+    file_hash_index: BTreeMap<ArtifactId, IndexedFileHashes>,
     /// Optional workspace.fnx + dependency graph.
     pub workspace_ir: super::workspace_fnx::WorkspaceIr,
     /// Motion dual-read index (singleton or artifact stubs).
@@ -249,12 +280,8 @@ impl WorkspaceSession {
                 let id = ArtifactId::Page(page_id);
                 let design_dir = PathBuf::from(PAGES_DIR).join(&slug);
                 let files = read_indexed_file_set(&entry, ArtifactKind::Page)?;
-                let disk_hash = hash_file_set(
-                    &files
-                        .iter()
-                        .map(|(n, b)| (n.as_str(), b.as_slice()))
-                        .collect::<Vec<_>>(),
-                );
+                let file_hashes = IndexedFileHashes::new(&files, None);
+                let disk_hash = file_hashes.content_hash;
                 let meta = ArtifactMeta {
                     id: id.clone(),
                     kind: ArtifactKind::Page,
@@ -262,7 +289,7 @@ impl WorkspaceSession {
                     design_dir,
                     disk_hash,
                 };
-                file_hash_index.insert(id.clone(), hash_files(&files));
+                file_hash_index.insert(id.clone(), file_hashes);
                 file_index.insert(id.clone(), disk_hash);
                 artifacts.insert(id, meta);
             }
@@ -329,12 +356,8 @@ impl WorkspaceSession {
                 components.insert_def(def, design_dir.clone());
                 let id = ArtifactId::Component(cid);
                 let files = read_indexed_file_set(&entry, ArtifactKind::Component)?;
-                let disk_hash = hash_file_set(
-                    &files
-                        .iter()
-                        .map(|(n, b)| (n.as_str(), b.as_slice()))
-                        .collect::<Vec<_>>(),
-                );
+                let file_hashes = IndexedFileHashes::new(&files, None);
+                let disk_hash = file_hashes.content_hash;
                 let meta = ArtifactMeta {
                     id: id.clone(),
                     kind: ArtifactKind::Component,
@@ -342,7 +365,7 @@ impl WorkspaceSession {
                     design_dir,
                     disk_hash,
                 };
-                file_hash_index.insert(id.clone(), hash_files(&files));
+                file_hash_index.insert(id.clone(), file_hashes);
                 file_index.insert(id.clone(), disk_hash);
                 artifacts.insert(id, meta);
             }
@@ -505,7 +528,7 @@ impl WorkspaceSession {
             ArtifactId::Component(_) => crate::project::layout::MASTER_FNX,
             _ => return false,
         };
-        files.contains_key(source)
+        files.files.contains_key(source)
     }
 
     /// Source and identity bytes for the open page/component sessions. The
@@ -615,12 +638,16 @@ impl WorkspaceSession {
             let bytes = if let Some(projected) = projected {
                 projected
             } else {
-                let expected = self.file_hash_index.get(id).ok_or_else(|| {
-                    SessionError::InvalidState(format!(
-                        "{} has no reconciled file hashes",
-                        id.debug_label()
-                    ))
-                })?;
+                let expected = &self
+                    .file_hash_index
+                    .get(id)
+                    .ok_or_else(|| {
+                        SessionError::InvalidState(format!(
+                            "{} has no reconciled file hashes",
+                            id.debug_label()
+                        ))
+                    })?
+                    .files;
                 if !expected.contains_key(source_name) && !expected.contains_key(ids_name) {
                     continue;
                 }
@@ -679,12 +706,16 @@ impl WorkspaceSession {
                 ArtifactId::Component(id) => components.get(id),
                 _ => continue,
             };
-            let expected = self.file_hash_index.get(id).ok_or_else(|| {
-                SessionError::InvalidState(format!(
-                    "{} has no reconciled file hashes",
-                    id.debug_label()
-                ))
-            })?;
+            let expected = &self
+                .file_hash_index
+                .get(id)
+                .ok_or_else(|| {
+                    SessionError::InvalidState(format!(
+                        "{} has no reconciled file hashes",
+                        id.debug_label()
+                    ))
+                })?
+                .files;
             for name in artifact_file_names(meta.kind) {
                 let hash = expected.get(*name).copied();
                 let path = meta.design_dir.join(name);
@@ -724,7 +755,7 @@ impl WorkspaceSession {
                     let path = projected_dir.join(name);
                     let hash = occupant
                         .and_then(|meta| self.file_hash_index.get(&meta.id))
-                        .and_then(|files| files.get(*name))
+                        .and_then(|files| files.files.get(*name))
                         .copied();
                     if let Some(previous) = preconditions.insert(path, hash)
                         && previous != hash
@@ -810,6 +841,7 @@ impl WorkspaceSession {
                 continue;
             };
             let current = read_indexed_file_set(&self.root.join(projected_dir), meta.kind)?;
+            let file_hashes = IndexedFileHashes::new(&current, self.file_hash_index.get(id));
             let header = expected_artifact_header(document, id)?;
             let expected_header = json_bytes(&header)?;
             if current
@@ -838,19 +870,17 @@ impl WorkspaceSession {
                     let expected = written_hashes.get(&path).copied().or_else(|| {
                         self.file_hash_index
                             .get(id)
-                            .and_then(|files| files.get(name))
+                            .and_then(|files| files.files.get(name))
                             .copied()
                     });
-                    let current_hash = current
-                        .iter()
-                        .find(|(file_name, _)| file_name == name)
-                        .map(|(_, bytes)| sha256_bytes(bytes));
+                    let current_hash = file_hashes.files.get(name).copied();
                     if current_hash != expected {
                         return Err(SessionError::SaveBlocked(SaveBlocked::DiskChangedAgain));
                     }
                 }
             }
-            for (name, bytes) in current
+            for (name, current_hash) in file_hashes
+                .files
                 .iter()
                 .filter(|(name, _)| name.starts_with("nodes/"))
             {
@@ -860,19 +890,14 @@ impl WorkspaceSession {
                     .or_else(|| {
                         self.file_hash_index
                             .get(id)
-                            .and_then(|files| files.get(name))
+                            .and_then(|files| files.files.get(name))
                             .copied()
                     });
-                if expected != Some(sha256_bytes(bytes)) {
+                if expected != Some(*current_hash) {
                     return Err(SessionError::SaveBlocked(SaveBlocked::DiskChangedAgain));
                 }
             }
-            let disk_hash = hash_file_set(
-                &current
-                    .iter()
-                    .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
-                    .collect::<Vec<_>>(),
-            );
+            let disk_hash = file_hashes.content_hash;
             let mut meta = meta.clone();
             meta.design_dir = projected_dir.clone();
             meta.slug = projected_dir
@@ -903,7 +928,7 @@ impl WorkspaceSession {
             } else {
                 None
             };
-            accepted.push((id.clone(), meta, disk_hash, node_map, hash_files(&current)));
+            accepted.push((id.clone(), meta, disk_hash, node_map, file_hashes));
         }
 
         let doc_dir = self.root.join(DOC_DIR);
@@ -1049,8 +1074,10 @@ impl WorkspaceSession {
         let previous_disk_hash = session.disk_hash;
         let result = session.save(&self.root)?;
         if session.disk_hash != previous_disk_hash {
-            self.file_hash_index
-                .insert(id.clone(), hash_files(&session.project_to_files()?));
+            self.file_hash_index.insert(
+                id.clone(),
+                IndexedFileHashes::new(&session.project_to_files()?, None),
+            );
         }
         self.file_index.insert(id.clone(), session.disk_hash);
         if let Some(meta) = self.artifacts.get_mut(&id) {
@@ -1218,7 +1245,8 @@ impl WorkspaceSession {
             self.remove_artifact_index(id);
         } else if let Some(meta) = self.artifacts.get(id) {
             let files = read_indexed_file_set(&self.root.join(&meta.design_dir), meta.kind)?;
-            self.file_hash_index.insert(id.clone(), hash_files(&files));
+            self.file_hash_index
+                .insert(id.clone(), IndexedFileHashes::new(&files, None));
         }
         Ok(())
     }
@@ -1300,7 +1328,8 @@ impl WorkspaceSession {
             if known.is_none() {
                 let files = read_indexed_file_set(&self.root.join(&meta.design_dir), meta.kind)?;
                 self.file_index.insert(id.clone(), meta.disk_hash);
-                self.file_hash_index.insert(id.clone(), hash_files(&files));
+                self.file_hash_index
+                    .insert(id.clone(), IndexedFileHashes::new(&files, None));
                 self.artifacts.insert(id.clone(), meta.clone());
                 self.refresh_component_def(&meta)?;
                 events.push(SessionEvent::Created { id });
@@ -1481,7 +1510,14 @@ impl WorkspaceSession {
                 m.disk_hash = h;
             }
         }
-        self.file_hash_index.insert(id.clone(), hash_files(&files));
+        self.file_hash_index.insert(
+            id.clone(),
+            IndexedFileHashes {
+                files: hash_files(&files),
+                content_hash: h,
+                order: files.iter().map(|(name, _)| name.clone()).collect(),
+            },
+        );
         Ok(())
     }
 
@@ -1649,7 +1685,14 @@ impl WorkspaceSession {
             disk_hash,
         };
         self.file_index.insert(id.clone(), disk_hash);
-        self.file_hash_index.insert(id.clone(), hash_files(&pairs));
+        self.file_hash_index.insert(
+            id.clone(),
+            IndexedFileHashes {
+                files: hash_files(&pairs),
+                content_hash: disk_hash,
+                order: pairs.iter().map(|(name, _)| name.clone()).collect(),
+            },
+        );
         self.artifacts.insert(id.clone(), meta);
         Ok(id)
     }
@@ -2064,4 +2107,41 @@ fn hash_workspace_shared_on_disk(root: &Path) -> Result<ContentHash, SessionErro
             .map(|(n, b)| (n.as_str(), b.as_slice()))
             .collect::<Vec<_>>(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indexed_file_hashes_require_the_same_order_names_and_exact_bytes() {
+        let files = vec![
+            ("page.fnx".to_owned(), b"source".to_vec()),
+            ("page.ids.json".to_owned(), b"sidecar".to_vec()),
+            ("page.json".to_owned(), b"header".to_vec()),
+        ];
+        let previous = IndexedFileHashes::new(&files, None);
+        let mut changed_bytes = files.clone();
+        changed_bytes.first_mut().expect("source slot").1 = b"Source".to_vec();
+        let mut changed_order = files.clone();
+        changed_order.reverse();
+        let mut changed_name = files.clone();
+        changed_name.first_mut().expect("source slot").0 = "master.fnx".into();
+        let mut missing_file = files.clone();
+        missing_file.pop();
+        for current in [
+            files.clone(),
+            changed_bytes,
+            changed_order,
+            changed_name,
+            missing_file,
+        ] {
+            let indexed = IndexedFileHashes::new(&current, Some(&previous));
+            assert_eq!(indexed.content_hash, hash_file_set(&current));
+            assert_eq!(indexed.files, hash_files(&current));
+            if current != files {
+                assert_ne!(indexed.content_hash, previous.content_hash);
+            }
+        }
+    }
 }
