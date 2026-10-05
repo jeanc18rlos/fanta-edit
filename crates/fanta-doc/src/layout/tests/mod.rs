@@ -29,6 +29,7 @@ mod flow_and_transforms;
 mod grid;
 mod grow;
 mod hug;
+mod mutations;
 mod stacking;
 mod text;
 mod wrapping;

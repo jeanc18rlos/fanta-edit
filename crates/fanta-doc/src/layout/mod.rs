@@ -43,7 +43,7 @@ use crate::node::{
 use crate::style::StrokeAlign;
 use crate::transform::Transform2D;
 use glam::{DMat2, DVec2};
-use size::{LocalBox, local_box, set_size};
+use size::{LocalBox, local_box, set_size, size_would_change};
 
 /// Measures the text extent `(width, height)`. Auto-width text is unbounded;
 /// auto-height text wraps at its current `local_size[0]`. Injected so the doc
@@ -185,7 +185,16 @@ pub fn solve_auto_layout_with_variables(
     let mut tree = VariableTextTree { scene, overrides };
     solve_auto_layout(&mut tree, root, measure);
     for (id, solved) in tree.overrides {
-        if let Some(original) = tree.scene.get_mut(id) {
+        let changed = tree.scene.get(id).is_some_and(|original| {
+            original.transform != solved.transform
+                || match (&original.data, &solved.data) {
+                    (NodeData::Text(original), NodeData::Text(solved)) => {
+                        original.local_size != solved.local_size
+                    }
+                    _ => false,
+                }
+        });
+        if changed && let Some(original) = tree.scene.get_mut(id) {
             original.transform = solved.transform;
             if let (NodeData::Text(original), NodeData::Text(solved)) =
                 (&mut original.data, solved.data)
@@ -357,18 +366,21 @@ fn apply_text_autoresize<T: LayoutTree>(tree: &mut T, id: NodeId, measure: &mut 
     let new_size = match tree.node(id).map(|n| &n.data) {
         Some(NodeData::Text(t)) if t.auto_resize != TextAutoResize::None => {
             let (w, h) = measure(t);
-            Some([
+            let size = [
                 if t.auto_resize == TextAutoResize::Height {
                     t.local_size[0]
                 } else {
                     w.max(0.0)
                 },
                 h.max(0.0),
-            ])
+            ];
+            (size != t.local_size).then_some(size)
         }
         _ => None,
     };
-    if let (Some([w, h]), Some(node)) = (new_size, tree.node_mut(id)) {
+    if let Some([w, h]) = new_size
+        && let Some(node) = tree.node_mut(id)
+    {
         if let NodeData::Text(t) = &mut node.data {
             t.local_size = [w, h];
         }
@@ -764,9 +776,19 @@ fn total_line_cross(line_thickness: &[f64], counter_spacing: f64) -> f64 {
 fn write_flow_children<T: LayoutTree>(tree: &mut T, infos: &[ChildInfo], flow_indices: &[usize]) {
     for &i in flow_indices {
         let info = &infos[i];
+        let Some(node) = tree.node(info.id) else {
+            continue;
+        };
+        let resize = size_would_change(node, info.bx.size[0], info.bx.size[1]);
+        let transform = info_transform(info);
+        if !resize && node.transform == transform {
+            continue;
+        }
         if let Some(node) = tree.node_mut(info.id) {
-            set_size(node, info.bx.size[0], info.bx.size[1]);
-            node.transform = info_transform(info);
+            if resize {
+                set_size(node, info.bx.size[0], info.bx.size[1]);
+            }
+            node.transform = transform;
         }
     }
 }
@@ -787,7 +809,9 @@ fn refresh_resized_flow_children<T: LayoutTree>(
         if changed == [false, false] {
             continue;
         }
-        if let Some(node) = tree.node_mut(info.id) {
+        if size_would_change(node, info.bx.size[0], info.bx.size[1])
+            && let Some(node) = tree.node_mut(info.id)
+        {
             set_size(node, info.bx.size[0], info.bx.size[1]);
         }
         if changed[0]
