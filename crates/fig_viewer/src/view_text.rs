@@ -22,60 +22,6 @@ use crate::text_edit::{self, CARET_BLINK_INTERVAL, CanvasTextEdit, TextEditSessi
 use crate::view::{FigView, TextEditSeed};
 
 impl FigView {
-    /// The topmost text node under `screen`, if any. The hit test returns
-    /// leaves, so a text node is normally hit directly; walk up the ancestor
-    /// chain for content nested under one (e.g. instance-expanded children).
-    pub(crate) fn text_node_at(&self, screen: DVec2, cx: &App) -> Option<NodeId> {
-        let bounds = self.container_bounds?;
-        let viewport = self.viewport?;
-        let (width, height) = bounds_size(bounds);
-        let screen_size = DVec2::new(width, height);
-        let item = self.item.read(cx);
-        let document = item.document()?;
-        let doc = &document.doc;
-        let world_point = fanta_canvas::screen_to_world(screen, &viewport, screen_size);
-        let hits = fanta_canvas::hit_test_deep(
-            &doc.scene,
-            world_point,
-            HitPrecision::Path,
-            doc.active_page(),
-        );
-        for hit in hits {
-            if matches!(
-                doc.scene.get(hit)?.data,
-                NodeData::Text(_) | NodeData::TextPath(_)
-            ) && text_edit::node_contains_screen(doc, hit, screen, &viewport, screen_size)
-            {
-                return Some(hit);
-            }
-            // Check ancestors (e.g. text containing other hittable nodes).
-            if let Some(text) = doc.scene.ancestors_of(hit).find(|node| {
-                matches!(node.data, NodeData::Text(_) | NodeData::TextPath(_))
-                    && text_edit::node_contains_screen(doc, node.id, screen, &viewport, screen_size)
-            }) {
-                return Some(text.id);
-            }
-            // Also search descendants: text nodes inside a frame/group that was
-            // hit. The renderer-backed predicate rejects empty areas inside a
-            // curved text layer's conservative spatial-index bounds.
-            for descendant_id in doc.scene.descendants_of(hit) {
-                if let Some(node) = doc.scene.get(descendant_id)
-                    && matches!(node.data, NodeData::Text(_) | NodeData::TextPath(_))
-                    && text_edit::node_contains_screen(
-                        doc,
-                        descendant_id,
-                        screen,
-                        &viewport,
-                        screen_size,
-                    )
-                {
-                    return Some(descendant_id);
-                }
-            }
-        }
-        None
-    }
-
     /// The topmost TEXT clone inside a component instance under `screen`,
     /// resolved for override editing. Instances are real scene nodes whose
     /// descendants are virtual, so the scene hit-test bottoms out at the

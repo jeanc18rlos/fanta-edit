@@ -152,7 +152,7 @@ pub(crate) fn layers_tree(
 ) -> Vec<LayersPanelItem> {
     let context = KindContext::from_doc(doc);
     if let Some(root) = page_root
-        && doc.is_component_root(root)
+        && context.component_roots.contains(&root)
     {
         return build_node(doc, root, expanded, &context)
             .into_iter()
@@ -183,7 +183,7 @@ fn build_node(
         has_children,
         visible: !node.flags.contains(fanta_doc::NodeFlags::HIDDEN),
         locked: node.flags.contains(fanta_doc::NodeFlags::LOCKED),
-        context_actions: Some(context_actions_with_kind(doc, id, kind)),
+        context_actions: Some(context_actions_with_kind(doc, id, kind, context)),
     })
 }
 
@@ -211,13 +211,15 @@ pub(crate) fn context_actions(
     let Some(node) = doc.scene.get(id) else {
         return Vec::new();
     };
-    context_actions_with_kind(doc, id, layers_kind(id, node, &KindContext::from_doc(doc)))
+    let context = KindContext::from_doc(doc);
+    context_actions_with_kind(doc, id, layers_kind(id, node, &context), &context)
 }
 
 fn context_actions_with_kind(
     doc: &Doc,
     id: NodeId,
     kind: LayersPanelNodeKind,
+    context: &KindContext,
 ) -> Vec<fanta_gpui::layers::LayersPanelContextAction> {
     use fanta_gpui::layers::LayersPanelContextAction as Action;
     let Some(node) = doc.scene.get(id) else {
@@ -228,7 +230,7 @@ fn context_actions_with_kind(
         .ancestors_of(id)
         .any(|node| node.flags.contains(fanta_doc::NodeFlags::LOCKED));
     let locked = node.flags.contains(fanta_doc::NodeFlags::LOCKED);
-    let master = doc.is_component_root(id);
+    let master = context.component_roots.contains(&id);
     let mut actions = fanta_gpui::layers::context_actions_for_kind(kind);
     actions.retain(|action| {
         if inherited_lock {
@@ -238,8 +240,9 @@ fn context_actions_with_kind(
             return matches!(action, Action::Copy | Action::CopyPasteAs | Action::LockUnlock | Action::GoToMainComponent);
         }
         match action {
+            Action::Flatten => crate::layer_context_ops::can_flatten_with_component_roots(doc, id, &context.component_roots),
             Action::OutlineStroke => match &node.data {
-                NodeData::Text(_) => true,
+                NodeData::Text(_) => crate::layer_context_ops::can_flatten_with_component_roots(doc, id, &context.component_roots),
                 NodeData::Vector(value) => !value.strokes.is_empty(),
                 NodeData::Group(value) => !value.strokes.is_empty(),
                 NodeData::Boolean(value) => !value.strokes.is_empty(),
@@ -540,6 +543,125 @@ mod tests {
         for id in [frame, text, rectangle, image] {
             assert!(!context_actions(&doc, id).contains(&Action::SendToFigmaMake));
         }
+    }
+
+    #[test]
+    fn shared_component_index_preserves_nested_master_action_eligibility() {
+        use fanta_gpui::layers::LayersPanelContextAction as Action;
+
+        let mut doc = Doc::new();
+        let page = insert(&mut doc, group(), None);
+        doc.add_page(page);
+        let ordinary = insert(&mut doc, group(), Some(page));
+        insert(&mut doc, rect(), Some(ordinary));
+        let container = insert(&mut doc, group(), Some(page));
+        let master = insert(&mut doc, group(), Some(container));
+        insert(&mut doc, rect(), Some(master));
+        let vector_master = insert(&mut doc, rect(), Some(page));
+        for root in [master, vector_master] {
+            let component = ComponentId::new();
+            doc.components.defs.insert(
+                component,
+                ComponentDef::new(component, root, "Protected component"),
+            );
+        }
+        let context = KindContext::from_doc(&doc);
+        for (id, allowed) in [
+            (ordinary, true),
+            (container, false),
+            (master, false),
+            (vector_master, false),
+        ] {
+            assert_eq!(crate::layer_context_ops::can_flatten(&doc, id), allowed);
+            assert_eq!(
+                crate::layer_context_ops::can_flatten_with_component_roots(
+                    &doc,
+                    id,
+                    &context.component_roots
+                ),
+                allowed
+            );
+            assert_eq!(
+                context_actions(&doc, id).contains(&Action::Flatten),
+                allowed
+            );
+        }
+        let tree = layers_tree(
+            &doc,
+            Some(page),
+            &HashSet::from([ordinary, container, master]),
+        );
+        let mut pending: Vec<_> = tree.iter().collect();
+        while let Some(row) = pending.pop() {
+            let id = node_id(&row.id).expect("node id");
+            assert_eq!(
+                row.context_actions.as_ref().expect("projected actions"),
+                &context_actions(&doc, id)
+            );
+            pending.extend(&row.children);
+        }
+        assert!(context_actions(&doc, ordinary).contains(&Action::Ungroup));
+        assert!(!context_actions(&doc, master).contains(&Action::Ungroup));
+    }
+
+    #[test]
+    #[ignore = "bounded CPU projection benchmark; run explicitly with --ignored --nocapture"]
+    fn component_heavy_layer_actions_bench() {
+        use sha2::{Digest as _, Sha256};
+        use std::time::Instant;
+
+        let mut doc = Doc::new();
+        let page = insert(&mut doc, group(), None);
+        doc.add_page(page);
+        let component_page = insert(&mut doc, group(), None);
+        doc.add_page(component_page);
+        for _ in 0..2000 {
+            insert(&mut doc, rect(), Some(page));
+            let root = insert(&mut doc, group(), Some(component_page));
+            let component = ComponentId::new();
+            doc.components.defs.insert(
+                component,
+                ComponentDef::new(component, root, "Benchmark component"),
+            );
+        }
+        let expanded = HashSet::new();
+        for _ in 0..3 {
+            std::hint::black_box(layers_tree(&doc, Some(page), &expanded));
+        }
+        let expected_actions: Vec<_> = layers_tree(&doc, Some(page), &expanded)
+            .into_iter()
+            .map(|row| row.context_actions)
+            .collect();
+        assert_eq!(expected_actions.len(), 2000);
+        let action_signature = format!("{:x}", Sha256::digest(format!("{expected_actions:?}")));
+        let mut milliseconds = Vec::new();
+        for _ in 0..11 {
+            let started = Instant::now();
+            let rows = layers_tree(&doc, Some(page), &expanded);
+            milliseconds.push(started.elapsed().as_secs_f64() * 1000.0);
+            assert_eq!(
+                rows.into_iter()
+                    .map(|row| row.context_actions)
+                    .collect::<Vec<_>>(),
+                expected_actions
+            );
+        }
+        milliseconds.sort_by(f64::total_cmp);
+        println!(
+            "{}",
+            serde_json::json!({
+                "measurement": "layer-tree projection CPU microbenchmark; not native or Spectrum drag latency",
+                "debug_assertions": cfg!(debug_assertions),
+                "displayed_vectors": 2000,
+                "component_definitions": 2000,
+                "warmup_projections": 3,
+                "measured_projections": milliseconds.len(),
+                "median_ms": milliseconds.get(5).expect("median sample"),
+                "p95_ms": milliseconds.last().expect("p95 sample"),
+                "max_ms": milliseconds.last().expect("max sample"),
+                "action_signature_sha256": action_signature,
+            })
+        );
     }
 
     #[test]

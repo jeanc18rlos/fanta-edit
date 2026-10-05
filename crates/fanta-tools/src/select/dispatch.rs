@@ -108,7 +108,8 @@ impl SelectTool {
         // catches only when the resize hit-test misses. Both win over a plain
         // node-hit so dragging near a small node's corner doesn't demote to a
         // move.
-        if !modifiers.extend_selection() && ctx.doc.selection.len() == 1 {
+        let drill_in = count >= 2 && count.is_multiple_of(2) && !modifiers.extend_selection();
+        if !drill_in && !modifiers.extend_selection() && ctx.doc.selection.len() == 1 {
             if let Some(&id) = ctx.doc.selection.iter().next() {
                 if let Some((local, world_transform)) =
                     super::resize::authored_resize_bounds(ctx, id)
@@ -173,7 +174,7 @@ impl SelectTool {
         // Double-click drills one level deeper, tracked by `self.scope`.
         let world = ctx.screen_to_world(screen);
         let scope_page = ctx.scope();
-        let Some(leaf) = ctx.hit_test(world, HitPrecision::Path) else {
+        let Some(mut leaf) = ctx.hit_test(world, HitPrecision::Path) else {
             // Empty canvas: exit any entered scope; release will clear/marquee.
             self.scope = None;
             self.phase = Phase::PressedOnEmpty {
@@ -181,6 +182,24 @@ impl SelectTool {
             };
             return ToolResponse::cursor(CursorHint::Crosshair);
         };
+
+        if let Some(scope) = self.scope
+            && (leaf == scope
+                || ctx
+                    .doc
+                    .scene
+                    .ancestors_of(leaf)
+                    .any(|node| node.id == scope)
+                || ctx
+                    .doc
+                    .scene
+                    .ancestors_of(scope)
+                    .any(|node| node.id == leaf))
+        {
+            leaf = ctx
+                .hit_test_in_scope(world, HitPrecision::Path, Some(scope))
+                .unwrap_or(leaf);
+        }
 
         // Drop a stale (deleted) or out-of-subtree entered scope so resolution
         // falls back to page level when the click leaves the entered container.
@@ -194,9 +213,19 @@ impl SelectTool {
 
         // Double-click drills in: enter the container the single click would
         // select, then resolve to its child toward the cursor (one level down).
-        if count >= 2 {
+        if drill_in {
             let here = Self::resolve_in_scope(&ctx.doc.scene, leaf, self.scope.or(scope_page));
-            self.scope = Some(here);
+            if ctx
+                .doc
+                .scene
+                .get(here)
+                .is_some_and(|node| node.can_have_children())
+            {
+                self.scope = Some(here);
+                leaf = ctx
+                    .hit_test_in_scope(world, HitPrecision::Path, self.scope)
+                    .unwrap_or(leaf);
+            }
         }
 
         let base = self.scope.or(scope_page);
@@ -210,7 +239,7 @@ impl SelectTool {
         // path acts on `selection` directly and so never had this bug. Skipped
         // while extending (Shift/Cmd, which toggles membership) and on a
         // double-click (which must always DRILL in, even into a selected frame).
-        let grabbed = (count < 2 && !extending)
+        let grabbed = (!drill_in && !extending)
             .then(|| {
                 std::iter::once(leaf)
                     .chain(ctx.doc.scene.ancestors_of(leaf).map(|a| a.id))

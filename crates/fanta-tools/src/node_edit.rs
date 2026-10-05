@@ -211,7 +211,7 @@ fn eligible_selection_target(doc: &Doc, scope: Option<NodeId>, id: NodeId) -> bo
             ancestor
                 .flags
                 .intersects(NodeFlags::LOCKED | NodeFlags::HIDDEN)
-                || matches!(ancestor.data, NodeData::Boolean(_))
+                || (matches!(ancestor.data, NodeData::Boolean(_)) && !doc.selection.contains(id))
         })
         || scope.is_some_and(|root| {
             id != root && !scene.ancestors_of(id).any(|ancestor| ancestor.id == root)

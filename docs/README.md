@@ -14,6 +14,9 @@ step: read the files here, or on GitHub.
   App Review, and Shipaton release checklist.
 - [`alpha/RELEASE_VALIDATION.md`](./alpha/RELEASE_VALIDATION.md) — measured
   performance, completed checks, and remaining release verification.
+- [`fanta/capabilities.md`](./fanta/capabilities.md) — current editor capability
+  guide; [`alpha/CAPABILITY_COVERAGE.md`](./alpha/CAPABILITY_COVERAGE.md) maps
+  capabilities to automated suites and the 5–11 October release gates.
 - [`alpha/RELEASE_STATUS_2026-09-12.md`](./alpha/RELEASE_STATUS_2026-09-12.md) —
   dated release report; [`SOL_ULTRA_HANDOFF.md`](./alpha/SOL_ULTRA_HANDOFF.md)
   provides the ordered continuation plan and ready-to-paste instructions.

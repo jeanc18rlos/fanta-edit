@@ -2722,7 +2722,7 @@ fn inspect_local_point(scene: &fanta_doc::Scene, id: NodeId, world_point: DVec2)
     local.is_finite().then_some(local)
 }
 
-fn inspect_descendants_visible_at(
+pub(crate) fn inspect_descendants_visible_at(
     scene: &fanta_doc::Scene,
     node: &fanta_doc::CanvasNode,
     world_point: DVec2,
@@ -2752,7 +2752,7 @@ fn inspect_descendants_visible_at(
     })
 }
 
-fn inspect_node_contains_point(
+pub(crate) fn inspect_node_contains_point(
     scene: &fanta_doc::Scene,
     node: &fanta_doc::CanvasNode,
     world_point: DVec2,

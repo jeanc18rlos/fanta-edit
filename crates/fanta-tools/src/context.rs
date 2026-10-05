@@ -162,7 +162,16 @@ impl<'a> ToolContext<'a> {
     }
 
     pub fn hit_test(&self, world_point: DVec2, precision: HitPrecision) -> Option<NodeId> {
-        hit_test_deep(&self.doc.scene, world_point, precision, self.scope())
+        self.hit_test_in_scope(world_point, precision, self.scope())
+    }
+
+    pub fn hit_test_in_scope(
+        &self,
+        world_point: DVec2,
+        precision: HitPrecision,
+        scope: Option<NodeId>,
+    ) -> Option<NodeId> {
+        hit_test_deep(&self.doc.scene, world_point, precision, scope)
             .into_iter()
             .find(|&id| {
                 self.hit_test_refiner

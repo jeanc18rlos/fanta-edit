@@ -67,41 +67,6 @@ fn expand_resolved(doc: &Doc, instance_id: NodeId) -> Option<(Vec<ExpandedNode>,
     Some((expanded, world))
 }
 
-/// The absolute world transform of the clone at `expanded[idx]`: fold the clone
-/// transforms from the expansion root's direct child down to the target onto
-/// `w_inst`, EXCLUDING the root clone's own transform (the renderer suppresses
-/// it — the instance node's transform, already in `w_inst`, positions the
-/// instance). `by_id` maps a clone id to its index in `expanded`.
-fn clone_world_transform(
-    expanded: &[ExpandedNode],
-    by_id: &HashMap<NodeId, usize>,
-    idx: usize,
-    w_inst: Transform2D,
-) -> Transform2D {
-    // Walk clone parent links target → up, collecting each node's transform but
-    // stopping BEFORE the root (a clone whose `parent` is `None`).
-    let mut chain: Vec<Transform2D> = Vec::new();
-    let mut cursor = idx;
-    loop {
-        let node = &expanded[cursor].node;
-        let Some(parent) = node.parent else {
-            break; // reached the expansion root — its transform is suppressed.
-        };
-        chain.push(node.transform);
-        let Some(&parent_idx) = by_id.get(&parent) else {
-            break;
-        };
-        cursor = parent_idx;
-    }
-    // `chain` is target → root-child; fold root-child → target so each inner
-    // transform composes under the outer ones (`acc = Tᵢ.then(&acc)`).
-    let mut world = w_inst;
-    for transform in chain.iter().rev() {
-        world = transform.then(&world);
-    }
-    world
-}
-
 /// Whether the clone at `idx` (or any of its clone ancestors) is hidden or
 /// fully transparent — the renderer skips those, so the hit-test must too, or
 /// a click would open an edit session on text that is never painted.
@@ -122,50 +87,59 @@ fn clone_is_painted(expanded: &[ExpandedNode], by_id: &HashMap<NodeId, usize>, i
     }
 }
 
-/// The topmost (last-painted) TEXT clone inside `instance_id` whose local box
-/// contains `world_point`, resolved for override editing. Paint order is the
-/// expansion's DFS pre-order, so the last containing text clone is on top.
 pub(crate) fn text_target_at(
     doc: &Doc,
     instance_id: NodeId,
     world_point: DVec2,
 ) -> Option<InstanceTextTarget> {
-    let (expanded, w_inst) = expand_resolved(doc, instance_id)?;
-    let by_id: HashMap<NodeId, usize> = expanded
+    let (expanded, world) = expand_resolved(doc, instance_id)?;
+    let paths = expanded
         .iter()
-        .enumerate()
-        .map(|(i, e)| (e.node.id, i))
-        .collect();
-
-    let mut hit: Option<(usize, Transform2D)> = None;
-    for (idx, entry) in expanded.iter().enumerate() {
-        let NodeData::Text(text) = &entry.node.data else {
-            continue;
-        };
-        if !clone_is_painted(&expanded, &by_id, idx) {
-            continue;
+        .map(|entry| (entry.node.id, entry.def_path.clone()))
+        .collect::<HashMap<_, _>>();
+    let mut scene = fanta_doc::Scene::new();
+    let nodes = expanded.into_iter().map(|entry| {
+        let mut node = entry.node;
+        // Instance rendering suppresses the master root's placement, and its
+        // invisible subtrees must not occlude another virtual text layer.
+        if node.parent.is_none() {
+            node.transform = world;
         }
-        let world = clone_world_transform(&expanded, &by_id, idx, w_inst);
-        if !world.is_finite() {
-            continue;
+        if node.opacity.get() <= 0.0 {
+            node.flags.insert(NodeFlags::HIDDEN);
         }
-        let local = world.inverse().transform_point(world_point);
-        let [w, h] = text.local_size;
-        if local.x >= 0.0 && local.x <= w && local.y >= 0.0 && local.y <= h {
-            hit = Some((idx, world)); // keep the last (topmost) match
-        }
+        node
+    });
+    if let Err(error) = scene.insert_many(nodes) {
+        log::warn!("could not hit-test component text: {error}");
+        return None;
     }
-
-    let (idx, world) = hit?;
-    let entry = &expanded[idx];
-    let NodeData::Text(text) = &entry.node.data else {
+    let hit = scene
+        .deep_hits_where(world_point, |id| {
+            let Some(node) = scene.get(id) else {
+                return false;
+            };
+            !node.flags.contains(NodeFlags::LOCKED)
+                && !scene.ancestors_of(id).any(|ancestor| {
+                    ancestor.flags.contains(NodeFlags::LOCKED)
+                        || !crate::canvas::inspect_descendants_visible_at(
+                            &scene,
+                            ancestor,
+                            world_point,
+                        )
+                })
+                && crate::canvas::inspect_node_contains_point(&scene, node, world_point)
+        })
+        .into_iter()
+        .next()?;
+    let NodeData::Text(text) = &scene.get(hit)?.data else {
         return None;
     };
     Some(InstanceTextTarget {
         instance_id,
-        def_path: entry.def_path.clone(),
+        def_path: paths.get(&hit)?.clone(),
         text: text.clone(),
-        world,
+        world: scene.world_transform(hit)?,
     })
 }
 
@@ -445,6 +419,98 @@ mod tests {
             text_target_at(&doc, instance_id, DVec2::new(520.0, 330.0)).is_none(),
             "a hidden clone must not be an edit target"
         );
+    }
+
+    #[test]
+    fn locked_text_or_ancestor_cannot_open_an_instance_override() {
+        for lock_parent in [false, true] {
+            let (mut doc, instance, path) = doc_with_nested_instance();
+            let target = if lock_parent {
+                path.first()
+            } else {
+                path.last()
+            }
+            .copied()
+            .expect("master path");
+            doc.scene
+                .get_mut(target)
+                .expect("master node")
+                .flags
+                .insert(NodeFlags::LOCKED);
+            assert!(text_target_at(&doc, instance, DVec2::new(550.0, 370.0)).is_none());
+            assert_eq!(
+                text_clones(&doc, instance).len(),
+                1,
+                "locked text remains visible in properties"
+            );
+        }
+    }
+
+    #[test]
+    fn virtual_text_hit_respects_occlusion_and_visible_cover_geometry() {
+        for cover_kind in ["filled", "hidden", "transparent", "outline", "outside"] {
+            let (mut doc, instance, path) = doc_with_instance();
+            let text = doc
+                .scene
+                .get(*path.first().expect("text path"))
+                .expect("master text");
+            let mut vector = fanta_doc::VectorNode::rect_solid(0.0, 0.0, 120.0, 30.0, Color::WHITE);
+            if cover_kind == "outline" {
+                vector.fills.clear();
+            }
+            let mut cover = CanvasNode::new(NodeData::Vector(vector));
+            cover.parent = text.parent;
+            cover.transform = if cover_kind == "outside" {
+                Transform2D::translation(200.0, 200.0)
+            } else {
+                text.transform
+            };
+            cover.index = fanta_doc::IndexKey::after(text.index);
+            if cover_kind == "hidden" {
+                cover.flags.insert(NodeFlags::HIDDEN);
+            }
+            if cover_kind == "transparent" {
+                cover.opacity = fanta_doc::UnitInterval::new(0.0);
+            }
+            doc.apply(Operation::create_node(cover)).expect("cover");
+            let before = serde_json::to_value(&doc).expect("original document");
+            let hit = text_target_at(&doc, instance, DVec2::new(520.0, 330.0));
+            assert_eq!(hit.is_some(), cover_kind != "filled", "{cover_kind}");
+            assert_eq!(
+                serde_json::to_value(&doc).expect("document after hit"),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn clipped_virtual_text_is_not_an_edit_target() {
+        let (mut doc, instance, path) = doc_with_nested_instance();
+        let inner = *path.first().expect("inner group");
+        let NodeData::Group(group) = &mut doc.scene.get_mut(inner).expect("inner group").data
+        else {
+            panic!("group")
+        };
+        group.clip_size = Some([5.0, 5.0]);
+        assert!(text_target_at(&doc, instance, DVec2::new(550.0, 370.0)).is_none());
+    }
+
+    #[test]
+    fn rounded_virtual_clip_rejects_text_outside_its_visible_corner() {
+        let (mut doc, instance, path) = doc_with_nested_instance();
+        let inner = *path.first().expect("inner group");
+        let text = *path.last().expect("text");
+        doc.scene.get_mut(text).expect("text").transform = Transform2D::IDENTITY;
+        let NodeData::Group(group) = &mut doc.scene.get_mut(inner).expect("inner group").data
+        else {
+            panic!("group")
+        };
+        group.clip_size = Some([100.0, 100.0]);
+        group.corner_radius = Some(40.0);
+        assert!(text_target_at(&doc, instance, DVec2::new(532.0, 342.0)).is_none());
+        doc.scene.get_mut(inner).expect("inner group").meta =
+            serde_json::json!({"clip_content": false});
+        assert!(text_target_at(&doc, instance, DVec2::new(532.0, 342.0)).is_some());
     }
 
     #[test]

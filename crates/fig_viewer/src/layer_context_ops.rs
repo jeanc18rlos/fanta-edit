@@ -6,6 +6,7 @@ use fanta_doc::{
 };
 use fanta_gpui::layers::LayersPanelContextAction as Action;
 use smallvec::SmallVec;
+use std::collections::HashSet;
 
 pub(crate) fn replace_data(node: &CanvasNode, data: NodeData) -> Operation {
     Operation::ReplaceData {
@@ -435,33 +436,269 @@ fn local_outline(doc: &Doc, id: NodeId) -> Result<skia_safe::Path> {
     }
 }
 
-fn flatten(doc: &Doc, id: NodeId) -> Result<Vec<Operation>> {
+#[cfg(test)]
+pub(crate) fn can_flatten(doc: &Doc, id: NodeId) -> bool {
+    validate_flatten(doc, id).is_ok()
+}
+
+pub(crate) fn can_flatten_with_component_roots(
+    doc: &Doc,
+    id: NodeId,
+    component_roots: &HashSet<NodeId>,
+) -> bool {
+    validate_flatten_with_component_roots(doc, id, component_roots).is_ok()
+}
+
+fn validate_flatten(doc: &Doc, id: NodeId) -> Result<()> {
+    let component_roots = doc
+        .components
+        .defs
+        .values()
+        .map(|definition| definition.root)
+        .collect();
+    validate_flatten_with_component_roots(doc, id, &component_roots)
+}
+
+fn validate_flatten_with_component_roots(
+    doc: &Doc,
+    id: NodeId,
+    component_roots: &HashSet<NodeId>,
+) -> Result<()> {
     let node = doc.scene.get(id).context("Missing layer")?;
-    if matches!(node.data, NodeData::Instance(_)) {
-        let mut scratch = doc.clone();
-        let mut operations = crate::properties_ops::detach_instance_operations(doc, id);
-        ensure!(!operations.is_empty(), "The main component is unavailable");
-        for operation in &operations {
-            scratch.apply(operation.clone())?;
-        }
-        operations.extend(flatten(&scratch, id)?);
-        return Ok(operations);
+    ensure!(
+        node.bindings.is_empty(),
+        "Flatten cannot preserve variable bindings"
+    );
+    ensure!(
+        !doc.scene
+            .descendants_of(id)
+            .any(|child| component_roots.contains(&child)),
+        "Detach component content before flattening"
+    );
+    for child in doc.scene.descendants_of(id).filter(|child| *child != id) {
+        let child = doc.scene.get(child).context("Missing child")?;
+        ensure!(
+            child.opacity == fanta_doc::UnitInterval::ONE
+                && child.blend_mode.is_normal()
+                && child.effects.is_empty()
+                && child.blurs.is_empty()
+                && !child.is_mask
+                && !child
+                    .flags
+                    .intersects(fanta_doc::NodeFlags::HIDDEN | fanta_doc::NodeFlags::LOCKED)
+                && child.bindings.is_empty()
+                && child.reactions.is_empty(),
+            "Flatten cannot preserve a child's appearance or interactions"
+        );
     }
-    let releases = release_components(doc, &[id])?;
-    if !releases.is_empty() {
-        let mut scratch = doc.clone();
-        for operation in &releases {
-            scratch.apply(operation.clone())?;
+    ensure!(
+        !doc.motion
+            .clips
+            .values()
+            .any(|clip| clip.tracks.values().any(|track| {
+                track.target.node != id
+                    && doc
+                        .scene
+                        .ancestors_of(track.target.node)
+                        .any(|parent| parent.id == id)
+            })),
+        "Flatten cannot preserve animated children"
+    );
+    match &node.data {
+        NodeData::Vector(vector) => ensure!(
+            vector.path.subpath_rules.is_empty(),
+            "Flatten cannot preserve mixed path fill rules"
+        ),
+        NodeData::Text(text) => ensure!(
+            std::iter::once(&text.style)
+                .chain(text.style_runs.iter().map(|run| &run.style))
+                .all(|style| style.color == text.style.color
+                    && !style.underline
+                    && !style.strikethrough),
+            "Flatten cannot preserve mixed text colors or decorations"
+        ),
+        NodeData::Group(_) => {
+            ensure!(
+                node.opacity == fanta_doc::UnitInterval::ONE
+                    && node.blend_mode.is_normal()
+                    && node.effects.is_empty()
+                    && node.blurs.is_empty(),
+                "Flatten cannot preserve the group's compositing effects"
+            );
+            let mut paint = None;
+            validate_flatten_group(doc, id, &mut paint)?;
+            ensure!(paint.is_some(), "The layer has no painted geometry");
         }
-        let mut operations = releases;
-        operations.extend(flatten(&scratch, id)?);
-        return Ok(operations);
+        NodeData::Boolean(_) => validate_boolean_flatten_geometry(doc, id)?,
+        _ => bail!("This layer cannot be flattened without changing its appearance"),
     }
+    Ok(())
+}
+
+fn validate_flatten_pattern_sources(doc: &Doc, id: NodeId) -> Result<()> {
+    let node = doc.scene.get(id).context("Missing layer")?;
+    if !matches!(node.data, NodeData::Vector(_)) || !doc.scene.children_of(Some(id)).is_empty() {
+        let affected: HashSet<_> = doc.scene.descendants_of(id).collect();
+        // Flatten deletes descendants and can change the retained node's
+        // tile bounds. Either change would alter another node's live pattern.
+        ensure!(
+            !doc.scene
+                .roots()
+                .iter()
+                .flat_map(|root| doc.scene.descendants_of(*root))
+                .filter(|node| *node == id || !affected.contains(node))
+                .filter_map(|node| doc.scene.get(node))
+                .any(|node| references_pattern_source(&node.data, &affected)),
+            "Flatten would change a pattern source used by another layer"
+        );
+    }
+    Ok(())
+}
+
+fn references_pattern_source(data: &NodeData, affected: &HashSet<NodeId>) -> bool {
+    let references = |paint: &Fill| matches!(paint, Fill::Pattern { pattern, .. } if affected.contains(&pattern.source_node_id));
+    if data
+        .strokes()
+        .is_some_and(|strokes| strokes.iter().any(|stroke| references(&stroke.paint)))
+    {
+        return true;
+    }
+    match data {
+        NodeData::Vector(vector) => vector.fills.iter().any(references),
+        NodeData::Boolean(boolean) => boolean.fills.iter().any(references),
+        NodeData::Group(group) => group
+            .background
+            .iter()
+            .chain(&group.background_fills)
+            .any(references),
+        NodeData::Instance(instance) => {
+            instance.overrides.iter().any(|entry| match &entry.value {
+                fanta_doc::OverrideValue::Fills { fills } => fills.iter().any(references),
+                fanta_doc::OverrideValue::Strokes { strokes } => {
+                    strokes.iter().any(|stroke| references(&stroke.paint))
+                }
+                fanta_doc::OverrideValue::Field { value } => {
+                    field_references_pattern_source(value, affected)
+                }
+                _ => false,
+            }) || instance.derived.iter().any(|entry| {
+                entry
+                    .fills
+                    .as_ref()
+                    .is_some_and(|fills| fills.iter().any(references))
+            })
+        }
+        _ => false,
+    }
+}
+
+fn field_references_pattern_source(value: &serde_json::Value, affected: &HashSet<NodeId>) -> bool {
+    match value {
+        serde_json::Value::Object(fields) => {
+            (value.get("kind").and_then(serde_json::Value::as_str) == Some("pattern")
+                && value
+                    .pointer("/pattern/source_node_id")
+                    .and_then(|source| serde_json::from_value::<NodeId>(source.clone()).ok())
+                    .is_some_and(|source| affected.contains(&source)))
+                || fields
+                    .values()
+                    .any(|field| field_references_pattern_source(field, affected))
+        }
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|field| field_references_pattern_source(field, affected)),
+        _ => false,
+    }
+}
+
+fn validate_flatten_group(doc: &Doc, id: NodeId, paint: &mut Option<Fill>) -> Result<()> {
+    let node = doc.scene.get(id).context("Missing layer")?;
+    match &node.data {
+        NodeData::Group(group) => {
+            ensure!(
+                group.clip_size.is_none()
+                    && group.background.is_none()
+                    && group.background_fills.is_empty()
+                    && group.strokes.is_empty()
+                    && group.auto_layout.is_none()
+                    && group.grid.is_none()
+                    && group.explicit_modes.is_empty(),
+                "Flatten cannot preserve frame paints, clipping or layout"
+            );
+            for child in doc.scene.children_of(Some(id)) {
+                validate_flatten_group(doc, *child, paint)?;
+            }
+        }
+        NodeData::Vector(vector) => {
+            let clipped = vector.local_size.is_some_and(|[width, height]| {
+                !node.flags.contains(fanta_doc::NodeFlags::UNCLIPPED_VECTOR)
+                    && !vector.path.rough_bounds().is_some_and(|bounds| {
+                        bounds.min_x >= 0.
+                            && bounds.min_y >= 0.
+                            && bounds.max_x <= width
+                            && bounds.max_y <= height
+                    })
+            });
+            ensure!(
+                vector.strokes.is_empty() && !clipped && vector.path.subpath_rules.is_empty(),
+                "Flatten cannot preserve child strokes or clipping"
+            );
+            let [fill @ Fill::Solid { color, blend }] = vector.fills.as_slice() else {
+                bail!("Flatten requires one opaque solid paint per child");
+            };
+            ensure!(
+                color.a == 255 && blend.is_normal(),
+                "Flatten cannot preserve translucent paints"
+            );
+            if let Some(previous) = paint {
+                ensure!(
+                    previous == fill,
+                    "Flatten cannot preserve different child paints"
+                );
+            } else {
+                *paint = Some(fill.clone());
+            }
+        }
+        _ => bail!("Flatten cannot preserve this group's child content"),
+    }
+    Ok(())
+}
+
+fn validate_boolean_flatten_geometry(doc: &Doc, id: NodeId) -> Result<()> {
+    let node = doc.scene.get(id).context("Missing operand")?;
+    match &node.data {
+        NodeData::Vector(vector) => ensure!(
+            vector.corner_radius.is_none()
+                && vector.corner_radii.is_none()
+                && vector.path.subpath_rules.is_empty(),
+            "Flatten cannot preserve this Boolean operand's geometry"
+        ),
+        NodeData::Group(group) => ensure!(
+            group.background.is_none() && group.background_fills.is_empty(),
+            "Flatten cannot preserve a Boolean operand's frame background"
+        ),
+        NodeData::Boolean(_) => {}
+        _ => bail!("Flatten cannot preserve this Boolean operand"),
+    }
+    for child in doc.scene.children_of(Some(id)) {
+        validate_boolean_flatten_geometry(doc, *child)?;
+    }
+    Ok(())
+}
+
+fn flatten(doc: &Doc, id: NodeId) -> Result<Vec<Operation>> {
+    validate_flatten(doc, id)?;
+    validate_flatten_pattern_sources(doc, id)?;
+    let node = doc.scene.get(id).context("Missing layer")?;
     let outline = local_outline(doc, id)?;
-    let path =
+    let mut path =
         PathData::from_svg_d(&outline.to_svg()).context("Could not serialize vector outline")?;
+    path.fill_rule = match outline.fill_type() {
+        skia_safe::PathFillType::EvenOdd => fanta_doc::FillRule::EvenOdd,
+        _ => fanta_doc::FillRule::NonZero,
+    };
     let mut fills = paints(&node.data);
-    if fills.is_empty() {
+    if fills.is_empty() && matches!(node.data, NodeData::Group(_)) {
         for child in doc.scene.descendants_of(id) {
             if let Some(node) = doc.scene.get(child) {
                 let paint = paints(&node.data);
@@ -487,29 +724,16 @@ fn flatten(doc: &Doc, id: NodeId) -> Result<Vec<Operation>> {
         NodeData::Group(value) => value.strokes.clone(),
         _ => SmallVec::new(),
     };
-    for (clip, animation) in &doc.motion.clips {
-        for track in animation.tracks.values() {
-            if track.target.node != id
-                && doc
-                    .scene
-                    .ancestors_of(track.target.node)
-                    .any(|parent| parent.id == id)
-            {
-                operations.push(Operation::SetAnimationTrack {
-                    clip: *clip,
-                    track: track.id,
-                    old: Some(Box::new(track.clone())),
-                    new: None,
-                });
-            }
-        }
-    }
     operations.push(replace_data(
         node,
         NodeData::Vector(VectorNode {
             path,
             fills,
             strokes,
+            local_size: match &node.data {
+                NodeData::Vector(vector) => vector.local_size,
+                _ => None,
+            },
             ..Default::default()
         }),
     ));
@@ -1170,6 +1394,336 @@ mod tests {
                 doc.scene.get(group).expect("node").data,
                 NodeData::Vector(_)
             ));
+        });
+    }
+
+    #[test]
+    fn flatten_refuses_unsupported_appearance_without_changing_the_document() {
+        for unsupported in [
+            "paint",
+            "opacity",
+            "effect",
+            "mask",
+            "clip",
+            "stroke",
+            "hidden",
+            "group-opacity",
+        ] {
+            let (mut doc, page, _) = fixture();
+            let group = insert(
+                &mut doc,
+                CanvasNode::new(NodeData::Group(GroupNode::default())),
+                Some(page),
+            );
+            insert(&mut doc, rect(), Some(group));
+            let child = insert(&mut doc, rect(), Some(group));
+            if unsupported == "group-opacity" {
+                doc.scene.get_mut(group).expect("group").opacity = UnitInterval::new(0.5);
+            } else if unsupported == "clip" {
+                let NodeData::Group(group) = &mut doc.scene.get_mut(group).expect("group").data
+                else {
+                    panic!("group fixture");
+                };
+                group.clip_size = Some([10., 10.]);
+            } else {
+                let node = doc.scene.get_mut(child).expect("child");
+                match unsupported {
+                    "opacity" => node.opacity = UnitInterval::new(0.5),
+                    "effect" => node.effects.push(fanta_doc::Shadow {
+                        kind: fanta_doc::ShadowKind::Drop,
+                        color: Color::BLACK,
+                        blur: 4.,
+                        spread: 0.,
+                        offset: [2., 2.],
+                        show_behind_node: false,
+                    }),
+                    "mask" => node.is_mask = true,
+                    "hidden" => node.flags.insert(fanta_doc::NodeFlags::HIDDEN),
+                    _ => {
+                        let NodeData::Vector(vector) = &mut node.data else {
+                            panic!("vector fixture");
+                        };
+                        if unsupported == "paint" {
+                            vector.fills = smallvec::smallvec![Fill::solid(Color::WHITE)];
+                        } else {
+                            vector.strokes.push(Stroke::solid(Color::WHITE, 4.));
+                        }
+                    }
+                }
+            }
+            let before = serde_json::to_value(&doc).expect("snapshot");
+            let history = doc.history.undo_depth();
+            assert!(!can_flatten(&doc, group), "{unsupported}");
+            assert!(
+                simple(&doc, group, Action::Flatten).is_err(),
+                "{unsupported}"
+            );
+            assert!(
+                !crate::gpui_adapters::layers::context_actions(&doc, group)
+                    .contains(&Action::Flatten)
+            );
+            assert_eq!(serde_json::to_value(&doc).expect("unchanged doc"), before);
+            assert_eq!(doc.history.undo_depth(), history);
+        }
+        let mut doc = Doc::new();
+        let mut text = fanta_doc::TextNode::new("Two colors", 100., 30.);
+        let mut style = text.style.clone();
+        style.color = Color::WHITE;
+        text.style_runs.push(fanta_doc::TextStyleRun {
+            start: 4,
+            end: 10,
+            style,
+        });
+        let text = insert(&mut doc, CanvasNode::new(NodeData::Text(text)), None);
+        let before = serde_json::to_value(&doc).expect("text snapshot");
+        assert!(simple(&doc, text, Action::OutlineStroke).is_err());
+        assert!(
+            !crate::gpui_adapters::layers::context_actions(&doc, text)
+                .contains(&Action::OutlineStroke)
+        );
+        assert_eq!(serde_json::to_value(&doc).expect("unchanged text"), before);
+    }
+
+    fn flatten_pixels(doc: &Doc) -> Vec<u8> {
+        let mut renderer = fanta_render::RasterRenderer::new(128, 128).expect("renderer");
+        renderer.render(&doc.scene, &doc.viewport);
+        renderer.copy_rgba()
+    }
+
+    fn node_pattern(source_node_id: NodeId) -> Fill {
+        Fill::Pattern {
+            pattern: Box::new(fanta_doc::PatternFill {
+                source_node_id,
+                tile_type: Default::default(),
+                scaling_factor: 1.,
+                spacing: Default::default(),
+                horizontal_alignment: Default::default(),
+            }),
+            opacity: 1.,
+            blend: fanta_doc::BlendMode::Normal,
+        }
+    }
+
+    #[test]
+    fn flatten_refuses_direct_and_indirect_pattern_sources_without_changing_pixels() {
+        for source_kind in [
+            "child",
+            "nested-child",
+            "container",
+            "indirect",
+            "boolean-child",
+            "text",
+        ] {
+            let mut doc = Doc::new();
+            let mut container = CanvasNode::new(if source_kind == "text" {
+                NodeData::Text(fanta_doc::TextNode::new("Pattern", 100., 40.))
+            } else if source_kind == "boolean-child" {
+                NodeData::Boolean(fanta_doc::BooleanNode::default())
+            } else {
+                NodeData::Group(GroupNode {
+                    local_size: Some([100., 100.]),
+                    ..Default::default()
+                })
+            });
+            container.transform = Transform2D::translation(200., 200.);
+            let root = insert(&mut doc, container, None);
+            let parent = if source_kind == "nested-child" {
+                insert(
+                    &mut doc,
+                    CanvasNode::new(NodeData::Group(GroupNode::default())),
+                    Some(root),
+                )
+            } else {
+                root
+            };
+            let child = if source_kind == "text" {
+                root
+            } else {
+                insert(&mut doc, rect(), Some(parent))
+            };
+            assert!(can_flatten(&doc, root));
+            let mut source = if source_kind == "container" {
+                root
+            } else {
+                child
+            };
+            if source_kind == "indirect" {
+                let mut intermediary = VectorNode::rect_solid(0., 0., 40., 20., Color::WHITE);
+                intermediary.fills = smallvec::smallvec![node_pattern(source)];
+                let mut intermediary = CanvasNode::new(NodeData::Vector(intermediary));
+                intermediary.transform = Transform2D::translation(400., 400.);
+                source = insert(&mut doc, intermediary, None);
+            }
+            let mut target = VectorNode::rect_solid(-20., -20., 40., 40., Color::WHITE);
+            target.fills = smallvec::smallvec![node_pattern(source)];
+            insert(&mut doc, CanvasNode::new(NodeData::Vector(target)), None);
+            let before = serde_json::to_value(&doc).expect("snapshot");
+            let pixels = flatten_pixels(&doc);
+            assert!(
+                pixels.chunks_exact(4).any(|pixel| pixel[3] > 0),
+                "visible pattern {source_kind}"
+            );
+            let history = doc.history.undo_depth();
+            assert!(
+                can_flatten(&doc, root),
+                "appearance-only menu eligibility: {source_kind}"
+            );
+            let error =
+                simple(&doc, root, Action::Flatten).expect_err("refuse pattern source deletion");
+            assert!(
+                error.to_string().contains("pattern source"),
+                "{source_kind}: {error}"
+            );
+            assert_eq!(
+                serde_json::to_value(&doc).expect("unchanged document"),
+                before
+            );
+            assert_eq!(flatten_pixels(&doc), pixels);
+            assert_eq!(doc.history.undo_depth(), history);
+        }
+    }
+
+    #[test]
+    fn flatten_pattern_guard_covers_every_typed_paint_slot_and_field_overrides() {
+        let source = NodeId::new();
+        let pattern = node_pattern(source);
+        let mut stroke = Stroke::solid(Color::BLACK, 2.);
+        stroke.paint = pattern.clone();
+        let mut cases = vec![
+            NodeData::Vector(VectorNode {
+                fills: smallvec::smallvec![pattern.clone()],
+                ..Default::default()
+            }),
+            NodeData::Vector(VectorNode {
+                strokes: smallvec::smallvec![stroke.clone()],
+                ..Default::default()
+            }),
+            NodeData::Group(GroupNode {
+                background: Some(pattern.clone()),
+                ..Default::default()
+            }),
+            NodeData::Group(GroupNode {
+                background_fills: smallvec::smallvec![pattern.clone()],
+                ..Default::default()
+            }),
+            NodeData::Group(GroupNode {
+                strokes: smallvec::smallvec![stroke.clone()],
+                ..Default::default()
+            }),
+            NodeData::Boolean(fanta_doc::BooleanNode {
+                fills: smallvec::smallvec![pattern.clone()],
+                ..Default::default()
+            }),
+            NodeData::Boolean(fanta_doc::BooleanNode {
+                strokes: smallvec::smallvec![stroke.clone()],
+                ..Default::default()
+            }),
+        ];
+        let instance = InstanceNode {
+            component: ComponentId::new(),
+            overrides: Vec::new(),
+            prop_values: Default::default(),
+            derived: Vec::new(),
+            local_size: [40., 20.],
+        };
+        for value in [
+            fanta_doc::OverrideValue::Fills {
+                fills: smallvec::smallvec![pattern.clone()],
+            },
+            fanta_doc::OverrideValue::Strokes {
+                strokes: smallvec::smallvec![stroke],
+            },
+            fanta_doc::OverrideValue::Field {
+                value: serde_json::json!({"fills": [pattern]}),
+            },
+        ] {
+            let mut instance = instance.clone();
+            instance.overrides.push(fanta_doc::Override {
+                target_path: Default::default(),
+                target_prop: fanta_doc::BoundProp::FillColor { index: 0 },
+                value,
+            });
+            cases.push(NodeData::Instance(instance));
+        }
+        let mut instance = instance;
+        instance.derived.push(fanta_doc::DerivedOverride {
+            path: Default::default(),
+            transform: None,
+            size: None,
+            fills: Some(smallvec::smallvec![pattern]),
+            path_data: None,
+            stroke_path: None,
+            stroke_weight: None,
+            text: None,
+        });
+        cases.push(NodeData::Instance(instance));
+        let affected = HashSet::from([source]);
+        let unrelated = HashSet::from([NodeId::new()]);
+        for data in cases {
+            assert!(references_pattern_source(&data, &affected), "{data:?}");
+            assert!(!references_pattern_source(&data, &unrelated));
+        }
+        assert!(!field_references_pattern_source(
+            &serde_json::json!({"fills": [{"kind": "pattern", "pattern": {"source_node_id": "invalid"}}]}),
+            &affected,
+        ));
+    }
+
+    #[test]
+    fn supported_group_and_boolean_flatten_preserve_pixels_and_undo() {
+        for kind in ["group", "union", "subtract", "unfilled"] {
+            let mut doc = Doc::new();
+            let data = if kind == "group" {
+                NodeData::Group(GroupNode::default())
+            } else {
+                NodeData::Boolean(fanta_doc::BooleanNode {
+                    op: if kind == "subtract" {
+                        fanta_doc::BooleanOp::Subtract
+                    } else {
+                        fanta_doc::BooleanOp::Union
+                    },
+                    fills: if kind == "unfilled" {
+                        SmallVec::new()
+                    } else {
+                        smallvec::smallvec![Fill::solid(Color::BLACK)]
+                    },
+                    strokes: smallvec::smallvec![Stroke::solid(Color::WHITE, 2.)],
+                })
+            };
+            let root = insert(&mut doc, CanvasNode::new(data), None);
+            let mut first = rect();
+            if let NodeData::Vector(vector) = &mut first.data {
+                vector.local_size = Some([40., 20.]);
+            }
+            insert(&mut doc, first, Some(root));
+            let mut second = rect();
+            second.transform = Transform2D::translation(20., 10.);
+            insert(&mut doc, second, Some(root));
+            let pixels = flatten_pixels(&doc);
+            assert!(can_flatten(&doc, root), "{kind}");
+            let operations = simple(&doc, root, Action::Flatten).expect("flatten supported shape");
+            roundtrip(&mut doc, operations, |doc| {
+                assert_eq!(flatten_pixels(doc), pixels, "{kind}");
+                assert!(doc.scene.children_of(Some(root)).is_empty());
+            });
+        }
+    }
+
+    #[test]
+    fn vector_flatten_preserves_even_odd_holes_and_viewport_clip() {
+        let mut doc = Doc::new();
+        let mut vector = VectorNode::rect_solid(0., 0., 40., 40., Color::BLACK);
+        vector
+            .path
+            .segments
+            .extend(PathData::rect(10., 10., 20., 20.).segments);
+        vector.path.fill_rule = fanta_doc::FillRule::EvenOdd;
+        vector.local_size = Some([35., 35.]);
+        let root = insert(&mut doc, CanvasNode::new(NodeData::Vector(vector)), None);
+        let pixels = flatten_pixels(&doc);
+        let operations = simple(&doc, root, Action::Flatten).expect("flatten clipped vector");
+        roundtrip(&mut doc, operations, |doc| {
+            assert_eq!(flatten_pixels(doc), pixels)
         });
     }
 

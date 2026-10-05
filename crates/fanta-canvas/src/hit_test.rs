@@ -90,7 +90,7 @@ pub fn hit_test(
     precision: HitPrecision,
     active_page: Option<NodeId>,
 ) -> Option<NodeId> {
-    scene.topmost_hit_where(world_point, |id| {
+    scene.topmost_hit_in_scope_where(world_point, active_page, |id| {
         page_scoped(scene, id, active_page)
             && !locked_by_flags(scene, id)
             && accept_precision(scene, id, world_point, precision)
@@ -185,7 +185,7 @@ pub fn hit_test_deep(
     active_page: Option<NodeId>,
 ) -> SmallVec<[NodeId; 8]> {
     scene
-        .deep_hits_where(world_point, |id| {
+        .deep_hits_in_scope_where(world_point, active_page, |id| {
             page_scoped(scene, id, active_page)
                 && !locked_by_flags(scene, id)
                 && accept_precision(scene, id, world_point, precision)

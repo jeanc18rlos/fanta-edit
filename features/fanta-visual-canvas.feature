@@ -43,6 +43,36 @@ Feature: Visual Design Canvas
     Then the text node renders with the default font
     And I can edit the text directly or via inspector
 
+  Scenario Outline: Double-click activates the selected node's editor
+    Given a visible unlocked <node> is selected on the active page in Design mode
+    And the Move tool is active
+    When I double-click the node without selection modifiers
+    Then <result>
+    And unrelated artwork and assets remain unchanged
+
+    Examples:
+      | node             | result                                      |
+      | text             | inline text editing opens at the word       |
+      | text on path     | inline text editing preserves the baseline  |
+      | vector           | Edit Path exposes the vector handles        |
+      | bitmap           | Crop activates and awaits a crop region     |
+      | video            | the properties inspector opens              |
+      | audio            | the properties inspector opens              |
+      | non-text instance | the properties inspector opens             |
+
+  Scenario: Double-click drills into one container level at a time
+    Given a nested frame containing editable text is selected
+    When I double-click its child container
+    Then selection drills into one container level
+    And an extra third click does not drill into another level
+    And inline text editing only starts after the text itself is selected
+
+  Scenario: Double-click obeys editing permissions
+    Given a locked node or an Inspect-mode document
+    When I double-click the canvas node
+    Then no artwork editing session starts
+    And the document history and saved content remain unchanged
+
   Scenario: Multiple selection and reparenting
     Given several nodes are selected
     When I reparent them under a new container
@@ -106,11 +136,14 @@ Feature: FNX Source + Visual Synchronization
     Then the operation is rejected with source_edit_locked
     And I must save the FNX buffer first
 
-  Scenario: Advanced styling only possible in FNX
+  Scenario: Advanced styling through inspector and FNX
     Given a node on canvas
-    When I want gradients, shadows, auto-layout or variable bindings
-    Then I edit the .fnx source
-    And save to see updates on canvas
+    When I edit a supported gradient, shadow, auto-layout or variable binding in the inspector
+    Then the canvas previews the change
+    And committing the change creates an undoable edit
+    And saving writes the corresponding FNX source
+    When I make a valid supported edit in that FNX source and save
+    Then the canvas reflects the source edit
 
 Feature: Motion, Timeline and Prototypes
   As a designer
@@ -151,6 +184,12 @@ Feature: Agent-driven Design Operations (DesignSurface)
     And one op would fail
     Then the entire batch rolls back
     And the result reports which op failed and why
+    And no partial assets, selection change or undo step is left behind
+
+  Scenario: Successful agent batch is one undoable edit
+    Given a design is open
+    When the agent applies a valid batch of create_node, set_props and reparent operations
+    Then all operations are applied
     And a single undo step is created with the provided label
 
   Scenario: Agent requests screenshots for verification

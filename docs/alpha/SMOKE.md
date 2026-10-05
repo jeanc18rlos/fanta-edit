@@ -1,5 +1,12 @@
 # Fanta alpha smoke test
 
+**Historical alpha.1 checklist.** Its dated results and control descriptions
+belong to the builds recorded below. For the October 2026 candidate, use the
+[current capability guide](../fanta/capabilities.md) and
+[capability coverage/release gates](CAPABILITY_COVERAGE.md). In particular, Code
+editing, advanced tools and the inspector have changed; old placeholder and
+read-only expectations are not current acceptance criteria.
+
 Run on the build machine and again on a second macOS account, downloading the
 DMG through a browser so quarantine is exercised the way a tester will hit it.
 
