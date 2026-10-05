@@ -263,6 +263,7 @@ fn create_selection_mask(
                 op,
                 fills: smallvec::smallvec![Fill::solid(Color::WHITE)],
                 strokes: smallvec::smallvec![],
+                baked: None,
             })
         }
         _ => NodeData::Vector(VectorNode {

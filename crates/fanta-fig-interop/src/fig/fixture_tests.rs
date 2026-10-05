@@ -7,10 +7,9 @@
 use super::*;
 
 /// Release gate for reported node-structure loss, independent of render fidelity.
-/// Spectrum currently fails: its Boolean operations are flattened and operands
-/// are omitted. An unset fixture is an error, never a successful skipped gate.
+/// An unset fixture is an error, never a successful skipped gate.
 #[test]
-#[ignore = "release gate: requires FANTA_FIG_FIXTURE; Spectrum Boolean structure is not yet preserved"]
+#[ignore = "release gate: requires FANTA_FIG_FIXTURE pointing at a representative .fig"]
 fn imports_real_fig_fixture_without_node_structure_loss() {
     let path = std::env::var("FANTA_FIG_FIXTURE")
         .expect("set FANTA_FIG_FIXTURE to the representative .fig being release-validated");

@@ -163,6 +163,9 @@ pub(crate) fn build_vector(
         "geometry": geom_tag,
         "stroke_only_outline": stroke_only,
     });
+    if let Some(guid) = change.get("guid").and_then(super::guid_key) {
+        node.meta["figma_id"] = serde_json::json!(guid);
+    }
     // Preserve original vectorNetworkBlob index for exact VectorNetwork
     // preservation / roundtrips (editable data, not just baked PathData).
     if from_vector_network {

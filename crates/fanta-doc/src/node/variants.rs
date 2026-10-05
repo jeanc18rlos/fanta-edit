@@ -104,9 +104,7 @@ pub struct GroupNode {
 /// *operands* under [`op`](BooleanNode::op), painted with this node's own
 /// `fills` / `strokes`. The operands are ordinary child nodes in the scene (like
 /// a [`GroupNode`]); the renderer materializes each child's outline to a path
-/// and folds them with path-ops. Native Boolean editing supports UNION /
-/// SUBTRACT / INTERSECT / EXCLUDE. The `.fig` importer currently retains baked
-/// vector geometry instead and reports the loss of editable Boolean operands.
+/// and folds them with path-ops.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct BooleanNode {
     /// Which set operation folds the operands.
@@ -120,6 +118,17 @@ pub struct BooleanNode {
     /// [`VectorNode::strokes`]. Empty ⇒ unstroked.
     #[serde(default, skip_serializing_if = "SmallVec::is_empty")]
     pub strokes: SmallVec<[Stroke; 1]>,
+    /// Imported appearance, usable only while its operand signature matches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baked: Option<BooleanBakedGeometry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BooleanBakedGeometry {
+    pub vector: VectorNode,
+    pub source: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stroke_outline: bool,
 }
 
 /// Horizontal constraint (Figma style) for children of non-auto-layout parents.

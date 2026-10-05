@@ -28,6 +28,7 @@ zip.workspace = true
 zstd.workspace = true
 
 [dev-dependencies]
+fanta-fnx.workspace = true
 # Tier-2 fidelity E2E only: derive `Deserialize` for the distilled OpenPencil
 # golden model. `serde_json` (a runtime dep) does the parsing.
 serde = { version = "1", features = ["derive"] }

@@ -858,3 +858,141 @@ fn nested_property_assignment_resolves_ancestor_root_before_child_properties() {
     assert_eq!(report.override_nested_resolved, 3);
     assert_swap_context_expansion(&doc, 2, "B");
 }
+
+#[test]
+fn boolean_instance_paint_snapshots_follow_master_edits_but_authored_paints_remain() {
+    for authored in [false, true] {
+        let mut nodes = swap_context_components();
+        let (fill, stroke) = if authored {
+            (
+                solid_paint(1.0, 0.0, 0.0, 1.0),
+                solid_paint(1.0, 1.0, 0.0, 1.0),
+            )
+        } else {
+            (
+                solid_paint(1.0, 1.0, 1.0, 1.0),
+                solid_paint(0.0, 0.0, 0.0, 1.0),
+            )
+        };
+        nodes.push(o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 12)),
+                ("parentIndex", parent_index(0, 10)),
+                ("type", KiwiValue::Enum("BOOLEAN_OPERATION".into())),
+                ("booleanOperation", KiwiValue::Enum("UNION".into())),
+                ("name", KiwiValue::String("Painted Boolean".into())),
+                ("size", vector(60.0, 20.0)),
+                (
+                    "fillPaints",
+                    KiwiValue::array(vec![solid_paint(1.0, 1.0, 1.0, 1.0)]),
+                ),
+                (
+                    "strokePaints",
+                    KiwiValue::array(vec![solid_paint(0.0, 0.0, 0.0, 1.0)]),
+                ),
+                ("strokeWeight", KiwiValue::Float(1.0)),
+            ],
+        ));
+        nodes.push(o(
+            "NodeChange",
+            vec![
+                ("guid", guid(0, 13)),
+                ("parentIndex", parent_index(0, 12)),
+                ("type", KiwiValue::Enum("RECTANGLE".into())),
+                ("size", vector(60.0, 20.0)),
+            ],
+        ));
+        nodes.push(swap_context_instance(
+            40,
+            None,
+            10,
+            vec![o(
+                "NodeChange",
+                vec![
+                    ("guidPath", swap_context_path(&[12])),
+                    ("fillPaints", KiwiValue::array(vec![fill])),
+                    ("strokePaints", KiwiValue::array(vec![stroke])),
+                    ("strokeWeight", KiwiValue::Float(1.0)),
+                ],
+            )],
+            Vec::new(),
+        ));
+        let (mut doc, _, _) = fig_to_doc(&doc_from(nodes)).expect("import Boolean paint overrides");
+        let paint_overrides = doc
+            .scene
+            .roots()
+            .iter()
+            .flat_map(|root| doc.scene.descendants_of(*root))
+            .find_map(|id| match &doc.scene.get(id)?.data {
+                NodeData::Instance(instance) if doc.scene.get(id)?.name == "Placement 40" => Some(
+                    instance
+                        .overrides
+                        .iter()
+                        .filter(|over| {
+                            matches!(
+                                &over.value,
+                                fanta_doc::OverrideValue::Fills { .. }
+                                    | fanta_doc::OverrideValue::Strokes { .. }
+                            )
+                        })
+                        .count(),
+                ),
+                _ => None,
+            })
+            .expect("outer instance paint overrides");
+        assert_eq!(paint_overrides, if authored { 2 } else { 0 });
+        let boolean_id = doc
+            .scene
+            .roots()
+            .iter()
+            .flat_map(|root| doc.scene.descendants_of(*root))
+            .find(|id| {
+                doc.scene
+                    .get(*id)
+                    .is_some_and(|node| node.name == "Painted Boolean")
+            })
+            .expect("Boolean master descendant");
+        let NodeData::Boolean(boolean) = &mut doc.scene.get_mut(boolean_id).expect("Boolean").data
+        else {
+            panic!("editable Boolean retained");
+        };
+        boolean.fills = [Fill::solid(Color::rgba(0, 0, 255, 255))]
+            .into_iter()
+            .collect();
+        boolean.strokes.first_mut().expect("stroke").paint =
+            Fill::solid(Color::rgba(0, 255, 0, 255));
+        let instance = doc
+            .scene
+            .roots()
+            .iter()
+            .flat_map(|root| doc.scene.descendants_of(*root))
+            .find_map(|id| match &doc.scene.get(id)?.data {
+                NodeData::Instance(instance) if doc.scene.get(id)?.name == "Placement 40" => {
+                    Some(instance)
+                }
+                _ => None,
+            })
+            .expect("outer instance");
+        let expanded = expand_instance(&doc.scene, &doc.components, instance);
+        let boolean = expanded
+            .iter()
+            .find_map(|entry| entry.node.data.as_boolean())
+            .expect("expanded Boolean");
+        let expected_fill = if authored {
+            Color::rgba(255, 0, 0, 255)
+        } else {
+            Color::rgba(0, 0, 255, 255)
+        };
+        let expected_stroke = if authored {
+            Color::rgba(255, 255, 0, 255)
+        } else {
+            Color::rgba(0, 255, 0, 255)
+        };
+        assert_eq!(boolean.fills.first(), Some(&Fill::solid(expected_fill)));
+        assert_eq!(
+            boolean.strokes.first().expect("expanded stroke").paint,
+            Fill::solid(expected_stroke)
+        );
+    }
+}

@@ -290,6 +290,7 @@ pub fn fig_to_doc(fig: &FigDocument) -> FigResult<(Doc, MapReport, HashMap<Asset
         &mut guid_to_node,
         &all_instance_ids,
     )?;
+    super::prepare_imported_booleans(&mut doc, &mut report, &mut guid_to_node, &guid_to_parent)?;
     resolve_grid_cells(&mut doc, &mut report, &grid_tracks, grid_anchors);
 
     // ---- pass 3: register pages + relocate component masters ----
@@ -448,6 +449,7 @@ pub fn fig_to_doc(fig: &FigDocument) -> FigResult<(Doc, MapReport, HashMap<Asset
     );
     report.image_assets_extracted = assets.len();
 
+    super::seal_imported_booleans(&mut doc)?;
     Ok((doc, report, assets))
 }
 
@@ -551,18 +553,7 @@ fn attach_to_parents(
         .order
         .into_iter()
         .filter_map(|id| built.remove(&id))
-        .map(|node| {
-            if matches!(&node.data, NodeData::Vector(_))
-                && node
-                    .meta
-                    .get("figma_type")
-                    .and_then(serde_json::Value::as_str)
-                    == Some("BOOLEAN_OPERATION")
-            {
-                report.boolean_operations_flattened += 1;
-            }
-            *node
-        });
+        .map(|node| *node);
     doc.scene
         .insert_many(batch)
         .map_err(|e| FigError::Mapping(e.to_string()))?;

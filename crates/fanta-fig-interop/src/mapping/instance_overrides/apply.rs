@@ -20,6 +20,7 @@ use std::collections::HashSet;
 fn master_paints(doc: &Doc, node_id: NodeId) -> (&[Fill], &[Stroke]) {
     match doc.scene.get(node_id).map(|node| &node.data) {
         Some(NodeData::Vector(v)) => (v.fills.as_slice(), v.strokes.as_slice()),
+        Some(NodeData::Boolean(boolean)) => (boolean.fills.as_slice(), boolean.strokes.as_slice()),
         Some(NodeData::Group(g)) => (g.background.as_slice(), g.strokes.as_slice()),
         _ => (&[], &[]),
     }

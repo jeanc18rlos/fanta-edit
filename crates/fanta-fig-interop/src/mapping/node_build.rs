@@ -191,7 +191,10 @@ pub(crate) fn build_node(type_name: &str, change: &KiwiValue, blobs: &[Vec<u8>])
         }
         // VECTOR-family geometry. STEP 2: decode the real path from the node's
         // `fillGeometry` command blobs; on failure keep the STEP-1 bbox fallback.
-        "VECTOR" | "STAR" | "LINE" | "BOOLEAN_OPERATION" | "REGULAR_POLYGON" => {
+        "BOOLEAN_OPERATION" => {
+            return super::build_boolean(change, size, &fills, transform, blobs);
+        }
+        "VECTOR" | "STAR" | "LINE" | "REGULAR_POLYGON" => {
             return build_vector(type_name, change, size, &fills, transform, blobs);
         }
         "TEXT" => build_text(change, size, first),

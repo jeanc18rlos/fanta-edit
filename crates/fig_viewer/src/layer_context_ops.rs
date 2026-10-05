@@ -529,7 +529,11 @@ fn validate_flatten_with_component_roots(
             validate_flatten_group(doc, id, &mut paint)?;
             ensure!(paint.is_some(), "The layer has no painted geometry");
         }
-        NodeData::Boolean(_) => validate_boolean_flatten_geometry(doc, id)?,
+        NodeData::Boolean(_) => {
+            if active_boolean_vector(doc, id)?.is_none() {
+                validate_boolean_flatten_geometry(doc, id)?;
+            }
+        }
         _ => bail!("This layer cannot be flattened without changing its appearance"),
     }
     Ok(())
@@ -664,6 +668,19 @@ fn validate_flatten_group(doc: &Doc, id: NodeId, paint: &mut Option<Fill>) -> Re
     Ok(())
 }
 
+fn active_boolean_vector(doc: &Doc, id: NodeId) -> Result<Option<VectorNode>> {
+    let node = doc.scene.get(id).context("Missing Boolean")?;
+    let Some(boolean) = node
+        .data
+        .as_boolean()
+        .filter(|boolean| boolean.baked.is_some())
+    else {
+        return Ok(None);
+    };
+    let signature = fanta_doc::boolean_geometry_signature(&doc.scene, id)?;
+    Ok(boolean.baked_vector(&signature))
+}
+
 fn validate_boolean_flatten_geometry(doc: &Doc, id: NodeId) -> Result<()> {
     let node = doc.scene.get(id).context("Missing operand")?;
     match &node.data {
@@ -677,7 +694,15 @@ fn validate_boolean_flatten_geometry(doc: &Doc, id: NodeId) -> Result<()> {
             group.background.is_none() && group.background_fills.is_empty(),
             "Flatten cannot preserve a Boolean operand's frame background"
         ),
-        NodeData::Boolean(_) => {}
+        NodeData::Boolean(boolean) => {
+            if boolean.baked.is_some() {
+                let signature = fanta_doc::boolean_geometry_signature(&doc.scene, id)?;
+                ensure!(
+                    boolean.baked_vector(&signature).is_none(),
+                    "Flatten cannot preserve this imported Boolean's baked appearance"
+                );
+            }
+        }
         _ => bail!("Flatten cannot preserve this Boolean operand"),
     }
     for child in doc.scene.children_of(Some(id)) {
@@ -690,24 +715,44 @@ fn flatten(doc: &Doc, id: NodeId) -> Result<Vec<Operation>> {
     validate_flatten(doc, id)?;
     validate_flatten_pattern_sources(doc, id)?;
     let node = doc.scene.get(id).context("Missing layer")?;
-    let outline = local_outline(doc, id)?;
-    let mut path =
-        PathData::from_svg_d(&outline.to_svg()).context("Could not serialize vector outline")?;
-    path.fill_rule = match outline.fill_type() {
-        skia_safe::PathFillType::EvenOdd => fanta_doc::FillRule::EvenOdd,
-        _ => fanta_doc::FillRule::NonZero,
-    };
-    let mut fills = paints(&node.data);
-    if fills.is_empty() && matches!(node.data, NodeData::Group(_)) {
-        for child in doc.scene.descendants_of(id) {
-            if let Some(node) = doc.scene.get(child) {
-                let paint = paints(&node.data);
-                if !paint.is_empty() {
-                    fills = paint;
+    let vector = if let Some(vector) = active_boolean_vector(doc, id)? {
+        vector
+    } else {
+        let outline = local_outline(doc, id)?;
+        let mut path = PathData::from_svg_d(&outline.to_svg())
+            .context("Could not serialize vector outline")?;
+        path.fill_rule = match outline.fill_type() {
+            skia_safe::PathFillType::EvenOdd => fanta_doc::FillRule::EvenOdd,
+            _ => fanta_doc::FillRule::NonZero,
+        };
+        let mut fills = paints(&node.data);
+        if fills.is_empty() && matches!(node.data, NodeData::Group(_)) {
+            for child in doc.scene.descendants_of(id) {
+                if let Some(node) = doc.scene.get(child) {
+                    let paint = paints(&node.data);
+                    if !paint.is_empty() {
+                        fills = paint;
+                    }
                 }
             }
         }
-    }
+        let strokes = match &node.data {
+            NodeData::Vector(value) => value.strokes.clone(),
+            NodeData::Boolean(value) => value.strokes.clone(),
+            NodeData::Group(value) => value.strokes.clone(),
+            _ => SmallVec::new(),
+        };
+        VectorNode {
+            path,
+            fills,
+            strokes,
+            local_size: match &node.data {
+                NodeData::Vector(vector) => vector.local_size,
+                _ => None,
+            },
+            ..Default::default()
+        }
+    };
     let mut operations = Vec::new();
     for child in doc.scene.children_of(Some(id)) {
         operations.push(Operation::DeleteSubtree {
@@ -718,25 +763,7 @@ fn flatten(doc: &Doc, id: NodeId) -> Result<Vec<Operation>> {
                 .collect(),
         });
     }
-    let strokes = match &node.data {
-        NodeData::Vector(value) => value.strokes.clone(),
-        NodeData::Boolean(value) => value.strokes.clone(),
-        NodeData::Group(value) => value.strokes.clone(),
-        _ => SmallVec::new(),
-    };
-    operations.push(replace_data(
-        node,
-        NodeData::Vector(VectorNode {
-            path,
-            fills,
-            strokes,
-            local_size: match &node.data {
-                NodeData::Vector(vector) => vector.local_size,
-                _ => None,
-            },
-            ..Default::default()
-        }),
-    ));
+    operations.push(replace_data(node, NodeData::Vector(vector)));
     Ok(operations)
 }
 
@@ -1670,6 +1697,105 @@ mod tests {
     }
 
     #[test]
+    fn flatten_preserves_root_bakes_and_refuses_nested_bakes_without_changing_content() {
+        for (nested, stroke_outline) in [(false, false), (false, true), (true, false)] {
+            let mut doc = Doc::new();
+            let root = insert(
+                &mut doc,
+                CanvasNode::new(NodeData::Boolean(fanta_doc::BooleanNode {
+                    fills: smallvec::smallvec![Fill::solid(Color::BLACK)],
+                    ..Default::default()
+                })),
+                None,
+            );
+            let baked_id = if nested {
+                insert(
+                    &mut doc,
+                    CanvasNode::new(NodeData::Boolean(fanta_doc::BooleanNode::default())),
+                    Some(root),
+                )
+            } else {
+                root
+            };
+            let operand = insert(&mut doc, rect(), Some(baked_id));
+            if stroke_outline {
+                let boolean = doc
+                    .scene
+                    .get_mut(baked_id)
+                    .expect("Boolean")
+                    .data
+                    .as_boolean_mut()
+                    .expect("Boolean data");
+                boolean.fills.clear();
+                boolean.strokes.push(Stroke::solid(Color::BLACK, 2.));
+            }
+            let mut vector = VectorNode::rect_solid(0., 0., 60., 30., Color::BLACK);
+            vector.local_size = Some([45., 25.]);
+            doc.scene
+                .get_mut(baked_id)
+                .expect("Boolean")
+                .data
+                .as_boolean_mut()
+                .expect("Boolean data")
+                .baked = Some(fanta_doc::BooleanBakedGeometry {
+                vector,
+                source: String::new(),
+                stroke_outline,
+            });
+            let source = fanta_doc::boolean_geometry_signature(&doc.scene, baked_id)
+                .expect("operand signature");
+            doc.scene
+                .get_mut(baked_id)
+                .expect("Boolean")
+                .data
+                .as_boolean_mut()
+                .expect("Boolean data")
+                .baked
+                .as_mut()
+                .expect("baked geometry")
+                .source = source;
+            let before = serde_json::to_value(&doc).expect("document snapshot");
+            let pixels = flatten_pixels(&doc);
+            let history = doc.history.undo_depth();
+            if !nested {
+                assert!(pixels.chunks_exact(4).any(|pixel| pixel[3] > 0));
+                assert!(can_flatten(&doc, root));
+                let operations = simple(&doc, root, Action::Flatten).expect("flatten baked root");
+                roundtrip(&mut doc, operations, |doc| {
+                    assert_eq!(flatten_pixels(doc), pixels);
+                    assert!(doc.scene.children_of(Some(root)).is_empty());
+                    let vector = doc
+                        .scene
+                        .get(root)
+                        .expect("root")
+                        .data
+                        .as_vector()
+                        .expect("vector");
+                    assert_eq!(vector.local_size, Some([45., 25.]));
+                    if stroke_outline {
+                        assert!(vector.strokes.is_empty());
+                    }
+                });
+                continue;
+            }
+            assert!(!can_flatten(&doc, root));
+            let error = simple(&doc, root, Action::Flatten).expect_err("preserve baked artwork");
+            assert!(error.to_string().contains("baked appearance"));
+            assert_eq!(
+                serde_json::to_value(&doc).expect("unchanged document"),
+                before
+            );
+            assert_eq!(flatten_pixels(&doc), pixels);
+            assert_eq!(doc.history.undo_depth(), history);
+
+            doc.scene
+                .set_transform(operand, Transform2D::translation(10., 0.))
+                .expect("edit operand");
+            assert!(can_flatten(&doc, root), "edited operands use live geometry");
+        }
+    }
+
+    #[test]
     fn supported_group_and_boolean_flatten_preserve_pixels_and_undo() {
         for kind in ["group", "union", "subtract", "unfilled"] {
             let mut doc = Doc::new();
@@ -1688,6 +1814,7 @@ mod tests {
                         smallvec::smallvec![Fill::solid(Color::BLACK)]
                     },
                     strokes: smallvec::smallvec![Stroke::solid(Color::WHITE, 2.)],
+                    baked: None,
                 })
             };
             let root = insert(&mut doc, CanvasNode::new(data), None);

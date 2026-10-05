@@ -18,60 +18,123 @@ fn import_loss_node(local: u32, kind: &str, parent: Option<u32>) -> KiwiValue {
 }
 
 #[test]
-fn boolean_import_reports_flattening_and_operand_loss_without_changing_baked_geometry() {
-    for operation in ["UNION", "SUBTRACT", "INTERSECT", "XOR"] {
-        let mut parent = import_loss_node(1, "BOOLEAN_OPERATION", None);
-        parent.set_field("booleanOperation", KiwiValue::Enum(operation.into()));
-        parent.set_field("fillGeometry", KiwiValue::array(vec![fig_path(0, "ODD")]));
-        let mut triangle = Vec::new();
-        triangle.extend(cmd(1, &[2.0, 2.0]));
-        triangle.extend(cmd(2, &[20.0, 2.0]));
-        triangle.extend(cmd(2, &[11.0, 16.0]));
-        triangle.extend(cmd(0, &[]));
-        let fig = doc_from_with_blobs(
-            vec![
-                parent,
-                import_loss_node(2, "VECTOR", Some(1)),
-                import_loss_node(3, "ROUNDED_RECTANGLE", Some(1)),
-            ],
-            vec![triangle],
-        );
-        let (doc, report, _) = fig_to_doc(&fig).expect("import baked Boolean");
-        assert_eq!(report.boolean_operations_flattened, 1, "{operation}");
-        assert_eq!(report.boolean_operands_dropped, 2, "{operation}");
-        assert_eq!(report.instance_children_dropped, 0, "{operation}");
-        assert_eq!(report.non_container_children_dropped, 0, "{operation}");
-        assert_eq!(report.mapped, 1);
-        assert_eq!(doc.scene.len(), 1);
-        let root = *doc.scene.roots().first().expect("baked parent");
-        let node = doc.scene.get(root).expect("mapped parent");
-        let NodeData::Vector(vector) = &node.data else {
-            panic!("reporting must retain the current baked-vector behavior");
-        };
-        assert_eq!(
-            vector.path.segments,
-            vec![
-                PathSegment::Move { to: [2.0, 2.0] },
-                PathSegment::Line { to: [20.0, 2.0] },
-                PathSegment::Line { to: [11.0, 16.0] },
-                PathSegment::Close,
-            ],
-        );
-        assert_eq!(vector.path.fill_rule, FillRule::EvenOdd);
-        assert!(doc.scene.children_of(Some(root)).is_empty());
-        let warning = report
-            .content_loss_summary()
-            .expect("editable structure loss");
-        assert!(warning.contains("Boolean operation was flattened to vectors"));
-        assert!(warning.contains("2 operand layers are not editable"));
+fn boolean_import_preserves_operations_operands_and_baked_geometry() {
+    for (operation, expected) in [
+        ("UNION", fanta_doc::BooleanOp::Union),
+        ("SUBTRACT", fanta_doc::BooleanOp::Subtract),
+        ("INTERSECT", fanta_doc::BooleanOp::Intersect),
+        ("XOR", fanta_doc::BooleanOp::Exclude),
+    ] {
+        for descendants_first in [false, true] {
+            let mut parent = import_loss_node(1, "BOOLEAN_OPERATION", None);
+            parent.set_field("booleanOperation", KiwiValue::Enum(operation.into()));
+            parent.set_field("fillGeometry", KiwiValue::array(vec![fig_path(0, "ODD")]));
+            let mut triangle = Vec::new();
+            triangle.extend(cmd(1, &[2.0, 2.0]));
+            triangle.extend(cmd(2, &[20.0, 2.0]));
+            triangle.extend(cmd(2, &[11.0, 16.0]));
+            triangle.extend(cmd(0, &[]));
+            let mut first = import_loss_node(2, "RECTANGLE", Some(1));
+            first
+                .get_mut("parentIndex")
+                .expect("parent")
+                .set_field("position", KiwiValue::String("b".into()));
+            let mut second = import_loss_node(3, "ROUNDED_RECTANGLE", Some(1));
+            second
+                .get_mut("parentIndex")
+                .expect("parent")
+                .set_field("position", KiwiValue::String("a".into()));
+            let mut nodes = vec![parent, first, second];
+            if descendants_first {
+                nodes.reverse();
+            }
+            let fig = doc_from_with_blobs(nodes, vec![triangle]);
+            let (doc, report, _) = fig_to_doc(&fig).expect("import editable Boolean");
+            assert_eq!(report.boolean_operations_flattened, 0, "{operation}");
+            assert_eq!(report.boolean_operands_dropped, 0, "{operation}");
+            assert_eq!(report.instance_children_dropped, 0, "{operation}");
+            assert_eq!(report.non_container_children_dropped, 0, "{operation}");
+            assert!(report.boolean_fallbacks_by_reason.is_empty());
+            assert!(report.content_loss_summary().is_none());
+            assert_eq!(report.mapped, 3);
+            assert_eq!(doc.scene.len(), 3);
+            let root = *doc.scene.roots().first().expect("Boolean parent");
+            let node = doc.scene.get(root).expect("mapped parent");
+            let NodeData::Boolean(boolean) = &node.data else {
+                panic!("editable Boolean");
+            };
+            assert_eq!(boolean.op, expected);
+            assert_eq!(node.meta["figma_id"], "0:1");
+            let baked = boolean.baked.as_ref().expect("original baked geometry");
+            assert_eq!(
+                baked.vector.path.segments,
+                vec![
+                    PathSegment::Move { to: [2.0, 2.0] },
+                    PathSegment::Line { to: [20.0, 2.0] },
+                    PathSegment::Line { to: [11.0, 16.0] },
+                    PathSegment::Close,
+                ]
+            );
+            assert_eq!(baked.vector.path.fill_rule, FillRule::EvenOdd);
+            assert_eq!(
+                baked.source,
+                fanta_doc::boolean_geometry_signature(&doc.scene, root).expect("valid geometry")
+            );
+            let ordered = doc
+                .scene
+                .children_of(Some(root))
+                .iter()
+                .map(|id| {
+                    doc.scene.get(*id).expect("operand").meta["figma_id"]
+                        .as_str()
+                        .expect("source identity")
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(ordered, ["0:3", "0:2"]);
+            assert_boolean_fnx_roundtrip(&doc, root);
+        }
     }
 }
 
+fn assert_boolean_fnx_roundtrip(doc: &Doc, root: NodeId) {
+    let nodes = doc
+        .scene
+        .descendants_of(root)
+        .map(|id| serde_json::to_value(doc.scene.get(id).expect("node")).expect("node JSON"))
+        .collect::<Vec<_>>();
+    let (source, sidecar) =
+        fanta_fnx::encode_subtree(&nodes, "BooleanFixture").expect("encode FNX");
+    let decoded = fanta_fnx::decode_subtree(&source, &sidecar).expect("decode FNX");
+    let mut scene = fanta_doc::Scene::new();
+    scene
+        .insert_many(
+            decoded
+                .into_iter()
+                .map(|node| serde_json::from_value::<CanvasNode>(node).expect("typed node")),
+        )
+        .expect("restore scene");
+    assert_eq!(scene.len(), doc.scene.len());
+    for id in doc.scene.descendants_of(root) {
+        assert_eq!(
+            scene.get(id),
+            doc.scene.get(id),
+            "identity, payload and source order roundtrip"
+        );
+        assert_eq!(scene.children_of(Some(id)), doc.scene.children_of(Some(id)));
+    }
+    assert_eq!(
+        fanta_doc::boolean_geometry_signature(&scene, root).expect("restored signature"),
+        fanta_doc::boolean_geometry_signature(&doc.scene, root).expect("original signature")
+    );
+}
+
 #[test]
-fn boolean_import_counts_all_discarded_operand_descendants_in_any_stream_order() {
+fn boolean_import_preserves_nested_operands_without_baked_parent_geometry() {
     for descendants_first in [false, true] {
+        let mut parent = import_loss_node(1, "BOOLEAN_OPERATION", None);
+        parent.set_field("booleanOperation", KiwiValue::Enum("SUBTRACT".into()));
         let mut nodes = vec![
-            import_loss_node(1, "BOOLEAN_OPERATION", None),
+            parent,
             import_loss_node(2, "GROUP", Some(1)),
             import_loss_node(3, "RECTANGLE", Some(2)),
         ];
@@ -79,13 +142,237 @@ fn boolean_import_counts_all_discarded_operand_descendants_in_any_stream_order()
             nodes.reverse();
         }
         let (doc, report, _) = fig_to_doc(&doc_from(nodes)).expect("import nested operand");
-        assert_eq!(report.boolean_operations_flattened, 1);
-        assert_eq!(report.boolean_operands_dropped, 2);
-        assert_eq!(report.instance_children_dropped, 0);
-        assert_eq!(report.non_container_children_dropped, 0);
-        assert_eq!(report.mapped, doc.scene.len());
-        assert_eq!(doc.scene.len(), 1);
+        assert_eq!(report.boolean_operations_flattened, 0);
+        assert_eq!(report.boolean_operands_dropped, 0);
+        assert_eq!(report.mapped, 3);
+        assert!(report.content_loss_summary().is_none());
+        let root = *doc.scene.roots().first().expect("root");
+        assert!(
+            matches!(&doc.scene.get(root).expect("Boolean").data, NodeData::Boolean(boolean) if boolean.baked.is_none())
+        );
+        assert_boolean_fnx_roundtrip(&doc, root);
     }
+}
+
+#[test]
+fn boolean_import_unknown_or_missing_operation_reports_explicit_fallback() {
+    for operation in [None, Some("FUTURE_OPERATION")] {
+        for descendants_first in [false, true] {
+            let mut parent = import_loss_node(1, "BOOLEAN_OPERATION", None);
+            if let Some(operation) = operation {
+                parent.set_field("booleanOperation", KiwiValue::Enum(operation.into()));
+            }
+            let mut nodes = vec![
+                parent,
+                import_loss_node(2, "GROUP", Some(1)),
+                import_loss_node(3, "RECTANGLE", Some(2)),
+            ];
+            if descendants_first {
+                nodes.reverse();
+            }
+            let (doc, report, _) = fig_to_doc(&doc_from(nodes)).expect("explicit fallback");
+            assert_eq!(report.boolean_operations_flattened, 1);
+            assert_eq!(report.boolean_operands_dropped, 2);
+            assert_eq!(report.instance_children_dropped, 0);
+            assert_eq!(report.non_container_children_dropped, 0);
+            assert_eq!(report.mapped, doc.scene.len());
+            let reason = operation
+                .map(|operation| format!("unknown operation {operation}"))
+                .unwrap_or_else(|| "missing operation".to_owned());
+            assert_eq!(report.boolean_fallbacks_by_reason.get(&reason), Some(&1));
+            assert!(
+                report
+                    .content_loss_summary()
+                    .expect("loss warning")
+                    .contains(&reason)
+            );
+            let node = doc
+                .scene
+                .get(*doc.scene.roots().first().expect("root"))
+                .expect("fallback node");
+            assert!(matches!(node.data, NodeData::Vector(_)));
+            assert_eq!(
+                node.meta["figma_boolean_operation"],
+                serde_json::json!(operation)
+            );
+        }
+    }
+}
+
+#[test]
+fn boolean_import_unsupported_operand_geometry_is_a_reported_baked_fallback() {
+    let mut parent = import_loss_node(1, "BOOLEAN_OPERATION", None);
+    parent.set_field("booleanOperation", KiwiValue::Enum("UNION".into()));
+    parent.set_field(
+        "fillGeometry",
+        KiwiValue::array(vec![fig_path(0, "NONZERO")]),
+    );
+    let mut triangle = Vec::new();
+    triangle.extend(cmd(1, &[0.0, 0.0]));
+    triangle.extend(cmd(2, &[10.0, 0.0]));
+    triangle.extend(cmd(2, &[5.0, 10.0]));
+    triangle.extend(cmd(0, &[]));
+    let fig = doc_from_with_blobs(
+        vec![parent, import_loss_node(2, "VECTOR", Some(1))],
+        vec![triangle],
+    );
+    let (doc, report, _) = fig_to_doc(&fig).expect("unavailable operand path");
+    assert_eq!(report.boolean_operations_flattened, 1);
+    assert_eq!(report.boolean_operands_dropped, 1);
+    assert_eq!(
+        report
+            .boolean_fallbacks_by_reason
+            .get("operand geometry is unavailable"),
+        Some(&1)
+    );
+    assert_eq!(report.mapped, 1);
+    let node = doc
+        .scene
+        .get(*doc.scene.roots().first().expect("root"))
+        .expect("baked fallback");
+    assert!(matches!(&node.data, NodeData::Vector(vector) if vector.path.segments.len() == 4));
+}
+
+#[test]
+fn boolean_import_operandless_vector_fallbacks_preserve_winding_and_stroke_outlines() {
+    for stroke_only in [false, true] {
+        let mut parent = import_loss_node(1, "BOOLEAN_OPERATION", None);
+        parent.set_field("booleanOperation", KiwiValue::Enum("SUBTRACT".into()));
+        parent.set_field(
+            if stroke_only {
+                "strokePaints"
+            } else {
+                "fillPaints"
+            },
+            KiwiValue::array(vec![solid_paint(1.0, 0.0, 0.0, 1.0)]),
+        );
+        if stroke_only {
+            parent.set_field("strokeWeight", KiwiValue::Float(2.0));
+        }
+        parent.set_field(
+            if stroke_only {
+                "strokeGeometry"
+            } else {
+                "fillGeometry"
+            },
+            KiwiValue::array(vec![fig_path(0, "ODD")]),
+        );
+        let mut ring = Vec::new();
+        for points in [
+            [[0., 0.], [10., 0.], [10., 10.], [0., 10.]],
+            [[3., 3.], [7., 3.], [7., 7.], [3., 7.]],
+        ] {
+            for (index, point) in points.into_iter().enumerate() {
+                ring.extend(cmd(if index == 0 { 1 } else { 2 }, &point));
+            }
+            ring.extend(cmd(0, &[]));
+        }
+        let (doc, report, _) = fig_to_doc(&doc_from_with_blobs(vec![parent], vec![ring]))
+            .expect("operandless baked operation");
+        assert!(
+            report
+                .content_loss_summary()
+                .expect("explicit fallback warning")
+                .contains("editable operands are unavailable")
+        );
+        assert_eq!(report.boolean_operations_flattened, 1);
+        assert_eq!(report.boolean_operands_dropped, 0);
+        assert_eq!(report.geometry_decoded, 1);
+        let root = *doc.scene.roots().first().expect("root");
+        let node = doc.scene.get(root).expect("fallback vector");
+        let NodeData::Vector(vector) = &node.data else {
+            panic!("operandless source remains an editable vector");
+        };
+        assert_eq!(node.meta["figma_boolean_operation"], "SUBTRACT");
+        assert_eq!(node.meta["stroke_only_outline"], stroke_only);
+        assert_eq!(vector.path.fill_rule, FillRule::EvenOdd);
+        assert_eq!(vector.path.segments.len(), 10);
+        assert_eq!(
+            vector.fills.as_slice(),
+            &[Fill::solid(Color::rgb(255, 0, 0))]
+        );
+        assert!(vector.strokes.is_empty());
+    }
+}
+
+#[test]
+fn boolean_import_nested_live_operands_are_preserved_and_unknown_ones_fallback() {
+    for known_nested_operation in [true, false] {
+        let mut outer = import_loss_node(1, "BOOLEAN_OPERATION", None);
+        outer.set_field("booleanOperation", KiwiValue::Enum("UNION".into()));
+        let mut inner = import_loss_node(2, "BOOLEAN_OPERATION", Some(1));
+        inner.set_field(
+            "booleanOperation",
+            KiwiValue::Enum(
+                if known_nested_operation {
+                    "XOR"
+                } else {
+                    "UNKNOWN"
+                }
+                .into(),
+            ),
+        );
+        let (doc, report, _) = fig_to_doc(&doc_from(vec![
+            import_loss_node(3, "RECTANGLE", Some(2)),
+            inner,
+            outer,
+        ]))
+        .expect("nested Boolean import");
+        let root = *doc.scene.roots().first().expect("root");
+        if known_nested_operation {
+            assert_eq!(doc.scene.len(), 3);
+            assert_eq!(report.boolean_operands_dropped, 0);
+            assert!(report.content_loss_summary().is_none());
+            assert_boolean_fnx_roundtrip(&doc, root);
+        } else {
+            assert_eq!(doc.scene.len(), 1);
+            assert_eq!(report.boolean_operands_dropped, 2);
+            assert_eq!(report.boolean_operations_flattened, 1);
+            assert_eq!(
+                report
+                    .boolean_fallbacks_by_reason
+                    .get("unsupported nested Boolean operation"),
+                Some(&1)
+            );
+            assert!(matches!(
+                doc.scene.get(root).expect("fallback").data,
+                NodeData::Vector(_)
+            ));
+        }
+    }
+}
+
+#[test]
+fn boolean_import_unmapped_operands_and_invalid_operation_fields_are_reported() {
+    let mut parent = import_loss_node(1, "BOOLEAN_OPERATION", None);
+    parent.set_field("booleanOperation", KiwiValue::Enum("UNION".into()));
+    let (doc, report, _) = fig_to_doc(&doc_from(vec![
+        parent.clone(),
+        import_loss_node(2, "UNSUPPORTED_OPERAND", Some(1)),
+    ]))
+    .expect("unmapped operand");
+    assert_eq!(
+        report
+            .boolean_fallbacks_by_reason
+            .get("unmapped operand nodes"),
+        Some(&1)
+    );
+    assert_eq!(report.skipped(), 1);
+    assert!(matches!(
+        doc.scene
+            .get(*doc.scene.roots().first().expect("root"))
+            .expect("fallback")
+            .data,
+        NodeData::Vector(_)
+    ));
+    parent.set_field("booleanOperation", KiwiValue::Float(2.0));
+    let (_, report, _) = fig_to_doc(&doc_from(vec![parent])).expect("invalid operation");
+    assert_eq!(
+        report
+            .boolean_fallbacks_by_reason
+            .get("invalid operation field"),
+        Some(&1)
+    );
 }
 
 #[test]

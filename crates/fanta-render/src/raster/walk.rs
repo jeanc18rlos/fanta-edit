@@ -172,8 +172,8 @@ fn resolved_world_transform(ctx: &mut RenderCtx, id: NodeId) -> Option<Transform
 
 /// Node-local subtree bounds matching the values and transforms that will be
 /// painted for the current motion sample. Intrinsic nodes use their resolved
-/// geometry directly; unclipped groups union resolved children. Boolean
-/// operands remain authored until the path-fold renderer can consume overlays.
+/// geometry directly; unclipped groups and Boolean operands union resolved
+/// children so animated operands cannot be culled at their authored positions.
 fn resolved_local_bounds(ctx: &mut RenderCtx, id: NodeId) -> Option<Bounds> {
     if let Some(bounds) = ctx.resolved_local_bounds.get(&id) {
         return *bounds;
@@ -182,7 +182,7 @@ fn resolved_local_bounds(ctx: &mut RenderCtx, id: NodeId) -> Option<Bounds> {
     if ctx.inputs.motion.is_none() {
         let node = ctx.scene.get(id)?;
         match &node.data {
-            NodeData::TextPath(_) => {}
+            NodeData::TextPath(_) | NodeData::Boolean(_) => {}
             NodeData::Group(group) if !group_clips_children(node, group) => {}
             _ => return ctx.scene.local_bounds(id),
         }
@@ -208,7 +208,7 @@ fn resolved_local_bounds(ctx: &mut RenderCtx, id: NodeId) -> Option<Bounds> {
                         .map(|[width, height]| Bounds::from_xywh(0.0, 0.0, width, height)),
                 )
             }
-            NodeData::Boolean(_) => (false, ctx.scene.local_bounds(id)),
+            NodeData::Boolean(_) => (true, ctx.scene.local_bounds(id)),
             NodeData::TextPath(text_path) => (false, text_path_bounds(text_path)),
             data => (false, data.local_bounds()),
         }
@@ -284,6 +284,14 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
     if opacity <= 0.0 {
         return;
     }
+    let boolean_shape = node
+        .is_boolean()
+        .then(|| super::boolean::prepare_scene_boolean(node, ctx));
+    let boolean_silhouette = boolean_shape.as_ref().and_then(|shape| shape.silhouette());
+    let local_bounds = boolean_shape
+        .as_ref()
+        .and_then(|shape| shape.bounds(node))
+        .or(local_bounds);
 
     // Viewport cull on the RESOLVED node's world bounds, EXPANDED by any drop
     // shadow's reach so a node that is only on-screen *because of its shadow*
@@ -328,8 +336,14 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
     // not this node's own (empty) effects layer. Self-contained — frosts nothing
     // and is free when the node carries no visible background blur.
     if ctx.supports_offscreen_layers {
-        if apply_background_blur(canvas, node, Some(id), ctx.scene, ctx.effective_scale)
-            == super::effects::BackgroundBlurOutcome::Failed
+        if apply_background_blur(
+            canvas,
+            node,
+            Some(id),
+            ctx.scene,
+            ctx.effective_scale,
+            boolean_silhouette.as_ref(),
+        ) == super::effects::BackgroundBlurOutcome::Failed
         {
             ctx.metrics.effect_failed = true;
         }
@@ -397,14 +411,15 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
             if folded_opacity {
                 ctx.metrics.opacity_folds += 1;
                 let outer_alpha = std::mem::replace(&mut ctx.paint_alpha, opacity);
-                paint_node_body(canvas, id, node, path_cache_id, ctx);
+                paint_node_body(canvas, id, node, path_cache_id, boolean_shape.as_ref(), ctx);
                 ctx.paint_alpha = outer_alpha;
             } else {
-                paint_node_body(canvas, id, node, path_cache_id, ctx);
+                paint_node_body(canvas, id, node, path_cache_id, boolean_shape.as_ref(), ctx);
             }
         }
         Some(layer) => {
             let content_bounds = match &node.data {
+                NodeData::Boolean(_) => local_bounds,
                 NodeData::Group(group) if !group_clips_children(node, group) => local_bounds,
                 _ => effects_layer_bounds(node, Some(id), ctx.scene),
             };
@@ -428,7 +443,14 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
                     && ctx.layer_cache_populate
                     && content_bounds.is_some_and(|content| {
                         render_layer_via_cache(canvas, id, &layer, content, ctx, |c, ctx| {
-                            paint_node_body(c, id, node, path_cache_id, ctx);
+                            paint_node_body(
+                                c,
+                                id,
+                                node,
+                                path_cache_id,
+                                boolean_shape.as_ref(),
+                                ctx,
+                            );
                         })
                     });
                 if via_cache {
@@ -446,7 +468,7 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
                             .save_layer(&rec.bounds(&padded_layer_rect(&b, ctx.effective_scale))),
                         None => canvas.save_layer(&rec),
                     };
-                    paint_node_body(canvas, id, node, path_cache_id, ctx);
+                    paint_node_body(canvas, id, node, path_cache_id, boolean_shape.as_ref(), ctx);
                     canvas.restore();
                 }
             }
@@ -466,13 +488,17 @@ fn paint_node_body(
     id: NodeId,
     node: &CanvasNode,
     path_cache_id: Option<NodeId>,
+    boolean_shape: Option<&super::boolean::BooleanShape>,
     ctx: &mut RenderCtx,
 ) {
     // Paint this node's own content (no children). For a scene Group the
     // background rect can fall back to the scene-computed content bounds, so we
     // pass `Some(id)`; the transient (instance) walk passes `None` and uses the
     // clip box only.
-    let content_state = paint_node_content(canvas, node, Some(id), path_cache_id, ctx);
+    let content_state = match boolean_shape {
+        Some(shape) => shape.paint(canvas, node, ctx),
+        None => paint_node_content(canvas, node, Some(id), path_cache_id, ctx),
+    };
 
     if let Some(inst) = node.data.as_instance() {
         render_instance(canvas, node.id, inst, ctx);
@@ -546,7 +572,13 @@ fn paint_node_body(
     // effects layer so opacity/blend apply to the shadow too. Drop shadows
     // already rode the layer paint above.
     if ctx.supports_offscreen_layers {
-        draw_inner_shadows(canvas, node, Some(id), ctx);
+        draw_inner_shadows(
+            canvas,
+            node,
+            Some(id),
+            ctx,
+            boolean_shape.and_then(|shape| shape.silhouette()).as_ref(),
+        );
     }
 }
 

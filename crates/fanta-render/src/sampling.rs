@@ -1329,7 +1329,7 @@ mod tests {
     }
 
     #[test]
-    fn sampling_transient_component_boolean_is_explicitly_unsupported() {
+    fn sampling_transient_component_boolean_uses_folded_parent_paint() {
         let (mut doc, page) = document();
         let master = insert(
             &mut doc,
@@ -1344,7 +1344,10 @@ mod tests {
         let boolean = insert(
             &mut doc,
             master,
-            NodeData::Boolean(fanta_doc::BooleanNode::default()),
+            NodeData::Boolean(fanta_doc::BooleanNode {
+                fills: [Fill::solid(Color::rgb(0, 0, 255))].into_iter().collect(),
+                ..Default::default()
+            }),
         );
         rect(&mut doc, boolean, 0., 0., 16., 16., Color::WHITE);
         let component = ComponentId::new();
@@ -1362,10 +1365,8 @@ mod tests {
                 local_size: [16., 16.],
             }),
         );
-        assert!(matches!(
-            request(&doc, page, test_geometry()).render(),
-            Err(SamplingError::UnsupportedContent)
-        ));
+        let (key, frame) = render(request(&doc, page, test_geometry()));
+        assert_eq!(color(&frame, &key, [32., 40.]), Color::rgb(0, 0, 255));
     }
 
     #[test]

@@ -245,11 +245,24 @@ fn expanded_subtree_bounds(
     scene: &Scene,
 ) -> Option<Bounds> {
     match &node.data {
-        NodeData::Group(group) if !group_clips_children(node, group) => {
-            let mut acc = group
-                .clip_size
-                .or(group.local_size)
-                .map(|[width, height]| Bounds::from_xywh(0.0, 0.0, width, height));
+        NodeData::Group(_) | NodeData::Boolean(_)
+            if node.is_boolean()
+                || node
+                    .data
+                    .as_group()
+                    .is_some_and(|group| !group_clips_children(node, group)) =>
+        {
+            let mut acc = match &node.data {
+                NodeData::Group(group) => group
+                    .clip_size
+                    .or(group.local_size)
+                    .map(|[width, height]| Bounds::from_xywh(0.0, 0.0, width, height)),
+                NodeData::Boolean(boolean) => boolean
+                    .baked
+                    .as_ref()
+                    .and_then(|baked| baked.vector.path.rough_bounds()),
+                _ => None,
+            };
             for &i in children.get(&node.id).into_iter().flatten() {
                 let Some(entry) = expanded.get(i) else {
                     continue;
@@ -343,6 +356,10 @@ fn render_expanded_inner(
     if opacity <= 0.0 {
         return;
     }
+    let boolean_shape = node
+        .is_boolean()
+        .then(|| super::boolean::prepare_expanded_boolean(node, expanded, children, ctx));
+    let boolean_silhouette = boolean_shape.as_ref().and_then(|shape| shape.silhouette());
 
     canvas.save();
     // The root's own transform is suppressed (see fn docs); descendants apply
@@ -356,8 +373,14 @@ fn render_expanded_inner(
     // layer (so it reads the real backdrop, not this node's own layer). No scene
     // id, so a background-only group has no fallback silhouette and won't frost.
     if ctx.supports_offscreen_layers {
-        if apply_background_blur(canvas, node, None, ctx.scene, ctx.effective_scale)
-            == super::effects::BackgroundBlurOutcome::Failed
+        if apply_background_blur(
+            canvas,
+            node,
+            None,
+            ctx.scene,
+            ctx.effective_scale,
+            boolean_silhouette.as_ref(),
+        ) == super::effects::BackgroundBlurOutcome::Failed
         {
             ctx.metrics.effect_failed = true;
         }
@@ -392,7 +415,10 @@ fn render_expanded_inner(
             // own geometry (clip box / path bounds / local_size); an unclipped
             // transient group falls back to the union of its transient children so
             // its layer is still bounded rather than viewport-sized.
-            expanded_subtree_bounds(node, expanded, children, ctx.scene),
+            boolean_shape
+                .as_ref()
+                .and_then(|shape| shape.bounds(node))
+                .or_else(|| expanded_subtree_bounds(node, expanded, children, ctx.scene)),
         );
     if used_layer {
         ctx.metrics.effect_layers += 1;
@@ -405,11 +431,17 @@ fn render_expanded_inner(
     let content_state = if folded_opacity {
         ctx.metrics.opacity_folds += 1;
         let outer_alpha = std::mem::replace(&mut ctx.paint_alpha, opacity);
-        let state = paint_node_content(canvas, node, None, None, ctx);
+        let state = match &boolean_shape {
+            Some(shape) => shape.paint(canvas, node, ctx),
+            None => paint_node_content(canvas, node, None, None, ctx),
+        };
         ctx.paint_alpha = outer_alpha;
         state
     } else {
-        paint_node_content(canvas, node, None, None, ctx)
+        match &boolean_shape {
+            Some(shape) => shape.paint(canvas, node, ctx),
+            None => paint_node_content(canvas, node, None, None, ctx),
+        }
     };
 
     if let Some(inner) = node.data.as_instance() {
@@ -418,6 +450,8 @@ fn render_expanded_inner(
         // id keys its own memo entry — distinct from the outer instance and from
         // other clones of the same master.
         render_instance(canvas, node.id, inner, ctx);
+    } else if node.is_boolean() {
+        // Operand paint is consumed by the fold, never drawn independently.
     } else if let Some(child_idx) = children.get(&node.id) {
         // Same mask semantics as the live-scene walk: a transient child flagged
         // `is_mask` masks its following siblings — so masks authored inside a
@@ -461,7 +495,7 @@ fn render_expanded_inner(
     // children), mirroring the live-scene walk's ordering — with no scene id, so
     // a background-only group has no fallback box (matches `paint_node_content`).
     if ctx.supports_offscreen_layers {
-        draw_inner_shadows(canvas, node, None, ctx);
+        draw_inner_shadows(canvas, node, None, ctx, boolean_silhouette.as_ref());
     }
 
     if used_layer {

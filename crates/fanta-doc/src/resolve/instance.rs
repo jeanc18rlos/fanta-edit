@@ -675,6 +675,15 @@ fn apply_derived(
 /// Write the baked resolved box size onto whichever node variant carries one.
 fn apply_derived_size(data: &mut NodeData, [w, h]: [f64; 2]) {
     match data {
+        NodeData::Boolean(boolean) => {
+            if let Some(baked) = &mut boolean.baked {
+                let mut vector = NodeData::Vector(baked.vector.clone());
+                apply_derived_size(&mut vector, [w, h]);
+                if let NodeData::Vector(vector) = vector {
+                    baked.vector = vector;
+                }
+            }
+        }
         NodeData::Vector(v) => {
             let Some(bounds) = v.path.rough_bounds() else {
                 return;
@@ -735,6 +744,33 @@ fn apply_derived_geometry(
     claims: OverrideClaims,
 ) {
     match data {
+        NodeData::Boolean(boolean) => {
+            if let Some(path) = &d.path_data {
+                if let Some(baked) = &mut boolean.baked {
+                    baked.vector.path = path.clone();
+                }
+                if d.stroke_path.is_none()
+                    && d.stroke_weight.is_none()
+                    && !boolean
+                        .baked
+                        .as_ref()
+                        .is_some_and(|baked| baked.stroke_outline)
+                {
+                    boolean.strokes.clear();
+                }
+            }
+            if !edited
+                && !claims.fill
+                && let Some(fills) = &d.fills
+            {
+                boolean.fills = fills.clone();
+            }
+            if let Some(width) = d.stroke_weight
+                && let Some(stroke) = boolean.strokes.first_mut()
+            {
+                stroke.width = width;
+            }
+        }
         NodeData::Vector(v) => {
             // Resolved fill geometry replaces the master path outright.
             if let Some(path) = &d.path_data {
@@ -1014,6 +1050,7 @@ fn apply_override(node: &mut CanvasNode, value: &OverrideValue) {
             _ => {}
         },
         OverrideValue::Fills { fills } => match &mut node.data {
+            NodeData::Boolean(boolean) => boolean.fills = fills.clone(),
             NodeData::Vector(v) => {
                 v.fills = fills.clone();
             }
@@ -1046,6 +1083,7 @@ fn apply_override(node: &mut CanvasNode, value: &OverrideValue) {
             _ => {}
         },
         OverrideValue::Strokes { strokes } => match &mut node.data {
+            NodeData::Boolean(boolean) => boolean.strokes = strokes.clone(),
             NodeData::Vector(v) => {
                 v.strokes = strokes.clone();
             }

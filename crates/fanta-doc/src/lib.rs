@@ -28,6 +28,10 @@
 #![forbid(unsafe_code)]
 
 pub mod binding;
+pub mod boolean;
+pub use boolean::{
+    BooleanGeometryError, boolean_geometry_signature, boolean_geometry_signature_with,
+};
 pub mod color;
 pub mod component;
 pub mod doc;
@@ -85,16 +89,16 @@ pub use motion::{
 };
 pub use node::fields::known_fields;
 pub use node::{
-    Action, AiArtifactNode, AudioNode, AutoLayout, AxisSizing, BitmapNode, BooleanNode, BooleanOp,
-    Camera3d, CanvasNode, ConstraintH, ConstraintV, Constraints, CounterAlign, DerivedOverride,
-    Direction, Easing, EmbedNode, FontVariation, GenerationStatus, GridAlign, GridCell, GridLayout,
-    GridTrack, GroupNode, InstanceNode, LayoutChild, LayoutMode, Link, MaskType, Model3dNode,
-    NodeData, NodeFlags, NodeGraph, NodeGraphNode, OverlayPosition, OverlaySettings, Override,
-    OverridePath, OverrideValue, ParametricShape, PrimaryAlign, PrototypeAnimation, Reaction,
-    ScrollBehavior, ScrollDirection, TextAlign, TextAutoResize, TextNode, TextPathAlignment,
-    TextPathDirection, TextPathNode, TextPathSide, TextPathStart, TextStyle, TextStyleRun,
-    Transition, TransitionStyle, Trigger, VAlign, VectorNode, VideoNode, WorkflowNode,
-    spring_progress,
+    Action, AiArtifactNode, AudioNode, AutoLayout, AxisSizing, BitmapNode, BooleanBakedGeometry,
+    BooleanNode, BooleanOp, Camera3d, CanvasNode, ConstraintH, ConstraintV, Constraints,
+    CounterAlign, DerivedOverride, Direction, Easing, EmbedNode, FontVariation, GenerationStatus,
+    GridAlign, GridCell, GridLayout, GridTrack, GroupNode, InstanceNode, LayoutChild, LayoutMode,
+    Link, MaskType, Model3dNode, NodeData, NodeFlags, NodeGraph, NodeGraphNode, OverlayPosition,
+    OverlaySettings, Override, OverridePath, OverrideValue, ParametricShape, PrimaryAlign,
+    PrototypeAnimation, Reaction, ScrollBehavior, ScrollDirection, TextAlign, TextAutoResize,
+    TextNode, TextPathAlignment, TextPathDirection, TextPathNode, TextPathSide, TextPathStart,
+    TextStyle, TextStyleRun, Transition, TransitionStyle, Trigger, VAlign, VectorNode, VideoNode,
+    WorkflowNode, spring_progress,
 };
 pub use op::{ModeScope, OpCtx, Operation};
 pub use path::{

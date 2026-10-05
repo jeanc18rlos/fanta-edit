@@ -129,6 +129,8 @@ pub struct MapReport {
     pub instance_children_dropped: usize,
     /// Boolean parents retained as baked vectors rather than editable operations.
     pub boolean_operations_flattened: usize,
+    /// Reasons retained Boolean parents required a non-editable vector fallback.
+    pub boolean_fallbacks_by_reason: HashMap<String, usize>,
     /// Authored operand nodes discarded below flattened Boolean parents.
     pub boolean_operands_dropped: usize,
     /// Nodes discarded below another non-container, excluding Boolean operands
@@ -416,6 +418,18 @@ impl MapReport {
             losses.push(format!(
                 "{} {operations} flattened to vectors; {} {operands} not editable",
                 self.boolean_operations_flattened, self.boolean_operands_dropped,
+            ));
+        }
+        if !self.boolean_fallbacks_by_reason.is_empty() {
+            let mut reasons = self.boolean_fallbacks_by_reason.iter().collect::<Vec<_>>();
+            reasons.sort_by_key(|(reason, _)| *reason);
+            losses.push(format!(
+                "Boolean fallback reasons: {}",
+                reasons
+                    .into_iter()
+                    .map(|(reason, count)| format!("{reason} ({count})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ));
         }
         if self.non_container_children_dropped > 0 {

@@ -1515,11 +1515,7 @@ fn design_stroke(
     node: &fanta_doc::CanvasNode,
     snapshots: &[PaintSnapshot],
 ) -> Option<DesignStroke> {
-    let strokes = match &node.data {
-        NodeData::Vector(vector) => &vector.strokes,
-        NodeData::Group(group) => &group.strokes,
-        _ => return None,
-    };
+    let strokes = node.data.strokes()?;
     if strokes.is_empty() {
         return None;
     }
@@ -1640,9 +1636,13 @@ fn gate_capabilities(
     );
     capabilities.fill &= matches!(
         data,
-        NodeData::Vector(_) | NodeData::Group(_) | NodeData::Text(_) | NodeData::TextPath(_)
+        NodeData::Vector(_)
+            | NodeData::Boolean(_)
+            | NodeData::Group(_)
+            | NodeData::Text(_)
+            | NodeData::TextPath(_)
     );
-    capabilities.stroke &= matches!(data, NodeData::Vector(_) | NodeData::Group(_));
+    capabilities.stroke &= data.strokes().is_some();
     let fill = capabilities.fill;
     let stroke = capabilities.stroke;
     capabilities.sections.retain(|section| match section {
@@ -1811,6 +1811,7 @@ pub(crate) fn design_node(
             .map(|(index, snapshot)| {
                 let fill = match &node.data {
                     NodeData::Vector(vector) => vector.fills.get(index),
+                    NodeData::Boolean(boolean) => boolean.fills.get(index),
                     NodeData::Group(group) => group
                         .background
                         .iter()
@@ -3834,6 +3835,12 @@ impl FigView {
                         {
                             let fill = vector.fills.remove(from);
                             vector.fills.insert(to, fill);
+                        } else if let NodeData::Boolean(boolean) = data
+                            && from < boolean.fills.len()
+                            && to < boolean.fills.len()
+                        {
+                            let fill = boolean.fills.remove(from);
+                            boolean.fills.insert(to, fill);
                         } else if let NodeData::Group(group) = data {
                             let count = usize::from(group.background.is_some())
                                 + group.background_fills.len();
@@ -6941,6 +6948,13 @@ fn current_paint(doc: &Doc, id: NodeId, is_stroke: bool, index: usize) -> Option
                 vector.fills.get(index)
             }
         }
+        NodeData::Boolean(boolean) => {
+            if is_stroke {
+                boolean.strokes.get(index).map(|stroke| &stroke.paint)
+            } else {
+                boolean.fills.get(index)
+            }
+        }
         NodeData::Group(group) => {
             if is_stroke {
                 group.strokes.get(index).map(|stroke| &stroke.paint)
@@ -9853,6 +9867,227 @@ mod tests {
             .expect("paint exists")
     }
 
+    fn doc_with_baked_boolean(stroke_outline: bool) -> (Doc, NodeId) {
+        let (mut doc, _, id) = doc_with_rect();
+        let node = doc.scene.get_mut(id).expect("source vector");
+        let NodeData::Vector(mut vector) = node.data.clone() else {
+            panic!("source vector");
+        };
+        vector.local_size = Some([200., 100.]);
+        let stroke = fanta_doc::Stroke::solid(FantaColor::rgb(0xe0, 0x30, 0x30), 2.);
+        if !stroke_outline {
+            vector.strokes.push(stroke.clone());
+        }
+        node.data = NodeData::Boolean(BooleanNode {
+            op: BooleanOp::Union,
+            fills: if stroke_outline {
+                Default::default()
+            } else {
+                vector.fills.clone()
+            },
+            strokes: smallvec::smallvec![stroke],
+            baked: Some(fanta_doc::BooleanBakedGeometry {
+                vector: vector.clone(),
+                source: String::new(),
+                stroke_outline,
+            }),
+        });
+        let mut operand = CanvasNode::new(NodeData::Vector(vector));
+        operand.parent = Some(id);
+        doc.scene.insert(operand).expect("editable operand");
+        let signature = fanta_doc::boolean_geometry_signature(&doc.scene, id).expect("signature");
+        doc.scene
+            .get_mut(id)
+            .expect("Boolean")
+            .data
+            .as_boolean_mut()
+            .expect("Boolean")
+            .baked
+            .as_mut()
+            .expect("bake")
+            .source = signature;
+        doc.selection.replace_with([id]);
+        (doc, id)
+    }
+
+    fn boolean_paint_png(doc: &Doc) -> Vec<u8> {
+        let mut renderer = fanta_render::RasterRenderer::new(320, 180).expect("renderer");
+        let metrics = renderer.render(
+            &doc.scene,
+            &fanta_doc::Viewport {
+                center: [110., 70.],
+                zoom: 1.,
+            },
+        );
+        assert!(!metrics.incomplete_artwork);
+        renderer.encode_png().expect("PNG")
+    }
+
+    async fn assert_boolean_inspector_paints(stroke_outline: bool, cx: &mut TestAppContext) {
+        let (doc, id) = doc_with_baked_boolean(stroke_outline);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let cx = &mut cx;
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+        let item = view.read_with(cx, |view, _| view.item().clone());
+        let (baseline, baseline_png) = item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document").doc;
+            (
+                doc.scene
+                    .descendants_of(id)
+                    .map(|id| doc.scene.get(id).expect("node").clone())
+                    .collect::<Vec<_>>(),
+                boolean_paint_png(doc),
+            )
+        });
+        panel.read_with(cx, |panel, _| {
+            let node = panel.node();
+            let capabilities = node.capabilities.as_ref().expect("capabilities");
+            assert!(capabilities.fill && capabilities.stroke);
+            assert!(capabilities.sections.contains(&DesignPanelSection::Fill));
+            assert!(capabilities.sections.contains(&DesignPanelSection::Stroke));
+            assert_eq!(node.fills.len(), usize::from(!stroke_outline));
+            assert_eq!(
+                node.stroke.as_ref().expect("stroke controls").paints.len(),
+                1
+            );
+        });
+        let color = DesignColor::rgb(20, 120, 220);
+        emit_inspector_paint_in_collection(
+            &panel,
+            cx,
+            id,
+            if stroke_outline {
+                DesignPanelCollection::Stroke
+            } else {
+                DesignPanelCollection::Fill
+            },
+            DesignPaintProperty::Color,
+            DesignPaintValue::Color(color),
+            DesignPanelEditPhase::Commit,
+        );
+        item.read_with(cx, |item, _| {
+            let doc = &item.document().expect("document").doc;
+            assert_eq!(
+                current_paint(doc, id, stroke_outline, 0).and_then(Fill::solid_color),
+                Some(fanta_color(color))
+            );
+            let boolean = doc
+                .scene
+                .get(id)
+                .expect("node")
+                .data
+                .as_boolean()
+                .expect("Boolean");
+            let signature =
+                fanta_doc::boolean_geometry_signature(&doc.scene, id).expect("signature");
+            assert!(
+                boolean.baked_vector(&signature).is_some(),
+                "paint edits retain valid geometry"
+            );
+            assert_ne!(
+                boolean_paint_png(doc),
+                baseline_png,
+                "the new color is painted"
+            );
+        });
+        panel.read_with(cx, |panel, _| {
+            let node = panel.node();
+            let paint = if stroke_outline {
+                &node.stroke.as_ref().expect("stroke").paints[0]
+            } else {
+                &node.fills[0]
+            };
+            assert_eq!(paint.color, color);
+        });
+        assert!(
+            item.update(cx, |item, cx| item.undo(cx))
+                .expect("undo color")
+        );
+        cx.run_until_parked();
+
+        for action in [
+            DesignPanelAction::PropertyChangeRequested {
+                node_id: id.to_string().into(),
+                property: DesignPanelProperty::StrokeWeight,
+                value: DesignPanelValue::Number(6.),
+            },
+            DesignPanelAction::CollectionItemAddRequested {
+                node_id: id.to_string().into(),
+                collection: DesignPanelCollection::Fill,
+                target: DesignPaintTarget::WholeLayer,
+            },
+            DesignPanelAction::CollectionItemAddRequested {
+                node_id: id.to_string().into(),
+                collection: DesignPanelCollection::Stroke,
+                target: DesignPaintTarget::WholeLayer,
+            },
+            DesignPanelAction::PropertyChangeRequested {
+                node_id: id.to_string().into(),
+                property: DesignPanelProperty::BooleanOperation,
+                value: DesignPanelValue::BooleanOperation(DesignBooleanOperation::Exclude),
+            },
+        ] {
+            let changes_operation = matches!(
+                &action,
+                DesignPanelAction::PropertyChangeRequested {
+                    property: DesignPanelProperty::BooleanOperation,
+                    ..
+                }
+            );
+            panel.update_in(cx, |_, _, cx| cx.emit(action));
+            cx.run_until_parked();
+            item.read_with(cx, |item, _| {
+                let doc = &item.document().expect("document").doc;
+                let boolean = doc
+                    .scene
+                    .get(id)
+                    .expect("node")
+                    .data
+                    .as_boolean()
+                    .expect("Boolean");
+                let signature =
+                    fanta_doc::boolean_geometry_signature(&doc.scene, id).expect("signature");
+                assert_eq!(
+                    boolean.baked_vector(&signature).is_some(),
+                    !stroke_outline && !changes_operation
+                );
+                assert_ne!(
+                    doc.scene.get(id),
+                    baseline.first(),
+                    "panel action changes the document"
+                );
+                boolean_paint_png(doc);
+            });
+            assert!(
+                item.update(cx, |item, cx| item.undo(cx))
+                    .expect("undo geometry edit")
+            );
+            cx.run_until_parked();
+            item.read_with(cx, |item, _| {
+                let doc = &item.document().expect("document").doc;
+                for node in &baseline {
+                    assert_eq!(doc.scene.get(node.id), Some(node));
+                }
+                assert_eq!(boolean_paint_png(doc), baseline_png);
+                assert!(
+                    !doc.history.can_undo(),
+                    "each panel action is exactly one undo step"
+                );
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn boolean_inspector_normal_paints_edit_render_and_undo(cx: &mut TestAppContext) {
+        assert_boolean_inspector_paints(false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn boolean_inspector_stroke_outline_paints_edit_render_and_undo(cx: &mut TestAppContext) {
+        assert_boolean_inspector_paints(true, cx).await;
+    }
+
     #[test]
     fn paint_visibility_mutates_fills_and_strokes_and_restores_their_alpha() {
         let (mut doc, _page, rect) = doc_with_rect();
@@ -11649,9 +11884,9 @@ mod tests {
             false,
             DesignCornerCapabilities::NONE,
         );
-        assert!(!boolean_caps.fill && !boolean_caps.stroke);
-        assert!(!boolean_caps.sections.contains(&DesignPanelSection::Fill));
-        assert!(!boolean_caps.sections.contains(&DesignPanelSection::Stroke));
+        assert!(boolean_caps.fill && boolean_caps.stroke);
+        assert!(boolean_caps.sections.contains(&DesignPanelSection::Fill));
+        assert!(boolean_caps.sections.contains(&DesignPanelSection::Stroke));
 
         let vector = NodeData::Vector(VectorNode::rect_solid(
             0.0,
