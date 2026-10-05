@@ -3370,3 +3370,318 @@ fn pending_layout_unsized_page_root_preserves_complete_child_geometry() {
     let (authored, _) = crate::read_project_tree(directory.path()).expect("read omission");
     assert_eq!(authored.pending_layout, [child].into_iter().collect());
 }
+
+#[test]
+fn accept_written_sources_rejects_post_write_changes_without_advancing_any_index() {
+    let metadata_state = |meta: &ArtifactMeta| {
+        (
+            meta.id.clone(),
+            meta.kind,
+            meta.slug.clone(),
+            meta.design_dir.clone(),
+            meta.disk_hash,
+        )
+    };
+    for opened in [true, false] {
+        for name in ["page.fnx", "page.ids.json", "page.json"] {
+            for remove in [false, true] {
+                let directory = tempdir().expect("project directory");
+                let mut document = Doc::new();
+                let mut pages = Vec::new();
+                for name in ["Edited", "Unopened"] {
+                    let mut root = CanvasNode::new(NodeData::Group(GroupNode::default()));
+                    root.name = name.into();
+                    let page = document.scene.insert(root).expect("page root");
+                    document.add_page(page);
+                    pages.push(page);
+                }
+                let edited = *pages.first().expect("edited page");
+                let unopened = *pages.last().expect("unopened page");
+                let assets = BTreeMap::new();
+                crate::write_project_tree(directory.path(), &document, &assets)
+                    .expect("initial project");
+                let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
+                let edited_id = ArtifactId::Page(edited);
+                workspace
+                    .open_artifact(edited_id.clone())
+                    .expect("open edited page");
+                document
+                    .scene
+                    .get_mut(edited)
+                    .expect("edited root")
+                    .transform = Transform2D::translation(11.0, 17.0);
+                workspace
+                    .artifact_mut(&edited_id)
+                    .expect("edited session")
+                    .adopt_document(&document)
+                    .expect("canvas edit");
+                let sources = workspace
+                    .validated_source_overrides_for_document(&document)
+                    .expect("retained sources");
+                let preconditions = workspace
+                    .source_write_preconditions(&document)
+                    .expect("write preconditions");
+                let report = crate::write_project_tree_cached_with_sources_checked(
+                    directory.path(),
+                    &document,
+                    &assets,
+                    &mut crate::ProjectWriteCache::default(),
+                    &sources,
+                    &preconditions,
+                )
+                .expect("checked write");
+                let before_index = workspace.file_index.clone();
+                let before_shared = (workspace.shared.base_hash, workspace.shared.disk_hash);
+                let before_metadata: BTreeMap<_, _> = workspace
+                    .artifacts
+                    .iter()
+                    .map(|(id, meta)| (id.clone(), metadata_state(meta)))
+                    .collect();
+                let before_open: BTreeMap<_, _> = workspace
+                    .open
+                    .iter()
+                    .map(|(id, session)| {
+                        (
+                            id.clone(),
+                            (
+                                session.base_hash,
+                                session.disk_hash,
+                                Arc::clone(&session.base_nodes),
+                                metadata_state(&session.meta),
+                            ),
+                        )
+                    })
+                    .collect();
+                let target = ArtifactId::Page(if opened { edited } else { unopened });
+                let relative = workspace
+                    .artifacts
+                    .get(&target)
+                    .expect("target metadata")
+                    .design_dir
+                    .join(name);
+                let path = directory.path().join(&relative);
+                let original = std::fs::read(&path).expect("written file");
+                if remove {
+                    std::fs::remove_file(&path).expect("external deletion after write");
+                } else {
+                    let mut changed = original.clone();
+                    let byte = changed.first_mut().expect("nonempty source");
+                    *byte ^= 1;
+                    assert_eq!(changed.len(), original.len(), "same-size mutation");
+                    std::fs::write(&path, changed).expect("external edit after write");
+                }
+                let asset_hash = workspace.asset_index_disk_hash().expect("asset index");
+                assert!(
+                    matches!(
+                        workspace.accept_written_sources(
+                            &document,
+                            asset_hash,
+                            &sources,
+                            &report.written_hashes
+                        ),
+                        Err(SessionError::SaveBlocked(SaveBlocked::DiskChangedAgain))
+                    ),
+                    "opened={opened}, path={}, remove={remove}",
+                    relative.display()
+                );
+                assert_eq!(
+                    workspace.file_index, before_index,
+                    "failed acceptance is atomic"
+                );
+                assert_eq!(
+                    (workspace.shared.base_hash, workspace.shared.disk_hash),
+                    before_shared
+                );
+                assert_eq!(
+                    workspace
+                        .source_write_preconditions(&document)
+                        .expect("unchanged cached preconditions"),
+                    preconditions,
+                    "rejected acceptance must not advance the per-file evidence used by the next writer"
+                );
+                let after_metadata: BTreeMap<_, _> = workspace
+                    .artifacts
+                    .iter()
+                    .map(|(id, meta)| (id.clone(), metadata_state(meta)))
+                    .collect();
+                assert_eq!(after_metadata, before_metadata);
+                assert_eq!(workspace.open.len(), before_open.len());
+                for (id, (base_hash, disk_hash, base_nodes, metadata)) in &before_open {
+                    let session = workspace
+                        .artifact(id)
+                        .expect("open session remains present");
+                    assert_eq!(session.base_hash, *base_hash);
+                    assert_eq!(session.disk_hash, *disk_hash);
+                    assert!(
+                        Arc::ptr_eq(&session.base_nodes, base_nodes),
+                        "retained source base must not advance"
+                    );
+                    assert_eq!(&metadata_state(&session.meta), metadata);
+                }
+                assert!(matches!(
+                    workspace
+                        .artifact(&edited_id)
+                        .expect("edited session")
+                        .state,
+                    ArtifactDirty::DirtyCanvas
+                ));
+                assert!(!workspace.open.contains_key(&ArtifactId::Page(unopened)));
+
+                std::fs::write(&path, original).expect("restore the exact writer output");
+                workspace
+                    .accept_written_sources(&document, asset_hash, &sources, &report.written_hashes)
+                    .expect("retry acceptance after reconciliation");
+                let fresh =
+                    WorkspaceSession::open(directory.path()).expect("independent disk index");
+                assert_eq!(workspace.file_index, fresh.file_index);
+                assert_eq!(
+                    workspace
+                        .source_write_preconditions(&document)
+                        .expect("accepted preconditions"),
+                    fresh
+                        .source_write_preconditions(&document)
+                        .expect("fresh preconditions")
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn accept_written_sources_after_conflict_matches_a_fresh_disk_index() {
+    for resolution in [ConflictResolution::KeepOurs, ConflictResolution::TakeTheirs] {
+        let (directory, page) = page_fixture();
+        let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
+        let id = ArtifactId::Page(page);
+        workspace.open_artifact(id.clone()).expect("open page");
+        workspace
+            .apply(
+                &id,
+                Operation::SetName {
+                    id: page,
+                    old: "Home".into(),
+                    new: "Canvas".into(),
+                },
+            )
+            .expect("authored edit");
+        let source = directory
+            .path()
+            .join(&workspace.artifacts.get(&id).expect("metadata").design_dir)
+            .join("page.fnx");
+        let original = std::fs::read_to_string(&source).expect("source");
+        let external = original.replacen("name=\"Home\"", "name=\"Disk\"", 1);
+        assert_ne!(original, external);
+        std::fs::write(&source, external).expect("conflicting source edit");
+        workspace.notify_fs_event(FsEvent::Modified { path: source });
+        assert!(matches!(
+            workspace.artifact(&id).expect("session").state,
+            ArtifactDirty::Conflict(_)
+        ));
+        workspace
+            .resolve_conflict(&id, resolution)
+            .expect("explicit conflict resolution");
+        let document = workspace
+            .artifact(&id)
+            .expect("resolved session")
+            .doc()
+            .clone_for_persist();
+        let sources = workspace
+            .validated_source_overrides_for_document(&document)
+            .expect("resolved sources");
+        let preconditions = workspace
+            .source_write_preconditions(&document)
+            .expect("resolved preconditions");
+        let report = crate::write_project_tree_cached_with_sources_checked(
+            directory.path(),
+            &document,
+            &BTreeMap::new(),
+            &mut crate::ProjectWriteCache::default(),
+            &sources,
+            &preconditions,
+        )
+        .expect("save resolved document");
+        workspace
+            .accept_written_sources(
+                &document,
+                workspace.asset_index_disk_hash().expect("asset hash"),
+                &sources,
+                &report.written_hashes,
+            )
+            .expect("accept resolved save");
+        let fresh = WorkspaceSession::open(directory.path()).expect("fresh independent index");
+        assert_eq!(workspace.file_index, fresh.file_index);
+        assert_eq!(
+            workspace
+                .source_write_preconditions(&document)
+                .expect("accepted preconditions"),
+            fresh
+                .source_write_preconditions(&document)
+                .expect("fresh preconditions")
+        );
+    }
+}
+
+#[test]
+#[ignore = "diagnostic: run acceptance hashing alone with no other Cargo/native work"]
+fn accept_written_sources_hashing_benchmark() {
+    let directory = tempdir().expect("benchmark directory");
+    let mut document = Doc::new();
+    for index in 0..512 {
+        let mut root = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        root.name = format!("Acceptance page {index}");
+        let page = document.scene.insert(root).expect("page");
+        document.add_page(page);
+    }
+    crate::write_project_tree(directory.path(), &document, &BTreeMap::new())
+        .expect("write benchmark");
+    let indexed = WorkspaceSession::open(directory.path()).expect("initial index");
+    let comment = format!("// {}\n", "retained authored source ".repeat(683));
+    for meta in indexed.artifacts.values() {
+        let path = directory.path().join(&meta.design_dir).join("page.fnx");
+        let mut bytes = comment.as_bytes().to_vec();
+        bytes.extend(std::fs::read(&path).expect("page source"));
+        std::fs::write(path, bytes).expect("authored comment");
+    }
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("authored index");
+    let sources = workspace
+        .validated_source_overrides_for_document(&document)
+        .expect("authored sources");
+    let preconditions = workspace
+        .source_write_preconditions(&document)
+        .expect("preconditions");
+    let report = crate::write_project_tree_cached_with_sources_checked(
+        directory.path(),
+        &document,
+        &BTreeMap::new(),
+        &mut crate::ProjectWriteCache::default(),
+        &sources,
+        &preconditions,
+    )
+    .expect("no-op checked writer");
+    assert!(report.written.is_empty());
+    assert!(report.removed.is_empty());
+    let baseline = workspace.file_index.clone();
+    for iteration in 0..5 {
+        let start = std::time::Instant::now();
+        workspace
+            .accept_written_sources(
+                &document,
+                workspace.asset_index_disk_hash().expect("asset hash"),
+                &sources,
+                &report.written_hashes,
+            )
+            .expect("accept unchanged sources");
+        eprintln!(
+            "acceptance_hashing pages=512 payload_bytes={} iteration={iteration} elapsed_us={}",
+            comment.len() * 512,
+            start.elapsed().as_micros()
+        );
+        assert_eq!(workspace.file_index, baseline);
+    }
+    assert_eq!(
+        workspace.file_index,
+        WorkspaceSession::open(directory.path())
+            .expect("fresh index")
+            .file_index
+    );
+}
