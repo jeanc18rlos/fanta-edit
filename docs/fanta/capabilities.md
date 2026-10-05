@@ -58,6 +58,11 @@ Implementation: [document.rs](../../crates/fig_viewer/src/document.rs),
 | Text on Path | Convert one eligible vector baseline, then edit its text and path text properties. Rounded/clipped geometry, zero-length paths and unsupported paints are rejected with a message. |
 | Media | Place supported local images, editable SVG, MP4 video and MP3 audio, or generation results. Files are validated before placement. Canvas media controls include playback and seek; video trim preserves the original asset and supports Undo/Redo. |
 
+Canvas, keyboard and toolbar Duplicate preserve copied component masters and
+complete variant sets using the same rules as Layers menu Duplicate. References
+to components outside the copied content remain unchanged. Ordinary Paste keeps
+its existing component references instead of creating new definitions.
+
 The properties inspector adapts to the selected kind and selection count. Its
 supported sections include position, size, rotation, opacity/blend,
 fills and gradients, strokes, effects, corners, typography, auto-layout/grid,

@@ -94,6 +94,18 @@ arbitrary string-valued component properties are outside the remapping scope.
 Both clipboard corrections postdate the native binary above, so their native
 clipboard acceptance remains open.
 
+Canvas, keyboard and toolbar Duplicate now use the same component-aware copy
+path as Layers menu Duplicate. A mounted Command+D regression reproduced the
+missing component definitions before the fix and passed afterward across five
+deterministic seeds. Its Command+C/Command+V control retains ordinary Paste's
+shared definitions. The test checks complete variant sets, local and external
+instances, primary and secondary variant actions, and exact typed document
+content through Undo/Redo, excluding only the edit timestamp and separately
+asserted selection/history. The combined editor suite passed **1,055 tests
+(1 ignored)** and `./script/clippy --locked -p fig_viewer` passed. Evidence is in
+`target/release-verification/canvas-duplicate-components-20261005/`.
+This correction also postdates the native binary above.
+
 The inspector/menu native follow-up used `85fc694b67c78f616401def73506e515594f52d7`,
 binary SHA-256 `d42e94c0febfa6c701c257485a470779b5c991c7e3567b856f6e5b6fb7dced99`.
 Build/source fingerprints and observations are in

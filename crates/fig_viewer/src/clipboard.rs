@@ -1634,7 +1634,7 @@ pub(crate) fn paste_to_replace_operations(
     Ok(operations)
 }
 
-fn clone_component_operations(
+pub(crate) fn clone_component_operations(
     doc: &Doc,
     clipboard: &CanvasClipboard,
     pasted: &mut PastedNodes,
