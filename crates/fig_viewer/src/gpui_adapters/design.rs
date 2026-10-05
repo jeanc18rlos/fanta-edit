@@ -9175,7 +9175,9 @@ mod tests {
         DesignPaintEdit, DesignPaintTarget, DesignPanelInspectionContext, DesignPanelPermissions,
         DesignPanelSurface, DesignTypographyTarget,
     };
-    use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext, point, px, size};
+    use gpui::{
+        Entity, Modifiers, MouseButton, TestAppContext, VisualTestContext, point, px, size,
+    };
     use image::GenericImageView as _;
     use project::{FakeFs, Project};
 
@@ -13913,6 +13915,202 @@ mod tests {
                 ((), DocChange::Content)
             });
         });
+    }
+
+    async fn assert_mounted_mixed_opacity_scrub(cancel: bool, cx: &mut TestAppContext) {
+        init_test(cx);
+        let (mut doc, page, rect) = doc_with_rect();
+        let mut control = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            40.0,
+            40.0,
+            FantaColor::rgb(0x20, 0x60, 0xa0),
+        )));
+        control.parent = Some(page);
+        control.transform = Transform2D::translation(350.0, 20.0);
+        doc.scene
+            .insert(control)
+            .expect("insert unselected control");
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let item = crate::document::ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/MixedOpacity.fig"),
+            doc,
+            cx,
+        );
+        let bitmap = item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let (doc, mut assets) = document.doc_and_assets();
+                let (asset, natural_size) = assets
+                    .add_image(inspector_test_png())
+                    .expect("load the real bitmap asset");
+                let mut bitmap = CanvasNode::new(NodeData::Bitmap(fanta_doc::BitmapNode {
+                    asset,
+                    natural_size,
+                    local_size: [80.0, 60.0],
+                    crop: None,
+                    fit: ImageFitMode::Fill,
+                    tint: None,
+                }));
+                bitmap.parent = Some(page);
+                bitmap.transform = Transform2D::translation(240.0, 20.0);
+                let bitmap_id = bitmap.id;
+                doc.scene.insert(bitmap).expect("insert selected bitmap");
+                doc.selection.replace_with([rect, bitmap_id]);
+                (bitmap_id, DocChange::None)
+            })
+            .expect("document ready")
+        });
+        let item_for_view = item.clone();
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| FigView::new(item_for_view, project, window, cx));
+        cx.simulate_resize(size(px(1200.0), px(1000.0)));
+        view.update_in(cx, |view, _, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+        let panel = view.read_with(cx, |view, _| {
+            view.gpui_design
+                .as_ref()
+                .expect("mounted inspector")
+                .panel
+                .clone()
+        });
+        let sidebar = cx
+            .debug_bounds("fanta-inspector-sidebar")
+            .expect("inspector bounds");
+        assert_eq!(sidebar.size.width, px(320.0));
+        let opacity = cx
+            .debug_bounds("fig-gpui-design-opacity-value")
+            .expect("opacity field");
+        assert!(sidebar.contains(&opacity.origin));
+        assert!(sidebar.contains(&opacity.bottom_right()));
+        assert!(
+            opacity.size.width >= px(40.0),
+            "the scrub field remains usable"
+        );
+        let (before, assets) = item.read_with(cx, |item, _| {
+            let document = item.document().expect("document ready");
+            assert!(!item.is_dirty());
+            assert!(!document.doc.history.can_undo());
+            assert_eq!(document.raw_assets.len(), 1);
+            (document.doc.scene.clone(), document.raw_assets.clone())
+        });
+        let start = opacity.center();
+        let preview = start - point(px(16.0), px(0.0));
+        assert!(opacity.contains(&preview));
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        cx.simulate_mouse_move(
+            start - point(px(8.0), px(0.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.run_until_parked();
+        cx.simulate_mouse_move(preview, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            panel.read_with(cx, |panel, _| panel.active_scrub_speed().is_some()),
+            "pointer movement starts a real scrub"
+        );
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("document ready");
+            assert_eq!(
+                serde_json::to_value(&document.doc.scene).expect("scene"),
+                serde_json::to_value(&before).expect("baseline"),
+                "mixed selection stays commit-only while scrubbing"
+            );
+            assert!(!item.is_dirty());
+            assert!(!document.doc.history.can_undo());
+        });
+        if cancel {
+            cx.simulate_keystrokes("escape");
+            cx.run_until_parked();
+            assert!(
+                panel.read_with(cx, |panel, _| panel.active_scrub_speed().is_none()),
+                "Escape releases the scrub while the pointer is still held"
+            );
+        }
+        let outside = point(sidebar.origin.x - px(40.0), start.y);
+        assert!(!sidebar.contains(&outside));
+        cx.simulate_mouse_up(outside, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            panel.read_with(cx, |panel, _| panel.active_scrub_speed().is_none()),
+            "release outside must finish pointer capture"
+        );
+        let after = item.read_with(cx, |item, _| {
+            let document = item.document().expect("document ready");
+            assert_eq!(
+                document.raw_assets, assets,
+                "scrubbing never rewrites assets"
+            );
+            assert_eq!(document.doc.selection.as_slice(), &[rect, bitmap]);
+            assert!(!item.content_preview_active());
+            let mut expected = before.clone();
+            for id in [rect, bitmap] {
+                let opacity = document.doc.scene.get(id).expect("selected node").opacity;
+                assert!((opacity.get() - if cancel { 1.0 } else { 0.84 }).abs() < 1e-6);
+                expected
+                    .get_mut(id)
+                    .expect("selected baseline node")
+                    .opacity = opacity;
+            }
+            assert_eq!(
+                serde_json::to_value(&document.doc.scene).expect("scene"),
+                serde_json::to_value(&expected).expect("expected"),
+                "only the two selected opacity fields may change"
+            );
+            assert_eq!(item.is_dirty(), !cancel);
+            assert_eq!(document.doc.history.undo_depth(), usize::from(!cancel));
+            document.doc.scene.clone()
+        });
+        if cancel {
+            item.update(cx, |item, cx| {
+                assert!(!item.undo(cx).expect("no cancelled edit to undo"))
+            });
+        } else {
+            item.update(cx, |item, cx| {
+                assert!(item.undo(cx).expect("undo mixed opacity"))
+            });
+            cx.run_until_parked();
+            item.read_with(cx, |item, _| {
+                let document = item.document().expect("document ready");
+                assert_eq!(
+                    serde_json::to_value(&document.doc.scene).expect("scene"),
+                    serde_json::to_value(&before).expect("baseline")
+                );
+                assert!(!document.doc.history.can_undo());
+                assert_eq!(document.raw_assets, assets);
+            });
+            item.update(cx, |item, cx| {
+                assert!(item.redo(cx).expect("redo mixed opacity"))
+            });
+            cx.run_until_parked();
+            item.read_with(cx, |item, _| {
+                let document = item.document().expect("document ready");
+                assert_eq!(
+                    serde_json::to_value(&document.doc.scene).expect("scene"),
+                    serde_json::to_value(&after).expect("committed scene")
+                );
+                assert!(!document.doc.history.can_redo());
+                assert_eq!(document.raw_assets, assets);
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn mounted_mixed_opacity_scrub_escape_cancels_before_outside_release(
+        cx: &mut TestAppContext,
+    ) {
+        assert_mounted_mixed_opacity_scrub(true, cx).await;
+    }
+
+    #[gpui::test]
+    async fn mounted_mixed_opacity_scrub_outside_release_commits_one_undo_step(
+        cx: &mut TestAppContext,
+    ) {
+        assert_mounted_mixed_opacity_scrub(false, cx).await;
     }
 
     #[gpui::test]
