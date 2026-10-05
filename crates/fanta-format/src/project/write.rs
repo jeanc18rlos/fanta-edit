@@ -410,17 +410,32 @@ fn heal_directory_case(dir: &Path, files: &ProjectedFiles) -> Result<()> {
             expected.insert((managed, design));
         }
     }
+    // List each managed parent once and index it by lowercase name: listing
+    // it again for every design made this quadratic (2.5 s per save on a
+    // project with ~2,400 components).
+    let mut listings: BTreeMap<&str, BTreeMap<String, Vec<String>>> = BTreeMap::new();
     for (managed, design) in expected {
-        let parent = dir.join(managed);
-        let Ok(entries) = fs::read_dir(&parent) else {
+        let listing = listings.entry(managed).or_insert_with(|| {
+            let mut by_lowercase: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            if let Ok(entries) = fs::read_dir(dir.join(managed)) {
+                for entry in entries.flatten() {
+                    if let Ok(name) = entry.file_name().into_string() {
+                        by_lowercase
+                            .entry(name.to_ascii_lowercase())
+                            .or_default()
+                            .push(name);
+                    }
+                }
+            }
+            by_lowercase
+        });
+        let Some(names) = listing.get(&design.to_ascii_lowercase()) else {
             continue;
         };
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else {
-                continue;
-            };
-            if name != design && name.eq_ignore_ascii_case(design) {
+        let parent = dir.join(managed);
+        for name in names {
+            let name = name.as_str();
+            if name != design {
                 let from = parent.join(name);
                 let via = parent.join(format!("{design}.case-heal"));
                 let to = parent.join(design);
@@ -819,7 +834,11 @@ fn project_designs(
                 .join(LOOSE_DIR)
                 .join(NODES_DIR)
                 .join(format!("{id}.json")),
-            Arc::new(json_bytes(&serde_json::to_value(node)?)?),
+            Arc::new(json_bytes(&{
+                let mut value = serde_json::to_value(node)?;
+                crate::project::read::repair_non_finite_geometry(&mut value);
+                value
+            })?),
         );
     }
     Ok(())
@@ -947,7 +966,10 @@ fn project_design_cached(
             .scene
             .get(*id)
             .ok_or_else(|| FormatError::InvalidProjectTree(format!("node {id} vanished")))?;
-        values.push(serde_json::to_value(node)?);
+        let mut value = serde_json::to_value(node)?;
+        // A non-finite number would be written as `null` and fail the read.
+        crate::project::read::repair_non_finite_geometry(&mut value);
+        values.push(value);
     }
     let produced = project_fnx_design(design_dir, fnx_name, ids_name, &values, fn_name, refs)?;
     for (relative, bytes) in &produced {

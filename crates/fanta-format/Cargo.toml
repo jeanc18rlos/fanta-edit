@@ -47,6 +47,7 @@ tempfile = "3"
 tempfile = "3"
 # Integration tests read the `.fnx` id sidecars to verify the v2 layout.
 serde_json = "1"
+anyhow.workspace = true
 fanta-fnx.workspace = true
 
 [lints]

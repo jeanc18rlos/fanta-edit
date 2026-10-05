@@ -722,7 +722,78 @@ fn read_design_nodes(
 /// "missing field `local_size`". Media nodes fall back to their intrinsic
 /// `natural_size`; text estimates a box from its style and content; everything
 /// else gets a visible placeholder box the user can resize.
+/// Replace geometry that is not a finite number. JSON has no NaN/Infinity, so
+/// `serde_json` writes a non-finite `f64` as `null`, and a `null` where the schema
+/// wants a number fails the whole project on read. Projects written before the
+/// importer's guards (`fanta-fig-interop` `read_transform`) carry such values on
+/// degenerate Figma nodes. A broken transform becomes identity and a broken size
+/// is dropped (an optional size reads as unset; a required one is backfilled).
+/// Returns whether anything was repaired.
+pub(crate) fn repair_non_finite_geometry(node: &mut Value) -> bool {
+    let Some(obj) = node.as_object_mut() else {
+        return false;
+    };
+    fn broken(obj: &Map<String, Value>, key: &str) -> bool {
+        obj.get(key).and_then(Value::as_array).is_some_and(|items| {
+            !items
+                .iter()
+                .all(|value| value.as_f64().is_some_and(f64::is_finite))
+        })
+    }
+    let mut repaired = Vec::new();
+    if broken(obj, "transform") {
+        obj.insert(
+            "transform".to_owned(),
+            json!([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]),
+        );
+        repaired.push("transform");
+    }
+    for key in ["clip_size", "local_size", "natural_size"] {
+        if broken(obj, key) {
+            obj.remove(key);
+            repaired.push(key);
+        }
+    }
+    // A Figma boolean whose bbox fallback had a non-finite size: its rectangle
+    // path carries the same nulls. Zero them, leaving an empty shape.
+    let mut path_repaired = false;
+    if let Some(segments) = obj
+        .get_mut("path")
+        .and_then(|path| path.get_mut("segments"))
+        .and_then(Value::as_array_mut)
+    {
+        for point in segments
+            .iter_mut()
+            .filter_map(Value::as_object_mut)
+            .flat_map(|segment| segment.values_mut())
+            .filter_map(Value::as_array_mut)
+        {
+            for coordinate in point.iter_mut() {
+                if !coordinate.as_f64().is_some_and(f64::is_finite) {
+                    *coordinate = json!(0.0);
+                    path_repaired = true;
+                }
+            }
+        }
+    }
+    if path_repaired {
+        repaired.push("path");
+    }
+    if repaired.is_empty() {
+        return false;
+    }
+    let id = obj.get("id").and_then(Value::as_str).unwrap_or("<no id>");
+    tracing::warn!(
+        target: "fanta::format",
+        node = id,
+        fields = ?repaired,
+        "replaced non-finite geometry"
+    );
+    true
+}
+
 pub(crate) fn backfill_required_geometry(node: &mut Value) {
+    repair_non_finite_geometry(node);
     let Some(obj) = node.as_object_mut() else {
         return;
     };

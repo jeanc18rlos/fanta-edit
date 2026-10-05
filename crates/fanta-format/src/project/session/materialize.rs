@@ -33,6 +33,74 @@ pub fn materialize_page(
     Ok(ScopedDoc { doc, root })
 }
 
+/// Scope a page or component out of a whole workspace document without a JSON
+/// round trip: the scoped scene shares every node payload with `document`
+/// ([`Scene::extract_subtree`]), so the session can later find what an edit
+/// touched by pointer. Checks what the IR path checks. `None` for kinds that
+/// still go through FNX (graphics).
+pub(crate) fn scope_from_document(
+    document: &Doc,
+    kind: ArtifactKind,
+    root: NodeId,
+    component: Option<&fanta_doc::ComponentDef>,
+) -> Option<Result<ScopedDoc, SessionError>> {
+    if !matches!(kind, ArtifactKind::Page | ArtifactKind::Component) {
+        return None;
+    }
+    Some((|| {
+        let mut scene = document.scene.extract_subtree(root).ok_or_else(|| {
+            SessionError::other(format!("artifact root {root} is not in the document"))
+        })?;
+        for id in scene.descendants_of(root) {
+            match scene.get(id).map(|node| &node.data) {
+                Some(fanta_doc::NodeData::Instance(_))
+                    if !import_allowed(kind, ImportTarget::LiveComponent) =>
+                {
+                    return Err(SessionError::ImportNotAllowed {
+                        feature: format!("live Instance in {}", kind.label()),
+                    });
+                }
+                Some(fanta_doc::NodeData::Model3d(_)) => {
+                    return Err(SessionError::ImportNotAllowed {
+                        feature: "model3d".into(),
+                    });
+                }
+                _ => {}
+            }
+        }
+        let mut doc = empty_scoped_doc(document.id);
+        doc.variables = document.variables.clone();
+        doc.active_modes = document.active_modes.clone();
+        match kind {
+            ArtifactKind::Page => {
+                if !matches!(
+                    scene.get(root).map(|node| &node.data),
+                    Some(fanta_doc::NodeData::Group(_))
+                ) {
+                    return Err(SessionError::InvalidSource(
+                        "page root must be a Frame (group)".into(),
+                    ));
+                }
+                strip_page_root_size(&mut scene, root);
+                doc.components = document.components.clone();
+            }
+            _ => {
+                let mut def = component.cloned().ok_or_else(|| {
+                    SessionError::other("component artifact without a definition")
+                })?;
+                def.root = root;
+                let mut components = ComponentLibrary::new();
+                components.defs.insert(def.id, def);
+                doc.components = components;
+            }
+        }
+        doc.scene = scene;
+        doc.pages = vec![root];
+        doc.active_page = Some(root);
+        Ok(ScopedDoc { doc, root })
+    })())
+}
+
 /// Materialize a component master IR into a scoped `Doc` (master closure only).
 pub fn materialize_component(
     ir: &ArtifactIr,
@@ -224,7 +292,7 @@ fn ensure_page_root_is_group(nodes: &[Value], root: NodeId) -> Result<(), Sessio
     }
 }
 
-fn strip_page_root_size(scene: &mut Scene, root: NodeId) {
+pub(crate) fn strip_page_root_size(scene: &mut Scene, root: NodeId) {
     if let Some(node) = scene.get_mut(root)
         && let fanta_doc::NodeData::Group(g) = &mut node.data
     {

@@ -4275,6 +4275,7 @@ dependencies = [
 name = "fanta-format"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "fanta-doc",
  "fanta-fnx",
  "serde",

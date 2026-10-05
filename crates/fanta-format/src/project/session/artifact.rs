@@ -173,21 +173,34 @@ impl ArtifactSession {
                 "adopted artifact has a different root id".into(),
             ));
         }
-        let mut scratch = self.clone();
-        scratch.scoped = scoped;
-        let source_sync = scratch.synchronize_retained_source_with_scene()?;
-        if scratch.projected_canvas_header()? != self.projected_canvas_header()? {
-            scratch.state = ArtifactDirty::DirtyCanvas;
-            scratch.working_generation = scratch.working_generation.wrapping_add(1);
+        if let Some(changed) = self.shared_scene_delta(&scoped) {
+            return self.adopt_shared_scene(scoped, changed);
         }
-        *self = scratch;
-        Ok(source_sync)
+        self.adopt_scoped_doc_full(scoped)
     }
 
     /// Extract only this artifact's subtree from a whole workspace document.
     /// The host can call this for the artifact it knows changed without cloning
     /// or scanning the other pages' scene nodes.
     pub fn adopt_document(&mut self, document: &Doc) -> Result<SourceSync, SessionError> {
+        let component = match self.id {
+            ArtifactId::Component(id) => Some(
+                document
+                    .components
+                    .defs
+                    .get(&id)
+                    .ok_or_else(|| SessionError::ArtifactNotFound(format!("component:{id}")))?,
+            ),
+            _ => None,
+        };
+        if let Some(scoped) = super::materialize::scope_from_document(
+            document,
+            self.kind,
+            self.scoped.root,
+            component,
+        ) {
+            return self.adopt_scoped_doc(scoped?);
+        }
         let nodes = super::materialize::collect_subtree_nodes(document, self.scoped.root)?;
         let ir = ArtifactIr::from_nodes(self.kind, self.fn_name.clone(), &nodes)?;
         let scoped =
@@ -768,6 +781,131 @@ impl ArtifactSession {
             json_bytes(&header).map_err(SessionError::from)?,
         ));
         Ok(files)
+    }
+
+    /// The nodes an adoption changes, when it can be reconciled by pointer:
+    /// the retained source matches the current scene, the incoming scene
+    /// shares every untouched node with it (`Scene::extract_subtree` from a
+    /// document derived from the one last adopted), and the edit leaves the
+    /// tree's shape and its root alone. Then the retained projection of each
+    /// unchanged node is already known to equal the scene's, so only changed
+    /// nodes are projected. `None` hands the adoption to the full path.
+    pub(crate) fn shared_scene_delta(&self, next: &ScopedDoc) -> Option<Vec<NodeId>> {
+        if !self.scene_in_sync()
+            || !matches!(
+                self.state,
+                ArtifactDirty::Clean | ArtifactDirty::DirtyCanvas
+            )
+        {
+            return None;
+        }
+        let root = self.scoped.root;
+        let current = &self.scoped.doc.scene;
+        let incoming = &next.doc.scene;
+        if current.len() != incoming.len() || current.get(root) != incoming.get(root) {
+            return None;
+        }
+        let mut changed = Vec::new();
+        let mut shared = 0usize;
+        for id in incoming.descendants_of(root).skip(1) {
+            if incoming.shares_node(current, id) {
+                shared += 1;
+                continue;
+            }
+            let (Some(before), Some(after)) = (current.get(id), incoming.get(id)) else {
+                return None;
+            };
+            if before.parent != after.parent || before.index != after.index {
+                return None;
+            }
+            changed.push(id);
+        }
+        // Nothing shared means the scenes were not derived from each other
+        // (the first adoption after opening from disk): no shortcut there.
+        (shared > 0 || changed.is_empty()).then_some(changed)
+    }
+
+    /// Adopt `scoped` by patching only the nodes [`Self::shared_scene_delta`]
+    /// found changed. A failure restores the previous scene and rebuilds the
+    /// source from it, so the session stays consistent.
+    fn adopt_shared_scene(
+        &mut self,
+        scoped: ScopedDoc,
+        changed: Vec<NodeId>,
+    ) -> Result<SourceSync, SessionError> {
+        let header_before = self.projected_canvas_header()?;
+        let mut previous = BTreeMap::new();
+        let mut after = BTreeMap::new();
+        for id in changed {
+            let to_value = |scene: &fanta_doc::Scene| {
+                serde_json::to_value(scene.get(id))
+                    .map_err(|error| SessionError::other(error.to_string()))
+            };
+            let before = to_value(&self.scoped.doc.scene)?;
+            let next = to_value(&scoped.doc.scene)?;
+            if before == next {
+                continue;
+            }
+            let Some(element) = self.ir.element(&id.0.to_string()).cloned() else {
+                return self.adopt_scoped_doc_full(scoped);
+            };
+            previous.insert(
+                id,
+                NodePatchBase {
+                    element,
+                    value: before,
+                },
+            );
+            after.insert(id, next);
+        }
+        let previous_scoped = std::mem::replace(&mut self.scoped, scoped);
+        let source_sync = if previous.is_empty() {
+            self.ir_stale = false;
+            SourceSync::Unchanged
+        } else {
+            match self.patch_source_values(previous, after) {
+                Ok(source_sync) => {
+                    self.state = ArtifactDirty::DirtyCanvas;
+                    self.working_generation = self.working_generation.wrapping_add(1);
+                    self.last_source_sync = source_sync.clone();
+                    source_sync
+                }
+                Err(error) => {
+                    self.scoped = previous_scoped;
+                    self.rebuild_source_from_scene(SourceRebuildReason::PatchUnavailable)?;
+                    self.mark_scene_synced();
+                    return Err(error);
+                }
+            }
+        };
+        self.mark_scene_synced();
+        if self.projected_canvas_header()? != header_before {
+            self.state = ArtifactDirty::DirtyCanvas;
+            self.working_generation = self.working_generation.wrapping_add(1);
+        }
+        #[cfg(debug_assertions)]
+        {
+            let scene = self.scene_node_map()?;
+            let retained = self.retained_scene_projection()?;
+            debug_assert!(
+                retained.nodes == scene.nodes,
+                "the incremental adoption left the retained source out of sync"
+            );
+        }
+        Ok(source_sync)
+    }
+
+    /// The full adoption: project both scenes and reconcile their difference.
+    fn adopt_scoped_doc_full(&mut self, scoped: ScopedDoc) -> Result<SourceSync, SessionError> {
+        let mut scratch = self.clone();
+        scratch.scoped = scoped;
+        let source_sync = scratch.synchronize_retained_source_with_scene()?;
+        if scratch.projected_canvas_header()? != self.projected_canvas_header()? {
+            scratch.state = ArtifactDirty::DirtyCanvas;
+            scratch.working_generation = scratch.working_generation.wrapping_add(1);
+        }
+        *self = scratch;
+        Ok(source_sync)
     }
 
     fn projected_canvas_header(&self) -> Result<Value, SessionError> {

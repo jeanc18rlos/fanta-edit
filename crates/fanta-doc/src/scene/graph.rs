@@ -329,6 +329,37 @@ impl Scene {
         self.nodes.get(&id).map(Arc::as_ref)
     }
 
+    /// A scene of `root`'s subtree that shares node payloads with `self`: every
+    /// node below the root stays the one `Arc` both scenes point at, and the
+    /// root is copied with its parent detached. Copying a page or component out
+    /// of a document this way costs a pointer per node, and [`Self::shares_node`]
+    /// can then tell an edited node (a fresh `Arc`) from an untouched one
+    /// without comparing content. `None` when `root` is absent.
+    pub fn extract_subtree(&self, root: NodeId) -> Option<Scene> {
+        let root_node = self.nodes.get(&root)?;
+        let mut scene = Scene::new();
+        let mut detached = CanvasNode::clone(root_node);
+        detached.parent = None;
+        scene.nodes.insert(root, Arc::new(detached));
+        for id in self.descendants_of(root).skip(1) {
+            if let Some(node) = self.nodes.get(&id) {
+                scene.nodes.insert(id, Arc::clone(node));
+            }
+        }
+        scene.rebuild_child_index();
+        Some(scene)
+    }
+
+    /// Whether `self` and `other` hold the very same payload for `id` — true
+    /// only for a node neither scene has rewritten since one was derived from
+    /// the other ([`Self::extract_subtree`], `Clone`).
+    pub fn shares_node(&self, other: &Scene, id: NodeId) -> bool {
+        match (self.nodes.get(&id), other.nodes.get(&id)) {
+            (Some(mine), Some(theirs)) => Arc::ptr_eq(mine, theirs),
+            _ => false,
+        }
+    }
+
     pub fn get_mut(&mut self, id: NodeId) -> Option<&mut CanvasNode> {
         // Note: callers must not change `id`, `parent`, or `index` through the
         // mutable reference — those go through dedicated methods so the child

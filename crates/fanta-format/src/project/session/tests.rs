@@ -2186,3 +2186,112 @@ fn subtree_root_follows_the_fnx_rule() {
     let two_roots = vec![group_json(master, "A", None), group_json(label, "B", None)];
     assert!(super::materialize::subtree_root(&two_roots).is_err());
 }
+
+#[test]
+fn adopting_an_edit_patches_only_the_edited_node() {
+    let directory = tempdir().expect("project directory");
+    let mut document = Doc::new();
+    let page = document
+        .scene
+        .insert(CanvasNode::new(NodeData::Group(GroupNode::default())))
+        .expect("page root");
+    document.add_page(page);
+    let mut children = Vec::new();
+    for name in ["A", "B", "C"] {
+        let mut child = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        child.name = name.into();
+        child.parent = Some(page);
+        children.push(document.scene.insert(child).expect("child"));
+    }
+    crate::write_project_tree(directory.path(), &document, &BTreeMap::new()).expect("write");
+
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("open project");
+    let id = ArtifactId::Page(page);
+    workspace.open_artifact(id.clone()).expect("open page");
+    // The first adoption replaces the scene loaded from disk: full path.
+    workspace
+        .artifact_mut(&id)
+        .expect("page session")
+        .adopt_document(&document.clone_for_persist())
+        .expect("first adoption");
+
+    document.scene.get_mut(children[1]).expect("B").transform = Transform2D::translation(40.0, 2.0);
+    let persisted = document.clone_for_persist();
+    let scoped =
+        super::materialize::scope_from_document(&persisted, ArtifactKind::Page, page, None)
+            .expect("pages scope by sharing")
+            .expect("scope");
+    let session = workspace.artifact_mut(&id).expect("page session");
+    assert_eq!(
+        session.shared_scene_delta(&scoped),
+        Some(vec![children[1]]),
+        "only the edited node differs by pointer"
+    );
+    let sync = session
+        .adopt_document(&persisted)
+        .expect("incremental adoption");
+    assert!(
+        matches!(&sync, SourceSync::PatchedNodes { nodes } if nodes == &vec![children[1]]),
+        "{sync:?}"
+    );
+    let files = session.project_to_files().expect("project the page");
+    let source = String::from_utf8(files[0].1.clone()).expect("utf8 source");
+    assert!(
+        source.contains("40"),
+        "the edit reached the source:\n{source}"
+    );
+
+    // A structural change (a new child) is not a pointer delta.
+    let mut extra = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    extra.parent = Some(page);
+    document.scene.insert(extra).expect("new child");
+    let persisted = document.clone_for_persist();
+    let scoped =
+        super::materialize::scope_from_document(&persisted, ArtifactKind::Page, page, None)
+            .expect("pages scope by sharing")
+            .expect("scope");
+    let session = workspace.artifact_mut(&id).expect("page session");
+    assert_eq!(session.shared_scene_delta(&scoped), None);
+    session.adopt_document(&persisted).expect("full adoption");
+    assert_eq!(session.doc().scene.len(), 5);
+}
+
+#[test]
+fn a_non_finite_transform_never_makes_a_project_unreadable() {
+    let directory = tempdir().expect("project directory");
+    let mut document = Doc::new();
+    let page = document
+        .scene
+        .insert(CanvasNode::new(NodeData::Group(GroupNode::default())))
+        .expect("page root");
+    document.add_page(page);
+    let mut broken = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    broken.parent = Some(page);
+    broken.transform = Transform2D::from_components([f64::NAN; 6]);
+    let broken = document.scene.insert(broken).expect("degenerate node");
+    crate::write_project_tree(directory.path(), &document, &BTreeMap::new()).expect("write");
+
+    let (loaded, _) = crate::read_project_tree(directory.path()).expect("the project reads back");
+    let transform = loaded.scene.get(broken).expect("node survives").transform;
+    assert_eq!(transform, Transform2D::IDENTITY);
+}
+
+#[test]
+fn reading_repairs_null_geometry_written_by_older_builds() {
+    let mut node = json!({
+        "type": "vector",
+        "id": "01KXH3WN53E9XXSEW27JETAVQD",
+        "transform": [null, null, null, null, null, null],
+        "clip_size": [null, null],
+        "path": {"segments": [
+            {"op": "move", "to": [0.0, 0.0]},
+            {"op": "line", "to": [null, 0.0]},
+            {"op": "close"}
+        ]}
+    });
+    assert!(crate::project::read::repair_non_finite_geometry(&mut node));
+    assert_eq!(node["transform"], json!([1.0, 0.0, 0.0, 1.0, 0.0, 0.0]));
+    assert!(node.get("clip_size").is_none());
+    assert_eq!(node["path"]["segments"][1]["to"], json!([0.0, 0.0]));
+    assert!(!crate::project::read::repair_non_finite_geometry(&mut node));
+}

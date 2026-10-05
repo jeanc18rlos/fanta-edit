@@ -341,6 +341,23 @@ actually driven. Nothing here claims more than that record supports.
   a 1.5 GiB cap (`DEFAULT_DECODED_BUDGET_BYTES`,
   `crates/fanta-render/src/asset.rs`), but nothing in these runs isolates which
   change moved which number.
+- **The save path's per-edit cost is now attributed and mostly gone.**
+  `crates/fanta-format/examples/first_save_profile.rs` replays `FigItem::save`
+  stage by stage on a copy of a project. The "first edit costs gigabytes" above
+  was `ArtifactSession::adopt_document`: every save round-tripped the edited
+  page through JSON and FNX IR and projected both scenes to reconcile them. It
+  now adopts by sharing node `Arc`s and patches only the nodes whose `Arc`
+  changed. Measured on 2026-10-04 with release builds:
+  - 29,299-node page of `basic`: adoption per autosave **4.18 s / +3.70 GiB →
+    0.01 s / +3.6 MiB**; first save after opening **10.54 s / +4.66 GiB →
+    4.93 s / +2.25 GiB** (the first adoption still reconciles against the
+    scene loaded from disk).
+  - UI3 kit (40,141 nodes, ~2,400 components): the write also spent 2.5 s per
+    save healing directory case quadratically; a whole save after the first is
+    now **~2.3 s, down from ~4.9 s**. What remains is re-reading and re-hashing
+    every unchanged design file for the overrides and disk preconditions.
+  These are heap figures from a counting allocator, not resident size, and the
+  canvas's own memory is not in them.
 - **The first frame of a page may decode its images.** Images are decoded
   lazily: `LazyAssetResolver::resolve` (`crates/fanta-render/src/asset.rs`)
   decodes an asset the first time the renderer asks for it, on whichever thread
