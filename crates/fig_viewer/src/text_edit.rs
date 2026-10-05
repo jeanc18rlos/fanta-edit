@@ -116,6 +116,7 @@ pub(crate) struct InstanceEdit {
     /// The instance's pre-edit override vec, restored on rewind before the
     /// undoable commit (mirrors the real-text rewind-then-`ReplaceData` stage).
     pub(crate) base_overrides: Vec<Override>,
+    last_preview_overrides: std::cell::RefCell<Option<Vec<Override>>>,
 }
 
 /// What the properties panel shows for a live text sub-selection: the style
@@ -258,6 +259,7 @@ impl TextEditSession {
             def_path: target.def_path,
             world: target.world,
             base_overrides,
+            last_preview_overrides: Default::default(),
         });
         session
     }
@@ -950,7 +952,7 @@ pub(crate) fn replace_styled_text_ranges(
 /// cache, so the measure pre-warms the very paragraph the next paint draws).
 /// Also pushes the current style runs so partial styling is previewed.
 pub(crate) fn apply_preview(doc: &mut Doc, session: &TextEditSession) {
-    if session.invalid_style_run.is_some() {
+    if session.invalid_style_run.is_some() || content_edit_error(doc, session).is_some() {
         return;
     }
     // Instance session: the edited text is a virtual clone, so the preview is a
@@ -964,6 +966,7 @@ pub(crate) fn apply_preview(doc: &mut Doc, session: &TextEditSession) {
             session.buffer.text(),
             session.changed_color(),
         );
+        *instance.last_preview_overrides.borrow_mut() = Some(overrides.clone());
         instance_text::set_overrides_transient(doc, instance.instance_id, overrides);
         return;
     }
@@ -1010,11 +1013,14 @@ pub(crate) fn apply_preview(doc: &mut Doc, session: &TextEditSession) {
 /// restore-then-apply staging as the select tool's move commit.
 pub(crate) fn rewind_preview(doc: &mut Doc, session: &TextEditSession) {
     if let Some(instance) = &session.instance {
-        instance_text::set_overrides_transient(
-            doc,
-            instance.instance_id,
-            instance.base_overrides.clone(),
-        );
+        if let Some(preview) = instance.last_preview_overrides.borrow().as_ref() {
+            instance_text::rewind_overrides_preview(
+                doc,
+                instance.instance_id,
+                &instance.base_overrides,
+                preview,
+            );
+        }
         return;
     }
     let Some(node) = doc.scene.get_mut(session.node_id) else {
@@ -1088,13 +1094,24 @@ pub(crate) fn commit_operation(doc: &Doc, session: &TextEditSession) -> Option<O
     })
 }
 
+pub(crate) fn content_edit_error(doc: &Doc, session: &TextEditSession) -> Option<String> {
+    let instance = session.instance.as_ref()?;
+    if session.buffer.text() == session.original.content {
+        return None;
+    }
+    instance_text::content_edit_error(doc, instance.instance_id, &instance.def_path)
+}
+
 /// The undoable operation(s) committing the session against the REWOUND
 /// document. A real-text session yields at most one [`Operation::ReplaceData`];
 /// an instance session yields up to two [`Operation::SetInstanceOverride`]s (a
 /// text-content override, and a glyph-color override when the color changed).
 /// Empty when nothing changed.
 pub(crate) fn commit_ops(doc: &Doc, session: &TextEditSession) -> Vec<Operation> {
-    if session.invalid_style_run.is_some() || !session.is_changed() {
+    if session.invalid_style_run.is_some()
+        || !session.is_changed()
+        || content_edit_error(doc, session).is_some()
+    {
         return Vec::new();
     }
     let Some(instance) = &session.instance else {

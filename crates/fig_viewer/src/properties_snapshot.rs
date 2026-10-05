@@ -612,6 +612,7 @@ pub(crate) struct InstanceSection {
 }
 
 pub(crate) struct InstanceTextSnapshot {
+    pub(crate) edit_error: Option<SharedString>,
     pub(crate) path: fanta_doc::OverridePath,
     /// The master text layer's name, the row label.
     pub(crate) label: SharedString,
@@ -1278,9 +1279,11 @@ pub(crate) fn instance_section(doc: &Doc, node: &CanvasNode) -> Option<InstanceS
             }
         })
         .collect();
+    let mut text_errors = crate::instance_text::content_edit_errors(doc, node.id);
     let texts = crate::instance_text::text_clones(doc, node.id)
         .into_iter()
         .map(|(path, label, content)| InstanceTextSnapshot {
+            edit_error: text_errors.remove(&path).map(Into::into),
             path,
             label: label.into(),
             content: content.into(),

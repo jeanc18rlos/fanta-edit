@@ -187,6 +187,29 @@ pub(crate) fn engine_blend_mode(mode: DesignBlendMode) -> Option<BlendMode> {
 
 /// Panel property ids for an instance's variant choices: `variant:<axis>`.
 const VARIANT_PROPERTY_PREFIX: &str = "variant:";
+const INSTANCE_TEXT_PROPERTY_PREFIX: &str = "instance-text:";
+
+fn instance_text_property_id(path: &fanta_doc::OverridePath) -> SharedString {
+    format!(
+        "{INSTANCE_TEXT_PROPERTY_PREFIX}{}",
+        path.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("/")
+    )
+    .into()
+}
+
+fn instance_text_property_path(property: &str) -> Option<fanta_doc::OverridePath> {
+    let path = property.strip_prefix(INSTANCE_TEXT_PROPERTY_PREFIX)?;
+    if path.is_empty() {
+        return Some(Default::default());
+    }
+    path.split('/')
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()
+}
 
 /// The kind fold from engine node data to the panel's canonical taxonomy.
 /// Vector provenance recovers Rectangle via `PathData::is_rect` and the
@@ -2033,6 +2056,15 @@ pub(crate) fn design_node(
                     ),
                 }
             }));
+        out.component_properties
+            .extend(instance.texts.iter().map(|text| {
+                DesignComponentProperty::text(
+                    instance_text_property_id(&text.path),
+                    text.label.clone(),
+                    text.content.clone(),
+                    text.content.clone(),
+                )
+            }));
     }
 
     out.capabilities = Some(gate_capabilities(
@@ -2061,6 +2093,23 @@ pub(crate) fn design_node(
                             value.clone(),
                         ))
                         .read_only_with_reason("This component property cannot be edited here"),
+                    ))
+                }),
+        );
+        let text_offset = instance.variants.len() + instance.props.len();
+        states.extend(
+            instance
+                .texts
+                .iter()
+                .enumerate()
+                .filter_map(|(index, text)| {
+                    let reason = text.edit_error.as_ref()?;
+                    Some((
+                        DesignPanelProperty::ComponentProperty(text_offset + index),
+                        DesignPanelPropertyValueState::Uniform(DesignPanelValue::Text(
+                            text.content.clone(),
+                        ))
+                        .read_only_with_reason(reason.clone()),
                     ))
                 }),
         );
@@ -3222,6 +3271,10 @@ impl FigView {
     }
 
     fn design_apply_ops(&mut self, operations: Vec<Operation>, cx: &mut Context<Self>) -> bool {
+        if let Some(error) = self.pending_bound_text_error(cx) {
+            crate::view::show_canvas_notice_deferred(error, cx);
+            return false;
+        }
         let preview_owner = cx.entity_id();
         let operations = finite_transform_operations(operations);
         if operations.is_empty() {
@@ -3449,6 +3502,10 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(error) = self.pending_bound_text_error(cx) {
+            crate::view::show_canvas_notice(error, window, cx);
+            return;
+        }
         if !self.is_editable(cx)
             && !matches!(
                 action,
@@ -6081,6 +6138,34 @@ impl FigView {
         let Some(id) = node_id(id) else {
             return;
         };
+        if let Some(path) = instance_text_property_path(property_id) {
+            self.finish_document_edits_for_external_change(cx);
+            let error = self.item().read(cx).document().and_then(|document| {
+                crate::instance_text::content_edit_error(&document.doc, id, &path)
+            });
+            if let Some(error) = error {
+                crate::view::show_canvas_notice_deferred(error, cx);
+                return;
+            }
+            let ops = self.design_ops(cx, |doc| {
+                let current = crate::instance_text::text_clones(doc, id)
+                    .into_iter()
+                    .find(|(candidate, _, _)| *candidate == path)
+                    .map(|(_, _, content)| content);
+                let Some(current) = current else {
+                    return Vec::new();
+                };
+                match value {
+                    Some(DesignComponentPropertyValue::Text(text)) if text.as_ref() != current => {
+                        crate::instance_text::commit_ops(doc, id, &path, Some(text), None)
+                    }
+                    None => crate::instance_text::reset_content_ops(doc, id, &path),
+                    _ => Vec::new(),
+                }
+            });
+            self.design_apply_ops(ops, cx);
+            return;
+        }
         if let Some(axis) = property_id.strip_prefix(VARIANT_PROPERTY_PREFIX) {
             // Reset has no meaning for a variant choice; a value swaps the
             // instance to the variant with that value on this axis.
@@ -13088,6 +13173,244 @@ mod tests {
             DesignCornerCapabilities::NONE,
         );
         assert!(vector_caps.fill && vector_caps.stroke);
+    }
+
+    #[gpui::test]
+    async fn bound_instance_text_current_design_rows_refuse_bound_and_edit_unbound_aliases(
+        cx: &mut TestAppContext,
+    ) {
+        use fanta_doc::{
+            Mode, ModeId, PropBindingTarget, Variable, VariableCollection, VariableCollectionId,
+            VariableId, VariableType,
+        };
+        use smallvec::smallvec;
+        let (mut doc, page, _) = doc_with_rect();
+        let collection = VariableCollectionId::new();
+        let mode = ModeId::new();
+        let variable = VariableId::new();
+        doc.variables.collections.insert(
+            collection,
+            VariableCollection {
+                id: collection,
+                name: "Text".into(),
+                modes: vec![Mode {
+                    id: mode,
+                    name: "Default".into(),
+                }],
+                default_mode: mode,
+                variable_order: vec![variable],
+            },
+        );
+        doc.variables.variables.insert(
+            variable,
+            Variable {
+                id: variable,
+                collection,
+                name: "Caption variable".into(),
+                ty: VariableType::String,
+                values_by_mode: BTreeMap::from([(
+                    mode,
+                    VarValue::String {
+                        value: "Resolved caption".into(),
+                    },
+                )]),
+                scopes: Vec::new(),
+            },
+        );
+        let mut master = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([220.0, 120.0]),
+            ..Default::default()
+        }));
+        master.transform = fanta_doc::Transform2D::translation(1000.0, 1000.0);
+        let master = doc.scene.insert(master).expect("master");
+        let mut children = Vec::new();
+        for (index, name) in [
+            "Bound content",
+            "Editable alias content",
+            "Field-unbound content",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut text = CanvasNode::new(NodeData::Text(fanta_doc::TextNode::new(
+                "Literal", 180.0, 28.0,
+            )));
+            text.name = name.into();
+            text.parent = Some(master);
+            text.index = doc.scene.next_child_index(Some(master));
+            text.transform = fanta_doc::Transform2D::translation(10.0, index as f64 * 32.0);
+            if index != 1 {
+                text.bindings
+                    .insert(fanta_doc::BoundProp::TextContent, variable);
+            }
+            children.push(doc.scene.insert(text).expect("text"));
+        }
+        let component = ComponentId::new();
+        let prop = ComponentPropId::new();
+        let mut definition = ComponentDef::new(component, master, "Captions");
+        definition.props.push(ComponentPropDef {
+            id: prop,
+            name: "Caption property".into(),
+            kind: ComponentPropKind::Text,
+            formatter: Default::default(),
+            default: VarValue::Alias { variable },
+            bindings: vec![PropBindingTarget {
+                path: smallvec![children[1]],
+                prop: fanta_doc::BoundProp::TextContent,
+            }],
+        });
+        doc.components.defs.insert(component, definition);
+        let field = fanta_doc::Override {
+            target_path: smallvec![children[2]],
+            target_prop: fanta_doc::BoundProp::TextContent,
+            value: fanta_doc::OverrideValue::Field {
+                value: serde_json::json!({"bindings": [], "name": "Keep override name"}),
+            },
+        };
+        let mut instance = CanvasNode::new(NodeData::Instance(InstanceNode {
+            component,
+            overrides: vec![field.clone()],
+            prop_values: BTreeMap::new(),
+            derived: Vec::new(),
+            local_size: [220.0, 120.0],
+        }));
+        instance.parent = Some(page);
+        let id = doc.scene.insert(instance).expect("instance");
+        doc.selection.select_only(id);
+        doc.history = Default::default();
+        let (view, panel, mut visual) = setup_view(doc, cx).await;
+        view.update_in(&mut visual, |view, _, cx| view.refresh_gpui_design(cx));
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+        let ids = panel.read_with(&visual, |panel, _| {
+            assert_eq!(
+                panel.node().component_properties.len(),
+                4,
+                "current Design inspector must include its three virtual Content rows"
+            );
+            let properties = &panel.node().component_properties;
+            assert_eq!(
+                properties[1].resolved_value,
+                DesignComponentPropertyValue::Text("Resolved caption".into())
+            );
+            assert_eq!(
+                properties[2].resolved_value,
+                DesignComponentPropertyValue::Text("Resolved caption".into())
+            );
+            let view_data = panel.view_data();
+            let state = view_data
+                .property_states
+                .get(&DesignPanelProperty::ComponentProperty(1))
+                .expect("bound Content state");
+            assert!(state.is_read_only());
+            assert!(
+                state
+                    .read_only_reason()
+                    .is_some_and(|reason| reason.contains("Caption variable"))
+            );
+            for index in [2, 3] {
+                assert!(
+                    !panel
+                        .view_data()
+                        .property_states
+                        .get(&DesignPanelProperty::ComponentProperty(index))
+                        .is_some_and(DesignPanelPropertyValueState::is_read_only)
+                );
+            }
+            [
+                properties[1].id.clone(),
+                properties[2].id.clone(),
+                properties[3].id.clone(),
+            ]
+        });
+        let item = view.read_with(&visual, |view, _| view.item().clone());
+        let before = item.read_with(&visual, |item, _| {
+            serde_json::to_value(item.doc().expect("document")).expect("before")
+        });
+        panel.update_in(&mut visual, |_, _, cx| {
+            cx.emit(DesignPanelAction::ComponentPropertyChangeRequested {
+                node_id: id.to_string().into(),
+                property_id: ids[0].clone(),
+                value: DesignComponentPropertyValue::Text("Ignored".into()),
+            })
+        });
+        visual.run_until_parked();
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                serde_json::to_value(item.doc().expect("document")).expect("blocked"),
+                before
+            );
+            assert!(!item.doc().expect("document").history.can_undo());
+        });
+        for (offset, content) in [(1, "Edited alias"), (2, "Edited unbound")] {
+            panel.update_in(&mut visual, |_, _, cx| {
+                cx.emit(DesignPanelAction::ComponentPropertyEditRequested {
+                    node_id: id.to_string().into(),
+                    property_id: ids[offset].clone(),
+                    value: DesignComponentPropertyValue::Text(content.into()),
+                    phase: DesignPanelEditPhase::Commit,
+                })
+            });
+            visual.run_until_parked();
+            item.read_with(&visual, |item, _| {
+                let doc = item.doc().expect("document");
+                let clones = crate::instance_text::text_clones(doc, id);
+                assert_eq!(
+                    clones
+                        .iter()
+                        .find(|(path, _, _)| path.last() == children.get(offset))
+                        .expect("edited clone")
+                        .2,
+                    content
+                );
+                let NodeData::Instance(instance) = &doc.scene.get(id).expect("instance").data
+                else {
+                    panic!("instance");
+                };
+                assert_eq!(instance.overrides.first(), Some(&field));
+                assert!(
+                    instance.prop_values.is_empty(),
+                    "virtual text editing leaves property aliases intact"
+                );
+            });
+        }
+        let edited = item.read_with(&visual, |item, _| {
+            item.doc()
+                .expect("document")
+                .scene
+                .get(id)
+                .expect("instance")
+                .clone()
+        });
+        item.update(&mut visual, |item, cx| {
+            assert!(item.undo(cx).expect("undo second Content edit"));
+            assert!(item.redo(cx).expect("redo second Content edit"));
+        });
+        item.read_with(&visual, |item, _| {
+            assert_eq!(item.doc().expect("document").scene.get(id), Some(&edited))
+        });
+        panel.update_in(&mut visual, |_, _, cx| {
+            cx.emit(DesignPanelAction::ComponentPropertyResetRequested {
+                node_id: id.to_string().into(),
+                property_id: ids[2].clone(),
+            })
+        });
+        visual.run_until_parked();
+        item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            let NodeData::Instance(instance) = &doc.scene.get(id).expect("instance").data else {
+                panic!("instance");
+            };
+            assert_eq!(instance.overrides.first(), Some(&field));
+            assert_eq!(
+                crate::instance_text::text_clones(doc, id)
+                    .iter()
+                    .find(|(path, _, _)| path.last() == children.get(2))
+                    .expect("reset clone")
+                    .2,
+                "Literal"
+            );
+        });
     }
 
     #[gpui::test]

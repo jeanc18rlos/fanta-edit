@@ -18,7 +18,7 @@
 //! [`expand_instance`]: fanta_doc::expand_instance
 //! [`SetInstanceOverride`]: fanta_doc::Operation::SetInstanceOverride
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use fanta_doc::{
     BoundProp, Color, Doc, ExpandedNode, Fill, InstanceExpansionContext, NodeData, NodeFlags,
@@ -177,15 +177,65 @@ pub(crate) fn text_clones(doc: &Doc, instance_id: NodeId) -> Vec<(OverridePath, 
         .collect()
 }
 
+pub(crate) fn content_edit_errors(
+    doc: &Doc,
+    instance_id: NodeId,
+) -> BTreeMap<OverridePath, String> {
+    let Some(node) = doc.scene.get(instance_id) else {
+        return BTreeMap::new();
+    };
+    let NodeData::Instance(instance) = &node.data else {
+        return BTreeMap::new();
+    };
+    let context = InstanceExpansionContext::new(&doc.variables, &doc.active_modes, instance_id);
+    fanta_doc::instance_bindings_with_context(&doc.scene, &doc.components, instance, &context)
+        .into_iter()
+        .filter_map(|(path, bindings)| {
+            let variable = bindings.get(&BoundProp::TextContent)?;
+            let name = doc.variables.variables.get(variable).map(|variable| variable.name.as_str());
+            let source = name.filter(|name| !name.is_empty()).map_or_else(
+                || "a variable".to_string(),
+                |name| format!("the variable ‘{name}’"),
+            );
+            Some((path, format!("This text is controlled by {source}. Edit the variable, or remove its text binding before editing this instance.")))
+        })
+        .collect()
+}
+
+pub(crate) fn content_edit_error(
+    doc: &Doc,
+    instance_id: NodeId,
+    path: &OverridePath,
+) -> Option<String> {
+    content_edit_errors(doc, instance_id).remove(path)
+}
+
 // ---------------------------------------------------------------------------
 // Override construction: preview (transient) and commit (undoable op)
 // ---------------------------------------------------------------------------
 
 /// The index of the override at `path`/`prop` in `overrides`, if present.
 fn override_index(overrides: &[Override], path: &OverridePath, prop: &BoundProp) -> Option<usize> {
+    if *prop == BoundProp::TextContent {
+        // Generic fields can clear bindings or carry unrelated authored data.
+        // Keep those payloads, and place edited text after the last one so it wins.
+        let last_field = overrides.iter().rposition(|entry| {
+            entry.target_path == *path && matches!(&entry.value, OverrideValue::Field { .. })
+        });
+        return overrides
+            .iter()
+            .enumerate()
+            .rfind(|(index, entry)| {
+                entry.target_path == *path
+                    && entry.target_prop == *prop
+                    && matches!(&entry.value, OverrideValue::Text { .. })
+                    && last_field.is_none_or(|last| *index > last)
+            })
+            .map(|(index, _)| index);
+    }
     overrides
         .iter()
-        .position(|ov| ov.target_path == *path && ov.target_prop == *prop)
+        .position(|entry| entry.target_path == *path && entry.target_prop == *prop)
 }
 
 /// A `Text` (content) override for the clone at `def_path`.
@@ -237,6 +287,9 @@ pub(crate) fn commit_ops(
     content: Option<&str>,
     color: Option<Color>,
 ) -> Vec<Operation> {
+    if content.is_some() && content_edit_error(doc, instance_id, def_path).is_some() {
+        return Vec::new();
+    }
     let Some(node) = doc.scene.get(instance_id) else {
         return Vec::new();
     };
@@ -274,6 +327,32 @@ pub(crate) fn commit_ops(
     ops
 }
 
+pub(crate) fn reset_content_ops(
+    doc: &Doc,
+    instance_id: NodeId,
+    path: &OverridePath,
+) -> Vec<Operation> {
+    if content_edit_error(doc, instance_id, path).is_some() {
+        return Vec::new();
+    }
+    snapshot_overrides(doc, instance_id)
+        .into_iter()
+        .enumerate()
+        .rev()
+        .filter_map(|(index, entry)| {
+            (entry.target_path == *path
+                && entry.target_prop == BoundProp::TextContent
+                && matches!(&entry.value, OverrideValue::Text { .. }))
+            .then(|| Operation::SetInstanceOverride {
+                id: instance_id,
+                index,
+                old: Some(entry),
+                new: None,
+            })
+        })
+        .collect()
+}
+
 /// The instance's current override vec (its pre-edit state), captured at session
 /// open so the preview can be rewound before the undoable commit — mirroring the
 /// real-text editor's rewind-then-`ReplaceData` staging.
@@ -301,6 +380,30 @@ pub(crate) fn set_overrides_transient(
             instance.overrides = overrides;
         }
     }
+}
+
+pub(crate) fn rewind_overrides_preview(
+    doc: &mut Doc,
+    instance_id: NodeId,
+    base: &[Override],
+    preview: &[Override],
+) {
+    let mut current = snapshot_overrides(doc, instance_id);
+    // A binding can arrive after the last successful preview. Reverting the
+    // entire vector would erase that payload while cancelling the rejected draft.
+    for (index, value) in preview.iter().enumerate().rev() {
+        if base.get(index) == Some(value) || current.get(index) != Some(value) {
+            continue;
+        }
+        if let Some(original) = base.get(index) {
+            if let Some(current) = current.get_mut(index) {
+                *current = original.clone();
+            }
+        } else {
+            current.remove(index);
+        }
+    }
+    set_overrides_transient(doc, instance_id, current);
 }
 
 /// The override vec for a live preview: `base` (the pre-edit overrides) with the
@@ -554,6 +657,334 @@ mod tests {
             frame
                 .explicit_modes
                 .insert(fixture.collection, fixture.modes[pin]);
+        }
+    }
+
+    #[test]
+    fn bound_instance_text_rejects_content_override_without_changing_binding_or_history() {
+        let mut fixture = resolved_text_fixture(true);
+        fixture
+            .doc
+            .scene
+            .get_mut(fixture.text)
+            .expect("master text")
+            .bindings
+            .insert(BoundProp::TextContent, fixture.alias);
+        set_text_modes(&mut fixture, 0, Some(1));
+        let before = serde_json::to_value(&fixture.doc).expect("authored document");
+        let depth = fixture.doc.history.undo_depth();
+        let target = text_target_at(&fixture.doc, fixture.instance, DVec2::new(620.0, 380.0))
+            .expect("bound text is still visible and targetable");
+        assert_eq!(target.text.content, "Visible B");
+        assert!(
+            commit_ops(
+                &fixture.doc,
+                fixture.instance,
+                &fixture.path,
+                Some("Ignored edit"),
+                None
+            )
+            .is_empty(),
+            "do not author an override that the direct variable binding will overwrite"
+        );
+        assert_eq!(
+            serde_json::to_value(&fixture.doc).expect("unchanged document"),
+            before
+        );
+        assert_eq!(fixture.doc.history.undo_depth(), depth);
+        assert_eq!(
+            text_clones(&fixture.doc, fixture.instance)[0].2,
+            "Visible B"
+        );
+        assert!(
+            !commit_ops(
+                &fixture.doc,
+                fixture.instance,
+                &fixture.path,
+                None,
+                Some(Color::WHITE)
+            )
+            .is_empty(),
+            "the content guard must not remove unrelated color capability"
+        );
+    }
+
+    #[test]
+    fn bound_instance_text_guard_uses_effective_field_overrides_and_preserves_alias_editability() {
+        for authored_bound in [false, true] {
+            for effective_bound in [false, true] {
+                let mut fixture = resolved_text_fixture(true);
+                if authored_bound {
+                    fixture
+                        .doc
+                        .scene
+                        .get_mut(fixture.text)
+                        .expect("master text")
+                        .bindings
+                        .insert(BoundProp::TextContent, fixture.alias);
+                }
+                let mut binding_node = fixture.doc.scene.get(fixture.text).expect("text").clone();
+                binding_node.bindings.clear();
+                if effective_bound {
+                    binding_node
+                        .bindings
+                        .insert(BoundProp::TextContent, fixture.alias);
+                }
+                let bindings = serde_json::to_value(binding_node)
+                    .expect("binding codec")
+                    .get("bindings")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!([]));
+                let field = Override {
+                    target_path: fixture.path.clone(),
+                    target_prop: BoundProp::TextContent,
+                    value: OverrideValue::Field {
+                        value: serde_json::json!({"bindings": bindings}),
+                    },
+                };
+                let NodeData::Instance(instance) = &mut fixture
+                    .doc
+                    .scene
+                    .get_mut(fixture.instance)
+                    .expect("instance")
+                    .data
+                else {
+                    panic!("instance");
+                };
+                instance.overrides.push(field);
+                let before = serde_json::to_value(&fixture.doc).expect("authored state");
+                let operations = commit_ops(
+                    &fixture.doc,
+                    fixture.instance,
+                    &fixture.path,
+                    Some("Edited"),
+                    None,
+                );
+                assert_eq!(
+                    operations.is_empty(),
+                    effective_bound,
+                    "effective binding must win over raw master status {authored_bound}/{effective_bound}"
+                );
+                assert_eq!(
+                    serde_json::to_value(&fixture.doc).expect("unchanged state"),
+                    before
+                );
+                if !effective_bound {
+                    for operation in operations {
+                        fixture.doc.apply(operation).expect("editable content");
+                    }
+                    assert_eq!(text_clones(&fixture.doc, fixture.instance)[0].2, "Edited");
+                    assert!(fixture.doc.undo().expect("undo content"));
+                    let mut restored = serde_json::to_value(&fixture.doc).expect("undo state");
+                    restored["metadata"]["modified_at"] = before["metadata"]["modified_at"].clone();
+                    let mut expected = before.clone();
+                    restored
+                        .as_object_mut()
+                        .expect("document object")
+                        .remove("history");
+                    expected
+                        .as_object_mut()
+                        .expect("document object")
+                        .remove("history");
+                    assert_eq!(restored, expected);
+                    assert!(!fixture.doc.history.can_undo());
+                    assert!(fixture.doc.redo().expect("redo content"));
+                    assert_eq!(text_clones(&fixture.doc, fixture.instance)[0].2, "Edited");
+                }
+            }
+        }
+        let mut fixture = resolved_text_fixture(true);
+        fixture
+            .doc
+            .scene
+            .get_mut(fixture.text)
+            .expect("text")
+            .bindings
+            .insert(BoundProp::TextContent, fixture.alias);
+        let field = Override {
+            target_path: fixture.path.clone(),
+            target_prop: BoundProp::TextContent,
+            value: OverrideValue::Field {
+                value: serde_json::json!({"bindings": [], "content": "Generic content", "name": "Keep generic name"}),
+            },
+        };
+        let NodeData::Instance(instance) = &mut fixture
+            .doc
+            .scene
+            .get_mut(fixture.instance)
+            .expect("instance")
+            .data
+        else {
+            panic!("instance");
+        };
+        instance.overrides = vec![
+            text_content_override(&fixture.path, "Earlier text"),
+            field,
+        ];
+        let original = instance.overrides.clone();
+        for operation in commit_ops(
+            &fixture.doc,
+            fixture.instance,
+            &fixture.path,
+            Some("Final text"),
+            None,
+        ) {
+            fixture
+                .doc
+                .apply(operation)
+                .expect("append after generic content");
+        }
+        assert_eq!(
+            text_clones(&fixture.doc, fixture.instance)[0].2,
+            "Final text"
+        );
+        let entries = snapshot_overrides(&fixture.doc, fixture.instance);
+        assert_eq!(&entries[..original.len()], &original);
+        assert_eq!(entries.len(), original.len() + 1);
+        let repeated = commit_ops(
+            &fixture.doc,
+            fixture.instance,
+            &fixture.path,
+            Some("Final edited twice"),
+            None,
+        );
+        for operation in repeated {
+            fixture
+                .doc
+                .apply(operation)
+                .expect("update final typed text");
+        }
+        assert_eq!(
+            snapshot_overrides(&fixture.doc, fixture.instance).len(),
+            entries.len()
+        );
+        assert_eq!(
+            text_clones(&fixture.doc, fixture.instance)[0].2,
+            "Final edited twice"
+        );
+        let fixture = resolved_text_fixture(false);
+        assert!(
+            !commit_ops(
+                &fixture.doc,
+                fixture.instance,
+                &fixture.path,
+                Some("Placed override"),
+                None
+            )
+            .is_empty(),
+            "a component-property alias is applied before the sparse text override and remains editable"
+        );
+    }
+
+    #[test]
+    fn bound_instance_text_preview_and_commit_recheck_new_and_unresolved_bindings() {
+        for missing_variable in [false, true] {
+            let mut fixture = resolved_text_fixture(true);
+            let target = text_target_at(&fixture.doc, fixture.instance, DVec2::new(620.0, 380.0))
+                .expect("editable text");
+            let mut session = crate::text_edit::TextEditSession::new_instance(
+                target,
+                snapshot_overrides(&fixture.doc, fixture.instance),
+            );
+            session.select_all();
+            session.insert("Draft retained");
+            fixture
+                .doc
+                .scene
+                .get_mut(fixture.text)
+                .expect("master text")
+                .bindings
+                .insert(
+                    BoundProp::TextContent,
+                    if missing_variable {
+                        fanta_doc::VariableId::new()
+                    } else {
+                        fixture.alias
+                    },
+                );
+            let before =
+                serde_json::to_value(&fixture.doc).expect("binding introduced after opening");
+            crate::text_edit::apply_preview(&mut fixture.doc, &session);
+            assert_eq!(
+                serde_json::to_value(&fixture.doc).expect("preview blocked"),
+                before,
+                "a newly bound draft must not install an ineffective transient override"
+            );
+            assert!(crate::text_edit::commit_ops(&fixture.doc, &session).is_empty());
+            assert!(
+                session.is_changed(),
+                "the unsaved user draft remains available for correction/cancel"
+            );
+            assert_eq!(
+                serde_json::to_value(&fixture.doc).expect("commit blocked"),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn bound_instance_text_cancel_preserves_late_same_instance_fields() {
+        for original_text in [None, Some("Existing typed override")] {
+            let mut fixture = resolved_text_fixture(true);
+            if let Some(content) = original_text {
+                for operation in commit_ops(
+                    &fixture.doc,
+                    fixture.instance,
+                    &fixture.path,
+                    Some(content),
+                    None,
+                ) {
+                    fixture.doc.apply(operation).expect("existing content");
+                }
+            }
+            let target = text_target_at(&fixture.doc, fixture.instance, DVec2::new(620.0, 380.0))
+                .expect("editable text");
+            let base = snapshot_overrides(&fixture.doc, fixture.instance);
+            let mut session = crate::text_edit::TextEditSession::new_instance(target, base.clone());
+            session.select_all();
+            session.insert("Preview first");
+            crate::text_edit::apply_preview(&mut fixture.doc, &session);
+            let field = Override {
+                target_path: fixture.path.clone(),
+                target_prop: BoundProp::Opacity,
+                value: OverrideValue::Field {
+                    value: serde_json::json!({
+                        "bindings": [[{"prop": "text_content"}, fixture.alias]],
+                        "name": "Keep late payload"
+                    }),
+                },
+            };
+            let NodeData::Instance(instance) = &mut fixture
+                .doc
+                .scene
+                .get_mut(fixture.instance)
+                .expect("instance")
+                .data
+            else {
+                panic!("instance")
+            };
+            instance.overrides.push(field.clone());
+            let history = serde_json::to_value(&fixture.doc.history).expect("history");
+            session.select_all();
+            session.insert("Rejected draft");
+            crate::text_edit::apply_preview(&mut fixture.doc, &session);
+            assert!(crate::text_edit::commit_ops(&fixture.doc, &session).is_empty());
+            crate::text_edit::rewind_preview(&mut fixture.doc, &session);
+            let mut expected = base;
+            expected.push(field);
+            assert_eq!(
+                snapshot_overrides(&fixture.doc, fixture.instance),
+                expected,
+                "cancel only owns the last successful preview, not a later Field payload"
+            );
+            assert_eq!(
+                serde_json::to_value(&fixture.doc.history).expect("history"),
+                history
+            );
+            assert_eq!(
+                text_clones(&fixture.doc, fixture.instance)[0].2,
+                "Visible A"
+            );
         }
     }
 

@@ -9,7 +9,7 @@
 
 use crate::binding::BoundProp;
 use crate::component::{ComponentDef, ComponentLibrary, ComponentPropKind};
-use crate::id::{ModeId, NodeId, VariableCollectionId};
+use crate::id::{ModeId, NodeId, VariableCollectionId, VariableId};
 use crate::node::{
     CanvasNode, InstanceNode, NodeData, NodeFlags, Override, OverridePath, OverrideValue,
 };
@@ -138,6 +138,52 @@ fn expand_instance_inner(
     instance: &InstanceNode,
     context: Option<&InstanceExpansionContext<'_>>,
 ) -> Vec<ExpandedNode> {
+    let mut out = expand_instance_before_bindings(scene, components, instance, context);
+    if let Some(context) = context {
+        for entry in &mut out {
+            for (property, variable) in entry.node.bindings.clone() {
+                if let Some(value) = resolve_bound_value(
+                    context.variables,
+                    scene,
+                    context.mode_anchor,
+                    context.active_modes,
+                    variable,
+                ) && property.apply_resolved(&mut entry.node, value)
+                {
+                    // Fresh clone ids have no scene ancestors; materialize once before
+                    // layout and prevent a later paint overlay from choosing another mode.
+                    entry.node.bindings.remove(&property);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Effective node bindings after property, sparse and derived instance overrides,
+/// before resolved values are materialized and their binding entries removed.
+/// Paths and variant selection match [`expand_instance_with_context`]. A binding
+/// can exist even when its variable cannot currently resolve in this context.
+pub fn instance_bindings_with_context(
+    scene: &Scene,
+    components: &ComponentLibrary,
+    instance: &InstanceNode,
+    context: &InstanceExpansionContext<'_>,
+) -> BTreeMap<OverridePath, BTreeMap<BoundProp, VariableId>> {
+    expand_instance_before_bindings(scene, components, instance, Some(context))
+        .into_iter()
+        .filter_map(|entry| {
+            (!entry.node.bindings.is_empty()).then_some((entry.def_path, entry.node.bindings))
+        })
+        .collect()
+}
+
+fn expand_instance_before_bindings(
+    scene: &Scene,
+    components: &ComponentLibrary,
+    instance: &InstanceNode,
+    context: Option<&InstanceExpansionContext<'_>>,
+) -> Vec<ExpandedNode> {
     let Some(def) = resolve_instance_def(scene, components, instance, context) else {
         return Vec::new();
     };
@@ -219,24 +265,6 @@ fn expand_instance_inner(
                 nested.path = remainder.iter().copied().collect();
                 inst.derived.push(nested);
             });
-        }
-    }
-    if let Some(context) = context {
-        for entry in &mut out {
-            for (property, variable) in entry.node.bindings.clone() {
-                if let Some(value) = resolve_bound_value(
-                    context.variables,
-                    scene,
-                    context.mode_anchor,
-                    context.active_modes,
-                    variable,
-                ) && property.apply_resolved(&mut entry.node, value)
-                {
-                    // Fresh clone ids have no scene ancestors; materialize once before
-                    // layout and prevent a later paint overlay from choosing another mode.
-                    entry.node.bindings.remove(&property);
-                }
-            }
         }
     }
     out
