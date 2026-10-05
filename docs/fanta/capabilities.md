@@ -99,12 +99,14 @@ the imported geometry; geometry or operation changes recompute it from operands.
 Constraint data can be retained by the document, but constraint controls are
 currently disabled in the default Design inspector.
 Mixed values must remain identifiable; controls must neither erase unsupported
-data nor silently apply to a stale selection. Numeric and color gestures preview
-live, commit as one history step, and restore the previous value when cancelled.
+data nor silently apply to a stale selection. Editable fields support draft
+cancellation and undoable commits. Controls that offer live previews restore
+the previous value when cancelled; mixed-selection opacity commits once when
+the gesture finishes and does not provide that single-node live preview.
 Native numeric/hex draft cancellation and Export-label checks passed at a 320 px
 inspector width. A two-kind selection's aggregate-opacity display/edit/Undo and
 the visible cross-document paste refusal also passed native checks; see the
-[coverage report](../alpha/CAPABILITY_COVERAGE.md#local-checkpoint--5-october)
+[coverage report](../alpha/CAPABILITY_COVERAGE.md#current-acceptance-status)
 for exact builds and remaining gesture checks.
 
 Implementation: [tools.rs](../../crates/fig_viewer/src/tools.rs),
