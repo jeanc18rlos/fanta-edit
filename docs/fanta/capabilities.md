@@ -155,9 +155,10 @@ an editor. Only the even click in each pair activates or drills in, preventing a
 triple-click from accidentally descending another level. Instance text also
 respects locked ancestors, overlapping virtual content and clipping, including
 rounded corners. Alias-backed component text properties use the placed instance's
-active or inherited mode when resolving editable text. The later correction is
-covered by automated tests; native verification remains pending. Text inside true nested
-instances and virtual Text on Path are not recursively targeted. A direct
+active or inherited mode when resolving editable text. Native checks on `a3a51b084b`
+cover default and placed aliases, derived text geometry, Save/single Undo/Redo,
+hidden-text no-op and strict reopening of the final saved state. Text inside true
+nested instances and virtual Text on Path are not recursively targeted. A direct
 text-content variable binding remains authoritative; changing its text requires
 changing the variable or binding. Text on Path accepts the shaped text area, including letter
 counters and spaces, while rejecting distant empty areas along the baseline.
