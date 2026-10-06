@@ -2090,3 +2090,15 @@ is not established. The original four-stage aggregate remains immutable;
 `1ff080f63a9dc6146e7e9119f49ae7dd1dc6aa174d8dce61e1a8dfce8a5cdcc5`.
 Boolean point edits, held-drag cancellation and the broader node/guard matrix
 remain unverified.
+
+## Integrated main hosted CI — 7 October
+
+Main commit `6ac89e6a2193603d45f7ce517d52493f2386884f` passes
+[Check run 37534261732](https://github.com/jeanc18rlos/fanta-edit/actions/runs/37534261732),
+including the Check and Mac App Store runtime jobs. Its push checkout tree is
+`22307a1d63aa90567f1dcac056cd556c693803ee`, matching the integrated source.
+The native-video job was skipped. This closes the previously pending hosted
+CI gate for this commit; it does not establish native-video acceptance,
+live large-page performance, or readiness of a signed direct-download DMG.
+Repository secret names still include the certificate/password pair and omit
+all three notarization-key secrets. No signed product artifact was built here.
