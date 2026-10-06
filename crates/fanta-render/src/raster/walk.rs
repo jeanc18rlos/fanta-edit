@@ -21,6 +21,7 @@ use super::{
 /// so adding the cull rect, the image cache, the instance cache, and the
 /// doc-level inputs did not balloon every recursive call's argument list.
 pub(crate) struct RenderCtx<'a> {
+    pub(crate) split: Option<super::split::SplitPass<'a>>,
     pub(crate) scene: &'a Scene,
     pub(crate) resolver: Option<&'a dyn AssetResolver>,
     pub(crate) cache: &'a mut ImageCache,
@@ -242,6 +243,12 @@ fn resolved_local_bounds(ctx: &mut RenderCtx, id: NodeId) -> Option<Bounds> {
 /// Geometry, visibility, culling, and painting read the same transient overlay
 /// (see [`resolve_overlay`]); the document is never mutated by rendering.
 pub(crate) fn render_node(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
+    if ctx
+        .split
+        .is_some_and(|split| !split.spec.includes(id, split.phase))
+    {
+        return;
+    }
     if ctx
         .metrics
         .sampling_budget

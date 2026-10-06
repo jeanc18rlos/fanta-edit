@@ -1066,6 +1066,7 @@ impl RasterRenderer {
             page_root,
             inputs,
             true,
+            None,
             &mut metrics,
         );
 
@@ -1105,8 +1106,59 @@ impl RasterRenderer {
         inputs: &RenderInputs,
     ) -> RenderMetrics {
         self.render_to_canvas_configured(
-            canvas, target_w, target_h, scene, viewport, page_root, inputs, true,
+            canvas, target_w, target_h, scene, viewport, page_root, inputs, true, None,
         )
+    }
+
+    /// Draw one prepared phase onto a transparent surface (Below includes the
+    /// normal page clear). Composite Below, Middle and Above at identical
+    /// viewport/size with source-over. Rejected or stale specs leave the target
+    /// untouched. This opt-in API is not used by normal page rendering.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_split_to_canvas(
+        &mut self,
+        canvas: &Canvas,
+        target_w: u32,
+        target_h: u32,
+        scene: &Scene,
+        viewport: &Viewport,
+        inputs: &RenderInputs,
+        spec: &super::SplitSpec,
+        phase: super::SplitPhase,
+    ) -> Result<RenderMetrics, super::SplitError> {
+        spec.validate(scene, inputs)?;
+        let scale = viewport.zoom * self.display_scale;
+        if target_w == 0
+            || target_h == 0
+            || target_w > i32::MAX as u32
+            || target_h > i32::MAX as u32
+            || !viewport.center.iter().all(|coordinate| {
+                coordinate.is_finite()
+                    && (*coordinate as f32).is_finite()
+                    && ((*coordinate * scale) as f32).is_finite()
+            })
+            || !viewport.zoom.is_finite()
+            || viewport.zoom <= 0.0
+            || !self.display_scale.is_finite()
+            || self.display_scale <= 0.0
+            || !scale.is_finite()
+            || scale <= 0.0
+            || !(scale as f32).is_finite()
+            || (scale as f32) <= 0.0
+        {
+            return Err(super::SplitError::InvalidViewport);
+        }
+        Ok(self.render_to_canvas_configured(
+            canvas,
+            target_w,
+            target_h,
+            scene,
+            viewport,
+            Some(spec.page_root()),
+            inputs,
+            true,
+            Some(super::split::SplitPass { spec, phase }),
+        ))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1120,6 +1172,7 @@ impl RasterRenderer {
         page_root: Option<NodeId>,
         inputs: &RenderInputs,
         supports_offscreen_layers: bool,
+        split: Option<super::split::SplitPass<'_>>,
     ) -> RenderMetrics {
         let started = Instant::now();
         let mut metrics = RenderMetrics::default();
@@ -1132,8 +1185,11 @@ impl RasterRenderer {
         let background = self.background;
         let display_scale = self.display_scale;
         let resolver = self.asset_resolver.clone();
-        let resolver_ref = resolver.as_deref();
-        let cache = &mut self.image_cache;
+        let resolver_ref = split
+            .map(|split| split.spec.resolver())
+            .or(resolver.as_deref());
+        let mut split_image_cache = split.map(|_| ImageCache::new());
+        let cache = split_image_cache.as_mut().unwrap_or(&mut self.image_cache);
         let instance_cache = &mut self.instance_cache;
         let boolean_cache = &mut self.boolean_cache;
         let path_cache = &mut self.path_cache;
@@ -1160,6 +1216,7 @@ impl RasterRenderer {
             page_root,
             inputs,
             supports_offscreen_layers,
+            split,
             &mut metrics,
         );
 
@@ -1214,6 +1271,7 @@ impl RasterRenderer {
             page_root,
             inputs,
             false,
+            None,
         );
         let data = svg_canvas.end();
         SvgRenderOutput {
@@ -1386,6 +1444,7 @@ impl RasterRenderer {
         canvas.scale((effective_scale, effective_scale));
         canvas.translate((-viewport.center[0] as f32, -viewport.center[1] as f32));
         let mut ctx = RenderCtx {
+            split: None,
             scene,
             resolver,
             cache,
@@ -1450,6 +1509,7 @@ impl RasterRenderer {
         page_root: Option<NodeId>,
         inputs: &RenderInputs,
         supports_offscreen_layers: bool,
+        split: Option<super::split::SplitPass<'_>>,
         metrics: &mut RenderMetrics,
     ) {
         // A page root carrying a solid background is the document's canvas
@@ -1459,7 +1519,12 @@ impl RasterRenderer {
         // walk then skips that root's own background paint so a translucent
         // page color is not composited twice.
         let page_background = page_background_color(scene, page_root, inputs);
-        canvas.clear(to_sk_color(page_background.unwrap_or(background)));
+        let clear = if split.is_some_and(|split| split.phase != super::SplitPhase::Below) {
+            Color::rgba(0, 0, 0, 0)
+        } else {
+            page_background.unwrap_or(background)
+        };
+        canvas.clear(to_sk_color(clear));
 
         let half_w = target_w as f32 * 0.5;
         let half_h = target_h as f32 * 0.5;
@@ -1504,23 +1569,27 @@ impl RasterRenderer {
         // pixels (see `LayerCache::begin_frame`). Motion playback moves nodes
         // without touching any epoch input, so a motion frame neither
         // consults nor fills the cache.
-        let layer_cache_populate = layer_cache.begin_frame(
-            canvas,
-            LayerEpoch {
-                scene_instance: scene.instance_id(),
-                scene_revision: scene.revision(),
-                mode_generation: inputs.mode_generation,
-                dark_ui: inputs.dark_ui,
-            },
-            effective_scale,
-            root_tx,
-            root_ty,
-        );
-        let layer_cache_lookups =
-            supports_offscreen_layers && inputs.motion.is_none() && layer_cache.is_enabled();
+        let layer_cache_populate = split.is_none()
+            && layer_cache.begin_frame(
+                canvas,
+                LayerEpoch {
+                    scene_instance: scene.instance_id(),
+                    scene_revision: scene.revision(),
+                    mode_generation: inputs.mode_generation,
+                    dark_ui: inputs.dark_ui,
+                },
+                effective_scale,
+                root_tx,
+                root_ty,
+            );
+        let layer_cache_lookups = split.is_none()
+            && supports_offscreen_layers
+            && inputs.motion.is_none()
+            && layer_cache.is_enabled();
 
         // Walk roots in z-order. Sub-tree recursion via the helper below.
         let mut ctx = RenderCtx {
+            split,
             scene,
             resolver,
             cache,

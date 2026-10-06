@@ -27,6 +27,7 @@ mod media;
 mod motion;
 mod pattern;
 mod shadows;
+mod split;
 mod shapes_basics;
 mod shapes_fill_rule;
 mod shapes_frame;
