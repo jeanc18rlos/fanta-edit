@@ -143,6 +143,7 @@ fn main() -> Result<()> {
     let node = doc.scene.get(moving).context("selected node disappeared")?;
     let node_name = node.name.clone();
     let node_kind = node.data.kind_tag();
+    let node_has_image_fill = image_node(&node.data);
     let original = node.transform;
     let moving_bounds = doc
         .scene
@@ -275,7 +276,7 @@ fn main() -> Result<()> {
         "executable": env::current_exe().context("locating benchmark binary")?,
         "page": { "id": page.to_string(), "index": page_index, "name": page_name, "scene_nodes": page_nodes },
         "moving_node": { "id": moving.to_string(), "page_index": moving_index,
-            "name": node_name, "kind": node_kind,
+            "name": node_name, "kind": node_kind, "has_image_fill": node_has_image_fill,
             "initial_world_bounds": [moving_bounds.min_x, moving_bounds.min_y, moving_bounds.max_x, moving_bounds.max_y] },
         "surface_pixels": options.size, "warmup_frames": 3, "measured_frames_per_zoom": options.frames,
         "distance_parent_units": options.distance,
