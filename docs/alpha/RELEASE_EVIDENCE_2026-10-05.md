@@ -1807,3 +1807,218 @@ are separate and that baseline is not a current import-performance result.
 The synthetic Save acceptance median 546.673→292.797 ms measures that phase only.
 No final native drag p95 below 16 ms, complete Save improvement or release-profile
 memory claim is established.
+
+
+## Mixed inspector edits and fast-exit scrub failure — 8a9a33c35e
+
+The separate ten-node/five-asset inspector fixture passes **seven bounded native
+checkpoints** on `8a9a33c35e` (binary `8d24b09c414c650c26724b616ddf6a200913e4b6942966186dc79a78c7a35ecb`).
+At 320 logical pixels, the two-kind selection correctly showed mixed opacity;
+typing 75% changed only the original 50% Vector and 100% Bitmap. Single
+Undo/Save, Redo/Save and final Undo/Save passed the complete typed oracle.
+All unrelated content and five assets remained exact. Equal explicit corners
+showed summary 7/All corners; varied corners showed TL1/TR2/BL4/BR3, matching
+serialized TL/TR/BR/BL order 1/2/3/4. Four separate equal-corner fields were not
+observed or edited. The initial corner-check expectations were revised; the original plan remains recorded.
+
+Open, read-only corner inspection and cold reopening have strict typed/timestamp
+and **24-file byte** equality against their respective frozen saved baselines.
+The original PID 81329 exited; the same bundle/profile reopened as PID 88491,
+without a post-launch Save. These are persistence and observed-layout samples,
+not a full inspector visual baseline.
+
+Two attempts to scrub the Vector from 50% to zero remain **FAIL**. The first
+started on the prefix icon outside the numeric scrub surface. The second
+started on the numeric body and moved straight outside; the hover-only move
+handler did not promote the armed input to a scrub. Neither achieved zero.
+The later automated correction is described below; no corrected-build native
+fix pass is claimed. Held Escape during dragging is covered only by mounted tests because
+the native automation sends atomic drags. Evidence: `native-inspector-release-20261005/`
+`native-review-v1.json`, each capture/verdict and runtime records. Independent
+small-file recomputation confirms the seven passes and both retained failures
+in `release-update-ui-spans-pr74-20261005/native-inspector-independent-review.json`.
+
+## Fixed painted ancestors and real-file CPU timings — PR 74
+
+[PR 74](https://github.com/jeanc18rlos/fanta-edit/pull/74), `fed62a3339`, allows
+a fixed ancestor paint box whose children overflow without clipping. The
+initial focused run retained two genuine UnsupportedAncestor failures and one
+passing control; all three then passed. The full renderer library passes
+**389 tests with two ignored**, and renderer/viewer lint passes. Earlier PR 72
+refusals and setup failures remain evidence for that earlier implementation.
+
+The new development-CPU Spectrum run accepted both declared image/instance
+targets at fit-all and 100%, three rounds each. **552 full-frame comparisons are
+exact (maximum channel difference zero); 1,440 paired measured frames** use
+alternating normal/retained order, three warmup pairs and 120 measured pairs per
+round. Nearest-rank quantiles below pool 360 samples per target/zoom:
+
+| Target / zoom | Normal p50 / p95 (ms) | Retained p50 / p95 (ms) |
+| --- | --- | --- |
+| Instance 4358 / fit-all | 151.837 / 159.209 | 9.513 / 10.444 |
+| Instance 4358 / 100% | 9.959 / 11.236 | 10.486 / 11.476 |
+| Image 2110 / fit-all | 151.511 / 160.927 | 16.780 / 18.492 |
+| Image 2110 / 100% | 1.489 / 2.268 | 9.163 / 10.546 |
+
+The 100% image case regresses substantially, and the 100% instance case does not
+improve. This needs a measured cost gate before live activation. Preparation
+**114.743–281.855 ms** is excluded from frame timing and must stay off the UI
+thread. Exact context validation costs about 3.1 ms median per frame. Counters
+for the moving middle omit static traversal/mask work and recorded foreground
+replay. Accounted surfaces/frozen pixels/picture bytes are not total memory or
+peak RSS. The complete authored document and original project files remain
+unchanged; no native worker, GPU presentation, drop, Save or release-build
+latency is measured. There is no native below-16-ms or universal speed claim.
+
+Evidence: `renderer-fixed-paint-ancestors-20261005/integration/`
+`final-validation.json`, `spectrum-summary.json`, `spectrum-cpu-run1/report.json`,
+`run-context.json` and `project-unchanged.json`. The later actual-Metal probe failed its original parity gate, as recorded below;
+it is not a passing timing measurement or visible canvas integration.
+
+## Inclusive UI-stage diagnostics — PR 75
+
+[PR 75](https://github.com/jeanc18rlos/fanta-edit/pull/75), `f47763b6ae`, extends
+opt-in gesture summaries with bounded counts, total and maximum wall time for
+tool dispatch, FigView element construction, Design refresh and owned
+ContentPreview postprocessing. Captured view/gesture identity and pending-span
+completion keep release and late replies on their original gesture. Inactive
+and mismatched nested views cannot contribute to another view's costs. Disabled
+spans do not read clocks or allocate samples; small scope bookkeeping remains.
+Separate guards time the viewer's six WorkspaceSession::open routes and encoded
+thumbnail wrapping through the existing slow-operation threshold.
+
+All **16 focused tests**, including six new pure cases, pass. The actual mounted
+pointer lifecycle passes four release/redraw configurations across five seeds.
+The full editor suite passes **1,164 tests with one ignored benchmark**, the
+benchmark CLI passes three tests, and repository lint/dependency checks and
+five-file formatting pass. A pre-existing test-format correction after the full
+run is retained as an explicitly whitespace-only diff. Native log capture from
+a new candidate remains pending. Evidence: `gesture-ui-spans-20261005/integration/`
+`final-validation.json`, tested/final source hashes and retained logs.
+
+These durations are **inclusive and overlap; do not add them together**. Render
+means element construction, not later layout/paint. Thumbnail wrapping does not
+measure full image decode/upload. Initial press setup and post-release settling
+remain outside the gesture boundary. This measures neither CPU time, OS input
+latency nor GPU timestamps and makes no performance-improvement claim.
+
+For the phase map above, Phase 0 now has this bounded UI-span implementation
+(native output still pending), and Phase 4 now has eligible real-file CPU
+parity/timings. Live worker integration, exact invalidation/font ownership,
+backend parity, preparation/cost policy and total-memory controls remain open.
+Phases 1–3 and 5–7 retain the listed gaps; the original plan is not complete.
+
+
+## Native four-format exports and simultaneous presets — 8a9a33c35e
+
+The same `8a9a33c35e` inspector candidate exported a 220×160 Vector at 50% opacity
+and a 220×160 Bitmap at 100% through actual PNG/JPG/SVG/PDF controls. The Vector
+five-output checkpoint (four formats plus a repeated PNG) passes independent
+dimensions/decoded appearance and preserves the first filename. The Bitmap
+PNG/SVG/PDF checks pass source-derived center-cover appearance. A single
+two-preset action then creates a repeated SVG with collision suffix and a
+440×320 `@2x` PNG; the original nine files remain byte-identical, and all **24
+authored project files remain exact**. The repeated SVG has a new generated clip
+ID but exactly matching decoded pixels. Its initial overstrict byte-equality
+harness failure remains retained. The 2× PNG checks 51,840 source-derived flat
+pixels exactly.
+
+The original Bitmap JPEG verdict remains **FAIL at four pixels** exceeding its
+RGB tolerance of 10 by 2–3. Independent analysis identifies Q90/4:4:4 encoding
+and reproduces mixed-block ringing with libjpeg; no export code or encoding
+was changed. A separately declared, bounded DCT-flat-block criterion checks
+**160 complete blocks / 10,240 pixels**, retains tolerance 10 and finds maximum
+error 1. Four independent positive controls and seven negative controls pass.
+This is not a rewrite of the original failure, a lossless-JPEG claim or general
+quality certification. Broader effects, selection batches and visible error
+paths remain open. No source Save was invoked during these export actions.
+
+Evidence: `native-export-release-20261005/final-handoff.json`,
+`operator-actions-v2.json`, the original `a01-b01-nine-outputs/verdict.json`,
+`jpeg-compression-classification/analysis.json`,
+`jpeg-v2-block-aware/verdict.json`, and
+`two-presets-eleven-outputs-v2/verdict.json`. The operator also observed a plain
+click selecting both nodes after the dropdown/export route. Its actual input
+flags were not captured, so the selection anomaly remains unexplained.
+
+## Opt-in click delivery and routing diagnostic — automated only
+
+A reviewed `view.rs` diagnostic now records actual GPUI canvas down/up, shared
+release and tool Press/Release events with event modifiers, window flags when
+available, route/primary-guard outcomes and selection before/after. It is
+disabled unless `FANTA_INPUT_DIAGNOSTICS=1`, caps reservations at **256 records
+per view**, and includes at most 16 selected IDs plus total count/truncation.
+It never records moves or keyboard/text payloads; disabled/capped paths skip
+payload and snapshot construction. Nested callbacks can log before enclosing
+callbacks, so the sequence denotes entry order, not log-line order.
+
+All **three focused controls pass**, including both mounted tests across five
+scheduler seeds: six cached/delivered modifier cases and two pan release orders
+per seed. Scene, assets, history and dirty state remain unchanged. The first
+pan test incorrectly assumed that the canvas handler always ended pan; its
+failure is preserved, and the corrected test explicitly covers the existing
+repaint-installed global listener. Production behavior was unchanged.
+Formatting and changed-file checks pass. The subsequent combined editor suite
+passes **1,171 tests with four ignored**, including these three controls; three
+benchmark CLI tests and repository lint also pass. Actual native log capture
+remains pending.
+
+Evidence: `native-click-diagnostics-20261005/validation.json`, both focused logs,
+`five-seeds.log`, reviewed/final patches and `operator-plan.md`. These controls
+prove GPUI routing and modifier semantics, not native NSEvent/automation
+delivery and not a fix for the original selection anomaly.
+
+## Actual-Metal parity refusal and localization controls
+
+The first test-only actual-backend probe compares normal `MacGpuRenderer`
+rendering against CPU-retained pixels uploaded/composed/flushed through Metal.
+Its first immutable Bitmap case at offset (-16,-6) fails: **maximum channel
+difference 28 exceeds the predeclared 2**, with 517 differing pixels (405 over
+2). **No timing samples are accepted** and the original failed frame/report
+remain retained. The full-frame CPU render and CPU-retained render are exactly
+equal; both differ from normal Metal at the same pixels.
+
+Three independent Metal-only controls—ordered phases, recorded Above picture,
+and same-context GPU Below snapshot with Src/middle/Above composition—each
+match normal Metal exactly on that first fixture. This localizes a backend
+appearance difference and supports further investigation; it does not validate
+the complete retained-session lifecycle, a larger fixture matrix, live canvas
+activation or GPU timing. The subsequent test-only GPU matrix now passes **all 40 full frames exactly**
+(maximum difference zero): Bitmap and instance text at scales 1/2 plus transparent
+Bitmap output, eight translations per fixture, retaining GPU Below and Above
+picture. The existing CPU session validates each translation; its CPU image is
+discarded and a fresh checked Middle spec is prepared. This intentional
+diagnostic redundancy is untimed, not the proposed production fast path. All
+authored documents, the test binary and 1,534 source fingerprints remain
+unchanged. No performance, context-loss recovery, memory bound or live
+activation is established. Evidence: `retained-metal-probe-20261005/integration/`
+`metal-run1/failure.json`, `metal-run1/pixel-classification.json`,
+`controls-run1/outputs/report.json`, `checkpoint-controls.json`, and
+`gpu-matrix-run1/outputs/report.json` with its unchanged-source/run manifests
+and `independent-release-review.json`.
+
+
+## Fast-exit scrub correction and combined validation — native retry pending
+
+The shared numeric input now observes an armed left-button scrub through a
+frame-scoped capture listener, so its first movement may already be outside the
+readout. The editor uses merged upstream revision
+`66dc0f1cfec60e7190e0d3b1ee98925e48e632ca`. Four meaningful mounted regressions
+failed on the old pin and pass on this revision; all **six scrub controls pass
+across five scheduler seeds**, covering single/mixed values, redraw ordering,
+Escape and late release. Existing document, Undo and asset assertions remain.
+The two earlier native zero-opacity failures remain historical failures; the
+new app's native scrub/Save/Undo/reopen retry has not yet been verified.
+
+The frozen combined source—including click diagnostics and test-only Metal
+probes—passes **1,171 editor tests, zero failures and four ignored tests**, plus
+**three benchmark CLI tests**, repository lint/dependency checks and formatting.
+The ignored tests are the existing layer-projection benchmark and three
+explicit Metal diagnostics; their separately executed results retain their own
+provenance. Source fingerprints stayed unchanged throughout validation.
+Evidence: `numeric-scrub-fast-exit-20261005/editor-validation.json` and its
+RED/GREEN, five-seed, full-editor, CLI and lint records. This completes the
+automated correction checkpoint, not exhaustive UI acceptance or release
+certification. The backend-compatible retained-surface proposal remains
+external and is held for the next session; the 40-frame diagnostic is not a
+production surface API or a performance result.
