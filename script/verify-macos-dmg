@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+import argparse
+import contextlib
+import hashlib
+import json
+import os
+from pathlib import Path
+import plistlib
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+class VerificationError(Exception):
+    pass
+
+
+def require(condition, message):
+    if not condition:
+        raise VerificationError(message)
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as source:
+        for block in iter(lambda: source.read(1024 * 1024), b''):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def bundle_manifest(app):
+    require(app.is_dir() and not app.is_symlink(), f'Expected an app directory: {app}')
+    entries = {}
+    for path in sorted(app.rglob('*')):
+        metadata = path.lstat()
+        relative = str(path.relative_to(app))
+        if stat.S_ISLNK(metadata.st_mode):
+            entries[relative] = {'kind': 'symlink', 'target': os.readlink(path)}
+        elif stat.S_ISDIR(metadata.st_mode):
+            entries[relative] = {'kind': 'directory'}
+        elif stat.S_ISREG(metadata.st_mode):
+            entries[relative] = {
+                'kind': 'file', 'size': metadata.st_size,
+                'executable_bits': stat.S_IMODE(metadata.st_mode) & 0o111,
+                'sha256': sha256(path),
+            }
+        else:
+            raise VerificationError(f'Unsupported bundle entry: {relative}')
+    return entries
+
+
+def verify_metadata(app, version):
+    with (app / 'Contents/Info.plist').open('rb') as source:
+        info = plistlib.load(source)
+    require(isinstance(info, dict), 'Info.plist must contain a dictionary')
+    expected = {
+        'CFBundleIdentifier': 'dev.fanta.Fanta',
+        'CFBundleExecutable': 'fanta',
+        'CFBundleShortVersionString': version,
+        'CFBundleVersion': version,
+    }
+    for key, value in expected.items():
+        require(info.get(key) == value, f'{key}: expected {value!r}, found {info.get(key)!r}')
+    urls = info.get('CFBundleURLTypes', [])
+    require(isinstance(urls, list) and all(isinstance(entry, dict) for entry in urls),
+            'CFBundleURLTypes must be an array of dictionaries')
+    schemes = []
+    for entry in urls:
+        values = entry.get('CFBundleURLSchemes', [])
+        require(isinstance(values, list) and all(isinstance(value, str) for value in values),
+                'CFBundleURLSchemes must be an array of strings')
+        schemes.extend(values)
+    require(schemes == ['fanta'], f'Expected exactly the fanta URL scheme, found {schemes!r}')
+    documents = info.get('CFBundleDocumentTypes', [])
+    require(isinstance(documents, list) and all(isinstance(entry, dict) for entry in documents),
+            'CFBundleDocumentTypes must be an array of dictionaries')
+    for entry in documents:
+        for key in ['LSItemContentTypes', 'CFBundleTypeExtensions']:
+            values = entry.get(key, [])
+            require(isinstance(values, list) and all(isinstance(value, str) for value in values),
+                    f'{key} must be an array of strings')
+    for key, value in [('LSItemContentTypes', 'public.folder'),
+                       ('CFBundleTypeExtensions', 'fig'), ('CFBundleTypeExtensions', 'fnx')]:
+        require(any(value in entry.get(key, []) and entry.get('CFBundleTypeRole') == 'Editor'
+                    and entry.get('CFBundleTypeIconFile') == 'Document' for entry in documents),
+                f'Missing Editor document registration/icon for {value}')
+    require((app / 'Contents/Resources/Document.icns').is_file(), 'Missing Document.icns')
+    for name in ['fanta', 'cli', 'git']:
+        path = app / 'Contents/MacOS' / name
+        require(path.is_file() and os.access(path, os.X_OK), f'Missing executable: {name}')
+    return expected
+
+
+def verify_contents(mount, staged_app, version, expected_manifest=None):
+    require(staged_app.name == 'Fanta.app', 'The staged stable bundle must be named Fanta.app')
+    apps = sorted(path.name for path in mount.iterdir() if path.suffix == '.app')
+    require(apps == ['Fanta.app'], f'Expected only Fanta.app in the image, found {apps!r}')
+    applications = mount / 'Applications'
+    require(applications.is_symlink() and os.readlink(applications) == '/Applications',
+            'The image must contain an Applications symlink targeting /Applications')
+    mounted_app = mount / 'Fanta.app'
+    expected_manifest = bundle_manifest(staged_app) if expected_manifest is None else expected_manifest
+    actual_manifest = bundle_manifest(mounted_app)
+    missing = sorted(expected_manifest.keys() - actual_manifest.keys())
+    added = sorted(actual_manifest.keys() - expected_manifest.keys())
+    changed = sorted(key for key in expected_manifest.keys() & actual_manifest.keys()
+                     if expected_manifest[key] != actual_manifest[key])
+    require(not (missing or added or changed),
+            f'Mounted bundle differs from staging: missing={missing!r}, added={added!r}, changed={changed!r}')
+    metadata = verify_metadata(mounted_app, version)
+    return {'metadata': metadata, 'entries': len(actual_manifest),
+            'files': sum(entry['kind'] == 'file' for entry in actual_manifest.values()),
+            'manifest_sha256': hashlib.sha256(json.dumps(actual_manifest, sort_keys=True).encode()).hexdigest()}
+
+
+def run_command(command, records):
+    result = subprocess.run([str(part) for part in command], stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, check=False)
+    output = result.stdout.decode(errors='replace')
+    errors = result.stderr.decode(errors='replace')
+    records.append({'command': [str(part) for part in command], 'exit_code': result.returncode,
+                    'stdout': output, 'stderr': errors})
+    if output:
+        print(output, end='')
+    if errors:
+        print(errors, end='', file=sys.stderr)
+    require(result.returncode == 0, f'Command failed ({result.returncode}): {command[0]}')
+    return result.stdout
+
+
+@contextlib.contextmanager
+def mounted_image(dmg, records):
+    with tempfile.TemporaryDirectory(prefix='fanta-dmg-verification-') as temporary:
+        mount = Path(temporary) / 'mount'
+        mount.mkdir()
+        run_command(['/usr/bin/hdiutil', 'attach', '-readonly', '-nobrowse', '-noautoopen',
+                     '-mountpoint', mount, '-plist', dmg], records)
+        try:
+            yield mount
+        finally:
+            run_command(['/usr/bin/hdiutil', 'detach', mount], records)
+
+
+def verify_signature_identity(output):
+    authority = next((line.removeprefix('Authority=') for line in output.splitlines()
+                      if line.startswith('Authority=')), '')
+    team = next((line.removeprefix('TeamIdentifier=') for line in output.splitlines()
+                 if line.startswith('TeamIdentifier=')), '')
+    require(authority.startswith('Developer ID Application: '),
+            f'Expected Developer ID Application signature, found {authority!r}')
+    require(re.fullmatch(r'[A-Z0-9]{10}', team) is not None,
+            f'Expected a signing TeamIdentifier, found {team!r}')
+    require(any('flags=' in line and 'runtime' in line for line in output.splitlines()),
+            'The distribution app is missing hardened runtime')
+    return {'authority': authority, 'team_identifier': team, 'hardened_runtime': True}
+
+
+def verify(dmg, staged_app, version, network, notarized, records):
+    require(dmg.is_file(), f'Missing DMG: {dmg}')
+    original_hash = sha256(dmg)
+    expected_manifest = bundle_manifest(staged_app)
+    run_command(['/usr/bin/hdiutil', 'verify', dmg], records)
+    with mounted_image(dmg, records) as mount:
+        contents = verify_contents(mount, staged_app, version, expected_manifest)
+        app = mount / 'Fanta.app'
+        scripts = Path(__file__).resolve().parent
+        run_command([scripts / 'verify-macos-document-icon', app], records)
+        git_command = [scripts / 'verify-bundled-git', app]
+        if network:
+            git_command.append('--network')
+        run_command(git_command, records)
+        run_command(['/usr/bin/codesign', '--verify', '--deep', '--strict', '--verbose=2', app], records)
+        signing = None
+        if notarized:
+            run_command(['/usr/bin/codesign', '--display', '--verbose=4', app], records)
+            signing = verify_signature_identity(records[-1]['stdout'] + records[-1]['stderr'])
+            run_command(['/usr/bin/xcrun', 'stapler', 'validate', dmg], records)
+            run_command(['/usr/sbin/spctl', '--assess', '--type', 'execute', '--verbose=4', app], records)
+            run_command(['/usr/sbin/spctl', '--assess', '--type', 'open', '--context',
+                         'context:primary-signature', '--verbose=4', dmg], records)
+    require(sha256(dmg) == original_hash, 'The DMG changed during verification')
+    require(bundle_manifest(staged_app) == expected_manifest, 'The staged bundle changed during verification')
+    return {'dmg_sha256': original_hash, 'contents': contents, 'signing': signing,
+            'distribution_trust': 'assessed' if notarized else 'not assessed: test-only artifact'}
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Verify the actual mounted Developer ID DMG against its staged app.')
+    parser.add_argument('dmg', type=Path)
+    parser.add_argument('staged_app', type=Path)
+    parser.add_argument('--version', required=True)
+    parser.add_argument('--network', action='store_true', help='Also test public HTTPS with bundled Git')
+    parser.add_argument('--notarized', action='store_true', help='Require Developer ID, hardened runtime, staple and Gatekeeper assessment')
+    parser.add_argument('--report', type=Path, required=True)
+    args = parser.parse_args()
+    if args.report.exists():
+        parser.error('Choose a new report path; existing evidence is not overwritten')
+    report = {'passed': False, 'commands': [], 'scope': 'Mounted DMG integrity, bundle identity/content and runtime checks; no native launch or clean-account installation proof.'}
+    try:
+        report.update(verify(args.dmg.resolve(), args.staged_app.resolve(), args.version,
+                             args.network, args.notarized, report['commands']))
+        report['passed'] = True
+    except (OSError, ValueError, VerificationError) as error:
+        report['error'] = str(error)
+        print(f'error: {error}', file=sys.stderr)
+    finally:
+        with args.report.open('x') as output:
+            json.dump(report, output, indent=2)
+            output.write('\n')
+    return 0 if report['passed'] else 1
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

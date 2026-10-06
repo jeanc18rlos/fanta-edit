@@ -46,6 +46,13 @@ jobs:
       - name: Check release scripts
         run: bash -n script/bundle-mac script/bundle-git script/verify-bundled-git script/generate-licenses script/verify-macos-document-icon script/verify-fanta-release
 
+      - name: Test macOS packaging preflight and artifact checks
+        shell: bash
+        run: |
+          python3 script/test-macos-release \
+            --report "${RUNNER_TEMP}/macos-packaging-regressions.json" \
+            2>&1 | tee "${RUNNER_TEMP}/macos-packaging-regressions.log"
+
       - name: Check the app and command line tool build
         run: cargo check --locked -p zed -p cli
 
@@ -60,7 +67,10 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: release-verification-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/fanta-release-verification
+          path: |
+            ${{ runner.temp }}/fanta-release-verification
+            ${{ runner.temp }}/macos-packaging-regressions.json
+            ${{ runner.temp }}/macos-packaging-regressions.log
           if-no-files-found: ignore
           retention-days: 14
 
