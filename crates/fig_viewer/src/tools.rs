@@ -289,7 +289,10 @@ impl ToolShell {
         self.kind = kind;
         self.tool = kind.build();
         self.tool.activate(ctx);
-        self.overlays.clear();
+        self.overlays = self
+            .tool
+            .overlays_after_document_change(ctx.doc)
+            .unwrap_or_default();
         self.append_selection_region_overlay();
         self.cursor = None;
     }
@@ -315,7 +318,10 @@ impl ToolShell {
         self.kind = kind;
         self.tool = kind.build();
         self.tool.activate(ctx);
-        self.overlays.clear();
+        self.overlays = self
+            .tool
+            .overlays_after_document_change(ctx.doc)
+            .unwrap_or_default();
         self.append_selection_region_overlay();
         self.cursor = None;
     }
@@ -506,6 +512,60 @@ pub fn key_event(key: LogicalKey, modifiers: Modifiers) -> ToolEvent {
 mod tests {
     use super::*;
     use gpui::NavigationDirection;
+
+    #[test]
+    fn node_edit_activation_refreshes_overlays_with_empty_switch_and_cancel_controls() {
+        use fanta_doc::{CanvasNode, NodeData, VectorNode};
+        let mut doc = Doc::new();
+        let mut viewport = Viewport::default();
+        let mut shell = ToolShell::new();
+        let mut context = tool_context(
+            &mut doc,
+            &mut viewport,
+            DVec2::new(800.0, 600.0),
+            ToolKind::Select,
+        );
+        shell.activate(ToolKind::NodeEdit, &mut context);
+        assert!(shell.overlays.is_empty(), "empty document");
+        let vector = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            120.0,
+            80.0,
+            Color::BLACK,
+        )));
+        let id = vector.id;
+        context.doc.scene.insert(vector).expect("vector");
+        shell.cancel_and_activate(ToolKind::NodeEdit, &mut context);
+        assert!(shell.overlays.is_empty(), "no selection");
+        context.doc.selection.select_only(id);
+        let expected = serde_json::to_value(&*context.doc).expect("before activation");
+        for restart in [true, false] {
+            if restart {
+                shell.cancel_and_activate(ToolKind::NodeEdit, &mut context);
+            } else {
+                shell.activate(ToolKind::NodeEdit, &mut context);
+            }
+            assert_eq!(
+                shell
+                    .overlays
+                    .iter()
+                    .filter(|overlay| matches!(overlay, ToolOverlay::PathAnchor { .. }))
+                    .count(),
+                4
+            );
+            assert_eq!(
+                serde_json::to_value(&*context.doc).expect("after activation"),
+                expected
+            );
+            shell.activate(ToolKind::Select, &mut context);
+            assert!(shell.overlays.is_empty(), "switch clears old path handles");
+        }
+        assert_eq!(
+            serde_json::to_value(&*context.doc).expect("after switches"),
+            expected
+        );
+    }
 
     /// Filled shapes land in Figma's neutral grey; the tools that spend the
     /// same field on a stroke or on glyphs keep black, where grey would be
