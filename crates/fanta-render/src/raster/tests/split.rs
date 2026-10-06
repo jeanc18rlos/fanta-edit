@@ -157,7 +157,7 @@ fn assert_parity_with_inputs(
         .expect("eligible split");
     let mut renderer = RasterRenderer::new(WIDTH, HEIGHT).expect("renderer");
     renderer.display_scale = display_scale;
-    if let Some(resolver) = resolver {
+    if let Some(resolver) = resolver.clone() {
         renderer.set_asset_resolver(resolver);
     }
     let mut expected = surface();
@@ -231,6 +231,41 @@ fn assert_parity_with_inputs(
     }
     let expected_pixels = pixels(&mut expected);
     let actual_pixels = pixels(&mut actual);
+    if spec.requires_ordered_paint() {
+        let mut direct = surface();
+        let matrix = direct.canvas().local_to_device();
+        let clip = direct.canvas().device_clip_bounds();
+        let saves = direct.canvas().save_count();
+        for phase in [SplitPhase::Below, SplitPhase::Middle, SplitPhase::Above] {
+            let metrics = renderer
+                .paint_split_to_canvas(
+                    direct.canvas(),
+                    WIDTH,
+                    HEIGHT,
+                    &doc.scene,
+                    viewport,
+                    inputs,
+                    &spec,
+                    phase,
+                )
+                .expect("direct ordered phase");
+            assert!(!metrics.incomplete_artwork && !metrics.effect_failed);
+            assert_eq!(direct.canvas().local_to_device(), matrix);
+            assert_eq!(direct.canvas().device_clip_bounds(), clip);
+            assert_eq!(direct.canvas().save_count(), saves);
+        }
+        let direct_pixels = pixels(&mut direct);
+        let maximum = direct_pixels
+            .iter()
+            .zip(&expected_pixels)
+            .map(|(actual, expected)| actual.abs_diff(*expected))
+            .max()
+            .expect("direct pixels");
+        assert!(
+            maximum <= 2,
+            "direct ordered maximum channel difference {maximum}"
+        );
+    }
     let differences: Vec<_> = expected_pixels
         .iter()
         .zip(&actual_pixels)
@@ -278,10 +313,52 @@ fn assert_parity_with_inputs(
         Some(page),
         inputs,
     );
+    let normal_after_pixels = pixels(&mut normal_after);
+    // The second normal frame populates effect caches. Compare the same cache
+    // transition without split calls so filter rounding cannot masquerade as contamination.
+    let mut control = RasterRenderer::new(WIDTH, HEIGHT).expect("normal control renderer");
+    control.display_scale = display_scale;
+    if let Some(resolver) = resolver {
+        control.set_asset_resolver(resolver);
+    }
+    let mut normal_control = surface();
+    control.render_to_canvas(
+        normal_control.canvas(),
+        WIDTH,
+        HEIGHT,
+        &doc.scene,
+        viewport,
+        Some(page),
+        inputs,
+    );
     assert_eq!(
-        pixels(&mut normal_after),
+        pixels(&mut normal_control),
         expected_pixels,
-        "split must not poison normal rendering caches"
+        "normal cold control"
+    );
+    control.render_to_canvas(
+        normal_control.canvas(),
+        WIDTH,
+        HEIGHT,
+        &doc.scene,
+        viewport,
+        Some(page),
+        inputs,
+    );
+    let control_pixels = pixels(&mut normal_control);
+    let warm_maximum = control_pixels
+        .iter()
+        .zip(&expected_pixels)
+        .map(|(a, b)| a.abs_diff(*b))
+        .max()
+        .expect("warm pixels");
+    assert!(
+        normal_after_pixels == control_pixels,
+        "split must not poison normal rendering caches; matched normal-only warm control"
+    );
+    assert!(
+        warm_maximum <= 1,
+        "normal cold-to-warm maximum {warm_maximum}"
     );
     assert_eq!(
         serde_json::to_value(doc).expect("after scene"),
@@ -407,7 +484,11 @@ fn split_rejects_unsafe_ancestors_and_paint_dependencies() {
         let (mut doc, page, parent, moving) = fixture(false, Color::WHITE);
         let node = doc
             .scene
-            .get_mut(if case < 5 { parent } else { moving })
+            .get_mut(if case < 6 || case == 10 {
+                parent
+            } else {
+                moving
+            })
             .expect("test node");
         match case {
             0 => node.opacity = UnitInterval::new(0.5),
@@ -431,10 +512,10 @@ fn split_rejects_unsafe_ancestors_and_paint_dependencies() {
             8 => node.transform = Transform2D::translation(f64::NAN, 0.0),
             9 => node.data = NodeData::Boolean(Default::default()),
             _ => {
-                node.data.as_vector_mut().expect("vector").fills[0] = Fill::Solid {
+                node.data.as_group_mut().expect("ancestor").background = Some(Fill::Solid {
                     color: Color::WHITE,
                     blend: BlendMode::Screen,
-                }
+                })
             }
         }
         assert!(
@@ -551,8 +632,8 @@ fn split_requires_decoded_assets_and_preserves_bitmap_pixels() {
 }
 
 #[test]
-fn split_rejects_static_sibling_masks_patterns_motion_and_unsupported_media() {
-    for case in 0..7 {
+fn split_rejects_static_sibling_patterns_motion_and_unsupported_media() {
+    for case in 1..7 {
         let (mut doc, page, _, moving) = fixture(false, Color::WHITE);
         let other = add(&mut doc, Some(page), rectangle(Color::WHITE), 75.0, 25.0);
         let node = doc.scene.get_mut(other).expect("sibling");
@@ -2385,12 +2466,32 @@ fn split_whole_instances_reject_unsupported_resolved_contents_and_cycles() {
         let mut placed = whole_instance(outer, [20.0, 20.0]);
         let expected = match case {
             0 => {
-                doc.scene.get_mut(root).expect("leaf").is_mask = true;
-                "masks"
+                doc.scene
+                    .get_mut(root)
+                    .expect("leaf")
+                    .blurs
+                    .push(Blur::background(2.0));
+                "backdrop"
             }
             1 => {
-                doc.scene.get_mut(root).expect("leaf").blend_mode = BlendMode::Screen;
-                "backdrop"
+                doc.scene
+                    .get_mut(root)
+                    .expect("leaf")
+                    .data
+                    .as_vector_mut()
+                    .expect("vector")
+                    .fills[0] = Fill::Pattern {
+                    pattern: Box::new(fanta_doc::PatternFill {
+                        source_node_id: root,
+                        tile_type: Default::default(),
+                        scaling_factor: 1.0,
+                        spacing: Default::default(),
+                        horizontal_alignment: Default::default(),
+                    }),
+                    opacity: 1.0,
+                    blend: BlendMode::Normal,
+                };
+                "pattern or shader"
             }
             2 => {
                 doc.scene
@@ -2821,5 +2922,558 @@ fn split_whole_instances_keep_nested_swapped_derived_sizes_and_text_layout() {
                 .any(|pixel| pixel[0] > 100 && pixel[1] < 10 && pixel[2] > 100),
             "the swapped-away magenta master must not paint"
         );
+    }
+}
+
+fn atomic_blend_fixture(blend: BlendMode, per_paint: bool, target: usize) -> (Doc, NodeId, NodeId) {
+    let (mut doc, page) = instance_page();
+    let mut nodes = Vec::new();
+    for (color, x, y) in [
+        (Color::rgb(20, 70, 190), -36.0, -29.0),
+        (Color::rgba(220, 40, 70, 210), -22.0, -19.0),
+        (Color::rgba(50, 210, 130, 170), -8.0, -9.0),
+    ] {
+        nodes.push(add(&mut doc, Some(page), rectangle(color), x, y));
+    }
+    let moving = nodes[1];
+    let node = doc.scene.get_mut(nodes[target]).expect("blend target");
+    if per_paint {
+        let fill = node
+            .data
+            .as_vector_mut()
+            .expect("vector")
+            .fills
+            .first_mut()
+            .expect("fill");
+        let Fill::Solid {
+            blend: paint_blend, ..
+        } = fill
+        else {
+            panic!("solid paint")
+        };
+        *paint_blend = blend;
+    } else {
+        node.blend_mode = blend;
+    }
+    (doc, page, moving)
+}
+
+#[test]
+fn split_atomic_blends_match_normal_across_every_phase_and_all_supported_modes() {
+    for blend in [
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Overlay,
+        BlendMode::Darken,
+        BlendMode::Lighten,
+        BlendMode::ColorDodge,
+        BlendMode::ColorBurn,
+        BlendMode::HardLight,
+        BlendMode::SoftLight,
+        BlendMode::Difference,
+        BlendMode::Exclusion,
+        BlendMode::Hue,
+        BlendMode::Saturation,
+        BlendMode::Color,
+        BlendMode::Luminosity,
+        BlendMode::LinearBurn,
+        BlendMode::LinearDodge,
+    ] {
+        for per_paint in [false, true] {
+            for target in 0..3 {
+                let (doc, page, moving) = atomic_blend_fixture(blend, per_paint, target);
+                for zoom in [0.13, 0.73, 1.0] {
+                    assert_parity(
+                        &doc,
+                        page,
+                        moving,
+                        &Viewport {
+                            center: [0.375, -0.625],
+                            zoom,
+                        },
+                        None,
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn split_atomic_screen_has_independent_backdrop_pixels_and_refuses_raster_phases() {
+    for per_paint in [false, true] {
+        let (mut doc, page) = instance_page();
+        add(
+            &mut doc,
+            Some(page),
+            rectangle(Color::rgb(0, 0, 255)),
+            -25.0,
+            -20.0,
+        );
+        let moving = add(
+            &mut doc,
+            Some(page),
+            rectangle(Color::rgb(255, 0, 0)),
+            -25.0,
+            -20.0,
+        );
+        let node = doc.scene.get_mut(moving).expect("moving");
+        if per_paint {
+            node.data.as_vector_mut().expect("vector").fills[0] = Fill::Solid {
+                color: Color::rgb(255, 0, 0),
+                blend: BlendMode::Screen,
+            };
+        } else {
+            node.blend_mode = BlendMode::Screen;
+        }
+        let viewport = Viewport {
+            center: [0.0, 0.0],
+            zoom: 1.0,
+        };
+        let result = assert_parity(&doc, page, moving, &viewport, None);
+        assert_eq!(
+            rgba_at(&result, WIDTH, 96, 80),
+            [255, 0, 255, 255],
+            "red Screen blends against already painted blue, not an empty phase surface"
+        );
+        let inputs = RenderInputs::empty();
+        let spec =
+            SplitSpec::prepare(&doc.scene, page, moving, &inputs, None).expect("Screen plan");
+        assert!(spec.requires_ordered_paint());
+        let mut target = surface();
+        target.canvas().clear(skia_safe::Color::CYAN);
+        let before = pixels(&mut target);
+        let mut renderer = RasterRenderer::new(WIDTH, HEIGHT).expect("renderer");
+        assert!(
+            renderer
+                .render_split_to_canvas(
+                    target.canvas(),
+                    WIDTH,
+                    HEIGHT,
+                    &doc.scene,
+                    &viewport,
+                    &inputs,
+                    &spec,
+                    SplitPhase::Middle
+                )
+                .is_err()
+        );
+        assert_eq!(pixels(&mut target), before);
+    }
+}
+
+fn closed_mask_group(
+    doc: &mut Doc,
+    parent: Option<NodeId>,
+    x: f64,
+    y: f64,
+    reverse: bool,
+    mask_type: fanta_doc::MaskType,
+    compound: bool,
+) -> NodeId {
+    let group = add(
+        doc,
+        parent,
+        NodeData::Group(GroupNode {
+            clip_size: Some([44.0, 40.0]),
+            corner_radius: Some(4.0),
+            auto_layout: Some(AutoLayout {
+                reverse_z: reverse,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        x,
+        y,
+    );
+    let mask = add(
+        doc,
+        Some(group),
+        NodeData::Vector(VectorNode::rect_solid(0.0, 0.0, 20.0, 35.0, Color::WHITE)),
+        0.0,
+        0.0,
+    );
+    let node = doc.scene.get_mut(mask).expect("mask");
+    node.is_mask = true;
+    node.mask_type = mask_type;
+    if compound {
+        let mask = add(
+            doc,
+            Some(group),
+            NodeData::Vector(VectorNode::rect_solid(0.0, 0.0, 40.0, 20.0, Color::WHITE)),
+            0.0,
+            0.0,
+        );
+        let node = doc.scene.get_mut(mask).expect("second mask");
+        node.is_mask = true;
+        node.mask_type = fanta_doc::MaskType::Luminance;
+    }
+    add(
+        doc,
+        Some(group),
+        NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            40.0,
+            40.0,
+            Color::rgb(255, 0, 0),
+        )),
+        0.0,
+        0.0,
+    );
+    add(
+        doc,
+        Some(group),
+        NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            12.0,
+            12.0,
+            Color::rgb(0, 0, 255),
+        )),
+        4.0,
+        4.0,
+    );
+    if reverse {
+        let children = doc.scene.children_of(Some(group)).to_vec();
+        for (index, id) in children.into_iter().enumerate() {
+            doc.scene
+                .set_index(id, fanta_doc::IndexKey::from_raw(-(index as f64)))
+                .expect("reverse structural order");
+        }
+    }
+    group
+}
+
+#[test]
+fn split_closed_masks_preserve_alpha_luminance_intersection_reverse_order_and_nested_clips() {
+    for mask_type in [
+        fanta_doc::MaskType::Alpha,
+        fanta_doc::MaskType::Vector,
+        fanta_doc::MaskType::Luminance,
+    ] {
+        for reverse in [false, true] {
+            for compound in [false, true] {
+                let (mut doc, page) = instance_page();
+                let frame = add(
+                    &mut doc,
+                    Some(page),
+                    NodeData::Group(GroupNode {
+                        clip_size: Some([170.0, 90.0]),
+                        corner_radius: Some(7.0),
+                        ..Default::default()
+                    }),
+                    -85.0,
+                    -45.0,
+                );
+                closed_mask_group(
+                    &mut doc,
+                    Some(frame),
+                    5.0,
+                    25.0,
+                    reverse,
+                    mask_type,
+                    compound,
+                );
+                let moving = closed_mask_group(
+                    &mut doc,
+                    Some(frame),
+                    65.0,
+                    25.0,
+                    reverse,
+                    mask_type,
+                    compound,
+                );
+                closed_mask_group(
+                    &mut doc,
+                    Some(frame),
+                    125.0,
+                    25.0,
+                    reverse,
+                    mask_type,
+                    compound,
+                );
+                for zoom in [0.13, 0.73, 1.0, 2.0] {
+                    for scale in [1.0, 2.0] {
+                        assert_parity_at_scale(
+                            &doc,
+                            page,
+                            moving,
+                            &Viewport {
+                                center: [0.375, -0.625],
+                                zoom,
+                            },
+                            None,
+                            scale,
+                        );
+                    }
+                }
+                let pixels = assert_parity(
+                    &doc,
+                    page,
+                    moving,
+                    &Viewport {
+                        center: [0.0, 0.0],
+                        zoom: 1.0,
+                    },
+                    None,
+                );
+                assert_eq!(rgba_at(&pixels, WIDTH, 86, 70), [0, 0, 255, 255]);
+                assert_eq!(
+                    rgba_at(&pixels, WIDTH, 104, 90),
+                    [0, 0, 0, 255],
+                    "content outside mask must be absent"
+                );
+                if compound {
+                    assert_eq!(
+                        rgba_at(&pixels, WIDTH, 82, 88),
+                        [0, 0, 0, 255],
+                        "second mask intersects the first"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn split_closed_mask_runs_on_ancestor_sequences_keep_hidden_and_empty_mask_semantics() {
+    for reverse in [false, true] {
+        let (mut doc, page) = instance_page();
+        doc.scene
+            .get_mut(page)
+            .expect("page")
+            .data
+            .as_group_mut()
+            .expect("group")
+            .auto_layout = Some(AutoLayout {
+            reverse_z: reverse,
+            ..Default::default()
+        });
+        let moving = add(
+            &mut doc,
+            Some(page),
+            rectangle(Color::rgb(10, 200, 10)),
+            -80.0,
+            -50.0,
+        );
+        let mask = add(&mut doc, Some(page), rectangle(Color::WHITE), -20.0, -20.0);
+        doc.scene.get_mut(mask).expect("mask").is_mask = true;
+        let hidden = add(&mut doc, Some(page), rectangle(Color::BLACK), -20.0, -20.0);
+        let node = doc.scene.get_mut(hidden).expect("hidden mask");
+        node.is_mask = true;
+        node.flags.insert(NodeFlags::HIDDEN);
+        add(
+            &mut doc,
+            Some(page),
+            rectangle(Color::rgb(240, 30, 30)),
+            -10.0,
+            -10.0,
+        );
+        let lone = add(&mut doc, Some(page), rectangle(Color::WHITE), 50.0, 35.0);
+        doc.scene.get_mut(lone).expect("empty last mask").is_mask = true;
+        if reverse {
+            let children = doc.scene.children_of(Some(page)).to_vec();
+            for (index, id) in children.into_iter().enumerate() {
+                doc.scene
+                    .set_index(id, fanta_doc::IndexKey::from_raw(-(index as f64)))
+                    .expect("reverse child order");
+            }
+        }
+        let result = assert_parity(
+            &doc,
+            page,
+            moving,
+            &Viewport {
+                center: [0.0, 0.0],
+                zoom: 1.0,
+            },
+            None,
+        );
+        assert_eq!(
+            rgba_at(&result, WIDTH, 96, 80),
+            [240, 30, 30, 255],
+            "hidden mask must not terminate the visible mask run"
+        );
+        assert_eq!(
+            rgba_at(&result, WIDTH, 155, 125),
+            [0, 0, 0, 255],
+            "trailing mask has no content and does not paint itself"
+        );
+        doc.scene.get_mut(mask).expect("zero-opacity mask").opacity = UnitInterval::new(0.0);
+        let erased = assert_parity(
+            &doc,
+            page,
+            moving,
+            &Viewport {
+                center: [0.0, 0.0],
+                zoom: 1.0,
+            },
+            None,
+        );
+        assert_eq!(
+            rgba_at(&erased, WIDTH, 96, 80),
+            [0, 0, 0, 255],
+            "zero opacity is still an active mask and erases its run"
+        );
+        let node = doc.scene.get_mut(mask).expect("luminance mask");
+        node.opacity = UnitInterval::new(1.0);
+        node.mask_type = fanta_doc::MaskType::Luminance;
+        node.data.as_vector_mut().expect("mask vector").fills[0] = Fill::solid(Color::BLACK);
+        let dark_luma = assert_parity(
+            &doc,
+            page,
+            moving,
+            &Viewport {
+                center: [0.0, 0.0],
+                zoom: 1.0,
+            },
+            None,
+        );
+        assert_eq!(rgba_at(&dark_luma, WIDTH, 96, 80), [0, 0, 0, 255]);
+        doc.scene.get_mut(mask).expect("alpha mask").mask_type = fanta_doc::MaskType::Alpha;
+        let opaque_alpha = assert_parity(
+            &doc,
+            page,
+            moving,
+            &Viewport {
+                center: [0.0, 0.0],
+                zoom: 1.0,
+            },
+            None,
+        );
+        assert_eq!(
+            rgba_at(&opaque_alpha, WIDTH, 96, 80),
+            [240, 30, 30, 255],
+            "opaque black hides content only as a luminance mask"
+        );
+    }
+}
+
+#[test]
+fn split_closed_masks_reject_every_cross_phase_mask_chain_without_mutation() {
+    for reverse in [false, true] {
+        for case in 0..4 {
+            let (mut doc, page) = instance_page();
+            doc.scene
+                .get_mut(page)
+                .expect("page")
+                .data
+                .as_group_mut()
+                .expect("group")
+                .auto_layout = Some(AutoLayout {
+                reverse_z: reverse,
+                ..Default::default()
+            });
+            let mask = add(&mut doc, Some(page), rectangle(Color::WHITE), -20.0, -20.0);
+            doc.scene.get_mut(mask).expect("mask").is_mask = true;
+            let candidate = add(
+                &mut doc,
+                Some(page),
+                if case == 2 {
+                    NodeData::Group(GroupNode::default())
+                } else {
+                    rectangle(Color::rgb(220, 30, 30))
+                },
+                -20.0,
+                -20.0,
+            );
+            let moving = if case == 2 {
+                add(&mut doc, Some(candidate), rectangle(Color::WHITE), 0.0, 0.0)
+            } else if case == 1 {
+                mask
+            } else {
+                candidate
+            };
+            if case == 3 {
+                doc.scene.get_mut(candidate).expect("second mask").is_mask = true;
+                add(
+                    &mut doc,
+                    Some(page),
+                    rectangle(Color::rgb(30, 30, 220)),
+                    -20.0,
+                    -20.0,
+                );
+            }
+            if reverse {
+                let children = doc.scene.children_of(Some(page)).to_vec();
+                for (index, id) in children.into_iter().enumerate() {
+                    doc.scene
+                        .set_index(id, fanta_doc::IndexKey::from_raw(-(index as f64)))
+                        .expect("reverse child order");
+                }
+            }
+            let before = serde_json::to_value(&doc).expect("before");
+            assert!(
+                matches!(SplitSpec::prepare(&doc.scene, page, moving, &RenderInputs::empty(), None), Err(SplitError::Mask(id)) if id == mask),
+                "case{case}/reverse{reverse} must reject the complete run before drawing"
+            );
+            assert_eq!(serde_json::to_value(&doc).expect("after"), before);
+        }
+    }
+}
+
+#[test]
+fn split_atomic_instances_preserve_internal_masks_blends_and_wrapper_effects() {
+    use fanta_doc::{ComponentDef, ComponentId};
+    for reverse in [false, true] {
+        let (mut doc, page) = instance_page();
+        add(
+            &mut doc,
+            Some(page),
+            rectangle(Color::rgb(30, 60, 150)),
+            -25.0,
+            -20.0,
+        );
+        let master = closed_mask_group(
+            &mut doc,
+            None,
+            10_000.0,
+            0.0,
+            reverse,
+            fanta_doc::MaskType::Luminance,
+            true,
+        );
+        let root = doc.scene.get_mut(master).expect("master");
+        root.opacity = UnitInterval::new(0.7);
+        root.blend_mode = BlendMode::Screen;
+        root.blurs.push(Blur::layer(1.3));
+        let component = ComponentId::new();
+        doc.components.defs.insert(
+            component,
+            ComponentDef::new(component, master, "Masked Screen component"),
+        );
+        let moving = add(
+            &mut doc,
+            Some(page),
+            NodeData::Instance(whole_instance(component, [44.0, 40.0])),
+            -22.0,
+            -20.0,
+        );
+        let root = doc.scene.get_mut(moving).expect("placement");
+        root.flags.insert(NodeFlags::ISOLATED_BLEND);
+        root.opacity = UnitInterval::new(0.8);
+        root.effects.push(Shadow {
+            kind: ShadowKind::Drop,
+            color: Color::rgba(200, 20, 80, 150),
+            blur: 2.0,
+            spread: 1.0,
+            offset: [2.0, 1.0],
+            show_behind_node: true,
+        });
+        for zoom in [0.13, 0.73, 1.0, 2.0] {
+            assert_parity_with_inputs(
+                &doc,
+                page,
+                moving,
+                &Viewport {
+                    center: [0.375, -0.625],
+                    zoom,
+                },
+                None,
+                1.0,
+                &RenderInputs::for_doc(&doc),
+            );
+        }
     }
 }
