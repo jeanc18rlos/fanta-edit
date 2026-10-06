@@ -8,8 +8,9 @@ license.workspace = true
 description = "Skia raster backend: scene walk, effects, instance/image caches; renders to an owned CPU surface or an externally owned Skia canvas."
 
 [features]
-gpu = ["skia-safe/gpu"]
-metal = ["gpu", "skia-safe/metal"]
+# Ganesh bindings need a concrete backend; skia-safe/gpu alone cannot compile.
+gpu = ["metal"]
+metal = ["skia-safe/metal"]
 
 [dependencies]
 fanta-doc.workspace = true

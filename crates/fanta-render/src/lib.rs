@@ -43,7 +43,7 @@ pub use paint::{fill_to_paint, stroke_to_paint};
 pub use path::to_sk_path;
 // `vector_outline_sk_path`: track svg-prod — the effective vector outline,
 // shared with the app's flatten/outline/simplify geometry ops.
-#[cfg(feature = "gpu")]
+#[cfg(feature = "metal")]
 pub use raster::RetainedGpuTarget;
 pub use raster::{
     MediaPlayback, RasterRenderer, RenderError, RenderInputs, RenderMetrics, RetainedBuildMetrics,

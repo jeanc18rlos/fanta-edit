@@ -699,11 +699,11 @@ pub enum RetainedError {
 
 enum RetainedBackend {
     Cpu,
-    #[cfg(feature = "gpu")]
+    #[cfg(feature = "metal")]
     Gpu(Box<RetainedGpuSurface>),
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(feature = "metal")]
 #[derive(Clone)]
 struct RetainedGpuSurface {
     context: skia_safe::gpu::DirectContext,
@@ -715,32 +715,23 @@ struct RetainedGpuSurface {
     _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(feature = "metal")]
 #[derive(Clone, PartialEq, Eq)]
 enum RetainedGpuFormat {
-    #[cfg(feature = "metal")]
     Metal(skia_safe::gpu::mtl::PixelFormat),
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(feature = "metal")]
 impl RetainedGpuFormat {
     fn capture(format: skia_safe::gpu::BackendFormat) -> Result<Self, RetainedError> {
-        #[cfg(feature = "metal")]
-        {
-            format
-                .as_mtl_format()
-                .map(Self::Metal)
-                .ok_or(RetainedError::ChangedBackend)
-        }
-        #[cfg(not(feature = "metal"))]
-        {
-            drop(format);
-            Err(RetainedError::ChangedBackend)
-        }
+        format
+            .as_mtl_format()
+            .map(Self::Metal)
+            .ok_or(RetainedError::ChangedBackend)
     }
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(feature = "metal")]
 impl RetainedGpuSurface {
     fn capture(surface: &mut skia_safe::Surface) -> Result<Self, RetainedError> {
         let mut context = surface
@@ -806,13 +797,13 @@ impl RetainedGpuSurface {
 /// a flushing backend-handle query on every frame. The host must retain the
 /// external render-target resources for this wrapper's lifetime. Currently only
 /// Metal is supported, with the `metal` feature; other backends reject explicitly.
-#[cfg(feature = "gpu")]
+#[cfg(feature = "metal")]
 pub struct RetainedGpuTarget {
     surface: skia_safe::Surface,
     backend: RetainedGpuSurface,
 }
 
-#[cfg(feature = "gpu")]
+#[cfg(feature = "metal")]
 impl RetainedGpuTarget {
     pub fn wrap_top_left(
         context: &mut skia_safe::gpu::DirectContext,
@@ -883,7 +874,7 @@ impl RetainedBackend {
                     Err(RetainedError::ChangedBackend)
                 }
             }
-            #[cfg(feature = "gpu")]
+            #[cfg(feature = "metal")]
             Self::Gpu(backend) => backend.validate(&mut RetainedGpuSurface::capture(surface)?),
         }
     }
@@ -891,12 +882,12 @@ impl RetainedBackend {
     fn validate_cpu(&mut self) -> Result<(), RetainedError> {
         match self {
             Self::Cpu => Ok(()),
-            #[cfg(feature = "gpu")]
+            #[cfg(feature = "metal")]
             Self::Gpu(_) => Err(RetainedError::ChangedBackend),
         }
     }
 
-    #[cfg(feature = "gpu")]
+    #[cfg(feature = "metal")]
     fn validate_gpu(&mut self, target: &mut RetainedGpuTarget) -> Result<(), RetainedError> {
         match self {
             Self::Gpu(backend) => backend.validate(&mut target.backend),
@@ -907,7 +898,7 @@ impl RetainedBackend {
     fn ensure_available(&mut self) -> Result<(), RetainedError> {
         match self {
             Self::Cpu => Ok(()),
-            #[cfg(feature = "gpu")]
+            #[cfg(feature = "metal")]
             Self::Gpu(backend) => backend.ensure_available(),
         }
     }
@@ -1008,7 +999,7 @@ impl RetainedTranslationSession {
     /// Allocate private surfaces compatible with the actual GPU target. The
     /// target's pixels and canvas state are untouched. Call `render_for_target`
     /// for every frame; the CPU-only `render` entry rejects this backend.
-    #[cfg(feature = "gpu")]
+    #[cfg(feature = "metal")]
     #[allow(clippy::too_many_arguments)]
     pub fn prepare_for_target(
         renderer: &mut super::RasterRenderer,
@@ -1250,7 +1241,7 @@ impl RetainedTranslationSession {
     /// Validate actual target affinity before semantic revision advancement or
     /// output mutation. The returned GPU image is only drawable on that context;
     /// callers own composition and synchronization. Target pixels/state are untouched.
-    #[cfg(feature = "gpu")]
+    #[cfg(feature = "metal")]
     #[allow(clippy::too_many_arguments)]
     pub fn render_for_target(
         &mut self,

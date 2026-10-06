@@ -111,7 +111,7 @@ pub use renderer::{
     MediaPlayback, RasterRenderer, RenderError, RenderInputs, RenderMetrics, SvgRenderOptions,
     SvgRenderOutput,
 };
-#[cfg(feature = "gpu")]
+#[cfg(feature = "metal")]
 pub use split::RetainedGpuTarget;
 pub use split::{
     RetainedBuildMetrics, RetainedError, RetainedFrame, RetainedFrameMetrics,
