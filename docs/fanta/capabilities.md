@@ -160,10 +160,26 @@ cover default and placed aliases, derived text geometry, Save/single Undo/Redo,
 hidden-text no-op and strict reopening of the final saved state. Text inside true
 nested instances and virtual Text on Path are not recursively targeted. A direct
 text-content variable binding remains authoritative; changing its text requires
-changing the variable or binding. Text on Path accepts the shaped text area, including letter
+changing the variable or binding. Native `8a9a33c35e` checks confirm its refusal
+notice/read-only Content row while alias-only instance text stays editable from
+the canvas and Design inspector, with single Undo/Redo and exact saved-state
+reopening. Post-restart refusal also passed after a selection/focus reset; an
+earlier targeting attempt and its unproven cause remain recorded.
+Text on Path accepts the shaped text area, including letter
 counters and spaces, while rejecting distant empty areas along the baseline.
 Inspection keeps exact glyph geometry. Automated regressions cover these cases; native input
-verification remains tracked in the release report.
+verification remains tracked in the release report. A bounded `a3a51b084b` check
+passes Bitmap Crop Apply/single Undo/Redo/reopening after observing Crop entry,
+and real curved TextPath **Edit text**/Save/single Undo/Redo/reopening preserves
+the curve and surrounding artwork. An earlier batched double-click/drag moved
+the bitmap instead; its failure and recovery remain recorded. Group/Boolean
+drill-in, selected-vector menu entry/Escape and Video/Audio/Node Graph/3D/AI/Embed
+properties reveal also preserve the document exactly. That build entered Edit
+Path without initial anchors; the corrected `8a9a33c35e` displays four anchors
+immediately through both double-click and the actual Edit vector menu, with
+unchanged saved content. Selected Bitmap/Vector Inspect refusals and a nine-layer
+generic menu passed separately; TextPath Inspect targeting was inconclusive.
+These checks do not establish every node-entry or text-input combination.
 
 ### Canvas context menu
 
@@ -325,8 +341,17 @@ Existing 3D payloads and assets are preserved when unrelated canvas changes are
 saved and reopened. Neither storage support nor a node enum constitutes a
 finished user workflow.
 
+Large-page rendering work remains incomplete. The opt-in retained renderer API
+passes automated checks, but it is not enabled in canvas dragging. Both sampled
+Spectrum targets safely refused preparation in every attempt, so this API has
+no Spectrum parity or timing result yet. The below-16-ms drag target is unproven.
+
 Mac App Store builds restrict local process execution, external agents and
 related inherited editor features; see [MAC_APP_STORE.md](../alpha/MAC_APP_STORE.md).
+The selected release target is a direct-download Mac app. Packaging now checks
+the app inside the produced DMG against the staged bundle and enforces the
+configured signature/notarization checks. Isolated verifier tests pass; the
+actual signed download and clean-Mac installation remain unverified.
 Account sign-in, billing, cloud generation and distribution have separate
 release gates. This guide makes no current production-status claim. Deliberately
 disabled inherited services are recorded in

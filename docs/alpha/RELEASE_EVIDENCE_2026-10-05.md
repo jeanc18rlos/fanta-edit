@@ -1426,3 +1426,384 @@ restarted. Native mode-changing actions, rich-text/IME input, true nested
 instances, virtual TextPath and direct text-content binding edit/refusal remain
 outside this fixture. This does not establish native rendering speed, all-node
 coverage or signed-installation readiness.
+
+
+## Native Bitmap Crop and TextPath transitions — a3a51b084b
+
+The existing dev candidate `a3a51b084b094dc9cf0f3c78fdd5cf0bb7e59120`, binary
+SHA-256 `6f292ee25db180df73c9d2ac6d8937d3ddd6e32e4c40dc641329110e92420046`,
+was exercised on a fresh three-page node-matrix project with 34 nodes, five real
+local assets and 30 project files. Frozen oracles compare every persisted field,
+root/child order and asset hash; they allow no geometry, numeric, style or
+reference exemptions beyond each declared edit and a present nondecreasing
+`modified_at`. They supply readback evidence, while the operator records actual
+input and visible results.
+
+| Crop checkpoint | Observed result and exact scope |
+| --- | --- |
+| Cancel | Canvas **Crop image**, drawn preview, Escape/Return/Escape and Save preserve the original typed document, including timestamp. The operator's contemporaneous full-files assertion failed on automatically initialized root `.git` storage and reported the original 30 project files unchanged. No canceled filesystem manifest was archived, so the formal cancellation claim is strict typed equality only. |
+| Failed entry retained | Batched double-click on an unselected bitmap followed immediately by drag left Select active and moved it from 70/110 to 310/230. Saved evidence fails with exactly these two unexpected transform changes plus timestamp. No crop was created. This is not relabeled as a passing crop or a fixed production defect. |
+| Recovery | One Undo/Save restores the complete original document/assets except valid timestamp advance. The baseline was never replaced by the failed moved state. |
+| Apply | Isolated double-click visibly enters Crop before a separate rectangle drag; Return/Save clips the grid. Exactly one fresh default Group named Crop is added at the original parent/index, with world rectangle approximately 110.67/141.24 to 351.29/261.22. Its exact values must satisfy the frozen gesture bounds. The original bitmap retains its ID/payload/world placement, reparents into Crop with the prescribed local translation, and all other content/assets remain exact. |
+| Undo and Redo | Single Undo/Save restores the original 34-node state; single Redo/Save restores the actual captured Crop ID/rectangle and complete 35-node state, apart from timestamp. |
+| Quit/relaunch | PID 61631 exited before PID 67292 launched the same binary/profile. The cropped grid reopened without another edit/Save. Typed data including timestamp and all 30 project files match the saved Redo; the complete 48-file inventory, including root `.git`, also happens to match. |
+
+The crop oracle was frozen before Apply. Its 45 sensitivity cases and three
+file-policy checks are synthetic validation, not extra native journeys.
+Independent review recomputed all six captured stages, including the expected
+failed entry, checked stage timestamp chronology and verified oracle, reader,
+provenance and snapshot hashes. The earlier cancellation is qualified in
+`initial-cancellation-operator-note.json`; no missing filesystem evidence was
+reconstructed.
+
+The TextPath journey uses the exact saved Crop cold snapshot as its immutable
+baseline: 35 nodes, five assets and 30 project files. Actual canvas **Edit text**
+selects `PATH EDIT ME`; Command+A and `QA PATH`, followed by Escape to commit and
+Save, leave blue 32 px text on the same curve. Only the target content and one
+explicit style run covering bytes 0–7 with the exact original base style change.
+The curve, transform, parent/index, all other nodes including Crop, document
+registries, child order and every asset stay exact. Single Undo/Save restores
+`PATH EDIT ME`; single Redo/Save restores the captured edited state.
+
+After PID 67292 exited, the same binary/profile relaunched as PID 68654 and
+restored QA PATH and the cropped grid, without another edit/Save. All typed
+fields, timestamp and 30 project files match the saved Redo exactly. The layout
+reopened at 38% zoom after the left dock restored; viewport continuity was not
+this oracle's acceptance target. Independent review recomputed all four
+TextPath captures and their provenance/file checks. Its frozen oracle passed
+35 sensitivity cases and four file-policy checks before input.
+
+Evidence: `target/release-verification/native-crop-transitions-20261005/` and
+`native-textpath-transitions-20261005/` (`native-*`, `runtime-restart.json`,
+`exit.json`, `native-acceptance-review.json`, `oracle-ready.json`). Root `.git`
+exclusion is an explicit project-byte policy; full inventories and their
+comparisons remain retained separately. The initial batched entry failure
+remains open as a reliability observation. Rotated/nested/mask crop, vector-mode
+transitions, TextPath conversion, range styling, Unicode/IME, virtual TextPath,
+broader per-node input and release-artifact installation remain unverified.
+
+
+## Native Group, Boolean, media and specialist entry — a3a51b084b
+
+The same `a3a51b084b` binary/profile, PID 68654, was checked against the frozen
+TextPath cold snapshot: 35 nodes, five assets and 30 project files. These are
+entry/navigation checks, with no intended authored edits.
+
+| Checkpoint | Operator-observed native input and result |
+| --- | --- |
+| Group and selected vector | The Group background menu offered Ungroup and no Edit vector. One separate double-click drilled into its background child with Move active; another pair entered Edit Path. Selecting the child directly in Layers then right-clicking preserved that target, and the actual Edit vector entry opened Edit Path. Escape returned Move and cleared selection; a subsequent right-click therefore correctly targeted the Group. |
+| Boolean and selected operand | The wrapper menu offered Boolean properties and opened its inspector. Double-click drilled into the left operand while Move remained active. Right-click retained that selected operand, and actual Edit vector entered Edit Path. Escape returned Move and cleared selection. |
+| Video and Audio | Each actual properties menu entry retained the matching type header, position and size, Appearance, Effects and named Export sections without overlap. Hiding the inspector then separately double-clicking the media node revealed it. Design and Move remained active. No playback, trim, export or media edit was invoked. |
+| Node Graph, 3D, AI and Embed | Each actual typed properties menu entry opened the matching inspector. Hiding the inspector, observing the expanded canvas, then isolated double-clicking the same selected artwork revealed it again. Design/Move, expected positions and 190 × 160 dimensions, Appearance, Effects and full named Export controls remained legible at 320 logical px. No specialized editor, export, playback, network generation or geometry edit was invoked. |
+
+After each sequence, explicit Save and strict readback preserve every persisted
+field including timestamp, root/child order and all five asset hashes. The 30
+project-file bytes and complete 48-file inventories are also identical to the
+frozen baseline. Independent review recomputed all four comparisons and checked
+reader/runtime hashes and recorded operator observations. Evidence is
+`native-textpath-transitions-20261005/native-group-vector-noop/`,
+`native-boolean-vector-noop/` and
+`native-node-entry-matrix-20261005/{media-primary-menus,specialist-primary-menus}/`;
+the aggregate review is
+`native-node-entry-matrix-20261005/completed-entry-review-v2.json`.
+
+The native Group/Boolean entries showed the Edit Path toolbar but no initial
+anchor squares. Source inspection found that context-aware ToolShell activation
+initializes the node-edit target and then clears overlays, without asking the
+tool for its current path overlays. The double-click route also skips the
+following tool release event, so activation alone does not populate anchors.
+A regression/fix candidate is being prepared; no corrected native result or
+vector-point authoring pass is claimed here. Locked/Inspect, mixed-selection,
+specialist content authoring and broader drawing remain separate acceptance work.
+
+
+## Native Inspect/multi-selection and corrected initial anchors
+
+Two further `a3a51b084b` checkpoints use the same immutable post-TextPath baseline.
+In Dev/Inspect, selecting the Bitmap and Group background Vector in Layers before
+isolated double-click retained their source inspectors without Crop or Edit
+Path. The Vector context menu enabled Copy but disabled writes; clicking its
+disabled Edit vector entry had no effect. TextPath double-click attempts left no
+selection, so they establish no successful TextPath hit/Inspect-target claim.
+An initial bitmap artwork click targeted its Crop wrapper; the exact Bitmap
+check subsequently used Layers selection. Returning to Design and Save preserves
+all typed data/timestamp/assets and all 30 project/48 total files.
+
+The other checkpoint uses canvas Command+A to select nine roots. At 320 logical
+px the inspector showed nine layers, mixed X/Y/W/H, arrangement, opacity and
+Add auto layout. Right-clicking selected QA PATH retained all nine and showed
+only generic selection commands, with no Edit text, Edit vector or Crop entry.
+No mutation command was invoked; Escape and Save preserve the strict baseline.
+This is one mixed-selection menu/layout state, not a full mixed-value gesture
+or applicable-action matrix.
+
+The missing initial anchors were corrected by initializing overlays from the
+activated tool after its target is ready. The regression baseline had three
+failures and one passing control. Final focused four tests pass with the three
+GPUI cases repeated across five seeds; the full editor passes 1,157 tests with
+one ignored, and viewer lint passes. Evidence is
+`node-edit-activation-anchors-20261005/{final-validation.json,final.patch,red.log,green.log,full-viewer.log}`.
+
+The new dev candidate `8a9a33c35e2e586a533ac0b991b37a1cb13e14c5`, binary
+SHA-256 `8d24b09c414c650c26724b616ddf6a200913e4b6942966186dc79a78c7a35ecb`,
+ran as PID 78080 in its isolated Editor Guards QA bundle/profile. On both the
+Group Vector and Boolean left operand, one isolated pair drilled into the child
+in Move and the next pair entered Edit Path with all four corner anchors already
+visible. Their actual Edit vector menu entries independently showed four
+anchors immediately. Escape cleared anchors/selection and returned Move. No
+point was moved. Save retains every baseline field including timestamp, all five
+assets, and the 30 project/48 total files exactly. The original `a3` failure is
+preserved; this corrected checkpoint proves activation display, not vector
+geometry authoring or its Undo/restart behavior.
+
+Evidence is `native-node-entry-matrix-20261005/{inspect-refusals,mixed-selection-menu,latest-path-anchors}/`
+and `native-editor-guards-candidate-20261005/{provenance.json,runtime.json}`.
+`completed-entry-review-v4.json` independently recomputes all seven node-entry
+captures, verifies the separate runtime identities and actual bundle binary
+hashes, and retains the stated targeting/authoring limits. The fixture remains
+35 nodes and five assets. Locked-node double-click combinations, richer mixed
+selections, specialist content authoring and signed installation remain open.
+
+The same source checkpoint contains the separate direct-bound instance-text
+guard: seven focused tests, including three mounted GPUI cases across five
+seeds; 45 resolver tests; full editor 1,154 passed/one ignored; three CLI tests
+and lint passed before the anchor correction. Original refusal, owned-action
+and cancellation failures remain in
+`bound-instance-text-guard-20261005/integration/`. Its independent review is
+pinned to the final patch and validation hashes. Owner-side late-binding
+injection exercises retained-draft safety; it is not evidence of a normal
+native route that mutates a binding during an owned preview, nor a general
+merge for arbitrary override-index changes. Its direct native fixture is
+separate and was still pending at this checkpoint.
+
+
+## Native direct-bound text refusal and editable alias — 8a9a33c35e
+
+The same Editor Guards QA candidate `8a9a33c35e2e586a533ac0b991b37a1cb13e14c5`,
+binary SHA-256 `8d24b09c414c650c26724b616ddf6a200913e4b6942966186dc79a78c7a35ecb`,
+was exercised on a fresh 24-node, four-definition, seven-variable/two-mode
+fixture with no assets and 34 project files. Its frozen oracle allows exactly
+one declared sparse Text override on the alias-only B01 instance; direct-bound
+A/C instances, component defaults, placed aliases, sibling content, derived
+geometry, bindings, modes, topology and every other field stay exact.
+
+| Recorded checkpoint | Native observation and persisted result |
+| --- | --- |
+| Open | A01/A02 show Default A, B01 Placed B, B02 remains hidden, C01/C02 Derived B. The immutable baseline, timestamp and all 34 project files match. |
+| Default-bound refusal | After isolated pairs select A01, double-click shows a notice naming Default alias, keeps Move and opens no caret. The current Design virtual Content row below the distinct Caption property is dim/read-only and opens no input. No typing or Save; strict baseline and 34 files unchanged. |
+| Derived-bound refusal | C01 shows Derived B from the placed B pin despite its master context. Double-click identifies Derived caption and refuses; its virtual Content row stays read-only. No typing or Save; strict baseline and 34 files unchanged. |
+| Inline alias edit and Undo | B01 enters inline editing; Command+A → QA alias → Escape/Save changes only its exact declared text override plus nondecreasing modified_at. One canvas-focused Undo/Save restores Placed B and removes that override entirely. |
+| Design Content edit, Undo and Redo | The editable B01 virtual Content row commits QA alias while Caption remains a variable alias. Single Undo/Save restores the full baseline except timestamp; single Redo/Save restores the exact expected override. Masters, other instances and all variable data remain unchanged. |
+| Repeat Save | An additional Save without edits matches saved Redo, including timestamp and all 34 file bytes. |
+| Quit/relaunch persistence | PID 78080 exited before the same bundle/profile relaunched as PID 81329. The saved seeds, QA alias and hidden sibling reappeared without another edit/Save. Strict typed fields/timestamp and all 34 files match saved Redo. |
+
+The post-restart **refusal interaction is inconclusive**. Repeated synthetic
+click-count-two calls did not advance selection, whereas a single click selected
+the containing Frame. No successful post-restart bound-text targeting/refusal is
+claimed. This does not invalidate the independent saved-state comparison, and
+it is retained for input-route investigation rather than relabeled as a passing
+guard check.
+
+All ten captured checkpoints independently recompute to their declared exact
+persistence expectations. Five include strict byte comparisons. Oracle and
+fixture hashes, snapshot hashes, recorded reader identity, runtime/build record
+identity, stage timestamp chronology and same-profile quit/relaunch provenance
+were checked. The review used small evidence files during a quiet CPU benchmark;
+it did not rehash the large executables, rerun native actions or claim timing.
+The binary/reader identities are tied to the previously recorded stable build.
+
+Evidence: `native-bound-instance-text-20261005/native-*`, `ready.json`,
+`native-acceptance-review.json` and
+`native-editor-guards-candidate-20261005/runtime-bound-cold.json`. The oracle's
+46 sensitivity cases and 34-file self-read are preparation checks, not additional
+native journeys. The earlier oracle version is retained; the final version pins
+baseline/descriptor hashes and excludes only root `.git` from the project-file
+manifest. Missing/invalid binding behavior, retained drafts when a binding
+arrives during an owned preview, arbitrary concurrent override-index changes,
+true nested instances and virtual TextPath remain outside this native fixture.
+No comprehensive E2E, signed-installer or performance pass follows.
+
+
+## Ordered blend and closed-mask renderer API — PR 70
+
+[PR 70](https://github.com/jeanc18rlos/fanta-edit/pull/70) extends the ordered
+split-rendering API; it does not enable that API in live canvas dragging.
+Complete subtrees and prepared instances stay atomic. Non-normal node and
+per-paint blends require ordered drawing; a mask sequence crossing phases,
+blended ancestor or background-sampling blur still refuses before drawing.
+The sibling-mask partition follows normal forward/reverse paint order,
+including consecutive masks and hidden/trailing-mask behavior.
+
+The regression-only runs retained three blend refusals and two closed-mask
+refusals, alongside the passing crossing-mask refusal control. Final validation
+passes **37 split cases**, the full renderer library **378 tests with two
+ignored**, and renderer/viewer lint plus dependency scan. Ordered picture replay
+and direct phase painting retain the existing at-most-two-channel-value pixel
+threshold, check matrix/clip/save-count preservation, and assert interior
+pixels independently. A bounded independent review found no material issue and
+matched the source/log fingerprints.
+
+The first green experiment failed an exact cold-versus-warm normal-render cache
+comparison even though both split pixel comparisons passed. A separate control
+reproduced the same at-most-one-channel-value cold/warm difference without split
+rendering. The corrected cache-contamination assertion remains byte-exact
+against an independent normal-only frame with the matching cache state, with a
+separate one-value cold/warm bound. The original failure and diagnostic are
+retained; the split pixel threshold was not relaxed.
+
+Evidence: `renderer-split-blend-masks-20261005/integration/validation.json`,
+`independent-node-review.json` and their hashed logs. The tested patch SHA-256 is
+`1d46a42f949e2e844d9bc97fc223f22bb2aad9343fe56dad6a68c730f999251d`.
+There is no native/Metal parity, Spectrum eligibility or performance result from
+these checks. Closed masks can still allocate blank layers in non-owning
+phases. Retained-session integration and its matched measurements remain a
+separate pending experiment; no live-canvas speedup is claimed.
+
+## Mounted direct-download verifier — PR 71
+
+[PR 71](https://github.com/jeanc18rlos/fanta-edit/pull/71) adds
+`script/verify-macos-dmg`, isolated packaging regressions and Check/release
+workflow integration. At source checkpoint
+`de30030e885d370422e8ab288f4abb119a1432dc`, these are later automated changes:
+the recorded native app remains the separate `8a9a33c35e` development build.
+
+The verifier mounts the produced DMG read-only without opening it, compares the
+mounted app's complete file/symlink/executable-bit manifest against staging,
+checks stable-app metadata, document/URL registrations, bundled executable and
+icon requirements, and checks the mounted signature. Notarized mode additionally
+requires Developer ID/hardened runtime, a stapled DMG ticket and Gatekeeper
+assessment of app and DMG. It verifies that the DMG and staging fingerprints
+remain unchanged and always attempts detachment after entering a mount. A
+failed check remains a failed report; existing reports are not overwritten.
+The current stable bundle-version contract is tested, not the Store build-number
+path. The signing TeamIdentifier is validated and reported, not pinned to a
+configured expected team.
+
+The isolated v2 suite passes **27 checks**, including an actual tiny inert DMG
+create/verify/read-only mount/tamper-detection/detach cycle. The default suite
+passes **26 with that one optional mount check skipped**, and root's subsequent
+run against the applied shared scripts independently records the same 26/1
+result. Tests cover preflight rejection before build tools run, intended
+metadata/container types, content/symlink/mode mismatches, cleanup and trust-check
+routing. Dummy tools and inert fixture executables do not prove product signing
+or application launch.
+
+Independent review caught a real CI false pass: the initial unspecified-shell
+`python | tee` step returned success when its test runner exited 7. The corrected
+step explicitly selects Bash with pipeline failure propagation. A regression
+executes the actual workflow command body with a failing dummy runner and real
+log capture; it now retains the log and returns 7. The initial failure, the
+missing-notary-guard mutant and v1 artifacts remain preserved. Final independent
+review found no remaining material blocker within this verifier's scope.
+
+Evidence: `macos-package-verification-20261005/{validation-v2.json,
+independent-node-review-v2.json,shared-ci-results.json}` and their recorded logs.
+The v2 patch SHA-256 is
+`92c5b5cf7500d1a8e790e16079dbe06fea32f536c18723e9bff47e04d24a9159`.
+**No signed Fanta DMG was available or accepted.** Real notarization/stapling,
+clean-account/Mac install and update, oldest-supported-OS execution, complete
+Mach-O dependency/minimum-OS inventory and symbol matching remain release work.
+The synthetic mount, pipeline and metadata passes are not substitutes for those
+checks or for native application E2E.
+
+
+## Post-restart bound-text refusal after input recovery — 8a9a33c35e
+
+The follow-up `native-cold-guard-recovery` checkpoint passes on the same
+restarted PID 81329. A plain Layers click had added A01 to its selected parent,
+showing two layers; that observation is consistent with a held modifier, but
+native modifier events were not captured. A modifier-only reset request was
+rejected without input. Shift+Escape, Escape and a blank click then cleared the
+selection/zoomed pane state. This does not establish the earlier cause or a
+production correction, and the initial inconclusive targeting record remains.
+
+After a fresh screenshot, isolated double-click pairs selected A01 and then
+showed the Default alias binding refusal, with Move active and no caret. Its
+read-only Content row opened no field. The equivalent C01 pairs showed Derived
+caption refusal, retaining Derived B, and its Content row also remained
+read-only. Escape and Save retained the exact saved Redo document, timestamp
+and all 34 project-file bytes. The fixture has 24 nodes and no assets.
+
+Independent small-file recomputation now passes all **11 recorded checkpoints**,
+six with strict byte comparisons, including this recovery. Evidence is
+`native-bound-instance-text-20261005/native-cold-guard-recovery/` and
+`native-acceptance-review-v2.json`; the prior ten-stage review is retained
+unchanged. Runtime and captured reader identities match the existing records.
+No new binary hashing, native actions, performance measurement or broad input
+reliability claim was performed by this review.
+
+
+## Retained translation API and Spectrum refusal — PR 72
+
+[PR 72](https://github.com/jeanc18rlos/fanta-edit/pull/72), commit `e09772a`,
+adds an opt-in renderer translation session. It passes **eight focused retained
+cases**, the full renderer library **386 tests with two ignored**, and
+renderer/viewer lint plus dependency scan. These include the prior 37 split
+cases. This new API had no meaningful pre-implementation runtime failure;
+missing-symbol compilation was not performed or labeled a product regression.
+A bounded independent review found no material issue. No live canvas/worker or
+Metal activation was added; native acceptance still uses `8a9a33c35e`.
+
+Spectrum run 2 attempted both selected image/instance targets at fit-all and
+100% over three rounds: **all 12 preparations safely returned
+UnsupportedAncestor**. Navigation and Inputs have explicit paint boxes with
+clip_content false, while the current API requires an active ancestor clip.
+Normal warmup rendering completed before preparation, but **zero parity runs
+and zero timing comparisons executed**. Recorded preparation durations are not
+drag benchmarks. The report remains overall_pass false. No pixel-parity,
+speedup or below-16-ms claim follows; the separate ancestor-eligibility work is
+not included in this checkpoint.
+
+The original harness failures remain: ambiguous runtime-library selection was
+rejected before linking, and run 1 rejected a bare NodeId before rendering.
+Run 2 corrected those harness inputs rather than rebasing the expected scene.
+The authored document stayed unchanged, and all **27,162 files/symlink targets**
+covering 166,757,318 regular-file bytes matched the baseline; filesystem times
+were not asserted. The API's memory accounting covers its surfaces/frozen
+pixels and approximate pictures, not total Skia, registry or prepared-instance
+memory or peak RSS. Exact per-frame registry/variable/asset comparisons remain
+part of its CPU cost.
+
+Evidence: `retained-worker-plan-20261005/session-candidate/integration/`
+`final-validation.json`, `independent-node-review.json`,
+`spectrum-cpu-run2/report.json` and `project-unchanged.json`. The tested API
+patch SHA-256 is
+`a2dc1beda0bab5d3baa82616cd1f6ee0b0735cee1c374ee7367de1c23ba58011`.
+The earlier PR 70 results and its cache-oracle failure/control remain separate.
+
+## Instance entry sequence control — mounted input only
+
+`mounted_instance_entry_from_empty_selection` passes **one mounted test with
+eight configurations across five scheduler seeds: 40 case executions**. It
+checks complete no-modifier click-count-two and count-one/count-two pairs from
+empty selection, for top-level and wrapped instances, with and without redraw.
+Viewer lint also passes at the same source fingerprint. No production defect
+was reproduced or input code changed. This covers the harness dispatch path,
+not native OS modifier delivery, and does not establish the cause of the
+original post-restart targeting ambiguity. The separate native recovery remains
+recorded above. Evidence: `instance-entry-sequences-20261005/integration/`
+`validation.json`, `lint-validation.json` and their retained logs.
+
+## Original runtime phases — status at e09772a
+
+The original plan contains Phase 0 and seven implementation phases. Preservation
+and UI corrections do not establish completion of all performance work.
+
+| Phase | Implemented or measured | Still outstanding |
+| --- | --- | --- |
+| 0 — Measure | CPU drag example, historical Spectrum import baseline, completed-worker gesture counters. | Broad UI/import spans, fresh-write sync count, specified synthetic heavy-drag benchmark and final native/release timing. Worker wall time is not input latency or FPS. |
+| 1 — Per-frame work | Epoch-change refill suppression and unchanged-resolver pattern retention. | Structural/content revision split, derived inspector/chrome caching and throttling, active-page indexed snapping, cached master membership and gesture-pinned render source. |
+| 2 — Components | Cached expansion child/root indexes and reused component roots in layer projection. | Layout/override/root lookup indexes, expanded-child culling and path retention, and component-preview-only worker patches. The measured child-index CPU benefit is modest; RSS was not measured. |
+| 3 — Effect reuse | Phase 1 avoids wasteful hot-frame refill. | SceneDelta-based transform-safe eviction and verification; the current epoch still clears all layers on scene revision changes. |
+| 4 — Retained move | Ordered split and retained translation APIs with invariant/pixel tests. | Live tool/worker/session integration, eligible Spectrum targets, parity/timing, gesture invalidation, full memory policy and tuning. All 12 recorded real-file preparations refused. |
+| 5 — Drop work | No-op layout writes skipped; precise scoped solves, fixed-island preservation and derived Undo/Redo. | Incremental spatial index, persistent clip-path cache, unclipped-group bounds reuse, text-cache LRU and measured native drop latency. |
+| 6 — Photos | Existing lazy decode/prewarm and display pyramid. | Display-resolution decode cap, parallel prewarm, upload-copy/mipmap work, byte-budget LRU and avoiding GPUI encoded-byte cloning/hashing. |
+| 7 — Import/write | Shared reference tables, precise changed-artifact selection, verified-hash Save reuse; some per-master import caches already exist. | Low-sync fresh-project transaction, open-with-write-report, single-pass serialization, further override/blob indexing, parallel image/instance work and measured complete first-write improvements. |
+
+The external source audit and prior evidence remain under
+`performance-phase-audit-20261005/`. The old import baseline's report mislabeled
+28 omitted Boolean operands as instance children; later fidelity corrections
+are separate and that baseline is not a current import-performance result.
+The synthetic Save acceptance median 546.673→292.797 ms measures that phase only.
+No final native drag p95 below 16 ms, complete Save improvement or release-profile
+memory claim is established.

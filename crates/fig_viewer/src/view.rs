@@ -16077,6 +16077,157 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn mounted_instance_entry_from_empty_selection_preserves_click_sequence_semantics(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::InputEvent as _;
+
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        for wrapped in [false, true] {
+            for isolated_second_click in [false, true] {
+                for redraw_between_down_and_up in [false, true] {
+                    let (mut doc, _, master) = text_selection_doc(true);
+                    let master = master.expect("master frame");
+                    doc.scene.get_mut(master).expect("master").transform =
+                        Transform2D::translation(1000.0, 1000.0);
+                    let component = fanta_doc::ComponentId::new();
+                    doc.components.defs.insert(
+                        component,
+                        fanta_doc::ComponentDef::new(component, master, "Entry sequence card"),
+                    );
+                    let wrapper = wrapped.then(|| {
+                        let mut node = CanvasNode::new(NodeData::Group(GroupNode {
+                            clip_size: Some([300.0, 200.0]),
+                            background: Some(Fill::solid(Color::WHITE)),
+                            ..Default::default()
+                        }));
+                        node.parent = doc.active_page();
+                        node.transform = Transform2D::translation(-150.0, -100.0);
+                        let id = node.id;
+                        doc.scene.insert(node).expect("wrapper");
+                        id
+                    });
+                    let mut instance = CanvasNode::new(NodeData::Instance(fanta_doc::InstanceNode {
+                        component,
+                        overrides: Vec::new(),
+                        prop_values: BTreeMap::new(),
+                        derived: Vec::new(),
+                        local_size: [200.0, 100.0],
+                    }));
+                    instance.parent = wrapper.or(doc.active_page());
+                    instance.transform = if wrapped {
+                        Transform2D::translation(50.0, 50.0)
+                    } else {
+                        Transform2D::translation(-100.0, -50.0)
+                    };
+                    let instance_id = instance.id;
+                    doc.scene.insert(instance).expect("instance");
+                    doc.selection.clear();
+                    doc.history = Default::default();
+                    let (item, view, mut visual) =
+                        mounted_canvas_interaction_fixture(&project, doc, BTreeMap::new(), cx);
+                    view.update(&mut visual, |view, cx| {
+                        view.set_viewport_silent(Viewport {
+                            center: [0.0, 0.0],
+                            zoom: 0.63,
+                        });
+                        cx.notify();
+                    });
+                    visual.run_until_parked();
+                    visual.update(|window, cx| window.draw(cx).clear());
+                    let expected = item.read_with(&visual, |item, _| {
+                        let mut expected = item.doc().expect("loaded document").clone();
+                        expected.selection.select_only(instance_id);
+                        serde_json::to_value(expected).expect("expected selected document")
+                    });
+                    let position = view.read_with(&visual, |view, _| {
+                        view.container_bounds.expect("canvas").center()
+                            + point(px(-60.0 * 0.63), px(-15.0 * 0.63))
+                    });
+                    let counts: &[usize] = if isolated_second_click { &[2] } else { &[1, 2] };
+                    for &click_count in counts {
+                        visual.update(|window, cx| {
+                            window.dispatch_event(
+                                MouseDownEvent {
+                                    position,
+                                    button: MouseButton::Left,
+                                    modifiers: gpui::Modifiers::none(),
+                                    click_count,
+                                    first_mouse: false,
+                                }
+                                .to_platform_input(),
+                                cx,
+                            );
+                            if redraw_between_down_and_up {
+                                window.draw(cx).clear();
+                            }
+                            window.dispatch_event(
+                                MouseUpEvent {
+                                    position,
+                                    button: MouseButton::Left,
+                                    modifiers: gpui::Modifiers::none(),
+                                    click_count,
+                                }
+                                .to_platform_input(),
+                                cx,
+                            );
+                        });
+                        if click_count == 1 {
+                            item.read_with(&visual, |item, _| {
+                                assert_eq!(
+                                    item.doc().expect("document").selection.as_slice(),
+                                    &[wrapper.unwrap_or(instance_id)]
+                                );
+                            });
+                        }
+                        view.read_with(&visual, |view, _| {
+                            assert!(!view.primary_pressed);
+                            assert!(!view.canvas_pointer_down);
+                        });
+                    }
+                    item.read_with(&visual, |item, _| {
+                        assert_eq!(
+                            serde_json::to_value(item.doc().expect("document")).expect("actual"),
+                            expected,
+                            "wrapped={wrapped}, isolated_second={isolated_second_click}, redraw={redraw_between_down_and_up}"
+                        );
+                        assert!(!item.is_dirty());
+                    });
+                    view.read_with(&visual, |view, _| {
+                        assert_eq!(
+                            view.text_edit.is_some(),
+                            !wrapped && !isolated_second_click,
+                            "the first pair selects/drills the wrapper; a selected leaf can enter editing"
+                        );
+                    });
+                    mounted_canvas_click(&mut visual, position, 2);
+                    view.read_with(&visual, |view, _| {
+                        assert!(
+                            view.text_edit
+                                .as_ref()
+                                .expect("subsequent second click enters selected instance text")
+                                .session
+                                .instance()
+                                .is_some()
+                        );
+                    });
+                    visual.simulate_keystrokes("escape");
+                    item.read_with(&visual, |item, _| {
+                        let doc = item.doc().expect("document");
+                        assert_eq!(
+                            serde_json::to_value(&doc.scene).expect("scene"),
+                            expected["scene"]
+                        );
+                        assert_eq!(doc.history.undo_depth(), 0);
+                        assert!(!item.is_dirty());
+                    });
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
     async fn mounted_canvas_pairs_drill_group_then_boolean_before_vector_editing(
         cx: &mut TestAppContext,
     ) {
