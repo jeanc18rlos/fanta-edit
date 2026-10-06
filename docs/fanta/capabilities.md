@@ -80,13 +80,22 @@ unsupported formats show a reason and cannot be placed.
 Canvas, keyboard and toolbar Duplicate preserve copied component masters and
 complete variant sets using the same rules as Layers menu Duplicate. References
 to components outside the copied content remain unchanged. Ordinary Paste keeps
-its existing component references instead of creating new definitions.
+existing live component references. If a copied master or complete variant set
+has since been removed, Paste restores its captured definitions with fresh IDs
+and reconnects the copied instances. Repeated Paste after Cut creates independent
+restored definitions.
 
-Clipboard release checks have exposed open command-guard defects: keyboard Cut
-can delete a locked bitmap, keyboard Duplicate can copy it despite the disabled
-menu policy, and cutting a component master can leave surviving instances with
-a missing master. Corrections are in progress; the earlier bounded Copy/Paste
-checks do not establish that every Cut or Duplicate route is safe.
+Keyboard Cut, Duplicate and Delete now respect direct and inherited locks.
+Removing a component master preserves supported surviving instance artwork.
+Cutting only part of a variant set, unresolved component dependencies, and
+detachments that cannot preserve appearance are refused before modifying the
+document; failed Cut leaves the clipboard unchanged. The app explains the
+refusal. These corrections pass the current automated suite, and native lock
+guards and three refusal paths pass on `938807f801`. Successful asset-bearing
+Save/Undo/Redo/restart acceptance remains open: those tests exposed a separate
+load-time vector viewport mutation, now corrected in automated tests with a
+native rerun pending. See the
+[current acceptance status](../alpha/CAPABILITY_COVERAGE.md#current-acceptance-status).
 
 The properties inspector adapts to the selected kind and selection count. Its
 supported sections include position, size, rotation, opacity/blend,
@@ -98,6 +107,10 @@ Booleans expose operation, fill and stroke controls. Paint recoloring retains
 the imported geometry; geometry or operation changes recompute it from operands.
 Constraint data can be retained by the document, but constraint controls are
 currently disabled in the default Design inspector.
+Single-node opacity, visibility and uniform vector radius display their active
+variable values, including aliases and inherited mode pins. Explicit corner
+values keep precedence; unresolved bindings show a labeled fallback and remain
+detachable. These display corrections await native verification on the new build.
 Mixed values must remain identifiable; controls must neither erase unsupported
 data nor silently apply to a stale selection. Editable fields support draft
 cancellation and undoable commits. Controls that offer live previews restore
@@ -157,7 +170,7 @@ inspector field transfers input to that field.
 | Video or audio | **Video properties** or **Audio properties** reveals the inspector. |
 | Boolean, node graph, 3D, AI artifact or embed | The corresponding **Boolean properties**, **Node graph properties**, **3D properties**, **AI artifact properties** or **Embed properties** entry reveals the inspector. |
 | Main component or instantiable variant-set frame | **Create instance** places an instance beside the component. |
-| Instance with an available main component | **Go to main component**, **Detach instance** and **Reset all overrides**. Detach preserves the expanded content and can be undone. |
+| Instance with an available main component | **Go to main component**, **Detach instance** and **Reset all overrides**. Supported detachments preserve expanded content and can be undone; unsupported appearance combinations explain the limitation and leave content unchanged. |
 | Eligible node | **Create component**, **Add auto layout**, **Outline stroke**, **Flatten** and **Use as mask** appear only when applicable, using the same operations as the layers panel. |
 | Selection or canvas | Clipboard commands, Duplicate/Delete, Group/Frame selection, Bring to front/Send to back; **Ungroup** appears for a supported container. Empty canvas offers Paste. |
 

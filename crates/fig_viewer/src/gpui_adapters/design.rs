@@ -1805,6 +1805,16 @@ pub(crate) fn design_node(
     out.rotation = section.rotation_degrees as f32;
     out.lock_aspect_ratio = false;
     out.opacity = section.opacity_percent as f32;
+    if let Some(DesignPanelValue::Number(value)) =
+        resolved_inspector_binding(doc, node, BoundProp::Opacity)
+    {
+        out.opacity = value;
+    }
+    if let Some(DesignPanelValue::Bool(value)) =
+        resolved_inspector_binding(doc, node, BoundProp::Visible)
+    {
+        out.visible = value;
+    }
     out.blend_mode = display_blend_mode(kind, node);
     out.shape_geometry = match &node.data {
         NodeData::Vector(vector) => match vector.parametric {
@@ -1851,6 +1861,12 @@ pub(crate) fn design_node(
             out.corner_radii = radii.map(|radius| radius as f32);
             out.independent_corners = true;
         }
+    }
+    if matches!(&node.data, NodeData::Vector(vector) if vector.corner_radii.is_none())
+        && let Some(DesignPanelValue::Number(value)) =
+            resolved_inspector_binding(doc, node, BoundProp::CornerRadius)
+    {
+        out.corner_radii = [value; 4];
     }
     out.corner_smoothing = section
         .corner_smoothing
@@ -2202,6 +2218,36 @@ pub(crate) fn aggregate_selection(
     (node, states)
 }
 
+fn resolved_inspector_binding(
+    doc: &Doc,
+    node: &fanta_doc::CanvasNode,
+    property: BoundProp,
+) -> Option<DesignPanelValue> {
+    if !property.applies_to(node) {
+        return None;
+    }
+    let variable = node.bindings.get(&property)?;
+    let resolved = fanta_doc::resolve_bound_value(
+        &doc.variables,
+        &doc.scene,
+        node.id,
+        &doc.active_modes,
+        *variable,
+    )?;
+    match (property, resolved) {
+        (BoundProp::Opacity, fanta_doc::ResolvedVarValue::Float { value }) => Some(
+            DesignPanelValue::Number(fanta_doc::UnitInterval::new(value as f32).get() * 100.0),
+        ),
+        (BoundProp::Visible, fanta_doc::ResolvedVarValue::Boolean { value }) => {
+            Some(DesignPanelValue::Bool(value))
+        }
+        (BoundProp::CornerRadius, fanta_doc::ResolvedVarValue::Float { value }) => {
+            Some(DesignPanelValue::Number(value as f32))
+        }
+        _ => None,
+    }
+}
+
 /// Bound-state projection for the whole-node `BoundProp`s the panel displays.
 pub(crate) fn bound_states(doc: &Doc, id: NodeId) -> PropertyStates {
     let Some(node) = doc.scene.get(id) else {
@@ -2271,13 +2317,39 @@ pub(crate) fn bound_states(doc: &Doc, id: NodeId) -> PropertyStates {
             .variable(*variable_id)
             .map(|variable| variable.name.clone())
             .unwrap_or_else(|| "Missing variable".to_string());
-        let resolved = match property {
+        let resolved = resolved_inspector_binding(doc, node, *prop);
+        let explicit_radius = match (prop, &node.data) {
+            (BoundProp::CornerRadius, NodeData::Vector(vector)) => {
+                vector.corner_radii.map(|radii| radii[0] as f32)
+            }
+            (BoundProp::CornerRadius, NodeData::Group(group)) => {
+                group.corner_radii.map(|radii| radii[0] as f32)
+            }
+            _ => None,
+        };
+        let name = if explicit_radius.is_some() {
+            format!("{name} (independent corners take precedence)")
+        } else if resolved.is_none() {
+            format!("{name} (unresolved; using layer fallback)")
+        } else {
+            name
+        };
+        let resolved = explicit_radius.map(DesignPanelValue::Number).or(resolved);
+        let resolved = resolved.unwrap_or_else(|| match property {
             DesignPanelProperty::Opacity => DesignPanelValue::Number(node.opacity.get() * 100.0),
             DesignPanelProperty::Visible => {
                 DesignPanelValue::Bool(!node.flags.contains(NodeFlags::HIDDEN))
             }
+            DesignPanelProperty::CornerRadius => {
+                let radius = match &node.data {
+                    NodeData::Vector(vector) => vector.corner_radius,
+                    NodeData::Group(group) => group.corner_radius,
+                    _ => None,
+                };
+                DesignPanelValue::Number(radius.unwrap_or(0.0) as f32)
+            }
             _ => DesignPanelValue::Number(0.0),
-        };
+        });
         states.push((
             property,
             DesignPanelPropertyValueState::bound(
@@ -11020,6 +11092,504 @@ mod tests {
             .insert(BoundProp::StrokeColor { index: 0 }, alias);
         doc.selection.replace_with([rect]);
         (doc, page, rect, collection, modes, color)
+    }
+
+    fn doc_with_bound_instance_opacity() -> (
+        Doc,
+        NodeId,
+        NodeId,
+        fanta_doc::VariableCollectionId,
+        [fanta_doc::ModeId; 2],
+        fanta_doc::VariableId,
+        fanta_doc::VariableId,
+    ) {
+        let (mut doc, page, master, collection, modes, variable) = doc_with_bound_paints();
+        let alias = *doc
+            .scene
+            .get(master)
+            .expect("master")
+            .bindings
+            .get(&BoundProp::StrokeColor { index: 0 })
+            .expect("alias binding");
+        let opacity = doc
+            .variables
+            .variables
+            .get_mut(&variable)
+            .expect("variable");
+        opacity.name = "Wrapper opacity".into();
+        opacity.ty = fanta_doc::VariableType::Float;
+        opacity.values_by_mode = BTreeMap::from([
+            (modes[0], VarValue::Float { value: 0.4 }),
+            (modes[1], VarValue::Float { value: 0.7 }),
+        ]);
+        let alias_variable = doc.variables.variables.get_mut(&alias).expect("alias");
+        alias_variable.name = "Opacity alias".into();
+        alias_variable.ty = fanta_doc::VariableType::Float;
+        let master_node = doc.scene.get_mut(master).expect("master");
+        master_node.bindings.clear();
+        master_node.opacity = fanta_doc::UnitInterval::new(0.5);
+        let component = ComponentId::new();
+        doc.components.defs.insert(
+            component,
+            fanta_doc::ComponentDef::new(component, master, "Half-opacity main"),
+        );
+        let mut instance = CanvasNode::new(NodeData::Instance(fanta_doc::InstanceNode {
+            component,
+            overrides: Vec::new(),
+            prop_values: BTreeMap::new(),
+            derived: Vec::new(),
+            local_size: [100.0, 100.0],
+        }));
+        instance.parent = Some(page);
+        instance.bindings.insert(BoundProp::Opacity, alias);
+        let id = instance.id;
+        doc.scene.insert(instance).expect("instance");
+        doc.selection.replace_with([id]);
+        (doc, page, id, collection, modes, variable, alias)
+    }
+
+    #[gpui::test]
+    async fn bound_opacity_inspector_resolves_instance_modes_and_aliases(cx: &mut TestAppContext) {
+        let (doc, page, id, collection, modes, _, alias) = doc_with_bound_instance_opacity();
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        for (mode, pin, expected) in [
+            (modes[0], None, 40.0),
+            (modes[1], None, 70.0),
+            (modes[1], Some(modes[0]), 40.0),
+        ] {
+            item.update(&mut cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    document.doc.active_modes.insert(collection, mode);
+                    let NodeData::Group(group) =
+                        &mut document.doc.scene.get_mut(page).expect("page").data
+                    else {
+                        panic!("page group")
+                    };
+                    group.explicit_modes.clear();
+                    if let Some(pin) = pin {
+                        group.explicit_modes.insert(collection, pin);
+                    }
+                    ((), DocChange::Content)
+                })
+                .expect("document");
+            });
+            let before = item.read_with(&cx, |item, _| {
+                serde_json::to_value(&item.document().expect("ready").doc).expect("snapshot")
+            });
+            view.update_in(&mut cx, |view, _, cx| view.refresh_gpui_design(cx));
+            cx.run_until_parked();
+            panel.read_with(&cx, |panel, _| {
+                assert_eq!(
+                    panel.node().opacity,
+                    expected,
+                    "selected wrapper opacity, not the master-composited opacity"
+                );
+                let data = panel.view_data();
+                let state = data
+                    .property_states
+                    .get(&DesignPanelProperty::Opacity)
+                    .expect("bound opacity");
+                let binding = state.binding().expect("binding retained");
+                assert_eq!(binding.id().as_ref(), alias.to_string());
+                assert_eq!(binding.name().as_ref(), "Opacity alias");
+                assert_eq!(state.resolved(), Some(&DesignPanelValue::Number(expected)));
+            });
+            item.read_with(&cx, |item, _| {
+                let doc = &item.document().expect("ready").doc;
+                assert_eq!(serde_json::to_value(doc).expect("snapshot"), before);
+                assert_eq!(doc.scene.get(id).expect("instance").opacity.get(), 1.0);
+                assert!(
+                    !doc.history.can_undo(),
+                    "display projection must not record edits"
+                );
+            });
+        }
+    }
+
+    #[test]
+    fn bound_opacity_inspector_marks_unresolved_literal_fallback_without_losing_binding() {
+        for failure in ["missing", "cycle", "type", "empty"] {
+            let (mut doc, _, id, _, modes, variable, alias) = doc_with_bound_instance_opacity();
+            match failure {
+                "missing" => {
+                    doc.variables.variables.remove(&variable);
+                }
+                "cycle" => {
+                    doc.variables
+                        .variables
+                        .get_mut(&variable)
+                        .expect("variable")
+                        .values_by_mode =
+                        BTreeMap::from([(modes[0], VarValue::Alias { variable: alias })]);
+                }
+                "type" => {
+                    doc.variables
+                        .variables
+                        .get_mut(&variable)
+                        .expect("variable")
+                        .values_by_mode = BTreeMap::from([(
+                        modes[0],
+                        VarValue::Color {
+                            value: FantaColor::WHITE,
+                        },
+                    )]);
+                }
+                "empty" => {
+                    doc.variables
+                        .variables
+                        .get_mut(&variable)
+                        .expect("variable")
+                        .values_by_mode
+                        .clear();
+                }
+                _ => unreachable!(),
+            }
+            let document = FigDocument::from_doc(doc, BTreeMap::new());
+            let before = serde_json::to_value(&document.doc).expect("snapshot");
+            let (node, _) = design_node(&document, id, &HashMap::new()).expect("projection");
+            assert_eq!(
+                node.opacity, 100.0,
+                "rendering uses saved fallback when {failure}"
+            );
+            let states = bound_states(&document.doc, id);
+            let (_, state) = states
+                .iter()
+                .find(|(property, _)| *property == DesignPanelProperty::Opacity)
+                .expect("opacity");
+            assert_eq!(
+                state.binding().expect("binding retained").id().as_ref(),
+                alias.to_string()
+            );
+            assert_eq!(state.resolved(), Some(&DesignPanelValue::Number(100.0)));
+            assert!(
+                !state.is_read_only(),
+                "unresolved bindings remain detachable"
+            );
+            assert_eq!(
+                state.binding().expect("binding retained").name().as_ref(),
+                "Opacity alias (unresolved; using layer fallback)"
+            );
+            assert_eq!(
+                serde_json::to_value(&document.doc).expect("snapshot"),
+                before
+            );
+            assert!(!document.doc.history.can_undo());
+        }
+    }
+
+    #[test]
+    fn bound_opacity_inspector_uses_rendering_clamp_without_changing_values() {
+        for (value, expected) in [(-0.5, 0.0), (0.0, 0.0), (0.4, 40.0), (1.7, 100.0)] {
+            let (mut doc, _, id, _, modes, variable, _) = doc_with_bound_instance_opacity();
+            doc.variables
+                .variables
+                .get_mut(&variable)
+                .expect("variable")
+                .values_by_mode = BTreeMap::from([(modes[0], VarValue::Float { value })]);
+            let document = FigDocument::from_doc(doc, BTreeMap::new());
+            let before = serde_json::to_value(&document.doc).expect("snapshot");
+            let (node, _) = design_node(&document, id, &HashMap::new()).expect("projection");
+            assert_eq!(node.opacity, expected);
+            let states = bound_states(&document.doc, id);
+            let (_, state) = states
+                .iter()
+                .find(|(property, _)| *property == DesignPanelProperty::Opacity)
+                .expect("opacity");
+            assert_eq!(state.resolved(), Some(&DesignPanelValue::Number(expected)));
+            assert!(state.binding().is_some());
+            assert_eq!(state.read_only_reason(), None);
+            assert_eq!(
+                serde_json::to_value(&document.doc).expect("snapshot"),
+                before
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn bound_whole_node_inspector_resolves_visibility_and_radius_modes(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut doc, page, id, collection, modes, variable) = doc_with_bound_paints();
+        let alias = *doc
+            .scene
+            .get(id)
+            .expect("node")
+            .bindings
+            .get(&BoundProp::StrokeColor { index: 0 })
+            .expect("alias");
+        let radius_variable = doc
+            .variables
+            .variables
+            .get_mut(&variable)
+            .expect("variable");
+        radius_variable.ty = fanta_doc::VariableType::Float;
+        radius_variable.values_by_mode = BTreeMap::from([
+            (modes[0], VarValue::Float { value: 12.0 }),
+            (modes[1], VarValue::Float { value: 24.0 }),
+        ]);
+        doc.variables.variables.get_mut(&alias).expect("alias").ty = fanta_doc::VariableType::Float;
+        let visible = fanta_doc::VariableId::new();
+        let visible_alias = fanta_doc::VariableId::new();
+        for (id, values) in [
+            (
+                visible,
+                BTreeMap::from([
+                    (modes[0], VarValue::Boolean { value: false }),
+                    (modes[1], VarValue::Boolean { value: true }),
+                ]),
+            ),
+            (
+                visible_alias,
+                BTreeMap::from([
+                    (modes[0], VarValue::Alias { variable: visible }),
+                    (modes[1], VarValue::Alias { variable: visible }),
+                ]),
+            ),
+        ] {
+            doc.variables.variables.insert(
+                id,
+                fanta_doc::Variable {
+                    id,
+                    collection,
+                    name: "Visibility".into(),
+                    ty: fanta_doc::VariableType::Boolean,
+                    values_by_mode: values,
+                    scopes: Vec::new(),
+                },
+            );
+        }
+        let node = doc.scene.get_mut(id).expect("node");
+        node.bindings = BTreeMap::from([
+            (BoundProp::CornerRadius, alias),
+            (BoundProp::Visible, visible_alias),
+        ]);
+        let NodeData::Vector(vector) = &mut node.data else {
+            panic!("vector")
+        };
+        vector.corner_radius = Some(7.0);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        for (mode, pin, radius, visibility) in [
+            (modes[0], None, 12.0, false),
+            (modes[1], None, 24.0, true),
+            (modes[1], Some(modes[0]), 12.0, false),
+        ] {
+            item.update(&mut cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    document.doc.active_modes.insert(collection, mode);
+                    let NodeData::Group(group) =
+                        &mut document.doc.scene.get_mut(page).expect("page").data
+                    else {
+                        panic!("group")
+                    };
+                    group.explicit_modes.clear();
+                    if let Some(pin) = pin {
+                        group.explicit_modes.insert(collection, pin);
+                    }
+                    ((), DocChange::Content)
+                })
+                .expect("ready");
+            });
+            let before = item.read_with(&cx, |item, _| {
+                serde_json::to_value(&item.document().expect("ready").doc).expect("snapshot")
+            });
+            view.update_in(&mut cx, |view, _, cx| view.refresh_gpui_design(cx));
+            cx.run_until_parked();
+            panel.read_with(&cx, |panel, _| {
+                assert_eq!(panel.node().visible, visibility);
+                assert_eq!(panel.node().corner_radii, [radius; 4]);
+                let data = panel.view_data();
+                for (property, variable, expected) in [
+                    (
+                        DesignPanelProperty::Visible,
+                        visible_alias,
+                        DesignPanelValue::Bool(visibility),
+                    ),
+                    (
+                        DesignPanelProperty::CornerRadius,
+                        alias,
+                        DesignPanelValue::Number(radius),
+                    ),
+                ] {
+                    let state = data.property_states.get(&property).expect("bound state");
+                    assert_eq!(state.resolved(), Some(&expected));
+                    assert_eq!(
+                        state.binding().expect("binding").id().as_ref(),
+                        variable.to_string()
+                    );
+                    assert!(
+                        !state.is_read_only(),
+                        "binding replacement and detach remain available"
+                    );
+                }
+            });
+            item.read_with(&cx, |item, _| {
+                let doc = &item.document().expect("ready").doc;
+                assert_eq!(serde_json::to_value(doc).expect("snapshot"), before);
+                assert!(!doc.history.can_undo());
+            });
+        }
+    }
+
+    #[test]
+    fn bound_whole_node_inspector_preserves_fallbacks_type_guards_and_independent_radii() {
+        let (mut doc, _, id, _, modes, variable) = doc_with_bound_paints();
+        let node = doc.scene.get_mut(id).expect("node");
+        node.bindings = BTreeMap::from([
+            (BoundProp::Visible, variable),
+            (BoundProp::CornerRadius, variable),
+        ]);
+        node.flags.insert(NodeFlags::HIDDEN);
+        let NodeData::Vector(vector) = &mut node.data else {
+            panic!("vector")
+        };
+        vector.corner_radius = Some(7.0);
+        // A color cannot resolve either Boolean visibility or Float radius.
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        let before = serde_json::to_value(&document.doc).expect("snapshot");
+        let (node, _) = design_node(&document, id, &HashMap::new()).expect("projection");
+        assert!(!node.visible);
+        assert_eq!(node.corner_radii, [7.0; 4]);
+        let states = bound_states(&document.doc, id);
+        for (property, expected) in [
+            (DesignPanelProperty::Visible, DesignPanelValue::Bool(false)),
+            (
+                DesignPanelProperty::CornerRadius,
+                DesignPanelValue::Number(7.0),
+            ),
+        ] {
+            let (_, state) = states
+                .iter()
+                .find(|(candidate, _)| *candidate == property)
+                .expect("state");
+            assert_eq!(state.resolved(), Some(&expected));
+            assert!(
+                state
+                    .binding()
+                    .expect("binding")
+                    .name()
+                    .contains("unresolved; using layer fallback")
+            );
+            assert!(!state.is_read_only());
+        }
+        assert_eq!(
+            serde_json::to_value(&document.doc).expect("snapshot"),
+            before
+        );
+
+        document
+            .doc
+            .variables
+            .variables
+            .get_mut(&variable)
+            .expect("variable")
+            .values_by_mode = BTreeMap::from([(modes[0], VarValue::Float { value: 18.0 })]);
+        let node = document.doc.scene.get_mut(id).expect("node");
+        let NodeData::Vector(vector) = &mut node.data else {
+            panic!("vector")
+        };
+        vector.corner_radii = Some([1.0, 2.0, 3.0, 4.0]);
+        let (node, _) = design_node(&document, id, &HashMap::new()).expect("projection");
+        assert_eq!(
+            node.corner_radii,
+            [1.0, 2.0, 3.0, 4.0],
+            "independent radii still take precedence in rendering"
+        );
+        assert!(node.independent_corners);
+        let source = document.doc.scene.get_mut(id).expect("node");
+        source.data = NodeData::Group(fanta_doc::GroupNode {
+            corner_radius: Some(9.0),
+            ..Default::default()
+        });
+        let (node, _) = design_node(&document, id, &HashMap::new()).expect("projection");
+        assert_eq!(
+            node.corner_radii, [9.0; 4],
+            "engine does not apply CornerRadius binding to Group"
+        );
+        let states = bound_states(&document.doc, id);
+        let (_, state) = states
+            .iter()
+            .find(|(property, _)| *property == DesignPanelProperty::CornerRadius)
+            .expect("radius");
+        assert_eq!(state.resolved(), Some(&DesignPanelValue::Number(9.0)));
+        assert!(
+            state
+                .binding()
+                .expect("binding")
+                .name()
+                .contains("unresolved; using layer fallback")
+        );
+    }
+
+    #[gpui::test]
+    async fn bound_whole_node_inspector_keeps_explicit_corner_precedence(cx: &mut TestAppContext) {
+        let (mut doc, _, id, _, modes, variable) = doc_with_bound_paints();
+        let radius = doc
+            .variables
+            .variables
+            .get_mut(&variable)
+            .expect("variable");
+        radius.ty = fanta_doc::VariableType::Float;
+        radius.values_by_mode = BTreeMap::from([(modes[0], VarValue::Float { value: 18.0 })]);
+        doc.scene.get_mut(id).expect("node").bindings =
+            BTreeMap::from([(BoundProp::CornerRadius, variable)]);
+        let (view, panel, mut cx) = setup_view(doc, cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        for (radii, group) in [
+            ([7.0; 4], false),
+            ([1.0, 2.0, 3.0, 4.0], false),
+            ([9.0; 4], true),
+        ] {
+            item.update(&mut cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    let node = document.doc.scene.get_mut(id).expect("node");
+                    if group {
+                        node.data = NodeData::Group(fanta_doc::GroupNode {
+                            corner_radii: Some(radii),
+                            ..Default::default()
+                        });
+                    } else if let NodeData::Vector(vector) = &mut node.data {
+                        vector.corner_radii = Some(radii);
+                    } else {
+                        panic!("vector");
+                    }
+                    ((), DocChange::Content)
+                })
+                .expect("ready");
+            });
+            let before = item.read_with(&cx, |item, _| {
+                serde_json::to_value(&item.document().expect("ready").doc).expect("snapshot")
+            });
+            view.update_in(&mut cx, |view, _, cx| view.refresh_gpui_design(cx));
+            cx.run_until_parked();
+            panel.read_with(&cx, |panel, _| {
+                assert_eq!(panel.node().corner_radii, radii.map(|value| value as f32));
+                let data = panel.view_data();
+                let state = data
+                    .property_states
+                    .get(&DesignPanelProperty::CornerRadius)
+                    .expect("radius");
+                assert_eq!(
+                    state.resolved(),
+                    Some(&DesignPanelValue::Number(radii[0] as f32)),
+                    "summary agrees with explicit corner geometry"
+                );
+                let binding = state.binding().expect("binding retained");
+                assert_eq!(binding.id().as_ref(), variable.to_string());
+                assert!(
+                    binding
+                        .name()
+                        .contains("independent corners take precedence")
+                );
+                assert!(!state.is_read_only(), "binding remains detachable");
+            });
+            item.read_with(&cx, |item, _| {
+                let doc = &item.document().expect("ready").doc;
+                assert_eq!(serde_json::to_value(doc).expect("snapshot"), before);
+                assert!(!doc.history.can_undo());
+            });
+        }
     }
 
     #[gpui::test]
