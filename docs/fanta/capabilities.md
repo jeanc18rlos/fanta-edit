@@ -129,7 +129,11 @@ for exact builds and remaining gesture checks. A later 320 px fixture passes
 differing 50%/100% values edited to 75%, single Undo/Redo, restoration and exact
 reopening. A fast drag that leaves the numeric readout before its first move
 did not start a scrub in the earlier tested build. The correction now passes
-automated regressions; its native retry remains pending.
+automated regressions. On the `ce8db37c34` QA build, dragging the numeric
+percentage readout to 0% now passes Save, one Undo, one Redo and a full quit/reopen
+with exact saved content, assets, timestamps and file bytes. Start the drag on
+the displayed value. Held-drag cancellation and broader field combinations
+remain unverified.
 
 Implementation: [tools.rs](../../crates/fig_viewer/src/tools.rs),
 [canvas tools](../../crates/fanta-tools/src),
@@ -181,7 +185,10 @@ drill-in, selected-vector menu entry/Escape and Video/Audio/Node Graph/3D/AI/Emb
 properties reveal also preserve the document exactly. That build entered Edit
 Path without initial anchors; the corrected `8a9a33c35e` displays four anchors
 immediately through both double-click and the actual Edit vector menu, with
-unchanged saved content. Selected Bitmap/Vector Inspect refusals and a nine-layer
+unchanged saved content. The `ce8db37c34` QA build also passes Edit vector
+menu entry for a Group-contained vector, a precise anchor drag/Save and one
+Undo/Redo. All 35 nodes and five assets match the predeclared states; its cold
+reopen and authored Boolean point edits remain unverified. Selected Bitmap/Vector Inspect refusals and a nine-layer
 generic menu passed separately; TextPath Inspect targeting was inconclusive.
 These checks do not establish every node-entry or text-input combination.
 
