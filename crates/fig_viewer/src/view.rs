@@ -332,6 +332,64 @@ impl Render for SidebarResizeDrag {
     }
 }
 
+const CLICK_DIAGNOSTIC_LIMIT: u16 = 256;
+const CLICK_DIAGNOSTIC_SELECTION_LIMIT: usize = 16;
+
+struct ClickDiagnostics {
+    reserved: u16,
+    #[cfg(test)]
+    records: Vec<serde_json::Value>,
+}
+
+impl ClickDiagnostics {
+    fn from_setting(value: Option<&std::ffi::OsStr>) -> Option<Self> {
+        (value == Some(std::ffi::OsStr::new("1"))).then(|| Self {
+            reserved: 0,
+            #[cfg(test)]
+            records: Vec::new(),
+        })
+    }
+
+    fn capture<T>(state: Option<&mut Self>, payload: impl FnOnce() -> T) -> Option<(u16, T)> {
+        let state = state?;
+        if state.reserved >= CLICK_DIAGNOSTIC_LIMIT {
+            return None;
+        }
+        state.reserved += 1;
+        Some((state.reserved, payload()))
+    }
+}
+
+#[derive(serde::Serialize)]
+struct ClickDiagnosticSnapshot {
+    selection: Vec<NodeId>,
+    selection_count: usize,
+    selection_truncated: bool,
+    tool: String,
+    mode: String,
+    primary_pressed: bool,
+    canvas_pointer_down: bool,
+    space_pan: bool,
+    text_edit_active: bool,
+}
+
+struct PendingClickDiagnostic {
+    sequence: u16,
+    stage: &'static str,
+    input: serde_json::Value,
+    before: ClickDiagnosticSnapshot,
+}
+
+fn click_diagnostic_modifiers(modifiers: gpui::Modifiers) -> serde_json::Value {
+    serde_json::json!({
+        "shift": modifiers.shift,
+        "command": modifiers.platform,
+        "control": modifiers.control,
+        "alt": modifiers.alt,
+        "function": modifiers.function,
+    })
+}
+
 pub struct FigView {
     pub(crate) item: Entity<FigItem>,
     project: Entity<Project>,
@@ -381,6 +439,7 @@ pub struct FigView {
     pub(crate) viewport: Option<Viewport>,
     pan_last_position: Option<Point<Pixels>>,
     primary_pressed: bool,
+    click_diagnostics: Option<ClickDiagnostics>,
     pub(crate) gesture_perf: Option<crate::gesture_perf::SharedGesturePerf>,
     /// A pointer button is down on the canvas, from the press until the
     /// release (wherever it lands). Broader than `primary_pressed`, which the
@@ -787,6 +846,9 @@ impl FigView {
             viewport: None,
             pan_last_position: None,
             primary_pressed: false,
+            click_diagnostics: ClickDiagnostics::from_setting(
+                std::env::var_os("FANTA_INPUT_DIAGNOSTICS").as_deref(),
+            ),
             gesture_perf: crate::perf_enabled().then(crate::gesture_perf::GesturePerf::shared),
             canvas_pointer_down: false,
             autosave_task: None,
@@ -2808,9 +2870,95 @@ impl FigView {
         true
     }
 
+    fn click_diagnostic_snapshot(&self, cx: &App) -> ClickDiagnosticSnapshot {
+        let selection = self.item.read(cx).doc().map(|doc| &doc.selection);
+        let selection_count = selection.map_or(0, |selection| selection.len());
+        ClickDiagnosticSnapshot {
+            selection: selection
+                .into_iter()
+                .flat_map(|selection| selection.iter().copied())
+                .take(CLICK_DIAGNOSTIC_SELECTION_LIMIT)
+                .collect(),
+            selection_count,
+            selection_truncated: selection_count > CLICK_DIAGNOSTIC_SELECTION_LIMIT,
+            tool: format!("{:?}", self.tools.kind()),
+            mode: format!("{:?}", self.editor_mode(cx)),
+            primary_pressed: self.primary_pressed,
+            canvas_pointer_down: self.canvas_pointer_down,
+            space_pan: self.space_pan,
+            text_edit_active: self.text_edit.is_some(),
+        }
+    }
+
+    fn begin_click_diagnostic(
+        &mut self,
+        stage: &'static str,
+        input: impl FnOnce() -> serde_json::Value,
+        cx: &App,
+    ) -> Option<PendingClickDiagnostic> {
+        let (sequence, input) = ClickDiagnostics::capture(self.click_diagnostics.as_mut(), input)?;
+        Some(PendingClickDiagnostic {
+            sequence,
+            stage,
+            input,
+            before: self.click_diagnostic_snapshot(cx),
+        })
+    }
+
+    fn finish_click_diagnostic(
+        &mut self,
+        pending: Option<PendingClickDiagnostic>,
+        route: &'static str,
+        cx: &Context<Self>,
+    ) {
+        let Some(pending) = pending else {
+            return;
+        };
+        let record = serde_json::json!({
+            "version": 1,
+            "pid": std::process::id(),
+            "view_id": cx.entity_id().as_u64(),
+            "sequence": pending.sequence,
+            "record_limit": CLICK_DIAGNOSTIC_LIMIT,
+            "stage": pending.stage,
+            "input": pending.input,
+            "route": route,
+            "before": pending.before,
+            "after": self.click_diagnostic_snapshot(cx),
+        });
+        match serde_json::to_string(&record) {
+            Ok(json) => log::info!("fanta_click_diagnostic {json}"),
+            Err(error) => log::warn!("serializing canvas click diagnostics failed: {error}"),
+        }
+        #[cfg(test)]
+        if let Some(diagnostics) = &mut self.click_diagnostics {
+            diagnostics.records.push(record);
+        }
+    }
+
     /// Send one event through the active tool, tracking whether it changed
     /// document content, only the selection, or nothing.
     fn dispatch_tool_event(&mut self, event: ToolEvent, cx: &mut Context<Self>) {
+        let diagnostic = match event {
+            ToolEvent::Pointer(
+                pointer @ (fanta_tools::PointerEvent::Press { .. }
+                | fanta_tools::PointerEvent::Release { .. }),
+            ) => self.begin_click_diagnostic(
+                "tool_dispatch",
+                || serde_json::json!({"coordinate_space":"canvas", "pointer":pointer}),
+                cx,
+            ),
+            _ => None,
+        };
+        let route = self.dispatch_tool_event_inner(event, cx);
+        self.finish_click_diagnostic(diagnostic, route, cx);
+    }
+
+    fn dispatch_tool_event_inner(
+        &mut self,
+        event: ToolEvent,
+        cx: &mut Context<Self>,
+    ) -> &'static str {
         let _perf_span = crate::gesture_perf::ui_span(
             self.gesture_perf.as_ref(),
             cx.entity_id().as_u64(),
@@ -2820,21 +2968,21 @@ impl FigView {
         if self.handle_annotation_tool_event(event, cx)
             || self.handle_measurement_tool_event(event, cx)
         {
-            return;
+            return "annotation_or_measurement";
         }
         let Some(bounds) = self.container_bounds else {
-            return;
+            return "missing_bounds";
         };
         let Some(viewport) = self.viewport else {
-            return;
+            return "missing_viewport";
         };
         if self.handle_motion_selection_event(event, viewport, cx) {
-            return;
+            return "motion_selection";
         }
         let editable = self.is_editable(cx);
         if !editable && self.tools.kind() != ToolKind::Hand {
             self.handle_read_only_event(event, cx);
-            return;
+            return "read_only_selection";
         }
 
         let screen_size = {
@@ -2842,7 +2990,7 @@ impl FigView {
             DVec2::new(width, height)
         };
         if self.defer_bitmap_wand_press(event, viewport, screen_size, cx) {
-            return;
+            return "deferred_bitmap_wand";
         }
         let viewport_before = viewport;
         let mut viewport = viewport;
@@ -3032,7 +3180,7 @@ impl FigView {
                 self.pending_text_edit = Some(node);
                 cx.notify();
             }
-            return;
+            return "tool_requested_exit";
         }
         // Document and selection changes already notify through the item's
         // event stream; only repaint here when something view-local changed.
@@ -3045,6 +3193,7 @@ impl FigView {
         {
             cx.notify();
         }
+        "tool_handled"
     }
 
     fn handle_motion_selection_event(
@@ -3558,6 +3707,31 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let diagnostic = self.begin_click_diagnostic(
+            "canvas_down",
+            || {
+                serde_json::json!({
+                    "button":format!("{:?}", event.button),
+                    "position":[f32::from(event.position.x), f32::from(event.position.y)],
+                    "coordinate_space":"window",
+                    "click_count":event.click_count,
+                    "first_mouse":event.first_mouse,
+                    "modifiers":click_diagnostic_modifiers(event.modifiers),
+                    "window_modifiers":click_diagnostic_modifiers(window.modifiers()),
+                })
+            },
+            cx,
+        );
+        let route = self.handle_mouse_down_inner(event, window, cx);
+        self.finish_click_diagnostic(diagnostic, route, cx);
+    }
+
+    fn handle_mouse_down_inner(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> &'static str {
         if event.button == MouseButton::Left {
             // Set before any of the branches below can return early: the
             // autosave stands down for the whole gesture, including the text
@@ -3577,7 +3751,7 @@ impl FigView {
                 );
                 self.prototype_suppress_click = response.suppress_click;
             }
-            return;
+            return "prototype";
         }
         if event.button == MouseButton::Left && self.is_editable(cx) {
             self.finish_panel_edits(cx);
@@ -3592,19 +3766,19 @@ impl FigView {
             && self.handle_text_edit_mouse_down(event, cx)
         {
             self.focus_handle.focus(window, cx);
-            return;
+            return "text_edit";
         }
 
         if self.handle_annotation_mouse_down(event, window, cx)
             || self.handle_measurement_mouse_down(event, window, cx)
             || self.handle_node_double_click(event, window, cx)
         {
-            return;
+            return "annotation_measurement_or_double_click";
         }
 
         self.focus_handle.focus(window, cx);
         let Some(bounds) = self.container_bounds else {
-            return;
+            return "missing_bounds";
         };
 
         // Comments: pin clicks open threads with any tool; in comment mode a
@@ -3614,7 +3788,7 @@ impl FigView {
             && !self.is_inspecting()
             && self.handle_comment_mouse_down(event.position, window, cx)
         {
-            return;
+            return "comment";
         }
 
         // Middle-drag, or a left-drag while space is held, pans regardless of
@@ -3624,11 +3798,11 @@ impl FigView {
         {
             self.pan_last_position = Some(event.position);
             cx.notify();
-            return;
+            return "pan";
         }
 
         let Some(button) = pointer_button(event.button) else {
-            return;
+            return "unsupported_button";
         };
         if button == ToolButton::Primary {
             self.primary_pressed = true;
@@ -3641,6 +3815,7 @@ impl FigView {
         if button == ToolButton::Primary && self.primary_pressed {
             self.begin_gesture_perf(window, cx);
         }
+        "tool_press"
     }
 
     /// Track the space bar for hold-to-pan. Returns whether the key was the
@@ -3680,9 +3855,32 @@ impl FigView {
     fn handle_mouse_up(
         &mut self,
         event: &MouseUpEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let diagnostic = self.begin_click_diagnostic(
+            "canvas_up",
+            || {
+                serde_json::json!({
+                    "button":format!("{:?}", event.button),
+                    "position":[f32::from(event.position.x), f32::from(event.position.y)],
+                    "coordinate_space":"window",
+                    "click_count":event.click_count,
+                    "modifiers":click_diagnostic_modifiers(event.modifiers),
+                    "window_modifiers":click_diagnostic_modifiers(window.modifiers()),
+                })
+            },
+            cx,
+        );
+        let route = self.handle_mouse_up_inner(event, cx);
+        self.finish_click_diagnostic(diagnostic, route, cx);
+    }
+
+    fn handle_mouse_up_inner(
+        &mut self,
+        event: &MouseUpEvent,
+        cx: &mut Context<Self>,
+    ) -> &'static str {
         if event.button == MouseButton::Left {
             self.canvas_pointer_down = false;
         }
@@ -3697,7 +3895,7 @@ impl FigView {
                     self.trigger_prototype_click(event.position, cx);
                 }
             }
-            return;
+            return "prototype";
         }
         if event.button == MouseButton::Middle {
             self.end_panning(cx);
@@ -3706,7 +3904,7 @@ impl FigView {
         // for the next drag; end the pan, keep `space_pan`.
         if event.button == MouseButton::Left && self.space_pan && self.is_panning() {
             self.end_panning(cx);
-            return;
+            return "space_pan";
         }
         if event.button == MouseButton::Left
             && let Some(edit) = self.text_edit.as_mut()
@@ -3717,24 +3915,47 @@ impl FigView {
         // The canvas and window listeners share an idempotent release path:
         // whichever runs first ends the gesture, so it never dispatches twice.
         self.handle_window_mouse_up(event, cx);
+        "shared_release"
     }
 
     /// Element listeners stop firing once the cursor leaves the canvas, so
     /// the window listener must also be able to end an active gesture.
     pub(crate) fn handle_window_mouse_up(&mut self, event: &MouseUpEvent, cx: &mut Context<Self>) {
+        let diagnostic = self.begin_click_diagnostic(
+            "shared_up",
+            || {
+                serde_json::json!({
+                    "button":format!("{:?}", event.button),
+                    "position":[f32::from(event.position.x), f32::from(event.position.y)],
+                    "coordinate_space":"window",
+                    "click_count":event.click_count,
+                    "modifiers":click_diagnostic_modifiers(event.modifiers),
+                })
+            },
+            cx,
+        );
+        let route = self.handle_window_mouse_up_inner(event, cx);
+        self.finish_click_diagnostic(diagnostic, route, cx);
+    }
+
+    fn handle_window_mouse_up_inner(
+        &mut self,
+        event: &MouseUpEvent,
+        cx: &mut Context<Self>,
+    ) -> &'static str {
         if event.button != MouseButton::Left {
-            return;
+            return "non_left_button";
         }
         // Cleared before the `primary_pressed` guard: a release that lands
         // outside the canvas comes through here only, and leaving the flag set
         // would hold the autosave off indefinitely.
         self.canvas_pointer_down = false;
         if !self.primary_pressed {
-            return;
+            return "primary_not_pressed";
         }
         let Some(bounds) = self.container_bounds else {
             self.end_gesture_perf("released_without_canvas_bounds");
-            return;
+            return "missing_bounds";
         };
         self.primary_pressed = false;
         let screen = screen_position_in_bounds(event.position, bounds);
@@ -3743,6 +3964,7 @@ impl FigView {
             cx,
         );
         self.end_gesture_perf("released");
+        "tool_release"
     }
 
     pub(crate) fn handle_window_mouse_move(
@@ -9284,6 +9506,9 @@ impl Item for FigView {
                 viewport,
                 pan_last_position: None,
                 primary_pressed: false,
+                click_diagnostics: ClickDiagnostics::from_setting(
+                    std::env::var_os("FANTA_INPUT_DIAGNOSTICS").as_deref(),
+                ),
                 gesture_perf: crate::perf_enabled().then(crate::gesture_perf::GesturePerf::shared),
                 canvas_pointer_down: false,
                 autosave_task: None,
@@ -15678,6 +15903,326 @@ mod tests {
                 });
             }
         }
+    }
+
+    #[test]
+    fn click_diagnostics_require_explicit_setting_and_bound_payload_work() {
+        use std::ffi::OsStr;
+        for value in [
+            None,
+            Some(OsStr::new("")),
+            Some(OsStr::new("0")),
+            Some(OsStr::new("true")),
+        ] {
+            assert!(ClickDiagnostics::from_setting(value).is_none());
+        }
+        assert!(ClickDiagnostics::capture::<()>(None, || panic!("disabled payload")).is_none());
+        let mut diagnostics =
+            ClickDiagnostics::from_setting(Some(OsStr::new("1"))).expect("enabled");
+        for sequence in 1..=CLICK_DIAGNOSTIC_LIMIT {
+            assert_eq!(
+                ClickDiagnostics::capture(Some(&mut diagnostics), || sequence),
+                Some((sequence, sequence))
+            );
+        }
+        assert!(
+            ClickDiagnostics::capture::<()>(Some(&mut diagnostics), || panic!("exhausted payload"))
+                .is_none()
+        );
+        assert_eq!(diagnostics.reserved, CLICK_DIAGNOSTIC_LIMIT);
+    }
+
+    #[gpui::test]
+    async fn mounted_click_diagnostics_distinguish_cached_flags_from_press_and_release(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui::InputEvent as _;
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (mut doc, first, images) = bitmap_canvas_doc();
+        let mut second_node = CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode::rect_solid(
+            0.0,
+            0.0,
+            80.0,
+            80.0,
+            Color::WHITE,
+        )));
+        second_node.parent = doc.active_page();
+        second_node.transform = Transform2D::translation(180.0, -40.0);
+        let second = second_node.id;
+        doc.scene.insert(second_node).expect("second target");
+        doc.selection.select_only(first);
+        let (item, view, mut visual) =
+            mounted_canvas_interaction_fixture(&project, doc, images, cx);
+        let (before, assets) = item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            (
+                serde_json::to_value(&document.doc.scene).expect("scene"),
+                document.raw_assets.clone(),
+            )
+        });
+        let none = gpui::Modifiers::none();
+        let shift = gpui::Modifiers {
+            shift: true,
+            ..none
+        };
+        let command = gpui::Modifiers {
+            platform: true,
+            ..none
+        };
+        for (cached, down, up, extends) in [
+            (shift, none, none, false),
+            (command, none, none, false),
+            (none, shift, none, true),
+            (none, none, shift, true),
+            (none, command, none, true),
+            (none, none, command, true),
+        ] {
+            item.update(&mut visual, |item, cx| {
+                item.with_document(cx, |document| {
+                    document.doc.selection.select_only(first);
+                    ((), DocChange::Selection)
+                });
+            });
+            view.update(&mut visual, |view, _| {
+                view.click_diagnostics =
+                    ClickDiagnostics::from_setting(Some(std::ffi::OsStr::new("1")));
+            });
+            visual.run_until_parked();
+            let position = view.read_with(&visual, |view, _| {
+                view.container_bounds.expect("canvas").center() + point(px(220.0), px(0.0))
+            });
+            visual.update(|window, cx| {
+                window.dispatch_event(
+                    gpui::ModifiersChangedEvent {
+                        modifiers: cached,
+                        ..Default::default()
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                assert_eq!(window.modifiers(), cached);
+                window.dispatch_event(
+                    MouseDownEvent {
+                        position,
+                        button: MouseButton::Left,
+                        modifiers: down,
+                        click_count: 1,
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                assert_eq!(window.modifiers(), down);
+                for _ in 0..2 {
+                    window.dispatch_event(
+                        MouseUpEvent {
+                            position,
+                            button: MouseButton::Left,
+                            modifiers: up,
+                            click_count: 1,
+                        }
+                        .to_platform_input(),
+                        cx,
+                    );
+                }
+            });
+            visual.run_until_parked();
+            item.read_with(&visual, |item, _| {
+                let document = item.document().expect("document");
+                assert!(document.doc.selection.contains(second));
+                assert_eq!(document.doc.selection.contains(first), extends);
+                assert_eq!(document.doc.selection.len(), if extends { 2 } else { 1 });
+                assert_eq!(
+                    serde_json::to_value(&document.doc.scene).expect("scene"),
+                    before
+                );
+                assert_eq!(document.raw_assets, assets);
+                assert_eq!(document.doc.history.undo_depth(), 0);
+                assert!(!item.is_dirty());
+            });
+            view.read_with(&visual, |view, _| {
+                let records = &view
+                    .click_diagnostics
+                    .as_ref()
+                    .expect("diagnostics")
+                    .records;
+                let down_record = records
+                    .iter()
+                    .find(|record| record["stage"] == "canvas_down")
+                    .expect("down");
+                assert_eq!(
+                    down_record["input"]["modifiers"],
+                    click_diagnostic_modifiers(down)
+                );
+                assert_eq!(
+                    down_record["input"]["window_modifiers"],
+                    click_diagnostic_modifiers(down)
+                );
+                assert_eq!(down_record["route"], "tool_press");
+                assert_eq!(
+                    records
+                        .iter()
+                        .filter(|record| record["route"] == "tool_release")
+                        .count(),
+                    1
+                );
+                assert!(
+                    records
+                        .iter()
+                        .any(|record| record["route"] == "primary_not_pressed")
+                );
+                let tool_records: Vec<_> = records
+                    .iter()
+                    .filter(|record| record["stage"] == "tool_dispatch")
+                    .collect();
+                assert_eq!(tool_records.len(), 2, "one press and one accepted release");
+                let release = tool_records
+                    .iter()
+                    .find(|record| record["input"]["pointer"]["kind"] == "release")
+                    .expect("tool release");
+                assert_eq!(
+                    release["input"]["pointer"]["modifiers"],
+                    serde_json::to_value(crate::tools::modifier_keys(up)).expect("modifiers")
+                );
+                assert_eq!(release["before"]["selection"], serde_json::json!([first]));
+                assert_eq!(
+                    release["after"]["selection_count"],
+                    if extends { 2 } else { 1 }
+                );
+                assert!(!view.primary_pressed && !view.canvas_pointer_down);
+            });
+            let records_before = view.read_with(&visual, |view, _| {
+                view.click_diagnostics
+                    .as_ref()
+                    .expect("diagnostics")
+                    .records
+                    .len()
+            });
+            visual.simulate_event(MouseMoveEvent {
+                position,
+                pressed_button: None,
+                modifiers: none,
+            });
+            view.update(&mut visual, |view, cx| {
+                view.dispatch_tool_event(key_event(LogicalKey::Escape, none), cx)
+            });
+            assert_eq!(
+                view.read_with(&visual, |view, _| view
+                    .click_diagnostics
+                    .as_ref()
+                    .expect("diagnostics")
+                    .records
+                    .len()),
+                records_before,
+                "moves and keys are not logged"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn mounted_click_diagnostics_keep_pan_routes_and_selection_payload_bounded(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (mut doc, first, images) = bitmap_canvas_doc();
+        doc.selection.select_only(first);
+        for index in 0..20 {
+            let mut node = CanvasNode::new(NodeData::Group(GroupNode::default()));
+            node.parent = doc.active_page();
+            node.transform = Transform2D::translation(2000.0 + f64::from(index), 0.0);
+            let id = node.id;
+            doc.scene.insert(node).expect("extra selected node");
+            doc.selection.add(id);
+        }
+        let (item, view, mut visual) =
+            mounted_canvas_interaction_fixture(&project, doc, images, cx);
+        use gpui::InputEvent as _;
+        let before = item.read_with(&visual, |item, _| {
+            serde_json::to_value(&item.doc().expect("doc").scene).expect("scene")
+        });
+        let position = view.read_with(&visual, |view, _| {
+            view.container_bounds.expect("canvas").center()
+        });
+        for paint_between_events in [false, true] {
+            view.update(&mut visual, |view, _| {
+                view.click_diagnostics =
+                    ClickDiagnostics::from_setting(Some(std::ffi::OsStr::new("1")));
+                view.space_pan = true;
+            });
+            visual.update(|window, cx| {
+                window.dispatch_event(
+                    MouseDownEvent {
+                        position,
+                        button: MouseButton::Left,
+                        modifiers: gpui::Modifiers::none(),
+                        click_count: 1,
+                        first_mouse: false,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+                assert!(view.read(cx).is_panning());
+                if paint_between_events {
+                    window.draw(cx).clear();
+                }
+                window.dispatch_event(
+                    MouseUpEvent {
+                        position,
+                        button: MouseButton::Left,
+                        modifiers: gpui::Modifiers::none(),
+                        click_count: 1,
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            });
+            visual.run_until_parked();
+            view.read_with(&visual, |view, _| {
+                let records = &view
+                    .click_diagnostics
+                    .as_ref()
+                    .expect("diagnostics")
+                    .records;
+                assert!(records.iter().any(|record| record["route"] == "pan"));
+                let expected_route = if paint_between_events {
+                    "shared_release"
+                } else {
+                    "space_pan"
+                };
+                assert!(
+                    records.iter().any(|record| record["stage"] == "canvas_up"
+                        && record["route"] == expected_route)
+                );
+                assert!(
+                    !records
+                        .iter()
+                        .any(|record| record["stage"] == "tool_dispatch")
+                );
+                assert!(!view.is_panning());
+                assert!(view.space_pan);
+                assert!(!view.primary_pressed && !view.canvas_pointer_down);
+                for record in records {
+                    assert_eq!(record["before"]["selection_count"], 21);
+                    assert_eq!(
+                        record["before"]["selection"]
+                            .as_array()
+                            .expect("selection")
+                            .len(),
+                        CLICK_DIAGNOSTIC_SELECTION_LIMIT
+                    );
+                    assert_eq!(record["before"]["selection_truncated"], true);
+                }
+            });
+        }
+        item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("doc");
+            assert_eq!(serde_json::to_value(&doc.scene).expect("scene"), before);
+            assert_eq!(doc.selection.len(), 21);
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert!(!item.is_dirty());
+        });
     }
 
     #[gpui::test]
