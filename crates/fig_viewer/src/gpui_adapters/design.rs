@@ -2622,6 +2622,11 @@ impl FigView {
     /// the matching `apply_clear_*`, which can discard transient dropdown
     /// state. The granular setters touch only what this adapter owns.
     pub(crate) fn refresh_gpui_design(&mut self, cx: &mut Context<Self>) {
+        let _perf_span = crate::gesture_perf::ui_span(
+            self.gesture_perf.as_ref(),
+            cx.entity_id().as_u64(),
+            crate::gesture_perf::UiStage::DesignRefresh,
+        );
         if self.gpui_design.is_none() {
             return;
         }

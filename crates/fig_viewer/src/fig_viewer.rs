@@ -172,6 +172,27 @@ pub(crate) fn perf_enabled() -> bool {
     *ENABLED.get_or_init(|| std::env::var_os("FANTA_PERF").is_some())
 }
 
+#[must_use]
+pub(crate) struct PerfSpan {
+    label: &'static str,
+    started: Option<std::time::Instant>,
+}
+
+pub(crate) fn perf_span(label: &'static str) -> PerfSpan {
+    PerfSpan {
+        label,
+        started: crate::gesture_perf::optional_timer(perf_enabled()),
+    }
+}
+
+impl Drop for PerfSpan {
+    fn drop(&mut self) {
+        if let Some(started) = self.started {
+            report_slow(self.label, started);
+        }
+    }
+}
+
 /// Log a hot-path duration when perf diagnostics are on and the cost is
 /// non-trivial. Run the app with `FANTA_PERF=1` to see where frames go.
 pub(crate) fn report_slow(label: &str, started: std::time::Instant) {
