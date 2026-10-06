@@ -14829,9 +14829,18 @@ mod tests {
         });
     }
 
-    async fn assert_mounted_mixed_opacity_scrub(cancel: bool, cx: &mut TestAppContext) {
+    async fn assert_mounted_opacity_scrub(
+        cancel: bool,
+        multiple: bool,
+        first_move_outside: bool,
+        cx: &mut TestAppContext,
+    ) {
         init_test(cx);
         let (mut doc, page, rect) = doc_with_rect();
+        if !multiple {
+            doc.scene.get_mut(rect).expect("opacity target").opacity =
+                fanta_doc::UnitInterval::new(0.5);
+        }
         let mut control = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
             0.0,
             0.0,
@@ -14870,11 +14879,20 @@ mod tests {
                 bitmap.transform = Transform2D::translation(240.0, 20.0);
                 let bitmap_id = bitmap.id;
                 doc.scene.insert(bitmap).expect("insert selected bitmap");
-                doc.selection.replace_with([rect, bitmap_id]);
+                doc.selection.replace_with(if multiple {
+                    vec![rect, bitmap_id]
+                } else {
+                    vec![rect]
+                });
                 (bitmap_id, DocChange::None)
             })
             .expect("document ready")
         });
+        let selected = if multiple {
+            vec![rect, bitmap]
+        } else {
+            vec![rect]
+        };
         let item_for_view = item.clone();
         let (view, cx) =
             cx.add_window_view(move |window, cx| FigView::new(item_for_view, project, window, cx));
@@ -14909,32 +14927,40 @@ mod tests {
             (document.doc.scene.clone(), document.raw_assets.clone())
         });
         let start = opacity.center();
-        let preview = start - point(px(16.0), px(0.0));
-        assert!(opacity.contains(&preview));
+        let outside = point(sidebar.origin.x - px(40.0), start.y);
+        assert!(!sidebar.contains(&outside));
         cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
         cx.run_until_parked();
-        cx.simulate_mouse_move(
-            start - point(px(8.0), px(0.0)),
-            MouseButton::Left,
-            Modifiers::none(),
-        );
-        cx.run_until_parked();
-        cx.simulate_mouse_move(preview, MouseButton::Left, Modifiers::none());
+        if first_move_outside {
+            cx.simulate_mouse_move(outside, MouseButton::Left, Modifiers::none());
+        } else {
+            let preview = start - point(px(16.0), px(0.0));
+            assert!(opacity.contains(&preview));
+            cx.simulate_mouse_move(
+                start - point(px(8.0), px(0.0)),
+                MouseButton::Left,
+                Modifiers::none(),
+            );
+            cx.run_until_parked();
+            cx.simulate_mouse_move(preview, MouseButton::Left, Modifiers::none());
+        }
         cx.run_until_parked();
         assert!(
             panel.read_with(cx, |panel, _| panel.active_scrub_speed().is_some()),
             "pointer movement starts a real scrub"
         );
-        item.read_with(cx, |item, _| {
-            let document = item.document().expect("document ready");
-            assert_eq!(
-                serde_json::to_value(&document.doc.scene).expect("scene"),
-                serde_json::to_value(&before).expect("baseline"),
-                "mixed selection stays commit-only while scrubbing"
-            );
-            assert!(!item.is_dirty());
-            assert!(!document.doc.history.can_undo());
-        });
+        if multiple {
+            item.read_with(cx, |item, _| {
+                let document = item.document().expect("document ready");
+                assert_eq!(
+                    serde_json::to_value(&document.doc.scene).expect("scene"),
+                    serde_json::to_value(&before).expect("baseline"),
+                    "mixed selection stays commit-only while scrubbing"
+                );
+                assert!(!item.is_dirty());
+                assert!(!document.doc.history.can_undo());
+            });
+        }
         if cancel {
             cx.simulate_keystrokes("escape");
             cx.run_until_parked();
@@ -14943,26 +14969,38 @@ mod tests {
                 "Escape releases the scrub while the pointer is still held"
             );
         }
-        let outside = point(sidebar.origin.x - px(40.0), start.y);
-        assert!(!sidebar.contains(&outside));
         cx.simulate_mouse_up(outside, MouseButton::Left, Modifiers::none());
         cx.run_until_parked();
         assert!(
             panel.read_with(cx, |panel, _| panel.active_scrub_speed().is_none()),
             "release outside must finish pointer capture"
         );
+        cx.simulate_mouse_move(
+            outside - point(px(12.0), px(0.0)),
+            MouseButton::Left,
+            Modifiers::none(),
+        );
+        cx.simulate_mouse_up(outside, MouseButton::Left, Modifiers::none());
+        cx.run_until_parked();
         let after = item.read_with(cx, |item, _| {
             let document = item.document().expect("document ready");
             assert_eq!(
                 document.raw_assets, assets,
                 "scrubbing never rewrites assets"
             );
-            assert_eq!(document.doc.selection.as_slice(), &[rect, bitmap]);
+            assert_eq!(document.doc.selection.as_slice(), selected.as_slice());
             assert!(!item.content_preview_active());
             let mut expected = before.clone();
-            for id in [rect, bitmap] {
+            for &id in &selected {
                 let opacity = document.doc.scene.get(id).expect("selected node").opacity;
-                assert!((opacity.get() - if cancel { 1.0 } else { 0.84 }).abs() < 1e-6);
+                let expected_opacity = if cancel {
+                    before.get(id).expect("baseline node").opacity.get()
+                } else if first_move_outside {
+                    0.0
+                } else {
+                    0.84
+                };
+                assert!((opacity.get() - expected_opacity).abs() < 1e-6);
                 expected
                     .get_mut(id)
                     .expect("selected baseline node")
@@ -14971,7 +15009,7 @@ mod tests {
             assert_eq!(
                 serde_json::to_value(&document.doc.scene).expect("scene"),
                 serde_json::to_value(&expected).expect("expected"),
-                "only the two selected opacity fields may change"
+                "only selected opacity fields may change"
             );
             assert_eq!(item.is_dirty(), !cancel);
             assert_eq!(document.doc.history.undo_depth(), usize::from(!cancel));
@@ -15015,14 +15053,42 @@ mod tests {
     async fn mounted_mixed_opacity_scrub_escape_cancels_before_outside_release(
         cx: &mut TestAppContext,
     ) {
-        assert_mounted_mixed_opacity_scrub(true, cx).await;
+        assert_mounted_opacity_scrub(true, true, false, cx).await;
     }
 
     #[gpui::test]
     async fn mounted_mixed_opacity_scrub_outside_release_commits_one_undo_step(
         cx: &mut TestAppContext,
     ) {
-        assert_mounted_mixed_opacity_scrub(false, cx).await;
+        assert_mounted_opacity_scrub(false, true, false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn mounted_opacity_scrub_first_move_outside_commits_and_undoes_single(
+        cx: &mut TestAppContext,
+    ) {
+        assert_mounted_opacity_scrub(false, false, true, cx).await;
+    }
+
+    #[gpui::test]
+    async fn mounted_opacity_scrub_first_move_outside_commits_and_undoes_mixed(
+        cx: &mut TestAppContext,
+    ) {
+        assert_mounted_opacity_scrub(false, true, true, cx).await;
+    }
+
+    #[gpui::test]
+    async fn mounted_opacity_scrub_first_move_outside_escape_cancels_single(
+        cx: &mut TestAppContext,
+    ) {
+        assert_mounted_opacity_scrub(true, false, true, cx).await;
+    }
+
+    #[gpui::test]
+    async fn mounted_opacity_scrub_first_move_outside_escape_cancels_mixed(
+        cx: &mut TestAppContext,
+    ) {
+        assert_mounted_opacity_scrub(true, true, true, cx).await;
     }
 
     #[gpui::test]
