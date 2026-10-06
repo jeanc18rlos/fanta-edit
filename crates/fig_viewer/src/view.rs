@@ -283,6 +283,7 @@ const MIN_INSPECTOR_SIDEBAR_WIDTH: f32 =
 const MIN_INSPECTOR_SIDEBAR_WIDTH: f32 = 260.0;
 const MAX_SIDEBAR_WIDTH: f32 = 560.0;
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.);
+const SIDEBAR_BORDER_WIDTH: Pixels = px(1.);
 /// How long the canvas waits after the last committing edit before writing the
 /// project tree. A Fanta project is meant to be readable as source by an agent
 /// and reviewable as a diff, so edits reach disk on their own; the delay keeps
@@ -6018,7 +6019,7 @@ impl FigView {
                     .h_full()
                     .w(self.layers_sidebar_width)
                     .flex_shrink_0()
-                    .border_r_1()
+                    .border_r(SIDEBAR_BORDER_WIDTH)
                     .border_color(cx.theme().colors().border)
             })
             .when(!self.layers_sidebar_visible, |sidebar| {
@@ -6032,7 +6033,7 @@ impl FigView {
             })
             .child(self.layers_sidebar.clone())
             .when(self.layers_sidebar_visible, |sidebar| {
-                sidebar.child(self.render_sidebar_resize_handle(SidebarKind::Layers))
+                sidebar.child(self.render_sidebar_resize_handle(SidebarKind::Layers, cx))
             });
         #[cfg(test)]
         let sidebar = sidebar.when(self.layers_sidebar_visible, |sidebar| {
@@ -6222,7 +6223,7 @@ impl FigView {
             .h_full()
             .w(self.inspector_sidebar_width)
             .flex_shrink_0()
-            .border_l_1()
+            .border_l(SIDEBAR_BORDER_WIDTH)
             .border_color(cx.theme().colors().border)
             .child(
                 v_flex()
@@ -6244,7 +6245,7 @@ impl FigView {
                     )
                     .child(div().flex_1().min_h_0().min_w_0().child(body)),
             )
-            .child(self.render_sidebar_resize_handle(SidebarKind::Inspector));
+            .child(self.render_sidebar_resize_handle(SidebarKind::Inspector, cx));
         #[cfg(test)]
         let sidebar = sidebar.debug_selector(|| "fanta-inspector-sidebar".to_owned());
         sidebar.into_any_element()
@@ -6442,8 +6443,13 @@ impl FigView {
             .into_any_element()
     }
 
-    fn render_sidebar_resize_handle(&self, sidebar: SidebarKind) -> AnyElement {
-        div()
+    fn render_sidebar_resize_handle(
+        &self,
+        sidebar: SidebarKind,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let view = cx.weak_entity();
+        let handle = div()
             .id(match sidebar {
                 SidebarKind::Layers => "fanta-layers-sidebar-resize-handle",
                 SidebarKind::Inspector => "fanta-inspector-sidebar-resize-handle",
@@ -6459,14 +6465,44 @@ impl FigView {
             .h_full()
             .w(SIDEBAR_RESIZE_HANDLE_SIZE)
             .cursor_col_resize()
-            .on_drag(SidebarResizeDrag { sidebar }, |drag, _, _, cx| {
+            .on_drag(SidebarResizeDrag { sidebar }, move |drag, offset, _, cx| {
+                // GPUI starts dragging during bubble dispatch, after this move's
+                // capture-phase resize listener. Apply that first movement here.
+                view.update(cx, |view, cx| {
+                    // The absolute handle is positioned against the sidebar's
+                    // padding box, inside its one-pixel border.
+                    let half_handle = SIDEBAR_RESIZE_HANDLE_SIZE / 2.;
+                    match sidebar {
+                        SidebarKind::Layers => {
+                            view.layers_sidebar_width = clamp_sidebar_width(
+                                view.layers_sidebar_width - SIDEBAR_BORDER_WIDTH - half_handle
+                                    + offset.x,
+                                sidebar,
+                            );
+                        }
+                        SidebarKind::Inspector => {
+                            view.inspector_sidebar_width = clamp_sidebar_width(
+                                view.inspector_sidebar_width - SIDEBAR_BORDER_WIDTH + half_handle
+                                    - offset.x,
+                                sidebar,
+                            );
+                        }
+                    }
+                    cx.notify();
+                })
+                .log_err();
                 cx.new(|_| drag.clone())
             })
             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                 cx.stop_propagation();
             })
-            .occlude()
-            .into_any_element()
+            .occlude();
+        #[cfg(test)]
+        let handle = handle.debug_selector(move || match sidebar {
+            SidebarKind::Layers => "fanta-layers-sidebar-resize-handle".to_owned(),
+            SidebarKind::Inspector => "fanta-inspector-sidebar-resize-handle".to_owned(),
+        });
+        handle.into_any_element()
     }
 
     fn render_tool_pill(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -12821,6 +12857,127 @@ mod tests {
             assert!(view.motion_keyframe_drag.is_none());
             assert_eq!(view.editor_workspace(cx), EditorWorkspace::Variables);
         });
+    }
+
+    async fn assert_mounted_sidebar_divider_drag(
+        sidebar_kind: SidebarKind,
+        first_move_finishes_drag: bool,
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (item, view, mut visual) =
+            mounted_canvas_interaction_fixture(&project, doc_with_one_page(), BTreeMap::new(), cx);
+        view.update(&mut visual, |view, cx| {
+            match sidebar_kind {
+                SidebarKind::Layers => {
+                    view.layers_sidebar_visible = true;
+                    view.layers_sidebar_width = px(320.0);
+                }
+                SidebarKind::Inspector => {
+                    view.inspector_sidebar_visible = true;
+                    view.inspector_sidebar_width = px(320.0);
+                }
+            }
+            cx.notify();
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        let (handle_selector, sidebar_selector) = match sidebar_kind {
+            SidebarKind::Layers => ("fanta-layers-sidebar-resize-handle", "fanta-layers-sidebar"),
+            SidebarKind::Inspector => (
+                "fanta-inspector-sidebar-resize-handle",
+                "fanta-inspector-sidebar",
+            ),
+        };
+        let handle = visual
+            .debug_bounds(handle_selector)
+            .expect("actual divider hit region");
+        let sidebar = visual.debug_bounds(sidebar_selector).expect("sidebar");
+        assert_eq!(sidebar.size.width, px(320.0));
+        assert!(handle.size.width >= px(4.0));
+        let original = item.read_with(&visual, |item, _| {
+            serde_json::to_value(&item.document().expect("document").doc).expect("snapshot")
+        });
+        let start = handle.center();
+        let direction = match sidebar_kind {
+            SidebarKind::Layers => 1.0,
+            SidebarKind::Inspector => -1.0,
+        };
+        let finish = start + point(px(direction * 120.0), px(0.0));
+        assert!(!sidebar.contains(&finish), "release is outside the sidebar");
+        visual.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::none());
+        visual.run_until_parked();
+        if !first_move_finishes_drag {
+            visual.simulate_mouse_move(
+                start + point(px(direction * 20.0), px(0.0)),
+                MouseButton::Left,
+                gpui::Modifiers::none(),
+            );
+            visual.run_until_parked();
+        }
+        visual.simulate_mouse_move(finish, MouseButton::Left, gpui::Modifiers::none());
+        visual.run_until_parked();
+        visual.update(|_, cx| {
+            assert!(
+                cx.has_active_drag(),
+                "actual GPUI drag has captured the divider"
+            );
+        });
+        visual.simulate_mouse_up(finish, MouseButton::Left, gpui::Modifiers::none());
+        visual.run_until_parked();
+        let expected = match sidebar_kind {
+            SidebarKind::Layers => finish.x - sidebar.left(),
+            SidebarKind::Inspector => sidebar.right() - finish.x,
+        };
+        view.read_with(&visual, |view, _| {
+            let actual = match sidebar_kind {
+                SidebarKind::Layers => view.layers_sidebar_width,
+                SidebarKind::Inspector => view.inspector_sidebar_width,
+            };
+            assert_eq!(actual, expected);
+        });
+        visual.update(|window, cx| {
+            assert!(
+                !cx.has_active_drag(),
+                "released divider must not remain captured"
+            );
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert_eq!(
+            visual
+                .debug_bounds(sidebar_selector)
+                .expect("sidebar")
+                .size
+                .width,
+            expected
+        );
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                serde_json::to_value(&item.document().expect("document").doc).expect("snapshot"),
+                original,
+                "resizing a sidebar must not edit or select canvas content"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn mounted_inspector_divider_single_move_and_release_resizes(cx: &mut TestAppContext) {
+        assert_mounted_sidebar_divider_drag(SidebarKind::Inspector, true, cx).await;
+    }
+
+    #[gpui::test]
+    async fn mounted_inspector_divider_two_move_drag_resizes(cx: &mut TestAppContext) {
+        assert_mounted_sidebar_divider_drag(SidebarKind::Inspector, false, cx).await;
+    }
+
+    #[gpui::test]
+    async fn mounted_layers_divider_single_move_and_release_resizes(cx: &mut TestAppContext) {
+        assert_mounted_sidebar_divider_drag(SidebarKind::Layers, true, cx).await;
     }
 
     #[gpui::test]

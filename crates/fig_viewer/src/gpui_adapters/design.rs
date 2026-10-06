@@ -11655,6 +11655,10 @@ mod tests {
             cx.run_until_parked();
             panel.read_with(&cx, |panel, _| {
                 assert_eq!(panel.node().corner_radii, radii.map(|value| value as f32));
+                assert!(
+                    panel.node().independent_corners,
+                    "explicit equal radii retain the authored independent-corner mode"
+                );
                 let data = panel.view_data();
                 let state = data
                     .property_states
@@ -11679,6 +11683,81 @@ mod tests {
                 assert_eq!(serde_json::to_value(doc).expect("snapshot"), before);
                 assert!(!doc.history.can_undo());
             });
+        }
+    }
+
+    #[gpui::test]
+    async fn equal_independent_corners_keep_mode_and_noop_enable_preserves_history(
+        cx: &mut TestAppContext,
+    ) {
+        for group in [false, true] {
+            for explicitly_independent in [false, true] {
+                let (mut doc, _, id) = doc_with_rect();
+                let node = doc.scene.get_mut(id).expect("node");
+                if group {
+                    node.data = NodeData::Group(GroupNode {
+                        clip_size: Some([200.0, 100.0]),
+                        corner_radius: Some(7.0),
+                        corner_radii: explicitly_independent.then_some([7.0; 4]),
+                        ..Default::default()
+                    });
+                } else if let NodeData::Vector(vector) = &mut node.data {
+                    vector.corner_radius = Some(7.0);
+                    vector.corner_radii = explicitly_independent.then_some([7.0; 4]);
+                }
+                doc.selection.replace_with([id]);
+                let (view, panel, mut visual) = setup_view(doc, cx).await;
+                let item = view.read_with(&visual, |view, _| view.item().clone());
+                let before = item.read_with(&visual, |item, _| {
+                    serde_json::to_value(&item.document().expect("document").doc).expect("snapshot")
+                });
+                panel.read_with(&visual, |panel, _| {
+                    assert_eq!(panel.node().corner_radii, [7.0; 4]);
+                    assert_eq!(panel.node().independent_corners, explicitly_independent);
+                });
+                panel.update_in(&mut visual, |_, _, cx| {
+                    cx.emit(DesignPanelAction::PropertyChangeRequested {
+                        node_id: id.to_string().into(),
+                        property: DesignPanelProperty::IndependentCorners,
+                        value: DesignPanelValue::Bool(true),
+                    });
+                });
+                visual.run_until_parked();
+                panel.read_with(&visual, |panel, _| {
+                    assert_eq!(panel.node().corner_radii, [7.0; 4]);
+                    assert!(panel.node().independent_corners);
+                });
+                item.read_with(&visual, |item, _| {
+                    let doc = &item.document().expect("document").doc;
+                    let radii = match &doc.scene.get(id).expect("node").data {
+                        NodeData::Vector(vector) => vector.corner_radii,
+                        NodeData::Group(group) => group.corner_radii,
+                        _ => panic!("corner fixture"),
+                    };
+                    assert_eq!(radii, Some([7.0; 4]));
+                    assert_eq!(
+                        doc.history.undo_depth(),
+                        usize::from(!explicitly_independent)
+                    );
+                    if explicitly_independent {
+                        assert_eq!(serde_json::to_value(doc).expect("snapshot"), before);
+                    }
+                });
+                if !explicitly_independent {
+                    item.update(&mut visual, |item, cx| item.undo(cx).expect("undo mode"));
+                    visual.run_until_parked();
+                    panel.read_with(&visual, |panel, _| {
+                        assert!(!panel.node().independent_corners);
+                        assert_eq!(panel.node().corner_radii, [7.0; 4]);
+                    });
+                    item.update(&mut visual, |item, cx| item.redo(cx).expect("redo mode"));
+                    visual.run_until_parked();
+                    panel.read_with(&visual, |panel, _| {
+                        assert!(panel.node().independent_corners);
+                        assert_eq!(panel.node().corner_radii, [7.0; 4]);
+                    });
+                }
+            }
         }
     }
 
