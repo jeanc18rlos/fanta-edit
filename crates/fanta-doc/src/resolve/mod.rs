@@ -29,9 +29,9 @@ mod variables;
 
 pub use instance::{
     ExpandedNode, InstanceExpansionContext, ResolvedComponentDefRef, backfill_vector_viewports,
-    def_local_path, expand_instance, expand_instance_with_context, resolved_component,
-    resolved_component_rev, resolved_component_rev_with_context, resolved_component_root,
-    resolved_component_root_with_context, resolved_component_with_context,
+    def_local_path, expand_instance, expand_instance_with_context, instance_bindings_with_context,
+    resolved_component, resolved_component_rev, resolved_component_rev_with_context,
+    resolved_component_root, resolved_component_root_with_context, resolved_component_with_context,
     strip_redundant_instance_overrides,
 };
 pub use variables::{resolve_bound_value, resolve_effective_mode};

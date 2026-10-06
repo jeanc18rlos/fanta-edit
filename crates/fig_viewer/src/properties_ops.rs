@@ -112,6 +112,13 @@ pub(crate) fn variant_select_operations(
     }]
 }
 
+pub(crate) fn field_edit_error(doc: &Doc, field: &InspectorField) -> Option<String> {
+    let InspectorField::InstanceText { id, path } = field else {
+        return None;
+    };
+    crate::instance_text::content_edit_error(doc, *id, path)
+}
+
 pub(crate) fn field_operations(doc: &Doc, field: &InspectorField, text: &str) -> Vec<Operation> {
     let scene = &doc.scene;
     match field {

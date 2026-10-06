@@ -2646,10 +2646,19 @@ impl FantaPropertiesPanel {
                             path: text.path.clone(),
                         },
                         text.content.clone(),
-                        editable.then(|| text.content.to_string()),
+                        (editable && text.edit_error.is_none()).then(|| text.content.to_string()),
                         cx,
                     )),
             );
+            if let Some(error) = &text.edit_error {
+                section = section.child(
+                    div().px_4().pb_1().child(
+                        Label::new(error.clone())
+                            .size(LabelSize::XSmall)
+                            .color(Color::Muted),
+                    ),
+                );
+            }
         }
         if editable {
             section = section.child(

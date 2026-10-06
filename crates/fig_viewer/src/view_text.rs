@@ -104,6 +104,9 @@ impl FigView {
                 return;
             }
             self.commit_text_edit(cx);
+            if self.text_edit.is_some() {
+                return;
+            }
         }
         let session = self.item.read(cx).document().and_then(|document| {
             match &document.doc.scene.get(node)?.data {
@@ -135,6 +138,13 @@ impl FigView {
         if !self.text_preview_mutation_allowed(cx) {
             return;
         }
+        let error = self.item.read(cx).document().and_then(|document| {
+            instance_text::content_edit_error(&document.doc, target.instance_id, &target.def_path)
+        });
+        if let Some(error) = error {
+            crate::view::show_canvas_notice(error, window, cx);
+            return;
+        }
         if let Some(edit) = self.text_edit.as_ref() {
             if edit.session.instance().is_some_and(|inst| {
                 inst.instance_id == target.instance_id && inst.def_path == target.def_path
@@ -142,6 +152,9 @@ impl FigView {
                 return;
             }
             self.commit_text_edit(cx);
+            if self.text_edit.is_some() {
+                return;
+            }
         }
         let Some(base_overrides) =
             self.item.read(cx).document().map(|document| {
@@ -229,6 +242,35 @@ impl FigView {
         cx.notify();
     }
 
+    pub(crate) fn cancel_bound_text_edit(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(edit) = self.text_edit.as_ref() else {
+            return false;
+        };
+        let blocked = self.item.read(cx).document().is_some_and(|document| {
+            text_edit::content_edit_error(&document.doc, &edit.session).is_some()
+        });
+        if !blocked {
+            return false;
+        }
+        let owner = cx.entity_id();
+        if !self.item.read(cx).can_preview_for_owner(owner) {
+            return true;
+        }
+        let Some(edit) = self.text_edit.take() else {
+            return false;
+        };
+        self.item.update(cx, |item, cx| {
+            item.with_document_for_owner(owner, cx, |document| {
+                text_edit::rewind_preview(&mut document.doc, &edit.session);
+                ((), DocChange::None)
+            });
+            item.finish_content_preview(owner, false, cx);
+        });
+        self.invalidate_canvas_cache();
+        cx.notify();
+        true
+    }
+
     /// End the session and, when the text changed, write it back as ONE
     /// undoable operation. The scene already holds the final content (the
     /// transient preview wrote it per keystroke), so this stages the commit
@@ -236,6 +278,21 @@ impl FigView {
     /// `ReplaceData { old: original, new: final }` through history.
     pub(crate) fn commit_text_edit(&mut self, cx: &mut Context<Self>) {
         if self.text_edit.is_none() {
+            return;
+        }
+        let error = self.text_edit.as_ref().and_then(|edit| {
+            self.item
+                .read(cx)
+                .document()
+                .and_then(|document| text_edit::content_edit_error(&document.doc, &edit.session))
+        });
+        if let Some(error) = error {
+            crate::view::show_canvas_notice_deferred(
+                format!(
+                    "{error} Your draft was kept. Copy it if needed, then press Escape to cancel."
+                ),
+                cx,
+            );
             return;
         }
         let preview_owner = cx.entity_id();
@@ -453,6 +510,21 @@ impl FigView {
 
     fn sync_text_preview(&mut self, cx: &mut Context<Self>) {
         if !self.text_preview_mutation_allowed(cx) {
+            return;
+        }
+        if let Some(error) = self.text_edit.as_ref().and_then(|edit| {
+            self.item
+                .read(cx)
+                .document()
+                .and_then(|document| text_edit::content_edit_error(&document.doc, &edit.session))
+        }) {
+            crate::view::show_canvas_notice_deferred(
+                format!(
+                    "{error} Your draft was kept. Copy it if needed, then press Escape to cancel."
+                ),
+                cx,
+            );
+            cx.notify();
             return;
         }
         let item = self.item.clone();
@@ -740,7 +812,9 @@ impl FigView {
         let handled = match keystroke.key.as_str() {
             // Escape commits and exits — Figma commits on escape.
             "escape" => {
-                self.commit_text_edit(cx);
+                if !self.cancel_bound_text_edit(cx) {
+                    self.commit_text_edit(cx);
+                }
                 true
             }
             "enter" if command => {

@@ -1292,6 +1292,9 @@ impl FigView {
 
     fn finish_document_edits(&mut self, cx: &mut Context<Self>) {
         self.commit_text_edit(cx);
+        if self.pending_bound_text_error(cx).is_some() {
+            return;
+        }
         self.finish_panel_edits(cx);
         self.commit_text_edit(cx);
         let clip_edit = self
@@ -1383,6 +1386,13 @@ impl FigView {
             self.invalidate_canvas_cache();
             cx.notify();
         }
+    }
+
+    pub(crate) fn pending_bound_text_error(&self, cx: &App) -> Option<String> {
+        self.text_edit.as_ref().and_then(|edit| {
+            self.item.read(cx).document().and_then(|document| crate::text_edit::content_edit_error(&document.doc, &edit.session))
+        }).or_else(|| self.inspector_sidebar.read(cx).pending_bound_text_error(cx))
+            .map(|error| format!("{error} Your draft was kept. Copy it if needed, then press Escape to cancel before continuing."))
     }
 
     pub(crate) fn finish_document_edits_for_external_change(&mut self, cx: &mut Context<Self>) {
@@ -4227,7 +4237,9 @@ impl FigView {
         // listener since the FigViewer keymap context is renamed while
         // editing, but guard here too for programmatic dispatch.
         if self.text_edit.is_some() {
-            self.commit_text_edit(cx);
+            if !self.cancel_bound_text_edit(cx) {
+                self.commit_text_edit(cx);
+            }
             return;
         }
         if self.is_editable(cx) {
@@ -5497,6 +5509,10 @@ impl FigView {
     }
 
     pub fn select_page(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Some(error) = self.pending_bound_text_error(cx) {
+            show_canvas_notice_deferred(error, cx);
+            return;
+        }
         if self.refuse_pending_annotation(cx) || self.refuse_pending_measurement(cx) {
             return;
         }
@@ -5669,6 +5685,9 @@ impl FigView {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Task<Result<Option<std::path::PathBuf>>> {
+        if let Some(error) = self.pending_bound_text_error(cx) {
+            return Task::ready(Err(anyhow::anyhow!(error)));
+        }
         if self.annotation_state.controller.has_pending_authoring() {
             return Task::ready(Err(anyhow::anyhow!(
                 "Add, save or cancel the annotation first. Its draft was kept."
@@ -8990,6 +9009,9 @@ impl Item for FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        if let Some(error) = self.pending_bound_text_error(cx) {
+            return Task::ready(Err(anyhow::anyhow!(error)));
+        }
         if self.annotation_state.controller.has_pending_authoring() {
             return Task::ready(Err(anyhow::anyhow!(
                 "Add, save or cancel the annotation first. Its draft was kept."
@@ -9016,6 +9038,9 @@ impl Item for FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        if let Some(error) = self.pending_bound_text_error(cx) {
+            return Task::ready(Err(anyhow::anyhow!(error)));
+        }
         if self.annotation_state.controller.has_pending_authoring() {
             return Task::ready(Err(anyhow::anyhow!(
                 "Add, save or cancel the annotation first. Its draft was kept."
@@ -14814,6 +14839,392 @@ mod tests {
                 Some(&original)
             );
             assert!(item.redo(cx).expect("redo text path edit"));
+        });
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn mounted_bound_instance_text_double_click_explains_refusal_without_editing(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (mut doc, master_text, master) = text_selection_doc(true);
+        let master = master.expect("master frame");
+        doc.scene.get_mut(master).expect("master").transform =
+            Transform2D::translation(1000.0, 1000.0);
+        let component = fanta_doc::ComponentId::new();
+        doc.components.defs.insert(
+            component,
+            fanta_doc::ComponentDef::new(component, master, "Bound card"),
+        );
+        let collection = fanta_doc::VariableCollectionId::new();
+        let mode = fanta_doc::ModeId::new();
+        let variable = fanta_doc::VariableId::new();
+        doc.variables.collections.insert(
+            collection,
+            fanta_doc::VariableCollection {
+                id: collection,
+                name: "Text variables".into(),
+                modes: vec![fanta_doc::Mode {
+                    id: mode,
+                    name: "Default".into(),
+                }],
+                default_mode: mode,
+                variable_order: vec![variable],
+            },
+        );
+        doc.variables.variables.insert(
+            variable,
+            fanta_doc::Variable {
+                id: variable,
+                collection,
+                name: "Bound caption".into(),
+                ty: fanta_doc::VariableType::String,
+                values_by_mode: BTreeMap::from([(
+                    mode,
+                    fanta_doc::VarValue::String {
+                        value: "Bound label".into(),
+                    },
+                )]),
+                scopes: Vec::new(),
+            },
+        );
+        doc.scene
+            .get_mut(master_text)
+            .expect("master text")
+            .bindings
+            .insert(fanta_doc::BoundProp::TextContent, variable);
+        let mut instance = CanvasNode::new(NodeData::Instance(fanta_doc::InstanceNode {
+            component,
+            overrides: Vec::new(),
+            prop_values: BTreeMap::new(),
+            derived: Vec::new(),
+            local_size: [200.0, 100.0],
+        }));
+        instance.parent = doc.active_page();
+        instance.transform = Transform2D::translation(-100.0, -50.0);
+        let instance_id = instance.id;
+        doc.scene.insert(instance).expect("instance");
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Bound-text.fig"),
+            doc,
+            cx,
+        );
+        let (multi_workspace, visual) = cx.add_window_view(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let workspace = multi_workspace.read_with(visual, |multi_workspace, _| {
+            multi_workspace.workspace().clone()
+        });
+        let view = visual.update(|window, cx| {
+            let view = cx.new(|cx| FigView::new(item.clone(), project, window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx)
+            });
+            window.activate_window();
+            view
+        });
+        visual.simulate_resize(size(px(1400.0), px(900.0)));
+        view.update(visual, |view, cx| {
+            view.set_viewport_silent(Viewport::default());
+            cx.notify();
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+        let before = item.read_with(visual, |item, _| {
+            let mut expected = item.doc().expect("document").clone();
+            expected.selection.select_only(instance_id);
+            serde_json::to_value(expected).expect("selected document before content changes")
+        });
+        let position = view.read_with(visual, |view, _| {
+            view.container_bounds.expect("canvas").center() + point(px(-60.0), px(-15.0))
+        });
+        for click_count in [1, 2] {
+            visual.simulate_event(MouseDownEvent {
+                position,
+                button: MouseButton::Left,
+                modifiers: gpui::Modifiers::none(),
+                click_count,
+                first_mouse: false,
+            });
+            visual.simulate_event(MouseUpEvent {
+                position,
+                button: MouseButton::Left,
+                modifiers: gpui::Modifiers::none(),
+                click_count,
+            });
+        }
+        visual.run_until_parked();
+        view.read_with(visual, |view, _| {
+            assert!(
+                view.text_edit.is_none(),
+                "a variable-controlled clone must not open an editor that cannot change its text"
+            )
+        });
+        workspace.read_with(visual, |workspace, _| {
+            assert!(
+                workspace
+                    .notification_ids()
+                    .contains(&NotificationId::named(CANVAS_NOTICE_ID.into())),
+                "double-click refusal must visibly explain the binding"
+            )
+        });
+        item.read_with(visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(serde_json::to_value(doc).expect("after clicks"), before);
+            assert_eq!(doc.selection.as_slice(), &[instance_id]);
+            assert!(!doc.history.can_undo());
+            assert!(!item.content_preview_active());
+        });
+
+        item.update(visual, |item, cx| {
+            item.with_document(cx, |document| {
+                document
+                    .doc
+                    .scene
+                    .get_mut(master_text)
+                    .expect("master text")
+                    .bindings
+                    .clear();
+                ((), DocChange::Content)
+            });
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+        for click_count in [1, 2] {
+            visual.simulate_event(MouseDownEvent {
+                position,
+                button: MouseButton::Left,
+                modifiers: gpui::Modifiers::none(),
+                click_count,
+                first_mouse: false,
+            });
+            visual.simulate_event(MouseUpEvent {
+                position,
+                button: MouseButton::Left,
+                modifiers: gpui::Modifiers::none(),
+                click_count,
+            });
+        }
+        visual.run_until_parked();
+        view.read_with(visual, |view, _| {
+            assert!(view.text_edit.is_some(), "unbound clone remains editable")
+        });
+        let original_instance = item.read_with(visual, |item, _| {
+            item.doc()
+                .expect("document")
+                .scene
+                .get(instance_id)
+                .expect("instance")
+                .clone()
+        });
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                gpui::EntityInputHandler::replace_text_in_range(
+                    view,
+                    Some(0..11),
+                    "Preview first",
+                    window,
+                    cx,
+                )
+            })
+        });
+        visual.run_until_parked();
+        item.update(visual, |item, cx| {
+            assert!(item.content_preview_active());
+            assert!(
+                item.apply(
+                    Operation::BindProperty {
+                        node: master_text,
+                        prop: fanta_doc::BoundProp::TextContent,
+                        old: None,
+                        new: variable
+                    },
+                    cx
+                )
+                .is_err(),
+                "ordinary sibling mutations cannot cross the active text preview barrier"
+            );
+        });
+        // Exercise the defensive recheck with an owner-side context change; the
+        // normal sibling operation above is correctly refused before this point.
+        let owner = view.entity_id();
+        let late_field = fanta_doc::Override {
+            target_path: vec![master_text].into(),
+            target_prop: fanta_doc::BoundProp::Opacity,
+            value: fanta_doc::OverrideValue::Field {
+                value: serde_json::json!({
+                    "bindings": [[{"prop": "text_content"}, variable]],
+                    "name": "Late binding payload"
+                }),
+            },
+        };
+        item.update(visual, |item, cx| {
+            item.with_document_for_owner(owner, cx, |document| {
+                let NodeData::Instance(instance) = &mut document
+                    .doc
+                    .scene
+                    .get_mut(instance_id)
+                    .expect("instance")
+                    .data
+                else {
+                    panic!("instance")
+                };
+                instance.overrides.push(late_field.clone());
+                ((), DocChange::None)
+            })
+            .expect("same preview owner")
+        });
+        let bound = item.read_with(visual, |item, _| {
+            let mut expected = item.doc().expect("document").clone();
+            expected.scene.get_mut(instance_id).expect("instance").data =
+                original_instance.data.clone();
+            let NodeData::Instance(instance) =
+                &mut expected.scene.get_mut(instance_id).expect("instance").data
+            else {
+                panic!("instance")
+            };
+            instance.overrides.push(late_field.clone());
+            (
+                serde_json::to_value(expected).expect("binding plus original instance"),
+                item.doc().expect("document").history.undo_depth(),
+                true,
+            )
+        });
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                gpui::EntityInputHandler::replace_text_in_range(
+                    view,
+                    Some(0..13),
+                    "Keep my draft",
+                    window,
+                    cx,
+                )
+            })
+        });
+        visual.run_until_parked();
+        view.read_with(visual, |view, _| {
+            assert_eq!(
+                view.text_edit
+                    .as_ref()
+                    .expect("draft kept")
+                    .session
+                    .buffer(),
+                "Keep my draft"
+            )
+        });
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_text_edit(master_text, TextEditSeed::SelectAll, window, cx);
+                let edit = view
+                    .text_edit
+                    .as_ref()
+                    .expect("rejected draft remains open");
+                assert_eq!(
+                    edit.session
+                        .instance()
+                        .expect("original virtual text")
+                        .instance_id,
+                    instance_id
+                );
+                assert_eq!(
+                    edit.session.buffer(),
+                    "Keep my draft",
+                    "opening another text target must not replace the blocked draft"
+                );
+            })
+        });
+        let before_inspector_action = item.read_with(visual, |item, _| {
+            serde_json::to_value(item.doc().expect("document")).expect("before inspector action")
+        });
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.refresh_gpui_design(cx);
+                let panel = view
+                    .gpui_design
+                    .as_ref()
+                    .expect("Design adapter")
+                    .panel
+                    .clone();
+                view.handle_design_action(
+                    &panel,
+                    &fanta_gpui::design::DesignPanelAction::PropertyChangeRequested {
+                        node_id: instance_id.to_string().into(),
+                        property: fanta_gpui::design::DesignPanelProperty::Opacity,
+                        value: fanta_gpui::design::DesignPanelValue::Number(40.0),
+                    },
+                    window,
+                    cx,
+                );
+            })
+        });
+        item.read_with(visual, |item, _| {
+            assert_eq!(
+                serde_json::to_value(item.doc().expect("document"))
+                    .expect("after inspector action"),
+                before_inspector_action,
+                "a rejected draft must block dependent inspector mutations"
+            );
+            assert!(
+                item.content_preview_active(),
+                "a refused inspector edit must not release the retained draft's preview barrier"
+            );
+        });
+        let save = visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                let project = view.project.clone();
+                workspace::item::Item::save(
+                    view,
+                    workspace::item::SaveOptions::default(),
+                    project,
+                    window,
+                    cx,
+                )
+            })
+        });
+        let error = save
+            .await
+            .expect_err("Save must explain the blocked draft instead of silently ignoring it");
+        assert!(error.to_string().contains("Escape"));
+        visual.simulate_keystrokes("escape");
+        visual.run_until_parked();
+        view.read_with(visual, |view, _| {
+            assert!(view.text_edit.is_none(), "Escape cancels the blocked draft")
+        });
+        item.read_with(visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(
+                serde_json::to_value(doc).expect("after cancellation"),
+                bound.0
+            );
+            assert_eq!(doc.history.undo_depth(), bound.1);
+            assert_eq!(item.is_dirty(), bound.2);
+            assert!(
+                !item.content_preview_active(),
+                "cancel must release the item for editing and saving"
+            );
+        });
+        item.update(visual, |item, cx| {
+            let name = item
+                .doc()
+                .expect("document")
+                .scene
+                .get(instance_id)
+                .expect("instance")
+                .name
+                .clone();
+            item.apply(
+                Operation::SetName {
+                    id: instance_id,
+                    old: name,
+                    new: "Editing resumed".into(),
+                },
+                cx,
+            )
+            .expect("ordinary edits resume after Escape");
         });
     }
 

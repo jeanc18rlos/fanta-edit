@@ -304,6 +304,7 @@ pub struct FantaPropertiesPanel {
     pub(crate) field_edit_snapshot: Option<NodeSnapshot>,
     pub(crate) field_edit_text_buffer_snapshot: Option<TextBuffer>,
     pub(crate) field_edit_previewed: bool,
+    field_edit_instance_preview: Option<Vec<fanta_doc::Override>>,
     pub(crate) suppress_field_editor_events: bool,
     /// Scroll state of the section stack. Reset whenever the inspected
     /// subject changes: a shorter inspector would otherwise keep the previous
@@ -453,6 +454,7 @@ impl FantaPropertiesPanel {
             field_edit_snapshot: None,
             field_edit_text_buffer_snapshot: None,
             field_edit_previewed: false,
+            field_edit_instance_preview: None,
             suppress_field_editor_events: false,
             content_scroll: ScrollHandle::new(),
             corner_radii_expanded: None,
@@ -2177,6 +2179,18 @@ impl FantaPropertiesPanel {
 
     // === Inline editing ===================================================
 
+    pub(crate) fn pending_bound_text_error(&self, cx: &App) -> Option<String> {
+        self.editing_field
+            .as_ref()
+            .and_then(|field| self.field_edit_error(field, cx))
+    }
+
+    fn field_edit_error(&self, field: &InspectorField, cx: &App) -> Option<String> {
+        let item = self.active_item(cx)?;
+        let document = item.read(cx).document()?;
+        crate::properties_ops::field_edit_error(&document.doc, field)
+    }
+
     pub(crate) fn start_editing(
         &mut self,
         field: InspectorField,
@@ -2187,7 +2201,14 @@ impl FantaPropertiesPanel {
         if !self.is_editable(cx) {
             return;
         }
+        if let Some(error) = self.field_edit_error(&field, cx) {
+            crate::view::show_canvas_notice(error, window, cx);
+            return;
+        }
         self.finish_continuous_edits(cx);
+        if self.editing_field.is_some() {
+            return;
+        }
         self.finish_content_preview(true, cx);
         let snapshot = self.snapshot_for_field(&field, cx);
         let text_buffer_snapshot = self.text_selection_buffer_for_field(&field, cx);
@@ -2203,6 +2224,7 @@ impl FantaPropertiesPanel {
         self.field_edit_snapshot = snapshot;
         self.field_edit_text_buffer_snapshot = text_buffer_snapshot;
         self.field_edit_previewed = false;
+        self.field_edit_instance_preview = None;
         self.editing_field = Some(field);
         self.field_editor.focus_handle(cx).focus(window, cx);
         cx.notify();
@@ -2222,11 +2244,20 @@ impl FantaPropertiesPanel {
         if !self.is_editable(cx) {
             return;
         }
+        if let Some(error) = self
+            .editing_field
+            .as_ref()
+            .and_then(|field| self.field_edit_error(field, cx))
+        {
+            crate::view::show_canvas_notice_deferred(error, cx);
+            return;
+        }
         let Some(field) = self.editing_field.take() else {
             return;
         };
         let text = self.field_editor.read(cx).text(cx);
         let snapshot = self.field_edit_snapshot.take();
+        let instance_preview = self.field_edit_instance_preview.take();
         let text_buffer_snapshot = self.field_edit_text_buffer_snapshot.take();
         let previewed = std::mem::take(&mut self.field_edit_previewed);
         if text_buffer_snapshot.is_some() {
@@ -2239,7 +2270,7 @@ impl FantaPropertiesPanel {
             return;
         }
         if previewed && let Some(snapshot) = snapshot {
-            self.restore_snapshot_preview(&snapshot, cx);
+            self.restore_field_snapshot_preview(&field, &snapshot, instance_preview.as_deref(), cx);
         }
         cx.notify();
         let committed = if self.try_apply_text_selection_field(&field, text.trim(), cx) {
@@ -2259,6 +2290,14 @@ impl FantaPropertiesPanel {
         if self.suppress_field_editor_events {
             return;
         }
+        if let Some(error) = self
+            .editing_field
+            .as_ref()
+            .and_then(|field| self.field_edit_error(field, cx))
+        {
+            crate::view::show_canvas_notice_deferred(error, cx);
+            return;
+        }
         let (Some(field), Some(snapshot)) =
             (self.editing_field.clone(), self.field_edit_snapshot.clone())
         else {
@@ -2275,12 +2314,23 @@ impl FantaPropertiesPanel {
             self.field_edit_text_buffer_snapshot = None;
         }
         self.preview_field_text(&field, &snapshot, text.trim(), cx);
+        if let InspectorField::InstanceText {
+            id: instance_id, ..
+        } = &field
+        {
+            self.field_edit_instance_preview = self.active_item(cx).and_then(|item| {
+                item.read(cx)
+                    .doc()
+                    .map(|doc| crate::instance_text::snapshot_overrides(doc, *instance_id))
+            });
+        }
         self.field_edit_previewed = true;
     }
 
     fn abandon_editing(&mut self, restore: bool, cx: &mut Context<Self>) {
         let field = self.editing_field.take();
         let snapshot = self.field_edit_snapshot.take();
+        let instance_preview = self.field_edit_instance_preview.take();
         let text_buffer_snapshot = self.field_edit_text_buffer_snapshot.take();
         let text_selection_preview = text_buffer_snapshot.is_some();
         let previewed = std::mem::take(&mut self.field_edit_previewed);
@@ -2292,7 +2342,16 @@ impl FantaPropertiesPanel {
                 _ => false,
             };
             if !restored_text && let Some(snapshot) = snapshot {
-                self.restore_snapshot_preview(&snapshot, cx);
+                if let Some(field) = field.as_ref() {
+                    self.restore_field_snapshot_preview(
+                        field,
+                        &snapshot,
+                        instance_preview.as_deref(),
+                        cx,
+                    );
+                } else {
+                    self.restore_snapshot_preview(&snapshot, cx);
+                }
             }
         }
         if previewed {
@@ -2607,6 +2666,39 @@ impl FantaPropertiesPanel {
                 log::debug!("dropping inspector preview: the document is not ready");
             }
         });
+    }
+
+    fn restore_field_snapshot_preview(
+        &self,
+        field: &InspectorField,
+        snapshot: &NodeSnapshot,
+        preview: Option<&[fanta_doc::Override]>,
+        cx: &mut Context<Self>,
+    ) {
+        if let InspectorField::InstanceText {
+            id: instance_id, ..
+        } = field
+        {
+            let (NodeData::Instance(base), Some(preview), Some(item)) =
+                (snapshot.data.as_ref(), preview, self.active_item(cx))
+            else {
+                return;
+            };
+            let owner = cx.entity_id();
+            item.update(cx, |item, cx| {
+                item.with_document_for_preview_owner(owner, cx, |document| {
+                    crate::instance_text::rewind_overrides_preview(
+                        &mut document.doc,
+                        *instance_id,
+                        &base.overrides,
+                        preview,
+                    );
+                    ((), DocChange::ContentPreview)
+                });
+            });
+        } else {
+            self.restore_snapshot_preview(snapshot, cx);
+        }
     }
 
     fn restore_snapshot_preview(&self, snapshot: &NodeSnapshot, cx: &mut Context<Self>) {
@@ -4209,6 +4301,208 @@ mod panel_integration_tests {
             assert_eq!(doc.scene.get(harness.vector_id), Some(&original));
             assert!(!doc.history.can_undo());
             assert!(!item.is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    async fn bound_instance_text_content_field_refuses_edit_and_keeps_resolved_value(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let harness = open_panel_with_gradient(linear_gradient_fill(), cx).await;
+        let inspector = harness
+            ._view
+            .read_with(cx, |view, _| view.inspector_for_test());
+        let item = harness._view.read_with(cx, |view, _| view.item().clone());
+        let instance = item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let doc = &mut document.doc;
+                let collection = fanta_doc::VariableCollectionId::new();
+                let mode = fanta_doc::ModeId::new();
+                let variable = fanta_doc::VariableId::new();
+                doc.variables.collections.insert(
+                    collection,
+                    fanta_doc::VariableCollection {
+                        id: collection,
+                        name: "Caption".into(),
+                        modes: vec![fanta_doc::Mode {
+                            id: mode,
+                            name: "Default".into(),
+                        }],
+                        default_mode: mode,
+                        variable_order: vec![variable],
+                    },
+                );
+                doc.variables.variables.insert(
+                    variable,
+                    fanta_doc::Variable {
+                        id: variable,
+                        collection,
+                        name: "Content".into(),
+                        ty: fanta_doc::VariableType::String,
+                        values_by_mode: BTreeMap::from([(
+                            mode,
+                            fanta_doc::VarValue::String {
+                                value: "Bound value".into(),
+                            },
+                        )]),
+                        scopes: Vec::new(),
+                    },
+                );
+                doc.scene
+                    .get_mut(harness.text_id)
+                    .expect("text root")
+                    .bindings
+                    .insert(fanta_doc::BoundProp::TextContent, variable);
+                let component = fanta_doc::ComponentId::new();
+                doc.components.defs.insert(
+                    component,
+                    fanta_doc::ComponentDef::new(component, harness.text_id, "Text root"),
+                );
+                let mut instance = CanvasNode::new(NodeData::Instance(fanta_doc::InstanceNode {
+                    component,
+                    overrides: Vec::new(),
+                    prop_values: BTreeMap::new(),
+                    derived: Vec::new(),
+                    local_size: [100.0, 24.0],
+                }));
+                instance.parent = doc.active_page();
+                let id = doc.scene.insert(instance).expect("instance");
+                doc.selection.select_only(id);
+                doc.history = Default::default();
+                (id, DocChange::Content)
+            })
+            .expect("document")
+        });
+        cx.run_until_parked();
+        let field = InspectorField::InstanceText {
+            id: instance,
+            path: Default::default(),
+        };
+        let before = item.read_with(cx, |item, _| {
+            serde_json::to_value(item.doc().expect("document")).expect("before")
+        });
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                read_field_text(item.doc().expect("document"), &field),
+                Some("Bound value".into())
+            )
+        });
+        harness
+            .scratch
+            .update(cx, |_, window, cx| {
+                inspector.update(cx, |panel, cx| {
+                    panel.start_editing(field.clone(), "Bound value".into(), window, cx);
+                    assert!(
+                        panel.editing_field.is_none(),
+                        "Content row must not open an ineffective override editor"
+                    );
+                    panel.field_editor.update(cx, |editor, cx| {
+                        editor.set_text("Ignored content", window, cx)
+                    });
+                    panel.commit_editing_value(cx);
+                })
+            })
+            .expect("Content field route");
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            assert!(field_operations(doc, &field, "Ignored content").is_empty());
+            assert_eq!(serde_json::to_value(doc).expect("after"), before);
+            assert_eq!(read_field_text(doc, &field), Some("Bound value".into()));
+            assert!(!doc.history.can_undo());
+            assert!(!item.content_preview_active());
+        });
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document
+                    .doc
+                    .scene
+                    .get_mut(harness.text_id)
+                    .expect("master text")
+                    .bindings
+                    .clear();
+                ((), DocChange::Content)
+            })
+        });
+        harness
+            .scratch
+            .update(cx, |_, window, cx| {
+                inspector.update(cx, |panel, cx| {
+                    panel.start_editing(field.clone(), "Hello".into(), window, cx);
+                    panel.field_editor.update(cx, |editor, cx| {
+                        editor.set_text("Inspector draft", window, cx)
+                    });
+                })
+            })
+            .expect("open unbound Content field");
+        cx.run_until_parked();
+        let owner = inspector.entity_id();
+        let late_field = fanta_doc::Override {
+            target_path: Default::default(),
+            target_prop: fanta_doc::BoundProp::Opacity,
+            value: fanta_doc::OverrideValue::Field {
+                value: serde_json::json!({
+                    "bindings": [[{"prop":"text_content"}, fanta_doc::VariableId::new()]],
+                    "name": "Preserve inspector-side binding"
+                }),
+            },
+        };
+        item.update(cx, |item, cx| {
+            assert!(
+                item.content_preview_active(),
+                "field typing owns a real preview"
+            );
+            item.with_document_for_owner(owner, cx, |document| {
+                let NodeData::Instance(data) =
+                    &mut document.doc.scene.get_mut(instance).expect("instance").data
+                else {
+                    panic!("instance")
+                };
+                data.overrides.push(late_field.clone());
+                ((), DocChange::None)
+            })
+            .expect("same field preview owner");
+        });
+        harness
+            .scratch
+            .update(cx, |_, window, cx| {
+                inspector.update(cx, |panel, cx| {
+                    panel.start_editing(
+                        InspectorField::Name(instance),
+                        "Another field".into(),
+                        window,
+                        cx,
+                    );
+                    assert_eq!(
+                        panel.editing_field,
+                        Some(field.clone()),
+                        "blocked commit retains the original field"
+                    );
+                    assert_eq!(panel.field_editor.read(cx).text(cx), "Inspector draft");
+                    panel.cancel_editing(window, cx);
+                    assert!(panel.editing_field.is_none());
+                })
+            })
+            .expect("reject switching field, then cancel");
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let doc = item.doc().expect("document");
+            let NodeData::Instance(instance) = &doc.scene.get(instance).expect("instance").data
+            else {
+                panic!("instance");
+            };
+            assert_eq!(instance.overrides, vec![late_field.clone()]);
+            assert_eq!(
+                doc.scene
+                    .get(harness.text_id)
+                    .expect("master text")
+                    .bindings
+                    .len(),
+                0
+            );
+            assert!(!doc.history.can_undo());
+            assert!(!item.content_preview_active());
         });
     }
 
