@@ -1961,7 +1961,9 @@ repaint-installed global listener. Production behavior was unchanged.
 Formatting and changed-file checks pass. The subsequent combined editor suite
 passes **1,171 tests with four ignored**, including these three controls; three
 benchmark CLI tests and repository lint also pass. Actual native log capture
-remains pending.
+was pending at this checkpoint. The 6 October scrub journey below now records
+bounded native release diagnostics; it does not establish the original
+selection anomaly's cause.
 
 Evidence: `native-click-diagnostics-20261005/validation.json`, both focused logs,
 `five-seeds.log`, reviewed/final patches and `operator-plan.md`. These controls
@@ -1998,7 +2000,7 @@ activation is established. Evidence: `retained-metal-probe-20261005/integration/
 and `independent-release-review.json`.
 
 
-## Fast-exit scrub correction and combined validation — native retry pending
+## Fast-exit scrub correction and combined validation — 5 October
 
 The shared numeric input now observes an armed left-button scrub through a
 frame-scoped capture listener, so its first movement may already be outside the
@@ -2022,3 +2024,69 @@ automated correction checkpoint, not exhaustive UI acceptance or release
 certification. The backend-compatible retained-surface proposal remains
 external and is held for the next session; the 40-frame diagnostic is not a
 production surface API or a performance result.
+
+
+## Native numeric-readout scrub and strict restart — 6 October
+
+The saved `ce8db37c342d4a7effe5ad11447cfb57825edb50` QA bundle, binary
+SHA-256 `33dbe06b26f1a3cc2be8d889f6479853ab92b844d5a81a165bdc7e8e42547160`,
+passes an isolated native opacity journey: numeric readout 50% → 0%, Save,
+one Undo/Save to 50%, one Redo/Save to 0%, then quit and reopen the same app.
+Each saved stage matches the complete predeclared ten-node/five-asset oracle;
+unrelated content and assets remain exact. The cold stage matches the saved
+Redo snapshot with exact timestamps and every project file byte. Its `.git`
+metadata is outside the authored-project oracle. No edit or Save follows reopening.
+
+A preceding drag from the separate leading icon produced no edit and failed the
+expected-zero oracle; that attempt remains retained. Pinned
+`panel/inspector_fields.rs` renders the icon outside the numeric scrub surface.
+The corrected retry starts on the visible percentage readout. Input logs confirm
+release outside the field with no modifiers, but do not prove the original
+selection anomaly's cause or a measured pointer speed. Held-drag Escape remains
+unverified. Earlier native failures and automated RED/GREEN records are unchanged.
+
+Evidence moved outside Cargo's build directory before `cargo clean`, preserving
+all 7,477 evidence entries with identical inode/size/mtime manifests. Historical
+`target/release-verification` paths resolve through a compatibility symlink to
+`/Users/jeanrojas/fanta-edit-qa-evidence/release-verification`. The aggregate is
+`native-fast-scrub-20261005/retry-20261006-final-summary.json`, SHA-256
+`7201affc43bcfacd59b82ce2cf9727cd607c61006649e20cac6b1dac38dd3e79`;
+its save/undo/redo/cold stages and the separate icon failure remain available.
+
+PRs 59–77 are now merged. Each required Check/Store job's actual checkout tree
+matches its PR head, prospective merge and final merged tree. Completed successful
+job evidence covers cancelled duplicates; no failing or missing test is waived.
+PR75's job-only retry passed after its earlier total-job timeout. Documentation-only
+PR78 is also merged: its Markdown diff passes whitespace validation, and every
+non-documentation file matches the tested PR77 head. Its hosted retry after a lost
+runner connection was still running at merge; final candidate CI remains open.
+The merge proofs, including this separate documentation validation, are in
+`integration-20261006/`. The latest QA bundle contains the merged application code
+and is separate from the signed direct-download release.
+The repository has certificate/password secrets;
+the three notarization-key secrets remain absent. Final signing, notarization,
+installation, live services and large-page performance acceptance remain open.
+
+
+## Group-contained vector point edit — 6 October
+
+The same `ce8db37c34` QA bundle passes one bounded authored-point journey in
+`/tmp/fanta-path-group-20261005`. Open preserves all 30 authored files exactly.
+The actual **Edit vector** menu displays four anchors. Dragging the top-left
+anchor by the predeclared 20×12 screenshot pixels at 100%/2× scale changes only
+its first Move `[0,0]` → `[10,6]`, the `UNCLIPPED_VECTOR` flag and monotonic
+modification time. Save, exactly one Undo/Save and exactly one Redo/Save each
+pass the complete 35-node/five-asset oracle. All unrelated typed content/assets
+remain exact; only the declared page FNX and document metadata bytes change.
+The frozen reader and eight oracle/harness hashes match their initial manifests.
+
+Evidence: `native-path-point-edit-20261005/group-{open,point,undo,redo}/capture.json`
+and their complete typed/file/oracle records. A later quit/relaunch of the same
+bundle passes strict comparison against saved Redo: all 35 nodes, five assets,
+30 file bytes and timestamps remain exact, with no Save after reopening. The
+app restores a fitted 38% camera rather than the prior 100%; camera persistence
+is not established. The original four-stage aggregate remains immutable;
+`group-native-with-cold-aggregate-20261006.json` has SHA-256
+`1ff080f63a9dc6146e7e9119f49ae7dd1dc6aa174d8dce61e1a8dfce8a5cdcc5`.
+Boolean point edits, held-drag cancellation and the broader node/guard matrix
+remain unverified.
