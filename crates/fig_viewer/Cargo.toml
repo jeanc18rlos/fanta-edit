@@ -95,6 +95,7 @@ workspace = { workspace = true, features = ["test-support"] }
 zlog.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
+fanta-render = { workspace = true, features = ["metal"] }
 media.workspace = true
 rodio = { workspace = true, features = ["mp3"] }
 core-foundation.workspace = true

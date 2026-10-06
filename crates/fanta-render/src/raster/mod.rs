@@ -111,6 +111,8 @@ pub use renderer::{
     MediaPlayback, RasterRenderer, RenderError, RenderInputs, RenderMetrics, SvgRenderOptions,
     SvgRenderOutput,
 };
+#[cfg(feature = "gpu")]
+pub use split::RetainedGpuTarget;
 pub use split::{
     RetainedBuildMetrics, RetainedError, RetainedFrame, RetainedFrameMetrics,
     RetainedTranslationSession, SplitError, SplitPhase, SplitSpec,

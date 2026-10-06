@@ -7,6 +7,10 @@ publish.workspace = true
 license.workspace = true
 description = "Skia raster backend: scene walk, effects, instance/image caches; renders to an owned CPU surface or an externally owned Skia canvas."
 
+[features]
+gpu = ["skia-safe/gpu"]
+metal = ["gpu", "skia-safe/metal"]
+
 [dependencies]
 fanta-doc.workspace = true
 # Text shaping + layout over Skia. No dependency cycle: `fanta-text` depends on
@@ -38,6 +42,9 @@ smallvec = { version = "1", features = ["union"] }
 # for a per-pixel comparison and encode a diff image on mismatch. `png`-only
 # feature set keeps the decoder surface minimal; matches `fanta-app`'s version.
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+[target.'cfg(target_os = "macos")'.dev-dependencies]
+metal.workspace = true
 
 [lints]
 workspace = true
