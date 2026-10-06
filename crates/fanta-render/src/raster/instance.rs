@@ -43,7 +43,17 @@ pub(crate) fn render_instance(
     } else {
         ctx.instance_mode_anchor.unwrap_or(instance_id)
     };
-    let expanded = expand_instance_memoized(ctx, instance_id, inst, mode_anchor);
+    let expanded = if let Some(split) = ctx.split {
+        // Preparation closes the entire nested graph; never rebuild against the normal memo.
+        let Some(prepared) = split.spec.prepared_instance(instance_id) else {
+            ctx.metrics.incomplete_artwork = true;
+            ctx.metrics.effect_failed = true;
+            return;
+        };
+        Arc::clone(prepared)
+    } else {
+        expand_instance_memoized(ctx, instance_id, inst, mode_anchor)
+    };
     if expanded.nodes.is_empty() {
         ctx.metrics.incomplete_artwork = true;
         // Genuinely unresolvable instance (master deleted / not loaded). Draw a
@@ -136,25 +146,41 @@ pub(crate) fn expand_instance_memoized(
             }
         }
     }
-    let mut expanded = fanta_doc::expand_instance_with_context(
+    let expanded = Arc::new(prepare_instance(
         ctx.scene,
         ctx.inputs.components,
         inst,
         &expansion_context,
-    );
+    ));
+    ctx.metrics.instance_indexes_built += 1;
+    ctx.instance_cache.insert(key, Arc::clone(&expanded));
+    expanded
+}
+
+pub(crate) fn prepare_instance(
+    scene: &Scene,
+    components: &fanta_doc::ComponentLibrary,
+    instance: &InstanceNode,
+    context: &fanta_doc::InstanceExpansionContext<'_>,
+) -> PreparedInstance {
+    let expanded = fanta_doc::expand_instance_with_context(scene, components, instance, context);
+    prepare_instance_nodes(instance, expanded)
+}
+
+pub(crate) fn prepare_instance_nodes(
+    instance: &InstanceNode,
+    mut expanded: Vec<ExpandedNode>,
+) -> PreparedInstance {
     // Figma's `derivedSymbolData` is already a resolved per-instance subtree, so
     // re-solving those clones moves icons/carets/text away from the baked
     // geometry — only masters without derived data need our layout pass. An
     // EDITED master keeps its baked geometry (only the fill falls through to the
     // master), so we must NOT re-solve it — doing so would resize its vectors to
     // the master box and distort them.
-    if inst.derived.is_empty() {
+    if instance.derived.is_empty() {
         fanta_doc::solve_expanded(&mut expanded, &mut measure_text_node);
     }
-    let expanded = Arc::new(PreparedInstance::new(expanded));
-    ctx.metrics.instance_indexes_built += 1;
-    ctx.instance_cache.insert(key, Arc::clone(&expanded));
-    expanded
+    PreparedInstance::new(expanded)
 }
 
 /// Hash of every frame mode pin (`GroupNode::explicit_modes`) on `anchor` and

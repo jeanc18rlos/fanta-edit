@@ -132,9 +132,28 @@ fn assert_parity_at_scale(
     resolver: Option<Arc<dyn AssetResolver>>,
     display_scale: f64,
 ) -> Vec<u8> {
+    assert_parity_with_inputs(
+        doc,
+        page,
+        moving,
+        viewport,
+        resolver,
+        display_scale,
+        &RenderInputs::empty(),
+    )
+}
+
+fn assert_parity_with_inputs(
+    doc: &Doc,
+    page: NodeId,
+    moving: NodeId,
+    viewport: &Viewport,
+    resolver: Option<Arc<dyn AssetResolver>>,
+    display_scale: f64,
+    inputs: &RenderInputs,
+) -> Vec<u8> {
     let before = serde_json::to_value(doc).expect("before scene");
-    let inputs = RenderInputs::empty();
-    let spec = SplitSpec::prepare(&doc.scene, page, moving, &inputs, resolver.as_deref())
+    let spec = SplitSpec::prepare(&doc.scene, page, moving, inputs, resolver.as_deref())
         .expect("eligible split");
     let mut renderer = RasterRenderer::new(WIDTH, HEIGHT).expect("renderer");
     renderer.display_scale = display_scale;
@@ -149,7 +168,7 @@ fn assert_parity_at_scale(
         &doc.scene,
         viewport,
         Some(page),
-        &inputs,
+        inputs,
     );
     assert!(!metrics.incomplete_artwork && !metrics.effect_failed);
     let mut actual = surface();
@@ -161,7 +180,7 @@ fn assert_parity_at_scale(
                 .begin_recording(skia_safe::Rect::from_wh(WIDTH as f32, HEIGHT as f32), None);
             let metrics = renderer
                 .paint_split_to_canvas(
-                    recording, WIDTH, HEIGHT, &doc.scene, viewport, &inputs, &spec, phase,
+                    recording, WIDTH, HEIGHT, &doc.scene, viewport, inputs, &spec, phase,
                 )
                 .expect("ordered phase");
             let picture = recorder.finish_recording_as_picture(None).expect("picture");
@@ -182,7 +201,7 @@ fn assert_parity_at_scale(
                     HEIGHT,
                     &doc.scene,
                     viewport,
-                    &inputs,
+                    inputs,
                     &spec,
                     phase,
                 )
@@ -193,7 +212,7 @@ fn assert_parity_at_scale(
                     HEIGHT,
                     &doc.scene,
                     viewport,
-                    &inputs,
+                    inputs,
                     &spec,
                     phase,
                 )
@@ -257,7 +276,7 @@ fn assert_parity_at_scale(
         &doc.scene,
         viewport,
         Some(page),
-        &inputs,
+        inputs,
     );
     assert_eq!(
         pixels(&mut normal_after),
@@ -1404,7 +1423,7 @@ fn split_ancestor_gradient_and_decoded_image_backgrounds_match_full_render() {
 }
 
 #[test]
-fn split_ancestor_clip_without_paint_keeps_empty_above_and_rejects_instances() {
+fn split_ancestor_clip_without_paint_keeps_empty_above_and_rejects_missing_instances() {
     let mut doc = Doc::new();
     let page = add(
         &mut doc,
@@ -1484,7 +1503,7 @@ fn split_ancestor_clip_without_paint_keeps_empty_above_and_rejects_instances() {
         local_size: [20.0, 20.0],
     });
     assert!(
-        matches!(SplitSpec::prepare(&doc.scene, page, moving, &inputs, None), Err(SplitError::UnsupportedNode(id)) if id == moving)
+        matches!(SplitSpec::prepare(&doc.scene, page, moving, &inputs, None), Err(SplitError::MissingInstance { instance, .. }) if instance == moving)
     );
 }
 
@@ -1649,5 +1668,1158 @@ fn split_plain_ancestor_raster_phases_keep_low_zoom_parity() {
                 }
             }
         }
+    }
+}
+
+fn whole_instance(component: fanta_doc::ComponentId, size: [f64; 2]) -> fanta_doc::InstanceNode {
+    fanta_doc::InstanceNode {
+        component,
+        overrides: Vec::new(),
+        prop_values: BTreeMap::new(),
+        derived: Vec::new(),
+        local_size: size,
+    }
+}
+
+fn instance_page() -> (Doc, NodeId) {
+    let mut doc = Doc::new();
+    let page = add(
+        &mut doc,
+        None,
+        NodeData::Group(GroupNode {
+            background: Some(Fill::solid(Color::BLACK)),
+            ..Default::default()
+        }),
+        0.0,
+        0.0,
+    );
+    (doc, page)
+}
+
+fn solid_master(doc: &mut Doc, color: Color) -> (fanta_doc::ComponentId, NodeId) {
+    let root = add(
+        doc,
+        None,
+        NodeData::Vector(VectorNode::rect_solid(0.0, 0.0, 20.0, 20.0, color)),
+        10_000.0,
+        5_000.0,
+    );
+    let component = fanta_doc::ComponentId::new();
+    doc.components.defs.insert(
+        component,
+        fanta_doc::ComponentDef::new(component, root, "Solid"),
+    );
+    (component, root)
+}
+
+#[test]
+fn split_whole_instances_preserve_derived_geometry_and_sparse_paints() {
+    use fanta_doc::{
+        BoundProp, ComponentDef, ComponentId, DerivedOverride, LayoutMode, Override, OverrideValue,
+    };
+    use smallvec::smallvec;
+    for reverse in [false, true] {
+        for reflected in [false, true] {
+            let (mut doc, page) = instance_page();
+            let frame = add(
+                &mut doc,
+                Some(page),
+                NodeData::Group(GroupNode {
+                    clip_size: Some([160.0, 100.0]),
+                    auto_layout: Some(AutoLayout {
+                        reverse_z: reverse,
+                        ..Default::default()
+                    }),
+                    background: Some(Fill::solid(Color::rgb(25, 30, 35))),
+                    ..Default::default()
+                }),
+                -80.0,
+                -50.0,
+            );
+            if reflected {
+                doc.scene.get_mut(frame).expect("frame").transform =
+                    Transform2D::scale_xy(-1.0, 1.0).then(&Transform2D::translation(80.0, -50.0));
+            }
+            let root = add(
+                &mut doc,
+                None,
+                NodeData::Group(GroupNode {
+                    clip_size: Some([40.0, 30.0]),
+                    auto_layout: Some(AutoLayout {
+                        mode: LayoutMode::Horizontal,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                10_000.0,
+                5_000.0,
+            );
+            let child = add(
+                &mut doc,
+                Some(root),
+                NodeData::Vector(VectorNode::rect_solid(
+                    0.0,
+                    0.0,
+                    30.0,
+                    22.0,
+                    Color::rgb(255, 0, 0),
+                )),
+                0.0,
+                0.0,
+            );
+            let component = ComponentId::new();
+            doc.components.defs.insert(
+                component,
+                ComponentDef::new(component, root, "Derived placement"),
+            );
+            add(
+                &mut doc,
+                Some(frame),
+                NodeData::Instance(whole_instance(component, [40.0, 30.0])),
+                12.0,
+                24.0,
+            );
+            let mut instance = whole_instance(component, [40.0, 30.0]);
+            instance.derived.push(DerivedOverride {
+                path: smallvec![child],
+                transform: Some(Transform2D::translation(20.0, 10.0)),
+                size: Some([12.0, 9.0]),
+                fills: Some(smallvec![Fill::solid(Color::rgb(0, 255, 0))]),
+                path_data: None,
+                stroke_path: None,
+                stroke_weight: None,
+                text: None,
+            });
+            instance.overrides.push(Override {
+                target_path: smallvec![child],
+                target_prop: BoundProp::FillColor { index: 0 },
+                value: OverrideValue::Fills {
+                    fills: smallvec![Fill::solid(Color::rgb(0, 0, 255))],
+                },
+            });
+            let moving = add(
+                &mut doc,
+                Some(frame),
+                NodeData::Instance(instance),
+                60.0,
+                24.0,
+            );
+            add(
+                &mut doc,
+                Some(frame),
+                NodeData::Instance(whole_instance(component, [40.0, 30.0])),
+                112.0,
+                24.0,
+            );
+            let inputs = RenderInputs::for_doc(&doc);
+            for zoom in [0.13, 0.73, 1.0, 2.0] {
+                for scale in [1.0, 2.0] {
+                    assert_parity_with_inputs(
+                        &doc,
+                        page,
+                        moving,
+                        &Viewport {
+                            center: [0.375, -0.625],
+                            zoom,
+                        },
+                        None,
+                        scale,
+                        &inputs,
+                    );
+                }
+            }
+            if !reflected {
+                let pixels = assert_parity_with_inputs(
+                    &doc,
+                    page,
+                    moving,
+                    &Viewport {
+                        center: [0.0, 0.0],
+                        zoom: 1.0,
+                    },
+                    None,
+                    1.0,
+                    &inputs,
+                );
+                assert_eq!(
+                    rgba_at(&pixels, WIDTH, 102, 69),
+                    [0, 0, 255, 255],
+                    "explicit paint wins over imported derived fill at the imported offset"
+                );
+                assert_eq!(
+                    rgba_at(&pixels, WIDTH, 80, 57),
+                    [25, 30, 35, 255],
+                    "derived geometry must not reflow to the left edge"
+                );
+            }
+        }
+    }
+}
+
+struct InstanceTheme {
+    collection: fanta_doc::VariableCollectionId,
+    light: fanta_doc::ModeId,
+    dark: fanta_doc::ModeId,
+    color: fanta_doc::VariableId,
+    placed_color: fanta_doc::VariableId,
+    opacity: fanta_doc::VariableId,
+    variant: fanta_doc::VariableId,
+}
+
+fn add_instance_theme(doc: &mut Doc) -> InstanceTheme {
+    use fanta_doc::{
+        Mode, ModeId, VarValue, Variable, VariableCollection, VariableCollectionId, VariableId,
+        VariableType,
+    };
+    let theme = InstanceTheme {
+        collection: VariableCollectionId::new(),
+        light: ModeId::new(),
+        dark: ModeId::new(),
+        color: VariableId::new(),
+        placed_color: VariableId::new(),
+        opacity: VariableId::new(),
+        variant: VariableId::new(),
+    };
+    doc.variables.collections.insert(
+        theme.collection,
+        VariableCollection {
+            id: theme.collection,
+            name: "Theme".into(),
+            modes: vec![
+                Mode {
+                    id: theme.light,
+                    name: "Light".into(),
+                },
+                Mode {
+                    id: theme.dark,
+                    name: "Dark".into(),
+                },
+            ],
+            default_mode: theme.light,
+            variable_order: vec![
+                theme.color,
+                theme.placed_color,
+                theme.opacity,
+                theme.variant,
+            ],
+        },
+    );
+    for (id, name, ty, light, dark) in [
+        (
+            theme.color,
+            "Default color",
+            VariableType::Color,
+            VarValue::Color {
+                value: Color::WHITE,
+            },
+            VarValue::Color {
+                value: Color::rgb(0, 0, 255),
+            },
+        ),
+        (
+            theme.placed_color,
+            "Placed color",
+            VariableType::Color,
+            VarValue::Color {
+                value: Color::rgb(255, 0, 0),
+            },
+            VarValue::Color {
+                value: Color::rgb(255, 255, 0),
+            },
+        ),
+        (
+            theme.opacity,
+            "Opacity",
+            VariableType::Float,
+            VarValue::Float { value: 0.5 },
+            VarValue::Float { value: 1.0 },
+        ),
+        (
+            theme.variant,
+            "Variant",
+            VariableType::String,
+            VarValue::String {
+                value: "Red".into(),
+            },
+            VarValue::String {
+                value: "Blue".into(),
+            },
+        ),
+    ] {
+        doc.variables.variables.insert(
+            id,
+            Variable {
+                id,
+                collection: theme.collection,
+                name: name.into(),
+                ty,
+                values_by_mode: BTreeMap::from([(theme.light, light), (theme.dark, dark)]),
+                scopes: Vec::new(),
+            },
+        );
+    }
+    theme
+}
+
+#[test]
+fn split_whole_instances_resolve_defaults_placed_aliases_and_nested_real_mode_anchor() {
+    use fanta_doc::{
+        BoundProp, ComponentDef, ComponentId, ComponentPropDef, ComponentPropId, ComponentPropKind,
+        PropBindingTarget, VarValue,
+    };
+    use smallvec::smallvec;
+    let (mut doc, page) = instance_page();
+    let theme = add_instance_theme(&mut doc);
+    let (leaf, root) = solid_master(&mut doc, Color::rgb(255, 0, 255));
+    doc.scene
+        .get_mut(root)
+        .expect("master")
+        .bindings
+        .insert(BoundProp::Opacity, theme.opacity);
+    let property = ComponentPropId::new();
+    doc.components
+        .defs
+        .get_mut(&leaf)
+        .expect("definition")
+        .props
+        .push(ComponentPropDef {
+            id: property,
+            name: "Surface".into(),
+            kind: ComponentPropKind::Color,
+            formatter: Default::default(),
+            default: VarValue::Alias {
+                variable: theme.color,
+            },
+            bindings: vec![PropBindingTarget {
+                path: smallvec![],
+                prop: BoundProp::FillColor { index: 0 },
+            }],
+        });
+    let outer_root = add(
+        &mut doc,
+        None,
+        NodeData::Group(GroupNode {
+            clip_size: Some([20.0, 20.0]),
+            explicit_modes: BTreeMap::from([(theme.collection, theme.light)]),
+            ..Default::default()
+        }),
+        10_000.0,
+        0.0,
+    );
+    add(
+        &mut doc,
+        Some(outer_root),
+        NodeData::Instance(whole_instance(leaf, [20.0, 20.0])),
+        0.0,
+        0.0,
+    );
+    let outer = ComponentId::new();
+    doc.components
+        .defs
+        .insert(outer, ComponentDef::new(outer, outer_root, "Nested"));
+    let pinned = add(
+        &mut doc,
+        Some(page),
+        NodeData::Group(GroupNode {
+            explicit_modes: BTreeMap::from([(theme.collection, theme.dark)]),
+            ..Default::default()
+        }),
+        -70.0,
+        -10.0,
+    );
+    let moving = add(
+        &mut doc,
+        Some(pinned),
+        NodeData::Instance(whole_instance(outer, [20.0, 20.0])),
+        0.0,
+        0.0,
+    );
+    add(
+        &mut doc,
+        Some(page),
+        NodeData::Instance(whole_instance(leaf, [20.0, 20.0])),
+        -10.0,
+        -10.0,
+    );
+    let mut placed = whole_instance(leaf, [20.0, 20.0]);
+    placed.prop_values.insert(
+        property,
+        VarValue::Alias {
+            variable: theme.placed_color,
+        },
+    );
+    add(
+        &mut doc,
+        Some(page),
+        NodeData::Instance(placed),
+        50.0,
+        -10.0,
+    );
+    for dark in [false, true] {
+        doc.active_modes = if dark {
+            BTreeMap::from([(theme.collection, theme.dark)])
+        } else {
+            BTreeMap::new()
+        };
+        let inputs = RenderInputs::for_doc(&doc);
+        let pixels = assert_parity_with_inputs(
+            &doc,
+            page,
+            moving,
+            &Viewport {
+                center: [0.0, 0.0],
+                zoom: 1.0,
+            },
+            None,
+            1.0,
+            &inputs,
+        );
+        assert_eq!(
+            rgba_at(&pixels, WIDTH, 36, 80),
+            [0, 0, 255, 255],
+            "nested expansion inherits the real placed pin, not the master frame pin or fresh clone ID"
+        );
+        let default = rgba_at(&pixels, WIDTH, 96, 80);
+        let placed = rgba_at(&pixels, WIDTH, 156, 80);
+        if dark {
+            assert_eq!(default, [0, 0, 255, 255]);
+            assert_eq!(placed, [255, 255, 0, 255]);
+        } else {
+            assert!(
+                default[0].abs_diff(128) <= 1
+                    && default[1] == default[0]
+                    && default[2] == default[0]
+                    && default[3] == 255,
+                "default color alias and opacity binding: {default:?}"
+            );
+            assert!(
+                placed[0].abs_diff(128) <= 1 && placed[1..] == [0, 0, 255],
+                "placed alias replaces the default: {placed:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn split_whole_instances_resolve_variant_aliases_and_nested_sparse_swaps() {
+    use fanta_doc::{
+        BoundProp, ComponentDef, ComponentId, ComponentPropDef, ComponentPropId, ComponentPropKind,
+        ComponentSet, ComponentSetMembership, Override, OverrideValue, VarValue, VariantAxis,
+    };
+    use smallvec::smallvec;
+    let (mut doc, page) = instance_page();
+    let theme = add_instance_theme(&mut doc);
+    let (red, _) = solid_master(&mut doc, Color::rgb(255, 0, 0));
+    let (blue, _) = solid_master(&mut doc, Color::rgb(0, 0, 255));
+    let set = ComponentId::new();
+    let property = ComponentPropId::new();
+    for (component, label) in [(red, "Red"), (blue, "Blue")] {
+        let def = doc.components.defs.get_mut(&component).expect("variant");
+        def.variant_of = Some(ComponentSetMembership {
+            set,
+            axis_values: BTreeMap::from([("Color".into(), label.into())]),
+        });
+        def.props.push(ComponentPropDef {
+            id: property,
+            name: "Color".into(),
+            kind: ComponentPropKind::Variant {
+                axis: "Color".into(),
+            },
+            formatter: Default::default(),
+            default: VarValue::Alias {
+                variable: theme.variant,
+            },
+            bindings: Vec::new(),
+        });
+    }
+    doc.components.sets.insert(
+        set,
+        ComponentSet {
+            id: set,
+            name: "Color".into(),
+            axes: vec![VariantAxis {
+                name: "Color".into(),
+                values: vec!["Red".into(), "Blue".into()],
+            }],
+            members: vec![red, blue],
+            default_variant: red,
+            root: None,
+        },
+    );
+    let outer_root = add(
+        &mut doc,
+        None,
+        NodeData::Group(GroupNode {
+            clip_size: Some([20.0, 20.0]),
+            ..Default::default()
+        }),
+        10_000.0,
+        0.0,
+    );
+    let mut nested_instance = whole_instance(red, [20.0, 20.0]);
+    nested_instance.prop_values.insert(
+        property,
+        VarValue::Alias {
+            variable: theme.variant,
+        },
+    );
+    let nested = add(
+        &mut doc,
+        Some(outer_root),
+        NodeData::Instance(nested_instance),
+        0.0,
+        0.0,
+    );
+    let outer = ComponentId::new();
+    doc.components
+        .defs
+        .insert(outer, ComponentDef::new(outer, outer_root, "Swap owner"));
+    let mut swapped = whole_instance(outer, [20.0, 20.0]);
+    swapped.overrides.push(Override {
+        target_path: smallvec![nested],
+        target_prop: BoundProp::Visible,
+        value: OverrideValue::SwapInstance { component: set },
+    });
+    let moving = add(
+        &mut doc,
+        Some(page),
+        NodeData::Instance(swapped),
+        -40.0,
+        -10.0,
+    );
+    let mut placed = whole_instance(set, [20.0, 20.0]);
+    placed.prop_values.insert(
+        property,
+        VarValue::String {
+            value: "Red".into(),
+        },
+    );
+    add(
+        &mut doc,
+        Some(page),
+        NodeData::Instance(placed),
+        20.0,
+        -10.0,
+    );
+    for dark in [false, true] {
+        doc.active_modes = if dark {
+            BTreeMap::from([(theme.collection, theme.dark)])
+        } else {
+            BTreeMap::new()
+        };
+        let pixels = assert_parity_with_inputs(
+            &doc,
+            page,
+            moving,
+            &Viewport {
+                center: [0.0, 0.0],
+                zoom: 1.0,
+            },
+            None,
+            1.0,
+            &RenderInputs::for_doc(&doc),
+        );
+        assert_eq!(
+            rgba_at(&pixels, WIDTH, 66, 80),
+            if dark {
+                [0, 0, 255, 255]
+            } else {
+                [255, 0, 0, 255]
+            }
+        );
+        assert_eq!(
+            rgba_at(&pixels, WIDTH, 126, 80),
+            [255, 0, 0, 255],
+            "placed variant value beats the aliased default"
+        );
+    }
+}
+
+#[test]
+fn split_whole_instances_reject_changed_input_identity_before_touching_the_target() {
+    let (mut doc, page) = instance_page();
+    let theme = add_instance_theme(&mut doc);
+    let (component, _) = solid_master(&mut doc, Color::WHITE);
+    let moving = add(
+        &mut doc,
+        Some(page),
+        NodeData::Instance(whole_instance(component, [20.0, 20.0])),
+        -10.0,
+        -10.0,
+    );
+    let original = RenderInputs::for_doc(&doc);
+    let spec =
+        SplitSpec::prepare(&doc.scene, page, moving, &original, None).expect("instance plan");
+    let mut changed_components = doc.components.clone();
+    changed_components
+        .defs
+        .get_mut(&component)
+        .expect("definition")
+        .name = "Changed without generation".into();
+    let mut changed_variables = doc.variables.clone();
+    changed_variables
+        .variables
+        .get_mut(&theme.opacity)
+        .expect("variable")
+        .values_by_mode
+        .insert(theme.light, fanta_doc::VarValue::Float { value: 0.75 });
+    let changed_modes = BTreeMap::from([(theme.collection, theme.dark)]);
+    let mut renderer = RasterRenderer::new(WIDTH, HEIGHT).expect("renderer");
+    let mut target = surface();
+    target.canvas().clear(skia_safe::Color::MAGENTA);
+    let untouched = pixels(&mut target);
+    for inputs in [
+        RenderInputs {
+            components: &changed_components,
+            ..RenderInputs::for_doc(&doc)
+        },
+        RenderInputs {
+            variables: &changed_variables,
+            ..RenderInputs::for_doc(&doc)
+        },
+        RenderInputs {
+            active_modes: &changed_modes,
+            ..RenderInputs::for_doc(&doc)
+        },
+        RenderInputs {
+            mode_generation: original.mode_generation + 1,
+            ..RenderInputs::for_doc(&doc)
+        },
+        RenderInputs {
+            dark_ui: !original.dark_ui,
+            ..RenderInputs::for_doc(&doc)
+        },
+    ] {
+        assert!(
+            renderer
+                .paint_split_to_canvas(
+                    target.canvas(),
+                    WIDTH,
+                    HEIGHT,
+                    &doc.scene,
+                    &Viewport {
+                        center: [0.0, 0.0],
+                        zoom: 1.0
+                    },
+                    &inputs,
+                    &spec,
+                    SplitPhase::Below
+                )
+                .is_err()
+        );
+        assert_eq!(
+            pixels(&mut target),
+            untouched,
+            "failed validation must not clear or paint"
+        );
+    }
+    for phase in [SplitPhase::Below, SplitPhase::Middle, SplitPhase::Above] {
+        renderer
+            .paint_split_to_canvas(
+                target.canvas(),
+                WIDTH,
+                HEIGHT,
+                &doc.scene,
+                &Viewport {
+                    center: [0.0, 0.0],
+                    zoom: 1.0,
+                },
+                &original,
+                &spec,
+                phase,
+            )
+            .expect("original inputs remain valid");
+    }
+    assert_eq!(
+        rgba_at(&pixels(&mut target), WIDTH, 96, 80),
+        [255, 255, 255, 255]
+    );
+    assert!(
+        renderer
+            .render_split_to_canvas(
+                target.canvas(),
+                WIDTH,
+                HEIGHT,
+                &doc.scene,
+                &Viewport {
+                    center: [0.0, 0.0],
+                    zoom: 1.0
+                },
+                &original,
+                &spec,
+                SplitPhase::Middle
+            )
+            .is_err(),
+        "instance plans must use ordered commands"
+    );
+}
+
+#[test]
+fn split_whole_instances_reject_unsupported_resolved_contents_and_cycles() {
+    use fanta_doc::{BoundProp, ComponentDef, ComponentId, Override, OverrideValue, VariableId};
+    use smallvec::smallvec;
+    for case in 0..6 {
+        let (mut doc, page) = instance_page();
+        let (leaf, root) = solid_master(&mut doc, Color::WHITE);
+        let outer_root = add(
+            &mut doc,
+            None,
+            NodeData::Group(GroupNode {
+                clip_size: Some([20.0, 20.0]),
+                ..Default::default()
+            }),
+            10_000.0,
+            0.0,
+        );
+        let nested = add(
+            &mut doc,
+            Some(outer_root),
+            NodeData::Instance(whole_instance(leaf, [20.0, 20.0])),
+            0.0,
+            0.0,
+        );
+        let outer = ComponentId::new();
+        doc.components
+            .defs
+            .insert(outer, ComponentDef::new(outer, outer_root, "Outer"));
+        let mut placed = whole_instance(outer, [20.0, 20.0]);
+        let expected = match case {
+            0 => {
+                doc.scene.get_mut(root).expect("leaf").is_mask = true;
+                "masks"
+            }
+            1 => {
+                doc.scene.get_mut(root).expect("leaf").blend_mode = BlendMode::Screen;
+                "backdrop"
+            }
+            2 => {
+                doc.scene
+                    .get_mut(root)
+                    .expect("leaf")
+                    .bindings
+                    .insert(BoundProp::Opacity, VariableId::new());
+                "variable-bound"
+            }
+            3 => {
+                placed.overrides.push(Override {
+                    target_path: smallvec![nested],
+                    target_prop: BoundProp::Visible,
+                    value: OverrideValue::SwapInstance {
+                        component: ComponentId::new(),
+                    },
+                });
+                "missing component"
+            }
+            4 => {
+                doc.scene.get_mut(root).expect("leaf").data =
+                    NodeData::Instance(whole_instance(outer, [20.0, 20.0]));
+                "recursive instance"
+            }
+            5 => {
+                placed.overrides.push(Override {
+                    target_path: smallvec![nested],
+                    target_prop: BoundProp::Visible,
+                    value: OverrideValue::Field {
+                        value: serde_json::json!({"local_size": [1.0e300, 20.0]}),
+                    },
+                });
+                "finite geometry"
+            }
+            _ => unreachable!(),
+        };
+        let moving = add(
+            &mut doc,
+            Some(page),
+            NodeData::Instance(placed),
+            -10.0,
+            -10.0,
+        );
+        let before = serde_json::to_value(&doc).expect("before");
+        let error = match SplitSpec::prepare(
+            &doc.scene,
+            page,
+            moving,
+            &RenderInputs::for_doc(&doc),
+            None,
+        ) {
+            Ok(_) => panic!("unsafe instance case {case} was accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains(expected), "case {case}: {error}");
+        assert!(
+            error.contains("definition path"),
+            "resolved failures should identify the instance path: {error}"
+        );
+        assert_eq!(serde_json::to_value(&doc).expect("after"), before);
+    }
+}
+
+#[test]
+fn split_whole_instances_bound_recursive_work_but_allow_repeated_masters() {
+    use fanta_doc::{ComponentDef, ComponentId};
+    let (mut doc, page) = instance_page();
+    let (leaf, _) = solid_master(&mut doc, Color::WHITE);
+    let moving = add(
+        &mut doc,
+        Some(page),
+        NodeData::Instance(whole_instance(leaf, [20.0, 20.0])),
+        -20.0,
+        -10.0,
+    );
+    add(
+        &mut doc,
+        Some(page),
+        NodeData::Instance(whole_instance(leaf, [20.0, 20.0])),
+        10.0,
+        -10.0,
+    );
+    assert_parity_with_inputs(
+        &doc,
+        page,
+        moving,
+        &Viewport {
+            center: [0.0, 0.0],
+            zoom: 1.0,
+        },
+        None,
+        1.0,
+        &RenderInputs::for_doc(&doc),
+    );
+    let mut next = leaf;
+    for _ in 0..65 {
+        let root = add(
+            &mut doc,
+            None,
+            NodeData::Instance(whole_instance(next, [20.0, 20.0])),
+            10_000.0,
+            0.0,
+        );
+        let component = ComponentId::new();
+        doc.components
+            .defs
+            .insert(component, ComponentDef::new(component, root, "Chain"));
+        next = component;
+    }
+    doc.scene.get_mut(moving).expect("moving").data =
+        NodeData::Instance(whole_instance(next, [20.0, 20.0]));
+    let error =
+        match SplitSpec::prepare(&doc.scene, page, moving, &RenderInputs::for_doc(&doc), None) {
+            Ok(_) => panic!("unbounded expansion was accepted"),
+            Err(error) => error.to_string(),
+        };
+    assert!(error.contains("node/depth budget"), "{error}");
+}
+
+#[test]
+fn split_whole_instances_freeze_nested_bitmap_assets_between_phases() {
+    use fanta_doc::{AssetId, ComponentDef, ComponentId};
+    struct Resolver(std::sync::Mutex<crate::DecodedImage>);
+    impl AssetResolver for Resolver {
+        fn resolve(&self, _: AssetId) -> Option<crate::DecodedImage> {
+            Some(self.0.lock().expect("resolver").clone())
+        }
+    }
+    let (mut doc, page) = instance_page();
+    let root = add(
+        &mut doc,
+        None,
+        NodeData::Bitmap(BitmapNode {
+            asset: AssetId::new(),
+            natural_size: [1, 1],
+            local_size: [20.0, 20.0],
+            crop: None,
+            fit: fanta_doc::ImageFitMode::Fill,
+            tint: None,
+        }),
+        10_000.0,
+        0.0,
+    );
+    let leaf = ComponentId::new();
+    doc.components
+        .defs
+        .insert(leaf, ComponentDef::new(leaf, root, "Bitmap"));
+    let outer_root = add(
+        &mut doc,
+        None,
+        NodeData::Instance(whole_instance(leaf, [20.0, 20.0])),
+        10_000.0,
+        0.0,
+    );
+    let outer = ComponentId::new();
+    doc.components
+        .defs
+        .insert(outer, ComponentDef::new(outer, outer_root, "Nested bitmap"));
+    let moving = add(
+        &mut doc,
+        Some(page),
+        NodeData::Instance(whole_instance(outer, [20.0, 20.0])),
+        -10.0,
+        -10.0,
+    );
+    let resolver = Arc::new(Resolver(std::sync::Mutex::new(crate::DecodedImage::new(
+        Arc::new(vec![240, 20, 30, 255]),
+        1,
+        1,
+    ))));
+    let inputs = RenderInputs::for_doc(&doc);
+    let before = serde_json::to_value(&doc).expect("before");
+    let spec = SplitSpec::prepare(&doc.scene, page, moving, &inputs, Some(resolver.as_ref()))
+        .expect("nested bitmap plan");
+    let viewport = Viewport {
+        center: [0.0, 0.0],
+        zoom: 1.0,
+    };
+    let mut renderer = RasterRenderer::new(WIDTH, HEIGHT).expect("renderer");
+    renderer.set_asset_resolver(resolver.clone());
+    let render = |renderer: &mut RasterRenderer| {
+        let mut target = surface();
+        for phase in [SplitPhase::Below, SplitPhase::Middle, SplitPhase::Above] {
+            renderer
+                .paint_split_to_canvas(
+                    target.canvas(),
+                    WIDTH,
+                    HEIGHT,
+                    &doc.scene,
+                    &viewport,
+                    &inputs,
+                    &spec,
+                    phase,
+                )
+                .expect("phase");
+        }
+        pixels(&mut target)
+    };
+    let initial = render(&mut renderer);
+    assert_eq!(rgba_at(&initial, WIDTH, 96, 80), [240, 20, 30, 255]);
+    *resolver.0.lock().expect("resolver") =
+        crate::DecodedImage::new(Arc::new(vec![20, 240, 30, 255]), 1, 1);
+    assert_eq!(render(&mut renderer), initial);
+    let mut fresh = RasterRenderer::new(WIDTH, HEIGHT).expect("fresh renderer");
+    fresh.set_asset_resolver(resolver);
+    let mut changed = surface();
+    fresh.render_to_canvas(
+        changed.canvas(),
+        WIDTH,
+        HEIGHT,
+        &doc.scene,
+        &viewport,
+        Some(page),
+        &inputs,
+    );
+    assert_eq!(
+        rgba_at(&pixels(&mut changed), WIDTH, 96, 80),
+        [20, 240, 30, 255]
+    );
+    assert_eq!(serde_json::to_value(&doc).expect("after"), before);
+}
+
+#[test]
+fn split_whole_instances_validate_bindings_after_field_overrides() {
+    use fanta_doc::{BoundProp, Override, OverrideValue, VariableId};
+    use smallvec::smallvec;
+    let (mut doc, page) = instance_page();
+    let theme = add_instance_theme(&mut doc);
+    doc.active_modes.insert(theme.collection, theme.dark);
+    let (component, root) = solid_master(&mut doc, Color::rgb(255, 0, 0));
+    doc.scene
+        .get_mut(root)
+        .expect("master")
+        .bindings
+        .insert(BoundProp::FillColor { index: 0 }, VariableId::new());
+    let mut bound = CanvasNode::new(rectangle(Color::WHITE));
+    bound
+        .bindings
+        .insert(BoundProp::FillColor { index: 0 }, theme.color);
+    let bindings = serde_json::to_value(&bound)
+        .expect("binding encoding")
+        .get("bindings")
+        .expect("bindings")
+        .clone();
+    let mut resolves = whole_instance(component, [20.0, 20.0]);
+    resolves.overrides.push(Override {
+        target_path: smallvec![],
+        target_prop: BoundProp::FillColor { index: 0 },
+        value: OverrideValue::Field {
+            value: serde_json::json!({"bindings": bindings}),
+        },
+    });
+    let moving = add(
+        &mut doc,
+        Some(page),
+        NodeData::Instance(resolves),
+        -40.0,
+        -10.0,
+    );
+    let mut removes = whole_instance(component, [20.0, 20.0]);
+    removes.overrides.push(Override {
+        target_path: smallvec![],
+        target_prop: BoundProp::FillColor { index: 0 },
+        value: OverrideValue::Field {
+            value: serde_json::json!({"bindings": []}),
+        },
+    });
+    add(
+        &mut doc,
+        Some(page),
+        NodeData::Instance(removes),
+        20.0,
+        -10.0,
+    );
+    let pixels = assert_parity_with_inputs(
+        &doc,
+        page,
+        moving,
+        &Viewport {
+            center: [0.0, 0.0],
+            zoom: 1.0,
+        },
+        None,
+        1.0,
+        &RenderInputs::for_doc(&doc),
+    );
+    assert_eq!(
+        rgba_at(&pixels, WIDTH, 66, 80),
+        [0, 0, 255, 255],
+        "resolved override-added binding"
+    );
+    assert_eq!(
+        rgba_at(&pixels, WIDTH, 126, 80),
+        [255, 0, 0, 255],
+        "override removes unresolved master binding"
+    );
+}
+
+#[test]
+fn split_whole_instances_keep_nested_swapped_derived_sizes_and_text_layout() {
+    use fanta_doc::{
+        BoundProp, ComponentDef, ComponentId, DerivedOverride, Override, OverrideValue,
+    };
+    use smallvec::smallvec;
+    let (mut doc, page) = instance_page();
+    let (original, _) = solid_master(&mut doc, Color::rgb(255, 0, 255));
+    let replacement_root = add(
+        &mut doc,
+        None,
+        NodeData::Group(GroupNode {
+            clip_size: Some([80.0, 40.0]),
+            ..Default::default()
+        }),
+        10_000.0,
+        0.0,
+    );
+    let child = add(
+        &mut doc,
+        Some(replacement_root),
+        NodeData::Text(TextNode::new("Master text", 20.0, 10.0)),
+        0.0,
+        0.0,
+    );
+    let replacement = ComponentId::new();
+    doc.components.defs.insert(
+        replacement,
+        ComponentDef::new(replacement, replacement_root, "Text replacement"),
+    );
+    let outer_root = add(
+        &mut doc,
+        None,
+        NodeData::Group(GroupNode {
+            clip_size: Some([80.0, 40.0]),
+            ..Default::default()
+        }),
+        10_000.0,
+        0.0,
+    );
+    let nested = add(
+        &mut doc,
+        Some(outer_root),
+        NodeData::Instance(whole_instance(original, [80.0, 40.0])),
+        0.0,
+        0.0,
+    );
+    let outer = ComponentId::new();
+    doc.components
+        .defs
+        .insert(outer, ComponentDef::new(outer, outer_root, "Derived swap"));
+    let mut placed = whole_instance(outer, [80.0, 40.0]);
+    placed.overrides.push(Override {
+        target_path: smallvec![nested],
+        target_prop: BoundProp::Visible,
+        value: OverrideValue::SwapInstance {
+            component: replacement,
+        },
+    });
+    placed.derived.push(DerivedOverride {
+        path: smallvec![nested, child],
+        transform: Some(Transform2D::translation(11.0, 7.0)),
+        size: Some([65.0, 28.0]),
+        fills: None,
+        path_data: None,
+        stroke_path: None,
+        stroke_weight: None,
+        text: Some(fanta_doc::node::DerivedText {
+            content: Some("Placed text".into()),
+            font_size: Some(13.0),
+            line_height: Some(1.2),
+            line_height_auto_percent: None,
+            letter_spacing: None,
+            color: Some(Color::WHITE),
+            weight: Some(700),
+            family: None,
+        }),
+    });
+    let moving = add(
+        &mut doc,
+        Some(page),
+        NodeData::Instance(placed),
+        -40.0,
+        -20.0,
+    );
+    let inputs = RenderInputs::for_doc(&doc);
+    let spec = SplitSpec::prepare(&doc.scene, page, moving, &inputs, None).expect("derived plan");
+    let outer = spec.prepared_instance(moving).expect("prepared outer");
+    let nested = outer
+        .nodes
+        .iter()
+        .find(|entry| matches!(entry.node.data, NodeData::Instance(_)))
+        .expect("nested placement");
+    let nested = spec
+        .prepared_instance(nested.node.id)
+        .expect("prepared nested");
+    let text = nested
+        .nodes
+        .iter()
+        .find(|entry| matches!(entry.node.data, NodeData::Text(_)))
+        .expect("derived text");
+    let NodeData::Text(payload) = &text.node.data else {
+        panic!("text payload")
+    };
+    assert_eq!(payload.content, "Placed text");
+    assert_eq!(payload.local_size, [65.0, 28.0]);
+    assert_eq!(text.node.transform, Transform2D::translation(11.0, 7.0));
+    for zoom in [0.73, 1.0, 2.0] {
+        let pixels = assert_parity_with_inputs(
+            &doc,
+            page,
+            moving,
+            &Viewport {
+                center: [0.0, 0.0],
+                zoom,
+            },
+            None,
+            1.0,
+            &RenderInputs::for_doc(&doc),
+        );
+        assert!(
+            pixels
+                .chunks_exact(4)
+                .any(|pixel| pixel[0] > 100 && pixel[1] > 100 && pixel[2] > 100),
+            "resolved text must visibly paint"
+        );
+        assert!(
+            !pixels
+                .chunks_exact(4)
+                .any(|pixel| pixel[0] > 100 && pixel[1] < 10 && pixel[2] > 100),
+            "the swapped-away magenta master must not paint"
+        );
     }
 }

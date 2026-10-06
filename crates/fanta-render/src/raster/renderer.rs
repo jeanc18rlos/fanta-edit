@@ -1112,7 +1112,7 @@ impl RasterRenderer {
 
     /// Draw one prepared phase onto a transparent surface (Below includes the
     /// normal page clear). Composite Below, Middle and Above at identical
-    /// viewport/size with source-over. Specs with clipped ancestors require
+    /// viewport/size with source-over. Specs with instances or clipped ancestors require
     /// [`Self::paint_split_to_canvas`] instead: flattening their antialiased
     /// paint into separate raster phases can change pixels. Rejection leaves
     /// the target untouched. Normal page rendering does not use this API.
@@ -1125,7 +1125,7 @@ impl RasterRenderer {
         scene: &Scene,
         viewport: &Viewport,
         inputs: &RenderInputs,
-        spec: &super::SplitSpec,
+        spec: &super::SplitSpec<'_>,
         phase: super::SplitPhase,
     ) -> Result<RenderMetrics, super::SplitError> {
         self.draw_split_to_canvas(
@@ -1150,7 +1150,7 @@ impl RasterRenderer {
         scene: &Scene,
         viewport: &Viewport,
         inputs: &RenderInputs,
-        spec: &super::SplitSpec,
+        spec: &super::SplitSpec<'_>,
         phase: super::SplitPhase,
     ) -> Result<RenderMetrics, super::SplitError> {
         self.draw_split_to_canvas(
@@ -1167,7 +1167,7 @@ impl RasterRenderer {
         scene: &Scene,
         viewport: &Viewport,
         inputs: &RenderInputs,
-        spec: &super::SplitSpec,
+        spec: &super::SplitSpec<'_>,
         phase: super::SplitPhase,
         clear_target: bool,
     ) -> Result<RenderMetrics, super::SplitError> {
