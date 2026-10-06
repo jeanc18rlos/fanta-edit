@@ -188,8 +188,12 @@ immediately through both double-click and the actual Edit vector menu, with
 unchanged saved content. The `ce8db37c34` QA build also passes Edit vector
 menu entry for a Group-contained vector, a precise anchor drag/Save and one
 Undo/Redo. All 35 nodes and five assets match the predeclared states; a full
-quit/reopen preserves all 30 project file bytes and timestamps exactly. Authored
-Boolean point edits remain unverified. Selected Bitmap/Vector Inspect refusals and a nine-layer
+quit/reopen preserves all 30 project file bytes and timestamps exactly. On 7 October,
+the same build also passes a two-operand authored Boolean's left-vector anchor
+edit through entry/cancel, Save, single Undo/Redo, exit and exact cold reopening.
+Its complete 35-node/five-asset oracle and all 30 file bytes remain exact;
+other Boolean arrangements and imported baked geometry remain unverified.
+Selected Bitmap/Vector Inspect refusals and a nine-layer
 generic menu passed separately; TextPath Inspect targeting was inconclusive.
 These checks do not establish every node-entry or text-input combination.
 

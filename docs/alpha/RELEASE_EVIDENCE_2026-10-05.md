@@ -2102,3 +2102,20 @@ CI gate for this commit; it does not establish native-video acceptance,
 live large-page performance, or readiness of a signed direct-download DMG.
 Repository secret names still include the certificate/password pair and omit
 all three notarization-key secrets. No signed product artifact was built here.
+
+## Boolean-contained vector point edit — 7 October
+
+The same `ce8db37c34` QA bundle passes all seven frozen Boolean fixture stages:
+open, actual Edit vector entry/Escape without movement, exact first anchor
+`[0,0]` → `[10,6]` and Save, one Undo/Save, one Redo/Save, exit and cold reopen.
+The authored two-operand Boolean has no imported baked geometry. All 35 nodes
+and five assets match the predeclared states; unrelated data stays exact.
+After clean quit, PID 35650 is absent and the same binary relaunches as PID 43867.
+Cold reopening preserves all 30 file bytes and timestamps against saved Redo,
+without another Save. Camera and history across processes are outside this proof.
+
+Evidence: `native-path-point-edit-20261005/boolean-native-aggregate-20261007.json`,
+SHA-256 `567fdff9fe6562d299e25a3517c2694935dab368a8dba95044237407f4047cec`.
+Root independently verified all 38 referenced record hashes and all seven
+declared stage verdicts in `boolean-root-integrity-20261007.json`. Earlier failures,
+fixture/oracle hashes and dirty user app sessions remain unchanged.
