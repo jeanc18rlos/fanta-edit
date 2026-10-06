@@ -1778,7 +1778,17 @@ impl FantaPropertiesPanel {
     /// master root's own surface props onto the (now plain) frame, which the
     /// data swap alone would drop.
     pub(crate) fn detach_instance(&mut self, id: NodeId, cx: &mut Context<Self>) {
-        self.apply_document_ops(cx, move |doc| detach_instance_operations(doc, id));
+        let mut failure = None;
+        self.apply_document_ops(cx, |doc| match detach_instance_operations(doc, id) {
+            Ok(operations) => operations,
+            Err(error) => {
+                failure = Some(error);
+                Vec::new()
+            }
+        });
+        if let Some(error) = failure {
+            crate::view::show_canvas_notice_deferred(format!("Detach instance: {error:#}"), cx);
+        }
     }
 
     /// Promote the selected frame or group into a component master, in place,

@@ -16,6 +16,8 @@ pub(crate) struct CanvasClipboard {
     roots: Vec<ClipboardRoot>,
     nodes: Vec<CanvasNode>,
     motion_tracks: Vec<ClipboardMotionTrack>,
+    #[serde(default, skip_serializing_if = "fanta_doc::ComponentLibrary::is_empty")]
+    components: fanta_doc::ComponentLibrary,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -37,6 +39,7 @@ pub(crate) enum ClipboardPlacement {
     Duplicate,
 }
 
+#[derive(Clone)]
 pub(crate) struct PastedNodes {
     pub(crate) nodes: Vec<CanvasNode>,
     pub(crate) roots: Vec<NodeId>,
@@ -98,13 +101,48 @@ impl CanvasClipboard {
                     .map(|track| ClipboardMotionTrack { clip: *clip, track })
             })
             .collect();
+        let mut components = fanta_doc::ComponentLibrary::new();
+        components.defs.extend(
+            doc.components
+                .defs
+                .iter()
+                .filter(|(_, definition)| captured_ids.contains(&definition.root))
+                .map(|(id, definition)| (*id, definition.clone())),
+        );
+        components.sets.extend(
+            doc.components
+                .sets
+                .iter()
+                .filter(|(_, set)| {
+                    !set.members.is_empty()
+                        && set
+                            .members
+                            .iter()
+                            .all(|member| components.defs.contains_key(member))
+                })
+                .map(|(id, set)| (*id, set.clone())),
+        );
         Some(Self {
             version: CLIPBOARD_VERSION,
             source_document: doc.id,
             roots: root_records,
             nodes,
             motion_tracks,
+            components,
         })
+    }
+
+    pub(crate) fn validate_cut(&self) -> Result<()> {
+        for definition in self.components.defs.values() {
+            if let Some(membership) = &definition.variant_of
+                && !self.components.sets.contains_key(&membership.set)
+            {
+                bail!(
+                    "Select every variant in the component set before cutting; a partial set cannot be restored by Paste"
+                );
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn display_text(&self) -> String {
@@ -1463,6 +1501,297 @@ mod tests {
         assert_eq!(component_copy_state(&doc), after);
     }
 
+    fn clipboard_swap_dependency_fixture() -> (Doc, NodeId, NodeId) {
+        let (mut doc, removed_master, _, _) = subtree_doc();
+        let removed = ComponentId::new();
+        doc.components.defs.insert(
+            removed,
+            ComponentDef::new(removed, removed_master, "Removed swap target"),
+        );
+        let mut surviving_master = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([40.0, 20.0]),
+            ..Default::default()
+        }));
+        surviving_master.parent = doc.active_page();
+        surviving_master.index = doc.scene.next_child_index(surviving_master.parent);
+        let surviving_root = surviving_master.id;
+        doc.scene
+            .insert(surviving_master)
+            .expect("surviving master");
+        let surviving = ComponentId::new();
+        doc.components.defs.insert(
+            surviving,
+            ComponentDef::new(surviving, surviving_root, "Surviving master"),
+        );
+        let mut default_master = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([40.0, 20.0]),
+            ..Default::default()
+        }));
+        default_master.parent = doc.active_page();
+        default_master.index = doc.scene.next_child_index(default_master.parent);
+        let default_root = default_master.id;
+        doc.scene.insert(default_master).expect("default master");
+        let default_component = ComponentId::new();
+        doc.components.defs.insert(
+            default_component,
+            ComponentDef::new(default_component, default_root, "Default nested content"),
+        );
+        let instance = |component| fanta_doc::InstanceNode {
+            component,
+            overrides: Vec::new(),
+            prop_values: Default::default(),
+            derived: Vec::new(),
+            local_size: [40.0, 20.0],
+        };
+        let mut nested = CanvasNode::new(NodeData::Instance(instance(default_component)));
+        nested.parent = Some(surviving_root);
+        let nested_id = nested.id;
+        doc.scene.insert(nested).expect("nested default instance");
+        let mut placement = instance(surviving);
+        placement.overrides.push(fanta_doc::Override {
+            target_path: [nested_id].into_iter().collect(),
+            target_prop: fanta_doc::BoundProp::Visible,
+            value: fanta_doc::OverrideValue::SwapInstance { component: removed },
+        });
+        let mut placement = CanvasNode::new(NodeData::Instance(placement));
+        placement.parent = doc.active_page();
+        placement.index = doc.scene.next_child_index(placement.parent);
+        let placement_id = placement.id;
+        doc.scene.insert(placement).expect("placed swap instance");
+        doc.history = Default::default();
+        (doc, removed_master, placement_id)
+    }
+
+    #[test]
+    fn clipboard_replace_refuses_a_swap_dependency_removed_by_replacement() {
+        let (mut doc, master, placement) = clipboard_swap_dependency_fixture();
+        doc.selection.select_only(placement);
+        let payload = CanvasClipboard::capture(&doc).expect("copy placement only");
+        doc.scene
+            .remove(placement)
+            .expect("copied source removed before replacement");
+        doc.selection.select_only(master);
+        let before = serde_json::to_value(&doc).expect("snapshot");
+        let error = paste_to_replace_operations(&doc, master, &payload)
+            .expect_err("swap target must exist after deletion");
+        assert!(
+            error
+                .to_string()
+                .contains("swap component is no longer available")
+        );
+        assert_eq!(serde_json::to_value(&doc).expect("snapshot"), before);
+    }
+
+    #[test]
+    fn clipboard_delete_refuses_surviving_sparse_swap_dependency_atomically() {
+        let (mut doc, master, _) = clipboard_swap_dependency_fixture();
+        doc.selection.select_only(master);
+        let before = serde_json::to_value(&doc).expect("snapshot");
+        let error = crate::layer_context_ops::delete_layers(&doc, master)
+            .expect_err("surviving virtual swap requires removed master");
+        assert!(error.to_string().contains("swapped component"));
+        assert_eq!(serde_json::to_value(&doc).expect("snapshot"), before);
+    }
+
+    #[test]
+    fn clipboard_replace_refuses_instance_over_its_own_master_atomically() {
+        let (mut doc, master, _, _) = subtree_doc();
+        let component = ComponentId::new();
+        doc.components.defs.insert(
+            component,
+            ComponentDef::new(component, master, "Replaced master"),
+        );
+        let mut instance = CanvasNode::new(NodeData::Instance(fanta_doc::InstanceNode {
+            component,
+            overrides: Vec::new(),
+            prop_values: Default::default(),
+            derived: Vec::new(),
+            local_size: [200.0, 120.0],
+        }));
+        instance.parent = doc.active_page();
+        instance.index = doc.scene.next_child_index(instance.parent);
+        let instance_id = instance.id;
+        doc.scene.insert(instance).expect("placed instance");
+        doc.selection.select_only(instance_id);
+        let payload = CanvasClipboard::capture(&doc).expect("copy placement only");
+        doc.selection.select_only(master);
+        let before = serde_json::to_value(&doc).expect("snapshot");
+        let error = paste_to_replace_operations(&doc, master, &payload)
+            .expect_err("the replacement cannot depend on the master it removes");
+        assert!(
+            error
+                .to_string()
+                .contains("component is no longer available")
+        );
+        assert_eq!(serde_json::to_value(&doc).expect("snapshot"), before);
+    }
+
+    #[test]
+    fn clipboard_replace_copied_master_over_itself_keeps_usable_definition() {
+        let (mut doc, master, _, _) = subtree_doc();
+        let component = ComponentId::new();
+        doc.components.defs.insert(
+            component,
+            ComponentDef::new(component, master, "Replaced master"),
+        );
+        doc.selection.select_only(master);
+        let payload = CanvasClipboard::capture(&doc).expect("copy master and definition");
+        let before = serde_json::to_value(&doc).expect("snapshot");
+        let operations = paste_to_replace_operations(&doc, master, &payload)
+            .expect("self replacement with complete master");
+        apply_transaction(&mut doc, "Replace", operations).expect("commit");
+        assert!(!doc.scene.contains(master));
+        assert_eq!(doc.components.defs.len(), 1);
+        let restored = doc.components.defs.values().next().expect("definition");
+        assert_ne!(restored.id, component);
+        assert_eq!(restored.name, "Replaced master");
+        assert!(doc.scene.contains(restored.root));
+        assert_eq!(doc.scene.descendants_of(restored.root).count(), 3);
+        assert!(doc.undo().expect("undo"));
+        let mut actual = serde_json::to_value(&doc).expect("after undo");
+        let mut expected = before;
+        actual.as_object_mut().expect("doc").remove("history");
+        expected.as_object_mut().expect("doc").remove("history");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn clipboard_cut_then_paste_to_replace_restores_components() {
+        let (mut doc, page, section, _, _, external) = component_variant_reference_doc();
+        let payload = CanvasClipboard::capture(&doc).expect("whole component subtree");
+        payload.validate_cut().expect("full sets captured");
+        let operations = crate::layer_context_ops::delete_layers(&doc, section).expect("cut");
+        apply_transaction(&mut doc, "Cut", operations).expect("commit cut");
+        let mut target = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([100.0, 100.0]),
+            ..Default::default()
+        }));
+        target.parent = Some(page);
+        let target_id = target.id;
+        doc.scene.insert(target).expect("replacement target");
+        doc.selection.select_only(target_id);
+        let before = serde_json::to_value(&doc).expect("before");
+        let operations = paste_to_replace_operations(&doc, target_id, &payload).expect("replace");
+        apply_transaction(&mut doc, "Replace", operations).expect("commit");
+        assert!(!doc.scene.contains(target_id));
+        assert_eq!(
+            doc.components.defs.len(),
+            4,
+            "restore three copied masters beside unchanged external dependency"
+        );
+        assert_eq!(doc.components.sets.len(), 1);
+        let set = doc.components.sets.values().next().expect("restored set");
+        assert!(
+            set.members
+                .iter()
+                .all(|id| doc.components.def(*id).is_some())
+        );
+        assert!(doc.components.def(external).is_some());
+        for node in doc
+            .scene
+            .roots()
+            .iter()
+            .flat_map(|root| doc.scene.descendants_of(*root))
+            .filter_map(|id| doc.scene.get(id))
+        {
+            if let NodeData::Instance(instance) = &node.data {
+                assert!(
+                    doc.components.def(instance.component).is_some()
+                        || doc.components.sets.contains_key(&instance.component),
+                    "pasted instances must retain valid component references"
+                );
+            }
+        }
+        assert!(doc.undo().expect("undo"));
+        let mut actual = serde_json::to_value(&doc).expect("after undo");
+        let mut expected = before;
+        actual.as_object_mut().expect("doc").remove("history");
+        expected.as_object_mut().expect("doc").remove("history");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn clipboard_paste_keeps_current_registry_after_intervening_edits() {
+        let (mut doc, _, section, set, member, _) = component_variant_reference_doc();
+        let payload = CanvasClipboard::capture(&doc).expect("copy complete section");
+        doc.components.defs.get_mut(&member).expect("member").name = "Edited after Copy".into();
+        let set = doc.components.sets.get_mut(&set).expect("set");
+        set.name = "Edited set".into();
+        set.default_variant = *set.members.last().expect("other member");
+        let registry = doc.components.clone();
+        let original_nodes = doc.scene.clone();
+        let mut pasted = payload
+            .instantiate(&doc, 16.0, ClipboardPlacement::Paste)
+            .expect("instantiate");
+        let operations = paste_operations(&doc, &payload, &mut pasted).expect("paste");
+        apply_transaction(&mut doc, "Paste", operations).expect("commit");
+        assert_eq!(
+            doc.components, registry,
+            "Copy snapshots must never overwrite live definitions"
+        );
+        for id in original_nodes.descendants_of(section) {
+            assert_eq!(doc.scene.get(id), original_nodes.get(id));
+        }
+        assert!(doc.undo().expect("undo"));
+        assert_eq!(doc.components, registry);
+        assert_eq!(
+            serde_json::to_value(&doc.scene).expect("scene"),
+            serde_json::to_value(&original_nodes).expect("original scene")
+        );
+    }
+
+    #[test]
+    fn clipboard_partial_variant_copy_refuses_restore_after_definition_removal() {
+        let (mut doc, _, _, _, member, _) = component_variant_reference_doc();
+        let root = doc.components.def(member).expect("member").root;
+        doc.selection.select_only(root);
+        let payload = CanvasClipboard::capture(&doc).expect("copy partial set");
+        assert!(payload.validate_cut().is_err());
+        let ids = doc
+            .scene
+            .roots()
+            .iter()
+            .flat_map(|root| doc.scene.descendants_of(*root))
+            .collect::<Vec<_>>();
+        for id in ids {
+            if let Some(CanvasNode {
+                data: NodeData::Instance(instance),
+                ..
+            }) = doc.scene.get_mut(id)
+            {
+                instance.overrides.clear();
+            }
+        }
+        let operations =
+            crate::layer_context_ops::delete_layers(&doc, root).expect("delete remains allowed");
+        apply_transaction(&mut doc, "Delete", operations).expect("delete");
+        let before = serde_json::to_value(&doc).expect("snapshot");
+        let mut pasted = payload
+            .instantiate(&doc, 16.0, ClipboardPlacement::Paste)
+            .expect("instantiate");
+        let error = paste_operations(&doc, &payload, &mut pasted)
+            .expect_err("cannot restore incomplete old set");
+        assert!(error.to_string().contains("complete set"));
+        assert_eq!(serde_json::to_value(&doc).expect("snapshot"), before);
+    }
+
+    #[test]
+    fn clipboard_legacy_payload_without_component_metadata_still_pastes() {
+        let (mut doc, root, _, _) = subtree_doc();
+        doc.selection.select_only(root);
+        let payload = CanvasClipboard::capture(&doc).expect("capture");
+        let mut json = serde_json::to_value(&payload).expect("serialize");
+        json.as_object_mut().expect("object").remove("components");
+        let decoded: CanvasClipboard = serde_json::from_value(json).expect("legacy v2 payload");
+        let mut pasted = decoded
+            .instantiate(&doc, 16.0, ClipboardPlacement::Paste)
+            .expect("instantiate");
+        let operations = paste_operations(&doc, &decoded, &mut pasted).expect("paste");
+        apply_transaction(&mut doc, "Paste", operations).expect("commit");
+        assert_eq!(doc.scene.len(), 7);
+        assert!(doc.components.is_empty());
+    }
+
     #[test]
     fn page_duplicate_preserves_component_masters_and_local_instances() {
         let mut doc = Doc::new();
@@ -1575,7 +1904,8 @@ pub(crate) fn paste_to_replace_operations(
         scratch.selection.replace_with([id]);
         let mut pasted = payload.instantiate(&scratch, 0., ClipboardPlacement::Paste)?;
         let mut preview = scratch.clone();
-        for operation in create_operations(&pasted) {
+        let mut preview_nodes = pasted.clone();
+        for operation in replacement_component_operations(&scratch, payload, &mut preview_nodes)? {
             preview.apply(operation)?;
         }
         let source = pasted
@@ -1624,12 +1954,16 @@ pub(crate) fn paste_to_replace_operations(
                 IndexKey::after(index)
             };
         }
-        let mut edits = crate::layer_context_ops::delete_layers(&scratch, id)?;
-        edits.extend(clone_component_operations(&scratch, payload, &mut pasted)?);
+        let edits = crate::layer_context_ops::delete_layers(&scratch, id)?;
         for operation in &edits {
             scratch.apply(operation.clone())?;
         }
+        let replacements = replacement_component_operations(&scratch, payload, &mut pasted)?;
+        for operation in &replacements {
+            scratch.apply(operation.clone())?;
+        }
         operations.extend(edits);
+        operations.extend(replacements);
     }
     Ok(operations)
 }
@@ -1639,21 +1973,153 @@ pub(crate) fn clone_component_operations(
     clipboard: &CanvasClipboard,
     pasted: &mut PastedNodes,
 ) -> Result<Vec<Operation>> {
+    clone_captured_components(&doc.components, clipboard, pasted)
+}
+
+pub(crate) fn paste_operations(
+    doc: &Doc,
+    clipboard: &CanvasClipboard,
+    pasted: &mut PastedNodes,
+) -> Result<Vec<Operation>> {
+    let restore = restored_component_library(doc, clipboard, pasted)?;
+    clone_captured_components(&restore, clipboard, pasted)
+}
+
+fn replacement_component_operations(
+    doc: &Doc,
+    clipboard: &CanvasClipboard,
+    pasted: &mut PastedNodes,
+) -> Result<Vec<Operation>> {
+    let mut library = restored_component_library(doc, clipboard, pasted)?;
+    let roots = clipboard
+        .nodes
+        .iter()
+        .map(|node| node.id)
+        .collect::<HashSet<_>>();
+    for definition in doc.components.defs.values() {
+        if roots.contains(&definition.root) {
+            library
+                .defs
+                .entry(definition.id)
+                .or_insert_with(|| definition.clone());
+        }
+    }
+    for set in doc.components.sets.values() {
+        if !set.members.is_empty()
+            && set
+                .members
+                .iter()
+                .all(|member| library.defs.contains_key(member))
+        {
+            library.sets.entry(set.id).or_insert_with(|| set.clone());
+        }
+    }
+    clone_captured_components(&library, clipboard, pasted)
+}
+
+fn restored_component_library(
+    doc: &Doc,
+    clipboard: &CanvasClipboard,
+    pasted: &PastedNodes,
+) -> Result<fanta_doc::ComponentLibrary> {
+    let mut restore = fanta_doc::ComponentLibrary::new();
+    for definition in clipboard.components.defs.values() {
+        if doc.components.defs.contains_key(&definition.id) {
+            continue;
+        }
+        if let Some(membership) = &definition.variant_of {
+            let set = clipboard.components.sets.get(&membership.set)
+                .context("The copied variant's complete set is unavailable; its contents were left unchanged")?;
+            restore.sets.insert(set.id, set.clone());
+            for member in &set.members {
+                let definition = clipboard
+                    .components
+                    .defs
+                    .get(member)
+                    .context("The copied component set is incomplete")?;
+                restore.defs.insert(*member, definition.clone());
+            }
+        } else {
+            restore.defs.insert(definition.id, definition.clone());
+        }
+    }
+    // A removed set may have surviving members. Restore an independent copy
+    // instead of replacing a registry entry that other instances still use.
+    for set in clipboard.components.sets.values() {
+        if !doc.components.sets.contains_key(&set.id) {
+            restore.sets.insert(set.id, set.clone());
+            for member in &set.members {
+                let definition = clipboard
+                    .components
+                    .defs
+                    .get(member)
+                    .context("The copied component set is incomplete")?;
+                restore.defs.insert(*member, definition.clone());
+            }
+        }
+    }
+    for definition in restore.defs.values() {
+        anyhow::ensure!(
+            clipboard
+                .nodes
+                .iter()
+                .any(|node| node.id == definition.root),
+            "The copied component master is missing from the clipboard"
+        );
+    }
+    for set in restore.sets.values() {
+        anyhow::ensure!(
+            !set.members.is_empty()
+                && set
+                    .members
+                    .iter()
+                    .all(|member| restore.defs.contains_key(member)),
+            "The copied component set is incomplete"
+        );
+    }
+    let available = |component| {
+        doc.components.defs.contains_key(&component)
+            || doc.components.sets.contains_key(&component)
+            || restore.defs.contains_key(&component)
+            || restore.sets.contains_key(&component)
+    };
+    for node in &pasted.nodes {
+        if let NodeData::Instance(instance) = &node.data {
+            anyhow::ensure!(
+                available(instance.component),
+                "A copied instance's component is no longer available; its contents were left unchanged"
+            );
+            for replacement in &instance.overrides {
+                if let fanta_doc::OverrideValue::SwapInstance { component } = &replacement.value {
+                    anyhow::ensure!(
+                        available(*component),
+                        "A copied instance's swap component is no longer available; its contents were left unchanged"
+                    );
+                }
+            }
+        }
+    }
+    Ok(restore)
+}
+
+fn clone_captured_components(
+    library: &fanta_doc::ComponentLibrary,
+    clipboard: &CanvasClipboard,
+    pasted: &mut PastedNodes,
+) -> Result<Vec<Operation>> {
     let nodes: HashMap<_, _> = clipboard
         .nodes
         .iter()
         .zip(&pasted.nodes)
         .map(|(source, copy)| (source.id, copy.id))
         .collect();
-    let components: HashMap<_, _> = doc
-        .components
+    let components: HashMap<_, _> = library
         .defs
         .values()
         .filter(|definition| nodes.contains_key(&definition.root))
         .map(|definition| (definition.id, fanta_doc::ComponentId::new()))
         .collect();
-    let sets: HashMap<_, _> = doc
-        .components
+    let sets: HashMap<_, _> = library
         .sets
         .values()
         .filter(|set| {
@@ -1705,8 +2171,8 @@ pub(crate) fn clone_component_operations(
             }
         }
     }
-    let mut operations = create_operations(&pasted);
-    for definition in doc.components.defs.values() {
+    let mut operations = create_operations(pasted);
+    for definition in library.defs.values() {
         let Some(id) = components.get(&definition.id) else {
             continue;
         };
@@ -1733,7 +2199,7 @@ pub(crate) fn clone_component_operations(
             def: Box::new(copy),
         });
     }
-    for set in doc.components.sets.values() {
+    for set in library.sets.values() {
         let Some(id) = sets.get(&set.id) else {
             continue;
         };
@@ -1742,8 +2208,13 @@ pub(crate) fn clone_component_operations(
         copy.members = set
             .members
             .iter()
-            .map(|member| components[member])
-            .collect();
+            .map(|member| {
+                components
+                    .get(member)
+                    .copied()
+                    .context("missing copied set member")
+            })
+            .collect::<Result<_>>()?;
         copy.default_variant = *components
             .get(&set.default_variant)
             .context("missing copied default variant")?;

@@ -14,7 +14,7 @@ use fanta_doc::{
     BlendMode, Blur, BlurKind, Bounds as FantaBounds, CanvasNode, Color as FantaColor,
     ComponentDef, ComponentId, ComponentPropId, Doc, Fill, Gradient, GroupNode, LayoutMode,
     NodeData, NodeId, Operation, Shadow, ShadowKind, Stroke, TextAutoResize, Transform2D,
-    UnitInterval, VarValue, expand_instance,
+    UnitInterval, VarValue,
 };
 use glam::DVec2;
 use gpui::Rgba;
@@ -738,20 +738,51 @@ pub(crate) fn selection_color_operations(
 /// under it. The master root's own wrapper-level surface props (opacity,
 /// effects, blurs, blend) live outside `NodeData`, so the data swap alone would
 /// drop them — they are composed onto the detached node by the follow-up ops.
-pub(crate) fn detach_instance_operations(doc: &Doc, id: NodeId) -> Vec<Operation> {
+pub(crate) fn detach_instance_operations(doc: &Doc, id: NodeId) -> anyhow::Result<Vec<Operation>> {
     let Some(node) = doc.scene.get(id) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let NodeData::Instance(instance) = &node.data else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    let expanded = expand_instance(&doc.scene, &doc.components, instance);
+    let expanded = fanta_doc::expand_instance_with_context(
+        &doc.scene,
+        &doc.components,
+        instance,
+        &fanta_doc::InstanceExpansionContext::new(&doc.variables, &doc.active_modes, id),
+    );
     // `expand_instance` yields the root first (empty def path), then its subtree
     // parents-before-children, so this insertion order stays valid.
     let Some(root) = expanded.iter().find(|entry| entry.def_path.is_empty()) else {
         // A dangling master: nothing to materialize.
-        return Vec::new();
+        return Ok(Vec::new());
     };
+    anyhow::ensure!(
+        !node.bindings.contains_key(&fanta_doc::BoundProp::Opacity)
+            || (root.node.opacity.get() - 1.0).abs() <= f32::EPSILON,
+        "Cannot detach bound opacity combined with the main component's opacity without changing its appearance"
+    );
+    anyhow::ensure!(
+        node.effects.is_empty() || root.node.effects.is_empty(),
+        "Cannot detach combined instance and main-component effects without changing their appearance"
+    );
+    anyhow::ensure!(
+        node.blurs.is_empty() || root.node.blurs.is_empty(),
+        "Cannot detach combined instance and main-component blurs without changing their appearance"
+    );
+    anyhow::ensure!(
+        node.blend_mode.is_normal() || root.node.blend_mode.is_normal(),
+        "Cannot detach combined instance and main-component blend modes without changing their appearance"
+    );
+    anyhow::ensure!(
+        root.node.blend_mode.is_normal()
+            || (node.opacity.get() == 1.0
+                && !node.bindings.contains_key(&fanta_doc::BoundProp::Opacity)
+                && node.effects.is_empty()
+                && node.blurs.is_empty()
+                && !node.flags.contains(fanta_doc::NodeFlags::ISOLATED_BLEND)),
+        "Cannot detach the main component's blend mode across the instance's opacity or isolation without changing its appearance"
+    );
     let root_id = root.node.id;
     let children: Vec<CanvasNode> = expanded
         .iter()
@@ -800,7 +831,7 @@ pub(crate) fn detach_instance_operations(doc: &Doc, id: NodeId) -> Vec<Operation
             new: root.node.blend_mode,
         });
     }
-    operations
+    Ok(operations)
 }
 
 /// Promote the frame or group rooted at `id` into a new component master —
@@ -2654,7 +2685,7 @@ mod tests {
     #[test]
     fn detach_instance_materializes_the_master_subtree_in_one_step() {
         let (mut doc, _, master_root_id, instance_id) = doc_with_instance();
-        let operations = detach_instance_operations(&doc, instance_id);
+        let operations = detach_instance_operations(&doc, instance_id).expect("detach");
         let Some(Operation::DetachInstance {
             id, new, expanded, ..
         }) = operations.first()
@@ -2680,8 +2711,16 @@ mod tests {
         assert_eq!(doc.scene.children_of(Some(instance_id)).len(), 1);
 
         // Detaching something that is not an instance is a no-op.
-        assert!(detach_instance_operations(&doc, master_root_id).is_empty());
-        assert!(detach_instance_operations(&doc, NodeId::new()).is_empty());
+        assert!(
+            detach_instance_operations(&doc, master_root_id)
+                .expect("non-instance")
+                .is_empty()
+        );
+        assert!(
+            detach_instance_operations(&doc, NodeId::new())
+                .expect("missing node")
+                .is_empty()
+        );
     }
 
     #[test]

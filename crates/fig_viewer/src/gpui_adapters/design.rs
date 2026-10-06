@@ -4260,8 +4260,22 @@ impl FigView {
                     return;
                 };
                 self.finish_document_edits_for_external_change(cx);
-                let ops = self.design_ops(cx, |doc| detach_instance_operations(doc, id));
-                self.design_apply_ops(ops, cx);
+                let result = self
+                    .item()
+                    .read(cx)
+                    .document()
+                    .map(|document| detach_instance_operations(&document.doc, id));
+                match result {
+                    Some(Ok(operations)) => {
+                        self.design_apply_ops(operations, cx);
+                    }
+                    Some(Err(error)) => crate::view::show_canvas_notice(
+                        format!("Detach instance: {error:#}"),
+                        window,
+                        cx,
+                    ),
+                    None => {}
+                }
             }
             DesignPanelAction::GoToMainComponentRequested { node_id: id } => {
                 let Some(id) = node_id(id) else {

@@ -1085,6 +1085,15 @@ pub(crate) fn replace_media(
 }
 
 fn release_components(doc: &Doc, roots: &[NodeId]) -> Result<Vec<Operation>> {
+    release_components_with_limits(doc, roots, 64, 100_000)
+}
+
+fn release_components_with_limits(
+    doc: &Doc,
+    roots: &[NodeId],
+    maximum_depth: usize,
+    maximum_nodes: usize,
+) -> Result<Vec<Operation>> {
     let removed: std::collections::HashSet<_> = roots
         .iter()
         .flat_map(|id| doc.scene.descendants_of(*id))
@@ -1100,26 +1109,95 @@ fn release_components(doc: &Doc, roots: &[NodeId]) -> Result<Vec<Operation>> {
         return Ok(Vec::new());
     }
     let mut operations = Vec::new();
-    for node in doc
+    let mut scratch = doc.clone();
+    let mut pending = doc
         .scene
         .roots()
         .iter()
         .flat_map(|id| doc.scene.descendants_of(*id))
-        .filter_map(|id| doc.scene.get(id))
-    {
-        if removed.contains(&node.id) {
+        .filter(|id| !removed.contains(id))
+        .filter(|id| {
+            doc.scene
+                .get(*id)
+                .is_some_and(|node| matches!(node.data, NodeData::Instance(_)))
+        })
+        .map(|id| (id, Vec::new()))
+        .collect::<Vec<_>>();
+    let mut detached_nodes = 0;
+    while let Some((id, mut path)) = pending.pop() {
+        let Some(node) = scratch.scene.get(id) else {
             continue;
+        };
+        let NodeData::Instance(instance) = &node.data else {
+            continue;
+        };
+        for replacement in &instance.overrides {
+            if let fanta_doc::OverrideValue::SwapInstance { component } = &replacement.value {
+                let affected = components.contains(component)
+                    || scratch.components.sets.get(component).is_some_and(|set| {
+                        set.members.iter().any(|member| components.contains(member))
+                    });
+                ensure!(
+                    !affected,
+                    "A surviving instance uses this swapped component; detach or reset that swap before deleting its main component"
+                );
+            }
         }
-        if let NodeData::Instance(instance) = &node.data
-            && components.contains(&instance.component)
-        {
-            let detach = crate::properties_ops::detach_instance_operations(doc, node.id);
-            ensure!(
-                !detach.is_empty(),
-                "Cannot preserve an instance of this component"
-            );
-            operations.extend(detach);
+        let Some(resolved) = fanta_doc::resolved_component_with_context(
+            &scratch.scene,
+            &scratch.components,
+            instance,
+            &fanta_doc::InstanceExpansionContext::new(
+                &scratch.variables,
+                &scratch.active_modes,
+                id,
+            ),
+        )
+        .filter(|resolved| components.contains(&resolved.resolved_component)) else {
+            continue;
+        };
+        ensure!(
+            !path.contains(&resolved.resolved_component),
+            "Cannot preserve a cyclic component dependency; no layers were deleted"
+        );
+        ensure!(
+            path.len() < maximum_depth,
+            "Cannot safely detach more than {maximum_depth} nested components; no layers were deleted"
+        );
+        let count = scratch
+            .scene
+            .descendants_of(resolved.resolved_root)
+            .take(maximum_nodes - detached_nodes + 1)
+            .count();
+        ensure!(
+            count <= maximum_nodes - detached_nodes,
+            "Cannot safely detach more than {maximum_nodes} component nodes at once; no layers were deleted"
+        );
+        detached_nodes += count;
+        path.push(resolved.resolved_component);
+        let detach = crate::properties_ops::detach_instance_operations(&scratch, id)?;
+        ensure!(
+            !detach.is_empty(),
+            "Cannot preserve an instance of this component"
+        );
+        for operation in &detach {
+            scratch.apply(operation.clone())?;
         }
+        operations.extend(detach);
+        // Expansion preserves nested instances, so materialized descendants
+        // must be checked before their component definitions can be removed.
+        pending.extend(
+            scratch
+                .scene
+                .descendants_of(id)
+                .filter(|id| {
+                    scratch
+                        .scene
+                        .get(*id)
+                        .is_some_and(|node| matches!(node.data, NodeData::Instance(_)))
+                })
+                .map(|id| (id, path.clone())),
+        );
     }
     for set in doc
         .components
@@ -1261,6 +1339,384 @@ mod tests {
         );
         assert!(doc.redo().expect("redo"));
         verify(doc);
+    }
+
+    fn nested_component_delete_fixture(cyclic: bool) -> (Doc, NodeId, NodeId, fanta_doc::AssetId) {
+        let mut doc = Doc::new();
+        let page = insert(
+            &mut doc,
+            CanvasNode::new(NodeData::Group(GroupNode::default())),
+            None,
+        );
+        doc.add_page(page);
+        doc.set_active_page(Some(page));
+        let mut master = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([32.0, 32.0]),
+            ..Default::default()
+        }));
+        master.transform = Transform2D::translation(500.0, 500.0);
+        let outer = insert(&mut doc, master.clone(), Some(page));
+        let inner = insert(
+            &mut doc,
+            {
+                master.id = NodeId::new();
+                master
+            },
+            Some(page),
+        );
+        let outer_component = ComponentId::new();
+        let inner_component = ComponentId::new();
+        doc.components.defs.insert(
+            outer_component,
+            ComponentDef::new(outer_component, outer, "Outer"),
+        );
+        doc.components.defs.insert(
+            inner_component,
+            ComponentDef::new(inner_component, inner, "Inner"),
+        );
+        let instance = |component| {
+            CanvasNode::new(NodeData::Instance(InstanceNode {
+                component,
+                overrides: Vec::new(),
+                prop_values: Default::default(),
+                derived: Vec::new(),
+                local_size: [32.0, 32.0],
+            }))
+        };
+        let mut nested = instance(inner_component);
+        nested.opacity = UnitInterval::new(0.7);
+        insert(&mut doc, nested, Some(outer));
+        let asset = fanta_doc::AssetId::new();
+        if cyclic {
+            insert(&mut doc, instance(outer_component), Some(inner));
+        } else {
+            insert(
+                &mut doc,
+                CanvasNode::new(NodeData::Bitmap(BitmapNode {
+                    asset,
+                    natural_size: [2, 2],
+                    local_size: [32.0, 32.0],
+                    crop: Some([0.0, 0.0, 0.75, 1.0]),
+                    fit: fanta_doc::ImageFitMode::Fill,
+                    tint: Some(Color::rgba(200, 180, 255, 230)),
+                })),
+                Some(inner),
+            );
+        }
+        let mut survivor = instance(outer_component);
+        survivor.opacity = UnitInterval::new(0.6);
+        let survivor = insert(&mut doc, survivor, Some(page));
+        doc.selection.replace_with([outer, inner]);
+        doc.history = Default::default();
+        (doc, outer, survivor, asset)
+    }
+
+    #[test]
+    fn layer_menu_delete_nested_masters_preserves_survivor_pixels_and_undo() {
+        let (mut doc, outer, survivor, asset) = nested_component_delete_fixture(false);
+        let mut resolver = fanta_render::InMemoryAssetResolver::new();
+        let bytes = std::sync::Arc::new(vec![
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 128, 255, 255, 0, 200,
+        ]);
+        resolver.insert(asset, fanta_render::DecodedImage::new(bytes.clone(), 2, 2));
+        let resolver = std::sync::Arc::new(resolver);
+        let pixels = |doc: &Doc| {
+            let mut renderer = fanta_render::RasterRenderer::new(128, 128).expect("renderer");
+            renderer.set_asset_resolver(resolver.clone());
+            renderer.render_with(
+                &doc.scene,
+                &doc.viewport,
+                &fanta_render::RenderInputs {
+                    components: &doc.components,
+                    variables: &doc.variables,
+                    active_modes: &doc.active_modes,
+                    ..fanta_render::RenderInputs::empty()
+                },
+            );
+            renderer.copy_rgba()
+        };
+        let expected = pixels(&doc);
+        assert!(expected.chunks_exact(4).any(|pixel| pixel[3] > 0));
+        let operations = delete_layers(&doc, outer).expect("delete nested definitions");
+        roundtrip(&mut doc, operations, |doc| {
+            assert!(doc.components.is_empty());
+            let descendants = doc
+                .scene
+                .descendants_of(survivor)
+                .filter_map(|id| doc.scene.get(id))
+                .collect::<Vec<_>>();
+            assert!(
+                descendants
+                    .iter()
+                    .all(|node| !matches!(node.data, NodeData::Instance(_))),
+                "newly detached nested instances must not reference the removed inner master"
+            );
+            assert!(descendants.iter().any(
+                |node| matches!(&node.data, NodeData::Bitmap(bitmap) if bitmap.asset == asset)
+            ));
+            assert_eq!(
+                pixels(doc),
+                expected,
+                "nested survivor keeps exact painted appearance and asset"
+            );
+            assert_eq!(
+                fanta_render::AssetResolver::resolve(resolver.as_ref(), asset)
+                    .expect("asset")
+                    .pixels_rgba
+                    .as_ref(),
+                bytes.as_ref()
+            );
+        });
+    }
+
+    #[test]
+    fn layer_menu_detach_master_blend_keeps_outer_isolation_pixels() {
+        for isolated in [false, true] {
+            let (mut doc, outer, survivor, asset) = nested_component_delete_fixture(false);
+            doc.scene.get_mut(outer).expect("master").blend_mode = fanta_doc::BlendMode::Multiply;
+            let placed = doc.scene.get_mut(survivor).expect("instance");
+            placed.opacity = UnitInterval::new(if isolated { 1.0 } else { 0.4 });
+            placed
+                .flags
+                .set(fanta_doc::NodeFlags::ISOLATED_BLEND, isolated);
+            let page = doc.active_page();
+            let mut backdrop = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                -64.0,
+                -64.0,
+                128.0,
+                128.0,
+                Color::rgb(255, 0, 0),
+            )));
+            backdrop.parent = page;
+            backdrop.index = fanta_doc::IndexKey::from_raw(0.0);
+            doc.scene.insert(backdrop).expect("opaque red backdrop");
+            let mut resolver = fanta_render::InMemoryAssetResolver::new();
+            resolver.insert(
+                asset,
+                fanta_render::DecodedImage::new(
+                    std::sync::Arc::new([0, 0, 255, 255].repeat(4)),
+                    2,
+                    2,
+                ),
+            );
+            let resolver = std::sync::Arc::new(resolver);
+            let pixels = |doc: &Doc| {
+                let mut renderer = fanta_render::RasterRenderer::new(128, 128).expect("renderer");
+                renderer.set_asset_resolver(resolver.clone());
+                renderer.render_with(
+                    &doc.scene,
+                    &doc.viewport,
+                    &fanta_render::RenderInputs {
+                        components: &doc.components,
+                        variables: &doc.variables,
+                        active_modes: &doc.active_modes,
+                        ..fanta_render::RenderInputs::empty()
+                    },
+                );
+                renderer.copy_rgba()
+            };
+            let expected = pixels(&doc);
+            assert!(
+                expected.chunks_exact(4).any(|pixel| pixel[2] > 0),
+                "the original isolated instance preserves a blue contribution"
+            );
+            let before = serde_json::to_value(&doc).expect("snapshot");
+            let error = crate::properties_ops::detach_instance_operations(&doc, survivor)
+                .expect_err("unsafe blend hoisting must be refused");
+            assert!(error.to_string().contains("blend mode across"));
+            assert!(
+                delete_layers(&doc, outer).is_err(),
+                "destructive commands use the same appearance guard"
+            );
+            assert_eq!(serde_json::to_value(&doc).expect("snapshot"), before);
+            assert_eq!(pixels(&doc), expected);
+        }
+    }
+
+    #[test]
+    fn layer_menu_delete_refuses_unsupported_instance_composition_atomically() {
+        for composition in ["bound opacity", "effects", "blurs", "blend modes"] {
+            let (mut doc, outer, survivor, _) = nested_component_delete_fixture(false);
+            match composition {
+                "bound opacity" => {
+                    let collection = fanta_doc::VariableCollectionId::new();
+                    let mode = fanta_doc::ModeId::new();
+                    let variable = fanta_doc::VariableId::new();
+                    doc.variables.collections.insert(
+                        collection,
+                        fanta_doc::VariableCollection {
+                            id: collection,
+                            name: "Opacity".into(),
+                            modes: vec![fanta_doc::Mode {
+                                id: mode,
+                                name: "Default".into(),
+                            }],
+                            default_mode: mode,
+                            variable_order: vec![variable],
+                        },
+                    );
+                    doc.variables.variables.insert(
+                        variable,
+                        fanta_doc::Variable {
+                            id: variable,
+                            collection,
+                            name: "Photo opacity".into(),
+                            ty: fanta_doc::VariableType::Float,
+                            values_by_mode: [(mode, fanta_doc::VarValue::Float { value: 0.4 })]
+                                .into_iter()
+                                .collect(),
+                            scopes: Vec::new(),
+                        },
+                    );
+                    doc.scene
+                        .get_mut(survivor)
+                        .expect("instance")
+                        .bindings
+                        .insert(fanta_doc::BoundProp::Opacity, variable);
+                    doc.scene.get_mut(outer).expect("master").opacity = UnitInterval::new(0.5);
+                }
+                "effects" => {
+                    for (id, offset) in [(outer, [7.0, 3.0]), (survivor, [-5.0, 2.0])] {
+                        doc.scene
+                            .get_mut(id)
+                            .expect("node")
+                            .effects
+                            .push(fanta_doc::Shadow {
+                                kind: Default::default(),
+                                color: Color::BLACK,
+                                blur: 2.0,
+                                spread: 0.0,
+                                offset,
+                                show_behind_node: true,
+                            });
+                    }
+                }
+                "blurs" => {
+                    doc.scene
+                        .get_mut(outer)
+                        .expect("master")
+                        .blurs
+                        .push(fanta_doc::Blur::layer(3.0));
+                    doc.scene
+                        .get_mut(survivor)
+                        .expect("instance")
+                        .blurs
+                        .push(fanta_doc::Blur::layer(5.0));
+                }
+                "blend modes" => {
+                    doc.scene.get_mut(outer).expect("master").blend_mode =
+                        fanta_doc::BlendMode::Multiply;
+                    doc.scene.get_mut(survivor).expect("instance").blend_mode =
+                        fanta_doc::BlendMode::Screen;
+                }
+                _ => unreachable!(),
+            }
+            let before = serde_json::to_value(&doc).expect("snapshot");
+            let detach_error = crate::properties_ops::detach_instance_operations(&doc, survivor)
+                .expect_err("explicit Detach must also refuse");
+            assert!(
+                detach_error.to_string().contains(composition),
+                "{composition}: {detach_error}"
+            );
+            let error = delete_layers(&doc, outer)
+                .expect_err("deletion must refuse rather than change composed appearance");
+            assert!(
+                error.to_string().contains(composition),
+                "{composition}: {error}"
+            );
+            assert_eq!(serde_json::to_value(&doc).expect("snapshot"), before);
+        }
+    }
+
+    #[test]
+    fn layer_menu_delete_nested_component_limits_refuse_without_partial_edits() {
+        let (doc, _, _, _) = nested_component_delete_fixture(false);
+        for (depth, nodes, reason) in [(1, 100, "nested components"), (64, 3, "component nodes")] {
+            let before = serde_json::to_value(&doc).expect("snapshot");
+            let error =
+                release_components_with_limits(&doc, doc.selection.as_slice(), depth, nodes)
+                    .expect_err("bounded materialization");
+            assert!(error.to_string().contains(reason), "{error}");
+            assert_eq!(serde_json::to_value(&doc).expect("snapshot"), before);
+        }
+    }
+
+    #[test]
+    fn layer_menu_delete_refuses_a_newly_materialized_sparse_swap() {
+        let (mut doc, outer, _, _) = nested_component_delete_fixture(false);
+        let original_nested = *doc
+            .scene
+            .children_of(Some(outer))
+            .first()
+            .expect("nested instance");
+        let NodeData::Instance(original) = &doc.scene.get(original_nested).expect("node").data
+        else {
+            panic!("instance");
+        };
+        let removed_component = original.component;
+        let page = doc.active_page();
+        let master = || {
+            let mut node = CanvasNode::new(NodeData::Group(GroupNode {
+                clip_size: Some([32.0, 32.0]),
+                ..Default::default()
+            }));
+            node.transform = Transform2D::translation(700.0, 700.0);
+            node
+        };
+        let surviving_root = insert(&mut doc, master(), page);
+        let default_root = insert(&mut doc, master(), page);
+        let surviving_component = ComponentId::new();
+        let default_component = ComponentId::new();
+        doc.components.defs.insert(
+            surviving_component,
+            ComponentDef::new(surviving_component, surviving_root, "Surviving base"),
+        );
+        doc.components.defs.insert(
+            default_component,
+            ComponentDef::new(default_component, default_root, "Default nested"),
+        );
+        let default_instance = insert(
+            &mut doc,
+            CanvasNode::new(NodeData::Instance(InstanceNode {
+                component: default_component,
+                overrides: Vec::new(),
+                prop_values: Default::default(),
+                derived: Vec::new(),
+                local_size: [32.0, 32.0],
+            })),
+            Some(surviving_root),
+        );
+        doc.scene
+            .get_mut(original_nested)
+            .expect("original nested")
+            .data = NodeData::Instance(InstanceNode {
+            component: surviving_component,
+            overrides: vec![fanta_doc::Override {
+                target_path: [default_instance].into_iter().collect(),
+                target_prop: fanta_doc::BoundProp::Visible,
+                value: fanta_doc::OverrideValue::SwapInstance {
+                    component: removed_component,
+                },
+            }],
+            prop_values: Default::default(),
+            derived: Vec::new(),
+            local_size: [32.0, 32.0],
+        });
+        let before = serde_json::to_value(&doc).expect("snapshot");
+        let error = delete_layers(&doc, outer)
+            .expect_err("newly materialized survivor has an unsupported sparse swap dependency");
+        assert!(error.to_string().contains("swapped component"));
+        assert_eq!(serde_json::to_value(&doc).expect("snapshot"), before);
+    }
+
+    #[test]
+    fn layer_menu_delete_nested_component_cycle_is_refused_atomically() {
+        let (doc, outer, _, _) = nested_component_delete_fixture(true);
+        let before = serde_json::to_value(&doc).expect("snapshot");
+        let error = delete_layers(&doc, outer)
+            .expect_err("cyclic dependency cannot be materialized safely");
+        assert!(error.to_string().contains("cyclic"));
+        assert_eq!(serde_json::to_value(&doc).expect("snapshot"), before);
     }
 
     #[test]
