@@ -21,8 +21,9 @@
 use std::collections::HashMap;
 
 use fanta_doc::{
-    BoundProp, Color, Doc, ExpandedNode, Fill, NodeData, NodeFlags, NodeId, Operation, Override,
-    OverridePath, OverrideValue, TextNode, Transform2D, expand_instance,
+    BoundProp, Color, Doc, ExpandedNode, Fill, InstanceExpansionContext, NodeData, NodeFlags,
+    NodeId, Operation, Override, OverridePath, OverrideValue, TextNode, Transform2D,
+    expand_instance_with_context,
 };
 use glam::DVec2;
 use smallvec::smallvec;
@@ -57,7 +58,9 @@ fn expand_resolved(doc: &Doc, instance_id: NodeId) -> Option<(Vec<ExpandedNode>,
         return None;
     };
     let world = doc.scene.world_transform(instance_id)?;
-    let mut expanded = expand_instance(&doc.scene, &doc.components, instance);
+    let context = InstanceExpansionContext::new(&doc.variables, &doc.active_modes, instance_id);
+    let mut expanded =
+        expand_instance_with_context(&doc.scene, &doc.components, instance, &context);
     if expanded.is_empty() {
         return None;
     }
@@ -366,6 +369,483 @@ mod tests {
 
         let def_path: OverridePath = smallvec![text_id];
         (doc, instance_id, def_path)
+    }
+
+    struct ResolvedTextFixture {
+        doc: Doc,
+        instance: NodeId,
+        master: NodeId,
+        text: NodeId,
+        frame: NodeId,
+        path: OverridePath,
+        collection: fanta_doc::VariableCollectionId,
+        modes: [fanta_doc::ModeId; 2],
+        caption: fanta_doc::VariableId,
+        alias: fanta_doc::VariableId,
+    }
+
+    fn resolved_text_variable(
+        fixture: &mut ResolvedTextFixture,
+        name: &str,
+        ty: fanta_doc::VariableType,
+        values: [fanta_doc::VarValue; 2],
+    ) -> fanta_doc::VariableId {
+        let id = fanta_doc::VariableId::new();
+        fixture.doc.variables.variables.insert(
+            id,
+            fanta_doc::Variable {
+                id,
+                collection: fixture.collection,
+                name: name.into(),
+                ty,
+                values_by_mode: fixture.modes.into_iter().zip(values).collect(),
+                scopes: Vec::new(),
+            },
+        );
+        fixture
+            .doc
+            .variables
+            .collections
+            .get_mut(&fixture.collection)
+            .expect("collection")
+            .variable_order
+            .push(id);
+        id
+    }
+
+    fn resolved_text_fixture(alias_as_default: bool) -> ResolvedTextFixture {
+        use fanta_doc::{
+            ComponentPropDef, ComponentPropId, ComponentPropKind, Mode, ModeId, PropBindingTarget,
+            VarValue, VariableCollection, VariableCollectionId, VariableType,
+        };
+        let (mut doc, instance, path) = doc_with_instance();
+        let text = *path.last().expect("text path");
+        let master = doc.scene.get(text).expect("text").parent.expect("master");
+        let collection = VariableCollectionId::new();
+        let modes = [ModeId::new(), ModeId::new()];
+        doc.variables.collections.insert(
+            collection,
+            VariableCollection {
+                id: collection,
+                name: "Placed modes".into(),
+                modes: modes
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, id)| Mode {
+                        id,
+                        name: format!("Mode {index}"),
+                    })
+                    .collect(),
+                default_mode: modes[0],
+                variable_order: Vec::new(),
+            },
+        );
+        let mut frame = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        frame.transform = Transform2D::translation(100.0, 50.0);
+        let frame = doc.scene.insert(frame).expect("placed frame");
+        doc.scene
+            .set_parent(instance, Some(frame), fanta_doc::IndexKey::FIRST)
+            .expect("instance parent");
+        doc.remove_page(instance).expect("old test page");
+        doc.add_page(frame);
+        doc.set_active_page(Some(frame));
+        let NodeData::Group(group) = &mut doc.scene.get_mut(master).expect("master").data else {
+            panic!("master group");
+        };
+        group.clip_size = Some([240.0, 96.0]);
+        group.explicit_modes.insert(collection, modes[0]);
+        let mut fixture = ResolvedTextFixture {
+            doc,
+            instance,
+            master,
+            text,
+            frame,
+            path,
+            collection,
+            modes,
+            caption: fanta_doc::VariableId::new(),
+            alias: fanta_doc::VariableId::new(),
+        };
+        fixture.caption = resolved_text_variable(
+            &mut fixture,
+            "Caption",
+            VariableType::String,
+            [
+                VarValue::String {
+                    value: "Visible A".into(),
+                },
+                VarValue::String {
+                    value: "Visible B".into(),
+                },
+            ],
+        );
+        let caption = fixture.caption;
+        fixture.alias = resolved_text_variable(
+            &mut fixture,
+            "Caption alias",
+            VariableType::String,
+            [
+                VarValue::Alias { variable: caption },
+                VarValue::Alias { variable: caption },
+            ],
+        );
+        let property = ComponentPropId::new();
+        let NodeData::Instance(placed) =
+            &mut fixture.doc.scene.get_mut(instance).expect("instance").data
+        else {
+            panic!("instance");
+        };
+        placed.local_size = [240.0, 96.0];
+        let component = placed.component;
+        if !alias_as_default {
+            placed.prop_values.insert(
+                property,
+                VarValue::Alias {
+                    variable: fixture.alias,
+                },
+            );
+        }
+        fixture
+            .doc
+            .components
+            .defs
+            .get_mut(&component)
+            .expect("definition")
+            .props
+            .push(ComponentPropDef {
+                id: property,
+                name: "Caption".into(),
+                kind: ComponentPropKind::Text,
+                formatter: Default::default(),
+                default: if alias_as_default {
+                    VarValue::Alias {
+                        variable: fixture.alias,
+                    }
+                } else {
+                    VarValue::String {
+                        value: "Default caption".into(),
+                    }
+                },
+                bindings: vec![PropBindingTarget {
+                    path: fixture.path.clone(),
+                    prop: BoundProp::TextContent,
+                }],
+            });
+        fixture.doc.history = Default::default();
+        fixture
+    }
+
+    fn set_text_modes(fixture: &mut ResolvedTextFixture, active: usize, pin: Option<usize>) {
+        fixture
+            .doc
+            .active_modes
+            .insert(fixture.collection, fixture.modes[active]);
+        let NodeData::Group(frame) = &mut fixture
+            .doc
+            .scene
+            .get_mut(fixture.frame)
+            .expect("frame")
+            .data
+        else {
+            panic!("frame");
+        };
+        frame.explicit_modes.clear();
+        if let Some(pin) = pin {
+            frame
+                .explicit_modes
+                .insert(fixture.collection, fixture.modes[pin]);
+        }
+    }
+
+    #[test]
+    fn resolved_instance_text_aliases_use_placed_modes_and_preserve_override_history() {
+        for alias_as_default in [false, true] {
+            let mut fixture = resolved_text_fixture(alias_as_default);
+            let point = DVec2::new(620.0, 380.0);
+            for (active, pin, expected) in [
+                (0, None, "Visible A"),
+                (1, None, "Visible B"),
+                (0, Some(1), "Visible B"),
+                (1, Some(0), "Visible A"),
+            ] {
+                set_text_modes(&mut fixture, active, pin);
+                let before = serde_json::to_value(&fixture.doc).expect("before targeting");
+                let target = text_target_at(&fixture.doc, fixture.instance, point)
+                    .expect("painted text is editable");
+                assert_eq!(target.text.content, expected);
+                assert_eq!(target.instance_id, fixture.instance);
+                assert_eq!(target.def_path, fixture.path);
+                assert_eq!(
+                    target.world.transform_point(DVec2::ZERO),
+                    DVec2::new(610.0, 370.0)
+                );
+                assert_eq!(
+                    text_clones(&fixture.doc, fixture.instance)
+                        .iter()
+                        .map(|(path, _, content)| (path, content.as_str()))
+                        .collect::<Vec<_>>(),
+                    vec![(&fixture.path, expected)]
+                );
+                assert_eq!(
+                    serde_json::to_value(&fixture.doc).expect("after targeting"),
+                    before
+                );
+            }
+            let original_instance = fixture
+                .doc
+                .scene
+                .get(fixture.instance)
+                .expect("instance")
+                .clone();
+            let original_master = fixture
+                .doc
+                .scene
+                .get(fixture.text)
+                .expect("master text")
+                .clone();
+            for operation in commit_ops(
+                &fixture.doc,
+                fixture.instance,
+                &fixture.path,
+                Some("Only this instance"),
+                None,
+            ) {
+                fixture.doc.apply(operation).expect("commit text");
+            }
+            assert_eq!(fixture.doc.history.undo_depth(), 1);
+            assert_eq!(
+                text_target_at(&fixture.doc, fixture.instance, point)
+                    .expect("edited text")
+                    .text
+                    .content,
+                "Only this instance"
+            );
+            assert_eq!(fixture.doc.scene.get(fixture.text), Some(&original_master));
+            assert!(fixture.doc.undo().expect("undo"));
+            assert_eq!(
+                fixture.doc.scene.get(fixture.instance),
+                Some(&original_instance)
+            );
+            assert_eq!(
+                text_target_at(&fixture.doc, fixture.instance, point)
+                    .expect("restored text")
+                    .text
+                    .content,
+                "Visible A"
+            );
+            assert!(fixture.doc.redo().expect("redo"));
+            assert_eq!(
+                text_target_at(&fixture.doc, fixture.instance, point)
+                    .expect("redone text")
+                    .text
+                    .content,
+                "Only this instance"
+            );
+            assert_eq!(fixture.doc.scene.get(fixture.text), Some(&original_master));
+        }
+    }
+
+    #[test]
+    fn resolved_instance_text_visibility_and_opacity_exclude_unpainted_clones() {
+        use fanta_doc::{VarValue, VariableType};
+        for property in [BoundProp::Visible, BoundProp::Opacity] {
+            for bind_parent in [false, true] {
+                let mut fixture = resolved_text_fixture(false);
+                let (ty, values) = if property == BoundProp::Visible {
+                    (
+                        VariableType::Boolean,
+                        [
+                            VarValue::Boolean { value: true },
+                            VarValue::Boolean { value: false },
+                        ],
+                    )
+                } else {
+                    (
+                        VariableType::Float,
+                        [
+                            VarValue::Float { value: 1.0 },
+                            VarValue::Float { value: 0.0 },
+                        ],
+                    )
+                };
+                let variable = resolved_text_variable(&mut fixture, "Painted", ty, values);
+                let owner = if bind_parent {
+                    fixture.master
+                } else {
+                    fixture.text
+                };
+                fixture
+                    .doc
+                    .scene
+                    .get_mut(owner)
+                    .expect("binding owner")
+                    .bindings
+                    .insert(property, variable);
+                for (active, pin, visible) in [
+                    (0, None, true),
+                    (1, None, false),
+                    (0, Some(1), false),
+                    (1, Some(0), true),
+                ] {
+                    set_text_modes(&mut fixture, active, pin);
+                    let before = serde_json::to_value(&fixture.doc).expect("before");
+                    assert_eq!(
+                        text_target_at(&fixture.doc, fixture.instance, DVec2::new(620.0, 380.0))
+                            .is_some(),
+                        visible,
+                        "{property:?}, parent={bind_parent}, pin={pin:?}"
+                    );
+                    assert_eq!(
+                        !text_clones(&fixture.doc, fixture.instance).is_empty(),
+                        visible
+                    );
+                    assert_eq!(serde_json::to_value(&fixture.doc).expect("after"), before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolved_instance_text_keeps_derived_geometry_and_resolved_clip_guards() {
+        use fanta_doc::{DerivedOverride, TextAutoResize, TextStyle, VarValue, VariableType};
+        let mut fixture = resolved_text_fixture(false);
+        let typography = resolved_text_variable(
+            &mut fixture,
+            "Typography",
+            VariableType::Typography,
+            [
+                VarValue::TextStyle {
+                    value: TextStyle {
+                        size_px: 12.0,
+                        ..Default::default()
+                    },
+                },
+                VarValue::TextStyle {
+                    value: TextStyle {
+                        size_px: 24.0,
+                        ..Default::default()
+                    },
+                },
+            ],
+        );
+        let text = fixture
+            .doc
+            .scene
+            .get_mut(fixture.text)
+            .expect("master text");
+        text.bindings.insert(BoundProp::TextStyle, typography);
+        let NodeData::Text(text) = &mut text.data else {
+            panic!("text");
+        };
+        text.auto_resize = TextAutoResize::WidthAndHeight;
+        let NodeData::Instance(instance) = &mut fixture
+            .doc
+            .scene
+            .get_mut(fixture.instance)
+            .expect("instance")
+            .data
+        else {
+            panic!("instance");
+        };
+        instance.derived.push(DerivedOverride {
+            path: fixture.path.clone(),
+            transform: Some(Transform2D::translation(40.0, 12.0)),
+            size: Some([180.0, 44.0]),
+            fills: None,
+            path_data: None,
+            stroke_path: None,
+            stroke_weight: None,
+            text: None,
+        });
+        set_text_modes(&mut fixture, 0, Some(1));
+        let before = serde_json::to_value(&fixture.doc).expect("before");
+        let point = DVec2::new(800.0, 390.0);
+        let target =
+            text_target_at(&fixture.doc, fixture.instance, point).expect("derived text bounds");
+        assert_eq!(target.text.content, "Visible B");
+        assert_eq!(target.text.style.size_px, 24.0);
+        assert_eq!(target.text.local_size, [180.0, 44.0]);
+        assert_eq!(
+            target.world.transform_point(DVec2::ZERO),
+            DVec2::new(640.0, 362.0)
+        );
+        assert!(text_target_at(&fixture.doc, fixture.instance, DVec2::new(830.0, 390.0)).is_none());
+        assert_eq!(serde_json::to_value(&fixture.doc).expect("after"), before);
+        fixture
+            .doc
+            .scene
+            .get_mut(fixture.text)
+            .expect("text")
+            .flags
+            .insert(NodeFlags::LOCKED);
+        assert!(text_target_at(&fixture.doc, fixture.instance, point).is_none());
+        fixture
+            .doc
+            .scene
+            .get_mut(fixture.text)
+            .expect("text")
+            .flags
+            .remove(NodeFlags::LOCKED);
+        let width = resolved_text_variable(
+            &mut fixture,
+            "Clip width",
+            VariableType::Float,
+            [
+                VarValue::Float { value: 240.0 },
+                VarValue::Float { value: 100.0 },
+            ],
+        );
+        fixture
+            .doc
+            .scene
+            .get_mut(fixture.master)
+            .expect("master")
+            .bindings
+            .insert(BoundProp::ClipWidth, width);
+        assert!(
+            text_target_at(&fixture.doc, fixture.instance, point).is_none(),
+            "resolved ancestor clip hides the text"
+        );
+        set_text_modes(&mut fixture, 1, Some(0));
+        assert!(
+            text_target_at(&fixture.doc, fixture.instance, point).is_some(),
+            "placed pin restores the wider clip"
+        );
+    }
+
+    #[test]
+    fn resolved_instance_text_unresolved_aliases_keep_the_authored_fallback() {
+        use fanta_doc::VarValue;
+        for cycle in [false, true] {
+            let mut fixture = resolved_text_fixture(false);
+            if cycle {
+                fixture
+                    .doc
+                    .variables
+                    .variables
+                    .get_mut(&fixture.caption)
+                    .expect("caption")
+                    .values_by_mode = fixture
+                    .modes
+                    .into_iter()
+                    .map(|mode| {
+                        (
+                            mode,
+                            VarValue::Alias {
+                                variable: fixture.alias,
+                            },
+                        )
+                    })
+                    .collect();
+            } else {
+                fixture.doc.variables.variables.remove(&fixture.caption);
+            }
+            let before = serde_json::to_value(&fixture.doc).expect("before");
+            let target = text_target_at(&fixture.doc, fixture.instance, DVec2::new(620.0, 380.0))
+                .expect("literal fallback text");
+            assert_eq!(target.text.content, "Master");
+            assert_eq!(serde_json::to_value(&fixture.doc).expect("after"), before);
+        }
     }
 
     #[test]
