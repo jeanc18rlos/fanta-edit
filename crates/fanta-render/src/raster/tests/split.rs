@@ -1417,6 +1417,7 @@ fn split_ancestor_compositing_and_unbounded_paint_remain_ineligible() {
             5 => node.blend_mode = BlendMode::Multiply,
             6 => {
                 node.meta = serde_json::json!({"clip_content": false});
+                node.data.as_group_mut().expect("group").clip_size = None;
             }
             7 => node.data.as_group_mut().expect("group").clip_size = None,
             8 => node.flags.insert(NodeFlags::HIDDEN),
@@ -4122,4 +4123,216 @@ fn retained_frame_images_stay_immutable_after_later_success_and_refusal() {
         second_pixels,
         "refusal preserves the last published image"
     );
+}
+
+#[test]
+fn split_fixed_paint_box_ancestors_keep_overflow_and_foreground_order() {
+    for local_size_only in [false, true] {
+        for reverse in [false, true] {
+            for reflected in [false, true] {
+                let (mut doc, page, _, moving) = clipped_ancestor_fixture(reverse, true, reflected);
+                let ancestors: Vec<_> = doc
+                    .scene
+                    .ancestors_of(moving)
+                    .filter(|node| node.id != page)
+                    .map(|node| node.id)
+                    .collect();
+                for id in ancestors {
+                    let node = doc.scene.get_mut(id).expect("ancestor");
+                    node.meta = serde_json::json!({
+                        "clip_content":false,
+                        "figma_type":if node.parent == Some(page) { "SECTION" } else { "FRAME" },
+                    });
+                    let group = node.data.as_group_mut().expect("group");
+                    if local_size_only {
+                        group.local_size = group.clip_size.take();
+                    }
+                }
+                for [x, y] in [[-25.0, -14.0], [0.0, 0.0], [80.0, 43.0], [130.0, 85.0]] {
+                    doc.scene
+                        .set_transform(moving, Transform2D::translation(x, y))
+                        .expect("overflow move");
+                    for (zoom, display_scale) in
+                        [(0.0225, 1.0), (0.73, 1.0), (1.0, 2.0), (2.0, 1.0)]
+                    {
+                        assert_parity_at_scale(
+                            &doc,
+                            page,
+                            moving,
+                            &Viewport {
+                                center: [0.375, -1.125],
+                                zoom,
+                            },
+                            None,
+                            display_scale,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn retained_fixed_paint_box_keeps_background_border_and_visible_overflow() {
+    for local_size_only in [false, true] {
+        let mut doc = Doc::new();
+        let page = add(
+            &mut doc,
+            None,
+            NodeData::Group(GroupNode {
+                background: Some(Fill::solid(Color::BLACK)),
+                ..Default::default()
+            }),
+            0.0,
+            0.0,
+        );
+        let mut stroke = fanta_doc::Stroke::solid(Color::rgb(0, 0, 255), 2.0);
+        stroke.align = fanta_doc::StrokeAlign::Inside;
+        let parent = add(
+            &mut doc,
+            Some(page),
+            NodeData::Group(GroupNode {
+                local_size: local_size_only.then_some([40.0, 40.0]),
+                clip_size: (!local_size_only).then_some([40.0, 40.0]),
+                background: Some(Fill::solid(Color::rgb(255, 0, 0))),
+                strokes: [stroke].into_iter().collect(),
+                ..Default::default()
+            }),
+            -20.0,
+            -20.0,
+        );
+        doc.scene.get_mut(parent).expect("parent").meta = serde_json::json!({"clip_content":false});
+        let moving = add(
+            &mut doc,
+            Some(parent),
+            NodeData::Vector(VectorNode::rect_solid(
+                0.0,
+                0.0,
+                8.0,
+                8.0,
+                Color::rgb(0, 255, 0),
+            )),
+            60.0,
+            0.0,
+        );
+        let viewport = Viewport {
+            center: [0.0, 0.0],
+            zoom: 1.0,
+        };
+        let mut renderer = RasterRenderer::new(WIDTH, HEIGHT).expect("retained renderer");
+        let mut normal = RasterRenderer::new(WIDTH, HEIGHT).expect("normal renderer");
+        {
+            let inputs = RenderInputs::for_doc(&doc);
+            let spec = SplitSpec::prepare(&doc.scene, page, moving, &inputs, None)
+                .expect("fixed paint extent");
+            assert!(spec.requires_ordered_paint());
+            let mut target = surface();
+            target.canvas().clear(skia_safe::Color::MAGENTA);
+            let sentinel = pixels(&mut target);
+            assert!(matches!(
+                renderer.render_split_to_canvas(
+                    target.canvas(),
+                    WIDTH,
+                    HEIGHT,
+                    &doc.scene,
+                    &viewport,
+                    &inputs,
+                    &spec,
+                    SplitPhase::Above
+                ),
+                Err(SplitError::RequiresOrderedPaint)
+            ));
+            assert!(
+                pixels(&mut target) == sentinel,
+                "reject independent raster paint before modifying output"
+            );
+        }
+        let mut session = RetainedTranslationSession::prepare(
+            &mut renderer,
+            &doc.scene,
+            page,
+            moving,
+            &viewport,
+            &RenderInputs::for_doc(&doc),
+            None,
+            0,
+        )
+        .expect("fixed box with overflow");
+        for [x, y] in [[60.0, 0.0], [18.0, -1.0], [80.0, 30.0], [-30.0, 20.0]] {
+            doc.scene
+                .set_transform(moving, Transform2D::translation(x, y))
+                .expect("move overflow");
+            assert_retained_frame(
+                &mut session,
+                &mut renderer,
+                &mut normal,
+                &doc,
+                page,
+                &viewport,
+                None,
+            );
+            let frame = session
+                .render(
+                    &mut renderer,
+                    &doc.scene,
+                    &viewport,
+                    &RenderInputs::for_doc(&doc),
+                    None,
+                    0,
+                )
+                .expect("same frame");
+            let painted = retained_image_pixels(&frame.image);
+            assert_eq!(
+                rgba_at(&painted, WIDTH, 96, 80),
+                [255, 0, 0, 255],
+                "fixed background does not become the moving descendant union"
+            );
+            assert_eq!(
+                rgba_at(&painted, WIDTH, 96, 61),
+                [0, 0, 255, 255],
+                "fixed border remains above even the edge-crossing child"
+            );
+            if x == 60.0 {
+                assert_eq!(
+                    rgba_at(&painted, WIDTH, 139, 63),
+                    [0, 255, 0, 255],
+                    "explicit paint extent must not introduce a child crop"
+                );
+                assert_eq!(
+                    rgba_at(&painted, WIDTH, 125, 80),
+                    [0, 0, 0, 255],
+                    "background remains confined to its authored40px extent"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn split_fixed_paint_box_still_rejects_unbounded_and_nonpositive_extent() {
+    for case in 0..5 {
+        let (mut doc, page, parent, moving) = clipped_ancestor_fixture(false, false, false);
+        let node = doc.scene.get_mut(parent).expect("ancestor");
+        node.meta = serde_json::json!({"clip_content":false,"figma_type":"SECTION"});
+        let group = node.data.as_group_mut().expect("group");
+        group.clip_size = None;
+        group.local_size = None;
+        match case {
+            0 => {}
+            1 => group.local_size = Some([0.0, 40.0]),
+            2 => group.local_size = Some([-1.0, 40.0]),
+            3 => group.clip_size = Some([40.0, 0.0]),
+            _ => {
+                group.clip_size = Some([0.0, 40.0]);
+                group.local_size = Some([40.0, 40.0]);
+            }
+        }
+        let before = serde_json::to_value(&doc).expect("before");
+        assert!(
+            matches!(SplitSpec::prepare(&doc.scene,page,moving,&RenderInputs::empty(),None),Err(SplitError::UnsupportedAncestor(id)) if id==parent),
+            "case{case}"
+        );
+        assert_eq!(serde_json::to_value(&doc).expect("after"), before);
+    }
 }
