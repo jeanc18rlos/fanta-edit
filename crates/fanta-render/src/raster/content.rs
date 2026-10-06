@@ -218,29 +218,8 @@ pub(crate) fn paint_node_content(
     }
 }
 
-/// Paint a group/frame's own content — its background fill(s) and, for a
-/// clipped frame, the child clip pushed onto the canvas (restored by the caller
-/// via the returned [`ContentPaintState`]). Split out of [`paint_node_content`]
-/// so that function reads as a thin per-variant dispatcher.
-fn paint_group(
-    canvas: &Canvas,
-    node: &CanvasNode,
-    g: &GroupNode,
-    scene_id: Option<NodeId>,
-    ctx: &mut RenderCtx,
-) -> ContentPaintState {
+fn push_group_child_clip(canvas: &Canvas, node: &CanvasNode, g: &GroupNode) -> ContentPaintState {
     let mut state = ContentPaintState::default();
-    // A Figma frame is a group carrying a background fill (and usually a clip
-    // size); a page (CANVAS) is a group with a background too. Painting that
-    // background is what separates a frame — and the page — from the dark
-    // canvas behind it. Without it every frame is transparent and its content
-    // (notably black text on a white frame) floats on the void, which reads as
-    // one undifferentiated jumble. A clipped frame fills its `[0,0,w,h]` box; an
-    // unclipped group with a background falls back to its content bounds. This
-    // box is what the background fills and the border strokes — both rounded to
-    // the frame's corner radius.
-    let box_bounds = frame_box_bounds(g, scene_id, ctx.scene);
-
     // Frame clipping: a Figma FRAME usually confines its content to its
     // box, whereas a plain group/page lets content overflow. The box is
     // carried by `clip_size`; `meta.clip_content=false` preserves the
@@ -266,12 +245,7 @@ fn paint_group(
     // follows in the caller — so it scopes exactly this frame's subtree.
     // Anti-aliased (`true`) to match the soft edges the rest of the
     // renderer draws.
-    let clips_content = node
-        .meta
-        .get("clip_content")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    let clipping = clips_content && g.clip_size.is_some();
+    let clipping = super::effects::group_clips_children(node, g);
     if clipping && let Some([w, h]) = g.clip_size {
         canvas.save();
         if g.corner_radius.is_some() || g.corner_radii.is_some() {
@@ -287,6 +261,39 @@ fn paint_group(
         }
         state.restore_child_clip = true;
     }
+
+    state
+}
+
+/// Paint a group/frame's own content — its background fill(s) and, for a
+/// clipped frame, the child clip pushed onto the canvas (restored by the caller
+/// via the returned [`ContentPaintState`]). Split out of [`paint_node_content`]
+/// so that function reads as a thin per-variant dispatcher.
+fn paint_group(
+    canvas: &Canvas,
+    node: &CanvasNode,
+    g: &GroupNode,
+    scene_id: Option<NodeId>,
+    ctx: &mut RenderCtx,
+) -> ContentPaintState {
+    let state = push_group_child_clip(canvas, node, g);
+    if scene_id
+        .zip(ctx.split)
+        .is_some_and(|(id, split)| !split.spec.paints_background(id, split.phase))
+    {
+        return state;
+    }
+    let clipping = state.restore_child_clip;
+    // A Figma frame is a group carrying a background fill (and usually a clip
+    // size); a page (CANVAS) is a group with a background too. Painting that
+    // background is what separates a frame — and the page — from the dark
+    // canvas behind it. Without it every frame is transparent and its content
+    // (notably black text on a white frame) floats on the void, which reads as
+    // one undifferentiated jumble. A clipped frame fills its `[0,0,w,h]` box; an
+    // unclipped group with a background falls back to its content bounds. This
+    // box is what the background fills and the border strokes — both rounded to
+    // the frame's corner radius.
+    let box_bounds = frame_box_bounds(g, scene_id, ctx.scene);
 
     // The bleed: when this frame clips, the background geometry is grown
     // outward by ~1 device pixel (converted to local units through the
