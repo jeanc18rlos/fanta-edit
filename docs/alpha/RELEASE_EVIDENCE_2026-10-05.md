@@ -1961,7 +1961,9 @@ repaint-installed global listener. Production behavior was unchanged.
 Formatting and changed-file checks pass. The subsequent combined editor suite
 passes **1,171 tests with four ignored**, including these three controls; three
 benchmark CLI tests and repository lint also pass. Actual native log capture
-remains pending.
+was pending at this checkpoint. The 6 October scrub journey below now records
+bounded native release diagnostics; it does not establish the original
+selection anomaly's cause.
 
 Evidence: `native-click-diagnostics-20261005/validation.json`, both focused logs,
 `five-seeds.log`, reviewed/final patches and `operator-plan.md`. These controls
@@ -2051,13 +2053,17 @@ all 7,477 evidence entries with identical inode/size/mtime manifests. Historical
 `7201affc43bcfacd59b82ce2cf9727cd607c61006649e20cac6b1dac38dd3e79`;
 its save/undo/redo/cold stages and the separate icon failure remain available.
 
-PRs 59–74 are now merged. Each required Check/Store job's actual checkout tree
+PRs 59–77 are now merged. Each required Check/Store job's actual checkout tree
 matches its PR head, prospective merge and final merged tree. Completed successful
 job evidence covers cancelled duplicates; no failing or missing test is waived.
-PRs 75–78 remain open; job-only retries cover PR75's total-job timeout and PR78's
-lost runner connection. The merge proofs are in `integration-20261006/`.
-The latest QA bundle contains those pending changes and is separate from the
-signed direct-download release. The repository has certificate/password secrets;
+PR75's job-only retry passed after its earlier total-job timeout. Documentation-only
+PR78 is also merged: its Markdown diff passes whitespace validation, and every
+non-documentation file matches the tested PR77 head. Its hosted retry after a lost
+runner connection was still running at merge; final candidate CI remains open.
+The merge proofs, including this separate documentation validation, are in
+`integration-20261006/`. The latest QA bundle contains the merged application code
+and is separate from the signed direct-download release.
+The repository has certificate/password secrets;
 the three notarization-key secrets remain absent. Final signing, notarization,
 installation, live services and large-page performance acceptance remain open.
 
