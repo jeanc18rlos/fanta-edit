@@ -187,21 +187,17 @@ fn main() -> Result<()> {
                 );
                 match result {
                     Ok(report) => {
-                        metal_failed = report
+                        metal_failed |= report
                             .get("timing_valid")
                             .and_then(serde_json::Value::as_bool)
                             != Some(true);
                         runs.push(serde_json::json!({"label":label,"zoom":zoom,"center":center.to_array(),"metal":report}));
-                        if metal_failed {
-                            break;
-                        }
                     }
                     Err(error) => {
                         runs.push(serde_json::json!({"label":label,"zoom":zoom,"center":center.to_array(),"metal":{
                             "accepted":false,"parity_passed":false,"timing_valid":false,"error":format!("{error:#}")
                         }}));
                         metal_failed = true;
-                        break;
                     }
                 }
             }
@@ -1124,6 +1120,13 @@ mod metal_bench {
                 retained_warmup.push(retained.sample);
             }
         }
+        evidence["stage"] = "motion_observability".into();
+        evidence["parity_passed"] = true.into();
+        evidence["parity"] = serde_json::json!({
+            "full_frame_pairs":parity_frames,"threshold":PARITY_THRESHOLD,
+            "maximum_channel_difference":maximum_difference,
+            "moving_target_changes_pixels":changed_from_first
+        });
         ensure!(
             changed_from_first,
             "moving target changed no pixels in this viewport; no valid timing comparison"
