@@ -187,8 +187,9 @@ Path without initial anchors; the corrected `8a9a33c35e` displays four anchors
 immediately through both double-click and the actual Edit vector menu, with
 unchanged saved content. The `ce8db37c34` QA build also passes Edit vector
 menu entry for a Group-contained vector, a precise anchor drag/Save and one
-Undo/Redo. All 35 nodes and five assets match the predeclared states; its cold
-reopen and authored Boolean point edits remain unverified. Selected Bitmap/Vector Inspect refusals and a nine-layer
+Undo/Redo. All 35 nodes and five assets match the predeclared states; a full
+quit/reopen preserves all 30 project file bytes and timestamps exactly. Authored
+Boolean point edits remain unverified. Selected Bitmap/Vector Inspect refusals and a nine-layer
 generic menu passed separately; TextPath Inspect targeting was inconclusive.
 These checks do not establish every node-entry or text-input combination.
 

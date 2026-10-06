@@ -2075,6 +2075,12 @@ remain exact; only the declared page FNX and document metadata bytes change.
 The frozen reader and eight oracle/harness hashes match their initial manifests.
 
 Evidence: `native-path-point-edit-20261005/group-{open,point,undo,redo}/capture.json`
-and their complete typed/file/oracle records. The final saved Redo state remains
-open in the isolated QA app. No cold restart, Boolean point edit, held-drag
-cancellation or broader node/guard matrix is established by this journey.
+and their complete typed/file/oracle records. A later quit/relaunch of the same
+bundle passes strict comparison against saved Redo: all 35 nodes, five assets,
+30 file bytes and timestamps remain exact, with no Save after reopening. The
+app restores a fitted 38% camera rather than the prior 100%; camera persistence
+is not established. The original four-stage aggregate remains immutable;
+`group-native-with-cold-aggregate-20261006.json` has SHA-256
+`1ff080f63a9dc6146e7e9119f49ae7dd1dc6aa174d8dce61e1a8dfce8a5cdcc5`.
+Boolean point edits, held-drag cancellation and the broader node/guard matrix
+remain unverified.
