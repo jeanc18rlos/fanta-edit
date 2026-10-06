@@ -44,7 +44,8 @@ pub use path::to_sk_path;
 // `vector_outline_sk_path`: track svg-prod — the effective vector outline,
 // shared with the app's flatten/outline/simplify geometry ops.
 pub use raster::{
-    MediaPlayback, RasterRenderer, RenderError, RenderInputs, RenderMetrics, SplitError,
+    MediaPlayback, RasterRenderer, RenderError, RenderInputs, RenderMetrics, RetainedBuildMetrics,
+    RetainedError, RetainedFrame, RetainedFrameMetrics, RetainedTranslationSession, SplitError,
     SplitPhase, SplitSpec, SvgRenderOptions, SvgRenderOutput, TextPathAffinity,
     TextPathCaretSegment, TextPathPosition, TextPathSelectionQuad, TextPathVisualDirection,
     measure_text_node, rounded_rect_contains_point, solve_doc_layout, solve_scene_layout,
