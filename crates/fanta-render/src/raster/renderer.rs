@@ -646,6 +646,12 @@ pub struct RasterRenderer {
 }
 
 impl RasterRenderer {
+    /// Epoch of this thread's shared text engine. Read again after rendering:
+    /// laying out newly visible text can register a downloaded font face.
+    pub fn current_font_generation() -> Option<u64> {
+        super::text::with_layout_engine(fanta_text::LayoutEngine::font_generation)
+    }
+
     /// Construct a renderer for `width` × `height` pixels. Returns `Err` for a
     /// zero dimension.
     ///

@@ -22,6 +22,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(target_os = "macos")]
+use crate::tools::TranslationGesture;
 use anyhow::{Context as _, Result, anyhow};
 #[cfg(target_os = "macos")]
 use core_foundation::{
@@ -44,11 +46,11 @@ use fanta_doc::scene::SceneDelta;
 use fanta_doc::{Action, AnimationClipId, AssetId, MotionEvaluation, NodeId, Viewport};
 #[cfg(target_os = "macos")]
 use fanta_doc::{
-    CanvasNode, ComponentLibrary, ModeId, Scene, Transform2D, VariableCollectionId,
+    CanvasNode, ComponentId, ComponentLibrary, ModeId, Scene, Transform2D, VariableCollectionId,
     VariableRegistry,
 };
 #[cfg(target_os = "macos")]
-use fanta_render::AssetResolver;
+use fanta_render::{AssetResolver, RetainedGpuTarget, RetainedTranslationSession};
 use fanta_render::{MediaPlayback, RasterRenderer, RenderInputs};
 use fanta_tools::{SnapGuideAxis, ToolOverlay};
 #[cfg(target_os = "macos")]
@@ -472,6 +474,43 @@ fn cost_after_install(
     carried.after(duration)
 }
 
+#[cfg(target_os = "macos")]
+fn retained_cost_eligible(
+    cost: RenderCost,
+    normal: Option<&SurfaceKey>,
+    current: &SurfaceKey,
+) -> bool {
+    cost == RenderCost::Expensive
+        && normal.is_some_and(|normal| {
+            normal.same_content_class(current)
+                && normal.size == current.size
+                && normal.viewport_center == current.viewport_center
+                && normal.viewport_zoom == current.viewport_zoom
+                && normal.motion_frame.is_none()
+                && normal.video_frame.is_none()
+                && normal.video_fill_frame.is_none()
+        })
+}
+
+#[cfg(target_os = "macos")]
+fn retained_cost_after_install(
+    previous: Option<&SurfaceKey>,
+    installed: &SurfaceKey,
+    cost: RenderCost,
+    duration: Duration,
+    path: FramePath,
+) -> RenderCost {
+    match path {
+        FramePath::Normal | FramePath::Refused(_) => {
+            cost_after_install(previous, installed, cost, duration)
+        }
+        FramePath::Retained(_) => match previous {
+            Some(previous) if previous.same_content_class(installed) => cost,
+            _ => RenderCost::Unknown,
+        },
+    }
+}
+
 /// What one paint pass does with the render thread and the newest frame.
 #[cfg(target_os = "macos")]
 #[derive(Debug, PartialEq, Eq)]
@@ -779,6 +818,13 @@ impl SceneSnapshot {
                 .patch_node(node, stamp)
                 .with_context(|| format!("patching node {id}"))?;
         }
+        for (id, preview_rev) in patch.component_previews {
+            self.components
+                .defs
+                .get_mut(&id)
+                .ok_or_else(|| anyhow!("missing preview component {id}"))?
+                .preview_rev = preview_rev;
+        }
         self.stamp = patch.stamp;
         Ok(())
     }
@@ -804,6 +850,7 @@ struct ScenePatch {
     stamp: SnapshotStamp,
     transforms: Vec<(NodeId, Transform2D)>,
     nodes: Vec<(CanvasNode, u64)>,
+    component_previews: Vec<(ComponentId, u64)>,
 }
 
 /// How to bring the render thread's copy in line with the document for the
@@ -879,7 +926,188 @@ fn build_scene_patch(
         stamp,
         transforms,
         nodes,
+        component_previews: Vec::new(),
     })
+}
+
+#[cfg(target_os = "macos")]
+struct TranslationProof {
+    gesture: TranslationGesture,
+    stamp: SnapshotStamp,
+    page: NodeId,
+    components: ComponentLibrary,
+    variables: VariableRegistry,
+    active_modes: BTreeMap<VariableCollectionId, ModeId>,
+    preview_components: Vec<ComponentId>,
+    initial_transform: Option<Transform2D>,
+}
+
+#[cfg(target_os = "macos")]
+impl TranslationProof {
+    fn capture(document: &FigDocument, gesture: TranslationGesture, page: NodeId) -> Self {
+        let ancestors: std::collections::HashSet<_> = std::iter::once(gesture.moving)
+            .chain(
+                document
+                    .doc
+                    .scene
+                    .ancestors_of(gesture.moving)
+                    .map(|node| node.id),
+            )
+            .collect();
+        Self {
+            gesture,
+            initial_transform: document
+                .doc
+                .scene
+                .get(gesture.moving)
+                .map(|node| node.transform),
+            stamp: SnapshotStamp::of(document),
+            page,
+            components: document.doc.components.clone(),
+            variables: document.doc.variables.clone(),
+            active_modes: document.doc.active_modes.clone(),
+            preview_components: document
+                .doc
+                .components
+                .defs
+                .iter()
+                .filter_map(|(id, def)| ancestors.contains(&def.root).then_some(*id))
+                .collect(),
+        }
+    }
+
+    fn patch(&mut self, document: &FigDocument, page: NodeId) -> Option<ScenePatch> {
+        let stamp = SnapshotStamp::of(document);
+        if page != self.page
+            || stamp.scene_instance != self.stamp.scene_instance
+            || stamp.asset_resolver != self.stamp.asset_resolver
+            || self.variables != document.doc.variables
+            || self.active_modes != document.doc.active_modes
+        {
+            return None;
+        }
+        let before = self.initial_transform?.to_components();
+        let after = document
+            .doc
+            .scene
+            .get(self.gesture.moving)?
+            .transform
+            .to_components();
+        if before.iter().take(4).ne(after.iter().take(4))
+            || !after.iter().all(|value| value.is_finite())
+        {
+            return None;
+        }
+        let delta = document
+            .doc
+            .scene
+            .changes_since(self.stamp.scene_revision)?;
+        if !delta.nodes.is_empty() || delta.transforms.iter().any(|id| *id != self.gesture.moving) {
+            return None;
+        }
+        let mut component_previews = Vec::new();
+        for id in &self.preview_components {
+            let before = self.components.defs.get_mut(id)?;
+            let after = document.doc.components.defs.get(id)?;
+            if before.preview_rev != after.preview_rev {
+                before.preview_rev = after.preview_rev;
+                component_previews.push((*id, after.preview_rev));
+            }
+        }
+        // Compare the complete library after normalizing only the known mover's
+        // containing preview counters, so future metadata cannot escape this proof.
+        if self.components != document.doc.components {
+            return None;
+        }
+        let mut patch = build_scene_patch(&document.doc.scene, &delta, stamp)?;
+        patch.component_previews = component_previews;
+        self.stamp = stamp;
+        Some(patch)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn retained_translation_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED
+        .get_or_init(|| std::env::var("FANTA_RETAINED_TRANSLATION").is_ok_and(|value| value == "1"))
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FramePath {
+    Normal,
+    Refused(TranslationGesture),
+    Retained(TranslationGesture),
+}
+
+#[cfg(target_os = "macos")]
+fn accepts_translation_frame(path: FramePath, current: Option<TranslationGesture>) -> bool {
+    match path {
+        FramePath::Normal => true,
+        FramePath::Retained(gesture) | FramePath::Refused(gesture) => Some(gesture) == current,
+    }
+}
+
+#[cfg(target_os = "macos")]
+enum CanvasTarget {
+    Normal(skia_safe::Surface),
+    Retained(RetainedGpuTarget),
+}
+
+#[cfg(target_os = "macos")]
+impl CanvasTarget {
+    fn canvas(&mut self) -> Result<&skia_safe::Canvas> {
+        match self {
+            Self::Normal(surface) => Ok(surface.canvas()),
+            Self::Retained(target) => target
+                .canvas()
+                .map_err(|error| anyhow!("canvas target lost: {error:?}")),
+        }
+    }
+
+    fn complete(&mut self, context: &mut gpu::DirectContext) -> Result<()> {
+        match self {
+            Self::Normal(_) => {
+                context.flush_submit_and_sync_cpu();
+                Ok(())
+            }
+            Self::Retained(target) => target
+                .flush_and_submit(gpu::SyncCpu::Yes)
+                .map_err(|error| anyhow!("canvas GPU completion failed: {error:?}")),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct WorkerTranslation {
+    gesture: Option<TranslationGesture>,
+    session: Option<RetainedTranslationSession>,
+    rejected: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl WorkerTranslation {
+    fn sync(&mut self, gesture: Option<TranslationGesture>) {
+        if self.gesture != gesture {
+            *self = Self {
+                gesture,
+                ..Self::default()
+            };
+        }
+    }
+
+    fn reject(&mut self, reason: &impl std::fmt::Display) {
+        if !self.rejected {
+            log::info!(
+                "retained translation refused gesture={:?}: {reason}",
+                self.gesture
+            );
+        }
+        self.session = None;
+        self.rejected = true;
+    }
 }
 
 /// Borrowed render inputs — from a snapshot on the render thread, or from the
@@ -1025,6 +1253,7 @@ struct RenderRequest {
     /// `RenderInputs::mode_generation` for this frame: the variables/modes
     /// half of the document's [`InputsFingerprint`].
     mode_generation: u64,
+    translation: Option<TranslationGesture>,
     perf_tag: Option<crate::gesture_perf::RequestTag>,
 }
 
@@ -1044,6 +1273,7 @@ enum RenderReply {
         result: Result<(
             SendBuffer,
             Duration,
+            FramePath,
             Option<crate::gesture_perf::FrameSample>,
         )>,
         perf_tag: Option<crate::gesture_perf::RequestTag>,
@@ -1200,8 +1430,9 @@ fn render_thread_loop(
             RenderReply::Frame {
                 key: request.key,
                 scale_factor: request.scale_factor,
-                result: result
-                    .map(|(buffer, duration, metrics)| (SendBuffer(buffer), duration, metrics)),
+                result: result.map(|(buffer, duration, path, metrics)| {
+                    (SendBuffer(buffer), duration, path, metrics)
+                }),
                 perf_tag: request.perf_tag,
             }
         });
@@ -1212,10 +1443,25 @@ fn render_thread_loop(
     }
 }
 
+#[cfg(target_os = "macos")]
+fn with_stable_font_generation<T>(
+    generation: impl Fn() -> Option<u64>,
+    operation: impl FnOnce(u64) -> Result<T>,
+) -> Result<T> {
+    let before = generation().context("font registration epoch is unavailable")?;
+    let output = operation(before)?;
+    anyhow::ensure!(
+        generation() == Some(before),
+        "font registrations changed during retained rendering"
+    );
+    Ok(output)
+}
+
 /// The Skia-Metal raster engine, owned by the render thread: renders one
 /// frame at a time into IOSurface-backed pixel buffers from its pool.
 #[cfg(target_os = "macos")]
 struct MacGpuRenderer {
+    translation: WorkerTranslation,
     raster_renderer: RasterRenderer,
     direct_context: skia_safe::gpu::DirectContext,
     texture_cache: CVMetalTextureCache,
@@ -1267,6 +1513,7 @@ impl MacGpuRenderer {
         raster_renderer.set_pixel_snap_pan(true);
 
         Ok(Self {
+            translation: WorkerTranslation::default(),
             raster_renderer,
             direct_context,
             texture_cache,
@@ -1362,8 +1609,10 @@ impl MacGpuRenderer {
     ) -> Result<(
         CVPixelBuffer,
         Duration,
+        FramePath,
         Option<crate::gesture_perf::FrameSample>,
     )> {
+        self.translation.sync(request.translation);
         let size = request.key.size;
         self.resize(size)?;
         if let Some(asset_resolver) = inputs.asset_resolver {
@@ -1424,15 +1673,29 @@ impl MacGpuRenderer {
         let texture_info = unsafe { mtl::TextureInfo::new(texture as mtl::Handle) };
         let backend_render_target =
             backend_render_targets::make_mtl((size.0 as i32, size.1 as i32), &texture_info);
-        let mut surface = gpu::surfaces::wrap_backend_render_target(
-            &mut self.direct_context,
-            &backend_render_target,
-            SurfaceOrigin::TopLeft,
-            ColorType::BGRA8888,
-            None,
-            None,
-        )
-        .ok_or_else(|| anyhow!("wrapping Metal texture as Skia surface failed"))?;
+        let mut target = if request.translation.is_some() {
+            CanvasTarget::Retained(
+                RetainedGpuTarget::wrap_top_left(
+                    &mut self.direct_context,
+                    &backend_render_target,
+                    ColorType::BGRA8888,
+                    None,
+                )
+                .map_err(|error| anyhow!("wrapping retained Metal target: {error:?}"))?,
+            )
+        } else {
+            CanvasTarget::Normal(
+                gpu::surfaces::wrap_backend_render_target(
+                    &mut self.direct_context,
+                    &backend_render_target,
+                    SurfaceOrigin::TopLeft,
+                    ColorType::BGRA8888,
+                    None,
+                    None,
+                )
+                .ok_or_else(|| anyhow!("wrapping Metal texture as Skia surface failed"))?,
+            )
+        };
 
         let render_viewport = Viewport {
             center: request.key.viewport_center,
@@ -1445,25 +1708,130 @@ impl MacGpuRenderer {
             mode_generation: request.mode_generation,
             motion: request.motion.as_ref(),
             playback: playback.as_ref(),
-            video_fill_frames: Some(&video_fill_frames),
+            video_fill_frames: (!video_fill_frames.is_empty()).then_some(&video_fill_frames),
             dark_ui: false,
         };
         let render_started = Instant::now();
-        let metrics = self.raster_renderer.render_to_canvas(
-            surface.canvas(),
-            size.0,
-            size.1,
-            inputs.scene,
-            &render_viewport,
-            request.key.page_root,
-            &render_inputs,
-        );
-        // The compositor samples the IOSurface as soon as we hand it to
-        // `paint_surface`, so the GPU work must be complete by then.
+        let resolver = inputs.asset_resolver.map(|resolver| resolver.as_ref());
+        let mut path = FramePath::Normal;
+        let mut retained_metrics = None;
+        let mut build_wall_us = None;
+        if let Some(gesture) = request.translation
+            && !self.translation.rejected
+            && let CanvasTarget::Retained(target) = &mut target
+        {
+            if self.translation.session.is_none() {
+                let build_started = Instant::now();
+                let prepared = with_stable_font_generation(
+                    RasterRenderer::current_font_generation,
+                    |font_generation| {
+                        let page = request
+                            .key
+                            .page_root
+                            .context("retained frame has no page")?;
+                        RetainedTranslationSession::prepare_for_target(
+                            &mut self.raster_renderer,
+                            target,
+                            inputs.scene,
+                            page,
+                            gesture.moving,
+                            &render_viewport,
+                            &render_inputs,
+                            resolver,
+                            font_generation,
+                        )
+                        .map_err(|error| anyhow!("{error:?}"))
+                    },
+                );
+                match prepared {
+                    Ok(session) => {
+                        // Private Below/Above preparation is not necessarily a
+                        // dependency of this external target until composition.
+                        self.direct_context.flush(None);
+                        if !self.direct_context.submit(gpu::SyncCpu::Yes)
+                            || self.direct_context.abandoned()
+                        {
+                            return Err(anyhow!("retained preparation GPU submission failed"));
+                        }
+                        build_wall_us = Some(crate::gesture_perf::duration_micros(
+                            build_started.elapsed(),
+                        ));
+                        log::info!(
+                            "retained translation prepared gesture={gesture:?} wall_us={} surface_bytes={} frozen_pixel_bytes={} picture_bytes={}",
+                            build_wall_us.unwrap_or_default(),
+                            session.build_metrics().surface_bytes,
+                            session.build_metrics().frozen_pixel_bytes,
+                            session.build_metrics().picture_bytes
+                        );
+                        self.translation.session = Some(session);
+                    }
+                    Err(error) => self.translation.reject(&error),
+                }
+            }
+            if let Some(session) = &mut self.translation.session {
+                let rendered = with_stable_font_generation(
+                    RasterRenderer::current_font_generation,
+                    |font_generation| {
+                        session
+                            .render_for_target(
+                                &mut self.raster_renderer,
+                                target,
+                                inputs.scene,
+                                &render_viewport,
+                                &render_inputs,
+                                resolver,
+                                font_generation,
+                            )
+                            .map_err(|error| anyhow!("{error:?}"))
+                    },
+                );
+                match rendered {
+                    Ok(frame) => {
+                        let mut paint = skia_safe::Paint::default();
+                        paint.set_blend_mode(skia_safe::BlendMode::Src);
+                        target
+                            .canvas()
+                            .map_err(|error| anyhow!("retained target lost: {error:?}"))?
+                            .draw_image(&frame.image, (0.0, 0.0), Some(&paint));
+                        retained_metrics = Some(frame.metrics);
+                        path = FramePath::Retained(gesture);
+                    }
+                    Err(error) => self.translation.reject(&format!("{error:?}")),
+                }
+            }
+        }
+        if let Some(gesture) = request.translation
+            && path == FramePath::Normal
+        {
+            self.direct_context.flush(None);
+            if !self.direct_context.submit(gpu::SyncCpu::Yes) || self.direct_context.abandoned() {
+                return Err(anyhow!("refused retained work could not finish safely"));
+            }
+            path = FramePath::Refused(gesture);
+        }
+        let normal_started = (!matches!(path, FramePath::Retained(_))).then(Instant::now);
+        let metrics = if normal_started.is_some() {
+            Some(
+                self.raster_renderer.render_to_canvas(
+                    target
+                        .canvas()
+                        .map_err(|error| anyhow!("canvas backend unavailable: {error:?}"))?,
+                    size.0,
+                    size.1,
+                    inputs.scene,
+                    &render_viewport,
+                    request.key.page_root,
+                    &render_inputs,
+                ),
+            )
+        } else {
+            None
+        };
         let flush_started = crate::gesture_perf::optional_timer(request.perf_tag.is_some());
-        self.direct_context.flush_submit_and_sync_cpu();
+        target.complete(&mut self.direct_context)?;
         let flush_duration = flush_started.map(|started| started.elapsed());
-        drop(surface);
+        let normal_cost = normal_started.map(|started| started.elapsed());
+        drop(target);
         drop(playback);
         drop(video_image);
         // Walk + flush + GPU sync: the whole cost of a fresh frame, measured
@@ -1472,13 +1840,17 @@ impl MacGpuRenderer {
         crate::report_slow("canvas scene render", render_started);
         let sample = flush_duration.map(|flush_duration| crate::gesture_perf::FrameSample {
             metrics,
+            retained_frame_wall_us: retained_metrics
+                .as_ref()
+                .map(|metrics| metrics.frame_micros),
+            retained_build_wall_us: build_wall_us,
             flush_sync_wall_us: crate::gesture_perf::duration_micros(flush_duration),
             render_wall_us: crate::gesture_perf::duration_micros(duration),
             physical_size: size,
             viewport_zoom: request.key.viewport_zoom,
             display_scale: request.scale_factor,
         });
-        Ok((pixel_buffer, duration, sample))
+        Ok((pixel_buffer, normal_cost.unwrap_or(duration), path, sample))
     }
 }
 
@@ -1529,6 +1901,10 @@ pub(crate) struct GpuCanvas {
     /// mode edit moves the variables generation, so a drag frame (which moves
     /// only the render generation) never re-hashes the registry.
     inputs_fingerprint: Option<FingerprintMemo>,
+    translation: Option<TranslationGesture>,
+    translation_proof: Option<TranslationProof>,
+    rejected_translation: Option<TranslationGesture>,
+    normal_cost_key: Option<SurfaceKey>,
     cost: RenderCost,
     last_render_at: Option<Instant>,
     /// Wall time of the most recent scene render. Drives the adaptive
@@ -1605,6 +1981,10 @@ impl GpuCanvas {
             to_recycle: Vec::new(),
             worker_snapshot: None,
             inputs_fingerprint: None,
+            translation: None,
+            translation_proof: None,
+            rejected_translation: None,
+            normal_cost_key: None,
             cost: RenderCost::Unknown,
             last_render_at: None,
             last_render_duration: Duration::ZERO,
@@ -1655,7 +2035,7 @@ impl GpuCanvas {
             } => {
                 self.in_flight = None;
                 match result {
-                    Ok((buffer, duration, sample)) => {
+                    Ok((buffer, duration, path, sample)) => {
                         if let Some((perf, tag)) = self.gesture_perf.as_ref().zip(perf_tag)
                             && !perf
                                 .borrow_mut()
@@ -1664,7 +2044,15 @@ impl GpuCanvas {
                             log::warn!("duplicate or unknown canvas gesture completion");
                         }
                         self.consecutive_failures = 0;
-                        self.install_frame(key, scale_factor, buffer.0, duration);
+                        if !accepts_translation_frame(path, self.translation) {
+                            self.to_recycle.push(buffer);
+                        } else {
+                            if let FramePath::Refused(gesture) = path {
+                                self.rejected_translation = Some(gesture);
+                                self.translation_proof = None;
+                            }
+                            self.install_frame(key, scale_factor, buffer.0, duration, path);
+                        }
                     }
                     Err(error) => {
                         if let Some((perf, tag)) = self.gesture_perf.as_ref().zip(perf_tag)
@@ -1703,6 +2091,18 @@ impl GpuCanvas {
         }
     }
 
+    fn sync_translation(&mut self, gesture: Option<TranslationGesture>) {
+        let gesture = retained_translation_enabled().then_some(gesture).flatten();
+        if self.translation != gesture {
+            self.translation = gesture;
+            self.translation_proof = None;
+            self.rejected_translation = None;
+            // End-of-gesture metadata must reach the worker even if the last
+            // preview and committed transforms produce identical pixels.
+            self.invalidate();
+        }
+    }
+
     /// The document's [`InputsFingerprint`]: unchanged while the render
     /// generation is, with the registry hash reused for as long as the
     /// variables generation is.
@@ -1738,15 +2138,17 @@ impl GpuCanvas {
         scale_factor: f32,
         buffer: CVPixelBuffer,
         duration: Duration,
+        path: FramePath,
     ) {
         let scale = f64::from(scale_factor.max(f32::EPSILON));
         let logical = (f64::from(key.size.0) / scale, f64::from(key.size.1) / scale);
         let previous = self.newest.take();
-        self.cost = cost_after_install(
+        self.cost = retained_cost_after_install(
             previous.as_ref().map(|frame| &frame.key),
             &key,
             self.cost,
             duration,
+            path,
         );
         if let Some(previous) = previous {
             self.retire(previous.buffer);
@@ -1756,7 +2158,10 @@ impl GpuCanvas {
             key,
             logical,
         });
-        self.last_render_duration = duration;
+        if !matches!(path, FramePath::Retained(_)) {
+            self.normal_cost_key = Some(key);
+            self.last_render_duration = duration;
+        }
         self.last_render_at = Some(Instant::now());
     }
 
@@ -1889,7 +2294,9 @@ impl GpuCanvas {
         motion: Option<MotionEvaluation>,
         video: Option<CanvasVideoFrame>,
         video_fills: Vec<CanvasVideoFillFrame>,
+        translation: Option<TranslationGesture>,
     ) -> Result<(Option<GpuFrame>, bool)> {
+        self.sync_translation(translation);
         self.pump_replies();
         if let Some(reason) = &self.failed {
             return Err(anyhow!("{reason}"));
@@ -1912,6 +2319,14 @@ impl GpuCanvas {
         let within_render_interval = self
             .last_render_at
             .is_some_and(|at| at.elapsed() < render_interval(self.last_render_duration));
+        let translation = self.translation.filter(|gesture| {
+            retained_cost_eligible(self.cost, self.normal_cost_key.as_ref(), &key)
+                && self.rejected_translation != Some(*gesture)
+                && motion.is_none()
+                && video.is_none()
+                && video_fills.is_empty()
+                && page_root.is_some()
+        });
         let plan = plan_paint(
             self.newest.as_ref().map(|frame| &frame.key),
             &key,
@@ -1936,6 +2351,7 @@ impl GpuCanvas {
                         .map(RenderVideoFillFrame::from)
                         .collect(),
                     mode_generation: self.inputs_fingerprint(document).variables,
+                    translation: None,
                     perf_tag: None,
                 };
                 self.render_blocking(LiveInputs::of(document), request)?;
@@ -1953,9 +2369,15 @@ impl GpuCanvas {
                         .map(RenderVideoFillFrame::from)
                         .collect(),
                     mode_generation: fingerprint.variables,
+                    translation,
                     perf_tag: None,
                 };
-                let source = self.snapshot_source(document, stamp, fingerprint);
+                let (source, translation) =
+                    self.translation_source(document, stamp, fingerprint, translation, page_root);
+                let request = RenderRequest {
+                    translation,
+                    ..request
+                };
                 self.dispatch(source, request)?;
                 self.worker_snapshot = Some(WorkerSnapshot { stamp, fingerprint });
             }
@@ -1972,6 +2394,46 @@ impl GpuCanvas {
             perf.borrow_mut().reused_paint(reprojected);
         }
         Ok((frame, repaint))
+    }
+
+    fn translation_source(
+        &mut self,
+        document: &FigDocument,
+        stamp: SnapshotStamp,
+        fingerprint: InputsFingerprint,
+        gesture: Option<TranslationGesture>,
+        page: Option<NodeId>,
+    ) -> (RenderSource, Option<TranslationGesture>) {
+        if let Some((gesture, page)) = gesture.zip(page) {
+            if let Some(proof) = &mut self.translation_proof {
+                if self
+                    .worker_snapshot
+                    .is_some_and(|worker| worker.stamp == proof.stamp)
+                    && let Some(patch) = proof.patch(document, page)
+                {
+                    return (RenderSource::Patch(Box::new(patch)), Some(gesture));
+                }
+                self.rejected_translation = Some(gesture);
+                self.translation_proof = None;
+                log::info!("retained translation UI proof refused gesture={gesture:?}");
+                return (
+                    RenderSource::Snapshot(Some(Box::new(SceneSnapshot::capture(document, stamp)))),
+                    None,
+                );
+            } else {
+                self.translation_proof = Some(TranslationProof::capture(document, gesture, page));
+                return (
+                    RenderSource::Snapshot(Some(Box::new(SceneSnapshot::capture(document, stamp)))),
+                    Some(gesture),
+                );
+            }
+        } else {
+            if self.translation_proof.is_some() {
+                self.rejected_translation = self.translation;
+            }
+            self.translation_proof = None;
+        }
+        (self.snapshot_source(document, stamp, fingerprint), None)
     }
 
     /// The scene source for an off-thread render: the worker's copy as is, a
@@ -2046,9 +2508,18 @@ impl FigView {
     /// The render thread signalled: pick up its replies and repaint so paint
     /// presents the new frame (or, if it went idle, requests the next one).
     pub(crate) fn on_gpu_canvas_reply(&mut self, cx: &mut Context<Self>) {
+        let translation = (self.editor_mode(cx) == EditorMode::Design)
+            .then(|| {
+                self.item
+                    .read(cx)
+                    .document()
+                    .and_then(|document| self.tools.translation_gesture(&document.doc))
+            })
+            .flatten();
         let Some(gpu) = self.gpu_canvas.as_mut() else {
             return;
         };
+        gpu.sync_translation(translation);
         if gpu.pump_replies() {
             if let Some(reason) = gpu.failed.as_deref() {
                 log::warn!("falling back to the CPU canvas: {reason}");
@@ -2559,6 +3030,9 @@ impl Element for CanvasElement {
             let motion = this.motion_evaluation(document, cx);
 
             #[cfg(target_os = "macos")]
+            let translation = (this.editor_mode(cx) == EditorMode::Design)
+                .then(|| this.tools.translation_gesture(&document.doc)).flatten();
+            #[cfg(target_os = "macos")]
             if gpu_available
                 && let Some(gpu) = this.gpu_canvas.as_mut()
             {
@@ -2573,6 +3047,7 @@ impl Element for CanvasElement {
                     motion.clone(),
                     video.clone(),
                     video_fills.clone(),
+                    translation,
                 ) {
                     Ok((frame, repaint)) => {
                         this.clear_rendered_canvas();
@@ -6605,6 +7080,540 @@ mod tests {
         }
     }
 
+    fn retained_worker_pixels(buffer: &CVPixelBuffer) -> Result<Vec<u8>> {
+        let image = copy_video_frame(buffer)?;
+        let width = i32::try_from(buffer.get_width())?;
+        let height = i32::try_from(buffer.get_height())?;
+        let info = skia_safe::ImageInfo::new(
+            (width, height),
+            ColorType::RGBA8888,
+            AlphaType::Premul,
+            None,
+        );
+        let row = usize::try_from(width)?
+            .checked_mul(4)
+            .context("row overflow")?;
+        let length = row
+            .checked_mul(usize::try_from(height)?)
+            .context("readback overflow")?;
+        let mut pixels = vec![0; length];
+        if !image.read_pixels(
+            &info,
+            &mut pixels,
+            row,
+            (0, 0),
+            skia_safe::image::CachingHint::Disallow,
+        ) {
+            return Err(anyhow!("worker IOSurface readback failed"));
+        }
+        Ok(pixels)
+    }
+
+    #[test]
+    #[ignore = "requires actual macOS Metal/CoreVideo; execute explicitly with --ignored"]
+    fn retained_worker_actual_iosurface_matches_full_renderer_and_falls_back_atomically()
+    -> Result<()> {
+        metal::objc::rc::autoreleasepool(|| {
+            let mut doc = fanta_doc::Doc::new();
+            let page = doc
+                .scene
+                .insert(CanvasNode::new(fanta_doc::NodeData::Group(
+                    fanta_doc::GroupNode::default(),
+                )))?;
+            doc.pages.push(page);
+            assert!(doc.set_active_page(Some(page)));
+            let mut node = CanvasNode::new(fanta_doc::NodeData::Vector(
+                fanta_doc::VectorNode::rect_solid(
+                    -25.0,
+                    -20.0,
+                    50.0,
+                    40.0,
+                    fanta_doc::Color::rgb(190, 50, 90),
+                ),
+            ));
+            node.parent = Some(page);
+            let moving = doc.scene.insert(node)?;
+            let mut sibling = rect(30.0, 15.0);
+            sibling.parent = Some(page);
+            sibling.index = doc.scene.next_child_index(Some(page));
+            let sibling = doc.scene.insert(sibling)?;
+            let containing = ComponentId::new();
+            doc.components.defs.insert(
+                containing,
+                fanta_doc::ComponentDef::new(containing, page, "Containing master"),
+            );
+            let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+            let mut snapshot = SceneSnapshot::capture(&document, SnapshotStamp::of(&document));
+            let gesture = translation_token(&document, moving);
+            let mut proof = TranslationProof::capture(&document, gesture, page);
+            let worker_scene = snapshot.scene.instance_id();
+            let mut full = MacGpuRenderer::new((128, 96))?;
+            let mut retained = MacGpuRenderer::new((128, 96))?;
+            let mut key = surface_key([0.0, 0.0], 1.0, 1);
+            key.size = (128, 96);
+            key.page_root = Some(page);
+            let mut request = RenderRequest {
+                key,
+                scale_factor: 1.0,
+                motion: None,
+                video: None,
+                video_fills: Vec::new(),
+                mode_generation: 0,
+                translation: Some(gesture),
+                perf_tag: None,
+            };
+            let mut first_buffer = None;
+            let mut first_pixels = None;
+            for (index, offset) in [0.0, 4.25, 12.0, -5.0].into_iter().enumerate() {
+                document
+                    .doc
+                    .scene
+                    .set_transform(moving, Transform2D::translation(offset, 0.0))?;
+                document
+                    .doc
+                    .components
+                    .bump_preview_for_node(&document.doc.scene, moving);
+                let patch = proof
+                    .patch(&document, page)
+                    .context("one proved translation")?;
+                assert_eq!(
+                    patch.component_previews,
+                    vec![(containing, u64::try_from(index)? + 1)]
+                );
+                snapshot.apply(patch)?;
+                assert_eq!(snapshot.scene.instance_id(), worker_scene);
+                assert_eq!(snapshot.components, document.doc.components);
+                assert_eq!(snapshot.scene.get(moving), document.doc.scene.get(moving));
+                request.key.scene = (snapshot.scene.instance_id(), snapshot.scene.revision());
+                let full_request = RenderRequest {
+                    translation: None,
+                    ..request.clone()
+                };
+                let (normal_buffer, _, normal_path, _) =
+                    full.render_frame(snapshot.inputs(), &full_request)?;
+                assert_eq!(normal_path, FramePath::Normal);
+                let (buffer, _, path, _) = retained.render_frame(snapshot.inputs(), &request)?;
+                assert_eq!(path, FramePath::Retained(gesture));
+                let normal_pixels = retained_worker_pixels(&normal_buffer)?;
+                let pixels = retained_worker_pixels(&buffer)?;
+                assert_eq!(pixels.len(), normal_pixels.len());
+                let maximum = pixels
+                    .iter()
+                    .zip(&normal_pixels)
+                    .map(|(left, right)| left.abs_diff(*right))
+                    .max()
+                    .context("empty frame")?;
+                assert!(
+                    maximum <= 2,
+                    "actual worker frame {index} max channel error {maximum}"
+                );
+                if index == 0 {
+                    assert!(
+                        pixels
+                            .chunks_exact(4)
+                            .any(|pixel| pixel.first() == Some(&190)),
+                        "actual colored artwork"
+                    );
+                    first_buffer = Some(buffer);
+                    first_pixels = Some(pixels);
+                } else {
+                    assert_ne!(
+                        Some(&pixels),
+                        first_pixels.as_ref(),
+                        "moving artwork must change output"
+                    );
+                }
+            }
+            assert_eq!(
+                retained_worker_pixels(first_buffer.as_ref().context("first owner")?)?,
+                first_pixels.context("first pixels")?,
+                "returned IOSurface is immutable while held"
+            );
+            document
+                .doc
+                .components
+                .defs
+                .get_mut(&containing)
+                .context("containing master")?
+                .name
+                .push_str(" changed");
+            document
+                .doc
+                .scene
+                .get_mut(sibling)
+                .context("sibling")?
+                .opacity = 0.5.into();
+            assert!(
+                proof.patch(&document, page).is_none(),
+                "full metadata must reject the patch"
+            );
+            snapshot = SceneSnapshot::capture(&document, SnapshotStamp::of(&document));
+            request.key.scene = (snapshot.scene.instance_id(), snapshot.scene.revision());
+            for _ in 0..2 {
+                let (normal_buffer, _, _, _) = full.render_frame(
+                    snapshot.inputs(),
+                    &RenderRequest {
+                        translation: None,
+                        ..request.clone()
+                    },
+                )?;
+                let (buffer, _, path, _) = retained.render_frame(snapshot.inputs(), &request)?;
+                assert_eq!(path, FramePath::Refused(gesture));
+                assert!(retained.translation.rejected);
+                assert!(retained.translation.session.is_none());
+                assert_eq!(
+                    retained_worker_pixels(&buffer)?,
+                    retained_worker_pixels(&normal_buffer)?,
+                    "refusal uses complete current scene"
+                );
+            }
+            request.translation = None;
+            let (_, _, path, _) = retained.render_frame(snapshot.inputs(), &request)?;
+            assert_eq!(path, FramePath::Normal);
+            assert!(retained.translation.gesture.is_none());
+            assert!(retained.translation.session.is_none());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn retained_worker_font_epoch_rejects_changes_before_composition() -> Result<()> {
+        use std::cell::Cell;
+        let epoch = Cell::new(Some(4));
+        let operations = Cell::new(0);
+        assert_eq!(
+            with_stable_font_generation(
+                || epoch.get(),
+                |value| {
+                    operations.set(operations.get() + 1);
+                    Ok(value)
+                }
+            )?,
+            4
+        );
+        let dropped = Cell::new(0);
+        struct Frame<'a>(&'a Cell<usize>);
+        impl Drop for Frame<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.0.get() + 1);
+            }
+        }
+        let result = with_stable_font_generation(
+            || epoch.get(),
+            |_| {
+                operations.set(operations.get() + 1);
+                epoch.set(Some(5));
+                Ok(Frame(&dropped))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            dropped.get(),
+            1,
+            "changed-font output is discarded before composition"
+        );
+        epoch.set(None);
+        let result = with_stable_font_generation(
+            || epoch.get(),
+            |_| {
+                operations.set(operations.get() + 1);
+                Ok(())
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            operations.get(),
+            2,
+            "unavailable epoch cannot start retained work"
+        );
+        Ok(())
+    }
+
+    fn translation_document() -> Result<(FigDocument, NodeId, NodeId, ComponentId, ComponentId)> {
+        let mut doc = fanta_doc::Doc::new();
+        let page = doc
+            .scene
+            .insert(CanvasNode::new(fanta_doc::NodeData::Group(
+                fanta_doc::GroupNode::default(),
+            )))?;
+        doc.pages.push(page);
+        assert!(doc.set_active_page(Some(page)));
+        let mut moving = rect(1.0, 2.0);
+        moving.parent = Some(page);
+        let moving = doc.scene.insert(moving)?;
+        let containing = ComponentId::new();
+        doc.components.defs.insert(
+            containing,
+            fanta_doc::ComponentDef::new(containing, page, "Containing"),
+        );
+        let unrelated_root = doc.scene.insert(rect(40.0, 20.0))?;
+        let unrelated = ComponentId::new();
+        doc.components.defs.insert(
+            unrelated,
+            fanta_doc::ComponentDef::new(unrelated, unrelated_root, "Other"),
+        );
+        Ok((
+            FigDocument::from_doc(doc, BTreeMap::new()),
+            page,
+            moving,
+            containing,
+            unrelated,
+        ))
+    }
+
+    fn translation_token(document: &FigDocument, moving: NodeId) -> TranslationGesture {
+        TranslationGesture {
+            serial: 1,
+            moving,
+            scene_instance: document.doc.scene.instance_id(),
+            page: document.doc.active_page(),
+        }
+    }
+
+    #[test]
+    fn retained_worker_translation_patches_keep_scene_identity_and_complete_component_metadata()
+    -> Result<()> {
+        let (mut document, page, moving, containing, _) = translation_document()?;
+        let gesture = translation_token(&document, moving);
+        let mut proof = TranslationProof::capture(&document, gesture, page);
+        let mut snapshot = SceneSnapshot::capture(&document, SnapshotStamp::of(&document));
+        let instance = snapshot.scene.instance_id();
+        for index in 1..=4 {
+            document.doc.scene.set_transform(
+                moving,
+                Transform2D::translation(1.0 + f64::from(index), 2.0),
+            )?;
+            document
+                .doc
+                .components
+                .bump_preview_for_node(&document.doc.scene, moving);
+            let patch = proof
+                .patch(&document, page)
+                .expect("proven single translation");
+            assert_eq!(patch.transforms.len(), 1);
+            assert!(patch.nodes.is_empty());
+            assert_eq!(
+                patch.component_previews,
+                vec![(containing, u64::from(index as u32))]
+            );
+            snapshot.apply(patch)?;
+            assert_eq!(snapshot.scene.instance_id(), instance);
+            assert_eq!(snapshot.scene.get(moving), document.doc.scene.get(moving));
+            assert_eq!(snapshot.components, document.doc.components);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retained_worker_translation_refuses_unproven_edits_even_when_old_fingerprint_matches()
+    -> Result<()> {
+        for mutation in 0..10 {
+            let (mut document, page, moving, containing, unrelated) = translation_document()?;
+            let gesture = translation_token(&document, moving);
+            let mut proof = TranslationProof::capture(&document, gesture, page);
+            let fingerprint = InputsFingerprint::of(&document.doc);
+            document
+                .doc
+                .scene
+                .set_transform(moving, Transform2D::translation(7.0, 2.0))?;
+            match mutation {
+                0 => document
+                    .doc
+                    .components
+                    .defs
+                    .get_mut(&containing)
+                    .expect("def")
+                    .name
+                    .push('x'),
+                1 => {
+                    document
+                        .doc
+                        .components
+                        .defs
+                        .get_mut(&containing)
+                        .expect("def")
+                        .rev += 1
+                }
+                2 => {
+                    document
+                        .doc
+                        .components
+                        .defs
+                        .get_mut(&unrelated)
+                        .expect("def")
+                        .preview_rev += 1
+                }
+                3 => document
+                    .doc
+                    .scene
+                    .get_mut(moving)
+                    .expect("mover")
+                    .name
+                    .push('x'),
+                4 => {
+                    document
+                        .doc
+                        .scene
+                        .set_transform(page, Transform2D::translation(1.0, 0.0))?;
+                }
+                5 => {
+                    document
+                        .doc
+                        .active_modes
+                        .insert(VariableCollectionId::new(), ModeId::new());
+                }
+                6 => {
+                    document.doc.scene.insert(rect(90.0, 30.0))?;
+                }
+                7 => {
+                    document
+                        .doc
+                        .scene
+                        .set_transform(moving, Transform2D::scale_xy(2.0, 1.0))?;
+                }
+                8 => {
+                    document.asset_resolver =
+                        Some(Arc::new(fanta_render::InMemoryAssetResolver::new()));
+                }
+                9 => {
+                    document.doc.scene = document.doc.scene.clone();
+                }
+                _ => unreachable!(),
+            }
+            if mutation == 0 {
+                assert_eq!(
+                    fingerprint,
+                    InputsFingerprint::of(&document.doc),
+                    "name change evades revision-count fingerprint"
+                );
+            }
+            assert!(
+                proof.patch(&document, page).is_none(),
+                "mutation {mutation}"
+            );
+        }
+        let (document, page, moving, _, _) = translation_document()?;
+        let mut proof =
+            TranslationProof::capture(&document, translation_token(&document, moving), page);
+        assert!(
+            proof.patch(&document, NodeId::new()).is_none(),
+            "page switch"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retained_worker_refuses_once_and_retires_stale_gesture_frames() -> Result<()> {
+        let (document, _, moving, _, _) = translation_document()?;
+        let first = translation_token(&document, moving);
+        let next = TranslationGesture {
+            serial: first.serial + 1,
+            ..first
+        };
+        let mut worker = WorkerTranslation::default();
+        worker.sync(Some(first));
+        worker.reject(&"unsupported scene");
+        worker.sync(Some(first));
+        assert!(worker.rejected);
+        assert!(accepts_translation_frame(
+            FramePath::Retained(first),
+            Some(first)
+        ));
+        assert!(!accepts_translation_frame(FramePath::Retained(first), None));
+        assert!(!accepts_translation_frame(
+            FramePath::Refused(first),
+            Some(next)
+        ));
+        worker.sync(None);
+        assert!(worker.session.is_none());
+        worker.sync(Some(next));
+        assert!(!worker.rejected);
+        Ok(())
+    }
+
+    #[test]
+    fn retained_worker_preparation_requires_expensive_normal_measurement_at_this_view() {
+        let normal = surface_key([0.0, 0.0], 0.1, 1);
+        let mut current = normal;
+        current.revision += 1;
+        for cost in [RenderCost::Cheap, RenderCost::Unknown] {
+            assert!(!retained_cost_eligible(cost, Some(&normal), &current));
+        }
+        assert!(!retained_cost_eligible(
+            RenderCost::Expensive,
+            None,
+            &current
+        ));
+        assert!(retained_cost_eligible(
+            RenderCost::Expensive,
+            Some(&normal),
+            &current
+        ));
+        current.viewport_zoom = 1.0;
+        assert!(!retained_cost_eligible(
+            RenderCost::Expensive,
+            Some(&normal),
+            &current
+        ));
+        current = normal;
+        current.page_root = Some(NodeId::new());
+        assert!(!retained_cost_eligible(
+            RenderCost::Expensive,
+            Some(&normal),
+            &current
+        ));
+        current = normal;
+        current.size.0 += 1;
+        assert!(!retained_cost_eligible(
+            RenderCost::Expensive,
+            Some(&normal),
+            &current
+        ));
+    }
+
+    #[test]
+    fn retained_worker_timings_never_make_an_expensive_or_unknown_scene_cheap() -> Result<()> {
+        let (document, _, moving, _, _) = translation_document()?;
+        let path = FramePath::Retained(translation_token(&document, moving));
+        let before = surface_key([0.0, 0.0], 1.0, 1);
+        let mut after = before;
+        after.revision += 1;
+        for cost in [RenderCost::Unknown, RenderCost::Expensive] {
+            assert_eq!(
+                retained_cost_after_install(
+                    Some(&before),
+                    &after,
+                    cost,
+                    Duration::from_micros(1),
+                    path
+                ),
+                cost
+            );
+        }
+        after.page_root = Some(NodeId::new());
+        assert_eq!(
+            retained_cost_after_install(
+                Some(&before),
+                &after,
+                RenderCost::Cheap,
+                Duration::ZERO,
+                path
+            ),
+            RenderCost::Unknown
+        );
+        assert_eq!(
+            retained_cost_after_install(
+                Some(&before),
+                &before,
+                RenderCost::Expensive,
+                Duration::from_millis(30),
+                FramePath::Refused(translation_token(&document, moving))
+            ),
+            RenderCost::Expensive
+        );
+        Ok(())
+    }
+
     fn rect(x: f64, y: f64) -> CanvasNode {
         let mut node = CanvasNode::new(fanta_doc::NodeData::Vector(
             fanta_doc::VectorNode::rect_solid(0.0, 0.0, 10.0, 10.0, fanta_doc::Color::WHITE),
@@ -6822,6 +7831,7 @@ mod tests {
             stamp: stamp_of(&scene, 2),
             transforms: vec![(NodeId::new(), Transform2D::IDENTITY)],
             nodes: vec![(reparented, 5)],
+            component_previews: Vec::new(),
         };
         assert!(copy.apply(patch).is_err());
     }

@@ -88,6 +88,11 @@ impl LayoutEngine {
         Self { fonts, resolver }
     }
 
+    /// Epoch of the mutable font provider used by this engine and its clones.
+    pub fn font_generation(&self) -> Option<u64> {
+        self.resolver.generation()
+    }
+
     /// Lay out `buffer` wrapping at `max_width` pixels.
     ///
     /// Each [`crate::buffer::StyleRun`] becomes a pushed Skia text style over
