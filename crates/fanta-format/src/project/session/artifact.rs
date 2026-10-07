@@ -780,8 +780,7 @@ impl ArtifactSession {
     fn project_canvas_files(&self) -> Result<Vec<(String, Vec<u8>)>, SessionError> {
         let header = self.projected_canvas_header()?;
         let (ir, text) = if self.ir_stale {
-            let (ir, _map) =
-                project_scene_to_node_map(&self.scoped, self.kind, &self.fn_name, header.clone())?;
+            let ir = self.projected_source_ir(header.clone())?;
             let text = ir.print_with(&self.ref_table);
             (ir, text)
         } else {
@@ -1816,12 +1815,30 @@ impl ArtifactSession {
         }
     }
 
+    fn projected_source_ir(&self, header: Value) -> Result<ArtifactIr, SessionError> {
+        let (mut ir, _map) =
+            project_scene_to_node_map(&self.scoped, self.kind, &self.fn_name, header)?;
+        if self.kind == ArtifactKind::Page {
+            // Runtime pages are unsized, but a structural edit does not author
+            // removal of dimensions retained in their original source.
+            let mut root = ir.root().clone();
+            for name in ["clip_size", "local_size"] {
+                if let Some(value) = self.ir.root().attrs.get(name) {
+                    root.attrs.insert(name.to_owned(), value.clone());
+                }
+            }
+            let sidecar = ir.sidecar().clone();
+            ir.replace_structure(root, sidecar)?;
+        }
+        Ok(ir)
+    }
+
     fn rebuild_source_from_scene(
         &mut self,
         reason: SourceRebuildReason,
     ) -> Result<SourceSync, SessionError> {
         let header = self.base_nodes.header.clone();
-        let (ir, _map) = project_scene_to_node_map(&self.scoped, self.kind, &self.fn_name, header)?;
+        let ir = self.projected_source_ir(header)?;
         let source = match self.source.rebuild_tree(&self.ir, &ir) {
             Ok(source) => source,
             Err(_) => {

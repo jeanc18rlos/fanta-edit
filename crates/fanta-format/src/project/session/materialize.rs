@@ -52,6 +52,16 @@ pub(crate) fn scope_from_document(
         let mut scene = document.scene.extract_subtree(root).ok_or_else(|| {
             SessionError::other(format!("artifact root {root} is not in the document"))
         })?;
+        // A registered master owns its subtree even when it is geometrically
+        // nested under another page or master. Match the project writer's
+        // nearest-component-root partition while retaining the current root.
+        for definition in document.components.defs.values() {
+            if definition.root != root && scene.contains(definition.root) {
+                scene
+                    .remove(definition.root)
+                    .map_err(|error| SessionError::DocAssemble(error.to_string()))?;
+            }
+        }
         for id in scene.descendants_of(root) {
             match scene.get(id).map(|node| &node.data) {
                 Some(fanta_doc::NodeData::Instance(_))
