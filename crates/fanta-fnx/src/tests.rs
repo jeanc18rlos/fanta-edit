@@ -2230,167 +2230,179 @@ fn seventeen_digit_floats_survive_the_text_boundary() {
     );
 }
 
-/// The headline defect from a real session: `pages/typography/page.fnx`
-/// rendered a flush-left frame as `x={1.1368683772161603e-13}`. That is an
-/// `f32` coordinate widened to `f64` and pushed through a layout solve — dust
-/// standing in for the zero the designer sees — and this file is meant to be
-/// read and hand-edited in a diff, so the printer clamps it.
 #[test]
-fn import_dust_prints_as_a_flush_zero() {
-    const DUST: f64 = 1.1368683772161603e-13;
+fn small_numbers_preserve_imported_coordinates_and_sizes() {
     let nodes = vec![json!({
         "type": "group", "id": "ROOT0000000000000000000000", "parent": null, "index": 1.0,
         "name": "Typography",
-        "transform": [1.0, 0.0, 0.0, 1.0, DUST, 40.0],
-        "clip_size": [DUST, 320.0]
+        "transform": [1.0, 0.0, 0.0, 1.0, 1.1368683772161603e-13, 40.0],
+        "clip_size": [5.684341886080802e-14, 320.0]
     })];
-    let tree = tree_from_nodes(&nodes).unwrap();
-    let text = print_doc("Typography", &tree.root);
-
-    assert!(text.contains("x={0.0}"), "dust must read as zero:\n{text}");
-    assert!(text.contains("y={40.0}"), "the real offset stays:\n{text}");
-    assert!(
-        text.contains("clip_size={[0.0, 320.0]}"),
-        "sizes are clamped the same way:\n{text}"
-    );
-    assert!(
-        !text.contains("1.1368683772161603"),
-        "dust leaked into the source:\n{text}"
-    );
+    assert_same_nodes(&round_trip(&nodes), &nodes);
 }
 
-/// The clamp is applied to every float the printer emits, not just the sugared
-/// `x`/`y`: a raw `transform={[a, b, c, d, tx, ty]}` and a size array carry the
-/// same dust from the same import, and a reader compares them side by side.
 #[test]
-fn dust_is_clamped_inside_raw_transforms_and_sizes() {
-    let nodes = vec![json!({
-        "type": "vector", "id": "VEC00000000000000000000000", "parent": null, "index": 1.0,
-        "name": "Spun",
-        "transform": [0.0, -1.0, 1.0, 1.1368683772161603e-13, 5.0, 7.0],
-        "local_size": [120.0, 5.684341886080802e-14],
-        "meta": { "gap": -2.842170943040401e-14 }
-    })];
-    let tree = tree_from_nodes(&nodes).unwrap();
-    let text = print_doc("Spun", &tree.root);
-
-    assert!(
-        text.contains("transform={[0.0, -1.0, 1.0, 0.0, 5.0, 7.0]}"),
-        "raw transform dust:\n{text}"
-    );
-    assert!(
-        text.contains("local_size={[120.0, 0.0]}"),
-        "size dust:\n{text}"
-    );
-    assert!(
-        text.contains(r#"meta={{"gap": 0.0}}"#),
-        "dust nested in an opaque blob:\n{text}"
-    );
+fn small_numbers_preserve_all_recorded_spectrum_field_kinds() {
+    let nodes = vec![
+        json!({
+            "type": "group", "id": "ROOT0000000000000000000000", "parent": null, "index": 1.0,
+            "name": "Color Slider",
+            "background": {"kind": "gradient", "gradient": {
+                "kind": "linear", "start": [0.0, -6.123234262925839e-17], "end": [1.0, 1.0], "stops": []
+            }},
+            "background_fills": [{"kind": "gradient", "gradient": {
+                "kind": "linear", "start": [-6.123234262925839e-17, 0.0], "end": [1.0, 1.0], "stops": []
+            }}]
+        }),
+        json!({
+            "type": "vector", "id": "VEC00000000000000000000000", "parent": "ROOT0000000000000000000000", "index": 1.0,
+            "name": "Vector",
+            "transform": [0.0, -1.0, 1.0, 1.1368683772161603e-13, -1.942890293094024e-16, 7.0],
+            "local_size": [120.0, 5.684341886080802e-14],
+            "path": {"segments": [
+                {"op": "move", "to": [0.0, 0.0]},
+                {"op": "cubic", "ctrl1": [1.0, 8.881784197001252e-16], "ctrl2": [2.0, 1.3322676295501878e-15], "to": [3.0, 4.0]}
+            ]},
+            "fills": [{"kind": "gradient", "gradient": {
+                "kind": "linear", "start": [0.0, -9.417827628865894e-10], "end": [1.0, 1.0], "stops": []
+            }}],
+            "meta": {"future_gain": -2.842170943040401e-14}
+        }),
+        json!({
+            "type": "instance", "id": "INST0000000000000000000000", "parent": "ROOT0000000000000000000000", "index": 2.0,
+            "name": "GlobeGrid", "component": "COMP0000000000000000000000",
+            "derived": [{"path": ["VEC00000000000000000000000"],
+                "transform": [1.0, 0.0, 0.0, 1.0, 1.232595164407831e-32, 0.0],
+                "path_data": {"segments": [
+                    {"op": "move", "to": [0.0, 0.0]},
+                    {"op": "cubic", "ctrl1": [1.0, 2.861908335370731e-15], "ctrl2": [2.0, 3.0], "to": [4.0, 5.0]}
+                ]}
+            }]
+        }),
+    ];
+    assert_same_nodes(&round_trip(&nodes), &nodes);
 }
 
-/// The clamp is a floor, not a rounder. Everything from the epsilon upwards
-/// keeps all of its digits, and prints as a plain decimal — a designer reading
-/// `0.0000025` can tell it from `0`, which is the whole point.
 #[test]
-fn values_at_and_above_the_clamp_survive_in_full() {
-    use crate::print::render_float;
-
+fn small_numbers_preserve_finite_bits_and_bounded_spelling() {
+    let values = [
+        0.0,
+        -0.0,
+        f64::from_bits(1),
+        -f64::from_bits(1),
+        f64::MIN_POSITIVE,
+        -f64::MIN_POSITIVE,
+        f64::MAX,
+        -f64::MAX,
+        1.232595164407831e-32,
+        -2.842170943040401e-14,
+        1.1368683772161603e-13,
+        9.99e-10,
+        -9.99e-10,
+        1e-9,
+        -1e-9,
+        1.25e-8,
+        -2.5e-6,
+        0.5,
+        21.762165069580078,
+        1440.0,
+    ];
+    let mut root = FnxElement::new("Frame");
+    root.attrs
+        .insert("future_samples".to_owned(), json!(values));
+    let source = print_doc("Finite", &root);
+    assert!(
+        source.len() < 2048,
+        "small values must not expand without a bound"
+    );
+    let parsed = parse_doc(&source).expect("finite source parses");
+    let samples = parsed
+        .attrs
+        .get("future_samples")
+        .and_then(Value::as_array)
+        .expect("all samples");
+    assert_eq!(samples.len(), values.len());
+    for (actual, expected) in samples.iter().zip(values) {
+        assert!(actual.is_f64(), "float kind changed for {expected:e}");
+        assert_eq!(
+            actual.as_f64().expect("float").to_bits(),
+            expected.to_bits(),
+            "finite bits changed for {expected:e}"
+        );
+    }
     for (value, spelling) in [
-        (1e-9_f64, "0.000000001"),
+        (1e-9, "0.000000001"),
         (-1e-9, "-0.000000001"),
         (1.25e-8, "0.0000000125"),
         (-2.5e-6, "-0.0000025"),
+        (0.00000025, "0.00000025"),
+        (0.0000005, "0.0000005"),
+        (0.000003, "0.000003"),
         (0.000123, "0.000123"),
         (0.5, "0.5"),
         (21.762165069580078, "21.762165069580078"),
         (1440.0, "1440.0"),
     ] {
-        assert_eq!(render_float(value), spelling, "printing {value:e}");
-        assert_eq!(
-            spelling.parse::<f64>().ok(),
-            Some(value),
-            "{spelling} must parse back to the value it was printed from"
-        );
-    }
-
-    // Only what is smaller than the epsilon collapses — including a `-0.0`,
-    // which is dust with a sign and must not print as `-0.0`.
-    for value in [
-        1.1368683772161603e-13,
-        -1.1368683772161603e-13,
-        9.99e-10,
-        0.0,
-        -0.0,
-    ] {
-        assert_eq!(render_float(value), "0.0", "clamping {value:e}");
+        assert_eq!(crate::print::render_float(value), spelling);
     }
 }
 
-/// No value in the range a design actually occupies may reach the reader as
-/// scientific notation: `e-` and `e+` are noise a designer cannot act on and a
-/// diff turns over for nothing.
 #[test]
-fn no_design_scale_value_prints_in_scientific_notation() {
-    let nodes = vec![json!({
-        "type": "group", "id": "ROOT0000000000000000000000", "parent": null, "index": 1.0,
-        "name": "Page",
-        "clip_size": [1440.0, 0.00000025],
-        "opacity": 0.0000005,
-        "transform": [1.0, 0.0, 0.0, 1.0, 21.762165069580078, 1.1368683772161603e-13],
-        "meta": { "ratio": 0.000003, "span": 1234567.0, "dust": -5.684341886080802e-14 }
-    })];
-    let tree = tree_from_nodes(&nodes).unwrap();
-    let text = print_doc("Page", &tree.root);
-
-    assert!(!text.contains("e-"), "negative exponent leaked:\n{text}");
-    assert!(!text.contains("e+"), "positive exponent leaked:\n{text}");
-    assert!(
-        text.contains("opacity={0.0000005}"),
-        "plain decimal:\n{text}"
+fn small_numbers_preserve_source_extensions_and_canonical_headers() {
+    let source = r#"<Frame id="ROOT0000000000000000000000" name="Extension" future={{"ratio": 1.232595164407831e-32, "literal": "1e-32", "count": 9007199254740993, "enabled": false, "missing": null}}>
+        <Text id="TEXT0000000000000000000000" name="Caption" content="Keep this text" meta={{"gain": -2.842170943040401e-14}} />
+    </Frame>"#;
+    let root = parse_doc(source).expect("source with future attributes");
+    let printed = print_doc("Extension", &root);
+    assert_eq!(
+        parse_doc(&printed).expect("printed future attributes"),
+        root
     );
-    assert!(
-        text.contains("clip_size={[1440.0, 0.00000025]}"),
-        "plain decimal in an array:\n{text}"
+    assert_eq!(
+        printed
+            .matches(crate::canonicalize::JSX_RUNTIME_PRAGMA)
+            .count(),
+        1
     );
+    assert_eq!(
+        printed
+            .matches(crate::canonicalize::JSX_FACTORY_PRAGMA)
+            .count(),
+        1
+    );
+    assert_eq!(
+        printed.matches(crate::canonicalize::FNX_TAG_IMPORT).count(),
+        1
+    );
+    assert!(printed.contains("9007199254740993"));
+    assert!(printed.contains("Keep this text"));
 }
 
-/// The clamp is the one place the text boundary is deliberately lossy, and the
-/// loss is bounded: dust decodes back as an exact zero, every other coordinate
-/// is untouched, and the next save writes the identical bytes — so the file
-/// settles instead of churning.
 #[test]
-fn clamped_dust_decodes_as_zero_and_the_next_print_is_a_fixpoint() {
+fn small_numbers_are_exact_and_idempotent_across_repeated_saves() {
     let nodes = vec![json!({
         "type": "vector", "id": "VEC00000000000000000000000", "parent": null, "index": 1.0,
         "name": "Rule",
         "transform": [1.0, 0.0, 0.0, 1.0, 1.1368683772161603e-13, 40.0],
-        "local_size": [120.0, 21.762165069580078]
+        "local_size": [120.0, 21.762165069580078],
+        "meta": {"exact_gain": 1.232595164407831e-32}
     })];
     let decoded = round_trip(&nodes);
-    assert_same_nodes(
-        &decoded,
-        &[json!({
-            "type": "vector", "id": "VEC00000000000000000000000", "parent": null, "index": 1.0,
-            "name": "Rule",
-            "transform": [1.0, 0.0, 0.0, 1.0, 0.0, 40.0],
-            "local_size": [120.0, 21.762165069580078]
-        })],
+    assert_same_nodes(&decoded, &nodes);
+    let first = print_doc(
+        "Rule",
+        &tree_from_nodes(&nodes).expect("original tree").root,
     );
-
-    let first = print_doc("Rule", &tree_from_nodes(&nodes).unwrap().root);
-    let second = print_doc("Rule", &tree_from_nodes(&decoded).unwrap().root);
-    assert_eq!(first, second, "a second save must not rewrite the file");
+    let second = print_doc(
+        "Rule",
+        &tree_from_nodes(&decoded).expect("decoded tree").root,
+    );
+    assert_eq!(first, second, "a second save must not rewrite source");
     let reparsed = parse_doc(&first).expect("reparse");
-    assert_eq!(
-        first,
-        print_doc("Rule", &reparsed),
-        "print must stay a fixpoint over parse"
-    );
+    assert_eq!(first, print_doc("Rule", &reparsed));
 }
 
-/// Integers are printed verbatim, never routed through `f64`: the clamp must
-/// not cost the codec the integers past 2^53 that have no `f64` spelling, and
-/// an integer cannot carry dust in the first place.
+// Converting integer attributes through f64 would lose values beyond 2^53.
 #[test]
 fn integer_attributes_keep_their_own_spelling() {
     use crate::print::render_attr;
