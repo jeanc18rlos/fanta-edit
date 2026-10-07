@@ -36,6 +36,19 @@ component FNX source, identity sidecars, metadata and assets. See
   ordinary saved-canvas source refresh remains its own undoable text transaction.
   An unsaved source buffer locks conflicting visual edits. Selecting a layer
   reveals its source; agent source-follow can be paused.
+- Structural canvas saves preserve future FNX attributes on surviving nodes and
+  keep authored comments when inserting or reparenting content. Explicit source
+  edits remain authoritative. Deletion or type changes that would erase
+  source-only data report a preservation error because typed Undo cannot restore
+  it; edit FNX to intentionally remove that data. All 13 node kinds recognize
+  their schema defaults, and conversion removes obsolete fields from the old
+  kind without discarding common fields. On `bf0650022c`, bounded native checks
+  pass plain-sibling Duplicate/Delete, saved Undo/Redo and cold reopen, visible
+  Save refusal followed by Undo recovery, and intentional source-field removal
+  without resurrection. Refusal protects persisted files; it does not prevent
+  the preceding live canvas edit. Hosted CI is tracked separately for each
+  published candidate; broader release gates and the scope of earlier
+  component-action results remain unchanged.
 - External source changes reload through the project watcher. Conflicting
   previews, pending saves and changed files are guarded rather than blindly
   overwritten. These protections still require full release-candidate testing.
