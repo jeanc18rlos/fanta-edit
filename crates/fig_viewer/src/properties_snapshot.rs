@@ -1192,52 +1192,18 @@ pub(crate) fn layout_child_snapshot(doc: &Doc, node: &CanvasNode) -> Option<Layo
     })
 }
 
-/// The [`ComponentDef`] an instance renders: a direct def hit, or — when the
-/// instance points at a component *set* — the member matching the instance's
-/// variant prop selections, falling back to the set's default variant. Mirrors
-/// `fanta_doc::resolve`'s private selection so the inspector shows the same
-/// variant the renderer draws.
 pub(crate) fn resolved_instance_def<'a>(
-    components: &'a ComponentLibrary,
+    doc: &'a Doc,
+    id: NodeId,
     instance: &InstanceNode,
 ) -> Option<&'a ComponentDef> {
-    if let Some(def) = components.def(instance.component) {
-        return Some(def);
-    }
-    let set = components.sets.get(&instance.component)?;
-    let exact = set.members.iter().copied().find(|member| {
-        components
-            .def(*member)
-            .and_then(|def| def.variant_of.as_ref())
-            .is_some_and(|membership| {
-                membership.axis_values.iter().all(|(axis, value)| {
-                    variant_selection(components, instance, axis)
-                        .is_none_or(|selected| selected == *value)
-                })
-            })
-    });
-    components.def(exact.unwrap_or(set.default_variant))
-}
-
-/// The instance's selected value for a variant axis, read from its
-/// `prop_values` against any member def's `Variant { axis }` prop.
-pub(crate) fn variant_selection(
-    components: &ComponentLibrary,
-    instance: &InstanceNode,
-    axis: &str,
-) -> Option<String> {
-    components.defs.values().find_map(|def| {
-        def.props.iter().find_map(|prop| match &prop.kind {
-            ComponentPropKind::Variant { axis: prop_axis } if prop_axis == axis => instance
-                .prop_values
-                .get(&prop.id)
-                .and_then(|value| match value {
-                    VarValue::String { value } => Some(value.clone()),
-                    _ => None,
-                }),
-            _ => None,
-        })
-    })
+    let resolved = fanta_doc::resolved_component_with_context(
+        &doc.scene,
+        &doc.components,
+        instance,
+        &fanta_doc::InstanceExpansionContext::new(&doc.variables, &doc.active_modes, id),
+    )?;
+    doc.components.def(resolved.resolved_component)
 }
 
 pub(crate) fn instance_section(doc: &Doc, node: &CanvasNode) -> Option<InstanceSection> {
@@ -1245,7 +1211,7 @@ pub(crate) fn instance_section(doc: &Doc, node: &CanvasNode) -> Option<InstanceS
         return None;
     };
     let components = &doc.components;
-    let def = resolved_instance_def(components, instance)?;
+    let def = resolved_instance_def(doc, node.id, instance)?;
     let mut variants = Vec::new();
     let mut component_name: SharedString = def.name.clone().into();
     if let Some(membership) = &def.variant_of
