@@ -69,8 +69,9 @@ fn stroke_outline_geometry(boolean: &BooleanNode) -> Option<Value> {
 fn canonicalize_saved_geometry(value: &mut Value) {
     match value {
         Value::Number(number) if number.is_f64() => {
-            // FNX writes float magnitudes below 1e-9 as zero. The signature
-            // must survive that normalization without changing live geometry.
+            // Retain the signature policy of projects written by the former
+            // FNX printer so their baked artwork stays valid. This changes
+            // only the compatibility key, never the stored operand geometry.
             if number.as_f64().is_some_and(|number| number.abs() < 1e-9) {
                 *value = json!(0.0);
             }

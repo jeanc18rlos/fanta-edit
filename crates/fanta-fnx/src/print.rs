@@ -10,24 +10,8 @@ use serde_json::{Number, Value};
 
 const GENERATED_MARKER: &str = "// @generated fanta source — the design is the source of truth; ids are mirrored in the .ids sidecar\n";
 
-/// Magnitude below which a printed float is arithmetic dust rather than a
-/// value anyone authored, and prints as a flush zero.
-///
-/// `.fnx` numbers are design units — one unit is one CSS pixel, ~0.26 mm — so
-/// 1e-9 units is roughly a quarter of a picometre: below anything a designer
-/// can place, a renderer can resolve, or a downstream consumer preserves. The
-/// noise this clamps sits four more orders of magnitude down (a `.fig`
-/// coordinate is an `f32` widened to `f64`, and one auto-layout solve later a
-/// flush-left frame reads `1.1368683772161603e-13`), while the smallest
-/// quantity a design can actually mean — a sub-pixel nudge, a normalized
-/// gradient stop, a barely-there opacity — is many orders above it. So the
-/// clamp cannot swallow an intended value, and it cannot leave dust behind.
-const NEGLIGIBLE_MAGNITUDE: f64 = 1e-9;
-
-/// Longest run of zeros an expanded plain decimal may open with before the
-/// exponent form is left alone, so no attribute can grow unboundedly wide.
-/// [`NEGLIGIBLE_MAGNITUDE`] already floors the printer at 1e-9 — eight leading
-/// zeros — so this bound only keeps [`to_positional`] total on its own terms.
+// Extremely small finite values keep exponent notation so preserving a value
+// cannot expand one attribute into hundreds of leading zeros.
 const MAX_LEADING_ZEROS: usize = 12;
 
 /// Render a single-root element tree as one `.fnx` file. `name` becomes the
@@ -171,33 +155,11 @@ fn render_number(number: &Number) -> String {
     }
 }
 
-/// One float as a plain decimal: dust reads as a flush zero, and nothing at
-/// design scale ever reaches the reader as scientific notation.
-///
-/// Everything that survives the clamp keeps `serde_json`'s shortest
-/// round-tripping spelling, digit for digit — expanding an exponent only moves
-/// the decimal point through those same digits — so a `.fig` coordinate that
-/// needs all 17 significant digits still parses back to the identical `f64`.
+/// Render a finite float without changing its value or JSON number kind.
 pub(crate) fn render_float(value: f64) -> String {
-    // Dust is clamped to a real `0.0` and then printed like any other float,
-    // rather than short-circuited to the string "0", for two reasons. Zero has
-    // to print in exactly ONE spelling or a coordinate that wobbles across the
-    // epsilon between two imports rewrites its line for nothing — the churn
-    // this clamp exists to stop — and `0.0` is already the spelling an exact
-    // zero has here. And a bare `0` reparses as a JSON *integer*, which would
-    // change the node's shape across the text boundary and break the crate's
-    // round-trip contract for `transform={[0.0, -1.0, 1.0, 0.0, …]}`.
-    //
-    // A `Value` cannot hold a non-finite float, so folding those in here is
-    // belt and braces: NaN and infinity are not coordinates either.
-    let value = if value.is_finite() && value.abs() >= NEGLIGIBLE_MAGNITUDE {
-        value
-    } else {
-        0.0
-    };
     let Some(shortest) = Number::from_f64(value).map(|number| number.to_string()) else {
-        // Unreachable — `from_f64` only rejects the non-finite values the
-        // clamp above has already replaced — but the printer must not panic.
+        // JSON attributes cannot contain non-finite floats. Keep the existing
+        // fallback for callers that pass one directly to this helper.
         return "0.0".to_owned();
     };
     let positional = shortest
