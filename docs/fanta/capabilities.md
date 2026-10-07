@@ -223,6 +223,15 @@ properties and applicable navigation remain available. Reordering applies to
 the selected roots and is undoable. The canvas menu is not shown in Draw mode
 or during prototype presentation.
 
+Variant-set instances use the member shown on the canvas for these commands
+and the Design inspector, including the set default, variable aliases, active
+modes and inherited mode pins. Reset clears instance customizations and restores
+the resolved default member's size. If **Go to main component** would switch
+scopes while source edits are pending, it keeps the current scope, selection and
+camera and explains that you must save or discard those edits first. Eight
+focused automated regressions cover these routes; native acceptance of this
+variant-set correction remains pending.
+
 Flatten is unavailable when it would discard images, mixed text colors or
 decorations, child effects, clipping, layout, bindings, animation or component
 links. Supported simple vector groups and boolean geometry remain convertible.
