@@ -8252,7 +8252,7 @@ fn current_prop_kind(
     let NodeData::Instance(instance) = &node.data else {
         return None;
     };
-    let definition = crate::properties_snapshot::resolved_instance_def(&doc.components, instance)?;
+    let definition = crate::properties_snapshot::resolved_instance_def(doc, id, instance)?;
     let schema = definition.props.iter().find(|schema| schema.id == prop)?;
     Some(match schema.kind {
         ComponentPropKind::Bool => EnginePropKind::Boolean,
@@ -13526,6 +13526,298 @@ mod tests {
             );
             assert!(!instance.prop_values.contains_key(&unsupported_prop));
             assert!(doc.history.can_undo());
+        });
+    }
+
+    #[gpui::test]
+    async fn variant_instance_inspector_projects_default_alias_and_placed_pin(
+        cx: &mut TestAppContext,
+    ) {
+        for (alias, active, pin, expected) in [
+            (false, 1, None, "Large"),
+            (true, 0, None, "Small"),
+            (true, 1, None, "Large"),
+            (true, 1, Some(0), "Small"),
+            (true, 0, Some(1), "Large"),
+        ] {
+            let mut fixture = crate::component_actions::tests::set_instance_fixture();
+            fixture
+                .doc
+                .active_modes
+                .insert(fixture.collection, fixture.modes[active]);
+            if alias {
+                let NodeData::Instance(instance) = &mut fixture
+                    .doc
+                    .scene
+                    .get_mut(fixture.instance)
+                    .expect("instance")
+                    .data
+                else {
+                    panic!("instance")
+                };
+                instance.prop_values.insert(
+                    fixture.property,
+                    VarValue::Alias {
+                        variable: fixture.variable,
+                    },
+                );
+            }
+            if let Some(pin) = pin {
+                let NodeData::Group(parent) = &mut fixture
+                    .doc
+                    .scene
+                    .get_mut(fixture.parent)
+                    .expect("parent")
+                    .data
+                else {
+                    panic!("parent")
+                };
+                parent
+                    .explicit_modes
+                    .insert(fixture.collection, fixture.modes[pin]);
+            }
+            let (view, panel, mut visual) = setup_view(fixture.doc, cx).await;
+            view.update_in(&mut visual, |view, _, cx| view.refresh_gpui_design(cx));
+            visual.run_until_parked();
+            visual.update(|window, cx| window.draw(cx).clear());
+            panel.read_with(&visual, |panel, _| {
+                let properties = &panel.node().component_properties;
+                assert_eq!(properties[0].id.as_ref(), "variant:Size");
+                assert_eq!(
+                    properties[0].resolved_value,
+                    DesignComponentPropertyValue::Variant(expected.into())
+                );
+                assert_eq!(
+                    properties[1].resolved_value,
+                    DesignComponentPropertyValue::Text(expected.into()),
+                    "inspector and resolved virtual text must agree"
+                );
+            });
+        }
+    }
+
+    fn variant_instance_authored_snapshot(doc: &Doc) -> serde_json::Value {
+        let mut content = serde_json::to_value(doc).expect("document");
+        content
+            .as_object_mut()
+            .expect("document object")
+            .remove("history");
+        content["metadata"]["modified_at"] = serde_json::json!(0);
+        content
+    }
+
+    #[gpui::test]
+    async fn variant_instance_inspector_variant_action_changes_rendered_member_and_undoes(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = crate::component_actions::tests::set_instance_fixture();
+        let id = fixture.instance;
+        let (view, panel, mut visual) = setup_view(fixture.doc, cx).await;
+        view.update_in(&mut visual, |view, _, cx| view.refresh_gpui_design(cx));
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+        let item = view.read_with(&visual, |view, _| view.item().clone());
+        let before = item.read_with(&visual, |item, _| {
+            variant_instance_authored_snapshot(item.doc().expect("document"))
+        });
+        panel.update_in(&mut visual, |_, _, cx| {
+            cx.emit(DesignPanelAction::ComponentPropertyChangeRequested {
+                node_id: id.to_string().into(),
+                property_id: "variant:Size".into(),
+                value: DesignComponentPropertyValue::Variant("Small".into()),
+            })
+        });
+        visual.run_until_parked();
+        let after = item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(
+                crate::component_actions::main_component_root(doc, id),
+                Some(fixture.roots[0])
+            );
+            assert_eq!(doc.history.undo_depth(), 1);
+            let mut expected = before.clone();
+            let node_key = serde_json::to_value(id).expect("node ID");
+            let expected_node = expected["scene"]["nodes"]
+                .get_mut(node_key.as_str().expect("serialized node ID"))
+                .expect("existing instance");
+            expected_node["component"] =
+                serde_json::to_value(fixture.members[0]).expect("component");
+            let actual = variant_instance_authored_snapshot(doc);
+            assert_eq!(actual, expected, "only explicit variant reference changes");
+            actual
+        });
+        item.update(&mut visual, |item, cx| {
+            assert!(item.undo(cx).expect("one Undo"))
+        });
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                variant_instance_authored_snapshot(item.doc().expect("document")),
+                before
+            )
+        });
+        item.update(&mut visual, |item, cx| {
+            assert!(item.redo(cx).expect("one Redo"))
+        });
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                variant_instance_authored_snapshot(item.doc().expect("document")),
+                after
+            )
+        });
+    }
+
+    #[gpui::test]
+    async fn variant_instance_inspector_property_action_uses_resolved_schema_and_undoes(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = crate::component_actions::tests::set_instance_fixture();
+        let property = ComponentPropId::new();
+        fixture
+            .doc
+            .components
+            .defs
+            .get_mut(&fixture.members[1])
+            .expect("Large")
+            .props
+            .push(ComponentPropDef {
+                id: property,
+                name: "Weight".into(),
+                kind: ComponentPropKind::Number,
+                formatter: Default::default(),
+                default: VarValue::Float { value: 2.0 },
+                bindings: Vec::new(),
+            });
+        let id = fixture.instance;
+        let (view, panel, mut visual) = setup_view(fixture.doc, cx).await;
+        view.update_in(&mut visual, |view, _, cx| view.refresh_gpui_design(cx));
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+        let item = view.read_with(&visual, |view, _| view.item().clone());
+        let before = item.read_with(&visual, |item, _| {
+            variant_instance_authored_snapshot(item.doc().expect("document"))
+        });
+        panel.update_in(&mut visual, |_, _, cx| {
+            cx.emit(DesignPanelAction::ComponentPropertyChangeRequested {
+                node_id: id.to_string().into(),
+                property_id: property.to_string().into(),
+                value: DesignComponentPropertyValue::Text("7.5".into()),
+            })
+        });
+        visual.run_until_parked();
+        let after = item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            let NodeData::Instance(instance) = &doc.scene.get(id).expect("instance").data else {
+                panic!("instance")
+            };
+            assert_eq!(
+                instance.prop_values.get(&property),
+                Some(&VarValue::Float { value: 7.5 })
+            );
+            assert_eq!(doc.history.undo_depth(), 1);
+            let mut expected = before.clone();
+            let node_key = serde_json::to_value(id).expect("node ID");
+            let expected_node = expected["scene"]["nodes"]
+                .get_mut(node_key.as_str().expect("serialized node ID"))
+                .expect("existing instance");
+            expected_node["prop_values"] = serde_json::to_value(std::collections::BTreeMap::from(
+                [(property, VarValue::Float { value: 7.5 })],
+            ))
+            .expect("property values");
+            let actual = variant_instance_authored_snapshot(doc);
+            assert_eq!(
+                actual, expected,
+                "only the intended exposed property changes"
+            );
+            actual
+        });
+        item.update(&mut visual, |item, cx| {
+            assert!(item.undo(cx).expect("one Undo"))
+        });
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                variant_instance_authored_snapshot(item.doc().expect("document")),
+                before
+            )
+        });
+        item.update(&mut visual, |item, cx| {
+            assert!(item.redo(cx).expect("one Redo"))
+        });
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                variant_instance_authored_snapshot(item.doc().expect("document")),
+                after
+            )
+        });
+    }
+
+    #[gpui::test]
+    async fn variant_instance_busy_source_navigation_preserves_scope_selection_and_camera(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = crate::component_actions::tests::set_instance_fixture();
+        let id = fixture.instance;
+        let (view, panel, mut visual) = setup_view(fixture.doc, cx).await;
+        view.update_in(&mut visual, |view, _, cx| {
+            view.set_viewport_silent(fanta_doc::Viewport {
+                center: [20.0, 30.0],
+                zoom: 2.0,
+            });
+            view.refresh_gpui_design(cx);
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+        let item = view.read_with(&visual, |view, _| view.item().clone());
+        item.update(&mut visual, |item, cx| {
+            item.set_source_edit_locked(true, cx)
+        });
+        let before = item.read_with(&visual, |item, _| {
+            serde_json::to_value(item.doc().expect("document")).expect("before")
+        });
+        let camera = view.read_with(&visual, |view, _| view.viewport());
+        let scope = view.read_with(&visual, |view, _| view.selected_page_index());
+        panel.update_in(&mut visual, |_, _, cx| {
+            cx.emit(DesignPanelAction::GoToMainComponentRequested {
+                node_id: id.to_string().into(),
+            })
+        });
+        visual.run_until_parked();
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                serde_json::to_value(item.doc().expect("document"))
+                    .expect("after blocked navigation"),
+                before
+            )
+        });
+        view.read_with(&visual, |view, _| {
+            assert_eq!(view.viewport(), camera);
+            assert_eq!(view.selected_page_index(), scope);
+        });
+        item.update(&mut visual, |item, cx| {
+            item.set_source_edit_locked(false, cx)
+        });
+        panel.update_in(&mut visual, |_, _, cx| {
+            cx.emit(DesignPanelAction::GoToMainComponentRequested {
+                node_id: id.to_string().into(),
+            })
+        });
+        visual.run_until_parked();
+        item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.active_page(), Some(fixture.roots[1]));
+            assert_eq!(doc.selection.as_slice(), &[fixture.roots[1]]);
+            assert_eq!(
+                serde_json::to_value(&doc.scene).expect("scene"),
+                before["scene"]
+            );
+            assert_eq!(
+                serde_json::to_value(&doc.components).expect("library"),
+                before["components"]
+            );
+            assert_eq!(
+                serde_json::to_value(&doc.metadata).expect("metadata"),
+                before["metadata"]
+            );
+            assert_eq!(doc.history.undo_depth(), 0);
         });
     }
 

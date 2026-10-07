@@ -68,7 +68,7 @@ pub(crate) fn variant_select_operations(
         return Vec::new();
     };
     let components = &doc.components;
-    let Some(definition) = resolved_instance_def(components, instance) else {
+    let Some(definition) = resolved_instance_def(doc, id, instance) else {
         return Vec::new();
     };
     let Some(membership) = &definition.variant_of else {

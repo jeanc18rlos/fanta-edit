@@ -452,7 +452,19 @@ impl FigView {
         if let Some(page) = page
             && Some(page) != current_page
         {
+            if self.item.read(cx).source_edit_locked() {
+                show_canvas_notice(
+                    "Save or discard source edits before navigating to another component"
+                        .to_owned(),
+                    window,
+                    cx,
+                );
+                return;
+            }
             self.select_page(page, cx);
+            if self.item.read(cx).doc().and_then(|doc| doc.active_page()) != Some(root) {
+                return;
+            }
         }
         self.item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
@@ -921,6 +933,344 @@ mod tests {
             visual.update(|window, _| next_focus.is_focused(window)),
             "a dismissal after focus transfer must not steal focus from the next control"
         );
+    }
+
+    fn variant_instance_content_snapshot(doc: &Doc) -> serde_json::Value {
+        let mut content = serde_json::to_value(doc).expect("document snapshot");
+        let object = content.as_object_mut().expect("document object");
+        object.remove("history");
+        object.remove("selection");
+        content["metadata"]["modified_at"] = serde_json::json!(0);
+        content
+    }
+
+    #[gpui::test]
+    async fn mounted_variant_instance_menu_navigates_resets_detaches_and_undoes(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use fanta_doc::{
+            BoundProp, DerivedOverride, InstanceNode, Override, OverrideValue, VarValue, Viewport,
+        };
+        use gpui::{MouseButton, MouseUpEvent, point, px, size};
+        use project::Project;
+        cx.update(|cx| {
+            zlog::init_test();
+            assets::Assets.load_test_fonts(cx);
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+            #[cfg(feature = "fanta-gpui-ui")]
+            {
+                gpui_component::init(cx);
+                fanta_gpui::init(cx);
+                crate::theme_bridge::init(cx);
+            }
+            cx.bind_keys([
+                gpui::KeyBinding::new("escape", crate::view::Cancel, Some("FigViewer")),
+                gpui::KeyBinding::new("cmd-z", crate::view::Undo, Some("FigViewer")),
+                gpui::KeyBinding::new("cmd-shift-z", crate::view::Redo, Some("FigViewer")),
+            ]);
+        });
+        let project = Project::test(fs::FakeFs::new(cx.executor()), [], cx).await;
+        for (alias, action, policy) in [
+            (false, LayerAction::GoToMainComponent, "editable"),
+            (true, LayerAction::GoToMainComponent, "editable"),
+            (true, LayerAction::ResetInstance, "editable"),
+            (true, LayerAction::DetachInstance, "editable"),
+            (true, LayerAction::GoToMainComponent, "read-only"),
+        ] {
+            let mut fixture = crate::component_actions::tests::set_instance_fixture();
+            if alias {
+                let NodeData::Group(parent) = &mut fixture
+                    .doc
+                    .scene
+                    .get_mut(fixture.parent)
+                    .expect("parent")
+                    .data
+                else {
+                    panic!("parent")
+                };
+                parent
+                    .explicit_modes
+                    .insert(fixture.collection, fixture.modes[0]);
+                let NodeData::Instance(instance) = &mut fixture
+                    .doc
+                    .scene
+                    .get_mut(fixture.instance)
+                    .expect("instance")
+                    .data
+                else {
+                    panic!("instance")
+                };
+                instance.prop_values.insert(
+                    fixture.property,
+                    VarValue::Alias {
+                        variable: fixture.variable,
+                    },
+                );
+                instance.local_size = [80.0, 40.0];
+                if action == LayerAction::ResetInstance {
+                    instance.local_size = [300.0, 200.0];
+                    instance.overrides.push(Override {
+                        target_path: vec![fixture.texts[0]].into(),
+                        target_prop: BoundProp::TextContent,
+                        value: OverrideValue::Text {
+                            value: "Custom".into(),
+                        },
+                    });
+                    instance.derived.push(DerivedOverride {
+                        path: vec![fixture.texts[0]].into(),
+                        transform: Some(fanta_doc::Transform2D::translation(12.0, 9.0)),
+                        size: None,
+                        fills: None,
+                        path_data: None,
+                        stroke_path: None,
+                        stroke_weight: None,
+                        text: None,
+                    });
+                }
+            }
+            let id = fixture.instance;
+            let expected_master = fixture.roots[usize::from(!alias)];
+            let item = crate::document::ready_item_for_test(
+                &project,
+                "/tmp/VariantInstanceMenu.fig".into(),
+                fixture.doc,
+                cx,
+            );
+            let (view, visual) = cx.add_window_view({
+                let item = item.clone();
+                let project = project.clone();
+                move |window, cx| FigView::new(item, project, window, cx)
+            });
+            visual.simulate_resize(size(px(1400.0), px(900.0)));
+            view.update(visual, |view, cx| {
+                view.set_viewport_silent(Viewport::default());
+                if policy == "read-only" {
+                    view.activate_tool(crate::tools::ToolKind::Inspect, cx);
+                }
+                cx.notify();
+            });
+            visual.run_until_parked();
+            visual.update(|window, cx| window.draw(cx).clear());
+            let before = item.read_with(visual, |item, _| {
+                variant_instance_content_snapshot(item.doc().expect("doc"))
+            });
+            let (before_metadata, before_assets) = item.read_with(visual, |item, _| {
+                let document = item.document().expect("document");
+                (document.doc.metadata.clone(), document.raw_assets.clone())
+            });
+            let position = view.read_with(visual, |view, _| {
+                view.container_bounds.expect("canvas").center() + point(px(15.0), px(15.0))
+            });
+            if alias && action == LayerAction::GoToMainComponent && policy == "editable" {
+                visual.simulate_event(MouseDownEvent {
+                    position,
+                    button: MouseButton::Left,
+                    modifiers: Default::default(),
+                    click_count: 2,
+                    first_mouse: false,
+                });
+                visual.simulate_event(MouseUpEvent {
+                    position,
+                    button: MouseButton::Left,
+                    modifiers: Default::default(),
+                    click_count: 2,
+                });
+                visual.run_until_parked();
+                view.read_with(visual, |view, _| {
+                    let session = &view
+                        .text_edit
+                        .as_ref()
+                        .expect("set-backed virtual text enters editing")
+                        .session;
+                    assert_eq!(
+                        session.buffer(),
+                        "Small",
+                        "placed pin must agree with renderer and navigation"
+                    );
+                    assert_eq!(
+                        session
+                            .instance()
+                            .expect("instance session")
+                            .def_path
+                            .as_slice(),
+                        &[fixture.texts[0]]
+                    );
+                });
+                visual.simulate_keystrokes("escape");
+                visual.run_until_parked();
+                item.read_with(visual, |item, _| {
+                    assert_eq!(
+                        variant_instance_content_snapshot(item.doc().expect("document")),
+                        before
+                    );
+                    assert!(!item.is_dirty());
+                });
+                item.update(visual, |item, cx| {
+                    item.with_document(cx, |document| {
+                        document.doc.selection.select_only(id);
+                        ((), DocChange::Selection)
+                    })
+                });
+            }
+            if policy != "editable" {
+                visual.update(|window, cx| {
+                    view.update(cx, |view, cx| {
+                        for action in [LayerAction::ResetInstance, LayerAction::DetachInstance] {
+                            view.run_layer_action(action.label(), id, action, window, cx);
+                        }
+                    })
+                });
+                item.read_with(visual, |item, _| {
+                    assert_eq!(
+                        variant_instance_content_snapshot(item.doc().expect("document")),
+                        before,
+                        "direct commands also refuse protected writes"
+                    )
+                });
+            }
+            visual.simulate_event(MouseDownEvent {
+                position,
+                button: MouseButton::Right,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            });
+            visual.simulate_event(MouseUpEvent {
+                position,
+                button: MouseButton::Right,
+                modifiers: Default::default(),
+                click_count: 1,
+            });
+            visual.run_until_parked();
+            item.read_with(visual, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(doc.selection.as_slice(), &[id]);
+                for action in [
+                    LayerAction::GoToMainComponent,
+                    LayerAction::DetachInstance,
+                    LayerAction::ResetInstance,
+                ] {
+                    assert!(
+                        crate::gpui_adapters::layers::context_actions(doc, id).contains(&action),
+                        "set action {action:?}, {policy}"
+                    );
+                }
+            });
+            visual.update(|window, cx| {
+                let menu = view
+                    .read(cx)
+                    .canvas_context_menu
+                    .as_ref()
+                    .expect("actual pointer opened menu")
+                    .menu
+                    .clone();
+                menu.update(cx, |menu, cx| {
+                    menu.select_first(&menu::SelectFirst, window, cx);
+                    let steps = match action {
+                        LayerAction::GoToMainComponent if policy != "editable" => 1,
+                        LayerAction::GoToMainComponent => 5,
+                        LayerAction::DetachInstance => 6,
+                        LayerAction::ResetInstance => 7,
+                        _ => unreachable!(),
+                    };
+                    for _ in 0..steps {
+                        menu.select_next(&menu::SelectNext, window, cx);
+                    }
+                    menu.confirm(&menu::Confirm, window, cx);
+                });
+            });
+            visual.run_until_parked();
+            if action == LayerAction::GoToMainComponent {
+                item.read_with(visual, |item, _| {
+                    let doc = item.doc().expect("document");
+                    assert_eq!(
+                        doc.selection.as_slice(),
+                        &[expected_master],
+                        "navigate to the variant actually rendered"
+                    );
+                    assert_eq!(
+                        doc.metadata, before_metadata,
+                        "navigation preserves timestamps and all metadata"
+                    );
+                    assert_eq!(
+                        item.document().expect("document").raw_assets,
+                        before_assets,
+                        "navigation preserves every asset byte"
+                    );
+                    assert_eq!(doc.active_page(), Some(expected_master));
+                    let mut expected = before.clone();
+                    expected["active_page"] =
+                        serde_json::to_value(expected_master).expect("master scope");
+                    assert_eq!(variant_instance_content_snapshot(doc), expected);
+                    assert_eq!(doc.history.undo_depth(), 0);
+                    assert!(!item.is_dirty());
+                });
+                view.read_with(visual, |view, _| {
+                    let expected_center = if alias {
+                        [1040.0, 20.0]
+                    } else {
+                        [1280.0, 40.0]
+                    };
+                    assert_eq!(
+                        view.viewport(),
+                        Some(Viewport {
+                            center: expected_center,
+                            zoom: 1.0
+                        }),
+                        "navigation fits the chosen component without changing the saved viewport"
+                    );
+                });
+                continue;
+            }
+            let after = item.read_with(visual, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(doc.history.undo_depth(), 1);
+                let content = variant_instance_content_snapshot(doc);
+                assert_eq!(content["components"], before["components"]);
+                assert_eq!(content["variables"], before["variables"]);
+                assert_eq!(content.get("asset_library"), before.get("asset_library"));
+                if action == LayerAction::ResetInstance {
+                    let expected = InstanceNode { component: fixture.set, overrides: Vec::new(), prop_values: Default::default(), derived: Vec::new(), local_size: [160.0, 80.0] };
+                    assert_eq!(doc.scene.get(id).expect("reset").data, NodeData::Instance(expected));
+                } else {
+                    assert!(matches!(doc.scene.get(id).expect("detached").data, NodeData::Group(_)));
+                    let children = doc.scene.children_of(Some(id));
+                    assert_eq!(children.len(), 1);
+                    assert!(matches!(&doc.scene.get(children[0]).expect("detached text").data, NodeData::Text(text) if text.content == "Small"));
+                    assert_eq!(doc.scene.local_bounds(id).expect("bounds").width(), 80.0);
+                }
+                content
+            });
+            visual.update(|window, cx| {
+                let focus = view.read(cx).focus_handle(cx);
+                focus.focus(window, cx);
+            });
+            visual.simulate_keystrokes("cmd-z");
+            visual.run_until_parked();
+            item.read_with(visual, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(
+                    variant_instance_content_snapshot(doc),
+                    before,
+                    "one Undo restores every authored field"
+                );
+                assert_eq!(doc.history.undo_depth(), 0);
+                assert_eq!(doc.history.redo_depth(), 1);
+            });
+            visual.simulate_keystrokes("cmd-shift-z");
+            visual.run_until_parked();
+            item.read_with(visual, |item, _| {
+                assert_eq!(
+                    variant_instance_content_snapshot(item.doc().expect("document")),
+                    after,
+                    "one Redo restores exact materialized IDs and content"
+                )
+            });
+        }
     }
 
     #[gpui::test]

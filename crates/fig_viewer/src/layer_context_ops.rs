@@ -180,15 +180,15 @@ pub(crate) fn simple(doc: &Doc, id: NodeId, action: Action) -> Result<Vec<Operat
             instance.overrides.clear();
             instance.prop_values.clear();
             instance.derived.clear();
-            if let Some(master) = doc
-                .components
-                .def(instance.component)
-                .and_then(|def| doc.scene.get(def.root))
-                .and_then(|node| node.data.local_bounds())
-            {
-                instance.local_size = [master.width(), master.height()];
+            let root = crate::component_actions::resolved_instance_root(doc, id, &instance)
+                .context("The main component is unavailable")?;
+            instance.local_size = crate::component_actions::master_size(doc, root)
+                .context("The main component has no bounds")?;
+            let data = NodeData::Instance(instance);
+            if data == node.data {
+                return Ok(Vec::new());
             }
-            Ok(vec![replace_data(node, NodeData::Instance(instance))])
+            Ok(vec![replace_data(node, data)])
         }
         Action::AddAutoLayout => auto_layout(doc, id, Some(LayoutMode::Horizontal)),
         Action::CreateComponent => {
@@ -2407,6 +2407,75 @@ mod tests {
             assert_eq!(node.transform, transform);
             assert_eq!(node.opacity, source.opacity);
         });
+    }
+
+    #[test]
+    fn variant_instance_reset_resolves_cleared_default_and_rejects_missing_master() {
+        use fanta_doc::{BoundProp, Override, OverrideValue, VarValue};
+        let mut fixture = crate::component_actions::tests::set_instance_fixture();
+        let NodeData::Instance(instance) = &mut fixture
+            .doc
+            .scene
+            .get_mut(fixture.instance)
+            .expect("instance")
+            .data
+        else {
+            panic!("instance")
+        };
+        instance.local_size = [300.0, 200.0];
+        instance.prop_values.insert(
+            fixture.property,
+            VarValue::String {
+                value: "Small".into(),
+            },
+        );
+        instance.overrides.push(Override {
+            target_path: vec![fixture.texts[0]].into(),
+            target_prop: BoundProp::TextContent,
+            value: OverrideValue::Text {
+                value: "Custom".into(),
+            },
+        });
+        let original = fixture
+            .doc
+            .scene
+            .get(fixture.instance)
+            .expect("instance")
+            .clone();
+        let library = fixture.doc.components.clone();
+        let operations =
+            simple(&fixture.doc, fixture.instance, Action::ResetInstance).expect("reset");
+        crate::clipboard::apply_transaction(&mut fixture.doc, "Reset instance", operations)
+            .expect("apply reset");
+        let NodeData::Instance(reset) = &fixture
+            .doc
+            .scene
+            .get(fixture.instance)
+            .expect("instance")
+            .data
+        else {
+            panic!("instance")
+        };
+        assert_eq!(reset.local_size, [160.0, 80.0]);
+        assert!(
+            reset.prop_values.is_empty() && reset.overrides.is_empty() && reset.derived.is_empty()
+        );
+        assert_eq!(fixture.doc.components, library);
+        assert_eq!(fixture.doc.history.undo_depth(), 1);
+        assert!(
+            simple(&fixture.doc, fixture.instance, Action::ResetInstance)
+                .expect("already reset")
+                .is_empty()
+        );
+        assert!(fixture.doc.undo().expect("undo"));
+        assert_eq!(fixture.doc.scene.get(fixture.instance), Some(&original));
+        fixture.doc.components.defs.remove(&fixture.members[1]);
+        let before = serde_json::to_value(&fixture.doc).expect("before invalid reset");
+        assert!(simple(&fixture.doc, fixture.instance, Action::ResetInstance).is_err());
+        assert_eq!(
+            serde_json::to_value(&fixture.doc).expect("after invalid reset"),
+            before
+        );
     }
 
     #[test]
