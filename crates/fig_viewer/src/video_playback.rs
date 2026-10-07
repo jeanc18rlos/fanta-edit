@@ -969,6 +969,209 @@ mod tests {
     }
 
     #[gpui::test]
+    fn inline_video_window_activation_installs_deferred_factory_once(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        let (sender, receiver) = futures::channel::oneshot::channel::<SessionFactory>();
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let (view, visual) = cx.add_window_view(|_, cx| {
+            let mut view = VideoPlaybackView::with_preparation(
+                Box::pin(async move {
+                    receiver
+                        .await
+                        .map_err(|error| anyhow!("fixture preparation: {error}"))
+                }),
+                cx,
+            );
+            view.time_range_us = Some([0, 3_000_000]);
+            view
+        });
+        visual.simulate_resize(gpui::size(px(320.), px(300.)));
+        visual.update(|window, _| window.activate_window());
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+        view.read_with(visual, |view, _| {
+            assert!(view.activation.is_some());
+            assert!(view.window_active);
+            assert!(view.preparation.is_some());
+        });
+        visual.deactivate_window();
+        assert!(!view.read_with(visual, |view, _| view.window_active));
+        let calls = factory_calls.clone();
+        let session_state = state.clone();
+        assert!(
+            sender
+                .send(Box::new(move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(Box::new(FakeSession(session_state)) as Box<dyn PlaybackSession>)
+                }))
+                .is_ok(),
+            "inactive preparation still owns its receiver"
+        );
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+        view.read_with(visual, |view, _| {
+            assert!(view.active);
+            assert!(!view.window_active);
+            assert!(!view.closed);
+            assert!(view.preparation.is_none());
+            assert!(view.pending_session.is_some());
+            assert!(view.session.is_none());
+            assert!(view.deadline.is_none());
+            assert!(view.error().is_none());
+            assert!(view.frame().is_none());
+            assert_eq!(view.status().duration_us, 0);
+        });
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
+        assert!(snapshot(&state).commands.is_empty());
+
+        visual.update(|window, _| window.activate_window());
+        visual.run_until_parked();
+        view.read_with(visual, |view, _| {
+            assert!(view.active && view.window_active && !view.closed);
+            assert!(view.preparation.is_none());
+            assert!(view.pending_session.is_none());
+            assert!(view.session.is_some());
+            assert!(view.deadline.is_none());
+            assert!(view.error().is_none());
+            assert!(view.frame().is_some());
+            assert!(!view.awaiting_frame);
+            assert!(!view.wants_play);
+            assert_eq!(view.status().state, VideoPlaybackState::Paused);
+            assert_eq!(view.status().current_time_us, 0);
+            assert_eq!(view.status().duration_us, 3_000_000);
+            assert_eq!(view.source_duration_us(), 10_000_000);
+        });
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            snapshot(&state).commands,
+            ["muted:true", "range:0:3000000", "seek:0"]
+        );
+        let bounds = view.read_with(visual, |view, _| {
+            view.scrub_bounds.expect("mounted seek control")
+        });
+        visual.simulate_click(bounds.center(), gpui::Modifiers::none());
+        visual.run_until_parked();
+        assert!(
+            (snapshot(&state).current_time_us as i64 - 1_500_000).abs() < 1000,
+            "the mounted seek control is interactive after activation"
+        );
+        assert!(!view.read_with(visual, |view, _| view.scrubbing));
+        visual.deactivate_window();
+        assert!(!view.read_with(visual, |view, _| view.window_active));
+        visual.update(|window, _| window.activate_window());
+        visual.run_until_parked();
+        view.read_with(visual, |view, _| {
+            assert!(view.window_active);
+            assert!(view.frame().is_some());
+            assert_eq!(view.status().state, VideoPlaybackState::Paused);
+            assert_eq!(view.status().duration_us, 3_000_000);
+            assert!(view.error().is_none());
+        });
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            !snapshot(&state)
+                .commands
+                .iter()
+                .any(|command| command == "play")
+        );
+        view.update(visual, |view, cx| view.close(cx));
+        visual.run_until_parked();
+        assert_eq!(snapshot(&state).dropped, 1);
+        view.read_with(visual, |view, _| {
+            assert!(view.session.is_none());
+            assert!(view.pending_session.is_none());
+            assert!(view.deadline.is_none());
+            assert!(view.frame().is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn inline_video_window_activation_does_not_install_closed_factory(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            let settings_store = settings::SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+        });
+        for prepared_before_close in [false, true] {
+            let (sender, receiver) = futures::channel::oneshot::channel::<SessionFactory>();
+            let state = Arc::new(Mutex::new(FakeState::default()));
+            let factory_calls = Arc::new(AtomicUsize::new(0));
+            let factory_drops = Arc::new(AtomicUsize::new(0));
+            let (view, visual) = cx.add_window_view(|_, cx| {
+                VideoPlaybackView::with_preparation(
+                    Box::pin(async move {
+                        receiver
+                            .await
+                            .map_err(|error| anyhow!("fixture preparation: {error}"))
+                    }),
+                    cx,
+                )
+            });
+            visual.update(|window, _| window.activate_window());
+            visual.run_until_parked();
+            visual.update(|window, cx| window.draw(cx).clear());
+            assert!(view.read_with(visual, |view, _| view.activation.is_some()));
+            visual.deactivate_window();
+            assert!(!view.read_with(visual, |view, _| view.window_active));
+            let calls = factory_calls.clone();
+            let session_state = state.clone();
+            let probe = DropProbe(factory_drops.clone());
+            let factory: SessionFactory = Box::new(move || {
+                let _probe = probe;
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(Box::new(FakeSession(session_state)) as Box<dyn PlaybackSession>)
+            });
+            if prepared_before_close {
+                assert!(sender.send(factory).is_ok());
+                visual.run_until_parked();
+                assert!(view.read_with(visual, |view, _| view.pending_session.is_some()));
+                view.update(visual, |view, cx| view.close(cx));
+            } else {
+                view.update(visual, |view, cx| view.close(cx));
+                visual.run_until_parked();
+                let rejected = sender.send(factory);
+                assert!(
+                    rejected.is_err(),
+                    "closed preparation releases its receiver"
+                );
+                drop(rejected);
+            }
+            visual.run_until_parked();
+            assert_eq!(factory_drops.load(Ordering::SeqCst), 1);
+            visual.update(|window, _| window.activate_window());
+            visual.run_until_parked();
+            view.read_with(visual, |view, _| {
+                assert!(view.window_active);
+                assert!(view.closed);
+                assert!(view.preparation.is_none());
+                assert!(view.pending_session.is_none());
+                assert!(view.session.is_none());
+                assert!(view.deadline.is_none());
+                assert!(view.frame().is_none());
+                assert!(view.error().is_none());
+                assert!(!view.wants_play);
+                assert_eq!(view.status().duration_us, 0);
+                assert_eq!(view.source_duration_us(), 0);
+            });
+            assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
+            assert_eq!(factory_drops.load(Ordering::SeqCst), 1);
+            assert!(snapshot(&state).commands.is_empty());
+            assert_eq!(snapshot(&state).dropped, 0);
+        }
+    }
+
+    #[gpui::test]
     fn inline_video_controls_preserve_latest_seek_pause_and_mute(cx: &mut gpui::TestAppContext) {
         let (view, state) = ready(cx);
         view.update(cx, |view, cx| {
