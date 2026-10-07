@@ -11,7 +11,7 @@ must use the signed, notarized DMG and the app installed from that exact DMG.
 The isolated development QA bundles and Mac App Store checks are separate
 evidence; neither establishes direct-download installation readiness.
 
-The integrated main commit `6ac89e6a2193603d45f7ce517d52493f2386884f` now
+The earlier integrated main checkpoint `6ac89e6a2193603d45f7ce517d52493f2386884f`
 passes the hosted Check and Mac App Store runtime jobs in
 [run 37534261732](https://github.com/jeanc18rlos/fanta-edit/actions/runs/37534261732).
 The push checkout tree matches that exact main commit. The native-video job
@@ -26,6 +26,52 @@ identifies their scope and the remaining acceptance work. Historical evidence in
 recorded there.
 
 ## Current acceptance status
+
+### Latest bounded checks — 7 October
+
+- **Inspector display/layout PASS on QA2824:** 16 static checks cover four
+  controls at 320/400 logical pixels in One Dark/One Light. Already-authored equal
+  independent corners show four fields; the precedence explanation is readable
+  in full, bound wrapper opacity shows 40%, and the selected Vector/Bitmap pair
+  shows Mixed. Thirteen strict snapshots preserve complete typed content,
+  timestamps, assets and files (bindings: 28 nodes, 25 files; mixed: 10 nodes,
+  5 assets, 24 files). Independent review verifies 144 linked hash records.
+  Bound Detach was visible but not invoked; this journey does not establish
+  authored edits, Undo/Redo, scrub cancellation or cold restart.
+- **Component navigation PASS on `67d29ea288`:** four actual Go to main component
+  routes resolve Large/Small/Large/Small and align artwork with selection.
+  Two strict checkpoints preserve all 20 nodes, 1 asset, timestamps and 30 files.
+  The earlier four alignment failures remain recorded. This is navigation
+  acceptance, not a saved Reset/Detach or cold-reopen claim.
+- **Frame/Section Escape PASS on `67d29ea288`:** each native drill-in enters
+  inline text, then one Escape exits before a later blank click. Eight
+  screenshots and independent input-state review support the two routes;
+  all 10 nodes, 1 asset, timestamps and 20 files remain unchanged. Three mounted
+  Escape cases and a bound-text cancellation control pass across five scheduler
+  iterations. Edited text, IME and TextPath are outside this native check.
+- **Variant action persistence PASS on `41becdffe5`:** ten native checkpoints
+  cover Open, two navigation controls (default Large and pinned Small), Reset,
+  single Undo/Redo saves, restoration before Detach, Detach, its single Undo/Redo
+  saves, and cold reopening. The complete typed oracle and file boundaries pass:
+  20 original nodes, 1 asset and 30 files, with exactly the expected 21-node
+  detached state. C01 becomes an 80 × 40 Frame with Small content. Only declared
+  files change; verified process exit and exact-binary reopening preserve the
+  saved Redo payload, timestamp and every file byte without another Save.
+  The earlier strict Detach failure remains retained: it duplicated four
+  component-owned nodes into unrelated page source and dropped page attributes.
+  The ownership correction (`2c7a9d1cd0`) and scope index (`41becdffe5`) pass
+  four ownership regressions, three index regressions, 234 format tests
+  (2 ignored), source-order tests (98 FNX plus 234 format), 1,196 editor tests
+  (2 ignored), and the required ten-crate lint. These fixtures do not establish
+  native edits of unknown source attributes or arbitrary nested detachments.
+
+Evidence is archived under `native-inspector-ui-candidate-20261007`,
+`native-variant-instance-menu-20261007-v4` (the `scope67-*` and `vdaf-*` records,
+plus the retained `native-detach` failure), `native-frame-section-text-20261007` (`scope67-*`), and
+`variant-detach-artifact-ownership-20261007` (`green-broad-run2` and
+`root-index-green-run1`). These development checks do not validate the final
+signed/notarized DMG or native large-page performance. Earlier dated results
+and failures follow without being reclassified.
 
 These results apply to the named builds and bounded journeys. Earlier
 native journeys in the appendix used `a82f90f87b`. The source-editor candidate
@@ -87,7 +133,7 @@ release artifact.
 | Code source editing | **Bounded native PASS:** Find and source Save/repeat Save/single Undo/Redo on `3e3f275fcd`; partial FNX Save with invalid JSON → selected Discard → Canvas Save, repeat Save and strict quit/relaunch on `ac038333e3`. The later instance-text source checkpoint passes 1,147 editor library tests (1 ignored) and viewer lint. The three benchmark CLI tests retain their earlier viewport/binding checkpoint, and the eight-stage run retains its `938807f801` identity. | Native recovery Undo, deliberately delayed own-write events, genuine concurrent external changes and multiwindow source editing remain unverified. The original false-conflict failure is retained; no focus production change is claimed. |
 | Clipboard guards and master preservation | **Bounded native PASS on `100fe26921`: all 41 harness checkpoints**, including asset Duplicate/Copy-Paste/Cut-Paste, master/final-variant deletion, repeated component-bundle Paste, Undo/Redo, all seven route restarts and direct/inherited lock guards. Complete typed/asset oracles pass; restarts include exact timestamp/file bytes. Earlier three visible refusal paths retain their `938807f801` evidence. | Original viewport-mutation failures remain retained. Broader dependency, partial-set and appearance combinations are not exhausted. Cross-document Paste remains unsupported; partial-set Cut and unsafe detach cases refuse without mutation. |
 | Prototype interaction removal | **Bounded native PASS:** explicit Remove/Save and single Undo/Save on `a82f90f87b`; a fresh matching user-edited baseline passes Save and verified process restart with exact typed content and all 19 files on `ac038333e3`. | The older strict restart failed against a stale baseline after confirmed user position edits and remains retained. Remove/Undo and playback were not repeated on the newer build; broader triggers/overlays remain open. |
-| Inspector and per-node actions | **Bounded native PASS on `100fe26921`:** wrapper opacity 40%, bound visibility/radius, explicit-corner summaries, ancestor-pinned 70%/visible/26 values and readable Available labels in One Dark and One Light. Open/Save/cold reopen and a theme roundtrip preserve all 28 nodes and 25 files exactly. Earlier paint, mixed-opacity, Export and per-node checks retain their own provenance. | B02's four separate corner controls and the precedence label were not observed; no native mode-change/Undo or exhaustive custom-theme check in this fixture. The later `a3a51b084b` native fixture passes alias/mode-aware text editing, hidden-text no-op and saved-state restart; direct-bound refusal/read-only Content and alias-only canvas/Design edits now pass the separate `8a9a33c35e` fixture, including Undo/Redo and strict saved-state reopening. A later post-restart refusal check passes after selection/focus reset; the earlier targeting attempt and its unproven cause remain recorded. Seven later `8a9a33c35e` inspector checkpoints pass: mixed 50%/100% → 75%, single Undo/Redo/restoration, corner inspection and exact cold reopen. Both earlier zero-opacity attempts remain failed. The updated UI pin passes four fast-exit regressions and six scrub controls across five seeds. Corrected `ce8db37c34` now passes a numeric-readout scrub to 0%, Save, single Undo/Redo and strict process restart with exact saved bytes. The later icon-targeted no-op is retained separately. The broader per-kind, gesture and keyboard matrix remains incomplete. |
+| Inspector and per-node actions | **Bounded native PASS on `100fe26921`:** wrapper opacity 40%, bound visibility/radius, explicit-corner summaries, ancestor-pinned 70%/visible/26 values and readable Available labels in One Dark and One Light. Open/Save/cold reopen and a theme roundtrip preserve all 28 nodes and 25 files exactly. Earlier paint, mixed-opacity, Export and per-node checks retain their own provenance. | B02's four separate corner controls and the precedence label were not observed in that earlier fixture; the 7 October static checks above now cover their display. Native mode-change/Undo and exhaustive custom-theme checks remain open. The later `a3a51b084b` native fixture passes alias/mode-aware text editing, hidden-text no-op and saved-state restart; direct-bound refusal/read-only Content and alias-only canvas/Design edits now pass the separate `8a9a33c35e` fixture, including Undo/Redo and strict saved-state reopening. A later post-restart refusal check passes after selection/focus reset; the earlier targeting attempt and its unproven cause remain recorded. Seven later `8a9a33c35e` inspector checkpoints pass: mixed 50%/100% → 75%, single Undo/Redo/restoration, corner inspection and exact cold reopen. Both earlier zero-opacity attempts remain failed. The updated UI pin passes four fast-exit regressions and six scrub controls across five seeds. Corrected `ce8db37c34` now passes a numeric-readout scrub to 0%, Save, single Undo/Redo and strict process restart with exact saved bytes. The later icon-targeted no-op is retained separately. The broader per-kind, gesture and keyboard matrix remains incomplete. |
 | Large-page responsiveness | Correctness tests and bounded CPU diagnostics pass; Save acceptance hashing improves one measured phase. PR 75 (`f47763b6ae`) adds inclusive per-gesture UI costs; focused tests, five-seed lifecycle, 1,164 editor tests (1 ignored), three CLI tests and lint pass; native log capture is pending. PR 74 (`fed62a3339`) accepts fixed painted ancestors: 389 renderer tests pass (2 ignored); 12 development-CPU Spectrum runs pass 552 exact parity frames and 1,440 paired timings. Fit-all improves, but 100% image performance regresses and the 100% instance case does not improve. The API remains outside live canvas dragging; earlier PR 72 refusal evidence is retained. The first actual-Metal comparison fails (maximum channel difference 28 versus threshold 2), so no timings are accepted. CPU-full/retained match exactly; three Metal-only composition controls match normal Metal on the first fixture. A separate test-only GPU matrix now matches all 40 frames exactly across five fixtures, with unchanged semantic proof and no timing. Production backend ownership/lifecycle and live activation remain open. | Native full Save remains slow in the development candidate; matched complete Save, pointer/frame p50/p95 and memory measurements on the final build are open. Instrumentation is not native input-latency evidence. No result establishes the drag p95 target below 16 ms. |
 | Final artifact and services | **All eight default automated stages PASS on `938807f801`**, with stable source fingerprints. Earlier component visual, MCP and distribution evidence retains its own build identity. Integrated main `6ac89e6a21` now passes exact-head hosted Check/Store jobs; native-video was skipped. Direct-download macOS is the selected release target. PR 71 adds mounted-DMG verification: 27 isolated checks pass with a tiny real test DMG; the applied default run passes 26 with that optional check skipped. | No signed product DMG has been verified. Remaining native journeys, current visual/private-fixture gates, live services, Developer ID signing, DMG notarization/stapling and clean-account/Mac installation checks remain open. |
 
