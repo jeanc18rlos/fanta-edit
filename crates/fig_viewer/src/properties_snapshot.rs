@@ -1692,7 +1692,6 @@ pub(crate) fn corner_radius_value(node: &CanvasNode) -> CornerRadiusValue {
         _ => return CornerRadiusValue::NotApplicable,
     };
     match radii {
-        Some([a, b, c, d]) if a == b && b == c && c == d => CornerRadiusValue::Uniform(a),
         Some(radii) => CornerRadiusValue::PerCorner(radii),
         None => CornerRadiusValue::Uniform(radius.unwrap_or(0.0)),
     }
