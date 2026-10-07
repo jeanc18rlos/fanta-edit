@@ -98,6 +98,16 @@ class PackagingPreflight(unittest.TestCase):
         self.reject({'FANTA_RELEASE_CHANNEL': 'stable', 'CARGO_TARGET_DIR': str(self.root / 'alternate-target')},
                     'Unset it before bundling')
 
+    def test_developer_bundle_requires_one_explicit_source_version(self):
+        manifest = self.root / 'crates/zed/Cargo.toml'
+        for content in ['[package]\nname = "zed"\n',
+                        '[package]\nversion = "1.0.0"\nversion = "2.0.0"\n']:
+            with self.subTest(manifest=content):
+                manifest.write_text(content)
+                self.before['crates/zed/Cargo.toml'] = manifest.read_bytes()
+                self.reject({'FANTA_RELEASE_CHANNEL': 'stable'},
+                            'Expected one explicit package version in crates/zed/Cargo.toml')
+
     def test_store_and_notarization_are_incompatible(self):
         self.reject({'FANTA_REQUIRE_NOTARIZATION': 'true'}, 'Mac App Store packages are submitted to App Store Connect', ['-s'])
 
@@ -106,6 +116,75 @@ class PackagingPreflight(unittest.TestCase):
                                 env={**self.environment, 'FANTA_RELEASE_CHANNEL': 'stable'}, capture_output=True, text=True)
         self.assertEqual(result.returncode, 99)
         self.assertEqual(self.log.read_text().splitlines(), ['cargo', 'cargo'])
+
+
+class BundleVersionProducer(unittest.TestCase):
+    def setUp(self):
+        PackagingPreflight.setUp(self)
+        self.app = self.root / 'generated/Fanta.app'
+        fixture(self.app)
+        info_path = self.app / 'Contents/Info.plist'
+        self.initial_info = plistlib.loads(info_path.read_bytes())
+        self.initial_info.update(CFBundleShortVersionString='1.0.0',
+                                 CFBundleVersion='20261007.135637', LSMinimumSystemVersion='10.15.7')
+        info_path.write_bytes(plistlib.dumps(self.initial_info))
+        self.environment['FANTA_TEST_APP_PATH'] = str(self.app)
+        self.stub(self.sentinels / 'cargo', 'cargo', r"""
+case "$*" in
+  '-q bundle --help') printf '%s\n' 'cargo-bundle v0.6.1-zed';;
+  build\ *) ;;
+  bundle\ *) printf '%s\n' "$FANTA_TEST_APP_PATH";;
+  *) exit 98;;
+esac
+""")
+        self.stub(self.sentinels / 'rustc', 'rustc', "printf '%s\\n' 'host: aarch64-apple-darwin'\n")
+        self.stub(self.sentinels / 'rustup', 'rustup', 'exit 0\n')
+        self.stub(self.root / 'script/generate-licenses', 'licenses', 'exit 0\n')
+        self.stub(self.root / 'crates/fanta_revenuecat/bundle-native.sh', 'store-boundary', 'exit 97\n')
+
+    def stub(self, path, label, body):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('#!/bin/sh\nset -eu\nprintf "%s\\n" "' + label + '" >> "$FANTA_SENTINEL_LOG"\n' + body)
+        path.chmod(0o755)
+
+    def run_producer(self, version, *, store=False):
+        manifest = self.root / 'crates/zed/Cargo.toml'
+        manifest.write_text('[package]\nname = "zed"\nversion = "' + version + '"\n\n'
+                            '[package.metadata.bundle-stable]\nname = "Fanta"\n')
+        original_manifest = manifest.read_bytes()
+        arguments = ['-s', '-d'] if store else []
+        result = subprocess.run(['/bin/bash', 'script/bundle-mac', *arguments, 'aarch64-apple-darwin'],
+                                cwd=self.root, env={**self.environment, 'FANTA_RELEASE_CHANNEL': 'stable',
+                                'FANTA_APP_STORE_VERSION': '1.4', 'FANTA_APP_STORE_BUILD_NUMBER': '47.2'},
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 97 if store else 99, result.stdout + result.stderr)
+        self.assertEqual(self.log.read_text().splitlines(),
+                         ['cargo', 'rustc', 'licenses', 'rustup', 'cargo', 'cargo',
+                          'store-boundary' if store else 'security'])
+        self.assertEqual(manifest.read_bytes(), original_manifest)
+        self.assertFalse(manifest.with_suffix('.toml.backup').exists())
+        app = self.root / 'target/aarch64-apple-darwin/release/app-store-dev/Fanta.app' if store else self.app
+        return plistlib.loads((app / 'Contents/Info.plist').read_bytes())
+
+    def assert_developer_version(self, version):
+        info = self.run_producer(version)
+        self.assertEqual(info['CFBundleVersion'], version)
+        self.assertEqual(info['CFBundleShortVersionString'], version)
+        self.assertEqual(info, {**self.initial_info, 'CFBundleVersion': version,
+                               'CFBundleShortVersionString': version})
+        verifier.verify_metadata(self.app, version)
+
+    def test_developer_bundle_replaces_timestamp_before_signing(self):
+        self.assert_developer_version('1.0.0')
+
+    def test_developer_bundle_tracks_source_version_before_signing(self):
+        self.assert_developer_version('9.8.7')
+
+    def test_store_bundle_retains_separate_version_and_build(self):
+        info = self.run_producer('9.8.7', store=True)
+        self.assertEqual(info, {**self.initial_info, 'CFBundleShortVersionString': '1.4',
+                               'CFBundleVersion': '47.2', 'LSMinimumSystemVersion': '12.0',
+                               'ITSAppUsesNonExemptEncryption': False})
 
 
 class WorkflowPipeline(unittest.TestCase):
@@ -328,7 +407,7 @@ if __name__ == '__main__':
         report = {'passed': result.wasSuccessful(), 'tests_run': result.testsRun,
                   'failures': len(result.failures), 'errors': len(result.errors), 'skipped': len(result.skipped),
                   'native_synthetic_dmg': NATIVE_DMG,
-                  'scope': 'Isolated real script preflight rejection, synthetic bundle/orchestration cases, and optional tiny real read-only DMG. No signed product artifact, native app launch, Cargo or credentials.',
+                  'scope': 'Isolated real script preflight and version production with stubbed build tools, synthetic bundle/orchestration cases, and optional tiny real read-only DMG. No signed product artifact, native app launch, real Cargo or credentials.',
                   'sources': {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
                               for path in [Path(__file__), ROOT / 'script/verify-macos-dmg', ROOT / 'script/bundle-mac']}}
         arguments.report.write_text(json.dumps(report, indent=2) + '\n')

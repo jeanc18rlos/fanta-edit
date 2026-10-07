@@ -184,6 +184,14 @@ if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
     exit 1
 fi
 
+if [[ "$app_store" != true ]]; then
+    bundle_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/zed/Cargo.toml)
+    if [[ -z "$bundle_version" || "$bundle_version" == *$'\n'* ]]; then
+        echo "Expected one explicit package version in crates/zed/Cargo.toml."
+        exit 1
+    fi
+fi
+
 cargo_bundle_version=$(cargo -q bundle --help 2>&1 | head -n 1 || echo "")
 if [ "$cargo_bundle_version" != "cargo-bundle v0.6.1-zed" ]; then
     cargo install cargo-bundle --locked --git https://github.com/zed-industries/cargo-bundle.git --rev 2be2669972dff3ddd4daf89a2cb29d2d06cad7c7
@@ -283,6 +291,12 @@ if [[ "$app_store" = true ]]; then
     else
         /usr/libexec/PlistBuddy -c 'Add :ITSAppUsesNonExemptEncryption bool false' "$info_plist"
     fi
+else
+    # cargo-bundle emits a date-based build number, but direct-download artifacts
+    # must carry the same source version in both fields before they are signed.
+    info_plist="${app_path}/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${bundle_version}" "$info_plist"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${bundle_version}" "$info_plist"
 fi
 
 # DocumentTypes.plist references CFBundleTypeIconFile "Document", so the bundle must contain Document.icns.
