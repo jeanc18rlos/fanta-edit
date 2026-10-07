@@ -3062,11 +3062,7 @@ impl FigItem {
                                 );
                             }
                             session.adopt_document_shared(&doc);
-                            for id in &changed_artifacts {
-                                if let Some(artifact) = session.artifact_mut(id) {
-                                    artifact.adopt_document(&doc)?;
-                                }
-                            }
+                            session.adopt_document_artifacts(&doc, &changed_artifacts)?;
                             let sources = session.validated_source_overrides_for_document(&doc)?;
                             let mut expected_disk = session.source_write_preconditions(&doc)?;
                             if let Some(previous_assets) = &previous_assets {

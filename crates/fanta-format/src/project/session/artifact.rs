@@ -183,6 +183,15 @@ impl ArtifactSession {
     /// The host can call this for the artifact it knows changed without cloning
     /// or scanning the other pages' scene nodes.
     pub fn adopt_document(&mut self, document: &Doc) -> Result<SourceSync, SessionError> {
+        let scopes = super::materialize::DocumentScopes::new(document);
+        self.adopt_document_scoped(&scopes)
+    }
+
+    pub(super) fn adopt_document_scoped(
+        &mut self,
+        scopes: &super::materialize::DocumentScopes<'_>,
+    ) -> Result<SourceSync, SessionError> {
+        let document = scopes.document();
         let component = match self.id {
             ArtifactId::Component(id) => Some(
                 document
@@ -193,12 +202,7 @@ impl ArtifactSession {
             ),
             _ => None,
         };
-        if let Some(scoped) = super::materialize::scope_from_document(
-            document,
-            self.kind,
-            self.scoped.root,
-            component,
-        ) {
+        if let Some(scoped) = scopes.scope(self.kind, self.scoped.root, component) {
             return self.adopt_scoped_doc(scoped?);
         }
         let nodes = super::materialize::collect_subtree_nodes(document, self.scoped.root)?;

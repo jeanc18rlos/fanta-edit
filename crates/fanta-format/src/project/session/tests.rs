@@ -3875,13 +3875,9 @@ fn artifact_ownership_structural_whole_project_save_preserves_unrelated_master_s
     );
     let expected = serde_json::to_value(&fixture.document).expect("full authored document");
     workspace.adopt_document_shared(&fixture.document);
-    for id in &artifacts {
-        workspace
-            .artifact_mut(id)
-            .expect("artifact")
-            .adopt_document(&fixture.document)
-            .expect("host all-artifact adoption");
-    }
+    workspace
+        .adopt_document_artifacts(&fixture.document, &artifacts)
+        .expect("host all-artifact adoption with one ownership index");
     let sources = workspace
         .validated_source_overrides_for_document(&fixture.document)
         .expect("validated sources");
@@ -4184,4 +4180,324 @@ fn artifact_ownership_untouched_unknown_attributes_and_comments_survive_property
         serde_json::to_value(&fixture.document).expect("expected content")
     );
     assert_eq!(assets, fixture.assets);
+}
+
+fn artifact_scope_index_reference_scene(document: &Doc, root: NodeId) -> fanta_doc::Scene {
+    let mut scene = document
+        .scene
+        .extract_subtree(root)
+        .expect("reference root");
+    for definition in document.components.defs.values() {
+        if definition.root != root && scene.contains(definition.root) {
+            scene
+                .remove(definition.root)
+                .expect("reference foreign root");
+        }
+    }
+    scene
+}
+
+#[test]
+fn artifact_scope_index_matches_definition_scan_payload_order_and_pending_layout() {
+    for reverse_definition_roots in [false, true] {
+        let mut fixture = artifact_ownership_fixture(true);
+        let (_, outer_root, outer_text) = *fixture.components.first().expect("outer");
+        let (_, inner_root, inner_text) = *fixture.components.last().expect("inner");
+        for name in ["Equal-index B", "Equal-index A"] {
+            let mut node = CanvasNode::new(NodeData::Group(GroupNode::default()));
+            node.name = name.into();
+            node.parent = Some(outer_root);
+            node.index = fanta_doc::IndexKey::FIRST;
+            fixture
+                .document
+                .scene
+                .insert(node)
+                .expect("equal-index sibling");
+        }
+        if reverse_definition_roots {
+            let ids: Vec<_> = fixture.document.components.defs.keys().copied().collect();
+            let first = *ids.first().expect("first definition");
+            let last = *ids.last().expect("last definition");
+            let first_root = fixture
+                .document
+                .components
+                .defs
+                .get(&first)
+                .expect("first")
+                .root;
+            let last_root = fixture
+                .document
+                .components
+                .defs
+                .get(&last)
+                .expect("last")
+                .root;
+            fixture
+                .document
+                .components
+                .defs
+                .get_mut(&first)
+                .expect("first")
+                .root = last_root;
+            fixture
+                .document
+                .components
+                .defs
+                .get_mut(&last)
+                .expect("last")
+                .root = first_root;
+        }
+        fixture
+            .document
+            .pending_layout
+            .extend([outer_text, inner_text, fixture.instance]);
+        let before = serde_json::to_value(&fixture.document).expect("input document");
+        let scopes = super::materialize::DocumentScopes::new(&fixture.document);
+        let artifacts =
+            fixture
+                .document
+                .pages
+                .iter()
+                .map(|root| (ArtifactKind::Page, *root, None))
+                .chain(fixture.document.components.defs.values().map(|definition| {
+                    (ArtifactKind::Component, definition.root, Some(definition))
+                }));
+        for (kind, root, definition) in artifacts {
+            let mut expected = artifact_scope_index_reference_scene(&fixture.document, root);
+            if kind == ArtifactKind::Page {
+                let NodeData::Group(group) = &mut expected.get_mut(root).expect("page").data else {
+                    panic!("page root kind");
+                };
+                group.clip_size = None;
+                group.local_size = None;
+            }
+            let actual = scopes
+                .scope(kind, root, definition)
+                .expect("supported kind")
+                .expect("scope");
+            assert_eq!(
+                serde_json::to_value(&actual.doc.scene).expect("actual"),
+                serde_json::to_value(&expected).expect("reference")
+            );
+            assert_eq!(
+                actual.doc.pending_layout,
+                fixture
+                    .document
+                    .pending_layout
+                    .iter()
+                    .copied()
+                    .filter(|id| expected.contains(*id))
+                    .collect()
+            );
+            for id in expected.descendants_of(root) {
+                assert_eq!(
+                    actual.doc.scene.children_of(Some(id)),
+                    expected.children_of(Some(id))
+                );
+                if id != root {
+                    assert!(actual.doc.scene.shares_node(&fixture.document.scene, id));
+                }
+            }
+            if root == fixture.masters {
+                assert!(actual.doc.scene.contains(fixture.container));
+                assert!(!actual.doc.scene.contains(outer_root));
+                assert!(!actual.doc.scene.contains(inner_root));
+            }
+            if root == fixture.routes {
+                assert!(actual.doc.scene.contains(fixture.instance));
+            }
+        }
+        assert_eq!(
+            serde_json::to_value(&fixture.document).expect("after"),
+            before
+        );
+    }
+}
+
+#[test]
+fn artifact_scope_index_rebuilds_after_definition_add_remove_and_root_retarget() {
+    let mut fixture = artifact_ownership_fixture(true);
+    let (outer, outer_root, _) = *fixture.components.first().expect("outer");
+    let (inner, inner_root, _) = *fixture.components.last().expect("inner");
+    let removed = fixture
+        .document
+        .components
+        .defs
+        .get(&inner)
+        .expect("inner definition")
+        .clone();
+    for state in 0..5 {
+        match state {
+            1 => {
+                fixture
+                    .document
+                    .components
+                    .defs
+                    .remove(&inner)
+                    .expect("remove inner ownership");
+            }
+            2 => {
+                fixture
+                    .document
+                    .components
+                    .defs
+                    .insert(inner, removed.clone());
+            }
+            3 => {
+                fixture
+                    .document
+                    .components
+                    .defs
+                    .get_mut(&outer)
+                    .expect("outer")
+                    .root = fixture.container;
+            }
+            4 => {
+                fixture
+                    .document
+                    .components
+                    .defs
+                    .get_mut(&inner)
+                    .expect("inner")
+                    .root = fixture.container;
+            }
+            _ => {}
+        }
+        let scopes = super::materialize::DocumentScopes::new(&fixture.document);
+        for root in [fixture.masters, fixture.container, outer_root, inner_root] {
+            let expected = artifact_scope_index_reference_scene(&fixture.document, root);
+            let actual = scopes.extract_scene(root).expect("new snapshot index");
+            assert_eq!(
+                serde_json::to_value(&actual).expect("actual"),
+                serde_json::to_value(&expected).expect("reference"),
+                "state {state}, root {root}"
+            );
+        }
+        let outer_scene = scopes.extract_scene(outer_root).expect("outer");
+        assert_eq!(outer_scene.contains(inner_root), state == 1 || state == 4);
+    }
+}
+
+#[test]
+fn artifact_scope_index_rejects_malformed_excluded_subtrees_before_adoption() {
+    let fixture = artifact_ownership_fixture(true);
+    let (outer, outer_root, _) = *fixture.components.first().expect("outer");
+    let (_, inner_root, inner_text) = *fixture.components.last().expect("inner");
+    let before_files = artifact_ownership_file_bytes(fixture.directory.path());
+    for corruption in [
+        "cycle",
+        "stale-child-index",
+        "missing-root",
+        "wrong-node-id",
+    ] {
+        let mut document = fixture.document.clone();
+        match corruption {
+            "cycle" => {
+                document.scene.get_mut(outer_root).expect("outer").parent = Some(inner_root);
+                document.scene.rebuild_child_index();
+            }
+            "stale-child-index" => {
+                // The foreign inner master would normally be pruned, but its
+                // descendants are still traversed by extract_subtree first.
+                document
+                    .scene
+                    .get_mut(inner_text)
+                    .expect("inner text")
+                    .parent = Some(fixture.routes);
+            }
+            "missing-root" => {
+                document.scene.remove(outer_root).expect("remove root");
+            }
+            "wrong-node-id" => {
+                document.scene.get_mut(inner_text).expect("text").id = NodeId::new();
+            }
+            _ => unreachable!(),
+        }
+        let snapshot = serde_json::to_value(&document).expect("malformed input");
+        let mut workspace = WorkspaceSession::open(fixture.directory.path()).expect("workspace");
+        let artifact = ArtifactId::Component(outer);
+        workspace
+            .open_artifact(artifact.clone())
+            .expect("open valid disk source");
+        let before = serde_json::to_value(workspace.artifact(&artifact).expect("artifact").doc())
+            .expect("before");
+        let result = workspace.adopt_document_artifacts(&document, [&artifact]);
+        assert!(
+            matches!(result, Err(SessionError::DocAssemble(_))),
+            "corruption {corruption}"
+        );
+        assert_eq!(
+            serde_json::to_value(workspace.artifact(&artifact).expect("artifact").doc())
+                .expect("after"),
+            before
+        );
+        assert_eq!(
+            serde_json::to_value(&document).expect("input after"),
+            snapshot
+        );
+        assert_eq!(
+            artifact_ownership_file_bytes(fixture.directory.path()),
+            before_files
+        );
+    }
+}
+
+#[test]
+#[ignore = "diagnostic: supply immutable FANTA_SCOPE_BENCH_DOC and run with an exclusive CPU window"]
+fn artifact_scope_index_spectrum_benchmark() {
+    let path = std::env::var_os("FANTA_SCOPE_BENCH_DOC").expect("FANTA_SCOPE_BENCH_DOC required");
+    let mut document: Doc =
+        serde_json::from_slice(&std::fs::read(path).expect("snapshot")).expect("typed Doc");
+    document.scene.rebuild_child_index();
+    let roots: Vec<_> = document
+        .pages
+        .iter()
+        .copied()
+        .chain(
+            document
+                .components
+                .defs
+                .values()
+                .map(|definition| definition.root),
+        )
+        .collect();
+    let scopes = super::materialize::DocumentScopes::new(&document);
+    for root in &roots {
+        let expected = artifact_scope_index_reference_scene(&document, *root);
+        let actual = scopes.extract_scene(*root).expect("indexed scope");
+        assert_eq!(
+            serde_json::to_value(&actual).expect("actual"),
+            serde_json::to_value(&expected).expect("expected")
+        );
+        for id in expected.descendants_of(*root) {
+            assert_eq!(actual.children_of(Some(id)), expected.children_of(Some(id)));
+            if id != *root {
+                assert!(actual.shares_node(&document.scene, id));
+            }
+        }
+    }
+    for round in 0..3 {
+        for indexed in if round % 2 == 0 {
+            [false, true]
+        } else {
+            [true, false]
+        } {
+            let started = std::time::Instant::now();
+            let scopes = indexed.then(|| super::materialize::DocumentScopes::new(&document));
+            for root in &roots {
+                let scene = if let Some(scopes) = &scopes {
+                    scopes.extract_scene(*root).expect("indexed extraction")
+                } else {
+                    artifact_scope_index_reference_scene(&document, *root)
+                };
+                std::hint::black_box(&scene);
+            }
+            eprintln!(
+                "scope_pruning_only round={round} indexed={indexed} artifacts={} definitions={} elapsed_us={}",
+                roots.len(),
+                document.components.defs.len(),
+                started.elapsed().as_micros()
+            );
+        }
+    }
 }
