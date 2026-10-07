@@ -11,13 +11,16 @@
 //! on the fields most recently added; extend it when adding fields.
 
 use super::{
-    AutoLayout, CanvasNode, Constraints, GroupNode, LayoutChild, MaskType, NodeData, Reaction,
-    ScrollBehavior, ScrollDirection, TextNode, TextPathAlignment, TextPathDirection, TextPathNode,
-    TextPathSide, TextPathStart, TextStyle, TextStyleRun, VectorNode,
+    AiArtifactNode, AudioNode, AutoLayout, BitmapNode, BooleanBakedGeometry, BooleanNode,
+    CanvasNode, Constraints, DerivedOverride, EmbedNode, GenerationStatus, GridCell, GridLayout,
+    GroupNode, InstanceNode, LayoutChild, MaskType, Model3dNode, NodeData, NodeGraphNode, Override,
+    OverrideValue, ParametricShape, Reaction, ScrollBehavior, ScrollDirection, TextAutoResize,
+    TextNode, TextPathAlignment, TextPathDirection, TextPathNode, TextPathSide, TextPathStart,
+    TextStyle, TextStyleRun, VectorNode, VideoNode,
 };
 use crate::binding::BoundProp;
 use crate::color::Color;
-use crate::id::VariableId;
+use crate::id::{AssetId, ComponentId, ComponentPropId, NodeId, VariableId};
 use crate::style::{Blur, Fill, Shadow, Stroke};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
@@ -87,7 +90,7 @@ fn maximal_node(data: NodeData) -> CanvasNode {
         animation: None,
     });
     node.layout_child = Some(LayoutChild {
-        grid: None,
+        grid: Some(GridCell::default()),
         grow: 1.0,
         absolute: true,
         align_self: Some(super::CounterAlign::Center),
@@ -106,7 +109,11 @@ fn maximal_variants() -> Vec<NodeData> {
         scrollable: true,
         scroll_direction: Some(ScrollDirection::Both),
         scroll_offset: Some([0.0, 5.0]),
-        auto_layout: Some(AutoLayout::default()),
+        auto_layout: Some(AutoLayout {
+            reverse_z: true,
+            ..Default::default()
+        }),
+        grid: Some(GridLayout::default()),
         corner_radius: Some(2.0),
         corner_radii: Some([1.0, 2.0, 3.0, 4.0]),
         corner_smoothing: 0.6,
@@ -125,6 +132,11 @@ fn maximal_variants() -> Vec<NodeData> {
     vector.corner_radius = Some(2.0);
     vector.corner_radii = Some([1.0, 2.0, 3.0, 4.0]);
     vector.corner_smoothing = 0.6;
+    vector.parametric = Some(ParametricShape::Arc {
+        start_rad: 0.0,
+        sweep_rad: 1.0,
+        inner_ratio: 0.5,
+    });
 
     let mut text = TextNode::new("x", 10.0, 10.0);
     text.style = TextStyle::default();
@@ -133,6 +145,7 @@ fn maximal_variants() -> Vec<NodeData> {
         end: 1,
         style: TextStyle::default(),
     });
+    text.auto_resize = TextAutoResize::Height;
     text.max_lines = Some(2);
     text.truncate = true;
     text.paragraph_spacing = 4.0;
@@ -152,11 +165,112 @@ fn maximal_variants() -> Vec<NodeData> {
     text_path.direction = TextPathDirection::Reverse;
     text_path.side = TextPathSide::Flipped;
 
+    let asset = AssetId::from_u128(1);
+    let node_id = NodeId::from_u128(2);
+    let bitmap = BitmapNode {
+        asset,
+        natural_size: [10, 10],
+        local_size: [10.0, 10.0],
+        crop: Some([0.0, 0.0, 1.0, 1.0]),
+        fit: crate::style::ImageFitMode::Fill,
+        tint: Some(Color::WHITE),
+    };
+    let video = VideoNode {
+        asset,
+        natural_size: [10, 10],
+        local_size: [10.0, 10.0],
+        time_range_us: [0, 1_000_000],
+        speed: 1.0,
+        muted: true,
+        volume: 0.5,
+        poster_frame_us: Some(0),
+        poster: Some(asset),
+        fit: crate::style::ImageFitMode::Fill,
+    };
+    let audio = AudioNode {
+        asset,
+        local_size: [10.0, 10.0],
+        time_range_us: [0, 1_000_000],
+        volume: 0.5,
+        muted: true,
+        waveform_color: Color::BLACK,
+    };
+    let graph = NodeGraphNode {
+        local_size: [10.0, 10.0],
+        graph: Default::default(),
+        preview: Some(asset),
+    };
+    let model = Model3dNode {
+        asset,
+        local_size: [10.0, 10.0],
+        camera: Default::default(),
+        overrides: serde_json::json!({ "material": true }),
+    };
+    let artifact = AiArtifactNode {
+        local_size: [10.0, 10.0],
+        prompt: "sample".into(),
+        model: "sample".into(),
+        params: serde_json::json!({ "quality": 1 }),
+        inputs: vec![node_id],
+        lineage_parent: Some(node_id),
+        output: Some(asset),
+        status: GenerationStatus::Done,
+        seed: Some(1),
+    };
+    let instance = InstanceNode {
+        component: ComponentId::from_u128(1),
+        overrides: vec![Override {
+            target_path: [node_id].into_iter().collect(),
+            target_prop: BoundProp::Visible,
+            value: OverrideValue::Visible { value: false },
+        }],
+        prop_values: [(
+            ComponentPropId::from_u128(1),
+            crate::value::VarValue::Boolean { value: true },
+        )]
+        .into_iter()
+        .collect(),
+        derived: vec![DerivedOverride {
+            path: [node_id].into_iter().collect(),
+            transform: None,
+            size: None,
+            fills: None,
+            path_data: None,
+            stroke_path: None,
+            stroke_weight: None,
+            text: None,
+        }],
+        local_size: [10.0, 10.0],
+    };
+    let boolean = BooleanNode {
+        op: Default::default(),
+        fills: [Fill::solid(Color::BLACK)].into_iter().collect(),
+        strokes: [Stroke::solid(Color::WHITE, 1.0)].into_iter().collect(),
+        baked: Some(BooleanBakedGeometry {
+            vector: vector.clone(),
+            source: "sample".into(),
+            stroke_outline: true,
+        }),
+    };
+    let embed = EmbedNode {
+        local_size: [10.0, 10.0],
+        kind: "sample".into(),
+        payload: serde_json::json!({ "value": 1 }),
+    };
     vec![
         NodeData::Group(group),
         NodeData::Vector(vector),
         NodeData::Text(text),
         NodeData::TextPath(text_path),
+        NodeData::Bitmap(bitmap),
+        NodeData::Video(video),
+        NodeData::Audio(audio),
+        NodeData::NodeGraph(graph),
+        NodeData::Model3d(model),
+        NodeData::AiArtifact(artifact),
+        NodeData::Instance(instance),
+        NodeData::Boolean(boolean),
+        NodeData::Embed(embed),
     ]
 }
 
@@ -208,5 +322,120 @@ mod tests {
         assert!(!group.contains("colour"));
         assert!(!vector.contains("radius"));
         assert!(known_fields("no_such_kind").is_none());
+    }
+    #[test]
+    fn maximal_samples_cover_recent_fields() {
+        let mut tags = BTreeSet::new();
+        for data in maximal_variants() {
+            let required: &[&str] = match &data {
+                NodeData::Group(_) => &[
+                    "local_size",
+                    "clip_size",
+                    "grid",
+                    "background_fills",
+                    "explicit_modes",
+                    "auto_layout",
+                    "corner_radii",
+                ],
+                NodeData::Vector(_) => &[
+                    "parametric",
+                    "local_size",
+                    "corner_radii",
+                    "corner_smoothing",
+                ],
+                NodeData::Text(_) => &[
+                    "auto_resize",
+                    "style_runs",
+                    "max_lines",
+                    "truncate",
+                    "paragraph_spacing",
+                    "paragraph_indent",
+                ],
+                NodeData::TextPath(_) => &["style_runs", "start", "alignment", "direction", "side"],
+                NodeData::Bitmap(_) => &["crop", "tint", "fit", "asset", "natural_size"],
+                NodeData::Video(_) => &[
+                    "poster",
+                    "poster_frame_us",
+                    "fit",
+                    "speed",
+                    "volume",
+                    "muted",
+                ],
+                NodeData::Audio(_) => &["waveform_color", "volume", "muted", "time_range_us"],
+                NodeData::NodeGraph(_) => &["preview", "graph"],
+                NodeData::Model3d(_) => &["camera", "overrides"],
+                NodeData::AiArtifact(_) => &[
+                    "lineage_parent",
+                    "output",
+                    "seed",
+                    "inputs",
+                    "params",
+                    "status",
+                ],
+                NodeData::Instance(_) => &[
+                    "overrides",
+                    "prop_values",
+                    "derived",
+                    "component",
+                    "local_size",
+                ],
+                NodeData::Boolean(_) => &["op", "fills", "strokes", "baked"],
+                NodeData::Embed(_) => &["kind", "payload"],
+            };
+            let value = serde_json::to_value(maximal_node(data)).expect("sample serializes");
+            let tag = value
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .expect("type");
+            tags.insert(tag.to_owned());
+            let fields = known_fields(tag).expect("every sample kind known");
+            for name in required.iter().copied().chain([
+                "id",
+                "parent",
+                "index",
+                "name",
+                "transform",
+                "constraints",
+                "opacity",
+                "blend_mode",
+                "effects",
+                "blurs",
+                "flags",
+                "is_mask",
+                "mask_type",
+                "scroll_behavior",
+                "meta",
+                "bindings",
+                "reactions",
+                "layout_child",
+            ]) {
+                assert!(fields.contains(name), "{tag} sample omitted {name}");
+            }
+            assert!(
+                !fields.contains("future_unknown_field"),
+                "{tag} must still reject unknown keys"
+            );
+        }
+        assert_eq!(
+            tags,
+            [
+                "group",
+                "vector",
+                "text",
+                "text_path",
+                "bitmap",
+                "video",
+                "audio",
+                "node_graph",
+                "model3d",
+                "ai_artifact",
+                "instance",
+                "boolean",
+                "embed"
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+        );
     }
 }

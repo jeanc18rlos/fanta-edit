@@ -20,8 +20,8 @@ const STRUCTURAL_KEYS: [&str; 4] = ["type", "id", "parent", "index"];
 pub(crate) const UNKNOWN_ATTRIBUTE: &str = "source.unknown_attribute";
 
 /// Diff every decoded node value's keys against the vocabulary table for its
-/// `type` tag. A tag [`fanta_doc::known_fields`] has no table for (media,
-/// instance, …) is skipped entirely — no table means no basis to warn, and a
+/// `type` tag. A future tag [`fanta_doc::known_fields`] has no table for is
+/// skipped entirely — no table means no basis to warn, and a
 /// false positive on every field would be worse than silence.
 pub(crate) fn unknown_attribute_diagnostics(nodes: &[Value]) -> Vec<SourceDiagnostic> {
     let mut diagnostics = Vec::new();
@@ -165,9 +165,9 @@ mod tests {
     }
 
     #[test]
-    fn kinds_without_a_vocabulary_table_are_skipped() {
+    fn future_kinds_without_a_vocabulary_table_are_skipped() {
         let nodes = [json!({
-            "type": "instance", "id": "x", "parent": null, "index": 1.0,
+            "type": "future_kind", "id": "x", "parent": null, "index": 1.0,
             "component": "y", "definitely_not_a_field": true,
         })];
         assert!(
@@ -194,5 +194,18 @@ mod tests {
         assert_eq!(edit_distance("corner_raduis", "corner_radii"), 2);
         assert_eq!(edit_distance("fillz", "fills"), 1);
         assert_eq!(edit_distance("same", "same"), 0);
+    }
+
+    #[test]
+    fn instance_defaults_are_known_but_future_attributes_warn() {
+        let nodes = [json!({
+            "type": "instance", "id": "x", "parent": null, "index": 1.0,
+            "component": "y", "local_size": [10, 10], "overrides": [],
+            "prop_values": {}, "derived": [], "effects": [], "bindings": [],
+            "future_instance_field": true,
+        })];
+        let diagnostics = unknown_attribute_diagnostics(&nodes);
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics[0].message.contains("future_instance_field"));
     }
 }
