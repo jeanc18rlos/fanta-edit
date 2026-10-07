@@ -679,6 +679,14 @@ pub enum RetainedError {
         "retained translation requires unchanged viewport, dimensions, scale, background and fonts"
     )]
     ChangedFrame,
+    #[error(
+        "retained rendering requires the same compatible GPU context, format and surface properties"
+    )]
+    ChangedBackend,
+    #[error("the retained GPU context was abandoned")]
+    BackendLost,
+    #[error("the retained GPU target could not submit its work")]
+    BackendSubmission,
     #[error("retained image {0} changed or became unavailable")]
     ChangedAsset(AssetId),
     #[error("retained pixel and picture storage exceeds its {limit} byte budget")]
@@ -689,8 +697,220 @@ pub enum RetainedError {
     IncompleteArtwork,
 }
 
+enum RetainedBackend {
+    Cpu,
+    #[cfg(feature = "metal")]
+    Gpu(Box<RetainedGpuSurface>),
+}
+
+#[cfg(feature = "metal")]
+#[derive(Clone)]
+struct RetainedGpuSurface {
+    context: skia_safe::gpu::DirectContext,
+    info: skia_safe::ImageInfo,
+    properties: skia_safe::SurfaceProps,
+    sample_count: usize,
+    format: RetainedGpuFormat,
+    // Ganesh context use must stay on its creating render thread.
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(feature = "metal")]
+#[derive(Clone, PartialEq, Eq)]
+enum RetainedGpuFormat {
+    Metal(skia_safe::gpu::mtl::PixelFormat),
+}
+
+#[cfg(feature = "metal")]
+impl RetainedGpuFormat {
+    fn capture(format: skia_safe::gpu::BackendFormat) -> Result<Self, RetainedError> {
+        format
+            .as_mtl_format()
+            .map(Self::Metal)
+            .ok_or(RetainedError::ChangedBackend)
+    }
+}
+
+#[cfg(feature = "metal")]
+impl RetainedGpuSurface {
+    fn capture(surface: &mut skia_safe::Surface) -> Result<Self, RetainedError> {
+        let mut context = surface
+            .direct_context()
+            .ok_or(RetainedError::ChangedBackend)?;
+        if context.abandoned() {
+            return Err(RetainedError::BackendLost);
+        }
+        let info = surface.image_info();
+        // The storage estimate assumes four bytes per pixel; it excludes driver
+        // allocation, caches and snapshots retained by the caller.
+        if !matches!(
+            info.color_type(),
+            skia_safe::ColorType::BGRA8888 | skia_safe::ColorType::RGBA8888
+        ) || info.alpha_type() != skia_safe::AlphaType::Premul
+            || info.color_space().is_some()
+        {
+            return Err(RetainedError::ChangedBackend);
+        }
+        let target = skia_safe::gpu::surfaces::get_backend_render_target(
+            surface,
+            skia_safe::surface::BackendHandleAccess::FlushRead,
+        )
+        .ok_or(RetainedError::ChangedBackend)?;
+        if target.sample_count() > 1 {
+            return Err(RetainedError::ChangedBackend);
+        }
+        Ok(Self {
+            context,
+            info,
+            properties: *surface.props(),
+            sample_count: target.sample_count(),
+            format: RetainedGpuFormat::capture(target.backend_format())?,
+            _thread_bound: std::marker::PhantomData,
+        })
+    }
+
+    fn ensure_available(&mut self) -> Result<(), RetainedError> {
+        if self.context.abandoned() {
+            Err(RetainedError::BackendLost)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn validate(&mut self, current: &mut Self) -> Result<(), RetainedError> {
+        self.ensure_available()?;
+        current.ensure_available()?;
+        if self.context.id() != current.context.id()
+            || self.info != current.info
+            || self.properties != current.properties
+            || self.sample_count != current.sample_count
+            || self.format != current.format
+        {
+            return Err(RetainedError::ChangedBackend);
+        }
+        Ok(())
+    }
+}
+
+/// A GPU target wrapped with a known TopLeft origin. Its surface cannot be
+/// replaced through this API, so context/format/origin validation does not need
+/// a flushing backend-handle query on every frame. The host must retain the
+/// external render-target resources for this wrapper's lifetime. Currently only
+/// Metal is supported, with the `metal` feature; other backends reject explicitly.
+#[cfg(feature = "metal")]
+pub struct RetainedGpuTarget {
+    surface: skia_safe::Surface,
+    backend: RetainedGpuSurface,
+}
+
+#[cfg(feature = "metal")]
+impl RetainedGpuTarget {
+    pub fn wrap_top_left(
+        context: &mut skia_safe::gpu::DirectContext,
+        target: &skia_safe::gpu::BackendRenderTarget,
+        color_type: skia_safe::ColorType,
+        properties: Option<&skia_safe::SurfaceProps>,
+    ) -> Result<Self, RetainedError> {
+        if context.abandoned() {
+            return Err(RetainedError::BackendLost);
+        }
+        if target.sample_count() > 1
+            || !matches!(
+                color_type,
+                skia_safe::ColorType::BGRA8888 | skia_safe::ColorType::RGBA8888
+            )
+        {
+            return Err(RetainedError::ChangedBackend);
+        }
+        let mut surface = skia_safe::gpu::surfaces::wrap_backend_render_target(
+            context,
+            target,
+            skia_safe::gpu::SurfaceOrigin::TopLeft,
+            color_type,
+            None,
+            properties,
+        )
+        .ok_or(RetainedError::ChangedBackend)?;
+        let backend = RetainedGpuSurface::capture(&mut surface)?;
+        Ok(Self { surface, backend })
+    }
+
+    pub fn image_info(&self) -> skia_safe::ImageInfo {
+        self.backend.info.clone()
+    }
+
+    pub fn canvas(&mut self) -> Result<&skia_safe::Canvas, RetainedError> {
+        self.backend.ensure_available()?;
+        Ok(self.surface.canvas())
+    }
+
+    pub fn image_snapshot(&mut self) -> Result<skia_safe::Image, RetainedError> {
+        self.backend.ensure_available()?;
+        retained_surface_snapshot(&mut self.surface)
+    }
+
+    /// Submit the target's work before exposing its external texture to a
+    /// consumer. Callers choose the same synchronization policy as normal paint.
+    pub fn flush_and_submit(
+        &mut self,
+        sync_cpu: skia_safe::gpu::SyncCpu,
+    ) -> Result<(), RetainedError> {
+        self.backend.ensure_available()?;
+        self.backend.context.flush_surface(&mut self.surface);
+        if !self.backend.context.submit(sync_cpu) {
+            return Err(RetainedError::BackendSubmission);
+        }
+        self.backend.ensure_available()
+    }
+}
+
+impl RetainedBackend {
+    fn validate_surface(&mut self, surface: &mut skia_safe::Surface) -> Result<(), RetainedError> {
+        match self {
+            Self::Cpu => {
+                if surface.recording_context().is_none() {
+                    Ok(())
+                } else {
+                    Err(RetainedError::ChangedBackend)
+                }
+            }
+            #[cfg(feature = "metal")]
+            Self::Gpu(backend) => backend.validate(&mut RetainedGpuSurface::capture(surface)?),
+        }
+    }
+
+    fn validate_cpu(&mut self) -> Result<(), RetainedError> {
+        match self {
+            Self::Cpu => Ok(()),
+            #[cfg(feature = "metal")]
+            Self::Gpu(_) => Err(RetainedError::ChangedBackend),
+        }
+    }
+
+    #[cfg(feature = "metal")]
+    fn validate_gpu(&mut self, target: &mut RetainedGpuTarget) -> Result<(), RetainedError> {
+        match self {
+            Self::Gpu(backend) => backend.validate(&mut target.backend),
+            Self::Cpu => Err(RetainedError::ChangedBackend),
+        }
+    }
+
+    fn ensure_available(&mut self) -> Result<(), RetainedError> {
+        match self {
+            Self::Cpu => Ok(()),
+            #[cfg(feature = "metal")]
+            Self::Gpu(backend) => backend.ensure_available(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct RetainedBuildMetrics {
+    /// Entire CPU preparation, including backend validation and surface allocation.
+    /// GPU composition, submission and completion remain the caller's responsibility.
+    pub build_micros: u64,
+    pub backend_validation_micros: u64,
+    pub surface_allocation_micros: u64,
     pub prepare_micros: u64,
     pub below_micros: u64,
     pub above_record_micros: u64,
@@ -705,10 +925,13 @@ pub struct RetainedBuildMetrics {
 
 #[derive(Clone, Debug, Default)]
 pub struct RetainedFrameMetrics {
+    pub backend_validation_micros: u64,
     pub validation_micros: u64,
     pub below_copy_micros: u64,
     pub middle_micros: u64,
     pub above_replay_micros: u64,
+    /// Entire CPU command preparation, including backend and semantic validation.
+    /// The caller must measure GPU composition and synchronization separately.
     pub frame_micros: u64,
     pub middle: super::RenderMetrics,
 }
@@ -718,7 +941,7 @@ pub struct RetainedFrame {
     pub metrics: RetainedFrameMetrics,
 }
 
-/// An opt-in CPU experiment for one fixed-view translation gesture. It owns
+/// An opt-in renderer for one fixed-view translation gesture. It owns
 /// its frame canvas so cached device-space paint cannot be replayed under a
 /// different caller matrix or clip. It is not connected to the live worker.
 /// Any failed frame disables reuse until the caller prepares a new session.
@@ -726,8 +949,9 @@ pub struct RetainedFrame {
 /// `font_generation` must change whenever the caller's font environment does.
 /// The storage budget covers two pixel surfaces, retained decoded images and
 /// recorded Picture bytes; the existing prepared node/depth limits apply too.
-/// Picture accounting is approximate and does not bound total Skia scratch
-/// memory. Callers must release old frame images to avoid snapshot copies.
+/// Picture accounting is approximate and does not bound GPU allocation or total
+/// Skia scratch memory. Callers must release old frame images to avoid snapshot
+/// copies. GPU images may only be composed on their validated target context.
 pub struct RetainedTranslationSession {
     spec: SplitSpec<'static>,
     moving: NodeId,
@@ -742,6 +966,7 @@ pub struct RetainedTranslationSession {
     below: skia_safe::Image,
     above: skia_safe::Picture,
     output: skia_safe::Surface,
+    backend: RetainedBackend,
     build_metrics: RetainedBuildMetrics,
     disabled: bool,
 }
@@ -771,6 +996,49 @@ impl RetainedTranslationSession {
         )
     }
 
+    /// Allocate private surfaces compatible with the actual GPU target. The
+    /// target's pixels and canvas state are untouched. Call `render_for_target`
+    /// for every frame; the CPU-only `render` entry rejects this backend.
+    #[cfg(feature = "metal")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_for_target(
+        renderer: &mut super::RasterRenderer,
+        target: &mut RetainedGpuTarget,
+        scene: &Scene,
+        page_root: NodeId,
+        moving: NodeId,
+        viewport: &fanta_doc::Viewport,
+        inputs: &RenderInputs,
+        resolver: Option<&dyn AssetResolver>,
+        font_generation: u64,
+    ) -> Result<Self, RetainedError> {
+        let started = std::time::Instant::now();
+        target.backend.ensure_available()?;
+        if target.backend.info.width() != renderer.width() as i32
+            || target.backend.info.height() != renderer.height() as i32
+        {
+            return Err(RetainedError::ChangedBackend);
+        }
+        let backend = RetainedBackend::Gpu(Box::new(target.backend.clone()));
+        let backend_validation_micros = elapsed_micros(started);
+        let size = (renderer.width() as i32, renderer.height() as i32);
+        Self::prepare_internal(
+            renderer,
+            scene,
+            page_root,
+            moving,
+            viewport,
+            inputs,
+            resolver,
+            font_generation,
+            RETAINED_PIXEL_AND_PICTURE_BUDGET,
+            backend,
+            || target.surface.new_surface_with_dimensions(size),
+            started,
+            backend_validation_micros,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn prepare_with_budget(
         renderer: &mut super::RasterRenderer,
@@ -783,7 +1051,40 @@ impl RetainedTranslationSession {
         font_generation: u64,
         byte_limit: usize,
     ) -> Result<Self, RetainedError> {
-        let started = std::time::Instant::now();
+        let size = (renderer.width() as i32, renderer.height() as i32);
+        Self::prepare_internal(
+            renderer,
+            scene,
+            page_root,
+            moving,
+            viewport,
+            inputs,
+            resolver,
+            font_generation,
+            byte_limit,
+            RetainedBackend::Cpu,
+            || skia_safe::surfaces::raster_n32_premul(size),
+            std::time::Instant::now(),
+            0,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_internal(
+        renderer: &mut super::RasterRenderer,
+        scene: &Scene,
+        page_root: NodeId,
+        moving: NodeId,
+        viewport: &fanta_doc::Viewport,
+        inputs: &RenderInputs,
+        resolver: Option<&dyn AssetResolver>,
+        font_generation: u64,
+        byte_limit: usize,
+        mut backend: RetainedBackend,
+        mut allocate: impl FnMut() -> Option<skia_safe::Surface>,
+        started: std::time::Instant,
+        mut backend_validation_micros: u64,
+    ) -> Result<Self, RetainedError> {
         let size = (renderer.width(), renderer.height());
         let surface_bytes = (size.0 as usize)
             .checked_mul(size.1 as usize)
@@ -825,9 +1126,13 @@ impl RetainedTranslationSession {
         let prepared_instances = spec.prepared_instance_count();
         let prepare_micros = elapsed_micros(started);
         let owned_inputs = spec.owned_inputs();
-        let mut below_surface =
-            skia_safe::surfaces::raster_n32_premul((size.0 as i32, size.1 as i32))
-                .ok_or(RetainedError::Allocation)?;
+        let allocation_started = std::time::Instant::now();
+        let mut below_surface = allocate().ok_or(RetainedError::Allocation)?;
+        let mut surface_allocation_micros = elapsed_micros(allocation_started);
+        let validation_started = std::time::Instant::now();
+        backend.validate_surface(&mut below_surface)?;
+        backend_validation_micros =
+            backend_validation_micros.saturating_add(elapsed_micros(validation_started));
         let below_started = std::time::Instant::now();
         let below_metrics = renderer.paint_split_to_canvas(
             below_surface.canvas(),
@@ -840,7 +1145,7 @@ impl RetainedTranslationSession {
             SplitPhase::Below,
         )?;
         require_complete(&below_metrics)?;
-        let below = below_surface.image_snapshot();
+        let below = retained_surface_snapshot(&mut below_surface)?;
         let below_micros = elapsed_micros(below_started);
         let mut recorder = skia_safe::PictureRecorder::new();
         let recording =
@@ -866,8 +1171,14 @@ impl RetainedTranslationSession {
             .checked_add(picture_bytes)
             .filter(|bytes| *bytes <= byte_limit)
             .ok_or(RetainedError::MemoryLimit { limit: byte_limit })?;
-        let output = skia_safe::surfaces::raster_n32_premul((size.0 as i32, size.1 as i32))
-            .ok_or(RetainedError::Allocation)?;
+        let allocation_started = std::time::Instant::now();
+        let mut output = allocate().ok_or(RetainedError::Allocation)?;
+        surface_allocation_micros =
+            surface_allocation_micros.saturating_add(elapsed_micros(allocation_started));
+        let validation_started = std::time::Instant::now();
+        backend.validate_surface(&mut output)?;
+        backend_validation_micros =
+            backend_validation_micros.saturating_add(elapsed_micros(validation_started));
         Ok(Self {
             spec,
             moving,
@@ -882,7 +1193,11 @@ impl RetainedTranslationSession {
             below,
             above,
             output,
+            backend,
             build_metrics: RetainedBuildMetrics {
+                build_micros: elapsed_micros(started),
+                backend_validation_micros,
+                surface_allocation_micros,
                 prepare_micros,
                 below_micros,
                 above_record_micros,
@@ -912,11 +1227,67 @@ impl RetainedTranslationSession {
         resolver: Option<&dyn AssetResolver>,
         font_generation: u64,
     ) -> Result<RetainedFrame, RetainedError> {
+        self.render_with_backend(
+            renderer,
+            RetainedBackend::validate_cpu,
+            scene,
+            viewport,
+            inputs,
+            resolver,
+            font_generation,
+        )
+    }
+
+    /// Validate actual target affinity before semantic revision advancement or
+    /// output mutation. The returned GPU image is only drawable on that context;
+    /// callers own composition and synchronization. Target pixels/state are untouched.
+    #[cfg(feature = "metal")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_for_target(
+        &mut self,
+        renderer: &mut super::RasterRenderer,
+        target: &mut RetainedGpuTarget,
+        scene: &Scene,
+        viewport: &fanta_doc::Viewport,
+        inputs: &RenderInputs,
+        resolver: Option<&dyn AssetResolver>,
+        font_generation: u64,
+    ) -> Result<RetainedFrame, RetainedError> {
+        self.render_with_backend(
+            renderer,
+            |backend| backend.validate_gpu(target),
+            scene,
+            viewport,
+            inputs,
+            resolver,
+            font_generation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_with_backend(
+        &mut self,
+        renderer: &mut super::RasterRenderer,
+        validate_backend: impl FnOnce(&mut RetainedBackend) -> Result<(), RetainedError>,
+        scene: &Scene,
+        viewport: &fanta_doc::Viewport,
+        inputs: &RenderInputs,
+        resolver: Option<&dyn AssetResolver>,
+        font_generation: u64,
+    ) -> Result<RetainedFrame, RetainedError> {
+        let started = std::time::Instant::now();
         if self.disabled {
             return Err(RetainedError::Disabled);
         }
-        let result =
-            self.render_checked(renderer, scene, viewport, inputs, resolver, font_generation);
+        let result = validate_backend(&mut self.backend).and_then(|()| {
+            let backend_validation_micros = elapsed_micros(started);
+            let mut frame =
+                self.render_checked(renderer, scene, viewport, inputs, resolver, font_generation)?;
+            self.backend.ensure_available()?;
+            frame.metrics.backend_validation_micros = backend_validation_micros;
+            frame.metrics.frame_micros = elapsed_micros(started);
+            Ok(frame)
+        });
         if result.is_err() {
             self.disabled = true;
         }
@@ -986,6 +1357,8 @@ impl RetainedTranslationSession {
                 return Err(RetainedError::ChangedAsset(*asset));
             }
         }
+        // Asset resolution is caller code and can abandon the context after the initial check.
+        self.backend.ensure_available()?;
         let validation_micros = elapsed_micros(started);
         // This is the only revision advance: every dependency and every intervening scene edit was checked above.
         self.spec.scene_revision = scene.revision();
@@ -1012,10 +1385,11 @@ impl RetainedTranslationSession {
         let above_started = std::time::Instant::now();
         canvas.draw_picture(&self.above, None, None);
         let above_replay_micros = elapsed_micros(above_started);
-        let image = self.output.image_snapshot();
+        let image = retained_surface_snapshot(&mut self.output)?;
         Ok(RetainedFrame {
             image,
             metrics: RetainedFrameMetrics {
+                backend_validation_micros: 0,
                 validation_micros,
                 below_copy_micros,
                 middle_micros,
@@ -1025,6 +1399,16 @@ impl RetainedTranslationSession {
             },
         })
     }
+}
+
+fn retained_surface_snapshot(
+    surface: &mut skia_safe::Surface,
+) -> Result<skia_safe::Image, RetainedError> {
+    // The no-bounds Skia wrapper unwraps allocation failure; full bounds have the same snapshot/COW semantics.
+    let bounds = skia_safe::IRect::from_wh(surface.width(), surface.height());
+    surface
+        .image_snapshot_with_bounds(bounds)
+        .ok_or(RetainedError::Allocation)
 }
 
 fn require_complete(metrics: &super::RenderMetrics) -> Result<(), RetainedError> {
@@ -1318,6 +1702,157 @@ mod tests {
 #[cfg(test)]
 mod retained_storage_tests {
     use super::*;
+
+    fn storage_fixture() -> (Scene, NodeId, NodeId) {
+        let mut scene = Scene::new();
+        let page = CanvasNode::new(NodeData::Group(fanta_doc::GroupNode::default()));
+        let page_id = page.id;
+        scene.insert(page).expect("page");
+        let mut moving = CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode::rect_solid(
+            0.0,
+            0.0,
+            8.0,
+            8.0,
+            fanta_doc::Color::WHITE,
+        )));
+        moving.parent = Some(page_id);
+        let moving_id = moving.id;
+        scene.insert(moving).expect("moving");
+        (scene, page_id, moving_id)
+    }
+
+    #[test]
+    fn retained_storage_allocation_failure_preserves_source_and_renderer_surface() {
+        let (scene, page_id, moving_id) = storage_fixture();
+        let viewport = fanta_doc::Viewport::default();
+        let inputs = RenderInputs::empty();
+        let original = scene.get(moving_id).expect("moving").clone();
+        let revision = scene.revision();
+        for failed_allocation in [1, 2] {
+            let mut renderer = super::super::RasterRenderer::new(32, 32).expect("renderer");
+            renderer.render_page_with(&scene, &viewport, Some(page_id), &inputs);
+            let original_pixels = renderer.copy_rgba();
+            let mut allocations = 0;
+            let result = RetainedTranslationSession::prepare_internal(
+                &mut renderer,
+                &scene,
+                page_id,
+                moving_id,
+                &viewport,
+                &inputs,
+                None,
+                0,
+                RETAINED_PIXEL_AND_PICTURE_BUDGET,
+                RetainedBackend::Cpu,
+                || {
+                    allocations += 1;
+                    if allocations == failed_allocation {
+                        None
+                    } else {
+                        skia_safe::surfaces::raster_n32_premul((32, 32))
+                    }
+                },
+                std::time::Instant::now(),
+                0,
+            );
+            assert!(matches!(result, Err(RetainedError::Allocation)));
+            assert_eq!(allocations, failed_allocation);
+            assert_eq!(scene.revision(), revision);
+            assert_eq!(scene.get(moving_id), Some(&original));
+            assert_eq!(renderer.copy_rgba(), original_pixels);
+        }
+    }
+
+    #[test]
+    fn retained_backend_rejection_precedes_revision_and_output_mutation() {
+        let (mut scene, page_id, moving_id) = storage_fixture();
+        let viewport = fanta_doc::Viewport::default();
+        let inputs = RenderInputs::empty();
+        let mut renderer = super::super::RasterRenderer::new(32, 32).expect("renderer");
+        let mut session = RetainedTranslationSession::prepare(
+            &mut renderer,
+            &scene,
+            page_id,
+            moving_id,
+            &viewport,
+            &inputs,
+            None,
+            0,
+        )
+        .expect("prepare");
+        session
+            .render(&mut renderer, &scene, &viewport, &inputs, None, 0)
+            .expect("initial frame");
+        let original_revision = session.spec.scene_revision;
+        let info = skia_safe::ImageInfo::new(
+            (32, 32),
+            skia_safe::ColorType::RGBA8888,
+            skia_safe::AlphaType::Premul,
+            None,
+        );
+        let mut original_pixels = vec![0; 32 * 32 * 4];
+        assert!(
+            session
+                .output
+                .read_pixels(&info, &mut original_pixels, 32 * 4, (0, 0))
+        );
+        scene
+            .set_transform(moving_id, fanta_doc::Transform2D::translation(5.0, 7.0))
+            .expect("translation");
+        assert!(matches!(
+            session.render_with_backend(
+                &mut renderer,
+                |_| Err(RetainedError::ChangedBackend),
+                &scene,
+                &viewport,
+                &inputs,
+                None,
+                0,
+            ),
+            Err(RetainedError::ChangedBackend)
+        ));
+        assert_eq!(session.spec.scene_revision, original_revision);
+        let mut rejected_pixels = vec![0; original_pixels.len()];
+        assert!(
+            session
+                .output
+                .read_pixels(&info, &mut rejected_pixels, 32 * 4, (0, 0))
+        );
+        assert_eq!(rejected_pixels, original_pixels);
+        assert!(matches!(
+            session.render(&mut renderer, &scene, &viewport, &inputs, None, 0),
+            Err(RetainedError::Disabled)
+        ));
+    }
+
+    #[test]
+    fn retained_storage_budget_rejects_before_allocator_runs() {
+        let (scene, page_id, moving_id) = storage_fixture();
+        let viewport = fanta_doc::Viewport::default();
+        let inputs = RenderInputs::empty();
+        let mut renderer = super::super::RasterRenderer::new(32, 32).expect("renderer");
+        let mut allocations = 0;
+        let result = RetainedTranslationSession::prepare_internal(
+            &mut renderer,
+            &scene,
+            page_id,
+            moving_id,
+            &viewport,
+            &inputs,
+            None,
+            0,
+            32 * 32 * 8 - 1,
+            RetainedBackend::Cpu,
+            || {
+                allocations += 1;
+                skia_safe::surfaces::raster_n32_premul((32, 32))
+            },
+            std::time::Instant::now(),
+            0,
+        );
+        assert!(matches!(result, Err(RetainedError::MemoryLimit { .. })));
+        assert_eq!(allocations, 0);
+    }
 
     #[test]
     fn retained_storage_budget_rejects_before_pixels_and_accepts_the_exact_accounted_boundary() {
