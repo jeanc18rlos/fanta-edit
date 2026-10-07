@@ -1512,6 +1512,13 @@
     },
   },
   {
+    "context": "FigViewerTextEdit && !Editor && !Input",
+    "use_key_equivalents": true,
+    "bindings": {
+      "escape": "fig_viewer::Cancel",
+    },
+  },
+  {
     "context": "FigViewerPrototype && !Editor && !Input",
     "use_key_equivalents": true,
     "bindings": {
