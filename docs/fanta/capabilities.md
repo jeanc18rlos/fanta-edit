@@ -90,7 +90,7 @@ Implementation: [document.rs](../../crates/fig_viewer/src/document.rs),
 | Region selection and crop | Rectangle/ellipse selection, lasso, polygonal lasso and Magic Wand produce a drawing selection. Draw options expose replace/add/subtract/intersect selection, inversion, applicable wand tolerance/contiguity and crop ratio. Crop commits an undoable crop; these controls are not a general bitmap pixel editor. |
 | Text | Create and edit inline text, select ranges, apply typography and text paints, and convert text to outlines. Instance text editing creates an override. |
 | Text on Path | Convert one eligible vector baseline, then edit its text and path text properties. Rounded/clipped geometry, zero-length paths and unsupported paints are rejected with a message. |
-| Media | Place supported local images, editable SVG, MP4 video and MP3 audio, or generation results. Files are validated before placement. Canvas media controls include playback and seek; video trim preserves the original asset and supports Undo/Redo. |
+| Media | Use the local picker to place supported raster images and MP4 video. Existing project assets and generation results also support placement of editable SVG and MP3 audio. Media is validated before placement. Supported media previews provide playback and seek; video trim preserves the original asset and supports Undo/Redo. |
 
 Draw exposes tool-specific size, opacity, smoothing and blend controls. Brush
 also supports tip, hardness and flow settings; Pencil and Eraser expose their
@@ -191,7 +191,7 @@ double-click to drill into its container before another pair enters editing.
 | Bitmap/image node | Activate Crop. Draw the crop region. | Enter applies; Escape cancels the pending crop. |
 | Group, frame, section or boolean | Drill into the next selectable child level. | A subsequent double-click can activate the selected leaf. |
 | Component instance | Edit a virtual text override when the pointer hits editable instance text; otherwise reveal its properties inspector. | Finish text editing or inspect instance properties. |
-| Video or audio | Reveal the properties inspector. | Playback remains in the appropriate Motion/Prototype controls; double-click does not change mode. |
+| Video or audio | Reveal the properties inspector. | Use the supported media or preview controls for playback; double-click keeps the current mode. |
 | Node graph, 3D, AI artifact or embed | Reveal the properties inspector. | No specialized editor is implied for placeholder types. |
 
 Locked, hidden, obscured and other-page scene nodes do not enter editing. Shift,
