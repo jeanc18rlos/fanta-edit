@@ -187,6 +187,113 @@ esac
                                'ITSAppUsesNonExemptEncryption': False})
 
 
+class DmgCreationProducer(unittest.TestCase):
+    stub = BundleVersionProducer.stub
+
+    def setUp(self):
+        BundleVersionProducer.setUp(self)
+        self.output = self.root / 'target/aarch64-apple-darwin/release'
+        self.output.mkdir(parents=True)
+        # The producer uses absolute strip; copy a real executable without ever running it.
+        for name in ['fanta', 'cli']:
+            shutil.copyfile('/usr/bin/true', self.output / name)
+            (self.output / name).chmod(0o755)
+        self.stub(self.sentinels / 'security', 'security', 'exit 0\n')
+        self.stub(self.sentinels / 'codesign', 'codesign', 'exit 0\n')
+        self.stub(self.sentinels / 'dsymutil', 'dsymutil', 'exit 0\n')
+        self.stub(self.sentinels / 'xcode-select', 'xcode-select', 'printf "/unused-sdk\\n"\n')
+        self.stub(self.sentinels / 'sleep', 'sleep', 'printf "%s\\n" "$*" >> "$FANTA_TEST_DELAYS"\n')
+        self.stub(self.root / 'script/bundle-git', 'bundle-git', 'exit 0\n')
+        self.calls = self.root / 'hdiutil-calls'
+        self.calls.mkdir()
+        self.delays = self.root / 'delays'
+        self.environment.update(FANTA_TEST_CALLS=str(self.calls), FANTA_TEST_DELAYS=str(self.delays))
+        self.stub(self.sentinels / 'hdiutil', 'hdiutil', r'''
+count_file="$FANTA_TEST_CALLS/count"
+attempt=1
+if [ -f "$count_file" ]; then attempt=$(( $(cat "$count_file") + 1 )); fi
+printf '%s\n' "$attempt" > "$count_file"
+printf '%s\n' "$@" > "$FANTA_TEST_CALLS/$attempt.args"
+for argument; do output="$argument"; done
+/usr/bin/stat -f '%i' target/aarch64-apple-darwin/release/dmg/Fanta.app > "$FANTA_TEST_CALLS/$attempt.inode"
+test -L target/aarch64-apple-darwin/release/dmg/Applications
+printf 'attempt %s progress\n' "$attempt"
+printf 'partial %s\n' "$attempt" > "$output"
+case "$FANTA_TEST_DMG_CASE:$attempt" in
+  success:*|busy-success:2) printf 'complete image\n' > "$output"; exit 0;;
+  nonbusy:*) printf 'hdiutil: create failed - Permission denied\n' >&2; exit 7;;
+  near-match:*) printf 'hdiutil: create failed - Resource busy elsewhere\n' >&2; exit 8;;
+  *) printf 'hdiutil: create failed - Resource busy\n' >&2; exit 1;;
+esac
+''')
+
+    def run_dmg(self, scenario, *, success, attempts, previous_image=False):
+        final = self.output / 'Fanta-aarch64.dmg'
+        if previous_image:
+            final.write_bytes(b'previous accepted image\n')
+        original_manifest = (self.root / 'crates/zed/Cargo.toml').read_bytes()
+        result = subprocess.run(['/bin/bash', 'script/bundle-mac', 'aarch64-apple-darwin'],
+                                cwd=self.root, env={**self.environment, 'FANTA_RELEASE_CHANNEL': 'stable',
+                                                   'FANTA_TEST_DMG_CASE': scenario},
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0 if success else (7 if scenario == 'nonbusy' else 8 if scenario == 'near-match' else 1),
+                         result.stdout + result.stderr)
+        self.assertEqual((self.root / 'crates/zed/Cargo.toml').read_bytes(), original_manifest)
+        calls = self.log.read_text().splitlines()
+        for once in ['licenses', 'rustup', 'dsymutil', 'bundle-git', 'codesign']:
+            self.assertEqual(calls.count(once), 1, calls)
+        self.assertEqual(calls.count('cargo'), 3, 'help, build and bundle run once each')
+        self.assertEqual(calls.count('hdiutil'), attempts)
+        self.assertEqual(calls.count('sleep'), attempts - 1)
+        if attempts > 1:
+            self.assertEqual(self.delays.read_text().splitlines(), [str(number * 2) for number in range(1, attempts)])
+        argument_lists = [(self.calls / f'{number}.args').read_text().splitlines()
+                          for number in range(1, attempts + 1)]
+        images = [Path(arguments[-1]) for arguments in argument_lists]
+        self.assertEqual(len(set(images)), attempts)
+        self.assertEqual(len({(self.calls / f'{number}.inode').read_text() for number in range(1, attempts + 1)}), 1)
+        for number, (arguments, image) in enumerate(zip(argument_lists, images), 1):
+            self.assertEqual(arguments[:-1], ['create', '-volname', 'Fanta', '-srcfolder',
+                                             'target/aarch64-apple-darwin/release/dmg', '-ov', '-format', 'UDZO', '-verbose'])
+            self.assertNotEqual(self.root / image, final)
+            attempt_directory = self.root / image.parent
+            self.assertTrue(attempt_directory.is_relative_to(self.output))
+            self.assertEqual((attempt_directory / 'stdout.log').read_text(), f'attempt {number} progress\n')
+            expected_exit = 0 if success and number == attempts else result.returncode if not success else 1
+            self.assertEqual((attempt_directory / 'exit-code').read_text(), f'{expected_exit}\n')
+            self.assertIn(f'DMG creation attempt {number}/3 exited {expected_exit}', result.stdout)
+            if success and number == attempts:
+                self.assertFalse((self.root / image).exists(), 'only the successful image is published')
+            else:
+                self.assertEqual((self.root / image).read_text(), f'partial {number}\n')
+                diagnostic = 'Permission denied' if scenario == 'nonbusy' else 'Resource busy elsewhere' if scenario == 'near-match' else 'Resource busy'
+                self.assertEqual((attempt_directory / 'stderr.log').read_text(), f'hdiutil: create failed - {diagnostic}\n')
+                self.assertIn(f'hdiutil: create failed - {diagnostic}', result.stderr)
+        if success:
+            self.assertEqual(final.read_bytes(), b'complete image\n')
+        elif previous_image:
+            self.assertEqual(final.read_bytes(), b'previous accepted image\n')
+        else:
+            self.assertFalse(final.exists(), 'failed partial output must never become the final DMG')
+        self.assertEqual((self.output / 'dmg/Applications').is_symlink(), not success)
+        self.assertTrue((self.output / 'dmg/Fanta.app/Contents/Resources/resource.txt').is_file())
+
+    def test_dmg_immediate_success(self):
+        self.run_dmg('success', success=True, attempts=1)
+
+    def test_dmg_busy_then_success_preserves_first_failure(self):
+        self.run_dmg('busy-success', success=True, attempts=2)
+
+    def test_dmg_busy_exhaustion_keeps_all_partials_unpublished(self):
+        self.run_dmg('busy', success=False, attempts=3)
+
+    def test_dmg_nonbusy_failure_does_not_retry_or_replace_existing_image(self):
+        self.run_dmg('nonbusy', success=False, attempts=1, previous_image=True)
+
+    def test_dmg_near_match_is_not_retried(self):
+        self.run_dmg('near-match', success=False, attempts=1)
+
+
 class WorkflowPipeline(unittest.TestCase):
     def test_failing_packaging_runner_is_not_masked_by_tee(self):
         workflow = (ROOT / '.github/workflows/check.yml').read_text()

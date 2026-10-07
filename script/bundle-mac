@@ -609,7 +609,36 @@ function sign_app_binaries() {
         ln -s /Applications "${dmg_source_directory}"
 
         echo "Creating final DMG at ${dmg_file_path} using ${dmg_source_directory}"
-        hdiutil create -volname Fanta -srcfolder "${dmg_source_directory}" -ov -format UDZO "${dmg_file_path}"
+        if [[ -d "$dmg_file_path" || -L "$dmg_file_path" ]]; then
+            echo "Refusing to replace a directory or symlink at ${dmg_file_path}." >&2
+            return 1
+        fi
+        local attempt attempt_directory attempt_image attempt_status
+        for attempt in 1 2 3; do
+            attempt_directory=$(mktemp -d "${dmg_target_directory}/dmg-create-${attempt}.XXXXXX")
+            attempt_image="${attempt_directory}/image.dmg"
+            echo "DMG creation attempt ${attempt}/3: ${attempt_directory}"
+            if LC_ALL=C hdiutil create -volname Fanta -srcfolder "${dmg_source_directory}" -ov -format UDZO -verbose "${attempt_image}" \
+                > "${attempt_directory}/stdout.log" 2> "${attempt_directory}/stderr.log"; then
+                attempt_status=0
+            else
+                attempt_status=$?
+            fi
+            printf '%s\n' "$attempt_status" > "${attempt_directory}/exit-code"
+            cat "${attempt_directory}/stdout.log"
+            cat "${attempt_directory}/stderr.log" >&2
+            echo "DMG creation attempt ${attempt}/3 exited ${attempt_status}; retained diagnostics at ${attempt_directory}"
+            if [[ "$attempt_status" = 0 ]]; then
+                mv -f "$attempt_image" "$dmg_file_path"
+                break
+            fi
+            # Only the observed transient error is retryable; keep partial images
+            # isolated so a failed attempt cannot replace a previous final image.
+            if [[ "$attempt" = 3 || "$(tail -n 1 "${attempt_directory}/stderr.log")" != 'hdiutil: create failed - Resource busy' ]]; then
+                return "$attempt_status"
+            fi
+            sleep "$((attempt * 2))"
+        done
 
         # If someone runs this bundle script locally, a symlink will be placed in `dmg_source_directory`.
         # This symlink causes CPU issues with Zed if the Zed codebase is the project being worked on, so we simply remove it for now.

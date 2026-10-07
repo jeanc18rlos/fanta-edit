@@ -107,6 +107,7 @@ jobs:
         with:
           shared-key: macos-release-aarch64
           cache-all-crates: true
+          cache-on-failure: ${{ github.event_name == 'workflow_dispatch' && startsWith(github.ref, 'refs/heads/') && inputs.distribution == 'developer-id' && !inputs.signed }}
 
       - name: Check licenses
         run: ./script/check-licenses
