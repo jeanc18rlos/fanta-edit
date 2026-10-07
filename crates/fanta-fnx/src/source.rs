@@ -245,7 +245,41 @@ impl FnxSourceMirror {
                 "structural source rebuild changed the artifact semantics".into(),
             ));
         }
-        Self::from_source_with(&rebuilt, next.sidecar(), Arc::clone(&self.refs))
+        let rebuilt = Self::from_source_with(&rebuilt, next.sidecar(), Arc::clone(&self.refs))?;
+        if self.child_comments()? != rebuilt.child_comments()? {
+            return Err(FnxError::Parse(
+                "cannot preserve authored FNX comments exactly in this canvas edit; edit the FNX source instead".into(),
+            ));
+        }
+        Ok(rebuilt)
+    }
+
+    fn child_comments(&self) -> Result<BTreeMap<String, usize>, FnxError> {
+        let tag_pieces: std::collections::BTreeSet<_> = self
+            .nodes
+            .values()
+            .flat_map(|node| std::iter::once(node.open).chain(node.close))
+            .collect();
+        let mut comments = BTreeMap::new();
+        for (position, piece) in self.pieces.iter().enumerate() {
+            // Wrapper code and tag values may contain comment-like strings;
+            // only scanner-validated JSX child trivia belongs to this check.
+            if position == 0 || position + 1 == self.pieces.len() || tag_pieces.contains(&position)
+            {
+                continue;
+            }
+            let mut trivia = piece.trim_start();
+            while !trivia.is_empty() {
+                let end = trivia
+                    .strip_prefix("{/*")
+                    .and_then(|comment| comment.find("*/}"))
+                    .map(|end| end + 6)
+                    .ok_or_else(|| FnxError::Parse("invalid retained FNX child trivia".into()))?;
+                *comments.entry(trivia[..end].to_owned()).or_insert(0) += 1;
+                trivia = trivia[end..].trim_start();
+            }
+        }
+        Ok(comments)
     }
 
     /// Replace one node's semantic tag/attributes without touching any other
@@ -617,10 +651,9 @@ impl<'a> StructuralSourceBuilder<'a> {
                 .id
                 .as_str();
             let child_old_position = self.by_id.get(child_id).copied();
-            let old_leading = old_position
-                .zip(child_old_position)
-                .filter(|(parent, child)| self.previous_elements[*child].1 == Some(*parent))
-                .and_then(|(_, child)| self.leading[child].as_ref());
+            // Leading child trivia follows its stable identity on reparent;
+            // the old parent no longer emits that child's interval.
+            let old_leading = child_old_position.and_then(|child| self.leading[child].as_ref());
             if let Some(leading) = old_leading {
                 out.push_str(&self.source[leading.clone()]);
             } else {

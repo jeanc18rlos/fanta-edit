@@ -4501,3 +4501,823 @@ fn artifact_scope_index_spectrum_benchmark() {
         }
     }
 }
+
+
+fn structural_source_fixture(
+    future_fields: bool,
+    child_comment: bool,
+) -> (tempfile::TempDir, NodeId, NodeId, NodeId) {
+    let (directory, page) = page_fixture();
+    let (mut document, assets) =
+        crate::read_project_tree(directory.path()).expect("fixture document");
+    let child = *document
+        .scene
+        .children_of(Some(page))
+        .first()
+        .expect("Card child");
+    document.scene.get_mut(child).expect("Card").opacity = fanta_doc::UnitInterval::new(0.4);
+    let mut destination = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    destination.parent = Some(page);
+    destination.name = "Destination".into();
+    let destination = document.scene.insert(destination).expect("destination");
+    crate::write_project_tree(directory.path(), &document, &assets).expect("canonical fixture");
+    let path = crate::locate_page_source(directory.path(), page).expect("source path");
+    let mut source = std::fs::read_to_string(&path).expect("source");
+    if future_fields {
+        source = source.replacen(
+            "name=\"Home\"",
+            "name=\"Home\" future_page={{\"version\":9,\"values\":[true,null,3]}}",
+            1,
+        );
+        source = source.replacen("name=\"Card\"", "name=\"Card\" future_prop={\"keep\"}", 1);
+    }
+    if child_comment {
+        let identity = format!("id=\"{}\"", child.0);
+        let position = source.find(&identity).expect("child identity");
+        let opening = source[..position].rfind('<').expect("child opening");
+        source.insert_str(opening, "{/* child note: keep once */}\n    ");
+    }
+    source.insert_str(0, "// authored wrapper remains exact\n");
+    std::fs::write(path, source).expect("authored fixture");
+    (directory, page, child, destination)
+}
+
+fn structural_source_assert_fields(source: &str, child: NodeId) {
+    let tree = fanta_fnx::parse_doc(source).expect("source remains valid");
+    assert_eq!(
+        tree.attrs.get("future_page"),
+        Some(&json!({"version":9,"values":[true,null,3]}))
+    );
+    fn find(element: &fanta_fnx::FnxElement, id: NodeId) -> Option<&fanta_fnx::FnxElement> {
+        if element.attrs.get("id") == Some(&json!(id.0.to_string())) {
+            return Some(element);
+        }
+        element.children.iter().find_map(|child| find(child, id))
+    }
+    assert_eq!(
+        find(&tree, child)
+            .expect("surviving child")
+            .attrs
+            .get("future_prop"),
+        Some(&json!("keep"))
+    );
+    assert!(source.starts_with("// authored wrapper remains exact\n"));
+}
+
+#[test]
+fn structural_source_fields_survive_create_undo_redo_and_cold() {
+    let (directory, page, child, _) = structural_source_fixture(true, true);
+    let source_path = crate::locate_page_source(directory.path(), page).expect("source path");
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
+    let artifact = ArtifactId::Page(page);
+    workspace.open_artifact(artifact.clone()).expect("page");
+    let before = artifact_ownership_file_bytes(directory.path());
+    let mut inserted = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    inserted.parent = Some(page);
+    let inserted_id = inserted.id;
+    workspace
+        .artifact_mut(&artifact)
+        .expect("session")
+        .apply(Operation::create_node(inserted))
+        .expect("create");
+    for step in ["created", "undo", "redo"] {
+        let session = workspace.artifact_mut(&artifact).expect("session");
+        match step {
+            "undo" => {
+                session.undo_atomic().expect("Undo");
+            }
+            "redo" => {
+                session.redo_atomic().expect("Redo");
+            }
+            _ => {}
+        }
+        structural_source_assert_fields(&session.source_text(), child);
+        assert_eq!(
+            session
+                .source_text()
+                .matches("{/* child note: keep once */}")
+                .count(),
+            1
+        );
+        workspace.save_artifact(artifact.clone()).expect("Save");
+        structural_source_assert_fields(
+            &std::fs::read_to_string(&source_path).expect("saved source"),
+            child,
+        );
+        let (reopened, _) = crate::read_project_tree(directory.path()).expect("cold read");
+        assert_eq!(reopened.scene.contains(inserted_id), step != "undo");
+        assert_eq!(
+            reopened.scene.get(child).expect("child").opacity,
+            fanta_doc::UnitInterval::new(0.4)
+        );
+        let after = artifact_ownership_file_bytes(directory.path());
+        for (path, bytes) in &before {
+            if directory.path().join(path) != source_path
+                && directory.path().join(path) != source_path.with_file_name("page.ids.json")
+            {
+                assert_eq!(
+                    after.get(path),
+                    Some(bytes),
+                    "unrelated file {}",
+                    path.display()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn structural_source_fields_host_adoption_preserves_future_fields_but_removes_known_value() {
+    let (directory, page, child, _) = structural_source_fixture(true, true);
+    let (mut document, assets) =
+        crate::read_project_tree(directory.path()).expect("read authored project");
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
+    let artifact = ArtifactId::Page(page);
+    workspace.open_artifact(artifact.clone()).expect("page");
+    document.scene.get_mut(child).expect("child").opacity = fanta_doc::UnitInterval::ONE;
+    let mut inserted = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    inserted.parent = Some(page);
+    document.scene.insert(inserted).expect("insert");
+    workspace
+        .adopt_document_artifacts(&document, [&artifact])
+        .expect("adopt host edit");
+    let session = workspace.artifact(&artifact).expect("page");
+    structural_source_assert_fields(&session.source_text(), child);
+    assert!(
+        !session.source_text().contains("opacity={0.4}"),
+        "known old value must not be revived"
+    );
+    let sources = workspace
+        .validated_source_overrides_for_document(&document)
+        .expect("sources");
+    let preconditions = workspace
+        .source_write_preconditions(&document)
+        .expect("preconditions");
+    crate::write_project_tree_cached_with_sources_checked(
+        directory.path(),
+        &document,
+        &assets,
+        &mut crate::ProjectWriteCache::default(),
+        &sources,
+        &preconditions,
+    )
+    .expect("checked whole-project save");
+    let (reopened, reopened_assets) =
+        crate::read_project_tree(directory.path()).expect("cold read");
+    assert_eq!(
+        serde_json::to_value(&reopened).expect("actual"),
+        serde_json::to_value(&document).expect("expected")
+    );
+    assert_eq!(reopened_assets, assets);
+}
+
+#[test]
+fn structural_source_fields_do_not_resurrect_explicit_source_removal() {
+    let (directory, page, child, _) = structural_source_fixture(true, false);
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
+    let artifact = ArtifactId::Page(page);
+    workspace.open_artifact(artifact.clone()).expect("page");
+    let session = workspace.artifact_mut(&artifact).expect("session");
+    let source = session.begin_text_edit().expect("source edit").clone();
+    let removed = source.replace(" future_prop={\"keep\"}", "");
+    assert_ne!(source, removed);
+    session
+        .set_text(removed)
+        .expect("remove future child attribute explicitly");
+    let document = session.doc().clone_for_persist();
+    session
+        .commit_text_to_scene(
+            document.id,
+            document.components,
+            document.variables,
+            document.active_modes,
+        )
+        .expect("accept source removal");
+    let mut inserted = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    inserted.parent = Some(page);
+    session
+        .apply(Operation::create_node(inserted))
+        .expect("structural edit");
+    assert!(!session.source_text().contains("future_prop"));
+    assert!(
+        session.source_text().contains("future_page"),
+        "unremoved root attribute survives"
+    );
+    workspace.save_artifact(artifact).expect("save");
+    let (reopened, _) = crate::read_project_tree(directory.path()).expect("cold read");
+    assert!(reopened.scene.contains(child));
+}
+
+#[test]
+fn structural_source_fields_reparent_keeps_child_comment_once_through_history() {
+    let (directory, page, child, destination) = structural_source_fixture(false, true);
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
+    let artifact = ArtifactId::Page(page);
+    workspace.open_artifact(artifact.clone()).expect("page");
+    let session = workspace.artifact_mut(&artifact).expect("session");
+    let previous = session.doc().scene.get(child).expect("child").clone();
+    session
+        .apply(Operation::Reparent {
+            id: child,
+            old_parent: previous.parent,
+            old_index: previous.index,
+            new_parent: Some(destination),
+            new_index: previous.index,
+        })
+        .expect("reparent");
+    for redo in [None, Some(false), Some(true)] {
+        let session = workspace.artifact_mut(&artifact).expect("session");
+        match redo {
+            Some(false) => {
+                session.undo_atomic().expect("Undo");
+            }
+            Some(true) => {
+                session.redo_atomic().expect("Redo");
+            }
+            None => {}
+        }
+        assert_eq!(
+            session
+                .source_text()
+                .matches("{/* child note: keep once */}")
+                .count(),
+            1,
+            "comment follows surviving child exactly once"
+        );
+        workspace.save_artifact(artifact.clone()).expect("save");
+        let (reopened, _) = crate::read_project_tree(directory.path()).expect("cold read");
+        assert_eq!(
+            reopened.scene.get(child).expect("child").parent,
+            Some(if redo == Some(false) {
+                page
+            } else {
+                destination
+            })
+        );
+    }
+}
+
+#[test]
+fn structural_source_fields_unsafe_delete_refuses_without_mutating_session_or_disk() {
+    for future_fields in [false, true] {
+        let (directory, page, child, _) = structural_source_fixture(future_fields, !future_fields);
+        let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
+        let artifact = ArtifactId::Page(page);
+        workspace.open_artifact(artifact.clone()).expect("page");
+        let disk = artifact_ownership_file_bytes(directory.path());
+        let session = workspace.artifact_mut(&artifact).expect("session");
+        let source = session.source_text();
+        let document = serde_json::to_value(session.doc()).expect("document");
+        let generation = session.working_generation();
+        let history = session.doc().history.undo_depth();
+        let snapshot = vec![session.doc().scene.get(child).expect("child").clone()];
+        let error = session
+            .apply(Operation::DeleteSubtree { snapshot })
+            .expect_err("cannot discard authored source data without a reversible representation");
+        assert!(
+            error.to_string().contains("source") || error.to_string().contains("comment"),
+            "meaningful refusal: {error}"
+        );
+        assert_eq!(session.source_text(), source);
+        assert_eq!(
+            serde_json::to_value(session.doc()).expect("document"),
+            document
+        );
+        assert_eq!(session.working_generation(), generation);
+        assert_eq!(session.doc().history.undo_depth(), history);
+        assert_eq!(artifact_ownership_file_bytes(directory.path()), disk);
+    }
+}
+
+#[test]
+fn structural_source_fields_type_change_refuses_atomically() {
+    let (directory, page, child, _) = structural_source_fixture(true, false);
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
+    let artifact = ArtifactId::Page(page);
+    workspace.open_artifact(artifact.clone()).expect("page");
+    let disk = artifact_ownership_file_bytes(directory.path());
+    let session = workspace.artifact_mut(&artifact).expect("session");
+    let before = serde_json::to_value(session.doc()).expect("before document");
+    let source = session.source_text();
+    let generation = session.working_generation();
+    let child_node = session.doc().scene.get(child).expect("child").clone();
+    let error = session
+        .apply(Operation::ReplaceData {
+            id: child,
+            old: Box::new(child_node.data),
+            new: Box::new(NodeData::Vector(fanta_doc::VectorNode::default())),
+        })
+        .expect_err("source-only data cannot move to a different node type");
+    assert!(error.to_string().contains("future_prop"), "{error}");
+    assert_eq!(session.source_text(), source);
+    assert_eq!(
+        serde_json::to_value(session.doc()).expect("after document"),
+        before
+    );
+    assert_eq!(session.working_generation(), generation);
+    assert_eq!(session.doc().history.undo_depth(), 0);
+    assert_eq!(artifact_ownership_file_bytes(directory.path()), disk);
+}
+
+#[test]
+fn structural_source_fields_plain_delete_undo_redo_ignores_comment_looking_attribute() {
+    let (directory, page, child, _) = structural_source_fixture(false, false);
+    let path = crate::locate_page_source(directory.path(), page).expect("source");
+    let mut source = std::fs::read_to_string(&path).expect("source");
+    let identity = format!("id=\"{}\"", child.0);
+    let identity_start = source.find(&identity).expect("child identity");
+    let opening_start = source[..identity_start].rfind('<').expect("child tag");
+    let opening_end = identity_start + source[identity_start..].find('>').expect("tag end") + 1;
+    let original_opening = &source[opening_start..opening_end];
+    let mut opening = original_opening.to_owned();
+    let value_start = opening.find("opacity={").expect("authored opacity") + "opacity={".len();
+    let value_end = value_start + opening[value_start..].find('}').expect("opacity end");
+    let authored: f64 = opening[value_start..value_end]
+        .parse()
+        .expect("numeric opacity");
+    assert!(
+        (authored - 0.4).abs() < 1e-6,
+        "fixture starts at 0.4: {authored}"
+    );
+    opening.replace_range(value_start..value_end, "1");
+    assert!(opening.contains("name=\"Card\""), "fixture child name");
+    opening = opening.replacen(
+        "name=\"Card\"",
+        "name=\"{/* ordinary string, not a comment */}\"",
+        1,
+    );
+    assert_ne!(opening, original_opening);
+    assert!(opening.contains("opacity={1}"));
+    assert!(opening.contains("{/* ordinary string, not a comment */}"));
+    source.replace_range(opening_start..opening_end, &opening);
+    std::fs::write(&path, source).expect("explicit known default");
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
+    let artifact = ArtifactId::Page(page);
+    workspace.open_artifact(artifact.clone()).expect("page");
+    let session = workspace.artifact_mut(&artifact).expect("session");
+    let original = session.doc().scene.get(child).expect("child").clone();
+    assert_eq!(original.opacity, fanta_doc::UnitInterval::ONE);
+    session
+        .apply(Operation::DeleteSubtree {
+            snapshot: vec![original.clone()],
+        })
+        .expect("ordinary Delete");
+    for stage in ["delete", "undo", "redo"] {
+        let session = workspace.artifact_mut(&artifact).expect("session");
+        match stage {
+            "undo" => {
+                session.undo_atomic().expect("Undo");
+            }
+            "redo" => {
+                session.redo_atomic().expect("Redo");
+            }
+            _ => {}
+        }
+        workspace.save_artifact(artifact.clone()).expect("save");
+        let (reopened, _) = crate::read_project_tree(directory.path()).expect("cold read");
+        assert_eq!(
+            reopened.scene.get(child),
+            if stage == "undo" {
+                Some(&original)
+            } else {
+                None
+            }
+        );
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("source")
+                .starts_with("// authored wrapper remains exact\n")
+        );
+    }
+}
+
+#[test]
+fn structural_source_fields_explicit_source_removal_allows_delete_without_resurrection() {
+    let (directory, page, child, _) = structural_source_fixture(true, true);
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
+    let artifact = ArtifactId::Page(page);
+    workspace.open_artifact(artifact.clone()).expect("page");
+    let session = workspace.artifact_mut(&artifact).expect("session");
+    let original = session.begin_text_edit().expect("text edit").clone();
+    let removed = original
+        .replace(" future_prop={\"keep\"}", "")
+        .replace("{/* child note: keep once */}", "");
+    assert_ne!(original, removed);
+    session.set_text(removed).expect("source removal");
+    let document = session.doc().clone_for_persist();
+    session
+        .commit_text_to_scene(
+            document.id,
+            document.components,
+            document.variables,
+            document.active_modes,
+        )
+        .expect("accept source");
+    session
+        .apply(Operation::DeleteSubtree {
+            snapshot: vec![session.doc().scene.get(child).expect("child").clone()],
+        })
+        .expect("Delete after explicit source removal");
+    session.undo_atomic().expect("Undo known node deletion");
+    assert!(session.doc().scene.contains(child));
+    assert!(!session.source_text().contains("future_prop"));
+    assert!(!session.source_text().contains("child note"));
+    assert!(session.source_text().contains("future_page"));
+    workspace.save_artifact(artifact).expect("save");
+    let (reopened, _) = crate::read_project_tree(directory.path()).expect("cold read");
+    assert!(reopened.scene.contains(child));
+}
+
+#[test]
+fn structural_source_fields_duplicate_identical_comments_stay_exact_on_reparent() {
+    let (directory, page, child, destination) = structural_source_fixture(false, true);
+    let path = crate::locate_page_source(directory.path(), page).expect("source path");
+    let mut source = std::fs::read_to_string(&path).expect("source");
+    let destination_id = format!("id=\"{}\"", destination.0);
+    let position = source.find(&destination_id).expect("destination id");
+    let opening = source[..position].rfind('<').expect("destination tag");
+    source.insert_str(opening, "{/* child note: keep once */}\n    ");
+    std::fs::write(&path, source).expect("two identical authored comments");
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
+    let artifact = ArtifactId::Page(page);
+    workspace.open_artifact(artifact.clone()).expect("page");
+    let session = workspace.artifact_mut(&artifact).expect("session");
+    let previous = session.doc().scene.get(child).expect("child").clone();
+    session
+        .apply(Operation::Reparent {
+            id: child,
+            old_parent: previous.parent,
+            old_index: previous.index,
+            new_parent: Some(destination),
+            new_index: previous.index,
+        })
+        .expect("reparent");
+    for stage in ["reparent", "undo", "redo"] {
+        let session = workspace.artifact_mut(&artifact).expect("session");
+        match stage {
+            "undo" => {
+                session.undo_atomic().expect("Undo");
+            }
+            "redo" => {
+                session.redo_atomic().expect("Redo");
+            }
+            _ => {}
+        }
+        assert_eq!(
+            session
+                .source_text()
+                .matches("{/* child note: keep once */}")
+                .count(),
+            2,
+            "identical comments must neither duplicate nor collapse"
+        );
+        workspace.save_artifact(artifact.clone()).expect("save");
+        assert_eq!(
+            std::fs::read_to_string(&path)
+                .expect("saved source")
+                .matches("{/* child note: keep once */}")
+                .count(),
+            2
+        );
+        let (reopened, _) = crate::read_project_tree(directory.path()).expect("cold read");
+        assert_eq!(
+            reopened.scene.get(child).expect("child").parent,
+            Some(if stage == "undo" { page } else { destination })
+        );
+    }
+}
+
+#[test]
+fn structural_source_fields_instance_and_bitmap_defaults_allow_delete_but_future_fields_refuse() {
+    use fanta_doc::{AssetId, BitmapNode, ComponentDef, ComponentId, ImageFitMode, InstanceNode};
+    for bitmap in [false, true] {
+        for future_field in [false, true] {
+            let (directory, page) = page_fixture();
+            let (mut document, mut assets) =
+                crate::read_project_tree(directory.path()).expect("baseline");
+            let master = document
+                .scene
+                .insert(CanvasNode::new(NodeData::Group(GroupNode::default())))
+                .expect("master");
+            let component = ComponentId::new();
+            document
+                .components
+                .defs
+                .insert(component, ComponentDef::new(component, master, "Master"));
+            let asset = AssetId::new();
+            assets.insert(asset, b"opaque asset persistence control".to_vec());
+            let data = if bitmap {
+                NodeData::Bitmap(BitmapNode {
+                    asset,
+                    natural_size: [1, 1],
+                    local_size: [10.0, 10.0],
+                    crop: None,
+                    fit: ImageFitMode::Fill,
+                    tint: None,
+                })
+            } else {
+                NodeData::Instance(InstanceNode {
+                    component,
+                    overrides: Vec::new(),
+                    prop_values: BTreeMap::new(),
+                    derived: Vec::new(),
+                    local_size: [10.0, 10.0],
+                })
+            };
+            let mut node = CanvasNode::new(data);
+            node.parent = Some(page);
+            let target = node.id;
+            document.scene.insert(node.clone()).expect("target");
+            crate::write_project_tree(directory.path(), &document, &assets).expect("project");
+            let path = crate::locate_page_source(directory.path(), page).expect("source path");
+            let source = std::fs::read_to_string(&path).expect("source");
+            let identity = format!("id=\"{}\"", target.0);
+            let defaults = if bitmap {
+                "crop={null} tint={null}"
+            } else {
+                "overrides={[]} prop_values={{}} derived={[]}"
+            };
+            let unknown = if future_field {
+                " future_unknown_field={{\"kept\":true}}"
+            } else {
+                ""
+            };
+            let source = source.replace(
+                &identity,
+                &format!(
+                    "{identity} {defaults} effects={{[]}} bindings={{[]}} reactions={{[]}}{unknown}"
+                ),
+            );
+            std::fs::write(&path, source).expect("explicit defaults");
+            let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
+            let artifact = ArtifactId::Page(page);
+            workspace.open_artifact(artifact.clone()).expect("open");
+            let files = artifact_ownership_file_bytes(directory.path());
+            let session = workspace.artifact_mut(&artifact).expect("session");
+            let original_source = session.source_text();
+            let original_doc = serde_json::to_value(session.doc()).expect("original document");
+            let operation = Operation::DeleteSubtree {
+                snapshot: vec![node.clone()],
+            };
+            if future_field {
+                let error = session
+                    .apply(operation)
+                    .expect_err("future fields remain protected");
+                assert!(
+                    error.to_string().contains("future_unknown_field"),
+                    "{error}"
+                );
+                assert_eq!(session.source_text(), original_source);
+                assert_eq!(
+                    serde_json::to_value(session.doc()).expect("document"),
+                    original_doc
+                );
+                assert_eq!(session.doc().history.undo_depth(), 0);
+                assert_eq!(artifact_ownership_file_bytes(directory.path()), files);
+                continue;
+            }
+            session
+                .apply(operation)
+                .expect("known explicit defaults do not block Delete");
+            for stage in ["delete", "undo", "redo"] {
+                let session = workspace.artifact_mut(&artifact).expect("session");
+                match stage {
+                    "undo" => {
+                        session.undo_atomic().expect("Undo");
+                    }
+                    "redo" => {
+                        session.redo_atomic().expect("Redo");
+                    }
+                    _ => {}
+                }
+                workspace.save_artifact(artifact.clone()).expect("save");
+                let (reopened, reopened_assets) =
+                    crate::read_project_tree(directory.path()).expect("cold read");
+                assert_eq!(
+                    reopened.scene.get(target),
+                    if stage == "undo" { Some(&node) } else { None }
+                );
+                assert_eq!(reopened.components, document.components);
+                assert_eq!(reopened_assets, assets);
+                let written = artifact_ownership_file_bytes(directory.path());
+                for (file, bytes) in &files {
+                    if directory.path().join(file) != path
+                        && directory.path().join(file) != path.with_file_name("page.ids.json")
+                    {
+                        assert_eq!(
+                            written.get(file),
+                            Some(bytes),
+                            "unrelated {}",
+                            file.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn structural_source_type_conversion_case(kind: &str, shared_adoption: bool) {
+    use fanta_doc::{AssetId, BitmapNode, ComponentDef, ComponentId, ImageFitMode, InstanceNode};
+    let (directory, page) = page_fixture();
+    let (mut document, mut assets) = crate::read_project_tree(directory.path()).expect("baseline");
+    let master = document
+        .scene
+        .insert(CanvasNode::new(NodeData::Group(GroupNode::default())))
+        .expect("master");
+    let component = ComponentId::new();
+    document
+        .components
+        .defs
+        .insert(component, ComponentDef::new(component, master, "Master"));
+    let asset = AssetId::new();
+    assets.insert(asset, b"opaque asset persistence control".to_vec());
+    let (data, defaults, obsolete): (NodeData, &str, &[&str]) = match kind {
+        "bitmap" => (
+            NodeData::Bitmap(BitmapNode {
+                asset,
+                natural_size: [1, 1],
+                local_size: [10.0, 10.0],
+                crop: None,
+                fit: ImageFitMode::Fill,
+                tint: None,
+            }),
+            "crop={null} tint={null}",
+            &["crop", "tint"],
+        ),
+        "instance" => (
+            NodeData::Instance(InstanceNode {
+                component,
+                overrides: Vec::new(),
+                prop_values: BTreeMap::new(),
+                derived: Vec::new(),
+                local_size: [10.0, 10.0],
+            }),
+            "overrides={[]} prop_values={{}} derived={[]}",
+            &["overrides", "prop_values", "derived"],
+        ),
+        "group" => (
+            NodeData::Group(GroupNode::default()),
+            "grid={null} background={null}",
+            &["grid", "background"],
+        ),
+        _ => panic!("unsupported fixture kind"),
+    };
+    let mut original = CanvasNode::new(data);
+    original.parent = Some(page);
+    let target = original.id;
+    document.scene.insert(original.clone()).expect("target");
+    crate::write_project_tree(directory.path(), &document, &assets).expect("project");
+    let path = crate::locate_page_source(directory.path(), page).expect("source");
+    let source = std::fs::read_to_string(&path).expect("source");
+    let identity = format!("id=\"{}\"", target.0);
+    let authored = source.replace(
+        &identity,
+        &format!("{identity} {defaults} constraints={{null}}"),
+    );
+    assert_ne!(authored, source);
+    std::fs::write(&path, authored).expect("authored defaults");
+    let before_files = artifact_ownership_file_bytes(directory.path());
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
+    let artifact = ArtifactId::Page(page);
+    workspace.open_artifact(artifact.clone()).expect("page");
+    let converted_data = if kind == "group" {
+        NodeData::Vector(fanta_doc::VectorNode::rect_solid(
+            0.0,
+            0.0,
+            10.0,
+            10.0,
+            fanta_doc::Color::BLACK,
+        ))
+    } else {
+        NodeData::Group(GroupNode::default())
+    };
+    let mut converted = original.clone();
+    converted.data = converted_data.clone();
+    let operation = Operation::ReplaceData {
+        id: target,
+        old: Box::new(original.data.clone()),
+        new: Box::new(converted_data),
+    };
+    let session = workspace.artifact_mut(&artifact).expect("session");
+    if shared_adoption {
+        let mut next = session.scoped.clone();
+        next.doc.apply(operation).expect("host conversion");
+        assert_eq!(
+            session.shared_scene_delta(&next),
+            Some(vec![target]),
+            "exercise shared host adoption"
+        );
+        session.adopt_scoped_doc(next).expect("adopt conversion");
+    } else {
+        session.apply(operation).expect("convert");
+    }
+    for stage in [
+        "convert",
+        "undo-convert",
+        "redo-convert",
+        "delete",
+        "undo-delete",
+        "redo-delete",
+    ] {
+        let session = workspace.artifact_mut(&artifact).expect("session");
+        match stage {
+            "undo-convert" | "undo-delete" => {
+                session.undo_atomic().expect("Undo");
+            }
+            "redo-convert" | "redo-delete" => {
+                session.redo_atomic().expect("Redo");
+            }
+            "delete" => {
+                session
+                    .apply(Operation::DeleteSubtree {
+                        snapshot: vec![converted.clone()],
+                    })
+                    .expect("converted node remains deletable");
+            }
+            _ => {}
+        }
+        let present = !matches!(stage, "delete" | "redo-delete");
+        let is_original = stage == "undo-convert";
+        if present && !is_original {
+            let element = session
+                .ir
+                .element(&target.0.to_string())
+                .expect("converted source node");
+            for field in obsolete {
+                assert!(
+                    !element.attrs.contains_key(*field),
+                    "{kind}→converted source kept obsolete {field} at {stage}"
+                );
+            }
+            if stage == "convert" {
+                assert_eq!(
+                    element.attrs.get("constraints"),
+                    Some(&Value::Null),
+                    "common wrapper default stays authored"
+                );
+            }
+        }
+        workspace.save_artifact(artifact.clone()).expect("save");
+        let (reopened, reopened_assets) =
+            crate::read_project_tree(directory.path()).expect("cold read");
+        let mut expected = document.clone_for_persist();
+        if present {
+            *expected.scene.get_mut(target).expect("expected target") = if is_original {
+                original.clone()
+            } else {
+                converted.clone()
+            };
+        } else {
+            expected
+                .apply(Operation::DeleteSubtree {
+                    snapshot: vec![original.clone()],
+                })
+                .expect("expected delete");
+        }
+        assert_eq!(
+            serde_json::to_value(&reopened.scene).expect("actual scene"),
+            serde_json::to_value(&expected.scene).expect("expected scene"),
+            "{kind} {stage}"
+        );
+        assert_eq!(reopened.components, document.components);
+        assert_eq!(reopened_assets, assets);
+        let mut cold = WorkspaceSession::open(directory.path()).expect("cold workspace");
+        cold.open_artifact(artifact.clone()).expect("cold artifact");
+        assert!(
+            cold.artifact(&artifact)
+                .expect("artifact")
+                .source_diagnostics()
+                .is_empty(),
+            "no spurious future-field diagnostics after {kind} {stage}"
+        );
+        let after_files = artifact_ownership_file_bytes(directory.path());
+        for (file, bytes) in &before_files {
+            if directory.path().join(file) != path
+                && directory.path().join(file) != path.with_file_name("page.ids.json")
+            {
+                assert_eq!(
+                    after_files.get(file),
+                    Some(bytes),
+                    "unrelated {}",
+                    file.display()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn structural_source_fields_type_conversion_bitmap_defaults_remain_deletable() {
+    structural_source_type_conversion_case("bitmap", false);
+}
+
+#[test]
+fn structural_source_fields_type_conversion_instance_defaults_remain_deletable() {
+    structural_source_type_conversion_case("instance", false);
+}
+
+#[test]
+fn structural_source_fields_type_conversion_group_defaults_host_adoption_remains_deletable() {
+    structural_source_type_conversion_case("group", true);
+}

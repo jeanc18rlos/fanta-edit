@@ -785,7 +785,7 @@ impl ArtifactSession {
         let header = self.projected_canvas_header()?;
         let (ir, text) = if self.ir_stale {
             let ir = self.projected_source_ir(header.clone())?;
-            let text = ir.print_with(&self.ref_table);
+            let text = self.source.rebuild_tree(&self.ir, &ir)?.render();
             (ir, text)
         } else {
             (self.ir.clone(), self.source.render())
@@ -1602,12 +1602,7 @@ impl ArtifactSession {
         scoped.doc.selection = filter_selection(self.scoped.doc.selection.clone(), &scoped.doc);
         scratch.scoped = scoped;
         let source_sync = if structural {
-            let text = canonical_ir.print_with(&scratch.ref_table);
-            scratch.source = FnxSourceMirror::from_source_with(
-                &text,
-                canonical_ir.sidecar(),
-                Arc::clone(&scratch.ref_table),
-            )?;
+            scratch.source = scratch.source.rebuild_tree(&scratch.ir, &canonical_ir)?;
             scratch.ir = canonical_ir;
             scratch.ir_stale = false;
             SourceSync::Rebuilt {
@@ -1782,15 +1777,19 @@ impl ArtifactSession {
         previous: BTreeMap<NodeId, NodePatchBase>,
         mut after: BTreeMap<NodeId, Value>,
     ) -> Result<SourceSync, SessionError> {
+        for (id, before) in &previous {
+            self.validate_source_node_change(&id.0.to_string(), &before.value, after.get(id))?;
+        }
         let mut patched = Vec::new();
         for (id, before) in previous {
             let Some(value) = after.remove(&id) else {
                 return self.rebuild_source_from_scene(SourceRebuildReason::PatchUnavailable);
             };
             let key = id.0.to_string();
+            let patch_base = self.source_patch_base(&key, &before.value, &value)?;
             if self
                 .ir
-                .patch_node_delta(&key, &before.value, &value)
+                .patch_node_delta(&key, patch_base.as_ref(), &value)
                 .is_err()
             {
                 return self.rebuild_source_from_scene(SourceRebuildReason::PatchUnavailable);
@@ -1819,22 +1818,106 @@ impl ArtifactSession {
         }
     }
 
-    fn projected_source_ir(&self, header: Value) -> Result<ArtifactIr, SessionError> {
-        let (mut ir, _map) =
-            project_scene_to_node_map(&self.scoped, self.kind, &self.fn_name, header)?;
-        if self.kind == ArtifactKind::Page {
-            // Runtime pages are unsized, but a structural edit does not author
-            // removal of dimensions retained in their original source.
-            let mut root = ir.root().clone();
-            for name in ["clip_size", "local_size"] {
-                if let Some(value) = self.ir.root().attrs.get(name) {
-                    root.attrs.insert(name.to_owned(), value.clone());
-                }
-            }
-            let sidecar = ir.sidecar().clone();
-            ir.replace_structure(root, sidecar)?;
+    fn validate_source_node_change(
+        &self,
+        id: &str,
+        before: &Value,
+        after: Option<&Value>,
+    ) -> Result<(), SessionError> {
+        if after.is_some_and(|after| before.get("type") == after.get("type")) {
+            return Ok(());
         }
-        Ok(ir)
+        let element = self
+            .ir
+            .element(id)
+            .ok_or_else(|| SessionError::other(format!("retained source lost node {id}")))?;
+        let known = before
+            .get("type")
+            .and_then(Value::as_str)
+            .and_then(fanta_doc::known_fields);
+        if let Some(name) = element.attrs.keys().find(|name| {
+            before.get(*name).is_none()
+                && !known.as_ref().is_some_and(|known| known.contains(*name))
+        }) {
+            // Typed history cannot restore attributes that only exist in FNX.
+            // The current accepted IR, rather than the disk baseline, owns them.
+            return Err(SessionError::InvalidState(format!(
+                "cannot delete or change the type of node {id}: authored source attribute `{name}` cannot be restored by canvas Undo; edit its FNX source instead"
+            )));
+        }
+        Ok(())
+    }
+
+    fn source_patch_base<'a>(
+        &self,
+        id: &str,
+        before: &'a Value,
+        after: &Value,
+    ) -> Result<std::borrow::Cow<'a, Value>, SessionError> {
+        if before.get("type") == after.get("type") {
+            return Ok(std::borrow::Cow::Borrowed(before));
+        }
+        let fields = |value: &Value| {
+            value
+                .get("type")
+                .and_then(Value::as_str)
+                .and_then(fanta_doc::known_fields)
+                .ok_or_else(|| SessionError::other("type change has no known source-field schema"))
+        };
+        let old_fields = fields(before)?;
+        let new_fields = fields(after)?;
+        let element = self
+            .ir
+            .element(id)
+            .ok_or_else(|| SessionError::other(format!("retained source lost node {id}")))?;
+        let mut patch_base = before.clone();
+        let object = patch_base
+            .as_object_mut()
+            .ok_or_else(|| SessionError::other("source patch base is not a node object"))?;
+        // Old-kind defaults omitted by serde are still deliberate removals on
+        // conversion. Leaving them in the new kind manufactures unknown fields
+        // and would make a later Delete fail its source-preservation guard.
+        for (name, value) in &element.attrs {
+            if old_fields.contains(name) && !new_fields.contains(name) {
+                object.insert(name.clone(), value.clone());
+            }
+        }
+        Ok(std::borrow::Cow::Owned(patch_base))
+    }
+
+    fn projected_source_ir(&self, header: Value) -> Result<ArtifactIr, SessionError> {
+        let (mut projected, after) =
+            project_scene_to_node_map(&self.scoped, self.kind, &self.fn_name, header)?;
+        let before = self.retained_scene_projection()?;
+        let mut retained = self.ir.clone();
+        for (id, previous) in &before.nodes {
+            let next = after.nodes.get(id);
+            self.validate_source_node_change(id, previous, next)?;
+            if let Some(next) = next {
+                let patch_base = self.source_patch_base(id, previous, next)?;
+                retained.patch_node_delta(id, patch_base.as_ref(), next)?;
+            }
+        }
+        fn carry_attributes(element: &mut FnxElement, retained: &ArtifactIr) {
+            if let Some(previous) = element
+                .attrs
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| retained.element(id))
+            {
+                element.attrs = previous.attrs.clone();
+            }
+            for child in &mut element.children {
+                carry_attributes(child, retained);
+            }
+        }
+        // Use fresh topology with current authored attributes. Semantic deltas
+        // remove changed known values, but cannot erase fields absent from both
+        // typed snapshots (including page dimensions and future FNX fields).
+        let mut root = projected.root().clone();
+        carry_attributes(&mut root, &retained);
+        projected.replace_structure(root, projected.sidecar().clone())?;
+        Ok(projected)
     }
 
     fn rebuild_source_from_scene(
@@ -1843,13 +1926,7 @@ impl ArtifactSession {
     ) -> Result<SourceSync, SessionError> {
         let header = self.base_nodes.header.clone();
         let ir = self.projected_source_ir(header)?;
-        let source = match self.source.rebuild_tree(&self.ir, &ir) {
-            Ok(source) => source,
-            Err(_) => {
-                let text = ir.print_with(&self.ref_table);
-                FnxSourceMirror::from_source_with(&text, ir.sidecar(), Arc::clone(&self.ref_table))?
-            }
-        };
+        let source = self.source.rebuild_tree(&self.ir, &ir)?;
         self.ir = ir;
         self.source = source;
         self.ir_stale = false;
@@ -2145,6 +2222,8 @@ fn is_variable_op(op: &Operation) -> bool {
 
 fn is_structural_op(op: &Operation) -> bool {
     artifact_op_impact(op) == ArtifactOpImpact::Structure
+        || matches!(op, Operation::ReplaceData { old, new, .. }
+            if std::mem::discriminant(old.as_ref()) != std::mem::discriminant(new.as_ref()))
 }
 
 fn patch_target(op: &Operation) -> Option<NodeId> {

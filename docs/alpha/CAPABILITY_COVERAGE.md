@@ -65,6 +65,40 @@ recorded there.
   (2 ignored), and the required ten-crate lint. These fixtures do not establish
   native edits of unknown source attributes or arbitrary nested detachments.
 
+- **Structural FNX source preservation: automated and bounded native PASS on
+  `bf0650022c`.** Hosted CI is tracked separately for each published candidate.
+  Surviving future attributes and
+  comments remain intact through structural saves. Explicit source removals stay
+  removed. Unsupported destructive changes report a preservation error rather
+  than silently printing a lossy replacement. All 13 node kinds recognize known
+  defaults; conversion removes only old-kind fields absent from the new schema.
+  Instance/media now receive non-fatal unknown-attribute warnings.
+  The initial five source-loss failures and three conversion failures remain
+  retained. Final validation passes 13 focused regressions, 401 document tests
+  (1 ignored), 98 FNX tests, 248 format tests (2 ignored), source-order runs of
+  98 FNX plus 248 format tests, 1,196 editor tests (2 ignored), and the required
+  ten-crate lint/dependency audit with actual macro-load proof.
+  Nineteen native checkpoints pass: ten plain-sibling Duplicate/Delete states,
+  three visible refusal/recovery states, and six intentional source-removal
+  states. Each checks complete typed content, source, 1 asset and all 30 files.
+  The three cold journeys match saved Redo payloads, timestamps and file bytes;
+  duplicated identities survive Redo and cold reopen. A protected Text deletion
+  first changes the live canvas, then Save visibly refuses and preserves every
+  persisted byte; one Undo and Save restore the original content. No pre-command
+  live atomicity is claimed. Removing one future field in FNX remains effective
+  through later Duplicate/Undo/Redo/cold; other fields and comments remain exact.
+  Four original capture-parser failures remain retained. A separately reviewed
+  literal-only `fnxColor` parser reevaluates the frozen captures without changing
+  expected data or file boundaries; it executes no JavaScript.
+  Evidence: `integration-20261007/structural-source-fields-20261007`, including
+  `green-broad-run3`, `native-positive-independent-review`,
+  `native-source-removal-independent-review`, and
+  `native-fixture/refusal-native-independent-aggregate.json`.
+  Native type conversion/reparent, arbitrary JavaScript/future grammar, camera
+  restoration and complete installed-app journeys are not established. Retained
+  rendering remains off. Signing/notarization, authenticated capabilities and
+  physical large-page performance remain separate release gates.
+
 Evidence is archived under `native-inspector-ui-candidate-20261007`,
 `native-variant-instance-menu-20261007-v4` (the `scope67-*` and `vdaf-*` records,
 plus the retained `native-detach` failure), `native-frame-section-text-20261007` (`scope67-*`), and
