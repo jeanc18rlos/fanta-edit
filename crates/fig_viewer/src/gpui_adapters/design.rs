@@ -1,7 +1,7 @@
 //! Connects the document model to the Design inspector read model and actions.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use anyhow::Context as _;
@@ -842,6 +842,9 @@ fn bundled_shader_catalog() -> DesignShaderViewData {
 }
 
 fn media_assets_for_document(document: &FigDocument) -> Vec<DesignMediaPaintAsset> {
+    #[cfg(test)]
+    tests::record_media_catalog_build(document.doc.id);
+
     let mut scene_names = HashMap::<AssetId, String>::new();
     if document.raw_assets.keys().any(|asset| {
         document
@@ -2482,6 +2485,37 @@ struct DesignCropSession {
     state: DesignMediaCropToolState,
 }
 
+#[derive(Default)]
+struct MediaAssetCatalogCache {
+    scene_instance: Option<u64>,
+    generation: u64,
+    raw_assets: Weak<BTreeMap<AssetId, Vec<u8>>>,
+    assets: Vec<DesignMediaPaintAsset>,
+}
+
+impl MediaAssetCatalogCache {
+    fn is_current(&self, document: &FigDocument) -> bool {
+        self.scene_instance == Some(document.doc.scene.instance_id())
+            && self.generation == document.render_generation()
+            && self
+                .raw_assets
+                .upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, &document.raw_assets))
+    }
+
+    fn get_or_build(&mut self, document: &FigDocument) -> Vec<DesignMediaPaintAsset> {
+        if !self.is_current(document) {
+            self.assets = media_assets_for_document(document);
+            self.scene_instance = Some(document.doc.scene.instance_id());
+            self.generation = document.render_generation();
+            // A weak owner detects replacement without retaining encoded bytes or
+            // forcing a copy when the document mutates its asset map.
+            self.raw_assets = Arc::downgrade(&document.raw_assets);
+        }
+        self.assets.clone()
+    }
+}
+
 pub(crate) struct DesignAdapter {
     pub panel: Entity<DesignPanel>,
     pub(crate) last_echo: Option<DesignEchoKey>,
@@ -2490,6 +2524,7 @@ pub(crate) struct DesignAdapter {
     crop_session: Option<DesignCropSession>,
     media_draft: Option<DesignMediaDraft>,
     media_draft_epoch: u64,
+    media_asset_catalog: MediaAssetCatalogCache,
     font_catalog: DesignFontViewData,
     font_catalog_dirty: bool,
     export_configurations: Vec<DesignExportConfiguration>,
@@ -2562,6 +2597,7 @@ impl DesignAdapter {
             crop_session: None,
             media_draft: None,
             media_draft_epoch: 0,
+            media_asset_catalog: MediaAssetCatalogCache::default(),
             font_catalog,
             font_catalog_dirty: true,
             export_configurations: vec![DesignExportConfiguration::new(
@@ -2704,11 +2740,10 @@ impl FigView {
                 page_index,
                 video_previews: video_preview_signature,
             };
-            if self
-                .gpui_design
-                .as_ref()
-                .is_some_and(|adapter| adapter.last_echo.as_ref() == Some(&key))
-            {
+            if self.gpui_design.as_ref().is_some_and(|adapter| {
+                adapter.last_echo.as_ref() == Some(&key)
+                    && adapter.media_asset_catalog.is_current(document)
+            }) {
                 return;
             }
             // The document speaks for the inspection context, the property
@@ -2736,7 +2771,10 @@ impl FigView {
                     adapter.media_draft_epoch = adapter.media_draft_epoch.wrapping_add(1);
                 }
             }
-            let media_assets = media_assets_for_document(document);
+            let Some(adapter) = self.gpui_design.as_mut() else {
+                return;
+            };
+            let media_assets = adapter.media_asset_catalog.get_or_build(document);
             let pattern_sources = selection
                 .first()
                 .filter(|_| selection.len() == 1)
@@ -12135,6 +12173,474 @@ mod tests {
             })
         });
         cx.run_until_parked();
+    }
+
+    thread_local! {
+        static MEDIA_CATALOG_BUILD_COUNTS: RefCell<HashMap<fanta_doc::DocId, usize>> = RefCell::default();
+    }
+
+    struct MediaCatalogBuildProbe(fanta_doc::DocId);
+
+    impl MediaCatalogBuildProbe {
+        fn new(document: fanta_doc::DocId) -> Self {
+            MEDIA_CATALOG_BUILD_COUNTS.with(|counts| {
+                let mut counts = counts.borrow_mut();
+                assert!(!counts.contains_key(&document));
+                counts.insert(document, 0);
+            });
+            Self(document)
+        }
+
+        fn count(&self) -> usize {
+            MEDIA_CATALOG_BUILD_COUNTS.with(|counts| {
+                *counts
+                    .borrow()
+                    .get(&self.0)
+                    .expect("registered document probe")
+            })
+        }
+    }
+
+    impl Drop for MediaCatalogBuildProbe {
+        fn drop(&mut self) {
+            MEDIA_CATALOG_BUILD_COUNTS.with(|counts| {
+                counts.borrow_mut().remove(&self.0);
+            });
+        }
+    }
+
+    pub(super) fn record_media_catalog_build(document: fanta_doc::DocId) {
+        MEDIA_CATALOG_BUILD_COUNTS.with(|counts| {
+            if let Some(count) = counts.borrow_mut().get_mut(&document) {
+                *count += 1;
+            }
+        });
+    }
+
+    fn media_catalog_fixture() -> (Doc, [NodeId; 3], AssetId, BTreeMap<AssetId, Vec<u8>>) {
+        let (mut doc, page, rectangle) = doc_with_rect();
+        let bytes = inspector_test_png();
+        let asset = fanta_format::asset_id_for_bytes(&bytes);
+        let mut images = Vec::new();
+        for (position, name) in [(2.0, "First image"), (3.0, "Second image")] {
+            let mut node = CanvasNode::new(NodeData::Bitmap(fanta_doc::BitmapNode {
+                asset,
+                natural_size: [2, 2],
+                local_size: [2.0, 2.0],
+                crop: None,
+                fit: ImageFitMode::Fill,
+                tint: None,
+            }));
+            node.name = name.into();
+            node.parent = Some(page);
+            node.index = fanta_doc::IndexKey::from_raw(position);
+            images.push(doc.scene.insert(node).expect("insert named image"));
+        }
+        let [first, second] = images.as_slice() else {
+            panic!("two image nodes");
+        };
+        doc.selection.replace_with([rectangle]);
+        (
+            doc,
+            [rectangle, *first, *second],
+            asset,
+            BTreeMap::from([(asset, bytes)]),
+        )
+    }
+
+    async fn setup_media_catalog_view(
+        doc: Doc,
+        assets: BTreeMap<AssetId, Vec<u8>>,
+        project_root: Option<PathBuf>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<FigView>, Entity<DesignPanel>, VisualTestContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let path = project_root.as_ref().map_or_else(
+            || PathBuf::from("/tmp/MediaCatalog.fig"),
+            |root| root.join("fanta.json"),
+        );
+        let item = crate::document::ready_item_with_root_for_test(
+            &project,
+            path,
+            project_root.clone(),
+            doc,
+            cx,
+        );
+        if project_root.is_some() {
+            item.update(cx, |item, cx| item.reload_from_disk(cx))
+                .await
+                .expect("load actual project and assets before mounting");
+        } else {
+            item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    *document = FigDocument::from_doc(document.doc.clone(), assets);
+                    ((), DocChange::None)
+                })
+                .expect("assemble fixture before mounting");
+            });
+        }
+        let (view, cx) =
+            cx.add_window_view(move |window, cx| FigView::new(item, project, window, cx));
+        cx.run_until_parked();
+        let panel = view.read_with(cx, |view, _| {
+            view.gpui_design
+                .as_ref()
+                .expect("mounted Design adapter")
+                .panel
+                .clone()
+        });
+        (view, panel, cx.clone())
+    }
+
+    fn refresh_media_catalog(view: &Entity<FigView>, cx: &mut VisualTestContext) {
+        view.update(cx, |view, cx| view.refresh_gpui_design(cx));
+        cx.run_until_parked();
+    }
+
+    fn assert_media_catalog(
+        panel: &Entity<DesignPanel>,
+        expected: &[(AssetId, &str)],
+        cx: &VisualTestContext,
+    ) {
+        panel.read_with(cx, |panel, _| {
+            let expected = expected
+                .iter()
+                .map(|(asset, name)| {
+                    let mut source = DesignPaintSource::new(asset.to_string(), (*name).to_owned());
+                    source.reference = Some(asset.to_string().into());
+                    DesignMediaPaintAsset::new(source, DesignMediaKind::Image)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(panel.media_paint_view_data().assets, expected);
+        });
+    }
+
+    #[gpui::test]
+    async fn media_catalog_cache_selection_only_reuses_projection(cx: &mut TestAppContext) {
+        let (doc, [rectangle, first, _], asset, assets) = media_catalog_fixture();
+        let original_scene = serde_json::to_value(&doc.scene).expect("scene snapshot");
+        let original_assets = assets.clone();
+        let probe = MediaCatalogBuildProbe::new(doc.id);
+        let (view, panel, mut cx) = setup_media_catalog_view(doc, assets, None, cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        assert_eq!(probe.count(), 1, "initial catalog build");
+        for selection in [vec![first], vec![], vec![rectangle]] {
+            item.update(&mut cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    document.doc.selection.replace_with(selection);
+                    ((), DocChange::Selection)
+                })
+                .expect("select layer");
+            });
+            refresh_media_catalog(&view, &mut cx);
+            assert_media_catalog(&panel, &[(asset, "First image")], &cx);
+            assert_eq!(probe.count(), 1, "selection changes must reuse the catalog");
+        }
+        view.update(&mut cx, |view, cx| {
+            view.gpui_design.as_mut().expect("adapter").last_echo = None;
+            view.refresh_gpui_design(cx);
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            probe.count(),
+            1,
+            "forced panel echo also reuses the catalog"
+        );
+        item.read_with(&cx, |item, _| {
+            let document = item.document().expect("document");
+            assert_eq!(
+                serde_json::to_value(&document.doc.scene).expect("scene"),
+                original_scene
+            );
+            assert_eq!(*document.raw_assets, original_assets);
+            assert!(!document.doc.history.can_undo());
+            assert!(!item.is_dirty());
+        });
+    }
+
+    #[gpui::test]
+    async fn media_catalog_cache_content_and_history_refresh(cx: &mut TestAppContext) {
+        let (doc, [_, first, _], asset, assets) = media_catalog_fixture();
+        let mut expected_scene = doc.scene.clone();
+        let probe = MediaCatalogBuildProbe::new(doc.id);
+        let (view, panel, mut cx) = setup_media_catalog_view(doc, assets.clone(), None, cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        item.update(&mut cx, |item, cx| {
+            item.apply(
+                Operation::SetName {
+                    id: first,
+                    old: "First image".into(),
+                    new: "Renamed image".into(),
+                },
+                cx,
+            )
+        })
+        .expect("rename image");
+        expected_scene.get_mut(first).expect("first image").name = "Renamed image".into();
+        refresh_media_catalog(&view, &mut cx);
+        assert_media_catalog(&panel, &[(asset, "Renamed image")], &cx);
+        assert_eq!(probe.count(), 2);
+        for (undo, name) in [(true, "First image"), (false, "Renamed image")] {
+            assert!(
+                item.update(&mut cx, |item, cx| if undo {
+                    item.undo(cx)
+                } else {
+                    item.redo(cx)
+                })
+                .expect("rename history")
+            );
+            refresh_media_catalog(&view, &mut cx);
+            assert_media_catalog(&panel, &[(asset, name)], &cx);
+            expected_scene.get_mut(first).expect("first image").name = name.into();
+            item.read_with(&cx, |item, _| {
+                assert_eq!(
+                    serde_json::to_value(&item.doc().expect("doc").scene).expect("scene"),
+                    serde_json::to_value(&expected_scene).expect("expected scene")
+                );
+            });
+        }
+        let first_node = expected_scene.get(first).expect("first image").clone();
+        item.update(&mut cx, |item, cx| {
+            item.apply(
+                Operation::DeleteSubtree {
+                    snapshot: vec![first_node],
+                },
+                cx,
+            )
+        })
+        .expect("delete first image");
+        let mut deleted_scene = expected_scene.clone();
+        deleted_scene.remove(first).expect("expected deletion");
+        for (history, name) in [
+            (None, "Second image"),
+            (Some(true), "Renamed image"),
+            (Some(false), "Second image"),
+        ] {
+            if let Some(undo) = history {
+                assert!(
+                    item.update(&mut cx, |item, cx| if undo {
+                        item.undo(cx)
+                    } else {
+                        item.redo(cx)
+                    })
+                    .expect("delete history")
+                );
+            }
+            refresh_media_catalog(&view, &mut cx);
+            assert_media_catalog(&panel, &[(asset, name)], &cx);
+            item.read_with(&cx, |item, _| {
+                let document = item.document().expect("document");
+                let expected = if history == Some(true) {
+                    &expected_scene
+                } else {
+                    &deleted_scene
+                };
+                assert_eq!(
+                    serde_json::to_value(&document.doc.scene).expect("scene"),
+                    serde_json::to_value(expected).expect("expected scene")
+                );
+                assert_eq!(*document.raw_assets, assets);
+            });
+        }
+        for (kind, present) in [
+            (fanta_doc::ProjectAssetKind::Image, true),
+            (fanta_doc::ProjectAssetKind::Audio, false),
+        ] {
+            item.update(&mut cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    document.doc.asset_library.insert(
+                        asset,
+                        fanta_doc::ProjectAsset {
+                            name: "  Library name  ".into(),
+                            kind,
+                        },
+                    );
+                    ((), DocChange::Content)
+                })
+                .expect("update asset metadata");
+            });
+            refresh_media_catalog(&view, &mut cx);
+            let expected = [(asset, "Library name")];
+            assert_media_catalog(&panel, if present { &expected } else { &[] }, &cx);
+        }
+        item.update(&mut cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.asset_library.remove(&asset);
+                document.doc_and_assets().1.remove(asset);
+                ((), DocChange::Content)
+            })
+            .expect("remove raw asset");
+        });
+        refresh_media_catalog(&view, &mut cx);
+        assert_media_catalog(&panel, &[], &cx);
+        item.update(&mut cx, |item, cx| {
+            item.with_document(cx, |document| {
+                assert_eq!(
+                    document
+                        .doc_and_assets()
+                        .1
+                        .add_image_tracked(inspector_test_png())
+                        .expect("restore real image")
+                        .0,
+                    asset
+                );
+                ((), DocChange::Content)
+            })
+            .expect("restore raw asset");
+        });
+        refresh_media_catalog(&view, &mut cx);
+        assert_media_catalog(&panel, &[(asset, "Second image")], &cx);
+    }
+
+    #[gpui::test]
+    async fn media_catalog_cache_raw_owner_and_scene_identity(cx: &mut TestAppContext) {
+        let (doc, [_, first, _], asset, assets) = media_catalog_fixture();
+        let document = FigDocument::from_doc(doc.clone(), assets.clone());
+        let mut cache = MediaAssetCatalogCache::default();
+        let strong_owners = Arc::strong_count(&document.raw_assets);
+        let original_catalog = cache.get_or_build(&document);
+        assert_eq!(Arc::strong_count(&document.raw_assets), strong_owners);
+        let owner = Arc::downgrade(&document.raw_assets);
+        let mut replacement = FigDocument::from_doc(doc.clone(), assets.clone());
+        replacement.raw_assets = document.raw_assets.clone();
+        replacement
+            .doc
+            .scene
+            .get_mut(first)
+            .expect("first image")
+            .name = "Replacement name".into();
+        assert_eq!(replacement.doc.id, document.doc.id);
+        assert_eq!(
+            replacement.render_generation(),
+            document.render_generation()
+        );
+        assert_ne!(
+            replacement.doc.scene.instance_id(),
+            document.doc.scene.instance_id()
+        );
+        assert!(!cache.is_current(&replacement));
+        let mut expected = original_catalog;
+        expected.first_mut().expect("one catalog entry").source.name = "Replacement name".into();
+        assert_eq!(cache.get_or_build(&replacement), expected);
+        drop(replacement);
+        drop(document);
+        assert!(
+            owner.upgrade().is_none(),
+            "the cache must not retain asset payloads"
+        );
+
+        // This owner has no resolver clone, so make_mut exercises Weak
+        // dissociation as well as the usual strong-owner copy-on-write path.
+        let mut sole_owner = FigDocument::from_doc(doc.clone(), BTreeMap::new());
+        sole_owner.raw_assets = Arc::new(assets.clone());
+        assert_eq!(cache.get_or_build(&sole_owner).len(), 1);
+        let owner = Arc::downgrade(&sole_owner.raw_assets);
+        assert_eq!(Arc::strong_count(&sole_owner.raw_assets), 1);
+        Arc::make_mut(&mut sole_owner.raw_assets).clear();
+        assert!(owner.upgrade().is_none());
+        assert!(cache.get_or_build(&sole_owner).is_empty());
+
+        let probe = MediaCatalogBuildProbe::new(doc.id);
+        let (view, panel, mut cx) = setup_media_catalog_view(doc, assets, None, cx).await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        let generation = item.read_with(&cx, |item, _| {
+            item.document().expect("document").render_generation()
+        });
+        let echo = view.read_with(&cx, |view, _| {
+            view.gpui_design
+                .as_ref()
+                .expect("adapter")
+                .last_echo
+                .clone()
+        });
+        assert!(echo.is_some());
+        let mut new_bytes = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([40, 50, 60, 255]),
+        ))
+        .write_to(
+            &mut std::io::Cursor::new(&mut new_bytes),
+            image::ImageFormat::Png,
+        )
+        .expect("encode replacement image");
+        let new_asset = fanta_format::asset_id_for_bytes(&new_bytes);
+        assert_ne!(new_asset, asset);
+        item.update(&mut cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.raw_assets = Arc::new(BTreeMap::from([(new_asset, new_bytes)]));
+                ((), DocChange::None)
+            })
+            .expect("replace owner without content generation change");
+        });
+        refresh_media_catalog(&view, &mut cx);
+        assert_media_catalog(&panel, &[(new_asset, "Image 1")], &cx);
+        view.read_with(&cx, |view, _| {
+            assert!(view.gpui_design.as_ref().expect("adapter").last_echo == echo);
+        });
+        assert_eq!(
+            probe.count(),
+            2,
+            "an unchanged outer echo must not hide owner replacement"
+        );
+        item.read_with(&cx, |item, _| {
+            let document = item.document().expect("document");
+            assert_eq!(document.render_generation(), generation);
+            assert!(!document.raw_assets.contains_key(&asset));
+            assert!(!document.doc.history.can_undo());
+        });
+    }
+
+    #[gpui::test]
+    async fn media_catalog_cache_reload_same_document_id(cx: &mut TestAppContext) {
+        let (mut doc, [rectangle, first, _], asset, assets) = media_catalog_fixture();
+        let directory = tempfile::tempdir().expect("project directory");
+        fanta_format::write_project_tree(directory.path(), &doc, &assets)
+            .expect("write original project");
+        let probe = MediaCatalogBuildProbe::new(doc.id);
+        let (view, panel, mut cx) = setup_media_catalog_view(
+            doc.clone(),
+            assets.clone(),
+            Some(directory.path().to_path_buf()),
+            cx,
+        )
+        .await;
+        let item = view.read_with(&cx, |view, _| view.item().clone());
+        assert_media_catalog(&panel, &[(asset, "First image")], &cx);
+        let scene_instance = item.read_with(&cx, |item, _| {
+            item.doc().expect("document").scene.instance_id()
+        });
+        let builds = probe.count();
+        doc.scene.get_mut(first).expect("first image").name = "Reloaded image".into();
+        fanta_format::write_project_tree(directory.path(), &doc, &assets)
+            .expect("rewrite named image at same path and DocId");
+        item.update(&mut cx, |item, cx| item.reload_from_disk(cx))
+            .await
+            .expect("actual reload");
+        item.update(&mut cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.replace_with([rectangle]);
+                ((), DocChange::Selection)
+            })
+            .expect("reselect same layer");
+        });
+        refresh_media_catalog(&view, &mut cx);
+        assert_media_catalog(&panel, &[(asset, "Reloaded image")], &cx);
+        assert_eq!(probe.count(), builds + 1);
+        item.read_with(&cx, |item, _| {
+            let document = item.document().expect("document");
+            assert_eq!(document.doc.id, doc.id);
+            assert_ne!(document.doc.scene.instance_id(), scene_instance);
+            assert_eq!(
+                serde_json::to_value(&document.doc.scene).expect("scene"),
+                serde_json::to_value(&doc.scene).expect("expected scene")
+            );
+            assert_eq!(*document.raw_assets, assets);
+            assert!(!document.doc.history.can_undo());
+            assert!(!item.is_dirty());
+        });
     }
 
     #[test]
