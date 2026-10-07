@@ -9,7 +9,7 @@
 //! 2. Onto an **externally owned Skia canvas** via
 //!    [`RasterRenderer::render_to_canvas`] — the seam a host's live-window
 //!    present uses with a GPU-backed (e.g. Ganesh/Metal) surface. Both paths
-//!    share the same scene walk, so they are pixel-identical.
+//!    share the same scene walk; backend rasterization can differ at antialiased edges.
 //!
 //! The scene model stays renderer-agnostic (`fanta-doc` has no Skia
 //! dependency — ARCHITECTURE.md §2); this crate is where Skia is allowed.
@@ -17,8 +17,8 @@
 //! component-instance expansion, variable resolution, culling, and the
 //! image/instance caches live here (ARCHITECTURE.md §4–§5).
 //!
-//! There is no GPU-owned surface or wgpu pipeline in this crate today. Layer
-//! caches and tile-based dirty regions are future work (ARCHITECTURE.md §4–§5).
+//! The optional `gpu` feature also supports retained translation sessions on
+//! backend-compatible private surfaces. The host owns GPU submission and presentation.
 
 #![allow(clippy::result_large_err)]
 #![forbid(unsafe_code)]
@@ -43,6 +43,8 @@ pub use paint::{fill_to_paint, stroke_to_paint};
 pub use path::to_sk_path;
 // `vector_outline_sk_path`: track svg-prod — the effective vector outline,
 // shared with the app's flatten/outline/simplify geometry ops.
+#[cfg(feature = "metal")]
+pub use raster::RetainedGpuTarget;
 pub use raster::{
     MediaPlayback, RasterRenderer, RenderError, RenderInputs, RenderMetrics, RetainedBuildMetrics,
     RetainedError, RetainedFrame, RetainedFrameMetrics, RetainedTranslationSession, SplitError,

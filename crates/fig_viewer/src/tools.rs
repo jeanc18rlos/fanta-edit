@@ -254,6 +254,14 @@ impl Tool for MeasureTool {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TranslationGesture {
+    pub serial: u64,
+    pub moving: fanta_doc::NodeId,
+    pub scene_instance: u64,
+    pub page: Option<fanta_doc::NodeId>,
+}
+
 /// The per-view tool shell: the live tool instance plus the render hints from
 /// the most recent event.
 pub struct ToolShell {
@@ -262,6 +270,8 @@ pub struct ToolShell {
     pub overlays: Vec<ToolOverlay>,
     pub cursor: Option<CursorHint>,
     draw_selection_region: Option<DrawSelectionRegion>,
+    translation_serial: u64,
+    translation: Option<TranslationGesture>,
 }
 
 impl ToolShell {
@@ -272,6 +282,36 @@ impl ToolShell {
             overlays: Vec::new(),
             cursor: None,
             draw_selection_region: None,
+            translation_serial: 0,
+            translation: None,
+        }
+    }
+
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn translation_gesture(&self, doc: &Doc) -> Option<TranslationGesture> {
+        self.translation.filter(|gesture| {
+            gesture.scene_instance == doc.scene.instance_id() && gesture.page == doc.active_page()
+        })
+    }
+
+    fn refresh_translation_gesture(&mut self, doc: &Doc) {
+        let moving = (self.kind == ToolKind::Select)
+            .then(|| self.tool.translating_root())
+            .flatten();
+        let previous = self
+            .translation
+            .map(|gesture| (gesture.moving, gesture.scene_instance, gesture.page));
+        let next = moving.map(|moving| (moving, doc.scene.instance_id(), doc.active_page()));
+        if previous != next {
+            self.translation = self.translation_serial.checked_add(1).and_then(|serial| {
+                self.translation_serial = serial;
+                next.map(|(moving, scene_instance, page)| TranslationGesture {
+                    serial,
+                    moving,
+                    scene_instance,
+                    page,
+                })
+            });
         }
     }
 
@@ -287,6 +327,7 @@ impl ToolShell {
         }
         self.tool.deactivate(ctx);
         self.kind = kind;
+        self.translation = None;
         self.tool = kind.build();
         self.tool.activate(ctx);
         self.overlays = self
@@ -307,6 +348,7 @@ impl ToolShell {
             return;
         }
         self.kind = kind;
+        self.translation = None;
         self.tool = kind.build();
         self.overlays.clear();
         self.append_selection_region_overlay();
@@ -316,6 +358,7 @@ impl ToolShell {
     pub fn cancel_and_activate(&mut self, kind: ToolKind, ctx: &mut ToolContext) {
         self.tool.deactivate(ctx);
         self.kind = kind;
+        self.translation = None;
         self.tool = kind.build();
         self.tool.activate(ctx);
         self.overlays = self
@@ -331,6 +374,7 @@ impl ToolShell {
     pub fn handle_event(&mut self, ctx: &mut ToolContext, event: ToolEvent) -> ToolResponse {
         ctx.draw_selection_region = self.draw_selection_region.clone();
         let response = self.tool.handle_event(ctx, event);
+        self.refresh_translation_gesture(ctx.doc);
         self.draw_selection_region = ctx.draw_selection_region.clone();
         self.overlays = response.overlays.to_vec();
         self.append_selection_region_overlay();
@@ -512,6 +556,156 @@ pub fn key_event(key: LogicalKey, modifiers: Modifiers) -> ToolEvent {
 mod tests {
     use super::*;
     use gpui::NavigationDirection;
+
+    #[test]
+    fn retained_worker_tool_hint_follows_actual_move_and_ends_on_release_escape_and_switch()
+    -> anyhow::Result<()> {
+        use fanta_doc::{CanvasNode, NodeData, VectorNode};
+        let mut doc = Doc::new();
+        let node = doc
+            .scene
+            .insert(CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                -100.0,
+                -100.0,
+                200.0,
+                200.0,
+                Color::WHITE,
+            ))))?;
+        let mut viewport = Viewport::default();
+        let mut shell = ToolShell::new();
+        let mut context = tool_context(
+            &mut doc,
+            &mut viewport,
+            DVec2::new(800.0, 600.0),
+            ToolKind::Select,
+        );
+        let mut last_serial = 0;
+        for finish in 0..3 {
+            shell.cancel_and_activate(ToolKind::Select, &mut context);
+            context
+                .doc
+                .scene
+                .set_transform(node, fanta_doc::Transform2D::IDENTITY)?;
+            context.doc.selection.select_only(node);
+            let press = ToolEvent::Pointer(PointerEvent::Press {
+                screen: [400.0, 300.0],
+                button: Button::Primary,
+                modifiers: ModifierKeys::empty(),
+                count: 1,
+            });
+            shell.handle_event(&mut context, press);
+            assert!(
+                shell.translation_gesture(context.doc).is_none(),
+                "press is not a drag"
+            );
+            shell.handle_event(
+                &mut context,
+                ToolEvent::Pointer(PointerEvent::Move {
+                    screen: [420.0, 310.0],
+                    modifiers: ModifierKeys::empty(),
+                }),
+            );
+            let gesture = shell
+                .translation_gesture(context.doc)
+                .expect("actual one-root drag");
+            assert_eq!(gesture.moving, node);
+            assert!(gesture.serial > last_serial);
+            last_serial = gesture.serial;
+            assert!(
+                shell.translation_gesture(&context.doc.clone()).is_none(),
+                "another document cannot inherit token"
+            );
+            match finish {
+                0 => {
+                    shell.handle_event(
+                        &mut context,
+                        ToolEvent::Pointer(PointerEvent::Release {
+                            screen: [420.0, 310.0],
+                            button: Button::Primary,
+                            modifiers: ModifierKeys::empty(),
+                        }),
+                    );
+                }
+                1 => {
+                    shell.handle_event(
+                        &mut context,
+                        ToolEvent::Key(KeyEvent::press(LogicalKey::Escape)),
+                    );
+                }
+                2 => shell.activate(ToolKind::Hand, &mut context),
+                _ => unreachable!(),
+            }
+            assert!(shell.translation_gesture(context.doc).is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn retained_worker_tool_hint_excludes_resize_keyboard_nudge_and_other_tools()
+    -> anyhow::Result<()> {
+        use fanta_doc::{CanvasNode, NodeData, VectorNode};
+        let mut doc = Doc::new();
+        let node = doc
+            .scene
+            .insert(CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                -100.0,
+                -100.0,
+                200.0,
+                200.0,
+                Color::WHITE,
+            ))))?;
+        doc.selection.select_only(node);
+        let mut viewport = Viewport::default();
+        let mut shell = ToolShell::new();
+        let mut context = tool_context(
+            &mut doc,
+            &mut viewport,
+            DVec2::new(800.0, 600.0),
+            ToolKind::Select,
+        );
+        shell.handle_event(
+            &mut context,
+            ToolEvent::Key(KeyEvent::press(LogicalKey::ArrowRight)),
+        );
+        assert!(shell.translation_gesture(context.doc).is_none());
+        // A selected rectangle's south-east resize handle is not a translation.
+        shell.handle_event(
+            &mut context,
+            ToolEvent::Pointer(PointerEvent::Press {
+                screen: [501.0, 400.0],
+                button: Button::Primary,
+                modifiers: ModifierKeys::empty(),
+                count: 1,
+            }),
+        );
+        shell.handle_event(
+            &mut context,
+            ToolEvent::Pointer(PointerEvent::Move {
+                screen: [520.0, 420.0],
+                modifiers: ModifierKeys::empty(),
+            }),
+        );
+        assert!(shell.translation_gesture(context.doc).is_none());
+        shell.cancel_and_activate(ToolKind::Hand, &mut context);
+        shell.handle_event(
+            &mut context,
+            ToolEvent::Pointer(PointerEvent::Press {
+                screen: [400.0, 300.0],
+                button: Button::Primary,
+                modifiers: ModifierKeys::empty(),
+                count: 1,
+            }),
+        );
+        shell.handle_event(
+            &mut context,
+            ToolEvent::Pointer(PointerEvent::Move {
+                screen: [430.0, 300.0],
+                modifiers: ModifierKeys::empty(),
+            }),
+        );
+        assert!(shell.translation_gesture(context.doc).is_none());
+        Ok(())
+    }
 
     #[test]
     fn node_edit_activation_refreshes_overlays_with_empty_switch_and_cancel_controls() {

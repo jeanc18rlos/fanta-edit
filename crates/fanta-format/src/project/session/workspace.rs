@@ -1069,6 +1069,22 @@ impl WorkspaceSession {
         true
     }
 
+    /// Adopt a captured document into already-open sources with one immutable
+    /// ownership index; publicly mutable definitions cannot invalidate it mid-batch.
+    pub fn adopt_document_artifacts<'a>(
+        &mut self,
+        document: &fanta_doc::Doc,
+        artifacts: impl IntoIterator<Item = &'a ArtifactId>,
+    ) -> Result<(), SessionError> {
+        let scopes = super::materialize::DocumentScopes::new(document);
+        for id in artifacts {
+            if let Some(artifact) = self.artifact_mut(id) {
+                artifact.adopt_document_scoped(&scopes)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn save_artifact(&mut self, id: ArtifactId) -> Result<SaveResult, SessionError> {
         let session = self.open.get_mut(&id).ok_or(SessionError::NotOpen)?;
         let previous_disk_hash = session.disk_hash;

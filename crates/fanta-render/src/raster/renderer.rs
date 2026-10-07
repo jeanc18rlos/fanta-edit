@@ -5,6 +5,7 @@
 //! and the per-frame state plumbing.
 //!
 //! [`InstanceCache`]: InstanceCache
+use super::walk::render_scoped_root;
 use super::{
     AlphaType, Arc, AssetResolver, BTreeMap, Canvas, Color, ColorType, ComponentLibrary,
     EncodedImageFormat, ExpandedNode, Fill, Hash, HashMap, Hasher, IdHashMap, ImageCache,
@@ -646,6 +647,12 @@ pub struct RasterRenderer {
 }
 
 impl RasterRenderer {
+    /// Epoch of this thread's shared text engine. Read again after rendering:
+    /// laying out newly visible text can register a downloaded font face.
+    pub fn current_font_generation() -> Option<u64> {
+        super::text::with_layout_engine(fanta_text::LayoutEngine::font_generation)
+    }
+
     /// Construct a renderer for `width` × `height` pixels. Returns `Err` for a
     /// zero dimension.
     ///
@@ -1525,7 +1532,7 @@ impl RasterRenderer {
             metrics: &mut metrics,
         };
         match page_root {
-            Some(root) => render_node(canvas, root, &mut ctx),
+            Some(root) => render_scoped_root(canvas, root, &mut ctx),
             None => {
                 for &root in scene.roots() {
                     render_node(canvas, root, &mut ctx);
@@ -1672,7 +1679,7 @@ impl RasterRenderer {
         match page_root {
             // Single page: walk just that root's subtree. Culling and the
             // save/restore stack work identically to the all-roots path.
-            Some(root) => render_node(canvas, root, &mut ctx),
+            Some(root) => render_scoped_root(canvas, root, &mut ctx),
             // All roots in z-order (legacy / single-implicit-page behavior).
             None => {
                 for &root in scene.roots() {

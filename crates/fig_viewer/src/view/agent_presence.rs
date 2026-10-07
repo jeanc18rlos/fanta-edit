@@ -1,6 +1,7 @@
 use super::*;
 use gpui::{
-    Animation, AnimationExt as _, Hsla, PathBuilder, canvas, ease_out_quint, pulsating_between,
+    Animation, AnimationExt as _, BoxShadow, Hsla, PathBuilder, canvas, ease_out_quint,
+    pulsating_between,
 };
 use std::time::Duration;
 
@@ -605,7 +606,37 @@ impl FigView {
         }
         let followed = state.read(cx).followed_agent().map(str::to_string);
         let background = cx.theme().colors().elevated_surface_background;
-        let mut overlay = div().absolute().inset_0().overflow_hidden();
+        let mut overlay = div().absolute().inset_0().overflow_hidden().when(
+            self.editor_workspace(cx) == EditorWorkspace::Canvas,
+            |overlay| {
+                let blue: Hsla = gpui::rgb(0x387bff).into();
+                let magenta: Hsla = gpui::rgb(0xe344ff).into();
+                overlay.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .border(px(5.0))
+                        .border_color(blue)
+                        .shadow(vec![
+                            BoxShadow::new(px(0.0), px(0.0), magenta.opacity(0.8))
+                                .blur_radius(px(30.0))
+                                .spread_radius(px(10.0))
+                                .inset(),
+                            BoxShadow::new(px(0.0), px(0.0), blue.opacity(0.9))
+                                .blur_radius(px(14.0))
+                                .spread_radius(px(5.0))
+                                .inset(),
+                        ])
+                        .with_animation(
+                            "fanta-agent-canvas-presence",
+                            Animation::new(Duration::from_millis(1600))
+                                .repeat()
+                                .with_easing(pulsating_between(0.65, 1.0)),
+                            |element, opacity| element.opacity(opacity),
+                        ),
+                )
+            },
+        );
         let mut controls = v_flex()
             .absolute()
             .top(px(54.0))

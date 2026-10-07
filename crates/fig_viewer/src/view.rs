@@ -4461,9 +4461,8 @@ impl FigView {
             return;
         }
         // Escape while editing text commits and exits the session (Figma
-        // commits on escape); this normally arrives through the key-down
-        // listener since the FigViewer keymap context is renamed while
-        // editing, but guard here too for programmatic dispatch.
+        // commits on escape). The dedicated text-edit key context routes
+        // Escape here before Workspace actions can consume it.
         if self.text_edit.is_some() {
             if !self.cancel_bound_text_edit(cx) {
                 self.commit_text_edit(cx);
@@ -8266,9 +8265,9 @@ impl Render for FigView {
             // While a text session is live the FigViewer keymap context must
             // not match: it binds bare letters (tool shortcuts), enter,
             // escape, backspace, and arrows, all of which belong to the text
-            // session. `FigViewerTextEdit` has no bindings, so those keys
-            // fall through to the session's key-down listener below and
-            // printable characters continue to the platform input handler.
+            // session. Only Escape is bound in the macOS text-edit context,
+            // before Workspace actions. Other keys fall through
+            // to the session listener or platform input handler.
             .key_context(if self.text_edit.is_some() {
                 "FigViewerTextEdit"
             } else if self.prototype_player.is_some() {
@@ -10637,6 +10636,228 @@ mod tests {
             gpui::Modifiers::default(),
             cx,
         );
+    }
+
+    fn bind_canvas_default_macos_keys(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            cx.clear_key_bindings();
+            let bindings = settings::KeymapFile::load_asset_allow_partial_failure(
+                "keymaps/default-macos.json",
+                cx,
+            )
+            .expect("actual default macOS keymap");
+            cx.bind_keys(bindings);
+        });
+    }
+
+    async fn assert_mounted_text_escape_default_keymap(
+        text_path: bool,
+        notification: bool,
+        edit_content: bool,
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        bind_canvas_default_macos_keys(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (mut doc, node, _) = text_selection_doc(true);
+        let hit = if text_path {
+            let (path, ink, _, _) = curved_text_path_hit_fixture();
+            let text = doc.scene.get_mut(node).expect("text node");
+            text.data = NodeData::TextPath(path);
+            text.transform = Transform2D::translation(-85.0, 20.0);
+            [ink[0] - 185.0, ink[1] - 30.0]
+        } else {
+            [-20.0, -10.0]
+        };
+        doc.selection.select_only(node);
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            "/tmp/DefaultKeymapTextEscape.fig".into(),
+            doc,
+            cx,
+        );
+        let window = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let multi_workspace = window.entity(cx).expect("multi workspace");
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let view = window
+            .update(cx, |_, window, cx| {
+                let view = cx.new(|cx| FigView::new(item.clone(), project, window, cx));
+                workspace.update(cx, |workspace, cx| {
+                    workspace.add_item_to_active_pane(
+                        Box::new(view.clone()),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
+                });
+                window.activate_window();
+                view.update(cx, |view, cx| {
+                    view.set_viewport_silent(Viewport::default());
+                    view.focus_handle.focus(window, cx);
+                    cx.notify();
+                });
+                view
+            })
+            .expect("mount text view in a real workspace");
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1400.0), px(900.0)));
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+        let position = view.read_with(&visual, |view, _| {
+            view.container_bounds.expect("canvas").center()
+                + point(px(hit[0] as f32), px(hit[1] as f32))
+        });
+        mounted_canvas_click(&mut visual, position, 2);
+        visual.run_until_parked();
+        view.read_with(&visual, |view, _| {
+            assert!(
+                view.text_edit.is_some(),
+                "actual double-click opens the text session"
+            );
+        });
+        let before = item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            (
+                serde_json::to_value(&document.doc).expect("baseline document"),
+                document.doc.scene.get(node).expect("original node").clone(),
+                document.raw_assets.clone(),
+                document.doc.history.undo_depth(),
+                item.is_dirty(),
+            )
+        });
+        let notice = NotificationId::named("canvas-text-escape-control".into());
+        if notification {
+            workspace.update(&mut visual, |workspace, cx| {
+                workspace.show_toast(Toast::new(notice.clone(), "Unrelated workspace notice"), cx);
+            });
+            visual.run_until_parked();
+            assert!(workspace.read_with(&visual, |workspace, _| {
+                workspace.notification_ids().contains(&notice)
+            }));
+        }
+        if edit_content {
+            visual.update(|window, cx| {
+                view.update(cx, |view, cx| {
+                    let end = view
+                        .text_edit
+                        .as_ref()
+                        .expect("session")
+                        .session
+                        .buffer()
+                        .encode_utf16()
+                        .count();
+                    gpui::EntityInputHandler::replace_and_mark_text_in_range(
+                        view,
+                        Some(0..end),
+                        "draft",
+                        Some(5..5),
+                        window,
+                        cx,
+                    );
+                    assert_eq!(
+                        gpui::EntityInputHandler::marked_text_range(view, window, cx),
+                        Some(0..5),
+                    );
+                    gpui::EntityInputHandler::replace_text_in_range(
+                        view, None, "QA text", window, cx,
+                    );
+                    gpui::EntityInputHandler::unmark_text(view, window, cx);
+                });
+            });
+            visual.simulate_keystrokes("enter");
+            view.read_with(&visual, |view, _| {
+                assert_eq!(
+                    view.text_edit
+                        .as_ref()
+                        .expect("Enter keeps the editor open")
+                        .session
+                        .buffer(),
+                    "QA text\n"
+                );
+            });
+        }
+        visual.simulate_keystrokes("escape");
+        visual.run_until_parked();
+        view.read_with(&visual, |view, _| {
+            assert!(
+                view.text_edit.is_none(),
+                "one Escape must close text before any blank click"
+            );
+        });
+        if notification {
+            assert!(
+                workspace.read_with(&visual, |workspace, _| {
+                    workspace.notification_ids().contains(&notice)
+                }),
+                "text Escape must not be consumed by unrelated workspace notification dismissal"
+            );
+        }
+        item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            assert!(
+                !item.content_preview_active(),
+                "Escape releases the preview barrier"
+            );
+            assert_eq!(document.raw_assets.as_ref(), before.2.as_ref());
+            if edit_content {
+                let actual = document.doc.scene.get(node).expect("edited node");
+                let content = match &actual.data {
+                    NodeData::Text(text) => &text.content,
+                    NodeData::TextPath(text) => &text.content,
+                    _ => panic!("text kind preserved"),
+                };
+                assert_eq!(content, "QA text\n");
+                assert_eq!(document.doc.history.undo_depth(), before.3 + 1);
+            } else {
+                assert_eq!(
+                    serde_json::to_value(&document.doc).expect("unchanged document"),
+                    before.0
+                );
+                assert_eq!(document.doc.history.undo_depth(), before.3);
+                assert_eq!(item.is_dirty(), before.4);
+            }
+        });
+        if edit_content {
+            visual.simulate_keystrokes("cmd-z");
+            visual.run_until_parked();
+            item.read_with(&visual, |item, _| {
+                let document = item.document().expect("document");
+                assert_eq!(document.doc.scene.get(node), Some(&before.1));
+                assert_eq!(document.doc.history.undo_depth(), before.3);
+                assert_eq!(document.raw_assets.as_ref(), before.2.as_ref());
+            });
+        }
+        workspace.update(&mut visual, |workspace, cx| {
+            workspace.clear_all_notifications(cx)
+        });
+    }
+
+    #[gpui::test]
+    async fn mounted_text_escape_default_keymap_without_notification(cx: &mut TestAppContext) {
+        for text_path in [false, true] {
+            assert_mounted_text_escape_default_keymap(text_path, false, false, cx).await;
+        }
+    }
+
+    #[gpui::test]
+    async fn mounted_text_escape_default_keymap_with_notification(cx: &mut TestAppContext) {
+        for text_path in [false, true] {
+            assert_mounted_text_escape_default_keymap(text_path, true, false, cx).await;
+        }
+    }
+
+    #[gpui::test]
+    async fn mounted_text_escape_default_keymap_commits_ime_and_enter_once(
+        cx: &mut TestAppContext,
+    ) {
+        for text_path in [false, true] {
+            assert_mounted_text_escape_default_keymap(text_path, true, true, cx).await;
+        }
     }
 
     fn mounted_canvas_interaction_fixture(
@@ -15240,6 +15461,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         init_visual_test(cx);
+        bind_canvas_default_macos_keys(cx);
         let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
         let (mut doc, master_text, master) = text_selection_doc(true);
         let master = master.expect("master frame");

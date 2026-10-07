@@ -231,27 +231,48 @@ fn context_actions_with_kind(
         .any(|node| node.flags.contains(fanta_doc::NodeFlags::LOCKED));
     let locked = node.flags.contains(fanta_doc::NodeFlags::LOCKED);
     let master = context.component_roots.contains(&id);
+    let has_main_component = crate::component_actions::main_component_root(doc, id).is_some();
     let mut actions = fanta_gpui::layers::context_actions_for_kind(kind);
     actions.retain(|action| {
+        if matches!(
+            action,
+            Action::GoToMainComponent | Action::DetachInstance | Action::ResetInstance
+        ) && !has_main_component
+        {
+            return false;
+        }
         if inherited_lock {
-            return matches!(action, Action::Copy | Action::CopyPasteAs | Action::GoToMainComponent);
+            return matches!(
+                action,
+                Action::Copy | Action::CopyPasteAs | Action::GoToMainComponent
+            );
         }
         if locked {
-            return matches!(action, Action::Copy | Action::CopyPasteAs | Action::LockUnlock | Action::GoToMainComponent);
+            return matches!(
+                action,
+                Action::Copy | Action::CopyPasteAs | Action::LockUnlock | Action::GoToMainComponent
+            );
         }
         match action {
-            Action::Flatten => crate::layer_context_ops::can_flatten_with_component_roots(doc, id, &context.component_roots),
+            Action::Flatten => crate::layer_context_ops::can_flatten_with_component_roots(
+                doc,
+                id,
+                &context.component_roots,
+            ),
             Action::OutlineStroke => match &node.data {
-                NodeData::Text(_) => crate::layer_context_ops::can_flatten_with_component_roots(doc, id, &context.component_roots),
+                NodeData::Text(_) => crate::layer_context_ops::can_flatten_with_component_roots(
+                    doc,
+                    id,
+                    &context.component_roots,
+                ),
                 NodeData::Vector(value) => !value.strokes.is_empty(),
                 NodeData::Group(value) => !value.strokes.is_empty(),
                 NodeData::Boolean(value) => !value.strokes.is_empty(),
                 _ => false,
             },
-            Action::GoToMainComponent | Action::DetachInstance | Action::ResetInstance => {
-                matches!(&node.data, NodeData::Instance(instance) if doc.components.defs.contains_key(&instance.component))
+            Action::Ungroup | Action::RemoveFrame => {
+                !master && matches!(node.data, NodeData::Group(_))
             }
-            Action::Ungroup | Action::RemoveFrame => !master && matches!(node.data, NodeData::Group(_)),
             Action::MoveToPage => doc.pages().len() > 1,
             Action::CreateComponent => !master && !matches!(kind, LayersPanelNodeKind::Other),
             _ => true,
@@ -542,6 +563,114 @@ mod tests {
         assert!(!context_actions(&doc, frame).contains(&Action::ConvertToSection));
         for id in [frame, text, rectangle, image] {
             assert!(!context_actions(&doc, id).contains(&Action::SendToFigmaMake));
+        }
+    }
+
+    #[test]
+    fn variant_instance_actions_intersect_resolution_lock_and_read_only_policy() {
+        use fanta_gpui::layers::LayersPanelContextAction as Action;
+        for invalid in [
+            None,
+            Some("missing component"),
+            Some("missing root"),
+            Some("empty set"),
+        ] {
+            for lock in [None, Some("own"), Some("ancestor")] {
+                let mut fixture = crate::component_actions::tests::set_instance_fixture();
+                match invalid {
+                    Some("missing component") => {
+                        fixture.doc.components.defs.clear();
+                    }
+                    Some("missing root") => {
+                        fixture
+                            .doc
+                            .components
+                            .defs
+                            .get_mut(&fixture.members[1])
+                            .expect("default")
+                            .root = NodeId::new();
+                    }
+                    Some("empty set") => {
+                        let set = fixture
+                            .doc
+                            .components
+                            .sets
+                            .get_mut(&fixture.set)
+                            .expect("set");
+                        set.members.clear();
+                        set.default_variant = fanta_doc::ComponentId::new();
+                    }
+                    _ => {}
+                }
+                if let Some(lock) = lock {
+                    fixture
+                        .doc
+                        .scene
+                        .get_mut(if lock == "own" {
+                            fixture.instance
+                        } else {
+                            fixture.parent
+                        })
+                        .expect("locked node")
+                        .flags
+                        .insert(fanta_doc::NodeFlags::LOCKED);
+                }
+                let actions = context_actions(&fixture.doc, fixture.instance);
+                assert_eq!(
+                    actions.contains(&Action::GoToMainComponent),
+                    invalid.is_none(),
+                    "navigation invalid={invalid:?}, lock={lock:?}"
+                );
+                for action in [Action::DetachInstance, Action::ResetInstance] {
+                    assert_eq!(
+                        actions.contains(&action),
+                        invalid.is_none() && lock.is_none(),
+                        "{action:?}, invalid={invalid:?}, lock={lock:?}"
+                    );
+                }
+                let mut tree = layers_tree(
+                    &fixture.doc,
+                    fixture.doc.active_page(),
+                    &HashSet::from([fixture.parent]),
+                );
+                restrict_read_only(&mut tree);
+                let instance = tree
+                    .iter()
+                    .find(|row| row.id.as_ref() == fixture.parent.to_string())
+                    .expect("parent row")
+                    .children
+                    .iter()
+                    .find(|row| row.id.as_ref() == fixture.instance.to_string())
+                    .expect("instance row");
+                let actions = instance.context_actions.as_ref().expect("actions");
+                assert_eq!(
+                    actions.contains(&Action::GoToMainComponent),
+                    invalid.is_none()
+                );
+                assert!(!actions.contains(&Action::DetachInstance));
+                assert!(!actions.contains(&Action::ResetInstance));
+            }
+        }
+        let mut fixture = crate::component_actions::tests::set_instance_fixture();
+        let NodeData::Instance(instance) = &mut fixture
+            .doc
+            .scene
+            .get_mut(fixture.instance)
+            .expect("instance")
+            .data
+        else {
+            panic!("instance")
+        };
+        instance.component = fixture.members[0];
+        for action in [
+            Action::GoToMainComponent,
+            Action::DetachInstance,
+            Action::ResetInstance,
+        ] {
+            assert!(
+                context_actions(&fixture.doc, fixture.instance).contains(&action),
+                "direct master control {action:?}"
+            );
         }
     }
 

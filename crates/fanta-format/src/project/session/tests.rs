@@ -3685,3 +3685,819 @@ fn accept_written_sources_hashing_benchmark() {
             .file_index
     );
 }
+
+struct ArtifactOwnershipFixture {
+    directory: tempfile::TempDir,
+    document: Doc,
+    assets: BTreeMap<fanta_doc::AssetId, Vec<u8>>,
+    routes: NodeId,
+    masters: NodeId,
+    container: NodeId,
+    components: Vec<(fanta_doc::ComponentId, NodeId, NodeId)>,
+    instance: NodeId,
+}
+
+fn artifact_ownership_fixture(nested_master: bool) -> ArtifactOwnershipFixture {
+    use fanta_doc::{
+        ComponentDef, ComponentId, ComponentSet, ComponentSetMembership, InstanceNode, TextNode,
+    };
+    let directory = tempdir().expect("project directory");
+    let mut document = Doc::new();
+    let mut pages = Vec::new();
+    for name in ["Routes", "Masters"] {
+        let mut node = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([900.0, 600.0]),
+            local_size: Some([900.0, 600.0]),
+            ..GroupNode::default()
+        }));
+        node.name = name.into();
+        let page = document.scene.insert(node).expect("page");
+        document.add_page(page);
+        pages.push(page);
+    }
+    let routes = *pages.first().expect("routes");
+    let masters = *pages.last().expect("masters");
+    let mut container = CanvasNode::new(NodeData::Group(GroupNode {
+        clip_size: Some([480.0, 150.0]),
+        local_size: Some([480.0, 150.0]),
+        ..GroupNode::default()
+    }));
+    container.name = "Variant container".into();
+    container.parent = Some(masters);
+    container.transform = Transform2D::translation(40.0, 60.0);
+    let container = document.scene.insert(container).expect("set container");
+    let set = ComponentId::new();
+    let mut components: Vec<(ComponentId, NodeId, NodeId)> = Vec::new();
+    for (position, name) in ["Small", "Large"].into_iter().enumerate() {
+        let mut master = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([80.0 + position as f64 * 80.0, 40.0]),
+            local_size: Some([80.0 + position as f64 * 80.0, 40.0]),
+            ..GroupNode::default()
+        }));
+        master.name = name.into();
+        master.parent = Some(if nested_master && position == 1 {
+            components.first().expect("outer master").1
+        } else {
+            container
+        });
+        master.index = fanta_doc::IndexKey::from_raw(position as f64 + 1.0);
+        master.transform = Transform2D::translation(20.0 + position as f64 * 180.0, 35.0);
+        let root = document.scene.insert(master).expect("master root");
+        let mut text = CanvasNode::new(NodeData::Text(TextNode::new(name, 64.0, 28.0)));
+        text.parent = Some(root);
+        text.name = format!("{name} caption");
+        text.transform = Transform2D::translation(8.0, 8.0);
+        let text = document.scene.insert(text).expect("master caption");
+        let id = ComponentId::new();
+        let mut definition = ComponentDef::new(id, root, name);
+        definition.variant_of = Some(ComponentSetMembership {
+            set,
+            axis_values: BTreeMap::new(),
+        });
+        document.components.defs.insert(id, definition);
+        components.push((id, root, text));
+    }
+    document.components.sets.insert(
+        set,
+        ComponentSet {
+            id: set,
+            name: "Size set".into(),
+            axes: Vec::new(),
+            members: components.iter().map(|entry| entry.0).collect(),
+            default_variant: components.last().expect("second default").0,
+            root: Some(container),
+        },
+    );
+    let mut instance = CanvasNode::new(NodeData::Instance(InstanceNode {
+        component: set,
+        overrides: Vec::new(),
+        prop_values: BTreeMap::new(),
+        derived: Vec::new(),
+        local_size: [160.0, 40.0],
+    }));
+    instance.parent = Some(routes);
+    instance.name = "Placed set instance must stay page-owned".into();
+    let instance = document.scene.insert(instance).expect("instance");
+    let assets = BTreeMap::from([(
+        fanta_doc::AssetId::new(),
+        b"unchanged asset control".to_vec(),
+    )]);
+    crate::write_project_tree(directory.path(), &document, &assets).expect("initial project");
+    let master_page_source =
+        crate::locate_page_source(directory.path(), masters).expect("master page source");
+    let source = std::fs::read_to_string(&master_page_source).expect("master page FNX");
+    assert!(source.contains("<Frame "), "fixture root opening");
+    let source = source.replacen(
+        "<Frame ",
+        "<Frame future_page_hint={{\"owner\":\"preserve\",\"values\":[1,2,3]}} ",
+        1,
+    );
+    std::fs::write(
+        &master_page_source,
+        format!("// Preserve this unrelated authored page.\n{source}"),
+    )
+    .expect("authored source comment and future attribute");
+    let (document, loaded_assets) =
+        crate::read_project_tree(directory.path()).expect("load canonical project");
+    assert_eq!(loaded_assets, assets);
+    ArtifactOwnershipFixture {
+        directory,
+        document,
+        assets,
+        routes,
+        masters,
+        container,
+        components,
+        instance,
+    }
+}
+
+fn artifact_ownership_file_bytes(
+    directory: &std::path::Path,
+) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn visit(
+        root: &std::path::Path,
+        directory: &std::path::Path,
+        output: &mut BTreeMap<std::path::PathBuf, Vec<u8>>,
+    ) {
+        for entry in std::fs::read_dir(directory).expect("project directory") {
+            let path = entry.expect("project entry").path();
+            assert!(!path.is_symlink(), "fixture must contain ordinary files");
+            if path.is_dir() {
+                visit(root, &path, output);
+            } else {
+                output.insert(
+                    path.strip_prefix(root)
+                        .expect("relative path")
+                        .to_path_buf(),
+                    std::fs::read(path).expect("file bytes"),
+                );
+            }
+        }
+    }
+    let mut files = BTreeMap::new();
+    visit(directory, directory, &mut files);
+    files
+}
+
+#[test]
+fn artifact_ownership_structural_whole_project_save_preserves_unrelated_master_sources() {
+    let mut fixture = artifact_ownership_fixture(false);
+    let before = artifact_ownership_file_bytes(fixture.directory.path());
+    let route_source =
+        crate::locate_page_source(fixture.directory.path(), fixture.routes).expect("route source");
+    let permitted = [
+        route_source.clone(),
+        route_source.with_file_name("page.ids.json"),
+    ];
+    let mut workspace = WorkspaceSession::open(fixture.directory.path()).expect("workspace");
+    let artifacts: Vec<_> = workspace
+        .artifacts
+        .keys()
+        .filter(|id| matches!(id, ArtifactId::Page(_) | ArtifactId::Component(_)))
+        .cloned()
+        .collect();
+    for id in &artifacts {
+        workspace.open_artifact(id.clone()).expect("all sources");
+    }
+    let revision = fixture.document.scene.revision();
+    let mut created = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    created.name = "New child after structural canvas edit".into();
+    created.parent = Some(fixture.routes);
+    fixture
+        .document
+        .scene
+        .insert(created)
+        .expect("structural edit");
+    assert!(
+        fixture.document.scene.changes_since(revision).is_none(),
+        "host takes conservative all-artifact adoption"
+    );
+    let expected = serde_json::to_value(&fixture.document).expect("full authored document");
+    workspace.adopt_document_shared(&fixture.document);
+    workspace
+        .adopt_document_artifacts(&fixture.document, &artifacts)
+        .expect("host all-artifact adoption with one ownership index");
+    let sources = workspace
+        .validated_source_overrides_for_document(&fixture.document)
+        .expect("validated sources");
+    let preconditions = workspace
+        .source_write_preconditions(&fixture.document)
+        .expect("disk guards");
+    crate::write_project_tree_cached_with_sources_checked(
+        fixture.directory.path(),
+        &fixture.document,
+        &fixture.assets,
+        &mut crate::ProjectWriteCache::default(),
+        &sources,
+        &preconditions,
+    )
+    .expect("host checked Save");
+    let after = artifact_ownership_file_bytes(fixture.directory.path());
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>(),
+        "no added or removed files"
+    );
+    for (path, bytes) in before {
+        if !permitted.contains(&fixture.directory.path().join(&path)) {
+            assert_eq!(
+                after.get(&path),
+                Some(&bytes),
+                "unrelated artifact must remain byte-exact: {}",
+                path.display()
+            );
+        }
+    }
+    let (reopened, assets) =
+        crate::read_project_tree(fixture.directory.path()).expect("cold project read");
+    assert_eq!(
+        serde_json::to_value(&reopened).expect("all reopened fields"),
+        expected
+    );
+    assert_eq!(assets, fixture.assets);
+    assert!(matches!(
+        reopened.scene.get(fixture.instance).map(|node| &node.data),
+        Some(NodeData::Instance(_))
+    ));
+}
+
+#[test]
+fn artifact_ownership_nested_registered_masters_are_excluded_but_container_and_instances_remain() {
+    let mut fixture = artifact_ownership_fixture(true);
+    let (outer, outer_root, outer_text) = *fixture.components.first().expect("outer");
+    let (_, inner_root, inner_text) = *fixture.components.last().expect("inner");
+    fixture
+        .document
+        .pending_layout
+        .extend([outer_text, inner_text]);
+    let before = serde_json::to_value(&fixture.document).expect("whole document");
+    let page = super::materialize::scope_from_document(
+        &fixture.document,
+        ArtifactKind::Page,
+        fixture.masters,
+        None,
+    )
+    .expect("page profile")
+    .expect("page scope");
+    assert_eq!(
+        page.doc.scene.len(),
+        2,
+        "only page and ordinary set container belong to page source"
+    );
+    assert!(page.doc.scene.contains(fixture.container));
+    assert!(!page.doc.scene.contains(outer_root));
+    assert!(page.doc.pending_layout.is_empty());
+    let component = super::materialize::scope_from_document(
+        &fixture.document,
+        ArtifactKind::Component,
+        outer_root,
+        fixture.document.components.defs.get(&outer),
+    )
+    .expect("component profile")
+    .expect("component scope");
+    assert_eq!(
+        component.doc.scene.len(),
+        2,
+        "outer source excludes independently registered nested master"
+    );
+    assert!(component.doc.scene.contains(outer_root));
+    assert!(
+        component
+            .doc
+            .scene
+            .shares_node(&fixture.document.scene, outer_text)
+    );
+    assert!(!component.doc.scene.contains(inner_root));
+    assert_eq!(
+        component.doc.pending_layout,
+        [outer_text].into_iter().collect()
+    );
+    let routes = super::materialize::scope_from_document(
+        &fixture.document,
+        ArtifactKind::Page,
+        fixture.routes,
+        None,
+    )
+    .expect("routes profile")
+    .expect("routes scope");
+    assert!(
+        routes.doc.scene.contains(fixture.instance),
+        "placed instances are not definition roots"
+    );
+    assert_eq!(
+        serde_json::to_value(&fixture.document).expect("whole document preserved"),
+        before
+    );
+}
+
+#[test]
+fn artifact_ownership_structural_page_rebuild_preserves_source_only_root_dimensions() {
+    for size_sugar in [false, true] {
+        let (directory, page) = page_fixture();
+        let source_path = crate::locate_page_source(directory.path(), page).expect("page source");
+        let mut tree =
+            fanta_fnx::parse_doc(&std::fs::read_to_string(&source_path).expect("source"))
+                .expect("tree");
+        let attributes = if size_sugar {
+            BTreeMap::from([
+                ("width".to_owned(), json!(900.0)),
+                ("height".to_owned(), json!(600.0)),
+            ])
+        } else {
+            BTreeMap::from([
+                ("clip_size".to_owned(), json!([900.0, 600.0])),
+                ("local_size".to_owned(), json!([900.0, 600.0])),
+            ])
+        };
+        for (name, value) in &attributes {
+            tree.attrs.insert(name.clone(), value.clone());
+        }
+        std::fs::write(&source_path, fanta_fnx::print_doc("Home", &tree))
+            .expect("authored page dimensions");
+        let authored =
+            fanta_fnx::parse_doc(&std::fs::read_to_string(&source_path).expect("authored source"))
+                .expect("canonical authored dimensions");
+        assert_eq!(
+            authored.attrs.get("clip_size"),
+            Some(&json!([900.0, 600.0]))
+        );
+        assert!(!authored.attrs.contains_key("width"));
+        assert!(!authored.attrs.contains_key("height"));
+        let dimensions = ["clip_size", "local_size"]
+            .into_iter()
+            .filter_map(|name| authored.attrs.get(name).map(|value| (name, value.clone())))
+            .collect::<BTreeMap<_, _>>();
+        let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
+        let id = ArtifactId::Page(page);
+        workspace.open_artifact(id.clone()).expect("page");
+        let mut created = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        created.parent = Some(page);
+        let created_id = created.id;
+        workspace
+            .artifact_mut(&id)
+            .expect("session")
+            .apply(Operation::create_node(created))
+            .expect("structural operation");
+        for stage in ["created", "undo", "redo"] {
+            let session = workspace.artifact_mut(&id).expect("session");
+            match stage {
+                "undo" => {
+                    session.undo_atomic().expect("single Undo");
+                }
+                "redo" => {
+                    session.redo_atomic().expect("single Redo");
+                }
+                _ => {}
+            }
+            let NodeData::Group(group) = &session.doc().scene.get(page).expect("page").data else {
+                panic!("page kind");
+            };
+            assert_eq!(group.local_size, None, "runtime page stays unsized");
+            assert_eq!(group.clip_size, None, "runtime page stays unclipped");
+            workspace
+                .save_artifact(id.clone())
+                .expect("save authored source");
+            let saved =
+                fanta_fnx::parse_doc(&std::fs::read_to_string(&source_path).expect("saved source"))
+                    .expect("saved tree");
+            for (name, value) in &dimensions {
+                assert_eq!(
+                    saved.attrs.get(*name),
+                    Some(value),
+                    "source attribute {name} survives {stage}"
+                );
+            }
+            let (reopened, _) = crate::read_project_tree(directory.path()).expect("cold read");
+            assert_eq!(reopened.scene.contains(created_id), stage != "undo");
+        }
+        let session = workspace.artifact_mut(&id).expect("session");
+        let project_id = session.doc().id;
+        let components = session.doc().components.clone();
+        let variables = session.doc().variables.clone();
+        let modes = session.doc().active_modes.clone();
+        let source = session
+            .begin_text_edit()
+            .expect("explicit source edit")
+            .clone();
+        let mut tree = fanta_fnx::parse_doc(&source).expect("source tree");
+        for name in ["clip_size", "local_size", "width", "height"] {
+            tree.attrs.remove(name);
+        }
+        session
+            .set_text(fanta_fnx::print_doc("Home", &tree))
+            .expect("remove source dimensions");
+        session
+            .commit_text_to_scene(project_id, components, variables, modes)
+            .expect("accept intentional removal");
+        let mut next_child = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        next_child.parent = Some(page);
+        session
+            .apply(Operation::create_node(next_child))
+            .expect("subsequent structural edit");
+        workspace
+            .save_artifact(id.clone())
+            .expect("save after intentional removal");
+        let saved =
+            fanta_fnx::parse_doc(&std::fs::read_to_string(&source_path).expect("saved source"))
+                .expect("saved tree");
+        for name in ["clip_size", "local_size", "width", "height"] {
+            assert!(
+                !saved.attrs.contains_key(name),
+                "do not resurrect deliberately removed source attribute {name}"
+            );
+        }
+    }
+}
+
+#[test]
+fn artifact_ownership_untouched_unknown_attributes_and_comments_survive_property_save() {
+    let mut fixture = artifact_ownership_fixture(false);
+    let source_path = crate::locate_page_source(fixture.directory.path(), fixture.masters)
+        .expect("unrelated Masters source");
+    let before = artifact_ownership_file_bytes(fixture.directory.path());
+    let authored = std::fs::read_to_string(&source_path).expect("authored Masters source");
+    assert!(authored.starts_with("// Preserve this unrelated authored page.\n"));
+    assert_eq!(
+        fanta_fnx::parse_doc(&authored)
+            .expect("valid source")
+            .attrs
+            .get("future_page_hint"),
+        Some(&json!({"owner": "preserve", "values": [1, 2, 3]})),
+    );
+    let route_source =
+        crate::locate_page_source(fixture.directory.path(), fixture.routes).expect("routes source");
+    let route_id = ArtifactId::Page(fixture.routes);
+    let mut workspace = WorkspaceSession::open(fixture.directory.path()).expect("workspace");
+    workspace
+        .open_artifact(route_id.clone())
+        .expect("only edited artifact");
+    fixture
+        .document
+        .scene
+        .get_mut(fixture.instance)
+        .expect("placed instance")
+        .transform = Transform2D::translation(17.0, 23.0);
+    workspace.adopt_document_shared(&fixture.document);
+    workspace
+        .artifact_mut(&route_id)
+        .expect("edited page")
+        .adopt_document(&fixture.document)
+        .expect("ordinary property edit");
+    let sources = workspace
+        .validated_source_overrides_for_document(&fixture.document)
+        .expect("retained sources");
+    let preconditions = workspace
+        .source_write_preconditions(&fixture.document)
+        .expect("preconditions");
+    crate::write_project_tree_cached_with_sources_checked(
+        fixture.directory.path(),
+        &fixture.document,
+        &fixture.assets,
+        &mut crate::ProjectWriteCache::default(),
+        &sources,
+        &preconditions,
+    )
+    .expect("checked property Save");
+    let after = artifact_ownership_file_bytes(fixture.directory.path());
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>()
+    );
+    for (path, bytes) in before {
+        if fixture.directory.path().join(&path) != route_source {
+            assert_eq!(
+                after.get(&path),
+                Some(&bytes),
+                "untouched source or asset changed: {}",
+                path.display()
+            );
+        }
+    }
+    let (reopened, assets) = crate::read_project_tree(fixture.directory.path()).expect("cold read");
+    assert_eq!(
+        serde_json::to_value(&reopened).expect("reopened content"),
+        serde_json::to_value(&fixture.document).expect("expected content")
+    );
+    assert_eq!(assets, fixture.assets);
+}
+
+fn artifact_scope_index_reference_scene(document: &Doc, root: NodeId) -> fanta_doc::Scene {
+    let mut scene = document
+        .scene
+        .extract_subtree(root)
+        .expect("reference root");
+    for definition in document.components.defs.values() {
+        if definition.root != root && scene.contains(definition.root) {
+            scene
+                .remove(definition.root)
+                .expect("reference foreign root");
+        }
+    }
+    scene
+}
+
+#[test]
+fn artifact_scope_index_matches_definition_scan_payload_order_and_pending_layout() {
+    for reverse_definition_roots in [false, true] {
+        let mut fixture = artifact_ownership_fixture(true);
+        let (_, outer_root, outer_text) = *fixture.components.first().expect("outer");
+        let (_, inner_root, inner_text) = *fixture.components.last().expect("inner");
+        for name in ["Equal-index B", "Equal-index A"] {
+            let mut node = CanvasNode::new(NodeData::Group(GroupNode::default()));
+            node.name = name.into();
+            node.parent = Some(outer_root);
+            node.index = fanta_doc::IndexKey::FIRST;
+            fixture
+                .document
+                .scene
+                .insert(node)
+                .expect("equal-index sibling");
+        }
+        if reverse_definition_roots {
+            let ids: Vec<_> = fixture.document.components.defs.keys().copied().collect();
+            let first = *ids.first().expect("first definition");
+            let last = *ids.last().expect("last definition");
+            let first_root = fixture
+                .document
+                .components
+                .defs
+                .get(&first)
+                .expect("first")
+                .root;
+            let last_root = fixture
+                .document
+                .components
+                .defs
+                .get(&last)
+                .expect("last")
+                .root;
+            fixture
+                .document
+                .components
+                .defs
+                .get_mut(&first)
+                .expect("first")
+                .root = last_root;
+            fixture
+                .document
+                .components
+                .defs
+                .get_mut(&last)
+                .expect("last")
+                .root = first_root;
+        }
+        fixture
+            .document
+            .pending_layout
+            .extend([outer_text, inner_text, fixture.instance]);
+        let before = serde_json::to_value(&fixture.document).expect("input document");
+        let scopes = super::materialize::DocumentScopes::new(&fixture.document);
+        let artifacts =
+            fixture
+                .document
+                .pages
+                .iter()
+                .map(|root| (ArtifactKind::Page, *root, None))
+                .chain(fixture.document.components.defs.values().map(|definition| {
+                    (ArtifactKind::Component, definition.root, Some(definition))
+                }));
+        for (kind, root, definition) in artifacts {
+            let mut expected = artifact_scope_index_reference_scene(&fixture.document, root);
+            if kind == ArtifactKind::Page {
+                let NodeData::Group(group) = &mut expected.get_mut(root).expect("page").data else {
+                    panic!("page root kind");
+                };
+                group.clip_size = None;
+                group.local_size = None;
+            }
+            let actual = scopes
+                .scope(kind, root, definition)
+                .expect("supported kind")
+                .expect("scope");
+            assert_eq!(
+                serde_json::to_value(&actual.doc.scene).expect("actual"),
+                serde_json::to_value(&expected).expect("reference")
+            );
+            assert_eq!(
+                actual.doc.pending_layout,
+                fixture
+                    .document
+                    .pending_layout
+                    .iter()
+                    .copied()
+                    .filter(|id| expected.contains(*id))
+                    .collect()
+            );
+            for id in expected.descendants_of(root) {
+                assert_eq!(
+                    actual.doc.scene.children_of(Some(id)),
+                    expected.children_of(Some(id))
+                );
+                if id != root {
+                    assert!(actual.doc.scene.shares_node(&fixture.document.scene, id));
+                }
+            }
+            if root == fixture.masters {
+                assert!(actual.doc.scene.contains(fixture.container));
+                assert!(!actual.doc.scene.contains(outer_root));
+                assert!(!actual.doc.scene.contains(inner_root));
+            }
+            if root == fixture.routes {
+                assert!(actual.doc.scene.contains(fixture.instance));
+            }
+        }
+        assert_eq!(
+            serde_json::to_value(&fixture.document).expect("after"),
+            before
+        );
+    }
+}
+
+#[test]
+fn artifact_scope_index_rebuilds_after_definition_add_remove_and_root_retarget() {
+    let mut fixture = artifact_ownership_fixture(true);
+    let (outer, outer_root, _) = *fixture.components.first().expect("outer");
+    let (inner, inner_root, _) = *fixture.components.last().expect("inner");
+    let removed = fixture
+        .document
+        .components
+        .defs
+        .get(&inner)
+        .expect("inner definition")
+        .clone();
+    for state in 0..5 {
+        match state {
+            1 => {
+                fixture
+                    .document
+                    .components
+                    .defs
+                    .remove(&inner)
+                    .expect("remove inner ownership");
+            }
+            2 => {
+                fixture
+                    .document
+                    .components
+                    .defs
+                    .insert(inner, removed.clone());
+            }
+            3 => {
+                fixture
+                    .document
+                    .components
+                    .defs
+                    .get_mut(&outer)
+                    .expect("outer")
+                    .root = fixture.container;
+            }
+            4 => {
+                fixture
+                    .document
+                    .components
+                    .defs
+                    .get_mut(&inner)
+                    .expect("inner")
+                    .root = fixture.container;
+            }
+            _ => {}
+        }
+        let scopes = super::materialize::DocumentScopes::new(&fixture.document);
+        for root in [fixture.masters, fixture.container, outer_root, inner_root] {
+            let expected = artifact_scope_index_reference_scene(&fixture.document, root);
+            let actual = scopes.extract_scene(root).expect("new snapshot index");
+            assert_eq!(
+                serde_json::to_value(&actual).expect("actual"),
+                serde_json::to_value(&expected).expect("reference"),
+                "state {state}, root {root}"
+            );
+        }
+        let outer_scene = scopes.extract_scene(outer_root).expect("outer");
+        assert_eq!(outer_scene.contains(inner_root), state == 1 || state == 4);
+    }
+}
+
+#[test]
+fn artifact_scope_index_rejects_malformed_excluded_subtrees_before_adoption() {
+    let fixture = artifact_ownership_fixture(true);
+    let (outer, outer_root, _) = *fixture.components.first().expect("outer");
+    let (_, inner_root, inner_text) = *fixture.components.last().expect("inner");
+    let before_files = artifact_ownership_file_bytes(fixture.directory.path());
+    for corruption in [
+        "cycle",
+        "stale-child-index",
+        "missing-root",
+        "wrong-node-id",
+    ] {
+        let mut document = fixture.document.clone();
+        match corruption {
+            "cycle" => {
+                document.scene.get_mut(outer_root).expect("outer").parent = Some(inner_root);
+                document.scene.rebuild_child_index();
+            }
+            "stale-child-index" => {
+                // The foreign inner master would normally be pruned, but its
+                // descendants are still traversed by extract_subtree first.
+                document
+                    .scene
+                    .get_mut(inner_text)
+                    .expect("inner text")
+                    .parent = Some(fixture.routes);
+            }
+            "missing-root" => {
+                document.scene.remove(outer_root).expect("remove root");
+            }
+            "wrong-node-id" => {
+                document.scene.get_mut(inner_text).expect("text").id = NodeId::new();
+            }
+            _ => unreachable!(),
+        }
+        let snapshot = serde_json::to_value(&document).expect("malformed input");
+        let mut workspace = WorkspaceSession::open(fixture.directory.path()).expect("workspace");
+        let artifact = ArtifactId::Component(outer);
+        workspace
+            .open_artifact(artifact.clone())
+            .expect("open valid disk source");
+        let before = serde_json::to_value(workspace.artifact(&artifact).expect("artifact").doc())
+            .expect("before");
+        let result = workspace.adopt_document_artifacts(&document, [&artifact]);
+        assert!(
+            matches!(result, Err(SessionError::DocAssemble(_))),
+            "corruption {corruption}"
+        );
+        assert_eq!(
+            serde_json::to_value(workspace.artifact(&artifact).expect("artifact").doc())
+                .expect("after"),
+            before
+        );
+        assert_eq!(
+            serde_json::to_value(&document).expect("input after"),
+            snapshot
+        );
+        assert_eq!(
+            artifact_ownership_file_bytes(fixture.directory.path()),
+            before_files
+        );
+    }
+}
+
+#[test]
+#[ignore = "diagnostic: supply immutable FANTA_SCOPE_BENCH_DOC and run with an exclusive CPU window"]
+fn artifact_scope_index_spectrum_benchmark() {
+    let path = std::env::var_os("FANTA_SCOPE_BENCH_DOC").expect("FANTA_SCOPE_BENCH_DOC required");
+    let mut document: Doc =
+        serde_json::from_slice(&std::fs::read(path).expect("snapshot")).expect("typed Doc");
+    document.scene.rebuild_child_index();
+    let roots: Vec<_> = document
+        .pages
+        .iter()
+        .copied()
+        .chain(
+            document
+                .components
+                .defs
+                .values()
+                .map(|definition| definition.root),
+        )
+        .collect();
+    let scopes = super::materialize::DocumentScopes::new(&document);
+    for root in &roots {
+        let expected = artifact_scope_index_reference_scene(&document, *root);
+        let actual = scopes.extract_scene(*root).expect("indexed scope");
+        assert_eq!(
+            serde_json::to_value(&actual).expect("actual"),
+            serde_json::to_value(&expected).expect("expected")
+        );
+        for id in expected.descendants_of(*root) {
+            assert_eq!(actual.children_of(Some(id)), expected.children_of(Some(id)));
+            if id != *root {
+                assert!(actual.shares_node(&document.scene, id));
+            }
+        }
+    }
+    for round in 0..3 {
+        for indexed in if round % 2 == 0 {
+            [false, true]
+        } else {
+            [true, false]
+        } {
+            let started = std::time::Instant::now();
+            let scopes = indexed.then(|| super::materialize::DocumentScopes::new(&document));
+            for root in &roots {
+                let scene = if let Some(scopes) = &scopes {
+                    scopes.extract_scene(*root).expect("indexed extraction")
+                } else {
+                    artifact_scope_index_reference_scene(&document, *root)
+                };
+                std::hint::black_box(&scene);
+            }
+            eprintln!(
+                "scope_pruning_only round={round} indexed={indexed} artifacts={} definitions={} elapsed_us={}",
+                roots.len(),
+                document.components.defs.len(),
+                started.elapsed().as_micros()
+            );
+        }
+    }
+}

@@ -34,73 +34,151 @@ pub fn materialize_page(
     Ok(ScopedDoc { doc, root })
 }
 
-/// Scope a page or component out of a whole workspace document without a JSON
-/// round trip: the scoped scene shares every node payload with `document`
-/// ([`Scene::extract_subtree`]), so the session can later find what an edit
-/// touched by pointer. Checks what the IR path checks. `None` for kinds that
-/// still go through FNX (graphics).
+pub(super) struct DocumentScopes<'a> {
+    document: &'a Doc,
+    component_roots: HashSet<NodeId>,
+}
+
+impl<'a> DocumentScopes<'a> {
+    pub(super) fn new(document: &'a Doc) -> Self {
+        Self {
+            document,
+            component_roots: document
+                .components
+                .defs
+                .values()
+                .map(|definition| definition.root)
+                .collect(),
+        }
+    }
+
+    pub(super) fn document(&self) -> &'a Doc {
+        self.document
+    }
+
+    pub(super) fn extract_scene(&self, root: NodeId) -> Result<Scene, SessionError> {
+        let mut pending = vec![(root, None, false)];
+        let mut visited = HashSet::new();
+        let mut foreign_roots = Vec::new();
+        while let Some((id, expected_parent, excluded)) = pending.pop() {
+            if !visited.insert(id) {
+                return Err(SessionError::DocAssemble(format!(
+                    "artifact {root} contains a repeated or cyclic child {id}"
+                )));
+            }
+            let node = self.document.scene.get(id).ok_or_else(|| {
+                SessionError::DocAssemble(format!("artifact {root} references missing node {id}"))
+            })?;
+            if node.id != id {
+                return Err(SessionError::DocAssemble(format!(
+                    "artifact {root} has a mismatched node identity at {id}"
+                )));
+            }
+            if id != root && node.parent != expected_parent {
+                return Err(SessionError::DocAssemble(format!(
+                    "artifact {root} has an inconsistent parent for {id}"
+                )));
+            }
+            let excluded = if !excluded && id != root && self.component_roots.contains(&id) {
+                foreign_roots.push(id);
+                true
+            } else {
+                excluded
+            };
+            // Extraction still traverses excluded descendants. Validate that
+            // entire domain before calling its unguarded descendant iterator.
+            pending.extend(
+                self.document
+                    .scene
+                    .children_of(Some(id))
+                    .iter()
+                    .rev()
+                    .map(|child| (*child, Some(id), excluded)),
+            );
+        }
+        let mut scene = self.document.scene.extract_subtree(root).ok_or_else(|| {
+            SessionError::DocAssemble(format!("artifact root {root} is not in the document"))
+        })?;
+        for id in foreign_roots {
+            scene
+                .remove(id)
+                .map_err(|error| SessionError::DocAssemble(error.to_string()))?;
+        }
+        Ok(scene)
+    }
+
+    pub(super) fn scope(
+        &self,
+        kind: ArtifactKind,
+        root: NodeId,
+        component: Option<&fanta_doc::ComponentDef>,
+    ) -> Option<Result<ScopedDoc, SessionError>> {
+        let document = self.document;
+        if !matches!(kind, ArtifactKind::Page | ArtifactKind::Component) {
+            return None;
+        }
+        Some((|| {
+            let mut scene = self.extract_scene(root)?;
+            for id in scene.descendants_of(root) {
+                match scene.get(id).map(|node| &node.data) {
+                    Some(fanta_doc::NodeData::Instance(_))
+                        if !import_allowed(kind, ImportTarget::LiveComponent) =>
+                    {
+                        return Err(SessionError::ImportNotAllowed {
+                            feature: format!("live Instance in {}", kind.label()),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            let mut doc = empty_scoped_doc(document.id);
+            doc.variables = document.variables.clone();
+            doc.active_modes = document.active_modes.clone();
+            match kind {
+                ArtifactKind::Page => {
+                    if !matches!(
+                        scene.get(root).map(|node| &node.data),
+                        Some(fanta_doc::NodeData::Group(_))
+                    ) {
+                        return Err(SessionError::InvalidSource(
+                            "page root must be a Frame (group)".into(),
+                        ));
+                    }
+                    strip_page_root_size(&mut scene, root);
+                    doc.components = document.components.clone();
+                }
+                _ => {
+                    let mut def = component.cloned().ok_or_else(|| {
+                        SessionError::other("component artifact without a definition")
+                    })?;
+                    def.root = root;
+                    let mut components = ComponentLibrary::new();
+                    components.defs.insert(def.id, def);
+                    doc.components = components;
+                }
+            }
+            doc.pending_layout = document
+                .pending_layout
+                .iter()
+                .copied()
+                .filter(|id| scene.contains(*id))
+                .collect();
+            doc.scene = scene;
+            doc.pages = vec![root];
+            doc.active_page = Some(root);
+            Ok(ScopedDoc { doc, root })
+        })())
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn scope_from_document(
     document: &Doc,
     kind: ArtifactKind,
     root: NodeId,
     component: Option<&fanta_doc::ComponentDef>,
 ) -> Option<Result<ScopedDoc, SessionError>> {
-    if !matches!(kind, ArtifactKind::Page | ArtifactKind::Component) {
-        return None;
-    }
-    Some((|| {
-        let mut scene = document.scene.extract_subtree(root).ok_or_else(|| {
-            SessionError::other(format!("artifact root {root} is not in the document"))
-        })?;
-        for id in scene.descendants_of(root) {
-            match scene.get(id).map(|node| &node.data) {
-                Some(fanta_doc::NodeData::Instance(_))
-                    if !import_allowed(kind, ImportTarget::LiveComponent) =>
-                {
-                    return Err(SessionError::ImportNotAllowed {
-                        feature: format!("live Instance in {}", kind.label()),
-                    });
-                }
-                _ => {}
-            }
-        }
-        let mut doc = empty_scoped_doc(document.id);
-        doc.variables = document.variables.clone();
-        doc.active_modes = document.active_modes.clone();
-        match kind {
-            ArtifactKind::Page => {
-                if !matches!(
-                    scene.get(root).map(|node| &node.data),
-                    Some(fanta_doc::NodeData::Group(_))
-                ) {
-                    return Err(SessionError::InvalidSource(
-                        "page root must be a Frame (group)".into(),
-                    ));
-                }
-                strip_page_root_size(&mut scene, root);
-                doc.components = document.components.clone();
-            }
-            _ => {
-                let mut def = component.cloned().ok_or_else(|| {
-                    SessionError::other("component artifact without a definition")
-                })?;
-                def.root = root;
-                let mut components = ComponentLibrary::new();
-                components.defs.insert(def.id, def);
-                doc.components = components;
-            }
-        }
-        doc.pending_layout = document
-            .pending_layout
-            .iter()
-            .copied()
-            .filter(|id| scene.contains(*id))
-            .collect();
-        doc.scene = scene;
-        doc.pages = vec![root];
-        doc.active_page = Some(root);
-        Ok(ScopedDoc { doc, root })
-    })())
+    DocumentScopes::new(document).scope(kind, root, component)
 }
 
 /// Materialize a component master IR into a scoped `Doc` (master closure only).

@@ -222,3 +222,349 @@ fn panning_the_viewport_unculls_a_distant_node() {
     let c = rgba_at(&buf, 64, 32, 32);
     assert!(c[0] > 200, "centre should now be red, got {c:?}");
 }
+
+fn scoped_root_fixture() -> Result<(Doc, NodeId, NodeId, NodeId), Box<dyn std::error::Error>> {
+    let mut doc = Doc::new();
+    let mut parent = CanvasNode::new(NodeData::Group(fanta_doc::GroupNode {
+        local_size: Some([1.0, 1.0]),
+        clip_size: Some([1.0, 1.0]),
+        background: Some(Fill::solid(Color::rgb(255, 0, 0))),
+        ..Default::default()
+    }));
+    parent.transform = Transform2D::translation(40.0, 60.0);
+    parent.opacity = fanta_doc::UnitInterval::new(0.25);
+    parent.flags.insert(NodeFlags::HIDDEN);
+    let parent = doc.scene.insert(parent)?;
+    let mut root = CanvasNode::new(NodeData::Group(fanta_doc::GroupNode {
+        local_size: Some([160.0, 80.0]),
+        clip_size: Some([160.0, 80.0]),
+        background: Some(Fill::solid(Color::rgb(0, 0, 255))),
+        ..Default::default()
+    }));
+    root.parent = Some(parent);
+    root.transform = Transform2D::translation(200.0, 35.0);
+    let root = doc.scene.insert(root)?;
+    let mut child = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+        0.0,
+        0.0,
+        20.0,
+        12.0,
+        Color::rgb(0, 255, 0),
+    )));
+    child.parent = Some(root);
+    child.transform = Transform2D::translation(10.0, 8.0);
+    let child = doc.scene.insert(child)?;
+    Ok((doc, parent, root, child))
+}
+
+fn assert_scoped_root_pixels(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    background: [u8; 4],
+    rectangles: &[([u32; 4], [u8; 4])],
+) {
+    assert_eq!(pixels.len(), width as usize * height as usize * 4);
+    for (offset, pixel) in pixels.chunks_exact(4).enumerate() {
+        let x = offset as u32 % width;
+        let y = offset as u32 / width;
+        let mut expected = background;
+        for ([left, top, right, bottom], color) in rectangles {
+            if x >= *left && x < *right && y >= *top && y < *bottom {
+                expected = *color;
+            }
+        }
+        assert_eq!(pixel, expected.as_slice(), "pixel ({x},{y})");
+    }
+}
+
+fn scoped_root_surface_pixels(surface: &mut Surface, width: u32, height: u32) -> Vec<u8> {
+    let info = ImageInfo::new(
+        (width as i32, height as i32),
+        ColorType::RGBA8888,
+        AlphaType::Unpremul,
+        None,
+    );
+    let mut pixels = vec![0; width as usize * height as usize * 4];
+    assert!(surface.read_pixels(&info, &mut pixels, width as usize * 4, (0, 0)));
+    pixels
+}
+
+#[test]
+fn scoped_root_cpu_preserves_world_coordinates_and_scope_isolation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (doc, _, root, _) = scoped_root_fixture()?;
+    let before = serde_json::to_value(&doc)?;
+    let revision = doc.scene.revision();
+    let viewport = Viewport {
+        center: [320.0, 135.0],
+        zoom: 1.0,
+    };
+    for scale in [1, 2] {
+        let mut renderer = RasterRenderer::new(400 * scale, 300 * scale)?;
+        renderer.display_scale = f64::from(scale);
+        let inputs = RenderInputs::for_doc(&doc);
+        let metrics = renderer.render_page_with(&doc.scene, &viewport, Some(root), &inputs);
+        assert_eq!(metrics.nodes_visited, 2);
+        assert_eq!(metrics.nodes_culled, 0);
+        assert_scoped_root_pixels(
+            &renderer.copy_rgba(),
+            400 * scale,
+            300 * scale,
+            [0; 4],
+            &[
+                (
+                    [120 * scale, 110 * scale, 280 * scale, 190 * scale],
+                    [0, 0, 255, 255],
+                ),
+                (
+                    [130 * scale, 118 * scale, 150 * scale, 130 * scale],
+                    [0, 255, 0, 255],
+                ),
+            ],
+        );
+        renderer.render_with(&doc.scene, &viewport, &inputs);
+        assert!(renderer.copy_rgba().iter().all(|channel| *channel == 0));
+    }
+    assert_eq!(serde_json::to_value(&doc)?, before);
+    assert_eq!(doc.scene.revision(), revision);
+    Ok(())
+}
+
+#[test]
+fn scoped_root_external_canvas_keeps_matrix_and_clip() -> Result<(), Box<dyn std::error::Error>> {
+    let (doc, _, root, _) = scoped_root_fixture()?;
+    let mut surface = surfaces::raster_n32_premul((400, 300)).ok_or("test surface")?;
+    surface.canvas().clear(skia_safe::Color::TRANSPARENT);
+    let mut renderer = RasterRenderer::new(400, 300)?;
+    let canvas = surface.canvas();
+    canvas.translate((3.0, 5.0));
+    canvas.clip_rect(Rect::from_xywh(0.0, 0.0, 300.0, 250.0), None, false);
+    let matrix = canvas.local_to_device_as_3x3();
+    let clip = canvas.device_clip_bounds();
+    let saves = canvas.save_count();
+    renderer.render_to_canvas(
+        canvas,
+        400,
+        300,
+        &doc.scene,
+        &Viewport {
+            center: [320.0, 135.0],
+            zoom: 1.0,
+        },
+        Some(root),
+        &RenderInputs::for_doc(&doc),
+    );
+    assert_eq!(canvas.local_to_device_as_3x3(), matrix);
+    assert_eq!(canvas.device_clip_bounds(), clip);
+    assert_eq!(canvas.save_count(), saves);
+    assert_scoped_root_pixels(
+        &scoped_root_surface_pixels(&mut surface, 400, 300),
+        400,
+        300,
+        [0; 4],
+        &[
+            ([123, 115, 283, 195], [0, 0, 255, 255]),
+            ([133, 123, 153, 135], [0, 255, 0, 255]),
+        ],
+    );
+    Ok(())
+}
+
+#[test]
+fn scoped_root_tiles_preserve_world_coordinates_and_other_pixels()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (doc, _, root, _) = scoped_root_fixture()?;
+    let inputs = RenderInputs::for_doc(&doc);
+    let viewport = Viewport {
+        center: [320.0, 135.0],
+        zoom: 1.0,
+    };
+    let background = Color::rgb(17, 19, 23);
+    let rectangles = [
+        ([17, 23, 417, 323], [255; 4]),
+        ([137, 133, 297, 213], [0, 0, 255, 255]),
+        ([147, 141, 167, 153], [0, 255, 0, 255]),
+    ];
+    let mut renderer = RasterRenderer::new(450, 350)?;
+    renderer.background = background;
+    renderer.render(&Scene::new(), &Viewport::default());
+    renderer.render_tile_self(
+        17.0,
+        23.0,
+        400.0,
+        300.0,
+        Some(Color::WHITE),
+        &doc.scene,
+        &viewport,
+        Some(root),
+        &inputs,
+    );
+    assert_scoped_root_pixels(
+        &renderer.copy_rgba(),
+        450,
+        350,
+        [17, 19, 23, 255],
+        &rectangles,
+    );
+
+    let mut surface = surfaces::raster_n32_premul((450, 350)).ok_or("test surface")?;
+    surface.canvas().clear(to_sk_color(background));
+    let saves = surface.canvas().save_count();
+    let matrix = surface.canvas().local_to_device_as_3x3();
+    renderer.render_tile_onto(
+        surface.canvas(),
+        17.0,
+        23.0,
+        400.0,
+        300.0,
+        Some(Color::WHITE),
+        &doc.scene,
+        &viewport,
+        Some(root),
+        &inputs,
+    );
+    assert_eq!(surface.canvas().save_count(), saves);
+    assert_eq!(surface.canvas().local_to_device_as_3x3(), matrix);
+    assert_scoped_root_pixels(
+        &scoped_root_surface_pixels(&mut surface, 450, 350),
+        450,
+        350,
+        [17, 19, 23, 255],
+        &rectangles,
+    );
+    Ok(())
+}
+
+#[test]
+fn scoped_root_nested_rotation_reflection_and_scale_are_applied_once()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut doc = Doc::new();
+    let mut grandparent = CanvasNode::new(NodeData::Group(fanta_doc::GroupNode::default()));
+    grandparent.transform = Transform2D::from_components([0.0, 1.0, -1.0, 0.0, 500.0, 30.0]);
+    let grandparent = doc.scene.insert(grandparent)?;
+    let mut parent = CanvasNode::new(NodeData::Group(fanta_doc::GroupNode::default()));
+    parent.parent = Some(grandparent);
+    parent.transform = Transform2D::from_components([2.0, 0.0, 0.0, -3.0, 40.0, 60.0]);
+    let parent = doc.scene.insert(parent)?;
+    let (fixture, _, root, child) = scoped_root_fixture()?;
+    let mut root_node = fixture.scene.get(root).ok_or("scope root")?.clone();
+    root_node.parent = Some(parent);
+    doc.scene.insert(root_node)?;
+    doc.scene
+        .insert(fixture.scene.get(child).ok_or("scope child")?.clone())?;
+    let before = serde_json::to_value(&doc)?;
+    let mut renderer = RasterRenderer::new(400, 400)?;
+    renderer.render_page_with(
+        &doc.scene,
+        &Viewport {
+            center: [665.0, 630.0],
+            zoom: 1.0,
+        },
+        Some(root),
+        &RenderInputs::for_doc(&doc),
+    );
+    // The composed map is (x,y) -> (545+3y,470+2x), independently of Scene's world cache.
+    assert_scoped_root_pixels(
+        &renderer.copy_rgba(),
+        400,
+        400,
+        [0; 4],
+        &[
+            ([80, 40, 320, 360], [0, 0, 255, 255]),
+            ([104, 60, 140, 100], [0, 255, 0, 255]),
+        ],
+    );
+    assert_eq!(serde_json::to_value(&doc)?, before);
+    Ok(())
+}
+
+#[test]
+fn scoped_root_motion_uses_resolved_ancestor_and_root_transforms()
+-> Result<(), Box<dyn std::error::Error>> {
+    use fanta_doc::{
+        AnimationClipId, MotionEvaluation, MotionProperty, MotionTarget, ResolvedVarValue,
+    };
+    let (doc, parent, root, _) = scoped_root_fixture()?;
+    let before = serde_json::to_value(&doc)?;
+    let revision = doc.scene.revision();
+    let motion = MotionEvaluation {
+        clip: AnimationClipId::new(),
+        playhead_ms: 500,
+        overrides: BTreeMap::from([
+            (
+                MotionTarget::new(parent, MotionProperty::PositionX),
+                ResolvedVarValue::Float { value: 240.0 },
+            ),
+            (
+                MotionTarget::new(root, MotionProperty::PositionY),
+                ResolvedVarValue::Float { value: 45.0 },
+            ),
+        ]),
+    };
+    let mut inputs = RenderInputs::for_doc(&doc);
+    inputs.motion = Some(&motion);
+    let mut renderer = RasterRenderer::new(400, 300)?;
+    let metrics = renderer.render_page_with(
+        &doc.scene,
+        &Viewport {
+            center: [520.0, 145.0],
+            zoom: 1.0,
+        },
+        Some(root),
+        &inputs,
+    );
+    assert_eq!(metrics.nodes_culled, 0);
+    assert_scoped_root_pixels(
+        &renderer.copy_rgba(),
+        400,
+        300,
+        [0; 4],
+        &[
+            ([120, 110, 280, 190], [0, 0, 255, 255]),
+            ([130, 118, 150, 130], [0, 255, 0, 255]),
+        ],
+    );
+    assert_eq!(serde_json::to_value(&doc)?, before);
+    assert_eq!(doc.scene.revision(), revision);
+    Ok(())
+}
+
+#[test]
+fn scoped_root_without_parent_and_missing_scope_keep_existing_behavior()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (fixture, _, root, child) = scoped_root_fixture()?;
+    let mut doc = Doc::new();
+    let mut root_node = fixture.scene.get(root).ok_or("scope root")?.clone();
+    root_node.parent = None;
+    root_node.transform = Transform2D::translation(240.0, 95.0);
+    doc.scene.insert(root_node)?;
+    doc.scene
+        .insert(fixture.scene.get(child).ok_or("scope child")?.clone())?;
+    let viewport = Viewport {
+        center: [320.0, 135.0],
+        zoom: 1.0,
+    };
+    let mut renderer = RasterRenderer::new(400, 300)?;
+    for scope in [None, Some(root)] {
+        renderer.render_page_with(&doc.scene, &viewport, scope, &RenderInputs::for_doc(&doc));
+        assert_scoped_root_pixels(
+            &renderer.copy_rgba(),
+            400,
+            300,
+            [0; 4],
+            &[
+                ([120, 110, 280, 190], [0, 0, 255, 255]),
+                ([130, 118, 150, 130], [0, 255, 0, 255]),
+            ],
+        );
+    }
+    renderer.render_page_with(
+        &doc.scene,
+        &viewport,
+        Some(NodeId::new()),
+        &RenderInputs::for_doc(&doc),
+    );
+    assert!(renderer.copy_rgba().iter().all(|channel| *channel == 0));
+    Ok(())
+}

@@ -31,6 +31,15 @@ impl Tool for SelectTool {
         }
     }
 
+    fn translating_root(&self) -> Option<fanta_doc::NodeId> {
+        match &self.phase {
+            Phase::Moving(selection) if selection.moving.len() == 1 => {
+                selection.moving.first().map(|(id, _)| *id)
+            }
+            _ => None,
+        }
+    }
+
     fn activate(&mut self, _ctx: &mut ToolContext) {
         self.enter_idle();
     }
@@ -386,5 +395,28 @@ impl SelectTool {
         }
         ctx.doc.history.commit(&mut ctx.doc.scene);
         ToolResponse::empty()
+    }
+}
+
+#[cfg(test)]
+mod translation_hint_tests {
+    use super::*;
+
+    #[test]
+    fn retained_translation_hint_requires_one_actual_moving_root() {
+        let mut tool = SelectTool::new();
+        assert_eq!(tool.translating_root(), None);
+        let root = fanta_doc::NodeId::new();
+        let mut moving = crate::tool::MovingSelection::default();
+        moving.moving.push((root, fanta_doc::Transform2D::IDENTITY));
+        tool.phase = Phase::Moving(Box::new(moving.clone()));
+        assert_eq!(tool.translating_root(), Some(root));
+        moving
+            .moving
+            .push((fanta_doc::NodeId::new(), fanta_doc::Transform2D::IDENTITY));
+        tool.phase = Phase::Moving(Box::new(moving));
+        assert_eq!(tool.translating_root(), None);
+        tool.phase = Phase::Idle;
+        assert_eq!(tool.translating_root(), None);
     }
 }

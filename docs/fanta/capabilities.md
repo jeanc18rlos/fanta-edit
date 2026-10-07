@@ -1,6 +1,6 @@
 # Fanta capability guide
 
-Source inventory updated **5 October 2026**. This describes the current editor
+Source inventory updated **7 October 2026**. This describes the current editor
 implementation; release verification is tracked separately in
 [the capability coverage report](../alpha/CAPABILITY_COVERAGE.md). Earlier alpha
 reports describe their dated builds and can contain controls that have since
@@ -114,8 +114,13 @@ detachable. Representative resolved and pinned values, explicit-corner summaries
 and exact Open/Save/cold preservation passed native checks on `100fe26921`.
 The Available label is readable in One Dark and One Light; changing themes and
 returning to One Dark preserves the document exactly.
-The separate four-field equal-corner control and precedence label were not
-observed; unresolved-binding fallback remains covered by automated tests.
+On 7 October, the later QA2824 build passes 16 static checks at 320 and 400 px
+in One Dark and One Light. Authored independent corners remain four separate
+fields even when all values are 7; the precedence explanation wraps in full.
+Bound wrapper opacity and mixed Vector/Bitmap values also display correctly.
+Thirteen checkpoints preserve all document fields, timestamps, assets and files.
+These checks do not invoke bound Detach or establish an edit/Undo journey;
+unresolved-binding fallback remains covered by automated tests.
 Mixed values must remain identifiable; controls must neither erase unsupported
 data nor silently apply to a stale selection. Editable fields support draft
 cancellation and undoable commits. Controls that offer live previews restore
@@ -222,6 +227,23 @@ are disabled in read-only mode or when selected layers are locked; read-only
 properties and applicable navigation remain available. Reordering applies to
 the selected roots and is undoable. The canvas menu is not shown in Draw mode
 or during prototype presentation.
+
+Variant-set instances use the member shown on the canvas for these commands
+and the Design inspector, including the set default, variable aliases, active
+modes and inherited mode pins. Reset clears instance customizations and restores
+the resolved default member's size. If **Go to main component** would switch
+scopes while source edits are pending, it keeps the current scope, selection and
+camera and explains that you must save or discard those edits first. Eight
+focused automated regressions cover these routes. On `67d29ea288`, four native
+Go to main component routes resolve the expected default or mode-selected
+member and align its artwork with selection. Two checkpoints preserve all
+20 nodes, the asset, timestamps and 30 project files. On the later `41becdffe5`
+QA build, ten native checkpoints pass Open, two navigation controls, Reset and
+Detach with single Undo/Redo saves, and cold reopening of the saved detached
+state. The 80 × 40 Small instance becomes a Frame with its expected child;
+only declared content/files change, and cold reopening preserves all saved bytes
+and the timestamp exactly. Earlier strict failures and broader limits remain in
+the [coverage report](../alpha/CAPABILITY_COVERAGE.md#current-acceptance-status).
 
 Flatten is unavailable when it would discard images, mixed text colors or
 decorations, child effects, clipping, layout, bindings, animation or component

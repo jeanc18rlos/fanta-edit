@@ -792,9 +792,10 @@ impl FigView {
 
     /// Keys the session resolves itself. These arrive here only when no key
     /// binding claimed them: the FigViewer keymap context is renamed to
-    /// `FigViewerTextEdit` while a session is live (see `render`), which has
-    /// no bindings, so tool shortcuts and canvas keys are suppressed and
-    /// everything falls through — printable characters continue on to the
+    /// `FigViewerTextEdit` while a session is live (see `render`). The macOS
+    /// Escape binding uses the same commit/cancel behavior before Workspace
+    /// actions can consume it; other text keys fall through here. Printable
+    /// characters continue on to the
     /// platform input handler (`EntityInputHandler`), which also carries IME
     /// composition.
     pub(crate) fn handle_text_edit_key_down(
