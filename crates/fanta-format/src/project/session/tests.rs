@@ -4502,7 +4502,6 @@ fn artifact_scope_index_spectrum_benchmark() {
     }
 }
 
-
 fn structural_source_fixture(
     future_fields: bool,
     child_comment: bool,

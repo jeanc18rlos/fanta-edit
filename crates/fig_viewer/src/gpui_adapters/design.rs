@@ -2636,7 +2636,8 @@ impl FigView {
                 panel.set_draft_preserving_focus_scope(draft_scope)
             });
         }
-        let viewer_properties = if self.is_art_read_only(cx) {
+        let editable = self.is_editable(cx);
+        let viewer_properties = if !editable {
             let target = self
                 .item()
                 .read(cx)
@@ -2682,7 +2683,6 @@ impl FigView {
             let Some(document) = fig_item.document() else {
                 return;
             };
-            let editable = self.is_editable(cx);
             let doc = &document.doc;
             let selection: Vec<NodeId> = doc
                 .selection
@@ -6753,6 +6753,36 @@ fn viewer_properties_view_data(
                 .with_property(DesignPanelProperty::Rotation),
             ],
         ));
+    }
+    if let Some(layout) = node
+        .layout
+        .as_ref()
+        .filter(|layout| layout.mode != DesignLayoutMode::None)
+    {
+        let gap = if layout.mode != DesignLayoutMode::Grid
+            && layout.item_spacing_mode == DesignItemSpacingMode::Auto
+        {
+            "Auto".to_owned()
+        } else {
+            viewer_number(layout.gap)
+        };
+        let mut rows = vec![
+            DesignViewerPropertyRow::new("gap", "Gap", gap).with_property(DesignPanelProperty::Gap),
+        ];
+        if layout.wrap || layout.mode == DesignLayoutMode::Grid {
+            rows.push(
+                DesignViewerPropertyRow::new(
+                    "counter-gap",
+                    "Counter-axis gap",
+                    layout
+                        .counter_axis_gap
+                        .map(viewer_number)
+                        .unwrap_or_else(|| "Auto".to_owned()),
+                )
+                .with_property(DesignPanelProperty::CounterAxisGap),
+            );
+        }
+        sections.push(viewer_property_section("layout", "Layout", rows));
     }
     sections.push(viewer_property_section(
         "appearance",
@@ -14006,6 +14036,105 @@ mod tests {
                 "Go to main lands on the Hover master"
             );
         });
+    }
+
+    #[test]
+    fn source_locked_inspector_layout_rows_match_spacing_modes() {
+        for (mode, wrap, primary_align, counter_auto_spacing, expected_gap, expected_counter) in [
+            (
+                LayoutMode::Horizontal,
+                false,
+                PrimaryAlign::Start,
+                false,
+                "8.5",
+                None,
+            ),
+            (
+                LayoutMode::Vertical,
+                true,
+                PrimaryAlign::Start,
+                false,
+                "8.5",
+                Some("3.25"),
+            ),
+            (
+                LayoutMode::Horizontal,
+                true,
+                PrimaryAlign::SpaceBetween,
+                true,
+                "Auto",
+                Some("Auto"),
+            ),
+            (
+                LayoutMode::Vertical,
+                false,
+                PrimaryAlign::SpaceEvenly,
+                false,
+                "Auto",
+                None,
+            ),
+            (
+                LayoutMode::Grid,
+                false,
+                PrimaryAlign::Start,
+                false,
+                "8.5",
+                Some("3.25"),
+            ),
+        ] {
+            for is_frame in [false, true] {
+                let (mut doc, _page, id) = doc_with_rect();
+                doc.scene.get_mut(id).expect("node").data = NodeData::Group(GroupNode {
+                    clip_size: is_frame.then_some([200.0, 100.0]),
+                    local_size: (!is_frame).then_some([200.0, 100.0]),
+                    grid: (mode == LayoutMode::Grid).then_some(fanta_doc::GridLayout {
+                        column_gap: 8.5,
+                        row_gap: 3.25,
+                        ..Default::default()
+                    }),
+                    auto_layout: Some(fanta_doc::AutoLayout {
+                        mode,
+                        wrap,
+                        spacing: 8.5,
+                        counter_spacing: 3.25,
+                        primary_align,
+                        counter_auto_spacing,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+                let before = serde_json::to_value(&doc).expect("before");
+                let document = FigDocument::from_doc(doc, BTreeMap::new());
+                let (node, _) = design_node(&document, id, &master_roots(&document.doc.components))
+                    .expect("node projection");
+                assert_eq!(
+                    node.kind,
+                    if is_frame {
+                        DesignPanelNodeKind::Frame
+                    } else {
+                        DesignPanelNodeKind::Group
+                    }
+                );
+                let properties = viewer_properties_view_data(&document.doc, id, &node)
+                    .expect("viewer projection");
+                let layout = properties.section("layout").expect("read-only layout");
+                let gap = layout.row("gap").expect("primary gap");
+                assert_eq!(
+                    gap.displayed_value.as_ref(),
+                    expected_gap,
+                    "mode={mode:?}, is_frame={is_frame}"
+                );
+                assert_eq!(gap.property, Some(DesignPanelProperty::Gap));
+                assert_eq!(
+                    layout
+                        .row("counter-gap")
+                        .map(|row| row.displayed_value.as_ref()),
+                    expected_counter,
+                    "mode={mode:?}, is_frame={is_frame}"
+                );
+                assert_eq!(serde_json::to_value(&document.doc).expect("after"), before);
+            }
+        }
     }
 
     #[gpui::test]

@@ -6136,7 +6136,7 @@ impl FigView {
                 // when its adapter mounted; `FANTA_GPUI_DESIGN=0` (or the
                 // process-wide `FANTA_GPUI_UI=0`) keeps the legacy panel.
                 #[cfg(feature = "fanta-gpui-ui")]
-                let body = self.render_properties_content(mode).unwrap_or_else(|| {
+                let body = self.render_properties_content(mode, cx).unwrap_or_else(|| {
                     match self.gpui_design.as_ref() {
                         Some(adapter) => adapter.panel.clone().into_any_element(),
                         None => self.inspector_sidebar.clone().into_any_element(),
