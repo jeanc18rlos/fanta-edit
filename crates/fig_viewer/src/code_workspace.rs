@@ -3741,6 +3741,278 @@ mod tests {
         (view, code, item, cx)
     }
 
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn source_locked_inspector_keeps_geometry_and_layout_readable(cx: &mut TestAppContext) {
+        use fanta_gpui::design::{
+            DesignPanelAction, DesignPanelProperty, DesignPanelTarget, DesignPanelValue,
+        };
+
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("project");
+        let (page, child) = write_spacing_project(temporary.path());
+        let (mut document, assets) =
+            fanta_format::read_project_tree(temporary.path()).expect("fixture");
+        let row = document
+            .scene
+            .get(child)
+            .expect("child")
+            .parent
+            .expect("row");
+        let frame = document.scene.get_mut(row).expect("frame");
+        frame.name = "Accepted row".into();
+        frame.transform = fanta_doc::Transform2D::translation(24.0, 32.0);
+        fanta_format::write_project_tree(temporary.path(), &document, &assets).expect("fixture");
+        let path = page_source_path(temporary.path(), page);
+        let original = std::fs::read_to_string(&path).expect("FNX");
+        let draft = original.replacen("Accepted row", "Unsaved draft row", 1);
+        assert_ne!(draft, original, "the test must create a real source edit");
+
+        let (view, code, item, cx) = mounted_source_recovery_fixture(temporary.path(), cx).await;
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.replace_with([row]);
+                ((), crate::document::DocChange::Selection)
+            });
+        });
+        cx.run_until_parked();
+        let panel = view.read_with(cx, |view, _| {
+            view.gpui_design
+                .as_ref()
+                .expect("mounted inspector")
+                .panel
+                .clone()
+        });
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.inspection_context().permissions().can_edit());
+            let node = panel.node();
+            assert_eq!(
+                (node.x, node.y, node.width, node.height),
+                (24.0, 32.0, 120.0, 40.0)
+            );
+            assert_eq!(node.layout.as_ref().expect("layout").gap, 8.0);
+        });
+        let before = item.read_with(cx, |item, _| {
+            serde_json::to_value(item.doc().expect("document")).expect("accepted document")
+        });
+        code.update_in(cx, |code, window, cx| {
+            code.fnx_editor
+                .as_ref()
+                .expect("FNX editor")
+                .update(cx, |editor, cx| {
+                    editor.set_text(draft.clone(), window, cx);
+                });
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert!(item.source_edit_locked());
+            assert!(!item.is_editable());
+        });
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        let canvas_tab = cx
+            .debug_bounds("fanta-collapsible-tab-fanta-editor-workspace-0")
+            .expect("Canvas tab");
+        cx.simulate_click(canvas_tab.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        panel.read_with(cx, |panel, _| {
+            assert!(!panel.inspection_context().permissions().can_edit());
+            let properties = panel
+                .viewer_properties_view_data()
+                .expect("a dirty source buffer must retain readable accepted properties");
+            assert_eq!(
+                properties.target,
+                DesignPanelTarget::Nodes {
+                    node_ids: vec![row.to_string().into()]
+                }
+            );
+            for (section, property, expected) in [
+                ("identity", "name", "Accepted row"),
+                ("geometry", "x", "24"),
+                ("geometry", "y", "32"),
+                ("geometry", "width", "120"),
+                ("geometry", "height", "40"),
+                ("layout", "gap", "8"),
+            ] {
+                assert_eq!(
+                    properties
+                        .section(section)
+                        .and_then(|section| section.row(property))
+                        .expect("read-only row")
+                        .displayed_value
+                        .as_ref(),
+                    expected
+                );
+            }
+        });
+        for selector in [
+            "fig-gpui-design-viewer-row-geometry-x",
+            "fig-gpui-design-viewer-row-layout-gap",
+        ] {
+            assert!(
+                cx.debug_bounds(selector).is_some(),
+                "{selector} must be rendered, not only stored"
+            );
+        }
+        panel.update_in(cx, |_, _, cx| {
+            cx.emit(DesignPanelAction::PropertyChangeRequested {
+                node_id: row.to_string().into(),
+                property: DesignPanelProperty::Gap,
+                value: DesignPanelValue::Number(99.0),
+            });
+        });
+        item.update(cx, |item, cx| {
+            assert!(
+                item.apply(
+                    fanta_doc::Operation::SetName {
+                        id: row,
+                        old: "Accepted row".into(),
+                        new: "Rejected canvas edit".into(),
+                    },
+                    cx
+                )
+                .is_err()
+            );
+        });
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let document = item.doc().expect("document");
+            assert_eq!(
+                serde_json::to_value(document).expect("locked document"),
+                before
+            );
+            assert_eq!(
+                (document.history.undo_depth(), document.history.redo_depth()),
+                (0, 0)
+            );
+        });
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.replace_with([child]);
+                ((), crate::document::DocChange::Selection)
+            });
+        });
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            let properties = panel
+                .viewer_properties_view_data()
+                .expect("child properties");
+            assert_eq!(
+                properties.target,
+                DesignPanelTarget::Nodes {
+                    node_ids: vec![child.to_string().into()]
+                }
+            );
+            let geometry = properties.section("geometry").expect("child geometry");
+            assert_eq!(geometry.row("x").expect("X").displayed_value.as_ref(), "52");
+            assert_eq!(geometry.row("y").expect("Y").displayed_value.as_ref(), "32");
+            assert!(
+                properties.section("layout").is_none(),
+                "a child must not inherit its parent's Gap"
+            );
+        });
+        let child_selected = item.read_with(cx, |item, _| {
+            serde_json::to_value(item.doc().expect("document")).expect("child selection")
+        });
+        for selection in [vec![], vec![row, child]] {
+            item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    document.doc.selection.replace_with(selection);
+                    ((), crate::document::DocChange::Selection)
+                });
+            });
+            cx.run_until_parked();
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+            assert!(
+                cx.debug_bounds("fanta-source-locked-inspector-selection")
+                    .is_some(),
+                "page and mixed selections need a readable selection notice"
+            );
+            assert!(
+                cx.debug_bounds("fig-gpui-design-viewer-row-geometry-x")
+                    .is_none()
+            );
+            panel.read_with(cx, |panel, _| {
+                assert!(!panel.inspection_context().permissions().can_edit());
+                assert!(panel.viewer_properties_view_data().is_none());
+            });
+            item.read_with(cx, |item, _| {
+                assert!(item.source_edit_locked() && !item.is_editable())
+            });
+        }
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.replace_with([child]);
+                ((), crate::document::DocChange::Selection)
+            });
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        assert!(
+            cx.debug_bounds("fanta-source-locked-inspector-selection")
+                .is_none()
+        );
+        assert!(
+            cx.debug_bounds("fig-gpui-design-viewer-row-geometry-x")
+                .is_some()
+        );
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                serde_json::to_value(item.doc().expect("document")).expect("restored selection"),
+                child_selected
+            );
+        });
+        code.read_with(cx, |code, cx| {
+            assert_eq!(
+                code.fnx_source_buffer
+                    .as_ref()
+                    .expect("source")
+                    .read(cx)
+                    .text(),
+                draft
+            );
+        });
+        assert_eq!(std::fs::read_to_string(&path).expect("disk FNX"), original);
+        let (disk, disk_assets) =
+            fanta_format::read_project_tree(temporary.path()).expect("disk document");
+        assert_eq!(
+            serde_json::to_value(&disk).expect("disk"),
+            serde_json::to_value(&document).expect("fixture")
+        );
+        assert_eq!(disk_assets, assets);
+
+        code.update(cx, |code, cx| code.discard_source_edit(cx))
+            .await
+            .expect("discard the owned draft");
+        cx.run_until_parked();
+        panel.read_with(cx, |panel, _| {
+            assert!(panel.inspection_context().permissions().can_edit());
+            assert!(panel.viewer_properties_view_data().is_none());
+            assert_eq!((panel.node().x, panel.node().y), (52.0, 32.0));
+        });
+        item.read_with(cx, |item, _| {
+            assert!(!item.source_edit_locked());
+            assert!(item.is_editable());
+            let document = item.doc().expect("document");
+            assert_eq!(
+                (document.history.undo_depth(), document.history.redo_depth()),
+                (0, 0)
+            );
+        });
+    }
+
     #[gpui::test]
     async fn source_recovery_canvas_tab_restores_save_keyboard_route(cx: &mut TestAppContext) {
         init_test(cx);

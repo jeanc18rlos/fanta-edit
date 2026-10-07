@@ -1,5 +1,5 @@
 use super::*;
-use fanta_gpui::design::DesignInspector;
+use fanta_gpui::design::{DesignInspector, DesignPanelTarget};
 use fanta_gpui::molecules::ZoomControlsAction;
 use fanta_gpui::properties_inspector::{
     PropertiesInspector, PropertiesInspectorAction, PropertiesInspectorChildren,
@@ -34,8 +34,49 @@ fn inspector_tab(mode: EditorMode) -> PropertiesInspectorTab {
 }
 
 impl FigView {
-    pub(super) fn render_properties_content(&self, mode: EditorMode) -> Option<AnyElement> {
+    pub(super) fn render_properties_content(
+        &self,
+        mode: EditorMode,
+        cx: &App,
+    ) -> Option<AnyElement> {
         let adapter = self.gpui_properties.as_ref()?;
+        if mode == EditorMode::Design && self.item.read(cx).source_edit_locked() {
+            let has_properties = self.gpui_design.as_ref().is_some_and(|design| {
+                let panel = design.panel.read(cx);
+                self.item.read(cx).doc().is_some_and(|doc| {
+                    let [id] = doc.selection.as_slice() else {
+                        return false;
+                    };
+                    !panel.inspection_context().permissions().can_edit()
+                        && doc.scene.contains(*id)
+                        && panel
+                            .viewer_properties_view_data()
+                            .is_some_and(|properties| {
+                                properties.is_valid()
+                                    && properties.target
+                                        == DesignPanelTarget::Nodes {
+                                            node_ids: vec![id.to_string().into()],
+                                        }
+                            })
+                })
+            });
+            if !has_properties {
+                return Some(
+                    div()
+                        .debug_selector(|| "fanta-source-locked-inspector-selection".to_owned())
+                        .w_full()
+                        .px_4()
+                        .py_3()
+                        .child(
+                            Label::new("Select one layer to inspect its properties")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted)
+                                .line_clamp(3),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
         Some(match mode {
             EditorMode::Design => adapter.design.clone().into_any_element(),
             EditorMode::Draw => adapter.draw.clone().into_any_element(),

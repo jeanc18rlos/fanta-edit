@@ -817,10 +817,7 @@ mod tests {
         else {
             panic!("instance");
         };
-        instance.overrides = vec![
-            text_content_override(&fixture.path, "Earlier text"),
-            field,
-        ];
+        instance.overrides = vec![text_content_override(&fixture.path, "Earlier text"), field];
         let original = instance.overrides.clone();
         for operation in commit_ops(
             &fixture.doc,

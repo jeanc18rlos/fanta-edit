@@ -36,6 +36,13 @@ component FNX source, identity sidecars, metadata and assets. See
   ordinary saved-canvas source refresh remains its own undoable text transaction.
   An unsaved source buffer locks conflicting visual edits. Selecting a layer
   reveals its source; agent source-follow can be paused.
+  While a draft owns editing, the accepted single layer's properties remain
+  readable, including position, size and auto-layout gap. Empty or mixed
+  selection asks the user to select one layer; canvas writes remain locked.
+  On `a7f16cb245`, a bounded native same-path external-change/Cancel journey
+  preserves the full unsaved draft, controlled external file bytes and timestamp,
+  and observed last-accepted canvas geometry and source lock. This does not
+  establish conflict resolution, recovery Undo, multiple windows or all edits.
 - Structural canvas saves preserve future FNX attributes on surviving nodes and
   keep authored comments when inserting or reparenting content. Explicit source
   edits remain authoritative. Deletion or type changes that would erase
@@ -191,6 +198,19 @@ notice/read-only Content row while alias-only instance text stays editable from
 the canvas and Design inspector, with single Undo/Redo and exact saved-state
 reopening. Post-restart refusal also passed after a selection/focus reset; an
 earlier targeting attempt and its unproven cause remain recorded.
+
+On `a7f16cb245`, a bounded native plain Text check changes `FRAME TEXT` to
+`FRAME EDIT`, commits with one Escape, and passes Save, single Undo/Redo and
+fresh-process reopening. Its fixed box, font/style, full 0..10 style range,
+other document content and asset remain exact. All 20 project files follow
+the declared edit/history states; cold reopening matches saved Redo exactly.
+The fixture uses a pre-existing disposable parent Git repository, whose
+metadata also remains exact. The earlier no-parent fixture correctly failed
+its strict file boundary when the desktop writer initialized Git; that evidence
+remains recorded. This check does not establish rich text, IME, multiline input
+or held-Escape behavior. See the [coverage matrix](../alpha/CAPABILITY_COVERAGE.md)
+for the full preconditions and remaining release gates.
+
 Text on Path accepts the shaped text area, including letter
 counters and spaces, while rejecting distant empty areas along the baseline.
 Inspection keeps exact glyph geometry. Automated regressions cover these cases; native input
@@ -396,12 +416,18 @@ Existing 3D payloads and assets are preserved when unrelated canvas changes are
 saved and reopened. Neither storage support nor a node enum constitutes a
 finished user workflow.
 
-Large-page rendering work remains incomplete. The opt-in retained renderer API
-now passes bounded Spectrum CPU parity and timing checks after fixed-ancestor
-support. It helps the sampled fit-all views but makes the 100% image case slower
-and does not improve the 100% instance case. It is not enabled in canvas
-dragging. New UI-cost diagnostics pass automated tests but still need native
-log capture. The below-16-ms native drag target remains unproven.
+Large-page rendering work remains incomplete. The retained renderer has a Metal
+API and an opt-in macOS canvas worker, enabled only with
+`FANTA_RETAINED_TRANSLATION=1`; normal rendering remains the default. Seven
+actual-Metal API tests and one IOSurface-worker test pass their bounded
+correctness and fallback checks. Earlier CPU fit-all gains do not establish
+native responsiveness. Standalone development Metal timings retain a 100% image
+regression and a slower 100% instance result; fit-all instance timings were
+rejected because the target produced no visible pixel motion. The sampled
+fit-all image p95 remains above 16 ms. Matched native gesture, complete Save and
+memory measurements are still required; the below-16-ms native drag target
+remains unproven. See the [coverage report](../alpha/CAPABILITY_COVERAGE.md) for
+exact evidence and earlier failures.
 
 Mac App Store builds restrict local process execution, external agents and
 related inherited editor features; see [MAC_APP_STORE.md](../alpha/MAC_APP_STORE.md).
