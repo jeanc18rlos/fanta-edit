@@ -5,6 +5,7 @@
 //! and the per-frame state plumbing.
 //!
 //! [`InstanceCache`]: InstanceCache
+use super::walk::render_scoped_root;
 use super::{
     AlphaType, Arc, AssetResolver, BTreeMap, Canvas, Color, ColorType, ComponentLibrary,
     EncodedImageFormat, ExpandedNode, Fill, Hash, HashMap, Hasher, IdHashMap, ImageCache,
@@ -1531,7 +1532,7 @@ impl RasterRenderer {
             metrics: &mut metrics,
         };
         match page_root {
-            Some(root) => render_node(canvas, root, &mut ctx),
+            Some(root) => render_scoped_root(canvas, root, &mut ctx),
             None => {
                 for &root in scene.roots() {
                     render_node(canvas, root, &mut ctx);
@@ -1678,7 +1679,7 @@ impl RasterRenderer {
         match page_root {
             // Single page: walk just that root's subtree. Culling and the
             // save/restore stack work identically to the all-roots path.
-            Some(root) => render_node(canvas, root, &mut ctx),
+            Some(root) => render_scoped_root(canvas, root, &mut ctx),
             // All roots in z-order (legacy / single-implicit-page behavior).
             None => {
                 for &root in scene.roots() {

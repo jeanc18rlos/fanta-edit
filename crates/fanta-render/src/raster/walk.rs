@@ -238,6 +238,25 @@ fn resolved_local_bounds(ctx: &mut RenderCtx, id: NodeId) -> Option<Bounds> {
     computed
 }
 
+pub(crate) fn render_scoped_root(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
+    let Some(parent) = ctx.scene.get(id).and_then(|node| node.parent) else {
+        render_node(canvas, id, ctx);
+        return;
+    };
+    let Some(parent_world) = resolved_world_transform(ctx, parent) else {
+        return;
+    };
+    if !parent_world.is_finite() {
+        return;
+    }
+    // Scoped component masters keep world coordinates for bounds, picking and
+    // overlays, but intentionally omit ancestor paint, opacity and clipping.
+    canvas.save();
+    canvas.concat(&to_sk_matrix(&parent_world));
+    render_node(canvas, id, ctx);
+    canvas.restore();
+}
+
 /// Draw one node of the *live scene* (and its scene children), depth-first.
 ///
 /// Geometry, visibility, culling, and painting read the same transient overlay
