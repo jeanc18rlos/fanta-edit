@@ -211,7 +211,9 @@ impl MetricSums {
 }
 
 pub(crate) struct FrameSample {
-    pub metrics: RenderMetrics,
+    pub metrics: Option<RenderMetrics>,
+    pub retained_frame_wall_us: Option<u64>,
+    pub retained_build_wall_us: Option<u64>,
     pub flush_sync_wall_us: u64,
     pub render_wall_us: u64,
     pub physical_size: (u32, u32),
@@ -223,7 +225,9 @@ pub(crate) struct FrameSample {
 struct CompletedSample {
     request_id: u64,
     source: RenderSourceKind,
-    scene_walk_wall_us: u64,
+    scene_walk_wall_us: Option<u64>,
+    retained_frame_wall_us: Option<u64>,
+    retained_build_wall_us: Option<u64>,
     flush_sync_wall_us: u64,
     render_wall_us: u64,
     physical_size: (u32, u32),
@@ -333,7 +337,7 @@ impl GestureRecord {
 
     fn summary(self, gesture_id: u64, end_reason: &'static str) -> GestureSummary {
         GestureSummary {
-            version: 2,
+            version: 3,
             gesture_id,
             context: self.context,
             backend: match (self.frames.is_empty(), self.cpu_fallback_paints > 0) {
@@ -342,7 +346,7 @@ impl GestureRecord {
                 (false, true) => "skia_metal_worker_with_cpu_fallback",
                 (false, false) => "skia_metal_worker",
             },
-            membership: "requests_dispatched_while_primary_tool_pressed; excludes_post_release_settling",
+            membership: "requests_dispatched_while_primary_tool_pressed; excludes_post_release_settling; scene_walk_and_metric_sums_include_normal_frames_only; render_wall_includes_retained_build_when_present",
             end_reason,
             pointer_moves: self.pointer_moves,
             content_preview_moves: self.content_preview_moves,
@@ -357,7 +361,9 @@ impl GestureRecord {
             source_kind_counts: self.source_kind_counts,
             failure_counts: self.failure_counts,
             scene_walk_wall_us: Distribution::from_values(
-                self.frames.iter().map(|frame| frame.scene_walk_wall_us),
+                self.frames
+                    .iter()
+                    .filter_map(|frame| frame.scene_walk_wall_us),
             ),
             flush_sync_wall_us: Distribution::from_values(
                 self.frames.iter().map(|frame| frame.flush_sync_wall_us),
@@ -482,11 +488,15 @@ impl GesturePerf {
         }
         match sample {
             Ok(sample) => {
-                record.metric_sums.add(&sample.metrics);
+                if let Some(metrics) = &sample.metrics {
+                    record.metric_sums.add(metrics);
+                }
                 record.frames.push(CompletedSample {
                     request_id: tag.request,
                     source: tag.source,
-                    scene_walk_wall_us: sample.metrics.frame_micros,
+                    scene_walk_wall_us: sample.metrics.as_ref().map(|metrics| metrics.frame_micros),
+                    retained_frame_wall_us: sample.retained_frame_wall_us,
+                    retained_build_wall_us: sample.retained_build_wall_us,
                     flush_sync_wall_us: sample.flush_sync_wall_us,
                     render_wall_us: sample.render_wall_us,
                     physical_size: sample.physical_size,
@@ -605,13 +615,117 @@ mod tests {
         metrics.layer_cache_hits = 3;
         metrics.layer_cache_misses = 2;
         FrameSample {
-            metrics,
+            metrics: Some(metrics),
+            retained_frame_wall_us: None,
+            retained_build_wall_us: None,
             flush_sync_wall_us: 4,
             render_wall_us: walk + 6,
             physical_size: (1600, 1200),
             viewport_zoom: 0.27,
             display_scale: 2.0,
         }
+    }
+
+    #[test]
+    fn retained_worker_metrics_do_not_invent_normal_scene_walk_samples() {
+        let mut perf = GesturePerf::default();
+        perf.begin(context());
+        let tag = perf.reserve(RenderSourceKind::Patch).expect("request");
+        perf.submitted(tag);
+        let mut frame = sample(500);
+        frame.metrics = None;
+        frame.retained_frame_wall_us = Some(20);
+        frame.retained_build_wall_us = Some(1000);
+        assert!(perf.complete(tag, Ok(frame)));
+        perf.end("release");
+        let summary = perf.summaries.last().expect("completed summary");
+        assert_eq!(summary.scene_walk_wall_us.count, 0);
+        assert_eq!(summary.metric_sums.nodes_visited, 0);
+        assert_eq!(
+            summary
+                .frames
+                .first()
+                .expect("frame")
+                .retained_frame_wall_us,
+            Some(20)
+        );
+        assert_eq!(
+            summary
+                .frames
+                .first()
+                .expect("frame")
+                .retained_build_wall_us,
+            Some(1000)
+        );
+    }
+
+    #[test]
+    fn retained_worker_serialized_v3_keeps_normal_and_retained_metrics_distinct() {
+        let mut perf = GesturePerf::default();
+        perf.begin(context());
+        let normal = perf
+            .reserve(RenderSourceKind::SnapshotFresh)
+            .expect("normal request");
+        perf.submitted(normal);
+        assert!(perf.complete(normal, Ok(sample(10))));
+        let retained = perf
+            .reserve(RenderSourceKind::Patch)
+            .expect("retained request");
+        perf.submitted(retained);
+        let mut frame = sample(500);
+        frame.metrics = None;
+        frame.retained_frame_wall_us = Some(20);
+        frame.retained_build_wall_us = Some(1000);
+        frame.render_wall_us = 1100;
+        assert!(perf.complete(retained, Ok(frame)));
+        perf.end("released");
+        let summary = perf.summaries.last().expect("completed summary");
+        let json = serde_json::to_value(summary).expect("serialized summary");
+        assert_eq!(json["version"], 3);
+        assert_eq!(json["completed"], 2);
+        assert_eq!(
+            json["scene_walk_wall_us"],
+            serde_json::json!({
+                "count": 1, "p50": 10, "p95": 10, "max": 10, "total": 10,
+            })
+        );
+        assert_eq!(json["metric_sums"]["nodes_visited"], 7);
+        assert_eq!(json["flush_sync_wall_us"]["count"], 2);
+        assert_eq!(json["render_wall_us"]["count"], 2);
+        let frames = json["frames"].as_array().expect("frame array");
+        let normal = frames.first().expect("normal frame");
+        let retained = frames.get(1).expect("retained frame");
+        assert_eq!(
+            normal.get("scene_walk_wall_us"),
+            Some(&serde_json::json!(10))
+        );
+        assert_eq!(
+            normal.get("retained_frame_wall_us"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            normal.get("retained_build_wall_us"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            retained.get("scene_walk_wall_us"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            retained.get("retained_frame_wall_us"),
+            Some(&serde_json::json!(20))
+        );
+        assert_eq!(
+            retained.get("retained_build_wall_us"),
+            Some(&serde_json::json!(1000))
+        );
+        assert!(summary.membership.contains("normal_frames_only"));
+        assert!(
+            summary
+                .membership
+                .contains("render_wall_includes_retained_build")
+        );
+        assert!(summary.ui_costs.timing.contains("must_not_be_summed"));
     }
 
     #[test]
@@ -829,7 +943,7 @@ mod tests {
         );
         assert_eq!(summary.ui_costs.view_render, UiCost::default());
         assert!(summary.ui_costs.timing.contains("must_not_be_summed"));
-        assert_eq!(summary.version, 2);
+        assert_eq!(summary.version, 3);
     }
 
     #[test]

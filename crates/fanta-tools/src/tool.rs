@@ -237,6 +237,11 @@ pub trait Tool {
         None
     }
 
+    // Selection alone cannot distinguish translation from resize/rotate previews.
+    fn translating_root(&self) -> Option<NodeId> {
+        None
+    }
+
     /// Hook called when the tool becomes active. Defaults to no-op. Tools that
     /// must reset internal state on (re-)activation override this.
     fn activate(&mut self, _ctx: &mut ToolContext) {}

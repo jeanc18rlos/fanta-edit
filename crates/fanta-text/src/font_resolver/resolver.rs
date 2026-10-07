@@ -2,7 +2,10 @@
 //! list, exposes the metric-adjust ratio, and runs the best-effort download.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
 use skia_safe::{
     FontMgr, FontStyle,
@@ -33,6 +36,7 @@ use super::substitute::{proprietary_substitute, substitute_metric_ratio};
 #[derive(Clone)]
 pub struct FontResolver {
     provider: TypefaceFontProvider,
+    generation: Arc<AtomicU64>,
     /// The one system font manager for this resolver's lifetime.
     system: FontMgr,
     /// Families already decoded and registered into `provider`, with the name
@@ -55,11 +59,19 @@ impl FontResolver {
         register_external_font_dirs(&mut provider, &mgr);
         Self {
             provider,
+            generation: Arc::new(AtomicU64::new(0)),
             system: mgr,
             registered: Arc::new(Mutex::new(HashMap::new())),
             families: Arc::new(Mutex::new(HashMap::new())),
             installed: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Registration epoch shared by clones of this provider. Saturation fails
+    /// closed because an unchanged sentinel cannot prove stable font inputs.
+    pub fn generation(&self) -> Option<u64> {
+        let generation = self.generation.load(Ordering::Acquire);
+        (generation != u64::MAX).then_some(generation)
     }
 
     /// The asset font provider, to install on a Skia `FontCollection` as its
@@ -354,7 +366,11 @@ impl FontResolver {
     /// itself mutates.
     fn download_and_register(&self, requested: &str) -> Option<String> {
         let bytes = fetch_google_font(requested)?;
-        let base = self.system.new_from_data(&bytes, None)?;
+        self.register_downloaded_bytes(requested, &bytes)
+    }
+
+    fn register_downloaded_bytes(&self, requested: &str, bytes: &[u8]) -> Option<String> {
+        let base = self.system.new_from_data(bytes, None)?;
 
         // Register under the requested name on a fresh clone of the provider
         // handle (which shares the same underlying Skia object the engine's
@@ -369,6 +385,15 @@ impl FontResolver {
             }
         }
         provider.register_typeface(base, requested);
+        if self
+            .generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                Some(generation.saturating_add(1))
+            })
+            .is_err()
+        {
+            self.generation.store(u64::MAX, Ordering::Release);
+        }
         Some(requested.to_string())
     }
 }
@@ -415,6 +440,54 @@ mod tests {
     use crate::font_resolver::{
         INTER_FAMILY, SOURCE_CODE_FAMILY, SOURCE_SANS_FAMILY, SOURCE_SERIF_FAMILY,
     };
+
+    #[test]
+    fn registration_epoch_tracks_actual_provider_mutations_and_clones() {
+        let resolver = FontResolver::new();
+        let shared = resolver.clone();
+        let independent = FontResolver::new();
+        assert_eq!(resolver.generation(), Some(0));
+        resolver.resolve_families(INTER_FAMILY);
+        assert_eq!(resolver.generation(), Some(0));
+        assert!(
+            resolver
+                .register_downloaded_bytes("Invalid epoch face", b"not a font")
+                .is_none()
+        );
+        assert_eq!(resolver.generation(), Some(0));
+        let bytes = BUNDLED
+            .first()
+            .and_then(|family| family.upright.first())
+            .expect("bundled font");
+        assert!(
+            resolver
+                .register_downloaded_bytes("Retained epoch face", bytes)
+                .is_some()
+        );
+        assert_eq!(resolver.generation(), Some(1));
+        assert_eq!(shared.generation(), Some(1));
+        assert_eq!(independent.generation(), Some(0));
+        let provider: FontMgr = shared.provider().clone().into();
+        assert!(
+            provider
+                .match_family_style("Retained epoch face", FontStyle::default())
+                .is_some()
+        );
+        resolver.generation.store(u64::MAX - 1, Ordering::Release);
+        assert!(
+            resolver
+                .register_downloaded_bytes("Retained saturated face", bytes)
+                .is_some()
+        );
+        assert_eq!(resolver.generation(), None);
+        assert_eq!(shared.generation(), None);
+        assert!(
+            resolver
+                .register_downloaded_bytes("Retained saturated second face", bytes)
+                .is_some()
+        );
+        assert_eq!(resolver.generation(), None);
+    }
 
     // -- metric-compatible substitution ----------------------------------
 
