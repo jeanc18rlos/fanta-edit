@@ -56,6 +56,10 @@ component FNX source, identity sidecars, metadata and assets. See
   the preceding live canvas edit. Hosted CI is tracked separately for each
   published candidate; broader release gates and the scope of earlier
   component-action results remain unchanged.
+- FNX printing preserves finite numeric values without rounding small magnitudes
+  to zero. PR91 verifies exact node/type/f64-bit and sidecar replay on the
+  Spectrum reference; a complete fresh native import/writer journey remains a
+  separate gate.
 - External source changes reload through the project watcher. Conflicting
   previews, pending saves and changed files are guarded rather than blindly
   overwritten. These protections still require full release-candidate testing.
@@ -92,6 +96,14 @@ Draw exposes tool-specific size, opacity, smoothing and blend controls. Brush
 also supports tip, hardness and flow settings; Pencil and Eraser expose their
 applicable subsets. The toolbar Color picker opens the selected fill or page
 background picker.
+
+On development QA `0f71b3961d`, one real three-second H.264 fixture passes bounded
+Play/Pause, paused Seek, Trim Cancel and Trim Apply with single Undo/Redo and
+cold saved-state checks. Its poster matches an independent frame reference,
+including exact RGBA bytes; Undo retains the added poster asset. The earlier a7
+0/0 readiness failure and later stale-display uncertainty remain unresolved.
+These results do not establish an activation fix, audio, arbitrary codecs/VFR or
+installed-release media behavior; see the [coverage report](../alpha/CAPABILITY_COVERAGE.md).
 
 The project **Assets** list shows saved/imported media, thumbnails and file sizes.
 Choose a visible target page to place a supported asset again; missing files or
@@ -435,7 +447,13 @@ The selected release target is a direct-download Mac app. Packaging now checks
 the app inside the produced DMG against the staged bundle and enforces the
 configured signature/notarization checks. Isolated verifier tests pass; the
 actual signed download and clean-Mac installation remain unverified.
-Account sign-in, billing, cloud generation and distribution have separate
-release gates. This guide makes no current production-status claim. Deliberately
+A bounded check of the approved production service, using an isolated profile
+and unchanged development `0f71b3961d` binary, shows an existing account, loaded
+billing data and persistence through one cold process restart. It does not
+establish fresh sign-in, recovery, general Settings navigation, AI/credits, live
+MCP or payment; no purchase or AI request was made. The recorded stale Settings
+display remains unresolved. Media breadth, native performance, installed
+capability coverage, distribution and remaining authenticated-service journeys
+are still release gates. Deliberately
 disabled inherited services are recorded in
 [disabled-services-binnacle.md](disabled-services-binnacle.md).

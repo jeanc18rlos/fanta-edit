@@ -172,6 +172,72 @@ recorded there.
   `native-text-aggregate.json` and `independent-final-native-review.json`),
   alongside `native-plain-text-escape-20261007/independent-edit-file-boundary-failure-review.json`.
 
+- **Exact FNX numeric preservation PASS on `6eb5758bb2` (merged in PR91).**
+  Five focused regressions failed before the correction and pass afterward;
+  all 98 FNX tests pass in both default and preserve-order configurations,
+  with formatting and required lint/dependency checks. The immutable Spectrum
+  reference passes exact node-field/type/f64-bit and sidecar replay for 73,925
+  nodes across 23 roots, including signed zero; both emissions match byte-for-byte.
+  This verifies the codec boundary, not a fresh native `.fig` import or complete
+  project/header/asset-writer roundtrip. The historical 15,278-field numeric
+  failure and the first validation run's external artifact-selector refusal
+  remain retained. [PR91](https://github.com/jeanc18rlos/fanta-edit/pull/91) merged
+  with the exact tested tree and normal hosted Check/Store passes.
+  Evidence: `integration-20261007/fnx-exact-small-numbers-continuation-v2/terminal-release-coverage-review.json`
+  and `pr91-ci-6eb5758/terminal-release-coverage-review.json`.
+
+- **One real H.264 fixture: ten native playback/trim checkpoints PASS on
+  development QA `0f71b3961d` / binary `80316a2101`.** Five checkpoints cover
+  ready controls, visibly advancing timestamped frames, Pause, one paused seek,
+  Trim Cancel/Save and cold reopening, preserving all 35 nodes, five assets and
+  48 files. Five further checkpoints cover a 0.6–2.4-second Trim Apply, single
+  Undo/Redo and cold reopening. Only the declared three Video fields, new poster
+  asset and timestamp change. The complete 320 × 180 poster RGBA matches the
+  independent pre-input 600,000-microsecond reference with zero tolerance; Undo
+  retains that asset, and Redo/cold preserve its identity and bytes. All 49 final
+  files and six assets, both Git boundaries and declared modes/mtimes match.
+  Cold uses explicit Video reselection; no automatic selection restoration is
+  claimed. The old a7 0/0 readiness failure, later stale-display uncertainty and
+  missing-screenshot-role capture failure remain recorded. The later case uses
+  the same MP4/project payload and was already ready before foreground switching;
+  no playback-code fix or activation recovery is established. Audio, other
+  codecs/VFR, missing/corrupt media and installed-release behavior remain open.
+  Evidence: `integration-20261007/native-real-video-a7-20261007/`:
+  `play-seek-trim-followup-v1/independent-native-followup-review.json`,
+  `trim-commit-capture-v1/independent-native-trim-v2-review.json`, and
+  `a7-to-0f-readiness-comparison-v1/comparison.json`.
+
+- **Approved-production account reads and one cold session: bounded PASS.**
+  A separate profile using the unchanged development `0f71b3961d` binary and
+  `https://api.fantaisa.net` shows an existing authenticated account and loaded
+  billing data. A normal Quit/reopen returns that account context and settled
+  billing page without another Sign-in action. All 37 saved blank-project file
+  records and settings stay exact; independent review covers 68 manifest records
+  and 38 recorded actions. This does not establish which sign-in branch ran,
+  fresh browser authentication or general Settings navigation: the initial
+  Sign-in footer and stale billing display remain recorded. No credential,
+  account identifier or financial value is published; no purchase or AI request
+  was made. Recovery, AI/credit, live MCP and payment acceptance remain open.
+  Evidence: `integration-20261007/production-account-native-review-20261007T123645Z/independent-review.json`
+  and `production-api-profile-setup-20261007/native-sign-in-v1/completed-account-session-result.json`.
+
+The combined [PR92](https://github.com/jeanc18rlos/fanta-edit/pull/92) head
+`f140915203` passes its own push/PR Check and Store jobs, including 1,204 editor
+passes, zero failures and two ignored diagnostics in each normal run. Ordinary
+native-video jobs are explicitly skipped; the separate dedicated run passes
+3/15/15 tests with traced and untraced playback. Actual push/dedicated and PR
+synthetic checkouts share tree `5a49a53962`. PR92 merged at 13:34:34 UTC as
+`26429e3453` with that exact tree. PR90 was automatically marked merged/closed
+by ancestry two seconds later; its earlier cache-timeout failure remains recorded.
+The two added activation tests use FakeSession; they do not diagnose native
+readiness failures. Evidence: `integration-20261007/native-real-video-a7-20261007/`
+`native-video-ci-combined-main-v1/ci-terminal-review/independent-final-terminal-review.json`
+and `pr92-root-merge-20261007/result.json`.
+These bounded additions leave five release groups open: unresolved media
+behavior and breadth; fresh import and physical performance; installed capability
+coverage; Developer ID/notarization/install/update/rollback; and remaining
+authenticated-service journeys. Retained rendering stays off by default.
+
 Evidence is archived under `native-inspector-ui-candidate-20261007`,
 `native-variant-instance-menu-20261007-v4` (the `scope67-*` and `vdaf-*` records,
 plus the retained `native-detach` failure), `native-frame-section-text-20261007` (`scope67-*`), and
@@ -319,11 +385,11 @@ coverage. The final column highlights the remaining acceptance work.
 | Motion/timeline | Viewer `motion_panel`, `motion_edit`, `timeline`, toolbar adapter tests; document/render motion tests | Easing edit/cancel, clip switching, duration and mode changes. Representative playback/ruler seek and keyframe drag/Undo passed on `ee80ec48c6`; time-field typing/seek with retained selection and strict restart passed on `0a0d3cd1c4`. Broader property coverage remains open. |
 | Prototypes | `fanta-present`; viewer `prototype_panel`, `prototype_player` and view tests | Native explicit Remove/Save and single Undo/Save pass on `a82f90f87b`; its restart mismatch is retained against a stale baseline after confirmed user position edits. A fresh matching baseline passes Save/strict process restart on `ac038333e3`. Other pointer/key/time triggers, overlays, transitions and safe links remain. Click navigation/Restart/Escape passed on `ee80ec48c6`; detail X retained reaction/card/wire with unchanged Save/restart snapshots on `0a0d3cd1c4`. |
 | Comments/review/Dev | Viewer `comments`, `comments_ui`, `view_annotations`, `view_measurements`, `view_dev_mode` and export tests | Pin/reply/resolve, draft preservation, mode transitions, keyboard ownership and read-only protection; no review overlays in artwork exports. |
-| Local image/SVG/video/audio | Viewer `generation_media`, `video_playback`, document/view and media tests; renderer live-media tests | Video/Audio properties menu entry, type/geometry/Appearance/Effects/Export sections and isolated double-click inspector reveal pass on `a3a51b084b`, without playback or document changes. Place/play/seek/trim/replay, corrupted files, missing source, poster/orientation, audible output and saved asset bytes after restart remain. |
+| Local image/SVG/video/audio | Viewer `generation_media`, `video_playback`, document/view and media tests; renderer live-media tests | Earlier `a3a51b084b` properties/reveal checks remain unchanged. The ten bounded H.264 playback/seek/Trim Cancel and Apply/history/cold checkpoints above now pass on `0f71b3961d`; exact poster and asset persistence are covered for that fixture. The earlier readiness and stale-display observations remain unresolved. Placement, other codecs/VFR, corrupted or missing sources, orientation, audible output and broader installed-app journeys remain. |
 | Export | Viewer `export::tests` and inspector export tests; renderer integration suites | Native `8a9a33c35e` Vector and Bitmap exports pass bounded PNG/SVG/PDF, Vector JPG, collision preservation and two simultaneous presets including 2× PNG checks; all 24 project files remain exact. Bitmap JPEG retains its original four-pixel FAIL; a separate DCT-flat-block oracle passes without raising tolerance. Broader fidelity/selection batches and visible export-error routes remain; no general JPEG-quality claim. |
 | Designer/MCP | Viewer `agent_surface` (including style projection), `live_mcp` and `plan_build` tests; `script/smoke-mcp` | Final app stdio/socket connection, real agent tool selection, one undo per successful batch, rollback on failure, source validation and screenshot inspection. |
 | Generation/recovery | Viewer `generation_workspace`, `generation_journal`, `generation_media`; account/provider CI tests | Signed-in final build with a real provider: submit/poll/save/place, timeout/retry, restart, sign-out/account switch and exactly-once recovery. Mock responses do not prove production availability. |
-| App shell/distribution/accounts | Existing `Check` jobs: sidebar, path prompt, agent toggle, Git, auth, Store restrictions; `script/test-macos-release` preflight/manifest/trust-routing cases and release workflow `script/verify-macos-dmg` | Menu/keyboard discovery, clean-profile launch, install/quarantine, signature/notarization, Keychain, sandbox file access, billing/restore and backend release compatibility. |
+| App shell/distribution/accounts | Existing `Check` jobs: sidebar, path prompt, agent toggle, Git, auth, Store restrictions; `script/test-macos-release` preflight/manifest/trust-routing cases and release workflow `script/verify-macos-dmg` | The bounded production existing-account/billing read and cold-session check above passes; fresh sign-in, session recovery, billing/payment/restore and backend release compatibility remain. Menu/keyboard discovery, installed clean-profile launch, quarantine, signature/notarization, Keychain and sandbox file access also remain. |
 | Large-page performance | Import scaling, renderer cache/culling, ignored latency/acceptance benchmarks and profiling examples; matched synthetic acceptance median 546.673→292.797 ms; worker and inclusive UI-stage gesture tests; PR 74 retained API CPU parity/timings (fit-all benefit and 100% image regression at that earlier pre-worker checkpoint); current opt-in Metal API/worker correctness (seven actual-Metal API tests plus one IOSurface-worker test) | Full native Save and gesture timings on Spectrum remain required; acceptance-only development timing and mounted instrumentation tests do not establish application latency. Measure frame p50/p95/max and memory; the drag p95 target below 16 ms is unproven. |
 
 ## Next bounded native checks
