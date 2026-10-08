@@ -10073,8 +10073,9 @@ mod tests {
         visual.run_until_parked();
         view.read_with(&visual, |view, _| assert!(view.text_edit.is_none()));
         let mut expected = before.clone();
+        let node_key = serde_json::to_value(id).expect("node ID");
         expected["scene"]["nodes"]
-            .get_mut(id.to_string())
+            .get_mut(node_key.as_str().expect("serialized node ID"))
             .expect("existing text path")["content"] = serde_json::json!("Test on a path");
         item.read_with(&visual, |item, _| {
             let doc = item.doc().expect("document");
