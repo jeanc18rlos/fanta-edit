@@ -11123,6 +11123,255 @@ mod tests {
         });
     }
 
+    #[cfg(target_os = "macos")]
+    async fn canvas_audio_fixture(
+        cx: &mut TestAppContext,
+    ) -> Result<(
+        Entity<FigItem>,
+        Entity<FigView>,
+        NodeId,
+        NodeId,
+        &mut gpui::VisualTestContext,
+    )> {
+        init_visual_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let project = Project::test(file_system, [], cx).await;
+        let mut doc = Doc::new();
+        let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page))?;
+        doc.add_page(page_id);
+        doc.set_active_page(Some(page_id));
+        let asset = AssetId::new();
+        doc.asset_library.insert(
+            asset,
+            fanta_doc::ProjectAsset {
+                name: "One second tone.mp3".into(),
+                kind: ProjectAssetKind::Audio,
+            },
+        );
+        let mut audio = CanvasNode::new(NodeData::Audio(fanta_doc::AudioNode {
+            asset,
+            local_size: [320.0, 80.0],
+            time_range_us: [0, 1_000_000],
+            volume: 1.0,
+            muted: false,
+            waveform_color: Color::WHITE,
+        }));
+        audio.parent = Some(page_id);
+        audio.name = "Selected audio".into();
+        let audio_id = audio.id;
+        doc.apply(Operation::create_node(audio))?;
+        let mut control = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            40.0,
+            40.0,
+            Color::WHITE,
+        )));
+        control.parent = Some(page_id);
+        control.name = "Untouched control".into();
+        let control_id = control.id;
+        doc.apply(Operation::create_node(control))?;
+        doc.selection.select_only(audio_id);
+        doc.history = Default::default();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            "/tmp/CanvasAudioLifecycle.fig".into(),
+            doc,
+            cx,
+        );
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                Arc::make_mut(&mut document.raw_assets).insert(
+                    asset,
+                    include_bytes!("../tests/fixtures/one_second_tone.mp3").to_vec(),
+                );
+                ((), DocChange::None)
+            })
+        })
+        .context("seed the mounted Audio asset")?;
+        let (workspace, visual) = cx.add_window_view(|window, cx| {
+            workspace::Workspace::test_new(project.clone(), window, cx)
+        });
+        let view = visual.update(|window, cx| {
+            let view = cx.new(|cx| FigView::new(item.clone(), project, window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            });
+            view.update(cx, |view, cx| {
+                view.set_editor_workspace(EditorWorkspace::Canvas, cx);
+                view.set_editor_mode(EditorMode::Design, cx);
+            });
+            window.activate_window();
+            view
+        });
+        visual.run_until_parked();
+        Ok((item, view, audio_id, control_id, visual))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_canvas_audio_document(
+        item: &Entity<FigItem>,
+        expected: &Doc,
+        assets: &BTreeMap<AssetId, Vec<u8>>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Result<()> {
+        item.read_with(cx, |item, _| {
+            let document = item.document().context("mounted Audio document")?;
+            assert_eq!(
+                serde_json::to_value(&document.doc)?,
+                serde_json::to_value(expected)?
+            );
+            assert_eq!(document.raw_assets.as_ref(), assets);
+            assert_eq!(document.doc.history.undo_depth(), 0);
+            assert_eq!(document.doc.history.redo_depth(), 0);
+            assert!(!item.is_dirty());
+            Ok(())
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_canvas_audio_panel(
+        view: &Entity<FigView>,
+        selected: Option<NodeId>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Result<Option<gpui::EntityId>> {
+        let playback = view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.canvas_audio
+                    .as_ref()
+                    .map(|session| session.source.node),
+                selected
+            );
+            view.canvas_audio
+                .as_ref()
+                .map(|session| session.playback.entity_id())
+        });
+        let bounds = cx.debug_bounds("canvas-audio-controls");
+        if selected.is_some() {
+            let bounds = bounds.context("mounted Audio controls must be rendered")?;
+            assert!(bounds.size.width > px(0.0) && bounds.size.height > px(0.0));
+        } else {
+            assert!(
+                bounds.is_none(),
+                "ineligible selection must not keep stale Audio controls"
+            );
+        }
+        Ok(playback)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn canvas_audio_window_activation_restores_selected_preview(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            let (item, view, audio, _, visual) = canvas_audio_fixture(cx).await?;
+            let (expected, assets) = item.read_with(visual, |item, _| {
+                let document = item.document().context("Audio baseline")?;
+                Ok::<_, anyhow::Error>((document.doc.clone(), document.raw_assets.clone()))
+            })?;
+            assert!(visual.update(|window, _| window.is_window_active()));
+            view.update(visual, |view, cx| {
+                view.set_editor_mode(EditorMode::Motion, cx)
+            });
+            visual.run_until_parked();
+            let mut previous = assert_canvas_audio_panel(&view, Some(audio), visual)?;
+            assert_canvas_audio_document(&item, &expected, assets.as_ref(), visual)?;
+            for _ in 0..2 {
+                visual.deactivate_window();
+                visual.run_until_parked();
+                assert!(!visual.update(|window, _| window.is_window_active()));
+                assert_canvas_audio_panel(&view, None, visual)?;
+                assert_canvas_audio_document(&item, &expected, assets.as_ref(), visual)?;
+                visual.update(|window, _| window.activate_window());
+                visual.run_until_parked();
+                assert!(visual.update(|window, _| window.is_window_active()));
+                let current = assert_canvas_audio_panel(&view, Some(audio), visual)?;
+                assert_ne!(current, previous, "activation must create a fresh preview");
+                previous = current;
+                assert_canvas_audio_document(&item, &expected, assets.as_ref(), visual)?;
+            }
+            Ok(())
+        }
+        .await;
+        assert!(
+            result.is_ok(),
+            "Audio activation regression setup/check failed: {result:?}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn canvas_audio_eligibility_tracks_mode_and_selection_across_activation(
+        cx: &mut TestAppContext,
+    ) {
+        let result: Result<()> = async {
+            let (item, view, audio, control, visual) = canvas_audio_fixture(cx).await?;
+            let (mut expected, assets) = item.read_with(visual, |item, _| {
+                let document = item.document().context("Audio baseline")?;
+                Ok::<_, anyhow::Error>((document.doc.clone(), document.raw_assets.clone()))
+            })?;
+            assert_canvas_audio_panel(&view, None, visual)?;
+            view.update(visual, |view, cx| {
+                view.set_editor_mode(EditorMode::Motion, cx)
+            });
+            visual.run_until_parked();
+            assert_canvas_audio_panel(&view, Some(audio), visual)?;
+            assert_canvas_audio_document(&item, &expected, assets.as_ref(), visual)?;
+
+            visual.deactivate_window();
+            item.update(visual, |item, cx| {
+                item.with_document(cx, |document| {
+                    document.doc.selection.select_only(control);
+                    ((), DocChange::Selection)
+                })
+            })
+            .context("select the control through FigItem")?;
+            expected.selection.select_only(control);
+            visual.run_until_parked();
+            assert_canvas_audio_panel(&view, None, visual)?;
+            assert_canvas_audio_document(&item, &expected, assets.as_ref(), visual)?;
+            visual.update(|window, _| window.activate_window());
+            visual.run_until_parked();
+            assert_canvas_audio_panel(&view, None, visual)?;
+            item.update(visual, |item, cx| {
+                item.with_document(cx, |document| {
+                    document.doc.selection.select_only(audio);
+                    ((), DocChange::Selection)
+                })
+            })
+            .context("restore Audio selection through FigItem")?;
+            expected.selection.select_only(audio);
+            visual.run_until_parked();
+            assert_canvas_audio_panel(&view, Some(audio), visual)?;
+            assert_canvas_audio_document(&item, &expected, assets.as_ref(), visual)?;
+
+            visual.deactivate_window();
+            for mode in [EditorMode::Design, EditorMode::Motion] {
+                view.update(visual, |view, cx| view.set_editor_mode(mode, cx));
+                visual.run_until_parked();
+                assert!(!visual.update(|window, _| window.is_window_active()));
+                assert_canvas_audio_panel(&view, None, visual)?;
+                assert_canvas_audio_document(&item, &expected, assets.as_ref(), visual)?;
+            }
+            visual.update(|window, _| window.activate_window());
+            visual.run_until_parked();
+            assert_canvas_audio_panel(&view, Some(audio), visual)?;
+            view.update(visual, |view, cx| {
+                view.set_editor_mode(EditorMode::Design, cx)
+            });
+            visual.run_until_parked();
+            assert_canvas_audio_panel(&view, None, visual)?;
+            assert_canvas_audio_document(&item, &expected, assets.as_ref(), visual)?;
+            Ok(())
+        }
+        .await;
+        assert!(
+            result.is_ok(),
+            "Audio eligibility regression setup/check failed: {result:?}"
+        );
+    }
+
     async fn local_media_picker_fixture(
         cx: &mut TestAppContext,
     ) -> (
