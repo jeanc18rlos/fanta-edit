@@ -2008,9 +2008,12 @@ async fn resolve_start_failure(
     // so the next start attempt can get a clean 401 and trigger the auth flow.
     // If there is no such session this is an ordinary startup error.
     if www_authenticate.is_none() {
+        // Account transports never use the endpoint's cached OAuth session, so
+        // their startup errors cannot establish that this separate session is stale.
         let server_url = match configuration.as_ref() {
             ContextServerConfiguration::Http { url, .. }
-                if !configuration.has_static_auth_header() =>
+                if !configuration.has_static_auth_header()
+                    && !cx.update(|cx| configuration.uses_account_auth(id, cx)) =>
             {
                 url.clone()
             }
@@ -2157,6 +2160,392 @@ async fn resolve_auth_required(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use context_server::transport::Transport;
+    use futures::future::LocalBoxFuture;
+    use gpui::TestAppContext;
+    use http_client::{AsyncBody, FakeHttpClient, Response};
+    use parking_lot::Mutex;
+    use std::pin::Pin;
+    use zed_credentials_provider::ZedCredentialsProvider;
+
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    struct CredentialState {
+        entries: HashMap<String, (String, Vec<u8>)>,
+        operations: Vec<(&'static str, String)>,
+    }
+
+    struct CountingCredentialsProvider(Mutex<CredentialState>);
+
+    impl CredentialsProvider for CountingCredentialsProvider {
+        fn read_credentials<'a>(
+            &'a self,
+            url: &'a str,
+            _cx: &'a AsyncApp,
+        ) -> LocalBoxFuture<'a, Result<Option<(String, Vec<u8>)>>> {
+            async move {
+                let mut state = self.0.lock();
+                state.operations.push(("read", url.to_string()));
+                Ok(state.entries.get(url).cloned())
+            }
+            .boxed_local()
+        }
+
+        fn write_credentials<'a>(
+            &'a self,
+            url: &'a str,
+            username: &'a str,
+            password: &'a [u8],
+            _cx: &'a AsyncApp,
+        ) -> LocalBoxFuture<'a, Result<()>> {
+            async move {
+                let mut state = self.0.lock();
+                state.operations.push(("write", url.to_string()));
+                state
+                    .entries
+                    .insert(url.to_string(), (username.to_string(), password.to_vec()));
+                Ok(())
+            }
+            .boxed_local()
+        }
+
+        fn delete_credentials<'a>(
+            &'a self,
+            url: &'a str,
+            _cx: &'a AsyncApp,
+        ) -> LocalBoxFuture<'a, Result<()>> {
+            async move {
+                let mut state = self.0.lock();
+                state.operations.push(("delete", url.to_string()));
+                state.entries.remove(url);
+                Ok(())
+            }
+            .boxed_local()
+        }
+    }
+
+    struct StartFailureTransport {
+        challenge: Option<oauth::WwwAuthenticate>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for StartFailureTransport {
+        async fn send(&self, _message: String) -> Result<()> {
+            anyhow::bail!("startup-failure test must not send protocol messages")
+        }
+
+        fn receive(&self) -> Pin<Box<dyn futures::Stream<Item = String> + Send>> {
+            Box::pin(futures::stream::empty())
+        }
+
+        fn receive_err(&self) -> Pin<Box<dyn futures::Stream<Item = String> + Send>> {
+            Box::pin(futures::stream::empty())
+        }
+
+        fn auth_challenge(&self) -> Option<oauth::WwwAuthenticate> {
+            self.challenge.clone()
+        }
+    }
+
+    struct StartFailureFixture {
+        id: ContextServerId,
+        server: Arc<ContextServer>,
+        configuration: Arc<ContextServerConfiguration>,
+        credentials: Arc<CountingCredentialsProvider>,
+        initial_credentials: CredentialState,
+        session_key: String,
+        http_requests: Arc<Mutex<Vec<(String, String)>>>,
+    }
+
+    impl StartFailureFixture {
+        fn new(
+            id: &str,
+            endpoint: &str,
+            headers: HashMap<String, String>,
+            challenged: bool,
+            cx: &mut TestAppContext,
+        ) -> Result<Self> {
+            let url = url::Url::parse(endpoint)?;
+            let session_key = ContextServerStore::keychain_key(&url);
+            let session = OAuthSession {
+                token_endpoint: url::Url::parse("https://auth.example.com/token")?,
+                resource: url.clone(),
+                client_registration: oauth::OAuthClientRegistration {
+                    client_id: "test-client".to_string(),
+                    client_secret: None,
+                },
+                tokens: oauth::OAuthTokens {
+                    access_token: "test-oauth-sentinel".to_string(),
+                    refresh_token: Some("test-refresh-sentinel".to_string()),
+                    expires_at: None,
+                },
+            };
+            let initial_credentials = CredentialState {
+                entries: HashMap::from_iter([
+                    (
+                        session_key.clone(),
+                        ("mcp-oauth".to_string(), serde_json::to_vec(&session)?),
+                    ),
+                    (
+                        "mcp-oauth:https://unrelated.example.com".to_string(),
+                        ("unrelated".to_string(), b"untouched".to_vec()),
+                    ),
+                ]),
+                operations: Vec::new(),
+            };
+            let credentials = Arc::new(CountingCredentialsProvider(Mutex::new(
+                initial_credentials.clone(),
+            )));
+            let http_requests = Arc::new(Mutex::new(Vec::new()));
+            let http_client = FakeHttpClient::create({
+                let http_requests = http_requests.clone();
+                move |request| {
+                    let http_requests = http_requests.clone();
+                    async move {
+                        let uri = request.uri().to_string();
+                        http_requests
+                            .lock()
+                            .push((request.method().to_string(), uri.clone()));
+                        let body = match uri.as_str() {
+                            "https://mcp.example.com/.well-known/oauth-protected-resource/mcp" => {
+                                serde_json::json!({
+                                    "resource": "https://mcp.example.com/mcp",
+                                    "authorization_servers": ["https://auth.example.com"],
+                                    "scopes_supported": ["mcp:read"]
+                                })
+                            }
+                            "https://auth.example.com/.well-known/oauth-authorization-server" => {
+                                serde_json::json!({
+                                    "issuer": "https://auth.example.com",
+                                    "authorization_endpoint": "https://auth.example.com/authorize",
+                                    "token_endpoint": "https://auth.example.com/token",
+                                    "code_challenge_methods_supported": ["S256"],
+                                    "client_id_metadata_document_supported": true
+                                })
+                            }
+                            _ => anyhow::bail!("unexpected test HTTP request: {uri}"),
+                        };
+                        Ok(Response::builder()
+                            .status(200)
+                            .header("Content-Type", "application/json")
+                            .body(AsyncBody::from(body.to_string()))?)
+                    }
+                }
+            });
+            cx.update(|cx| {
+                let settings_store = SettingsStore::test(cx);
+                cx.set_global(settings_store);
+                ClientSettings::override_global(
+                    ClientSettings {
+                        server_url: "https://api.fantaisa.net".to_string(),
+                        cloud_updates_enabled: false,
+                        credentials_url: None,
+                    },
+                    cx,
+                );
+                cx.set_global(ZedCredentialsProvider(credentials.clone()));
+                cx.set_http_client(http_client);
+            });
+            let id = ContextServerId(id.into());
+            let configuration = Arc::new(ContextServerConfiguration::Http {
+                url,
+                headers,
+                timeout: None,
+                oauth: None,
+            });
+            let server = Arc::new(ContextServer::new(
+                id.clone(),
+                Arc::new(StartFailureTransport {
+                    challenge: challenged.then_some(oauth::WwwAuthenticate {
+                        resource_metadata: None,
+                        scope: None,
+                        error: None,
+                        error_description: None,
+                    }),
+                }),
+            ));
+            Ok(Self {
+                id,
+                server,
+                configuration,
+                credentials,
+                initial_credentials,
+                session_key,
+                http_requests,
+            })
+        }
+
+        async fn resolve(&self, cx: &mut TestAppContext) -> ContextServerState {
+            resolve_start_failure(
+                &self.id,
+                anyhow::anyhow!("distinct startup timeout"),
+                self.server.clone(),
+                self.configuration.clone(),
+                &cx.to_async(),
+            )
+            .await
+        }
+
+        fn assert_untouched(&self) {
+            assert_eq!(*self.credentials.0.lock(), self.initial_credentials);
+            assert!(self.http_requests.lock().is_empty());
+        }
+
+        fn assert_error(&self, state: ContextServerState, expected: &str) {
+            let ContextServerState::Error {
+                server,
+                configuration,
+                error,
+            } = state
+            else {
+                panic!("expected startup error");
+            };
+            assert!(Arc::ptr_eq(&server, &self.server));
+            assert!(Arc::ptr_eq(&configuration, &self.configuration));
+            assert_eq!(error.as_ref(), expected);
+        }
+    }
+
+    #[gpui::test]
+    async fn test_fanta_mcp_start_failure_managed_account_preserves_unused_oauth_cache(
+        cx: &mut TestAppContext,
+    ) {
+        for (id, endpoint) in [
+            ("fanta", "https://api.fantaisa.net/mcp"),
+            ("fanta-design", "https://api.fantaisa.net/v2/mcp"),
+        ] {
+            let fixture = StartFailureFixture::new(id, endpoint, HashMap::default(), false, cx)
+                .expect("valid managed-account test fixture");
+            let state = fixture.resolve(cx).await;
+            fixture.assert_untouched();
+            fixture.assert_error(state, "distinct startup timeout");
+        }
+    }
+
+    #[gpui::test]
+    async fn test_fanta_mcp_start_failure_managed_401_preserves_unused_oauth_cache(
+        cx: &mut TestAppContext,
+    ) {
+        for (id, endpoint) in [
+            ("fanta", "https://api.fantaisa.net/mcp"),
+            ("fanta-design", "https://api.fantaisa.net/v2/mcp"),
+        ] {
+            let fixture = StartFailureFixture::new(id, endpoint, HashMap::default(), true, cx)
+                .expect("valid managed-account test fixture");
+            let state = fixture.resolve(cx).await;
+            fixture.assert_untouched();
+            fixture.assert_error(
+                state,
+                "Your Fanta account could not authenticate. Sign out and sign in to Fanta again.",
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_fanta_mcp_start_failure_generic_oauth_retains_cached_session_recovery(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = StartFailureFixture::new(
+            "other",
+            "https://mcp.example.com/mcp",
+            HashMap::default(),
+            false,
+            cx,
+        )
+        .expect("valid generic OAuth test fixture");
+        let state = fixture.resolve(cx).await;
+        let mut expected_credentials = fixture.initial_credentials.clone();
+        expected_credentials.entries.remove(&fixture.session_key);
+        expected_credentials.operations = vec![
+            ("read", fixture.session_key.clone()),
+            ("delete", fixture.session_key.clone()),
+        ];
+        assert_eq!(*fixture.credentials.0.lock(), expected_credentials);
+        assert_eq!(
+            *fixture.http_requests.lock(),
+            vec![
+                (
+                    "GET".to_string(),
+                    "https://mcp.example.com/.well-known/oauth-protected-resource/mcp".to_string(),
+                ),
+                (
+                    "GET".to_string(),
+                    "https://auth.example.com/.well-known/oauth-authorization-server".to_string(),
+                ),
+            ]
+        );
+        let ContextServerState::AuthRequired {
+            server,
+            configuration,
+            discovery,
+        } = state
+        else {
+            panic!("expected generic OAuth discovery");
+        };
+        assert!(Arc::ptr_eq(&server, &fixture.server));
+        assert!(Arc::ptr_eq(&configuration, &fixture.configuration));
+        assert_eq!(
+            discovery.resource_metadata.resource.as_str(),
+            "https://mcp.example.com/mcp"
+        );
+        assert_eq!(
+            discovery.auth_server_metadata.issuer.as_str(),
+            "https://auth.example.com/"
+        );
+        assert_eq!(discovery.scopes, ["mcp:read"]);
+    }
+
+    #[gpui::test]
+    async fn test_fanta_mcp_start_failure_generic_without_cache_preserves_original_error(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = StartFailureFixture::new(
+            "other",
+            "https://mcp.example.com/mcp",
+            HashMap::default(),
+            false,
+            cx,
+        )
+        .expect("valid generic OAuth test fixture");
+        fixture
+            .initial_credentials
+            .entries
+            .remove(&fixture.session_key);
+        *fixture.credentials.0.lock() = fixture.initial_credentials.clone();
+        let state = fixture.resolve(cx).await;
+        let mut expected_credentials = fixture.initial_credentials.clone();
+        expected_credentials.operations = vec![("read", fixture.session_key.clone())];
+        assert_eq!(*fixture.credentials.0.lock(), expected_credentials);
+        assert!(fixture.http_requests.lock().is_empty());
+        fixture.assert_error(state, "distinct startup timeout");
+    }
+
+    #[gpui::test]
+    async fn test_fanta_mcp_start_failure_static_headers_never_touch_oauth_cache(
+        cx: &mut TestAppContext,
+    ) {
+        for header in ["Authorization", "x-api-key"] {
+            for challenged in [false, true] {
+                let fixture = StartFailureFixture::new(
+                    "fanta",
+                    "https://api.fantaisa.net/mcp",
+                    HashMap::from_iter([(header.to_string(), "explicit-test-key".to_string())]),
+                    challenged,
+                    cx,
+                )
+                .expect("valid static-header test fixture");
+                let state = fixture.resolve(cx).await;
+                fixture.assert_untouched();
+                fixture.assert_error(
+                    state,
+                    if challenged {
+                        "Server returned 401 Unauthorized. Check your configured authentication header."
+                    } else {
+                        "distinct startup timeout"
+                    },
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_fanta_mcp_account_token_is_limited_to_backend_endpoint() {
