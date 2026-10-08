@@ -9,7 +9,7 @@ on Zed-owned infrastructure. Local editor features can stay available, but
 hosted features should be enabled only when Fanta owns the endpoint, policy,
 release process, and user-facing disclosure.
 
-## Current Baseline
+## Current baseline — 9 October 2026
 
 | Service surface | Current Fanta default | Why it changed | Re-enable when |
 | --- | --- | --- | --- |
@@ -17,20 +17,29 @@ release process, and user-facing disclosure.
 | Diagnostics and crash upload | `"diagnostics": false` | Crash reports can contain sensitive metadata and need Fanta-owned handling. | Fanta has crash ingestion, symbolication, retention rules, alerting, and disclosure. |
 | Auto-update | `"auto_update": false` | The updater expects trusted signed artifacts and release metadata owned by the product. | Fanta has signed builds, update assets, checksums/signatures, release notes, and rollback steps. |
 | Hosted server URL | `"server_url": "https://api.fantaisa.net"` | Account, docs, release, collaboration, telemetry, and cloud routes must not target `zed.dev` by default. | `api.fantaisa.net` has compatible routes, or cloud-dependent features are gated. |
-| Zed-hosted model provider | Default model uses `anthropic`; the default `zed.dev` provider entry was removed. | New agent threads should not assume access to Zed-hosted model brokerage. | Fanta owns a model gateway, or users explicitly configure their own provider. |
+| Managed model provider | New threads default to `Fanta`; account-backed catalog and requests use Fanta endpoints. Explicitly configured providers remain available. | The old `zed.dev` default was removed; the earlier Anthropic default is historical. | Live model execution, pricing, quotas and recovery need their own acceptance; a populated catalog is insufficient. |
+| Realtime cloud updates | `"cloud_updates_enabled": false` | The account API does not expose the inherited realtime update socket. | Fanta has a compatible realtime service and validated failure/recovery behavior. |
 
-## Code Touchpoints Changed
+Stable defaults target `https://api.fantaisa.net`; development/preview overrides
+use the separate `https://api-v2.fantaisa.net` account, provider and MCP endpoints.
+An environment or user override can change routing. Sign-in, catalog, billing
+and configured HTTP MCP are not disabled by the realtime-cloud setting. See the
+[account workflow](capabilities.md#accounts-models-and-connected-tools) and
+[current acceptance scope](../alpha/CAPABILITY_COVERAGE.md#bounded-checks-through-8-october).
 
-- [assets/settings/default.json](assets/settings/default.json)
-  - Default agent model provider changed from `zed.dev` to `anthropic`.
+## Historical baseline changes
+
+- [assets/settings/default.json](../../assets/settings/default.json)
+  - The first pass changed the agent model from `zed.dev` to `anthropic`;
+    current defaults instead use the managed `Fanta` provider.
   - Default telemetry diagnostics and metrics changed to `false`.
   - Default auto-update changed to `false`.
   - Default `server_url` changed from `https://zed.dev` to `https://api.fantaisa.net`.
   - Default `zed.dev` language model provider entry was removed.
-- [crates/auto_update/src/auto_update.rs](crates/auto_update/src/auto_update.rs)
+- [crates/auto_update/src/auto_update.rs](../../crates/auto_update/src/auto_update.rs)
   - Auto-update default documentation now describes Fanta's disabled baseline.
   - The default-setting test now expects auto-update to be disabled.
-- [FANTA.md](FANTA.md)
+- [FANTA.md](../../FANTA.md)
   - Records the fork contract, service-safety baseline, release resources, and first feature substrate.
 
 ## Self-Hosting Binnacle
@@ -60,7 +69,8 @@ Implementation notes:
 
 - Keep unavailable routes explicit. Return clear 404 or feature-disabled responses instead of accepting requests you do not process.
 - Keep local development settings separate so dev builds do not accidentally call production services.
-- Decide whether `server_url` is a true public cloud root or only a placeholder until hosted services exist.
+- Keep account, model and managed-MCP endpoints on the intended environment;
+  configured routes do not establish that every service is available.
 
 Verification:
 
@@ -147,14 +157,17 @@ Recommended rollout:
 
 ## 5. Model Gateway Or Bring-Your-Own-Key
 
-Lowest-risk first path:
+The managed Fanta provider is implemented and is the current default. Users can
+also explicitly configure their own providers, local models or supported
+external agents. The earlier recommendation to defer all hosted brokerage is
+historical; it must not be read as the current application's behavior.
 
-- Keep bring-your-own-key providers available.
-- Keep local providers such as Ollama available.
-- Keep external agents available.
-- Avoid Fanta-hosted model brokerage until billing, quotas, auth, and policy are real.
+Account/catalog/billing reads have bounded evidence. Production generation,
+exact charged-cost limits, managed-MCP execution and recovery remain release
+gates. A visible price chip or local token limit does not bound the total cost
+of an agent loop, retries or auxiliary requests.
 
-Hosted gateway requirements:
+Hosted gateway requirements still requiring operational verification:
 
 - Account and auth model.
 - Provider API key management.
@@ -188,7 +201,8 @@ Minimum resources:
 
 Implementation notes:
 
-- If hosted collaboration is not part of the first Fanta baseline, gate sign-in and collaboration entry points.
+- Keep unimplemented collaboration separate from account sign-in and billing;
+  working account access does not establish shared realtime editing.
 - Preserve local editing, git, terminal, and external agent workflows independently from hosted collaboration.
 - Define keychain credential names before enabling sign-in so Fanta credentials cannot collide with Zed credentials.
 
@@ -206,6 +220,7 @@ Implementation notes:
 
 1. Choose whether project-local settings stay in `.zed/` for compatibility or move to `.fanta-edit/` for full identity separation.
 2. Choose the CLI binary name: `fanta`, `fanta-edit`, or keep `zed` temporarily for upstream compatibility.
-3. Decide whether Fanta will offer hosted models or start with bring-your-own-key plus external agents.
+3. Complete production validation and policy coverage for the implemented Fanta
+   gateway, while preserving explicitly configured provider alternatives.
 4. Disable or archive Zed-owned GitHub Actions and Cloudflare workers before any public CI runs.
 5. Create a first private signed macOS build before revisiting auto-update.
