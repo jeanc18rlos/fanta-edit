@@ -391,7 +391,7 @@ mod tests {
         let [first_neighbor, second_neighbor, component_neighbor] = neighbors.as_slice() else {
             return Err("fixture must create three neighbors".into());
         };
-        assert!(doc.set_active_page(Some(*first_page)));
+        assert_eq!(doc.active_page(), Some(*first_page));
         let mut viewport = Viewport::default();
         let snap = SnapEngine {
             targets: fanta_canvas::SnapTargets::NODE_EDGES,
