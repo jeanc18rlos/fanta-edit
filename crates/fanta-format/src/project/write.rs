@@ -35,7 +35,7 @@ use fanta_doc::{AssetId, ComponentId, Doc, DocId, NodeId};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write as _;
@@ -54,6 +54,7 @@ use super::media::{ASSET_INDEX_FILE, MediaRegistry, asset_index_bytes, sniff_med
 const TRANSACTION_DIR: &str = ".fanta-transaction";
 static PROJECT_LOCKS: OnceLock<Mutex<BTreeMap<PathBuf, Weak<Mutex<()>>>>> = OnceLock::new();
 thread_local! {
+    static SUCCESSFUL_PROJECT_SYNCS: Cell<usize> = const { Cell::new(0) };
     static HELD_PROJECT_READ_LOCKS: RefCell<BTreeSet<PathBuf>> = const { RefCell::new(BTreeSet::new()) };
 }
 
@@ -124,6 +125,9 @@ pub struct WriteReport {
     pub written_hashes: BTreeMap<PathBuf, [u8; 32]>,
     /// Stale files deleted because the projection no longer contains them.
     pub removed: Vec<PathBuf>,
+    /// Successful file and directory `sync_all` calls during this save, including
+    /// transaction recovery and editor-support writes. Platform no-ops are excluded.
+    pub sync_count: usize,
 }
 
 /// The in-memory projection: every non-asset file the tree should contain,
@@ -300,6 +304,9 @@ fn write_project_tree_cached_impl(
     sources: &BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>,
     expected_disk: Option<&BTreeMap<PathBuf, Option<[u8; 32]>>>,
 ) -> Result<WriteReport> {
+    // The writer is synchronous; a per-thread delta includes shared recovery and
+    // editor-support helpers without counting concurrent saves on other threads.
+    let syncs_before = SUCCESSFUL_PROJECT_SYNCS.get();
     validate_source_override_keys(sources)?;
     if let Some(expected_disk) = expected_disk {
         validate_expected_disk_paths(expected_disk)?;
@@ -382,6 +389,7 @@ fn write_project_tree_cached_impl(
         written,
         written_hashes,
         removed,
+        sync_count: SUCCESSFUL_PROJECT_SYNCS.get().wrapping_sub(syncs_before),
     })
 }
 
@@ -1563,7 +1571,7 @@ fn sync_directories_deepest_first(parents: BTreeSet<PathBuf>) -> Result<()> {
 
 #[cfg(unix)]
 fn sync_directory(path: &Path) -> Result<()> {
-    fs::File::open(path)?.sync_all()?;
+    sync_file(&fs::File::open(path)?)?;
     Ok(())
 }
 
@@ -1816,6 +1824,12 @@ fn prune_removed_artifact_directories(dir: &Path, removals: &[PlannedRemoval]) -
     Ok(())
 }
 
+fn sync_file(file: &fs::File) -> std::io::Result<()> {
+    file.sync_all()?;
+    SUCCESSFUL_PROJECT_SYNCS.set(SUCCESSFUL_PROJECT_SYNCS.get().wrapping_add(1));
+    Ok(())
+}
+
 pub(super) fn write_with_parents(path: &Path, bytes: &[u8]) -> Result<()> {
     write_with_parents_with(path, |file| file.write_all(bytes))
 }
@@ -1840,7 +1854,7 @@ fn write_with_parents_with(
             temporary.as_file().set_permissions(permissions)?;
         }
         write(temporary.as_file_mut())?;
-        temporary.as_file().sync_all()
+        sync_file(temporary.as_file())
     })();
     if let Err(error) = result {
         return Err(discard_project_temporary(temporary, error).into());
@@ -1875,6 +1889,173 @@ fn ensure_parent_directories(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn sync_count_includes_fresh_transaction_and_editor_support() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let document = Doc::new();
+        let assets = BTreeMap::new();
+        let fresh = write_project_tree(directory.path(), &document, &assets)?;
+        assert_eq!(fresh.written.len(), 10);
+        assert!(fresh.removed.is_empty());
+        // Ten projected files, one journal, six support files; Unix additionally
+        // syncs staged/journal publication, three destination parents, and cleanup.
+        assert_eq!(fresh.sync_count, if cfg!(unix) { 24 } else { 17 });
+        assert!(!directory.path().join(TRANSACTION_DIR).exists());
+        for relative in [
+            ".gitignore",
+            "fnx.d.ts",
+            ".prettierrc.json",
+            ".prettierignore",
+            "AGENTS.md",
+            "fanta.md",
+        ] {
+            assert!(directory.path().join(relative).is_file());
+        }
+
+        let unchanged = write_project_tree(directory.path(), &document, &assets)?;
+        assert_eq!(unchanged, WriteReport::default());
+
+        fs::remove_file(directory.path().join("fanta.md"))?;
+        let repaired_support = write_project_tree(directory.path(), &document, &assets)?;
+        assert!(repaired_support.written.is_empty());
+        assert!(repaired_support.removed.is_empty());
+        assert_eq!(repaired_support.sync_count, 1);
+        assert_eq!(
+            fs::read(directory.path().join("fanta.md"))?,
+            super::super::layout::FANTA_SPEC.as_bytes()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sync_count_tracks_single_file_save_and_parent_directories() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut document = Doc::new();
+        write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        document.metadata.title = "Changed title".into();
+
+        let changed = write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        assert_eq!(changed.written, vec![PathBuf::from("doc/metadata.json")]);
+        assert!(changed.removed.is_empty());
+        assert_eq!(changed.sync_count, if cfg!(unix) { 3 } else { 1 });
+        let (reopened, assets) = super::super::read_project_tree(directory.path())?;
+        assert_eq!(reopened.metadata, document.metadata);
+        assert!(assets.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn sync_count_tracks_multi_file_transaction_without_double_counting_parents() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let document = Doc::new();
+        write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        let mut originals = BTreeMap::new();
+        for relative in ["doc/active_modes.json", "doc/variables.json"] {
+            let path = directory.path().join(relative);
+            let original = fs::read(&path)?;
+            let mut changed = original.clone();
+            changed.push(b'\n');
+            fs::write(path, changed)?;
+            originals.insert(PathBuf::from(relative), original);
+        }
+
+        let repaired = write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        assert_eq!(
+            repaired.written,
+            originals.keys().cloned().collect::<Vec<_>>()
+        );
+        assert!(repaired.removed.is_empty());
+        // The two files share doc/ and the project root; each parent is synced once.
+        assert_eq!(repaired.sync_count, if cfg!(unix) { 9 } else { 3 });
+        for (relative, original) in originals {
+            assert_eq!(fs::read(directory.path().join(relative))?, original);
+        }
+        assert!(!directory.path().join(TRANSACTION_DIR).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn sync_count_tracks_removal_without_a_file_sync() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let document = Doc::new();
+        write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        let relative = PathBuf::from(format!("pages/_loose/nodes/{}.json", NodeId::from_u128(19)));
+        fs::create_dir_all(directory.path().join("pages/_loose/nodes"))?;
+        fs::write(directory.path().join(&relative), b"{}\n")?;
+
+        let removed = write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        assert!(removed.written.is_empty());
+        assert_eq!(removed.removed, vec![relative.clone()]);
+        assert_eq!(removed.sync_count, if cfg!(unix) { 4 } else { 0 });
+        assert!(!directory.path().join(relative).exists());
+        assert!(!directory.path().join("pages/_loose").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn sync_count_includes_pending_recovery_before_an_unchanged_save() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut document = Doc::new();
+        write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        let relative = PathBuf::from("doc/metadata.json");
+        let old = fs::read(directory.path().join(&relative))?;
+        document.metadata.title = "Recovered title".into();
+        let new = json_bytes(&serde_json::to_value(&document.metadata)?)?;
+        let journal = directory.path().join(TRANSACTION_DIR);
+        fs::create_dir_all(journal.join("staged"))?;
+        fs::write(journal.join("staged/00000000"), &new)?;
+        fs::write(
+            journal.join("plan.json"),
+            serde_json::to_vec(&ProjectTransaction {
+                version: 1,
+                writes: vec![TransactionWrite {
+                    relative: relative.clone(),
+                    old: FileState::Regular(sha256_hex(&old)),
+                    new_sha256: sha256_hex(&new),
+                }],
+                removals: Vec::new(),
+            })?,
+        )?;
+
+        let recovered = write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        assert!(recovered.written.is_empty());
+        assert!(recovered.removed.is_empty());
+        assert_eq!(recovered.sync_count, if cfg!(unix) { 3 } else { 0 });
+        assert_eq!(fs::read(directory.path().join(relative))?, new);
+        assert!(!journal.exists());
+        assert_eq!(
+            write_project_tree(directory.path(), &document, &BTreeMap::new())?,
+            WriteReport::default()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn sync_count_excludes_failed_writes_and_other_threads() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let failed = directory.path().join("failed.json");
+        let syncs_before = SUCCESSFUL_PROJECT_SYNCS.get();
+        let result = write_with_parents_with(&failed, |file| {
+            file.write_all(b"partial")?;
+            Err(std::io::Error::other("injected write failure"))
+        });
+        assert!(result.is_err());
+        assert!(!failed.exists());
+        assert_eq!(SUCCESSFUL_PROJECT_SYNCS.get(), syncs_before);
+
+        let path = directory.path().join("other-thread.json");
+        let count = std::thread::spawn(move || -> Result<usize> {
+            let syncs_before = SUCCESSFUL_PROJECT_SYNCS.get();
+            write_with_parents(&path, b"{}\n")?;
+            Ok(SUCCESSFUL_PROJECT_SYNCS.get().wrapping_sub(syncs_before))
+        })
+        .join()
+        .map_err(|_| std::io::Error::other("sync worker panicked"))??;
+        assert_eq!(count, 1);
+        assert_eq!(SUCCESSFUL_PROJECT_SYNCS.get(), syncs_before);
+        Ok(())
+    }
 
     #[test]
     fn page_registry_history_cached_save_reorders_prunes_and_restores_page_files() {

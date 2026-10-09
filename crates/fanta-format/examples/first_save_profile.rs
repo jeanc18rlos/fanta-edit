@@ -130,6 +130,12 @@ fn main() -> anyhow::Result<()> {
                 &root, &persisted, &assets, &mut cache, &sources, &expected,
             )
         })?;
+        println!(
+            "  writes {}, removals {}, successful durability syncs {}",
+            report.written.len(),
+            report.removed.len(),
+            report.sync_count,
+        );
         let index_hash = report
             .written_hashes
             .get(std::path::Path::new("assets/index.json"))
