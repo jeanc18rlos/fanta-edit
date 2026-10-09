@@ -25,14 +25,14 @@
 //!
 //! ## Validity
 //!
-//! One [`LayerEpoch`] guards the whole cache: the scene instance + revision,
-//! the render inputs' `mode_generation`, and `dark_ui`. Any content edit
-//! moves one of them and the cache is dropped wholesale — it is a NAVIGATION
-//! cache, correct because nothing a pan or zoom does can change a layer's
-//! pixels except its device placement, and cheap because that is the only
-//! invalidation it needs. (Per-node stamps are deliberately not used: a
-//! transform-only drag does not stamp the moved node — see
-//! `Scene::set_transform` — so a subtree stamp would not be a sound key.)
+//! Scene identity, render modes, component metadata and asset ownership guard
+//! the whole cache. Within that epoch, `Scene::changes_since` distinguishes
+//! transforms from data edits: moving a subtree invalidates its strict
+//! ancestors, while data edits also invalidate the node and its descendants.
+//! Structural, untracked or expired change history drops everything. Node
+//! stamps alone cannot make this distinction because transform-only edits do
+//! not stamp ordinary geometry. Layers containing cross-tree pattern sources
+//! stay volatile, since their dependencies are not scene ancestors.
 //!
 //! Per entry, the local→device matrix at render time is kept. A lookup is a
 //! **hit** only when the current matrix equals it up to an INTEGER device
@@ -61,7 +61,8 @@
 //! populating is enabled only on a frame that repeats the previous frame's
 //! content epoch and scale and moves the viewport by whole device pixels (see
 //! [`LayerCache::begin_frame`]): the first frame at a new zoom renders
-//! directly, as does each frame of a content edit. The following stable
+//! directly. Edited nodes and their ancestors cannot refill during that
+//! frame; unrelated layers can still hit or fill. The following stable
 //! whole-pixel frames (a pan, or a settle repaint)
 //! fill the cache at most [`LAYER_CACHE_POPULATE_PER_FRAME`] layers per
 //! frame, and pans from then on hit.
@@ -70,7 +71,9 @@ use super::{
     AlphaType, Bounds, Canvas, IdHashMap, ImageInfo, NodeId, Paint, Rect, RenderCtx,
     padded_layer_rect,
 };
+use fanta_doc::{ComponentLibrary, Scene};
 use skia_safe::{IRect, Matrix, SamplingOptions};
+use std::collections::HashSet;
 
 /// The largest layer, in device pixels, the cache will hold as one entry
 /// (4 Mpx ≈ 16 MB RGBA). Bigger layers — a page-spanning blurred backdrop
@@ -104,9 +107,9 @@ const INTEGER_PAN_EPS: f32 = 1.0 / 512.0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LayerEpoch {
     pub(crate) scene_instance: u64,
-    pub(crate) scene_revision: u64,
     pub(crate) mode_generation: u64,
     pub(crate) dark_ui: bool,
+    pub(crate) asset_resolver: Option<usize>,
 }
 
 /// One node's cached, filtered layer.
@@ -142,6 +145,10 @@ pub(crate) struct LayerCache {
     bytes: usize,
     budget_bytes: usize,
     epoch: Option<LayerEpoch>,
+    seen_revision: Option<u64>,
+    components: ComponentLibrary,
+    hot_nodes: HashSet<NodeId>,
+    moved_roots: HashSet<NodeId>,
     /// Frame serial for LRU ordering.
     frame: u64,
     /// The previous frame's effective scale and root device translation —
@@ -170,6 +177,10 @@ impl Default for LayerCache {
             bytes: 0,
             budget_bytes: LAYER_CACHE_DEFAULT_BUDGET_BYTES,
             epoch: None,
+            seen_revision: None,
+            components: ComponentLibrary::default(),
+            hot_nodes: HashSet::new(),
+            moved_roots: HashSet::new(),
             frame: 0,
             last_frame: None,
             enabled: true,
@@ -180,9 +191,8 @@ impl Default for LayerCache {
 }
 
 impl LayerCache {
-    /// Start a frame: drop everything if the epoch moved, advance the LRU
-    /// clock, and report whether this frame may POPULATE the cache. Lookups
-    /// are allowed regardless.
+    /// Apply the scene delta before any lookup. Unknown history cannot prove
+    /// a cached layer is unchanged, so it takes the same cold path as a new epoch.
     ///
     /// Populating is worth its cost (an offscreen per layer, ~2× a direct
     /// save-layer) only when later frames can hit, i.e. when the viewport is
@@ -196,25 +206,59 @@ impl LayerCache {
     pub(crate) fn begin_frame(
         &mut self,
         canvas: &Canvas,
+        scene: &Scene,
+        components: &ComponentLibrary,
         epoch: LayerEpoch,
         effective_scale: f32,
-        root_tx: f64,
-        root_ty: f64,
+        root_translation: (f64, f64),
     ) -> bool {
-        let epoch_changed = self.epoch != Some(epoch);
-        if epoch_changed {
+        let components_changed = self.components != *components;
+        let epoch_changed = self.epoch != Some(epoch) || components_changed;
+        self.hot_nodes.clear();
+        self.moved_roots.clear();
+        let delta = (!epoch_changed)
+            .then(|| {
+                self.seen_revision
+                    .and_then(|revision| scene.changes_since(revision))
+            })
+            .flatten();
+        let reset = delta.is_none();
+        if reset {
             self.clear();
-            self.epoch = Some(epoch);
+        } else if let Some(delta) = delta {
+            for id in delta.transforms {
+                self.moved_roots.insert(id);
+                self.hot_nodes.insert(id);
+                for ancestor in scene.ancestors_of(id) {
+                    self.hot_nodes.insert(ancestor.id);
+                    self.remove(ancestor.id);
+                }
+            }
+            for id in delta.nodes {
+                for affected in scene
+                    .descendants_of(id)
+                    .chain(scene.ancestors_of(id).map(|node| node.id))
+                {
+                    self.hot_nodes.insert(affected);
+                    self.remove(affected);
+                }
+            }
         }
+        if components_changed {
+            self.components.clone_from(components);
+        }
+        self.epoch = Some(epoch);
+        self.seen_revision = Some(scene.revision());
         self.frame = self.frame.wrapping_add(1);
         self.populated_this_frame = 0;
+        let (root_tx, root_ty) = root_translation;
         let scale_bits = effective_scale.to_bits();
         let whole_pixel_pan = |a: f64, b: f64| {
             let d = a - b;
             (d - d.round()).abs() <= f64::from(INTEGER_PAN_EPS)
         };
         let populate = self.enabled
-            && !epoch_changed
+            && !reset
             && self.last_frame.is_some_and(|(bits, tx, ty)| {
                 bits == scale_bits && whole_pixel_pan(root_tx, tx) && whole_pixel_pan(root_ty, ty)
             });
@@ -242,6 +286,23 @@ impl LayerCache {
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
         self.bytes = 0;
+        self.seen_revision = None;
+        self.hot_nodes.clear();
+        self.moved_roots.clear();
+    }
+
+    fn remove(&mut self, id: NodeId) {
+        if let Some(entry) = self.entries.remove(&id) {
+            self.bytes -= entry.bytes;
+        }
+    }
+
+    pub(crate) fn may_populate(&self, scene: &Scene, id: NodeId) -> bool {
+        !self.hot_nodes.contains(&id)
+            && (self.moved_roots.is_empty()
+                || !scene
+                    .ancestors_of(id)
+                    .any(|node| self.moved_roots.contains(&node.id)))
     }
 
     /// Claim one of this frame's [`LAYER_CACHE_POPULATE_PER_FRAME`] populate

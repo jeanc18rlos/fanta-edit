@@ -511,6 +511,9 @@ pub(crate) fn pattern_paint(
     blend: BlendMode,
     ctx: &mut RenderCtx,
 ) -> Option<Paint> {
+    // A pattern can reference a different subtree. Scene-delta invalidation
+    // of effect layers only follows ancestry, so it cannot retain this draw.
+    ctx.layer_volatile = true;
     let (source_key, source, source_bounds) = render_source(pattern, ctx)?;
     let spacing_x = pattern.spacing.x.max(0.0).min(1000.0);
     let spacing_y = pattern.spacing.y.max(0.0).min(1000.0);
