@@ -107,6 +107,11 @@ also supports tip, hardness and flow settings; Pencil and Eraser expose their
 applicable subsets. The toolbar Color picker opens the selected fill or page
 background picker.
 
+In an editable Design canvas, activating Crop also shows **Ratio**, **Cancel**
+and **Apply crop** controls. These merged controls have mounted regression
+coverage; the earlier missing-controls failures remain recorded, and their
+latest installed-app journey is still pending.
+
 On development QA `0f71b3961d`, one real three-second H.264 fixture passes bounded
 Play/Pause, paused Seek, Trim Cancel and Trim Apply with single Undo/Redo and
 cold saved-state checks. Its poster matches an independent frame reference,
@@ -474,9 +479,13 @@ model supports those inputs.
   Resolve the saved request before submitting another. Account changes and
   unavailable models are checked during recovery.
 
-Available models come from the signed-in account's catalog. Real-provider
-submit/poll/save/place, restart recovery, credits and payment behavior still
-require service acceptance; mock recovery tests do not establish availability.
+Available models come from the signed-in account's catalog. A bounded 9 October
+internal build33 Seedream image journey passes generation, placement, Undo/Redo,
+Save and reopening, with one matching five-credit usage row. It does not prove
+ordinary balance debit, exactly-once upstream execution or other providers.
+In-flight recovery, broader generation and payment behavior remain unverified;
+mock recovery tests do not establish availability. See the
+[dated acceptance scope](../alpha/CAPABILITY_COVERAGE.md#current-acceptance-status).
 
 Implementation: [export](../../crates/fig_viewer/src/export.rs),
 [agent operations](../../crates/fig_viewer/src/agent_surface.rs),
@@ -510,7 +519,8 @@ There are two distinct MCP directions:
 Bounded native checks have observed an existing account, billing reads and model
 rows. They do not establish fresh browser/callback sign-in, trustworthy current
 prices/caps for a paid request, live managed-MCP execution, payments or general
-account recovery. No paid AI request is accepted by this coverage record.
+account recovery. The bounded image-generation result above does not establish
+Agent chat or a total spending cap.
 
 Implementation: [account and billing UI](../../crates/zed/src/zed/settings_modal.rs),
 [MCP settings](../../crates/zed/src/zed/settings_mcp.rs),
@@ -543,8 +553,12 @@ Mac App Store builds restrict local process execution, external agents and
 related inherited editor features; see [MAC_APP_STORE.md](../alpha/MAC_APP_STORE.md).
 The selected release target is a direct-download Mac app. Packaging now checks
 the app inside the produced DMG against the staged bundle and enforces the
-configured signature/notarization checks. The 9 October internal optimized
-**build33**, from `79cc2ef8c094149e8496476c1cb53e2945b8b54a`, passes hosted and
+configured signature/notarization checks. At the 9 October, 21:19 UTC checkpoint,
+**build37**
+targets the accepted source but its package and latest native acceptance remain
+pending. The following **build33** result is historical, not validation of later
+fixes. That internal optimized artifact, from
+`79cc2ef8c094149e8496476c1cb53e2945b8b54a`, passes hosted and
 local mounted-package verification, CLI checks and isolated QA derivation. It
 is an arm64, ad-hoc-signed artifact (`signed=false`), not a Developer ID/notarized
 release. These checks do not replace native capability acceptance. The
