@@ -52,6 +52,8 @@ run_cargo_build() (
     mkfifo "$progress_directory/control"
     exec 9<>"$progress_directory/control"
 
+    printf '[build-progress] enabled=1 sample_interval_s=30\n'
+
     # Only this wrapper retains the writer. EOF stops the sampler even if the
     # runner kills the wrapper before its EXIT trap can run.
     python3 - 3<"$progress_directory/control" 9>&- <<'PY_BUILD_PROGRESS' &

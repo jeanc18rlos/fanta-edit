@@ -339,20 +339,28 @@ sys.exit(int(os.environ['TEST_BUILD_STATUS']))
 ''')
         self.wrapper = self.root / 'wrapper.sh'
         self.wrapper.write_text('set -euo pipefail\n' + self.function + '\nrun_cargo_build "$@"\n')
+        self.silent_sampler_bin = self.root / 'silent-sampler-bin'
+        self.silent_sampler_bin.mkdir()
+        silent_sampler = self.silent_sampler_bin / 'python3'
+        # A sampler may exit on EOF before it reports any resource measurements.
+        silent_sampler.write_text('#!/bin/sh\n/bin/cat >/dev/null\n')
+        silent_sampler.chmod(0o755)
 
-    def start_build(self, status=0, enabled=True):
+    def start_build(self, status=0, enabled=True, silent_sampler=False):
+        path = f'{self.silent_sampler_bin}:/usr/bin:/bin' if silent_sampler else '/usr/bin:/bin'
         return subprocess.Popen(['/bin/bash', str(self.wrapper), sys.executable,
                                  str(self.fake_build), 'private-argument-must-not-be-logged'],
                                 cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                 start_new_session=True,
-                                env={'PATH': '/usr/bin:/bin', 'TMPDIR': str(self.root),
+                                env={'PATH': path, 'TMPDIR': str(self.root),
                                      'FANTA_RELEASE_BUILD_DIAGNOSTICS': str(enabled).lower(),
                                      'TEST_BUILD_STATUS': str(status), 'PRIVATE_TOKEN': 'must-not-be-logged'})
 
     def test_build_status_arguments_and_normal_monitor_cleanup(self):
-        for enabled, status in [(False, 0), (True, 0), (True, 37)]:
-            with self.subTest(enabled=enabled, status=status):
-                process = self.start_build(status, enabled)
+        for enabled, status, silent_sampler in [(False, 0, False), (True, 0, False),
+                                                 (True, 37, False), (True, 0, True), (True, 37, True)]:
+            with self.subTest(enabled=enabled, status=status, silent_sampler=silent_sampler):
+                process = self.start_build(status, enabled, silent_sampler)
                 stdout, stderr = process.communicate(timeout=10)
                 self.assertEqual(process.returncode, status, stdout + stderr)
                 observed = json.loads((self.root / 'build.json').read_text())
@@ -362,7 +370,10 @@ sys.exit(int(os.environ['TEST_BUILD_STATUS']))
                 self.assertNotIn('must-not-be-logged', stdout + stderr)
                 self.assertFalse(list(self.root.glob('fanta-build-progress.*')))
                 if enabled:
-                    self.assertIn('[build-progress]', stdout)
+                    self.assertEqual(stdout.splitlines()[:1],
+                                     ['[build-progress] enabled=1 sample_interval_s=30'])
+                    if silent_sampler:
+                        self.assertNotIn('elapsed_s=', stdout)
                 else:
                     self.assertNotIn('[build-progress]', stdout)
 
@@ -387,6 +398,18 @@ sys.exit(int(os.environ['TEST_BUILD_STATUS']))
                 self.assertNotIn('must-not-be-logged', stdout + stderr)
                 if stop_signal == signal.SIGTERM:
                     self.assertFalse(list(self.root.glob('fanta-build-progress.*')))
+
+    def test_eof_before_first_sample_does_not_fabricate_measurements(self):
+        sampler = mock.Mock()
+        captured = io.StringIO()
+        with mock.patch.dict(self.namespace, sample=sampler), \
+                mock.patch.object(self.namespace['time'], 'monotonic', return_value=1), \
+                mock.patch.object(self.namespace['select'], 'select', return_value=([3], [], [])), \
+                mock.patch.object(self.namespace['os'], 'read', return_value=b''), \
+                contextlib.redirect_stdout(captured):
+            self.namespace['main']()
+        sampler.assert_not_called()
+        self.assertEqual(captured.getvalue(), '')
 
     def test_progress_filters_unrelated_processes_and_never_emits_commands(self):
         output = '''10 1 0.0 100 00:01 /bin/bash
