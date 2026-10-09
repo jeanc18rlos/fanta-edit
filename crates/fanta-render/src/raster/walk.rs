@@ -3,7 +3,7 @@
 //! variable-binding [`resolve_overlay`]. The transient instance-subtree walk
 //! lives in [`instance`](super::instance) and shares these helpers.
 use super::effects::{effects_layer_paint, group_clips_children};
-use super::layer_cache::{LayerCache, LayerLookup, render_layer_via_cache};
+use super::layer_cache::{LayerCache, LayerLookup, render_layer_via_cache, verify_layer_hit};
 use super::{
     AssetResolver, BlendMode, BooleanCache, Bounds, Canvas, CanvasNode, Fill, IdHashMap,
     ImageCache, InstanceCache, MaskType, NodeData, NodeFlags, NodeId, Paint, PathCache,
@@ -457,13 +457,33 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
             let cacheable = ctx.layer_cache_lookups
                 && path_cache_id.is_some()
                 && !subtree_has_live_video_fill(ctx, id);
-            let served = cacheable
-                && matches!(
-                    ctx.layer_cache.lookup(canvas, id, &layer.composite_paint()),
-                    LayerLookup::Hit
-                );
-            if served {
+            let lookup = if cacheable {
+                ctx.layer_cache.lookup(canvas, id, &layer.composite_paint())
+            } else {
+                LayerLookup::Miss
+            };
+            if !matches!(lookup, LayerLookup::Miss) {
                 ctx.metrics.layer_cache_hits += 1;
+                if let LayerLookup::SampledHit(sample) = lookup {
+                    verify_layer_hit(
+                        canvas,
+                        id,
+                        &layer,
+                        content_bounds,
+                        sample,
+                        ctx,
+                        |canvas, ctx| {
+                            paint_node_body(
+                                canvas,
+                                id,
+                                node,
+                                path_cache_id,
+                                boolean_shape.as_ref(),
+                                ctx,
+                            );
+                        },
+                    );
+                }
             } else {
                 let via_cache = cacheable
                     && ctx.layer_cache_populate

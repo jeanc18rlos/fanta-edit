@@ -72,6 +72,18 @@ pub struct RenderMetrics {
     /// An observable filter/allocation/readback failure omitted a backdrop effect.
     pub effect_failed: bool,
     pub(crate) sampling_budget: Option<crate::sampling::SamplingWorkBudget>,
+    pub layer_cache_verify_attempted: u32,
+    pub layer_cache_verify_completed: u32,
+    pub layer_cache_verify_equal: u32,
+    pub layer_cache_verify_mismatch: u32,
+    pub layer_cache_verify_skipped: u32,
+    pub layer_cache_verify_unavailable: u32,
+    pub layer_cache_verify_pixels: u64,
+    pub layer_cache_verify_differing_pixels: u64,
+    pub layer_cache_verify_differing_channels: u64,
+    pub layer_cache_verify_max_delta: u8,
+    /// Bounds, work budget, format/backend, surface, buffer, readback, artwork.
+    pub layer_cache_verify_reasons: [u32; 7],
 }
 
 /// Serialization controls for the headless SVG canvas.
@@ -851,6 +863,11 @@ impl RasterRenderer {
     /// [`Self::set_pixel_snap_pan`], which makes every pan a whole-pixel pan.
     pub fn set_layer_cache_enabled(&mut self, enabled: bool) {
         self.layer_cache.set_enabled(enabled);
+    }
+
+    #[cfg(test)]
+    pub(super) fn layer_cache_for_test(&mut self) -> &mut LayerCache {
+        &mut self.layer_cache
     }
 
     /// Whether the effect-layer cache is enabled.
