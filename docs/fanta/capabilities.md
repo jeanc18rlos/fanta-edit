@@ -1,7 +1,8 @@
 # Fanta capability guide
 
-Source inventory updated **7 October 2026**. This describes the current editor
-implementation; release verification is tracked separately in
+Source inventory updated **9 October 2026**; acceptance evidence below is dated.
+This describes the current editor implementation; release verification is tracked
+separately in
 [the capability coverage report](../alpha/CAPABILITY_COVERAGE.md). Earlier alpha
 reports describe their dated builds and can contain controls that have since
 changed. A feature listed here is not a claim that its complete installed-app
@@ -102,8 +103,13 @@ Play/Pause, paused Seek, Trim Cancel and Trim Apply with single Undo/Redo and
 cold saved-state checks. Its poster matches an independent frame reference,
 including exact RGBA bytes; Undo retains the added poster asset. The earlier a7
 0/0 readiness failure and later stale-display uncertainty remain unresolved.
-These results do not establish an activation fix, audio, arbitrary codecs/VFR or
-installed-release media behavior; see the [coverage report](../alpha/CAPABILITY_COVERAGE.md).
+These results do not establish an activation fix, arbitrary codecs/VFR or
+installed-release media behavior. Separate 8 October optimized Audio checks
+cover one Play/Pause/seek/Save/cold journey. MP3 placement passes bounded
+storage/history checks, but cold Audio previews were absent for the original
+MP3 tone and the newly placed one-second MP3; no WAV case was verified. Audio
+preview recovery is not established. See the
+[coverage report](../alpha/CAPABILITY_COVERAGE.md#bounded-checks-through-8-october).
 
 The project **Assets** list shows saved/imported media, thumbnails and file sizes.
 Choose a visible target page to place a supported asset again; missing files or
@@ -139,6 +145,22 @@ Booleans expose operation, fill and stroke controls. Paint recoloring retains
 the imported geometry; geometry or operation changes recompute it from operands.
 Constraint data can be retained by the document, but constraint controls are
 currently disabled in the default Design inspector.
+
+For one editable physical Text on Path layer, the Design inspector header's
+**Edit object** action opens inline editing with all text selected. It is
+unavailable for multiple selections, pages, virtual instance TextPath content,
+locked layers or locked ancestors, and read-only states such as Inspect or a
+pending Source draft. The command rechecks the current selection and editability;
+a stale or newly protected target leaves the document unchanged.
+
+With one layer selected, **Select matching layers** appears when another layer
+of the same kind exists on the active page. It selects matching descendants on
+that page without editing content or adding an Undo step. Sections match other
+Sections rather than ordinary Frames or Groups, regardless of their paint;
+component masters retain their component identity. An explicit Frame identity
+is not treated as an imported Section. This matching rule does not change the
+inspector's property presets.
+
 Single-node opacity, visibility and uniform vector radius display their active
 variable values, including aliases and inherited mode pins. Explicit corner
 values keep precedence; unresolved bindings show a labeled fallback and remain
@@ -220,8 +242,10 @@ The fixture uses a pre-existing disposable parent Git repository, whose
 metadata also remains exact. The earlier no-parent fixture correctly failed
 its strict file boundary when the desktop writer initialized Git; that evidence
 remains recorded. This check does not establish rich text, IME, multiline input
-or held-Escape behavior. See the [coverage matrix](../alpha/CAPABILITY_COVERAGE.md)
-for the full preconditions and remaining release gates.
+or held-Escape behavior. A separate 8 October Command-Return/multiline journey
+passes bounded Save/history/cold checks, with second-line clipping in its fixed
+box. See the [coverage matrix](../alpha/CAPABILITY_COVERAGE.md#bounded-checks-through-8-october)
+for its limits and remaining release gates.
 
 Text on Path accepts the shaped text area, including letter
 counters and spaces, while rejecting distant empty areas along the baseline.
@@ -355,6 +379,18 @@ In Dev, **Saved Code** is read-only. Measurements and annotations can still be
 authored on an editable page, and Undo/Redo is limited to those review marks;
 artwork edits remain blocked. **Readiness unavailable** is a disabled control.
 
+Select an editable animation clip, pause playback and enable **Auto key** to
+edit the **At playhead** properties. Edits preview live and commit as one
+keyframe change. These controls are unavailable without an active clip, during
+playback or on a read-only page.
+
+Prototype interactions offer **On click**, **On drag**, **On hover**,
+**While pressing**, **After delay** and **On key press** triggers. Choose
+**Navigate to**, **Open overlay**, **Scroll to**, **Set variable**,
+**Change variant**, **Open link**, **Back** or **Close**, then configure the
+applicable destination, value or transition. Supported authoring choices do
+not imply that every trigger/action combination has passed native acceptance.
+
 The timeline's **Current time** field accepts a typed time and seeks on Return.
 The interaction detail's **X** closes the detail while retaining its interaction;
 **Remove** is the separate deletion action.
@@ -406,18 +442,67 @@ Batches are transactional: failure preserves document state, assets, selection
 and history. A successful batch is a single undoable edit. Tool screenshots
 verify rendered output; they do not prove that a mouse or keyboard control works.
 
-The generation workspace offers image, video, audio and vector creation, plus
-supported source/mask workflows, preview, save, placement and durable recovery.
-Vector creation and image tracing can yield editable paths. Available models
-come from the signed-in account's catalog; network failures and uncertain jobs
-have recovery paths. Live provider availability, credits and payment behavior
-require separate service validation.
+The generation workspace has **Image**, **Video**, **Audio**, **Vector**,
+**Design** and **Masks** modes. Select an available model and review its supported
+options before submitting. Source images, end frames, masks and voice references
+are available only for compatible operations; a mode does not promise that every
+model supports those inputs.
+
+- **Vector** offers **Create vectors** and **Trace image**, producing editable
+  paths for supported results.
+- **Design → Prepare design brief** opens an unsent Agent Panel prompt for the
+  active canvas. Review and send it to begin; preparing the brief changes no art.
+- **Masks** generates selectable masks from a source. A selected mask can guide
+  an image edit; supported background removal can produce a transparent result.
+- Preview a completed result, **Save result** to a chosen file, or add a
+  supported result to project assets and place it from **Assets**. Canvas/asset
+  writes require an editable design; save or discard pending source edits first.
+- **Retry submission** and saved **Recover…** entries resume uncertain requests.
+  Resolve the saved request before submitting another. Account changes and
+  unavailable models are checked during recovery.
+
+Available models come from the signed-in account's catalog. Real-provider
+submit/poll/save/place, restart recovery, credits and payment behavior still
+require service acceptance; mock recovery tests do not establish availability.
 
 Implementation: [export](../../crates/fig_viewer/src/export.rs),
 [agent operations](../../crates/fig_viewer/src/agent_surface.rs),
 [live MCP tools](../../crates/fig_viewer/src/live_mcp.rs),
 [generation workspace](../../crates/fig_viewer/src/generation_workspace.rs), and
 [recovery journal](../../crates/fig_viewer/src/generation_journal.rs).
+
+## Accounts, models and connected tools
+
+Use **Sign in to Fanta**, then open **Settings → Credits & billing** to view the
+account's balance, usage and purchase history. Available actions depend on the
+account and distribution; a displayed control is not proof of a completed
+payment or restore. The Agent Panel model chooser lists available Fanta models
+and their displayed price information. Choose the model and an appropriate
+agent profile before sending a request. Tool permissions, retries and auxiliary
+requests matter: a model's output limit or a restrictive profile is not a total
+spending cap. See [AI_DESIGNER.md](../alpha/AI_DESIGNER.md) for canvas permissions.
+
+There are two distinct MCP directions:
+
+- The **local live MCP** server lets external agents inspect/edit this editor,
+  using the transactional tools described above.
+- **Settings → MCP** manages servers used by the agent. The configured Fanta
+  hosted server uses the signed-in account when its endpoint matches the account
+  server and no explicit `Authorization` or `X-API-Key` header overrides it.
+  The stable default enables generation tools at `/mcp`; `fanta-design` at `/v2/mcp` is disabled in
+  stable and enabled by the separate development/preview configuration. Custom
+  HTTP or local-command servers have their own configuration and access rules;
+  local commands are restricted in Mac App Store builds.
+
+Bounded native checks have observed an existing account, billing reads and model
+rows. They do not establish fresh browser/callback sign-in, trustworthy current
+prices/caps for a paid request, live managed-MCP execution, payments or general
+account recovery. No paid AI request is accepted by this coverage record.
+
+Implementation: [account and billing UI](../../crates/zed/src/zed/settings_modal.rs),
+[MCP settings](../../crates/zed/src/zed/settings_mcp.rs),
+[account-backed MCP](../../crates/project/src/context_server_store.rs), and
+[service defaults](../../assets/settings/default.json).
 
 ## Boundaries
 
@@ -445,8 +530,10 @@ Mac App Store builds restrict local process execution, external agents and
 related inherited editor features; see [MAC_APP_STORE.md](../alpha/MAC_APP_STORE.md).
 The selected release target is a direct-download Mac app. Packaging now checks
 the app inside the produced DMG against the staged bundle and enforces the
-configured signature/notarization checks. Isolated verifier tests pass; the
-actual signed download and clean-Mac installation remain unverified.
+configured signature/notarization checks. Isolated verifier tests and the
+8 October internal optimized DMG verification pass. That arm64 artifact is ad-hoc signed (`signed=false`), with a separately
+verified isolated QA derivative; it is not a Developer ID/notarized release.
+Public download, clean-Mac installation, update and rollback remain unverified.
 A bounded check of the approved production service, using an isolated profile
 and unchanged development `0f71b3961d` binary, shows an existing account, loaded
 billing data and persistence through one cold process restart. It does not

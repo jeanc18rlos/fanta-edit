@@ -258,12 +258,22 @@ fn matching_design_layers<'a>(
     page: Option<NodeId>,
 ) -> impl Iterator<Item = NodeId> + 'a {
     let masters = crate::properties_snapshot::master_roots(&doc.components);
-    let inspected = doc.scene.get(id).map(|node| {
-        (
-            design_kind(id, &node.data, &masters),
-            std::mem::discriminant(&node.data),
-        )
-    });
+    let matching_kind = move |id, node: &fanta_doc::CanvasNode| {
+        let kind = design_kind(id, &node.data, &masters);
+        // Section identity does not depend on the backing paint used by the inspector preset.
+        if kind != DesignPanelNodeKind::Component
+            && matches!(node.data, NodeData::Group(_))
+            && crate::layer_context_ops::is_section(node)
+        {
+            DesignPanelNodeKind::Section
+        } else {
+            kind
+        }
+    };
+    let inspected = doc
+        .scene
+        .get(id)
+        .map(|node| (matching_kind(id, node), std::mem::discriminant(&node.data)));
     let roots = page
         .map(|page| doc.scene.children_of(Some(page)))
         .unwrap_or_else(|| doc.scene.children_of(None));
@@ -274,7 +284,7 @@ fn matching_design_layers<'a>(
         .filter(move |candidate| {
             inspected.is_some_and(|(kind, discriminant)| {
                 doc.scene.get(*candidate).is_some_and(|candidate_node| {
-                    design_kind(*candidate, &candidate_node.data, &masters) == kind
+                    matching_kind(*candidate, candidate_node) == kind
                         && (kind != DesignPanelNodeKind::Other
                             || discriminant == std::mem::discriminant(&candidate_node.data))
                 })
@@ -15113,6 +15123,267 @@ mod tests {
                 assert_eq!(item.doc().expect("document").scene.get(id), Some(&original));
             });
         }
+    }
+
+    struct SectionMatchingFixture {
+        doc: Doc,
+        page: NodeId,
+        sections: [NodeId; 2],
+        frames: [NodeId; 2],
+        group: NodeId,
+        components: [NodeId; 2],
+    }
+
+    fn section_matching_fixture() -> SectionMatchingFixture {
+        let (mut doc, page, _) = doc_with_rect();
+        let other_page = doc
+            .scene
+            .insert(CanvasNode::new(NodeData::Group(GroupNode::default())))
+            .expect("other page");
+        doc.add_page(other_page);
+        let mut insert = |parent: NodeId, meta: serde_json::Value, clipped: bool, painted: bool| {
+            let mut node = CanvasNode::new(NodeData::Group(GroupNode {
+                local_size: (!clipped).then_some([120.0, 80.0]),
+                clip_size: clipped.then_some([120.0, 80.0]),
+                background: painted.then_some(fanta_doc::Fill::solid(FantaColor::BLACK)),
+                ..Default::default()
+            }));
+            node.parent = Some(parent);
+            node.meta = meta;
+            doc.scene.insert(node).expect("matching fixture layer")
+        };
+        let authored = insert(
+            page,
+            serde_json::json!({"fanta_kind": "section"}),
+            false,
+            false,
+        );
+        let imported = insert(
+            page,
+            serde_json::json!({"figma_type": "SECTION"}),
+            false,
+            true,
+        );
+        let frame = insert(page, serde_json::json!({}), true, false);
+        let explicit_frame = insert(
+            page,
+            serde_json::json!({"fanta_kind": "frame", "figma_type": "SECTION"}),
+            true,
+            false,
+        );
+        let group = insert(page, serde_json::json!({}), false, false);
+        let component = insert(
+            page,
+            serde_json::json!({"fanta_kind": "section"}),
+            false,
+            false,
+        );
+        let other_component = insert(page, serde_json::json!({}), true, false);
+        insert(
+            other_page,
+            serde_json::json!({"fanta_kind": "section"}),
+            false,
+            false,
+        );
+        for root in [component, other_component] {
+            let component_id = ComponentId::new();
+            doc.components.defs.insert(
+                component_id,
+                ComponentDef::new(component_id, root, "Component"),
+            );
+        }
+        doc.set_active_page(Some(page));
+        doc.history = Default::default();
+        doc.metadata.modified_at = 0;
+        SectionMatchingFixture {
+            doc,
+            page,
+            sections: [authored, imported],
+            frames: [frame, explicit_frame],
+            group,
+            components: [component, other_component],
+        }
+    }
+
+    #[test]
+    fn section_matching_distinguishes_semantic_roles_and_preserves_inspector_presets() {
+        use DesignSelectionHeaderControlKind::SelectMatchingLayers;
+        let mut fixture = section_matching_fixture();
+        let [authored, imported] = fixture.sections;
+        let [frame, explicit_frame] = fixture.frames;
+        let [component, other_component] = fixture.components;
+        for (target, expected) in [
+            (authored, HashSet::from(fixture.sections)),
+            (imported, HashSet::from(fixture.sections)),
+            (frame, HashSet::from(fixture.frames)),
+            (explicit_frame, HashSet::from(fixture.frames)),
+            (fixture.group, HashSet::from([fixture.group])),
+            (component, HashSet::from(fixture.components)),
+            (other_component, HashSet::from(fixture.components)),
+        ] {
+            assert_eq!(
+                matching_design_layers(&fixture.doc, target, Some(fixture.page))
+                    .collect::<HashSet<_>>(),
+                expected,
+            );
+        }
+        let masters = master_roots(&fixture.doc.components);
+        for (target, expected) in [
+            (authored, DesignPanelNodeKind::Group),
+            (imported, DesignPanelNodeKind::Frame),
+        ] {
+            let node = fixture.doc.scene.get(target).expect("section");
+            assert_eq!(design_kind(target, &node.data, &masters), expected);
+            let header =
+                selection_header_for_doc(&fixture.doc, &[target], Some(fixture.page), false)
+                    .expect("section header");
+            assert_eq!(header.title.as_ref(), "Section");
+            assert!(
+                header
+                    .primary_controls
+                    .iter()
+                    .any(|control| control.kind == SelectMatchingLayers)
+            );
+        }
+        fixture
+            .doc
+            .scene
+            .get_mut(imported)
+            .expect("imported section")
+            .meta = serde_json::json!({"fanta_kind": "frame", "figma_type": "SECTION"});
+        let header = selection_header_for_doc(&fixture.doc, &[authored], Some(fixture.page), true)
+            .expect("single section header");
+        assert!(
+            header
+                .primary_controls
+                .iter()
+                .all(|control| control.kind != SelectMatchingLayers),
+            "unrelated groups, frames, components and another page do not offer a matching selection"
+        );
+    }
+
+    #[gpui::test]
+    async fn section_matching_header_action_preserves_document_and_tracks_conversion_undo(
+        cx: &mut TestAppContext,
+    ) {
+        let mut fixture = section_matching_fixture();
+        let [authored, imported] = fixture.sections;
+        fixture.doc.selection.select_only(authored);
+        let (view, panel, mut context) = setup_view(fixture.doc, cx).await;
+        let context = &mut context;
+        let item = view.read_with(context, |view, _| view.item().clone());
+        let original = item.read_with(context, |item, _| item.doc().expect("document").clone());
+        assert!(!item.read_with(context, |item, _| item.is_dirty()));
+        panel.read_with(context, |panel, _| {
+            assert_eq!(
+                panel
+                    .view_data()
+                    .projections
+                    .selection_header
+                    .expect("header")
+                    .view_data
+                    .title
+                    .as_ref(),
+                "Section"
+            );
+        });
+        panel.update_in(context, |_, _, cx| {
+            cx.emit(DesignPanelAction::SelectionHeaderCommandRequested {
+                target: DesignPanelTarget::Nodes {
+                    node_ids: vec![authored.to_string().into()],
+                },
+                command: DesignSelectionHeaderCommand::SelectMatchingLayers,
+            });
+        });
+        context.run_until_parked();
+        item.read_with(context, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(
+                doc.selection.iter().copied().collect::<HashSet<_>>(),
+                HashSet::from([authored, imported])
+            );
+            let mut expected = original.clone();
+            expected.selection = doc.selection.clone();
+            assert_eq!(
+                serde_json::to_value(doc).expect("actual document"),
+                serde_json::to_value(expected).expect("expected document")
+            );
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert_eq!(doc.history.redo_depth(), 0);
+            assert!(!item.is_dirty());
+        });
+        item.update(context, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.select_only(authored);
+                ((), crate::document::DocChange::Selection)
+            })
+            .expect("select section");
+        });
+        context.run_until_parked();
+        panel.update_in(context, |_, _, cx| {
+            cx.emit(DesignPanelAction::SelectionHeaderCommandRequested {
+                target: DesignPanelTarget::Nodes {
+                    node_ids: vec![authored.to_string().into()],
+                },
+                command: DesignSelectionHeaderCommand::ChangeLayerType {
+                    kind: DesignPanelNodeKind::Frame,
+                },
+            });
+        });
+        context.run_until_parked();
+        item.read_with(context, |item, _| {
+            let doc = item.doc().expect("document");
+            assert!(!crate::layer_context_ops::is_section(
+                doc.scene.get(authored).expect("converted frame")
+            ));
+            let [frame, explicit_frame] = fixture.frames;
+            assert_eq!(
+                matching_design_layers(doc, authored, Some(fixture.page)).collect::<HashSet<_>>(),
+                HashSet::from([authored, frame, explicit_frame])
+            );
+            assert_eq!(doc.selection.as_slice(), &[authored]);
+            assert_eq!(doc.history.undo_depth(), 1);
+            assert_eq!(doc.history.redo_depth(), 0);
+            assert!(item.is_dirty());
+            assert!(doc.metadata.modified_at > 0);
+        });
+        assert!(
+            item.update(context, |item, cx| item.undo(cx))
+                .expect("undo frame conversion")
+        );
+        context.run_until_parked();
+        item.read_with(context, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.selection.as_slice(), &[authored]);
+            assert_eq!(
+                matching_design_layers(doc, authored, Some(fixture.page)).collect::<HashSet<_>>(),
+                HashSet::from([authored, imported])
+            );
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert_eq!(doc.history.redo_depth(), 1);
+            assert!(item.is_dirty(), "Undo has not saved the document");
+            let mut expected = original.clone();
+            expected.history = doc.history.clone();
+            assert!(doc.metadata.modified_at > 0);
+            expected.metadata.modified_at = doc.metadata.modified_at;
+            assert_eq!(
+                serde_json::to_value(doc).expect("restored document"),
+                serde_json::to_value(expected).expect("original content")
+            );
+        });
+        panel.read_with(context, |panel, _| {
+            assert_eq!(
+                panel
+                    .view_data()
+                    .projections
+                    .selection_header
+                    .expect("restored header")
+                    .view_data
+                    .title
+                    .as_ref(),
+                "Section"
+            );
+        });
     }
 
     #[test]

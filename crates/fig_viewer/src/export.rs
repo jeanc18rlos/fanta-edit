@@ -14,7 +14,7 @@ use crate::document::{FigPage, page_bounds};
 
 const MAX_EXPORT_PIXELS: u32 = 8192;
 const MAX_EXPORT_TOTAL_PIXELS: u64 = 16 * 1024 * 1024;
-const JPEG_QUALITY: u8 = 90;
+const JPEG_QUALITY: u8 = 95;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ExportFormat {
@@ -876,6 +876,146 @@ mod tests {
             image::open(&paths[1]).expect("JPEG is decodable").color(),
             image::ColorType::Rgb8
         );
+    }
+
+    #[test]
+    fn bitmap_jpeg_center_cover_preserves_source_flat_regions() -> Result<()> {
+        use fanta_doc::{AssetId, BitmapNode, ImageFitMode};
+        use fanta_render::{DecodedImage, InMemoryAssetResolver};
+        use sha2::{Digest as _, Sha256};
+
+        let encoded = include_bytes!("../tests/fixtures/export-bitmap-center-cover.png");
+        assert_eq!(
+            format!("{:x}", Sha256::digest(encoded)),
+            "93487f26aef753b48185a775d007fc39ecb767e685860b6e54905a39db5f5ba0"
+        );
+        let source = image::load_from_memory(encoded)?.to_rgba8();
+        assert_eq!(source.dimensions(), (320, 180));
+        let asset: AssetId = "a_01M455JDQQ9YXJBQBZ37RX7D59".parse()?;
+        let pixels = Arc::new(source.as_raw().clone());
+        let mut resolver = InMemoryAssetResolver::new();
+        assert!(
+            resolver
+                .insert(asset, DecodedImage::new(Arc::clone(&pixels), 320, 180))
+                .is_none()
+        );
+        let resolver = Arc::new(resolver);
+
+        let mut doc = Doc::new();
+        let mut bitmap = CanvasNode::new(NodeData::Bitmap(BitmapNode {
+            asset,
+            natural_size: [320, 180],
+            local_size: [220.0, 160.0],
+            crop: None,
+            fit: ImageFitMode::Fill,
+            tint: None,
+        }));
+        bitmap.id = "n_01M455JDQS8E4SX5C51Z2PK9S0".parse()?;
+        bitmap.name = "B01 BITMAP 100% - mixed target".into();
+        bitmap.transform = Transform2D::translation(320.0, 120.0);
+        bitmap.opacity = 1.0.into();
+        let bitmap = insert(&mut doc, bitmap);
+        insert(&mut doc, exportable_frame("Unselected", 700.0));
+        doc.selection.select_only(bitmap);
+        let original_document = serde_json::to_value(&doc)?;
+
+        let directory = tempfile::tempdir()?;
+        let exports = directory.path().join("exports");
+        std::fs::create_dir(&exports)?;
+        let existing = exports.join("B01 BITMAP 100% - mixed target.jpg");
+        std::fs::write(&existing, b"existing export must survive")?;
+        let batch = prepare_export_jobs(
+            &doc,
+            Some(resolver),
+            None,
+            directory.path().to_path_buf(),
+            &[
+                ExportPreset {
+                    format: ExportFormat::Png,
+                    scale: ExportScale::One,
+                },
+                ExportPreset {
+                    format: ExportFormat::Jpeg,
+                    scale: ExportScale::One,
+                },
+            ],
+        )?;
+        assert_eq!(batch.targets.len(), 1);
+        assert_eq!(
+            batch.targets.first().context("bitmap target")?.bounds,
+            Bounds::from_xywh(320.0, 120.0, 220.0, 160.0)
+        );
+        let paths = run_export_jobs(batch)?;
+        let png_path = exports.join("B01 BITMAP 100% - mixed target.png");
+        let jpeg_path = exports.join("B01 BITMAP 100% - mixed target-2.jpg");
+        assert_eq!(paths, [png_path.clone(), jpeg_path.clone()]);
+        let png = image::open(&png_path)?.to_rgba8();
+        let jpeg = image::open(&jpeg_path)?;
+        assert_eq!(png.dimensions(), (220, 160));
+        assert_eq!(jpeg.dimensions(), (220, 160));
+        assert_eq!(jpeg.color(), image::ColorType::Rgb8);
+        let jpeg = jpeg.to_rgba8();
+        assert!(png.pixels().all(|pixel| pixel[3] == 255));
+        assert!(jpeg.pixels().all(|pixel| pixel[3] == 255));
+
+        let mut checked_pixels = Vec::new();
+        let mut jpeg_failures = Vec::new();
+        for y in 0..160 {
+            for x in 0..220 {
+                // Preserve the original pointwise mask, including mixed DCT blocks:
+                // center-cover crops source x=36.25..283.75 at scale 8/9.
+                let source_x = (580 + (2 * x + 1) * 9) / 16;
+                let source_y = (2 * y + 1) * 9 / 16;
+                if !(5..315).contains(&source_x) || !(5..175).contains(&source_y) {
+                    continue;
+                }
+                let expected = source.get_pixel(source_x, source_y);
+                if !(source_y - 5..=source_y + 5).all(|neighbor_y| {
+                    (source_x - 5..=source_x + 5)
+                        .all(|neighbor_x| source.get_pixel(neighbor_x, neighbor_y) == expected)
+                }) {
+                    continue;
+                }
+                checked_pixels.push((x, y));
+                let lossless = png.get_pixel(x, y);
+                assert!(
+                    lossless.0[..3]
+                        .iter()
+                        .zip(&expected.0[..3])
+                        .all(|(actual, expected)| actual.abs_diff(*expected) <= 2),
+                    "PNG crop/color mismatch at ({x}, {y}): {lossless:?} versus {expected:?}"
+                );
+                let actual = jpeg.get_pixel(x, y);
+                if actual.0[..3]
+                    .iter()
+                    .zip(&expected.0[..3])
+                    .any(|(actual, expected)| actual.abs_diff(*expected) > 10)
+                {
+                    jpeg_failures.push((x, y, *expected, *actual));
+                }
+            }
+        }
+        assert_eq!(checked_pixels.len(), 13_248);
+        for original_failure in [(105, 7), (118, 7), (105, 48), (118, 48)] {
+            assert!(checked_pixels.contains(&original_failure));
+        }
+        assert_eq!(serde_json::to_value(&doc)?, original_document);
+        assert_eq!(pixels.as_ref(), source.as_raw());
+        assert_eq!(std::fs::read(&existing)?, b"existing export must survive");
+        let mut actual_paths = std::fs::read_dir(&exports)?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        actual_paths.sort();
+        let mut expected_paths = vec![existing, png_path, jpeg_path];
+        expected_paths.sort();
+        assert_eq!(actual_paths, expected_paths);
+        assert!(
+            jpeg_failures.is_empty(),
+            "{} of 13,248 source-flat pixels exceed JPEG tolerance 10; first: {:?}",
+            jpeg_failures.len(),
+            jpeg_failures.iter().take(8).collect::<Vec<_>>()
+        );
+        Ok(())
     }
 
     #[test]
