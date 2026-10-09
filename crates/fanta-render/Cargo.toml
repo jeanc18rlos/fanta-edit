@@ -19,6 +19,7 @@ fanta-doc.workspace = true
 # `TextNode`'s doc-level style/align into the engine's types and paints the
 # resulting `TextLayout` straight onto the scene canvas.
 fanta-text.workspace = true
+lru.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
