@@ -72,7 +72,7 @@ use super::{
     padded_layer_rect,
 };
 use fanta_doc::{ComponentLibrary, Scene};
-use skia_safe::{IRect, Matrix, SamplingOptions};
+use skia_safe::{ColorType, IRect, Matrix, SamplingOptions, Surface};
 use std::collections::HashSet;
 
 /// The largest layer, in device pixels, the cache will hold as one entry
@@ -136,6 +136,7 @@ pub(crate) enum LayerLookup {
     Miss,
     /// The cached image was drawn in place of the layer.
     Hit,
+    SampledHit(VerificationSample),
 }
 
 /// The cross-frame effect-layer cache. Owned by the renderer next to the
@@ -168,6 +169,9 @@ pub(crate) struct LayerCache {
     /// serves both kinds, so a lookup only serves entries of the canvas's
     /// kind. Probed per frame by [`Self::begin_frame`].
     canvas_is_gpu: Option<bool>,
+    verification: VerificationSchedule,
+    #[cfg(test)]
+    verification_fault: VerificationFault,
 }
 
 impl Default for LayerCache {
@@ -186,6 +190,11 @@ impl Default for LayerCache {
             enabled: true,
             populated_this_frame: 0,
             canvas_is_gpu: None,
+            verification: VerificationSchedule::new(
+                std::env::var("FANTA_LAYER_CACHE_VERIFY").is_ok_and(|value| value == "1"),
+            ),
+            #[cfg(test)]
+            verification_fault: VerificationFault::None,
         }
     }
 }
@@ -388,7 +397,19 @@ impl LayerCache {
             Some(composite),
         );
         canvas.restore();
-        LayerLookup::Hit
+        if self.verification.nominate(self.frame) {
+            LayerLookup::SampledHit(VerificationSample {
+                image: entry.image.clone(),
+                position: ((entry.origin.0 as f32) + rx, (entry.origin.1 as f32) + ry),
+                matrix: affine_of(&m),
+                frame: self.frame,
+                texture_backed: entry.texture_backed,
+                #[cfg(test)]
+                fault: self.verification_fault,
+            })
+        } else {
+            LayerLookup::Hit
+        }
     }
 
     /// Store a freshly rendered layer image for `id`. `matrix` is the node's
@@ -430,6 +451,43 @@ impl LayerCache {
         );
         self.bytes += bytes;
         true
+    }
+
+    #[cfg(test)]
+    pub(super) fn verification_test_policy(
+        &mut self,
+        enabled: bool,
+        every_hit: bool,
+        fault: VerificationFault,
+    ) {
+        self.verification = VerificationSchedule::new(enabled);
+        self.verification.every_hit = every_hit;
+        self.verification_fault = fault;
+    }
+
+    #[cfg(test)]
+    pub(super) fn verification_test_state(&self) -> (usize, usize, u32, Vec<(NodeId, u32, u64)>) {
+        let mut entries: Vec<_> = self
+            .entries
+            .iter()
+            .map(|(id, entry)| (*id, entry.image.unique_id(), entry.last_used))
+            .collect();
+        entries.sort_unstable();
+        (self.len(), self.bytes, self.populated_this_frame, entries)
+    }
+
+    #[cfg(test)]
+    pub(super) fn verification_poison(&mut self, id: NodeId, move_extent: bool) {
+        let entry = self.entries.get_mut(&id).expect("cached test layer");
+        if move_extent {
+            entry.origin.0 += 80;
+        } else {
+            let mut surface =
+                skia_safe::surfaces::raster_n32_premul((entry.image.width(), entry.image.height()))
+                    .expect("poison surface");
+            surface.canvas().clear(skia_safe::Color::MAGENTA);
+            entry.image = surface.image_snapshot();
+        }
     }
 
     /// Evict least-recently-used entries NOT used this frame until `incoming`
@@ -541,23 +599,23 @@ pub(crate) fn render_layer_via_cache(
     let Some(mut surface) = canvas.new_surface(&info, Some(&props)) else {
         return false;
     };
-    let offscreen = surface.canvas();
-    offscreen.clear(skia_safe::Color::TRANSPARENT);
-    // The node's local space, shifted so the output rect's corner is (0, 0).
-    offscreen.translate((-(dev_out.left as f32), -(dev_out.top as f32)));
-    offscreen.concat(&m);
-    let filter_paint = layer.filter_paint();
-    let rec = skia_safe::canvas::SaveLayerRec::default()
-        .paint(&filter_paint)
-        .bounds(&padded);
-    offscreen.save_layer(&rec);
-    let outer_visible = std::mem::replace(&mut ctx.visible, UNCULLED_WORLD);
-    let outer_volatile = std::mem::replace(&mut ctx.layer_volatile, false);
-    body(offscreen, ctx);
-    ctx.visible = outer_visible;
-    let volatile = ctx.layer_volatile;
-    ctx.layer_volatile = outer_volatile || volatile;
-    offscreen.restore();
+    let mut volatile = false;
+    paint_filtered_layer(
+        surface.canvas(),
+        layer,
+        padded,
+        &m,
+        dev_out,
+        ctx,
+        |canvas, ctx| {
+            let outer_visible = std::mem::replace(&mut ctx.visible, UNCULLED_WORLD);
+            let outer_volatile = std::mem::replace(&mut ctx.layer_volatile, false);
+            body(canvas, ctx);
+            ctx.visible = outer_visible;
+            volatile = ctx.layer_volatile;
+            ctx.layer_volatile = outer_volatile || volatile;
+        },
+    );
     let image = surface.image_snapshot();
 
     // Composite: identity CTM (the image is in device pixels), the layer
@@ -576,6 +634,479 @@ pub(crate) fn render_layer_via_cache(
             .store(id, image, affine_of(&m), (dev_out.left, dev_out.top));
     }
     true
+}
+
+const VERIFY_MAX_PIXELS: usize = 262_144;
+const VERIFY_MAX_BYTES: usize = 4 << 20;
+
+struct VerificationSchedule {
+    enabled: bool,
+    hits: u64,
+    attempts: u32,
+    last_frame: Option<u64>,
+    logs: u32,
+    #[cfg(test)]
+    every_hit: bool,
+}
+
+impl VerificationSchedule {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            hits: 0,
+            attempts: 0,
+            last_frame: None,
+            logs: 0,
+            #[cfg(test)]
+            every_hit: false,
+        }
+    }
+
+    fn nominate(&mut self, frame: u64) -> bool {
+        if !self.enabled || self.attempts >= 64 {
+            return false;
+        }
+        self.hits = self.hits.wrapping_add(1);
+        #[cfg(test)]
+        let forced = self.every_hit;
+        #[cfg(not(test))]
+        let forced = false;
+        if !forced
+            && (!self.hits.is_multiple_of(128)
+                || self
+                    .last_frame
+                    .is_some_and(|last| frame.wrapping_sub(last) < 30))
+        {
+            return false;
+        }
+        self.last_frame = Some(frame);
+        self.attempts += 1;
+        true
+    }
+}
+
+pub(crate) struct VerificationSample {
+    image: skia_safe::Image,
+    position: (f32, f32),
+    matrix: [f32; 6],
+    frame: u64,
+    texture_backed: bool,
+    #[cfg(test)]
+    fault: VerificationFault,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum VerificationFault {
+    #[default]
+    None,
+    Surface,
+    Buffer,
+    Readback,
+    Volatile,
+    Incomplete,
+    Effect,
+    NonArtwork,
+    Budget,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VerificationFailure {
+    Bounds,
+    Budget,
+    Format,
+    Surface,
+    Buffer,
+    Readback,
+    Artwork,
+}
+
+#[derive(Debug)]
+struct PixelComparison {
+    pixels: u64,
+    differing_pixels: u64,
+    differing_channels: u64,
+    max_delta: u8,
+    first_mismatch: Option<(usize, usize)>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct VerificationRegion {
+    bounds: IRect,
+    width: usize,
+    row_bytes: usize,
+    buffer_bytes: usize,
+}
+
+impl VerificationRegion {
+    fn new(current: IRect, position: (f32, f32), size: (i32, i32)) -> Option<Self> {
+        let integer = |value: f32| {
+            let value = f64::from(value);
+            (value.is_finite()
+                && value.fract() == 0.0
+                && value >= f64::from(i32::MIN)
+                && value <= f64::from(i32::MAX))
+            .then_some(value as i64)
+        };
+        if size.0 <= 0
+            || size.1 <= 0
+            || current.left >= current.right
+            || current.top >= current.bottom
+        {
+            return None;
+        }
+        let left = integer(position.0)?;
+        let top = integer(position.1)?;
+        let right = left.checked_add(i64::from(size.0))?;
+        let bottom = top.checked_add(i64::from(size.1))?;
+        let left = left.min(i64::from(current.left));
+        let top = top.min(i64::from(current.top));
+        let right = right.max(i64::from(current.right));
+        let bottom = bottom.max(i64::from(current.bottom));
+        let width = usize::try_from(right.checked_sub(left)?).ok()?;
+        let height = usize::try_from(bottom.checked_sub(top)?).ok()?;
+        let pixels = width.checked_mul(height)?;
+        let row_bytes = width.checked_mul(4)?;
+        let buffer_bytes = row_bytes.checked_mul(height)?;
+        if pixels == 0
+            || pixels > VERIFY_MAX_PIXELS
+            || buffer_bytes.checked_mul(4)? > VERIFY_MAX_BYTES
+        {
+            return None;
+        }
+        Some(Self {
+            bounds: IRect::from_ltrb(
+                i32::try_from(left).ok()?,
+                i32::try_from(top).ok()?,
+                i32::try_from(right).ok()?,
+                i32::try_from(bottom).ok()?,
+            ),
+            width,
+            row_bytes,
+            buffer_bytes,
+        })
+    }
+}
+
+fn checked_device_rect(matrix: &Matrix, local: &Rect) -> Option<IRect> {
+    let (device, _) = matrix.map_rect(local);
+    if !device.is_finite() || matrix.has_perspective() {
+        return None;
+    }
+    let coordinate = |value: f32, lower: bool| {
+        let rounded = if lower {
+            f64::from(value).floor() - 1.0
+        } else {
+            f64::from(value).ceil() + 1.0
+        };
+        (rounded >= f64::from(i32::MIN) && rounded <= f64::from(i32::MAX)).then_some(rounded as i32)
+    };
+    let result = IRect::from_ltrb(
+        coordinate(device.left, true)?,
+        coordinate(device.top, true)?,
+        coordinate(device.right, false)?,
+        coordinate(device.bottom, false)?,
+    );
+    (result.left < result.right && result.top < result.bottom).then_some(result)
+}
+
+fn paint_filtered_layer(
+    canvas: &Canvas,
+    layer: &EffectsLayerPaint,
+    padded: Rect,
+    matrix: &Matrix,
+    bounds: IRect,
+    ctx: &mut RenderCtx,
+    body: impl FnOnce(&Canvas, &mut RenderCtx),
+) {
+    canvas.clear(skia_safe::Color::TRANSPARENT);
+    canvas.translate((-(bounds.left as f32), -(bounds.top as f32)));
+    canvas.concat(matrix);
+    let filter_paint = layer.filter_paint();
+    let rec = skia_safe::canvas::SaveLayerRec::default()
+        .paint(&filter_paint)
+        .bounds(&padded);
+    canvas.save_layer(&rec);
+    body(canvas, ctx);
+    canvas.restore();
+}
+
+fn supported_canvas(canvas: &Canvas, texture_backed: bool) -> bool {
+    if !texture_backed {
+        return canvas.peek_pixels().is_some();
+    }
+    #[cfg(feature = "metal")]
+    {
+        canvas.recording_context().is_some()
+    }
+    #[cfg(not(feature = "metal"))]
+    {
+        false
+    }
+}
+
+fn compatible_surface(
+    canvas: &Canvas,
+    info: &ImageInfo,
+    texture_backed: bool,
+) -> Result<Surface, VerificationFailure> {
+    let props = canvas.top_props();
+    let mut surface = canvas
+        .new_surface(info, Some(&props))
+        .ok_or(VerificationFailure::Surface)?;
+    if surface.image_info() != *info
+        || surface.recording_context().is_some() != texture_backed
+        || (!texture_backed && surface.peek_pixels().is_none())
+    {
+        return Err(VerificationFailure::Surface);
+    }
+    Ok(surface)
+}
+
+fn comparison_pixels(
+    surface: &mut Surface,
+    info: &ImageInfo,
+    region: VerificationRegion,
+) -> Result<Vec<u8>, VerificationFailure> {
+    let mut pixels = Vec::new();
+    pixels
+        .try_reserve_exact(region.buffer_bytes)
+        .map_err(|_| VerificationFailure::Buffer)?;
+    pixels.resize(region.buffer_bytes, 0);
+    if !surface.read_pixels(info, &mut pixels, region.row_bytes, (0, 0)) {
+        return Err(VerificationFailure::Readback);
+    }
+    Ok(pixels)
+}
+
+fn compare_pixels(cached: &[u8], reference: &[u8], width: usize) -> PixelComparison {
+    let mut comparison = PixelComparison {
+        pixels: (cached.len() / 4) as u64,
+        differing_pixels: 0,
+        differing_channels: 0,
+        max_delta: 0,
+        first_mismatch: None,
+    };
+    for (index, (left, right)) in cached
+        .chunks_exact(4)
+        .zip(reference.chunks_exact(4))
+        .enumerate()
+    {
+        if left != right {
+            comparison.differing_pixels += 1;
+            comparison
+                .first_mismatch
+                .get_or_insert((index % width, index / width));
+            for (left, right) in left.iter().zip(right) {
+                comparison.differing_channels += u64::from(left != right);
+                comparison.max_delta = comparison.max_delta.max(left.abs_diff(*right));
+            }
+        }
+    }
+    comparison
+}
+
+fn compare_layer(
+    canvas: &Canvas,
+    layer: &EffectsLayerPaint,
+    content_bounds: Option<Bounds>,
+    sample: &VerificationSample,
+    ctx: &mut RenderCtx,
+    body: impl FnOnce(&Canvas, &mut RenderCtx),
+) -> Result<PixelComparison, VerificationFailure> {
+    let base = canvas.image_info();
+    if !matches!(base.color_type(), ColorType::RGBA8888 | ColorType::BGRA8888)
+        || base.bytes_per_pixel() != 4
+        || !supported_canvas(canvas, sample.texture_backed)
+    {
+        return Err(VerificationFailure::Format);
+    }
+    let padded = padded_layer_rect(
+        &content_bounds.ok_or(VerificationFailure::Bounds)?,
+        ctx.effective_scale,
+    );
+    if !padded.is_finite() {
+        return Err(VerificationFailure::Bounds);
+    }
+    let output = match &layer.filter {
+        None => padded,
+        Some(filter) if filter.can_compute_fast_bounds() => filter.compute_fast_bounds(padded),
+        Some(_) => return Err(VerificationFailure::Bounds),
+    };
+    let matrix = canvas.local_to_device_as_3x3();
+    let current = checked_device_rect(&matrix, &output).ok_or(VerificationFailure::Bounds)?;
+    let region = VerificationRegion::new(
+        current,
+        sample.position,
+        (sample.image.width(), sample.image.height()),
+    )
+    .ok_or(VerificationFailure::Bounds)?;
+    let info = ImageInfo::new(
+        (region.bounds.width(), region.bounds.height()),
+        base.color_type(),
+        AlphaType::Premul,
+        base.color_space(),
+    );
+    #[cfg(test)]
+    if sample.fault == VerificationFault::Surface {
+        return Err(VerificationFailure::Surface);
+    }
+    let mut cached = compatible_surface(canvas, &info, sample.texture_backed)?;
+    let mut reference = compatible_surface(canvas, &info, sample.texture_backed)?;
+    cached.canvas().clear(skia_safe::Color::TRANSPARENT);
+    cached.canvas().draw_image_with_sampling_options(
+        &sample.image,
+        (
+            sample.position.0 - region.bounds.left as f32,
+            sample.position.1 - region.bounds.top as f32,
+        ),
+        SamplingOptions::default(),
+        None,
+    );
+
+    let outer_metrics = std::mem::replace(
+        ctx.metrics,
+        super::RenderMetrics {
+            sampling_budget: Some(crate::sampling::SamplingWorkBudget::default()),
+            ..Default::default()
+        },
+    );
+    let outer_visible = std::mem::replace(&mut ctx.visible, UNCULLED_WORLD);
+    let outer_lookup = std::mem::replace(&mut ctx.layer_cache_lookups, false);
+    let outer_populate = std::mem::replace(&mut ctx.layer_cache_populate, false);
+    let outer_volatile = std::mem::replace(&mut ctx.layer_volatile, false);
+    paint_filtered_layer(
+        reference.canvas(),
+        layer,
+        padded,
+        &matrix,
+        region.bounds,
+        ctx,
+        |canvas, ctx| {
+            let entered = ctx
+                .metrics
+                .sampling_budget
+                .as_mut()
+                .is_some_and(|budget| budget.enter());
+            if entered {
+                body(canvas, ctx);
+                if let Some(budget) = &mut ctx.metrics.sampling_budget {
+                    budget.leave();
+                }
+            }
+        },
+    );
+    #[cfg(test)]
+    match sample.fault {
+        VerificationFault::Volatile => ctx.layer_volatile = true,
+        VerificationFault::Incomplete => ctx.metrics.incomplete_artwork = true,
+        VerificationFault::Effect => ctx.metrics.effect_failed = true,
+        VerificationFault::NonArtwork => ctx.metrics.non_artwork_content = true,
+        VerificationFault::Budget => {
+            if let Some(budget) = &mut ctx.metrics.sampling_budget {
+                budget.exhausted = true;
+            }
+        }
+        _ => {}
+    }
+    let reference_volatile = std::mem::replace(&mut ctx.layer_volatile, outer_volatile);
+    ctx.visible = outer_visible;
+    ctx.layer_cache_lookups = outer_lookup;
+    ctx.layer_cache_populate = outer_populate;
+    let reference_metrics = std::mem::replace(ctx.metrics, outer_metrics);
+    if reference_metrics
+        .sampling_budget
+        .as_ref()
+        .is_some_and(|budget| budget.exhausted || budget.expansion_exhausted)
+    {
+        return Err(VerificationFailure::Budget);
+    }
+    if reference_volatile
+        || reference_metrics.incomplete_artwork
+        || reference_metrics.non_artwork_content
+        || reference_metrics.effect_failed
+    {
+        return Err(VerificationFailure::Artwork);
+    }
+    #[cfg(test)]
+    if sample.fault == VerificationFault::Buffer {
+        return Err(VerificationFailure::Buffer);
+    }
+    let read_info = ImageInfo::new(
+        (region.bounds.width(), region.bounds.height()),
+        ColorType::RGBA8888,
+        AlphaType::Premul,
+        base.color_space(),
+    );
+    let cached_pixels = comparison_pixels(&mut cached, &read_info, region)?;
+    #[cfg(test)]
+    if sample.fault == VerificationFault::Readback {
+        return Err(VerificationFailure::Readback);
+    }
+    let reference_pixels = comparison_pixels(&mut reference, &read_info, region)?;
+    Ok(compare_pixels(
+        &cached_pixels,
+        &reference_pixels,
+        region.width,
+    ))
+}
+
+pub(crate) fn verify_layer_hit(
+    canvas: &Canvas,
+    id: NodeId,
+    layer: &EffectsLayerPaint,
+    content_bounds: Option<Bounds>,
+    sample: VerificationSample,
+    ctx: &mut RenderCtx,
+    body: impl FnOnce(&Canvas, &mut RenderCtx),
+) {
+    let result = compare_layer(canvas, layer, content_bounds, &sample, ctx, body);
+    ctx.metrics.layer_cache_verify_attempted += 1;
+    let failed = match &result {
+        Ok(comparison) => {
+            ctx.metrics.layer_cache_verify_completed += 1;
+            ctx.metrics.layer_cache_verify_pixels += comparison.pixels;
+            ctx.metrics.layer_cache_verify_differing_pixels += comparison.differing_pixels;
+            ctx.metrics.layer_cache_verify_differing_channels += comparison.differing_channels;
+            ctx.metrics.layer_cache_verify_max_delta = ctx
+                .metrics
+                .layer_cache_verify_max_delta
+                .max(comparison.max_delta);
+            if comparison.differing_pixels == 0 {
+                ctx.metrics.layer_cache_verify_equal += 1;
+                false
+            } else {
+                ctx.metrics.layer_cache_verify_mismatch += 1;
+                true
+            }
+        }
+        Err(VerificationFailure::Bounds | VerificationFailure::Budget) => {
+            ctx.metrics.layer_cache_verify_skipped += 1;
+            true
+        }
+        Err(_) => {
+            ctx.metrics.layer_cache_verify_unavailable += 1;
+            true
+        }
+    };
+    if let Err(reason) = &result {
+        let index = match reason {
+            VerificationFailure::Bounds => 0,
+            VerificationFailure::Budget => 1,
+            VerificationFailure::Format => 2,
+            VerificationFailure::Surface => 3,
+            VerificationFailure::Buffer => 4,
+            VerificationFailure::Readback => 5,
+            VerificationFailure::Artwork => 6,
+        };
+        ctx.metrics.layer_cache_verify_reasons[index] += 1;
+    }
+    if failed && ctx.layer_cache.verification.logs < 8 {
+        ctx.layer_cache.verification.logs += 1;
+        tracing::warn!(node = %id, frame = sample.frame, revision = ctx.scene.revision(),
+            gpu = sample.texture_backed, matrix = ?sample.matrix, position = ?sample.position,
+            content_bounds = ?content_bounds, result = ?result, "sampled layer cache verification");
+    }
 }
 
 /// Bytes a `w × h` RGBA8 layer image occupies.
@@ -625,6 +1156,349 @@ pub(crate) const UNCULLED_WORLD: Bounds = Bounds {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn with_verification_context(test: impl FnOnce(&mut RenderCtx)) {
+        let scene = Scene::new();
+        let inputs = super::super::RenderInputs::empty();
+        let mut images = super::super::ImageCache::default();
+        let mut instances = super::super::InstanceCache::default();
+        let mut booleans = super::super::BooleanCache::default();
+        let mut paths = super::super::PathCache::default();
+        let mut patterns = super::super::PatternCache::default();
+        let mut layers = LayerCache::default();
+        layers.verification = VerificationSchedule::new(false);
+        let mut metrics = super::super::RenderMetrics {
+            nodes_visited: 19,
+            layer_cache_hits: 7,
+            incomplete_artwork: true,
+            sampling_budget: Some(crate::sampling::SamplingWorkBudget::default()),
+            ..Default::default()
+        };
+        if let Some(budget) = &mut metrics.sampling_budget {
+            assert!(budget.enter());
+            assert!(budget.reserve_expanded_node());
+        }
+        let mut ctx = RenderCtx {
+            split: None,
+            scene: &scene,
+            resolver: None,
+            cache: &mut images,
+            instance_cache: &mut instances,
+            boolean_cache: &mut booleans,
+            path_cache: &mut paths,
+            pattern_cache: &mut patterns,
+            pattern_stack: Vec::new(),
+            inputs: &inputs,
+            instance_mode_anchor: None,
+            resolved_local_transforms: IdHashMap::default(),
+            resolved_world_transforms: IdHashMap::default(),
+            resolved_local_bounds: IdHashMap::default(),
+            visible: Bounds {
+                min_x: 1.0,
+                min_y: 2.0,
+                max_x: 3.0,
+                max_y: 4.0,
+            },
+            effective_scale: 1.0,
+            page_background_root: None,
+            supports_offscreen_layers: true,
+            paint_alpha: 1.0,
+            layer_cache: &mut layers,
+            layer_cache_lookups: true,
+            layer_cache_populate: true,
+            live_video_fill_subtrees: IdHashMap::default(),
+            layer_volatile: true,
+            metrics: &mut metrics,
+        };
+        test(&mut ctx);
+    }
+
+    fn verification_sample(fault: VerificationFault) -> VerificationSample {
+        VerificationSample {
+            image: raster_image(8, 8),
+            position: (0.0, 0.0),
+            matrix: [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            frame: 1,
+            texture_backed: false,
+            fault,
+        }
+    }
+
+    #[test]
+    fn layer_verification_schedule_and_checked_region_bound_all_attempts() {
+        let mut off = VerificationSchedule::new(false);
+        for frame in 0..256 {
+            assert!(!off.nominate(frame));
+        }
+        assert_eq!((off.hits, off.attempts, off.last_frame), (0, 0, None));
+        let mut schedule = VerificationSchedule::new(true);
+        for hit in 1..=128 {
+            assert_eq!(schedule.nominate(1), hit == 128);
+        }
+        for _ in 0..128 {
+            assert!(!schedule.nominate(30));
+        }
+        for hit in 1..=128 {
+            assert_eq!(schedule.nominate(31), hit == 128);
+        }
+        for attempt in 2..64 {
+            for hit in 1..=128 {
+                assert_eq!(schedule.nominate(attempt * 30 + 1), hit == 128);
+            }
+        }
+        for frame in 2_000..2_500 {
+            assert!(!schedule.nominate(frame));
+        }
+        assert_eq!(schedule.attempts, 64);
+        let mut cache = LayerCache::default();
+        cache.verification = schedule;
+        cache.clear();
+        cache.set_enabled(false);
+        cache.set_enabled(true);
+        assert_eq!(cache.verification.attempts, 64);
+        assert!(!cache.verification.nominate(3_000));
+
+        let maximum =
+            VerificationRegion::new(IRect::from_ltrb(0, 0, 512, 512), (0.0, 0.0), (512, 512))
+                .expect("maximum union");
+        assert_eq!(maximum.buffer_bytes * 4, VERIFY_MAX_BYTES);
+        for (bounds, position, size) in [
+            (IRect::from_ltrb(0, 0, 513, 512), (0.0, 0.0), (1, 1)),
+            (
+                IRect::from_ltrb(i32::MIN, 0, i32::MAX, 1),
+                (0.0, 0.0),
+                (1, 1),
+            ),
+            (IRect::from_ltrb(0, 0, 1, 1), (f32::INFINITY, 0.0), (1, 1)),
+            (IRect::from_ltrb(0, 0, 1, 1), (0.5, 0.0), (1, 1)),
+            (IRect::from_ltrb(0, 0, 1, 1), (0.0, 0.0), (0, 1)),
+            (IRect::from_ltrb(0, 0, 0, 1), (0.0, 0.0), (1, 1)),
+        ] {
+            assert!(VerificationRegion::new(bounds, position, size).is_none());
+        }
+        assert!(
+            checked_device_rect(
+                &Matrix::new_identity(),
+                &Rect::from_ltrb(-f32::MAX, 0.0, f32::MAX, 1.0)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn layer_verification_restores_original_metrics_budget_and_flags_on_every_outcome() {
+        for outer_volatile in [false, true] {
+            for fault in [
+                VerificationFault::None,
+                VerificationFault::Surface,
+                VerificationFault::Buffer,
+                VerificationFault::Readback,
+                VerificationFault::Volatile,
+                VerificationFault::Incomplete,
+                VerificationFault::NonArtwork,
+                VerificationFault::Effect,
+                VerificationFault::Budget,
+            ] {
+                with_verification_context(|ctx| {
+                    ctx.layer_volatile = outer_volatile;
+                    let before_metrics = format!("{:?}", ctx.metrics);
+                    let before_visible = ctx.visible;
+                    let before_cache = ctx.layer_cache.verification_test_state();
+                    let mut surface =
+                        skia_safe::surfaces::raster_n32_premul((16, 16)).expect("surface");
+                    surface
+                        .canvas()
+                        .clip_rect(Rect::from_xywh(0.0, 0.0, 1.0, 1.0), None, false);
+                    let sample = verification_sample(fault);
+                    let layer = EffectsLayerPaint {
+                        filter: None,
+                        opacity: 0.5,
+                        blend_mode: super::super::BlendMode::Multiply,
+                    };
+                    let result = compare_layer(
+                        surface.canvas(),
+                        &layer,
+                        Some(Bounds {
+                            min_x: 0.0,
+                            min_y: 0.0,
+                            max_x: 8.0,
+                            max_y: 8.0,
+                        }),
+                        &sample,
+                        ctx,
+                        |canvas, ctx| {
+                            assert!(
+                                !ctx.layer_cache_lookups
+                                    && !ctx.layer_cache_populate
+                                    && !ctx.layer_volatile
+                            );
+                            assert_eq!(ctx.visible, UNCULLED_WORLD);
+                            assert!(!ctx.metrics.incomplete_artwork);
+                            assert_eq!(ctx.metrics.nodes_visited, 0);
+                            assert!(ctx.metrics.sampling_budget.is_some());
+                            ctx.metrics.nodes_visited += 11;
+                            canvas.clear(skia_safe::Color::BLUE);
+                        },
+                    );
+                    match fault {
+                        VerificationFault::None => assert!(
+                            result.expect("completed comparison").differing_pixels > 1,
+                            "comparison must see pixels outside the original one-pixel clip"
+                        ),
+                        VerificationFault::Surface => {
+                            assert!(matches!(result, Err(VerificationFailure::Surface)))
+                        }
+                        VerificationFault::Buffer => {
+                            assert!(matches!(result, Err(VerificationFailure::Buffer)))
+                        }
+                        VerificationFault::Readback => {
+                            assert!(matches!(result, Err(VerificationFailure::Readback)))
+                        }
+                        VerificationFault::Budget => {
+                            assert!(matches!(result, Err(VerificationFailure::Budget)))
+                        }
+                        _ => assert!(matches!(result, Err(VerificationFailure::Artwork))),
+                    }
+                    assert_eq!(format!("{:?}", ctx.metrics), before_metrics);
+                    assert_eq!(ctx.visible, before_visible);
+                    assert!(ctx.layer_cache_lookups && ctx.layer_cache_populate);
+                    assert_eq!(ctx.layer_volatile, outer_volatile);
+                    assert_eq!(ctx.layer_cache.verification_test_state(), before_cache);
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn layer_verification_rejects_high_precision_before_paint_and_balances_real_budget_exhaustion()
+    {
+        with_verification_context(|ctx| {
+            let before = format!("{:?}", ctx.metrics);
+            let info = ImageInfo::new((8, 8), ColorType::RGBAF16, AlphaType::Premul, None);
+            let mut surface =
+                skia_safe::surfaces::raster(&info, None, None).expect("high precision surface");
+            let layer = EffectsLayerPaint {
+                filter: None,
+                opacity: 1.0,
+                blend_mode: super::super::BlendMode::Normal,
+            };
+            let bounds = Some(Bounds {
+                min_x: 0.0,
+                min_y: 0.0,
+                max_x: 8.0,
+                max_y: 8.0,
+            });
+            let result = compare_layer(
+                surface.canvas(),
+                &layer,
+                bounds,
+                &verification_sample(VerificationFault::None),
+                ctx,
+                |_, _| panic!("unsupported format must refuse before painting/allocation"),
+            );
+            assert!(matches!(result, Err(VerificationFailure::Format)));
+            let mut surface = skia_safe::surfaces::raster_n32_premul((8, 8)).expect("surface");
+            let result = compare_layer(
+                surface.canvas(),
+                &layer,
+                bounds,
+                &verification_sample(VerificationFault::None),
+                ctx,
+                |_, ctx| {
+                    let budget = ctx.metrics.sampling_budget.as_mut().expect("fresh budget");
+                    let mut entered = 0;
+                    while budget.enter() {
+                        entered += 1;
+                    }
+                    assert_eq!(entered, 63, "reference root occupies the first depth slot");
+                    for _ in 0..entered {
+                        budget.leave();
+                    }
+                },
+            );
+            assert!(matches!(result, Err(VerificationFailure::Budget)));
+            assert_eq!(format!("{:?}", ctx.metrics), before);
+        });
+    }
+
+    #[test]
+    fn layer_verification_preserves_near_integer_hit_eligibility() {
+        let mut surface = skia_safe::surfaces::raster_n32_premul((16, 16)).expect("surface");
+        let canvas = surface.canvas();
+        let scene = Scene::new();
+        let components = ComponentLibrary::default();
+        let mut cache = LayerCache::default();
+        cache.verification = VerificationSchedule::new(true);
+        cache.verification.every_hit = true;
+        cache.begin_frame(
+            canvas,
+            &scene,
+            &components,
+            epoch(&scene, 0),
+            1.0,
+            (0.0, 0.0),
+        );
+        let id = NodeId::new();
+        assert!(cache.store(
+            id,
+            raster_image(8, 8),
+            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            (0, 0)
+        ));
+        cache.begin_frame(
+            canvas,
+            &scene,
+            &components,
+            epoch(&scene, 0),
+            1.0,
+            (0.0, 0.0),
+        );
+        canvas.translate((1.0 + INTEGER_PAN_EPS * 0.5, 0.0));
+        assert!(matches!(
+            cache.lookup(canvas, id, &Paint::default()),
+            LayerLookup::SampledHit(_)
+        ));
+        canvas.reset_matrix();
+        canvas.translate((1.0 + INTEGER_PAN_EPS * 2.0, 0.0));
+        assert!(matches!(
+            cache.lookup(canvas, id, &Paint::default()),
+            LayerLookup::Miss
+        ));
+        assert_eq!(cache.verification.attempts, 1);
+    }
+
+    #[test]
+    fn layer_verification_limits_failure_logs_without_losing_counts() {
+        with_verification_context(|ctx| {
+            let mut surface = skia_safe::surfaces::raster_n32_premul((8, 8)).expect("surface");
+            let layer = EffectsLayerPaint {
+                filter: None,
+                opacity: 1.0,
+                blend_mode: super::super::BlendMode::Normal,
+            };
+            for _ in 0..12 {
+                verify_layer_hit(
+                    surface.canvas(),
+                    NodeId::new(),
+                    &layer,
+                    Some(Bounds {
+                        min_x: 0.0,
+                        min_y: 0.0,
+                        max_x: 8.0,
+                        max_y: 8.0,
+                    }),
+                    verification_sample(VerificationFault::Surface),
+                    ctx,
+                    |_, _| panic!("failed allocation"),
+                );
+            }
+            assert_eq!(ctx.layer_cache.verification.logs, 8);
+            assert_eq!(ctx.metrics.layer_cache_verify_attempted, 12);
+            assert_eq!(ctx.metrics.layer_cache_verify_unavailable, 12);
+            assert_eq!(ctx.metrics.layer_cache_verify_reasons[3], 12);
+            assert_eq!(ctx.metrics.layer_cache_verify_completed, 0);
+        });
+    }
 
     fn raster_image(w: i32, h: i32) -> skia_safe::Image {
         let info = ImageInfo::new_n32_premul((w, h), None);

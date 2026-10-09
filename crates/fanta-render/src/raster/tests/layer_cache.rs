@@ -875,3 +875,293 @@ fn layer_cache_component_guard_comparison_diagnostic() -> Result<(), Box<dyn std
     }
     Ok(())
 }
+
+fn verification_metrics_removed(mut metrics: RenderMetrics) -> String {
+    metrics.frame_micros = 0;
+    metrics.layer_cache_verify_attempted = 0;
+    metrics.layer_cache_verify_completed = 0;
+    metrics.layer_cache_verify_equal = 0;
+    metrics.layer_cache_verify_mismatch = 0;
+    metrics.layer_cache_verify_skipped = 0;
+    metrics.layer_cache_verify_unavailable = 0;
+    metrics.layer_cache_verify_pixels = 0;
+    metrics.layer_cache_verify_differing_pixels = 0;
+    metrics.layer_cache_verify_differing_channels = 0;
+    metrics.layer_cache_verify_max_delta = 0;
+    metrics.layer_cache_verify_reasons = [0; 7];
+    format!("{metrics:?}")
+}
+
+#[test]
+fn sampled_layer_hits_match_nested_effect_pixels_without_changing_the_frame() {
+    use crate::raster::layer_cache::VerificationFault;
+    let (doc, _) = sampler_doc();
+    let before = serde_json::to_value(&doc).expect("document");
+    let mut checked = RasterRenderer::new(W, H).expect("checked renderer");
+    let mut ordinary = RasterRenderer::new(W, H).expect("ordinary renderer");
+    checked
+        .layer_cache_for_test()
+        .verification_test_policy(true, true, VerificationFault::None);
+    ordinary
+        .layer_cache_for_test()
+        .verification_test_policy(false, false, VerificationFault::None);
+    for renderer in [&mut checked, &mut ordinary] {
+        renderer.render(&doc.scene, &vp(0.0, 0.0));
+        renderer.render(&doc.scene, &vp(0.0, 0.0));
+    }
+    for (x, y) in [(7.0, -3.0), (-11.0, 5.0), (40.0, 30.0)] {
+        let viewport = vp(x, y);
+        let metrics = checked.render(&doc.scene, &viewport);
+        let baseline = ordinary.render(&doc.scene, &viewport);
+        assert_eq!(baseline.layer_cache_verify_attempted, 0);
+        assert!(metrics.layer_cache_verify_equal >= 5, "{metrics:?}");
+        assert_eq!(
+            metrics.layer_cache_verify_attempted,
+            metrics.layer_cache_hits
+        );
+        assert_eq!(
+            metrics.layer_cache_verify_completed,
+            metrics.layer_cache_verify_equal
+        );
+        assert_eq!(
+            (
+                metrics.layer_cache_verify_mismatch,
+                metrics.layer_cache_verify_skipped,
+                metrics.layer_cache_verify_unavailable
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(checked.copy_rgba(), ordinary.copy_rgba());
+        assert_eq!(max_diff(&checked.copy_rgba(), &fresh(&doc, &viewport).0), 0);
+        assert_eq!(
+            verification_metrics_removed(metrics),
+            verification_metrics_removed(baseline)
+        );
+        assert_eq!(checked.layer_cache_stats(), ordinary.layer_cache_stats());
+    }
+    let fractional = checked.render(&doc.scene, &vp(40.25, 30.5));
+    assert_eq!(
+        (
+            fractional.layer_cache_hits,
+            fractional.layer_cache_verify_attempted
+        ),
+        (0, 0)
+    );
+    assert_eq!(
+        serde_json::to_value(&doc).expect("unchanged document"),
+        before
+    );
+}
+
+#[test]
+fn sampled_layer_hit_failures_preserve_output_metrics_and_cached_images() {
+    use crate::raster::layer_cache::VerificationFault;
+    for (fault, skipped, reason) in [
+        (VerificationFault::Surface, false, 3),
+        (VerificationFault::Buffer, false, 4),
+        (VerificationFault::Readback, false, 5),
+        (VerificationFault::Volatile, false, 6),
+        (VerificationFault::Incomplete, false, 6),
+        (VerificationFault::NonArtwork, false, 6),
+        (VerificationFault::Effect, false, 6),
+        (VerificationFault::Budget, true, 1),
+    ] {
+        let (doc, _) = sampler_doc();
+        let mut checked = RasterRenderer::new(W, H).expect("checked renderer");
+        let mut ordinary = RasterRenderer::new(W, H).expect("ordinary renderer");
+        checked
+            .layer_cache_for_test()
+            .verification_test_policy(true, true, fault);
+        ordinary.layer_cache_for_test().verification_test_policy(
+            false,
+            false,
+            VerificationFault::None,
+        );
+        for renderer in [&mut checked, &mut ordinary] {
+            renderer.render(&doc.scene, &vp(0.0, 0.0));
+            renderer.render(&doc.scene, &vp(0.0, 0.0));
+        }
+        let before = checked.layer_cache_for_test().verification_test_state();
+        let metrics = checked.render(&doc.scene, &vp(4.0, 2.0));
+        let baseline = ordinary.render(&doc.scene, &vp(4.0, 2.0));
+        assert!(
+            metrics.layer_cache_verify_attempted >= 5,
+            "{fault:?}: {metrics:?}"
+        );
+        assert_eq!(metrics.layer_cache_verify_completed, 0);
+        assert_eq!(
+            metrics.layer_cache_verify_reasons[reason],
+            metrics.layer_cache_verify_attempted
+        );
+        assert_eq!(
+            metrics.layer_cache_verify_skipped,
+            if skipped {
+                metrics.layer_cache_verify_attempted
+            } else {
+                0
+            }
+        );
+        assert_eq!(
+            metrics.layer_cache_verify_unavailable,
+            if skipped {
+                0
+            } else {
+                metrics.layer_cache_verify_attempted
+            }
+        );
+        assert_eq!(checked.copy_rgba(), ordinary.copy_rgba());
+        assert_eq!(
+            verification_metrics_removed(metrics),
+            verification_metrics_removed(baseline)
+        );
+        let after = checked.layer_cache_for_test().verification_test_state();
+        assert_eq!((before.0, before.1), (after.0, after.1));
+        assert_eq!(after.2, 0);
+        assert_eq!(
+            before
+                .3
+                .iter()
+                .map(|(id, image, _)| (*id, *image))
+                .collect::<Vec<_>>(),
+            after
+                .3
+                .iter()
+                .map(|(id, image, _)| (*id, *image))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            before
+                .3
+                .iter()
+                .zip(&after.3)
+                .all(|(before, after)| after.2 >= before.2)
+        );
+        let ordinary_state = ordinary.layer_cache_for_test().verification_test_state();
+        assert_eq!(
+            after
+                .3
+                .iter()
+                .map(|(id, _, used)| (*id, *used))
+                .collect::<Vec<_>>(),
+            ordinary_state
+                .3
+                .iter()
+                .map(|(id, _, used)| (*id, *used))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn sampled_layer_hits_detect_poisoned_pixels_and_extents_without_repair() {
+    use crate::raster::layer_cache::VerificationFault;
+    for move_extent in [false, true] {
+        let (doc, shadowed) = sampler_doc();
+        let mut renderer = RasterRenderer::new(W, H).expect("renderer");
+        renderer.layer_cache_for_test().verification_test_policy(
+            true,
+            true,
+            VerificationFault::None,
+        );
+        renderer.render(&doc.scene, &vp(0.0, 0.0));
+        renderer.render(&doc.scene, &vp(0.0, 0.0));
+        renderer
+            .layer_cache_for_test()
+            .verification_poison(shadowed, move_extent);
+        let poisoned = renderer.layer_cache_for_test().verification_test_state();
+        for _ in 0..2 {
+            let metrics = renderer.render(&doc.scene, &vp(0.0, 0.0));
+            assert_eq!(metrics.layer_cache_verify_mismatch, 1, "{metrics:?}");
+            assert!(metrics.layer_cache_verify_differing_pixels > 0);
+            assert!(metrics.layer_cache_verify_differing_channels > 0);
+            assert!(metrics.layer_cache_verify_max_delta > 0);
+            let retained = renderer.layer_cache_for_test().verification_test_state();
+            assert_eq!((poisoned.0, poisoned.1), (retained.0, retained.1));
+            assert_eq!(
+                poisoned
+                    .3
+                    .iter()
+                    .map(|(id, image, _)| (*id, *image))
+                    .collect::<Vec<_>>(),
+                retained
+                    .3
+                    .iter()
+                    .map(|(id, image, _)| (*id, *image))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+#[test]
+fn sampled_intrinsic_layers_stay_exact_under_moving_masks_and_ancestor_clips()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::raster::layer_cache::VerificationFault;
+    let mut doc = Doc::new();
+    let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+        clip_size: Some([70.0, 70.0]),
+        corner_radius: Some(8.0),
+        ..Default::default()
+    }));
+    frame.transform = Transform2D::translation(-40.0, -30.0);
+    let frame_id = frame.id;
+    doc.apply(Operation::create_node(frame))?;
+    let mut mask = rect(0.0, 0.0, 30.0, 65.0, Color::WHITE);
+    mask.parent = Some(frame_id);
+    mask.index = IndexKey::FIRST;
+    mask.is_mask = true;
+    let mask_id = mask.id;
+    doc.apply(Operation::create_node(mask))?;
+    let mut child = rect(0.0, 8.0, 95.0, 45.0, Color::rgb(50, 180, 240));
+    child.parent = Some(frame_id);
+    child.index = IndexKey::after(IndexKey::FIRST);
+    child.effects.push(shadow([5.0, 4.0], 6.0));
+    doc.apply(Operation::create_node(child))?;
+    let mut renderer = RasterRenderer::new(W, H)?;
+    renderer
+        .layer_cache_for_test()
+        .verification_test_policy(true, true, VerificationFault::None);
+    let viewport = vp(0.0, 0.0);
+    renderer.render(&doc.scene, &viewport);
+    renderer.render(&doc.scene, &viewport);
+    let initial = renderer.copy_rgba();
+    for offset in [12.0, 45.25] {
+        doc.scene
+            .set_transform(mask_id, Transform2D::translation(offset, 0.0))?;
+        let metrics = renderer.render(&doc.scene, &viewport);
+        assert_eq!(
+            (metrics.layer_cache_hits, metrics.layer_cache_verify_equal),
+            (1, 1)
+        );
+        assert_eq!(
+            (
+                metrics.layer_cache_verify_mismatch,
+                metrics.layer_cache_verify_unavailable
+            ),
+            (0, 0)
+        );
+        assert_ne!(renderer.copy_rgba(), initial);
+        assert_eq!(renderer.copy_rgba(), fresh(&doc, &viewport).0);
+    }
+    let NodeData::Group(group) = &mut doc.scene.get_mut(frame_id).expect("frame").data else {
+        panic!("group");
+    };
+    group.clip_size = Some([120.0, 90.0]);
+    let changed = renderer.render(&doc.scene, &viewport);
+    assert_eq!(
+        (
+            changed.layer_cache_hits,
+            changed.layer_cache_verify_attempted
+        ),
+        (0, 0)
+    );
+    assert_eq!(renderer.copy_rgba(), fresh(&doc, &viewport).0);
+    renderer.render(&doc.scene, &viewport);
+    let settled = renderer.render(&doc.scene, &viewport);
+    assert_eq!(
+        (settled.layer_cache_hits, settled.layer_cache_verify_equal),
+        (1, 1)
+    );
+    assert_eq!(renderer.copy_rgba(), fresh(&doc, &viewport).0);
+    Ok(())
+}
