@@ -3044,7 +3044,7 @@ impl FigView {
         .flatten();
         let draw_content_only = self.editor_mode(cx) == EditorMode::Draw;
         #[cfg(feature = "fanta-gpui-ui")]
-        let draw_selection_settings = (draw_content_only
+        let draw_selection_settings = ((draw_content_only
             && matches!(
                 active_tool,
                 ToolKind::RectangleSelect
@@ -3054,30 +3054,31 @@ impl FigView {
                     | ToolKind::MagicWand
                     | ToolKind::Crop
             ))
-        .then(|| {
-            let options = &self.gpui_toolbar.as_ref()?.draw_options;
-            let operation = match options.selection_operation {
-                fanta_gpui::toolbar::DrawSelectionOperation::Replace => {
-                    fanta_tools::select::RectangleSelectionOperation::Replace
-                }
-                fanta_gpui::toolbar::DrawSelectionOperation::Add => {
-                    fanta_tools::select::RectangleSelectionOperation::Add
-                }
-                fanta_gpui::toolbar::DrawSelectionOperation::Subtract => {
-                    fanta_tools::select::RectangleSelectionOperation::Subtract
-                }
-                fanta_gpui::toolbar::DrawSelectionOperation::Intersect => {
-                    fanta_tools::select::RectangleSelectionOperation::Intersect
-                }
-            };
-            Some((
-                operation,
-                options.tolerance,
-                options.contiguous,
-                options.crop_ratio.to_string(),
-            ))
-        })
-        .flatten();
+            || (self.editor_mode(cx) == EditorMode::Design && active_tool == ToolKind::Crop))
+            .then(|| {
+                let options = &self.gpui_toolbar.as_ref()?.draw_options;
+                let operation = match options.selection_operation {
+                    fanta_gpui::toolbar::DrawSelectionOperation::Replace => {
+                        fanta_tools::select::RectangleSelectionOperation::Replace
+                    }
+                    fanta_gpui::toolbar::DrawSelectionOperation::Add => {
+                        fanta_tools::select::RectangleSelectionOperation::Add
+                    }
+                    fanta_gpui::toolbar::DrawSelectionOperation::Subtract => {
+                        fanta_tools::select::RectangleSelectionOperation::Subtract
+                    }
+                    fanta_gpui::toolbar::DrawSelectionOperation::Intersect => {
+                        fanta_tools::select::RectangleSelectionOperation::Intersect
+                    }
+                };
+                Some((
+                    operation,
+                    options.tolerance,
+                    options.contiguous,
+                    options.crop_ratio.to_string(),
+                ))
+            })
+            .flatten();
         let wand_override = self.wand_override.take();
         let tools = &mut self.tools;
         let mut wants_exit = false;
@@ -16938,6 +16939,385 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fanta-gpui-ui")]
+    async fn assert_mounted_design_crop_controls(cx: &mut TestAppContext, context_menu: bool) {
+        init_visual_test(cx);
+        cx.update(|cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new("home", menu::SelectFirst, Some("menu")),
+                gpui::KeyBinding::new("down", menu::SelectNext, Some("menu")),
+                gpui::KeyBinding::new("enter", menu::Confirm, Some("menu")),
+            ]);
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, bitmap, images) = bitmap_canvas_doc();
+        let (item, view, mut visual) =
+            mounted_canvas_interaction_fixture(&project, doc, images, cx);
+        let (expected, original_assets) = item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            let mut expected = document.doc.clone();
+            expected.selection.select_only(bitmap);
+            (
+                serde_json::to_value(expected).expect("selected document"),
+                document.raw_assets.clone(),
+            )
+        });
+        let assert_unchanged = |visual: &gpui::VisualTestContext| {
+            item.read_with(visual, |item, _| {
+                let document = item.document().expect("document");
+                assert_eq!(
+                    serde_json::to_value(&document.doc).expect("document"),
+                    expected
+                );
+                assert_eq!(document.doc.selection.as_slice(), &[bitmap]);
+                assert_eq!(document.doc.history.undo_depth(), 0);
+                assert_eq!(document.doc.history.redo_depth(), 0);
+                assert_eq!(document.raw_assets, original_assets);
+                assert!(!item.is_dirty());
+            });
+            view.read_with(visual, |view, cx| {
+                assert_eq!(view.editor_mode(cx), EditorMode::Design);
+            });
+        };
+        assert!(visual.debug_bounds("design-crop-controls").is_none());
+        let position = view.read_with(&visual, |view, _| {
+            view.container_bounds.expect("canvas").center()
+        });
+        if context_menu {
+            visual.simulate_event(MouseDownEvent {
+                position,
+                button: MouseButton::Right,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            });
+            visual.simulate_event(MouseUpEvent {
+                position,
+                button: MouseButton::Right,
+                modifiers: Default::default(),
+                click_count: 1,
+            });
+            visual.run_until_parked();
+            view.read_with(&visual, |view, _| {
+                assert!(view.canvas_context_menu.is_some());
+            });
+            visual.simulate_keystrokes("home down down down down down enter");
+        } else {
+            mounted_canvas_click(&mut visual, position, 1);
+            mounted_canvas_click(&mut visual, position, 2);
+        }
+        visual.update(|window, cx| window.draw(cx).clear());
+        view.read_with(&visual, |view, _| {
+            assert_eq!(view.active_tool(), ToolKind::Crop);
+        });
+        assert_unchanged(&visual);
+        for selector in [
+            "design-crop-ratio",
+            "design-crop-cancel",
+            "design-crop-apply",
+        ] {
+            assert!(visual.debug_bounds(selector).is_some(), "{selector}");
+        }
+        let apply = visual
+            .debug_bounds("design-crop-apply")
+            .expect("Apply crop");
+        visual.simulate_click(apply.center(), gpui::Modifiers::none());
+        assert_unchanged(&visual);
+        let ratio = visual.debug_bounds("design-crop-ratio").expect("Ratio");
+        visual.simulate_click(ratio.center(), gpui::Modifiers::none());
+        visual.update(|window, cx| window.draw(cx).clear());
+        let square_ratio = visual
+            .debug_bounds("MENU_ITEM-1:1")
+            .expect("square crop ratio menu item");
+        visual.simulate_click(square_ratio.center(), gpui::Modifiers::none());
+        visual.update(|window, cx| window.draw(cx).clear());
+        assert!(visual.debug_bounds("MENU_ITEM-1:1").is_none());
+        view.read_with(&visual, |view, cx| {
+            let adapter = view.gpui_toolbar.as_ref().expect("toolbar");
+            assert_eq!(adapter.draw_options.crop_ratio.as_ref(), "1:1");
+            let properties = view.gpui_properties.as_ref().expect("properties");
+            assert_eq!(
+                properties
+                    .draw
+                    .read(cx)
+                    .view_data()
+                    .options
+                    .crop_ratio
+                    .as_ref(),
+                "1:1"
+            );
+        });
+        assert_unchanged(&visual);
+        let start = position + point(px(-40.0), px(-20.0));
+        let end = position + point(px(40.0), px(20.0));
+        visual.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::none());
+        visual.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::none());
+        visual.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(&visual, |view, _| {
+            let preview = view
+                .tools
+                .overlays
+                .iter()
+                .find_map(|overlay| match overlay {
+                    fanta_tools::ToolOverlay::PreviewRect { world_rect } => Some(*world_rect),
+                    _ => None,
+                })
+                .expect("ratio-constrained crop preview");
+            assert_eq!(preview.width(), 80.0);
+            assert_eq!(preview.height(), 80.0);
+        });
+        assert_unchanged(&visual);
+        visual.update(|window, cx| window.draw(cx).clear());
+        let cancel = visual.debug_bounds("design-crop-cancel").expect("Cancel");
+        visual.simulate_click(cancel.center(), gpui::Modifiers::none());
+        view.read_with(&visual, |view, _| {
+            assert_eq!(view.active_tool(), ToolKind::Crop);
+            assert!(
+                !view
+                    .tools
+                    .overlays
+                    .iter()
+                    .any(|overlay| matches!(overlay, fanta_tools::ToolOverlay::PreviewRect { .. }))
+            );
+        });
+        assert_unchanged(&visual);
+        visual.update(|window, cx| window.draw(cx).clear());
+        let apply = visual
+            .debug_bounds("design-crop-apply")
+            .expect("Apply crop");
+        visual.simulate_click(apply.center(), gpui::Modifiers::none());
+        assert_unchanged(&visual);
+        let cancel = visual.debug_bounds("design-crop-cancel").expect("Cancel");
+        visual.simulate_click(cancel.center(), gpui::Modifiers::none());
+        visual.update(|window, cx| window.draw(cx).clear());
+        view.read_with(&visual, |view, _| {
+            assert_eq!(view.active_tool(), ToolKind::Select);
+        });
+        assert!(visual.debug_bounds("design-crop-controls").is_none());
+        assert_unchanged(&visual);
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn mounted_design_crop_context_menu_controls_preserve_cancelled_document(
+        cx: &mut TestAppContext,
+    ) {
+        assert_mounted_design_crop_controls(cx, true).await;
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn mounted_design_crop_double_click_controls_preserve_cancelled_document(
+        cx: &mut TestAppContext,
+    ) {
+        assert_mounted_design_crop_controls(cx, false).await;
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn mounted_design_crop_apply_button_commits_once_and_roundtrips_history(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        cx.update(|cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new("home", menu::SelectFirst, Some("menu")),
+                gpui::KeyBinding::new("down", menu::SelectNext, Some("menu")),
+                gpui::KeyBinding::new("enter", menu::Confirm, Some("menu")),
+            ]);
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, bitmap, images) = bitmap_canvas_doc();
+        let (item, view, mut visual) =
+            mounted_canvas_interaction_fixture(&project, doc, images, cx);
+        let position = view.read_with(&visual, |view, _| {
+            view.container_bounds.expect("canvas").center()
+        });
+        mounted_canvas_click(&mut visual, position, 1);
+        let (original_doc, original_assets, original_world) = item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            (
+                document.doc.clone(),
+                document.raw_assets.clone(),
+                document.doc.scene.world_transform(bitmap),
+            )
+        });
+        let original = original_doc.scene.get(bitmap).expect("bitmap").clone();
+        let page = original.parent.expect("page");
+        mounted_canvas_click(&mut visual, position, 2);
+        visual.update(|window, cx| window.draw(cx).clear());
+        let ratio = visual.debug_bounds("design-crop-ratio").expect("Ratio");
+        visual.simulate_click(ratio.center(), gpui::Modifiers::none());
+        visual.update(|window, cx| window.draw(cx).clear());
+        let square_ratio = visual
+            .debug_bounds("MENU_ITEM-1:1")
+            .expect("square crop ratio menu item");
+        visual.simulate_click(square_ratio.center(), gpui::Modifiers::none());
+        visual.update(|window, cx| window.draw(cx).clear());
+        assert!(visual.debug_bounds("MENU_ITEM-1:1").is_none());
+        let start = position + point(px(-40.0), px(-20.0));
+        let end = position + point(px(40.0), px(20.0));
+        visual.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::none());
+        visual.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::none());
+        visual.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(&visual, |view, cx| {
+            assert_eq!(view.editor_mode(cx), EditorMode::Design);
+            assert_eq!(view.active_tool(), ToolKind::Crop);
+            assert_eq!(
+                view.gpui_toolbar
+                    .as_ref()
+                    .expect("toolbar")
+                    .draw_options
+                    .crop_ratio
+                    .as_ref(),
+                "1:1"
+            );
+            let preview = view
+                .tools
+                .overlays
+                .iter()
+                .find_map(|overlay| match overlay {
+                    fanta_tools::ToolOverlay::PreviewRect { world_rect } => Some(*world_rect),
+                    _ => None,
+                })
+                .expect("pending crop");
+            assert_eq!(
+                preview,
+                fanta_doc::Bounds::from_xywh(-40.0, -20.0, 80.0, 80.0)
+            );
+        });
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                serde_json::to_value(item.doc().expect("document")).expect("preview document"),
+                serde_json::to_value(&original_doc).expect("original document")
+            );
+            assert!(!item.is_dirty());
+        });
+        let now = || {
+            i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock after Unix epoch")
+                    .as_secs(),
+            )
+            .expect("timestamp fits document metadata")
+        };
+        let started = now();
+        visual.update(|window, cx| window.draw(cx).clear());
+        let apply = visual
+            .debug_bounds("design-crop-apply")
+            .expect("Apply crop");
+        visual.simulate_click(apply.center(), gpui::Modifiers::none());
+        let crop = item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            let crop = single_selection(doc).expect("crop selected");
+            assert_ne!(crop, bitmap);
+            assert_eq!(doc.scene.len(), original_doc.scene.len() + 1);
+            assert_eq!(doc.scene.children_of(Some(page)), &[crop]);
+            assert_eq!(doc.scene.children_of(Some(crop)), &[bitmap]);
+            assert_eq!(doc.scene.get(bitmap).expect("bitmap").data, original.data);
+            assert_eq!(doc.scene.world_transform(bitmap), original_world);
+            crop
+        });
+        let mut expected = original_doc.clone();
+        let mut group = CanvasNode::new(NodeData::Group(GroupNode {
+            local_size: Some([80.0, 80.0]),
+            clip_size: Some([80.0, 80.0]),
+            ..Default::default()
+        }));
+        group.id = crop;
+        group.name = "Crop".into();
+        group.parent = Some(page);
+        group.index = original.index;
+        group.transform = Transform2D::translation(-40.0, -20.0);
+        let mut transaction = fanta_doc::Transaction::new("Crop");
+        transaction.push(Operation::create_node(group));
+        transaction.push(Operation::Reparent {
+            id: bitmap,
+            old_parent: Some(page),
+            old_index: original.index,
+            new_parent: Some(crop),
+            new_index: IndexKey::FIRST,
+        });
+        transaction.push(Operation::SetTransform {
+            id: bitmap,
+            old: original.transform,
+            new: Transform2D::translation(-60.0, -30.0),
+        });
+        expected
+            .apply_transaction(transaction)
+            .expect("expected crop transaction");
+        expected.selection.select_only(crop);
+        let assert_state = |visual: &gpui::VisualTestContext, expected: &Doc| {
+            item.read_with(visual, |item, _| {
+                let document = item.document().expect("document");
+                let actual = &document.doc;
+                assert!((started..=now()).contains(&actual.metadata.modified_at));
+                let mut expected = expected.clone();
+                // Only the wall-clock field varies between the independently constructed transaction and UI input.
+                expected.metadata.modified_at = actual.metadata.modified_at;
+                assert_eq!(
+                    serde_json::to_value(actual).expect("actual document"),
+                    serde_json::to_value(&expected).expect("expected document")
+                );
+                assert_eq!(document.raw_assets, original_assets);
+                assert_eq!(actual.scene.world_transform(bitmap), original_world);
+                assert!(item.is_dirty());
+            });
+            view.read_with(visual, |view, cx| {
+                assert_eq!(view.editor_mode(cx), EditorMode::Design);
+                assert!(!view.tools.overlays.iter().any(|overlay| matches!(
+                    overlay,
+                    fanta_tools::ToolOverlay::PreviewRect { .. }
+                )));
+            });
+        };
+        assert_eq!(expected.history.undo_depth(), 1);
+        assert_eq!(expected.history.redo_depth(), 0);
+        assert_state(&visual, &expected);
+        let applied = item.read_with(&visual, |item, _| {
+            serde_json::to_value(item.doc().expect("document")).expect("applied document")
+        });
+        visual.update(|window, cx| window.draw(cx).clear());
+        let apply = visual
+            .debug_bounds("design-crop-apply")
+            .expect("Apply crop");
+        visual.simulate_click(apply.center(), gpui::Modifiers::none());
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                serde_json::to_value(item.doc().expect("document")).expect("second apply"),
+                applied
+            );
+        });
+        assert_state(&visual, &expected);
+        visual.simulate_keystrokes("cmd-z");
+        assert!(expected.undo().expect("expected Undo"));
+        expected.selection.clear();
+        assert_eq!(expected.history.undo_depth(), 0);
+        assert_eq!(expected.history.redo_depth(), 1);
+        item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert!(doc.selection.is_empty());
+            assert_eq!(doc.scene.get(bitmap), Some(&original));
+            assert_eq!(
+                serde_json::to_value(&doc.scene).expect("undone scene"),
+                serde_json::to_value(&original_doc.scene).expect("original scene")
+            );
+        });
+        assert_state(&visual, &expected);
+        visual.simulate_keystrokes("cmd-shift-z");
+        assert!(expected.redo().expect("expected Redo"));
+        assert_eq!(expected.history.undo_depth(), 1);
+        assert_eq!(expected.history.redo_depth(), 0);
+        item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert!(doc.selection.is_empty());
+            assert_eq!(doc.scene.children_of(Some(page)), &[crop]);
+            assert_eq!(doc.scene.children_of(Some(crop)), &[bitmap]);
+        });
+        assert_state(&visual, &expected);
+    }
+
     #[gpui::test]
     async fn mounted_bitmap_crop_applies_once_and_history_preserves_the_asset(
         cx: &mut TestAppContext,
@@ -17849,7 +18229,135 @@ impl FigView {
             .right_0()
             .justify_center()
             .track_focus(&self.native_toolbar_focus)
-            .child(adapter.panel.clone())
+            .child(
+                v_flex()
+                    .items_center()
+                    .gap_2()
+                    .when(self.design_crop_controls_visible(cx), |toolbar| {
+                        toolbar.child(self.render_design_crop_controls(cx))
+                    })
+                    .child(adapter.panel.clone()),
+            )
+            .into_any_element()
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn design_crop_controls_visible(&self, cx: &App) -> bool {
+        self.editor_mode(cx) == EditorMode::Design
+            && self.tools.kind() == ToolKind::Crop
+            && self.is_editable(cx)
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn handle_design_crop_toolbar_action(
+        &mut self,
+        action: &fanta_gpui::toolbar::ToolbarAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.design_crop_controls_visible(cx) {
+            return;
+        }
+        let Some(panel) = self
+            .gpui_toolbar
+            .as_ref()
+            .map(|adapter| adapter.panel.clone())
+        else {
+            return;
+        };
+        self.focus_handle.focus(window, cx);
+        self.handle_toolbar_action(&panel, action, window, cx);
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn render_design_crop_controls(&self, cx: &mut Context<Self>) -> AnyElement {
+        use fanta_gpui::toolbar::{DrawToolbarAction, ToolbarAction};
+        let Some(adapter) = self.gpui_toolbar.as_ref() else {
+            return div().into_any_element();
+        };
+        let view = cx.weak_entity();
+        let ratios = adapter.draw_options.crop_ratios.clone();
+        let ratio = adapter.draw_options.crop_ratio.clone();
+        let ratio_menu = PopoverMenu::new("design-crop-ratio-menu")
+            .trigger(
+                Button::new("design-crop-ratio-button", format!("Ratio: {ratio}"))
+                    .size(ButtonSize::Compact)
+                    .end_icon(Icon::new(IconName::ChevronDown).size(IconSize::XSmall)),
+            )
+            .menu(move |window, cx| {
+                let view = view.clone();
+                let ratios = ratios.clone();
+                Some(ContextMenu::build(window, cx, move |mut menu, _, _| {
+                    for ratio in ratios {
+                        let view = view.clone();
+                        menu = menu.entry(ratio.clone(), None, move |window, cx| {
+                            view.update(cx, |view, cx| {
+                                let Some(adapter) = view.gpui_toolbar.as_ref() else {
+                                    return;
+                                };
+                                let mut options = adapter.draw_options.clone();
+                                options.crop_ratio = ratio.clone();
+                                view.handle_design_crop_toolbar_action(
+                                    &ToolbarAction::DrawOptionsChangeRequested { options },
+                                    window,
+                                    cx,
+                                );
+                            })
+                            .log_err();
+                        });
+                    }
+                    menu
+                }))
+            });
+        h_flex()
+            .id("design-crop-controls")
+            .debug_selector(|| "design-crop-controls".to_owned())
+            .occlude()
+            .gap_2()
+            .px_2()
+            .py_1()
+            .rounded_lg()
+            .shadow_md()
+            .bg(cx.theme().colors().panel_background)
+            .child(
+                div()
+                    .debug_selector(|| "design-crop-ratio".to_owned())
+                    .child(ratio_menu),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "design-crop-cancel".to_owned())
+                    .child(
+                        Button::new("design-crop-cancel-button", "Cancel")
+                            .size(ButtonSize::Compact)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.handle_design_crop_toolbar_action(
+                                    &ToolbarAction::DrawActionInvoked {
+                                        action: DrawToolbarAction::CancelCrop,
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .debug_selector(|| "design-crop-apply".to_owned())
+                    .child(
+                        Button::new("design-crop-apply-button", "Apply crop")
+                            .size(ButtonSize::Compact)
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.handle_design_crop_toolbar_action(
+                                    &ToolbarAction::DrawActionInvoked {
+                                        action: DrawToolbarAction::ApplyCrop,
+                                    },
+                                    window,
+                                    cx,
+                                );
+                            })),
+                    ),
+            )
             .into_any_element()
     }
 
