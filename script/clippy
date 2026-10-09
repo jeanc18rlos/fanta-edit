@@ -6,8 +6,17 @@ if [[ ! " $* " == *" -p "* && ! " $* " == *" --package "* ]]; then
     set -- "$@" --workspace
 fi
 
+case "${FANTA_CLIPPY_DEFAULT_FEATURES-0}" in
+    0) set -- "$@" --all-features ;;
+    1) ;;
+    *)
+        printf 'FANTA_CLIPPY_DEFAULT_FEATURES must be 0 or 1.\n' >&2
+        exit 2
+        ;;
+esac
+
 set -x
-"${CARGO:-cargo}" clippy "$@" --release --all-targets --all-features -- --deny warnings
+"${CARGO:-cargo}" clippy "$@" --release --all-targets -- --deny warnings
 
 # If local, run other checks if we have the tools installed.
 if [[ -z "${GITHUB_ACTIONS+x}" ]]; then

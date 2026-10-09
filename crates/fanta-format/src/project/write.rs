@@ -295,6 +295,69 @@ pub fn write_project_tree_cached_with_sources_and_media_registry(
     write_project_tree_cached_impl(dir, doc, assets, cache, Some(media_registry), sources, None)
 }
 
+/// Populate an owned, empty, unpublished staging directory without durability
+/// calls. The caller must durably flush the complete staged filesystem before
+/// exclusively publishing this directory, then durably flush its parent.
+/// Existing projects must use the checked, transactional writer instead.
+pub fn stage_new_project_tree_cached(
+    dir: &Path,
+    doc: &Doc,
+    assets: &BTreeMap<AssetId, Vec<u8>>,
+    cache: &mut ProjectWriteCache,
+) -> Result<WriteReport> {
+    if !fs::symlink_metadata(dir)?.file_type().is_dir()
+        || fs::read_dir(dir)?.next().transpose()?.is_some()
+    {
+        return Err(FormatError::InvalidProjectTree(
+            "new-project staging requires an owned empty directory".into(),
+        ));
+    }
+    let syncs_before = SUCCESSFUL_PROJECT_SYNCS.get();
+    let mut files = project_files_cached_with_sources(doc, cache, &BTreeMap::new())?;
+    files.insert(
+        PathBuf::from(ASSETS_DIR).join(ASSET_INDEX_FILE),
+        Arc::new(asset_index_bytes(assets)?),
+    );
+    let asset_files = project_asset_files(assets, None)?;
+    super::layout::scaffold_project_directories(dir)?;
+    let mut report = WriteReport::default();
+    for (relative, bytes) in files
+        .iter()
+        .map(|(path, bytes)| (path, bytes.as_slice()))
+        .chain(asset_files.iter().map(|(path, bytes)| (path, *bytes)))
+    {
+        write_unpublished_file(&dir.join(relative), |file| file.write_all(bytes))?;
+        report.written.push(relative.clone());
+        report
+            .written_hashes
+            .insert(relative.clone(), Sha256::digest(bytes).into());
+    }
+    for (relative, bytes) in super::layout::fresh_project_editor_support() {
+        write_unpublished_file(&dir.join(relative), |file| file.write_all(bytes))?;
+    }
+    report.written.sort();
+    report.sync_count = SUCCESSFUL_PROJECT_SYNCS.get().wrapping_sub(syncs_before);
+    Ok(report)
+}
+
+fn write_unpublished_file(
+    path: &Path,
+    write: impl FnOnce(&mut fs::File) -> std::io::Result<()>,
+) -> Result<()> {
+    ensure_parent_directories(path)?;
+    let parent = path.parent().ok_or_else(|| {
+        FormatError::InvalidProjectTree("staged project file has no parent".into())
+    })?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    if let Err(error) = write(temporary.as_file_mut()) {
+        return Err(discard_project_temporary(temporary, error).into());
+    }
+    if let Err(error) = temporary.persist_noclobber(path) {
+        return Err(discard_project_temporary(error.file, error.error).into());
+    }
+    Ok(())
+}
+
 fn write_project_tree_cached_impl(
     dir: &Path,
     doc: &Doc,
@@ -1889,6 +1952,161 @@ fn ensure_parent_directories(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[cfg(unix)]
+    #[test]
+    fn unpublished_project_matches_scaffolded_writer_without_file_syncs() -> Result<()> {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fn inventory(
+            root: &Path,
+            directory: &Path,
+            entries: &mut BTreeMap<PathBuf, (u32, Option<Vec<u8>>)>,
+        ) -> Result<()> {
+            for entry in fs::read_dir(directory)? {
+                let path = entry?.path();
+                let metadata = fs::symlink_metadata(&path)?;
+                let relative = path
+                    .strip_prefix(root)
+                    .map_err(|error| FormatError::InvalidProjectTree(error.to_string()))?
+                    .to_path_buf();
+                let mode = metadata.permissions().mode() & 0o7777;
+                if metadata.is_dir() {
+                    entries.insert(relative, (mode, None));
+                    inventory(root, &path, entries)?;
+                } else if metadata.is_file() {
+                    entries.insert(relative, (mode, Some(fs::read(path)?)));
+                } else {
+                    return Err(FormatError::InvalidProjectTree(
+                        "Unexpected staged entry".into(),
+                    ));
+                }
+            }
+            Ok(())
+        }
+
+        for asset_count in [1, 128] {
+            let staged = tempfile::tempdir()?;
+            let existing = tempfile::tempdir()?;
+            let (document, _, _, _) = cache_fixture();
+            let assets = (0..asset_count)
+                .map(|index| {
+                    let bytes = format!("distinct fresh asset {index}").into_bytes();
+                    (crate::asset_id_for_bytes(&bytes), bytes)
+                })
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(assets.len(), asset_count);
+            let mut cache = ProjectWriteCache::default();
+            let report =
+                stage_new_project_tree_cached(staged.path(), &document, &assets, &mut cache)?;
+            super::super::scaffold_project_tree(existing.path())?;
+            write_project_tree(existing.path(), &document, &assets)?;
+            let mut actual = BTreeMap::new();
+            let mut expected = BTreeMap::new();
+            inventory(staged.path(), staged.path(), &mut actual)?;
+            inventory(existing.path(), existing.path(), &mut expected)?;
+            assert_eq!(actual, expected);
+            assert_eq!(
+                staged.path().metadata()?.permissions().mode() & 0o7777,
+                existing.path().metadata()?.permissions().mode() & 0o7777
+            );
+            assert_eq!(
+                report.sync_count, 0,
+                "publication must supply the durability barrier"
+            );
+            assert!(cache.cached_designs() > 0);
+            assert!(report.removed.is_empty());
+            assert_eq!(report.written.len(), report.written_hashes.len());
+            for (relative, hash) in &report.written_hashes {
+                let actual: [u8; 32] =
+                    Sha256::digest(fs::read(staged.path().join(relative))?).into();
+                assert_eq!(&actual, hash);
+            }
+            let (reopened, reopened_assets) = super::super::read_project_tree(staged.path())?;
+            assert_eq!(project_files(&reopened)?, project_files(&document)?);
+            assert_eq!(reopened_assets, assets);
+            assert_eq!(
+                write_project_tree_cached(staged.path(), &document, &assets, &mut cache)?,
+                WriteReport::default()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unpublished_project_rejects_an_occupied_directory() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let sentinel = directory.path().join("sentinel");
+        fs::write(&sentinel, b"existing bytes")?;
+        let result = stage_new_project_tree_cached(
+            directory.path(),
+            &Doc::new(),
+            &BTreeMap::new(),
+            &mut ProjectWriteCache::default(),
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(&sentinel)?, b"existing bytes");
+        assert_eq!(
+            fs::read_dir(directory.path())?
+                .collect::<std::io::Result<Vec<_>>>()?
+                .len(),
+            1
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unpublished_project_rejects_a_linked_directory() -> Result<()> {
+        let parent = tempfile::tempdir()?;
+        let target = parent.path().join("real");
+        let linked = parent.path().join("linked");
+        fs::create_dir(&target)?;
+        std::os::unix::fs::symlink(&target, &linked)?;
+        assert!(
+            stage_new_project_tree_cached(
+                &linked,
+                &Doc::new(),
+                &BTreeMap::new(),
+                &mut ProjectWriteCache::default()
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read_dir(target)?
+                .collect::<std::io::Result<Vec<_>>>()?
+                .len(),
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unpublished_file_failure_and_collision_do_not_leave_or_replace_bytes() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let target = directory.path().join("payload");
+        let result = write_unpublished_file(&target, |file| {
+            file.write_all(b"partial")?;
+            Err(std::io::Error::other("injected write failure"))
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_dir(directory.path())?
+                .collect::<std::io::Result<Vec<_>>>()?
+                .len(),
+            0
+        );
+        fs::write(&target, b"existing")?;
+        assert!(write_unpublished_file(&target, |file| file.write_all(b"replacement")).is_err());
+        assert_eq!(fs::read(&target)?, b"existing");
+        assert_eq!(
+            fs::read_dir(directory.path())?
+                .collect::<std::io::Result<Vec<_>>>()?
+                .len(),
+            1
+        );
+        Ok(())
+    }
 
     #[test]
     fn sync_count_includes_fresh_transaction_and_editor_support() -> Result<()> {
