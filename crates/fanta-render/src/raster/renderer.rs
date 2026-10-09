@@ -767,6 +767,7 @@ impl RasterRenderer {
         }
         self.asset_resolver = Some(resolver);
         self.pattern_cache.clear();
+        self.layer_cache.clear();
     }
 
     /// Drop every cached uploaded image. Assets are content-addressed and
@@ -774,6 +775,7 @@ impl RasterRenderer {
     /// callers can call this to reclaim image memory (e.g. when switching
     /// documents) or after swapping the asset resolver for an unrelated store.
     pub fn clear_image_cache(&mut self) {
+        self.layer_cache.clear();
         self.image_cache.clear();
         self.pattern_cache.clear();
     }
@@ -802,6 +804,7 @@ impl RasterRenderer {
     /// was present.
     pub fn invalidate_image(&mut self, id: fanta_doc::AssetId) -> bool {
         self.pattern_cache.clear();
+        self.layer_cache.clear();
         self.image_cache.remove(id)
     }
 
@@ -828,8 +831,8 @@ impl RasterRenderer {
     }
 
     /// Drop every cached effect layer (they rebuild lazily as layers are
-    /// rendered). Correctness never requires this — the cache drops itself on
-    /// any content edit — but call it to reclaim GPU/CPU memory eagerly, e.g.
+    /// rendered). Correctness never requires this — scene deltas invalidate
+    /// affected layers — but call it to reclaim GPU/CPU memory eagerly, e.g.
     /// on a document switch.
     pub fn clear_layer_cache(&mut self) {
         self.layer_cache.clear();
@@ -841,8 +844,8 @@ impl RasterRenderer {
     /// (visible layer blur or drop shadow, non-`Normal` blend, non-foldable
     /// opacity, isolation) is rendered once per zoom into an offscreen and
     /// re-used across pans, pixel-identically, whenever the pan is a whole
-    /// number of device pixels (see `raster::layer_cache`). Everything is
-    /// dropped on any content edit. Disabling clears the cache and restores
+    /// number of device pixels (see `raster::layer_cache`). Scene edits evict
+    /// affected layers. Disabling clears the cache and restores
     /// the direct save-layer path byte for byte. Interactive hosts that pan
     /// by fractional device pixels get the benefit by also enabling
     /// [`Self::set_pixel_snap_pan`], which makes every pan a whole-pixel pan.
@@ -1624,24 +1627,23 @@ impl RasterRenderer {
             canvas.translate((-viewport.center[0] as f32, -viewport.center[1] as f32));
         }
 
-        // The effect-layer cache's frame bookkeeping: everything it holds is
-        // dropped when the content epoch moves; a frame may populate it only
-        // when it repeats the previous frame's scale and pans by whole device
-        // pixels (see `LayerCache::begin_frame`). Motion playback moves nodes
+        // Motion playback moves nodes
         // without touching any epoch input, so a motion frame neither
         // consults nor fills the cache.
         let layer_cache_populate = split.is_none()
             && layer_cache.begin_frame(
                 canvas,
+                scene,
+                inputs.components,
                 LayerEpoch {
                     scene_instance: scene.instance_id(),
-                    scene_revision: scene.revision(),
                     mode_generation: inputs.mode_generation,
                     dark_ui: inputs.dark_ui,
+                    asset_resolver: resolver
+                        .map(|resolver| std::ptr::from_ref(resolver).cast::<()>() as usize),
                 },
                 effective_scale,
-                root_tx,
-                root_ty,
+                (root_tx, root_ty),
             );
         let layer_cache_lookups = split.is_none()
             && supports_offscreen_layers

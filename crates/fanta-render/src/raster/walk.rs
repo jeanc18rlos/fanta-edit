@@ -467,6 +467,7 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
             } else {
                 let via_cache = cacheable
                     && ctx.layer_cache_populate
+                    && ctx.layer_cache.may_populate(ctx.scene, id)
                     && content_bounds.is_some_and(|content| {
                         render_layer_via_cache(canvas, id, &layer, content, ctx, |c, ctx| {
                             paint_node_body(

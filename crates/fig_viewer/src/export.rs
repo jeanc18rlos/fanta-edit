@@ -926,7 +926,7 @@ mod tests {
         std::fs::write(&existing, b"existing export must survive")?;
         let batch = prepare_export_jobs(
             &doc,
-            Some(resolver.clone()),
+            Some(resolver),
             None,
             directory.path().to_path_buf(),
             &[
