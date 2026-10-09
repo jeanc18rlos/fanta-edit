@@ -1397,12 +1397,15 @@ impl FigView {
         }
         self.timeline_shell
             .update(cx, |timeline, cx| timeline.reset_keyframe_drag(cx));
-        self.cancel_tool_preview_if_active(cx);
+        self.cancel_tool_gesture_if_active(cx);
         self.sync_motion_timeline(cx);
     }
 
-    fn cancel_tool_preview_if_active(&mut self, cx: &mut Context<Self>) {
-        if !self.item.read(cx).content_preview_active() {
+    fn cancel_tool_gesture_if_active(&mut self, cx: &mut Context<Self>) {
+        // Select can be interrupted before its first preview. Reset that
+        // press too, so the next hover cannot promote it into a drag.
+        let pending_selection = self.primary_pressed && self.tools.kind() == ToolKind::Select;
+        if !pending_selection && !self.item.read(cx).content_preview_active() {
             return;
         }
         let preview_owner = cx.entity_id();
@@ -3989,6 +3992,12 @@ impl FigView {
         }
 
         if !self.primary_pressed {
+            return;
+        }
+        if self.tools.kind() == ToolKind::Select && event.pressed_button != Some(MouseButton::Left)
+        {
+            self.end_gesture_perf("pointer_button_lost");
+            self.cancel_tool_gesture_if_active(cx);
             return;
         }
         let Some(bounds) = self.container_bounds else {
@@ -16852,6 +16861,343 @@ mod tests {
             assert_eq!(doc.history.undo_depth(), 0);
             assert!(!item.is_dirty());
         });
+    }
+
+    #[gpui::test]
+    async fn mounted_lost_primary_release_cancels_pending_press_and_drag(cx: &mut TestAppContext) {
+        use gpui::InputEvent as _;
+
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (mut doc, bitmap, images) = bitmap_canvas_doc();
+        let mut control = doc.scene.get(bitmap).expect("bitmap").clone();
+        control.id = NodeId::new();
+        control.index = doc.scene.next_child_index(control.parent);
+        control.transform = Transform2D::translation(300.0, 200.0);
+        doc.scene.insert(control).expect("untouched bitmap");
+        doc.selection.select_only(bitmap);
+        let (item, view, mut visual) =
+            mounted_canvas_interaction_fixture(&project, doc, images, cx);
+        let (expected, assets, transform, world_bounds, order) =
+            item.read_with(&visual, |item, _| {
+                let document = item.document().expect("document");
+                (
+                    serde_json::to_value(&document.doc).expect("full document"),
+                    document.raw_assets.clone(),
+                    document.doc.scene.get(bitmap).expect("bitmap").transform,
+                    document.doc.scene.world_bounds(bitmap),
+                    document
+                        .doc
+                        .scene
+                        .children_of(document.doc.active_page())
+                        .to_vec(),
+                )
+            });
+        let bounds = view.read_with(&visual, |view, _| view.container_bounds.expect("canvas"));
+        let start = bounds.center();
+        for pressed_button in [None, Some(MouseButton::Right)] {
+            for preview_before_loss in [false, true] {
+                for repaint_after_press in [false, true] {
+                    visual.update(|window, cx| {
+                        window.dispatch_event(
+                            MouseDownEvent {
+                                position: start,
+                                button: MouseButton::Left,
+                                modifiers: gpui::Modifiers::none(),
+                                click_count: 1,
+                                first_mouse: false,
+                            }
+                            .to_platform_input(),
+                            cx,
+                        );
+                        assert!(view.read(cx).primary_pressed);
+                        assert!(view.read(cx).canvas_pointer_down);
+                        if repaint_after_press {
+                            window.draw(cx).clear();
+                        }
+                        if preview_before_loss {
+                            window.dispatch_event(
+                                MouseMoveEvent {
+                                    position: start + point(px(24.0), px(12.0)),
+                                    pressed_button: Some(MouseButton::Left),
+                                    modifiers: gpui::Modifiers::none(),
+                                }
+                                .to_platform_input(),
+                                cx,
+                            );
+                            let item = item.read(cx);
+                            assert!(item.content_preview_active());
+                            assert_ne!(
+                                item.doc()
+                                    .expect("document")
+                                    .scene
+                                    .get(bitmap)
+                                    .expect("bitmap")
+                                    .transform,
+                                transform
+                            );
+                            assert_eq!(item.doc().expect("document").history.undo_depth(), 0);
+                        }
+                        window.dispatch_event(
+                            MouseMoveEvent {
+                                position: bounds.origin - point(px(20.0), px(20.0)),
+                                pressed_button,
+                                modifiers: gpui::Modifiers::none(),
+                            }
+                            .to_platform_input(),
+                            cx,
+                        );
+                    });
+                    visual.run_until_parked();
+                    item.read_with(&visual, |item, _| {
+                        let document = item.document().expect("document");
+                        assert_eq!(
+                            serde_json::to_value(&document.doc).expect("full document"),
+                            expected,
+                            "lost release must not promote or preserve a content preview"
+                        );
+                        assert_eq!(document.raw_assets, assets);
+                        assert_eq!(document.doc.scene.world_bounds(bitmap), world_bounds);
+                        assert_eq!(document.doc.history.undo_depth(), 0);
+                        assert_eq!(document.doc.history.redo_depth(), 0);
+                        assert_eq!(
+                            document.doc.scene.children_of(document.doc.active_page()),
+                            order
+                        );
+                        assert!(!item.content_preview_active());
+                        assert!(!item.is_dirty());
+                    });
+                    view.read_with(&visual, |view, _| {
+                        assert!(!view.primary_pressed && !view.canvas_pointer_down);
+                        assert_eq!(view.active_tool(), ToolKind::Select);
+                    });
+                    for position in [start + point(px(40.0), px(30.0)), start] {
+                        visual.simulate_event(MouseMoveEvent {
+                            position,
+                            pressed_button: None,
+                            modifiers: gpui::Modifiers::none(),
+                        });
+                    }
+                    visual.simulate_event(MouseUpEvent {
+                        position: start,
+                        button: MouseButton::Left,
+                        modifiers: gpui::Modifiers::none(),
+                        click_count: 1,
+                    });
+                    mounted_canvas_click(&mut visual, start, 1);
+                    item.read_with(&visual, |item, _| {
+                        let document = item.document().expect("document");
+                        assert_eq!(
+                            serde_json::to_value(&document.doc).expect("full document"),
+                            expected
+                        );
+                        assert_eq!(document.raw_assets, assets);
+                        assert_eq!(
+                            document.doc.scene.get(bitmap).expect("bitmap").transform,
+                            transform
+                        );
+                        assert_eq!(document.doc.history.undo_depth(), 0);
+                        assert_eq!(document.doc.history.redo_depth(), 0);
+                        assert!(!item.content_preview_active());
+                        assert!(!item.is_dirty());
+                    });
+                }
+            }
+        }
+    }
+
+    #[gpui::test]
+    async fn mounted_deactivation_cancels_canvas_press_before_content_preview(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (mut doc, bitmap, images) = bitmap_canvas_doc();
+        let mut control = doc.scene.get(bitmap).expect("bitmap").clone();
+        control.id = NodeId::new();
+        control.index = doc.scene.next_child_index(control.parent);
+        control.transform = Transform2D::translation(300.0, 200.0);
+        doc.scene.insert(control).expect("untouched bitmap");
+        doc.selection.select_only(bitmap);
+        let (item, view, mut visual) =
+            mounted_canvas_interaction_fixture(&project, doc, images, cx);
+        let (expected, assets, world_bounds, order) = item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            (
+                serde_json::to_value(&document.doc).expect("full document"),
+                document.raw_assets.clone(),
+                document.doc.scene.world_bounds(bitmap),
+                document
+                    .doc
+                    .scene
+                    .children_of(document.doc.active_page())
+                    .to_vec(),
+            )
+        });
+        let start = view.read_with(&visual, |view, _| {
+            view.container_bounds.expect("canvas").center()
+        });
+        for workspace_deactivated in [false, true] {
+            visual.simulate_event(MouseDownEvent {
+                position: start,
+                button: MouseButton::Left,
+                modifiers: gpui::Modifiers::none(),
+                click_count: 1,
+                first_mouse: false,
+            });
+            view.read_with(&visual, |view, cx| {
+                assert!(view.primary_pressed && view.canvas_pointer_down);
+                assert!(!item.read(cx).content_preview_active());
+            });
+            view.update_in(&mut visual, |view, window, cx| {
+                if workspace_deactivated {
+                    Item::workspace_deactivated(view, window, cx);
+                } else {
+                    Item::deactivated(view, window, cx);
+                }
+            });
+            item.read_with(&visual, |item, _| {
+                let document = item.document().expect("document");
+                assert_eq!(
+                    serde_json::to_value(&document.doc).expect("full document"),
+                    expected,
+                    "deactivation must preserve selection before a new click"
+                );
+                assert_eq!(document.raw_assets, assets);
+                assert_eq!(document.doc.scene.world_bounds(bitmap), world_bounds);
+                assert_eq!(document.doc.history.undo_depth(), 0);
+                assert_eq!(document.doc.history.redo_depth(), 0);
+                assert_eq!(
+                    document.doc.scene.children_of(document.doc.active_page()),
+                    order
+                );
+                assert!(!item.content_preview_active());
+                assert!(!item.is_dirty());
+            });
+            view.read_with(&visual, |view, _| {
+                assert!(!view.primary_pressed && !view.canvas_pointer_down);
+            });
+            visual.simulate_event(MouseMoveEvent {
+                position: start + point(px(40.0), px(30.0)),
+                pressed_button: None,
+                modifiers: gpui::Modifiers::none(),
+            });
+            mounted_canvas_click(&mut visual, start, 1);
+            item.read_with(&visual, |item, _| {
+                let document = item.document().expect("document");
+                assert_eq!(
+                    serde_json::to_value(&document.doc).expect("full document"),
+                    expected
+                );
+                assert_eq!(document.raw_assets, assets);
+                assert_eq!(document.doc.history.undo_depth(), 0);
+                assert_eq!(document.doc.history.redo_depth(), 0);
+                assert!(!item.content_preview_active());
+                assert!(!item.is_dirty());
+            });
+        }
+    }
+
+    #[gpui::test]
+    async fn mounted_pen_anchors_survive_pending_press_deactivation(cx: &mut TestAppContext) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, _, images) = bitmap_canvas_doc();
+        let (item, view, mut visual) =
+            mounted_canvas_interaction_fixture(&project, doc, images, cx);
+        let center = view.read_with(&visual, |view, _| {
+            view.container_bounds.expect("canvas").center()
+        });
+        mounted_canvas_click(&mut visual, center, 1);
+        visual.update(|window, cx| {
+            let focus_handle = view.read(cx).focus_handle.clone();
+            focus_handle.focus(window, cx);
+            window.dispatch_action(ActivatePenTool.boxed_clone(), cx);
+        });
+        visual.run_until_parked();
+        view.read_with(&visual, |view, _| {
+            assert_eq!(view.active_tool(), ToolKind::Pen)
+        });
+        for position in [
+            center + point(px(-80.0), px(-152.0)),
+            center + point(px(80.0), px(-152.0)),
+        ] {
+            mounted_canvas_click(&mut visual, position, 1);
+        }
+        let third_anchor = center + point(px(80.0), px(-80.0));
+        visual.simulate_event(MouseDownEvent {
+            position: third_anchor,
+            button: MouseButton::Left,
+            modifiers: gpui::Modifiers::none(),
+            click_count: 1,
+            first_mouse: false,
+        });
+        let expected_lines = vec![
+            fanta_tools::ToolOverlay::PreviewLine {
+                world_start: [-80.0, -152.0],
+                world_end: [80.0, -152.0],
+            },
+            fanta_tools::ToolOverlay::PreviewLine {
+                world_start: [80.0, -152.0],
+                world_end: [80.0, -80.0],
+            },
+        ];
+        view.read_with(&visual, |view, _| {
+            assert_eq!(view.active_tool(), ToolKind::Pen);
+            assert!(view.primary_pressed);
+            assert_eq!(
+                view.tools.overlays.get(..2),
+                Some(expected_lines.as_slice())
+            );
+        });
+        let (expected, assets) = item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            assert!(!item.content_preview_active());
+            (
+                serde_json::to_value(&document.doc).expect("full document"),
+                document.raw_assets.clone(),
+            )
+        });
+        for workspace_deactivated in [false, true] {
+            view.update_in(&mut visual, |view, window, cx| {
+                if workspace_deactivated {
+                    Item::workspace_deactivated(view, window, cx);
+                } else {
+                    Item::deactivated(view, window, cx);
+                }
+            });
+            view.read_with(&visual, |view, _| {
+                assert_eq!(view.active_tool(), ToolKind::Pen);
+                assert_eq!(
+                    view.tools.overlays.get(..2),
+                    Some(expected_lines.as_slice())
+                );
+            });
+            visual.simulate_event(MouseMoveEvent {
+                position: third_anchor + point(px(12.0), px(14.0)),
+                pressed_button: None,
+                modifiers: gpui::Modifiers::none(),
+            });
+            view.read_with(&visual, |view, _| {
+                assert_eq!(view.active_tool(), ToolKind::Pen);
+                assert_eq!(
+                    view.tools.overlays.get(..2),
+                    Some(expected_lines.as_slice())
+                );
+            });
+            item.read_with(&visual, |item, _| {
+                let document = item.document().expect("document");
+                assert_eq!(
+                    serde_json::to_value(&document.doc).expect("full document"),
+                    expected
+                );
+                assert_eq!(document.raw_assets, assets);
+                assert_eq!(document.doc.history.undo_depth(), 0);
+                assert_eq!(document.doc.history.redo_depth(), 0);
+                assert!(!item.content_preview_active());
+                assert!(!item.is_dirty());
+            });
+        }
     }
 
     #[gpui::test]
