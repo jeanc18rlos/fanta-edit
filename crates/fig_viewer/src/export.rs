@@ -14,7 +14,7 @@ use crate::document::{FigPage, page_bounds};
 
 const MAX_EXPORT_PIXELS: u32 = 8192;
 const MAX_EXPORT_TOTAL_PIXELS: u64 = 16 * 1024 * 1024;
-const JPEG_QUALITY: u8 = 90;
+const JPEG_QUALITY: u8 = 95;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ExportFormat {
