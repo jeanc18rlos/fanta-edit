@@ -17025,7 +17025,13 @@ mod tests {
         assert_unchanged(&visual);
         let ratio = visual.debug_bounds("design-crop-ratio").expect("Ratio");
         visual.simulate_click(ratio.center(), gpui::Modifiers::none());
-        visual.simulate_keystrokes("home down down enter");
+        visual.update(|window, cx| window.draw(cx).clear());
+        let square_ratio = visual
+            .debug_bounds("MENU_ITEM-1:1")
+            .expect("square crop ratio menu item");
+        visual.simulate_click(square_ratio.center(), gpui::Modifiers::none());
+        visual.update(|window, cx| window.draw(cx).clear());
+        assert!(visual.debug_bounds("MENU_ITEM-1:1").is_none());
         view.read_with(&visual, |view, cx| {
             let adapter = view.gpui_toolbar.as_ref().expect("toolbar");
             assert_eq!(adapter.draw_options.crop_ratio.as_ref(), "1:1");
@@ -17142,7 +17148,13 @@ mod tests {
         visual.update(|window, cx| window.draw(cx).clear());
         let ratio = visual.debug_bounds("design-crop-ratio").expect("Ratio");
         visual.simulate_click(ratio.center(), gpui::Modifiers::none());
-        visual.simulate_keystrokes("home down down enter");
+        visual.update(|window, cx| window.draw(cx).clear());
+        let square_ratio = visual
+            .debug_bounds("MENU_ITEM-1:1")
+            .expect("square crop ratio menu item");
+        visual.simulate_click(square_ratio.center(), gpui::Modifiers::none());
+        visual.update(|window, cx| window.draw(cx).clear());
+        assert!(visual.debug_bounds("MENU_ITEM-1:1").is_none());
         let start = position + point(px(-40.0), px(-20.0));
         let end = position + point(px(40.0), px(20.0));
         visual.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::none());
