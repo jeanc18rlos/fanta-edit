@@ -27,6 +27,31 @@ recorded there.
 
 ## Current acceptance status
 
+### Combined-main automated checks — 9 October
+
+Exact main `7ee4525f7578add2dcd32cd4b35b62edcdbf805b`, tree
+`5324a22114499eb7ded0acb7587d1fb5e8e9d3f7`, passes hosted Check and Mac App Store
+runtime in [run 37866707698](https://github.com/jeanc18rlos/fanta-edit/actions/runs/37866707698).
+Both job checkouts match that revision. All six release-verification stages
+pass: engine, import, source-order, editor, workspace and UI. The editor stage
+passes **1,211 tests plus four drag-example tests**, with zero failures and two
+ignored diagnostics: the actual Metal/CoreVideo retained-worker check and the
+component-heavy layer-action CPU benchmark.
+
+The logs include both new Audio lifecycle tests, both semantic Section-matching
+tests, all three TextPath inspector-header tests, and the strengthened
+`canvas_menu_primary_entries_activate_the_matching_editor` test. The latter
+starts the inspector collapsed and checks actual properties-menu reveal for
+seven node kinds; it also covers TextPath **Edit text** entry. These are automated
+regressions, not new native acceptance or a fix for the unresolved Audio preview.
+
+The native-video job was **skipped**, and the private Spectrum import-preservation
+stage was not executed. This Check does **not** run `script/clippy`; no full lint
+pass is claimed. Installer/signing, native persistence, performance and production
+service gates remain open. The independently reviewed run, source identities,
+logs and ten-file artifact are retained at
+`integration-20261007/final-main-resumed-20261009/independent-terminal-review.json`.
+
 ### Bounded checks through 8 October
 
 [PR 97](https://github.com/jeanc18rlos/fanta-edit/pull/97) merged as
@@ -58,7 +83,7 @@ All earlier failures remain recorded.
 | Save As refusal | Cancel, occupied-folder refusal, actual original-target text edit/Save and cold; 10 nodes, one asset, 20 files and destination sentinel preserved. | Successful Save As to a new destination and Undo/Redo. Autosave may precede explicit Save. |
 | Existing Audio | Explicit Play/Pause, paused midpoint seek, Save and cold; 35 nodes, five assets, 48 files. Reselection/Motion reopening were explicit. | Audibility, sample precision, history availability, restoration and performance. |
 | Corrupt/unsupported media | Corrupt-MP4 and loose-MP3 refusal, no-edit Save and cold; exact typed content, 48 files and both Git boundaries. | History availability and other codecs/missing-media cases. Loose-MP3 refusal is not project-Assets placement. |
-| Project-Assets MP3 | Placement/Save, Undo/Save, Redo/Save and cold storage/geometry; final 36 nodes, six assets and 49 files match saved Redo. | **Cold preview readiness is unaccepted:** the whole Audio preview was absent for MP3 and later a single WAV. The storage oracle did not check that panel; this is not a codec conclusion or an Audio fix. |
+| Project-Assets MP3 | Placement/Save, Undo/Save, Redo/Save and cold storage/geometry; final 36 nodes, six assets and 49 files match saved Redo. | **Cold preview readiness is unaccepted:** the whole Audio preview was absent for the original MP3 tone and the newly placed one-second MP3; no WAV case was verified. The storage oracle did not check that panel; this is not a codec conclusion or an Audio fix. |
 | Fresh Spectrum first-open archive | Qualified composition of full mapped-document/raw-source checks and the permission/inventory tail on the same archive: 73,925 nodes, 9,012 definitions, 23 pages, 41 assets, 27,162 files/9,049 directories. | Not a newly passed end-to-end capture or full raw-Kiwi fidelity proof; the original offline terminal position was transcribed from tool output. Schema-proven f32 fields compare exact bits; fresh files use source-defined 0600 permissions. Original numeric/permission refusals remain. **No fresh-import Save, cold or performance acceptance.** |
 
 Evidence is retained under the local QA archive's `integration-20261007/`:
@@ -441,7 +466,7 @@ coverage. The final column highlights the remaining acceptance work.
 | Motion/timeline | Viewer `motion_panel`, `motion_edit`, `timeline`, toolbar adapter tests; document/render motion tests | Easing edit/cancel, clip switching, duration and mode changes. Representative playback/ruler seek and keyframe drag/Undo passed on `ee80ec48c6`; time-field typing/seek with retained selection and strict restart passed on `0a0d3cd1c4`. Broader property coverage remains open. |
 | Prototypes | `fanta-present`; viewer `prototype_panel`, `prototype_player` and view tests | Native explicit Remove/Save and single Undo/Save pass on `a82f90f87b`; its restart mismatch is retained against a stale baseline after confirmed user position edits. A fresh matching baseline passes Save/strict process restart on `ac038333e3`. Other pointer/key/time triggers, overlays, transitions and safe links remain. Click navigation/Restart/Escape passed on `ee80ec48c6`; detail X retained reaction/card/wire with unchanged Save/restart snapshots on `0a0d3cd1c4`. |
 | Comments/review/Dev | Viewer `comments`, `comments_ui`, `view_annotations`, `view_measurements`, `view_dev_mode` and export tests | Pin/reply/resolve, draft preservation, mode transitions, keyboard ownership and read-only protection; no review overlays in artwork exports. |
-| Local image/SVG/video/audio | Viewer `generation_media`, `video_playback`, document/view and media tests; renderer live-media tests | Earlier `a3a51b084b` properties/reveal checks remain unchanged. The ten bounded H.264 playback/seek/Trim Cancel and Apply/history/cold checkpoints above now pass on `0f71b3961d`; exact poster and asset persistence are covered for that fixture. The earlier readiness and stale-display observations remain unresolved. The 8 October existing-Audio and corrupt/loose-MP3 refusal checks above pass. Project-Assets MP3 placement/history/cold storage passes, but MP3/single-WAV cold preview remains unaccepted. Other codecs/VFR, missing sources, orientation, audible output and broader installed-app journeys remain. |
+| Local image/SVG/video/audio | Viewer `generation_media`, `video_playback`, document/view and media tests; renderer live-media tests | Earlier `a3a51b084b` properties/reveal checks remain unchanged. The ten bounded H.264 playback/seek/Trim Cancel and Apply/history/cold checkpoints above now pass on `0f71b3961d`; exact poster and asset persistence are covered for that fixture. The earlier readiness and stale-display observations remain unresolved. The 8 October existing-Audio and corrupt/loose-MP3 refusal checks above pass. Project-Assets MP3 placement/history/cold storage passes, but cold Audio preview for the original and newly placed MP3 remains unaccepted. Other codecs/VFR, missing sources, orientation, audible output and broader installed-app journeys remain. |
 | Export | Viewer `export::tests` and inspector export tests; renderer integration suites | Native `8a9a33c35e` Vector and Bitmap exports pass bounded PNG/SVG/PDF, Vector JPG, collision preservation and two simultaneous presets including 2× PNG checks; all 24 project files remain exact. Bitmap JPEG retains its original four-pixel FAIL; a separate DCT-flat-block oracle passes without raising tolerance. Broader fidelity/selection batches and visible export-error routes remain; no general JPEG-quality claim. |
 | Designer/MCP | Viewer `agent_surface` (including style projection), `live_mcp` and `plan_build` tests; `script/smoke-mcp`; managed-account failure-path regressions in `project::context_server_store` | Final app local stdio/socket connection, real agent tool selection, one undo per successful batch, rollback, source validation and screenshots. Separately verify hosted account-managed MCP discovery/tool/auth/recovery; local editor MCP tests do not cover that service. |
 | Generation/recovery | Viewer `generation_workspace`, `generation_journal`, `generation_media`; account/provider CI tests | Signed-in final build with a real provider: submit/poll/save/place, timeout/retry, restart, sign-out/account switch and exactly-once recovery. Mock responses do not prove production availability. |
