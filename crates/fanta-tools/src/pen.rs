@@ -108,7 +108,7 @@ impl PenTool {
                 ..
             } => {
                 let world = ctx.screen_to_world(DVec2::from(screen));
-                let snap = ctx.snap.snap_point(world, &ctx.doc.scene, &[]);
+                let snap = ctx.snap_point(world, &[]);
                 let pos = snap.world;
                 self.cursor = pos;
 

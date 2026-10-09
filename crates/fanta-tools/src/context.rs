@@ -161,6 +161,16 @@ impl<'a> ToolContext<'a> {
         self.scope_root.or_else(|| self.doc.active_page())
     }
 
+    pub fn collect_snap_candidates(&self, exclude: &[NodeId]) -> fanta_canvas::SnapCandidates {
+        self.snap
+            .collect_candidates_in_scope(&self.doc.scene, self.scope(), exclude)
+    }
+
+    pub fn snap_point(&self, world: DVec2, exclude: &[NodeId]) -> fanta_canvas::SnapResult {
+        self.snap
+            .snap_point_with(&self.collect_snap_candidates(exclude), world)
+    }
+
     pub fn hit_test(&self, world_point: DVec2, precision: HitPrecision) -> Option<NodeId> {
         self.hit_test_in_scope(world_point, precision, self.scope())
     }
@@ -350,5 +360,72 @@ mod tests {
         assert!((bounds.min_y - 20.0).abs() < 1e-9);
         assert!((bounds.max_x - 40.0).abs() < 1e-9);
         assert!((bounds.max_y - 60.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn snapping_follows_active_page_and_explicit_subtree_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut doc = Doc::new();
+        let mut roots = Vec::new();
+        let mut neighbors = Vec::new();
+        for coordinate in [100.0, 98.0, 95.0] {
+            let root = CanvasNode::new(NodeData::Group(GroupNode::default()));
+            let root_id = root.id;
+            doc.apply(Operation::create_node(root))?;
+            doc.add_page(root_id);
+            let mut neighbor = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                coordinate,
+                0.0,
+                20.0,
+                20.0,
+                Color::WHITE,
+            )));
+            neighbor.parent = Some(root_id);
+            neighbors.push(neighbor.id);
+            roots.push(root_id);
+            doc.apply(Operation::create_node(neighbor))?;
+        }
+        let [first_page, second_page, component] = roots.as_slice() else {
+            return Err("fixture must create three roots".into());
+        };
+        let [first_neighbor, second_neighbor, component_neighbor] = neighbors.as_slice() else {
+            return Err("fixture must create three neighbors".into());
+        };
+        assert!(doc.set_active_page(Some(*first_page)));
+        let mut viewport = Viewport::default();
+        let snap = SnapEngine {
+            targets: fanta_canvas::SnapTargets::NODE_EDGES,
+            ..Default::default()
+        };
+        let mut context = ToolContext::new(&mut doc, &mut viewport, snap, DVec2::new(800.0, 600.0));
+        let probe = DVec2::new(97.5, 40.0);
+        let kind = |result: fanta_canvas::SnapResult| result.x.map(|snap| snap.kind);
+        assert_eq!(
+            kind(context.snap_point(probe, &[])),
+            Some(fanta_canvas::SnapKind::NodeEdgeMin {
+                source: *first_neighbor
+            })
+        );
+        assert!(context.doc.set_active_page(Some(*second_page)));
+        assert_eq!(
+            kind(context.snap_point(probe, &[])),
+            Some(fanta_canvas::SnapKind::NodeEdgeMin {
+                source: *second_neighbor
+            })
+        );
+        context.scope_root = Some(*component);
+        assert_eq!(
+            kind(context.snap_point(probe, &[])),
+            Some(fanta_canvas::SnapKind::NodeEdgeMin {
+                source: *component_neighbor
+            })
+        );
+        assert!(
+            context
+                .collect_snap_candidates(&[*component_neighbor])
+                .is_empty()
+        );
+        assert_eq!(context.collect_snap_candidates(&[]).x_len(), 2);
+        Ok(())
     }
 }

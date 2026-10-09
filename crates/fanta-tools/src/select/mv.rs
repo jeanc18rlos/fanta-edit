@@ -138,7 +138,7 @@ impl SelectTool {
                 // the top-level movers is enough: their descendants ride along,
                 // so they are not stationary neighbors to snap against either.
                 let moving_ids: SmallVec<[NodeId; 8]> = moving.iter().map(|(id, _)| *id).collect();
-                let snap_candidates = ctx.snap.collect_candidates(&ctx.doc.scene, &moving_ids);
+                let snap_candidates = ctx.collect_snap_candidates(&moving_ids);
                 // No `history.begin` here: the drag is a transient preview that
                 // writes transforms directly; the single transaction is opened
                 // and committed on release (`on_release`).

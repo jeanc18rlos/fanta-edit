@@ -115,7 +115,7 @@ impl SelectTool {
         // node so it can't snap to itself. The drag is transient (see below),
         // so we do NOT open a history transaction here — that happens once on
         // release in `on_release`.
-        let snap_candidates = ctx.snap.collect_candidates(&ctx.doc.scene, &[node_id]);
+        let snap_candidates = ctx.collect_snap_candidates(&[node_id]);
         let state = ResizingState {
             handle,
             node_id,
