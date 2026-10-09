@@ -2,7 +2,7 @@
 //!
 //! The doc is reassembled in `serde_json::Value` space from the granular
 //! files, run through the schema-migration ladder if the tree was written by
-//! an older build, and only then handed to `Doc::from_json_str` — which
+//! an older build, and only then handed to `Doc::from_json_value` — which
 //! rebuilds the scene's child index and validates. Presence state
 //! (`active_page`, `selection`, `viewport`, `history`) is never on disk, so
 //! the loaded doc carries serde defaults for all of it.
@@ -234,7 +234,7 @@ fn read_project_tree_with_source_override_locked(
         value = migrate(value, manifest.schema_version, SCHEMA_VERSION)?;
     }
     let assets = read_assets(dir, json_override)?;
-    let mut doc = Doc::from_json_str(&value.to_string()).map_err(|error| {
+    let mut doc = Doc::from_json_value(&mut value).map_err(|error| {
         let error = match serde_path_to_error::deserialize::<_, Doc>(&value) {
             Err(error) => error.to_string(),
             Ok(_) => error.to_string(),
@@ -1285,4 +1285,122 @@ pub fn page_scope_of_source(path: &Path) -> Option<(PathBuf, ScopedDesign)> {
         return None;
     }
     Some((project_root.to_path_buf(), design))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fanta_doc::node::{CanvasNode, GroupNode, NodeData, VectorNode};
+    use fanta_doc::{Color, IndexKey, UnitInterval};
+
+    #[test]
+    fn assembled_project_load_preserves_content_and_saved_bytes()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let mut doc = Doc::new();
+        let parent = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        let parent_id = parent.id;
+        doc.scene.insert(parent)?;
+        doc.pages.push(parent_id);
+        let mut later = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            20.0,
+            30.0,
+            Color::BLACK,
+        )));
+        later.parent = Some(parent_id);
+        later.index = IndexKey::from_raw(2.0000000000000004);
+        later.opacity = UnitInterval::new(0.35179502);
+        let later_id = later.id;
+        doc.scene.insert(later)?;
+        let mut earlier = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            Color::BLACK,
+        )));
+        earlier.parent = Some(parent_id);
+        earlier.index = IndexKey::from_raw(0.9999999999999999);
+        let earlier_id = earlier.id;
+        doc.scene.insert(earlier)?;
+        doc.metadata.title = "JSON value load 雪".into();
+        doc.metadata.created_at = 9_007_199_254_740_993;
+        let assets = BTreeMap::new();
+        crate::write_project_tree(directory.path(), &doc, &assets)?;
+
+        let (loaded, loaded_assets) = read_project_tree(directory.path())?;
+        assert_eq!(serde_json::to_value(&loaded)?, serde_json::to_value(&doc)?);
+        assert_eq!(
+            loaded.scene.children_of(Some(parent_id)),
+            &[earlier_id, later_id]
+        );
+        assert!(loaded.pending_layout.is_empty());
+        assert_eq!(loaded_assets, assets);
+        let report = crate::write_project_tree(directory.path(), &loaded, &loaded_assets)?;
+        assert!(report.written.is_empty(), "{:?}", report.written);
+        assert!(report.removed.is_empty(), "{:?}", report.removed);
+
+        let manifest_path = directory.path().join(super::super::layout::FANTA_JSON);
+        let mut manifest = read_json_file(&manifest_path)?;
+        *manifest.get_mut("schema_version").ok_or("missing schema")? = 2.into();
+        let (migrated, migrated_assets) = read_project_tree_with_json_override(
+            directory.path(),
+            &JsonSourceOverride {
+                path: &manifest_path,
+                value: &manifest,
+            },
+        )?;
+        assert_eq!(
+            serde_json::to_value(&migrated)?,
+            serde_json::to_value(&doc)?
+        );
+        assert_eq!(
+            migrated.scene.children_of(Some(parent_id)),
+            &[earlier_id, later_id]
+        );
+        assert_eq!(migrated_assets, assets);
+        Ok(())
+    }
+
+    #[test]
+    fn assembled_project_load_preserves_field_diagnostics_and_schema_gate()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let doc = Doc::new();
+        crate::write_project_tree(directory.path(), &doc, &BTreeMap::new())?;
+        let metadata_path = directory.path().join(DOC_DIR).join(METADATA_JSON);
+        let mut metadata = serde_json::to_value(&doc.metadata)?;
+        *metadata.get_mut("title").ok_or("missing title")? = false.into();
+        let result = read_project_tree_with_json_override(
+            directory.path(),
+            &JsonSourceOverride {
+                path: &metadata_path,
+                value: &metadata,
+            },
+        );
+        match result {
+            Err(FormatError::InvalidProjectTree(message)) => {
+                assert!(message.starts_with(&directory.path().display().to_string()));
+                assert!(message.contains("metadata.title"), "{message}");
+                assert!(message.contains("invalid type: boolean"), "{message}");
+            }
+            other => return Err(format!("unexpected malformed metadata result: {other:?}").into()),
+        }
+        let manifest_path = directory.path().join(super::super::layout::FANTA_JSON);
+        let mut manifest = read_json_file(&manifest_path)?;
+        *manifest.get_mut("schema_version").ok_or("missing schema")? = (SCHEMA_VERSION + 1).into();
+        assert!(matches!(
+            read_project_tree_with_json_override(
+                directory.path(),
+                &JsonSourceOverride { path: &manifest_path, value: &manifest },
+            ),
+            Err(FormatError::UnsupportedSchema { found, supported })
+                if found == SCHEMA_VERSION + 1 && supported == SCHEMA_VERSION
+        ));
+        let (unchanged, _) = read_project_tree(directory.path())?;
+        assert_eq!(serde_json::to_value(unchanged)?, serde_json::to_value(doc)?);
+        Ok(())
+    }
 }
