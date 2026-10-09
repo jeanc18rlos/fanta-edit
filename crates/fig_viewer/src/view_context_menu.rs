@@ -576,6 +576,28 @@ mod tests {
     use super::*;
     use fanta_doc::{CanvasNode, ComponentDef, ComponentId, Doc, GroupNode, Operation};
 
+    fn init_context_menu_test(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            zlog::init_test();
+            assets::Assets.load_test_fonts(cx);
+            let settings = settings::SettingsStore::test(cx);
+            cx.set_global(settings);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+            #[cfg(feature = "fanta-gpui-ui")]
+            {
+                gpui_component::init(cx);
+                fanta_gpui::init(cx);
+                crate::theme_bridge::init(cx);
+            }
+            cx.bind_keys([
+                gpui::KeyBinding::new("escape", crate::view::Cancel, Some("FigViewer")),
+                gpui::KeyBinding::new("escape", menu::Cancel, Some("menu")),
+            ]);
+        });
+    }
+
     #[test]
     fn menu_targets_follow_what_the_layer_is() {
         let mut doc = Doc::new();
@@ -644,9 +666,15 @@ mod tests {
             AiArtifactNode, AssetId, AudioNode, BitmapNode, EmbedNode, Model3dNode, NodeGraphNode,
             TextNode, VectorNode, VideoNode,
         };
+        let mut baseline = fanta_doc::PathData::new();
+        baseline.move_to(0.0, 40.0).line_to(180.0, 40.0);
         vec![
             (
                 NodeData::Text(TextNode::new("Title", 100.0, 30.0)),
+                "Edit text",
+            ),
+            (
+                NodeData::TextPath(fanta_doc::TextPathNode::new(baseline, "Path title")),
                 "Edit text",
             ),
             (
@@ -695,6 +723,15 @@ mod tests {
                     waveform_color: fanta_doc::Color::BLACK,
                 }),
                 "Audio properties",
+            ),
+            (
+                NodeData::Boolean(fanta_doc::BooleanNode {
+                    fills: [fanta_doc::Fill::solid(fanta_doc::Color::BLACK)]
+                        .into_iter()
+                        .collect(),
+                    ..Default::default()
+                }),
+                "Boolean properties",
             ),
             (
                 NodeData::NodeGraph(NodeGraphNode {
@@ -778,25 +815,7 @@ mod tests {
         use gpui::{MouseButton, MouseUpEvent, px, size};
         use project::Project;
 
-        cx.update(|cx| {
-            zlog::init_test();
-            assets::Assets.load_test_fonts(cx);
-            let settings = settings::SettingsStore::test(cx);
-            cx.set_global(settings);
-            theme_settings::init(theme::LoadThemes::JustBase, cx);
-            release_channel::init(semver::Version::new(0, 0, 0), cx);
-            editor::init(cx);
-            #[cfg(feature = "fanta-gpui-ui")]
-            {
-                gpui_component::init(cx);
-                fanta_gpui::init(cx);
-                crate::theme_bridge::init(cx);
-            }
-            cx.bind_keys([
-                gpui::KeyBinding::new("escape", crate::view::Cancel, Some("FigViewer")),
-                gpui::KeyBinding::new("escape", menu::Cancel, Some("menu")),
-            ]);
-        });
+        init_context_menu_test(cx);
         let project = Project::test(fs::FakeFs::new(cx.executor()), [], cx).await;
         let mut doc = Doc::new();
         let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
@@ -1273,18 +1292,19 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "fanta-gpui-ui")]
     #[gpui::test]
     async fn canvas_menu_primary_entries_activate_the_matching_editor(
         cx: &mut gpui::TestAppContext,
     ) {
+        use crate::editor_session::EditorMode;
         use crate::tools::ToolKind;
-        use fanta_doc::Viewport;
-        use gpui::{MouseButton, point, px, size};
+        use fanta_doc::{Transform2D, Viewport};
+        use fanta_gpui::design::DesignPanelTarget;
+        use fanta_gpui::properties_inspector::PropertiesInspectorTab;
+        use gpui::{MouseButton, MouseUpEvent, point, px, size};
         use project::Project;
-        cx.update(|cx| {
-            let settings = settings::SettingsStore::test(cx);
-            cx.set_global(settings);
-        });
+        init_context_menu_test(cx);
         let project = Project::test(fs::FakeFs::new(cx.executor()), [], cx).await;
         for (data, label) in leaf_menu_cases() {
             let expected_tool = match &data {
@@ -1292,7 +1312,29 @@ mod tests {
                 NodeData::Bitmap(_) => ToolKind::Crop,
                 _ => ToolKind::Select,
             };
-            let edits_text = matches!(data, NodeData::Text(_));
+            let text_content = match &data {
+                NodeData::Text(text) => Some(text.content.clone()),
+                NodeData::TextPath(text) => Some(text.content.clone()),
+                _ => None,
+            };
+            let properties_entry = text_content.is_none() && expected_tool == ToolKind::Select;
+            let expected_title = if matches!(data, NodeData::Boolean(_)) {
+                "Boolean operation"
+            } else {
+                data.default_name()
+            };
+            let hit = if let NodeData::TextPath(text) = &data {
+                let quad = fanta_render::text_path_selection_quads(text, 0..1)
+                    .into_iter()
+                    .next()
+                    .expect("first TextPath character has shaped geometry");
+                quad.points
+                    .iter()
+                    .fold(DVec2::ZERO, |sum, point| sum + DVec2::from_array(*point))
+                    / 4.0
+            } else {
+                DVec2::new(20.0, 15.0)
+            };
             let mut doc = Doc::new();
             let page = CanvasNode::new(NodeData::Group(GroupNode::default()));
             let page_id = page.id;
@@ -1302,70 +1344,188 @@ mod tests {
             let mut node = CanvasNode::new(data);
             let node_id = node.id;
             node.parent = Some(page_id);
+            node.name = format!("Menu target: {label}");
+            node.transform = Transform2D::translation(24.0, 32.0);
+            let boolean = matches!(node.data, NodeData::Boolean(_));
             doc.apply(Operation::create_node(node)).expect("leaf");
+            if boolean {
+                let mut operand =
+                    CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode::rect_solid(
+                        0.0,
+                        0.0,
+                        100.0,
+                        100.0,
+                        fanta_doc::Color::BLACK,
+                    )));
+                operand.parent = Some(node_id);
+                doc.apply(Operation::create_node(operand))
+                    .expect("Boolean operand");
+            }
             doc.history = Default::default();
             let item =
                 crate::document::ready_item_for_test(&project, "/tmp/LeafMenu.fig".into(), doc, cx);
-            let original = item.read_with(cx, |item, _| {
-                item.doc()
-                    .expect("document")
-                    .scene
-                    .get(node_id)
-                    .expect("leaf")
-                    .clone()
+            let (view, visual) = cx.add_window_view({
+                let item = item.clone();
+                let project = project.clone();
+                move |window, cx| FigView::new(item, project, window, cx)
             });
-            let scratch = cx.add_window(|_, _| gpui::Empty);
-            let view = scratch
-                .update(cx, |_, window, cx| {
-                    cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx))
-                })
-                .expect("view");
-            scratch
-                .update(cx, |_, window, cx| {
-                    view.update(cx, |view, cx| {
-                        view.set_container_bounds(gpui::Bounds {
-                            origin: point(px(0.0), px(0.0)),
-                            size: size(px(800.0), px(600.0)),
-                        });
-                        view.set_viewport_silent(Viewport::default());
-                        view.deploy_canvas_context_menu(
-                            &MouseDownEvent {
-                                button: MouseButton::Right,
-                                position: point(px(420.0), px(315.0)),
-                                modifiers: Default::default(),
-                                click_count: 1,
-                                first_mouse: false,
-                            },
-                            window,
-                            cx,
-                        );
-                    });
-                    let menu = view
-                        .read(cx)
-                        .canvas_context_menu
-                        .as_ref()
-                        .expect("menu")
-                        .menu
-                        .clone();
-                    menu.update(cx, |menu, cx| {
-                        menu.select_first(&menu::SelectFirst, window, cx);
-                        for _ in 0..5 {
-                            menu.select_next(&menu::SelectNext, window, cx);
-                        }
-                        menu.confirm(&menu::Confirm, window, cx);
-                    });
-                })
-                .expect("activate primary entry");
-            view.read_with(cx, |view, _| {
+            visual.simulate_resize(size(px(1400.0), px(1000.0)));
+            view.update(visual, |view, cx| {
+                view.set_editor_mode(EditorMode::Design, cx);
+                view.set_viewport_silent(Viewport::default());
+                cx.notify();
+            });
+            visual.run_until_parked();
+            visual.update(|window, cx| window.draw(cx).clear());
+            view.update_in(visual, |view, window, cx| {
+                let inspector = view
+                    .properties_inspector_for_test()
+                    .expect("mounted inspector");
+                if !inspector.read(cx).is_collapsed() {
+                    view.toggle_inspector_sidebar(&crate::view::ToggleInspectorSidebar, window, cx);
+                }
+                cx.notify();
+            });
+            visual.run_until_parked();
+            visual.update(|window, cx| window.draw(cx).clear());
+            let inspector = view.read_with(visual, |view, _| {
+                view.properties_inspector_for_test()
+                    .expect("mounted inspector")
+            });
+            assert!(
+                inspector.read_with(visual, |inspector, _| inspector.is_collapsed()),
+                "{label}"
+            );
+            assert!(
+                visual.debug_bounds("fanta-inspector-sidebar").is_none(),
+                "{label}"
+            );
+            let original = item.read_with(visual, |item, _| item.doc().expect("document").clone());
+            let position = visual
+                .debug_bounds("fig-container")
+                .expect("canvas")
+                .center()
+                + point(px((24.0 + hit.x) as f32), px((32.0 + hit.y) as f32));
+            visual.simulate_event(MouseDownEvent {
+                button: MouseButton::Right,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+                first_mouse: false,
+            });
+            visual.simulate_event(MouseUpEvent {
+                button: MouseButton::Right,
+                position,
+                modifiers: Default::default(),
+                click_count: 1,
+            });
+            visual.run_until_parked();
+            assert!(
+                inspector.read_with(visual, |inspector, _| inspector.is_collapsed()),
+                "{label}: targeting the layer must not satisfy the reveal assertion"
+            );
+            visual.update(|window, cx| {
+                let menu = view
+                    .read(cx)
+                    .canvas_context_menu
+                    .as_ref()
+                    .expect("menu")
+                    .menu
+                    .clone();
+                menu.update(cx, |menu, cx| {
+                    menu.select_first(&menu::SelectFirst, window, cx);
+                    for _ in 0..5 {
+                        menu.select_next(&menu::SelectNext, window, cx);
+                    }
+                    menu.confirm(&menu::Confirm, window, cx);
+                });
+            });
+            visual.run_until_parked();
+            visual.update(|window, cx| window.draw(cx).clear());
+            view.read_with(visual, |view, cx| {
                 assert_eq!(view.active_tool(), expected_tool, "{label}");
-                assert_eq!(view.text_edit.is_some(), edits_text, "{label}");
+                assert_eq!(view.editor_mode(cx), EditorMode::Design, "{label}");
+                assert_eq!(view.text_edit.is_some(), text_content.is_some(), "{label}");
+                if let Some(content) = &text_content {
+                    let edit = view.text_edit.as_ref().expect("text editor");
+                    assert_eq!(edit.session.node_id(), node_id, "{label}");
+                    assert_eq!(edit.session.selected_range(), 0..content.len(), "{label}");
+                }
             });
-            item.read_with(cx, |item, _| {
+            if properties_entry {
+                inspector.read_with(visual, |inspector, _| {
+                    assert!(
+                        !inspector.is_collapsed(),
+                        "{label}: the menu must reveal properties"
+                    );
+                    assert_eq!(
+                        inspector.active_tab(),
+                        PropertiesInspectorTab::Design,
+                        "{label}"
+                    );
+                });
+                let sidebar = visual
+                    .debug_bounds("fanta-inspector-sidebar")
+                    .expect("rendered properties inspector");
+                for selector in ["fig-gpui-design-x", "fig-gpui-design-y"] {
+                    let row = visual
+                        .debug_bounds(selector)
+                        .unwrap_or_else(|| panic!("{label}: missing {selector}"));
+                    assert!(
+                        row.size.width > px(0.0) && row.size.height > px(0.0),
+                        "{label}: {selector}"
+                    );
+                    assert!(
+                        sidebar.contains(&row.center()),
+                        "{label}: {selector} outside inspector"
+                    );
+                }
+                view.read_with(visual, |view, cx| {
+                    let panel = view
+                        .gpui_design
+                        .as_ref()
+                        .expect("Design adapter")
+                        .panel
+                        .read(cx);
+                    let header = panel
+                        .view_data()
+                        .projections
+                        .selection_header
+                        .expect("selected node header");
+                    assert_eq!(
+                        header.target,
+                        DesignPanelTarget::Nodes {
+                            node_ids: vec![node_id.to_string().into()]
+                        },
+                        "{label}"
+                    );
+                    assert_eq!(header.view_data.title.as_ref(), expected_title, "{label}");
+                    let node = panel.node();
+                    assert_eq!(node.id.as_ref(), node_id.to_string(), "{label}");
+                    assert_eq!(
+                        node.name.as_ref(),
+                        format!("Menu target: {label}"),
+                        "{label}"
+                    );
+                    assert_eq!(
+                        (node.x, node.y, node.width, node.height),
+                        (24.0, 32.0, 100.0, 100.0),
+                        "{label}"
+                    );
+                });
+            }
+            item.read_with(visual, |item, _| {
                 let doc = item.doc().expect("document");
                 assert_eq!(doc.selection.as_slice(), &[node_id], "{label}");
-                assert_eq!(doc.scene.get(node_id), Some(&original), "{label}");
-                assert_eq!(doc.scene.len(), 2, "{label}");
+                let mut expected = original.clone();
+                expected.selection.select_only(node_id);
+                assert_eq!(
+                    serde_json::to_value(doc).expect("actual document"),
+                    serde_json::to_value(expected).expect("expected document"),
+                    "{label}"
+                );
                 assert_eq!(doc.history.undo_depth(), 0, "{label}");
+                assert_eq!(doc.history.redo_depth(), 0, "{label}");
                 assert!(!item.is_dirty(), "{label}");
             });
         }
