@@ -633,12 +633,12 @@ mod tests {
         surface.image_snapshot()
     }
 
-    fn epoch(revision: u64) -> LayerEpoch {
+    fn epoch(scene: &Scene, mode_generation: u64) -> LayerEpoch {
         LayerEpoch {
-            scene_instance: 1,
-            scene_revision: revision,
-            mode_generation: 0,
+            scene_instance: scene.instance_id(),
+            mode_generation,
             dark_ui: false,
+            asset_resolver: None,
         }
     }
 
@@ -650,18 +650,34 @@ mod tests {
         let mut probe = skia_safe::surfaces::raster_n32_premul((4, 4)).unwrap();
         let canvas = probe.canvas();
         let mut cache = LayerCache::default();
+        let scene = Scene::new();
+        let components = ComponentLibrary::default();
         cache.set_budget_bytes(3 * layer_bytes(10, 10));
         let ids: Vec<NodeId> = (0..4).map(|_| NodeId::new()).collect();
         let m = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
 
         for id in &ids[..3] {
-            cache.begin_frame(canvas, epoch(1), 1.0, 0.0, 0.0);
+            cache.begin_frame(
+                canvas,
+                &scene,
+                &components,
+                epoch(&scene, 1),
+                1.0,
+                (0.0, 0.0),
+            );
             assert!(cache.store(*id, raster_image(10, 10), m, (0, 0)));
         }
         assert_eq!(cache.len(), 3);
         // A fourth entry evicts the least recently used until it fits: only
         // ids[0] (frame 1) must go.
-        cache.begin_frame(canvas, epoch(1), 1.0, 0.0, 0.0);
+        cache.begin_frame(
+            canvas,
+            &scene,
+            &components,
+            epoch(&scene, 1),
+            1.0,
+            (0.0, 0.0),
+        );
         assert!(cache.store(ids[3], raster_image(10, 10), m, (0, 0)));
         assert_eq!(cache.len(), 3);
         assert!(!cache.entries.contains_key(&ids[0]));
@@ -676,7 +692,14 @@ mod tests {
         // three via lookups (a hit needs the canvas kind probe, so start a
         // frame with entries present), then a newcomer that needs space is
         // refused rather than evicting a live entry.
-        cache.begin_frame(canvas, epoch(1), 1.0, 0.0, 0.0);
+        cache.begin_frame(
+            canvas,
+            &scene,
+            &components,
+            epoch(&scene, 1),
+            1.0,
+            (0.0, 0.0),
+        );
         let paint = Paint::default();
         for id in &ids[1..4] {
             assert!(matches!(
@@ -688,7 +711,14 @@ mod tests {
         assert_eq!(cache.len(), 3);
 
         // A new epoch drops everything.
-        cache.begin_frame(canvas, epoch(2), 1.0, 0.0, 0.0);
+        cache.begin_frame(
+            canvas,
+            &scene,
+            &components,
+            epoch(&scene, 2),
+            1.0,
+            (0.0, 0.0),
+        );
         assert_eq!((cache.len(), cache.bytes()), (0, 0));
     }
 
@@ -699,12 +729,28 @@ mod tests {
         let mut probe = skia_safe::surfaces::raster_n32_premul((4, 4)).unwrap();
         let canvas = probe.canvas();
         let mut cache = LayerCache::default();
-        cache.begin_frame(canvas, epoch(1), 1.0, 0.0, 0.0);
+        let scene = Scene::new();
+        let components = ComponentLibrary::default();
+        cache.begin_frame(
+            canvas,
+            &scene,
+            &components,
+            epoch(&scene, 1),
+            1.0,
+            (0.0, 0.0),
+        );
         for _ in 0..LAYER_CACHE_POPULATE_PER_FRAME {
             assert!(cache.take_populate_slot());
         }
         assert!(!cache.take_populate_slot());
-        cache.begin_frame(canvas, epoch(1), 1.0, 0.0, 0.0);
+        cache.begin_frame(
+            canvas,
+            &scene,
+            &components,
+            epoch(&scene, 1),
+            1.0,
+            (0.0, 0.0),
+        );
         assert!(cache.take_populate_slot());
     }
 
@@ -715,21 +761,86 @@ mod tests {
         let mut probe = skia_safe::surfaces::raster_n32_premul((4, 4)).unwrap();
         let canvas = probe.canvas();
         let mut cache = LayerCache::default();
-        assert!(!cache.begin_frame(canvas, epoch(1), 0.5, 10.0, 20.0));
-        assert!(cache.begin_frame(canvas, epoch(1), 0.5, 10.0, 20.0));
+        let scene = Scene::new();
+        let components = ComponentLibrary::default();
+        assert!(!cache.begin_frame(
+            canvas,
+            &scene,
+            &components,
+            epoch(&scene, 1),
+            0.5,
+            (10.0, 20.0)
+        ));
+        assert!(cache.begin_frame(
+            canvas,
+            &scene,
+            &components,
+            epoch(&scene, 1),
+            0.5,
+            (10.0, 20.0)
+        ));
         // Whole-pixel pans keep populating; a fractional one does not.
-        assert!(cache.begin_frame(canvas, epoch(1), 0.5, 13.0, 18.0));
-        assert!(!cache.begin_frame(canvas, epoch(1), 0.5, 13.5, 18.0));
-        assert!(!cache.begin_frame(canvas, epoch(1), 0.5, 13.5, 18.25));
-        assert!(cache.begin_frame(canvas, epoch(1), 0.5, 14.5, 17.25));
+        assert!(cache.begin_frame(
+            canvas,
+            &scene,
+            &components,
+            epoch(&scene, 1),
+            0.5,
+            (13.0, 18.0)
+        ));
+        assert!(!cache.begin_frame(
+            canvas,
+            &scene,
+            &components,
+            epoch(&scene, 1),
+            0.5,
+            (13.5, 18.0)
+        ));
+        assert!(!cache.begin_frame(
+            canvas,
+            &scene,
+            &components,
+            epoch(&scene, 1),
+            0.5,
+            (13.5, 18.25)
+        ));
+        assert!(cache.begin_frame(
+            canvas,
+            &scene,
+            &components,
+            epoch(&scene, 1),
+            0.5,
+            (14.5, 17.25)
+        ));
         // A zoom step: direct first, then populate again.
-        assert!(!cache.begin_frame(canvas, epoch(1), 0.25, 14.5, 17.25));
-        assert!(cache.begin_frame(canvas, epoch(1), 0.25, 14.5, 17.25));
+        assert!(!cache.begin_frame(
+            canvas,
+            &scene,
+            &components,
+            epoch(&scene, 1),
+            0.25,
+            (14.5, 17.25)
+        ));
+        assert!(cache.begin_frame(
+            canvas,
+            &scene,
+            &components,
+            epoch(&scene, 1),
+            0.25,
+            (14.5, 17.25)
+        ));
         let m = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
         assert!(cache.store(NodeId::new(), raster_image(2, 2), m, (0, 0)));
         cache.set_enabled(false);
         assert_eq!(cache.len(), 0);
-        assert!(!cache.begin_frame(canvas, epoch(1), 0.25, 14.5, 17.25));
+        assert!(!cache.begin_frame(
+            canvas,
+            &scene,
+            &components,
+            epoch(&scene, 1),
+            0.25,
+            (14.5, 17.25)
+        ));
         assert!(!cache.store(NodeId::new(), raster_image(2, 2), m, (0, 0)));
     }
 
