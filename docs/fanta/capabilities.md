@@ -106,8 +106,9 @@ including exact RGBA bytes; Undo retains the added poster asset. The earlier a7
 These results do not establish an activation fix, arbitrary codecs/VFR or
 installed-release media behavior. Separate 8 October optimized Audio checks
 cover one Play/Pause/seek/Save/cold journey. MP3 placement passes bounded
-storage/history checks, but later MP3 and single-WAV cold previews were absent;
-Audio preview recovery is not established. See the
+storage/history checks, but cold Audio previews were absent for the original
+MP3 tone and the newly placed one-second MP3; no WAV case was verified. Audio
+preview recovery is not established. See the
 [coverage report](../alpha/CAPABILITY_COVERAGE.md#bounded-checks-through-8-october).
 
 The project **Assets** list shows saved/imported media, thumbnails and file sizes.
@@ -144,6 +145,22 @@ Booleans expose operation, fill and stroke controls. Paint recoloring retains
 the imported geometry; geometry or operation changes recompute it from operands.
 Constraint data can be retained by the document, but constraint controls are
 currently disabled in the default Design inspector.
+
+For one editable physical Text on Path layer, the Design inspector header's
+**Edit object** action opens inline editing with all text selected. It is
+unavailable for multiple selections, pages, virtual instance TextPath content,
+locked layers or locked ancestors, and read-only states such as Inspect or a
+pending Source draft. The command rechecks the current selection and editability;
+a stale or newly protected target leaves the document unchanged.
+
+With one layer selected, **Select matching layers** appears when another layer
+of the same kind exists on the active page. It selects matching descendants on
+that page without editing content or adding an Undo step. Sections match other
+Sections rather than ordinary Frames or Groups, regardless of their paint;
+component masters retain their component identity. An explicit Frame identity
+is not treated as an imported Section. This matching rule does not change the
+inspector's property presets.
+
 Single-node opacity, visibility and uniform vector radius display their active
 variable values, including aliases and inherited mode pins. Explicit corner
 values keep precedence; unresolved bindings show a labeled fallback and remain
