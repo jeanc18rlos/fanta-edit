@@ -12809,7 +12809,7 @@ mod tests {
         let original_transform = original.scene.get(rectangle).expect("rectangle").transform;
         let initial_revision = original.scene.content_revision();
         let original_value = serde_json::to_value(&original).expect("original document");
-        let mut expected = original.clone();
+        let mut expected = original;
         let expected_sources = vec![DesignPatternSource::new(
             source.to_string(),
             "Pattern source",
