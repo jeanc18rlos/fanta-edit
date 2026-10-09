@@ -28,6 +28,11 @@ on:
         required: true
         default: false
         type: boolean
+      build_diagnostics:
+        description: Log bounded build resource progress and retain Cargo timings when available
+        required: true
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -114,6 +119,7 @@ jobs:
 
       - name: Build and package Fanta
         env:
+          FANTA_RELEASE_BUILD_DIAGNOSTICS: ${{ github.event_name == 'workflow_dispatch' && inputs.build_diagnostics }}
           FANTA_CLIENT_CHECKSUM_SEED: ${{ secrets.FANTA_CLIENT_CHECKSUM_SEED }}
           MACOS_CERTIFICATE: ${{ env.FANTA_REQUIRE_NOTARIZATION == 'true' && secrets.MACOS_CERTIFICATE || '' }}
           MACOS_CERTIFICATE_PASSWORD: ${{ env.FANTA_REQUIRE_NOTARIZATION == 'true' && secrets.MACOS_CERTIFICATE_PASSWORD || '' }}
@@ -145,6 +151,16 @@ jobs:
           else
             ./script/bundle-mac aarch64-apple-darwin
           fi
+
+      - name: Preserve optional Cargo build timings
+        if: ${{ always() && inputs.build_diagnostics && hashFiles('target/cargo-timings/*.html') != '' }}
+        continue-on-error: true
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: macos-build-timings-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/cargo-timings/*.html
+          if-no-files-found: ignore
+          retention-days: 30
 
       - name: Verify app bundle and record checksums
         if: env.FANTA_APP_STORE != 'true'
