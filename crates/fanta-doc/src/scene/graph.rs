@@ -191,6 +191,10 @@ pub struct Scene {
     /// other derived cache.
     #[serde(skip)]
     pub(crate) revision: std::cell::Cell<u64>,
+    #[serde(skip)]
+    content_revision: std::cell::Cell<u64>,
+    #[serde(skip)]
+    structure_revision: std::cell::Cell<u64>,
     /// Per-node "data may have changed" stamps for renderer geometry caches.
     ///
     /// A node's stamp records the value [`Scene::revision`] had right after
@@ -268,6 +272,8 @@ impl Default for Scene {
             local_bounds_cache: RefCell::new(IdHashMap::default()),
             spatial_index: RefCell::new(None),
             revision: std::cell::Cell::new(0),
+            content_revision: std::cell::Cell::new(0),
+            structure_revision: std::cell::Cell::new(0),
             instance_id: mint_scene_instance_id(),
             change_log: RefCell::new(VecDeque::new()),
         }
@@ -294,6 +300,8 @@ impl Clone for Scene {
             local_bounds_cache: self.local_bounds_cache.clone(),
             spatial_index: RefCell::new(None),
             revision: self.revision.clone(),
+            content_revision: self.content_revision.clone(),
+            structure_revision: self.structure_revision.clone(),
             instance_id: mint_scene_instance_id(),
             change_log: RefCell::new(VecDeque::new()),
         }
@@ -968,6 +976,19 @@ impl Scene {
     /// revision moves, so the log's revision sequence has no gaps — see the
     /// field docs on [`Scene::change_log`].
     pub(crate) fn record_change(&self, change: SceneChange) {
+        match change {
+            SceneChange::Transform(_) => {}
+            SceneChange::Node(_) => {
+                self.content_revision
+                    .set(self.content_revision.get().wrapping_add(1));
+            }
+            SceneChange::Structural | SceneChange::Unknown => {
+                self.content_revision
+                    .set(self.content_revision.get().wrapping_add(1));
+                self.structure_revision
+                    .set(self.structure_revision.get().wrapping_add(1));
+            }
+        }
         let revision = self.revision.get().wrapping_add(1);
         self.revision.set(revision);
         let mut log = self.change_log.borrow_mut();
@@ -975,6 +996,20 @@ impl Scene {
         while log.len() > SCENE_CHANGE_LOG_CAP {
             log.pop_front();
         }
+    }
+
+    /// Excludes only edits reported through `set_transform`; generic mutable
+    /// access remains conservative. Pair with `instance_id` across scenes.
+    /// This does not track document-level registries, variables, or assets.
+    pub fn content_revision(&self) -> u64 {
+        self.content_revision.get()
+    }
+
+    /// Excludes node data and transform edits, but includes unknown edits.
+    /// Pair with `instance_id`; document-level page/component registries are
+    /// outside this counter even when they refer to scene nodes.
+    pub fn structure_revision(&self) -> u64 {
+        self.structure_revision.get()
     }
 
     /// What a copy of this scene taken at `revision` must refresh to match it

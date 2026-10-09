@@ -2531,6 +2531,41 @@ impl MediaAssetCatalogCache {
     }
 }
 
+#[derive(Default)]
+struct PatternSourceCatalogCache {
+    key: Option<(u64, u64, NodeId)>,
+    sources: Vec<DesignPatternSource>,
+    #[cfg(test)]
+    build_count: usize,
+}
+
+impl PatternSourceCatalogCache {
+    fn get_or_build(&mut self, doc: &Doc, target: Option<NodeId>) -> Vec<DesignPatternSource> {
+        let Some(target) = target else {
+            self.key = None;
+            self.sources.clear();
+            return Vec::new();
+        };
+        let key = (
+            doc.scene.instance_id(),
+            doc.scene.content_revision(),
+            target,
+        );
+        if self.key != Some(key) {
+            self.sources = pattern_source_candidates(doc, target)
+                .into_iter()
+                .map(|(id, name)| DesignPatternSource::new(id.to_string(), name))
+                .collect();
+            self.key = Some(key);
+            #[cfg(test)]
+            {
+                self.build_count += 1;
+            }
+        }
+        self.sources.clone()
+    }
+}
+
 pub(crate) struct DesignAdapter {
     pub panel: Entity<DesignPanel>,
     pub(crate) last_echo: Option<DesignEchoKey>,
@@ -2540,6 +2575,7 @@ pub(crate) struct DesignAdapter {
     media_draft: Option<DesignMediaDraft>,
     media_draft_epoch: u64,
     media_asset_catalog: MediaAssetCatalogCache,
+    pattern_source_catalog: PatternSourceCatalogCache,
     font_catalog: DesignFontViewData,
     font_catalog_dirty: bool,
     export_configurations: Vec<DesignExportConfiguration>,
@@ -2613,6 +2649,7 @@ impl DesignAdapter {
             media_draft: None,
             media_draft_epoch: 0,
             media_asset_catalog: MediaAssetCatalogCache::default(),
+            pattern_source_catalog: PatternSourceCatalogCache::default(),
             font_catalog,
             font_catalog_dirty: true,
             export_configurations: vec![DesignExportConfiguration::new(
@@ -2790,16 +2827,10 @@ impl FigView {
                 return;
             };
             let media_assets = adapter.media_asset_catalog.get_or_build(document);
-            let pattern_sources = selection
-                .first()
-                .filter(|_| selection.len() == 1)
-                .map(|selected| {
-                    pattern_source_candidates(doc, *selected)
-                        .into_iter()
-                        .map(|(id, name)| DesignPatternSource::new(id.to_string(), name))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let pattern_sources = adapter.pattern_source_catalog.get_or_build(
+                doc,
+                selection.first().filter(|_| selection.len() == 1).copied(),
+            );
             Some((
                 key,
                 view_data,
@@ -9514,6 +9545,206 @@ mod tests {
         (doc, page_id, ids)
     }
 
+    fn assert_pattern_catalog(
+        cache: &mut PatternSourceCatalogCache,
+        doc: &Doc,
+        target: NodeId,
+        expected: &[(NodeId, &str)],
+        builds: usize,
+    ) {
+        let before = serde_json::to_value(doc).expect("document snapshot");
+        let history = (doc.history.undo_depth(), doc.history.redo_depth());
+        let expected = expected
+            .iter()
+            .map(|(id, name)| DesignPatternSource::new(id.to_string(), (*name).to_owned()))
+            .collect::<Vec<_>>();
+        assert_eq!(cache.get_or_build(doc, Some(target)), expected);
+        assert_eq!(cache.get_or_build(doc, Some(target)), expected);
+        assert_eq!(cache.build_count, builds);
+        assert_eq!(
+            serde_json::to_value(doc).expect("document snapshot"),
+            before
+        );
+        assert_eq!(
+            (doc.history.undo_depth(), doc.history.redo_depth()),
+            history
+        );
+    }
+
+    #[test]
+    fn pattern_catalog_preserves_order_and_invalidates_content_structure_and_history() {
+        let (mut doc, page, [target, source, other]) = doc_with_three_squares();
+        for (id, index) in [(target, 1.0), (source, 2.0), (other, 3.0)] {
+            doc.scene
+                .set_index(id, fanta_doc::IndexKey::from_raw(index))
+                .expect("stable order");
+        }
+        let mut cache = PatternSourceCatalogCache::default();
+        assert_pattern_catalog(
+            &mut cache,
+            &doc,
+            target,
+            &[(source, "Square 1"), (other, "Square 2")],
+            1,
+        );
+        for step in 0..120 {
+            doc.scene
+                .set_transform(source, Transform2D::translation(f64::from(step), 4.0))
+                .expect("move source");
+            doc.scene
+                .set_transform(target, Transform2D::translation(9.0, f64::from(step)))
+                .expect("move target");
+            assert_pattern_catalog(
+                &mut cache,
+                &doc,
+                target,
+                &[(source, "Square 1"), (other, "Square 2")],
+                1,
+            );
+        }
+        doc.apply(Operation::SetName {
+            id: source,
+            old: "Square 1".into(),
+            new: "Renamed".into(),
+        })
+        .expect("rename");
+        assert_pattern_catalog(
+            &mut cache,
+            &doc,
+            target,
+            &[(source, "Renamed"), (other, "Square 2")],
+            2,
+        );
+        assert!(doc.undo().expect("undo rename"));
+        assert_pattern_catalog(
+            &mut cache,
+            &doc,
+            target,
+            &[(source, "Square 1"), (other, "Square 2")],
+            3,
+        );
+        assert!(doc.redo().expect("redo rename"));
+        assert_pattern_catalog(
+            &mut cache,
+            &doc,
+            target,
+            &[(source, "Renamed"), (other, "Square 2")],
+            4,
+        );
+        doc.scene
+            .set_index(other, fanta_doc::IndexKey::from_raw(0.0))
+            .expect("reorder");
+        assert_pattern_catalog(
+            &mut cache,
+            &doc,
+            target,
+            &[(other, "Square 2"), (source, "Renamed")],
+            5,
+        );
+        let mut group = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        group.name = "Container".into();
+        group.parent = Some(page);
+        group.index = fanta_doc::IndexKey::from_raw(4.0);
+        let group = doc.scene.insert(group).expect("insert group");
+        assert_pattern_catalog(
+            &mut cache,
+            &doc,
+            target,
+            &[
+                (other, "Square 2"),
+                (source, "Renamed"),
+                (group, "Container"),
+            ],
+            6,
+        );
+        doc.scene
+            .set_parent(target, Some(group), fanta_doc::IndexKey::from_raw(0.0))
+            .expect("reparent target");
+        assert_pattern_catalog(
+            &mut cache,
+            &doc,
+            target,
+            &[(other, "Square 2"), (source, "Renamed")],
+            7,
+        );
+        assert!(
+            !pattern_source_is_valid(&doc, target, group),
+            "current ancestors remain invalid at action time"
+        );
+        doc.scene.get_mut(source).expect("source").data =
+            NodeData::Text(fanta_doc::TextNode::new("Not a pattern source", 20.0, 20.0));
+        assert_pattern_catalog(&mut cache, &doc, target, &[(other, "Square 2")], 8);
+        assert!(
+            !pattern_source_is_valid(&doc, target, source),
+            "stale picker source cannot be applied"
+        );
+        doc.scene.remove(other).expect("remove source");
+        assert_pattern_catalog(&mut cache, &doc, target, &[], 9);
+        doc.scene.invalidate_world_cache();
+        assert_pattern_catalog(&mut cache, &doc, target, &[], 10);
+    }
+
+    #[test]
+    fn pattern_catalog_replaces_one_target_and_separates_scene_instances() {
+        let (mut doc, _, [target, source, other]) = doc_with_three_squares();
+        for (id, index) in [(target, 1.0), (source, 2.0), (other, 3.0)] {
+            doc.scene
+                .set_index(id, fanta_doc::IndexKey::from_raw(index))
+                .expect("stable order");
+        }
+        let mut cache = PatternSourceCatalogCache::default();
+        assert_pattern_catalog(
+            &mut cache,
+            &doc,
+            target,
+            &[(source, "Square 1"), (other, "Square 2")],
+            1,
+        );
+        assert_pattern_catalog(
+            &mut cache,
+            &doc,
+            source,
+            &[(target, "Square 0"), (other, "Square 2")],
+            2,
+        );
+        assert_pattern_catalog(
+            &mut cache,
+            &doc,
+            target,
+            &[(source, "Square 1"), (other, "Square 2")],
+            3,
+        );
+        let mut copy = doc.clone();
+        assert_pattern_catalog(
+            &mut cache,
+            &copy,
+            target,
+            &[(source, "Square 1"), (other, "Square 2")],
+            4,
+        );
+        copy.scene.get_mut(source).expect("source").name = "Reloaded".into();
+        let parsed = Doc::from_json_str(&copy.to_json_pretty().expect("serialize copy"))
+            .expect("reload copy");
+        assert_eq!(parsed.id, doc.id);
+        assert_pattern_catalog(
+            &mut cache,
+            &parsed,
+            target,
+            &[(source, "Reloaded"), (other, "Square 2")],
+            5,
+        );
+        assert!(cache.get_or_build(&parsed, None).is_empty());
+        assert!(cache.key.is_none());
+        assert!(cache.sources.is_empty());
+        assert_pattern_catalog(
+            &mut cache,
+            &parsed,
+            target,
+            &[(source, "Reloaded"), (other, "Square 2")],
+            6,
+        );
+    }
+
     #[test]
     fn pattern_picker_settings_write_and_echo_into_the_scene() {
         let (mut doc, page, [target, source, replacement_source]) = doc_with_three_squares();
@@ -12551,6 +12782,145 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             assert_eq!(panel.media_paint_view_data().assets, expected);
+        });
+    }
+
+    #[gpui::test]
+    async fn pattern_catalog_reuses_transform_previews_without_stale_inspector_geometry(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut doc, [rectangle, _, _], _, assets) = media_catalog_fixture();
+        let page = doc
+            .scene
+            .get(rectangle)
+            .expect("rectangle")
+            .parent
+            .expect("page");
+        let mut source = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        source.name = "Pattern source".into();
+        source.parent = Some(page);
+        source.index = doc.scene.next_child_index(Some(page));
+        let source = doc.scene.insert(source).expect("pattern source");
+        let (view, panel, mut visual) =
+            setup_media_catalog_view(doc, assets.clone(), None, cx).await;
+        let owner = view.entity_id();
+        let item = view.read_with(&visual, |view, _| view.item().clone());
+        let original = item.read_with(&visual, |item, _| item.doc().expect("document").clone());
+        let original_transform = original.scene.get(rectangle).expect("rectangle").transform;
+        let initial_revision = original.scene.content_revision();
+        let original_value = serde_json::to_value(&original).expect("original document");
+        let mut expected = original.clone();
+        let expected_sources = vec![DesignPatternSource::new(
+            source.to_string(),
+            "Pattern source",
+        )];
+        for (x, y) in [(30.0, 40.0), (55.0, 75.0), (80.0, 95.0)] {
+            let transform = Transform2D::translation(x, y);
+            item.update(&mut visual, |item, cx| {
+                item.with_document_for_owner(owner, cx, |document| {
+                    document
+                        .doc
+                        .scene
+                        .set_transform(rectangle, transform)
+                        .expect("preview move");
+                    ((), DocChange::ContentPreview)
+                })
+                .expect("owned document preview");
+            });
+            expected
+                .scene
+                .set_transform(rectangle, transform)
+                .expect("expected preview");
+            let before_refresh = item.read_with(&visual, |item, _| {
+                let document = item.document().expect("document");
+                assert_eq!(
+                    serde_json::to_value(&document.doc).expect("preview"),
+                    serde_json::to_value(&expected).expect("expected")
+                );
+                assert!(item.is_dirty(), "preview remains dirty until cancellation");
+                document.render_generation()
+            });
+            refresh_media_catalog(&view, &mut visual);
+            panel.read_with(&visual, |panel, _| {
+                let node = panel.node();
+                assert_eq!(node.id.as_ref(), rectangle.to_string());
+                assert_eq!((node.x, node.y), (x as f32, y as f32));
+                assert_eq!((node.width, node.height), (200.0, 100.0));
+                assert_eq!(
+                    panel.media_paint_view_data().pattern_sources,
+                    expected_sources
+                );
+            });
+            view.read_with(&visual, |view, _| {
+                let adapter = view.gpui_design.as_ref().expect("adapter");
+                assert_eq!(adapter.pattern_source_catalog.build_count, 1);
+                assert_eq!(
+                    adapter.last_echo.as_ref().expect("echo").generation,
+                    before_refresh
+                );
+            });
+            item.read_with(&visual, |item, _| {
+                let document = item.document().expect("document");
+                assert_eq!(
+                    serde_json::to_value(&document.doc).expect("after refresh"),
+                    serde_json::to_value(&expected).expect("expected")
+                );
+                assert_eq!(*document.raw_assets, assets);
+                assert_eq!(
+                    document.doc.selection.iter().copied().collect::<Vec<_>>(),
+                    vec![rectangle]
+                );
+                assert_eq!(document.doc.history.undo_depth(), 0);
+                assert_eq!(document.doc.history.redo_depth(), 0);
+                assert_eq!(document.doc.scene.content_revision(), initial_revision);
+                assert_eq!(document.render_generation(), before_refresh);
+                assert!(item.is_dirty());
+            });
+        }
+        item.update(&mut visual, |item, cx| {
+            item.with_document_for_owner(owner, cx, |document| {
+                document
+                    .doc
+                    .scene
+                    .set_transform(rectangle, original_transform)
+                    .expect("restore preview");
+                ((), DocChange::ContentPreview)
+            })
+            .expect("owned preview restore");
+            assert!(item.finish_content_preview(owner, false, cx));
+        });
+        refresh_media_catalog(&view, &mut visual);
+        panel.read_with(&visual, |panel, _| {
+            assert_eq!((panel.node().x, panel.node().y), (10.0, 20.0));
+            assert_eq!(
+                panel.media_paint_view_data().pattern_sources,
+                expected_sources
+            );
+        });
+        view.read_with(&visual, |view, _| {
+            assert_eq!(
+                view.gpui_design
+                    .as_ref()
+                    .expect("adapter")
+                    .pattern_source_catalog
+                    .build_count,
+                1
+            );
+        });
+        item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            assert_eq!(
+                serde_json::to_value(&document.doc).expect("restored"),
+                original_value
+            );
+            assert_eq!(*document.raw_assets, assets);
+            assert_eq!(
+                document.doc.selection.iter().copied().collect::<Vec<_>>(),
+                vec![rectangle]
+            );
+            assert_eq!(document.doc.history.undo_depth(), 0);
+            assert_eq!(document.doc.history.redo_depth(), 0);
+            assert!(!item.is_dirty());
         });
     }
 
