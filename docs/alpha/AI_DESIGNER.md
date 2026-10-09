@@ -22,7 +22,10 @@ desktop and narrow widths before finishing.
 
 **Edit Visual** applies undoable canvas operations directly. **Write** and
 **Full Access** can edit saved FNX source; **Ultra** coordinates specialists for
-larger tasks. **Plan** and **Review** preserve the scene. `design_system` exposes
+larger tasks. **Plan** and **Review** preserve the scene. These permissions do
+not impose a total spending cap: retries, tools and auxiliary requests can add
+charges. See [accounts, models and connected tools](../fanta/capabilities.md#accounts-models-and-connected-tools)
+for provider routing, catalog and service-acceptance limits. `design_system` exposes
 the supported variable, collection, mode, binding, and component schema; agents
 should inspect it before creating foundations.
 

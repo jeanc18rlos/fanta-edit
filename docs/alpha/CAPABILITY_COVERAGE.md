@@ -27,6 +27,46 @@ recorded there.
 
 ## Current acceptance status
 
+### Final source and internal package — 9 October
+
+Main `79cc2ef8c094149e8496476c1cb53e2945b8b54a`, tree
+`bd69de45f92675b55d32f647d6c8c147da237537`, passes exact-main Check and Store
+in [run 37884589268](https://github.com/jeanc18rlos/fanta-edit/actions/runs/37884589268).
+All six verification stages pass: **1,212 editor tests, 405 renderer tests and
+four drag-example tests**, with zero failures; two editor and two renderer tests
+remain ignored. The totals include 22 layer-cache cases. The same tree passed
+the candidate's separate [twelve-crate release lint](https://github.com/jeanc18rlos/fanta-edit/actions/runs/37881418740).
+This is not full-workspace lint or a new main-push lint execution. Ordinary
+native video was skipped; private Spectrum and native performance are separate.
+
+Effect-layer invalidation preserves unaffected cached layers and uses conservative
+fallbacks for changed dependencies. Exact cache-on/off pixel tests pass; the
+9,012-definition comparison timings are unoptimized diagnostics, not native drag
+latency. Retained translation remains disabled. The merged Bitmap JPEG quality-95
+fix passes the original regression without changing its mask or tolerances;
+the quality-90 failure remains preserved. Latest native export still needs its
+own result.
+
+Internal optimized [build33](https://github.com/jeanc18rlos/fanta-edit/actions/runs/37884728571)
+uses that exact main source. Installer/checksum acquisition, hosted and local
+mounted-bundle verification, CLI and isolated QA derivation pass. The public
+release job was skipped. This arm64 artifact is ad-hoc signed (`signed=false`);
+Developer ID/notarization, quarantine installation, public download, update and
+rollback remain unaccepted. Broader native editor, Spectrum, service and
+performance gates remain open; this checkpoint does not supersede their dated
+failures.
+
+Evidence under the local QA archive's `integration-20261007/`:
+
+- `effect-layer-invalidation-20261009/canonical-ci-integrated/root-terminal-review.json`
+- `final-main-macos-artifact-20261009/independent-monitor/terminal-37884589268/root-terminal-review.json`
+- `final-main-macos-artifact-20261009/coherent-suite-v2/actual-acquisition-run1/result.json`
+- `final-main-macos-artifact-20261009/coherent-suite-v2/local-qa/actual-local-run1/result.json`
+- `bitmap-jpeg-quality-q95-publication-20261009T0208Z/canonical-ci/terminal-review/root-terminal-q95-review.json`
+
+The following earlier checkpoints retain their original source identities and
+acceptance limits.
+
 ### Combined-main automated checks — 9 October
 
 Exact main `7ee4525f7578add2dcd32cd4b35b62edcdbf805b`, tree
@@ -467,7 +507,7 @@ coverage. The final column highlights the remaining acceptance work.
 | Prototypes | `fanta-present`; viewer `prototype_panel`, `prototype_player` and view tests | Native explicit Remove/Save and single Undo/Save pass on `a82f90f87b`; its restart mismatch is retained against a stale baseline after confirmed user position edits. A fresh matching baseline passes Save/strict process restart on `ac038333e3`. Other pointer/key/time triggers, overlays, transitions and safe links remain. Click navigation/Restart/Escape passed on `ee80ec48c6`; detail X retained reaction/card/wire with unchanged Save/restart snapshots on `0a0d3cd1c4`. |
 | Comments/review/Dev | Viewer `comments`, `comments_ui`, `view_annotations`, `view_measurements`, `view_dev_mode` and export tests | Pin/reply/resolve, draft preservation, mode transitions, keyboard ownership and read-only protection; no review overlays in artwork exports. |
 | Local image/SVG/video/audio | Viewer `generation_media`, `video_playback`, document/view and media tests; renderer live-media tests | Earlier `a3a51b084b` properties/reveal checks remain unchanged. The ten bounded H.264 playback/seek/Trim Cancel and Apply/history/cold checkpoints above now pass on `0f71b3961d`; exact poster and asset persistence are covered for that fixture. The earlier readiness and stale-display observations remain unresolved. The 8 October existing-Audio and corrupt/loose-MP3 refusal checks above pass. Project-Assets MP3 placement/history/cold storage passes, but cold Audio preview for the original and newly placed MP3 remains unaccepted. Other codecs/VFR, missing sources, orientation, audible output and broader installed-app journeys remain. |
-| Export | Viewer `export::tests` and inspector export tests; renderer integration suites | Native `8a9a33c35e` Vector and Bitmap exports pass bounded PNG/SVG/PDF, Vector JPG, collision preservation and two simultaneous presets including 2× PNG checks; all 24 project files remain exact. Bitmap JPEG retains its original four-pixel FAIL; a separate DCT-flat-block oracle passes without raising tolerance. Broader fidelity/selection batches and visible export-error routes remain; no general JPEG-quality claim. |
+| Export | Viewer `export::tests` and inspector export tests; renderer integration suites | Native `8a9a33c35e` Vector and Bitmap exports pass bounded PNG/SVG/PDF, Vector JPG, collision preservation and two simultaneous presets including 2× PNG checks; all 24 project files remain exact. Bitmap JPEG retains its original four-pixel FAIL and separate DCT-flat-block pass. The later quality-95 fix passes the unchanged original hosted regression; latest native retest, broader fidelity/selection batches and visible export-error routes remain. No general JPEG-quality claim. |
 | Designer/MCP | Viewer `agent_surface` (including style projection), `live_mcp` and `plan_build` tests; `script/smoke-mcp`; managed-account failure-path regressions in `project::context_server_store` | Final app local stdio/socket connection, real agent tool selection, one undo per successful batch, rollback, source validation and screenshots. Separately verify hosted account-managed MCP discovery/tool/auth/recovery; local editor MCP tests do not cover that service. |
 | Generation/recovery | Viewer `generation_workspace`, `generation_journal`, `generation_media`; account/provider CI tests | Signed-in final build with a real provider: submit/poll/save/place, timeout/retry, restart, sign-out/account switch and exactly-once recovery. Mock responses do not prove production availability. |
 | App shell/distribution/accounts | Existing `Check` jobs: sidebar, path prompt, agent toggle, Git, auth, Store restrictions; `script/test-macos-release` preflight/manifest/trust-routing cases and release workflow `script/verify-macos-dmg` | The bounded production existing-account/billing read and cold-session check above passes; fresh sign-in, session recovery, billing/payment/restore and backend release compatibility remain. Menu/keyboard discovery, installed clean-profile launch, quarantine, signature/notarization, Keychain and sandbox file access also remain. |
