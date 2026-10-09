@@ -78,8 +78,10 @@ Changed project files are written through temporary files and atomic renames.
 A multi-file change uses the ignored `.fanta-transaction/` journal. Opening a
 project replays an interrupted transaction only when its expected old/new
 hashes still match; otherwise it reports a recovery error instead of choosing
-one version. A no-op save writes nothing, and a changed page does not require
-printing unrelated pages. Do not edit or commit `.fanta-transaction/`.
+one version. Unchanged generated design files are not rewritten, and a changed
+page does not require printing unrelated pages. Save can seed missing editor
+support files or upgrade exact legacy seeds; customized support files remain
+preserved. Do not edit or commit `.fanta-transaction/`.
 
 ## Format modules
 
@@ -117,8 +119,11 @@ restart complete a save that stopped between atomic file renames.
 
 ## Current limits
 
-- The Code pane displays FNX and tokens but does not yet edit them in place;
-  use an external editor or agent. Both enter through the same watcher path.
+- The Code workspace edits supported FNX and JSON in saved projects. Save
+  validates drafts; invalid or conflicting drafts preserve the last valid file
+  and canvas until resolved. Read-only states and pending operations constrain
+  editing. External editors and agents use the same reconciliation boundary.
+  See [Projects, pages and source](capabilities.md#projects-pages-and-source).
 - Project-contained font registration, ordinary SVG/video paste, and editable
   SVG features outside the current vector subset still need format handlers.
   Latent-tensor blobs have the content-addressed storage convention but no

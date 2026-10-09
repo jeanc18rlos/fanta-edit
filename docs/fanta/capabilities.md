@@ -15,6 +15,15 @@ Create a design from **New Design**, open a Fanta project folder, or import a
 component FNX source, identity sidecars, metadata and assets. See
 [project-schema.md](project-schema.md) for the layout.
 
+Keep the manifest, source, identity sidecars and referenced assets together when
+copying a project. A received folder can open in Restricted Mode if its `.zed`
+settings or Git configuration could run commands. Review its origin and trust
+prompt; do not remove its Git history or enable global trust just to suppress
+the prompt. Save As refuses occupied destinations. File reconciliation detects
+conflicts, but cannot make a concurrent external write and rename atomic; see
+[editing and recovery](project-schema.md#editing-and-recovery) and
+[current format limits](project-schema.md#current-limits).
+
 - Figma imports warn when known layer structures are flattened or omitted.
   Supported Boolean operations retain editable operands and their imported
   artwork. Changing an operand or operation recomputes the geometry; Undo can
@@ -400,10 +409,11 @@ drag/Undo, plus prototype click navigation, Restart, Escape and saved-project
 reopening. The corrected time field and non-destructive detail X also passed
 native checks with strict saved-content equality after restart. A later native
 explicit Remove/Save and single Undo/Save also passed complete comparisons.
-That journey's restart was compared with an outdated baseline after confirmed
-user position edits; no matching-baseline restart pass is claimed. The
-[coverage report](../alpha/CAPABILITY_COVERAGE.md) records exact provenance and
-remaining cases.
+That journey's first restart was compared with an outdated baseline after
+confirmed user position edits; the failure remains recorded. A later fresh
+matching-baseline Save/restart passes on `ac038333e3`. This does not establish
+other triggers or overlays. The [coverage report](../alpha/CAPABILITY_COVERAGE.md)
+records exact provenance and remaining cases.
 
 Implementation: [timeline](../../crates/fig_viewer/src/timeline.rs),
 [motion](../../crates/fig_viewer/src/motion_panel.rs),
@@ -421,9 +431,12 @@ multi-selection batches and multiple presets are supported. Export operates on
 committed artwork, reports completion/failure and refuses an active preview.
 Bounded native Vector/Bitmap exports validate dimensions, PNG/SVG/PDF appearance,
 Vector JPG, collision preservation and two simultaneous presets, including 2×
-PNG. Bitmap JPG has a separate limited flat-block pass; its original four-pixel
-comparison failure remains recorded. Imported or advanced effects, broader
-batches and general JPEG quality still need format-specific checks.
+PNG. Bitmap JPG retains its original four-pixel failure and separate limited
+flat-block pass. The later quality-95 correction passes the hosted regression
+using the original fixture, crop, pixel mask and tolerances; quality 90 fails
+that same test. This does not replace a native retest on the latest app or prove
+general JPEG fidelity, and higher quality can increase file size. Imported or
+advanced effects and broader batches still need format-specific checks.
 
 The built-in designer can inspect/edit the canvas, use project `fanta.md`
 instructions, prepare design assets, follow source edits and report agent
@@ -530,9 +543,13 @@ Mac App Store builds restrict local process execution, external agents and
 related inherited editor features; see [MAC_APP_STORE.md](../alpha/MAC_APP_STORE.md).
 The selected release target is a direct-download Mac app. Packaging now checks
 the app inside the produced DMG against the staged bundle and enforces the
-configured signature/notarization checks. Isolated verifier tests and the
-8 October internal optimized DMG verification pass. That arm64 artifact is ad-hoc signed (`signed=false`), with a separately
-verified isolated QA derivative; it is not a Developer ID/notarized release.
+configured signature/notarization checks. The 9 October internal optimized
+**build33**, from `79cc2ef8c094149e8496476c1cb53e2945b8b54a`, passes hosted and
+local mounted-package verification, CLI checks and isolated QA derivation. It
+is an arm64, ad-hoc-signed artifact (`signed=false`), not a Developer ID/notarized
+release. These checks do not replace native capability acceptance. The
+[coverage report](../alpha/CAPABILITY_COVERAGE.md#final-source-and-internal-package--9-october)
+retains its exact source and evidence links.
 Public download, clean-Mac installation, update and rollback remain unverified.
 A bounded check of the approved production service, using an isolated profile
 and unchanged development `0f71b3961d` binary, shows an existing account, loaded
