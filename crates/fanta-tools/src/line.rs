@@ -113,7 +113,7 @@ fn snap_pointer(ctx: &ToolContext, screen: [f64; 2]) -> Option<SnapResult> {
     if !world.is_finite() {
         return None;
     }
-    let snapped = ctx.snap.snap_point(world, &ctx.doc.scene, &[]);
+    let snapped = ctx.snap_point(world, &[]);
     snapped.world.is_finite().then_some(snapped)
 }
 

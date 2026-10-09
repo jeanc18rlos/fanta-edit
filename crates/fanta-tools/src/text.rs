@@ -99,7 +99,7 @@ impl TextTool {
                 ..
             } => {
                 let world = ctx.screen_to_world(DVec2::from(screen));
-                let snap = ctx.snap.snap_point(world, &ctx.doc.scene, &[]);
+                let snap = ctx.snap_point(world, &[]);
                 let origin = snap.world;
                 self.draft = Some(Draft {
                     origin,
@@ -116,7 +116,7 @@ impl TextTool {
                     return ToolResponse::cursor(CursorHint::Text);
                 };
                 let world = ctx.screen_to_world(DVec2::from(screen));
-                let snap = ctx.snap.snap_point(world, &ctx.doc.scene, &[]);
+                let snap = ctx.snap_point(world, &[]);
                 draft.current = snap.world;
                 self.draft = Some(draft);
                 let mut response =
@@ -137,7 +137,7 @@ impl TextTool {
                     return ToolResponse::cursor(CursorHint::Default);
                 };
                 let world = ctx.screen_to_world(DVec2::from(screen));
-                let snap = ctx.snap.snap_point(world, &ctx.doc.scene, &[]);
+                let snap = ctx.snap_point(world, &[]);
                 draft.current = snap.world;
                 let rect = draft.rect();
 

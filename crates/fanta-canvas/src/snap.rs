@@ -156,7 +156,7 @@ pub struct SnapResult {
 ///
 /// ## Why this is gesture-stable
 ///
-/// Collecting candidates means walking the entire scene and reading every
+/// Collecting candidates means walking the scoped scene and reading every
 /// non-excluded node's world bounds — an O(total nodes) traversal. During a
 /// drag the *only* nodes whose geometry changes are the ones being dragged,
 /// and those are precisely the nodes in the `exclude` list, which the
@@ -164,8 +164,8 @@ pub struct SnapResult {
 /// neighbors) therefore keeps the exact same edges and centers for the whole
 /// gesture. That makes the candidate set a loop-invariant: collect it once at
 /// press, reuse it on every mouse-move frame, and the snap results are
-/// bit-for-bit identical to recomputing it each frame — at O(neighbors) per
-/// frame instead of O(total nodes).
+/// bit-for-bit identical to recomputing it each frame. Each axis is sorted once;
+/// queries use binary search to scan only targets within the maximum threshold.
 ///
 /// Grid and pixel-grid targets are intentionally *not* cached here: they are
 /// computed analytically per query (closest line to the value) rather than
@@ -173,8 +173,31 @@ pub struct SnapResult {
 /// snapshot.
 #[derive(Debug, Clone, Default)]
 pub struct SnapCandidates {
-    x: SmallVec<[(f64, SnapKind); 16]>,
-    y: SmallVec<[(f64, SnapKind); 16]>,
+    x: SmallVec<[SnapCandidate; 16]>,
+    y: SmallVec<[SnapCandidate; 16]>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SnapCandidate {
+    coordinate: f64,
+    kind: SnapKind,
+    traversal_order: usize,
+}
+
+fn index_axis_candidates(
+    candidates: SmallVec<[(f64, SnapKind); 16]>,
+) -> SmallVec<[SnapCandidate; 16]> {
+    let mut indexed: SmallVec<[SnapCandidate; 16]> = candidates
+        .into_iter()
+        .enumerate()
+        .map(|(traversal_order, (coordinate, kind))| SnapCandidate {
+            coordinate,
+            kind,
+            traversal_order,
+        })
+        .collect();
+    indexed.sort_by(|left, right| left.coordinate.total_cmp(&right.coordinate));
+    indexed
 }
 
 impl SnapCandidates {
@@ -208,10 +231,19 @@ impl SnapEngine {
     /// on each subsequent frame; see [`SnapCandidates`] for why the snapshot
     /// stays valid for the whole gesture.
     pub fn collect_candidates(&self, scene: &Scene, exclude: &[NodeId]) -> SnapCandidates {
-        let axis = self.collect_axis_candidates(scene, exclude);
+        self.collect_candidates_in_scope(scene, None, exclude)
+    }
+
+    pub fn collect_candidates_in_scope(
+        &self,
+        scene: &Scene,
+        scope_root: Option<NodeId>,
+        exclude: &[NodeId],
+    ) -> SnapCandidates {
+        let axis = self.collect_axis_candidates(scene, scope_root, exclude);
         SnapCandidates {
-            x: axis.x,
-            y: axis.y,
+            x: index_axis_candidates(axis.x),
+            y: index_axis_candidates(axis.y),
         }
     }
 
@@ -316,12 +348,13 @@ impl SnapEngine {
     fn snap_axis_x(
         &self,
         value: f64,
-        candidates: &[(f64, SnapKind)],
+        candidates: &[SnapCandidate],
         pixel_to_world: f64,
     ) -> Option<AxisSnap> {
         // Grid is special — closest grid line, not a precomputed candidate set
         // (otherwise the candidate list explodes).
         let mut best: Option<(f64, SnapKind, f64)> = None; // (target, kind, abs_world_delta)
+        let mut best_traversal_order = None;
 
         if self.targets.contains(SnapTargets::GRID) && self.grid.spacing > 0.0 {
             let snapped = grid_snap_1d(value, self.grid.origin[0], self.grid.spacing);
@@ -344,9 +377,9 @@ impl SnapEngine {
             }
         }
 
-        for (candidate_value, kind) in candidates {
-            let world_delta = (*candidate_value - value).abs();
-            let threshold_world = match kind {
+        for candidate in self.nearby_candidates(candidates, value, pixel_to_world) {
+            let world_delta = (candidate.coordinate - value).abs();
+            let threshold_world = match candidate.kind {
                 SnapKind::NodeEdgeMin { .. } | SnapKind::NodeEdgeMax { .. } => {
                     self.thresholds.edge * pixel_to_world
                 }
@@ -354,9 +387,15 @@ impl SnapEngine {
                 _ => continue,
             };
             if world_delta <= threshold_world {
-                let entry = (*candidate_value, *kind, world_delta);
-                if best.is_none_or(|(_, _, prev)| world_delta < prev) {
+                let entry = (candidate.coordinate, candidate.kind, world_delta);
+                if best.is_none_or(|(_, _, previous)| {
+                    world_delta < previous
+                        || (world_delta == previous
+                            && best_traversal_order
+                                .is_some_and(|order| candidate.traversal_order < order))
+                }) {
                     best = Some(entry);
+                    best_traversal_order = Some(candidate.traversal_order);
                 }
             }
         }
@@ -371,10 +410,11 @@ impl SnapEngine {
     fn snap_axis_y(
         &self,
         value: f64,
-        candidates: &[(f64, SnapKind)],
+        candidates: &[SnapCandidate],
         pixel_to_world: f64,
     ) -> Option<AxisSnap> {
         let mut best: Option<(f64, SnapKind, f64)> = None;
+        let mut best_traversal_order = None;
 
         if self.targets.contains(SnapTargets::GRID) && self.grid.spacing > 0.0 {
             let snapped = grid_snap_1d(value, self.grid.origin[1], self.grid.spacing);
@@ -395,9 +435,9 @@ impl SnapEngine {
             }
         }
 
-        for (candidate_value, kind) in candidates {
-            let world_delta = (*candidate_value - value).abs();
-            let threshold_world = match kind {
+        for candidate in self.nearby_candidates(candidates, value, pixel_to_world) {
+            let world_delta = (candidate.coordinate - value).abs();
+            let threshold_world = match candidate.kind {
                 SnapKind::NodeEdgeMin { .. } | SnapKind::NodeEdgeMax { .. } => {
                     self.thresholds.edge * pixel_to_world
                 }
@@ -405,9 +445,15 @@ impl SnapEngine {
                 _ => continue,
             };
             if world_delta <= threshold_world {
-                let entry = (*candidate_value, *kind, world_delta);
-                if best.is_none_or(|(_, _, prev)| world_delta < prev) {
+                let entry = (candidate.coordinate, candidate.kind, world_delta);
+                if best.is_none_or(|(_, _, previous)| {
+                    world_delta < previous
+                        || (world_delta == previous
+                            && best_traversal_order
+                                .is_some_and(|order| candidate.traversal_order < order))
+                }) {
                     best = Some(entry);
+                    best_traversal_order = Some(candidate.traversal_order);
                 }
             }
         }
@@ -419,15 +465,49 @@ impl SnapEngine {
         })
     }
 
-    fn collect_axis_candidates(&self, scene: &Scene, exclude: &[NodeId]) -> AxisCandidates {
+    fn nearby_candidates<'a>(
+        &self,
+        candidates: &'a [SnapCandidate],
+        value: f64,
+        pixel_to_world: f64,
+    ) -> &'a [SnapCandidate] {
+        let maximum_distance = self.thresholds.edge.max(self.thresholds.center) * pixel_to_world;
+        if !value.is_finite() || !maximum_distance.is_finite() {
+            return candidates;
+        }
+        if maximum_distance < 0.0 {
+            return &[];
+        }
+        // Expand the distance before adding it: rounded subtraction can accept
+        // a target beyond the mathematical threshold, especially near zero.
+        let search_distance = maximum_distance.next_up();
+        let minimum = (value - search_distance).next_down();
+        let maximum = (value + search_distance).next_up();
+        let start = candidates
+            .partition_point(|candidate| candidate.coordinate.total_cmp(&minimum).is_lt());
+        let end = candidates
+            .partition_point(|candidate| !candidate.coordinate.total_cmp(&maximum).is_gt());
+        candidates.get(start..end).unwrap_or(&[])
+    }
+
+    fn collect_axis_candidates(
+        &self,
+        scene: &Scene,
+        scope_root: Option<NodeId>,
+        exclude: &[NodeId],
+    ) -> AxisCandidates {
         let mut out = AxisCandidates::default();
         let want_edges = self.targets.contains(SnapTargets::NODE_EDGES);
         let want_centers = self.targets.contains(SnapTargets::NODE_CENTERS);
         if !want_edges && !want_centers {
             return out;
         }
-        for &root in scene.roots() {
+        if let Some(root) = scope_root {
             collect_node_candidates(scene, root, exclude, want_edges, want_centers, &mut out);
+        } else {
+            for &root in scene.roots() {
+                collect_node_candidates(scene, root, exclude, want_edges, want_centers, &mut out);
+            }
         }
         out
     }
@@ -828,5 +908,201 @@ mod tests {
         assert_eq!(all.x_len(), without.x_len() + 2);
         assert_eq!(all.y_len(), without.y_len() + 2);
         assert!(!without.is_empty());
+    }
+
+    #[test]
+    fn indexed_candidates_keep_traversal_ties_and_grid_priority() {
+        let first = NodeId::new();
+        let second = NodeId::new();
+        let axis = index_axis_candidates(SmallVec::from_vec(vec![
+            (102.0, SnapKind::NodeEdgeMin { source: first }),
+            (98.0, SnapKind::NodeEdgeMax { source: second }),
+        ]));
+        let engine = SnapEngine {
+            targets: SnapTargets::NODE_EDGES,
+            ..Default::default()
+        };
+        assert_eq!(
+            engine.snap_axis_x(100.0, &axis, 1.0),
+            Some(AxisSnap {
+                kind: SnapKind::NodeEdgeMin { source: first },
+                at: 102.0,
+                delta: 2.0,
+            })
+        );
+        let engine = SnapEngine {
+            targets: SnapTargets::GRID | SnapTargets::NODE_EDGES,
+            grid: SnapGrid {
+                spacing: 8.0,
+                origin: [102.0, 102.0],
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            engine.snap_axis_y(100.0, &axis, 1.0).map(|snap| snap.kind),
+            Some(SnapKind::Grid)
+        );
+    }
+
+    fn linear_axis_reference(
+        engine: &SnapEngine,
+        value: f64,
+        candidates: &[(f64, SnapKind)],
+        grid_origin: f64,
+        pixel_to_world: f64,
+    ) -> Option<AxisSnap> {
+        let mut best = None;
+        if engine.targets.contains(SnapTargets::GRID) && engine.grid.spacing > 0.0 {
+            let at = grid_snap_1d(value, grid_origin, engine.grid.spacing);
+            if (at - value).abs() <= engine.thresholds.grid * pixel_to_world {
+                best = Some(AxisSnap {
+                    at,
+                    kind: SnapKind::Grid,
+                    delta: at - value,
+                });
+            }
+        }
+        if engine.targets.contains(SnapTargets::PIXEL_GRID)
+            && engine.zoom >= 1.0
+            && (value.round() - value).abs() < 1e-9
+        {
+            return Some(AxisSnap {
+                at: value.round(),
+                kind: SnapKind::PixelGrid,
+                delta: 0.0,
+            });
+        }
+        for &(coordinate, kind) in candidates {
+            let threshold = match kind {
+                SnapKind::NodeEdgeMin { .. } | SnapKind::NodeEdgeMax { .. } => {
+                    engine.thresholds.edge
+                }
+                SnapKind::NodeCenter { .. } => engine.thresholds.center,
+                _ => continue,
+            } * pixel_to_world;
+            let distance = (coordinate - value).abs();
+            if distance <= threshold
+                && best.is_none_or(|previous: AxisSnap| distance < previous.delta.abs())
+            {
+                best = Some(AxisSnap {
+                    at: coordinate,
+                    kind,
+                    delta: coordinate - value,
+                });
+            }
+        }
+        best
+    }
+
+    #[test]
+    fn indexed_axis_matches_linear_reference_for_random_targets_and_thresholds() {
+        let mut random_state = 0x517c_c1b7_2722_0a95_u64;
+        let mut random_coordinate = || {
+            random_state = random_state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            ((random_state >> 32) % 257) as f64 * 0.25 - 32.0
+        };
+        let raw: SmallVec<[(f64, SnapKind); 16]> = (0..128)
+            .map(|position| {
+                let source = NodeId::new();
+                let kind = match position % 3 {
+                    0 => SnapKind::NodeEdgeMin { source },
+                    1 => SnapKind::NodeEdgeMax { source },
+                    _ => SnapKind::NodeCenter { source },
+                };
+                (random_coordinate(), kind)
+            })
+            .collect();
+        let indexed = index_axis_candidates(raw.clone());
+        for zoom in [0.01, 0.5, 1.0, 4.0, 100.0] {
+            for (edge, center) in [(0.0, 0.0), (1.0, 6.0), (6.0, 1.0), (-1.0, -1.0)] {
+                let engine = SnapEngine {
+                    zoom,
+                    targets: SnapTargets::all(),
+                    thresholds: SnapThresholds {
+                        edge,
+                        center,
+                        grid: 0.75,
+                    },
+                    grid: SnapGrid {
+                        origin: [0.25, -0.75],
+                        spacing: 7.0,
+                    },
+                };
+                let pixel_to_world = 1.0 / zoom;
+                for _probe in 0..128 {
+                    let value = random_coordinate();
+                    assert_eq!(
+                        engine.snap_axis_x(value, &indexed, pixel_to_world),
+                        linear_axis_reference(&engine, value, &raw, 0.25, pixel_to_world)
+                    );
+                    assert_eq!(
+                        engine.snap_axis_y(value, &indexed, pixel_to_world),
+                        linear_axis_reference(&engine, value, &raw, -0.75, pixel_to_world)
+                    );
+                }
+            }
+        }
+        let engine = SnapEngine {
+            thresholds: SnapThresholds {
+                edge: f64::INFINITY,
+                center: f64::NAN,
+                grid: 0.0,
+            },
+            ..Default::default()
+        };
+        for value in [f64::INFINITY, f64::NEG_INFINITY, f64::NAN, f64::MAX] {
+            assert_eq!(
+                engine.snap_axis_x(value, &indexed, 1.0),
+                linear_axis_reference(&engine, value, &raw, 0.0, 1.0)
+            );
+        }
+    }
+
+    #[test]
+    fn indexed_query_visits_only_nearby_sorted_candidates() {
+        let source = NodeId::new();
+        let raw = (0..10_000)
+            .map(|coordinate| (f64::from(coordinate), SnapKind::NodeCenter { source }))
+            .collect();
+        let candidates = index_axis_candidates(raw);
+        let engine = SnapEngine {
+            thresholds: SnapThresholds {
+                edge: 1.0,
+                center: 2.0,
+                grid: 0.0,
+            },
+            ..Default::default()
+        };
+        assert_eq!(engine.nearby_candidates(&candidates, 5000.0, 1.0).len(), 5);
+        assert_eq!(
+            engine
+                .snap_axis_x(5000.25, &candidates, 1.0)
+                .map(|snap| snap.at),
+            Some(5000.0)
+        );
+    }
+
+    #[test]
+    fn indexed_axis_keeps_cancellation_boundary_acceptance() {
+        let engine = SnapEngine {
+            targets: SnapTargets::NODE_EDGES,
+            thresholds: SnapThresholds {
+                edge: 1.0,
+                center: 0.0,
+                grid: 0.0,
+            },
+            ..Default::default()
+        };
+        let source = NodeId::new();
+        for (value, coordinate) in [(-1.0, f64::EPSILON / 4.0), (1.0, -f64::EPSILON / 4.0)] {
+            let raw = SmallVec::from_vec(vec![(coordinate, SnapKind::NodeEdgeMin { source })]);
+            let candidates = index_axis_candidates(raw.clone());
+            let expected = linear_axis_reference(&engine, value, &raw, 0.0, 1.0);
+            assert!(expected.is_some());
+            assert_eq!(engine.snap_axis_x(value, &candidates, 1.0), expected);
+            assert_eq!(engine.snap_axis_y(value, &candidates, 1.0), expected);
+        }
     }
 }

@@ -95,7 +95,7 @@ impl SectionTool {
                 ..
             } => {
                 let world = ctx.screen_to_world(DVec2::from(screen));
-                let snap = ctx.snap.snap_point(world, &ctx.doc.scene, &[]);
+                let snap = ctx.snap_point(world, &[]);
                 let origin = snap.world;
                 self.draft = Some(Draft {
                     origin,
@@ -112,7 +112,7 @@ impl SectionTool {
                     return ToolResponse::cursor(CursorHint::Crosshair);
                 };
                 let world = ctx.screen_to_world(DVec2::from(screen));
-                let snap = ctx.snap.snap_point(world, &ctx.doc.scene, &[]);
+                let snap = ctx.snap_point(world, &[]);
                 draft.current = snap.world;
                 self.draft = Some(draft);
                 let rect = draft.rect(modifiers);
@@ -132,7 +132,7 @@ impl SectionTool {
                     return ToolResponse::cursor(CursorHint::Default);
                 };
                 let world = ctx.screen_to_world(DVec2::from(screen));
-                let snap = ctx.snap.snap_point(world, &ctx.doc.scene, &[]);
+                let snap = ctx.snap_point(world, &[]);
                 draft.current = snap.world;
                 let rect = draft.rect(modifiers);
                 if rect.width() > 0.0 && rect.height() > 0.0 {
