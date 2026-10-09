@@ -740,14 +740,7 @@ pub fn scaffold_project_tree(dir: &Path) -> Result<()> {
     if existing_manifest {
         read_manifest(dir)?;
     }
-    fs::create_dir_all(dir.join(DOC_DIR))?;
-    fs::create_dir_all(dir.join(PAGES_DIR))?;
-    fs::create_dir_all(dir.join(COMPONENTS_DIR))?;
-    for media in super::media::MEDIA_DIRS {
-        fs::create_dir_all(dir.join(ASSETS_DIR).join(media))?;
-    }
-    fs::create_dir_all(dir.join(PREVIEWS_DIR))?;
-    fs::create_dir_all(dir.join(EXPORTS_DIR))?;
+    scaffold_project_directories(dir)?;
     seed_gitignore(dir)?;
     seed_agents_md(dir)?;
     seed_fanta_spec(dir)?;
@@ -760,6 +753,29 @@ pub fn scaffold_project_tree(dir: &Path) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+pub(super) fn scaffold_project_directories(dir: &Path) -> Result<()> {
+    fs::create_dir_all(dir.join(DOC_DIR))?;
+    fs::create_dir_all(dir.join(PAGES_DIR))?;
+    fs::create_dir_all(dir.join(COMPONENTS_DIR))?;
+    for media in super::media::MEDIA_DIRS {
+        fs::create_dir_all(dir.join(ASSETS_DIR).join(media))?;
+    }
+    fs::create_dir_all(dir.join(PREVIEWS_DIR))?;
+    fs::create_dir_all(dir.join(EXPORTS_DIR))?;
+    Ok(())
+}
+
+pub(super) fn fresh_project_editor_support() -> [(&'static str, &'static [u8]); 6] {
+    [
+        (GITIGNORE_NAME, GITIGNORE.as_bytes()),
+        (AGENTS_MD_NAME, AGENTS_MD.as_bytes()),
+        ("fanta.md", FANTA_SPEC.as_bytes()),
+        (FNX_TYPES_NAME, FNX_TYPES.as_bytes()),
+        (FNX_PRETTIER_NAME, FNX_PRETTIER.as_bytes()),
+        (PRETTIERIGNORE_NAME, PRETTIERIGNORE.as_bytes()),
+    ]
 }
 
 /// Seed editor support files that are missing from an existing project.
@@ -845,13 +861,13 @@ fn seed_fnx_types(dir: &Path) -> Result<()> {
 /// and change detection degenerates. Seed a `.prettierignore` so tooling that
 /// honors it leaves `.fnx` alone; the `.prettierrc.json` overrides remain for
 /// a user who deliberately deletes the ignore.
-fn seed_prettierignore(dir: &Path) -> Result<()> {
-    const PRETTIERIGNORE_NAME: &str = ".prettierignore";
-    const PRETTIERIGNORE: &str =
-        "# Generated Fanta design source: the engine printer is its canonical
+const PRETTIERIGNORE_NAME: &str = ".prettierignore";
+const PRETTIERIGNORE: &str = "# Generated Fanta design source: the engine printer is its canonical
 # formatter; reformatting it fights the surgical source patcher.
 *.fnx
 ";
+
+fn seed_prettierignore(dir: &Path) -> Result<()> {
     let path = dir.join(PRETTIERIGNORE_NAME);
     if !path.exists() {
         super::write::write_with_parents(&path, PRETTIERIGNORE.as_bytes())?;

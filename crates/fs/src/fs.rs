@@ -567,6 +567,42 @@ impl RealFs {
     }
 }
 
+/// Flush all staged data and metadata on a filesystem to hardware before
+/// publishing a directory whose individual files were not synced.
+#[cfg(target_os = "macos")]
+pub fn sync_volume_for_publication(directory: &std::fs::File) -> io::Result<()> {
+    // Unlike fsync/fcntl, Apple's volume-sync API returns the error code itself.
+    unsafe extern "C" {
+        fn fsync_volume_np(fd: libc::c_int, flags: libc::c_int) -> libc::c_int;
+    }
+    const SYNC_VOLUME_FULLSYNC: libc::c_int = 0x01;
+    const SYNC_VOLUME_WAIT: libc::c_int = 0x02;
+    // The borrowed File owns a live descriptor for the entire synchronous call.
+    let result = unsafe {
+        fsync_volume_np(
+            directory.as_raw_fd(),
+            SYNC_VOLUME_FULLSYNC | SYNC_VOLUME_WAIT,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(result))
+    }
+}
+
+/// Publish a staged directory without replacing any concurrently created target.
+#[cfg(target_os = "macos")]
+pub fn rename_directory_exclusive(source: &Path, target: &Path) -> io::Result<()> {
+    if !std::fs::symlink_metadata(source)?.file_type().is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "staging path is not a directory",
+        ));
+    }
+    rename_without_replace(source, target)
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn rename_without_replace(source: &Path, target: &Path) -> io::Result<()> {
     let source = path_to_c_string(source)?;

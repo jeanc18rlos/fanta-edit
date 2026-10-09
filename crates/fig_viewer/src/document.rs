@@ -3452,6 +3452,28 @@ fn materialize_project_on_open(
     let created_here = !target.exists();
     let mut write_cache = fanta_format::ProjectWriteCache::default();
     let started = Instant::now();
+    #[cfg(all(target_os = "macos", not(feature = "mac_app_store")))]
+    let staged_new_project = created_here;
+    #[cfg(not(all(target_os = "macos", not(feature = "mac_app_store"))))]
+    let staged_new_project = false;
+    #[cfg(all(target_os = "macos", not(feature = "mac_app_store")))]
+    let written = if staged_new_project {
+        write_new_project_materialized(&target, &document.doc, &document.raw_assets, &mut write_cache)
+            .map(|report| {
+                log::debug!(
+                    "fresh project: {} projected writes, {} per-file syncs, completed durability steps {:?}",
+                    report.project.written.len(), report.project.sync_count, report.completed
+                );
+            })
+    } else {
+        write_project_cached(
+            &target,
+            &document.doc,
+            &document.raw_assets,
+            &mut write_cache,
+        )
+    };
+    #[cfg(not(all(target_os = "macos", not(feature = "mac_app_store"))))]
     let written = write_project_cached(
         &target,
         &document.doc,
@@ -3473,7 +3495,10 @@ fn materialize_project_on_open(
             // is scaffolded first), so leaving it would hijack every reopen
             // AND block the save that could repair it. Remove what we
             // created; the first save re-materializes.
-            if created_here && let Err(error) = std::fs::remove_dir_all(&target) {
+            if created_here
+                && !staged_new_project
+                && let Err(error) = std::fs::remove_dir_all(&target)
+            {
                 log::error!(
                     "cleaning up partial Fanta project at {} failed: {error:#}",
                     target.display()
@@ -3482,6 +3507,143 @@ fn materialize_project_on_open(
             None
         }
     }
+}
+
+#[cfg(all(target_os = "macos", not(feature = "mac_app_store")))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreshPublicationStep {
+    VolumeFullSync,
+    ExclusiveRename,
+    ParentFullSync,
+}
+
+#[cfg(all(target_os = "macos", not(feature = "mac_app_store")))]
+#[derive(Debug)]
+struct FreshPublicationReport {
+    project: fanta_format::WriteReport,
+    completed: Vec<FreshPublicationStep>,
+}
+
+#[cfg(all(target_os = "macos", not(feature = "mac_app_store")))]
+trait FreshPublicationFilesystem {
+    fn sync_volume(&mut self, directory: &std::fs::File) -> std::io::Result<()>;
+    fn publish(&mut self, source: &Path, target: &Path) -> std::io::Result<()>;
+    fn sync_parent(&mut self, directory: &std::fs::File) -> std::io::Result<()>;
+}
+
+#[cfg(all(target_os = "macos", not(feature = "mac_app_store")))]
+struct MacFreshPublicationFilesystem;
+
+#[cfg(all(target_os = "macos", not(feature = "mac_app_store")))]
+impl FreshPublicationFilesystem for MacFreshPublicationFilesystem {
+    fn sync_volume(&mut self, directory: &std::fs::File) -> std::io::Result<()> {
+        fs::sync_volume_for_publication(directory)
+    }
+
+    fn publish(&mut self, source: &Path, target: &Path) -> std::io::Result<()> {
+        fs::rename_directory_exclusive(source, target)
+    }
+
+    fn sync_parent(&mut self, directory: &std::fs::File) -> std::io::Result<()> {
+        directory.sync_all()
+    }
+}
+
+#[cfg(all(target_os = "macos", not(feature = "mac_app_store")))]
+fn publish_new_project_with(
+    target: &Path,
+    prepare: impl FnOnce(&Path) -> Result<fanta_format::WriteReport>,
+    filesystem: &mut impl FreshPublicationFilesystem,
+) -> Result<FreshPublicationReport> {
+    match std::fs::symlink_metadata(target) {
+        Ok(_) => anyhow::bail!("New project target {} already exists", target.display()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("Checking new project destination"),
+    }
+    let parent = target
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent_directory = std::fs::File::open(parent).context("Opening new project parent")?;
+    // tempfile directories use normal mkdir permissions, including the current
+    // umask, so the published root keeps the old create_dir_all mode.
+    let staging = tempfile::Builder::new()
+        .prefix(".fanta-new-project-")
+        .tempdir_in(parent)?;
+    let mut published = false;
+    let result = (|| {
+        let project = prepare(staging.path())?;
+        let mut completed = Vec::with_capacity(3);
+        filesystem
+            .sync_volume(&std::fs::File::open(staging.path())?)
+            .context("Flushing the complete staged project before publication")?;
+        completed.push(FreshPublicationStep::VolumeFullSync);
+        filesystem
+            .publish(staging.path(), target)
+            .context("Publishing the new project without replacing another destination")?;
+        published = true;
+        completed.push(FreshPublicationStep::ExclusiveRename);
+        filesystem.sync_parent(&parent_directory)
+            .context("Project was published, but its final parent durability flush failed; the project was retained")?;
+        completed.push(FreshPublicationStep::ParentFullSync);
+        Ok(FreshPublicationReport { project, completed })
+    })();
+    if published {
+        // Once published, a later durability error must never delete the target.
+        let _former_staging_path = staging.keep();
+        return result;
+    }
+    match (result, staging.close()) {
+        (result, Ok(())) => result,
+        (Err(error), Err(cleanup)) => Err(error.context(format!(
+            "Also failed to remove unpublished staging: {cleanup}"
+        ))),
+        (Ok(_), Err(cleanup)) => Err(cleanup).context("Removing unpublished staging"),
+    }
+}
+
+#[cfg(all(target_os = "macos", not(feature = "mac_app_store")))]
+fn write_new_project_materialized(
+    target: &Path,
+    doc: &Doc,
+    raw_assets: &BTreeMap<AssetId, Vec<u8>>,
+    cache: &mut fanta_format::ProjectWriteCache,
+) -> Result<FreshPublicationReport> {
+    let report = publish_new_project_with(
+        target,
+        |staging| {
+            let report =
+                fanta_format::stage_new_project_tree_cached(staging, doc, raw_assets, cache)?;
+            #[cfg(feature = "fanta-gpui-ui")]
+            if let Some(png) = project_thumbnail(doc, raw_assets)? {
+                use std::io::Write as _;
+                let mut file = tempfile::NamedTempFile::new_in(staging)?;
+                if let Err(error) = file.write_all(&png) {
+                    return match file.close() {
+                        Ok(()) => Err(error).context("Writing staged project thumbnail"),
+                        Err(cleanup) => Err(error).context(format!(
+                            "Writing staged thumbnail; cleanup also failed: {cleanup}"
+                        )),
+                    };
+                }
+                if let Err(error) = file.persist_noclobber(staging.join(".fant.preview.png")) {
+                    let primary = error.error;
+                    return match error.file.close() {
+                        Ok(()) => Err(primary).context("Publishing staged project thumbnail"),
+                        Err(cleanup) => Err(primary).context(format!(
+                            "Publishing staged thumbnail; cleanup also failed: {cleanup}"
+                        )),
+                    };
+                }
+            }
+            Ok(report)
+        },
+        &mut MacFreshPublicationFilesystem,
+    )?;
+    // Git initialization remains best-effort and uses the final ancestor chain;
+    // it is not part of the authored-project durability count above.
+    git_init_if_needed(target);
+    Ok(report)
 }
 
 pub(crate) fn write_project(
@@ -3685,6 +3847,25 @@ fn write_project_cached_report_with_sources(
     }
     .with_context(|| format!("writing Fanta project at {}", root.display()))?;
     #[cfg(feature = "fanta-gpui-ui")]
+    if let Some(png) = project_thumbnail(doc, raw_assets)? {
+        crate::generation_media::write_output(&root.join(".fant.preview.png"), &png)?;
+    } else {
+        match std::fs::remove_file(root.join(".fant.preview.png")) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("Removing the old project thumbnail"),
+        }
+    }
+    #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
+    git_init_if_needed(root);
+    Ok(report)
+}
+
+#[cfg(feature = "fanta-gpui-ui")]
+fn project_thumbnail(
+    doc: &Doc,
+    raw_assets: &BTreeMap<AssetId, Vec<u8>>,
+) -> Result<Option<Vec<u8>>> {
     if let Some(thumbnail) = doc
         .scene
         .roots()
@@ -3705,17 +3886,10 @@ fn write_project_cached_report_with_sources(
         ));
         let png = crate::export::render_thumbnail(doc, Some(resolver), thumbnail)
             .context("Rendering the project thumbnail")?;
-        crate::generation_media::write_output(&root.join(".fant.preview.png"), &png)?;
+        Ok(Some(png))
     } else {
-        match std::fs::remove_file(root.join(".fant.preview.png")) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("Removing the old project thumbnail"),
-        }
+        Ok(None)
     }
-    #[cfg(not(all(target_os = "macos", feature = "mac_app_store")))]
-    git_init_if_needed(root);
-    Ok(report)
 }
 
 /// Turn a freshly written project into a git repository, so that every later
@@ -4544,6 +4718,321 @@ pub(crate) fn fit_bounds(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(all(target_os = "macos", not(feature = "mac_app_store")))]
+    mod fresh_publication {
+        use super::*;
+        use fanta_doc::{CanvasNode, NodeData, VectorNode};
+        use std::os::unix::fs::PermissionsExt as _;
+
+        #[derive(Default)]
+        struct RecordingFilesystem {
+            attempted: Vec<FreshPublicationStep>,
+            fail: Option<FreshPublicationStep>,
+            occupy_target: bool,
+        }
+
+        impl RecordingFilesystem {
+            fn attempt(&mut self, step: FreshPublicationStep) -> std::io::Result<()> {
+                self.attempted.push(step);
+                if self.fail == Some(step) {
+                    Err(std::io::Error::other(format!("injected {step:?} failure")))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        impl FreshPublicationFilesystem for RecordingFilesystem {
+            fn sync_volume(&mut self, _directory: &std::fs::File) -> std::io::Result<()> {
+                self.attempt(FreshPublicationStep::VolumeFullSync)
+            }
+
+            fn publish(&mut self, source: &Path, target: &Path) -> std::io::Result<()> {
+                self.attempt(FreshPublicationStep::ExclusiveRename)?;
+                if self.occupy_target {
+                    std::fs::create_dir(target)?;
+                    std::fs::write(target.join("sentinel"), b"another publisher")?;
+                }
+                fs::rename_directory_exclusive(source, target)
+            }
+
+            fn sync_parent(&mut self, _directory: &std::fs::File) -> std::io::Result<()> {
+                self.attempt(FreshPublicationStep::ParentFullSync)
+            }
+        }
+
+        fn prepare_payload(staging: &Path) -> Result<fanta_format::WriteReport> {
+            std::fs::write(staging.join("payload"), b"complete staged bytes")?;
+            Ok(fanta_format::WriteReport::default())
+        }
+
+        fn assert_no_staging(parent: &Path) -> Result<()> {
+            for entry in std::fs::read_dir(parent)? {
+                assert!(
+                    !entry?
+                        .file_name()
+                        .to_string_lossy()
+                        .starts_with(".fanta-new-project-")
+                );
+            }
+            Ok(())
+        }
+
+        fn inventory(root: &Path) -> Result<BTreeMap<PathBuf, (u32, Option<Vec<u8>>)>> {
+            fn visit(
+                root: &Path,
+                path: &Path,
+                entries: &mut BTreeMap<PathBuf, (u32, Option<Vec<u8>>)>,
+            ) -> Result<()> {
+                let metadata = std::fs::symlink_metadata(path)?;
+                let relative = path.strip_prefix(root)?.to_path_buf();
+                let mode = metadata.permissions().mode() & 0o7777;
+                if metadata.is_dir() {
+                    entries.insert(relative, (mode, None));
+                    for entry in std::fs::read_dir(path)? {
+                        visit(root, &entry?.path(), entries)?;
+                    }
+                } else {
+                    anyhow::ensure!(metadata.is_file(), "Unexpected nonregular project entry");
+                    entries.insert(relative, (mode, Some(std::fs::read(path)?)));
+                }
+                Ok(())
+            }
+            let mut entries = BTreeMap::new();
+            visit(root, root, &mut entries)?;
+            Ok(entries)
+        }
+
+        #[test]
+        fn fresh_publication_prepare_failure_cleans_only_its_staging() -> Result<()> {
+            let parent = tempfile::tempdir()?;
+            let target = parent.path().join("project");
+            let sentinel = parent.path().join("sentinel");
+            std::fs::write(&sentinel, b"untouched")?;
+            let mut filesystem = RecordingFilesystem::default();
+            let result = publish_new_project_with(
+                &target,
+                |staging| {
+                    std::fs::write(staging.join("partial"), b"partial")?;
+                    anyhow::bail!("injected projection failure")
+                },
+                &mut filesystem,
+            );
+            assert!(result.is_err());
+            assert!(filesystem.attempted.is_empty());
+            assert!(!target.exists());
+            assert_eq!(std::fs::read(sentinel)?, b"untouched");
+            assert_no_staging(parent.path())
+        }
+
+        #[test]
+        fn fresh_publication_barrier_failure_never_publishes() -> Result<()> {
+            let parent = tempfile::tempdir()?;
+            let target = parent.path().join("project");
+            let mut filesystem = RecordingFilesystem {
+                fail: Some(FreshPublicationStep::VolumeFullSync),
+                ..Default::default()
+            };
+            assert!(publish_new_project_with(&target, prepare_payload, &mut filesystem).is_err());
+            assert_eq!(filesystem.attempted, [FreshPublicationStep::VolumeFullSync]);
+            assert!(!target.exists());
+            assert_no_staging(parent.path())
+        }
+
+        #[test]
+        fn fresh_publication_rename_failure_and_racing_destination_are_preserved() -> Result<()> {
+            for occupy_target in [false, true] {
+                let parent = tempfile::tempdir()?;
+                let target = parent.path().join("project");
+                let mut filesystem = RecordingFilesystem {
+                    fail: (!occupy_target).then_some(FreshPublicationStep::ExclusiveRename),
+                    occupy_target,
+                    ..Default::default()
+                };
+                assert!(
+                    publish_new_project_with(&target, prepare_payload, &mut filesystem).is_err()
+                );
+                assert_eq!(
+                    filesystem.attempted,
+                    [
+                        FreshPublicationStep::VolumeFullSync,
+                        FreshPublicationStep::ExclusiveRename
+                    ]
+                );
+                if occupy_target {
+                    assert_eq!(
+                        std::fs::read(target.join("sentinel"))?,
+                        b"another publisher"
+                    );
+                    assert_eq!(
+                        std::fs::read_dir(target)?
+                            .collect::<std::io::Result<Vec<_>>>()?
+                            .len(),
+                        1
+                    );
+                } else {
+                    assert!(!target.exists());
+                }
+                assert_no_staging(parent.path())?;
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn fresh_publication_existing_empty_directory_or_symlink_is_not_adopted() -> Result<()> {
+            for linked in [false, true] {
+                let parent = tempfile::tempdir()?;
+                let target = parent.path().join("project");
+                if linked {
+                    std::os::unix::fs::symlink(parent.path().join("missing"), &target)?;
+                } else {
+                    std::fs::create_dir(&target)?;
+                }
+                let mut filesystem = RecordingFilesystem::default();
+                assert!(
+                    publish_new_project_with(
+                        &target,
+                        |_| { anyhow::bail!("prepare must not run for an occupied destination") },
+                        &mut filesystem
+                    )
+                    .is_err()
+                );
+                assert!(filesystem.attempted.is_empty());
+                assert_eq!(
+                    std::fs::symlink_metadata(&target)?.file_type().is_symlink(),
+                    linked
+                );
+                assert_no_staging(parent.path())?;
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn fresh_publication_parent_failure_retains_the_published_project() -> Result<()> {
+            let parent = tempfile::tempdir()?;
+            let target = parent.path().join("project");
+            let mut filesystem = RecordingFilesystem {
+                fail: Some(FreshPublicationStep::ParentFullSync),
+                ..Default::default()
+            };
+            let error = publish_new_project_with(&target, prepare_payload, &mut filesystem)
+                .expect_err("injected post-publication durability failure");
+            assert!(format!("{error:#}").contains("project was retained"));
+            assert_eq!(
+                filesystem.attempted,
+                [
+                    FreshPublicationStep::VolumeFullSync,
+                    FreshPublicationStep::ExclusiveRename,
+                    FreshPublicationStep::ParentFullSync
+                ]
+            );
+            assert_eq!(
+                std::fs::read(target.join("payload"))?,
+                b"complete staged bytes"
+            );
+            assert_no_staging(parent.path())
+        }
+
+        #[test]
+        fn fresh_publication_reports_only_successful_steps_in_required_order() -> Result<()> {
+            let parent = tempfile::tempdir()?;
+            let target = parent.path().join("project");
+            let mut filesystem = RecordingFilesystem::default();
+            let report = publish_new_project_with(&target, prepare_payload, &mut filesystem)?;
+            let expected = [
+                FreshPublicationStep::VolumeFullSync,
+                FreshPublicationStep::ExclusiveRename,
+                FreshPublicationStep::ParentFullSync,
+            ];
+            assert_eq!(filesystem.attempted, expected);
+            assert_eq!(report.completed, expected);
+            assert_eq!(report.project.sync_count, 0);
+            assert_eq!(
+                std::fs::read(target.join("payload"))?,
+                b"complete staged bytes"
+            );
+            assert_no_staging(parent.path())
+        }
+
+        #[test]
+        fn fresh_materialization_matches_scaffold_thumbnail_and_assets_with_two_barriers()
+        -> Result<()> {
+            for asset_count in [1, 128] {
+                let parent = tempfile::tempdir()?;
+                std::fs::create_dir(parent.path().join(".git"))?;
+                let target = parent.path().join("fresh");
+                let old_target = parent.path().join("existing");
+                let mut document = doc_with_one_page();
+                let page = *document.pages().first().context("fixture page")?;
+                let mut node = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                    0.0,
+                    0.0,
+                    40.0,
+                    20.0,
+                    fanta_doc::Color::BLACK,
+                )));
+                node.parent = Some(page);
+                node.meta = serde_json::json!({"fanta_project_thumbnail": true});
+                document.scene.insert(node)?;
+                let assets = (0..asset_count)
+                    .map(|index| {
+                        let bytes = format!("distinct materialized asset {index}").into_bytes();
+                        (fanta_format::asset_id_for_bytes(&bytes), bytes)
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                assert_eq!(assets.len(), asset_count);
+                let mut cache = fanta_format::ProjectWriteCache::default();
+                let report =
+                    write_new_project_materialized(&target, &document, &assets, &mut cache)?;
+                write_project_cached(
+                    &old_target,
+                    &document,
+                    &assets,
+                    &mut fanta_format::ProjectWriteCache::default(),
+                )?;
+                assert_eq!(inventory(&target)?, inventory(&old_target)?);
+                assert_eq!(
+                    report.completed,
+                    [
+                        FreshPublicationStep::VolumeFullSync,
+                        FreshPublicationStep::ExclusiveRename,
+                        FreshPublicationStep::ParentFullSync
+                    ]
+                );
+                assert_eq!(
+                    report.project.sync_count, 0,
+                    "no per-file or journal flush in the unpublished tree"
+                );
+                assert!(cache.cached_designs() > 0);
+                assert!(
+                    !target.join(".git").exists(),
+                    "use the final parent repository"
+                );
+                #[cfg(feature = "fanta-gpui-ui")]
+                {
+                    let preview = image::open(target.join(".fant.preview.png"))?;
+                    assert_eq!((preview.width(), preview.height()), (40, 20));
+                }
+                let (actual_doc, actual_assets) = fanta_format::read_project_tree(&target)?;
+                let (expected_doc, expected_assets) = fanta_format::read_project_tree(&old_target)?;
+                assert_eq!(
+                    serde_json::to_value(&actual_doc)?,
+                    serde_json::to_value(&expected_doc)?
+                );
+                assert_eq!(actual_assets, assets);
+                assert_eq!(expected_assets, assets);
+                let before_second_save = inventory(&target)?;
+                assert_eq!(
+                    write_project_cached_report(&target, &document, &assets, &mut cache)?,
+                    fanta_format::WriteReport::default()
+                );
+                assert_eq!(inventory(&target)?, before_second_save);
+                assert_no_staging(parent.path())?;
+            }
+            Ok(())
+        }
+    }
 
     fn master_save_fixture(count: usize) -> (Doc, Vec<(fanta_doc::ComponentId, NodeId)>) {
         let mut document = doc_with_one_page();

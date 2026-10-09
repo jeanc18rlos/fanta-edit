@@ -175,6 +175,8 @@ for stage in "${selected_stages[@]}"; do
                 -p fanta-doc -p fanta-fnx -p fanta-format -p fanta-canvas \
                 -p fanta-tools -p fanta-render -p fanta-fig-interop \
                 -p fanta-present -p fanta-text -p fig_viewer -p workspace -p fanta_ui
+            run_stage lint-default env FANTA_CLIPPY_DEFAULT_FEATURES=1 \
+                ./script/clippy --locked -p fanta-format -p fig_viewer -p fs
             ;;
         visual)
             if [[ "$list_only" == false && "$(uname -s)" != Darwin ]]; then
