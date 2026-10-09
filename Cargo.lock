@@ -5084,6 +5084,7 @@ dependencies = [
  "fanta-doc",
  "fanta-text",
  "image",
+ "lru",
  "metal",
  "serde_json",
  "skia-safe",

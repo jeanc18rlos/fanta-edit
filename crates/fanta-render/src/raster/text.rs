@@ -5,9 +5,10 @@ use super::{
     TextNode, TextStyle, Transform2D, VAlign,
 };
 use fanta_text::{LayoutOptions, TextLayout};
-use std::collections::HashMap;
+use lru::LruCache;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
 
 // ---------------------------------------------------------------------------
 // Text rendering
@@ -43,10 +44,8 @@ pub(crate) fn with_layout_engine<R>(f: impl FnOnce(&LayoutEngine) -> R) -> R {
     })
 }
 
-/// Soft cap on the shaped-layout cache. A fit-zoom design-system page has a few
-/// thousand distinct (content+style+width) text runs; past this we clear
-/// wholesale (cheap, rare) so a long editing session can't grow it unbounded.
-const LAYOUT_CACHE_CAP: usize = 16384;
+/// Keep recently measured or painted runs warm when new text exceeds the cap.
+const LAYOUT_CACHE_CAP: NonZeroUsize = NonZeroUsize::MIN.saturating_add(16_383);
 
 thread_local! {
     /// Per-thread cache of shaped [`TextLayout`]s, keyed by a hash of the
@@ -66,7 +65,7 @@ thread_local! {
     /// first-visit page switch shapes each run ONCE (in the measure pass) instead
     /// of twice (measure + cold draw). The key is computed identically on both
     /// paths so they genuinely share entries.
-    static LAYOUT_CACHE: RefCell<HashMap<u64, TextLayout>> = RefCell::new(HashMap::new());
+    static LAYOUT_CACHE: RefCell<LruCache<u64, TextLayout>> = RefCell::new(LruCache::new(LAYOUT_CACHE_CAP));
 }
 
 /// Compute the `(wrap_width, align)` a [`TextNode`] shapes at. Shared by measure
@@ -214,19 +213,16 @@ fn shape_layout(node: &TextNode) -> TextLayout {
 /// first-visit page switch shapes each run ONCE, not twice.
 ///
 /// `node.content` is assumed non-empty (callers special-case the empty string).
-/// Keeps the existing soft cap: past [`LAYOUT_CACHE_CAP`] distinct runs we clear
-/// the whole cache (cheap, rare) so a long session can't grow it unbounded.
+/// Past [`LAYOUT_CACHE_CAP`] distinct runs, evict only the least recently used
+/// layout so measuring or painting a hot run keeps it resident.
 pub(crate) fn with_shaped_layout<R>(node: &TextNode, f: impl FnOnce(&TextLayout) -> R) -> R {
     let (wrap_width, align) = shape_params(node);
     let key = shape_key(node, wrap_width, align);
-    LAYOUT_CACHE.with(|c| {
-        let mut cache = c.borrow_mut();
-        if cache.len() >= LAYOUT_CACHE_CAP && !cache.contains_key(&key) {
-            cache.clear();
-        }
+    LAYOUT_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
         // Shape on a miss (the expensive path); reuse the shaped paragraph on
         // every subsequent measure/draw of the same run.
-        let layout = cache.entry(key).or_insert_with(|| shape_layout(node));
+        let layout = cache.get_or_insert(key, || shape_layout(node));
         f(layout)
     })
 }
@@ -451,3 +447,112 @@ pub(crate) fn to_align(align: TextAlign) -> Align {
 // Reference-only `use` so the symbol exists in scope for doc links.
 #[allow(dead_code)]
 fn _doc_refs(_: Transform2D, _: &CanvasNode) {}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::raster::{RasterRenderer, RenderError};
+
+    struct CacheScope {
+        previous: LruCache<u64, TextLayout>,
+    }
+
+    impl CacheScope {
+        fn new(capacity: NonZeroUsize) -> Self {
+            Self {
+                previous: LAYOUT_CACHE.with(|cache| {
+                    std::mem::replace(&mut *cache.borrow_mut(), LruCache::new(capacity))
+                }),
+            }
+        }
+    }
+
+    impl Drop for CacheScope {
+        fn drop(&mut self) {
+            LAYOUT_CACHE.with(|cache| {
+                std::mem::swap(&mut *cache.borrow_mut(), &mut self.previous);
+            });
+        }
+    }
+
+    fn key(node: &TextNode) -> u64 {
+        let (width, align) = shape_params(node);
+        shape_key(node, width, align)
+    }
+
+    #[test]
+    fn shaped_layout_overflow_keeps_measured_and_painted_hot_entries() -> Result<(), RenderError> {
+        let _scope = CacheScope::new(NonZeroUsize::MIN.saturating_add(2));
+        let first = TextNode::new("First", 200.0, 80.0);
+        let second = TextNode::new("Second", 200.0, 80.0);
+        let third = TextNode::new("Third", 200.0, 80.0);
+        let fourth = TextNode::new("Fourth", 200.0, 80.0);
+        let measured = crate::raster::instance::measure_text_node(&first);
+        for node in [&first, &second, &third] {
+            crate::raster::instance::measure_text_node(node);
+        }
+        let render = || -> Result<Vec<u8>, RenderError> {
+            let mut renderer = RasterRenderer::new(200, 80)?;
+            draw_text_node(renderer.canvas(), &first);
+            Ok(renderer.copy_rgba())
+        };
+        let before = render()?;
+        assert!(
+            before
+                .chunks_exact(4)
+                .any(|pixel| pixel.last().copied() != Some(0))
+        );
+        crate::raster::instance::measure_text_node(&fourth);
+        LAYOUT_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            assert_eq!(cache.len(), 3);
+            assert!(cache.contains(&key(&first)));
+            assert!(!cache.contains(&key(&second)));
+            assert!(cache.contains(&key(&third)));
+            assert!(cache.contains(&key(&fourth)));
+        });
+        assert_eq!(before, render()?);
+        assert_eq!(measured, crate::raster::instance::measure_text_node(&first));
+        crate::raster::instance::measure_text_node(&third);
+        crate::raster::instance::measure_text_node(&second);
+        LAYOUT_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            assert_eq!(cache.len(), 3);
+            assert!(cache.contains(&key(&first)));
+            assert!(cache.contains(&key(&third)));
+            assert!(!cache.contains(&key(&fourth)));
+            assert!(cache.contains(&key(&second)));
+        });
+        Ok(())
+    }
+
+    #[test]
+    fn evicted_layout_rebuild_keeps_exact_pixels_and_measurement() -> Result<(), RenderError> {
+        let _scope = CacheScope::new(NonZeroUsize::MIN.saturating_add(1));
+        let mut target = TextNode::new("Cache parity", 120.0, 64.0);
+        target.style.size_px = 22.0;
+        let measured = crate::raster::instance::measure_text_node(&target);
+        let render = || -> Result<Vec<u8>, RenderError> {
+            let mut renderer = RasterRenderer::new(120, 64)?;
+            draw_text_node(renderer.canvas(), &target);
+            Ok(renderer.copy_rgba())
+        };
+        let before = render()?;
+        assert!(
+            before
+                .chunks_exact(4)
+                .any(|pixel| pixel.last().copied() != Some(0))
+        );
+        for content in ["Another run", "One more run"] {
+            crate::raster::instance::measure_text_node(&TextNode::new(content, 120.0, 64.0));
+        }
+        LAYOUT_CACHE.with(|cache| assert!(!cache.borrow().contains(&key(&target))));
+        assert_eq!(
+            measured,
+            crate::raster::instance::measure_text_node(&target)
+        );
+        assert_eq!(before, render()?);
+        assert_eq!(layout_cache_len(), 2);
+        Ok(())
+    }
+}
