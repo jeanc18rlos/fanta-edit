@@ -1397,12 +1397,15 @@ impl FigView {
         }
         self.timeline_shell
             .update(cx, |timeline, cx| timeline.reset_keyframe_drag(cx));
-        self.cancel_tool_preview_if_active(cx);
+        self.cancel_tool_gesture_if_active(cx);
         self.sync_motion_timeline(cx);
     }
 
-    fn cancel_tool_preview_if_active(&mut self, cx: &mut Context<Self>) {
-        if !self.item.read(cx).content_preview_active() {
+    fn cancel_tool_gesture_if_active(&mut self, cx: &mut Context<Self>) {
+        // Select can be interrupted before its first preview. Reset that
+        // press too, so the next hover cannot promote it into a drag.
+        let pending_selection = self.primary_pressed && self.tools.kind() == ToolKind::Select;
+        if !pending_selection && !self.item.read(cx).content_preview_active() {
             return;
         }
         let preview_owner = cx.entity_id();
@@ -3989,6 +3992,12 @@ impl FigView {
         }
 
         if !self.primary_pressed {
+            return;
+        }
+        if self.tools.kind() == ToolKind::Select && event.pressed_button != Some(MouseButton::Left)
+        {
+            self.end_gesture_perf("pointer_button_lost");
+            self.cancel_tool_gesture_if_active(cx);
             return;
         }
         let Some(bounds) = self.container_bounds else {
