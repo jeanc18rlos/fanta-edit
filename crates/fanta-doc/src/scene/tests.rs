@@ -24,6 +24,114 @@ fn group_node() -> CanvasNode {
 }
 
 #[test]
+fn catalog_revisions_distinguish_transforms_content_and_structure() {
+    let mut scene = Scene::new();
+    let revisions = |scene: &Scene| {
+        (
+            scene.revision(),
+            scene.content_revision(),
+            scene.structure_revision(),
+        )
+    };
+    assert_eq!(revisions(&scene), (0, 0, 0));
+    let parent = scene.insert(group_node()).expect("parent");
+    let mut child = rect_node(0.0, 0.0, 20.0, 10.0);
+    child.parent = Some(parent);
+    let child = scene.insert(child).expect("child");
+    assert_eq!(revisions(&scene), (2, 2, 2));
+    scene
+        .set_transform(child, Transform2D::translation(4.0, 8.0))
+        .expect("move");
+    assert_eq!(revisions(&scene), (3, 2, 2));
+    assert_eq!(
+        scene.changes_since(2),
+        Some(SceneDelta {
+            transforms: vec![child],
+            nodes: vec![]
+        })
+    );
+    scene.get_mut(child).expect("child").name = "Renamed".into();
+    assert_eq!(revisions(&scene), (4, 3, 2));
+    let mut replacement = scene.get(child).expect("child").clone();
+    replacement.name = "Patched".into();
+    scene
+        .patch_node(replacement, scene.node_stamp(child))
+        .expect("patch");
+    assert_eq!(revisions(&scene), (5, 4, 2));
+    scene
+        .set_index(child, IndexKey::from_raw(2.0))
+        .expect("reorder");
+    assert_eq!(revisions(&scene), (6, 5, 3));
+    scene
+        .set_parent(child, None, IndexKey::from_raw(3.0))
+        .expect("reparent");
+    assert_eq!(revisions(&scene), (7, 6, 4));
+    scene.remove(child).expect("remove");
+    assert_eq!(revisions(&scene), (8, 7, 5));
+    scene.rebuild_child_index();
+    assert_eq!(revisions(&scene), (9, 8, 6));
+    scene.invalidate_world_cache();
+    assert_eq!(revisions(&scene), (10, 9, 7));
+    assert!(scene.get_mut(child).is_none());
+    assert!(scene.set_transform(child, Transform2D::IDENTITY).is_err());
+    assert_eq!(revisions(&scene), (10, 9, 7));
+    assert!(scene.changes_since(2).is_none());
+}
+
+#[test]
+fn catalog_revisions_are_derived_and_scene_identity_separates_copies() {
+    let mut scene = Scene::new();
+    let id = scene.insert(rect_node(0.0, 0.0, 20.0, 10.0)).expect("node");
+    scene.get_mut(id).expect("node").name = "Source".into();
+    let bytes = serde_json::to_vec(&scene).expect("scene bytes");
+    let copy = scene.clone();
+    assert_ne!(copy.instance_id(), scene.instance_id());
+    assert_eq!(copy.content_revision(), scene.content_revision());
+    assert_eq!(copy.structure_revision(), scene.structure_revision());
+    assert_eq!(serde_json::to_vec(&copy).expect("copy bytes"), bytes);
+    let parsed: Scene = serde_json::from_slice(&bytes).expect("parse scene");
+    assert_ne!(parsed.instance_id(), scene.instance_id());
+    assert_eq!(
+        (parsed.content_revision(), parsed.structure_revision()),
+        (0, 0)
+    );
+    assert_eq!(serde_json::to_vec(&parsed).expect("parsed bytes"), bytes);
+    scene.invalidate_world_cache();
+    assert_eq!(
+        serde_json::to_vec(&scene).expect("invalidated bytes"),
+        bytes
+    );
+    assert_eq!(copy.content_revision() + 1, scene.content_revision());
+}
+
+#[test]
+fn catalog_revisions_survive_change_log_eviction() {
+    let mut scene = Scene::new();
+    let id = scene.insert(rect_node(0.0, 0.0, 20.0, 10.0)).expect("node");
+    let initial_revision = scene.revision();
+    for step in 0..=SCENE_CHANGE_LOG_CAP {
+        scene
+            .set_transform(id, Transform2D::translation(step as f64, 0.0))
+            .expect("move");
+    }
+    assert!(scene.changes_since(initial_revision).is_none());
+    assert_eq!(
+        (scene.content_revision(), scene.structure_revision()),
+        (1, 1)
+    );
+    scene.get_mut(id).expect("node").name = "After rollover".into();
+    assert_eq!(
+        (scene.content_revision(), scene.structure_revision()),
+        (2, 1)
+    );
+    scene.invalidate_world_cache();
+    assert_eq!(
+        (scene.content_revision(), scene.structure_revision()),
+        (3, 2)
+    );
+}
+
+#[test]
 fn curve_body_hits_survive_parent_transforms_and_spatial_index_refresh() {
     for cubic in [false, true] {
         let mut scene = Scene::new();
