@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import contextlib
+import io
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -9,9 +10,11 @@ import os
 from pathlib import Path
 import plistlib
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -78,6 +81,14 @@ class PackagingPreflight(unittest.TestCase):
 
     def test_invalid_notarization_flag(self):
         self.reject({'FANTA_REQUIRE_NOTARIZATION': 'maybe'}, 'FANTA_REQUIRE_NOTARIZATION must be true or false')
+
+    def test_build_diagnostics_require_explicit_ci_opt_in(self):
+        self.reject({'FANTA_RELEASE_BUILD_DIAGNOSTICS': 'maybe'},
+                    'FANTA_RELEASE_BUILD_DIAGNOSTICS must be true or false')
+        self.reject({'FANTA_RELEASE_BUILD_DIAGNOSTICS': 'true'},
+                    'Build diagnostics require GitHub Actions CI')
+        self.reject({'FANTA_RELEASE_BUILD_DIAGNOSTICS': 'true', 'CI': 'true'},
+                    'Build diagnostics require GitHub Actions CI')
 
     def test_required_notarization_without_credentials(self):
         self.reject({'FANTA_REQUIRE_NOTARIZATION': 'true'}, 'Distribution requires Apple notarization credentials')
@@ -186,6 +197,14 @@ esac
                                'CFBundleVersion': '47.2', 'LSMinimumSystemVersion': '12.0',
                                'ITSAppUsesNonExemptEncryption': False})
 
+    def test_diagnostics_preserve_developer_signing_boundary(self):
+        self.environment.update(FANTA_RELEASE_BUILD_DIAGNOSTICS='true', CI='true', GITHUB_ACTIONS='true')
+        self.assert_developer_version('9.8.7')
+
+    def test_diagnostics_preserve_store_signing_boundary(self):
+        self.environment.update(FANTA_RELEASE_BUILD_DIAGNOSTICS='true', CI='true', GITHUB_ACTIONS='true')
+        self.test_store_bundle_retains_separate_version_and_build()
+
 
 class DmgCreationProducer(unittest.TestCase):
     stub = BundleVersionProducer.stub
@@ -292,6 +311,105 @@ esac
 
     def test_dmg_near_match_is_not_retried(self):
         self.run_dmg('near-match', success=False, attempts=1)
+
+
+class BuildProgress(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix='fanta-build-progress-test-')
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        source = (ROOT / 'script/bundle-mac').read_text()
+        self.function = source.split('run_cargo_build() (', 1)[1].split('\ndecode_app_store_provisioning_profile()', 1)[0]
+        self.function = 'run_cargo_build() (' + self.function
+        python_source = self.function.split("<<'PY_BUILD_PROGRESS' &\n", 1)[1].split('\nPY_BUILD_PROGRESS', 1)[0]
+        self.namespace = {'__name__': 'build_progress_test'}
+        exec(compile(python_source, 'bundle-mac:build-progress', 'exec'), self.namespace)
+        self.fake_build = self.root / 'fake-build.py'
+        self.fake_build.write_text('''import json, os, pathlib, sys, time
+try:
+    os.fstat(9)
+except OSError:
+    writer_closed = True
+else:
+    writer_closed = False
+pathlib.Path('build.json').write_text(json.dumps({'arguments': sys.argv[1:], 'writer_closed': writer_closed,
+                                               'wrapper_pid': os.getppid()}))
+time.sleep(0.3)
+sys.exit(int(os.environ['TEST_BUILD_STATUS']))
+''')
+        self.wrapper = self.root / 'wrapper.sh'
+        self.wrapper.write_text('set -euo pipefail\n' + self.function + '\nrun_cargo_build "$@"\n')
+
+    def start_build(self, status=0, enabled=True):
+        return subprocess.Popen(['/bin/bash', str(self.wrapper), sys.executable,
+                                 str(self.fake_build), 'private-argument-must-not-be-logged'],
+                                cwd=self.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                start_new_session=True,
+                                env={'PATH': '/usr/bin:/bin', 'TMPDIR': str(self.root),
+                                     'FANTA_RELEASE_BUILD_DIAGNOSTICS': str(enabled).lower(),
+                                     'TEST_BUILD_STATUS': str(status), 'PRIVATE_TOKEN': 'must-not-be-logged'})
+
+    def test_build_status_arguments_and_normal_monitor_cleanup(self):
+        for enabled, status in [(False, 0), (True, 0), (True, 37)]:
+            with self.subTest(enabled=enabled, status=status):
+                process = self.start_build(status, enabled)
+                stdout, stderr = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, status, stdout + stderr)
+                observed = json.loads((self.root / 'build.json').read_text())
+                self.assertTrue(observed['writer_closed'])
+                self.assertEqual(observed['arguments'], ['private-argument-must-not-be-logged'] +
+                                 (['--timings'] if enabled else []))
+                self.assertNotIn('must-not-be-logged', stdout + stderr)
+                self.assertFalse(list(self.root.glob('fanta-build-progress.*')))
+                if enabled:
+                    self.assertIn('[build-progress]', stdout)
+                else:
+                    self.assertNotIn('[build-progress]', stdout)
+
+    def test_monitor_stops_after_wrapper_signal_or_lost_writer(self):
+        for stop_signal in [signal.SIGTERM, signal.SIGKILL]:
+            with self.subTest(signal=stop_signal):
+                marker = self.root / 'build.json'
+                marker.unlink(missing_ok=True)
+                process = self.start_build()
+                deadline = time.monotonic() + 5
+                while not marker.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(marker.exists())
+                wrapper_pid = json.loads(marker.read_text())['wrapper_pid']
+                self.assertIsNone(process.poll())
+                self.assertEqual(os.getpgid(wrapper_pid), process.pid)
+                os.kill(wrapper_pid, stop_signal)
+                # communicate requires the sampler's inherited output pipes to close too.
+                stdout, stderr = process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 143 if stop_signal == signal.SIGTERM else 137,
+                                 stdout + stderr)
+                self.assertNotIn('must-not-be-logged', stdout + stderr)
+                if stop_signal == signal.SIGTERM:
+                    self.assertFalse(list(self.root.glob('fanta-build-progress.*')))
+
+    def test_progress_filters_unrelated_processes_and_never_emits_commands(self):
+        output = '''10 1 0.0 100 00:01 /bin/bash
+11 10 1.0 200 00:01 /private/not-a-secret/sampler
+12 11 1.0 300 00:01 /bin/ps
+13 10 25.5 400 01:02 /usr/bin/cargo
+14 13 50.0 500 02:03 /private/secret-token/rustc
+15 13 0.5 600 02:03 /private/credential-name
+16 1 90.0 700 02:03 /private/unrelated-token
+17 13 nan 800 02:03 /private/malformed
+'''
+        rows = self.namespace['process_rows'](output, 10, 11)
+        self.assertEqual(rows, [(13, 25.5, 400, '01:02', 'cargo'),
+                                (14, 50.0, 500, '02:03', 'rustc'),
+                                (15, 0.5, 600, '02:03', 'other')])
+        captured = io.StringIO()
+        with mock.patch.dict(self.namespace, command_output=lambda arguments: output), contextlib.redirect_stdout(captured):
+            self.namespace['sample'](10, 11, 30)
+        emitted = captured.getvalue()
+        self.assertIn('processes=3 cpu_percent=76.0 rss_kib=1500', emitted)
+        self.assertIn('swap_mib=unavailable', emitted)
+        for forbidden in ['private', 'token', 'credential', 'unrelated', 'malformed', '/usr/bin']:
+            self.assertNotIn(forbidden, emitted)
 
 
 class WorkflowPipeline(unittest.TestCase):

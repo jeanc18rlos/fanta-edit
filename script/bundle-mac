@@ -15,6 +15,146 @@ app_store_ad_hoc=false
 IDENTITY="${MACOS_SIGNING_IDENTITY:-}"
 INSTALLER_IDENTITY="${MACOS_APP_STORE_INSTALLER_IDENTITY:-}"
 
+case "${FANTA_RELEASE_BUILD_DIAGNOSTICS:-false}" in
+    true)
+        if [[ "${CI:-}" != true || "${GITHUB_ACTIONS:-}" != true ]]; then
+            echo "Build diagnostics require GitHub Actions CI."
+            exit 1
+        fi
+        ;;
+    false) ;;
+    *) echo "FANTA_RELEASE_BUILD_DIAGNOSTICS must be true or false."; exit 1;;
+esac
+
+run_cargo_build() (
+    if [[ "${FANTA_RELEASE_BUILD_DIAGNOSTICS:-false}" != true ]]; then
+        "$@"
+        exit "$?"
+    fi
+
+    local progress_directory progress_pid=""
+    progress_directory=$(mktemp -d "${TMPDIR:-/tmp}/fanta-build-progress.XXXXXX")
+    finish_build_progress() {
+        local build_status=$?
+        trap - EXIT
+        exec 9>&-
+        if [[ -n "$progress_pid" ]] && ! wait "$progress_pid"; then
+            echo "[build-progress] sampler stopped unsuccessfully" >&2
+        fi
+        if ! rm -f "$progress_directory/control" || ! rmdir "$progress_directory"; then
+            echo "[build-progress] temporary control cleanup failed" >&2
+        fi
+        exit "$build_status"
+    }
+    trap finish_build_progress EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    mkfifo "$progress_directory/control"
+    exec 9<>"$progress_directory/control"
+
+    # Only this wrapper retains the writer. EOF stops the sampler even if the
+    # runner kills the wrapper before its EXIT trap can run.
+    python3 - 3<"$progress_directory/control" 9>&- <<'PY_BUILD_PROGRESS' &
+import math
+import os
+import re
+import select
+import shutil
+import subprocess
+import time
+
+
+def command_output(arguments):
+    try:
+        result = subprocess.run(arguments, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, timeout=3, check=False)
+        return result.stdout if result.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired, UnicodeError):
+        return None
+
+
+def process_rows(output, root_pid, sampler_pid):
+    rows = {}
+    for line in output.splitlines():
+        fields = line.split(None, 5)
+        if len(fields) != 6:
+            continue
+        pid, parent, cpu, rss, elapsed, command = fields
+        if not all(value.isdecimal() for value in (pid, parent, rss)):
+            continue
+        if not re.fullmatch(r'[0-9]+(?:\.[0-9]+)?', cpu) or not re.fullmatch(r'[0-9:-]+', elapsed):
+            continue
+        if not math.isfinite(float(cpu)):
+            continue
+        name = os.path.basename(command)
+        label = name if name in {'cargo', 'rustc', 'cc', 'clang', 'clang++', 'ld'} else 'other'
+        rows[int(pid)] = (int(parent), float(cpu), int(rss), elapsed, label)
+
+    def descendants(parent):
+        found = {parent}
+        while True:
+            expanded = found | {pid for pid, row in rows.items() if row[0] in found}
+            if expanded == found:
+                return found
+            found = expanded
+
+    owned = descendants(root_pid) - descendants(sampler_pid) - {root_pid}
+    return [(pid, *rows[pid][1:]) for pid in sorted(owned) if pid in rows]
+
+
+def sample(root_pid, sampler_pid, elapsed):
+    prefix = f'[build-progress] elapsed_s={int(elapsed)}'
+    output = command_output(['/bin/ps', '-axo', 'pid=,ppid=,pcpu=,rss=,etime=,comm='])
+    if output is None:
+        print(f'{prefix} processes=unavailable', flush=True)
+    else:
+        rows = process_rows(output, root_pid, sampler_pid)
+        print(f'{prefix} processes={len(rows)} cpu_percent={sum(row[1] for row in rows):.1f} '
+              f'rss_kib={sum(row[2] for row in rows)}', flush=True)
+        for pid, cpu, rss, age, label in rows[:32]:
+            print(f'[build-progress] pid={pid} kind={label} cpu_percent={cpu:.1f} '
+                  f'rss_kib={rss} process_elapsed={age}', flush=True)
+        if len(rows) > 32:
+            print(f'[build-progress] omitted_process_rows={len(rows) - 32}', flush=True)
+    try:
+        print(f'{prefix} disk_free_mib={shutil.disk_usage(".").free // (1024 * 1024)}', flush=True)
+    except OSError:
+        print(f'{prefix} disk_free_mib=unavailable', flush=True)
+    swap = command_output(['/usr/sbin/sysctl', '-n', 'vm.swapusage'])
+    values = dict(re.findall(r'\b(total|used|free)\s*=\s*([0-9]+(?:\.[0-9]+)?)M\b', swap or ''))
+    if set(values) == {'total', 'used', 'free'} and all(math.isfinite(float(value)) for value in values.values()):
+        print(f'{prefix} swap_total_mib={float(values["total"]):.1f} '
+              f'swap_used_mib={float(values["used"]):.1f} swap_free_mib={float(values["free"]):.1f}', flush=True)
+    else:
+        print(f'{prefix} swap_mib=unavailable', flush=True)
+
+
+def main():
+    started = time.monotonic()
+    deadline = started + 180 * 60
+    root_pid, sampler_pid = os.getppid(), os.getpid()
+    next_sample = started
+    while time.monotonic() < deadline:
+        remaining = min(next_sample, deadline) - time.monotonic()
+        if select.select([3], [], [], max(0, remaining))[0] and not os.read(3, 1):
+            return
+        if time.monotonic() >= deadline:
+            break
+        sample(root_pid, sampler_pid, time.monotonic() - started)
+        next_sample = time.monotonic() + 30
+    print('[build-progress] sampler reached its 180-minute limit', flush=True)
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, ValueError):
+        print('[build-progress] sampler unavailable', flush=True)
+PY_BUILD_PROGRESS
+    progress_pid=$!
+    "$@" --timings 9>&-
+)
+
 decode_app_store_provisioning_profile() {
     local profile_path="$1"
     local output_path="$2"
@@ -237,9 +377,9 @@ rustup target add $target_triple
 
 echo "Compiling zed binaries"
 if [[ "$app_store" = true ]]; then
-    cargo build ${build_flag} --locked --package zed --features zed/mac_app_store --target "$target_triple"
+    run_cargo_build cargo build ${build_flag} --locked --package zed --features zed/mac_app_store --target "$target_triple"
 else
-    cargo build ${build_flag} --locked --package zed --package cli --target "$target_triple"
+    run_cargo_build cargo build ${build_flag} --locked --package zed --package cli --target "$target_triple"
 fi
 
 echo "Creating application bundle"
