@@ -1,0 +1,96 @@
+name: Release lint
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/fanta-lint.yml'
+      - 'script/clippy'
+      - 'script/verify-fanta-release'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+      - 'crates/fanta-doc/**'
+      - 'crates/fanta-fnx/**'
+      - 'crates/fanta-format/**'
+      - 'crates/fanta-canvas/**'
+      - 'crates/fanta-tools/**'
+      - 'crates/fanta-render/**'
+      - 'crates/fanta-fig-interop/**'
+      - 'crates/fanta-present/**'
+      - 'crates/fanta-text/**'
+      - 'crates/fig_viewer/**'
+      - 'crates/workspace/**'
+      - 'crates/fanta_ui/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-lint-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  lint:
+    name: Lint release editor and engines
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Record checkout and lint configuration
+        shell: bash
+        run: |
+          evidence_directory="${RUNNER_TEMP}/fanta-lint"
+          mkdir -p "$evidence_directory/config"
+          {
+            date -u +%Y-%m-%dT%H:%M:%SZ
+            git show --no-patch --format='commit %H%ntree %T%nparents %P' HEAD
+            git status --short
+            printf 'Event: %s\nRef: %s\nRun: %s\nAttempt: %s\n' \
+              "$GITHUB_EVENT_NAME" "$GITHUB_REF" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            uname -a
+            ./script/verify-fanta-release --list --stage lint
+            shasum -a 256 .github/workflows/fanta-lint.yml script/clippy \
+              script/verify-fanta-release Cargo.toml Cargo.lock \
+              rust-toolchain.toml .cargo/config.toml
+          } > "$evidence_directory/checkout.txt"
+          cp Cargo.toml Cargo.lock rust-toolchain.toml "$evidence_directory/config/"
+          cp .cargo/config.toml "$evidence_directory/config/cargo-config.toml"
+          cp script/clippy script/verify-fanta-release "$evidence_directory/config/"
+
+      - name: Install the repository Rust toolchain and inspect native tools
+        shell: bash
+        run: |
+          {
+            test "$(uname -m)" = arm64
+            rustup show active-toolchain
+            rustup component list --installed
+            rustc --version
+            cargo --version
+            xcodebuild -version
+            xcrun -sdk macosx --find clang
+            xcrun -sdk macosx --find metal
+            xcrun -sdk macosx --find metallib
+          } 2>&1 | tee "${RUNNER_TEMP}/fanta-lint/toolchain.log"
+
+      - name: Lint the release editor and engine crates
+        run: |
+          ./script/verify-fanta-release --stage lint \
+            --output-dir "${RUNNER_TEMP}/fanta-lint"
+
+      - name: Preserve lint evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-lint-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fanta-lint
+          if-no-files-found: warn
+          retention-days: 14
