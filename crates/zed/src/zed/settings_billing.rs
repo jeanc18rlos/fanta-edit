@@ -1,5 +1,5 @@
 use anyhow::{Context as _, Result, bail, ensure};
-use chrono::{Duration, SecondsFormat, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use client::Client;
 use fanta_gpui::{
     billing::{
@@ -232,23 +232,40 @@ pub(super) async fn load_account_summary(
     })
 }
 
-fn usage_path(range: BillingUsageRange, by_key: bool) -> String {
-    let days = match range {
-        BillingUsageRange::Days7 => 7,
-        BillingUsageRange::Days30 => 30,
-        BillingUsageRange::Days90 => 90,
-    };
-    let to = Utc::now();
-    let from = to - Duration::days(days);
-    let mut path = format!(
-        "/v1/usage?from={}&to={}",
-        from.to_rfc3339_opts(SecondsFormat::Secs, true),
-        to.to_rfc3339_opts(SecondsFormat::Secs, true)
-    );
-    if by_key {
-        path.push_str("&group_by=key");
+struct UsageWindow {
+    range: BillingUsageRange,
+    from: DateTime<Utc>,
+    to: DateTime<Utc>,
+}
+
+impl UsageWindow {
+    fn new(range: BillingUsageRange, to: DateTime<Utc>) -> Self {
+        Self {
+            range,
+            from: to - Duration::days(Self::days(range)),
+            to,
+        }
     }
-    path
+
+    fn days(range: BillingUsageRange) -> i64 {
+        match range {
+            BillingUsageRange::Days7 => 7,
+            BillingUsageRange::Days30 => 30,
+            BillingUsageRange::Days90 => 90,
+        }
+    }
+
+    fn path(&self, by_key: bool) -> String {
+        let mut path = format!(
+            "/v1/usage?from={}&to={}",
+            self.from.to_rfc3339_opts(SecondsFormat::Secs, true),
+            self.to.to_rfc3339_opts(SecondsFormat::Secs, true)
+        );
+        if by_key {
+            path.push_str("&group_by=key");
+        }
+        path
+    }
 }
 
 fn comma(value: i64) -> String {
@@ -288,17 +305,13 @@ fn credit_title(reason: &str, delta: i64) -> &'static str {
 }
 
 fn build_usage(
-    range: BillingUsageRange,
+    window: &UsageWindow,
     rows: Vec<UsageRow>,
     key_rows: Vec<KeyUsage>,
     keys: &[KeySummary],
     balance: i64,
 ) -> BillingUsage {
-    let days = match range {
-        BillingUsageRange::Days7 => 7,
-        BillingUsageRange::Days30 => 30,
-        BillingUsageRange::Days90 => 90,
-    };
+    let days = UsageWindow::days(window.range);
     let mut daily = BTreeMap::<String, i64>::new();
     let mut models = BTreeMap::<String, (i64, i64)>::new();
     for row in rows {
@@ -313,12 +326,13 @@ fn build_usage(
     let trend: Vec<BillingUsagePoint> = if total == 0 {
         Vec::new()
     } else {
-        (0..days)
-            .rev()
-            .map(|offset| {
-                let date = (Utc::now() - Duration::days(offset))
-                    .format("%Y-%m-%d")
-                    .to_string();
+        window
+            .from
+            .date_naive()
+            .iter_days()
+            .take_while(|date| *date <= window.to.date_naive())
+            .map(|date| {
+                let date = date.format("%Y-%m-%d").to_string();
                 let amount = daily.get(&date).copied().unwrap_or(0);
                 BillingUsagePoint {
                     label: date.get(5..).unwrap_or(&date).to_owned().into(),
@@ -366,10 +380,10 @@ fn build_usage(
         })
         .collect();
     BillingUsage {
-        range,
+        range: window.range,
         period_label: format!("Last {days} days").into(),
         total_label: format!("{} credits used", comma(total)).into(),
-        allowance_label: "Credit use during this period".into(),
+        allowance_label: "Rolling period · first and last UTC days may be partial".into(),
         reset_label: SharedString::default(),
         allowance_fraction: if total > 0 {
             (total as f32 / (total + balance.max(0)) as f32).clamp(0., 1.)
@@ -416,8 +430,9 @@ pub(super) async fn load_billing_snapshot(
     server_url: String,
     range: BillingUsageRange,
 ) -> Result<BillingViewData> {
-    let usage_request_path = usage_path(range, false);
-    let key_usage_path = usage_path(range, true);
+    let usage_window = UsageWindow::new(range, Utc::now());
+    let usage_request_path = usage_window.path(false);
+    let key_usage_path = usage_window.path(true);
     let me: MeResponse = get(&client, &token, &server_url, "/v1/me").await?;
     let credits: CreditsResponse = get(&client, &token, &server_url, "/v1/credits").await?;
     let subscription: SubscriptionResponse =
@@ -694,7 +709,7 @@ pub(super) async fn load_billing_snapshot(
         })
         .collect();
     let usage = build_usage(
-        range,
+        &usage_window,
         usage.days,
         key_usage.by_key,
         &keys.keys,
@@ -922,7 +937,8 @@ async fn export_usage(
     range: BillingUsageRange,
     cx: &mut AsyncWindowContext,
 ) -> Result<BillingActionOutcome> {
-    let usage: UsageResponse = get(client, token, server_url, &usage_path(range, false)).await?;
+    let window = UsageWindow::new(range, Utc::now());
+    let usage: UsageResponse = get(client, token, server_url, &window.path(false)).await?;
     let path = cx.update(|_, cx| {
         cx.prompt_for_new_path(
             &PathBuf::from(paths::home_dir().as_path()),
@@ -1201,13 +1217,164 @@ mod tests {
             "from": "2026-09-01T00:00:00Z", "to": "2026-09-28T00:00:00Z",
             "by_key": [{"api_key_id": null, "requests": 5, "billed_credits": 42}]
         }))?;
-        let view = build_usage(BillingUsageRange::Days30, usage.days, keys.by_key, &[], 458);
+        let window = UsageWindow::new(BillingUsageRange::Days30, "2026-09-28T00:00:00Z".parse()?);
+        let view = build_usage(&window, usage.days, keys.by_key, &[], 458);
         assert_eq!(view.total_label.as_ref(), "42 credits used");
         assert_eq!(view.categories.len(), 2);
         assert_eq!(view.api_keys[0].name.as_ref(), "Desktop and other usage");
         assert!(view.reset_label.is_empty());
-        let empty = build_usage(BillingUsageRange::Days30, Vec::new(), Vec::new(), &[], 500);
+        let empty = build_usage(&window, Vec::new(), Vec::new(), &[], 500);
         assert!(empty.trend.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn usage_window_shares_exact_bounds_for_daily_and_key_queries() -> Result<()> {
+        for (range, from) in [
+            (BillingUsageRange::Days7, "2025-03-25T12:34:56Z"),
+            (BillingUsageRange::Days30, "2025-03-02T12:34:56Z"),
+            (BillingUsageRange::Days90, "2025-01-01T12:34:56Z"),
+        ] {
+            let window = UsageWindow::new(range, "2025-04-01T12:34:56Z".parse()?);
+            let path = format!("/v1/usage?from={from}&to=2025-04-01T12:34:56Z");
+            assert_eq!(window.path(false), path);
+            assert_eq!(window.path(true), format!("{path}&group_by=key"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn usage_rollup_includes_partial_boundary_days_and_empty_middle_days() -> Result<()> {
+        for (range, days, first_day) in [
+            (BillingUsageRange::Days7, 7, "2025-03-25"),
+            (BillingUsageRange::Days30, 30, "2025-03-02"),
+            (BillingUsageRange::Days90, 90, "2025-01-01"),
+        ] {
+            let window = UsageWindow::new(range, "2025-04-01T12:34:56Z".parse()?);
+            let rows = vec![
+                UsageRow {
+                    day: format!("{first_day} 00:00:00+00"),
+                    model: "example-a".into(),
+                    requests: 1,
+                    billed_credits: 2,
+                },
+                UsageRow {
+                    day: format!("{first_day} 00:00:00+00"),
+                    model: "example-b".into(),
+                    requests: 1,
+                    billed_credits: 3,
+                },
+                UsageRow {
+                    day: "2025-04-01 00:00:00+00".into(),
+                    model: "example-a".into(),
+                    requests: 1,
+                    billed_credits: 7,
+                },
+            ];
+            let view = build_usage(
+                &window,
+                rows,
+                vec![KeyUsage {
+                    api_key_id: None,
+                    requests: 3,
+                    billed_credits: 12,
+                }],
+                &[],
+                100,
+            );
+            assert_eq!(view.trend.len(), days + 1);
+            assert_eq!(
+                view.trend.first().context("first day")?.label.as_ref(),
+                first_day.get(5..).context("day label")?
+            );
+            assert_eq!(
+                view.trend.last().context("last day")?.label.as_ref(),
+                "04-01"
+            );
+            assert_eq!(view.total_label.as_ref(), "12 credits used");
+            assert_eq!(view.period_label.as_ref(), format!("Last {days} days"));
+            let mut amounts = Vec::new();
+            for (index, point) in view.trend.iter().enumerate() {
+                let expected = if index == 0 {
+                    5
+                } else if index == days {
+                    7
+                } else {
+                    0
+                };
+                assert_eq!(point.amount_label.as_ref(), format!("{expected} credits"));
+                assert_eq!(point.fraction, expected as f32 / 7.0);
+                amounts.push(
+                    point
+                        .amount_label
+                        .strip_suffix(" credits")
+                        .context("credit suffix")?
+                        .parse::<i64>()?,
+                );
+            }
+            assert_eq!(amounts.iter().sum::<i64>(), 12);
+            let category_amounts = view
+                .categories
+                .iter()
+                .map(|category| (category.name.as_ref(), category.amount_label.as_ref()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                category_amounts,
+                vec![("example-a", "9 credits"), ("example-b", "3 credits")]
+            );
+            assert_eq!(
+                view.api_keys
+                    .first()
+                    .context("usage key")?
+                    .amount_label
+                    .as_ref(),
+                "12 credits"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn usage_rollup_keeps_the_request_window_across_midnight() -> Result<()> {
+        for (to, first_day, last_day) in [
+            ("2025-03-31T23:59:59Z", "2025-03-24", "03-31"),
+            ("2025-04-01T00:00:00Z", "2025-03-25", "04-01"),
+        ] {
+            let window = UsageWindow::new(BillingUsageRange::Days7, to.parse()?);
+            let view = build_usage(
+                &window,
+                vec![UsageRow {
+                    day: format!("{first_day} 00:00:00+00"),
+                    model: "example-a".into(),
+                    requests: 1,
+                    billed_credits: 4,
+                }],
+                Vec::new(),
+                &[],
+                100,
+            );
+            assert_eq!(view.trend.len(), 8);
+            assert_eq!(
+                view.trend.first().context("first day")?.label.as_ref(),
+                first_day.get(5..).context("day label")?
+            );
+            assert_eq!(
+                view.trend
+                    .first()
+                    .context("first day")?
+                    .amount_label
+                    .as_ref(),
+                "4 credits"
+            );
+            assert_eq!(
+                view.trend.last().context("last day")?.label.as_ref(),
+                last_day
+            );
+            assert_eq!(view.total_label.as_ref(), "4 credits used");
+            let empty = build_usage(&window, Vec::new(), Vec::new(), &[], 100);
+            assert!(empty.trend.is_empty());
+            assert_eq!(empty.total_label.as_ref(), "0 credits used");
+        }
         Ok(())
     }
 
