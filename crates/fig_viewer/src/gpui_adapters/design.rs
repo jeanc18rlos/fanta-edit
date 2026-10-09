@@ -344,7 +344,12 @@ pub(crate) fn selection_header_for_doc(
             }
             controls.push(menu);
         }
-        if selection.len() == 1 && matches!(node.data, NodeData::Vector(_) | NodeData::Text(_)) {
+        if selection.len() == 1
+            && matches!(
+                node.data,
+                NodeData::Vector(_) | NodeData::Text(_) | NodeData::TextPath(_)
+            )
+        {
             controls.push(DesignSelectionHeaderControl::direct(Kind::EditObject));
         }
     }
@@ -4970,13 +4975,12 @@ impl FigView {
                 }
             }
             DesignSelectionHeaderCommand::EditObject => {
-                let kind = self.item().read(cx).document().and_then(|document| {
-                    document
-                        .doc
-                        .scene
-                        .get(first)
-                        .map(|node| matches!(node.data, NodeData::Text(_)))
-                });
+                let kind =
+                    self.item().read(cx).document().and_then(|document| {
+                        document.doc.scene.get(first).map(|node| {
+                            matches!(node.data, NodeData::Text(_) | NodeData::TextPath(_))
+                        })
+                    });
                 match kind {
                     Some(true) => {
                         self.open_text_edit(first, crate::view::TextEditSeed::SelectAll, window, cx)
@@ -9955,6 +9959,230 @@ mod tests {
     fn apply_operations(doc: &mut Doc, operations: Vec<Operation>) {
         for operation in operations {
             doc.apply(operation).expect("apply inspector operation");
+        }
+    }
+
+    #[test]
+    fn text_path_inspector_header_requires_one_editable_physical_node() {
+        let (mut doc, page, id) = doc_with_text_path();
+        let has_edit = |doc: &Doc, ids: &[NodeId], editable| {
+            selection_header_for_doc(doc, ids, Some(page), editable)
+                .expect("selected text path header")
+                .primary_controls
+                .iter()
+                .any(|control| control.command() == Some(DesignSelectionHeaderCommand::EditObject))
+        };
+        assert!(has_edit(&doc, &[id], true));
+        assert!(!has_edit(&doc, &[id], false));
+        let mut other = doc.scene.get(id).expect("text path").clone();
+        other.id = NodeId::new();
+        other.index = doc.scene.next_child_index(Some(page));
+        let other_id = doc.scene.insert(other).expect("second editable text path");
+        assert!(!has_edit(&doc, &[id, other_id], true));
+        doc.scene
+            .get_mut(id)
+            .expect("text path")
+            .flags
+            .insert(fanta_doc::NodeFlags::LOCKED);
+        assert!(!has_edit(&doc, &[id], true));
+        doc.scene
+            .get_mut(id)
+            .expect("text path")
+            .flags
+            .remove(fanta_doc::NodeFlags::LOCKED);
+        doc.scene
+            .get_mut(page)
+            .expect("page")
+            .flags
+            .insert(fanta_doc::NodeFlags::LOCKED);
+        assert!(!has_edit(&doc, &[id], true));
+    }
+
+    #[gpui::test]
+    async fn text_path_inspector_header_edits_content_with_one_undo_redo(cx: &mut TestAppContext) {
+        let (mut doc, page, id) = doc_with_text_path();
+        let node = doc.scene.get_mut(id).expect("text path");
+        node.transform = Transform2D::translation(40.0, 60.0);
+        node.opacity = 0.75.into();
+        let NodeData::TextPath(path) = &mut node.data else {
+            panic!("text path fixture")
+        };
+        path.path
+            .move_to(150.0, 30.0)
+            .cubic_to(180.0, -20.0, 220.0, 80.0, 260.0, 30.0);
+        path.start = TextPathStart::new(4, 0.25).expect("second contour start");
+        let mut trailing_style = path.style.clone();
+        trailing_style.color = FantaColor::rgb(0x40, 0x80, 0xc0);
+        trailing_style.weight = 400;
+        path.style_runs.push(TextStyleRun {
+            start: 4,
+            end: path.content.len(),
+            style: trailing_style,
+        });
+        let mut sibling = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            40.0,
+            20.0,
+            FantaColor::BLACK,
+        )));
+        sibling.parent = Some(page);
+        sibling.index = doc.scene.next_child_index(Some(page));
+        doc.scene.insert(sibling).expect("unrelated sibling");
+        doc.selection.replace_with([id]);
+        let (view, panel, mut visual) = setup_view(doc, cx).await;
+        let item = view.read_with(&visual, |view, _| view.item().clone());
+        let snapshot = |doc: &Doc| {
+            let mut value = serde_json::to_value(doc).expect("authored document");
+            value
+                .as_object_mut()
+                .expect("document object")
+                .remove("history");
+            value["metadata"]["modified_at"] = serde_json::json!(0);
+            value
+        };
+        let before = item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.history.undo_depth(), 0);
+            snapshot(doc)
+        });
+        let (target, command) = panel.read_with(&visual, |panel, _| {
+            let header = panel
+                .view_data()
+                .projections
+                .selection_header
+                .expect("mounted selection header");
+            let command = header
+                .view_data
+                .primary_controls
+                .iter()
+                .filter_map(|control| control.command())
+                .find(|command| *command == DesignSelectionHeaderCommand::EditObject)
+                .expect("physical TextPath exposes Edit object");
+            (header.target, command)
+        });
+        panel.update_in(&mut visual, |_, _, cx| {
+            cx.emit(DesignPanelAction::SelectionHeaderCommandRequested { target, command });
+        });
+        visual.run_until_parked();
+        view.update_in(&mut visual, |view, _, cx| {
+            assert_eq!(view.active_tool(), crate::tools::ToolKind::Select);
+            let edit = view.text_edit.as_mut().expect("TextPath text editor");
+            assert!(edit.session.is_text_path());
+            assert_eq!(edit.session.node_id(), id);
+            assert!(edit.session.instance().is_none());
+            assert_eq!(edit.session.selected_range(), 0.."Text on a path".len());
+            edit.session.move_to(1, false);
+            edit.session.move_to(3, true);
+            cx.notify();
+        });
+        visual.update(|window, cx| window.draw(cx).clear());
+        visual.simulate_input("es");
+        visual.run_until_parked();
+        view.update(&mut visual, |view, cx| view.commit_text_edit(cx));
+        visual.run_until_parked();
+        view.read_with(&visual, |view, _| assert!(view.text_edit.is_none()));
+        let mut expected = before.clone();
+        let node_key = serde_json::to_value(id).expect("node ID");
+        expected["scene"]["nodes"]
+            .get_mut(node_key.as_str().expect("serialized node ID"))
+            .expect("existing text path")["content"] = serde_json::json!("Test on a path");
+        item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.history.undo_depth(), 1);
+            assert_eq!(snapshot(doc), expected, "only the selected text changes");
+        });
+        item.update(&mut visual, |item, cx| {
+            assert!(item.undo(cx).expect("one text Undo"));
+        });
+        item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.history.undo_depth(), 0);
+            assert_eq!(snapshot(doc), before);
+        });
+        item.update(&mut visual, |item, cx| {
+            assert!(item.redo(cx).expect("one text Redo"));
+        });
+        item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(doc.history.undo_depth(), 1);
+            assert!(!doc.history.can_redo());
+            assert_eq!(snapshot(doc), expected);
+        });
+    }
+
+    #[gpui::test]
+    async fn text_path_inspector_header_rejects_stale_and_read_only_actions(
+        cx: &mut TestAppContext,
+    ) {
+        let (mut doc, page, id) = doc_with_text_path();
+        doc.selection.replace_with([id]);
+        let (view, panel, mut visual) = setup_view(doc, cx).await;
+        let item = view.read_with(&visual, |view, _| view.item().clone());
+        let target = DesignPanelTarget::Nodes {
+            node_ids: vec![id.to_string().into()],
+        };
+        item.update(&mut visual, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.replace_with([page]);
+                ((), DocChange::Selection)
+            })
+            .expect("document");
+        });
+        for read_only in [false, true] {
+            if read_only {
+                item.update(&mut visual, |item, cx| {
+                    item.with_document(cx, |document| {
+                        document.doc.selection.replace_with([id]);
+                        ((), DocChange::Selection)
+                    })
+                    .expect("document");
+                });
+                view.update_in(&mut visual, |view, _, cx| {
+                    view.activate_tool(crate::tools::ToolKind::Inspect, cx);
+                    view.refresh_gpui_design(cx);
+                });
+            }
+            visual.run_until_parked();
+            panel.read_with(&visual, |panel, _| {
+                assert!(
+                    panel
+                        .view_data()
+                        .projections
+                        .selection_header
+                        .is_none_or(|header| header.view_data.primary_controls.iter().all(
+                            |control| {
+                                control.command() != Some(DesignSelectionHeaderCommand::EditObject)
+                            }
+                        ))
+                );
+            });
+            let before = item.read_with(&visual, |item, _| {
+                serde_json::to_value(item.doc().expect("document")).expect("before")
+            });
+            panel.update_in(&mut visual, |_, _, cx| {
+                cx.emit(DesignPanelAction::SelectionHeaderCommandRequested {
+                    target: target.clone(),
+                    command: DesignSelectionHeaderCommand::EditObject,
+                });
+            });
+            visual.run_until_parked();
+            view.read_with(&visual, |view, _| {
+                assert!(view.text_edit.is_none());
+                assert_eq!(
+                    view.active_tool(),
+                    if read_only {
+                        crate::tools::ToolKind::Inspect
+                    } else {
+                        crate::tools::ToolKind::Select
+                    }
+                );
+            });
+            item.read_with(&visual, |item, _| {
+                let doc = item.doc().expect("document");
+                assert_eq!(doc.history.undo_depth(), 0);
+                assert_eq!(serde_json::to_value(doc).expect("unchanged"), before);
+            });
         }
     }
 
