@@ -772,6 +772,14 @@ impl Doc {
     /// the scene's child index (`#[serde(skip)]` for compactness), and validates.
     pub fn from_json_str(s: &str) -> Result<Self, DocLoadError> {
         let mut value: serde_json::Value = serde_json::from_str(s)?;
+        Self::from_json_value(&mut value)
+    }
+
+    /// Load an assembled document without a JSON text round trip. Migration
+    /// updates `value` in place, retaining it for callers' error diagnostics.
+    /// Deserialization rebuilds the scene's child index and validates it just
+    /// as [`Self::from_json_str`] does.
+    pub fn from_json_value(value: &mut serde_json::Value) -> Result<Self, DocLoadError> {
         let from = value
             .get("schema_version")
             .and_then(|v| v.as_u64())
@@ -787,9 +795,9 @@ impl Doc {
             supported: SCHEMA_VERSION,
         })?;
         if from < SCHEMA_VERSION {
-            migrate_doc_json(&mut value, from)?;
+            migrate_doc_json(value, from)?;
         }
-        let mut doc: Doc = serde_json::from_value(value)?;
+        let mut doc = Doc::deserialize(&*value)?;
         doc.scene.rebuild_child_index();
         doc.scene.validate().map_err(DocLoadError::InvalidScene)?;
         Ok(doc)
@@ -797,7 +805,7 @@ impl Doc {
 }
 
 /// Migrate a raw `.fant.json` [`serde_json::Value`] in place from `from_version`
-/// up to [`SCHEMA_VERSION`]. Shared by [`Doc::from_json_str`] and the
+/// up to [`SCHEMA_VERSION`]. Shared by [`Doc::from_json_value`] and the
 /// `fanta-format` container loader so both load paths apply the same steps.
 ///
 /// Steps:
@@ -1328,6 +1336,201 @@ mod tests {
         let back = Doc::from_json_str(&s).unwrap();
         assert_eq!(back.id, d.id);
         assert_eq!(back.schema_version, SCHEMA_VERSION);
+    }
+
+    fn json_value_fixture() -> Result<(Doc, NodeId, NodeId, NodeId), SceneError> {
+        let mut doc = Doc::new();
+        let mut parent = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        parent.id = NodeId::from_u128(1);
+        let parent_id = parent.id;
+        doc.apply(Operation::create_node(parent))?;
+        let mut later = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            20.0,
+            30.0,
+            Color::BLACK,
+        )));
+        later.id = NodeId::from_u128(2);
+        later.parent = Some(parent_id);
+        later.index = crate::index::IndexKey::from_raw(2.0000000000000004);
+        later.opacity = crate::style::UnitInterval::new(0.35179502);
+        later.name = "quote \" and newline\n雪".into();
+        let later_id = later.id;
+        doc.apply(Operation::create_node(later))?;
+        let mut earlier = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            1.0,
+            2.0,
+            3.0,
+            4.0,
+            Color::BLACK,
+        )));
+        earlier.id = NodeId::from_u128(3);
+        earlier.parent = Some(parent_id);
+        earlier.index = crate::index::IndexKey::from_raw(0.9999999999999999);
+        let earlier_id = earlier.id;
+        doc.apply(Operation::create_node(earlier))?;
+        doc.pages.push(parent_id);
+        doc.active_page = Some(parent_id);
+        doc.selection.replace_with(vec![later_id]);
+        doc.viewport.center = [0.1, -0.0];
+        doc.viewport.zoom = 1.0000000000000002;
+        doc.metadata.created_at = 9_007_199_254_740_993;
+        Ok((doc, parent_id, earlier_id, later_id))
+    }
+
+    #[test]
+    fn json_value_load_preserves_serialized_doc_and_ordered_children()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (doc, parent, earlier, later) = json_value_fixture()?;
+        let original = serde_json::to_value(&doc)?;
+        let mut value = original.clone();
+        let unindexed: Doc = serde_json::from_value(original.clone())?;
+        assert!(unindexed.scene.roots().is_empty());
+        assert!(unindexed.scene.children_of(Some(parent)).is_empty());
+
+        let direct = Doc::from_json_value(&mut value)?;
+        let from_string = Doc::from_json_str(&doc.to_json_pretty()?)?;
+        assert_eq!(value, original);
+        for loaded in [&direct, &from_string] {
+            assert_eq!(loaded.scene.roots(), &[parent]);
+            assert_eq!(loaded.scene.children_of(Some(parent)), &[earlier, later]);
+            assert_eq!(serde_json::to_value(loaded)?, original);
+            assert!(loaded.history.can_undo());
+        }
+        assert_eq!(direct.to_json_string()?, from_string.to_json_string()?);
+        assert_eq!(direct.to_json_pretty()?, from_string.to_json_pretty()?);
+        Ok(())
+    }
+
+    fn use_legacy_vector_paths(value: &mut serde_json::Value) -> usize {
+        match value {
+            serde_json::Value::Object(object) => {
+                let mut replaced = 0;
+                if object.get("type").and_then(|value| value.as_str()) == Some("vector")
+                    && let Some(path) = object.get_mut("path")
+                    && let Some(segments) = path.get_mut("segments")
+                {
+                    *path = segments.take();
+                    replaced += 1;
+                }
+                replaced
+                    + object
+                        .values_mut()
+                        .map(use_legacy_vector_paths)
+                        .sum::<usize>()
+            }
+            serde_json::Value::Array(items) => items.iter_mut().map(use_legacy_vector_paths).sum(),
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn json_value_load_migrates_scene_and_history_paths() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (doc, parent, earlier, later) = json_value_fixture()?;
+        let current = serde_json::to_value(&doc)?;
+        for version in [None, Some(1), Some(2)] {
+            let mut legacy = current.clone();
+            if version != Some(2) {
+                assert_eq!(use_legacy_vector_paths(&mut legacy), 4);
+            }
+            let object = legacy.as_object_mut().ok_or("document must be an object")?;
+            match version {
+                Some(version) => {
+                    object.insert("schema_version".into(), version.into());
+                }
+                None => {
+                    object.remove("schema_version");
+                }
+            }
+            let source = serde_json::to_string(&legacy)?;
+            let loaded = Doc::from_json_value(&mut legacy)?;
+            assert_eq!(legacy, current);
+            assert_eq!(loaded.scene.children_of(Some(parent)), &[earlier, later]);
+            assert_eq!(serde_json::to_value(&loaded)?, current);
+            assert_eq!(serde_json::to_value(Doc::from_json_str(&source)?)?, current);
+            assert_eq!(
+                serde_json::to_value(Doc::from_json_value(&mut legacy)?)?,
+                current
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn json_value_load_rejects_future_schema_without_mutating_input()
+    -> Result<(), Box<dyn std::error::Error>> {
+        for version in [u64::from(SCHEMA_VERSION) + 1, u64::MAX] {
+            let mut value = serde_json::to_value(Doc::new())?;
+            *value.get_mut("schema_version").ok_or("missing schema")? = version.into();
+            let original = value.clone();
+            let direct = Doc::from_json_value(&mut value);
+            let from_string = Doc::from_json_str(&serde_json::to_string(&original)?);
+            for result in [direct, from_string] {
+                assert!(matches!(
+                    result,
+                    Err(DocLoadError::UnsupportedSchema { found, supported })
+                        if found == version && supported == SCHEMA_VERSION
+                ));
+            }
+            assert_eq!(value, original);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn json_value_load_keeps_malformed_and_invalid_scene_rejection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (doc, _, _, later) = json_value_fixture()?;
+        let mut bad_metadata = serde_json::to_value(&doc)?;
+        *bad_metadata
+            .pointer_mut("/metadata/title")
+            .ok_or("missing title")? = false.into();
+        let mut missing_id = serde_json::to_value(&doc)?;
+        missing_id
+            .as_object_mut()
+            .ok_or("document must be an object")?
+            .remove("id");
+        for mut value in [
+            serde_json::Value::Null,
+            serde_json::json!([]),
+            bad_metadata,
+            missing_id,
+        ] {
+            let original = value.clone();
+            assert!(matches!(
+                Doc::from_json_value(&mut value),
+                Err(DocLoadError::Json(_))
+            ));
+            assert!(matches!(
+                Doc::from_json_str(&serde_json::to_string(&original)?),
+                Err(DocLoadError::Json(_))
+            ));
+            assert_eq!(value, original);
+        }
+        let mut orphan = serde_json::to_value(&doc)?;
+        let later_key = serde_json::to_value(later)?;
+        let later_key = later_key
+            .as_str()
+            .ok_or("node ID must serialize as a string")?;
+        *orphan
+            .pointer_mut(&format!("/scene/nodes/{later_key}/parent"))
+            .ok_or("missing parent")? = serde_json::to_value(NodeId::from_u128(99))?;
+        let original = orphan.clone();
+        assert!(matches!(
+            Doc::from_json_value(&mut orphan),
+            Err(DocLoadError::InvalidScene(_))
+        ));
+        assert!(matches!(
+            Doc::from_json_str(&serde_json::to_string(&original)?),
+            Err(DocLoadError::InvalidScene(_))
+        ));
+        assert_eq!(orphan, original);
+        assert!(
+            matches!(Doc::from_json_str("{"), Err(DocLoadError::Json(error)) if error.is_syntax() || error.is_eof())
+        );
+        Ok(())
     }
 
     #[test]
