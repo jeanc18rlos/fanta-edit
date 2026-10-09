@@ -120,6 +120,9 @@ jobs:
       - name: Test Store App Access settings guide
         run: cargo test --locked -p zed --bin fanta --features mac_app_store store_app_access_guide_has_one_system_action_and_three_explanations
 
+      - name: Test account billing date windows
+        run: cargo test --locked -p zed --bin fanta --features mac_app_store usage_
+
       - name: Test Store Welcome App Access entry
         run: cargo test --locked -p workspace --lib --features mac_app_store store_welcome_links_to_app_access_guide
 
