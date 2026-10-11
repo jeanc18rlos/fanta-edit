@@ -50,10 +50,19 @@ not an independently archived screenshot suite or complete capability matrix.
 | Local Video/Audio | Motion selection provides preview/play/pause/progress/end; Audio also seeks to start/end and toggles mute/volume. Full project remains byte/mode/mtime/identity exact. | Muted playback does not prove audibility. Audio natural end showed 0:02/0:03 with full progress; cause unassigned. No trim/rate edits, codec breadth or general cold-preview reliability. |
 | Spectrum Save/tab close | One actual Typography text target persists through CmdS, close-prompt Save and warm reopen; Cancel retains tab/content and Don't Save closes the tab. Twelve scoped files and 42 asset files are frozen. | Other pages/components were not reread. No pre-choice snapshot for Don't Save, so rollback/write causality is unproved. Original inert Save/Discard report is not reproduced or explained. |
 | CmdShiftW Save and recovery | Own TextPath edit already exists on disk before any close choice. Save settles old project content to welcome; same-process exact-path reopen retains it. Native restoration returns 33 nonmetadata files, assets and exports exactly. | Inventory exposed no original window IDs; no full-window disappearance, cold restart or Quit claim. Save did not establish a write already observed before choice; the controlled failure below is a separate journey. |
-| Controlled save failure / Don't Save | With writes denied in two owned directories, CmdS displayed a permission error. Close-prompt Save retained the dirty draft and logged an error, with no separate close-error dialog observed. The prompt could be opened again; Don't Save reached welcome. Seven full captures preserve all 20 file bytes, modes, nanosecond mtimes, current file IDs and the asset, with no transaction remnants. After permission restoration, exact-path warm reopen showed the original saved text. | Current37 remains unchanged. No successful post-fault Save retry, original-window-ID disappearance, cold restart, general rollback or historical Spectrum-cause proof. The autosave retry loop and close-error feedback remain open. |
+| Controlled save failure / Don't Save | With writes denied in two owned directories, CmdS displayed a permission error. Close-prompt Save retained the dirty draft and logged an error, with no separate close-error dialog observed. The prompt could be opened again; Don't Save reached welcome. Seven full captures preserve all 20 file bytes, modes, nanosecond mtimes, current file IDs and the asset, with no transaction remnants. After permission restoration, exact-path warm reopen showed the original saved text. | This initial fault journey did not exercise successful retry or cold restart; the later checks below are separate. No original-window-ID disappearance, general rollback or historical Spectrum-cause proof. The installed autosave retry loop and close-error feedback remain open. |
+| Post-fault Save recovery | Restoring the two original directory modes while a retry prompt was open allowed Save to settle the project to welcome; warm reopen showed the new marker. The visible control text was then restored. | Autosave wrote the marker before the Save choice, so explicit-write causality is unproved. Native Git initialization added two files; the target style run was normalized to equivalent values, not restored byte-for-byte to the original archive. Eighteen other original files remained exact. |
+| Active canvas text Save | CmdS without Escape or prior commit persisted one standalone text replacement and then its restoration. The other nonmetadata files in the 22-file project remain exact; the restored target FNX matches this test's normalized baseline. | One valid text edit; not numeric input, rich text, IME or the original Spectrum incident. Autosave write causality is not excluded. |
+| Clean Quit and cold restart | Old PID absence and app-not-running state were observed before explicit relaunch. The exact project restored with a clean tab and saved control text; all 37 entries/22 files match the post-recovery baseline. | Small owned fixture and clean Quit only; no unsaved Quit, failure branch, Spectrum restart, original-archive byte equality or independent rendered oracle. |
+| Focused numeric draft Save/Close | **Reproduced gap:** with X40 and a focused draft48, CmdS left the project unchanged and the tab clean. Window Close reached welcome without an unsaved prompt; reopening showed X40. Enter then CmdS persisted X48, and the same route restored X40. | One valid Text X field. The target FNX bytes were restored to this normalized baseline; 20 other files remain exact, while metadata differs only in `modified_at`. Native rewrite identities and times remain recorded. This is separate from the unexplained Spectrum Save/Discard report. Numeric fix, automated regression and matching installed-app verification remain pending. |
 | Bitmap exports | Actual PNG/JPG/SVG/PDF outputs are 320×180; only export files are added. PNG and SVG embedded/rendered pixels and PDF embedded bitmap match the original. JPEG's declared 1,200 cell-interior pixels have max error 1 at tolerance 10. | PDF 72-dpi rendering retains 5,673 edge-difference pixels (max 204). JPEG full-image max error is 18; the historical 13,248-pixel mask was not rerun. Selected-Bitmap full-node export does not test clipped parent frames or vector/multipage fidelity. |
 
-The fault journey ran from 01:07 to 01:10 UTC on 11 October. Access-time
+The four follow-up rows above add evidence through **01:38 UTC, 11 October**;
+they do not replace the earlier fault snapshots or their original limits. Native
+observations remain root-operated conversation evidence, with separately frozen
+storage and process records. No later source fix is installed in Current37.
+
+The initial fault journey ran from 01:07 to 01:10 UTC on 11 October. Access-time
 changes are retained explicitly: initial native opening advanced seven files
 before the fault, and later reads advanced seven files in each raw evidence
 copy. Relative to the settled native pre-fault snapshot, only the two intended
@@ -64,9 +73,11 @@ that every timestamp stayed unchanged.
 The saved log contains **55 autosave failures over 74 seconds**. Source review
 identifies a failure → resync → Edited → debounce path that can re-arm autosave;
 the persistent warning is deduplicated but write attempts are not stopped by
-that notice. This remains an open feedback-loop issue, not an accepted fix or a
-general retry timing bound. The historical Spectrum Save/Discard incident is
-still unexplained.
+that notice. The installed app retains this feedback loop. A separate local
+source candidate adds a shared failed-automatic-write guard and five real-I/O
+GPUI regressions; that combined source has not been compiled or tested yet and
+is not an installed fix. No general retry timing bound or explanation of the
+historical Spectrum Save/Discard incident follows.
 
 Separately, draft [PR120](https://github.com/jeanc18rlos/fanta-edit/pull/120),
 head `dd3e0915c753a2eff62f68ead0f6e02f64f7b2fe`, passes canonical
@@ -94,6 +105,10 @@ Evidence under the local QA archive's `integration-20261007/`:
 - `release-resume-20261011/manual-root-window-close-restore-addendum-20261011.json`
 - `release-resume-20261011/export-format-review-20261011-run1/result.json`
 - `release-resume-20261011/manual-root-save-failure-discard-addendum-20261011.json`
+- `release-resume-20261011/manual-root-save-recovery-addendum-20261011.json`
+- `release-resume-20261011/manual-root-active-text-save-addendum-20261011.json`
+- `release-resume-20261011/manual-root-cold-restart-addendum-20261011.json`
+- `release-resume-20261011/manual-root-inspector-numeric-save-gap-20261011.json`
 - `release-resume-20261011/save-failure-matrix-preparation-v1-20261011/metadata-atime-qualification-01.json`
 - `release-resume-20261011/save-failure-matrix-preparation-v1-20261011/independent-fault-review-01.json`
 - `close-window-error-recovery-20261011/ci-pr120-v2/independent-terminal-review.json`

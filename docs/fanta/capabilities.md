@@ -35,8 +35,9 @@ conflicts, but cannot make a concurrent external write and rename atomic; see
 - Use the left panel to find and switch pages, rename, reorder, duplicate or
   delete pages, select layers, expand nesting, and drag layers into a different
   parent or position. Page roots and component recursion have edit guards.
-- Canvas edits support Undo/Redo and debounced autosave. Save commits active
-  valid property edits. Autosave can persist an edit while a close prompt is
+- Canvas edits support Undo/Redo and debounced autosave. Active canvas text can
+  be saved directly; the focused numeric-input exception below remains open.
+  Autosave can persist an edit while a close prompt is
   open; **Don't Save** does not roll back changes already written. Save As creates
   a separate project and rejects occupied or unsafe destinations. Clean canvas
   tabs restore their project and page/component scope when the workspace reopens.
@@ -47,9 +48,15 @@ conflicts, but cannot make a concurrent external write and rename atomic; see
   Save in the close prompt retained the dirty draft and logged an error without
   a separate close-error dialog; retrying the prompt and choosing Don't Save
   returned to welcome. Restoring permissions and reopening showed the original
-  saved text. This does not establish a successful Save retry after the fault or
-  rollback of previously saved edits. Repeated autosave retries and close-error
-  feedback remain open issues in the
+  saved text. In a later check, restoring writes allowed retry Save to finish
+  and the new text to reopen; autosave had already persisted it before the
+  choice. Active text CmdS and clean Quit/cold reopening also pass on that one
+  owned fixture, without proving rollback or the original incident's cause.
+  A separate build37 check found that a focused X-field draft was not committed
+  by CmdS and was lost on window Close without a prompt. Pressing Enter before
+  Save committed the value. Until this gap is fixed, commit numeric input with
+  Enter before saving or closing. The proposed autosave and close-error fixes
+  are not installed in build37; the bounded results and open issues are in the
   [latest acceptance record](../alpha/CAPABILITY_COVERAGE.md#current37-native-checks--11-october).
 - The **Code** workspace edits FNX and supported JSON sources. Saving valid
   source updates the canvas; invalid drafts preserve the last valid file and
