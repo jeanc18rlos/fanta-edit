@@ -3677,12 +3677,13 @@ impl FigView {
                 doc.active_page(),
             )
             .or_else(|| {
-                fanta_tools::NodeEditTool::vector_at_screen(
+                fanta_tools::NodeEditTool::vector_at_screen_with_refiner(
                     doc,
                     &viewport,
                     screen_size,
                     doc.active_page(),
                     screen,
+                    Some(crate::canvas::accepts_authoring_hit),
                 )
             });
             while let Some(container) = hit
@@ -18029,6 +18030,135 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn mounted_physical_leaf_entry_respects_rounded_ancestor_clips(cx: &mut TestAppContext) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        for kind in ["text", "vector", "bitmap"] {
+            for (clipping, local, enters) in [
+                (true, DVec2::new(1., 1.), false),
+                (true, DVec2::new(50., 50.), true),
+                (false, DVec2::new(1., 1.), true),
+            ] {
+                let (mut doc, node_id, assets) = bitmap_canvas_doc();
+                let data = match kind {
+                    "text" => NodeData::Text(TextNode::new("Visible text", 100., 100.)),
+                    "vector" => {
+                        NodeData::Vector(VectorNode::rect_solid(0., 0., 100., 100., Color::WHITE))
+                    }
+                    _ => {
+                        let mut bitmap = doc.scene.get(node_id).expect("bitmap").data.clone();
+                        assert!(bitmap.set_local_size(100., 100.));
+                        bitmap
+                    }
+                };
+                let transform =
+                    Transform2D::rotation(0.4).then(&Transform2D::translation(-50., -50.));
+                let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+                    clip_size: Some([100., 100.]),
+                    corner_radius: Some(50.),
+                    ..Default::default()
+                }));
+                frame.parent = doc.active_page();
+                frame.transform = transform;
+                frame.meta = serde_json::json!({"clip_content": clipping});
+                let frame_id = frame.id;
+                doc.scene.insert(frame).expect("rounded frame");
+                {
+                    let mut node = doc.scene.remove(node_id).expect("physical leaf");
+                    node.parent = Some(frame_id);
+                    node.transform = Transform2D::IDENTITY;
+                    node.data = data;
+                    doc.scene.insert(node).expect("reparented physical leaf");
+                }
+                doc.selection.select_only(node_id);
+                doc.history = Default::default();
+                let (item, view, mut visual) =
+                    mounted_canvas_interaction_fixture(&project, doc, assets, cx);
+                let snapshot = |item: &FigItem| {
+                    let document = item.document().expect("ready document");
+                    let mut doc = document.doc.clone();
+                    doc.selection.clear();
+                    (
+                        serde_json::to_value(doc).expect("authored document"),
+                        document.raw_assets.clone(),
+                    )
+                };
+                let original = item.read_with(&visual, |item, _| snapshot(item));
+                let position = view.read_with(&visual, |view, _| {
+                    let bounds = view.container_bounds.expect("mounted canvas");
+                    let viewport = view.viewport.expect("viewport");
+                    let (width, height) = bounds_size(bounds);
+                    let screen = fanta_canvas::world_to_screen(
+                        transform.transform_point(local),
+                        &viewport,
+                        DVec2::new(width, height),
+                    );
+                    bounds.origin + point(px(screen.x as f32), px(screen.y as f32))
+                });
+                visual.simulate_event(MouseDownEvent {
+                    button: MouseButton::Right,
+                    position,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                });
+                visual.simulate_event(MouseUpEvent {
+                    button: MouseButton::Right,
+                    position,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                });
+                visual.run_until_parked();
+                visual.update(|window, cx| window.draw(cx).clear());
+                view.read_with(&visual, |view, _| {
+                    assert!(view.canvas_context_menu.is_some(), "{kind}: real menu");
+                    assert!(view.text_edit.is_none());
+                    assert_eq!(view.active_tool(), ToolKind::Select);
+                });
+                item.read_with(&visual, |item, _| {
+                    assert_eq!(
+                        item.doc().expect("document").selection.contains(node_id),
+                        enters,
+                        "{kind}: menu at {local:?}, clipping {clipping}"
+                    );
+                    assert_eq!(snapshot(item), original);
+                    assert_eq!(item.doc().expect("document").history.undo_depth(), 0);
+                    assert!(!item.is_dirty());
+                });
+                visual.simulate_keystrokes("escape");
+                visual.run_until_parked();
+                item.update(&mut visual, |item, cx| {
+                    item.with_document(cx, |document| {
+                        document.doc.selection.select_only(node_id);
+                        ((), DocChange::Selection)
+                    });
+                });
+                visual.update(|window, cx| window.draw(cx).clear());
+                mounted_canvas_click(&mut visual, position, 2);
+                view.read_with(&visual, |view, _| {
+                    assert_eq!(
+                        view.text_edit.is_some(),
+                        enters && kind == "text",
+                        "{kind}: double-click at {local:?}, clipping {clipping}"
+                    );
+                    let tool = match (enters, kind) {
+                        (true, "vector") => ToolKind::NodeEdit,
+                        (true, "bitmap") => ToolKind::Crop,
+                        _ => ToolKind::Select,
+                    };
+                    assert_eq!(view.active_tool(), tool);
+                });
+                item.read_with(&visual, |item, _| {
+                    assert_eq!(snapshot(item), original);
+                    assert_eq!(item.doc().expect("document").history.undo_depth(), 0);
+                    assert!(!item.is_dirty());
+                });
+                visual.update(|window, _| window.remove_window());
+            }
+        }
+    }
+
+    #[gpui::test]
     async fn canvas_double_click_does_not_edit_covered_or_locked_text(cx: &mut TestAppContext) {
         init_test(cx);
         let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
@@ -20213,7 +20343,7 @@ mod tests {
                 }
             }
         };
-        let assert_crop_press = |visual: &gpui::VisualTestContext,
+        let assert_crop_press = |visual: &mut gpui::VisualTestContext,
                                  position: Point<Pixels>,
                                  stage: &str| {
             let diagnostic_regions: Vec<_> = [
@@ -20308,7 +20438,7 @@ mod tests {
         let cancel_start = position + point(px(-40.0), px(-20.0));
         let cancel_end = position + point(px(40.0), px(20.0));
         visual.simulate_mouse_down(cancel_start, MouseButton::Left, gpui::Modifiers::none());
-        assert_crop_press(&visual, cancel_start, "cancel preview after press");
+        assert_crop_press(&mut visual, cancel_start, "cancel preview after press");
         visual.simulate_mouse_move(cancel_end, MouseButton::Left, gpui::Modifiers::none());
         assert_crop_preview(&visual, "cancel preview after move before redraw");
         visual.simulate_mouse_up(cancel_end, MouseButton::Left, gpui::Modifiers::none());
@@ -20370,7 +20500,7 @@ mod tests {
         let start = position + point(px(-40.0), px(-20.0));
         let end = position + point(px(40.0), px(20.0));
         visual.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::none());
-        assert_crop_press(&visual, start, "apply preview after press");
+        assert_crop_press(&mut visual, start, "apply preview after press");
         visual.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::none());
         assert_crop_preview(&visual, "apply preview after move before redraw");
         view.read_with(&visual, |view, _| assert!(!view.tools.can_apply_crop()));

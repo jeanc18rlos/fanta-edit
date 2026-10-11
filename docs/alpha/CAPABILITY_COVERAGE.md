@@ -7,10 +7,13 @@ failures or missing content, and slow editing on large pages. The user now accep
 Spectrum performance. The original save/close incident remains unexplained.
 Internal Mac build43 passes the bounded ordinary-Text Save/error/retry and node
 samples below. Both `ab9faf717` Check runs pass 74/77 required names and fail
-three Crop cases. The hosted TextPath and recreated-entry regressions now pass,
-but the separate dependency blur fixture fails and its test-only successor is
-pending. Matching fractional native verification, earlier unexplained Boolean
-attempts and wider recovery/distribution requirements remain open.
+three Crop cases. The hosted TextPath and recreated-entry regressions pass at
+that source. The dependency `3e78` rerun now passes all nine required property
+regressions. Published host `86c`'s push Check fails to compile the new Crop test
+diagnostics; no editor tests execute there. A reviewed test compile correction
+and rounded-ancestor click repair are prepared; their matching hosted and native
+acceptance remain pending. Matching fractional native verification, earlier
+unexplained Boolean attempts and recovery/distribution requirements remain open.
 
 The selected distribution is a **direct-download Mac app**. Final acceptance
 must use the signed, notarized DMG and the app installed from that exact DMG.
@@ -32,6 +35,42 @@ identifies their scope and the remaining acceptance work. Historical evidence in
 recorded there.
 
 ## Current acceptance status
+
+### Published 86c checks and rounded-clip successor — 11 October
+
+The exact dependency revision `3e78e85fba99491b1c640f449ec706b4c483378d`
+passes all nine required property regressions in
+[run 38150035768](https://github.com/squidred-dev/fanta-ui/actions/runs/38150035768).
+The GPUI library records 921 passes, zero failures and one ignored; formatting,
+checking, denied-warning lint and 43 package verifications also pass. This is
+the test-only active-window correction to the retained `a795a7ed` blur failure;
+production dependency code is unchanged.
+
+The published host `86c811343` pins `3e78`. Its
+[push Check](https://github.com/jeanc18rlos/fanta-edit/actions/runs/38152705179)
+compiles the app/CLI, but editor-test compilation fails `E0596`: the new bounded
+Crop diagnostic needs a mutable `VisualTestContext` for `debug_bounds`.
+Only 35/77 required names have actual passes (workspace5 and independent30);
+42 editor cases are compile-blocked. All 238 workspace and 20 Store tests pass.
+The reviewed three-`mut` correction preserves the existing gestures and
+assertions. There is no new Crop mouse-delivery result and the prior three
+Crop runtime failures remain unresolved.
+
+The prepared authoring repair applies the existing rounded-ancestor mask to
+physical Text, Vector and Bitmap targets, and filters each Vector fallback
+candidate so a visible underlying path can still receive the click. It keeps
+the existing public Vector helper, scopes, selected controls and screen-space
+tolerance. Three new geometry/tool/mounted-menu and double-click regressions
+are source-reviewed. They and the existing transformed-parent TextPath test
+are added to the strict required gate: 51 core plus 30 independent, 81 total.
+No passing result is claimed for that unpublished successor or its new tests.
+
+Internal build44 is `ab9faf717`, older than this successor; its exact package
+and native validation remain required. The local notarization profile has been
+validated, but no shipping package has been signed, notarized or stapled.
+Production Agent request journeys remain unaccepted: the existing request-count
+control does not establish an aggregate credit cap. Earlier bounded image
+request/debit and cold-session acceptance remains recorded below.
 
 ### ab9 hosted checks and build43 native samples — 11 October
 
@@ -58,10 +97,11 @@ before its later Enter/subsequent-edit checks. The real-edit fractional test and
 seven retained controls pass; `fanta-gpui` records 920 passes, one failure and
 one ignored. Later dependency lint/package stages are skipped. The reviewed
 test-only successor `3e78e85fba99491b1c640f449ec706b4c483378d` activates the test
-window and asserts focus; production dependency source is unchanged. This release
-candidate updates only the 41 manifest revision references and 84 lockfile
-revision occurrences. Its hosted rerun and the host checks with that pin remain
-pending. Host success does not substitute for the failed dependency case.
+window and asserts focus; production dependency source is unchanged. Its later
+actual CI passes all nine required cases, including untouched blur, as recorded
+above. Host86c updates the 41 manifest revision references and 84 lockfile revision
+occurrences. Its editor compilation failure is separate and leaves the host
+runtime gate unresolved. The original dependency failure remains in the record.
 
 Internal build43 is exact `1f838bf20`, with dependency `026496ed`; it does not
 contain the fractional repair or the latest recreated-entry fix. Root's owned
@@ -117,9 +157,11 @@ preview/commit sequences. The existing required unchanged-field host test retain
 its original close journey and adds mounted fractional X/Y focus, Enter, blur,
 invalid/Escape and real-edit checks. A new geometry/history test covers a rotated
 TextPath under a transformed parent. All 77 required names and their original
-oracles are preserved. Source review, formatting and patch checks pass; these
-new and extended tests have not executed. Matching dependency CI, host
-`--locked` checks and packaged native verification remain required. The native
+oracles are preserved. At this 14:15 source checkpoint the new and extended
+tests had not executed. Later `ab9` host tests and dependency `3e78` tests pass as
+recorded above; host `86c` editor compilation is blocked by its new Crop diagnostic.
+Matching packaged native verification and the complete final host gate remain
+required. The native
 focus mechanism remains a source-supported inference, without a captured
 transient Preview or transform. This does not resolve the Crop failures or
 earlier Boolean attempts below.

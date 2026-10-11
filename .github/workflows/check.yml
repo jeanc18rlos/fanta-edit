@@ -114,7 +114,11 @@ jobs:
                   "canvas_session_empty_restore_allows_only_newly_added_project_auto_open",
                   "canvas_session_legacy_manifest_root_restores_once_then_keeps_empty_layout",
                   "canvas_session_manifest_normalization_preserves_ordinary_and_malformed_files",
-                  "canvas_session_explicit_reused_open_survives_later_manifest_read_failure"
+                  "canvas_session_explicit_reused_open_survives_later_manifest_read_failure",
+                  "rounded_ancestor_clips_filter_physical_authoring_hits",
+                  "rounded_ancestor_vector_fallback_preserves_tolerance_and_visible_candidates",
+                  "mounted_physical_leaf_entry_respects_rounded_ancestor_clips",
+                  "text_path_position_matches_visual_bounds_and_undo_under_transformed_parent"
               ],
               "workspace": [
                   "test_close_window_reports_save_failure_and_retries",
@@ -144,7 +148,7 @@ jobs:
                   actual = [(full_name, status) for full_name, status in tests if full_name.rsplit("::", 1)[-1] == name]
                   checks[label][name] = {"actual": actual, "passed": len(actual) == 1 and actual[0][1] == "ok"}
           passed = all(stage_checks.values()) and all(result["passed"] for group in checks.values() for result in group.values())
-          report = {"passed": passed, "required_count": 47, "stages": stage_checks, "groups": checks,
+          report = {"passed": passed, "required_count": 51, "stages": stage_checks, "groups": checks,
                     "scope": "Actual full-suite offline editor/workspace execution; the separate30 Agent/ACP/Settings gate remains required. No native, GPU, service or performance acceptance."}
           (output / "required-core-regressions.json").write_text(json.dumps(report, indent=2) + "\n")
           print(json.dumps(report))

@@ -106,8 +106,10 @@ conflicts, but cannot make a concurrent external write and rename atomic; see
   Escape restores it and saved files remain unchanged. A source repair prevents
   untouched fields from changing values and preserves the precision of real
   position edits. The `ab9faf717` host fractional and transformed-parent tests
-  pass; the separate dependency untouched-blur test fails and a test-only window
-  activation correction is pending. Matching fractional native acceptance remains
+  pass. The original dependency untouched-blur failure remains recorded; its
+  test-only window activation successor `3e78` now passes all nine required cases.
+  Host86c pins that revision but its new Crop diagnostic fails test compilation,
+  leaving the full host gate open. Matching fractional native acceptance remains
   open; build43 has the older dependency.
   Both published `29890b774` Check runs pass 72/77 and fail five runtime cases.
   Matching lint and Skia source checks pass separately. Build42 does not accept later Save All/error feedback,
@@ -129,7 +131,15 @@ conflicts, but cannot make a concurrent external write and rename atomic; see
   not establish multi-document failure ordering or shared Discard. Crop
   Cancel clears a pending preview but keeps the tool active; a subsequent Cancel
   or Escape exits it. This is separate from the three failing hosted Crop cases.
-  See the [current scoped results](../alpha/CAPABILITY_COVERAGE.md#ab9-hosted-checks-and-build43-native-samples--11-october).
+  See the [current scoped results](../alpha/CAPABILITY_COVERAGE.md#published-86c-checks-and-rounded-clip-successor--11-october).
+- **Prepared rounded-corner targeting repair:** invisible physical Text, Vector
+  and Bitmap children behind a rounded ancestor clip are excluded from authoring
+  hits. Vector fallback applies the same filter to every candidate and retains
+  a visible path underneath. Existing parent-frame bounds and selected controls
+  keep their authoring behavior. Three new geometry/tool/mounted-entry tests and
+  the existing transformed-parent TextPath test join the required 81-name gate.
+  This is reviewed source awaiting matching hosted and packaged native results;
+  it does not establish a passing release or resolve the retained Crop failures.
 - The **Code** workspace edits FNX and supported JSON sources. Saving valid
   source updates the canvas; invalid drafts preserve the last valid file and
   scene. Multi-buffer Save is sequential, not atomic: in a bounded build39 check,
