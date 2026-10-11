@@ -12312,6 +12312,188 @@ mod tests {
         assert_property_draft_persistence("40", "Close", false, cx)
             .await
             .expect("unchanged field");
+        use crate::properties_snapshot::selection_world_geometry;
+        use fanta_gpui::design::DesignPropertyDraftState;
+
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        for horizontal in [true, false] {
+            let (mut doc, _, images) = bitmap_canvas_doc();
+            let mut baseline = fanta_doc::PathData::new();
+            baseline
+                .move_to(0.0, 55.0)
+                .quad_to(185.0, -35.0, 370.0, 55.0);
+            let mut text_path = fanta_doc::TextPathNode::new(baseline, "QA PATH");
+            text_path.style.size_px = 32.0;
+            let bounds = fanta_render::text_path_visual_bounds(&text_path).expect("shaped text");
+            let mut node = CanvasNode::new(NodeData::TextPath(text_path));
+            node.parent = doc.active_page();
+            node.transform =
+                Transform2D::translation(55.375 - bounds.min_x, 356.375 - bounds.min_y);
+            let id = node.id;
+            doc.apply(Operation::create_node(node)).expect("TextPath");
+            doc.history = Default::default();
+            let (item, view, _host, mut visual) = pane_layout_fixture(&project, doc, images, cx);
+            item.update(&mut visual, |item, cx| {
+                item.with_document(cx, |document| {
+                    document.doc.selection.select_only(id);
+                    ((), DocChange::Selection)
+                })
+                .expect("select mounted TextPath");
+            });
+            draw_pane_layout(&mut visual);
+            let panel = view.read_with(&visual, |view, _| {
+                view.gpui_design.as_ref().expect("Design").panel.clone()
+            });
+            let snapshot = |item: &FigItem| {
+                let document = item.document().expect("document");
+                (
+                    serde_json::to_value(&document.doc).expect("full document"),
+                    document.raw_assets.clone(),
+                    document.doc.scene.get(id).expect("TextPath").transform,
+                    selection_world_geometry(&document.doc, id).expect("visual bounds"),
+                    document.doc.history.undo_depth(),
+                    document.doc.history.redo_depth(),
+                    item.is_dirty(),
+                )
+            };
+            let before = item.read_with(&visual, |item, _| {
+                assert!(!item.is_dirty());
+                assert_eq!(item.doc().expect("document").history.undo_depth(), 0);
+                assert_eq!(item.doc().expect("document").history.redo_depth(), 0);
+                snapshot(item)
+            });
+            let original_doc =
+                item.read_with(&visual, |item, _| item.doc().expect("document").clone());
+            let original = before.3;
+            let coordinate = if horizontal { original.x } else { original.y };
+            let initial_text = if horizontal { "55.38" } else { "356.38" };
+            assert_ne!(
+                coordinate as f32,
+                initial_text.parse::<f32>().expect("rounded display")
+            );
+            let selector = if horizontal {
+                "fig-gpui-design-x"
+            } else {
+                "fig-gpui-design-y"
+            };
+            for terminal in ["blur", "enter", "invalid-cancel"] {
+                let field_center = visual
+                    .debug_bounds(selector)
+                    .expect("mounted position input")
+                    .center();
+                visual.simulate_click(field_center, gpui::Modifiers::none());
+                draw_pane_layout(&mut visual);
+                assert_eq!(
+                    panel.read_with(&visual, |panel, cx| panel.property_draft_state(cx)),
+                    DesignPropertyDraftState::Unchanged
+                );
+                item.read_with(&visual, |item, _| {
+                    assert_eq!(
+                        snapshot(item),
+                        before,
+                        "focus must not author a rounded seed"
+                    )
+                });
+                view.read_with(&visual, |view, cx| {
+                    assert!(!view.is_dirty(cx));
+                    assert!(!view.has_pending_view_edits(cx));
+                });
+                visual.simulate_keystrokes("cmd-a cmd-c");
+                assert_eq!(
+                    visual
+                        .read_from_clipboard()
+                        .expect("actual input")
+                        .text()
+                        .as_deref(),
+                    Some(initial_text)
+                );
+                match terminal {
+                    "blur" => view.update_in(&mut visual, |view, window, cx| {
+                        view.focus_handle.focus(window, cx)
+                    }),
+                    "enter" => visual.simulate_keystrokes("enter"),
+                    "invalid-cancel" => {
+                        visual.simulate_input("bad");
+                        draw_pane_layout(&mut visual);
+                        assert_eq!(
+                            panel.read_with(&visual, |panel, cx| panel.property_draft_state(cx)),
+                            DesignPropertyDraftState::Invalid
+                        );
+                        item.read_with(&visual, |item, _| {
+                            assert_eq!(snapshot(item), before, "invalid text must not preview")
+                        });
+                        view.read_with(&visual, |view, cx| {
+                            assert!(view.has_pending_view_edits(cx))
+                        });
+                        visual.simulate_keystrokes("escape");
+                    }
+                    _ => unreachable!(),
+                }
+                draw_pane_layout(&mut visual);
+                assert_eq!(
+                    panel.read_with(&visual, |panel, cx| panel.property_draft_state(cx)),
+                    DesignPropertyDraftState::None
+                );
+                item.read_with(&visual, |item, _| {
+                    assert_eq!(
+                        snapshot(item),
+                        before,
+                        "unchanged terminal must preserve authored state"
+                    )
+                });
+                view.read_with(&visual, |view, cx| assert!(!view.is_dirty(cx)));
+            }
+            let field_center = visual
+                .debug_bounds(selector)
+                .expect("position input")
+                .center();
+            visual.simulate_click(field_center, gpui::Modifiers::none());
+            visual.simulate_keystrokes("cmd-a");
+            let target = if horizontal { 72.125 } else { 392.125 };
+            visual.simulate_input(&target.to_string());
+            draw_pane_layout(&mut visual);
+            item.read_with(&visual, |item, _| {
+                let preview = snapshot(item);
+                assert!(preview.6, "a genuine preview remains dirty");
+                assert_eq!((preview.4, preview.5), (0, 0));
+                let actual = if horizontal { preview.3.x } else { preview.3.y };
+                assert!((actual - target).abs() < 1.0e-9);
+            });
+            visual.simulate_keystrokes("enter");
+            draw_pane_layout(&mut visual);
+            assert_eq!(
+                panel.read_with(&visual, |panel, cx| panel.property_draft_state(cx)),
+                DesignPropertyDraftState::None
+            );
+            item.read_with(&visual, |item, _| {
+                let after = snapshot(item);
+                assert!(after.6);
+                assert_eq!((after.4, after.5), (1, 0));
+                assert_eq!(after.1, before.1);
+                let geometry = after.3;
+                let actual = if horizontal { geometry.x } else { geometry.y };
+                let other = if horizontal {
+                    geometry.y - original.y
+                } else {
+                    geometry.x - original.x
+                };
+                assert!((actual - target).abs() < 1.0e-9);
+                assert!(other.abs() < 1.0e-9);
+                assert!((geometry.width - original.width).abs() < 1.0e-9);
+                assert!((geometry.height - original.height).abs() < 1.0e-9);
+                let doc = item.doc().expect("committed document");
+                let mut expected_scene = original_doc.scene.clone();
+                expected_scene
+                    .set_transform(id, after.2)
+                    .expect("expected position");
+                assert_eq!(
+                    serde_json::to_value(&doc.scene).expect("committed scene"),
+                    serde_json::to_value(expected_scene).expect("expected scene")
+                );
+                assert_eq!(doc.selection.iter().copied().collect::<Vec<_>>(), vec![id]);
+            });
+        }
     }
 
     #[cfg(target_os = "macos")]

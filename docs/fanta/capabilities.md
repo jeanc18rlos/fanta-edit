@@ -101,7 +101,10 @@ conflicts, but cannot make a concurrent external write and rename atomic; see
   rejection/Close Without Saving and locked-leaf canvas samples pass within their stated
   scope. Earlier Boolean entry failures remain unexplained despite later traced
   success. Merely focusing TextPath X now reproduces a shifted, dirty preview;
-  Escape restores it and saved files remain unchanged. This is still open.
+  Escape restores it and saved files remain unchanged. A source repair prevents
+  untouched fields from changing values and preserves the precision of real
+  position edits. Hosted and matching packaged native checks remain pending;
+  the installed issue is still open.
   Both published `29890b774` Check runs pass 72/77 and fail five runtime cases.
   Matching lint and Skia source checks pass separately. Build42 does not accept later Save All/error feedback,
   captured-Open or the prepared identity/test corrections. See the

@@ -7,8 +7,8 @@
 use std::collections::HashMap;
 
 use fanta_canvas::{
-    HAlign, ResizeHandle, VAlign, align_to_bounds_h, align_to_bounds_v, resize_box_keep_rotation,
-    resize_transform_keep_rotation, rotate_about, transform_angle,
+    ResizeHandle, resize_box_keep_rotation, resize_transform_keep_rotation, rotate_about,
+    transform_angle,
 };
 use fanta_doc::{
     BlendMode, Blur, BlurKind, Bounds as FantaBounds, CanvasNode, Color as FantaColor,
@@ -24,6 +24,7 @@ use crate::color_picker::{representative_gradient_color, seed_gradient_from_colo
 use crate::properties_snapshot::{
     CornerRadiusValue, FONT_WEIGHTS, InspectorField, NodeSnapshot, PaintKind, auto_layout_snapshot,
     corner_radius_value, corner_smoothing_value, master_roots, resolved_instance_def,
+    selection_world_geometry,
 };
 
 pub(crate) const DEFAULT_FILL_COLOR: FantaColor = FantaColor::rgb(217, 217, 217);
@@ -136,24 +137,10 @@ pub(crate) fn field_operations(doc: &Doc, field: &InspectorField, text: &str) ->
             }]
         }
         InspectorField::X(id) => parse_number(text)
-            .map(|x| {
-                align_to_bounds_h(
-                    scene,
-                    &[*id],
-                    FantaBounds::from_xywh(x, 0.0, 0.0, 0.0),
-                    HAlign::Left,
-                )
-            })
+            .map(|x| position_operations(doc, *id, x, true))
             .unwrap_or_default(),
         InspectorField::Y(id) => parse_number(text)
-            .map(|y| {
-                align_to_bounds_v(
-                    scene,
-                    &[*id],
-                    FantaBounds::from_xywh(0.0, y, 0.0, 0.0),
-                    VAlign::Top,
-                )
-            })
+            .map(|y| position_operations(doc, *id, y, false))
             .unwrap_or_default(),
         InspectorField::Width(id) => parse_number(text)
             .map(|width| resize_operations(doc, *id, width, true))
@@ -444,8 +431,8 @@ pub(crate) fn read_field_text(doc: &Doc, field: &InspectorField) -> Option<Strin
             .into_iter()
             .find(|comment| comment.id == *id)
             .map(|comment| comment.text),
-        InspectorField::X(id) => scene.world_bounds(*id).map(|b| format_number(b.min_x)),
-        InspectorField::Y(id) => scene.world_bounds(*id).map(|b| format_number(b.min_y)),
+        InspectorField::X(id) => selection_world_geometry(doc, *id).map(|b| format_number(b.x)),
+        InspectorField::Y(id) => selection_world_geometry(doc, *id).map(|b| format_number(b.y)),
         InspectorField::Width(id) => inspector_world_size(doc, *id)
             .map(|(w, _)| w)
             .or_else(|| scene.world_bounds(*id).map(|b| b.width()))
@@ -1197,6 +1184,48 @@ pub(crate) fn finite_transform_operations(operations: Vec<Operation>) -> Vec<Ope
         .collect()
 }
 
+pub(crate) fn position_operations(
+    doc: &Doc,
+    id: NodeId,
+    coordinate: f64,
+    horizontal: bool,
+) -> Vec<Operation> {
+    let Some(geometry) = selection_world_geometry(doc, id) else {
+        return Vec::new();
+    };
+    let current = if horizontal { geometry.x } else { geometry.y };
+    if coordinate == current {
+        return Vec::new();
+    }
+    let Some(node) = doc.scene.get(id) else {
+        return Vec::new();
+    };
+    let parent_world = node
+        .parent
+        .and_then(|parent| doc.scene.world_transform(parent))
+        .unwrap_or(Transform2D::IDENTITY);
+    let determinant = parent_world.0.matrix2.determinant();
+    if !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
+        return Vec::new();
+    }
+    // TextPath's scene bounds include a conservative hit-test band; inspector
+    // position edits must translate the same painted box as its readout.
+    let world_delta = if horizontal {
+        DVec2::new(coordinate - current, 0.0)
+    } else {
+        DVec2::new(0.0, coordinate - current)
+    };
+    let local_delta = parent_world.inverse().transform_vector(world_delta);
+    let new = node
+        .transform
+        .then(&Transform2D::translation(local_delta.x, local_delta.y));
+    finite_transform_operations(vec![Operation::SetTransform {
+        id,
+        old: node.transform,
+        new,
+    }])
+}
+
 pub(crate) fn rotation_operations(doc: &Doc, id: NodeId, degrees: f64) -> Vec<Operation> {
     let scene = &doc.scene;
     let Some(node) = scene.get(id) else {
@@ -1811,6 +1840,83 @@ mod tests {
             .expect("text path should have conservative document bounds");
         assert_ne!(exact, conservative);
         (text_path, exact)
+    }
+
+    #[test]
+    fn text_path_position_matches_visual_bounds_and_undo_under_transformed_parent() {
+        for transformed_parent in [false, true] {
+            for horizontal in [false, true] {
+                let (text_path, _) = text_path_with_exact_bounds();
+                let mut doc = Doc::new();
+                let mut parent = CanvasNode::new(NodeData::Group(GroupNode::default()));
+                if transformed_parent {
+                    parent.transform = Transform2D::scale_xy(1.4, 0.7)
+                        .then(&Transform2D::rotation(0.4))
+                        .then(&Transform2D::translation(80.0, -25.0));
+                }
+                let parent_id = parent.id;
+                doc.scene.insert(parent).expect("parent");
+                let mut node = CanvasNode::new(NodeData::TextPath(text_path));
+                node.parent = Some(parent_id);
+                node.transform =
+                    Transform2D::rotation(-0.25).then(&Transform2D::translation(60.375, 365.125));
+                let id = node.id;
+                let original_data = node.data.clone();
+                doc.scene.insert(node).expect("TextPath");
+                doc.selection.replace_with([id]);
+                let before = serde_json::to_value(&doc.scene).expect("scene");
+                let geometry = selection_world_geometry(&doc, id).expect("visual geometry");
+                let conservative = doc.scene.world_bounds(id).expect("scene bounds");
+                assert_ne!(
+                    (geometry.x, geometry.y),
+                    (conservative.min_x, conservative.min_y)
+                );
+                let field = if horizontal {
+                    InspectorField::X(id)
+                } else {
+                    InspectorField::Y(id)
+                };
+                let current = if horizontal { geometry.x } else { geometry.y };
+                assert_eq!(read_field_text(&doc, &field), Some(format_number(current)));
+                assert!(position_operations(&doc, id, current, horizontal).is_empty());
+                assert!(field_operations(&doc, &field, "bad").is_empty());
+                assert_eq!(
+                    serde_json::to_value(&doc.scene).expect("unchanged scene"),
+                    before
+                );
+                let target_text = format_number(current + 37.25);
+                let target = parse_number(&target_text).expect("target");
+                let operations = field_operations(&doc, &field, &target_text);
+                assert_eq!(operations.len(), 1);
+                doc.history.begin("Position", &mut doc.scene);
+                for operation in operations {
+                    doc.apply(operation).expect("position");
+                }
+                doc.history.commit(&mut doc.scene);
+                let actual = selection_world_geometry(&doc, id).expect("moved visual geometry");
+                let (position, unchanged_position) = if horizontal {
+                    (actual.x, actual.y - geometry.y)
+                } else {
+                    (actual.y, actual.x - geometry.x)
+                };
+                assert!((position - target).abs() < 1.0e-9);
+                assert!(unchanged_position.abs() < 1.0e-9);
+                assert!((actual.width - geometry.width).abs() < 1.0e-9);
+                assert!((actual.height - geometry.height).abs() < 1.0e-9);
+                assert_eq!(doc.scene.get(id).expect("TextPath").data, original_data);
+                assert_eq!(doc.selection.iter().copied().collect::<Vec<_>>(), vec![id]);
+                assert_eq!(read_field_text(&doc, &field), Some(target_text));
+                assert_eq!(doc.history.undo_depth(), 1);
+                assert!(doc.undo().expect("undo position"));
+                assert_eq!(
+                    serde_json::to_value(&doc.scene).expect("restored scene"),
+                    before
+                );
+                assert!(doc.redo().expect("redo position"));
+                let redone = selection_world_geometry(&doc, id).expect("redone geometry");
+                assert_eq!(redone, actual);
+            }
+        }
     }
 
     #[test]

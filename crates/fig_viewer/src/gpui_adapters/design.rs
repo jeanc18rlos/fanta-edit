@@ -68,9 +68,9 @@ use crate::properties_ops::{
     apply_preview_operation, blurs_operations, default_blur, default_shadow,
     detach_instance_operations, effects_operations, field_operations, finite_transform_operations,
     format_number, instance_prop_operations, layout_gap_operations, layout_limit_operations,
-    layout_padding_operations, parse_color, parse_number, read_field_text, replace_data_operation,
-    restore_snapshot, set_clip_content_meta_operation, set_corner_radius_corner, set_fill_color,
-    shadow_field_operations, stroke_list_mut,
+    layout_padding_operations, parse_color, parse_number, position_operations, read_field_text,
+    replace_data_operation, restore_snapshot, set_clip_content_meta_operation,
+    set_corner_radius_corner, set_fill_color, shadow_field_operations, stroke_list_mut,
 };
 use crate::properties_snapshot::PaintKind as EnginePaintKind;
 use crate::properties_snapshot::{
@@ -8383,8 +8383,8 @@ fn property_operations(
     };
 
     match (property, value) {
-        (P::X, _) => field(InspectorField::X(id), number(value)?),
-        (P::Y, _) => field(InspectorField::Y(id), number(value)?),
+        (P::X, _) => Some(position_operations(doc, id, number(value)?, true)),
+        (P::Y, _) => Some(position_operations(doc, id, number(value)?, false)),
         (P::Width, _) => field(InspectorField::Width(id), number(value)?),
         (P::Height, _) => field(InspectorField::Height(id), number(value)?),
         (P::Rotation, V::AngleRadians(radians)) => field(

@@ -33,6 +33,29 @@ recorded there.
 
 ## Current acceptance status
 
+### Fractional inspector source repair — 11 October, 14:15 UTC
+
+The reviewed successor now includes a repair for the build42 TextPath focus
+failure. The component avoids previewing its untouched initial display value
+and cancels untouched Enter/blur without changing the existing terminal behavior
+after a real preview. Host X/Y edits use the same visible bounds as the inspector
+readout, convert translations through transformed parents and preserve authored
+fractional values. The dependency revision is
+`a795a7ed5079f8c04e3b035d307d4e27ec8f1026` in draft
+[PR12](https://github.com/squidred-dev/fanta-ui/pull/12).
+
+Two new component tests cover untouched fractional focus/Enter/blur and genuine
+preview/commit sequences. The existing required unchanged-field host test retains
+its original close journey and adds mounted fractional X/Y focus, Enter, blur,
+invalid/Escape and real-edit checks. A new geometry/history test covers a rotated
+TextPath under a transformed parent. All 77 required names and their original
+oracles are preserved. Source review, formatting and patch checks pass; these
+new and extended tests have not executed. Matching dependency CI, host
+`--locked` checks and packaged native verification remain required. The native
+focus mechanism remains a source-supported inference, without a captured
+transient Preview or transform. This does not resolve the Crop failures or
+earlier Boolean attempts below.
+
 ### Build42 native samples and 29890b test successor — 11 October
 
 Published `29890b774` changes tests only. Both canonical and push Check now have
