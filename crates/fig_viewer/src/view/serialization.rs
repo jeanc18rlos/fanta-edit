@@ -807,15 +807,23 @@ mod tests {
         assert_eq!(active_root(&workspace, cx), original_root);
         assert_eq!(project_bytes(fixture.directory.path()), original_bytes);
         drop(subscription);
+        let restored_manifest = manifest.with_file_name("restored-manifest");
         fixture
             .file_system
-            .remove_file(&manifest, fs::RemoveOptions::default())
-            .await
-            .expect("remove injected abstract symlink");
-        fixture
-            .file_system
-            .insert_file(&manifest, manifest_bytes)
+            .insert_file(&restored_manifest, manifest_bytes)
             .await;
+        fixture
+            .file_system
+            .rename(
+                &restored_manifest,
+                &manifest,
+                fs::RenameOptions {
+                    overwrite: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("replace injected abstract symlink with original manifest");
         fixture.file_system.unpause_events_and_flush();
         cx.run_until_parked();
         let reopened_again = explicit_manifest_open(window, manifest, cx).await;
@@ -858,7 +866,8 @@ mod tests {
             1
         );
         assert_eq!(
-            active_root(&workspace, cx),
+            std::fs::canonicalize(active_root(&workspace, cx))
+                .expect("opened project canonical path"),
             std::fs::canonicalize(fixture.directory.path().join("Other"))
                 .expect("new project canonical path")
         );
@@ -927,14 +936,21 @@ mod tests {
                 .count()),
             1
         );
-        assert_eq!(
-            restored.read_with(cx, |workspace, cx| workspace
+        restored.read_with(cx, |workspace, cx| {
+            let view = workspace
                 .active_item_as::<FigView>(cx)
-                .expect("restored legacy canvas")
-                .read(cx)
-                .selected_page_root),
-            Some(fixture.pages[1])
-        );
+                .expect("restored legacy canvas");
+            let view = view.read(cx);
+            assert_eq!(view.scope, Some(FigScope::Page(fixture.pages[1])));
+            assert_eq!(
+                view.item
+                    .read(cx)
+                    .doc()
+                    .expect("restored legacy document")
+                    .active_page(),
+                Some(fixture.pages[1])
+            );
+        });
         assert_eq!(
             restored.read_with(cx, |workspace, cx| workspace
                 .root_paths(cx)

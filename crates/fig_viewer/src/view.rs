@@ -19701,7 +19701,15 @@ mod tests {
                         .debug_bounds(trailing_selector)
                         .expect("accessible trailing mode control");
                     assert!(trailing.is_contained_within(&viewport));
-                    assert!(row.is_contained_within(&viewport));
+                    // GPUI point containment excludes the bottom/right edges; a fitting
+                    // scroll row can share those edges with its viewport.
+                    assert!(
+                        row.left() >= viewport.left()
+                            && row.top() >= viewport.top()
+                            && row.right() <= viewport.right()
+                            && row.bottom() <= viewport.bottom(),
+                        "{mode:?} at {canvas_width}: row {row:?} / viewport {viewport:?}"
+                    );
                     assert!(visual.debug_bounds("toolbar-primary-fade-start").is_none());
                     assert!(visual.debug_bounds("toolbar-primary-fade-end").is_none());
                 }
@@ -19914,7 +19922,9 @@ mod tests {
             view.read_with(&visual, |view, _| view.viewport()),
             Some(Viewport::default())
         );
-        let assert_controls = |visual: &mut gpui::VisualTestContext, hint_visible: bool| {
+        let assert_controls = |visual: &mut gpui::VisualTestContext,
+                               hint_visible: bool,
+                               stage: &str| {
             let canvas = visual.debug_bounds("fig-container").expect("canvas");
             let controls = visual
                 .debug_bounds("design-crop-controls")
@@ -19938,7 +19948,15 @@ mod tests {
                 occupied.push(bounds);
             }
             let hint = visual.debug_bounds("design-crop-hint");
-            assert_eq!(hint.is_some(), hint_visible);
+            view.read_with(visual, |view, _| {
+                assert_eq!(
+                    hint.is_some(), hint_visible,
+                    "{stage} at {canvas_width}: canvas={canvas:?}, controls={controls:?}, hint={hint:?}, tool={:?}, pressed={}, canvas_pressed={}, ready={}, viewport={:?}, container={:?}, overlays={:?}",
+                    view.active_tool(), view.primary_pressed, view.canvas_pointer_down,
+                    view.tools.can_apply_crop(), view.viewport(), view.container_bounds,
+                    view.tools.overlays,
+                );
+            });
             if let Some(hint) = hint {
                 assert!(hint.is_contained_within(&controls), "hint must not clip");
                 occupied.push(hint);
@@ -19951,6 +19969,31 @@ mod tests {
                     );
                 }
             }
+        };
+        let assert_crop_press = |visual: &gpui::VisualTestContext, stage: &str| {
+            view.read_with(visual, |view, _| {
+                assert_eq!(view.active_tool(), ToolKind::Crop, "{stage}");
+                assert!(
+                    view.primary_pressed && view.canvas_pointer_down,
+                    "{stage} at {canvas_width}: pressed={}, canvas_pressed={}, ready={}, viewport={:?}, container={:?}, overlays={:?}",
+                    view.primary_pressed, view.canvas_pointer_down,
+                    view.tools.can_apply_crop(), view.viewport(), view.container_bounds,
+                    view.tools.overlays,
+                );
+            });
+        };
+        let assert_crop_preview = |visual: &gpui::VisualTestContext, stage: &str| {
+            view.read_with(visual, |view, _| {
+                assert!(
+                    view.tools.overlays.iter().any(|overlay| matches!(
+                        overlay, fanta_tools::ToolOverlay::PreviewRect { .. }
+                    )),
+                    "{stage} at {canvas_width}: tool={:?}, pressed={}, canvas_pressed={}, ready={}, viewport={:?}, container={:?}, overlays={:?}",
+                    view.active_tool(), view.primary_pressed, view.canvas_pointer_down,
+                    view.tools.can_apply_crop(), view.viewport(), view.container_bounds,
+                    view.tools.overlays,
+                );
+            });
         };
         let position = view.read_with(&visual, |view, _| {
             view.container_bounds.expect("canvas").center()
@@ -19986,7 +20029,7 @@ mod tests {
         };
         mounted_canvas_click(&mut visual, position, 2);
         draw_pane_layout(&mut visual);
-        assert_controls(&mut visual, true);
+        assert_controls(&mut visual, true, "entered Crop");
         view.read_with(&visual, |view, _| {
             assert_eq!(view.active_tool(), ToolKind::Crop);
             assert!(!view.tools.can_apply_crop());
@@ -20001,10 +20044,21 @@ mod tests {
         let cancel_start = position + point(px(-40.0), px(-20.0));
         let cancel_end = position + point(px(40.0), px(20.0));
         visual.simulate_mouse_down(cancel_start, MouseButton::Left, gpui::Modifiers::none());
+        assert_crop_press(&visual, "cancel preview after press");
         visual.simulate_mouse_move(cancel_end, MouseButton::Left, gpui::Modifiers::none());
+        assert_crop_preview(&visual, "cancel preview after move before redraw");
         visual.simulate_mouse_up(cancel_end, MouseButton::Left, gpui::Modifiers::none());
+        assert_crop_preview(&visual, "cancel preview after release before redraw");
+        view.read_with(&visual, |view, _| {
+            assert!(
+                view.tools.can_apply_crop(),
+                "cancel preview after release at {canvas_width}: pressed={}, canvas_pressed={}, viewport={:?}, container={:?}, overlays={:?}",
+                view.primary_pressed, view.canvas_pointer_down, view.viewport(),
+                view.container_bounds, view.tools.overlays,
+            );
+        });
         draw_pane_layout(&mut visual);
-        assert_controls(&mut visual, false);
+        assert_controls(&mut visual, false, "released cancel preview after redraw");
         view.read_with(&visual, |view, _| assert!(view.tools.can_apply_crop()));
         assert_unedited(&visual);
         let cancel = visual
@@ -20013,7 +20067,7 @@ mod tests {
             .center();
         visual.simulate_click(cancel, gpui::Modifiers::none());
         draw_pane_layout(&mut visual);
-        assert_controls(&mut visual, true);
+        assert_controls(&mut visual, true, "cancelled preview");
         view.read_with(&visual, |view, _| {
             assert_eq!(view.active_tool(), ToolKind::Crop);
             assert!(!view.tools.can_apply_crop());
@@ -20039,7 +20093,7 @@ mod tests {
         assert_unedited(&visual);
         mounted_canvas_click(&mut visual, position, 2);
         draw_pane_layout(&mut visual);
-        assert_controls(&mut visual, true);
+        assert_controls(&mut visual, true, "re-entered Crop");
         let ratio = visual.debug_bounds("design-crop-ratio").expect("Ratio");
         visual.simulate_click(ratio.center(), gpui::Modifiers::none());
         draw_pane_layout(&mut visual);
@@ -20052,11 +20106,18 @@ mod tests {
         let start = position + point(px(-40.0), px(-20.0));
         let end = position + point(px(40.0), px(20.0));
         visual.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::none());
+        assert_crop_press(&visual, "apply preview after press");
         visual.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::none());
+        assert_crop_preview(&visual, "apply preview after move before redraw");
         view.read_with(&visual, |view, _| assert!(!view.tools.can_apply_crop()));
         draw_pane_layout(&mut visual);
-        assert!(visual.debug_bounds("design-crop-hint").is_none());
+        assert_crop_preview(&visual, "apply preview after move redraw before release");
+        assert!(
+            visual.debug_bounds("design-crop-hint").is_none(),
+            "apply preview after move redraw at {canvas_width}",
+        );
         visual.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::none());
+        assert_crop_preview(&visual, "apply preview after release before redraw");
         view.read_with(&visual, |view, cx| {
             assert!(view.tools.can_apply_crop());
             assert_eq!(view.editor_mode(cx), EditorMode::Design);
@@ -20114,7 +20175,7 @@ mod tests {
         };
         let started = now();
         draw_pane_layout(&mut visual);
-        assert_controls(&mut visual, false);
+        assert_controls(&mut visual, false, "released apply preview after redraw");
         let apply = visual
             .debug_bounds("design-crop-apply")
             .expect("Apply crop");
