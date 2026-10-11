@@ -11134,6 +11134,258 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    async fn assert_native_figview_window_close(
+        save: bool,
+        autosave_while_prompt_open: bool,
+        cx: &mut TestAppContext,
+    ) -> Result<()> {
+        use gpui::UpdateGlobal;
+        use project::ProjectItem as _;
+
+        init_visual_test(cx);
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            cx.set_global(db::AppDatabase::test_new());
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.workspace.autosave = Some(settings::AutosaveSetting::Off);
+                    settings
+                        .session
+                        .get_or_insert_default()
+                        .restore_unsaved_buffers = Some(false);
+                });
+            });
+        });
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("Close Matrix");
+        let (mut initial, text_id, _) = text_selection_doc(false);
+        let mut control = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            150.0,
+            100.0,
+            40.0,
+            30.0,
+            Color::BLACK,
+        )));
+        control.parent = initial.active_page();
+        control.name = "Unchanged control".into();
+        initial.apply(Operation::create_node(control))?;
+        crate::document::write_project(&root, &initial, &BTreeMap::new())?;
+        let (original_on_disk, original_assets) = fanta_format::read_project_tree(&root)?;
+        let original_on_disk = serde_json::to_value(original_on_disk)?;
+
+        // Source buffers must observe the same files that the canvas writer changes.
+        let file_system = Arc::new(fs::RealFs::new(None, cx.executor()));
+        let project = Project::test(file_system, [root.as_path()], cx).await;
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("fixture worktree")
+                .read(cx)
+                .id()
+        });
+        let item = cx
+            .update(|cx| {
+                FigItem::try_open(
+                    &project,
+                    &project::ProjectPath {
+                        worktree_id,
+                        path: util::rel_path::rel_path("fanta.json").into(),
+                    },
+                    cx,
+                )
+            })
+            .expect("native project opener")
+            .await?;
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert!(item.has_ready_document());
+            assert_eq!(item.project_root(), Some(root.as_path()));
+            assert!(!item.is_dirty());
+        });
+
+        let window = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let multi_workspace = window.entity(cx)?;
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let session_id = workspace.read_with(cx, |workspace, _| workspace.session_id());
+        assert!(session_id.is_some());
+        let view = window.update(cx, |_, window, cx| {
+            let view = cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            });
+            window.activate_window();
+            view.update(cx, |view, cx| {
+                view.set_viewport_silent(Viewport::default());
+                view.focus_handle.focus(window, cx);
+            });
+            view
+        })?;
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1400.0), px(900.0)));
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_text_edit(text_id, TextEditSeed::SelectAll, window, cx);
+                assert!(view.text_edit.is_some(), "real text editor is open");
+                gpui::EntityInputHandler::replace_text_in_range(
+                    view,
+                    Some(0..11),
+                    "Close draft",
+                    window,
+                    cx,
+                );
+                view.commit_text_edit(cx);
+                assert!(view.text_edit.is_none());
+            });
+        });
+        visual.run_until_parked();
+        let (edited, assets) = item.read_with(&visual, |item, _| {
+            assert!(item.is_dirty(), "committed edit has not yet been saved");
+            let document = item.document().expect("edited document");
+            let NodeData::Text(text) = &document.doc.scene.get(text_id).expect("text node").data
+            else {
+                panic!("fixture text kind preserved")
+            };
+            assert_eq!(text.content, "Close draft");
+            (
+                document.doc.clone_for_persist(),
+                document.raw_assets.clone(),
+            )
+        });
+        let expected_root = directory.path().join("Expected saved projection");
+        crate::document::write_project(&expected_root, &edited, &assets)?;
+        let (expected_on_disk, expected_assets) = fanta_format::read_project_tree(&expected_root)?;
+        let expected_on_disk = serde_json::to_value(expected_on_disk)?;
+        assert_ne!(expected_on_disk, original_on_disk);
+        assert_eq!(
+            serde_json::to_value(fanta_format::read_project_tree(&root)?.0)?,
+            original_on_disk,
+            "the pre-prompt state must still contain the original text"
+        );
+
+        multi_workspace.update_in(&mut visual, |multi_workspace, window, cx| {
+            multi_workspace.close_window(&workspace::CloseWindow, window, cx);
+        });
+        visual.run_until_parked();
+        let prompt = visual.pending_prompt().expect("dirty native close prompt");
+        assert!(prompt.0.contains("save"), "actual save prompt: {prompt:?}");
+        workspace.read_with(&visual, |workspace, cx| {
+            assert_eq!(workspace.session_id(), session_id);
+            assert_eq!(workspace.project().entity_id(), project.entity_id());
+            assert_eq!(
+                workspace
+                    .active_item_as::<FigView>(cx)
+                    .map(|view| view.entity_id()),
+                Some(view.entity_id())
+            );
+        });
+        if autosave_while_prompt_open {
+            visual.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+            visual.run_until_parked();
+            assert!(
+                visual.has_pending_prompt(),
+                "autosave does not answer the prompt"
+            );
+            item.read_with(&visual, |item, _| assert!(!item.is_dirty()));
+            view.read_with(&visual, |view, _| assert!(view.autosave_task.is_none()));
+            let (saved, saved_assets) = fanta_format::read_project_tree(&root)?;
+            assert_eq!(serde_json::to_value(saved)?, expected_on_disk);
+            assert_eq!(saved_assets, expected_assets);
+        }
+        visual.simulate_prompt_answer(if save { "Save" } else { "Don't Save" });
+        visual.run_until_parked();
+
+        // Window-scoped updates require a live window; retained entities remain readable after close.
+        assert!(!visual.has_pending_prompt());
+        assert!(!visual.read(|cx| cx.windows().contains(&window.into())));
+        workspace.read_with(&visual, |workspace, cx| {
+            assert_eq!(
+                workspace.session_id(),
+                None,
+                "the original session was removed"
+            );
+            assert_eq!(workspace.project().entity_id(), project.entity_id());
+            assert_eq!(
+                workspace
+                    .active_item_as::<FigView>(cx)
+                    .map(|view| view.entity_id()),
+                Some(view.entity_id()),
+                "window close must not merely close the canvas tab"
+            );
+        });
+        view.read_with(&visual, |view, _| {
+            assert_eq!(view.item.entity_id(), item.entity_id())
+        });
+        item.read_with(&visual, |item, _| {
+            assert!(!item.is_dirty());
+            assert_eq!(item.project_root(), Some(root.as_path()));
+            let NodeData::Text(text) = &item
+                .doc()
+                .expect("retained document")
+                .scene
+                .get(text_id)
+                .expect("text")
+                .data
+            else {
+                panic!("fixture text kind preserved")
+            };
+            assert_eq!(
+                text.content,
+                if save { "Close draft" } else { "Hello world" }
+            );
+        });
+        let (actual, actual_assets) = fanta_format::read_project_tree(&root)?;
+        assert_eq!(
+            serde_json::to_value(actual)?,
+            if save {
+                expected_on_disk
+            } else {
+                original_on_disk
+            }
+        );
+        assert_eq!(
+            actual_assets,
+            if save {
+                expected_assets
+            } else {
+                original_assets
+            }
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn mounted_native_figview_save_closes_multi_workspace_window(cx: &mut TestAppContext) {
+        assert_native_figview_window_close(true, false, cx)
+            .await
+            .expect("Save persists the native canvas and removes its window");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn mounted_native_figview_discard_closes_multi_workspace_window(cx: &mut TestAppContext) {
+        assert_native_figview_window_close(false, false, cx)
+            .await
+            .expect("Don't Save reloads the native canvas and removes its window");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn mounted_native_figview_autosave_during_prompt_then_save_closes_window(
+        cx: &mut TestAppContext,
+    ) {
+        assert_native_figview_window_close(true, true, cx)
+            .await
+            .expect("Save finishes closing after the canvas autosaved while prompted");
+    }
+
+    #[cfg(target_os = "macos")]
     async fn canvas_audio_fixture(
         cx: &mut TestAppContext,
     ) -> Result<(
