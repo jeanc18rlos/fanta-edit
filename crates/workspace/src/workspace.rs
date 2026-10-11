@@ -12226,8 +12226,12 @@ mod tests {
             )
             .await;
         let project = Project::test(file_system, ["root".as_ref()], cx).await;
-        let (workspace, cx) =
-            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("mounted workspace");
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
         let drafts = [
             (1, "first.txt", "first draft", true, None),
             (

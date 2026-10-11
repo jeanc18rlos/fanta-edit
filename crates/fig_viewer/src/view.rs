@@ -19809,10 +19809,17 @@ mod tests {
                 ),
                 size(px(pane_width), canvas.size.height),
             );
-            for (index, workspace) in [(1, EditorWorkspace::Variables), (2, EditorWorkspace::Code)]
-            {
-                let selector = format!("fanta-collapsible-tab-fanta-editor-workspace-{index}");
-                let tab = visual.debug_bounds(&selector).expect("workspace tab");
+            for (selector, workspace) in [
+                (
+                    "fanta-collapsible-tab-fanta-editor-workspace-1",
+                    EditorWorkspace::Variables,
+                ),
+                (
+                    "fanta-collapsible-tab-fanta-editor-workspace-2",
+                    EditorWorkspace::Code,
+                ),
+            ] {
+                let tab = visual.debug_bounds(selector).expect("workspace tab");
                 visual.simulate_click(tab.center(), Modifiers::default());
                 draw_pane_layout(&mut visual);
                 assert_eq!(

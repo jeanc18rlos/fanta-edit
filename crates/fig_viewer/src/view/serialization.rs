@@ -715,7 +715,10 @@ mod tests {
             (
                 serde_json::to_value(item.doc().expect("original document"))
                     .expect("serialize original document"),
-                item.raw_assets().clone(),
+                item.document()
+                    .expect("original document")
+                    .raw_assets
+                    .clone(),
             )
         });
         let session = workspace.read_with(cx, |workspace, _| workspace.session_id());
@@ -792,7 +795,10 @@ mod tests {
                 (
                     serde_json::to_value(item.doc().expect("reopened document"))
                         .expect("serialize reopened document"),
-                    item.raw_assets().clone(),
+                    item.document()
+                        .expect("reopened document")
+                        .raw_assets
+                        .clone(),
                 ),
                 original_document
             );
