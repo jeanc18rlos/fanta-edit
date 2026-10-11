@@ -19,7 +19,9 @@ mod serialization;
 mod timeline_adapter;
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    rc::Rc,
     sync::Arc,
 };
 
@@ -451,6 +453,7 @@ pub struct FigView {
     autosave_task: Option<Task<()>>,
     /// The save error the user has been shown and not yet seen cleared.
     reported_save_failure: Option<String>,
+    save_failure_notice: Rc<RefCell<Option<SharedString>>>,
     /// The selection handle the cursor is over, resolved on hover so
     /// `render` only reads it — hit-testing eight handles per redraw would
     /// run on every window frame, not just on pointer movement.
@@ -734,6 +737,7 @@ impl FigView {
         let descriptor = crate::document::take_pending_view_descriptor(cx);
         let opened_entry_id = descriptor.and_then(|descriptor| descriptor.entry_id);
         let scope = descriptor.and_then(|descriptor| descriptor.scope);
+        let save_failure_notice = item.read(cx).save_failure_notice.clone();
         let editor_session = cx.new(|_| EditorSession::new());
         // A variables-scoped tab starts in the variables space — the
         // `doc/variables.json` file IS the variables registry, so that's what
@@ -855,6 +859,7 @@ impl FigView {
             canvas_pointer_down: false,
             autosave_task: None,
             reported_save_failure: None,
+            save_failure_notice,
             hover_resize_handle: None,
             space_pan: false,
             container_bounds: None,
@@ -5913,17 +5918,51 @@ impl FigView {
     /// stays up until a save succeeds ([`Self::clear_save_failure`]); debounced
     /// retries that keep failing do not raise it again (their errors differ
     /// only in details such as the transaction's temp directory).
-    fn report_save_failure(&mut self, error: String, cx: &mut Context<Self>) {
-        if self.reported_save_failure.is_some() {
+    fn report_save_failure(&mut self, error: &anyhow::Error, cx: &mut Context<Self>) {
+        if self.save_failure_notice.borrow().is_some() {
+            self.reported_save_failure
+                .get_or_insert_with(|| format!("{error:#}"));
             return;
         }
-        show_save_failure_notice_deferred(format!("Your design is not being saved: {error}"), cx);
-        self.reported_save_failure = Some(error);
+        let item = self.item.read(cx);
+        let name = item
+            .project_root()
+            .unwrap_or(&item.abs_path)
+            .file_name()
+            .map(|name| name.to_string_lossy().chars().take(48).collect::<String>())
+            .unwrap_or_else(|| "Design".into());
+        let reason = match error.chain().find_map(|cause| cause.downcast_ref::<std::io::Error>()) {
+            Some(error) if error.kind() == std::io::ErrorKind::PermissionDenied =>
+                "Write access was denied. Check the project folder's permissions, then try Save again.".to_owned(),
+            Some(error) if error.kind() == std::io::ErrorKind::NotFound =>
+                "The project location could not be found. Restore it, then try Save again.".to_owned(),
+            Some(error) => match error.raw_os_error() {
+                Some(code) => format!("The write failed (system error {code}). Check the project location and try Save again."),
+                None => "The write failed. Check the project location and try Save again. Details are in the log.".into(),
+            },
+            None => "The save failed. Your changes are still open. Check the log for details and try Save again.".into(),
+        };
+        *self.save_failure_notice.borrow_mut() =
+            Some(format!("{name} could not be saved. {reason}").into());
+        self.reported_save_failure
+            .get_or_insert_with(|| format!("{error:#}"));
+        sync_save_failure_notice_deferred(
+            self.item.entity_id(),
+            self.save_failure_notice.clone(),
+            cx,
+        );
     }
 
     fn clear_save_failure(&mut self, cx: &mut Context<Self>) {
-        if self.reported_save_failure.take().is_some() {
-            dismiss_save_failure_notice_deferred(cx);
+        self.reported_save_failure = None;
+        // Saved subscriptions may run while the shared item is borrowed.
+        let visible = self.save_failure_notice.borrow_mut().take().is_some();
+        if visible {
+            sync_save_failure_notice_deferred(
+                self.item.entity_id(),
+                self.save_failure_notice.clone(),
+                cx,
+            );
         }
     }
 
@@ -5947,7 +5986,7 @@ impl FigView {
             if let Err(error) = save.await {
                 log::error!("autosaving the canvas failed: {error:#}");
                 view.update(cx, |this, cx| {
-                    this.report_save_failure(format!("{error:#}"), cx);
+                    this.report_save_failure(&error, cx);
                 })
                 .log_err();
             }
@@ -9086,6 +9125,13 @@ impl Item for FigView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.save_failure_notice.borrow().is_some() {
+            sync_save_failure_notice_deferred(
+                self.item.entity_id(),
+                self.save_failure_notice.clone(),
+                cx,
+            );
+        }
         if let Some(workspace_entity) = workspace.weak_handle().upgrade() {
             self.workspace_activation_subscription = Some(cx.subscribe(
                 &workspace_entity,
@@ -9149,6 +9195,13 @@ impl Item for FigView {
     }
 
     fn on_removed(&self, _cx: &mut Context<Self>) {
+        if self.save_failure_notice.borrow().is_some() {
+            sync_save_failure_notice_deferred(
+                self.item.entity_id(),
+                self.save_failure_notice.clone(),
+                _cx,
+            );
+        }
         self.invalidate_local_media_origin();
         #[cfg(target_os = "macos")]
         {
@@ -9554,6 +9607,7 @@ impl Item for FigView {
         Self: Sized,
     {
         let item = self.item.clone();
+        let save_failure_notice = self.save_failure_notice.clone();
         let project = self.project.clone();
         let viewport = self.viewport;
         let selected_page_index = self.selected_page_index;
@@ -9661,6 +9715,7 @@ impl Item for FigView {
                 canvas_pointer_down: false,
                 autosave_task: None,
                 reported_save_failure: None,
+                save_failure_notice,
                 hover_resize_handle: None,
                 space_pan: false,
                 container_bounds: None,
@@ -11772,8 +11827,8 @@ mod tests {
         item.read_with(&visual, |item, _| {
             assert_eq!(
                 item.is_dirty(),
-                shared_tab,
-                "only the independent shared edit is committed"
+                changed || shared_tab,
+                "an active preview is dirty without committing history"
             );
             let doc = item.doc().expect("preview document");
             assert_eq!(
@@ -12942,6 +12997,332 @@ mod tests {
                 "a successful save clears the report"
             )
         });
+    }
+
+    struct SaveFailureNoticeFixture {
+        _directory: tempfile::TempDir,
+        root: std::path::PathBuf,
+        project: Entity<Project>,
+        item: Entity<FigItem>,
+        view: Entity<FigView>,
+        workspace: Entity<workspace::Workspace>,
+        window: gpui::WindowHandle<MultiWorkspace>,
+    }
+
+    async fn save_failure_notice_fixture(
+        name: &str,
+        cx: &mut TestAppContext,
+    ) -> Result<SaveFailureNoticeFixture> {
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(name);
+        crate::document::write_project(&root, &doc_with_one_page(), &BTreeMap::new())?;
+        let file_system = Arc::new(fs::RealFs::new(None, cx.executor()));
+        let project = Project::test(file_system, [root.as_path()], cx).await;
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("fixture worktree")
+                .read(cx)
+                .id()
+        });
+        let item = cx
+            .update(|cx| {
+                FigItem::try_open(
+                    &project,
+                    &project::ProjectPath {
+                        worktree_id,
+                        path: util::rel_path::rel_path("fanta.json").into(),
+                    },
+                    cx,
+                )
+            })
+            .context("native fixture opener")?
+            .await?;
+        cx.run_until_parked();
+        assert!(item.read_with(cx, |item, _| item.has_ready_document()));
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .entity(cx)?
+            .read_with(cx, |root, _| root.workspace().clone());
+        let view = window.update(cx, |_, window, cx| {
+            let view = cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            });
+            window.activate_window();
+            view
+        })?;
+        cx.run_until_parked();
+        Ok(SaveFailureNoticeFixture {
+            _directory: directory,
+            root,
+            project,
+            item,
+            view,
+            workspace,
+            window,
+        })
+    }
+
+    fn save_failure_notice_document(
+        item: &Entity<FigItem>,
+        cx: &TestAppContext,
+    ) -> (
+        serde_json::Value,
+        BTreeMap<AssetId, Vec<u8>>,
+        usize,
+        usize,
+        bool,
+    ) {
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("ready notification fixture");
+            (
+                serde_json::to_value(&document.doc).expect("complete document"),
+                document.raw_assets.as_ref().clone(),
+                document.doc.history.undo_depth(),
+                document.doc.history.redo_depth(),
+                item.is_dirty(),
+            )
+        })
+    }
+
+    fn assert_save_failure_notice(
+        fixture: &SaveFailureNoticeFixture,
+        present: bool,
+        cx: &TestAppContext,
+    ) {
+        assert_eq!(
+            fixture.workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .notification_ids()
+                    .contains(&save_failure_notice_id(fixture.item.entity_id()))
+            }),
+            present
+        );
+    }
+
+    fn report_notice_fixture_failure(view: &Entity<FigView>, cx: &mut TestAppContext) {
+        let error = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            .context("writing /private/fixture/.fanta-transaction-build-private");
+        view.update(cx, |view, cx| view.report_save_failure(&error, cx));
+    }
+
+    #[gpui::test]
+    async fn save_failure_notice_real_write_error_is_concise_and_recovery_is_scoped(
+        cx: &mut TestAppContext,
+    ) {
+        let result: Result<()> = async {
+            init_visual_test(cx);
+            cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+            let first = save_failure_notice_fixture("First design", cx).await?;
+            let other = save_failure_notice_fixture("Other design", cx).await?;
+            report_notice_fixture_failure(&other.view, cx);
+            cx.run_until_parked();
+            let files = autosave_project_files(&first.root)?;
+            let mut fault = AutosaveDirectoryFault::apply(&first.root)?;
+            add_rect(&first.item, cx);
+            let document = save_failure_notice_document(&first.item, cx);
+            settle_autosave_and_resync(cx);
+            assert_save_failure_notice(&first, true, cx);
+            assert_save_failure_notice(&other, true, cx);
+            first.view.read_with(cx, |view, _| {
+                assert!(
+                    view.reported_save_failure
+                        .as_ref()
+                        .is_some_and(|error| error.contains("Permission denied"))
+                );
+                let state = view.save_failure_notice.borrow();
+                let message = state.as_ref().expect("persistent concise notice");
+                assert!(message.contains("First design"));
+                assert!(message.contains("Write access was denied"));
+                assert!(message.contains("try Save again"));
+                assert!(message.len() < 200);
+                assert!(!message.contains(first.root.to_string_lossy().as_ref()));
+                assert!(!message.contains(".fanta-transaction"));
+            });
+            assert_eq!(autosave_project_files(&first.root)?, files);
+            assert_eq!(save_failure_notice_document(&first.item, cx), document);
+            fault.restore()?;
+            first
+                .view
+                .update(cx, |view, cx| view.save_document(cx))
+                .await?;
+            cx.run_until_parked();
+            assert_save_failure_notice(&first, false, cx);
+            assert_save_failure_notice(&other, true, cx);
+            assert_autosave_persisted_draft(&first.root, &first.item, cx)?;
+            Ok(())
+        }
+        .await;
+        result.expect(
+            "a real failed write is explained briefly without clearing another design's warning",
+        );
+    }
+
+    #[gpui::test]
+    async fn save_failure_notice_discard_removes_only_the_closed_document(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            init_visual_test(cx);
+            cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+            let first = save_failure_notice_fixture("Discard design", cx).await?;
+            let other = save_failure_notice_fixture("Keep design", cx).await?;
+            let files = autosave_project_files(&first.root)?;
+            let other_document = save_failure_notice_document(&other.item, cx);
+            add_rect(&first.item, cx);
+            report_notice_fixture_failure(&first.view, cx);
+            report_notice_fixture_failure(&other.view, cx);
+            cx.run_until_parked();
+            assert_save_failure_notice(&first, true, cx);
+            assert_save_failure_notice(&other, true, cx);
+            let close = first.window.update(cx, |_, window, cx| {
+                let pane = first.workspace.read(cx).active_pane().clone();
+                pane.update(cx, |pane, cx| {
+                    pane.close_item_by_id(
+                        first.view.entity_id(),
+                        workspace::SaveIntent::Skip,
+                        window,
+                        cx,
+                    )
+                })
+            })?;
+            close.await?;
+            cx.run_until_parked();
+            assert_eq!(
+                first.workspace.read_with(cx, |workspace, cx| workspace
+                    .items_of_type::<FigView>(cx)
+                    .count()),
+                0
+            );
+            assert_save_failure_notice(&first, false, cx);
+            assert_save_failure_notice(&other, true, cx);
+            assert!(
+                first
+                    .view
+                    .read_with(cx, |view, _| view.save_failure_notice.borrow().is_none())
+            );
+            assert_eq!(autosave_project_files(&first.root)?, files);
+            assert_eq!(
+                save_failure_notice_document(&other.item, cx),
+                other_document
+            );
+            Ok(())
+        }
+        .await;
+        result.expect(
+            "Discard clears only its document's notice even while the removed view is retained",
+        );
+    }
+
+    #[gpui::test]
+    async fn save_failure_notice_survives_one_shared_tab_until_the_last_removal(
+        cx: &mut TestAppContext,
+    ) {
+        let result: Result<()> = async {
+            init_visual_test(cx);
+            cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+            let fixture = save_failure_notice_fixture("Shared design", cx).await?;
+            let sibling = fixture.window.update(cx, |_, window, cx| {
+                let sibling = cx.new(|cx| {
+                    FigView::new(fixture.item.clone(), fixture.project.clone(), window, cx)
+                });
+                fixture.workspace.update(cx, |workspace, cx| {
+                    workspace.split_item(
+                        workspace::SplitDirection::Right,
+                        Box::new(sibling.clone()),
+                        window,
+                        cx,
+                    )
+                });
+                sibling
+            })?;
+            assert_ne!(fixture.view.entity_id(), sibling.entity_id());
+            assert_eq!(
+                sibling.read_with(cx, |view, _| view.item.entity_id()),
+                fixture.item.entity_id()
+            );
+            assert_eq!(
+                fixture.workspace.read_with(cx, |workspace, cx| workspace
+                    .items_of_type::<FigView>(cx)
+                    .count()),
+                2
+            );
+            let document = save_failure_notice_document(&fixture.item, cx);
+            let files = autosave_project_files(&fixture.root)?;
+            report_notice_fixture_failure(&fixture.view, cx);
+            cx.run_until_parked();
+            assert_save_failure_notice(&fixture, true, cx);
+            for (view, expected) in [(&fixture.view, true), (&sibling, false)] {
+                fixture.window.update(cx, |_, window, cx| {
+                    let panes = fixture.workspace.read(cx).panes().to_vec();
+                    for pane in panes {
+                        pane.update(cx, |pane, cx| {
+                            pane.remove_item(view.entity_id(), false, false, window, cx)
+                        });
+                    }
+                })?;
+                cx.run_until_parked();
+                assert_save_failure_notice(&fixture, expected, cx);
+            }
+            assert!(
+                fixture
+                    .view
+                    .read_with(cx, |view, _| view.save_failure_notice.borrow().is_none())
+            );
+            assert_eq!(save_failure_notice_document(&fixture.item, cx), document);
+            assert_eq!(autosave_project_files(&fixture.root)?, files);
+            Ok(())
+        }
+        .await;
+        result.expect("removing one tab preserves a shared document warning until its last mounted owner leaves");
+    }
+
+    #[gpui::test]
+    async fn save_failure_notice_deferred_show_cannot_outlive_save_or_removal(
+        cx: &mut TestAppContext,
+    ) {
+        let result: Result<()> = async {
+            init_visual_test(cx);
+            cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+            let fixture = save_failure_notice_fixture("Deferred design", cx).await?;
+            let document = save_failure_notice_document(&fixture.item, cx);
+            let files = autosave_project_files(&fixture.root)?;
+            fixture.window.update(cx, |_, _, cx| {
+                let error = anyhow::anyhow!("queued diagnostic");
+                fixture
+                    .view
+                    .update(cx, |view, cx| view.report_save_failure(&error, cx));
+                fixture
+                    .item
+                    .update(cx, |_, cx| cx.emit(FigItemEvent::Saved));
+            })?;
+            cx.run_until_parked();
+            assert_save_failure_notice(&fixture, false, cx);
+            fixture.window.update(cx, |_, window, cx| {
+                let error = anyhow::anyhow!("queued diagnostic before removal");
+                fixture
+                    .view
+                    .update(cx, |view, cx| view.report_save_failure(&error, cx));
+                let pane = fixture.workspace.read(cx).active_pane().clone();
+                pane.update(cx, |pane, cx| {
+                    pane.remove_item(fixture.view.entity_id(), false, false, window, cx)
+                });
+            })?;
+            cx.run_until_parked();
+            assert_save_failure_notice(&fixture, false, cx);
+            assert!(
+                fixture
+                    .view
+                    .read_with(cx, |view, _| view.save_failure_notice.borrow().is_none())
+            );
+            assert_eq!(save_failure_notice_document(&fixture.item, cx), document);
+            assert_eq!(autosave_project_files(&fixture.root)?, files);
+            Ok(())
+        }
+        .await;
+        result.expect("queued notification work reconciles current document ownership and successful-save state");
     }
 
     struct AutosaveDirectoryFault {
@@ -20951,7 +21332,6 @@ impl FigView {
 /// One id shared by every canvas notice, so a second click replaces the
 /// standing message instead of stacking a queue of them.
 const CANVAS_NOTICE_ID: &str = "fanta-canvas-notice";
-const SAVE_FAILURE_NOTICE_ID: &str = "fanta-save-failure";
 
 /// How many selected layers a toolbar Agent prompt lists by id.
 #[cfg(feature = "fanta-gpui-ui")]
@@ -21053,25 +21433,52 @@ pub(crate) fn show_canvas_notice_deferred(message: String, cx: &mut App) {
     show_toast_deferred(CANVAS_NOTICE_ID, message, true, cx);
 }
 
-/// A save failure stays on screen until a save succeeds: an autohiding toast
-/// would let the user keep editing a document that never reaches disk.
-fn show_save_failure_notice_deferred(message: String, cx: &mut App) {
-    show_toast_deferred(SAVE_FAILURE_NOTICE_ID, message, false, cx);
+fn save_failure_notice_id(item: gpui::EntityId) -> NotificationId {
+    NotificationId::composite::<FigItem>(item)
 }
 
-fn dismiss_save_failure_notice_deferred(cx: &mut App) {
-    cx.defer(|cx| {
-        let id = NotificationId::named(SAVE_FAILURE_NOTICE_ID.into());
+fn sync_save_failure_notice_deferred(
+    item: gpui::EntityId,
+    state: Rc<RefCell<Option<SharedString>>>,
+    cx: &mut App,
+) {
+    cx.defer(move |cx| {
+        let mut workspaces = Vec::new();
         for window in cx.windows() {
-            if let Some(multi_workspace) = window.downcast::<MultiWorkspace>() {
-                multi_workspace
-                    .update(cx, |multi_workspace, _, cx| {
-                        for workspace in multi_workspace.workspaces() {
-                            workspace.update(cx, |workspace, cx| workspace.dismiss_toast(&id, cx));
-                        }
+            if let Some(window) = window.downcast::<MultiWorkspace>() {
+                if let Some(owners) = window
+                    .update(cx, |multi_workspace, _, _| {
+                        multi_workspace.workspaces().cloned().collect::<Vec<_>>()
                     })
-                    .log_err();
+                    .log_err()
+                {
+                    workspaces.extend(owners);
+                }
             }
+        }
+        let owners = workspaces
+            .into_iter()
+            .map(|workspace| {
+                let owns_item = workspace
+                    .read(cx)
+                    .items_of_type::<FigView>(cx)
+                    .any(|view| view.read(cx).item.entity_id() == item);
+                (workspace, owns_item)
+            })
+            .collect::<Vec<_>>();
+        if !owners.iter().any(|(_, owns_item)| *owns_item) {
+            state.borrow_mut().take();
+        }
+        let message = state.borrow().clone();
+        let id = save_failure_notice_id(item);
+        for (workspace, owns_item) in owners {
+            workspace.update(cx, |workspace, cx| {
+                if let Some(message) = message.as_ref().filter(|_| owns_item) {
+                    workspace.show_toast(Toast::new(id.clone(), message.to_string()), cx);
+                } else {
+                    workspace.dismiss_toast(&id, cx);
+                }
+            });
         }
     });
 }

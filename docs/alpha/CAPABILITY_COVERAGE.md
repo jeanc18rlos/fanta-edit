@@ -222,6 +222,89 @@ Evidence under the local QA archive's `integration-20261007/`:
 - `property-draft-save-close-20261011/app-pr123-release-lint-v4/terminal-review/result.json`
 - `property-draft-save-close-20261011/skia-source-compatibility-ci-v2/terminal/independent-terminal-review.json`
 
+### Current38 native acceptance and c406 checks — 11 October
+
+Current38 is `stable.38.e46a8638349da4713f7ae2fda57690724b0b6337`;
+its executable SHA-256 is
+`962fb2015c4aaea63f228e83173bd47950cc5a1d423ddd7aeed6cbb43770adc1`.
+The isolated QA copy is ad-hoc signed. Source comparison binds its Save/Close,
+inspector and canvas entry paths to later `0732a74`/`c40637a`, with the later
+Code-to-Canvas focus correction excluded. It does not contain the later
+Settings, Agent/ACP or Skia changes. These bounded native results supersede
+the corresponding Current37 gaps without changing the retained failures.
+
+| Journey | Recorded result and scope |
+| --- | --- |
+| Focused properties and close | Eleven small-project cases pass: focused valid Save, invalid Save/Close rejection, retained input, Cancel, Discard, warm reopen, Undo/Redo and unchanged-field close. The later valid48-to-invalid-minus case also rejects Save/Close Save and discards safely; all 22 saved file hashes remain unchanged. |
+| Spectrum save and close | Focused Save, close Cancel, close-dialog Save, Discard and warm reopens pass on the owned copy. Restoration preserves all 27,164 file records except normal save metadata. The original user incident remains unattributed. Spectrum responsiveness is accepted by the user; no new numerical frame-latency claim. |
+| Real write failure and recovery | Seven bounded cases pass: permission failure preserves all 22 saved files; Cancel retains the draft; Close Save reports failure; Discard closes; warm reopen retains the old value; restoring exact permissions permits explicit Save; Undo/Save restores authored bytes. No permission fault remains active. Timed suppression of unchanged automatic retries was not measured natively. |
+| Focused Save As | Save As commits a focused nested Text position into a separate copy; all 48 original file bytes remain unchanged. All 30 authored copy paths, assets, identifiers and unrelated pages are preserved. The changed page contains the intended local coordinate change and one nonsemantic TextPath attribute reorder. Clean close and warm reopen retain the displayed position. No cold restart, occupied destination or shared-owner native claim. |
+| Shared-pane properties | Save All commits the later pane's focused position and clears both unsaved markers. Invalid Save All retains the raw input with all 22 saved files unchanged; close Cancel retains both panes; Discard closes the invalid pane while the other retains the saved value. Explicit restoration and clean close preserve authored baseline bytes. No shared-pane Undo or cold-restart acceptance. |
+| Inspector and canvas nodes | Crop readiness, Apply/Save/Undo/Redo/restoration; TextPath/group/Boolean entry; decoded video progression; audio progress; specialist inspector/menu entry; and Text/Frame layouts at 320/400 points in light/dark pass within the recorded assertions. All 48 Matrix paths remain and authored pages/IDs/assets are restored. This does not prove every menu action, audible output, 3D rendering or all controls. |
+
+The write-failure notice has two open UI defects: it displays repeated full
+project/internal transaction paths, and survives document Discard on another
+design until a later successful Save. The reviewed source correction limits
+the visible message, scopes it to the shared document and reconciles mounted
+owners after Save or removal. Four new mounted regression tests cover real
+write failure/recovery, Discard, shared tabs and deferred callbacks. These
+changes are uncompiled and unexecuted; new automated/native acceptance is
+still required before either defect can be marked resolved.
+
+Split-pane layout also remains open: at a 1,536-point window width with the
+360-point agent dock visible, the two panes keep their full layer sidebars and
+inspectors. The canvas has no visible area and inspector controls are clipped.
+
+On published `c40637a`, [Check 38114415067](https://github.com/jeanc18rlos/fanta-edit/actions/runs/38114415067)
+is terminal **FAIL**. The main editor result is 1,237 passed, five failed and two
+ignored; 20 of 25 required core regressions passed. The five property cases stop
+at the same pre-Save fixture assertion: an active preview marks the item dirty
+without committing history. The local two-line expectation correction retains
+all downstream document/history/assets/disk and Save/Close assertions; it is
+unexecuted. The independent job records 27 of 30 named passes; all three Settings
+tests panic because their fixture lacks `GlobalThemeSettingsProvider`, before
+keyboard-close behavior is checked. A local fixture correction initializes the
+test settings store and existing theme settings provider; production code and
+all keyboard assertions remain unchanged. It awaits hosted execution.
+Store records 20 passing tests. Terminal
+review authenticates 21 committed source/configuration bindings, all 43 archive
+file members and all 55 named regression results. The workflow is not green.
+
+The exact-head [Release lint workflow 38114415145](https://github.com/jeanc18rlos/fanta-edit/actions/runs/38114415145)
+passes twelve packages with all features and three packages with default
+features, using release/all-targets checks with warnings denied. Root review
+authenticates seven committed configuration bindings and all twelve archive
+members. This verifies lint completion, without test or native-app acceptance.
+
+The exact-head [Skia source workflow 38114415227](https://github.com/jeanc18rlos/fanta-edit/actions/runs/38114415227)
+passes default and Metal release/all-targets compilation with warnings denied,
+full native source builds, generated bindings and license generation. Root
+review checks all 59 committed source/configuration hashes and saved checkout
+tree/parents. This is no GPU, native-app, performance or signed-installer result.
+Mac39 is still being observed at exact `0732a74`; its native acceptance and
+direct-download signing/notarization remain open.
+
+The local QA archive retains these root aggregates under
+`integration-20261007/release-resume-20261011/`:
+
+- `build38-native-save-acceptance-20261011/root-focused-property-native-aggregate.json`
+- `build38-spectrum-save-close-20261011/additive-native-completion-aggregate.json`
+- `build38-node-inspector-native-20261011/root-node-inspector-native-aggregate.json`
+- `build38-native-write-failure-20261011/root-native-write-failure-recovery-aggregate.json`
+- `build38-native-write-failure-20261011/last-valid-preview-invalid-close-native-addendum.json`
+- `build38-native-save-as-20261011/root-native-focused-save-as-aggregate.json`
+- `build38-native-shared-pane-save-20261011/root-native-shared-pane-save-aggregate.json`
+
+The exact-head root reviews are retained separately under
+`integration-20261007/property-draft-save-close-20261011/`:
+
+- `check-ci-pr123-v5-20261011/terminal-review/root-terminal-input-review.json`
+- `app-pr123-release-lint-v5/terminal-review/root-terminal-input-review.json`
+- `skia-source-compatibility-ci-v3/terminal/root-terminal-input-review.json`
+
+Inline native screenshots were observed; standalone screenshot artifacts are
+not claimed by these aggregates.
+
 ### Final source and internal package — 9 October
 
 **Dated reconciliation: evidence through 21:19 UTC, 9 October.** Accepted main is

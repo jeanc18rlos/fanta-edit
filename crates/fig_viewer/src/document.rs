@@ -3,9 +3,11 @@
 //! as an unwrapped `fanta-project` directory.
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     io::Read as _,
     path::{Path, PathBuf},
+    rc::Rc,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -216,6 +218,7 @@ pub struct FigItem {
     project_root: Option<PathBuf>,
     dirty: bool,
     failed_autosave: Option<(PathBuf, u64)>,
+    pub(crate) save_failure_notice: Rc<RefCell<Option<SharedString>>>,
     /// Dirty state before the first transient preview frame. Cleared by a
     /// committed edit; canceling a preview restores it so opening and closing
     /// an inspector gesture without a change does not dirty the document.
@@ -1547,6 +1550,7 @@ impl project::ProjectItem for FigItem {
                     project_root,
                     dirty: false,
                     failed_autosave: None,
+                    save_failure_notice: Default::default(),
                     content_preview: None,
                     external_change_pending: false,
                     pending_external_full_reload: false,
@@ -3441,6 +3445,7 @@ pub(crate) fn ready_item_with_root_for_test(
         project_root,
         dirty: false,
         failed_autosave: None,
+        save_failure_notice: Default::default(),
         content_preview: None,
         external_change_pending: false,
         pending_external_full_reload: false,
@@ -9026,6 +9031,7 @@ mod tests {
             project_root,
             dirty: false,
             failed_autosave: None,
+            save_failure_notice: Default::default(),
             content_preview: None,
             external_change_pending: false,
             pending_external_full_reload: false,

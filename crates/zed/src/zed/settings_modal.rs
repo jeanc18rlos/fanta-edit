@@ -1253,7 +1253,9 @@ mod tests {
     ) -> (gpui::AnyWindowHandle, &mut gpui::VisualTestContext) {
         cx.update(|cx| {
             assets::Assets.load_test_fonts(cx);
-            theme::init(theme::LoadThemes::JustBase, cx);
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
             gpui_component::init(cx);
             fanta_gpui::init(cx);
             cx.bind_keys([
