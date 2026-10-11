@@ -1919,9 +1919,12 @@ impl GenerationWorkspace {
         let active_id = active_run.and_then(RunSummary::generation_id);
         if let Some(run) = active_run {
             let kind = run.mode.generation_kind().expect("creation run kind");
-            let server_title = active_id
-                .and_then(|id| self.gallery.iter().find(|record| record.id == id))
-                .and_then(|record| record.title.as_deref());
+            let gallery_record =
+                active_id.and_then(|id| self.gallery.iter().find(|record| record.id == id));
+            let server_title = gallery_record.and_then(|record| record.title.as_deref());
+            let created_at = gallery_record
+                .map(|record| record.created_at.clone())
+                .unwrap_or_default();
             let title = creation_title_for_model(
                 preferred_gallery_title(self.active_title.as_deref(), server_title),
                 Some(&run.prompt),
@@ -1944,7 +1947,8 @@ impl GenerationWorkspace {
                         model_label.clone(),
                         GenerationOutputStatus::Running,
                     )
-                    .prompt(run.prompt.clone()),
+                    .prompt(run.prompt.clone())
+                    .created_at(created_at.clone()),
                 );
             }
             for (index, output) in self.outputs.iter().enumerate() {
@@ -1956,6 +1960,7 @@ impl GenerationWorkspace {
                     model_label.clone(),
                     GenerationOutputStatus::Succeeded,
                 )
+                .created_at(created_at.clone())
                 .detail(output.mime.clone())
                 .can_add_to_project(self.canvas_item.is_some() && output.can_add_to_project());
                 if !run.prompt.is_empty() {
