@@ -51,7 +51,7 @@ use util::{ResultExt, paths::PathExt};
 use workspace::{
     ItemSettings, MultiWorkspace, Pane, Toast,
     item::{Item, ItemEvent, ProjectItem, SaveOptions, TabContentParams},
-    notifications::NotificationId,
+    notifications::{NotificationId, save_io_error_detail},
 };
 
 use crate::canvas::{
@@ -5942,17 +5942,9 @@ impl FigView {
             .file_name()
             .map(|name| name.to_string_lossy().chars().take(48).collect::<String>())
             .unwrap_or_else(|| "Design".into());
-        let reason = match error.chain().find_map(|cause| cause.downcast_ref::<std::io::Error>()) {
-            Some(error) if error.kind() == std::io::ErrorKind::PermissionDenied =>
-                "Write access was denied. Check the project folder's permissions, then try Save again.".to_owned(),
-            Some(error) if error.kind() == std::io::ErrorKind::NotFound =>
-                "The project location could not be found. Restore it, then try Save again.".to_owned(),
-            Some(error) => match error.raw_os_error() {
-                Some(code) => format!("The write failed (system error {code}). Check the project location and try Save again."),
-                None => "The write failed. Check the project location and try Save again. Details are in the log.".into(),
-            },
-            None => "The save failed. Your changes are still open. Check the log for details and try Save again.".into(),
-        };
+        let reason = save_io_error_detail(error).unwrap_or_else(|| {
+            "The save failed. Your changes are still open. Check the log for details and try Save again.".into()
+        });
         *self.save_failure_notice.borrow_mut() =
             Some(format!("{name} could not be saved. {reason}").into());
         self.reported_save_failure
@@ -19537,6 +19529,7 @@ mod tests {
         cx: &mut TestAppContext,
     ) {
         use fanta_gpui::toolbar::ToolbarMode;
+        use gpui::Modifiers;
 
         init_visual_test(cx);
         let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;

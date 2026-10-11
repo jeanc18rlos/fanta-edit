@@ -81,7 +81,7 @@ use language::{Buffer, LanguageRegistry, Rope, language_settings::all_language_s
 pub use modal_layer::*;
 use node_runtime::NodeRuntime;
 use notifications::{
-    DetachAndPromptErr, Notifications, dismiss_app_notification,
+    DetachAndPromptErr, Notifications, dismiss_app_notification, save_io_error_detail,
     simple_message_notification::MessageNotification,
 };
 pub use pane::*;
@@ -3710,7 +3710,9 @@ impl Workspace {
             window,
             cx,
         )
-        .detach_and_log_err(cx);
+        .detach_and_prompt_err("Failed to save all", window, cx, |error, _, _| {
+            save_io_error_detail(error)
+        });
     }
 
     fn send_keystrokes(
@@ -3971,9 +3973,29 @@ impl Workspace {
     #[allow(clippy::type_complexity)]
     pub fn open_paths(
         &mut self,
+        abs_paths: Vec<PathBuf>,
+        options: OpenOptions,
+        pane: Option<WeakEntity<Pane>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Vec<Option<anyhow::Result<Box<dyn ItemHandle>>>>> {
+        self.open_paths_with_manifest_roots(
+            abs_paths,
+            options,
+            pane,
+            HashMap::default(),
+            window,
+            cx,
+        )
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn open_paths_with_manifest_roots(
+        &mut self,
         mut abs_paths: Vec<PathBuf>,
         options: OpenOptions,
         pane: Option<WeakEntity<Pane>>,
+        manifest_roots: HashMap<PathBuf, PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Vec<Option<anyhow::Result<Box<dyn ItemHandle>>>>> {
@@ -4004,12 +4026,22 @@ impl Workspace {
                 let project_path = match visible {
                     Some(visible) => match this
                         .update(cx, |this, cx| {
-                            Workspace::project_path_for_path(
-                                this.project.clone(),
-                                abs_path,
-                                visible,
-                                cx,
-                            )
+                            if let Some(root) = manifest_roots.get(abs_path) {
+                                Workspace::project_path_for_captured_local_path(
+                                    this.project.clone(),
+                                    abs_path,
+                                    Some(root.clone()),
+                                    visible,
+                                    cx,
+                                )
+                            } else {
+                                Workspace::project_path_for_path(
+                                    this.project.clone(),
+                                    abs_path,
+                                    visible,
+                                    cx,
+                                )
+                            }
                         })
                         .log_err()
                     {
@@ -4974,10 +5006,32 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<Box<dyn ItemHandle>>> {
+        self.open_abs_path_with_manifest_root(abs_path, options, None, window, cx)
+    }
+
+    pub(crate) fn open_abs_path_with_manifest_root(
+        &mut self,
+        abs_path: PathBuf,
+        options: OpenOptions,
+        manifest_root: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<Box<dyn ItemHandle>>> {
+        let manifest_roots = manifest_root
+            .map(|root| (abs_path.clone(), root))
+            .into_iter()
+            .collect();
         cx.spawn_in(window, async move |workspace, cx| {
             let open_paths_task_result = workspace
                 .update_in(cx, |workspace, window, cx| {
-                    workspace.open_paths(vec![abs_path.clone()], options, None, window, cx)
+                    workspace.open_paths_with_manifest_roots(
+                        vec![abs_path.clone()],
+                        options,
+                        None,
+                        manifest_roots,
+                        window,
+                        cx,
+                    )
                 })
                 .with_context(|| format!("open abs path {abs_path:?} task spawn"))?
                 .await;
@@ -7896,22 +7950,30 @@ impl Workspace {
             .on_action(cx.listener(|workspace, action: &Save, window, cx| {
                 workspace
                     .save_active_item(action.save_intent.unwrap_or(SaveIntent::Save), window, cx)
-                    .detach_and_prompt_err("Failed to save", window, cx, |_, _, _| None);
+                    .detach_and_prompt_err("Failed to save", window, cx, |error, _, _| {
+                        save_io_error_detail(error)
+                    });
             }))
             .on_action(cx.listener(|workspace, _: &FormatAndSave, window, cx| {
                 workspace
                     .save_active_item(SaveIntent::FormatAndSave, window, cx)
-                    .detach_and_prompt_err("Failed to save", window, cx, |_, _, _| None);
+                    .detach_and_prompt_err("Failed to save", window, cx, |error, _, _| {
+                        save_io_error_detail(error)
+                    });
             }))
             .on_action(cx.listener(|workspace, _: &SaveWithoutFormat, window, cx| {
                 workspace
                     .save_active_item(SaveIntent::SaveWithoutFormat, window, cx)
-                    .detach_and_prompt_err("Failed to save", window, cx, |_, _, _| None);
+                    .detach_and_prompt_err("Failed to save", window, cx, |error, _, _| {
+                        save_io_error_detail(error)
+                    });
             }))
             .on_action(cx.listener(|workspace, _: &SaveAs, window, cx| {
                 workspace
                     .save_active_item(SaveIntent::SaveAs, window, cx)
-                    .detach_and_prompt_err("Failed to save", window, cx, |_, _, _| None);
+                    .detach_and_prompt_err("Failed to save", window, cx, |error, _, _| {
+                        save_io_error_detail(error)
+                    });
             }))
             .on_action(
                 cx.listener(|workspace, _: &ActivatePreviousPane, window, cx| {
@@ -11843,7 +11905,7 @@ mod tests {
         let (worktree, project_path) = cx
             .update(|cx| {
                 Workspace::project_path_for_captured_local_path(
-                    project,
+                    project.clone(),
                     &manifest,
                     captured.manifest_root,
                     true,
@@ -11860,6 +11922,14 @@ mod tests {
         assert_eq!(
             project_path.worktree_id,
             worktree.read_with(cx, |worktree, _| worktree.id())
+        );
+        assert_eq!(
+            project.read_with(cx, |project, cx| {
+                project
+                    .worktree_for_id(project_path.worktree_id, cx)
+                    .map(|worktree| worktree.entity_id())
+            }),
+            Some(worktree.entity_id())
         );
         file_system
             .insert_file(&manifest, original.into_bytes())
@@ -12141,6 +12211,107 @@ mod tests {
         close_window_after_save_failure(cx, true)
             .await
             .expect("failed save should allow a successful retry");
+    }
+
+    #[gpui::test]
+    async fn test_save_all_reports_failure_preserves_remaining_drafts_and_retries(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        file_system
+            .insert_tree(
+                "/root",
+                json!({ "first.txt": "", "failing.txt": "", "last.txt": "", "clean.txt": "" }),
+            )
+            .await;
+        let project = Project::test(file_system, ["root".as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let drafts = [
+            (1, "first.txt", "first draft", true, None),
+            (
+                2,
+                "failing.txt",
+                "invalid draft",
+                true,
+                Some("The width must be a number"),
+            ),
+            (3, "last.txt", "remaining draft", true, None),
+            (4, "clean.txt", "saved content", false, None),
+        ]
+        .into_iter()
+        .map(|(identifier, path, state, dirty, failure)| {
+            let project_item = cx.update(|_, cx| {
+                let project_item = TestProjectItem::new(identifier, path, cx);
+                project_item.update(cx, |item, _| item.is_dirty = dirty);
+                project_item
+            });
+            let item = cx.new(|cx| {
+                let mut item = TestItem::new(cx)
+                    .with_dirty(dirty)
+                    .with_project_items(std::slice::from_ref(&project_item));
+                item.state = state.to_owned();
+                item.save_error = failure.map(ToOwned::to_owned);
+                item
+            });
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+            });
+            (project_item, item, state)
+        })
+        .collect::<Vec<_>>();
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        let session = workspace.read_with(cx, |workspace, _| workspace.session_id());
+        let expected_items = drafts
+            .iter()
+            .map(|(_, item, _)| item.entity_id())
+            .collect::<Vec<_>>();
+        let assert_state = |save_counts: [usize; 4], dirty: [bool; 4], cx: &VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                assert!(!workspace.removing);
+                assert_eq!(workspace.session_id(), session);
+                assert_eq!(
+                    workspace
+                        .items(cx)
+                        .map(|item| item.item_id())
+                        .collect::<Vec<_>>(),
+                    expected_items
+                );
+            });
+            for ((project_item, item, state), (save_count, dirty)) in
+                drafts.iter().zip(save_counts.into_iter().zip(dirty))
+            {
+                item.read_with(cx, |item, cx| {
+                    assert_eq!(item.state.as_str(), *state);
+                    assert_eq!(item.is_dirty, dirty);
+                    assert_eq!(project_item.read(cx).is_dirty, dirty);
+                    assert_eq!(item.save_count, save_count);
+                    assert_eq!(item.save_as_count, 0);
+                    assert_eq!(item.reload_count, 0);
+                });
+            }
+        };
+        assert_state([0, 0, 0, 0], [true, true, true, false], cx);
+
+        cx.dispatch_action(SaveAll { save_intent: None });
+        let (message, detail) = cx.pending_prompt().expect("Save All error must be visible");
+        assert_eq!(message, "Failed to save all");
+        assert_eq!(detail, "The width must be a number.");
+        assert_state([1, 1, 0, 0], [false, true, true, false], cx);
+
+        cx.simulate_prompt_answer("OK");
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        assert_state([1, 1, 0, 0], [false, true, true, false], cx);
+        for (_, item, _) in &drafts {
+            item.update(cx, |item, _| item.save_error = None);
+        }
+        cx.dispatch_action(SaveAll { save_intent: None });
+        assert!(!cx.has_pending_prompt());
+        assert_state([1, 2, 1, 0], [false, false, false, false], cx);
+        cx.update(|window, cx| window.draw(cx).clear());
     }
 
     #[gpui::test]

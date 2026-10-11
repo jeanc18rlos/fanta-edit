@@ -692,6 +692,139 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn canvas_session_explicit_reused_open_survives_later_manifest_read_failure(
+        cx: &mut TestAppContext,
+    ) {
+        use fs::Fs as _;
+        use futures::FutureExt as _;
+        use std::{cell::Cell, rc::Rc};
+
+        let fixture = fixture(cx).await;
+        let original_bytes = project_bytes(fixture.directory.path());
+        let manifest = fixture.directory.path().join("Original/fanta.json");
+        let manifest_bytes = fixture
+            .file_system
+            .read_file_sync(&manifest)
+            .expect("original abstract manifest");
+        let (window, workspace) = manifest_workspace(&fixture, cx).await;
+        let original_document = workspace.read_with(cx, |workspace, cx| {
+            let view = workspace
+                .active_item_as::<FigView>(cx)
+                .expect("original design");
+            let item = view.read(cx).item.read(cx);
+            (
+                serde_json::to_value(item.doc().expect("original document"))
+                    .expect("serialize original document"),
+                item.raw_assets().clone(),
+            )
+        });
+        let session = workspace.read_with(cx, |workspace, _| workspace.session_id());
+        let original_root = active_root(&workspace, cx);
+        close_canvas(window, &workspace, cx).await;
+        let other = explicit_manifest_open(
+            window,
+            fixture.directory.path().join("Other/fanta.json"),
+            cx,
+        )
+        .await;
+        assert_ne!(other, workspace);
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace.items(cx).count()),
+            0
+        );
+        let multi_workspace = window
+            .update(cx, |_, _, cx| cx.entity())
+            .expect("mounted multi-workspace");
+        assert_eq!(
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace
+                .workspaces()
+                .count()),
+            2
+        );
+        let fault_injected = Rc::new(Cell::new(false));
+        let subscription = cx.update(|cx| {
+            let workspace = workspace.clone();
+            let manifest = manifest.clone();
+            let file_system = fixture.file_system.clone();
+            let fault_injected = fault_injected.clone();
+            cx.subscribe(&multi_workspace, move |multi_workspace, event, cx| {
+                if matches!(
+                    event,
+                    workspace::MultiWorkspaceEvent::ActiveWorkspaceChanged { .. }
+                ) && multi_workspace.read(cx).workspace() == &workspace
+                    && !fault_injected.get()
+                {
+                    file_system.pause_events();
+                    // Activation follows captured-root matching; only the abstract reader fails.
+                    file_system
+                        .insert_symlink(&manifest, manifest.with_file_name("missing-manifest"))
+                        .now_or_never()
+                        .expect("FakeFs symlink injection must complete synchronously");
+                    fault_injected.set(true);
+                }
+            })
+        });
+        cx.run_until_parked();
+        let reopened = explicit_manifest_open(window, manifest.clone(), cx).await;
+        assert!(
+            fault_injected.get(),
+            "fault follows actual workspace activation"
+        );
+        assert!(
+            fixture.file_system.load(&manifest).await.is_err(),
+            "the redundant abstract manifest read is unavailable"
+        );
+        assert_eq!(
+            reopened, workspace,
+            "explicit Open must reuse the captured root"
+        );
+        assert_eq!(
+            workspace.read_with(cx, |workspace, _| workspace.session_id()),
+            session
+        );
+        let reopened_view = workspace.read_with(cx, |workspace, cx| {
+            let views = workspace.items_of_type::<FigView>(cx).collect::<Vec<_>>();
+            assert_eq!(views.len(), 1);
+            let view = views.first().expect("one reopened design");
+            let item = view.read(cx).item.read(cx);
+            assert!(item.has_ready_document());
+            assert_eq!(
+                (
+                    serde_json::to_value(item.doc().expect("reopened document"))
+                        .expect("serialize reopened document"),
+                    item.raw_assets().clone(),
+                ),
+                original_document
+            );
+            view.entity_id()
+        });
+        assert_eq!(active_root(&workspace, cx), original_root);
+        assert_eq!(project_bytes(fixture.directory.path()), original_bytes);
+        drop(subscription);
+        fixture
+            .file_system
+            .remove_file(&manifest, fs::RemoveOptions::default())
+            .await
+            .expect("remove injected abstract symlink");
+        fixture
+            .file_system
+            .insert_file(&manifest, manifest_bytes)
+            .await;
+        fixture.file_system.unpause_events_and_flush();
+        cx.run_until_parked();
+        let reopened_again = explicit_manifest_open(window, manifest, cx).await;
+        assert_eq!(reopened_again, workspace);
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .items_of_type::<FigView>(cx)
+                .map(|view| view.entity_id())
+                .collect::<Vec<_>>()),
+            vec![reopened_view]
+        );
+        assert_eq!(project_bytes(fixture.directory.path()), original_bytes);
+    }
+
+    #[gpui::test]
     async fn canvas_session_empty_restore_allows_only_newly_added_project_auto_open(
         cx: &mut TestAppContext,
     ) {

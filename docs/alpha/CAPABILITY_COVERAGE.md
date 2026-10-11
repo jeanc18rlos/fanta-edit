@@ -123,6 +123,81 @@ No local Cargo/product run or shipping acceptance is claimed. Earlier dated
 sections retain their original scope and failures.
 
 
+### Build41 write-failure follow-up and a51d checks — 11 October
+
+The later build41 `c46a1b41` fault journeys use an owned Text project. Denied
+manual Save retains X48 and the dirty marker. With autosave enabled, a close
+write-error offers Close Without Saving and Cancel; Cancel retains the draft,
+while closing without saving removes its tab and owner-scoped warning. Warm
+reopen shows saved X40. Restoring permissions permits explicit Save to persist
+X48 and clear the notice; Undo and Save restore authored bytes. Final storage is
+139/140 original files byte-exact, with only owned `metadata.modified_at`
+changed; owned page/sidecar mtimes changed. All temporary modes are restored.
+
+A separate journey with the settings autosave toggle off exercises explicit
+Save All, three-choice tab Close → Save, and File → Close Window → Save.
+Save All logs a denied write and retains the draft, but shows **no action-level
+error dialog**; a later notice comes from separate FigView autosave. Tab-close
+Save reports failure and Cancel retains X48. Window-close Save reports failure
+and acknowledgment keeps the window/draft; subsequent tab Don't Save closes
+and clears the notice. All 140 files retain bytes, modes and mtimes against
+this later baseline, all 37 fault-entry modes are restored, and normal Quit
+leaves the owned processes absent. No cold restart or successful multi-document
+Save All/atomicity is accepted. **UI failure remains:** manual and close dialogs
+repeat absolute/internal transaction paths; tab-close uses an `untitled` label.
+
+The saved `a51d57c2` push Check is **FAIL: 33/75 required names pass**, comprising
+30 independent and three workspace cases. The captured-manifest lifetime test
+fails with `entity released` before its later path/restoration assertions; all
+41 editor names are unexecuted because four test clicks lack the `Modifiers`
+import. Workspace totals are 236 passes/one failure; engine, import, source-order
+and UI stages pass. Store's 20 cases and default-feature touched-crate lint pass,
+but post-stage ancillary checks are skipped. Canonical Check is still running
+at the latest saved 10:35 UTC observation. Both release-lint modes fail the same
+missing import; independently reviewed Skia source compilation/notices pass.
+These are separate scopes, not whole-candidate or native acceptance.
+
+External corrections retain the original failures: a test-local import and a
+retained Project with a same-project worktree assertion address the two test
+faults. Manual/close/Save All error-details V3 proposes concise I/O guidance,
+a visible tab-label fallback and an explicit Save All error dialog. Its one new
+mounted TestItem action test checks partial-save ordering, preserved drafts and
+retry; it is not a real native writer test. These proposals remain unapplied,
+uncompiled and unexecuted. The current strict gate is 75; adding that test would
+require 76 actual named passes. Pending Mac build42 and build41 do not validate
+these external proposals. Earlier dated records and their failures are retained.
+
+### Terminal a51d checks and captured Open successor — 11 October
+
+This additive update uses the saved terminal observation at 10:50:46 UTC.
+Both canonical and push Check runs for `a51d57c2` are **FAIL: 33 of 75 required
+names pass, one workspace name fails and 41 editor names are compile-blocked**.
+The captured-manifest test fails with `entity released` before its later
+path/restoration assertions. The editor suite, comments and drag
+cases do not execute because four responsive test clicks lack `Modifiers`.
+Workspace totals are 236 passes/one failure. Engine, import, source-order and
+UI stages pass; **post-stage ancillary checks are skipped**. Each run separately
+passes Store's 20 cases, all 30 independent names and default-feature touched-
+crate lint. Both release-lint configurations fail the missing import; accepted
+Skia default/Metal source compilation and notices remain a separate result.
+
+The test import and Project-lifetime corrections, concise named save errors
+and Save All feedback remain source-reviewed, uncompiled and unexecuted. A
+further source fix carries captured canonical manifest/root identity through
+explicit Open when reusing a workspace and through the ordinary file opener.
+It retains public wrappers, ordinary loading/error behavior and remote routing.
+Its new mounted regression injects a later FakeFs manifest-read failure after
+actual workspace activation, then checks one ready design, the same workspace,
+session, document/assets and real project bytes, plus repeated-Open deduplication.
+It is not an OS permission fault, cold startup or native acceptance result.
+
+If the proposed combined gate is adopted, **47 core plus 30 independent names
+(77 total)** must actually pass: the existing 75, the Save All action regression
+and the captured explicit-Open regression. All release stages remain required.
+No matching execution of this successor is accepted. Build41 and the a51d Mac42
+package cannot validate these later source fixes. The earlier 10:35 cutoff and
+all historical failures remain unchanged below and above this update.
+
 ### Current37 native checks — 11 October
 
 Exact `22f734193844eab66485e3cb322b529c2965e297` / tree

@@ -74,6 +74,25 @@ conflicts, but cannot make a concurrent external write and rename atomic; see
   journeys still do not establish full release readiness. See the
   [acceptance record](../alpha/CAPABILITY_COVERAGE.md), which
   retains the [build37 failure](../alpha/CAPABILITY_COVERAGE.md#current37-native-checks--11-october).
+- A separate build41 write-failure check on an owned Text project retains the
+  dirty draft on denied Save and close errors. Cancel keeps the draft; closing
+  without saving removes the owner tab and its warning. Restoring write access
+  permits explicit retry; Undo and Save restore authored content. **Alert polish
+  remains open:** manual Save and close alerts expose long internal paths, and
+  the tab-close error uses an `untitled` label. Explicit Save All retained the
+  draft but showed no action-level dialog; a later autosave notice is separate
+  feedback. Proposed concise, named errors and a Save All dialog are external,
+  uncompiled and unexecuted; they are not installed-app acceptance. These owned
+  fault checks do not establish atomic multi-document Save or the original
+  Spectrum incident's cause.
+- A later 11 October update records both `a51d57c2` hosted Check runs as failed;
+  the earlier `37c4073d` success above remains tied to that source. Test-fixture
+  corrections and save-error improvements still need matching execution. A
+  further source-reviewed fix carries a validated project-manifest identity
+  through explicit Open of a reused workspace, so a later abstract-reader
+  failure cannot silently skip reopening its closed design tab. Its mounted
+  regression is unexecuted; no installed-app behavior is claimed. See the
+  [dated terminal update](../alpha/CAPABILITY_COVERAGE.md#terminal-a51d-checks-and-captured-open-successor--11-october).
 - The **Code** workspace edits FNX and supported JSON sources. Saving valid
   source updates the canvas; invalid drafts preserve the last valid file and
   scene. Multi-buffer Save is sequential, not atomic: in a bounded build39 check,
