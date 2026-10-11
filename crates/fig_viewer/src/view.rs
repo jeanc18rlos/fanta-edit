@@ -6590,6 +6590,12 @@ impl FigView {
             .top(px(8.0))
             .left_0()
             .right_0()
+            .when(workspace == EditorWorkspace::Canvas, |tabs| {
+                let layout = self.pane_sidebar_layout();
+                tabs.left(layout.layers.unwrap_or_default())
+                    .right(layout.inspector.unwrap_or_default())
+                    .when(layout.layers.is_none(), |tabs| tabs.top(px(88.0)))
+            })
             .justify_center()
             .child(div().occlude().child(tabs))
             .into_any_element()
@@ -19526,6 +19532,733 @@ mod tests {
     }
 
     #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn mounted_canvas_toolbar_fits_narrow_panes_and_scrolls_without_panning(
+        cx: &mut TestAppContext,
+    ) {
+        use fanta_gpui::toolbar::ToolbarMode;
+
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, _, images) = bitmap_canvas_doc();
+        let (item, view, host, mut visual) = pane_layout_fixture(&project, doc, images, cx);
+        let toolbar = view.read_with(&visual, |view, _| {
+            view.gpui_toolbar
+                .as_ref()
+                .expect("toolbar")
+                .panel
+                .entity_id()
+        });
+        let before = item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            (
+                serde_json::to_value(&document.doc).expect("document snapshot"),
+                document.raw_assets.clone(),
+                document.doc.history.undo_depth(),
+                document.doc.history.redo_depth(),
+                item.is_dirty(),
+            )
+        });
+        let assert_workspace_tabs = |visual: &mut gpui::VisualTestContext,
+                                     bounds: Bounds<Pixels>| {
+            let tabs = [
+                "fanta-collapsible-tab-fanta-editor-workspace-0",
+                "fanta-collapsible-tab-fanta-editor-workspace-1",
+                "fanta-collapsible-tab-fanta-editor-workspace-2",
+            ]
+            .map(|selector| visual.debug_bounds(selector).expect(selector));
+            for tab in &tabs {
+                assert!(tab.is_contained_within(&bounds), "{tab:?} / {bounds:?}");
+            }
+            let first = tabs.first().expect("Canvas tab");
+            let last = tabs.last().expect("Code tab");
+            let center = (first.left() + last.right()) / 2.0;
+            assert!(
+                (center - bounds.center().x).abs() <= px(1.0),
+                "workspace tabs must center on their current body: {tabs:?} / {bounds:?}"
+            );
+        };
+        for (mode_selector, mode, toolbar_mode, leading_selector, trailing_selector) in [
+            (
+                "toolbar-mode-design",
+                EditorMode::Design,
+                ToolbarMode::Design,
+                "toolbar-group-move-tools-trigger",
+                "toolbar-group-comment-tools-trigger",
+            ),
+            (
+                "toolbar-mode-motion",
+                EditorMode::Motion,
+                ToolbarMode::Motion,
+                "toolbar-tool-motion-select",
+                "toolbar-tool-text",
+            ),
+            (
+                "toolbar-mode-draw",
+                EditorMode::Draw,
+                ToolbarMode::Draw,
+                "toolbar-tool-hand",
+                "toolbar-tool-color-picker",
+            ),
+        ] {
+            let mode_control = visual
+                .debug_bounds("toolbar-mode-selector")
+                .expect("mode control");
+            visual.simulate_click(mode_control.center(), Modifiers::default());
+            draw_pane_layout(&mut visual);
+            let mode_choice = visual.debug_bounds(mode_selector).expect(mode_selector);
+            visual.simulate_click(mode_choice.center(), Modifiers::default());
+            draw_pane_layout(&mut visual);
+            assert!(visual.debug_bounds("toolbar-mode-menu").is_none());
+            let focus =
+                visual.update(|window, cx| window.focused(cx).expect("mode selection focus"));
+            for canvas_width in [720.0, 240.0, 256.0, 336.0, 720.0] {
+                host.update(&mut visual, |host, cx| {
+                    host.pane_width = px(canvas_width + 680.0);
+                    cx.notify();
+                });
+                draw_pane_layout(&mut visual);
+                let canvas = visual.debug_bounds("fig-container").expect("canvas");
+                assert_eq!(canvas.size.width, px(canvas_width));
+                assert_workspace_tabs(&mut visual, canvas);
+                let surface = visual
+                    .debug_bounds("editor-toolbar-surface")
+                    .expect("toolbar surface");
+                assert!(
+                    surface.is_contained_within(&canvas),
+                    "{canvas_width}: {surface:?} / {canvas:?}"
+                );
+                assert!((surface.center().x - canvas.center().x).abs() <= px(1.0));
+                for selector in ["toolbar-mode-selector", "toolbar-tool-actions"] {
+                    let control = visual.debug_bounds(selector).expect(selector);
+                    assert!(
+                        control.is_contained_within(&surface),
+                        "{selector}: {control:?}"
+                    );
+                }
+                let viewport = visual
+                    .debug_bounds("toolbar-primary-viewport")
+                    .expect("scroll viewport");
+                assert!(viewport.is_contained_within(&surface));
+                if let Some(secondary) = visual.debug_bounds("toolbar-secondary-viewport") {
+                    assert!(secondary.is_contained_within(&surface));
+                }
+                let scroll_position = viewport.center();
+                let canvas_viewport = view.read_with(&visual, |view, _| view.viewport());
+                visual.simulate_event(ScrollWheelEvent {
+                    position: scroll_position,
+                    delta: ScrollDelta::Pixels(point(px(1000.0), px(0.0))),
+                    ..Default::default()
+                });
+                draw_pane_layout(&mut visual);
+                assert_eq!(
+                    view.read_with(&visual, |view, _| view.viewport()),
+                    canvas_viewport
+                );
+                let first = visual
+                    .debug_bounds(leading_selector)
+                    .expect("leading mode control");
+                assert!(
+                    first.is_contained_within(&viewport),
+                    "leading control: {first:?} / {viewport:?}"
+                );
+                let row = visual
+                    .debug_bounds("toolbar-primary-row")
+                    .expect("tool row");
+                if row.size.width > viewport.size.width + px(1.0) {
+                    assert!(visual.debug_bounds("toolbar-primary-fade-end").is_some());
+                    visual.simulate_event(ScrollWheelEvent {
+                        position: scroll_position,
+                        delta: ScrollDelta::Pixels(point(px(-1000.0), px(0.0))),
+                        ..Default::default()
+                    });
+                    draw_pane_layout(&mut visual);
+                    let moved = visual
+                        .debug_bounds("toolbar-primary-row")
+                        .expect("scrolled tool row");
+                    assert!(
+                        moved.left() < row.left(),
+                        "real wheel input must scroll the row"
+                    );
+                    let trailing = visual
+                        .debug_bounds(trailing_selector)
+                        .expect("trailing mode control");
+                    assert!(
+                        trailing.is_contained_within(&viewport),
+                        "trailing control: {trailing:?} / {viewport:?}"
+                    );
+                    assert!(visual.debug_bounds("toolbar-primary-fade-start").is_some());
+                    assert!(visual.debug_bounds("toolbar-primary-fade-end").is_none());
+                    assert_eq!(
+                        view.read_with(&visual, |view, _| view.viewport()),
+                        canvas_viewport
+                    );
+                    visual.simulate_event(ScrollWheelEvent {
+                        position: scroll_position,
+                        delta: ScrollDelta::Pixels(point(px(1000.0), px(0.0))),
+                        ..Default::default()
+                    });
+                    draw_pane_layout(&mut visual);
+                    let restored = visual
+                        .debug_bounds("toolbar-primary-row")
+                        .expect("restored tool row");
+                    assert!((restored.left() - row.left()).abs() <= px(1.0));
+                } else {
+                    let trailing = visual
+                        .debug_bounds(trailing_selector)
+                        .expect("accessible trailing mode control");
+                    assert!(trailing.is_contained_within(&viewport));
+                    assert!(row.is_contained_within(&viewport));
+                    assert!(visual.debug_bounds("toolbar-primary-fade-start").is_none());
+                    assert!(visual.debug_bounds("toolbar-primary-fade-end").is_none());
+                }
+                if canvas_width == 720.0 && mode == EditorMode::Design {
+                    assert!(
+                        surface.size.width < canvas.size.width,
+                        "wide Design pill retains its intrinsic size"
+                    );
+                    let exposed_canvas = point(canvas.left() + px(2.0), surface.center().y);
+                    assert!(!surface.contains(&exposed_canvas));
+                    visual.simulate_event(ScrollWheelEvent {
+                        position: exposed_canvas,
+                        delta: ScrollDelta::Pixels(point(px(0.0), px(24.0))),
+                        ..Default::default()
+                    });
+                    draw_pane_layout(&mut visual);
+                    assert_ne!(
+                        view.read_with(&visual, |view, _| view.viewport()),
+                        canvas_viewport,
+                        "the transparent width-bound wrapper must not block exposed canvas input"
+                    );
+                    visual.simulate_event(ScrollWheelEvent {
+                        position: exposed_canvas,
+                        delta: ScrollDelta::Pixels(point(px(0.0), px(-24.0))),
+                        ..Default::default()
+                    });
+                    draw_pane_layout(&mut visual);
+                }
+                assert_eq!(
+                    view.read_with(&visual, |view, _| view.viewport()),
+                    canvas_viewport
+                );
+                visual.update(|window, _| assert!(focus.is_focused(window)));
+                view.read_with(&visual, |view, cx| {
+                    assert_eq!(view.editor_mode(cx), mode);
+                    assert_eq!(
+                        view.gpui_toolbar
+                            .as_ref()
+                            .expect("toolbar")
+                            .panel
+                            .read(cx)
+                            .mode(),
+                        toolbar_mode
+                    );
+                    assert_eq!(
+                        view.gpui_toolbar
+                            .as_ref()
+                            .expect("same toolbar")
+                            .panel
+                            .entity_id(),
+                        toolbar
+                    );
+                    assert!(view.layers_sidebar_visible && view.inspector_sidebar_visible);
+                    assert_eq!(
+                        (view.layers_sidebar_width, view.inspector_sidebar_width),
+                        (px(280.0), px(400.0))
+                    );
+                    assert_eq!(view.pane_width, Some(px(canvas_width + 680.0)));
+                });
+                item.read_with(&visual, |item, _| {
+                    let document = item.document().expect("document");
+                    assert_eq!(
+                        (
+                            serde_json::to_value(&document.doc).expect("document snapshot"),
+                            document.raw_assets.clone(),
+                            document.doc.history.undo_depth(),
+                            document.doc.history.redo_depth(),
+                            item.is_dirty(),
+                        ),
+                        before
+                    );
+                });
+            }
+        }
+        for (pane_width, canvas_width) in [
+            (1016.0, 336.0),
+            (588.0, 240.0),
+            (450.0, 450.0),
+            (1400.0, 720.0),
+        ] {
+            host.update(&mut visual, |host, cx| {
+                host.pane_width = px(pane_width);
+                cx.notify();
+            });
+            draw_pane_layout(&mut visual);
+            let canvas = visual.debug_bounds("fig-container").expect("canvas");
+            assert_eq!(canvas.size.width, px(canvas_width));
+            assert_workspace_tabs(&mut visual, canvas);
+            let layout = view.read_with(&visual, |view, _| view.pane_sidebar_layout());
+            let canvas_tab = visual
+                .debug_bounds("fanta-collapsible-tab-fanta-editor-workspace-0")
+                .expect("Canvas tab above compact header");
+            if layout.layers.is_none() {
+                assert!(
+                    canvas_tab.top() >= canvas.top() + px(80.0),
+                    "compact workspace controls must clear the collapsed Layers header"
+                );
+            } else {
+                assert!(canvas_tab.top() < canvas.top() + px(80.0));
+            }
+            let pane = Bounds::new(
+                point(
+                    canvas.left() - layout.layers.unwrap_or_default(),
+                    canvas.top(),
+                ),
+                size(px(pane_width), canvas.size.height),
+            );
+            for (index, workspace) in [(1, EditorWorkspace::Variables), (2, EditorWorkspace::Code)]
+            {
+                let selector = format!("fanta-collapsible-tab-fanta-editor-workspace-{index}");
+                let tab = visual.debug_bounds(&selector).expect("workspace tab");
+                visual.simulate_click(tab.center(), Modifiers::default());
+                draw_pane_layout(&mut visual);
+                assert_eq!(
+                    view.read_with(&visual, |view, cx| view.editor_workspace(cx)),
+                    workspace
+                );
+                assert_workspace_tabs(&mut visual, pane);
+                let canvas_tab = visual
+                    .debug_bounds("fanta-collapsible-tab-fanta-editor-workspace-0")
+                    .expect("return Canvas tab");
+                assert!(
+                    canvas_tab.top() < pane.top() + px(80.0),
+                    "non-Canvas workspace controls retain their original top position"
+                );
+                visual.simulate_click(canvas_tab.center(), Modifiers::default());
+                draw_pane_layout(&mut visual);
+                view.update_in(&mut visual, |view, window, cx| {
+                    assert_eq!(view.editor_workspace(cx), EditorWorkspace::Canvas);
+                    if workspace == EditorWorkspace::Code {
+                        assert!(view.focus_handle(cx).is_focused(window));
+                    }
+                    assert_eq!(view.editor_mode(cx), EditorMode::Draw);
+                    assert_eq!(
+                        view.gpui_toolbar
+                            .as_ref()
+                            .expect("same toolbar")
+                            .panel
+                            .entity_id(),
+                        toolbar
+                    );
+                    assert!(view.layers_sidebar_visible && view.inspector_sidebar_visible);
+                    assert_eq!(
+                        (view.layers_sidebar_width, view.inspector_sidebar_width),
+                        (px(280.0), px(400.0))
+                    );
+                });
+                let returned_canvas = visual
+                    .debug_bounds("fig-container")
+                    .expect("returned canvas");
+                assert_eq!(returned_canvas, canvas);
+                assert_workspace_tabs(&mut visual, returned_canvas);
+                item.read_with(&visual, |item, _| {
+                    let document = item.document().expect("document");
+                    assert_eq!(
+                        (
+                            serde_json::to_value(&document.doc).expect("document snapshot"),
+                            document.raw_assets.clone(),
+                            document.doc.history.undo_depth(),
+                            document.doc.history.redo_depth(),
+                            item.is_dirty(),
+                        ),
+                        before
+                    );
+                });
+            }
+        }
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    async fn assert_narrow_design_crop_controls(canvas_width: f32, cx: &mut TestAppContext) {
+        init_visual_test(cx);
+        cx.update(|cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new("home", menu::SelectFirst, Some("menu")),
+                gpui::KeyBinding::new("down", menu::SelectNext, Some("menu")),
+                gpui::KeyBinding::new("enter", menu::Confirm, Some("menu")),
+                gpui::KeyBinding::new("cmd-z", Undo, Some("FigViewer")),
+                gpui::KeyBinding::new("cmd-shift-z", Redo, Some("FigViewer")),
+            ]);
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, bitmap, images) = bitmap_canvas_doc();
+        let (item, view, host, mut visual) = pane_layout_fixture(&project, doc, images, cx);
+        host.update(&mut visual, |host, cx| {
+            host.pane_width = px(canvas_width + 680.0);
+            cx.notify();
+        });
+        view.update(&mut visual, |view, cx| {
+            view.set_viewport_silent(Viewport::default());
+            cx.notify();
+        });
+        draw_pane_layout(&mut visual);
+        assert_eq!(
+            visual
+                .debug_bounds("fig-container")
+                .expect("narrow canvas")
+                .size
+                .width,
+            px(canvas_width)
+        );
+        assert_eq!(
+            view.read_with(&visual, |view, _| view.viewport()),
+            Some(Viewport::default())
+        );
+        let assert_controls = |visual: &mut gpui::VisualTestContext, hint_visible: bool| {
+            let canvas = visual.debug_bounds("fig-container").expect("canvas");
+            let controls = visual
+                .debug_bounds("design-crop-controls")
+                .expect("Crop controls");
+            assert!(
+                controls.is_contained_within(&canvas),
+                "{controls:?} / {canvas:?}"
+            );
+            let mut occupied = Vec::new();
+            for selector in [
+                "design-crop-ratio",
+                "design-crop-cancel",
+                "design-crop-apply",
+            ] {
+                let bounds = visual.debug_bounds(selector).expect(selector);
+                assert!(
+                    bounds.is_contained_within(&controls),
+                    "{selector}: {bounds:?} / {controls:?}"
+                );
+                assert!(bounds.size.width > px(0.0) && bounds.size.height > px(0.0));
+                occupied.push(bounds);
+            }
+            let hint = visual.debug_bounds("design-crop-hint");
+            assert_eq!(hint.is_some(), hint_visible);
+            if let Some(hint) = hint {
+                assert!(hint.is_contained_within(&controls), "hint must not clip");
+                occupied.push(hint);
+            }
+            for (index, bounds) in occupied.iter().enumerate() {
+                for other in occupied.iter().skip(index + 1) {
+                    assert!(
+                        !bounds.intersects(other),
+                        "controls must not overlap: {bounds:?} / {other:?}"
+                    );
+                }
+            }
+        };
+        let position = view.read_with(&visual, |view, _| {
+            view.container_bounds.expect("canvas").center()
+        });
+        mounted_canvas_click(&mut visual, position, 1);
+        let (original_doc, original_assets, original_world) = item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            (
+                document.doc.clone(),
+                document.raw_assets.clone(),
+                document.doc.scene.world_transform(bitmap),
+            )
+        });
+        let original = original_doc.scene.get(bitmap).expect("bitmap").clone();
+        let page = original.parent.expect("page");
+        let assert_unedited = |visual: &gpui::VisualTestContext| {
+            item.read_with(visual, |item, _| {
+                let document = item.document().expect("document");
+                assert_eq!(
+                    serde_json::to_value(&document.doc).expect("actual document"),
+                    serde_json::to_value(&original_doc).expect("original document")
+                );
+                assert_eq!(document.raw_assets, original_assets);
+                assert_eq!(
+                    (
+                        document.doc.history.undo_depth(),
+                        document.doc.history.redo_depth()
+                    ),
+                    (0, 0)
+                );
+                assert!(!item.is_dirty());
+            });
+        };
+        mounted_canvas_click(&mut visual, position, 2);
+        draw_pane_layout(&mut visual);
+        assert_controls(&mut visual, true);
+        view.read_with(&visual, |view, _| {
+            assert_eq!(view.active_tool(), ToolKind::Crop);
+            assert!(!view.tools.can_apply_crop());
+        });
+        let apply = visual
+            .debug_bounds("design-crop-apply")
+            .expect("disabled Apply")
+            .center();
+        visual.simulate_click(apply, gpui::Modifiers::none());
+        draw_pane_layout(&mut visual);
+        assert_unedited(&visual);
+        let cancel_start = position + point(px(-40.0), px(-20.0));
+        let cancel_end = position + point(px(40.0), px(20.0));
+        visual.simulate_mouse_down(cancel_start, MouseButton::Left, gpui::Modifiers::none());
+        visual.simulate_mouse_move(cancel_end, MouseButton::Left, gpui::Modifiers::none());
+        visual.simulate_mouse_up(cancel_end, MouseButton::Left, gpui::Modifiers::none());
+        draw_pane_layout(&mut visual);
+        assert_controls(&mut visual, false);
+        view.read_with(&visual, |view, _| assert!(view.tools.can_apply_crop()));
+        assert_unedited(&visual);
+        let cancel = visual
+            .debug_bounds("design-crop-cancel")
+            .expect("Cancel preview")
+            .center();
+        visual.simulate_click(cancel, gpui::Modifiers::none());
+        draw_pane_layout(&mut visual);
+        assert_controls(&mut visual, true);
+        view.read_with(&visual, |view, _| {
+            assert_eq!(view.active_tool(), ToolKind::Crop);
+            assert!(!view.tools.can_apply_crop());
+            assert!(
+                !view
+                    .tools
+                    .overlays
+                    .iter()
+                    .any(|overlay| matches!(overlay, fanta_tools::ToolOverlay::PreviewRect { .. }))
+            );
+        });
+        assert_unedited(&visual);
+        let cancel = visual
+            .debug_bounds("design-crop-cancel")
+            .expect("Exit Crop")
+            .center();
+        visual.simulate_click(cancel, gpui::Modifiers::none());
+        draw_pane_layout(&mut visual);
+        assert!(visual.debug_bounds("design-crop-controls").is_none());
+        view.read_with(&visual, |view, _| {
+            assert_eq!(view.active_tool(), ToolKind::Select)
+        });
+        assert_unedited(&visual);
+        mounted_canvas_click(&mut visual, position, 2);
+        draw_pane_layout(&mut visual);
+        assert_controls(&mut visual, true);
+        let ratio = visual.debug_bounds("design-crop-ratio").expect("Ratio");
+        visual.simulate_click(ratio.center(), gpui::Modifiers::none());
+        draw_pane_layout(&mut visual);
+        let square_ratio = visual
+            .debug_bounds("MENU_ITEM-1:1")
+            .expect("square crop ratio menu item");
+        visual.simulate_click(square_ratio.center(), gpui::Modifiers::none());
+        draw_pane_layout(&mut visual);
+        assert!(visual.debug_bounds("MENU_ITEM-1:1").is_none());
+        let start = position + point(px(-40.0), px(-20.0));
+        let end = position + point(px(40.0), px(20.0));
+        visual.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::none());
+        visual.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(&visual, |view, _| assert!(!view.tools.can_apply_crop()));
+        draw_pane_layout(&mut visual);
+        assert!(visual.debug_bounds("design-crop-hint").is_none());
+        visual.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(&visual, |view, cx| {
+            assert!(view.tools.can_apply_crop());
+            assert_eq!(view.editor_mode(cx), EditorMode::Design);
+            assert_eq!(view.active_tool(), ToolKind::Crop);
+            assert_eq!(
+                view.gpui_toolbar
+                    .as_ref()
+                    .expect("toolbar")
+                    .draw_options
+                    .crop_ratio
+                    .as_ref(),
+                "1:1"
+            );
+            let preview = view
+                .tools
+                .overlays
+                .iter()
+                .find_map(|overlay| match overlay {
+                    fanta_tools::ToolOverlay::PreviewRect { world_rect } => Some(*world_rect),
+                    _ => None,
+                })
+                .expect("pending crop");
+            assert_eq!(
+                preview,
+                fanta_doc::Bounds::from_xywh(-40.0, -20.0, 80.0, 80.0)
+            );
+        });
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                serde_json::to_value(item.doc().expect("document")).expect("preview document"),
+                serde_json::to_value(&original_doc).expect("original document")
+            );
+            assert!(!item.is_dirty());
+        });
+        view.update(&mut visual, |view, cx| {
+            view.dispatch_tool_event(
+                key_event(LogicalKey::ArrowLeft, gpui::Modifiers::none()),
+                cx,
+            );
+        });
+        view.read_with(&visual, |view, _| {
+            assert!(view.tools.overlays.is_empty());
+            assert!(view.tools.can_apply_crop());
+        });
+        draw_pane_layout(&mut visual);
+        assert!(visual.debug_bounds("design-crop-hint").is_none());
+        let now = || {
+            i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock after Unix epoch")
+                    .as_secs(),
+            )
+            .expect("timestamp fits document metadata")
+        };
+        let started = now();
+        draw_pane_layout(&mut visual);
+        assert_controls(&mut visual, false);
+        let apply = visual
+            .debug_bounds("design-crop-apply")
+            .expect("Apply crop");
+        visual.simulate_click(apply.center(), gpui::Modifiers::none());
+        let crop = item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            let crop = single_selection(doc).expect("crop selected");
+            assert_ne!(crop, bitmap);
+            assert_eq!(doc.scene.len(), original_doc.scene.len() + 1);
+            assert_eq!(doc.scene.children_of(Some(page)), &[crop]);
+            assert_eq!(doc.scene.children_of(Some(crop)), &[bitmap]);
+            assert_eq!(doc.scene.get(bitmap).expect("bitmap").data, original.data);
+            assert_eq!(doc.scene.world_transform(bitmap), original_world);
+            crop
+        });
+        let mut expected = original_doc.clone();
+        let mut group = CanvasNode::new(NodeData::Group(GroupNode {
+            local_size: Some([80.0, 80.0]),
+            clip_size: Some([80.0, 80.0]),
+            ..Default::default()
+        }));
+        group.id = crop;
+        group.name = "Crop".into();
+        group.parent = Some(page);
+        group.index = original.index;
+        group.transform = Transform2D::translation(-40.0, -20.0);
+        let mut transaction = fanta_doc::Transaction::new("Crop");
+        transaction.push(Operation::create_node(group));
+        transaction.push(Operation::Reparent {
+            id: bitmap,
+            old_parent: Some(page),
+            old_index: original.index,
+            new_parent: Some(crop),
+            new_index: IndexKey::FIRST,
+        });
+        transaction.push(Operation::SetTransform {
+            id: bitmap,
+            old: original.transform,
+            new: Transform2D::translation(-60.0, -30.0),
+        });
+        expected
+            .apply_transaction(transaction)
+            .expect("expected crop transaction");
+        expected.selection.select_only(crop);
+        let assert_state = |visual: &gpui::VisualTestContext, expected: &Doc| {
+            item.read_with(visual, |item, _| {
+                let document = item.document().expect("document");
+                let actual = &document.doc;
+                assert!((started..=now()).contains(&actual.metadata.modified_at));
+                let mut expected = expected.clone();
+                // Only the wall-clock field varies between the independently constructed transaction and UI input.
+                expected.metadata.modified_at = actual.metadata.modified_at;
+                assert_eq!(
+                    serde_json::to_value(actual).expect("actual document"),
+                    serde_json::to_value(&expected).expect("expected document")
+                );
+                assert_eq!(document.raw_assets, original_assets);
+                assert_eq!(
+                    (actual.history.undo_depth(), actual.history.redo_depth()),
+                    (expected.history.undo_depth(), expected.history.redo_depth())
+                );
+                assert_eq!(actual.scene.world_transform(bitmap), original_world);
+                assert!(item.is_dirty());
+            });
+            view.read_with(visual, |view, cx| {
+                assert_eq!(view.editor_mode(cx), EditorMode::Design);
+                assert!(!view.tools.can_apply_crop());
+                assert!(!view.tools.overlays.iter().any(|overlay| matches!(
+                    overlay,
+                    fanta_tools::ToolOverlay::PreviewRect { .. }
+                )));
+            });
+        };
+        assert_eq!(expected.history.undo_depth(), 1);
+        assert_eq!(expected.history.redo_depth(), 0);
+        assert_state(&visual, &expected);
+        let applied = item.read_with(&visual, |item, _| {
+            serde_json::to_value(item.doc().expect("document")).expect("applied document")
+        });
+        draw_pane_layout(&mut visual);
+        let apply = visual
+            .debug_bounds("design-crop-apply")
+            .expect("Apply crop");
+        visual.simulate_click(apply.center(), gpui::Modifiers::none());
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                serde_json::to_value(item.doc().expect("document")).expect("second apply"),
+                applied
+            );
+        });
+        assert_state(&visual, &expected);
+        visual.simulate_keystrokes("cmd-z");
+        assert!(expected.undo().expect("expected Undo"));
+        expected.selection.clear();
+        assert_eq!(expected.history.undo_depth(), 0);
+        assert_eq!(expected.history.redo_depth(), 1);
+        item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert!(doc.selection.is_empty());
+            assert_eq!(doc.scene.get(bitmap), Some(&original));
+            assert_eq!(
+                serde_json::to_value(&doc.scene).expect("undone scene"),
+                serde_json::to_value(&original_doc.scene).expect("original scene")
+            );
+        });
+        assert_state(&visual, &expected);
+        visual.simulate_keystrokes("cmd-shift-z");
+        assert!(expected.redo().expect("expected Redo"));
+        assert_eq!(expected.history.undo_depth(), 1);
+        assert_eq!(expected.history.redo_depth(), 0);
+        item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert!(doc.selection.is_empty());
+            assert_eq!(doc.scene.children_of(Some(page)), &[crop]);
+            assert_eq!(doc.scene.children_of(Some(crop)), &[bitmap]);
+        });
+        assert_state(&visual, &expected);
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn mounted_canvas_crop_controls_fit_240_and_preserve_cancel_apply_history(
+        cx: &mut TestAppContext,
+    ) {
+        assert_narrow_design_crop_controls(240.0, cx).await;
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn mounted_canvas_crop_controls_fit_256_and_preserve_cancel_apply_history(
+        cx: &mut TestAppContext,
+    ) {
+        assert_narrow_design_crop_controls(256.0, cx).await;
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn mounted_canvas_crop_controls_fit_336_and_preserve_cancel_apply_history(
+        cx: &mut TestAppContext,
+    ) {
+        assert_narrow_design_crop_controls(336.0, cx).await;
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
     async fn assert_mounted_design_crop_controls(cx: &mut TestAppContext, context_menu: bool) {
         init_visual_test(cx);
         cx.update(|cx| {
@@ -20849,6 +21582,8 @@ impl FigView {
             .track_focus(&self.native_toolbar_focus)
             .child(
                 v_flex()
+                    .w_full()
+                    .min_w_0()
                     .items_center()
                     .gap_2()
                     .when(self.design_crop_controls_visible(cx), |toolbar| {
@@ -20937,6 +21672,10 @@ impl FigView {
         h_flex()
             .id("design-crop-controls")
             .debug_selector(|| "design-crop-controls".to_owned())
+            .min_w_0()
+            .max_w_full()
+            .flex_wrap()
+            .justify_center()
             .occlude()
             .gap_2()
             .px_2()
@@ -20948,6 +21687,8 @@ impl FigView {
                 row.child(
                     div()
                         .debug_selector(|| "design-crop-hint".to_owned())
+                        .min_w_0()
+                        .max_w_full()
                         .child(
                             Label::new("Drag on the canvas to select a crop")
                                 .size(LabelSize::Small)
@@ -20958,11 +21699,13 @@ impl FigView {
             .child(
                 div()
                     .debug_selector(|| "design-crop-ratio".to_owned())
+                    .flex_none()
                     .child(ratio_menu),
             )
             .child(
                 div()
                     .debug_selector(|| "design-crop-cancel".to_owned())
+                    .flex_none()
                     .child(
                         Button::new("design-crop-cancel-button", "Cancel")
                             .size(ButtonSize::Compact)
@@ -20980,6 +21723,7 @@ impl FigView {
             .child(
                 div()
                     .debug_selector(|| "design-crop-apply".to_owned())
+                    .flex_none()
                     .child(
                         Button::new("design-crop-apply-button", "Apply crop")
                             .size(ButtonSize::Compact)

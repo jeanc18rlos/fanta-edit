@@ -1221,7 +1221,17 @@ impl MultiWorkspace {
             }
 
             cx.update(|cx| {
-                Workspace::new_local(paths, app_state, None, None, None, OpenMode::NewWindow, cx)
+                Workspace::new_local_with_restore_intent(
+                    paths,
+                    app_state,
+                    None,
+                    None,
+                    None,
+                    OpenMode::NewWindow,
+                    true,
+                    Default::default(),
+                    cx,
+                )
             })
             .await?;
 
@@ -1470,6 +1480,7 @@ impl MultiWorkspace {
         let excluding = excluding.to_vec();
 
         cx.spawn(async move |_this, cx| {
+            let restoring = project_group.is_some();
             let effective_path_list = if let Some(project_group) = project_group {
                 let metadata_tasks: Vec<_> = paths
                     .iter()
@@ -1493,16 +1504,15 @@ impl MultiWorkspace {
                 PathList::new(&paths)
             };
 
+            let (matching_paths, captured_paths) =
+                crate::local_fanta_root_paths(effective_path_list.paths(), app_state.fs.as_ref())
+                    .await;
+            let matching_paths = PathList::new(&matching_paths);
             if let Some(requesting_window) = requesting_window
                 && let Some(workspace) = requesting_window
                     .update(cx, |multi_workspace, window, cx| {
                         multi_workspace
-                            .workspace_for_paths_excluding(
-                                &effective_path_list,
-                                None,
-                                &excluding,
-                                cx,
-                            )
+                            .workspace_for_paths_excluding(&matching_paths, None, &excluding, cx)
                             .inspect(|workspace| {
                                 multi_workspace.activate(
                                     workspace.clone(),
@@ -1520,13 +1530,15 @@ impl MultiWorkspace {
 
             let result = cx
                 .update(|cx| {
-                    Workspace::new_local(
+                    Workspace::new_local_with_restore_intent(
                         effective_path_list.paths().to_vec(),
                         app_state,
                         requesting_window,
                         None,
                         init,
                         open_mode,
+                        restoring,
+                        captured_paths,
                         cx,
                     )
                 })
@@ -2150,6 +2162,7 @@ impl MultiWorkspace {
                 log::debug!("project loading no longer waits for its first frame");
             }
         });
+        let fs = self.workspace().read(cx).app_state().fs.clone();
         let open = if self.multi_workspace_enabled(cx) {
             let empty_workspace = if self
                 .active_workspace
@@ -2191,6 +2204,18 @@ impl MultiWorkspace {
                     )
                 })?;
                 let new_workspace = create_task.await?;
+                for path in paths {
+                    if crate::fanta_manifest_root(&path, fs.as_ref())
+                        .await
+                        .is_some()
+                    {
+                        new_workspace
+                            .update_in(cx, |workspace, window, cx| {
+                                workspace.open_abs_path(path, Default::default(), window, cx)
+                            })?
+                            .await?;
+                    }
+                }
 
                 if let Some(empty_workspace) = empty_workspace {
                     if !this.update_in(cx, |this, window, cx| {

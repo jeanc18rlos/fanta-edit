@@ -421,6 +421,433 @@ mod tests {
         })
     }
 
+    fn project_bytes(root: &std::path::Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn visit(
+            root: &std::path::Path,
+            directory: &std::path::Path,
+            files: &mut BTreeMap<PathBuf, Vec<u8>>,
+        ) {
+            for entry in std::fs::read_dir(directory).expect("fixture directory") {
+                let entry = entry.expect("fixture entry");
+                let path = entry.path();
+                if entry.file_type().expect("fixture type").is_dir() {
+                    visit(root, &path, files);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root)
+                            .expect("fixture relative path")
+                            .to_path_buf(),
+                        std::fs::read(path).expect("fixture bytes"),
+                    );
+                }
+            }
+        }
+        let mut files = BTreeMap::new();
+        visit(root, root, &mut files);
+        files
+    }
+
+    async fn manifest_workspace(
+        fixture: &Fixture,
+        cx: &mut TestAppContext,
+    ) -> (WindowHandle<workspace::MultiWorkspace>, Entity<Workspace>) {
+        cx.update(|cx| {
+            cx.set_global(db::AppDatabase::test_new());
+            <dyn fs::Fs>::set_global(fixture.file_system.clone(), cx);
+            crate::workspace_hooks::init(cx);
+        });
+        let app_state = fixture
+            .workspace
+            .read_with(cx, |workspace, _| workspace.app_state().clone());
+        let result = cx
+            .update(|cx| {
+                Workspace::new_local(
+                    vec![fixture.directory.path().join("Original/fanta.json")],
+                    app_state,
+                    None,
+                    None,
+                    None,
+                    workspace::OpenMode::Activate,
+                    cx,
+                )
+            })
+            .await
+            .expect("explicit manifest workspace");
+        drop(result.opened_items);
+        cx.run_until_parked();
+        assert_eq!(
+            result.workspace.read_with(cx, |workspace, cx| workspace
+                .items_of_type::<FigView>(cx)
+                .count()),
+            1
+        );
+        (result.window, result.workspace)
+    }
+
+    async fn explicit_manifest_open(
+        window: WindowHandle<workspace::MultiWorkspace>,
+        manifest: PathBuf,
+        cx: &mut TestAppContext,
+    ) -> Entity<Workspace> {
+        let task = window
+            .update(cx, |multi_workspace, window, cx| {
+                assert!(multi_workspace.multi_workspace_enabled(cx));
+                multi_workspace.open_project(
+                    vec![manifest],
+                    workspace::OpenMode::Activate,
+                    window,
+                    cx,
+                )
+            })
+            .expect("manifest picker route");
+        let workspace = task.await.expect("explicit manifest open");
+        cx.run_until_parked();
+        workspace
+    }
+
+    async fn close_canvas(
+        window: WindowHandle<workspace::MultiWorkspace>,
+        workspace: &Entity<Workspace>,
+        cx: &mut TestAppContext,
+    ) {
+        window
+            .update(cx, |_, window, cx| {
+                let pane = workspace.read(cx).active_pane().clone();
+                let item = pane.read(cx).active_item().expect("open design").item_id();
+                pane.update(cx, |pane, cx| {
+                    pane.close_item_by_id(item, workspace::pane::SaveIntent::Close, window, cx)
+                })
+            })
+            .expect("close design task")
+            .await
+            .expect("close clean design");
+        cx.run_until_parked();
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace.items(cx).count()),
+            0
+        );
+    }
+
+    async fn quit_and_restore(
+        window: WindowHandle<workspace::MultiWorkspace>,
+        workspace: Entity<Workspace>,
+        cx: &mut TestAppContext,
+    ) -> (WindowHandle<workspace::MultiWorkspace>, Entity<Workspace>) {
+        use workspace::{
+            MultiWorkspaceState, SerializedMultiWorkspace, SerializedWorkspaceLocation,
+            SessionWorkspace,
+        };
+        let app_state = workspace.read_with(cx, |workspace, _| workspace.app_state().clone());
+        assert!(
+            window
+                .update(cx, |_, window, cx| {
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.prepare_to_close(workspace::CloseIntent::Quit, window, cx)
+                    })
+                })
+                .expect("prepare quit task")
+                .await
+                .expect("prepare normal quit")
+        );
+        window
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.flush_serialization(window, cx)
+                })
+            })
+            .expect("flush workspace")
+            .await;
+        window
+            .update(cx, |multi_workspace, _, _| {
+                multi_workspace.flush_serialization()
+            })
+            .expect("flush window")
+            .await;
+        let saved = workspace.read_with(cx, |workspace, cx| SerializedMultiWorkspace {
+            active_workspace: SessionWorkspace {
+                workspace_id: workspace.database_id().expect("saved workspace id"),
+                location: SerializedWorkspaceLocation::Local,
+                paths: workspace::PathList::new(&workspace.root_paths(cx)),
+                window_id: None,
+            },
+            state: MultiWorkspaceState::default(),
+        });
+        window
+            .update(cx, |_, window, _| window.remove_window())
+            .expect("remove old window");
+        cx.update(|_| drop(workspace));
+        cx.run_until_parked();
+        let window = cx
+            .update(|cx| {
+                cx.spawn(async move |mut cx| {
+                    workspace::restore_multiworkspace(saved, app_state, &mut cx).await
+                })
+            })
+            .await
+            .expect("restore saved window");
+        cx.run_until_parked();
+        let workspace = window
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("restored workspace");
+        (window, workspace)
+    }
+
+    #[gpui::test]
+    async fn canvas_session_explicit_manifest_reuses_workspace_and_closed_tab(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = fixture(cx).await;
+        let original_bytes = project_bytes(fixture.directory.path());
+        let manifest = fixture.directory.path().join("Original/fanta.json");
+        let root = fixture.directory.path().join("Original");
+        let (window, workspace) = manifest_workspace(&fixture, cx).await;
+        let first = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_item_as::<FigView>(cx)
+                .expect("manifest view")
+                .entity_id()
+        });
+        let reopened = explicit_manifest_open(window, manifest.clone(), cx).await;
+        assert_eq!(reopened, workspace);
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .items_of_type::<FigView>(cx)
+                .map(|view| view.entity_id())
+                .collect::<Vec<_>>()),
+            vec![first]
+        );
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .root_paths(cx)
+                .into_iter()
+                .map(|path| path.to_path_buf())
+                .collect::<Vec<_>>()),
+            vec![root]
+        );
+        drop(reopened);
+        close_canvas(window, &workspace, cx).await;
+        let (window, workspace) = quit_and_restore(window, workspace, cx).await;
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace.items(cx).count()),
+            0
+        );
+        let reopened = explicit_manifest_open(window, manifest.clone(), cx).await;
+        assert_eq!(
+            reopened, workspace,
+            "explicit Open reuses the restored empty directory workspace"
+        );
+        let first = workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .active_item_as::<FigView>(cx)
+                .expect("explicitly reopened design")
+                .entity_id()
+        });
+        let reopened_again = explicit_manifest_open(window, manifest.clone(), cx).await;
+        assert_eq!(reopened_again, workspace);
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .items_of_type::<FigView>(cx)
+                .map(|view| view.entity_id())
+                .collect::<Vec<_>>()),
+            vec![first]
+        );
+        drop(reopened);
+        drop(reopened_again);
+        close_canvas(window, &workspace, cx).await;
+        window
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.flush_serialization(window, cx)
+                })
+            })
+            .expect("persist empty layout before explicit new_local")
+            .await;
+        let app_state = workspace.read_with(cx, |workspace, _| workspace.app_state().clone());
+        let explicitly_reopened = cx
+            .update(|cx| {
+                Workspace::new_local(
+                    vec![manifest],
+                    app_state,
+                    Some(window),
+                    None,
+                    None,
+                    workspace::OpenMode::Activate,
+                    cx,
+                )
+            })
+            .await
+            .expect("explicit manifest intent survives saved directory paths");
+        drop(explicitly_reopened.opened_items);
+        cx.run_until_parked();
+        assert_eq!(explicitly_reopened.window, window);
+        assert_eq!(
+            explicitly_reopened
+                .workspace
+                .read_with(cx, |workspace, cx| workspace
+                    .items_of_type::<FigView>(cx)
+                    .count()),
+            1
+        );
+        assert_eq!(project_bytes(fixture.directory.path()), original_bytes);
+    }
+
+    #[gpui::test]
+    async fn canvas_session_empty_restore_allows_only_newly_added_project_auto_open(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = fixture(cx).await;
+        let original_bytes = project_bytes(fixture.directory.path());
+        let (window, workspace) = manifest_workspace(&fixture, cx).await;
+        close_canvas(window, &workspace, cx).await;
+        let (window, workspace) = quit_and_restore(window, workspace, cx).await;
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace.items(cx).count()),
+            0
+        );
+        let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
+        project
+            .update(cx, |project, cx| {
+                project.find_or_create_worktree(fixture.directory.path().join("Other"), true, cx)
+            })
+            .await
+            .expect("add a new project folder");
+        cx.run_until_parked();
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .items_of_type::<FigView>(cx)
+                .count()),
+            1
+        );
+        assert_eq!(
+            active_root(&workspace, cx),
+            std::fs::canonicalize(fixture.directory.path().join("Other"))
+                .expect("new project canonical path")
+        );
+        close_canvas(window, &workspace, cx).await;
+        let (_, restored) = quit_and_restore(window, workspace, cx).await;
+        assert_eq!(
+            restored.read_with(cx, |workspace, cx| workspace.items(cx).count()),
+            0,
+            "both saved empty project roots stay empty"
+        );
+        assert_eq!(project_bytes(fixture.directory.path()), original_bytes);
+    }
+
+    #[gpui::test]
+    async fn canvas_session_legacy_manifest_root_restores_once_then_keeps_empty_layout(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = fixture(cx).await;
+        let original_bytes = project_bytes(fixture.directory.path());
+        let manifest = fixture.directory.path().join("Original/fanta.json");
+        let (window, workspace) = manifest_workspace(&fixture, cx).await;
+        close_canvas(window, &workspace, cx).await;
+        let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
+        let legacy_root = project
+            .update(cx, |project, cx| {
+                project.create_worktree(&manifest, true, cx)
+            })
+            .await
+            .expect("legacy file root");
+        let legacy_path = ProjectPath {
+            worktree_id: legacy_root.read_with(cx, |worktree, _| worktree.id()),
+            path: util::rel_path::RelPath::empty_arc(),
+        };
+        let opened = window
+            .update(cx, |_, window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.open_path(legacy_path, None, true, window, cx)
+                })
+            })
+            .expect("legacy open task")
+            .await
+            .expect("legacy manifest item");
+        cx.run_until_parked();
+        let view = opened.downcast::<FigView>().expect("legacy design");
+        view.update(cx, |view, cx| view.select_page(1, cx));
+        assert_eq!(
+            workspace.read_with(cx, |workspace, cx| workspace
+                .items_of_type::<FigView>(cx)
+                .count()),
+            1
+        );
+        assert!(workspace.read_with(cx, |workspace, cx| {
+            workspace
+                .root_paths(cx)
+                .iter()
+                .any(|path| path.as_ref() == manifest)
+        }));
+        drop(view);
+        drop(opened);
+        drop(legacy_root);
+        drop(project);
+        let (window, restored) = quit_and_restore(window, workspace, cx).await;
+        assert_eq!(
+            restored.read_with(cx, |workspace, cx| workspace
+                .items_of_type::<FigView>(cx)
+                .count()),
+            1
+        );
+        assert_eq!(
+            restored.read_with(cx, |workspace, cx| workspace
+                .active_item_as::<FigView>(cx)
+                .expect("restored legacy canvas")
+                .read(cx)
+                .selected_page_root),
+            Some(fixture.pages[1])
+        );
+        assert_eq!(
+            restored.read_with(cx, |workspace, cx| workspace
+                .root_paths(cx)
+                .into_iter()
+                .map(|path| path.to_path_buf())
+                .collect::<Vec<_>>()),
+            vec![fixture.directory.path().join("Original")]
+        );
+        close_canvas(window, &restored, cx).await;
+        let (_, restored) = quit_and_restore(window, restored, cx).await;
+        assert_eq!(
+            restored.read_with(cx, |workspace, cx| workspace.items(cx).count()),
+            0,
+            "implicit legacy manifest paths must not reopen closed items"
+        );
+        assert_eq!(project_bytes(fixture.directory.path()), original_bytes);
+    }
+
+    #[gpui::test]
+    async fn canvas_session_manifest_normalization_preserves_ordinary_and_malformed_files(
+        cx: &mut TestAppContext,
+    ) {
+        let fixture = fixture(cx).await;
+        let ordinary = fixture.directory.path().join("ordinary.txt");
+        let malformed = fixture.directory.path().join("Malformed/fanta.json");
+        fixture
+            .file_system
+            .insert_tree(
+                fixture.directory.path(),
+                serde_json::json!({
+                    "ordinary.txt": "ordinary file",
+                    "Malformed": { "fanta.json": "{not a Fanta manifest}" },
+                }),
+            )
+            .await;
+        let project = Project::test(fixture.file_system.clone(), [], cx).await;
+        for path in [ordinary, malformed] {
+            let (worktree, project_path) = cx
+                .update(|cx| Workspace::project_path_for_path(project.clone(), &path, true, cx))
+                .await
+                .expect("ordinary file worktree");
+            assert_eq!(
+                worktree.read_with(cx, |worktree, _| worktree.abs_path().to_path_buf()),
+                path
+            );
+            assert!(
+                project_path.path.is_empty(),
+                "ordinary files retain file-root semantics"
+            );
+        }
+    }
+
     #[gpui::test]
     async fn canvas_session_save_as_restores_destination_and_page_without_focus_theft(
         cx: &mut TestAppContext,

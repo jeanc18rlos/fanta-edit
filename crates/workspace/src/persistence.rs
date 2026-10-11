@@ -80,7 +80,7 @@ struct FantaManifestIdentity {
     project_id: String,
 }
 
-async fn fanta_project_id_at(path: &Path, fs: &dyn Fs) -> Option<String> {
+pub(crate) async fn fanta_project_id_at(path: &Path, fs: &dyn Fs) -> Option<String> {
     let manifest_path = path.join("fanta.json");
     let metadata = fs.metadata(&manifest_path).await.ok().flatten()?;
     if metadata.is_dir || metadata.len > MAX_FANTA_MANIFEST_BYTES {

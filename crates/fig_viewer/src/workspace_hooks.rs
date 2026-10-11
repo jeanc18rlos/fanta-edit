@@ -15,7 +15,7 @@
 //! the canvas rather than to a JSON buffer.
 //!
 //! Saved canvas tabs restore through `SerializableItem`. This hook also opens
-//! newly added project folders and sessions saved before canvas serialization.
+//! newly added project folders; saved layouts, including empty ones, are authoritative.
 
 use std::path::{Path, PathBuf};
 
@@ -124,7 +124,7 @@ pub(crate) fn open_design_for_worktree(
     };
     // The cheap, synchronous half of the dedupe: bail before spawning anything
     // when this project is plainly already open.
-    if design_is_open(workspace, &root, cx) {
+    if !auto_open_is_allowed(workspace, &root) || design_is_open(workspace, &root, cx) {
         return Task::ready(Ok(()));
     }
 
@@ -148,7 +148,7 @@ pub(crate) fn open_design_for_worktree(
             // `.fig` load adopting the directory it just materialized) both
             // reach this point, and without the second check each one opens
             // its own tab.
-            if design_is_open(workspace, &root, cx) {
+            if !auto_open_is_allowed(workspace, &root) || design_is_open(workspace, &root, cx) {
                 return anyhow::Ok(None);
             }
             let path = ProjectPath {
@@ -162,7 +162,8 @@ pub(crate) fn open_design_for_worktree(
         if let Some((path, open)) = open {
             let item = open.await?;
             workspace.update_in(cx, |workspace, window, cx| {
-                if design_is_open(workspace, &root, cx)
+                if !auto_open_is_allowed(workspace, &root)
+                    || design_is_open(workspace, &root, cx)
                     || worktree_root(&project, worktree_id, cx).as_ref() != Some(&root)
                 {
                     crate::document::take_pending_view_descriptor(cx);
@@ -199,6 +200,11 @@ pub(crate) fn open_design_for_worktree(
         }
         anyhow::Ok(())
     })
+}
+
+fn auto_open_is_allowed(workspace: &Workspace, root: &Path) -> bool {
+    workspace.should_auto_open_fanta_project(root)
+        && workspace.should_auto_open_fanta_project(&canonical(root))
 }
 
 fn worktree_root(project: &Entity<Project>, worktree_id: WorktreeId, cx: &App) -> Option<PathBuf> {

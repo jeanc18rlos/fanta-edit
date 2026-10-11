@@ -105,12 +105,21 @@ jobs:
                   "pane_layout_preserves_invalid_property_input_across_compaction",
                   "audio_preview_completed_player_reaches_known_duration",
                   "audio_preview_paused_and_seeked_player_keeps_incomplete_position",
-                  "audio_preview_close_resets_completed_position"
+                  "audio_preview_close_resets_completed_position",
+                  "mounted_canvas_toolbar_fits_narrow_panes_and_scrolls_without_panning",
+                  "mounted_canvas_crop_controls_fit_240_and_preserve_cancel_apply_history",
+                  "mounted_canvas_crop_controls_fit_256_and_preserve_cancel_apply_history",
+                  "mounted_canvas_crop_controls_fit_336_and_preserve_cancel_apply_history",
+                  "canvas_session_explicit_manifest_reuses_workspace_and_closed_tab",
+                  "canvas_session_empty_restore_allows_only_newly_added_project_auto_open",
+                  "canvas_session_legacy_manifest_root_restores_once_then_keeps_empty_layout",
+                  "canvas_session_manifest_normalization_preserves_ordinary_and_malformed_files"
               ],
               "workspace": [
                   "test_close_window_reports_save_failure_and_retries",
                   "test_close_window_reports_save_failure_and_can_discard",
-                  "test_multi_workspace_close_window_multiple_workspaces_cancel"
+                  "test_multi_workspace_close_window_multiple_workspaces_cancel",
+                  "canvas_session_captured_manifest_identity_survives_later_read_failure"
               ]
           }
           required_stages = ("engine", "import", "source-order", "editor", "workspace", "ui")
@@ -133,7 +142,7 @@ jobs:
                   actual = [(full_name, status) for full_name, status in tests if full_name.rsplit("::", 1)[-1] == name]
                   checks[label][name] = {"actual": actual, "passed": len(actual) == 1 and actual[0][1] == "ok"}
           passed = all(stage_checks.values()) and all(result["passed"] for group in checks.values() for result in group.values())
-          report = {"passed": passed, "required_count": 36, "stages": stage_checks, "groups": checks,
+          report = {"passed": passed, "required_count": 45, "stages": stage_checks, "groups": checks,
                     "scope": "Actual full-suite offline editor/workspace execution; the separate30 Agent/ACP/Settings gate remains required. No native, GPU, service or performance acceptance."}
           (output / "required-core-regressions.json").write_text(json.dumps(report, indent=2) + "\n")
           print(json.dumps(report))

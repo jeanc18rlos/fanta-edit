@@ -1,6 +1,6 @@
 # Fanta capability guide
 
-Source inventory updated **9 October 2026**; bounded native evidence updated
+Source inventory updated **11 October 2026**; bounded native evidence updated
 **11 October 2026**. Acceptance evidence below is dated.
 This describes the current editor implementation; release verification is tracked
 separately in
@@ -39,8 +39,13 @@ conflicts, but cannot make a concurrent external write and rename atomic; see
   be saved directly; focused numeric-input behavior is qualified below.
   Autosave can persist an edit while a close prompt is
   open; **Don't Save** does not roll back changes already written. Save As creates
-  a separate project and rejects occupied or unsafe destinations. Clean canvas
-  tabs restore their project and page/component scope when the workspace reopens.
+  a separate project and rejects occupied or unsafe destinations. Session restore
+  records project and page/component scope, but build39 failed closed-tab
+  membership: normal Quit and a cold launch without manual Open restored two
+  design tabs after all had been closed. Saved project bytes remained exact.
+  The release candidate's restoration fix and five regression sources remain
+  uncompiled and unexecuted; hosted checks and a matching native app must still
+  accept them. Scoped restore is not fully accepted.
   Unsaved canvas or source content still requires the normal close/save decision.
   A bounded build37 Save/close/warm-reopen journey succeeds, but the original
   reported inert Save/Discard incident is not reproduced or explained. In a
@@ -58,16 +63,24 @@ conflicts, but cannot make a concurrent external write and rename atomic; see
   recorded. Later bounded build39 checks on an owned fixture passed focused
   numeric CmdS without Enter and valid focused-input Close → Save. Invalid
   input was retained when Save was rejected; Close Without Saving then closed
-  the tab, and warm reopening showed the last saved value. These checks do not
-  explain the original Spectrum incident or prove native acceptance of later
-  source changes. Hosted checks on 11 October passed all nine property-draft
-  regression cases, including invalid input and shared views, while the complete
-  app check still failed separately. Neither result establishes full release
-  readiness. See the [acceptance record](../alpha/CAPABILITY_COVERAGE.md), which
+  the tab, and warm reopening showed the last saved value. Build41 repeats these
+  bounded focused-property Save/close results on an owned Text fixture, including
+  invalid-input Cancel/Discard and valid Close Save restoring the original FNX.
+  These checks do not explain the original Spectrum incident or prove native
+  acceptance of later source changes. Both canonical and push hosted Check runs for `37c4073d` on
+  11 October pass all 66 required names, including all nine property-draft cases
+  for invalid input and shared views. Earlier complete-Check failures remain
+  recorded; the latest source checks are green. Hosted success and bounded native
+  journeys still do not establish full release readiness. See the
+  [acceptance record](../alpha/CAPABILITY_COVERAGE.md), which
   retains the [build37 failure](../alpha/CAPABILITY_COVERAGE.md#current37-native-checks--11-october).
 - The **Code** workspace edits FNX and supported JSON sources. Saving valid
   source updates the canvas; invalid drafts preserve the last valid file and
-  scene. Embedded Find searches the active FNX/JSON editor; **Discard draft**
+  scene. Multi-buffer Save is sequential, not atomic: in a bounded build39 check,
+  valid FNX was saved before a second invalid JSON draft was rejected. Cancel
+  retained the invalid draft; Discard closed it and kept the FNX already saved.
+  This is not rollback of earlier writes. Embedded Find searches the active
+  FNX/JSON editor; **Discard draft**
   discards only the selected buffer. Source Save preserves authored Undo, and
   ordinary saved-canvas source refresh remains its own undoable text transaction.
   An unsaved source buffer locks conflicting visual edits. Selecting a layer
@@ -138,7 +151,19 @@ and **Apply crop** controls. Drag inside the image to create the crop region,
 then Apply. On build37, one freeform Bitmap Apply/Undo/Redo/final Undo/Cancel
 journey restores full project content except its modification timestamp. The
 earlier missing-controls failures remain recorded; other crop modes and cold
-reopening are not covered by that journey.
+reopening are not covered by that journey. On build39, both side panels left a
+256-point canvas that clipped the toolbar's leading control; a 336-point canvas
+clipped the Crop hint and placed Apply beyond the right edge. Bitmap drill-in,
+Crop entry and Cancel passed, without Apply in that journey. Build41 also passes
+wrapped-image Crop entry, Apply followed by Undo, and a separate preview Cancel;
+Cancel leaves Crop mode active. Its preview moves the action bar, so an old
+Cancel click position can instead hit Apply. At an actual 336-point canvas,
+Apply, the bottom toolbar and the top Canvas/Variables/Code controls still clip.
+The uncompiled responsive fix in this release candidate bounds toolbar/Crop
+controls and positions the top workspace tabs within the canvas. Its four unexecuted mounted regression
+sources cover mode changes, scrolling, workspace switching and Crop history at
+narrow and wide layouts. Hosted execution and a matching native app must accept
+these behaviors.
 
 On development QA `0f71b3961d`, one real three-second H.264 fixture passes bounded
 Play/Pause, paused Seek, Trim Cancel and Trim Apply with single Undo/Redo and
@@ -565,8 +590,9 @@ by automatic continuations, retries, fallback and automatic compaction. Reaching
 the limit stops the turn with a visible message while preserving completed work;
 a new user turn gets a fresh limit. Manual compaction, title generation, tools,
 subagents and provider-internal retries are outside this limit. This is not a
-dollar or token limit. Hosted checks on 11 October passed the nine request-limit
-regressions; the complete app check still failed separately. Paid native Agent
+dollar or token limit. Both canonical and push Check runs for `37c4073d` on
+11 October pass all 66 required names, including the nine request-limit
+regressions. Earlier failed runs remain recorded. Paid native Agent
 behavior remains unverified. A positive account balance does not reserve the
 full turn's potential cost, and safe billing of repeated chat requests is not
 established. See the [coverage report](../alpha/CAPABILITY_COVERAGE.md) for the
@@ -628,7 +654,17 @@ Mac App Store builds restrict local process execution, external agents and
 related inherited editor features; see [MAC_APP_STORE.md](../alpha/MAC_APP_STORE.md).
 The selected release target is a direct-download Mac app. Packaging now checks
 the app inside the produced DMG against the staged bundle and enforces the
-configured signature/notarization checks. Internal **build37**, exact
+configured signature/notarization checks. Latest completed internal **build41**,
+exact `c46a1b41bcd00222cbdba5e9a1ce450fc0658c10`, passes hosted package/source,
+checksum, local mounted-package, CLI and isolated persistent-QA preparation
+checks. Its bounded native focused-property Save/close, TextPath/Group editing,
+Boolean vector entry, Bitmap Crop and sampled inspector layouts pass; narrow
+336-point controls still clip. Build41 predates the fully green `37c4073d` source
+checks and its Settings Escape/audio changes, and the responsive-controls
+and closed-tab restoration fixes in this release candidate. Earlier build39 at `0732a74e` retains its
+scoped native journeys and closed-tab restart failure; build41 did not retest
+that cold-session path. Both internal packages are unsigned/ad-hoc QA, not
+Developer ID/notarized releases. Earlier **build37**, exact
 `22f734193844eab66485e3cb322b529c2965e297`, now passes hosted and local package,
 checksum, CLI and isolated-QA verification. Its bounded 11 October native checks
 cover selected inspector, Crop, media playback, export and save/close routes;
