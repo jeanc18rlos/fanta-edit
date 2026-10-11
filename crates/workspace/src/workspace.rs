@@ -11854,7 +11854,7 @@ mod tests {
         let dirty_item = cx.new(|cx| {
             let mut item = TestItem::new(cx)
                 .with_dirty(true)
-                .with_project_items(&[project_item.clone()]);
+                .with_project_items(std::slice::from_ref(&project_item));
             item.state = "unsaved draft".to_owned();
             item.save_error = Some("injected save failure".to_owned());
             item
