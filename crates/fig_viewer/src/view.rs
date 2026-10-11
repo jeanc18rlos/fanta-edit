@@ -11700,7 +11700,10 @@ mod tests {
                 document.active_page()
             );
         });
-        visual.update(|window, cx| window.draw(cx).clear());
+        visual.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
         let panel = view.read_with(&visual, |view, _| {
             view.gpui_design
                 .as_ref()
@@ -11718,7 +11721,10 @@ mod tests {
         let before = item.read_with(&visual, |item, _| item.doc().expect("document").clone());
         let before_history = (before.history.undo_depth(), before.history.redo_depth());
         let replace_input = |visual: &mut gpui::VisualTestContext, text: &str| {
-            visual.update(|window, cx| window.draw(cx).clear());
+            visual.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
             let field = visual
                 .debug_bounds("fig-gpui-design-x")
                 .expect("rendered X field");

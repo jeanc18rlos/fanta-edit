@@ -160,6 +160,35 @@ The graphics-generator backport retains Skia 0.84 and its original MIT license;
 fresh forced-source default/Metal builds and actual bundled notices remain
 required. A normal prebuilt lint pass does not establish that fallback works.
 
+**11 October, 05:08 UTC successor:** On exact
+`0732a74ed46f3c3727a9581ab49f89665966b683`, the canonical Check remains failed.
+Sixteen of the 25 required core regressions passed: all five failed-autosave
+cases, three real FigView window-close cases, three Crop cases, the region
+guard, three workspace close cases and the Source-to-Canvas keyboard route.
+All nine property-draft cases still failed at the fixture's **rendered X field**
+lookup, before their intended Save/Close assertions. The editor result was
+1,233 passed, nine failed and two ignored; workspace passed 236 tests. Engine,
+import, source-order and UI stages passed. Later ancillary checks were skipped.
+
+The separate default-feature job passed 23 of 30 required named tests: seven
+Agent request-budget tests, seven output-limit tests, eight compaction tests and
+one manual-compaction cancellation test. Four ACP tests did not execute because
+an assertion callback lacked mutable access; three Settings tests and all Store
+tests were blocked by an invalid fixture `.detach()` call. Default-feature
+release-blocker Clippy also failed on the ACP test compilation error. The strict
+result guard rejected these missing executions. Three narrow fixture
+corrections are source-reviewed only: mutable ACP assertion access, the Settings
+listener return type, and refreshing the cached workspace before locating the
+actual rendered X field. Their assertions are unchanged and a new hosted run
+remains required.
+
+Both configurations of the separate release-lint workflow passed on this head.
+The exact-head Skia workflow also passed forced-source default and Metal
+compilation, generated bindings and generated license notices. This resolves
+the source-build fallback check above, not GPU tests, installer notices or native
+app behavior. These hosted results do not validate a matching installed app or
+clear the recorded Current37 focused-field Save/Close negative.
+
 User acceptance of Spectrum responsiveness is qualitative. Historical numeric
 native p95, durability and memory measurements remain unproved, but no further
 performance optimization is requested by this resumed check. Release signing,
@@ -189,6 +218,9 @@ Evidence under the local QA archive's `integration-20261007/`:
 - `release-resume-20261011/production-generation-preview-addendum-20261011.json`
 - `release-resume-20261011/production-auth-cold-addendum-20261011.json`
 - `property-draft-save-close-20261011/host-candidate-v3/ready.json`
+- `autosave-failure-retry-20261011/ci-pr123-v4/terminal-review/review.json`
+- `property-draft-save-close-20261011/app-pr123-release-lint-v4/terminal-review/result.json`
+- `property-draft-save-close-20261011/skia-source-compatibility-ci-v2/terminal/independent-terminal-review.json`
 
 ### Final source and internal package — 9 October
 

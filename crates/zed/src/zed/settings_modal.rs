@@ -1260,8 +1260,7 @@ mod tests {
                 gpui::KeyBinding::new("cmd-w", workspace::CloseWindow, Some("SettingsWindow")),
                 gpui::KeyBinding::new("escape", workspace::CloseWindow, Some("SettingsWindow")),
             ]);
-            cx.on_action(|_: &workspace::CloseWindow, cx| Workspace::close_global(cx))
-                .detach();
+            cx.on_action(|_: &workspace::CloseWindow, cx| Workspace::close_global(cx));
         });
         let other_window = {
             let other = cx.add_empty_window();

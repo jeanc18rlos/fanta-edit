@@ -8289,7 +8289,7 @@ mod tests {
             *elicitation_action.borrow(),
             Some(acp::ElicitationAction::Cancel)
         );
-        thread.read_with(cx, |thread, _| {
+        thread.update(cx, |thread, _| {
             assert!(thread.running_turn.is_none());
             assert!(thread.had_error());
             assert!(thread.last_user_message().is_some());
