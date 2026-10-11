@@ -11139,6 +11139,7 @@ mod tests {
         autosave_while_prompt_open: bool,
         cx: &mut TestAppContext,
     ) -> Result<()> {
+        use gpui::UpdateGlobal;
         use project::ProjectItem as _;
 
         init_visual_test(cx);
