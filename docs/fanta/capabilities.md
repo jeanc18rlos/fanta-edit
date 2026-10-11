@@ -58,6 +58,11 @@ conflicts, but cannot make a concurrent external write and rename atomic; see
   Enter before saving or closing. The proposed autosave and close-error fixes
   are not installed in build37; the bounded results and open issues are in the
   [latest acceptance record](../alpha/CAPABILITY_COVERAGE.md#current37-native-checks--11-october).
+  A later source-reviewed successor adds an ordinary property-draft Save/close
+  API and nine mounted regression cases, including invalid input and shared
+  views. Those tests have not executed on the combined source, and the change
+  has not been verified in an installed app. The build37 numeric-input gap
+  remains the current native result.
 - The **Code** workspace edits FNX and supported JSON sources. Saving valid
   source updates the canvas; invalid drafts preserve the last valid file and
   scene. Embedded Find searches the active FNX/JSON editor; **Discard draft**
@@ -518,6 +523,17 @@ In-flight recovery, broader generation and payment behavior remain unverified;
 mock recovery tests do not establish availability. See the
 [dated acceptance scope](../alpha/CAPABILITY_COVERAGE.md#current-acceptance-status).
 
+A separate **11 October build37** check completed normal browser sign-in with
+the human-selected production account and loaded 18 image models. One
+FLUX1.1Pro request quoted six credits, returned a Ready image and showed the
+balance change from 344 to 338. Native download produced a decoded 1024×768 JPEG;
+Refresh and Open preview retained the matching result. After clean Quit and a
+new process, the account restored without browser sign-in, the balance remained
+338, and Refresh returned the same three Ready creations and 18 models. Opening
+the existing preview made no new generation request. This is one bounded
+account/model journey, not database exactly-once, network-loss recovery, Agent,
+other-model or Add-to-project acceptance. The owned project remained unchanged.
+
 Implementation: [export](../../crates/fig_viewer/src/export.rs),
 [agent operations](../../crates/fig_viewer/src/agent_surface.rs),
 [live MCP tools](../../crates/fig_viewer/src/live_mcp.rs),
@@ -547,11 +563,14 @@ There are two distinct MCP directions:
   HTTP or local-command servers have their own configuration and access rules;
   local commands are restricted in Mac App Store builds.
 
-Bounded native checks have observed an existing account, billing reads and model
+Earlier bounded native checks observed an existing account, billing reads and model
 rows. They do not establish fresh browser/callback sign-in, trustworthy current
 prices/caps for a paid request, live managed-MCP execution, payments or general
 account recovery. The bounded image-generation result above does not establish
 Agent chat or a total spending cap.
+The later build37 sign-in, six-credit image debit and cold session/history check
+above are separate positive evidence; they do not establish those remaining
+service or spending guarantees.
 
 Implementation: [account and billing UI](../../crates/zed/src/zed/settings_modal.rs),
 [MCP settings](../../crates/zed/src/zed/settings_mcp.rs),

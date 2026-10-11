@@ -88,6 +88,32 @@ pass; they do not replace the native storage observations. At this evidence
 cutoff it is unmerged and absent from Current37. A matching updated package and
 native error-feedback/recovery checks remain pending.
 
+#### Additive production and source follow-up — 11 October
+
+Evidence through **02:33 UTC** adds the following results without replacing the
+earlier native cutoffs or failures. These production checks used the same
+installed Current37 source, not the proposed fixes.
+
+| Journey | New bounded evidence | Limits retained |
+| --- | --- | --- |
+| Normal production sign-in and one image request | The human selected the account in the normal browser flow; native account state agreed. The catalog showed 18 image models. One FLUX1.1Pro request quoted six credits, returned Ready and showed balance 344→338. Native download produced a decoded 1024×768 JPEG; Refresh retained three Ready creations and balance 338. Open preview showed the matching title, model, image, JPEG type and original prompt. | One request/model/account and observed balance debit, not a database exactly-once or network-loss proof. No Agent request, Add to project, purchase or other-model acceptance. The owned 37-entry/22-file project remained exact. |
+| Cold production session and history | Clean Quit was followed by observed old main/helper PID absence and app-not-running state before explicit relaunch. The same account restored without browser sign-in, balance remained 338, and Refresh returned 18 models and three Ready creations. The existing blue-circle result opened and closed its matching preview. | No extra Generate or credit spend. Project bytes and recorded metadata stayed exact. Refresh-token expiry, interrupted requests, sign-out/account switching and general recovery remain untested. |
+
+The earlier five-credit Seedream usage reservation remains distinct from the
+new six-credit observed debit. Total accounted authorization is **11 of 500
+credits**, leaving **489**; the account balance of 338 is a separate quantity.
+This does not establish a hard spending limit for Agent chat or further requests.
+The empty Created value observed in the installed preview remains a native UI
+gap; its small source projection correction is uncompiled and uninstalled.
+
+The local successor now includes the source-reviewed property-draft API and
+nine mounted Save/close cases for ordinary focused fields, valid/invalid input,
+Cancel/Discard and shared views with the draft owner in the later pane. Final
+combined compilation, all nine executions, full Check/Store/lint and matching
+installed-app verification remain pending. The focused numeric CmdS/Close
+negative above is still the installed-app result; neither the source review nor
+the separate standalone green branches establishes a native fix.
+
 User acceptance of Spectrum responsiveness is qualitative. Historical numeric
 native p95, durability and memory measurements remain unproved, but no further
 performance optimization is requested by this resumed check. Release signing,
@@ -113,6 +139,10 @@ Evidence under the local QA archive's `integration-20261007/`:
 - `release-resume-20261011/save-failure-matrix-preparation-v1-20261011/independent-fault-review-01.json`
 - `close-window-error-recovery-20261011/ci-pr120-v2/independent-terminal-review.json`
 - `close-window-error-recovery-20261011/ci-pr120-v2/root-terminal-acceptance-20261011.json`
+- `release-resume-20261011/production-generation-completion-20261011.json`
+- `release-resume-20261011/production-generation-preview-addendum-20261011.json`
+- `release-resume-20261011/production-auth-cold-addendum-20261011.json`
+- `property-draft-save-close-20261011/host-candidate-v3/ready.json`
 
 ### Final source and internal package — 9 October
 
