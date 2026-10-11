@@ -1,188 +1,102 @@
 # Fanta
 
-**Your design is code.**
+**Your design is source.** Fanta is a native macOS design editor. Import a
+`.fig`, create a design, or open a Fanta project folder. Canvas changes save as
+readable FNX alongside the project's assets, so you can inspect changes with
+Git and edit the same design through the Code workspace or an agent.
 
-> A Fanta project is a git-tracked folder of .fnx source. Every canvas edit is a
-> reviewable change; every source edit reloads the canvas.
+The next distribution is **Fanta 1.0.0 Public Alpha for Apple Silicon Macs**.
+Publication requires the matching accepted build, signed and notarized installer,
+and reviewed recordings. Until those checks finish, the download page shows
+preparation status.
 
-Fanta is a design app whose file format is source. Open a `.fig` or start a new
-design and Fanta writes a project folder — `fanta.json`, a `pages/` tree of
-`.fnx` source, `components/`, an `AGENTS.md` seed — and `git init`s it. You draw
-on a canvas; the folder changes; `git diff` shows you exactly what you did.
-
-That makes agents first-class rather than bolted on. Claude Code and Codex
-connect over MCP and edit the same source your cursor edits, and the canvas
-reloads as the files change. Nothing is hidden inside an opaque binary document.
-
-This is an **alpha**. It is rough in places, and
-[`docs/alpha/KNOWN_ISSUES.md`](docs/alpha/KNOWN_ISSUES.md) is honest rather than
-short.
-
-![The Fanta canvas, with the pages and layers rail, the inspector and the agent
-panel](docs/screenshots/canvas.png)
-
-The same page, as the source Fanta saves it. Edit either side; the other
-follows.
-
-![The Code tab showing the page's .fnx source](docs/screenshots/code.png)
-
-```
-cargo run -p zed                     # build and run; the binary is named fanta
-claude mcp add -s user fanta -- \
-  /Applications/Fanta.app/Contents/MacOS/fanta --mcp-stdio   # connect an agent
-script/smoke-mcp <fanta-binary> <project-dir>   # prove the whole loop, 18 checks
-```
-
-[Build from source](#build-from-source) · [Connect an agent](#connect-an-agent)
-· [Install the DMG](#install)
-
-## Requirements
-
-- **Apple Silicon.** The bundle script builds for the host triple and the alpha
-  is built on `aarch64-apple-darwin`; there is no Intel build.
-- **macOS.** Only macOS 26.6.2 — the build machine's version — has been tested.
-  The deployment target is 10.15.7 and no minimum is declared in the bundle, but
-  no other version has been run.
+[Download and installation](https://www.fantaisa.net/download) ·
+[Three demos and the ten-minute exercise](docs/alpha/DEMO_GUIDE.md) ·
+[Capability guide](docs/fanta/capabilities.md) ·
+[Connect an agent](docs/fanta/agent-quickstart.md)
 
 ## Install
 
-Download the DMG, open it, drag **Fanta** to Applications.
+Use the installer linked from the [download page](https://www.fantaisa.net/download),
+then open `Fanta-aarch64.dmg` and drag **Fanta** into **Applications**. Check the
+published SHA-256 checksum before installation. The public package requires
+Developer ID signing, Apple notarization and stapling before it becomes available.
+Do not remove quarantine attributes or disable Gatekeeper to install it.
 
-The alpha DMG is ad-hoc signed, so macOS blocks the first launch. Either go
-through **System Settings > Privacy & Security > Open Anyway** after the
-unverified-developer dialog, or clear the quarantine attribute yourself:
+Apple Silicon is the first release target. The download page lists the macOS
+versions actually tested for the published package. A compiler deployment target
+does not establish support for an older macOS version. Automatic updates are
+disabled in this alpha; use the [manual replacement steps](docs/alpha/PUBLIC_ALPHA.md#manual-updates).
 
-```
-xattr -dr com.apple.quarantine /Applications/Fanta.app
-```
+The [current installation guide](docs/alpha/PUBLIC_ALPHA.md) covers verification,
+requirements, limitations and troubleshooting. Earlier alpha reports retain their
+original dates and build identities.
 
-The full step-by-step is in
-[`docs/alpha/RELEASE_NOTES.md`](docs/alpha/RELEASE_NOTES.md).
+## Start with one small design
+
+1. Open a project or import a `.fig` you have permission to use. Keep the original
+   file: edits save into a separate Fanta project folder.
+2. Change one layer on the canvas. Use Undo and Redo to inspect the result.
+3. Open **Code** to see the corresponding FNX. The Code workspace edits supported
+   FNX and JSON in saved projects. Save a valid draft to update the canvas.
+4. Use **Review Changes** to inspect the Git diff, then save, close and reopen the
+   project. Keep its manifest, source, identity sidecars and assets together.
+5. Export a selection as PNG and open the resulting image.
+
+[Follow the ten-minute exercise](docs/alpha/DEMO_GUIDE.md#the-ten-minute-exercise).
+The same guide will contain orientation screenshots, short silent GIFs and
+captioned recordings from the accepted release build. Missing screenshot links
+have been removed while those assets are being recorded.
 
 ## Connect an agent
 
-Fanta runs a local MCP server whenever the app is open — on by default. Register
-it once:
+Open the intended project in Fanta and choose **Connect Codex or Claude Code**.
+Use the copied project-scoped instructions: they identify the running executable
+and its user-data directory. Keep that Fanta instance open, restart your agent,
+check its MCP connection and call `get_editor_state` before editing.
 
-```
-claude mcp add -s user fanta -- /Applications/Fanta.app/Contents/MacOS/fanta --mcp-stdio
-```
-
-For Codex, add this to `~/.codex/config.toml`:
-
-```toml
-[mcp_servers.fanta]
-command = "/Applications/Fanta.app/Contents/MacOS/fanta"
-args = ["--mcp-stdio"]
-```
-
-Both strings are what the welcome page's **Copy command** and **Copy Codex
-config** buttons put on your clipboard. When a client connects, the Fanta window
-toasts *"Agent connected: &lt;client&gt;"*. The server exposes six tools
-against the focused design: `get_editor_state`, `get_guidelines`, `batch_get`,
-`batch_design`, `get_screenshot` and `read_fnx_source`. `batch_design` speaks
-the `design_surface::DesignOp` vocabulary — create, style, auto-layout, align,
-distribute, group, duplicate, componentise — as one undo step per call.
-
-Then ask for something — *"add a 200x100 blue rectangle called Hero to this
-page"*. The agent's edit lands on the canvas, autosaves to the project folder
-about a second later, and shows up in `git diff` like any other change.
+The local bridge exposes the focused design, project source inspection and
+validation, bounded design operations, screenshots and comments. It runs over a
+local Unix socket. External file edits enter through the project's reconciliation
+path. Built-in agent tools and hosted media generation have separate configuration
+and billing requirements. See the [agent quickstart](docs/fanta/agent-quickstart.md)
+for exact tool names and a bounded first task.
 
 ## Build from source
 
-```
+```sh
 cargo run -p zed
 ```
 
-The binary is named `fanta`. Useful entry points:
+The executable is named `fanta`.
 
-- `cargo build -p zed` — the app.
-- `./script/clippy` — lints. Use this rather than `cargo clippy` directly.
-- `./script/bundle-mac` — builds and signs `Fanta.app` and the DMG. It strips
-  the shipped binary and always emits `fanta.dwarf` alongside it, so panic
-  backtraces are symbolicated with
-  `atos -o fanta.dwarf -arch arm64 -l <load address> <address>`.
-- `./script/smoke-mcp <fanta-binary> <project-dir>` — drives the whole
-  canvas-to-agent-to-git loop against a running app and asserts 18 things about
-  it. The fastest way to know a build works.
+- `cargo build -p zed` builds the app.
+- `./script/clippy` runs the repository's lints.
+- `./script/bundle-mac` builds a local bundle and emits matching crash symbols.
+  A local bundle does not establish acceptance of the public installer.
+- `./script/smoke-mcp <fanta-binary> <project-dir>` exercises the local agent
+  bridge against a running application.
 
-The design engine lives in the vendored `crates/fanta-*` crates; reusable GPUI
-and Zed UI packages come from [fanta-ui](https://github.com/squidred-dev/fanta-ui).
-The app shell is a fork of Zed with its design workflows layered on top.
+The design engine lives in `crates/fanta-*`. Reusable GPUI and Zed UI packages
+come from [fanta-ui](https://github.com/squidred-dev/fanta-ui). `Cargo.lock` records
+its dependency revisions.
 
-## Getting started in the app
+## Limitations and feedback
 
-1. **File > Open...** a `.fig` file, or **File > New Design...** to start empty.
-   Opening a `.fig` writes a Fanta project folder beside it on open, and
-   `git init`s it; that folder, not the original `.fig`, is what your edits go
-   to. Large files take a while: on a release build, a 9.6 MB `.fig` reaches a
-   canvas that answers in about 2 s and a 128 MB one in about 50 s (measured
-   over MCP on 2026-09-09, launch to a canvas that reports a node count — nobody
-   watched the window, so this is not time-to-a-frame-you-can-look-at; see
-   [`docs/alpha/REHEARSAL.md`](docs/alpha/REHEARSAL.md)).
-2. Draw. Edits autosave about a second after you stop — no `cmd-s` needed.
-   `cmd-g` groups the selection, `cmd-alt-g` wraps it in a frame,
-   `cmd-shift-g` ungroups; pasting an image from another app places it.
-3. **File > Review Changes** shows the diff your edits made; **File > Commit…**
-   commits them.
-4. Open the **Code** tab to read the `.fnx` behind what you are looking at. It
-   is read-only in the app on purpose: edit it in your own editor and the canvas
-   follows the file.
-5. To use the built-in agent panel instead of an external one, paste an
-   Anthropic API key under its settings, or sign in for the managed provider.
+This is an alpha. The [current capability guide](docs/fanta/capabilities.md)
+distinguishes implemented behavior from build-specific native checks. In
+particular, not every imported Figma feature has identical rendering, saving
+multiple source buffers is sequential, and concurrent external writes can
+require conflict resolution. Start with a copy of a small project.
 
-## Known issues in this alpha
-
-The full list is
-[`docs/alpha/KNOWN_ISSUES.md`](docs/alpha/KNOWN_ISSUES.md). The ones you will
-meet first:
-
-- Parts of the toolbar and inspector are visible but not wired up. They say so
-  when clicked rather than failing silently.
-- The Pass Through blend mode and most effect kinds beyond shadows and blurs do
-  nothing.
-- Canvas copy and paste works within one document only. Pasting an image works;
-  pasting any other kind of file still does nothing.
-- Nothing in this build has been clicked. The agent operations behind Group,
-  Ungroup, align, components and the rest were driven over MCP against a release
-  build on 2026-09-09 and worked; the keyboard shortcuts, the toolbar, image
-  paste and dragging on the canvas have only been exercised by unit tests.
-- Memory is high. A large document settles at about 2 GiB, and the first edit
-  plus its autosave took that to 5.8 GiB on a 128 MB file — about 3.8 GiB for
-  one rectangle — before later autosaves brought it back to about 5 GiB.
-- Opening a folder that is *not* a design project raises an inherited
-  Restricted Mode dialog that Escape will not dismiss. A design project Fanta
-  scaffolded is trusted automatically; one you received as a zip or a copied
-  folder is only trusted if its `.git` has no hooks and a config every line of
-  which is on a short allowlist of keys known to be inert, so a shared project
-  can prompt too.
-- Without Xcode Command Line Tools installed, a new project saves but is not
-  git-initialised.
-- Very large community `.fig` files are slow to open: a 128 MB, 40,141-node one
-  took 48-54 s across three runs.
-- On a very wide page, an unpaged `batch_get` listing overflows the 256 KiB
-  response cap — 967,017 bytes on a 40,141-node document. Page it with
-  `offset`/`limit`, new in this change: the page that refused has 8,920 direct
-  children and lists in 45 windows of 200.
-
-## Feedback
-
-There is no public issue tracker for the alpha yet — report back through
-whoever gave you the build. Logs live in `~/Library/Logs/Fanta/`, and attaching
-`Fanta.log` makes almost every report easier to act on. One ERROR line in there
-is known and cosmetic — the Metal renderer's `scene too large … retrying`. The
-`language not found` line older builds logged once per launch is gone: across
-six launches of a release build on 2026-09-09 the log recorded zero ERROR lines
-and zero panics. Anything at ERROR level is worth sending.
-
-If the app crashed, the shipped binary is stripped, so a backtrace is bare
-addresses. `script/bundle-mac` writes `fanta.dwarf` next to the binary it built;
-symbolicate with `atos -o fanta.dwarf -arch arm64 -l <load address> <address>`.
+Report reproducible bugs through the support links on the download page. Include
+the app version, macOS version, steps and expected versus observed behavior.
+Logs live in `~/Library/Logs/Fanta/`; remove secrets and private project content
+before attaching them. Send private account or billing reports to
+[support@fantaisa.net](mailto:support@fantaisa.net).
 
 ## License
 
-GPL-3.0-or-later. Fanta is a fork of Zed; see `NOTICE.md` and `LICENSE-GPL`.
-The editor and vendored engine source are in this repository. The GPUI fork,
-reusable components, and Zed UI baseline are published from
-[fanta-ui](https://github.com/squidred-dev/fanta-ui); `Cargo.lock` records the
-exact package versions used by this build.
+GPL-3.0-or-later. Fanta is a fork of Zed. See `NOTICE.md` and `LICENSE-GPL`.
+The editor and vendored engine source are in this repository. The GPUI fork and
+reusable components are published from [fanta-ui](https://github.com/squidred-dev/fanta-ui).

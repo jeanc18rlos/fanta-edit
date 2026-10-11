@@ -1,5 +1,7 @@
 # Known issues, Fanta 0.1.0-alpha.1
 
+> Historical September 2026 findings tied to the builds named below. For current distribution and limitations, use [Public Alpha](PUBLIC_ALPHA.md) and the [capability guide](../fanta/capabilities.md). Original failures and measurements remain unchanged.
+
 Written from the code and from the alpha rehearsal, not from wishful thinking.
 Every entry is something a tester can hit on purpose. Where a claim comes from
 reading source rather than from running the app, it says so. Re-checked entry by

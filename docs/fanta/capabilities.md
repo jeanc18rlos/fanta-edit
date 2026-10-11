@@ -1,5 +1,7 @@
 # Fanta capability guide
 
+For installation and a first workflow, use the [current Public Alpha guide](../alpha/PUBLIC_ALPHA.md), [ten-minute exercise and demos](../alpha/DEMO_GUIDE.md), and [agent quickstart](agent-quickstart.md). Reviewed screenshots and recordings will be linked there after capture from the accepted release build.
+
 Source inventory updated **11 October 2026**; bounded native evidence updated
 **11 October 2026**. Acceptance evidence below is dated.
 This describes the current editor implementation; release verification is tracked

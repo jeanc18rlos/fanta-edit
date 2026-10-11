@@ -1,5 +1,7 @@
 # Live MCP v2 + native agent design tools
 
+> Architecture and implementation history beginning in July 2026. Proposed tool names and dated inventories below are not the current connection reference. Use the [agent quickstart](fanta/agent-quickstart.md) for the inspected 13-tool local interface, project-scoped setup and source-editing rules.
+
 The program that makes fanta-edit's design surface (fig_viewer) drivable by
 agents — external ones over MCP and the built-in agent panel natively — plus
 media generation (image/video via the configured backend) and collaboration.

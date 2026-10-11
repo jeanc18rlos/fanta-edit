@@ -1,5 +1,7 @@
 # Fanta 0.1.0-alpha.1
 
+> Historical September 2026 release report. Unsigned-install guidance, tool inventory and Code descriptions below apply to the dated builds. Use [Public Alpha installation](PUBLIC_ALPHA.md), the [capability guide](../fanta/capabilities.md) and [agent quickstart](../fanta/agent-quickstart.md) for current guidance. Original evidence is preserved.
+
 **Your design is code.**
 
 > A Fanta project is a git-tracked folder of .fnx source. Every canvas edit is a
