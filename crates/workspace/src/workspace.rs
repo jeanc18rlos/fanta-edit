@@ -11811,6 +11811,129 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_close_window_reports_save_failure_and_retries(cx: &mut TestAppContext) {
+        close_window_after_save_failure(cx, true)
+            .await
+            .expect("failed save should allow a successful retry");
+    }
+
+    #[gpui::test]
+    async fn test_close_window_reports_save_failure_and_can_discard(cx: &mut TestAppContext) {
+        close_window_after_save_failure(cx, false)
+            .await
+            .expect("failed save should allow explicit discard");
+    }
+
+    async fn close_window_after_save_failure(
+        cx: &mut TestAppContext,
+        retry_save: bool,
+    ) -> Result<()> {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/root", json!({ "draft.txt": "saved content" }))
+            .await;
+        let clean_project = Project::test(fs.clone(), ["root".as_ref()], cx).await;
+        let dirty_project = Project::test(fs, ["root".as_ref()], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(clean_project, window, cx));
+        cx.run_until_parked();
+        window_handle.update(cx, |multi_workspace, _, cx| {
+            multi_workspace.open_sidebar(cx)
+        })?;
+        let clean_workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())?;
+        let dirty_workspace = window_handle.update(cx, |multi_workspace, window, cx| {
+            multi_workspace.test_add_workspace(dirty_project, window, cx)
+        })?;
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let clean_item = cx.new(TestItem::new);
+        clean_workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(clean_item.clone()), None, true, window, cx);
+        });
+        let project_item = cx.update(|_, cx| dirty_project_item(1, "draft.txt", cx));
+        let dirty_item = cx.new(|cx| {
+            let mut item = TestItem::new(cx)
+                .with_dirty(true)
+                .with_project_items(std::slice::from_ref(&project_item));
+            item.state = "unsaved draft".to_owned();
+            item.save_error = Some("injected save failure".to_owned());
+            item
+        });
+        dirty_workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(dirty_item.clone()), None, true, window, cx);
+        });
+        let sessions = [
+            clean_workspace.read_with(cx, |workspace, _| workspace.session_id()),
+            dirty_workspace.read_with(cx, |workspace, _| workspace.session_id()),
+        ];
+        assert!(sessions.iter().all(Option::is_some));
+        window_handle.update(cx, |multi_workspace, window, cx| {
+            multi_workspace.activate(clean_workspace.clone(), None, window, cx);
+            multi_workspace.close_window(&CloseWindow, window, cx);
+        })?;
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Save");
+        cx.run_until_parked();
+        let (message, detail) = cx.pending_prompt().context("save error must be visible")?;
+        assert_eq!(message, "Unable to close window");
+        assert!(detail.contains("injected save failure"));
+        assert!(detail.contains("Try saving again"));
+        window_handle.read_with(cx, |multi_workspace, _| {
+            assert_eq!(multi_workspace.workspaces().count(), 2);
+            assert_eq!(multi_workspace.workspace(), &dirty_workspace);
+        })?;
+        for (workspace, session) in [&clean_workspace, &dirty_workspace]
+            .into_iter()
+            .zip(&sessions)
+        {
+            workspace.read_with(cx, |workspace, cx| {
+                assert!(!workspace.removing);
+                assert_eq!(&workspace.session_id(), session);
+                assert_eq!(workspace.items(cx).count(), 1);
+            });
+        }
+        dirty_item.read_with(cx, |item, cx| {
+            assert_eq!(item.state, "unsaved draft");
+            assert!(item.is_dirty);
+            assert!(project_item.read(cx).is_dirty);
+            assert_eq!(item.save_count, 1);
+            assert_eq!(item.save_as_count, 0);
+            assert_eq!(item.reload_count, 0);
+        });
+        clean_item.read_with(cx, |item, _| {
+            assert_eq!(item.save_count, 0);
+            assert_eq!(item.reload_count, 0);
+            assert!(!item.is_dirty);
+        });
+        cx.simulate_prompt_answer("OK");
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        if retry_save {
+            dirty_item.update(cx, |item, _| item.save_error = None);
+        }
+        window_handle.update(cx, |multi_workspace, window, cx| {
+            multi_workspace.close_window(&CloseWindow, window, cx);
+        })?;
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer(if retry_save { "Save" } else { "Don't Save" });
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        assert!(window_handle.update(cx, |_, _, _| ()).is_err());
+        dirty_item.read_with(cx, |item, cx| {
+            assert_eq!(item.state, "unsaved draft");
+            assert!(!item.is_dirty);
+            assert_eq!(item.save_count, if retry_save { 2 } else { 1 });
+            assert_eq!(item.reload_count, usize::from(!retry_save));
+            if retry_save {
+                assert!(!project_item.read(cx).is_dirty);
+            }
+        });
+        Ok(())
+    }
+
+    #[gpui::test]
     async fn test_multi_workspace_close_window_multiple_workspaces_cancel(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -11867,6 +11990,12 @@ mod tests {
             })
             .unwrap();
 
+        let sessions = [
+            workspace_a.read_with(cx, |workspace, _| workspace.session_id()),
+            workspace_b.read_with(cx, |workspace, _| workspace.session_id()),
+        ];
+        assert!(sessions.iter().all(Option::is_some));
+
         // Dispatch CloseWindow — workspace A will pass, workspace B will prompt
         multi_workspace_handle
             .update(cx, |mw, window, cx| {
@@ -11895,6 +12024,19 @@ mod tests {
             multi_workspace_handle.update(cx, |_, _, _| ()).is_ok(),
             "window should still exist after cancelling one workspace's close"
         );
+        for (workspace, session) in [&workspace_a, &workspace_b].into_iter().zip(&sessions) {
+            workspace.read_with(cx, |workspace, cx| {
+                assert!(!workspace.removing);
+                assert_eq!(&workspace.session_id(), session);
+                assert_eq!(workspace.items(cx).count(), 1);
+            });
+        }
+        item_b.read_with(cx, |item, _| {
+            assert!(item.is_dirty);
+            assert_eq!(item.save_count, 0);
+            assert_eq!(item.save_as_count, 0);
+            assert_eq!(item.reload_count, 0);
+        });
     }
 
     #[gpui::test]

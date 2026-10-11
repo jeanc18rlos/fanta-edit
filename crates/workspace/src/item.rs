@@ -1502,6 +1502,7 @@ pub mod test {
         pub label: String,
         pub close_blocker: Option<SharedString>,
         pub save_count: usize,
+        pub save_error: Option<String>,
         pub save_as_count: usize,
         pub reload_count: usize,
         pub is_dirty: bool,
@@ -1594,6 +1595,7 @@ pub mod test {
                 label: String::new(),
                 close_blocker: None,
                 save_count: 0,
+                save_error: None,
                 save_as_count: 0,
                 reload_count: 0,
                 is_dirty: false,
@@ -1782,6 +1784,7 @@ pub mod test {
                     state: self.state.clone(),
                     label: self.label.clone(),
                     save_count: self.save_count,
+                    save_error: self.save_error.clone(),
                     save_as_count: self.save_as_count,
                     reload_count: self.reload_count,
                     close_blocker: self.close_blocker.clone(),
@@ -1841,6 +1844,9 @@ pub mod test {
             cx: &mut Context<Self>,
         ) -> Task<anyhow::Result<()>> {
             self.save_count += 1;
+            if let Some(error) = &self.save_error {
+                return Task::ready(Err(anyhow::anyhow!(error.clone())));
+            }
             self.is_dirty = false;
             for item in &self.project_items {
                 item.update(cx, |item, _| {

@@ -29,6 +29,7 @@ use ui::{CommonAnimationExt as _, ContextMenu, right_click_menu};
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
 pub(super) const PROJECT_OPEN_FRAME_WAIT: Duration = Duration::from_millis(200);
 
+use crate::notifications::DetachAndPromptErr;
 use crate::open_remote_project_with_existing_connection;
 use crate::{
     CloseIntent, CloseWindow, DockPosition, Event as WorkspaceEvent, Item, ModalView, OpenMode,
@@ -618,9 +619,15 @@ impl MultiWorkspace {
                     .update_in(cx, |workspace, window, cx| {
                         workspace.prepare_to_close(CloseIntent::CloseWindow, window, cx)
                     })?
-                    .await?;
-                if !should_continue {
-                    this.update_in(cx, |this, window, cx| this.can_close(window, cx))?;
+                    .await;
+                if !should_continue.as_ref().is_ok_and(|&allowed| allowed) {
+                    this.update_in(cx, |this, window, cx| {
+                        for retained in this.workspaces() {
+                            retained.update(cx, |workspace, cx| workspace.cancel_close(window, cx));
+                        }
+                        this.can_close(window, cx);
+                    })?;
+                    should_continue?;
                     return anyhow::Ok(());
                 }
             }
@@ -633,7 +640,11 @@ impl MultiWorkspace {
 
             anyhow::Ok(())
         })
-        .detach_and_log_err(cx);
+        .detach_and_prompt_err("Unable to close window", window, cx, |error, _, _| {
+            Some(format!(
+                "The window is still open. Try saving again, or close it again and choose Don't Save.\n\n{error:#}"
+            ))
+        });
     }
 
     fn subscribe_to_workspace(
