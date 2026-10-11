@@ -3779,15 +3779,23 @@ impl AcpThread {
                 .await?;
 
             this.update(cx, |this, cx| {
-                if this.parent_session_id.is_none() {
-                    this.project
-                        .update(cx, |project, cx| project.set_agent_location(None, cx));
-                }
-
                 let is_same_turn = this
                     .running_turn
                     .as_ref()
                     .is_some_and(|turn| turn_id == turn.id);
+                if !is_same_turn
+                    && matches!(
+                        &response,
+                        Ok(Ok(response)) if response.stop_reason == acp::StopReason::MaxTurnRequests
+                    )
+                {
+                    return Ok(None);
+                }
+
+                if this.parent_session_id.is_none() {
+                    this.project
+                        .update(cx, |project, cx| project.set_agent_location(None, cx));
+                }
 
                 // If the user submitted a follow up message, running_turn might
                 // already point to a different turn. Therefore we only want to
@@ -3836,6 +3844,19 @@ impl AcpThread {
                                 this.cancel_pending_turn_entries(cx);
                             }
                             return Err(anyhow!(MaxOutputTokensError));
+                        }
+
+                        if r.stop_reason == acp::StopReason::MaxTurnRequests {
+                            if is_same_turn {
+                                this.cancel_pending_turn_entries(cx);
+                                cx.emit(AcpThreadEvent::StatusChanged);
+                            }
+                            this.had_error = true;
+                            cx.emit(AcpThreadEvent::Error);
+                            cx.emit(AcpThreadEvent::Stopped(r.stop_reason));
+                            return Err(anyhow!(
+                                "Automatic request limit reached. Completed work is preserved. Send a new message to continue."
+                            ));
                         }
 
                         let canceled = matches!(r.stop_reason, acp::StopReason::Cancelled);
@@ -8185,6 +8206,257 @@ mod tests {
                 panic!("expected an elicitation entry");
             };
             assert!(matches!(elicitation.status, ElicitationStatus::Canceled));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_turn_request_budget_stop_is_visible_and_preserves_completed_entries(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        enable_acp_beta(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let prompt_count = Rc::new(RefCell::new(0usize));
+        let elicitation_action = Rc::new(RefCell::new(None));
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message({
+            let prompt_count = prompt_count.clone();
+            let elicitation_action = elicitation_action.clone();
+            move |request, thread, mut cx| {
+                let prompt_count = prompt_count.clone();
+                let elicitation_action = elicitation_action.clone();
+                async move {
+                    *prompt_count.borrow_mut() += 1;
+                    if *prompt_count.borrow() > 1 {
+                        return Ok(acp::PromptResponse::new(acp::StopReason::EndTurn));
+                    }
+                    thread.update(&mut cx, |thread, cx| {
+                        thread.handle_session_update(
+                            acp::SessionUpdate::ToolCall(
+                                acp::ToolCall::new("completed-before-limit", "Completed work")
+                                    .kind(acp::ToolKind::Fetch)
+                                    .status(acp::ToolCallStatus::Completed)
+                                    .raw_output(serde_json::json!({"preserved": true})),
+                            ),
+                            cx,
+                        )
+                    })??;
+                    let response_task =
+                        request_test_session_elicitation(thread, request.session_id, &mut cx)?;
+                    cx.spawn(async move |_cx| {
+                        *elicitation_action.borrow_mut() = Some(response_task.await.action);
+                    })
+                    .detach();
+                    Ok(acp::PromptResponse::new(acp::StopReason::MaxTurnRequests))
+                }
+                .boxed_local()
+            }
+        }));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("new session");
+        let observed = Rc::new(RefCell::new((0usize, 0usize)));
+        thread.update(cx, |_, cx| {
+            let observed = observed.clone();
+            cx.subscribe(&thread, move |_, _, event, _| match event {
+                AcpThreadEvent::Error => observed.borrow_mut().0 += 1,
+                AcpThreadEvent::Stopped(acp::StopReason::MaxTurnRequests) => {
+                    observed.borrow_mut().1 += 1
+                }
+                _ => {}
+            })
+            .detach();
+        });
+        let error = thread
+            .update(cx, |thread, cx| {
+                thread.send(vec!["Do bounded work".into()], cx)
+            })
+            .await
+            .expect_err("request exhaustion must be visible");
+        assert!(
+            error
+                .to_string()
+                .contains("Automatic request limit reached")
+        );
+        assert!(error.to_string().contains("Send a new message"));
+        cx.run_until_parked();
+        assert_eq!(*prompt_count.borrow(), 1, "no automatic resubmission");
+        assert_eq!(*observed.borrow(), (1, 1));
+        assert_eq!(
+            *elicitation_action.borrow(),
+            Some(acp::ElicitationAction::Cancel)
+        );
+        thread.read_with(cx, |thread, _| {
+            assert!(thread.running_turn.is_none());
+            assert!(thread.had_error());
+            assert!(thread.last_user_message().is_some());
+            let completed = thread
+                .entries()
+                .iter()
+                .find_map(|entry| match entry {
+                    AgentThreadEntry::ToolCall(call)
+                        if call.id == acp::ToolCallId::from("completed-before-limit") =>
+                    {
+                        Some(call)
+                    }
+                    _ => None,
+                })
+                .expect("completed tool retained");
+            assert_eq!(completed.status, ToolCallStatus::Completed);
+            assert_eq!(
+                completed.raw_output,
+                Some(serde_json::json!({"preserved": true}))
+            );
+        });
+        let response = thread
+            .update(cx, |thread, cx| {
+                thread.send(vec!["Continue explicitly".into()], cx)
+            })
+            .await
+            .expect("explicit follow-up")
+            .expect("response");
+        assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
+        assert_eq!(*prompt_count.borrow(), 2);
+    }
+
+    #[gpui::test]
+    async fn test_turn_request_budget_stale_stop_preserves_the_current_turn(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let filesystem = FakeFs::new(cx.executor());
+        let project = Project::test(filesystem, [], cx).await;
+        let (first_sender, first_receiver) = futures::channel::oneshot::channel::<()>();
+        let (second_sender, second_receiver) = futures::channel::oneshot::channel::<()>();
+        let first_receiver = RefCell::new(Some(first_receiver));
+        let second_receiver = RefCell::new(Some(second_receiver));
+        let connection = Rc::new(FakeAgentConnection::new().on_user_message(
+            move |request, _thread, _cx| {
+                let is_first = request.prompt.iter().any(|content| {
+                    matches!(content, acp::ContentBlock::Text(text) if text.text == "first")
+                });
+                let receiver = if is_first {
+                    first_receiver.borrow_mut().take()
+                } else {
+                    second_receiver.borrow_mut().take()
+                };
+                async move {
+                    receiver.expect("completion gate").await?;
+                    Ok(acp::PromptResponse::new(if is_first {
+                        acp::StopReason::MaxTurnRequests
+                    } else {
+                        acp::StopReason::EndTurn
+                    }))
+                }
+                .boxed_local()
+            },
+        ));
+        let thread = cx
+            .update(|cx| {
+                connection.new_session(project, PathList::new(&[Path::new(path!("/test"))]), cx)
+            })
+            .await
+            .expect("new session");
+        let observed = Rc::new(RefCell::new((0usize, Vec::new())));
+        thread.update(cx, |_, cx| {
+            let observed = observed.clone();
+            cx.subscribe(&thread, move |_, _, event, _| match event {
+                AcpThreadEvent::Error => observed.borrow_mut().0 += 1,
+                AcpThreadEvent::Stopped(reason) => observed.borrow_mut().1.push(*reason),
+                _ => {}
+            })
+            .detach();
+        });
+        let first_request = thread.update(cx, |thread, cx| thread.send_raw("first", cx));
+        cx.run_until_parked();
+        let second_request = thread.update(cx, |thread, cx| {
+            thread.send_command(vec!["second".into()], cx)
+        });
+        let current_turn = thread.read_with(cx, |thread, _| thread.turn_id);
+        let compaction_id = ContextCompactionId("current-compaction".into());
+        let tool_id = acp::ToolCallId::from("current-tool");
+        let markdown = cx.new(|cx| Markdown::new("Current ".into(), None, None, cx));
+        thread.update(cx, |thread, cx| {
+            thread.push_context_compaction(
+                ContextCompaction {
+                    id: compaction_id.clone(),
+                    status: ContextCompactionStatus::InProgress,
+                    summary: None,
+                },
+                cx,
+            );
+            thread
+                .handle_session_update(
+                    acp::SessionUpdate::ToolCall(
+                        acp::ToolCall::new(tool_id.clone(), "Current work")
+                            .status(acp::ToolCallStatus::InProgress),
+                    ),
+                    cx,
+                )
+                .expect("current tool update");
+            thread.streaming_text_buffer = Some(StreamingTextBuffer {
+                pending: "turn text".into(),
+                bytes_to_reveal_per_tick: 1,
+                target: markdown.clone(),
+                _reveal_task: Task::ready(()),
+            });
+        });
+        first_sender.send(()).expect("first completion receiver");
+        assert!(
+            first_request
+                .await
+                .expect("stale exhaustion is ignored")
+                .is_none()
+        );
+        cx.run_until_parked();
+        assert_eq!(*observed.borrow(), (0, Vec::new()));
+        thread.read_with(cx, |thread, cx| {
+            assert_eq!(
+                thread.running_turn.as_ref().map(|turn| turn.id),
+                Some(current_turn)
+            );
+            assert!(!thread.had_error());
+            assert_eq!(
+                thread.tool_call(&tool_id).expect("current tool").1.status,
+                ToolCallStatus::InProgress
+            );
+            let compaction = thread
+                .entries()
+                .iter()
+                .find_map(|entry| match entry {
+                    AgentThreadEntry::ContextCompaction(compaction)
+                        if compaction.id == compaction_id =>
+                    {
+                        Some(compaction)
+                    }
+                    _ => None,
+                })
+                .expect("current compaction");
+            assert_eq!(compaction.status, ContextCompactionStatus::InProgress);
+            let buffer = thread
+                .streaming_text_buffer
+                .as_ref()
+                .expect("current buffer");
+            assert_eq!(buffer.pending, "turn text");
+            assert_eq!(buffer.target.entity_id(), markdown.entity_id());
+            assert_eq!(markdown.read(cx).source().as_ref(), "Current ");
+        });
+        second_sender.send(()).expect("second completion receiver");
+        let response = second_request
+            .await
+            .expect("current turn succeeds")
+            .expect("current response");
+        assert_eq!(response.stop_reason, acp::StopReason::EndTurn);
+        cx.run_until_parked();
+        assert_eq!(*observed.borrow(), (0, vec![acp::StopReason::EndTurn]));
+        thread.read_with(cx, |thread, cx| {
+            assert!(thread.running_turn.is_none());
+            assert!(!thread.had_error());
+            assert!(thread.streaming_text_buffer.is_none());
+            assert_eq!(markdown.read(cx).source().as_ref(), "Current turn text");
         });
     }
 

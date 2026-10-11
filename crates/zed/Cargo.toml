@@ -140,6 +140,10 @@ gpui = { workspace = true, features = [
     "windows-manifest",
 ] }
 
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+gpui-component.workspace = true
+
 [build-dependencies]
 windows_resources = { path = "../windows_resources" }
 

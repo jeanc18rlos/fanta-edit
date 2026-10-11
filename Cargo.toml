@@ -147,6 +147,7 @@ members = [
 ]
 default-members = ["crates/zed"]
 exclude = [
+    "vendor/skia-bindings-0.84.0",
     "crates/collections",
     "crates/component",
     "crates/fanta-gpui",
@@ -808,6 +809,7 @@ features = [
 ]
 
 [patch.crates-io]
+skia-bindings = { path = "vendor/skia-bindings-0.84.0" }
 fanta-gpui = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "026496ed6f8c1a8c5bdf9d9ae607908818d5a425" }
 fanta-gpui-async-process = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "026496ed6f8c1a8c5bdf9d9ae607908818d5a425" }
 fanta-gpui-collections = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "026496ed6f8c1a8c5bdf9d9ae607908818d5a425" }

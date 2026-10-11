@@ -4051,6 +4051,11 @@ mod tests {
         cx.simulate_click(button.center(), gpui::Modifiers::none());
         cx.run_until_parked();
         view.update_in(cx, |view, window, cx| {
+            assert_eq!(
+                view.editor_workspace(cx),
+                crate::editor_session::EditorWorkspace::Canvas,
+                "the rendered Canvas tab must change the workspace"
+            );
             assert!(
                 view.focus_handle(cx).is_focused(window),
                 "Canvas must own focus after leaving source"

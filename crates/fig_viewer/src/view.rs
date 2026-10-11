@@ -6421,9 +6421,18 @@ impl FigView {
     fn render_workspace_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
         let workspace = self.editor_workspace(cx);
         let view = cx.weak_entity();
-        let tabs = EditorWorkspaceTabs::new(workspace, move |workspace, _, cx| {
-            view.update(cx, |view, cx| view.set_editor_workspace(workspace, cx))
-                .log_err();
+        let tabs = EditorWorkspaceTabs::new(workspace, move |workspace, window, cx| {
+            view.update(cx, |view, cx| {
+                let previous_workspace = view.editor_workspace(cx);
+                view.set_editor_workspace(workspace, cx);
+                if previous_workspace == EditorWorkspace::Code
+                    && workspace == EditorWorkspace::Canvas
+                    && view.editor_workspace(cx) == EditorWorkspace::Canvas
+                {
+                    view.focus_handle(cx).focus(window, cx);
+                }
+            })
+            .log_err();
         })
         .variables_visible(!self.is_dev_mode(cx));
         h_flex()
@@ -11551,11 +11560,10 @@ mod tests {
             .expect("native project opener")
             .await?;
         cx.run_until_parked();
-        item.update(cx, |item, cx| {
-            item.with_document(cx, |document| {
-                document.doc.selection.select_only(text_id);
-                ((), DocChange::Selection)
-            });
+        item.read_with(cx, |item, _| {
+            assert!(item.has_ready_document());
+            assert_eq!(item.project_root(), Some(root.as_path()));
+            assert!(!item.is_dirty());
         });
         let window = cx.add_window(|window, cx| {
             workspace::MultiWorkspace::test_new(project.clone(), window, cx)
@@ -11621,8 +11629,7 @@ mod tests {
             view.update(cx, |view, cx| {
                 view.inspector_sidebar_visible = true;
                 view.set_viewport_silent(Viewport::default());
-                view.refresh_gpui_design(cx);
-                view.refresh_properties_inspector(window, cx);
+                view.focus_handle.focus(window, cx);
                 cx.notify();
             });
             (view, other)
@@ -11655,6 +11662,44 @@ mod tests {
         assert_shared_views(&visual);
         visual.simulate_resize(size(px(1400.0), px(1000.0)));
         visual.run_until_parked();
+        item.update(&mut visual, |item, cx| {
+            item.with_document(cx, |document| {
+                assert!(document.doc.scene.contains(text_id));
+                document.doc.selection.select_only(text_id);
+                ((), DocChange::Selection)
+            })
+        })
+        .context("select the loaded text in its mounted canvas")?;
+        visual.run_until_parked();
+        view.update_in(&mut visual, |view, window, cx| {
+            assert_eq!(view.editor_workspace(cx), EditorWorkspace::Canvas);
+            assert_eq!(view.editor_mode(cx), EditorMode::Design);
+            assert!(view.is_editable(cx));
+            assert!(view.inspector_sidebar_visible);
+            view.refresh_gpui_design(cx);
+            view.refresh_properties_inspector(window, cx);
+            view.focus_handle.focus(window, cx);
+        });
+        visual.run_until_parked();
+        visual.read(|cx| {
+            assert_eq!(
+                workspace
+                    .read(cx)
+                    .active_item_as::<FigView>(cx)
+                    .expect("active inspector draft owner")
+                    .entity_id(),
+                view.entity_id()
+            );
+            let document = item.read(cx).doc().expect("loaded document");
+            assert_eq!(
+                document.selection.iter().copied().collect::<Vec<_>>(),
+                vec![text_id]
+            );
+            assert_eq!(
+                document.scene.get(text_id).expect("selected text").parent,
+                document.active_page()
+            );
+        });
         visual.update(|window, cx| window.draw(cx).clear());
         let panel = view.read_with(&visual, |view, _| {
             view.gpui_design
@@ -11662,6 +11707,13 @@ mod tests {
                 .expect("Design panel")
                 .panel
                 .clone()
+        });
+        panel.read_with(&visual, |panel, _| {
+            let selection = panel.inspection_context().selection().items();
+            assert_eq!(selection.len(), 1, "mounted inspector selection");
+            assert_eq!(panel.node().id.as_ref(), text_id.to_string());
+            assert!(panel.inspection_context().permissions().can_edit());
+            assert_eq!((panel.node().x, panel.node().y), (40.0, 60.0));
         });
         let before = item.read_with(&visual, |item, _| item.doc().expect("document").clone());
         let before_history = (before.history.undo_depth(), before.history.redo_depth());
@@ -12830,10 +12882,8 @@ mod tests {
         let (_dir, root, item, view) = autosave_fixture(cx).await;
         // A loaded project knows the disk it came from; a failed save resyncs
         // against it.
-        let on_disk = fanta_format::read_project_tree(&root)
-            .expect("project on disk")
-            .0;
-        item.update(cx, |item, _| item.set_merge_base_for_test(on_disk));
+        let (on_disk, assets) = fanta_format::read_project_tree(&root).expect("project on disk");
+        item.update(cx, |item, _| item.set_merge_base_for_test(on_disk, assets));
         // Every directory, so no write (temp file plus rename) can land anywhere.
         fn collect_directories(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             out.push(dir.to_path_buf());
@@ -13009,12 +13059,32 @@ mod tests {
     ) {
         let result: Result<()> = async {
             let (_directory, root, item, view) = autosave_fixture(cx).await;
-            let baseline = fanta_format::read_project_tree(&root)?.0;
-            item.update(cx, |item, _| item.set_merge_base_for_test(baseline));
+            let (baseline, assets) = fanta_format::read_project_tree(&root)?;
+            item.update(cx, |item, _| item.set_merge_base_for_test(baseline, assets));
             let files = autosave_project_files(&root)?;
             let mut fault = AutosaveDirectoryFault::apply(&root)?;
+            assert_eq!(
+                item.read_with(cx, |item, _| item.save_attempts_for_test()),
+                0
+            );
             add_rect(&item, cx);
+            let generation = item.read_with(cx, |item, _| {
+                item.document
+                    .ready()
+                    .expect("ready fixture")
+                    .render_generation()
+            });
             settle_autosave_and_resync(cx);
+            assert_eq!(
+                item.read_with(cx, |item, _| {
+                    item.document
+                        .ready()
+                        .expect("ready fixture")
+                        .render_generation()
+                }),
+                generation,
+                "unchanged-disk resync preserves the failed authored generation"
+            );
             let notice = view.read_with(cx, |view, _| view.reported_save_failure.clone());
             assert!(
                 notice
@@ -13053,8 +13123,8 @@ mod tests {
     async fn explicit_save_retries_the_unchanged_failed_autosave(cx: &mut TestAppContext) {
         let result: Result<()> = async {
             let (_directory, root, item, view) = autosave_fixture(cx).await;
-            let baseline = fanta_format::read_project_tree(&root)?.0;
-            item.update(cx, |item, _| item.set_merge_base_for_test(baseline));
+            let (baseline, assets) = fanta_format::read_project_tree(&root)?;
+            item.update(cx, |item, _| item.set_merge_base_for_test(baseline, assets));
             let files = autosave_project_files(&root)?;
             let mut fault = AutosaveDirectoryFault::apply(&root)?;
             add_rect(&item, cx);
@@ -13105,8 +13175,8 @@ mod tests {
     async fn new_edit_retries_after_an_autosave_failure(cx: &mut TestAppContext) {
         let result: Result<()> = async {
             let (_directory, root, item, view) = autosave_fixture(cx).await;
-            let baseline = fanta_format::read_project_tree(&root)?.0;
-            item.update(cx, |item, _| item.set_merge_base_for_test(baseline));
+            let (baseline, assets) = fanta_format::read_project_tree(&root)?;
+            item.update(cx, |item, _| item.set_merge_base_for_test(baseline, assets));
             let mut fault = AutosaveDirectoryFault::apply(&root)?;
             add_rect(&item, cx);
             settle_autosave_and_resync(cx);
@@ -13136,8 +13206,8 @@ mod tests {
     async fn newer_edit_during_failed_autosave_remains_eligible(cx: &mut TestAppContext) {
         let result: Result<()> = async {
             let (_directory, root, item, view) = autosave_fixture(cx).await;
-            let baseline = fanta_format::read_project_tree(&root)?.0;
-            item.update(cx, |item, _| item.set_merge_base_for_test(baseline));
+            let (baseline, assets) = fanta_format::read_project_tree(&root)?;
+            item.update(cx, |item, _| item.set_merge_base_for_test(baseline, assets));
             let mut fault = AutosaveDirectoryFault::apply(&root)?;
             let (arrived, resume) = item.read_with(cx, |item, _| item.pause_next_save_for_test());
             add_rect(&item, cx);
@@ -13179,8 +13249,8 @@ mod tests {
     ) {
         let result: Result<()> = async {
             let (_directory, root, item, _view) = autosave_fixture(cx).await;
-            let baseline = fanta_format::read_project_tree(&root)?.0;
-            item.update(cx, |item, _| item.set_merge_base_for_test(baseline));
+            let (baseline, assets) = fanta_format::read_project_tree(&root)?;
+            item.update(cx, |item, _| item.set_merge_base_for_test(baseline, assets));
             let files = autosave_project_files(&root)?;
             let mut fault = AutosaveDirectoryFault::apply(&root)?;
             add_rect(&item, cx);

@@ -104,15 +104,48 @@ new six-credit observed debit. Total accounted authorization is **11 of 500
 credits**, leaving **489**; the account balance of 338 is a separate quantity.
 This does not establish a hard spending limit for Agent chat or further requests.
 The empty Created value observed in the installed preview remains a native UI
-gap; its small source projection correction is uncompiled and uninstalled.
+gap; its source correction compiles in the combined candidate but is uninstalled.
+
+A later independent project clone imported this existing image with one **Add
+to project** click. Save and warm reopen retained the library asset; placing it
+once created the matching image node, and Undo and Save restored the original
+page while retaining the asset. The original 37-entry/22-file project was
+unchanged and balance remained 338. This covers one existing-image import,
+placement and warm reopening; cold import restoration and backend idempotency
+remain unverified.
 
 The local successor now includes the source-reviewed property-draft API and
 nine mounted Save/close cases for ordinary focused fields, valid/invalid input,
-Cancel/Discard and shared views with the draft owner in the later pane. Final
-combined compilation, all nine executions, full Check/Store/lint and matching
-installed-app verification remain pending. The focused numeric CmdS/Close
-negative above is still the installed-app result; neither the source review nor
-the separate standalone green branches establishes a native fix.
+Cancel/Discard and shared views with the draft owner in the later pane. At exact
+`b2804d58be3e888c70b292655569d674cbc1fa50`, all nine compiled and executed but
+failed before reaching the rendered X field. Three autosave cases also failed
+their unchanged write-count assertions, and the existing Source-to-Canvas
+keyboard test failed its focus assertion. The editor summary is 1,229 passed,
+13 failed and two ignored. This is a failed Check, not acceptance of inspector
+saving. The Store job and both release-lint configurations passed separately.
+
+The correction mounts and focuses the canvas before selecting the loaded text,
+asserts the active owner, selection and inspector coordinates before the same
+input lookup, and supplies the autosave fixtures' actual saved asset baseline.
+The original draft, history, file and write-count assertions remain unchanged.
+An accepted Source-to-Canvas tab click now explicitly returns focus to the
+canvas; its existing CmdS and persistence assertions remain. Corrected hosted
+execution and matching installed-app verification are pending. The focused
+numeric CmdS/Close negative above is still the installed-app result.
+
+On that failed Check, three mounted whole-window Save/Discard cases, all three
+mounted Crop cases, the region guard, two queued/in-flight autosave cases and
+three workspace close-error/Cancel cases passed their named assertions. These
+12 bounded passes do not replace the failed cases or native checks. Dependency
+PR12's exact `026496ed6f8c1a8c5bdf9d9ae607908818d5a425` passed all five component
+draft tests and its full hosted checks; it remains separate from app acceptance.
+
+The candidate additionally restores the Settings-window key context, with three
+default-feature keyboard regressions, and adds a shared 64-dispatch native Agent
+turn limit, with seven Agent and two ACP regressions. Those tests are unexecuted.
+The graphics-generator backport retains Skia 0.84 and its original MIT license;
+fresh forced-source default/Metal builds and actual bundled notices remain
+required. A normal prebuilt lint pass does not establish that fallback works.
 
 User acceptance of Spectrum responsiveness is qualitative. Historical numeric
 native p95, durability and memory measurements remain unproved, but no further

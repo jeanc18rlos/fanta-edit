@@ -73,11 +73,32 @@ check_license () {
     exit 1
 }
 
+check_vendored_skia_license () {
+    python3 - <<'PYTHON'
+import hashlib
+from pathlib import Path
+import tomllib
+
+root = Path("vendor/skia-bindings-0.84.0")
+manifest = tomllib.loads((root / "Cargo.toml").read_text())
+if manifest["package"]["license"] != "MIT":
+    raise SystemExit("Vendored skia-bindings must retain its original MIT license declaration")
+expected = "4b33ed5b329a3a79eb1243fd91373c68b0ae0b9df7503bfc50d0c5253adf1b9a"
+if hashlib.sha256((root / "LICENSE").read_bytes()).hexdigest() != expected:
+    raise SystemExit("Vendored skia-bindings LICENSE differs from the original upstream bytes")
+PYTHON
+}
+
 check_no_agpl_license_file
 
 git ls-files -z -- "Cargo.toml" "**/Cargo.toml" | while IFS= read -r -d '' cargo_toml; do
     [[ -f "$cargo_toml" ]] || continue
     check_manifest_for_agpl "$cargo_toml"
+
+    if [[ "$cargo_toml" == "vendor/skia-bindings-0.84.0/Cargo.toml" ]]; then
+        check_vendored_skia_license
+        continue
+    fi
 
     if [[ "$cargo_toml" == */Cargo.toml ]]; then
         check_license "$(dirname "$cargo_toml")"

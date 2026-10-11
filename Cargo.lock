@@ -13114,8 +13114,6 @@ checksum = "56199f7ddabf13fe5074ce809e7d3f42b42ae711800501b5b16ea82ad029c39d"
 [[package]]
 name = "skia-bindings"
 version = "0.84.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b612a544c0cc0da82271eac1c40b6b055fe3c5aa20bb7b3922f830c777d9aff0"
 dependencies = [
  "bindgen",
  "cc",
@@ -17734,6 +17732,7 @@ dependencies = [
  "fanta-gpui",
  "fanta-gpui-collections",
  "fanta-gpui-component",
+ "fanta-gpui-components",
  "fanta-gpui-core",
  "fanta-gpui-gpui-platform",
  "fanta-gpui-gpui-tokio",

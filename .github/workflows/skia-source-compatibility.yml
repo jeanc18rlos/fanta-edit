@@ -1,0 +1,167 @@
+name: Skia source compatibility
+
+on:
+  pull_request:
+    paths:
+      - 'vendor/skia-bindings-0.84.0/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'script/clippy'
+      - 'script/check-licenses'
+      - 'script/generate-licenses'
+      - 'script/licenses/**'
+      - '.github/workflows/skia-source-compatibility.yml'
+      - 'rust-toolchain.toml'
+      - '.cargo/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: skia-source-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  source:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Bind source, toolchain and fresh targets
+        id: prepare
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence_directory="${RUNNER_TEMP}/skia-source-evidence"
+          mkdir "$evidence_directory"
+          mkdir "${RUNNER_TEMP}/skia-source-default" "${RUNNER_TEMP}/skia-source-metal"
+          {
+            date -u +%Y-%m-%dT%H:%M:%SZ
+            git show --no-patch --format='commit %H%ntree %T%nparents %P' HEAD
+            git status --short
+            printf 'Event: %s\nRef: %s\nRun: %s\nAttempt: %s\n' \
+              "$GITHUB_EVENT_NAME" "$GITHUB_REF" "$GITHUB_RUN_ID" "$GITHUB_RUN_ATTEMPT"
+            uname -a
+            rustup show active-toolchain
+            rustc --version
+            cargo --version
+            xcodebuild -version
+            xcrun -sdk macosx clang --version
+            shasum -a 256 Cargo.toml Cargo.lock rust-toolchain.toml .cargo/config.toml \
+              script/clippy script/check-licenses script/generate-licenses \
+              .github/workflows/skia-source-compatibility.yml
+            find vendor/skia-bindings-0.84.0 -type f -exec shasum -a 256 {} \;
+          } 2>&1 | tee "$evidence_directory/source.txt"
+          test "$(uname -m)" = arm64
+          test "$(xcodebuild -version)" = $'Xcode 26.6\nBuild version 17F113'
+          test "$(rustc --version | cut -d ' ' -f 2)" = 1.95.0
+          for variable in FORCE_SKIA_BINARIES_DOWNLOAD SKIA_SOURCE_DIR SKIA_LIBRARY_SEARCH_PATH DOCS_RS; do
+            if [[ -n "${!variable+x}" ]]; then
+              printf 'Unexpected source-build override: %s\n' "$variable" >&2
+              exit 1
+            fi
+          done
+          ./script/check-licenses 2>&1 | tee "$evidence_directory/license-check.log"
+          cargo metadata --locked --format-version 1 > "$evidence_directory/metadata.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          evidence = Path(os.environ["RUNNER_TEMP"]) / "skia-source-evidence"
+          metadata = json.loads((evidence / "metadata.json").read_text())
+          bindings = [package for package in metadata["packages"] if package["name"] == "skia-bindings"]
+          assert len(bindings) == 1
+          package = bindings[0]
+          assert package["version"] == "0.84.0" and package["source"] is None
+          assert Path(package["manifest_path"]).resolve() == Path("vendor/skia-bindings-0.84.0/Cargo.toml").resolve()
+          assert package["id"] not in metadata["workspace_members"]
+          safe = [package for package in metadata["packages"] if package["name"] == "skia-safe"]
+          assert len(safe) == 1 and safe[0]["version"] == "0.84.0"
+          assert safe[0]["source"] == "registry+https://github.com/rust-lang/crates.io-index"
+          PY
+
+      - name: Compile default renderer from Skia source
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence_directory="${RUNNER_TEMP}/skia-source-evidence"
+          FORCE_SKIA_BUILD=1 FANTA_CLIPPY_DEFAULT_FEATURES=1 \
+            CARGO_TARGET_DIR="${RUNNER_TEMP}/skia-source-default" \
+            ./script/clippy --locked -p fanta-render -vv 2>&1 | tee "$evidence_directory/default.log"
+          grep -F 'STARTING A FULL BUILD' "$evidence_directory/default.log"
+          grep -F 'GENERATING BINDINGS' "$evidence_directory/default.log"
+          compgen -G "${RUNNER_TEMP}/skia-source-default/release/build/skia-bindings-*/out/skia/bindings.rs" > /dev/null
+
+      - name: Compile Metal-feature renderer from Skia source
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence_directory="${RUNNER_TEMP}/skia-source-evidence"
+          FORCE_SKIA_BUILD=1 FANTA_CLIPPY_DEFAULT_FEATURES=1 \
+            CARGO_TARGET_DIR="${RUNNER_TEMP}/skia-source-metal" \
+            ./script/clippy --locked -p fanta-render --features metal -vv 2>&1 | tee "$evidence_directory/metal.log"
+          grep -F 'STARTING A FULL BUILD' "$evidence_directory/metal.log"
+          grep -F 'GENERATING BINDINGS' "$evidence_directory/metal.log"
+          compgen -G "${RUNNER_TEMP}/skia-source-metal/release/build/skia-bindings-*/out/skia/bindings.rs" > /dev/null
+
+      - name: Generate bundled dependency notices
+        if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence_directory="${RUNNER_TEMP}/skia-source-evidence"
+          ./script/generate-licenses "$evidence_directory/licenses.md" 2>&1 | tee "$evidence_directory/license-generation.log"
+          grep -F '[skia-bindings 0.84.0]' "$evidence_directory/licenses.md"
+          grep -F 'Copyright (c) 2019 rust-skia Contributors' "$evidence_directory/licenses.md"
+
+      - name: Preserve source-build outputs and generated bindings
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+
+          temporary = Path(os.environ["RUNNER_TEMP"])
+          evidence = temporary / "skia-source-evidence"
+          evidence.mkdir(exist_ok=True)
+          records = []
+          for configuration in ("default", "metal"):
+              target = temporary / f"skia-source-{configuration}"
+              for build in sorted((target / "release/build").glob("skia-bindings-*")):
+                  for relative in ("output", "stderr", "invoked.timestamp", "out/skia/bindings.rs"):
+                      source = build / relative
+                      if not source.is_file():
+                          continue
+                      destination = evidence / "build-output" / configuration / build.name / relative
+                      destination.parent.mkdir(parents=True, exist_ok=True)
+                      shutil.copyfile(source, destination)
+                      content = destination.read_bytes()
+                      records.append({"configuration": configuration, "path": str(destination.relative_to(evidence)), "bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()})
+          (evidence / "build-output.json").write_text(json.dumps(records, indent=2) + "\n")
+          PY
+          git status --short > "${RUNNER_TEMP}/skia-source-evidence/final-status.txt"
+
+      - name: Upload compatibility evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: skia-source-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/skia-source-evidence
+          if-no-files-found: error
+          retention-days: 14

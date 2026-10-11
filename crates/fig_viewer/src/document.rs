@@ -1746,11 +1746,16 @@ impl FigItem {
         }
     }
 
-    /// The disk snapshot a real load records ([`Self::merge_base`]); test
-    /// fixtures built from a document skip the load and set it here.
+    /// Test fixtures skip loading, but resync needs both disk baselines to
+    /// distinguish unchanged files from a full document replacement.
     #[cfg(test)]
-    pub(crate) fn set_merge_base_for_test(&mut self, base: Doc) {
+    pub(crate) fn set_merge_base_for_test(
+        &mut self,
+        base: Doc,
+        assets: BTreeMap<AssetId, Vec<u8>>,
+    ) {
         self.merge_base = Some(base);
+        self.last_saved_assets = Some(Arc::new(assets));
     }
 
     pub fn has_conflict(&self) -> bool {

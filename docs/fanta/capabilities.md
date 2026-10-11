@@ -534,6 +534,13 @@ the existing preview made no new generation request. This is one bounded
 account/model journey, not database exactly-once, network-loss recovery, Agent,
 other-model or Add-to-project acceptance. The owned project remained unchanged.
 
+A later build37 check used **Add to project** once for that existing image in
+an independent project clone. Save and warm reopen retained the library image;
+one placement and Save retained its matching bytes, and Undo and Save restored
+the original page while keeping the library image. The original project stayed
+unchanged and the balance remained 338. Cold import restoration and other models
+remain unverified.
+
 Implementation: [export](../../crates/fig_viewer/src/export.rs),
 [agent operations](../../crates/fig_viewer/src/agent_surface.rs),
 [live MCP tools](../../crates/fig_viewer/src/live_mcp.rs),
@@ -550,6 +557,14 @@ and their displayed price information. Choose the model and an appropriate
 agent profile before sending a request. Tool permissions, retries and auxiliary
 requests matter: a model's output limit or a restrictive profile is not a total
 spending cap. See [AI_DESIGNER.md](../alpha/AI_DESIGNER.md) for canvas permissions.
+
+The current source limits each native Agent turn to 64 model dispatches shared
+by automatic continuations, retries, fallback and automatic compaction. Reaching
+the limit stops the turn with a visible message while preserving completed work;
+a new user turn gets a fresh limit. Manual compaction, title generation, tools,
+subagents and provider-internal retries are outside this limit. This is not a
+dollar or token limit. The nine new automated regressions and matching installed
+app behavior remain unverified; production Agent acceptance is still open.
 
 There are two distinct MCP directions:
 
