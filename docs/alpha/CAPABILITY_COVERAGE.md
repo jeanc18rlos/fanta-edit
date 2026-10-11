@@ -5,12 +5,12 @@
 reports included degraded inspector UI, double-clicks with no useful node action,
 failures or missing content, and slow editing on large pages. The user now accepts
 Spectrum performance. The original save/close incident remains unexplained.
-Internal Mac build42 passes bounded native Save/close, restoration and inspector
-checks recorded below; earlier Boolean entry failures remain unexplained.
-Both Check runs for `29890b774` fail five runtime cases; the prepared successor
-remains uncompiled and unexecuted. TextPath position-field focus also reproduces
-an unexplained native preview shift. These results do not establish every node,
-recovery or distribution requirement.
+Internal Mac build43 passes the bounded ordinary-Text Save/error/retry and node
+samples below. Both `ab9faf717` Check runs pass 74/77 required names and fail
+three Crop cases. The hosted TextPath and recreated-entry regressions now pass,
+but the separate dependency blur fixture fails and its test-only successor is
+pending. Matching fractional native verification, earlier unexplained Boolean
+attempts and wider recovery/distribution requirements remain open.
 
 The selected distribution is a **direct-download Mac app**. Final acceptance
 must use the signed, notarized DMG and the app installed from that exact DMG.
@@ -32,6 +32,74 @@ identifies their scope and the remaining acceptance work. Historical evidence in
 recorded there.
 
 ## Current acceptance status
+
+### ab9 hosted checks and build43 native samples — 11 October
+
+Both canonical and push Check for `ab9faf717` record **74/77 required names
+passing and three Crop runtime failures**. Each editor suite has 1260 passes,
+three failures and two ignored; all 238 workspace tests and 30 independent
+regressions and 20 Store tests pass. Engine/import/source-order/UI stages pass;
+the editor stage fails, drag tests do not run and later ancillary steps are
+skipped. Both denied-warning Release lint modes and forced-source default/Metal
+Skia compilation and notices pass separately. These do not establish a complete
+Check pass, GPU behavior or packaged acceptance.
+
+The recreated-entry public Open regression, narrow-toolbar test, extended
+fractional X/Y focus/Enter/blur/invalid-input host test and new transformed-parent
+TextPath geometry/history test now actually pass. The three Crop tests stop at
+their first intended drag press after disabled Apply: the canvas handler has no
+matching entry in the recorded events. Their later drag/Apply/history assertions
+are not reached. The prepared successor adds bounded raw mouse capture/bubble
+and known-control geometry diagnostics while preserving every gesture, assertion
+and required name. It is unexecuted instrumentation, not a proven Crop repair.
+
+Separate dependency CI for `a795a7ed` fails the untouched fractional blur test
+before its later Enter/subsequent-edit checks. The real-edit fractional test and
+seven retained controls pass; `fanta-gpui` records 920 passes, one failure and
+one ignored. Later dependency lint/package stages are skipped. The reviewed
+test-only successor `3e78e85fba99491b1c640f449ec706b4c483378d` activates the test
+window and asserts focus; production dependency source is unchanged. This release
+candidate updates only the 41 manifest revision references and 84 lockfile
+revision occurrences. Its hosted rerun and the host checks with that pin remain
+pending. Host success does not substitute for the failed dependency case.
+
+Internal build43 is exact `1f838bf20`, with dependency `026496ed`; it does not
+contain the fractional repair or the latest recreated-entry fix. Root's owned
+ordinary Text fixture passes focused integer CmdS and Save All, valid close Save
+and warm reopen. Denied writes produce readable permission guidance; tab-close
+errors name the design file and offer Close Without Saving/Cancel, and window
+errors explain that the window remains open. Cancel retains X48 and the dirty
+tab; restoring permissions and retrying Save without typing persists X48.
+Discard closes the tab, and authored restoration returns all page/identity/
+asset/Git bytes to baseline; only `metadata.modified_at` differs. Final membership
+and modes match. No final inode/mtime/atime continuity, cold restart, multi-document
+Save All or original-incident cause is claimed. A resized-image
+misreading of X40 after Cancel was withdrawn after the original images showed X48.
+
+Further build43 samples exercise Text edit entry and authored restoration,
+Frame/Section drill-in, and Image context/double-click Crop entry. Inline Undo
+did not initially restore the text; document Undo after leaving the editor did.
+A native Crop drag enables Apply; Cancel removes its preview and leaves Crop
+active with Apply disabled, and subsequent Escape or second Cancel exits it. This matches the
+two-stage tool cancellation source and is separate from the hosted missing-press
+failures. These samples do not accept Crop Apply/history, every node, arbitrary
+widths, fractional TextPath behavior or build44.
+
+The second native batch adds TextPath text edit/Save/Undo restoration, Group
+child drill and Boolean operand entry showing four handles, without moving an
+anchor. One mislabeled operand-menu capture actually reselects the Boolean
+parent. In two panes of one design, focused X40→48 in the later pane remains
+absent from the pre-Save All file, then Save All persists exactly that edit and
+clears both tabs. Earlier-pane Undo/Save All restores the original page; both
+clean closes remove their tabs. Core74 and shared37 inventories preserve all
+authored bytes and modes, with only save metadata changed; the post-Crop37
+inventory matches its pre-journey baseline exactly. This does not accept
+multi-document failure ordering, shared Discard or the fractional repair.
+
+Signed/notarized distribution
+and production Agent spending admission remain open; no paid Agent request is
+admitted by the request-count limit.
+
 
 ### Fractional inspector source repair — 11 October, 14:15 UTC
 

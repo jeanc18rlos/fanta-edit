@@ -15425,6 +15425,7 @@ mod tests {
     struct PaneLayoutTestHost {
         view: Entity<FigView>,
         pane_width: Pixels,
+        mouse_trace: Option<std::rc::Rc<std::cell::RefCell<Vec<serde_json::Value>>>>,
     }
 
     #[cfg(feature = "fanta-gpui-ui")]
@@ -15432,6 +15433,32 @@ mod tests {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             h_flex()
                 .size_full()
+                .when_some(self.mouse_trace.clone(), |host, mouse_trace| {
+                    host.child(
+                        gpui::canvas(
+                            |_, _, _| (),
+                            move |_, _, window, _| {
+                                window.on_mouse_event(
+                                    move |event: &MouseDownEvent, phase, window, _| {
+                                        let mut records = mouse_trace.borrow_mut();
+                                        if records.len() < 64 {
+                                            records.push(serde_json::json!({
+                                                "phase": format!("{phase:?}"),
+                                                "button": format!("{:?}", event.button),
+                                                "position": [f32::from(event.position.x), f32::from(event.position.y)],
+                                                "window_position": [f32::from(window.mouse_position().x), f32::from(window.mouse_position().y)],
+                                                "viewport": [f32::from(window.viewport_size().width), f32::from(window.viewport_size().height)],
+                                                "captured_hitbox": format!("{:?}", window.captured_hitbox()),
+                                            }));
+                                        }
+                                    },
+                                );
+                            },
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                })
                 .child(
                     div()
                         .w(self.pane_width)
@@ -15499,6 +15526,7 @@ mod tests {
                 PaneLayoutTestHost {
                     view,
                     pane_width: px(1400.0),
+                    mouse_trace: None,
                 }
             }
         });
@@ -20112,8 +20140,10 @@ mod tests {
         let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
         let (doc, bitmap, images) = bitmap_canvas_doc();
         let (item, view, host, mut visual) = pane_layout_fixture(&project, doc, images, cx);
+        let mouse_trace = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         host.update(&mut visual, |host, cx| {
             host.pane_width = px(canvas_width + 680.0);
+            host.mouse_trace = Some(mouse_trace.clone());
             cx.notify();
         });
         view.update(&mut visual, |view, cx| {
@@ -20186,15 +20216,33 @@ mod tests {
         let assert_crop_press = |visual: &gpui::VisualTestContext,
                                  position: Point<Pixels>,
                                  stage: &str| {
+            let diagnostic_regions: Vec<_> = [
+                "fig-container",
+                "design-crop-controls",
+                "design-crop-hint",
+                "design-crop-ratio",
+                "design-crop-cancel",
+                "design-crop-apply",
+                "fanta-canvas-toolbar",
+                "editor-toolbar",
+                "editor-toolbar-surface",
+                "fanta-inspector-overlay",
+                "fanta-layers-sidebar-resize-handle",
+                "fanta-inspector-sidebar-resize-handle",
+            ]
+            .into_iter()
+            .map(|selector| (selector, visual.debug_bounds(selector)))
+            .collect();
             view.read_with(visual, |view, _| {
                 assert_eq!(view.active_tool(), ToolKind::Crop, "{stage}");
                 assert!(
                     view.primary_pressed && view.canvas_pointer_down,
-                    "{stage} at {canvas_width}: position={position:?}, pressed={}, canvas_pressed={}, ready={}, viewport={:?}, container={:?}, overlays={:?}, diagnostic_records={:?}",
+                    "{stage} at {canvas_width}: position={position:?}, pressed={}, canvas_pressed={}, ready={}, viewport={:?}, container={:?}, overlays={:?}, diagnostic_records={:?}, regions={diagnostic_regions:?}, window_mouse_records(limit=64)={:?}",
                     view.primary_pressed, view.canvas_pointer_down,
                     view.tools.can_apply_crop(), view.viewport(), view.container_bounds,
                     view.tools.overlays,
                     view.click_diagnostics.as_ref().map(|diagnostics| &diagnostics.records),
+                    mouse_trace.borrow(),
                 );
             });
         };

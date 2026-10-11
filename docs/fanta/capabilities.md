@@ -81,15 +81,17 @@ conflicts, but cannot make a concurrent external write and rename atomic; see
   the tab-close error uses an `untitled` label. Explicit Save All retained the
   draft but showed no action-level dialog; a later autosave notice is separate
   feedback. Concise, named errors and a Save All dialog are now in source;
-  their recorded `29890b774` hosted regressions pass, while matching native
-  verification remains pending. These owned fault checks do not establish
+  their recorded `29890b774` hosted regressions pass. Later build43 native
+  samples below verify bounded manual/tab/window error presentation; broader
+  failure routes remain pending. These owned fault checks do not establish
   atomic multi-document Save or the original Spectrum incident's cause.
 - A later 11 October update records both `a51d57c2` hosted Check runs as failed;
   the earlier `37c4073d` success above remains tied to that source. Subsequent
   `29890b774` results are listed below. Its captured explicit-Open regression
   reaches successful read-failure recovery but fails when repeated Open after
-  manifest recreation adds a duplicate tab. The prepared per-view entry-identity
-  fix still needs execution; no matching installed-app behavior is claimed. See the
+  manifest recreation adds a duplicate tab. The later `ab9faf717` per-view
+  entry-identity regression passes in both hosted runs; no matching installed-app
+  recreation behavior is claimed. See the
   [dated terminal update](../alpha/CAPABILITY_COVERAGE.md#terminal-a51d-checks-and-captured-open-successor--11-october).
 - **Later 11 October acceptance:** internal build42, exact `a51d57c2`, passes
   bounded Spectrum focused Save/Cancel/Discard with full pre-choice comparisons,
@@ -103,12 +105,31 @@ conflicts, but cannot make a concurrent external write and rename atomic; see
   success. Merely focusing TextPath X now reproduces a shifted, dirty preview;
   Escape restores it and saved files remain unchanged. A source repair prevents
   untouched fields from changing values and preserves the precision of real
-  position edits. Hosted and matching packaged native checks remain pending;
-  the installed issue is still open.
+  position edits. The `ab9faf717` host fractional and transformed-parent tests
+  pass; the separate dependency untouched-blur test fails and a test-only window
+  activation correction is pending. Matching fractional native acceptance remains
+  open; build43 has the older dependency.
   Both published `29890b774` Check runs pass 72/77 and fail five runtime cases.
   Matching lint and Skia source checks pass separately. Build42 does not accept later Save All/error feedback,
   captured-Open or the prepared identity/test corrections. See the
   [dated successor record](../alpha/CAPABILITY_COVERAGE.md#build42-native-samples-and-29890b-test-successor--11-october).
+- **Build43 bounded follow-up:** the internal package is exact `1f838bf20`.
+  An owned ordinary Text integer field passes focused CmdS, Save All, close Save
+  and warm reopening. Denied-write alerts give readable permission guidance;
+  tab-close errors name the design file and retain Cancel/Close Without Saving,
+  while window-close errors explain that the window remains open. Cancel retains
+  the dirty X48 draft; retry Save after restoring permissions persists it without
+  retyping. Discard closes the tab, and final authored bytes are restored apart
+  from normal `metadata.modified_at`. This does not establish multi-document Save
+  All, fractional TextPath, cold restart or later-source acceptance. Sampled
+  Text/Frame/Section/Image entry routes work within the recorded scope. A later
+  batch adds TextPath text Save/Undo, Group drill and Boolean operand entry with
+  four handles, without an anchor edit. Two panes of one design pass later-pane
+  focused integer Save All and earlier-pane Undo/Save All restoration; this does
+  not establish multi-document failure ordering or shared Discard. Crop
+  Cancel clears a pending preview but keeps the tool active; a subsequent Cancel
+  or Escape exits it. This is separate from the three failing hosted Crop cases.
+  See the [current scoped results](../alpha/CAPABILITY_COVERAGE.md#ab9-hosted-checks-and-build43-native-samples--11-october).
 - The **Code** workspace edits FNX and supported JSON sources. Saving valid
   source updates the canvas; invalid drafts preserve the last valid file and
   scene. Multi-buffer Save is sequential, not atomic: in a bounded build39 check,
@@ -194,11 +215,14 @@ wrapped-image Crop entry, Apply followed by Undo, and a separate preview Cancel;
 Cancel leaves Crop mode active. Its preview moves the action bar, so an old
 Cancel click position can instead hit Apply. At an actual 336-point canvas,
 Apply, the bottom toolbar and the top Canvas/Variables/Code controls still clip.
-The uncompiled responsive fix in this release candidate bounds toolbar/Crop
-controls and positions the top workspace tabs within the canvas. Its four unexecuted mounted regression
-sources cover mode changes, scrolling, workspace switching and Crop history at
-narrow and wide layouts. Hosted execution and a matching native app must accept
-these behaviors.
+The responsive implementation bounds toolbar/Crop controls and positions the
+top workspace tabs within the canvas. In both `ab9faf717` Check runs, the mounted
+toolbar regression passes its mode, scrolling and workspace-switching checks.
+The three mounted Crop regressions at 240, 256 and 336 points execute but fail
+at the first intended drag press after disabled Apply; their later preview,
+Apply and history assertions are not reached. A prepared diagnostic successor
+adds bounded raw mouse-delivery observations without changing those gestures or
+assertions. Its execution and complete matching native coverage remain pending.
 
 On development QA `0f71b3961d`, one real three-second H.264 fixture passes bounded
 Play/Pause, paused Seek, Trim Cancel and Trim Apply with single Undo/Redo and
