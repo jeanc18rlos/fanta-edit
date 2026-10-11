@@ -305,6 +305,37 @@ The exact-head root reviews are retained separately under
 Inline native screenshots were observed; standalone screenshot artifacts are
 not claimed by these aggregates.
 
+### Follow-up to Current38 and c406 — 11 October
+
+Evidence cutoff: **11 October, 07:03 UTC**. The statuses below record that
+cutoff; later checkout and run outcomes require separate evidence.
+
+Published `3307c9` adds the reviewed save-warning changes and fixture corrections.
+Its main Check compilation fails with `E0277`: the notification identifier passes
+an `EntityId` where `ElementId` is required. Both release-lint configurations also
+report `E0599` because the new test fixture lacks the `ProjectItem` trait import.
+The four save-warning regressions have not executed; previous native results
+must not be presented as acceptance of these changes.
+
+Two minimal local corrections use the supported named entity identifier and a
+function-local trait import. Both are source-reviewed and statically checked,
+but remain uncommitted, uncompiled and unexecuted at this cutoff. All original
+failure records and test assertions are preserved. Canonical Check's remaining
+jobs are still pending; separate job results must be reviewed before acceptance.
+
+A reviewed local pane-layout candidate uses each pane's available width to size
+or overlay its docks while retaining preferred widths, visibility and focused
+Design input. Four new mounted regressions await execution. It is source-only:
+the observed split-pane clipping remains a native release gap, and widths below
+the combined layout budget do not imply simultaneous visible minimums.
+
+A separate Current38 check enters a standalone Rectangle's vector editor by
+both double-click and Edit vector. A deselected locked primitive is not selected
+by double-click and offers only Paste at that canvas point. Clean close preserves
+all 48 owned file paths/bytes and the original Matrix's 48 files. This proves
+bounded primitive entry and locked-point protection, not vector mutation, all
+locked-selection routes, export or acceptance of a later build. The initial
+invalid root-authored fixture was rejected and corrected before the valid test.
 ### Final source and internal package — 9 October
 
 **Dated reconciliation: evidence through 21:19 UTC, 9 October.** Accepted main is

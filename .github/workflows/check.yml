@@ -62,6 +62,82 @@ jobs:
             --stage engine --stage import --stage source-order --stage editor --stage workspace --stage ui \
             --output-dir "${RUNNER_TEMP}/fanta-release-verification"
 
+      - name: Verify every required editor and workspace regression actually passed
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          python3 - <<'PYCORE'
+          import csv, json, os, re
+          from pathlib import Path
+          output = Path(os.environ["RUNNER_TEMP"]) / "fanta-release-verification"
+          output.mkdir(parents=True, exist_ok=True)
+          expected = {
+              "editor": [
+                  "property_draft_explicit_save_commits_focused_input",
+                  "property_draft_invalid_save_preserves_then_corrects_input",
+                  "property_draft_window_save_commits_after_prompt_focus",
+                  "property_draft_invalid_window_save_keeps_discard_available",
+                  "property_draft_window_cancel_then_discard_preserves_shared_item",
+                  "property_draft_invalid_window_cancel_then_discard",
+                  "property_draft_unchanged_focused_field_closes_without_prompt",
+                  "property_draft_shared_save_all_commits_later_pane_owner_first",
+                  "property_draft_invalid_shared_save_all_keeps_discard_available",
+                  "unchanged_failed_autosave_stays_dirty_without_repeated_writes",
+                  "explicit_save_retries_the_unchanged_failed_autosave",
+                  "new_edit_retries_after_an_autosave_failure",
+                  "newer_edit_during_failed_autosave_remains_eligible",
+                  "queued_identical_autosave_is_suppressed_after_the_first_failure",
+                  "mounted_native_figview_save_closes_multi_workspace_window",
+                  "mounted_native_figview_discard_closes_multi_workspace_window",
+                  "mounted_native_figview_autosave_during_prompt_then_save_closes_window",
+                  "mounted_design_crop_context_menu_controls_preserve_cancelled_document",
+                  "mounted_design_crop_double_click_controls_preserve_cancelled_document",
+                  "mounted_design_crop_apply_button_commits_once_and_roundtrips_history",
+                  "draw_region_survives_tool_switch_and_masks_crop",
+                  "source_recovery_canvas_tab_restores_save_keyboard_route",
+                  "save_failure_notice_real_write_error_is_concise_and_recovery_is_scoped",
+                  "save_failure_notice_discard_removes_only_the_closed_document",
+                  "save_failure_notice_survives_one_shared_tab_until_the_last_removal",
+                  "save_failure_notice_deferred_show_cannot_outlive_save_or_removal",
+                  "pane_layout_reserves_canvas_without_changing_hidden_panel_preferences",
+                  "pane_layout_measures_the_pane_and_restores_wide_sidebars",
+                  "pane_layout_preserves_valid_property_input_across_compaction",
+                  "pane_layout_preserves_invalid_property_input_across_compaction"
+              ],
+              "workspace": [
+                  "test_close_window_reports_save_failure_and_retries",
+                  "test_close_window_reports_save_failure_and_can_discard",
+                  "test_multi_workspace_close_window_multiple_workspaces_cancel"
+              ]
+          }
+          required_stages = ("engine", "import", "source-order", "editor", "workspace", "ui")
+          stage_path = output / "results.tsv"
+          stages = []
+          if stage_path.exists():
+              with stage_path.open() as stream:
+                  stages = list(csv.DictReader(stream, delimiter="\t"))
+          stage_checks = {}
+          for stage in required_stages:
+              rows = [row for row in stages if row.get("stage") == stage]
+              stage_checks[stage] = len(rows) == 1 and rows[0].get("result") == "PASS" and rows[0].get("exit_code") == "0"
+          checks = {}
+          for label, names in expected.items():
+              path = output / (label + ".log")
+              text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", path.read_text(errors="replace")) if path.exists() else ""
+              tests = re.findall(r"^test ([A-Za-z0-9_:]+) \.\.\. (ok|FAILED|ignored)(?:,.*)?$", text, re.MULTILINE)
+              checks[label] = {}
+              for name in names:
+                  actual = [(full_name, status) for full_name, status in tests if full_name.rsplit("::", 1)[-1] == name]
+                  checks[label][name] = {"actual": actual, "passed": len(actual) == 1 and actual[0][1] == "ok"}
+          passed = all(stage_checks.values()) and all(result["passed"] for group in checks.values() for result in group.values())
+          report = {"passed": passed, "required_count": 33, "stages": stage_checks, "groups": checks,
+                    "scope": "Actual full-suite offline editor/workspace execution; the separate30 Agent/ACP/Settings gate remains required. No native, GPU, service or performance acceptance."}
+          (output / "required-core-regressions.json").write_text(json.dumps(report, indent=2) + "\n")
+          print(json.dumps(report))
+          if not passed:
+              raise SystemExit("Required core regressions or release verification stages did not all pass")
+          PYCORE
+
       - name: Preserve release verification evidence
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

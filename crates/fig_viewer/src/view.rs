@@ -284,6 +284,7 @@ const MIN_INSPECTOR_SIDEBAR_WIDTH: f32 =
 #[cfg(not(feature = "fanta-gpui-ui"))]
 const MIN_INSPECTOR_SIDEBAR_WIDTH: f32 = 260.0;
 const MAX_SIDEBAR_WIDTH: f32 = 560.0;
+const MIN_PANE_CANVAS_WIDTH: f32 = 240.0;
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.);
 const SIDEBAR_BORDER_WIDTH: Pixels = px(1.);
 /// How long the canvas waits after the last committing edit before writing the
@@ -415,6 +416,10 @@ pub struct FigView {
     inspector_sidebar_visible: bool,
     layers_sidebar_width: Pixels,
     inspector_sidebar_width: Pixels,
+    pane_width: Option<Pixels>,
+    revealed_compact_sidebar: Option<SidebarKind>,
+    inspector_has_focus: bool,
+    inspector_focus_handle: FocusHandle,
     selected_page_index: Option<usize>,
     /// Root node of the explicitly selected page, used to re-resolve
     /// `selected_page_index` when a disk reload reorders or removes pages.
@@ -762,8 +767,7 @@ impl FigView {
         let file_inspector_subscription = cx.subscribe(
             &layers_sidebar,
             |this, _, event: &FileInspectorVisibilityChanged, cx| {
-                this.layers_sidebar_visible = event.0;
-                this.persist_sidebar_layout(cx);
+                this.set_layers_sidebar_visible(event.0, cx);
                 cx.notify();
             },
         );
@@ -842,6 +846,10 @@ impl FigView {
             inspector_sidebar_visible,
             layers_sidebar_width,
             inspector_sidebar_width,
+            pane_width: None,
+            revealed_compact_sidebar: None,
+            inspector_has_focus: false,
+            inspector_focus_handle: cx.focus_handle(),
             selected_page_index: None,
             selected_page_root: None,
             opened_entry_id,
@@ -3422,7 +3430,7 @@ impl FigView {
             self.hovered_node = None;
             self.hover_resize_handle = None;
             self.sync_measurement_edit_barrier(cx);
-            self.inspector_sidebar_visible = true;
+            self.reveal_node_properties(cx);
             cx.notify();
             return;
         }
@@ -3461,7 +3469,7 @@ impl FigView {
                 .update(cx, |panel, cx| panel.set_inspecting(true, cx));
             self.layers_sidebar
                 .update(cx, |panel, cx| panel.set_inspecting(true, cx));
-            self.inspector_sidebar_visible = true;
+            self.reveal_node_properties(cx);
             self.invalidate_canvas_cache();
             cx.notify();
             return;
@@ -3606,6 +3614,9 @@ impl FigView {
 
     pub(crate) fn reveal_node_properties(&mut self, cx: &mut Context<Self>) {
         self.inspector_sidebar_visible = true;
+        if self.pane_sidebar_layout().inspector.is_none() {
+            self.revealed_compact_sidebar = Some(SidebarKind::Inspector);
+        }
         cx.notify();
     }
 
@@ -6031,8 +6042,7 @@ impl FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.layers_sidebar_visible = !self.layers_sidebar_visible;
-        self.persist_sidebar_layout(cx);
+        self.set_layers_sidebar_visible(!self.layers_sidebar_expanded(), cx);
         cx.notify();
     }
 
@@ -6048,12 +6058,112 @@ impl FigView {
                 .design
                 .update(cx, |design, cx| design.deactivate(window, cx));
         }
-        #[cfg(not(feature = "fanta-gpui-ui"))]
-        let _ = window;
         self.finish_panel_edits(cx);
-        self.inspector_sidebar_visible = !self.inspector_sidebar_visible;
-        self.persist_sidebar_layout(cx);
+        self.set_inspector_sidebar_visible(!self.inspector_sidebar_expanded(cx), window, cx);
         cx.notify();
+    }
+
+    fn pane_sidebar_layout(&self) -> PaneSidebarLayout {
+        pane_sidebar_layout(
+            self.pane_width,
+            self.layers_sidebar_visible
+                .then_some(self.layers_sidebar_width),
+            self.inspector_sidebar_visible
+                .then_some(self.inspector_sidebar_width),
+        )
+    }
+
+    fn layers_sidebar_expanded(&self) -> bool {
+        self.pane_sidebar_layout().layers.is_some()
+            || (self.layers_sidebar_visible
+                && self.revealed_compact_sidebar == Some(SidebarKind::Layers))
+    }
+
+    fn inspector_sidebar_expanded(&self, _cx: &App) -> bool {
+        let keep_draft = self.inspector_has_focus;
+        #[cfg(feature = "fanta-gpui-ui")]
+        let keep_draft = keep_draft
+            || self.gpui_design.as_ref().is_some_and(|adapter| {
+                adapter.panel.read(_cx).property_draft_state(_cx)
+                    != fanta_gpui::design::DesignPropertyDraftState::None
+            });
+        self.pane_sidebar_layout().inspector.is_some()
+            || (self.inspector_sidebar_visible
+                && (self.revealed_compact_sidebar == Some(SidebarKind::Inspector) || keep_draft))
+    }
+
+    fn displayed_sidebar_width(&self, sidebar: SidebarKind) -> Pixels {
+        let layout = self.pane_sidebar_layout();
+        let (docked, preferred) = match sidebar {
+            SidebarKind::Layers => (layout.layers, self.layers_sidebar_width),
+            SidebarKind::Inspector => (layout.inspector, self.inspector_sidebar_width),
+        };
+        docked.unwrap_or_else(|| {
+            let width = preferred.min(self.pane_width.unwrap_or(preferred));
+            match sidebar {
+                SidebarKind::Layers => width,
+                SidebarKind::Inspector => width.max(px(MIN_INSPECTOR_SIDEBAR_WIDTH)),
+            }
+        })
+    }
+
+    fn set_layers_sidebar_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.layers_sidebar_visible && self.pane_sidebar_layout().layers.is_none() {
+            self.revealed_compact_sidebar = visible.then_some(SidebarKind::Layers);
+        } else {
+            self.layers_sidebar_visible = visible;
+            if visible && self.pane_sidebar_layout().layers.is_none() {
+                self.revealed_compact_sidebar = Some(SidebarKind::Layers);
+            }
+            self.persist_sidebar_layout(cx);
+        }
+    }
+
+    fn set_inspector_sidebar_visible(
+        &mut self,
+        visible: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.inspector_sidebar_visible && self.pane_sidebar_layout().inspector.is_none() {
+            self.revealed_compact_sidebar = visible.then_some(SidebarKind::Inspector);
+            if !visible {
+                self.inspector_has_focus = false;
+                self.focus_handle.focus(window, cx);
+            }
+        } else {
+            self.inspector_sidebar_visible = visible;
+            if visible && self.pane_sidebar_layout().inspector.is_none() {
+                self.revealed_compact_sidebar = Some(SidebarKind::Inspector);
+            }
+            self.persist_sidebar_layout(cx);
+        }
+    }
+
+    fn pane_width_probe(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.weak_entity();
+        gpui::canvas(
+            move |bounds, _, cx| {
+                view.update(cx, |view, cx| {
+                    if view.pane_width != Some(bounds.size.width) {
+                        view.pane_width = Some(bounds.size.width);
+                        let layout = view.pane_sidebar_layout();
+                        if matches!(view.revealed_compact_sidebar, Some(SidebarKind::Layers))
+                            && layout.layers.is_some()
+                            || matches!(view.revealed_compact_sidebar, Some(SidebarKind::Inspector))
+                                && layout.inspector.is_some()
+                        {
+                            view.revealed_compact_sidebar = None;
+                        }
+                        cx.notify();
+                    }
+                })
+                .log_err();
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full()
     }
 
     fn persist_sidebar_layout(&self, cx: &mut Context<Self>) {
@@ -6098,20 +6208,20 @@ impl FigView {
 
     fn render_layers_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         self.layers_sidebar.update(cx, |panel, cx| {
-            panel.set_file_inspector_collapsed(!self.layers_sidebar_visible, cx);
+            panel.set_file_inspector_collapsed(!self.layers_sidebar_expanded(), cx);
         });
         let sidebar = div()
             .id("fanta-layers-sidebar")
             .relative()
-            .when(self.layers_sidebar_visible, |sidebar| {
+            .when(self.layers_sidebar_expanded(), |sidebar| {
                 sidebar
                     .h_full()
-                    .w(self.layers_sidebar_width)
+                    .w(self.displayed_sidebar_width(SidebarKind::Layers))
                     .flex_shrink_0()
                     .border_r(SIDEBAR_BORDER_WIDTH)
                     .border_color(cx.theme().colors().border)
             })
-            .when(!self.layers_sidebar_visible, |sidebar| {
+            .when(!self.layers_sidebar_expanded(), |sidebar| {
                 sidebar
                     .absolute()
                     .top_0()
@@ -6121,11 +6231,11 @@ impl FigView {
                     .occlude()
             })
             .child(self.layers_sidebar.clone())
-            .when(self.layers_sidebar_visible, |sidebar| {
+            .when(self.layers_sidebar_expanded(), |sidebar| {
                 sidebar.child(self.render_sidebar_resize_handle(SidebarKind::Layers, cx))
             });
         #[cfg(test)]
-        let sidebar = sidebar.when(self.layers_sidebar_visible, |sidebar| {
+        let sidebar = sidebar.when(self.layers_sidebar_expanded(), |sidebar| {
             sidebar.debug_selector(|| "fanta-layers-sidebar".to_owned())
         });
         sidebar.into_any_element()
@@ -6308,9 +6418,10 @@ impl FigView {
     ) -> AnyElement {
         let sidebar = div()
             .id("fanta-inspector-sidebar")
+            .track_focus(&self.inspector_focus_handle)
             .relative()
             .h_full()
-            .w(self.inspector_sidebar_width)
+            .w(self.displayed_sidebar_width(SidebarKind::Inspector))
             .flex_shrink_0()
             .border_l(SIDEBAR_BORDER_WIDTH)
             .border_color(cx.theme().colors().border)
@@ -6794,20 +6905,20 @@ impl FigView {
                     .child(
                         IconButton::new(
                             "fig-toggle-layers-sidebar",
-                            if self.layers_sidebar_visible {
+                            if self.layers_sidebar_expanded() {
                                 IconName::ThreadsSidebarLeftOpen
                             } else {
                                 IconName::ThreadsSidebarLeftClosed
                             },
                         )
                         .icon_size(IconSize::Small)
-                        .toggle_state(self.layers_sidebar_visible)
-                        .icon_color(if self.layers_sidebar_visible {
+                        .toggle_state(self.layers_sidebar_expanded())
+                        .icon_color(if self.layers_sidebar_expanded() {
                             Color::Accent
                         } else {
                             Color::Muted
                         })
-                        .tooltip(Tooltip::text(if self.layers_sidebar_visible {
+                        .tooltip(Tooltip::text(if self.layers_sidebar_expanded() {
                             "Hide Layers"
                         } else {
                             "Show Layers"
@@ -6819,20 +6930,20 @@ impl FigView {
                     .child(
                         IconButton::new(
                             "fig-toggle-inspector-sidebar",
-                            if self.inspector_sidebar_visible {
+                            if self.inspector_sidebar_expanded(cx) {
                                 IconName::ThreadsSidebarRightOpen
                             } else {
                                 IconName::ThreadsSidebarRightClosed
                             },
                         )
                         .icon_size(IconSize::Small)
-                        .toggle_state(self.inspector_sidebar_visible)
-                        .icon_color(if self.inspector_sidebar_visible {
+                        .toggle_state(self.inspector_sidebar_expanded(cx))
+                        .icon_color(if self.inspector_sidebar_expanded(cx) {
                             Color::Accent
                         } else {
                             Color::Muted
                         })
-                        .tooltip(Tooltip::text(if self.inspector_sidebar_visible {
+                        .tooltip(Tooltip::text(if self.inspector_sidebar_expanded(cx) {
                             "Hide Inspector"
                         } else {
                             "Show Inspector"
@@ -6881,6 +6992,40 @@ fn resize_cursor(handle: fanta_canvas::ResizeHandle) -> CursorStyle {
         ResizeHandle::NorthWest | ResizeHandle::SouthEast => CursorStyle::ResizeUpLeftDownRight,
         ResizeHandle::NorthEast | ResizeHandle::SouthWest => CursorStyle::ResizeUpRightDownLeft,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PaneSidebarLayout {
+    layers: Option<Pixels>,
+    inspector: Option<Pixels>,
+}
+
+fn pane_sidebar_layout(
+    pane_width: Option<Pixels>,
+    mut layers: Option<Pixels>,
+    mut inspector: Option<Pixels>,
+) -> PaneSidebarLayout {
+    let preferred_inspector = inspector;
+    if let Some(pane_width) = pane_width {
+        let budget = (pane_width - px(MIN_PANE_CANVAS_WIDTH)).max(px(0.0));
+        let total = layers.unwrap_or_default() + inspector.unwrap_or_default();
+        if total > budget {
+            if let Some(width) = layers.as_mut() {
+                *width = (*width - (total - budget)).max(px(MIN_LAYERS_SIDEBAR_WIDTH));
+            }
+            let remaining = budget - layers.unwrap_or_default();
+            if let Some(width) = inspector.as_mut() {
+                *width = (*width).min(remaining.max(px(MIN_INSPECTOR_SIDEBAR_WIDTH)));
+            }
+            if layers.unwrap_or_default() + inspector.unwrap_or_default() > budget {
+                layers = None;
+                inspector = preferred_inspector
+                    .filter(|_| budget >= px(MIN_INSPECTOR_SIDEBAR_WIDTH))
+                    .map(|width| budget.min(width));
+            }
+        }
+    }
+    PaneSidebarLayout { layers, inspector }
 }
 
 fn clamp_sidebar_width(width: Pixels, sidebar: SidebarKind) -> Pixels {
@@ -8294,6 +8439,7 @@ impl Render for FigView {
             cx.entity_id().as_u64(),
             crate::gesture_perf::UiStage::ViewRender,
         );
+        self.inspector_has_focus = self.inspector_focus_handle.contains_focused(window, cx);
         let development_read_only = self.is_dev_mode(cx);
         self.code_workspace.update(cx, |workspace, cx| {
             workspace.set_development_read_only(development_read_only, cx)
@@ -8607,28 +8753,30 @@ impl Render for FigView {
             })
             .when(!has_error && !is_loading, |this| {
                 let presenting_prototype = self.prototype_player.is_some();
-                let workspace_body = if presenting_prototype {
-                    self.render_prototype_presentation(window, cx)
-                } else if editor_workspace == EditorWorkspace::Variables {
-                    div()
-                        .id("fanta-variables-workspace-body")
-                        .size_full()
-                        .overflow_hidden()
-                        .child(self.variables_workspace.clone())
-                        .into_any_element()
-                } else if editor_workspace == EditorWorkspace::Code {
-                    div()
-                        .id("fanta-code-workspace-body")
-                        .size_full()
-                        .overflow_hidden()
-                        .child(self.code_workspace.clone())
-                        .into_any_element()
-                } else {
-                    div()
+                let workspace_body =
+                    if presenting_prototype {
+                        self.render_prototype_presentation(window, cx)
+                    } else if editor_workspace == EditorWorkspace::Variables {
+                        div()
+                            .id("fanta-variables-workspace-body")
+                            .size_full()
+                            .overflow_hidden()
+                            .child(self.variables_workspace.clone())
+                            .into_any_element()
+                    } else if editor_workspace == EditorWorkspace::Code {
+                        div()
+                            .id("fanta-code-workspace-body")
+                            .size_full()
+                            .overflow_hidden()
+                            .child(self.code_workspace.clone())
+                            .into_any_element()
+                    } else {
+                        div()
                         .id("fanta-canvas-workspace-body")
                         .size_full()
                         .relative()
                         .overflow_hidden()
+                        .child(self.pane_width_probe(cx))
                         .child(
                             v_flex()
                                 .size_full()
@@ -8640,8 +8788,8 @@ impl Render for FigView {
                                         .w_full()
                                         .overflow_hidden()
                                         .children(
-                                            self.layers_sidebar_visible
-                                                .then(|| self.render_layers_sidebar(cx)),
+                                            self.pane_sidebar_layout().layers
+                                                .map(|_| self.render_layers_sidebar(cx)),
                                         )
                                         .child(
                                             v_flex()
@@ -8767,8 +8915,8 @@ impl Render for FigView {
                                                 }),
                                         )
                                         .children(
-                                            self.inspector_sidebar_visible
-                                                .then(|| self.render_inspector_sidebar(cx)),
+                                            self.pane_sidebar_layout().inspector
+                                                .map(|_| self.render_inspector_sidebar(cx)),
                                         ),
                                 )
                                 .children((editor_mode == EditorMode::Motion).then(|| {
@@ -8784,7 +8932,7 @@ impl Render for FigView {
                             {
                                 self.gpui_properties
                                     .as_ref()
-                                    .filter(|_| !self.inspector_sidebar_visible)
+                                    .filter(|_| !self.inspector_sidebar_expanded(cx))
                                     .map(|_| {
                                         gpui::deferred(
                                             div()
@@ -8802,8 +8950,28 @@ impl Render for FigView {
                                 None::<AnyElement>
                             }
                         })
-                        .children((!self.layers_sidebar_visible).then(|| {
-                            gpui::deferred(self.render_layers_sidebar(cx)).with_priority(3)
+                        .children(self.pane_sidebar_layout().layers.is_none().then(|| {
+                            gpui::deferred(
+                                div().absolute().top_0().bottom_0().left_0()
+                                    .when(self.layers_sidebar_expanded(), |sidebar| {
+                                        sidebar.w(self.displayed_sidebar_width(SidebarKind::Layers))
+                                            .bg(cx.theme().colors().panel_background).occlude()
+                                    })
+                                    .child(self.render_layers_sidebar(cx)),
+                            ).with_priority(3)
+                        }))
+                        .children((self.pane_sidebar_layout().inspector.is_none()
+                            && self.inspector_sidebar_expanded(cx)).then(|| {
+                            gpui::deferred(
+                                div().id("fanta-inspector-overlay")
+                                    .debug_selector(|| "fanta-inspector-overlay".to_owned())
+                                    .absolute().top_0().bottom_0().right_0()
+                                    .w(self.pane_width.unwrap_or(self.inspector_sidebar_width)
+                                        .min(self.displayed_sidebar_width(SidebarKind::Inspector)))
+                                    .overflow_x_scroll()
+                                    .bg(cx.theme().colors().panel_background).occlude()
+                                    .child(self.render_inspector_sidebar(cx)),
+                            ).with_priority(4)
                         }))
                         .children(
                             self.item
@@ -8812,7 +8980,7 @@ impl Render for FigView {
                                 .then(|| self.render_source_edit_lock_banner(cx)),
                         )
                         .into_any_element()
-                };
+                    };
                 let workspace_body = div()
                     .size_full()
                     .relative()
@@ -9636,8 +9804,7 @@ impl Item for FigView {
             let file_inspector_subscription = cx.subscribe(
                 &layers_sidebar,
                 |this, _, event: &FileInspectorVisibilityChanged, cx| {
-                    this.layers_sidebar_visible = event.0;
-                    this.persist_sidebar_layout(cx);
+                    this.set_layers_sidebar_visible(event.0, cx);
                     cx.notify();
                 },
             );
@@ -9698,6 +9865,10 @@ impl Item for FigView {
                 inspector_sidebar_visible,
                 layers_sidebar_width,
                 inspector_sidebar_width,
+                pane_width: None,
+                revealed_compact_sidebar: None,
+                inspector_has_focus: false,
+                inspector_focus_handle: cx.focus_handle(),
                 selected_page_index,
                 selected_page_root,
                 opened_entry_id,
@@ -13013,6 +13184,8 @@ mod tests {
         name: &str,
         cx: &mut TestAppContext,
     ) -> Result<SaveFailureNoticeFixture> {
+        use project::ProjectItem as _;
+
         cx.executor().allow_parking();
         let directory = tempfile::tempdir()?;
         let root = directory.path().join(name);
@@ -15001,6 +15174,409 @@ mod tests {
             assert!(view.motion_keyframe_drag.is_none());
             assert_eq!(view.editor_workspace(cx), EditorWorkspace::Variables);
         });
+    }
+
+    #[test]
+    fn pane_layout_reserves_canvas_without_changing_hidden_panel_preferences() {
+        let preferred_layers = Some(px(280.0));
+        let preferred_inspector = Some(px(400.0));
+        assert_eq!(
+            pane_sidebar_layout(Some(px(1400.0)), preferred_layers, preferred_inspector),
+            PaneSidebarLayout {
+                layers: preferred_layers,
+                inspector: preferred_inspector
+            }
+        );
+        assert_eq!(
+            pane_sidebar_layout(Some(px(588.0)), preferred_layers, preferred_inspector),
+            PaneSidebarLayout {
+                layers: None,
+                inspector: Some(px(348.0))
+            }
+        );
+        assert_eq!(
+            pane_sidebar_layout(Some(px(450.0)), preferred_layers, preferred_inspector),
+            PaneSidebarLayout {
+                layers: None,
+                inspector: None
+            }
+        );
+        assert_eq!(
+            pane_sidebar_layout(Some(px(588.0)), preferred_layers, None),
+            PaneSidebarLayout {
+                layers: preferred_layers,
+                inspector: None
+            }
+        );
+        assert_eq!(
+            pane_sidebar_layout(Some(px(588.0)), None, preferred_inspector),
+            PaneSidebarLayout {
+                layers: None,
+                inspector: Some(px(348.0))
+            }
+        );
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    struct PaneLayoutTestHost {
+        view: Entity<FigView>,
+        pane_width: Pixels,
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    impl Render for PaneLayoutTestHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            h_flex()
+                .size_full()
+                .child(
+                    div()
+                        .w(self.pane_width)
+                        .h_full()
+                        .flex_shrink_0()
+                        .child(self.view.clone()),
+                )
+                .child(div().flex_1().h_full())
+        }
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn draw_pane_layout(visual: &mut gpui::VisualTestContext) {
+        for _ in 0..3 {
+            visual.run_until_parked();
+            visual.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+        }
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn pane_layout_fixture(
+        project: &Entity<Project>,
+        doc: Doc,
+        images: BTreeMap<AssetId, Vec<u8>>,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<FigItem>,
+        Entity<FigView>,
+        Entity<PaneLayoutTestHost>,
+        gpui::VisualTestContext,
+    ) {
+        let item = crate::document::ready_item_for_test(
+            project,
+            std::path::PathBuf::from("/tmp/PaneLayout.fig"),
+            doc,
+            cx,
+        );
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let (_, mut assets) = document.doc_and_assets();
+                for (expected, bytes) in images {
+                    let (actual, _) = assets.add_image(bytes).expect("fixture image");
+                    assert_eq!(actual, expected);
+                }
+                ((), DocChange::None)
+            })
+            .expect("ready fixture document");
+        });
+        let window = cx.add_window({
+            let item = item.clone();
+            let project = project.clone();
+            move |window, cx| {
+                let view = cx.new(|cx| FigView::new(item, project, window, cx));
+                view.update(cx, |view, cx| {
+                    view.layers_sidebar_visible = true;
+                    view.inspector_sidebar_visible = true;
+                    view.layers_sidebar_width = px(280.0);
+                    view.inspector_sidebar_width = px(400.0);
+                    view.focus_handle.focus(window, cx);
+                });
+                window.activate_window();
+                PaneLayoutTestHost {
+                    view,
+                    pane_width: px(1400.0),
+                }
+            }
+        });
+        let host = window.entity(cx).expect("pane host");
+        let view = host.read_with(cx, |host, _| host.view.clone());
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1536.0), px(1084.0)));
+        draw_pane_layout(&mut visual);
+        (item, view, host, visual)
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn pane_layout_measures_the_pane_and_restores_wide_sidebars(cx: &mut TestAppContext) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, _, images) = bitmap_canvas_doc();
+        let (item, view, host, mut visual) = pane_layout_fixture(&project, doc, images, cx);
+        let before = item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            (
+                serde_json::to_value(&document.doc).expect("document snapshot"),
+                document.raw_assets.clone(),
+                document.doc.history.undo_depth(),
+                document.doc.history.redo_depth(),
+                item.is_dirty(),
+            )
+        });
+        for (width, canvas_width, inspector_width) in [
+            (1400.0, 720.0, Some(400.0)),
+            (588.0, 240.0, Some(348.0)),
+            (450.0, 450.0, None),
+        ] {
+            host.update(&mut visual, |host, cx| {
+                host.pane_width = px(width);
+                cx.notify();
+            });
+            draw_pane_layout(&mut visual);
+            view.read_with(&visual, |view, _| {
+                assert_eq!(
+                    view.pane_width,
+                    Some(px(width)),
+                    "the window remains 1536 points wide"
+                );
+                assert!(view.layers_sidebar_visible && view.inspector_sidebar_visible);
+                assert_eq!(
+                    (view.layers_sidebar_width, view.inspector_sidebar_width),
+                    (px(280.0), px(400.0))
+                );
+            });
+            assert_eq!(
+                visual
+                    .debug_bounds("fig-container")
+                    .expect("canvas")
+                    .size
+                    .width,
+                px(canvas_width)
+            );
+            let inspector = visual.debug_bounds("fanta-inspector-sidebar");
+            assert_eq!(
+                inspector.map(|bounds| bounds.size.width),
+                inspector_width.map(px)
+            );
+            if width < 1400.0 {
+                assert!(visual.debug_bounds("file-inspector-toggle").is_some());
+            }
+        }
+        let toggle = visual
+            .debug_bounds("properties-inspector-toggle")
+            .expect("compact Inspector toggle")
+            .center();
+        visual.simulate_click(toggle, gpui::Modifiers::none());
+        draw_pane_layout(&mut visual);
+        let inspector = visual
+            .debug_bounds("fanta-inspector-sidebar")
+            .expect("revealed Inspector");
+        assert_eq!(inspector.size.width, px(400.0));
+        assert_eq!(inspector.right(), px(450.0));
+        assert_eq!(
+            visual
+                .debug_bounds("fig-container")
+                .expect("canvas remains allocated")
+                .size
+                .width,
+            px(450.0)
+        );
+        let toggle = visual
+            .debug_bounds("properties-inspector-toggle")
+            .expect("expanded Inspector toggle")
+            .center();
+        visual.simulate_click(toggle, gpui::Modifiers::none());
+        draw_pane_layout(&mut visual);
+        assert!(visual.debug_bounds("fanta-inspector-sidebar").is_none());
+        let toggle = visual
+            .debug_bounds("file-inspector-toggle")
+            .expect("compact Layers toggle")
+            .center();
+        visual.simulate_click(toggle, gpui::Modifiers::none());
+        draw_pane_layout(&mut visual);
+        assert_eq!(
+            visual
+                .debug_bounds("fanta-layers-sidebar")
+                .expect("revealed Layers")
+                .size
+                .width,
+            px(280.0)
+        );
+        host.update(&mut visual, |host, cx| {
+            host.pane_width = px(1400.0);
+            cx.notify();
+        });
+        draw_pane_layout(&mut visual);
+        assert_eq!(
+            visual
+                .debug_bounds("fanta-layers-sidebar")
+                .expect("restored Layers")
+                .size
+                .width,
+            px(280.0)
+        );
+        assert_eq!(
+            visual
+                .debug_bounds("fanta-inspector-sidebar")
+                .expect("restored Inspector")
+                .size
+                .width,
+            px(400.0)
+        );
+        assert_eq!(
+            visual
+                .debug_bounds("fig-container")
+                .expect("restored canvas")
+                .size
+                .width,
+            px(720.0)
+        );
+        item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            assert_eq!(
+                (
+                    serde_json::to_value(&document.doc).expect("document snapshot"),
+                    document.raw_assets.clone(),
+                    document.doc.history.undo_depth(),
+                    document.doc.history.redo_depth(),
+                    item.is_dirty()
+                ),
+                before
+            );
+        });
+        view.read_with(&visual, |view, _| {
+            assert!(view.layers_sidebar_visible && view.inspector_sidebar_visible);
+            assert_eq!(
+                (view.layers_sidebar_width, view.inspector_sidebar_width),
+                (px(280.0), px(400.0))
+            );
+        });
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    async fn assert_pane_layout_preserves_property_draft(draft: &str, cx: &mut TestAppContext) {
+        use fanta_gpui::design::DesignPropertyDraftState;
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, text, _) = text_selection_doc(false);
+        let (item, view, host, mut visual) =
+            pane_layout_fixture(&project, doc, BTreeMap::new(), cx);
+        item.update(&mut visual, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.select_only(text);
+                ((), DocChange::Selection)
+            })
+            .expect("select mounted text");
+        });
+        draw_pane_layout(&mut visual);
+        let panel = view.read_with(&visual, |view, _| {
+            view.gpui_design.as_ref().expect("Design").panel.clone()
+        });
+        let field = visual
+            .debug_bounds("fig-gpui-design-x")
+            .expect("X input")
+            .center();
+        visual.simulate_click(field, gpui::Modifiers::none());
+        visual.simulate_keystrokes("cmd-a");
+        visual.simulate_input(draft);
+        visual.run_until_parked();
+        let focus = visual.update(|window, cx| window.focused(cx).expect("property input focus"));
+        let expected_state = if draft == "-" {
+            DesignPropertyDraftState::Invalid
+        } else {
+            DesignPropertyDraftState::Valid
+        };
+        assert_eq!(
+            panel.read_with(&visual, |panel, cx| panel.property_draft_state(cx)),
+            expected_state
+        );
+        let before = item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            (
+                serde_json::to_value(&document.doc).expect("draft preview"),
+                document.raw_assets.clone(),
+                document.doc.history.undo_depth(),
+                document.doc.history.redo_depth(),
+                item.is_dirty(),
+            )
+        });
+        for width in [588.0, 450.0, 1400.0] {
+            host.update(&mut visual, |host, cx| {
+                host.pane_width = px(width);
+                cx.notify();
+            });
+            draw_pane_layout(&mut visual);
+            visual.update(|window, _| {
+                assert!(
+                    focus.is_focused(window),
+                    "resizing preserves the actual input focus"
+                )
+            });
+            assert_eq!(
+                panel.read_with(&visual, |panel, cx| panel.property_draft_state(cx)),
+                expected_state
+            );
+            view.read_with(&visual, |view, _| {
+                assert_eq!(
+                    view.gpui_design
+                        .as_ref()
+                        .expect("same Design")
+                        .panel
+                        .entity_id(),
+                    panel.entity_id()
+                );
+                assert!(view.inspector_sidebar_visible && view.layers_sidebar_visible);
+                assert_eq!(
+                    (view.layers_sidebar_width, view.inspector_sidebar_width),
+                    (px(280.0), px(400.0))
+                );
+            });
+            let inspector = visual
+                .debug_bounds("fanta-inspector-sidebar")
+                .expect("draft remains visible");
+            let field = visual
+                .debug_bounds("fig-gpui-design-x")
+                .expect("same mounted input");
+            assert!(inspector.size.width >= px(MIN_INSPECTOR_SIDEBAR_WIDTH));
+            assert!(field.left() >= inspector.left() && field.right() <= inspector.right());
+            assert!(inspector.right() <= px(width));
+            visual.simulate_keystrokes("cmd-a cmd-c");
+            assert_eq!(
+                visual
+                    .read_from_clipboard()
+                    .expect("copied actual input")
+                    .text()
+                    .as_deref(),
+                Some(draft)
+            );
+            item.read_with(&visual, |item, _| {
+                let document = item.document().expect("document");
+                assert_eq!(
+                    (
+                        serde_json::to_value(&document.doc).expect("draft preview"),
+                        document.raw_assets.clone(),
+                        document.doc.history.undo_depth(),
+                        document.doc.history.redo_depth(),
+                        item.is_dirty()
+                    ),
+                    before
+                );
+            });
+        }
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn pane_layout_preserves_valid_property_input_across_compaction(cx: &mut TestAppContext) {
+        assert_pane_layout_preserves_property_draft("48", cx).await;
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn pane_layout_preserves_invalid_property_input_across_compaction(
+        cx: &mut TestAppContext,
+    ) {
+        assert_pane_layout_preserves_property_draft("-", cx).await;
     }
 
     async fn assert_mounted_sidebar_divider_drag(
@@ -20183,8 +20759,8 @@ impl FigView {
             duration_ms,
             auto_keyframe: self.motion_auto_keyframe,
             time_comment_armed: self.comment_state.motion_time_comment_active(),
-            layers_sidebar_visible: self.layers_sidebar_visible,
-            inspector_sidebar_visible: self.inspector_sidebar_visible,
+            layers_sidebar_visible: self.layers_sidebar_expanded(),
+            inspector_sidebar_visible: self.inspector_sidebar_expanded(cx),
             // Live keymap text, like the tooltip the old native button had.
             fit_to_view_shortcut: ui::text_for_action(&FitToView, window, cx).map(Into::into),
         }
@@ -20428,7 +21004,7 @@ impl FigView {
     /// every other press would read as broken.
     #[cfg(feature = "fanta-gpui-ui")]
     fn reveal_layers_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.layers_sidebar_visible {
+        if !self.layers_sidebar_expanded() {
             self.toggle_layers_sidebar(&ToggleLayersSidebar, window, cx);
         }
         self.layers_sidebar.focus_handle(cx).focus(window, cx);
@@ -20861,7 +21437,7 @@ impl FigView {
                 );
                 return;
             };
-            if !self.inspector_sidebar_visible {
+            if !self.inspector_sidebar_expanded(cx) {
                 self.toggle_inspector_sidebar(&ToggleInspectorSidebar, window, cx);
             }
             self.refresh_properties_inspector(window, cx);
@@ -20881,7 +21457,7 @@ impl FigView {
             return;
         }
         self.set_editor_mode(EditorMode::Design, cx);
-        if !self.inspector_sidebar_visible {
+        if !self.inspector_sidebar_expanded(cx) {
             self.toggle_inspector_sidebar(&ToggleInspectorSidebar, window, cx);
         }
         self.refresh_properties_inspector(window, cx);
@@ -20916,7 +21492,7 @@ impl FigView {
             self.export_design_selection(window, cx);
             return;
         }
-        if !self.inspector_sidebar_visible {
+        if !self.inspector_sidebar_expanded(cx) {
             self.toggle_inspector_sidebar(&ToggleInspectorSidebar, window, cx);
         }
         let inspector = self.inspector_sidebar.downgrade();
@@ -21434,7 +22010,7 @@ pub(crate) fn show_canvas_notice_deferred(message: String, cx: &mut App) {
 }
 
 fn save_failure_notice_id(item: gpui::EntityId) -> NotificationId {
-    NotificationId::composite::<FigItem>(item)
+    NotificationId::composite::<FigItem>(("save-failure", item))
 }
 
 fn sync_save_failure_notice_deferred(
