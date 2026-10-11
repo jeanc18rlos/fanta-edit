@@ -1,6 +1,7 @@
 # Fanta capability guide
 
-Source inventory updated **9 October 2026**; acceptance evidence below is dated.
+Source inventory updated **9 October 2026**; bounded native evidence updated
+**11 October 2026**. Acceptance evidence below is dated.
 This describes the current editor implementation; release verification is tracked
 separately in
 [the capability coverage report](../alpha/CAPABILITY_COVERAGE.md). Earlier alpha
@@ -35,10 +36,21 @@ conflicts, but cannot make a concurrent external write and rename atomic; see
   delete pages, select layers, expand nesting, and drag layers into a different
   parent or position. Page roots and component recursion have edit guards.
 - Canvas edits support Undo/Redo and debounced autosave. Save commits active
-  valid property edits; failures remain visible. Save As creates a separate
-  project and rejects occupied or unsafe destinations. Clean canvas tabs restore
-  their project and page/component scope when the workspace reopens. Unsaved
-  canvas or source content still requires the normal close/save decision.
+  valid property edits. Autosave can persist an edit while a close prompt is
+  open; **Don't Save** does not roll back changes already written. Save As creates
+  a separate project and rejects occupied or unsafe destinations. Clean canvas
+  tabs restore their project and page/component scope when the workspace reopens.
+  Unsaved canvas or source content still requires the normal close/save decision.
+  A bounded build37 Save/close/warm-reopen journey succeeds, but the original
+  reported inert Save/Discard incident is not reproduced or explained. In a
+  separate build37 test with writes denied, CmdS displayed a permission error.
+  Save in the close prompt retained the dirty draft and logged an error without
+  a separate close-error dialog; retrying the prompt and choosing Don't Save
+  returned to welcome. Restoring permissions and reopening showed the original
+  saved text. This does not establish a successful Save retry after the fault or
+  rollback of previously saved edits. Repeated autosave retries and close-error
+  feedback remain open issues in the
+  [latest acceptance record](../alpha/CAPABILITY_COVERAGE.md#current37-native-checks--11-october).
 - The **Code** workspace edits FNX and supported JSON sources. Saving valid
   source updates the canvas; invalid drafts preserve the last valid file and
   scene. Embedded Find searches the active FNX/JSON editor; **Discard draft**
@@ -108,9 +120,11 @@ applicable subsets. The toolbar Color picker opens the selected fill or page
 background picker.
 
 In an editable Design canvas, activating Crop also shows **Ratio**, **Cancel**
-and **Apply crop** controls. These merged controls have mounted regression
-coverage; the earlier missing-controls failures remain recorded, and their
-latest installed-app journey is still pending.
+and **Apply crop** controls. Drag inside the image to create the crop region,
+then Apply. On build37, one freeform Bitmap Apply/Undo/Redo/final Undo/Cancel
+journey restores full project content except its modification timestamp. The
+earlier missing-controls failures remain recorded; other crop modes and cold
+reopening are not covered by that journey.
 
 On development QA `0f71b3961d`, one real three-second H.264 fixture passes bounded
 Play/Pause, paused Seek, Trim Cancel and Trim Apply with single Undo/Redo and
@@ -155,6 +169,11 @@ fills and gradients, strokes, effects, corners, typography, auto-layout/grid,
 variables, components and export. Page selection has page-specific properties. Audio and specialist leaves show
 their own type labels and expose supported position, dimensions, appearance,
 effects and export controls; these controls preserve the underlying content.
+**Video properties**, **Audio properties** and specialist properties entries
+reveal this inspector; they do not switch modes or open dedicated media editors.
+For a supported single Video or Audio selection, playback controls appear below
+the canvas in **Motion** or **Prototype**. Audio preview also requires an active
+canvas window; a missing preview is not diagnosed by the Properties action alone.
 Booleans expose operation, fill and stroke controls. Paint recoloring retains
 the imported geometry; geometry or operation changes recompute it from operands.
 Constraint data can be retained by the document, but constraint controls are
@@ -227,7 +246,7 @@ double-click to drill into its container before another pair enters editing.
 | Bitmap/image node | Activate Crop. Draw the crop region. | Enter applies; Escape cancels the pending crop. |
 | Group, frame, section or boolean | Drill into the next selectable child level. | A subsequent double-click can activate the selected leaf. |
 | Component instance | Edit a virtual text override when the pointer hits editable instance text; otherwise reveal its properties inspector. | Finish text editing or inspect instance properties. |
-| Video or audio | Reveal the properties inspector. | Use the supported media or preview controls for playback; double-click keeps the current mode. |
+| Video or audio | Reveal the properties inspector without changing mode. | Select the supported media in Motion or Prototype for playback controls below the canvas. |
 | Node graph, 3D, AI artifact or embed | Reveal the properties inspector. | No specialized editor is implied for placeholder types. |
 
 Locked, hidden, obscured and other-page scene nodes do not enter editing. Shift,
@@ -439,9 +458,14 @@ Vector JPG, collision preservation and two simultaneous presets, including 2×
 PNG. Bitmap JPG retains its original four-pixel failure and separate limited
 flat-block pass. The later quality-95 correction passes the hosted regression
 using the original fixture, crop, pixel mask and tolerances; quality 90 fails
-that same test. This does not replace a native retest on the latest app or prove
-general JPEG fidelity, and higher quality can increase file size. Imported or
-advanced effects and broader batches still need format-specific checks.
+that same test. A later build37 Bitmap export produces PNG, JPG, SVG and PDF
+with unchanged project content and assets. PNG pixels, SVG embedded/rendered
+pixels and the PDF embedded bitmap match the source. PDF raster rendering has
+retained edge differences; JPEG passes only a declared 1,200-pixel cell-interior
+check, not the original regression mask. Exporting the selected Bitmap yields
+its full image; this does not establish clipped parent-frame export. General
+JPEG fidelity, advanced effects and broader batches remain format-specific
+checks, and higher quality can increase file size.
 
 The built-in designer can inspect/edit the canvas, use project `fanta.md`
 instructions, prepare design assets, follow source edits and report agent
@@ -546,18 +570,23 @@ regression and a slower 100% instance result; fit-all instance timings were
 rejected because the target produced no visible pixel motion. The sampled
 fit-all image p95 remains above 16 ms. Matched native gesture, complete Save and
 memory measurements are still required; the below-16-ms native drag target
-remains unproven. See the [coverage report](../alpha/CAPABILITY_COVERAGE.md) for
-exact evidence and earlier failures.
+remains unproven. The user's 11 October hands-on Spectrum check accepts its
+current performance; this qualitative result is separate from those unmeasured
+benchmarks and does not request another optimization pass. See the
+[coverage report](../alpha/CAPABILITY_COVERAGE.md) for exact evidence and earlier
+failures.
 
 Mac App Store builds restrict local process execution, external agents and
 related inherited editor features; see [MAC_APP_STORE.md](../alpha/MAC_APP_STORE.md).
 The selected release target is a direct-download Mac app. Packaging now checks
 the app inside the produced DMG against the staged bundle and enforces the
-configured signature/notarization checks. At the 9 October, 21:19 UTC checkpoint,
-**build37**
-targets the accepted source but its package and latest native acceptance remain
-pending. The following **build33** result is historical, not validation of later
-fixes. That internal optimized artifact, from
+configured signature/notarization checks. Internal **build37**, exact
+`22f734193844eab66485e3cb322b529c2965e297`, now passes hosted and local package,
+checksum, CLI and isolated-QA verification. Its bounded 11 October native checks
+cover selected inspector, Crop, media playback, export and save/close routes;
+see the [latest acceptance record](../alpha/CAPABILITY_COVERAGE.md#current37-native-checks--11-october).
+It remains ad-hoc signed, not a Developer ID/notarized release. The following
+**build33** result is historical, not validation of later fixes. That internal optimized artifact, from
 `79cc2ef8c094149e8496476c1cb53e2945b8b54a`, passes hosted and
 local mounted-package verification, CLI checks and isolated QA derivation. It
 is an arm64, ad-hoc-signed artifact (`signed=false`), not a Developer ID/notarized

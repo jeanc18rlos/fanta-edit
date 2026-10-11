@@ -1,10 +1,12 @@
-# Release capability coverage — 9 October 2026
+# Release capability coverage — 11 October 2026
 
 **Release readiness is not established.** The target window is Monday
 **5 October through Sunday 11 October 2026**, Europe/Madrid. The immediate user
-reports are degraded inspector UI, double-clicks with no useful node action,
-failures or missing content, and slow editing on large pages. Treat those as
-release blockers until reproduced and verified on the candidate build.
+reports included degraded inspector UI, double-clicks with no useful node action,
+failures or missing content, and slow editing on large pages. The user now accepts
+Spectrum performance. The save/close incident remains unexplained, while the
+bounded build37 checks below replace only their matching pending acceptance
+items; they do not close every node or error-recovery journey.
 
 The selected distribution is a **direct-download Mac app**. Final acceptance
 must use the signed, notarized DMG and the app installed from that exact DMG.
@@ -26,6 +28,76 @@ identifies their scope and the remaining acceptance work. Historical evidence in
 recorded there.
 
 ## Current acceptance status
+
+### Current37 native checks — 11 October
+
+Exact `22f734193844eab66485e3cb322b529c2965e297` / tree
+`555b8260c540fb253c091d34711e177ad664a926`, internal build37, passes hosted
+packaging and local installer/archive, mounted manifest, CLI and isolated-QA
+verification. It is ad-hoc signed, not notarized or approved for public release.
+This supersedes the package-pending state in the dated 9 October entry below.
+Later draft source changes are not present in this app.
+
+Root drove the actual app and described conversation screenshots/AX observations.
+Independent read-only snapshots bind saved project bytes, modes, nanosecond
+mtimes and assets. These are bounded manual UI observations plus storage proof,
+not an independently archived screenshot suite or complete capability matrix.
+
+| Journey | New bounded evidence | Limits retained |
+| --- | --- | --- |
+| Inspector and node entry | Dark/light 320/400-pixel samples; TextPath and nested-text edit/Undo; Boolean drill and four visible points. NodeGraph, 3D and AI properties-menu/hidden-inspector double-click reveal matching Design headers and geometry. Full small-project no-edit comparison is exact. | Other themes/width combinations, mixed/locked states, point dragging, actual 3D rendering and specialist editors remain separate. |
+| Freeform Bitmap Crop | Apply adds one nested Crop and compensates bitmap placement. Undo restores full FNX/IDs; Redo restores exact applied bytes and wrapper ID; final Undo/Cancel restores all 30 non-Git file bytes except `metadata.modified_at`, with assets exact. | One fixture; no new cold restart, ratio/rotated-crop or generic crop-UX acceptance. The older missing-controls failures are preserved. |
+| Local Video/Audio | Motion selection provides preview/play/pause/progress/end; Audio also seeks to start/end and toggles mute/volume. Full project remains byte/mode/mtime/identity exact. | Muted playback does not prove audibility. Audio natural end showed 0:02/0:03 with full progress; cause unassigned. No trim/rate edits, codec breadth or general cold-preview reliability. |
+| Spectrum Save/tab close | One actual Typography text target persists through CmdS, close-prompt Save and warm reopen; Cancel retains tab/content and Don't Save closes the tab. Twelve scoped files and 42 asset files are frozen. | Other pages/components were not reread. No pre-choice snapshot for Don't Save, so rollback/write causality is unproved. Original inert Save/Discard report is not reproduced or explained. |
+| CmdShiftW Save and recovery | Own TextPath edit already exists on disk before any close choice. Save settles old project content to welcome; same-process exact-path reopen retains it. Native restoration returns 33 nonmetadata files, assets and exports exactly. | Inventory exposed no original window IDs; no full-window disappearance, cold restart or Quit claim. Save did not establish a write already observed before choice; the controlled failure below is a separate journey. |
+| Controlled save failure / Don't Save | With writes denied in two owned directories, CmdS displayed a permission error. Close-prompt Save retained the dirty draft and logged an error, with no separate close-error dialog observed. The prompt could be opened again; Don't Save reached welcome. Seven full captures preserve all 20 file bytes, modes, nanosecond mtimes, current file IDs and the asset, with no transaction remnants. After permission restoration, exact-path warm reopen showed the original saved text. | Current37 remains unchanged. No successful post-fault Save retry, original-window-ID disappearance, cold restart, general rollback or historical Spectrum-cause proof. The autosave retry loop and close-error feedback remain open. |
+| Bitmap exports | Actual PNG/JPG/SVG/PDF outputs are 320×180; only export files are added. PNG and SVG embedded/rendered pixels and PDF embedded bitmap match the original. JPEG's declared 1,200 cell-interior pixels have max error 1 at tolerance 10. | PDF 72-dpi rendering retains 5,673 edge-difference pixels (max 204). JPEG full-image max error is 18; the historical 13,248-pixel mask was not rerun. Selected-Bitmap full-node export does not test clipped parent frames or vector/multipage fidelity. |
+
+The fault journey ran from 01:07 to 01:10 UTC on 11 October. Access-time
+changes are retained explicitly: initial native opening advanced seven files
+before the fault, and later reads advanced seven files in each raw evidence
+copy. Relative to the settled native pre-fault snapshot, only the two intended
+directories changed mode/ctime; their original modes were restored on the same
+inodes. This is file-content and specified-metadata preservation, not a claim
+that every timestamp stayed unchanged.
+
+The saved log contains **55 autosave failures over 74 seconds**. Source review
+identifies a failure → resync → Edited → debounce path that can re-arm autosave;
+the persistent warning is deduplicated but write attempts are not stopped by
+that notice. This remains an open feedback-loop issue, not an accepted fix or a
+general retry timing bound. The historical Spectrum Save/Discard incident is
+still unexplained.
+
+Separately, draft [PR120](https://github.com/jeanc18rlos/fanta-edit/pull/120),
+head `dd3e0915c753a2eff62f68ead0f6e02f64f7b2fe`, passes canonical
+[Check/Store](https://github.com/jeanc18rlos/fanta-edit/actions/runs/38098361843)
+and [Release lint](https://github.com/jeanc18rlos/fanta-edit/actions/runs/38098361825).
+Its three generic mounted close/error/retry/discard/cancel tests execute and
+pass; they do not replace the native storage observations. At this evidence
+cutoff it is unmerged and absent from Current37. A matching updated package and
+native error-feedback/recovery checks remain pending.
+
+User acceptance of Spectrum responsiveness is qualitative. Historical numeric
+native p95, durability and memory measurements remain unproved, but no further
+performance optimization is requested by this resumed check. Release signing,
+clean installation/update, production spending bounds and broad E2E remain open.
+
+Evidence under the local QA archive's `integration-20261007/`:
+
+- `build37-terminal-resume-20261011/result.json`
+- `build37-artifact-acquisition-v1-20261009/actual-acquisition-20261011-run1/result.json`
+- `build37-local-qa-preparation-v2-20261011/actual-local-qa-run1/result.json`
+- `release-resume-20261011/manual-root-isolated-spectrum-close-addendum-20261011.json`
+- `release-resume-20261011/manual-root-crop-sequence-addendum-20261011.json`
+- `release-resume-20261011/manual-root-specialist-inspector-addendum-20261011.json`
+- `release-resume-20261011/manual-root-media-playback-addendum-20261011.json`
+- `release-resume-20261011/manual-root-window-close-restore-addendum-20261011.json`
+- `release-resume-20261011/export-format-review-20261011-run1/result.json`
+- `release-resume-20261011/manual-root-save-failure-discard-addendum-20261011.json`
+- `release-resume-20261011/save-failure-matrix-preparation-v1-20261011/metadata-atime-qualification-01.json`
+- `release-resume-20261011/save-failure-matrix-preparation-v1-20261011/independent-fault-review-01.json`
+- `close-window-error-recovery-20261011/ci-pr120-v2/independent-terminal-review.json`
+- `close-window-error-recovery-20261011/ci-pr120-v2/root-terminal-acceptance-20261011.json`
 
 ### Final source and internal package — 9 October
 
@@ -571,6 +643,10 @@ coverage. The final column highlights the remaining acceptance work.
 | Large-page performance | Import scaling, renderer cache/culling, ignored latency/acceptance benchmarks and profiling examples; matched synthetic acceptance median 546.673→292.797 ms; worker and inclusive UI-stage gesture tests; PR 74 retained API CPU parity/timings (fit-all benefit and 100% image regression at that earlier pre-worker checkpoint); current opt-in Metal API/worker correctness (seven actual-Metal API tests plus one IOSurface-worker test) | Full native Save and gesture timings on Spectrum remain required; acceptance-only development timing and mounted instrumentation tests do not establish application latency. Measure frame p50/p95/max and memory; the drag p95 target below 16 ms is unproven. |
 
 ## Next bounded native checks
+
+The queue below preserves earlier build-specific plans. Apply the 11 October
+update above before selecting another check; do not repeat completed bounded
+journeys or reopen the user-accepted Spectrum performance work from this table.
 
 These areas retain bounded follow-up work; completed parts are identified
 below. Use disposable fixtures without replacing their existing evidence.
