@@ -319,6 +319,16 @@ impl ToolShell {
         self.kind
     }
 
+    pub fn can_apply_crop(&self) -> bool {
+        self.kind == ToolKind::Crop
+            && (self.tool.pending_crop_bounds().is_some()
+                || self
+                    .draw_selection_region
+                    .as_ref()
+                    .and_then(|region| region.shape.bounds())
+                    .is_some())
+    }
+
     /// Switch tools, letting the old tool abort any in-flight gesture and the
     /// new one reset its state.
     pub fn activate(&mut self, kind: ToolKind, ctx: &mut ToolContext) {
@@ -1034,7 +1044,9 @@ mod tests {
             }),
         );
         assert!(shell.draw_selection_region.is_some());
+        assert!(!shell.can_apply_crop());
         shell.activate(ToolKind::Crop, &mut context);
+        assert!(shell.can_apply_crop());
         assert!(
             shell
                 .overlays
@@ -1058,6 +1070,7 @@ mod tests {
         );
         assert_eq!(children[1], node_id);
         assert!(shell.draw_selection_region.is_none());
+        assert!(!shell.can_apply_crop());
     }
 
     #[test]

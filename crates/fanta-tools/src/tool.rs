@@ -237,6 +237,10 @@ pub trait Tool {
         None
     }
 
+    fn pending_crop_bounds(&self) -> Option<Bounds> {
+        None
+    }
+
     // Selection alone cannot distinguish translation from resize/rotate previews.
     fn translating_root(&self) -> Option<NodeId> {
         None
