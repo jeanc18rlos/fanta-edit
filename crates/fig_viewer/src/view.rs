@@ -3004,6 +3004,7 @@ impl FigView {
         );
         let overlays_before = self.tools.overlays.clone();
         let cursor_before = self.tools.cursor;
+        let crop_ready_before = self.tools.can_apply_crop();
 
         let active_tool = self.tools.kind();
         #[cfg(feature = "fanta-gpui-ui")]
@@ -3195,6 +3196,7 @@ impl FigView {
             || !crate::canvas::same_viewport(viewport_before, viewport)
             || self.tools.overlays != overlays_before
             || self.tools.cursor != cursor_before
+            || self.tools.can_apply_crop() != crop_ready_before
         {
             cx.notify();
         }
@@ -17355,7 +17357,9 @@ mod tests {
         visual.update(|window, cx| window.draw(cx).clear());
         view.read_with(&visual, |view, _| {
             assert_eq!(view.active_tool(), ToolKind::Crop);
+            assert!(!view.tools.can_apply_crop());
         });
+        assert!(visual.debug_bounds("design-crop-hint").is_some());
         assert_unchanged(&visual);
         for selector in [
             "design-crop-ratio",
@@ -17368,6 +17372,15 @@ mod tests {
             .debug_bounds("design-crop-apply")
             .expect("Apply crop");
         visual.simulate_click(apply.center(), gpui::Modifiers::none());
+        view.update_in(&mut visual, |view, window, cx| {
+            view.handle_design_crop_toolbar_action(
+                &fanta_gpui::toolbar::ToolbarAction::DrawActionInvoked {
+                    action: fanta_gpui::toolbar::DrawToolbarAction::ApplyCrop,
+                },
+                window,
+                cx,
+            );
+        });
         assert_unchanged(&visual);
         let ratio = visual.debug_bounds("design-crop-ratio").expect("Ratio");
         visual.simulate_click(ratio.center(), gpui::Modifiers::none());
@@ -17411,13 +17424,16 @@ mod tests {
                 .expect("ratio-constrained crop preview");
             assert_eq!(preview.width(), 80.0);
             assert_eq!(preview.height(), 80.0);
+            assert!(view.tools.can_apply_crop());
         });
         assert_unchanged(&visual);
         visual.update(|window, cx| window.draw(cx).clear());
+        assert!(visual.debug_bounds("design-crop-hint").is_none());
         let cancel = visual.debug_bounds("design-crop-cancel").expect("Cancel");
         visual.simulate_click(cancel.center(), gpui::Modifiers::none());
         view.read_with(&visual, |view, _| {
             assert_eq!(view.active_tool(), ToolKind::Crop);
+            assert!(!view.tools.can_apply_crop());
             assert!(
                 !view
                     .tools
@@ -17428,6 +17444,7 @@ mod tests {
         });
         assert_unchanged(&visual);
         visual.update(|window, cx| window.draw(cx).clear());
+        assert!(visual.debug_bounds("design-crop-hint").is_some());
         let apply = visual
             .debug_bounds("design-crop-apply")
             .expect("Apply crop");
@@ -17505,8 +17522,12 @@ mod tests {
         let end = position + point(px(40.0), px(20.0));
         visual.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::none());
         visual.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(&visual, |view, _| assert!(!view.tools.can_apply_crop()));
+        visual.update(|window, cx| window.draw(cx).clear());
+        assert!(visual.debug_bounds("design-crop-hint").is_none());
         visual.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::none());
         view.read_with(&visual, |view, cx| {
+            assert!(view.tools.can_apply_crop());
             assert_eq!(view.editor_mode(cx), EditorMode::Design);
             assert_eq!(view.active_tool(), ToolKind::Crop);
             assert_eq!(
@@ -17539,6 +17560,18 @@ mod tests {
             );
             assert!(!item.is_dirty());
         });
+        view.update(&mut visual, |view, cx| {
+            view.dispatch_tool_event(
+                key_event(LogicalKey::ArrowLeft, gpui::Modifiers::none()),
+                cx,
+            );
+        });
+        view.read_with(&visual, |view, _| {
+            assert!(view.tools.overlays.is_empty());
+            assert!(view.tools.can_apply_crop());
+        });
+        visual.update(|window, cx| window.draw(cx).clear());
+        assert!(visual.debug_bounds("design-crop-hint").is_none());
         let now = || {
             i64::try_from(
                 std::time::SystemTime::now()
@@ -17612,6 +17645,7 @@ mod tests {
             });
             view.read_with(visual, |view, cx| {
                 assert_eq!(view.editor_mode(cx), EditorMode::Design);
+                assert!(!view.tools.can_apply_crop());
                 assert!(!view.tools.overlays.iter().any(|overlay| matches!(
                     overlay,
                     fanta_tools::ToolOverlay::PreviewRect { .. }
@@ -18624,6 +18658,13 @@ impl FigView {
         let view = cx.weak_entity();
         let ratios = adapter.draw_options.crop_ratios.clone();
         let ratio = adapter.draw_options.crop_ratio.clone();
+        let can_apply = self.tools.can_apply_crop();
+        let show_hint = !can_apply
+            && !self
+                .tools
+                .overlays
+                .iter()
+                .any(|overlay| matches!(overlay, fanta_tools::ToolOverlay::PreviewRect { .. }));
         let ratio_menu = PopoverMenu::new("design-crop-ratio-menu")
             .trigger(
                 Button::new("design-crop-ratio-button", format!("Ratio: {ratio}"))
@@ -18665,6 +18706,17 @@ impl FigView {
             .rounded_lg()
             .shadow_md()
             .bg(cx.theme().colors().panel_background)
+            .when(show_hint, |row| {
+                row.child(
+                    div()
+                        .debug_selector(|| "design-crop-hint".to_owned())
+                        .child(
+                            Label::new("Drag on the canvas to select a crop")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                )
+            })
             .child(
                 div()
                     .debug_selector(|| "design-crop-ratio".to_owned())
@@ -18693,6 +18745,7 @@ impl FigView {
                     .child(
                         Button::new("design-crop-apply-button", "Apply crop")
                             .size(ButtonSize::Compact)
+                            .disabled(!can_apply)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.handle_design_crop_toolbar_action(
                                     &ToolbarAction::DrawActionInvoked {
@@ -18957,10 +19010,12 @@ impl FigView {
                     DrawToolbarAction::Deselect => self.deselect_canvas(cx),
                     DrawToolbarAction::InvertSelection => self.invert_draw_selection(cx),
                     DrawToolbarAction::ApplyCrop if self.tools.kind() == ToolKind::Crop => {
-                        self.dispatch_tool_event(
-                            key_event(LogicalKey::Enter, window.modifiers()),
-                            cx,
-                        );
+                        if self.tools.can_apply_crop() {
+                            self.dispatch_tool_event(
+                                key_event(LogicalKey::Enter, window.modifiers()),
+                                cx,
+                            );
+                        }
                     }
                     DrawToolbarAction::CancelCrop if self.tools.kind() == ToolKind::Crop => {
                         self.dispatch_tool_event(
