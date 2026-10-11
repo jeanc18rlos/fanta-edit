@@ -11895,7 +11895,11 @@ mod tests {
                 old: Transform2D::translation(40.0, 60.0),
                 new: Transform2D::translation(48.0, 60.0),
             })?;
-            let now = chrono::Utc::now().timestamp_millis();
+            let now = i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs(),
+            )?;
             item.read_with(&visual, |item, _| {
                 let actual = item.doc().expect("saved document");
                 assert!((before.metadata.modified_at..=now).contains(&actual.metadata.modified_at));
