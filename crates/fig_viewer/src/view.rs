@@ -22042,7 +22042,14 @@ impl FigView {
                     .items_center()
                     .gap_2()
                     .when(self.design_crop_controls_visible(cx), |toolbar| {
-                        toolbar.child(self.render_design_crop_controls(cx))
+                        toolbar.child(
+                            h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .px_2()
+                                .justify_center()
+                                .child(self.render_design_crop_controls(cx)),
+                        )
                     })
                     .child(adapter.panel.clone()),
             )
