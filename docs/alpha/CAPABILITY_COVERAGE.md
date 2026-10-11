@@ -1,10 +1,12 @@
-# Release capability coverage — 9 October 2026
+# Release capability coverage — 11 October 2026
 
 **Release readiness is not established.** The target window is Monday
 **5 October through Sunday 11 October 2026**, Europe/Madrid. The immediate user
-reports are degraded inspector UI, double-clicks with no useful node action,
-failures or missing content, and slow editing on large pages. Treat those as
-release blockers until reproduced and verified on the candidate build.
+reports included degraded inspector UI, double-clicks with no useful node action,
+failures or missing content, and slow editing on large pages. The user now accepts
+Spectrum performance. The save/close incident remains unexplained, while the
+bounded build37 checks below replace only their matching pending acceptance
+items; they do not close every node or error-recovery journey.
 
 The selected distribution is a **direct-download Mac app**. Final acceptance
 must use the signed, notarized DMG and the app installed from that exact DMG.
@@ -27,9 +29,105 @@ recorded there.
 
 ## Current acceptance status
 
+### Current37 native checks — 11 October
+
+Exact `22f734193844eab66485e3cb322b529c2965e297` / tree
+`555b8260c540fb253c091d34711e177ad664a926`, internal build37, passes hosted
+packaging and local installer/archive, mounted manifest, CLI and isolated-QA
+verification. It is ad-hoc signed, not notarized or approved for public release.
+This supersedes the package-pending state in the dated 9 October entry below.
+Later draft source changes are not present in this app.
+
+Root drove the actual app and described conversation screenshots/AX observations.
+Independent read-only snapshots bind saved project bytes, modes, nanosecond
+mtimes and assets. These are bounded manual UI observations plus storage proof,
+not an independently archived screenshot suite or complete capability matrix.
+
+| Journey | New bounded evidence | Limits retained |
+| --- | --- | --- |
+| Inspector and node entry | Dark/light 320/400-pixel samples; TextPath and nested-text edit/Undo; Boolean drill and four visible points. NodeGraph, 3D and AI properties-menu/hidden-inspector double-click reveal matching Design headers and geometry. Full small-project no-edit comparison is exact. | Other themes/width combinations, mixed/locked states, point dragging, actual 3D rendering and specialist editors remain separate. |
+| Freeform Bitmap Crop | Apply adds one nested Crop and compensates bitmap placement. Undo restores full FNX/IDs; Redo restores exact applied bytes and wrapper ID; final Undo/Cancel restores all 30 non-Git file bytes except `metadata.modified_at`, with assets exact. | One fixture; no new cold restart, ratio/rotated-crop or generic crop-UX acceptance. The older missing-controls failures are preserved. |
+| Local Video/Audio | Motion selection provides preview/play/pause/progress/end; Audio also seeks to start/end and toggles mute/volume. Full project remains byte/mode/mtime/identity exact. | Muted playback does not prove audibility. Audio natural end showed 0:02/0:03 with full progress; cause unassigned. No trim/rate edits, codec breadth or general cold-preview reliability. |
+| Spectrum Save/tab close | One actual Typography text target persists through CmdS, close-prompt Save and warm reopen; Cancel retains tab/content and Don't Save closes the tab. Twelve scoped files and 42 asset files are frozen. | Other pages/components were not reread. No pre-choice snapshot for Don't Save, so rollback/write causality is unproved. Original inert Save/Discard report is not reproduced or explained. |
+| CmdShiftW Save and recovery | Own TextPath edit already exists on disk before any close choice. Save settles old project content to welcome; same-process exact-path reopen retains it. Native restoration returns 33 nonmetadata files, assets and exports exactly. | Inventory exposed no original window IDs; no full-window disappearance, cold restart or Quit claim. Save did not establish a write already observed before choice; the controlled failure below is a separate journey. |
+| Controlled save failure / Don't Save | With writes denied in two owned directories, CmdS displayed a permission error. Close-prompt Save retained the dirty draft and logged an error, with no separate close-error dialog observed. The prompt could be opened again; Don't Save reached welcome. Seven full captures preserve all 20 file bytes, modes, nanosecond mtimes, current file IDs and the asset, with no transaction remnants. After permission restoration, exact-path warm reopen showed the original saved text. | Current37 remains unchanged. No successful post-fault Save retry, original-window-ID disappearance, cold restart, general rollback or historical Spectrum-cause proof. The autosave retry loop and close-error feedback remain open. |
+| Bitmap exports | Actual PNG/JPG/SVG/PDF outputs are 320×180; only export files are added. PNG and SVG embedded/rendered pixels and PDF embedded bitmap match the original. JPEG's declared 1,200 cell-interior pixels have max error 1 at tolerance 10. | PDF 72-dpi rendering retains 5,673 edge-difference pixels (max 204). JPEG full-image max error is 18; the historical 13,248-pixel mask was not rerun. Selected-Bitmap full-node export does not test clipped parent frames or vector/multipage fidelity. |
+
+The fault journey ran from 01:07 to 01:10 UTC on 11 October. Access-time
+changes are retained explicitly: initial native opening advanced seven files
+before the fault, and later reads advanced seven files in each raw evidence
+copy. Relative to the settled native pre-fault snapshot, only the two intended
+directories changed mode/ctime; their original modes were restored on the same
+inodes. This is file-content and specified-metadata preservation, not a claim
+that every timestamp stayed unchanged.
+
+The saved log contains **55 autosave failures over 74 seconds**. Source review
+identifies a failure → resync → Edited → debounce path that can re-arm autosave;
+the persistent warning is deduplicated but write attempts are not stopped by
+that notice. This remains an open feedback-loop issue, not an accepted fix or a
+general retry timing bound. The historical Spectrum Save/Discard incident is
+still unexplained.
+
+Separately, draft [PR120](https://github.com/jeanc18rlos/fanta-edit/pull/120),
+head `dd3e0915c753a2eff62f68ead0f6e02f64f7b2fe`, passes canonical
+[Check/Store](https://github.com/jeanc18rlos/fanta-edit/actions/runs/38098361843)
+and [Release lint](https://github.com/jeanc18rlos/fanta-edit/actions/runs/38098361825).
+Its three generic mounted close/error/retry/discard/cancel tests execute and
+pass; they do not replace the native storage observations. At this evidence
+cutoff it is unmerged and absent from Current37. A matching updated package and
+native error-feedback/recovery checks remain pending.
+
+User acceptance of Spectrum responsiveness is qualitative. Historical numeric
+native p95, durability and memory measurements remain unproved, but no further
+performance optimization is requested by this resumed check. Release signing,
+clean installation/update, production spending bounds and broad E2E remain open.
+
+Evidence under the local QA archive's `integration-20261007/`:
+
+- `build37-terminal-resume-20261011/result.json`
+- `build37-artifact-acquisition-v1-20261009/actual-acquisition-20261011-run1/result.json`
+- `build37-local-qa-preparation-v2-20261011/actual-local-qa-run1/result.json`
+- `release-resume-20261011/manual-root-isolated-spectrum-close-addendum-20261011.json`
+- `release-resume-20261011/manual-root-crop-sequence-addendum-20261011.json`
+- `release-resume-20261011/manual-root-specialist-inspector-addendum-20261011.json`
+- `release-resume-20261011/manual-root-media-playback-addendum-20261011.json`
+- `release-resume-20261011/manual-root-window-close-restore-addendum-20261011.json`
+- `release-resume-20261011/export-format-review-20261011-run1/result.json`
+- `release-resume-20261011/manual-root-save-failure-discard-addendum-20261011.json`
+- `release-resume-20261011/save-failure-matrix-preparation-v1-20261011/metadata-atime-qualification-01.json`
+- `release-resume-20261011/save-failure-matrix-preparation-v1-20261011/independent-fault-review-01.json`
+- `close-window-error-recovery-20261011/ci-pr120-v2/independent-terminal-review.json`
+- `close-window-error-recovery-20261011/ci-pr120-v2/root-terminal-acceptance-20261011.json`
+
 ### Final source and internal package — 9 October
 
-Main `79cc2ef8c094149e8496476c1cb53e2945b8b54a`, tree
+**Dated reconciliation: evidence through 21:19 UTC, 9 October.** Accepted main is
+`22f734193844eab66485e3cb322b529c2965e297`, tree
+`555b8260c540fb253c091d34711e177ad664a926`, containing PR107–116. Its tree matches
+the accepted PR116 Check/Store checkout; this is not a new main-run or native
+result. The merged work includes Design Crop controls, direct-Value loading,
+fresh-project publication, text LRU, usage-window consistency, scoped snapping,
+lost Select-press cancellation and build diagnostics.
+
+[Build37](https://github.com/jeanc18rlos/fanta-edit/actions/runs/37983647643)
+targets that exact source with diagnostics enabled and `signed=false`. Its saved
+20:46 UTC snapshot is still at Build and package; no terminal installer or native
+acceptance is credited here. Acquisition/local-QA helpers and fixtures are
+preparation only. Build36 is an older intermediate source and cannot replace
+it. The accepted installed native evidence below remains historical build33.
+
+Draft [PR117](https://github.com/jeanc18rlos/fanta-edit/pull/117), corrected head
+`4196fba72c`, and [PR118](https://github.com/jeanc18rlos/fanta-edit/pull/118), head
+`4349b0dded`, each pass their separate twelve-crate all-feature and three-crate
+default-feature release lint. PR117's original redundant-clone lint failure
+remains retained. Full Check/test acceptance is still pending for both; PR118's
+21:19 snapshot shows Store success while Check continues. Lint does not execute
+the six new catalog or nine verifier regressions. Neither draft is in build37.
+Standalone default-renderer lint, Metal-feature execution and the proposed six
+explicitly ignored real-GPU tests remain separate, unexecuted coverage work;
+no GPU, native or performance pass follows from these lint results.
+
+Historical main `79cc2ef8c094149e8496476c1cb53e2945b8b54a`, tree
 `bd69de45f92675b55d32f647d6c8c147da237537`, passes exact-main Check and Store
 in [run 37884589268](https://github.com/jeanc18rlos/fanta-edit/actions/runs/37884589268).
 All six verification stages pass: **1,212 editor tests, 405 renderer tests and
@@ -63,6 +161,37 @@ Evidence under the local QA archive's `integration-20261007/`:
 - `final-main-macos-artifact-20261009/coherent-suite-v2/actual-acquisition-run1/result.json`
 - `final-main-macos-artifact-20261009/coherent-suite-v2/local-qa/actual-local-run1/result.json`
 - `bitmap-jpeg-quality-q95-publication-20261009T0208Z/canonical-ci/terminal-review/root-terminal-q95-review.json`
+
+Additional bounded **build33** native evidence from 9 October:
+
+- Save As Copy to a new destination and reopening preserve the complete saved
+  typed document, original/copy files, modes, timestamps and Git boundaries.
+  A new process is bound, but an all-app-absent interval was not sampled before
+  relaunch; restart history and general Save As acceptance are excluded.
+- A separate fresh Audio cold entry passes visible preview, Play and 0:03 with
+  exact storage. It does not prove audibility or resolve every older absent-panel
+  case. The historical 26-entry cohort remains **FAIL**: 24 bounded visual
+  successes, two missing Crop-control failures and unexplained Model3D
+  X265→281/modified-time changes. Actor/cause is unknown; later fixes do not
+  explain that failure retroactively.
+- One Seedream image generation/placement, Undo/Redo, Save and restart passes
+  its bounded storage check with one matching five-credit usage row. Ordinary
+  ledger debit, currency charge and exactly-once transport/provider execution
+  remain unproved. Of the authorized maximum 500 credits, five are conservatively
+  reserved and 495 remain; this records no additional spend. No bounded Native
+  Agent request is admitted. Other providers, in-flight recovery, live managed
+  MCP and latest-build account/service journeys remain open.
+
+Further evidence under the same `integration-20261007/` archive:
+
+- `RELEASE-RESUME-20261009-200015Z.txt` and `RELEASE-CHECKPOINT-20261009-205349Z.txt`
+- `pr116-root-merge-20261009/result.json`
+- `phase1c-pattern-source-catalog-20261009/ci-pr117-v2/lint-terminal-review/result.json`
+- `phase3-layer-cache-verifier-20261009/ci-pr118-v1/lint-terminal-review/result.json`
+- `fresh-native-build33-20261009/cold-copy-storage/actual-20261009-run1/independent-native-storage-review.json`
+- `native-node-matrix-final-capture-v1-20261009/runs/media-audio-cold-open-build33-run1/independent-audio-cold-review-20261009.json`
+- `final-build33-panel-preference-continuation-v1-20261009/matrix/runs/media-node-entries-final-partial-run1/independent-storage-failure-review.json`
+- `persistent-generation-build33-20261009/independent-node-final-image-journey-review-20261009.json`
 
 The following earlier checkpoints retain their original source identities and
 acceptance limits.
@@ -492,7 +621,7 @@ coverage. The final column highlights the remaining acceptance work.
 | Capability | Existing automated evidence to run | Remaining acceptance work |
 | --- | --- | --- |
 | Create/open/import | `fig_viewer::new_design::tests`, `document::tests`; `fanta-fig-interop` mapping/parser tests | New project and `.fig`/`.fant` import, collision handling, malformed file and missing asset UI; compare representative imported pages with reference renders. |
-| Save/autosave/Save As/reopen | `fanta-format` full suite; `fig_viewer::document::tests`, `view::tests`, `view::serialization::tests` (`canvas_session_*`, `save_generation_*`, `a_failing_autosave_is_reported_until_a_save_succeeds`, `save_as_*`) | The 8 October Save As Cancel/refusal/original-target/cold check above passes. Successful Save As to a new destination, write failures and concurrent edits remain; compare complete files, nodes and assets. |
+| Save/autosave/Save As/reopen | `fanta-format` full suite; `fig_viewer::document::tests`, `view::tests`, `view::serialization::tests` (`canvas_session_*`, `save_generation_*`, `a_failing_autosave_is_reported_until_a_save_succeeds`, `save_as_*`) | The 8 October Save As Cancel/refusal/original-target/cold check above passes. The later build33 Copy/reopen check above covers one new destination with exact storage, not restart history. Latest-build Save As, write failures and concurrent edits remain; compare complete files, nodes and assets. |
 | Source ↔ canvas | `fig_viewer::code_workspace::tests`, `editor_session::tests`; FNX/format source-order tests; PR 52 watcher-output Save/reopen and own-write ownership regressions | Earlier Save/repair/restoration/restart pass on `a82f90f87b`; Find and source Save→Undo/Redo pass on `3e3f275fcd`. The false own-write conflict in that build is retained; partial Save → selected Discard → Canvas Save/repeat Save/strict process restart now passes on `ac038333e3`. Small clean external reload/autosave/cold-process checks pass separately. The `a7f16cb245` native same-path external rename during an unsaved draft and Workspace Cancel now pass the bounded check above. The 8 October external-change/Workspace Discard/cold check above also passes. Recovery Undo, multiple tabs/windows, other external-conflict paths and agent source-follow remain. |
 | Pages/layers/structure | Viewer design-panel, structure, layer-context and clipboard tests; `canvas_menu_reorder_entries_execute_and_undo` confirms both ordering entries. Primary menu cases retain a selected boolean operand; mounted asset-subtree menu Duplicate/Cut control passes. | All 41 bounded native clipboard checkpoints pass on `100fe26921`, including image-subtree copy/cut/duplicate, component/variant preservation, lock guards and all route restarts. Original viewport-mutation failures remain retained; broader structure/dependency combinations remain open. Earlier asset-free keyboard Duplicate/Paste/Undo/Redo and Paste restart passed on `9ca127c1be`; bitmap cross-page and visible cross-document refusal passed separately. |
 | Navigation/selection/transforms | `fanta-canvas` hit-test/snap tests and `tests/end_to_end.rs`; `fanta-tools::select::tests`, `scale::tests`; viewer toolbar adapter tests | Pan, zoom, nested selection, rapid drag/release, resizing and scaling in a dense imported page. Check focus and pointer capture. |
@@ -509,11 +638,15 @@ coverage. The final column highlights the remaining acceptance work.
 | Local image/SVG/video/audio | Viewer `generation_media`, `video_playback`, document/view and media tests; renderer live-media tests | Earlier `a3a51b084b` properties/reveal checks remain unchanged. The ten bounded H.264 playback/seek/Trim Cancel and Apply/history/cold checkpoints above now pass on `0f71b3961d`; exact poster and asset persistence are covered for that fixture. The earlier readiness and stale-display observations remain unresolved. The 8 October existing-Audio and corrupt/loose-MP3 refusal checks above pass. Project-Assets MP3 placement/history/cold storage passes, but cold Audio preview for the original and newly placed MP3 remains unaccepted. Other codecs/VFR, missing sources, orientation, audible output and broader installed-app journeys remain. |
 | Export | Viewer `export::tests` and inspector export tests; renderer integration suites | Native `8a9a33c35e` Vector and Bitmap exports pass bounded PNG/SVG/PDF, Vector JPG, collision preservation and two simultaneous presets including 2× PNG checks; all 24 project files remain exact. Bitmap JPEG retains its original four-pixel FAIL and separate DCT-flat-block pass. The later quality-95 fix passes the unchanged original hosted regression; latest native retest, broader fidelity/selection batches and visible export-error routes remain. No general JPEG-quality claim. |
 | Designer/MCP | Viewer `agent_surface` (including style projection), `live_mcp` and `plan_build` tests; `script/smoke-mcp`; managed-account failure-path regressions in `project::context_server_store` | Final app local stdio/socket connection, real agent tool selection, one undo per successful batch, rollback, source validation and screenshots. Separately verify hosted account-managed MCP discovery/tool/auth/recovery; local editor MCP tests do not cover that service. |
-| Generation/recovery | Viewer `generation_workspace`, `generation_journal`, `generation_media`; account/provider CI tests | Signed-in final build with a real provider: submit/poll/save/place, timeout/retry, restart, sign-out/account switch and exactly-once recovery. Mock responses do not prove production availability. |
+| Generation/recovery | Viewer `generation_workspace`, `generation_journal`, `generation_media`; account/provider CI tests | The historical build33 Seedream sample above covers one generation/place/history/Save/restart journey and usage row. Final-build provider breadth, timeout/retry, in-flight recovery, sign-out/account switch and ordinary debit remain. Mock responses do not prove production availability. |
 | App shell/distribution/accounts | Existing `Check` jobs: sidebar, path prompt, agent toggle, Git, auth, Store restrictions; `script/test-macos-release` preflight/manifest/trust-routing cases and release workflow `script/verify-macos-dmg` | The bounded production existing-account/billing read and cold-session check above passes; fresh sign-in, session recovery, billing/payment/restore and backend release compatibility remain. Menu/keyboard discovery, installed clean-profile launch, quarantine, signature/notarization, Keychain and sandbox file access also remain. |
 | Large-page performance | Import scaling, renderer cache/culling, ignored latency/acceptance benchmarks and profiling examples; matched synthetic acceptance median 546.673→292.797 ms; worker and inclusive UI-stage gesture tests; PR 74 retained API CPU parity/timings (fit-all benefit and 100% image regression at that earlier pre-worker checkpoint); current opt-in Metal API/worker correctness (seven actual-Metal API tests plus one IOSurface-worker test) | Full native Save and gesture timings on Spectrum remain required; acceptance-only development timing and mounted instrumentation tests do not establish application latency. Measure frame p50/p95/max and memory; the drag p95 target below 16 ms is unproven. |
 
 ## Next bounded native checks
+
+The queue below preserves earlier build-specific plans. Apply the 11 October
+update above before selecting another check; do not repeat completed bounded
+journeys or reopen the user-accepted Spectrum performance work from this table.
 
 These areas retain bounded follow-up work; completed parts are identified
 below. Use disposable fixtures without replacing their existing evidence.

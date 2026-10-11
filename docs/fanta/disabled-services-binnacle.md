@@ -162,10 +162,15 @@ also explicitly configure their own providers, local models or supported
 external agents. The earlier recommendation to defer all hosted brokerage is
 historical; it must not be read as the current application's behavior.
 
-Account/catalog/billing reads have bounded evidence. Production generation,
-exact charged-cost limits, managed-MCP execution and recovery remain release
-gates. A visible price chip or local token limit does not bound the total cost
-of an agent loop, retries or auxiliary requests.
+Account/catalog/billing reads have bounded evidence. One historical internal
+build33 Seedream image journey also passes generation, placement, Undo/Redo,
+Save and reopening with a matching five-credit usage row. That does not prove
+ordinary credit-ledger debit, a currency charge or exactly-once upstream
+execution. Broader generation, charged-cost limits, managed-MCP execution and
+recovery remain release gates. A visible price chip or local token limit does
+not bound an agent loop, retries or auxiliary requests. The
+[dated coverage record](../alpha/CAPABILITY_COVERAGE.md#current-acceptance-status)
+keeps that sample separate from pending latest-build service acceptance.
 
 Hosted gateway requirements still requiring operational verification:
 
