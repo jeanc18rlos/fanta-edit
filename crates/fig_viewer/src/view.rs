@@ -546,6 +546,7 @@ pub struct FigView {
 pub enum FigViewEvent {
     Edited,
     TitleChanged,
+    PropertyDraftChanged,
 }
 
 #[cfg(target_os = "macos")]
@@ -2478,6 +2479,42 @@ impl FigView {
                 .as_ref()
                 .is_some_and(|adapter| adapter.session.is_some());
         pending_edit
+    }
+
+    fn after_property_draft_commit(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        resume: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) -> Task<Result<()>> + 'static,
+    ) -> Task<Result<()>> {
+        #[cfg(feature = "fanta-gpui-ui")]
+        if let Some(adapter) = self.gpui_design.as_ref() {
+            match adapter
+                .panel
+                .update(cx, |panel, cx| panel.try_commit_property_draft(window, cx))
+            {
+                Err(error) => return Task::ready(Err(error.into())),
+                Ok(true) => {
+                    let (sender, receiver) = futures::channel::oneshot::channel();
+                    cx.defer_in(window, move |view, window, cx| {
+                        let save = resume(view, window, cx);
+                        if sender.send(save).is_err() {
+                            log::debug!(
+                                "property save was cancelled before its edit intent settled"
+                            );
+                        }
+                    });
+                    return cx.spawn(async move |_, _| {
+                        receiver
+                            .await
+                            .context("property edit interrupted before save")?
+                            .await
+                    });
+                }
+                Ok(false) => {}
+            }
+        }
+        resume(self, window, cx)
     }
 
     pub(crate) fn defer_after_preserved_design_draft(
@@ -5849,6 +5886,7 @@ impl FigView {
     fn autosave_allowed(&self, cx: &App) -> bool {
         let item = self.item.read(cx);
         item.project_root().is_some()
+            && !self.has_pending_view_edits(cx)
             && item.is_dirty()
             && !item.unchanged_autosave_failed()
             && !item.has_conflict()
@@ -9133,7 +9171,7 @@ impl Item for FigView {
                 f(ItemEvent::Edit);
                 f(ItemEvent::UpdateTab);
             }
-            FigViewEvent::TitleChanged => {
+            FigViewEvent::TitleChanged | FigViewEvent::PropertyDraftChanged => {
                 f(ItemEvent::UpdateTab);
             }
         }
@@ -9242,8 +9280,48 @@ impl Item for FigView {
             })
     }
 
+    fn has_pending_view_edits(&self, _cx: &App) -> bool {
+        #[cfg(feature = "fanta-gpui-ui")]
+        if let Some(adapter) = self.gpui_design.as_ref() {
+            return matches!(
+                adapter.panel.read(_cx).property_draft_state(_cx),
+                fanta_gpui::design::DesignPropertyDraftState::Valid
+                    | fanta_gpui::design::DesignPropertyDraftState::Invalid
+            );
+        }
+        false
+    }
+
+    fn prepare_for_save_or_close(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        #[cfg(feature = "fanta-gpui-ui")]
+        if let Some(adapter) = self.gpui_design.as_ref() {
+            let unchanged = adapter.panel.update(_cx, |panel, cx| {
+                if panel.property_draft_state(cx)
+                    == fanta_gpui::design::DesignPropertyDraftState::Unchanged
+                {
+                    match panel.try_commit_property_draft(_window, cx) {
+                        Ok(_) => true,
+                        Err(error) => {
+                            log::error!("unchanged property could not finish: {error}");
+                            panel.preserve_property_draft_for_host_action();
+                            false
+                        }
+                    }
+                } else {
+                    panel.preserve_property_draft_for_host_action();
+                    false
+                }
+            });
+            if unchanged {
+                self.finish_gpui_design_edits(_cx);
+            }
+        }
+    }
+
     fn is_dirty(&self, cx: &App) -> bool {
-        self.item.read(cx).is_dirty() || self.code_workspace.read(cx).source_is_dirty(cx)
+        self.has_pending_view_edits(cx)
+            || self.item.read(cx).is_dirty()
+            || self.code_workspace.read(cx).source_is_dirty(cx)
     }
 
     fn has_conflict(&self, cx: &App) -> bool {
@@ -9286,81 +9364,87 @@ impl Item for FigView {
         &mut self,
         project: Entity<Project>,
         path: project::ProjectPath,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        if let Some(error) = self.pending_bound_text_error(cx) {
-            return Task::ready(Err(anyhow::anyhow!(error)));
-        }
-        if self.annotation_state.controller.has_pending_authoring() {
-            return Task::ready(Err(anyhow::anyhow!(
-                "Add, save or cancel the annotation first. Its draft was kept."
-            )));
-        }
-        if self.measurement_controller.has_pending_authoring() {
-            return Task::ready(Err(anyhow::anyhow!(
-                "Finish or cancel the measurement drag first. Its preview was kept."
-            )));
-        }
-        if self.prototype_player.is_some() {
-            self.exit_prototype_session(cx);
-        }
-        self.finish_document_edits(cx);
-        self.autosave_task = None;
-        self.item
-            .update(cx, |item, cx| item.save_as(project, path, cx))
+        self.after_property_draft_commit(window, cx, move |view, _window, cx| {
+            if let Some(error) = view.pending_bound_text_error(cx) {
+                return Task::ready(Err(anyhow::anyhow!(error)));
+            }
+            if view.annotation_state.controller.has_pending_authoring() {
+                return Task::ready(Err(anyhow::anyhow!(
+                    "Add, save or cancel the annotation first. Its draft was kept."
+                )));
+            }
+            if view.measurement_controller.has_pending_authoring() {
+                return Task::ready(Err(anyhow::anyhow!(
+                    "Finish or cancel the measurement drag first. Its preview was kept."
+                )));
+            }
+            if view.prototype_player.is_some() {
+                view.exit_prototype_session(cx);
+            }
+            view.finish_document_edits(cx);
+            view.autosave_task = None;
+            view.item
+                .update(cx, |item, cx| item.save_as(project, path, cx))
+        })
     }
 
     fn save(
         &mut self,
-        _options: SaveOptions,
+        options: SaveOptions,
         _project: Entity<Project>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        if let Some(error) = self.pending_bound_text_error(cx) {
-            return Task::ready(Err(anyhow::anyhow!(error)));
+        if options.autosave && self.has_pending_view_edits(cx) {
+            return Task::ready(Ok(()));
         }
-        if self.annotation_state.controller.has_pending_authoring() {
-            return Task::ready(Err(anyhow::anyhow!(
-                "Add, save or cancel the annotation first. Its draft was kept."
-            )));
-        }
-        if self.measurement_controller.has_pending_authoring() {
-            return Task::ready(Err(anyhow::anyhow!(
-                "Finish or cancel the measurement drag first. Its preview was kept."
-            )));
-        }
-
-        if self.prototype_player.is_some() {
-            self.exit_prototype_session(cx);
-        }
-        let source_is_dirty = self.code_workspace.read(cx).source_is_dirty(cx);
-        let canvas_is_dirty = self.item.read(cx).is_dirty();
-        if source_is_dirty && canvas_is_dirty {
-            if self.editor_workspace(cx) == EditorWorkspace::Code {
-                let discard_canvas = self.item.update(cx, |item, cx| {
-                    item.discard_canvas_edits_for_source_resolution(cx)
-                });
-                let code_workspace = self.code_workspace.clone();
-                return cx.spawn(async move |_, cx| {
-                    discard_canvas.await?;
-                    let save_source = code_workspace.update(cx, |workspace, cx| {
-                        workspace
-                            .save_source_edit(cx)
-                            .unwrap_or_else(|| Task::ready(Ok(())))
-                    });
-                    save_source.await
-                });
+        self.after_property_draft_commit(window, cx, move |view, _window, cx| {
+            if let Some(error) = view.pending_bound_text_error(cx) {
+                return Task::ready(Err(anyhow::anyhow!(error)));
+            }
+            if view.annotation_state.controller.has_pending_authoring() {
+                return Task::ready(Err(anyhow::anyhow!(
+                    "Add, save or cancel the annotation first. Its draft was kept."
+                )));
+            }
+            if view.measurement_controller.has_pending_authoring() {
+                return Task::ready(Err(anyhow::anyhow!(
+                    "Finish or cancel the measurement drag first. Its preview was kept."
+                )));
             }
 
-            self.finish_document_edits(cx);
-            let discard_source = self
-                .code_workspace
-                .update(cx, |workspace, cx| workspace.discard_source_edit(cx));
-            let item = self.item.clone();
-            let project = self.project.clone();
-            return cx.spawn(async move |_, cx| {
+            if view.prototype_player.is_some() {
+                view.exit_prototype_session(cx);
+            }
+            let source_is_dirty = view.code_workspace.read(cx).source_is_dirty(cx);
+            let canvas_is_dirty = view.item.read(cx).is_dirty();
+            if source_is_dirty && canvas_is_dirty {
+                if view.editor_workspace(cx) == EditorWorkspace::Code {
+                    let discard_canvas = view.item.update(cx, |item, cx| {
+                        item.discard_canvas_edits_for_source_resolution(cx)
+                    });
+                    let code_workspace = view.code_workspace.clone();
+                    return cx.spawn(async move |_, cx| {
+                        discard_canvas.await?;
+                        let save_source = code_workspace.update(cx, |workspace, cx| {
+                            workspace
+                                .save_source_edit(cx)
+                                .unwrap_or_else(|| Task::ready(Ok(())))
+                        });
+                        save_source.await
+                    });
+                }
+
+                view.finish_document_edits(cx);
+                let discard_source = view
+                    .code_workspace
+                    .update(cx, |workspace, cx| workspace.discard_source_edit(cx));
+                let item = view.item.clone();
+                let project = view.project.clone();
+                return cx.spawn(async move |_, cx| {
                 discard_source.await?;
                 let save_document = item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
                 let Some(root) = save_document.await? else {
@@ -9377,35 +9461,36 @@ impl Item for FigView {
                 }
                 Ok(())
             });
-        }
-        if let Some(source_save) = self
-            .code_workspace
-            .update(cx, |workspace, cx| workspace.save_source_edit(cx))
-        {
-            return source_save;
-        }
-        let task = self.save_document(cx);
-        let project = self.project.clone();
-        cx.spawn(async move |_, cx| {
-            let Some(root) = task.await? else {
-                return Ok(());
-            };
-            log::info!("materialized Fanta project at {}", root.display());
-            // First-class Zed integration: surface the freshly written project
-            // as a *visible* worktree so its fanta.json / `.fnx` / asset files
-            // show up in the project panel and open as ordinary text. A failure
-            // here (e.g. a remote project that can't adopt a local folder) must
-            // not fail the save — the project already exists on disk.
-            let worktree = project.update(cx, |project, cx| {
-                project.find_or_create_worktree(root.clone(), true, cx)
-            });
-            if let Err(error) = worktree.await {
-                log::error!(
-                    "adding materialized Fanta project {} to the workspace failed: {error:#}",
-                    root.display()
-                );
             }
-            Ok(())
+            if let Some(source_save) = view
+                .code_workspace
+                .update(cx, |workspace, cx| workspace.save_source_edit(cx))
+            {
+                return source_save;
+            }
+            let task = view.save_document(cx);
+            let project = view.project.clone();
+            cx.spawn(async move |_, cx| {
+                let Some(root) = task.await? else {
+                    return Ok(());
+                };
+                log::info!("materialized Fanta project at {}", root.display());
+                // First-class Zed integration: surface the freshly written project
+                // as a *visible* worktree so its fanta.json / `.fnx` / asset files
+                // show up in the project panel and open as ordinary text. A failure
+                // here (e.g. a remote project that can't adopt a local folder) must
+                // not fail the save — the project already exists on disk.
+                let worktree = project.update(cx, |project, cx| {
+                    project.find_or_create_worktree(root.clone(), true, cx)
+                });
+                if let Err(error) = worktree.await {
+                    log::error!(
+                        "adding materialized Fanta project {} to the workspace failed: {error:#}",
+                        root.display()
+                    );
+                }
+                Ok(())
+            })
         })
     }
 
@@ -9428,6 +9513,12 @@ impl Item for FigView {
 
         if self.prototype_player.is_some() {
             self.exit_prototype_session(cx);
+        }
+        #[cfg(feature = "fanta-gpui-ui")]
+        if let Some(adapter) = self.gpui_properties.as_ref() {
+            adapter
+                .design
+                .update(cx, |design, cx| design.deactivate(_window, cx));
         }
         self.finish_document_edits(cx);
         let discard_source = self
@@ -11386,6 +11477,531 @@ mod tests {
         assert_native_figview_window_close(true, true, cx)
             .await
             .expect("Save finishes closing after the canvas autosaved while prompted");
+    }
+
+    #[cfg(all(target_os = "macos", feature = "fanta-gpui-ui"))]
+    async fn assert_property_draft_persistence(
+        draft: &str,
+        choice: &str,
+        shared_tab: bool,
+        cx: &mut TestAppContext,
+    ) -> Result<()> {
+        use fanta_gpui::design::DesignPropertyDraftState;
+        use gpui::UpdateGlobal;
+        use project::ProjectItem as _;
+        use workspace::item::ItemHandle;
+
+        init_visual_test(cx);
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            cx.set_global(db::AppDatabase::test_new());
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.workspace.autosave = Some(settings::AutosaveSetting::Off);
+                    settings
+                        .session
+                        .get_or_insert_default()
+                        .restore_unsaved_buffers = Some(false);
+                });
+            });
+        });
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("Property draft");
+        let (mut initial, text_id, _) = text_selection_doc(false);
+        initial
+            .scene
+            .set_transform(text_id, Transform2D::translation(40.0, 60.0))?;
+        let asset_id = AssetId::new();
+        initial.asset_library.insert(
+            asset_id,
+            fanta_doc::ProjectAsset {
+                name: "Unchanged asset".into(),
+                kind: fanta_doc::ProjectAssetKind::Image,
+            },
+        );
+        let raw_assets = BTreeMap::from([(asset_id, b"unchanged fixture asset".to_vec())]);
+        crate::document::write_project(&root, &initial, &raw_assets)?;
+        let (original_disk, original_assets) = fanta_format::read_project_tree(&root)?;
+        let original_disk = serde_json::to_value(original_disk)?;
+        let project = Project::test(
+            Arc::new(fs::RealFs::new(None, cx.executor())),
+            [root.as_path()],
+            cx,
+        )
+        .await;
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("fixture worktree")
+                .read(cx)
+                .id()
+        });
+        let item = cx
+            .update(|cx| {
+                FigItem::try_open(
+                    &project,
+                    &project::ProjectPath {
+                        worktree_id,
+                        path: util::rel_path::rel_path("fanta.json").into(),
+                    },
+                    cx,
+                )
+            })
+            .expect("native project opener")
+            .await?;
+        cx.run_until_parked();
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.select_only(text_id);
+                ((), DocChange::Selection)
+            });
+        });
+        let window = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let multi_workspace = window.entity(cx)?;
+        let workspace = multi_workspace.read_with(cx, |root, _| root.workspace().clone());
+        let (view, other) = window.update(cx, |_, window, cx| {
+            let view = cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx));
+            let other = if shared_tab {
+                let other = cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx));
+                other.update(cx, |other, cx| {
+                    other.inspector_sidebar_visible = false;
+                    cx.notify();
+                });
+                workspace.update(cx, |workspace, cx| {
+                    workspace.add_item_to_active_pane(
+                        Box::new(other.clone()),
+                        None,
+                        false,
+                        window,
+                        cx,
+                    );
+                    workspace.split_item(
+                        workspace::SplitDirection::Right,
+                        Box::new(view.clone()),
+                        window,
+                        cx,
+                    );
+                });
+                item.update(cx, |item, cx| {
+                    let old = item
+                        .doc()
+                        .expect("document")
+                        .scene
+                        .get(text_id)
+                        .expect("text")
+                        .name
+                        .clone();
+                    item.apply(
+                        Operation::SetName {
+                            id: text_id,
+                            old,
+                            new: "Shared committed edit".into(),
+                        },
+                        cx,
+                    )
+                })
+                .expect("shared committed edit");
+                Some(other)
+            } else {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.add_item_to_active_pane(
+                        Box::new(view.clone()),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
+                });
+                None
+            };
+            window.activate_window();
+            view.update(cx, |view, cx| {
+                view.inspector_sidebar_visible = true;
+                view.set_viewport_silent(Viewport::default());
+                view.refresh_gpui_design(cx);
+                view.refresh_properties_inspector(window, cx);
+                cx.notify();
+            });
+            (view, other)
+        })?;
+        let assert_shared_views = |visual: &gpui::VisualTestContext| {
+            if let Some(other) = &other {
+                visual.read(|cx| {
+                    let panes = workspace.read(cx).panes();
+                    assert_eq!(panes.len(), 2);
+                    let mounted = panes
+                        .iter()
+                        .map(|pane| {
+                            pane.read(cx)
+                                .items()
+                                .map(|item| item.item_id())
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        mounted,
+                        vec![vec![other.entity_id()], vec![view.entity_id()]]
+                    );
+                    assert_ne!(view.entity_id(), other.entity_id());
+                    assert_eq!(view.read(cx).item.entity_id(), item.entity_id());
+                    assert_eq!(other.read(cx).item.entity_id(), item.entity_id());
+                });
+            }
+        };
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        assert_shared_views(&visual);
+        visual.simulate_resize(size(px(1400.0), px(1000.0)));
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+        let panel = view.read_with(&visual, |view, _| {
+            view.gpui_design
+                .as_ref()
+                .expect("Design panel")
+                .panel
+                .clone()
+        });
+        let before = item.read_with(&visual, |item, _| item.doc().expect("document").clone());
+        let before_history = (before.history.undo_depth(), before.history.redo_depth());
+        let replace_input = |visual: &mut gpui::VisualTestContext, text: &str| {
+            visual.update(|window, cx| window.draw(cx).clear());
+            let field = visual
+                .debug_bounds("fig-gpui-design-x")
+                .expect("rendered X field");
+            visual.simulate_click(field.center(), gpui::Modifiers::none());
+            visual.simulate_keystrokes("cmd-a");
+            visual.simulate_input(text);
+            visual.run_until_parked();
+        };
+        if draft == "40" {
+            let field = visual
+                .debug_bounds("fig-gpui-design-x")
+                .expect("rendered X field");
+            visual.simulate_click(field.center(), gpui::Modifiers::none());
+            visual.run_until_parked();
+        } else {
+            replace_input(&mut visual, "48");
+            if draft != "48" {
+                replace_input(&mut visual, draft);
+            }
+        }
+        let changed = draft != "40";
+        let invalid = draft == "-";
+        let state = if invalid {
+            DesignPropertyDraftState::Invalid
+        } else if changed {
+            DesignPropertyDraftState::Valid
+        } else {
+            DesignPropertyDraftState::Unchanged
+        };
+        assert_eq!(
+            panel.read_with(&visual, |panel, cx| panel.property_draft_state(cx)),
+            state
+        );
+        view.read_with(&visual, |view, cx| {
+            assert_eq!(view.has_pending_view_edits(cx), changed);
+            assert_eq!(view.is_dirty(cx), changed || shared_tab);
+            assert!(!view.autosave_allowed(cx));
+            if !shared_tab {
+                assert!(
+                    view.autosave_task.is_none(),
+                    "preview and draft status must not schedule saving"
+                );
+            }
+        });
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                item.is_dirty(),
+                shared_tab,
+                "only the independent shared edit is committed"
+            );
+            let doc = item.doc().expect("preview document");
+            assert_eq!(
+                (doc.history.undo_depth(), doc.history.redo_depth()),
+                before_history
+            );
+            let mut preview = before.clone();
+            preview
+                .scene
+                .set_transform(
+                    text_id,
+                    Transform2D::translation(if changed { 48.0 } else { 40.0 }, 60.0),
+                )
+                .expect("expected preview");
+            assert_eq!(
+                serde_json::to_value(doc).expect("preview document"),
+                serde_json::to_value(preview).expect("expected preview document")
+            );
+            assert_eq!(
+                item.document().expect("document").raw_assets.as_ref(),
+                &original_assets
+            );
+        });
+        assert_eq!(
+            serde_json::to_value(fanta_format::read_project_tree(&root)?.0)?,
+            original_disk
+        );
+        if shared_tab {
+            workspace.read_with(&visual, |workspace, cx| {
+                assert!(
+                    !workspace::Pane::skip_save_on_close(&view, workspace, cx),
+                    "another tab retains the shared edit, but cannot retain this input draft"
+                );
+            });
+        }
+        if changed {
+            visual.read(|cx| assert!(!ItemHandle::can_autosave(&view, cx)));
+            view.update_in(&mut visual, |view, window, cx| {
+                Item::save(
+                    view,
+                    SaveOptions {
+                        autosave: true,
+                        format: false,
+                        force_format: false,
+                    },
+                    project.clone(),
+                    window,
+                    cx,
+                )
+            })
+            .await?;
+            assert_eq!(
+                panel.read_with(&visual, |panel, cx| panel.property_draft_state(cx)),
+                state
+            );
+            assert_eq!(
+                serde_json::to_value(fanta_format::read_project_tree(&root)?.0)?,
+                original_disk
+            );
+        }
+        let mut saved = false;
+        if choice == "Explicit" {
+            let result = workspace
+                .update_in(&mut visual, |workspace, window, cx| {
+                    workspace.save_active_item(workspace::SaveIntent::Save, window, cx)
+                })
+                .await;
+            if invalid {
+                assert!(
+                    result
+                        .expect_err("invalid Save must refuse")
+                        .to_string()
+                        .contains("invalid property")
+                );
+                assert_eq!(
+                    panel.read_with(&visual, |panel, cx| panel.property_draft_state(cx)),
+                    state
+                );
+                assert_eq!(
+                    serde_json::to_value(fanta_format::read_project_tree(&root)?.0)?,
+                    original_disk
+                );
+                replace_input(&mut visual, "48");
+                workspace
+                    .update_in(&mut visual, |workspace, window, cx| {
+                        workspace.save_active_item(workspace::SaveIntent::Save, window, cx)
+                    })
+                    .await?;
+            } else {
+                result?;
+            }
+            saved = changed;
+        } else {
+            multi_workspace.update_in(&mut visual, |root, window, cx| {
+                root.close_window(&workspace::CloseWindow, window, cx)
+            });
+            visual.run_until_parked();
+            if changed {
+                let prompt = visual
+                    .pending_prompt()
+                    .expect("normal three-choice dirty prompt");
+                if shared_tab {
+                    assert_eq!(
+                        prompt.0,
+                        "Do you want to save all changes in the following files?"
+                    );
+                } else {
+                    assert!(prompt.0.contains("save"));
+                }
+                assert_shared_views(&visual);
+                assert_eq!(
+                    panel.read_with(&visual, |panel, cx| panel.property_draft_state(cx)),
+                    state,
+                    "prompt activation must not consume a valid or invalid draft"
+                );
+                assert_eq!(
+                    serde_json::to_value(fanta_format::read_project_tree(&root)?.0)?,
+                    original_disk
+                );
+                visual.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+                visual.run_until_parked();
+                assert!(visual.has_pending_prompt());
+                assert_eq!(
+                    serde_json::to_value(fanta_format::read_project_tree(&root)?.0)?,
+                    original_disk
+                );
+                visual.simulate_prompt_answer(choice);
+                visual.run_until_parked();
+                let save_requested = matches!(choice, "Save" | "Save all");
+                if choice == "Cancel" || (save_requested && invalid) {
+                    if invalid && save_requested {
+                        let error = visual
+                            .pending_prompt()
+                            .expect("visible close Save validation error");
+                        assert!(format!("{} {}", error.0, error.1).contains("invalid property"));
+                        visual.simulate_prompt_answer("OK");
+                        visual.run_until_parked();
+                    }
+                    assert!(visual.read(|cx| cx.windows().contains(&window.into())));
+                    assert_shared_views(&visual);
+                    assert_eq!(
+                        panel.read_with(&visual, |panel, cx| panel.property_draft_state(cx)),
+                        state
+                    );
+                    view.read_with(&visual, |view, cx| assert!(view.is_dirty(cx)));
+                    assert_eq!(
+                        serde_json::to_value(fanta_format::read_project_tree(&root)?.0)?,
+                        original_disk
+                    );
+                    multi_workspace.update_in(&mut visual, |root, window, cx| {
+                        root.close_window(&workspace::CloseWindow, window, cx)
+                    });
+                    visual.run_until_parked();
+                    assert!(visual.has_pending_prompt(), "retry still offers Discard");
+                    visual.simulate_prompt_answer(if shared_tab {
+                        "Discard all"
+                    } else {
+                        "Don't Save"
+                    });
+                    visual.run_until_parked();
+                } else {
+                    saved = save_requested;
+                }
+            }
+            assert!(!visual.has_pending_prompt());
+            assert!(
+                !visual.read(|cx| cx.windows().contains(&window.into())),
+                "the original whole window closed"
+            );
+        }
+        let (actual_disk, actual_assets) = fanta_format::read_project_tree(&root)?;
+        assert_eq!(actual_assets, original_assets);
+        if saved {
+            let mut expected = before.clone();
+            expected.apply(Operation::SetTransform {
+                id: text_id,
+                old: Transform2D::translation(40.0, 60.0),
+                new: Transform2D::translation(48.0, 60.0),
+            })?;
+            let now = chrono::Utc::now().timestamp_millis();
+            item.read_with(&visual, |item, _| {
+                let actual = item.doc().expect("saved document");
+                assert!((before.metadata.modified_at..=now).contains(&actual.metadata.modified_at));
+                expected.metadata.modified_at = actual.metadata.modified_at;
+                assert_eq!(
+                    serde_json::to_value(actual).expect("actual"),
+                    serde_json::to_value(&expected).expect("expected")
+                );
+                assert_eq!(actual.history.undo_depth(), before_history.0 + 1);
+                assert_eq!(actual.history.redo_depth(), 0);
+                assert!(!item.is_dirty());
+            });
+            let expected_root = directory.path().join("Expected projection");
+            crate::document::write_project(&expected_root, &expected, &original_assets)?;
+            assert_eq!(
+                serde_json::to_value(actual_disk)?,
+                serde_json::to_value(fanta_format::read_project_tree(&expected_root)?.0)?
+            );
+        } else {
+            assert_eq!(serde_json::to_value(actual_disk)?, original_disk);
+            item.read_with(&visual, |item, _| {
+                assert!(!item.is_dirty());
+                let doc = item.doc().expect("restored document");
+                assert_eq!(doc.history.undo_depth(), 0);
+                assert_eq!(doc.history.redo_depth(), 0);
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "macos", feature = "fanta-gpui-ui"))]
+    #[gpui::test]
+    async fn property_draft_explicit_save_commits_focused_input(cx: &mut TestAppContext) {
+        assert_property_draft_persistence("48", "Explicit", false, cx)
+            .await
+            .expect("focused Save");
+    }
+
+    #[cfg(all(target_os = "macos", feature = "fanta-gpui-ui"))]
+    #[gpui::test]
+    async fn property_draft_invalid_save_preserves_then_corrects_input(cx: &mut TestAppContext) {
+        assert_property_draft_persistence("-", "Explicit", false, cx)
+            .await
+            .expect("invalid Save and correction");
+    }
+
+    #[cfg(all(target_os = "macos", feature = "fanta-gpui-ui"))]
+    #[gpui::test]
+    async fn property_draft_window_save_commits_after_prompt_focus(cx: &mut TestAppContext) {
+        assert_property_draft_persistence("48", "Save", false, cx)
+            .await
+            .expect("window Save");
+    }
+
+    #[cfg(all(target_os = "macos", feature = "fanta-gpui-ui"))]
+    #[gpui::test]
+    async fn property_draft_invalid_window_save_keeps_discard_available(cx: &mut TestAppContext) {
+        assert_property_draft_persistence("-", "Save", false, cx)
+            .await
+            .expect("invalid close Save and Discard");
+    }
+
+    #[cfg(all(target_os = "macos", feature = "fanta-gpui-ui"))]
+    #[gpui::test]
+    async fn property_draft_window_cancel_then_discard_preserves_shared_item(
+        cx: &mut TestAppContext,
+    ) {
+        assert_property_draft_persistence("48", "Cancel", true, cx)
+            .await
+            .expect("shared pending view");
+    }
+
+    #[cfg(all(target_os = "macos", feature = "fanta-gpui-ui"))]
+    #[gpui::test]
+    async fn property_draft_shared_save_all_commits_later_pane_owner_first(
+        cx: &mut TestAppContext,
+    ) {
+        assert_property_draft_persistence("48", "Save all", true, cx)
+            .await
+            .expect("shared Save all settles the later pane's draft first");
+    }
+
+    #[cfg(all(target_os = "macos", feature = "fanta-gpui-ui"))]
+    #[gpui::test]
+    async fn property_draft_invalid_shared_save_all_keeps_discard_available(
+        cx: &mut TestAppContext,
+    ) {
+        assert_property_draft_persistence("-", "Save all", true, cx)
+            .await
+            .expect("invalid shared Save all preserves both views and offers Discard");
+    }
+
+    #[cfg(all(target_os = "macos", feature = "fanta-gpui-ui"))]
+    #[gpui::test]
+    async fn property_draft_invalid_window_cancel_then_discard(cx: &mut TestAppContext) {
+        assert_property_draft_persistence("-", "Cancel", false, cx)
+            .await
+            .expect("invalid Cancel and Discard");
+    }
+
+    #[cfg(all(target_os = "macos", feature = "fanta-gpui-ui"))]
+    #[gpui::test]
+    async fn property_draft_unchanged_focused_field_closes_without_prompt(cx: &mut TestAppContext) {
+        assert_property_draft_persistence("40", "Close", false, cx)
+            .await
+            .expect("unchanged field");
     }
 
     #[cfg(target_os = "macos")]

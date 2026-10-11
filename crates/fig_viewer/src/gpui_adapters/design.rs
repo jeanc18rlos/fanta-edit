@@ -38,20 +38,20 @@ use fanta_gpui::design::{
     DesignPanelNodeCapabilities, DesignPanelNodeKind, DesignPanelParentLayout, DesignPanelProperty,
     DesignPanelPropertyValueState, DesignPanelSection, DesignPanelSelection, DesignPanelTarget,
     DesignPanelValue, DesignPatternHorizontalAlignment, DesignPatternPaint, DesignPatternSource,
-    DesignPatternTileType, DesignPolygonGeometry, DesignSelectionHeaderCommand,
-    DesignSelectionHeaderControl, DesignSelectionHeaderControlKind, DesignSelectionHeaderMenu,
-    DesignSelectionHeaderMenuItem, DesignSelectionHeaderViewData, DesignShaderDefinition,
-    DesignShaderGradientStop, DesignShaderPaint, DesignShaderPropertyAssignment,
-    DesignShaderPropertyDefinition, DesignShaderPropertyKind, DesignShaderPropertyValue,
-    DesignShaderViewData, DesignShapeGeometry, DesignSizingMode, DesignStackingOrder,
-    DesignStarGeometry, DesignStroke, DesignStrokeAlign, DesignStrokeCap, DesignStrokeDashMode,
-    DesignStrokeDashes, DesignStrokeEditContext, DesignStrokeJoin, DesignStrokeWeightMode,
-    DesignStrokeWeights, DesignTextDecoration, DesignTextHorizontalAlignment,
-    DesignTextPathDirection, DesignTextPathOrientation, DesignTextPathPlacement,
-    DesignTextPathStartData, DesignTextPathViewData, DesignTextResize, DesignTextVerticalAlignment,
-    DesignTransformOperation, DesignTypography, DesignTypographyTarget, DesignVideoPreviewAction,
-    DesignVideoPreviewState, DesignViewerPropertiesViewData, DesignViewerPropertyRow,
-    DesignViewerPropertySection,
+    DesignPatternTileType, DesignPolygonGeometry, DesignPropertyDraftState,
+    DesignSelectionHeaderCommand, DesignSelectionHeaderControl, DesignSelectionHeaderControlKind,
+    DesignSelectionHeaderMenu, DesignSelectionHeaderMenuItem, DesignSelectionHeaderViewData,
+    DesignShaderDefinition, DesignShaderGradientStop, DesignShaderPaint,
+    DesignShaderPropertyAssignment, DesignShaderPropertyDefinition, DesignShaderPropertyKind,
+    DesignShaderPropertyValue, DesignShaderViewData, DesignShapeGeometry, DesignSizingMode,
+    DesignStackingOrder, DesignStarGeometry, DesignStroke, DesignStrokeAlign, DesignStrokeCap,
+    DesignStrokeDashMode, DesignStrokeDashes, DesignStrokeEditContext, DesignStrokeJoin,
+    DesignStrokeWeightMode, DesignStrokeWeights, DesignTextDecoration,
+    DesignTextHorizontalAlignment, DesignTextPathDirection, DesignTextPathOrientation,
+    DesignTextPathPlacement, DesignTextPathStartData, DesignTextPathViewData, DesignTextResize,
+    DesignTextVerticalAlignment, DesignTransformOperation, DesignTypography,
+    DesignTypographyTarget, DesignVideoPreviewAction, DesignVideoPreviewState,
+    DesignViewerPropertiesViewData, DesignViewerPropertyRow, DesignViewerPropertySection,
 };
 use gpui::{
     AppContext as _, ClipboardItem, Context, Entity, SharedString, Subscription, TaskExt as _,
@@ -2545,6 +2545,8 @@ pub(crate) struct DesignAdapter {
     export_configurations: Vec<DesignExportConfiguration>,
     export_edit_snapshot: Option<Vec<DesignExportConfiguration>>,
     next_export_id: u64,
+    property_draft_state: DesignPropertyDraftState,
+    _draft_subscription: Subscription,
     _subscription: Subscription,
 }
 
@@ -2604,6 +2606,16 @@ impl DesignAdapter {
             panel.set_supported_blend_modes(&DesignBlendMode::ALL, cx);
         });
         let subscription = cx.subscribe_in(&panel, window, FigView::handle_design_action);
+        let draft_subscription = cx.observe(&panel, |view, panel, cx| {
+            let state = panel.read(cx).property_draft_state(cx);
+            if let Some(adapter) = view.gpui_design.as_mut()
+                && adapter.property_draft_state != state
+            {
+                adapter.property_draft_state = state;
+                cx.emit(crate::view::FigViewEvent::PropertyDraftChanged);
+                cx.notify();
+            }
+        });
         Self {
             panel,
             last_echo: None,
@@ -2621,6 +2633,8 @@ impl DesignAdapter {
             )],
             export_edit_snapshot: None,
             next_export_id: 1,
+            property_draft_state: DesignPropertyDraftState::None,
+            _draft_subscription: draft_subscription,
             _subscription: subscription,
         }
     }

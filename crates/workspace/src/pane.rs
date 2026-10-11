@@ -1930,6 +1930,9 @@ impl Pane {
     // save it. That said, if you still have the buffer open in a different pane
     // we can close this one without fear of losing data.
     pub fn skip_save_on_close(item: &dyn ItemHandle, workspace: &Workspace, cx: &App) -> bool {
+        if item.has_pending_view_edits(cx) {
+            return false;
+        }
         let mut dirty_project_item_ids = Vec::new();
         item.for_each_project_item(cx, &mut |project_item_id, project_item| {
             if project_item.is_dirty() {
@@ -2029,6 +2032,7 @@ impl Pane {
         let mut items_to_close = Vec::new();
         for item in &self.items {
             if should_close(item.item_id()) {
+                item.prepare_for_save_or_close(window, cx);
                 items_to_close.push(item.boxed_clone());
             }
         }
@@ -2042,7 +2046,13 @@ impl Pane {
             // This will cause Zed to expand the content of the currently active item
             //
             // Beyond that sort in order of project path, with untitled files and multibuffers coming last.
-            (active_item_id == Some(item.item_id()), path.is_none(), path)
+            // A view-owned preview must settle before another view saves or reloads its model.
+            (
+                !item.has_pending_view_edits(cx),
+                active_item_id == Some(item.item_id()),
+                path.is_none(),
+                path,
+            )
         });
 
         let workspace = self.workspace.clone();
@@ -2322,6 +2332,7 @@ impl Pane {
 
         const DELETED_MESSAGE: &str = "This file has been deleted on disk since you started editing it. Do you want to recreate it?";
 
+        cx.update(|window, cx| item.prepare_for_save_or_close(window, cx))?;
         let path_style = project.read_with(cx, |project, cx| project.path_style(cx));
         if save_intent == SaveIntent::Skip {
             let is_saveable_singleton = cx.update(|_window, cx| {

@@ -3425,7 +3425,22 @@ impl Workspace {
         }
     }
 
+    pub(crate) fn preserve_pending_view_edits(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let items = self
+            .items(cx)
+            .map(|item| item.boxed_clone())
+            .collect::<Vec<_>>();
+        for item in items {
+            item.prepare_for_save_or_close(window, cx);
+        }
+    }
+
     pub fn can_close_items(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.preserve_pending_view_edits(window, cx);
         let blocked = self.panes.iter().find_map(|pane| {
             pane.read(cx)
                 .items()
@@ -3702,6 +3717,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<bool>> {
+        self.preserve_pending_view_edits(window, cx);
         let closing = save_intent == SaveIntent::Close;
         if closing && !self.can_close_items(window, cx) {
             return Task::ready(Ok(false));
@@ -3784,6 +3800,11 @@ impl Workspace {
                 dirty_items
             };
 
+            let mut dirty_items = dirty_items;
+            cx.update(|_, cx| {
+                // A sibling can share the model while only one view owns its pending preview.
+                dirty_items.sort_by_key(|(_, item)| !item.has_pending_view_edits(cx));
+            })?;
             for (pane, item) in dirty_items {
                 let (singleton, project_entry_ids) = cx.update(|_, cx| {
                     (

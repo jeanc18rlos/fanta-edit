@@ -596,6 +596,11 @@ impl MultiWorkspace {
         cx: &mut Context<Self>,
     ) -> bool {
         for workspace in workspaces {
+            workspace.update(cx, |workspace, cx| {
+                workspace.preserve_pending_view_edits(window, cx)
+            });
+        }
+        for workspace in workspaces {
             if !workspace.update(cx, |workspace, cx| workspace.can_close_items(window, cx)) {
                 for retained in workspaces {
                     retained.update(cx, |workspace, cx| workspace.cancel_close(window, cx));
@@ -610,10 +615,17 @@ impl MultiWorkspace {
 
     pub fn close_window(&mut self, _: &CloseWindow, window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn_in(window, async move |this, cx| {
-            let workspaces = this.update(cx, |multi_workspace, _cx| {
-                multi_workspace.workspaces().cloned().collect::<Vec<_>>()
+            let workspaces = this.update(cx, |multi_workspace, cx| {
+                let mut workspaces = multi_workspace.workspaces().cloned().collect::<Vec<_>>();
+                workspaces.sort_by_key(|workspace| {
+                    !workspace.read(cx).items(cx).any(|item| item.has_pending_view_edits(cx))
+                });
+                workspaces
             })?;
 
+            for workspace in &workspaces {
+                workspace.update_in(cx, |workspace, window, cx| workspace.preserve_pending_view_edits(window, cx))?;
+            }
             for workspace in workspaces {
                 let should_continue = workspace
                     .update_in(cx, |workspace, window, cx| {
