@@ -1,7 +1,7 @@
 # Fanta 1.0.0 Public Alpha
 
 Current distribution guide, prepared **11 October 2026** for the **12 October**
-launch. The public download remains unavailable until the final release checks
+launch. The public download becomes available after the final release checks
 pass. [The download page](https://www.fantaisa.net/download) is the current source
 for availability, installer, checksum, tested macOS versions and support.
 

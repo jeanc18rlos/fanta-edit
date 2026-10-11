@@ -1,8 +1,8 @@
 # Public Alpha visual assets
 
-Launch recordings and screenshots are pending capture from the accepted Fanta
-1.0.0 build. The old README's `canvas.png` and `code.png` files were absent. Their
-broken embeds have been removed. Do not substitute historical QA images or a
+Launch recordings and screenshots must come from the accepted Fanta 1.0.0
+build. The old README's `canvas.png` and `code.png` files were absent. Their broken
+embeds were removed. Do not substitute historical QA images or a
 recreated editor UI as evidence of the released app.
 
 | Asset after review | Use |

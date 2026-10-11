@@ -5,10 +5,9 @@
 readable FNX alongside the project's assets, so you can inspect changes with
 Git and edit the same design through the Code workspace or an agent.
 
-The next distribution is **Fanta 1.0.0 Public Alpha for Apple Silicon Macs**.
-Publication requires the matching accepted build, signed and notarized installer,
-and reviewed recordings. Until those checks finish, the download page shows
-preparation status.
+The **Fanta 1.0.0 Public Alpha** distribution targets Apple Silicon Macs.
+The download page reports current availability. Publication requires the matching
+accepted build, signed and notarized installer, and reviewed recordings.
 
 [Download and installation](https://www.fantaisa.net/download) ·
 [Three demos and the ten-minute exercise](docs/alpha/DEMO_GUIDE.md) ·

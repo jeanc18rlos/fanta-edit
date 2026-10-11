@@ -1,8 +1,9 @@
 # Fanta demos and the ten-minute exercise
 
-Prepared **11 October 2026**. The three launch recordings will use the accepted
-Public Alpha build. They are not yet available. Recording length is flexible: complete workflows and readability take priority, and the creator will edit the final cuts. Until review finishes, this page
-does not embed old recordings or missing images as evidence of the release.
+Prepared **11 October 2026**. Launch recordings use the accepted Public Alpha
+build. The website links the reviewed footage when available. Recording length
+is flexible: complete workflows and readability take priority, and the creator
+edits the final cuts. Old recordings and missing images are not release evidence.
 
 [Watch the reviewed demos](https://www.fantaisa.net/#demo) when available.
 Documentation uses silent footage with captions. Website and deck players start
