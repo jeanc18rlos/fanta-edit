@@ -108,9 +108,9 @@ conflicts, but cannot make a concurrent external write and rename atomic; see
   position edits. The `ab9faf717` host fractional and transformed-parent tests
   pass. The original dependency untouched-blur failure remains recorded; its
   test-only window activation successor `3e78` now passes all nine required cases.
-  Host86c pins that revision but its new Crop diagnostic fails test compilation,
-  leaving the full host gate open. Matching fractional native acceptance remains
-  open; build43 has the older dependency.
+  Host86c pins that revision but its new Crop diagnostic fails test compilation.
+  Later build44 ab9/a795 passes bounded fractional and transformed-parent native
+  checks below; it does not validate fa47 or every transform/font case.
   Both published `29890b774` Check runs pass 72/77 and fail five runtime cases.
   Matching lint and Skia source checks pass separately. Build42 does not accept later Save All/error feedback,
   captured-Open or the prepared identity/test corrections. See the
@@ -132,14 +132,25 @@ conflicts, but cannot make a concurrent external write and rename atomic; see
   Cancel clears a pending preview but keeps the tool active; a subsequent Cancel
   or Escape exits it. This is separate from the three failing hosted Crop cases.
   See the [current scoped results](../alpha/CAPABILITY_COVERAGE.md#published-86c-checks-and-rounded-clip-successor--11-october).
-- **Prepared rounded-corner targeting repair:** invisible physical Text, Vector
+- **Rounded-corner targeting repair in fa47:** invisible physical Text, Vector
   and Bitmap children behind a rounded ancestor clip are excluded from authoring
   hits. Vector fallback applies the same filter to every candidate and retains
   a visible path underneath. Existing parent-frame bounds and selected controls
   keep their authoring behavior. Three new geometry/tool/mounted-entry tests and
   the existing transformed-parent TextPath test join the required 81-name gate.
-  This is reviewed source awaiting matching hosted and packaged native results;
-  it does not establish a passing release or resolve the retained Crop failures.
+  All four have actual passes in both fa47 Check runs; each has 78/81 required
+  passes and the same three Crop failures. Matching native rounded-clip acceptance remains pending.
+- **Build44 bounded follow-up (ab9/a795):** untouched and edited fractional
+  TextPath inputs, one transformed parent, Group text edit/Save/Undo and Crop
+  Apply/history pass on owned fixtures. Full authored restoration is verified
+  apart from modification metadata. Boolean point Undo restores canonical
+  geometry and properties but may serialize `Vector` instead of `Rect` shorthand;
+  byte spelling is separate from semantic Undo, with no demonstrated data loss.
+  In a denied-write check, explicit Save/close errors retain X48 through Cancel;
+  restored permissions allow close Save without retyping. Separate-document Save
+  All, OS-error Discard and cold recovery are not covered by that route. These
+  internal QA results do not establish fa47 or shipping acceptance. See the
+  [current scoped results](../alpha/CAPABILITY_COVERAGE.md#current-fa47-hosted-results-and-build44-native-samples--11-october).
 - The **Code** workspace edits FNX and supported JSON sources. Saving valid
   source updates the canvas; invalid drafts preserve the last valid file and
   scene. Multi-buffer Save is sequential, not atomic: in a bounded build39 check,
@@ -230,9 +241,13 @@ top workspace tabs within the canvas. In both `ab9faf717` Check runs, the mounte
 toolbar regression passes its mode, scrolling and workspace-switching checks.
 The three mounted Crop regressions at 240, 256 and 336 points execute but fail
 at the first intended drag press after disabled Apply; their later preview,
-Apply and history assertions are not reached. A prepared diagnostic successor
-adds bounded raw mouse-delivery observations without changing those gestures or
-assertions. Its execution and complete matching native coverage remain pending.
+Apply and history assertions are not reached. Both later fa47 Check runs pass
+78/81 required names and retain those three failures: raw window delivery
+reaches an oversized Crop panel that occludes the canvas drag point; the hint
+collapses to zero width at 336. The source-reviewed one-line `flex_none` hint
+fix is included in the successor to fa47; matching execution remains pending.
+Build44 separately passes bounded Apply/Undo/Redo/restoration, without proving
+those CI logical widths or the candidate fix.
 
 On development QA `0f71b3961d`, one real three-second H.264 fixture passes bounded
 Play/Pause, paused Seek, Trim Cancel and Trim Apply with single Undo/Redo and

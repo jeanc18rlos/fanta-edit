@@ -5,15 +5,14 @@
 reports included degraded inspector UI, double-clicks with no useful node action,
 failures or missing content, and slow editing on large pages. The user now accepts
 Spectrum performance. The original save/close incident remains unexplained.
-Internal Mac build43 passes the bounded ordinary-Text Save/error/retry and node
-samples below. Both `ab9faf717` Check runs pass 74/77 required names and fail
-three Crop cases. The hosted TextPath and recreated-entry regressions pass at
-that source. The dependency `3e78` rerun now passes all nine required property
-regressions. Published host `86c`'s push Check fails to compile the new Crop test
-diagnostics; no editor tests execute there. A reviewed test compile correction
-and rounded-ancestor click repair are prepared; their matching hosted and native
-acceptance remain pending. Matching fractional native verification, earlier
-unexplained Boolean attempts and recovery/distribution requirements remain open.
+Latest completed internal Mac build44 is `ab9faf717` with dependency `a795`;
+its bounded fractional TextPath, transformed-parent, Crop/history and save-error
+checks pass within the scopes below. It does not contain host `fa47c68fed`.
+Both fa47 Check runs record 78/81 required passes and three Crop failures;
+both workflows are terminal failures. The successor to fa47 includes the
+source-reviewed one-line `flex_none` hint fix; matching execution remains pending.
+The original save/close incident, complete capability coverage and
+signed/notarized installation remain unresolved.
 
 The selected distribution is a **direct-download Mac app**. Final acceptance
 must use the signed, notarized DMG and the app installed from that exact DMG.
@@ -35,6 +34,51 @@ identifies their scope and the remaining acceptance work. Historical evidence in
 recorded there.
 
 ## Current acceptance status
+
+### Current fa47 hosted results and build44 native samples — 11 October
+
+At the saved 18:10:31 UTC final independent review, both fa47 Check runs are
+terminal failures. The
+[push run](https://github.com/jeanc18rlos/fanta-edit/actions/runs/38158454711) and
+[canonical run](https://github.com/jeanc18rlos/fanta-edit/actions/runs/38158457450)
+each have 78/81 required passes: editor 1263 passed, three failed and two ignored;
+workspace238, independent30 and Store20 pass. All three rounded-ancestor
+regressions and the transformed-parent TextPath pure test pass. The other five
+release stages and independent default lint pass. The final review binds actual
+named results and artifact bytes; skipped ancillary steps are not passes, and
+neither workflow is a whole-Check pass.
+
+The three Crop failures at 240/256/336 receive the intended press in both window
+phases, but a 716.5-pixel-tall Crop-controls region covers that point. At 336 the
+hint is zero-width and 682.5 pixels tall. The successor's one-line `flex_none`
+fix makes that hint a non-shrinking flex item while retaining its maximum width,
+wrapping, controls and every existing test gesture/assertion. It has only source/static
+review; hosted and matching native results are pending. This supersedes the
+earlier absence of delivery diagnostics, not the retained historical failures.
+
+Root accepted build44 TextPath phases003–023 and transformed-parent phases001–011:
+untouched focus/Enter/blur preserves authored content; focused fractional X/Y
+Save persists only the intended translation; Undo restores it. Text entry from
+the context menu, Escape, Save and document Undo also restore the owned baseline.
+Crop024–032 passes disabled Apply, preview, Apply/Save, Undo/Redo and final
+restoration, preserving the image world translation. Each fixture retains all
+74 entries/modes and final authored bytes except `metadata.modified_at`.
+These native coordinates do not establish the three CI logical widths.
+
+Core Group text edit/Save/Undo restores authored bytes. Boolean point Undo
+restores canonical rectangle geometry/properties/flags but keeps `Vector`
+spelling instead of the original `Rect` shorthand. Source comparison narrows
+this to serialization spelling drift, not demonstrated geometry or history loss;
+byte restoration was explicit after closing, not credited to native Undo.
+
+On owned Save A, denied writes produce explicit CmdS/close-Save errors; Cancel
+retains X48. Restoring all37 modes then retrying close Save without typing writes
+only X40→48 plus metadata and closes. Root accepted this bounded route and
+explicitly restored X40 after closure. It does not prove separate-document Save
+All, OS-error Discard, cold recovery or the original Spectrum incident's cause.
+All build44 results remain exact ab9/a795, not fa47 or the new Crop candidate.
+Signing credentials/profile are ready; controller V2 is source-reviewed only.
+No signed/notarized shipping package or installation is accepted.
 
 ### Published 86c checks and rounded-clip successor — 11 October
 

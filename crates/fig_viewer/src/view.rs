@@ -22142,7 +22142,7 @@ impl FigView {
                 row.child(
                     div()
                         .debug_selector(|| "design-crop-hint".to_owned())
-                        .min_w_0()
+                        .flex_none()
                         .max_w_full()
                         .child(
                             Label::new("Drag on the canvas to select a crop")
