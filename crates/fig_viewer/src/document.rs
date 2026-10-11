@@ -322,8 +322,9 @@ fn register_shared_project_item(root: PathBuf, item: &Entity<FigItem>, cx: &mut 
 /// two, exactly like `agent_surface::set_active_item`. Sound because the
 /// foreground is serial between `try_open` resolving and the view being
 /// constructed, and every `try_open` overwrites the slot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FigViewDescriptor {
+    pub(crate) path: ProjectPath,
     pub(crate) entry_id: Option<ProjectEntryId>,
     pub(crate) scope: Option<FigScope>,
 }
@@ -1381,6 +1382,7 @@ impl project::ProjectItem for FigItem {
                 cx.update(|cx| {
                     set_pending_view_descriptor(
                         FigViewDescriptor {
+                            path,
                             entry_id,
                             scope: initial_scope,
                         },
@@ -1537,7 +1539,7 @@ impl project::ProjectItem for FigItem {
                 let project_subscription = Self::project_subscription(&project, cx);
 
                 Self {
-                    path,
+                    path: path.clone(),
                     abs_path,
                     entry_id,
                     document: FigDocumentState::Loading {
@@ -1583,6 +1585,7 @@ impl project::ProjectItem for FigItem {
             cx.update(|cx| {
                 set_pending_view_descriptor(
                     FigViewDescriptor {
+                        path,
                         entry_id,
                         scope: initial_scope,
                     },

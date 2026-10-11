@@ -193,7 +193,11 @@ impl SerializableItem for FigView {
                     .entry_for_path(&path, cx)
                     .map(|entry| entry.id);
                 crate::document::set_pending_view_descriptor(
-                    crate::document::FigViewDescriptor { entry_id, scope },
+                    crate::document::FigViewDescriptor {
+                        path,
+                        entry_id,
+                        scope,
+                    },
                     cx,
                 );
                 cx.new(|cx| Self::new(item, project, window, cx))
@@ -228,8 +232,7 @@ impl SerializableItem for FigView {
             .map(|root| root.join("fanta.json"))
             .unwrap_or_else(|| item.abs_path().to_path_buf());
         let source_path = self
-            .opened_entry_id
-            .and_then(|entry| self.project.read(cx).path_for_entry(entry, cx))
+            .project_path_for_opened_entry(cx)
             .and_then(|path| self.project.read(cx).absolute_path(&path, cx))
             .filter(|path| {
                 item.project_root()
@@ -785,7 +788,7 @@ mod tests {
             workspace.read_with(cx, |workspace, _| workspace.session_id()),
             session
         );
-        let reopened_view = workspace.read_with(cx, |workspace, cx| {
+        let (reopened_view, original_entry) = workspace.read_with(cx, |workspace, cx| {
             let views = workspace.items_of_type::<FigView>(cx).collect::<Vec<_>>();
             assert_eq!(views.len(), 1);
             let view = views.first().expect("one reopened design");
@@ -802,7 +805,9 @@ mod tests {
                 ),
                 original_document
             );
-            view.entity_id()
+            let entries = view.read(cx).project_entry_ids(cx);
+            assert_eq!(entries.len(), 1);
+            (view.entity_id(), *entries.first().expect("original entry"))
         });
         assert_eq!(active_root(&workspace, cx), original_root);
         assert_eq!(project_bytes(fixture.directory.path()), original_bytes);
@@ -826,6 +831,19 @@ mod tests {
             .expect("replace injected abstract symlink with original manifest");
         fixture.file_system.unpause_events_and_flush();
         cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            let project = workspace.project().read(cx);
+            let path = project
+                .find_project_path(&manifest, cx)
+                .expect("recreated manifest path");
+            let entry = project.entry_for_path(&path, cx).expect("recreated entry");
+            assert_ne!(entry.id, original_entry, "the manifest entry was replaced");
+            let view = workspace
+                .active_item_as::<FigView>(cx)
+                .expect("retained design");
+            assert_eq!(view.entity_id(), reopened_view);
+            assert_eq!(view.read(cx).project_entry_ids(cx).as_slice(), &[entry.id]);
+        });
         let reopened_again = explicit_manifest_open(window, manifest, cx).await;
         assert_eq!(reopened_again, workspace);
         assert_eq!(
@@ -1239,6 +1257,11 @@ mod tests {
             views
                 .iter()
                 .all(|view| { view.read_with(cx, |view, _| view.opened_entry_id.is_none()) })
+        );
+        assert!(
+            views
+                .iter()
+                .all(|view| { view.read_with(cx, |view, _| view.opened_project_path.is_none()) })
         );
         cx.executor()
             .advance_clock(workspace::SERIALIZATION_THROTTLE_TIME * 2);

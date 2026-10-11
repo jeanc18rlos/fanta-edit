@@ -43,9 +43,8 @@ conflicts, but cannot make a concurrent external write and rename atomic; see
   records project and page/component scope, but build39 failed closed-tab
   membership: normal Quit and a cold launch without manual Open restored two
   design tabs after all had been closed. Saved project bytes remained exact.
-  The release candidate's restoration fix and five regression sources remain
-  uncompiled and unexecuted; hosted checks and a matching native app must still
-  accept them. Scoped restore is not fully accepted.
+  Subsequent hosted and bounded build42 checks are recorded below; broader
+  scoped restore remains unaccepted.
   Unsaved canvas or source content still requires the normal close/save decision.
   A bounded build37 Save/close/warm-reopen journey succeeds, but the original
   reported inert Save/Discard incident is not reproduced or explained. In a
@@ -70,7 +69,7 @@ conflicts, but cannot make a concurrent external write and rename atomic; see
   acceptance of later source changes. Both canonical and push hosted Check runs for `37c4073d` on
   11 October pass all 66 required names, including all nine property-draft cases
   for invalid input and shared views. Earlier complete-Check failures remain
-  recorded; the latest source checks are green. Hosted success and bounded native
+  recorded; those exact source checks are green. Hosted success and bounded native
   journeys still do not establish full release readiness. See the
   [acceptance record](../alpha/CAPABILITY_COVERAGE.md), which
   retains the [build37 failure](../alpha/CAPABILITY_COVERAGE.md#current37-native-checks--11-october).
@@ -81,18 +80,32 @@ conflicts, but cannot make a concurrent external write and rename atomic; see
   remains open:** manual Save and close alerts expose long internal paths, and
   the tab-close error uses an `untitled` label. Explicit Save All retained the
   draft but showed no action-level dialog; a later autosave notice is separate
-  feedback. Proposed concise, named errors and a Save All dialog are external,
-  uncompiled and unexecuted; they are not installed-app acceptance. These owned
-  fault checks do not establish atomic multi-document Save or the original
-  Spectrum incident's cause.
+  feedback. Concise, named errors and a Save All dialog are now in source;
+  their recorded `29890b774` hosted regressions pass, while matching native
+  verification remains pending. These owned fault checks do not establish
+  atomic multi-document Save or the original Spectrum incident's cause.
 - A later 11 October update records both `a51d57c2` hosted Check runs as failed;
-  the earlier `37c4073d` success above remains tied to that source. Test-fixture
-  corrections and save-error improvements still need matching execution. A
-  further source-reviewed fix carries a validated project-manifest identity
-  through explicit Open of a reused workspace, so a later abstract-reader
-  failure cannot silently skip reopening its closed design tab. Its mounted
-  regression is unexecuted; no installed-app behavior is claimed. See the
+  the earlier `37c4073d` success above remains tied to that source. Subsequent
+  `29890b774` results are listed below. Its captured explicit-Open regression
+  reaches successful read-failure recovery but fails when repeated Open after
+  manifest recreation adds a duplicate tab. The prepared per-view entry-identity
+  fix still needs execution; no matching installed-app behavior is claimed. See the
   [dated terminal update](../alpha/CAPABILITY_COVERAGE.md#terminal-a51d-checks-and-captured-open-successor--11-october).
+- **Later 11 October acceptance:** internal build42, exact `a51d57c2`, passes
+  bounded Spectrum focused Save/Cancel/Discard with full pre-choice comparisons,
+  warm reopening and authored restoration. Closing all tabs then a cold launch
+  restores zero tabs; explicit Open and repeat Open retain one. Sampled
+  light/dark inspectors fit at 320/400 points. Native Crop Apply/Undo/Redo restores
+  the document and all six assets; only the restored state is reopened. Later
+  disabled-Apply/drag/Cancel, ellipse point/history, mixed-menu, invalid-X
+  rejection/Close Without Saving and locked-leaf canvas samples pass within their stated
+  scope. Earlier Boolean entry failures remain unexplained despite later traced
+  success. Merely focusing TextPath X now reproduces a shifted, dirty preview;
+  Escape restores it and saved files remain unchanged. This is still open.
+  Both published `29890b774` Check runs pass 72/77 and fail five runtime cases.
+  Matching lint and Skia source checks pass separately. Build42 does not accept later Save All/error feedback,
+  captured-Open or the prepared identity/test corrections. See the
+  [dated successor record](../alpha/CAPABILITY_COVERAGE.md#build42-native-samples-and-29890b-test-successor--11-october).
 - The **Code** workspace edits FNX and supported JSON sources. Saving valid
   source updates the canvas; invalid drafts preserve the last valid file and
   scene. Multi-buffer Save is sequential, not atomic: in a bounded build39 check,

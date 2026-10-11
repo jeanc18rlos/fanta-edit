@@ -175,6 +175,7 @@ pub(crate) fn open_design_for_worktree(
                     .map(|entry| entry.id);
                 crate::document::set_pending_view_descriptor(
                     crate::document::FigViewDescriptor {
+                        path,
                         entry_id,
                         scope: None,
                     },

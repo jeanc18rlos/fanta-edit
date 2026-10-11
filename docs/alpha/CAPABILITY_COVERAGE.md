@@ -5,10 +5,12 @@
 reports included degraded inspector UI, double-clicks with no useful node action,
 failures or missing content, and slow editing on large pages. The user now accepts
 Spectrum performance. The original save/close incident remains unexplained.
-Internal Mac build41 passes the bounded native Save/close and inspector checks
-below, but narrow canvas controls still clip. Closed-tab restoration remains an
-open build39 failure. These results do not establish every node, recovery or
-distribution requirement.
+Internal Mac build42 passes bounded native Save/close, restoration and inspector
+checks recorded below; earlier Boolean entry failures remain unexplained.
+Both Check runs for `29890b774` fail five runtime cases; the prepared successor
+remains uncompiled and unexecuted. TextPath position-field focus also reproduces
+an unexplained native preview shift. These results do not establish every node,
+recovery or distribution requirement.
 
 The selected distribution is a **direct-download Mac app**. Final acceptance
 must use the signed, notarized DMG and the app installed from that exact DMG.
@@ -30,6 +32,81 @@ identifies their scope and the remaining acceptance work. Historical evidence in
 recorded there.
 
 ## Current acceptance status
+
+### Build42 native samples and 29890b test successor — 11 October
+
+Published `29890b774` changes tests only. Both canonical and push Check now have
+**72/77 required names passing and five runtime failures**: repeated public Open after manifest
+recreation, one toolbar case and three Crop cases. Editor: 1257 passes, five
+failures, two ignored; workspace: all 238 pass. Independent 30 and Store 20
+pass. Engine/import/source-order/UI stages pass; editor fails, drag cases do
+not run and later ancillary steps are skipped. Both Release lint modes and
+forced-source default/Metal Skia compilation and notices pass separately.
+These do not establish whole-Check, GPU or native acceptance.
+
+The canonical run completed at the saved 13:46 UTC observation. Its
+[canonical Check](https://github.com/jeanc18rlos/fanta-edit/actions/runs/38141090463)
+and [push Check](https://github.com/jeanc18rlos/fanta-edit/actions/runs/38141087563)
+failures are preserved with exact source, logs and artifacts. The sole Check
+observer has ended. All 77 required names remain unchanged. The prepared successor contains a
+per-view recreated-entry identity fix, an inclusive toolbar test assertion and
+more Crop dispatch diagnostics. These four-file changes remain uncompiled and
+unexecuted. Crop diagnostics are not a production or gesture fix.
+Mac43 still packages exact `1f838bf20` at its saved 13:32 UTC snapshot.
+
+Both preceding `1f838bf20` Check runs remain recorded as **70/77 passes and
+seven runtime failures** (three serialization, one toolbar, three Crop).
+Editor: 1255 passes, seven failures, two ignored; workspace238, all30 independent
+and20 Store tests pass. The newer run passes two previously failing serialization
+cases; its five remaining failures are not waived. No local Cargo runs occurred.
+
+Latest completed internal build42 is exact `a51d57c2`, not this successor.
+On the owned Spectrum fixture, focused CmdS saves X8; Cancel retains draft16
+with disk8; close Save writes16; Don't Save closes draft24 with the full
+pre-choice saved16 inventory unchanged. Warm reopen shows16. Restoration
+returns the entire page to original bytes, with only normal save metadata
+changed. A snapshot overlapping a write was refused and retained; a later
+stable capture required no additional Save. Normal Quit/cold launch without
+Open restores zero design tabs; public Open and repeat Open retain one.
+Canvas/Variables/Code fit and switch at one 336-point canvas. These results do
+not explain the historical Spectrum incident or prove all restoration paths.
+
+A further build42 sample covers visible light/dark inspector sections at
+320/400 points, TextPath and nested Group text entry, and Bitmap Crop menu and
+double-click entry. Crop controls fit 256 points. Actual Apply/Save, Undo/Save,
+Redo/Save and final Undo/Save preserve all six asset files; the full document
+is restored apart from `modified_at`. Only the restored state is closed and
+reopened, not the cropped state. Video/Audio and specialist nodes reveal
+matching inspectors and property menus; no playback or specialist engine runs.
+Earlier Boolean parent-drill and operand-edit attempts fail visibly. Fresh
+later attempts drill into an operand, show wide-canvas NodeEdit UI and narrow
+four-vertex feedback; no exact input/tool trace explains the earlier failures.
+These remain unresolved, without a repair claim.
+
+Later build42 samples (UI106–141) add a traced fresh Boolean parent→operand→
+NodeEdit route; ellipse creation, vector entry, point edit, Save/Undo/Redo and
+full authored restoration; and a mixed TextPath/Boolean menu without leaf-only
+edit actions. Invalid TextPath X Save reports an error; Close Without Saving
+then public reopen preserves all48 files. A locked TextPath leaf blocks canvas
+editing; Undo/Save restores authored bytes. These are bounded routes, not an
+explanation of earlier Boolean046/050 failures or general lock acceptance.
+
+UI142–147 confirms disabled Crop Apply leaves the document unchanged, a native
+drag enables Apply, and Cancel/Escape restores the clean state with all saved
+records exact. It does not explain the distinct hosted Crop failures. In a
+separate UI148–152 retake, merely focusing TextPath X shifts its preview and
+dirties the tab before typing. Escape restores geometry and clean state; all
+saved files remain exact and no Save occurs. This visible focus defect remains
+open, without a source-cause or repair claim.
+
+Build42 lacks later manual-error/Save All presentation and final captured
+explicit-Open changes. No native acceptance transfers to `1f838bf20` or
+`29890b774`; shipping signing/notarization and broader native coverage remain
+open. Full inspector inputs, broader mixed/locked policies, all invalid-value cases
+and IME remain unaccepted beyond the specific journeys above. Inherited autosave Off does not
+disable FigView's debounce: Don't Save cannot undo already persisted content,
+so close-choice claims require a full immediate pre-choice disk checkpoint.
+Historical sections below retain their dated source and failure scopes.
 
 ### Latest completed app and successor checks — 11 October
 

@@ -43,7 +43,7 @@ use gpui::{
     div, px,
 };
 use language::Capability;
-use project::{Project, ProjectEntryId};
+use project::{Project, ProjectEntryId, ProjectPath};
 use settings::{Settings as _, update_settings_file};
 use smallvec::SmallVec;
 use ui::{ContextMenu, ContextMenuEntry, Divider, IconPosition, PopoverMenu, Tooltip, prelude::*};
@@ -429,6 +429,7 @@ pub struct FigView {
     /// the pane so each opened path keeps its OWN tab even though every tab
     /// shares the project's one [`FigItem`].
     opened_entry_id: Option<ProjectEntryId>,
+    opened_project_path: Option<ProjectPath>,
     /// What this tab is scoped to. Re-asserted on focus so the shared
     /// document's single render root follows the focused tab, and updated by
     /// in-tab navigation ([`Self::select_page`]).
@@ -740,8 +741,11 @@ impl FigView {
         // open (the clicked entry and the scope its path implies); the shared
         // item cannot, since one item backs every tab of the project.
         let descriptor = crate::document::take_pending_view_descriptor(cx);
-        let opened_entry_id = descriptor.and_then(|descriptor| descriptor.entry_id);
-        let scope = descriptor.and_then(|descriptor| descriptor.scope);
+        let opened_entry_id = descriptor
+            .as_ref()
+            .and_then(|descriptor| descriptor.entry_id);
+        let scope = descriptor.as_ref().and_then(|descriptor| descriptor.scope);
+        let opened_project_path = descriptor.map(|descriptor| descriptor.path);
         let save_failure_notice = item.read(cx).save_failure_notice.clone();
         let editor_session = cx.new(|_| EditorSession::new());
         // A variables-scoped tab starts in the variables space — the
@@ -853,6 +857,7 @@ impl FigView {
             selected_page_index: None,
             selected_page_root: None,
             opened_entry_id,
+            opened_project_path,
             scope,
             is_focused: false,
             agent_navigation_focus: None,
@@ -948,13 +953,26 @@ impl FigView {
         }
     }
 
+    fn project_path_for_opened_entry(&self, cx: &App) -> Option<ProjectPath> {
+        self.opened_entry_id
+            .and_then(|entry| self.project.read(cx).path_for_entry(entry, cx))
+            .or_else(|| self.opened_project_path.clone())
+    }
+
     fn reconcile_opened_entry_with_project_root(&mut self, cx: &App) {
+        self.opened_project_path = self.project_path_for_opened_entry(cx);
         if let Some(root) = self.item.read(cx).project_root() {
             self.opened_entry_id = self.opened_entry_id.filter(|entry_id| {
                 let project = self.project.read(cx);
                 project
                     .path_for_entry(*entry_id, cx)
                     .and_then(|path| project.absolute_path(&path, cx))
+                    .is_some_and(|path| path.starts_with(root))
+            });
+            self.opened_project_path = self.opened_project_path.take().filter(|path| {
+                self.project
+                    .read(cx)
+                    .absolute_path(path, cx)
                     .is_some_and(|path| path.starts_with(root))
             });
         }
@@ -9418,7 +9436,12 @@ impl Item for FigView {
         // of a project, so the default (the item's own entry — its FIRST-open
         // path) would collapse every scoped open onto that first tab; report
         // the entry this view was actually opened from instead.
-        match self.opened_entry_id {
+        let opened_entry_id = self
+            .project_path_for_opened_entry(cx)
+            .and_then(|path| self.project.read(cx).entry_for_path(&path, cx))
+            .map(|entry| entry.id)
+            .or(self.opened_entry_id);
+        match opened_entry_id {
             Some(entry_id) => [entry_id].into_iter().collect(),
             None => {
                 let project = self.project.read(cx);
@@ -9469,8 +9492,7 @@ impl Item for FigView {
         let item = self.item.read(cx);
         let project = self.project.read(cx);
         let source_path = self
-            .opened_entry_id
-            .and_then(|entry| project.path_for_entry(entry, cx))
+            .project_path_for_opened_entry(cx)
             .and_then(|path| project.absolute_path(&path, cx));
         let path = source_path.as_deref().unwrap_or_else(|| item.abs_path());
         ItemSettings::get_global(cx)
@@ -9779,6 +9801,7 @@ impl Item for FigView {
         let selected_page_index = self.selected_page_index;
         let selected_page_root = self.selected_page_root;
         let opened_entry_id = self.opened_entry_id;
+        let opened_project_path = self.project_path_for_opened_entry(cx);
         let scope = self.scope;
         let last_seen_root = self.last_seen_root;
         let layers_sidebar_visible = self.layers_sidebar_visible;
@@ -9870,6 +9893,7 @@ impl Item for FigView {
                 selected_page_index,
                 selected_page_root,
                 opened_entry_id,
+                opened_project_path,
                 scope,
                 is_focused: false,
                 agent_navigation_focus: None,
@@ -19617,8 +19641,13 @@ mod tests {
                 let surface = visual
                     .debug_bounds("editor-toolbar-surface")
                     .expect("toolbar surface");
+                // The responsive surface may exactly fill the canvas width; GPUI's
+                // point containment excludes its bottom/right edges.
                 assert!(
-                    surface.is_contained_within(&canvas),
+                    surface.left() >= canvas.left()
+                        && surface.top() >= canvas.top()
+                        && surface.right() <= canvas.right()
+                        && surface.bottom() <= canvas.bottom(),
                     "{canvas_width}: {surface:?} / {canvas:?}"
                 );
                 assert!((surface.center().x - canvas.center().x).abs() <= px(1.0));
@@ -19907,6 +19936,8 @@ mod tests {
         });
         view.update(&mut visual, |view, cx| {
             view.set_viewport_silent(Viewport::default());
+            view.click_diagnostics =
+                ClickDiagnostics::from_setting(Some(std::ffi::OsStr::new("1")));
             cx.notify();
         });
         draw_pane_layout(&mut visual);
@@ -19970,15 +20001,18 @@ mod tests {
                 }
             }
         };
-        let assert_crop_press = |visual: &gpui::VisualTestContext, stage: &str| {
+        let assert_crop_press = |visual: &gpui::VisualTestContext,
+                                 position: Point<Pixels>,
+                                 stage: &str| {
             view.read_with(visual, |view, _| {
                 assert_eq!(view.active_tool(), ToolKind::Crop, "{stage}");
                 assert!(
                     view.primary_pressed && view.canvas_pointer_down,
-                    "{stage} at {canvas_width}: pressed={}, canvas_pressed={}, ready={}, viewport={:?}, container={:?}, overlays={:?}",
+                    "{stage} at {canvas_width}: position={position:?}, pressed={}, canvas_pressed={}, ready={}, viewport={:?}, container={:?}, overlays={:?}, diagnostic_records={:?}",
                     view.primary_pressed, view.canvas_pointer_down,
                     view.tools.can_apply_crop(), view.viewport(), view.container_bounds,
                     view.tools.overlays,
+                    view.click_diagnostics.as_ref().map(|diagnostics| &diagnostics.records),
                 );
             });
         };
@@ -20044,7 +20078,7 @@ mod tests {
         let cancel_start = position + point(px(-40.0), px(-20.0));
         let cancel_end = position + point(px(40.0), px(20.0));
         visual.simulate_mouse_down(cancel_start, MouseButton::Left, gpui::Modifiers::none());
-        assert_crop_press(&visual, "cancel preview after press");
+        assert_crop_press(&visual, cancel_start, "cancel preview after press");
         visual.simulate_mouse_move(cancel_end, MouseButton::Left, gpui::Modifiers::none());
         assert_crop_preview(&visual, "cancel preview after move before redraw");
         visual.simulate_mouse_up(cancel_end, MouseButton::Left, gpui::Modifiers::none());
@@ -20106,7 +20140,7 @@ mod tests {
         let start = position + point(px(-40.0), px(-20.0));
         let end = position + point(px(40.0), px(20.0));
         visual.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::none());
-        assert_crop_press(&visual, "apply preview after press");
+        assert_crop_press(&visual, start, "apply preview after press");
         visual.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::none());
         assert_crop_preview(&visual, "apply preview after move before redraw");
         view.read_with(&visual, |view, _| assert!(!view.tools.can_apply_crop()));
