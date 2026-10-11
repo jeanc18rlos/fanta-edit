@@ -36,7 +36,7 @@ conflicts, but cannot make a concurrent external write and rename atomic; see
   delete pages, select layers, expand nesting, and drag layers into a different
   parent or position. Page roots and component recursion have edit guards.
 - Canvas edits support Undo/Redo and debounced autosave. Active canvas text can
-  be saved directly; the focused numeric-input exception below remains open.
+  be saved directly; focused numeric-input behavior is qualified below.
   Autosave can persist an edit while a close prompt is
   open; **Don't Save** does not roll back changes already written. Save As creates
   a separate project and rejects occupied or unsafe destinations. Clean canvas
@@ -54,15 +54,17 @@ conflicts, but cannot make a concurrent external write and rename atomic; see
   owned fixture, without proving rollback or the original incident's cause.
   A separate build37 check found that a focused X-field draft was not committed
   by CmdS and was lost on window Close without a prompt. Pressing Enter before
-  Save committed the value. Until this gap is fixed, commit numeric input with
-  Enter before saving or closing. The proposed autosave and close-error fixes
-  are not installed in build37; the bounded results and open issues are in the
-  [latest acceptance record](../alpha/CAPABILITY_COVERAGE.md#current37-native-checks--11-october).
-  A later source-reviewed successor adds an ordinary property-draft Save/close
-  API and nine mounted regression cases, including invalid input and shared
-  views. Those tests have not executed on the combined source, and the change
-  has not been verified in an installed app. The build37 numeric-input gap
-  remains the current native result.
+  Save committed the value on that build; this historical failure remains
+  recorded. Later bounded build39 checks on an owned fixture passed focused
+  numeric CmdS without Enter and valid focused-input Close → Save. Invalid
+  input was retained when Save was rejected; Close Without Saving then closed
+  the tab, and warm reopening showed the last saved value. These checks do not
+  explain the original Spectrum incident or prove native acceptance of later
+  source changes. Hosted checks on 11 October passed all nine property-draft
+  regression cases, including invalid input and shared views, while the complete
+  app check still failed separately. Neither result establishes full release
+  readiness. See the [acceptance record](../alpha/CAPABILITY_COVERAGE.md), which
+  retains the [build37 failure](../alpha/CAPABILITY_COVERAGE.md#current37-native-checks--11-october).
 - The **Code** workspace edits FNX and supported JSON sources. Saving valid
   source updates the canvas; invalid drafts preserve the last valid file and
   scene. Embedded Find searches the active FNX/JSON editor; **Discard draft**
@@ -563,8 +565,12 @@ by automatic continuations, retries, fallback and automatic compaction. Reaching
 the limit stops the turn with a visible message while preserving completed work;
 a new user turn gets a fresh limit. Manual compaction, title generation, tools,
 subagents and provider-internal retries are outside this limit. This is not a
-dollar or token limit. The nine new automated regressions and matching installed
-app behavior remain unverified; production Agent acceptance is still open.
+dollar or token limit. Hosted checks on 11 October passed the nine request-limit
+regressions; the complete app check still failed separately. Paid native Agent
+behavior remains unverified. A positive account balance does not reserve the
+full turn's potential cost, and safe billing of repeated chat requests is not
+established. See the [coverage report](../alpha/CAPABILITY_COVERAGE.md) for the
+separate test and production limits.
 
 There are two distinct MCP directions:
 
@@ -594,9 +600,10 @@ Implementation: [account and billing UI](../../crates/zed/src/zed/settings_modal
 
 ## Boundaries
 
-Node-graph, generic AI-artifact and embed node types exist in the format, but the
-canvas renderer currently draws placeholders for those types. A 3D node has a
-renderer hook; this inventory does not establish a complete shipped 3D editor.
+Node-graph, 3D, generic AI-artifact and embed node types exist in the format, but
+the canvas renderer currently draws placeholders for those types. The 3D card
+shows a studio cube, not the stored model payload. Their properties entries open
+the shared inspector, not dedicated content editors.
 Existing 3D payloads and assets are preserved when unrelated canvas changes are
 saved and reopened. Neither storage support nor a node enum constitutes a
 finished user workflow.

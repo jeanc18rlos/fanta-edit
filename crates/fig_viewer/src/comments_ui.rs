@@ -2124,6 +2124,29 @@ mod tests {
         });
         let view = window.entity(cx).expect("view");
         let mut visual = VisualTestContext::from_window(window.into(), cx);
+        let exposed_canvas_position = |visual: &mut VisualTestContext| {
+            let canvas = visual.debug_bounds("fig-container").expect("canvas");
+            let position = gpui::point(canvas.left() + px(2.), canvas.center().y);
+            assert!(canvas.contains(&position));
+            for selector in [
+                "fanta-comment-composer",
+                "fanta-comment-thread",
+                "fanta-comment-preview",
+                "file-inspector-floating-card",
+                "fanta-layers-sidebar",
+                "properties-inspector-floating-card",
+                "fanta-inspector-overlay",
+                "fanta-canvas-toolbar",
+            ] {
+                if let Some(bounds) = visual.debug_bounds(selector) {
+                    assert!(
+                        !bounds.contains(&position),
+                        "canvas input point {position:?} is covered by {selector}: {bounds:?}"
+                    );
+                }
+            }
+            position
+        };
         visual.simulate_resize(size(px(1_200.), px(800.)));
         visual.update(|window, cx| window.draw(cx).clear());
 
@@ -2264,9 +2287,9 @@ mod tests {
                     );
                 });
             }
-            let canvas = visual.debug_bounds("fig-container").expect("canvas");
+            let position = exposed_canvas_position(&mut visual);
             visual.simulate_event(gpui::ScrollWheelEvent {
-                position: gpui::point(canvas.left() + px(2.), canvas.top() + px(2.)),
+                position,
                 delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-20.))),
                 ..Default::default()
             });
@@ -2277,11 +2300,8 @@ mod tests {
                 );
             });
         }
-        let canvas = visual.debug_bounds("fig-container").expect("canvas");
-        visual.simulate_click(
-            gpui::point(canvas.left() + px(2.), canvas.top() + px(2.)),
-            gpui::Modifiers::none(),
-        );
+        let position = exposed_canvas_position(&mut visual);
+        visual.simulate_click(position, gpui::Modifiers::none());
         item.read_with(&visual, |item, _| {
             let document = item.document().expect("document");
             assert!(

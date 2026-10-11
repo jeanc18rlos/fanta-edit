@@ -4,9 +4,9 @@
 **5 October through Sunday 11 October 2026**, Europe/Madrid. The immediate user
 reports included degraded inspector UI, double-clicks with no useful node action,
 failures or missing content, and slow editing on large pages. The user now accepts
-Spectrum performance. The save/close incident remains unexplained, while the
-bounded build37 checks below replace only their matching pending acceptance
-items; they do not close every node or error-recovery journey.
+Spectrum performance. The original save/close incident remains unexplained.
+The latest completed Mac build39 passes the bounded save/close journeys below;
+it does not establish every node, recovery or distribution requirement.
 
 The selected distribution is a **direct-download Mac app**. Final acceptance
 must use the signed, notarized DMG and the app installed from that exact DMG.
@@ -28,6 +28,39 @@ identifies their scope and the remaining acceptance work. Historical evidence in
 recorded there.
 
 ## Current acceptance status
+
+### Latest completed app and successor checks — 11 October
+
+The latest completed internal Mac build39 is exact
+`0732a74ed46f3c3727a9581ab49f89665966b683`. Native focused numeric CmdS,
+valid Close Save, invalid Close Save followed by Discard, and Code-to-Canvas
+keyboard focus pass on the owned fixture. NodeGraph, Model3D, AiArtifact and
+Embed pass hidden-inspector double-click reveal, shared properties-menu entry,
+width Save/Undo/Redo and warm document
+reopen. Restoration preserves geometry and payloads; four explicit identity
+transforms and ordinary save metadata remain. Real specialist payload rendering,
+dedicated editors and cold restart are not
+accepted. Settings search Escape closes the window instead of clearing search;
+General and local MCP-input CmdW correctly close only Settings.
+
+Successor `c46a1b41bcd00222cbdba5e9a1ce450fc0658c10`, tree
+`6310c5050eaa6caa75a7a091b38e25710bbe3c40`, passes release lint and forced-source
+Skia default/Metal compilation and notices. Its canonical
+[Check run](https://github.com/jeanc18rlos/fanta-edit/actions/runs/38120414605)
+and push run both fail overall: 60/63 required names pass, three Settings cases
+are compile-blocked, and the separate comments-card wheel assertion fails.
+All four pane-layout cases and all four scoped save-warning cases actually pass;
+this is automated evidence, with matching native acceptance still pending.
+Mac41 targets this successor and remains packaging-pending at this checkpoint.
+
+Reviewed local corrections replace the unavailable Settings test constructor,
+load the real application keymaps in Settings tests, preserve Input Escape
+through keymap reload, choose exposed canvas coordinates in the comments test,
+and display a completed audio player's known duration. Three new offline audio
+regressions increase the strict required-name gate to 66. These integrated
+changes have formatting and source/static review only; the next hosted run and
+matching Mac app must execute them. No local Cargo run or shipping acceptance
+is claimed. Earlier dated evidence retains its original scope and failures.
 
 ### Current37 native checks — 11 October
 
@@ -325,7 +358,8 @@ jobs are still pending; separate job results must be reviewed before acceptance.
 
 A reviewed local pane-layout candidate uses each pane's available width to size
 or overlay its docks while retaining preferred widths, visibility and focused
-Design input. Four new mounted regressions await execution. It is source-only:
+Design input. Three mounted GPUI regressions and one pure layout-policy test
+await execution. It is source-only:
 the observed split-pane clipping remains a native release gap, and widths below
 the combined layout budget do not imply simultaneous visible minimums.
 

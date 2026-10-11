@@ -1253,15 +1253,12 @@ mod tests {
     ) -> (gpui::AnyWindowHandle, &mut gpui::VisualTestContext) {
         cx.update(|cx| {
             assets::Assets.load_test_fonts(cx);
-            let settings_store = SettingsStore::test(cx);
+            let settings_store = SettingsStore::new(cx, &settings::default_settings());
             cx.set_global(settings_store);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
             gpui_component::init(cx);
             fanta_gpui::init(cx);
-            cx.bind_keys([
-                gpui::KeyBinding::new("cmd-w", workspace::CloseWindow, Some("SettingsWindow")),
-                gpui::KeyBinding::new("escape", workspace::CloseWindow, Some("SettingsWindow")),
-            ]);
+            crate::zed::reload_keymaps(cx, Vec::new());
             cx.on_action(|_: &workspace::CloseWindow, cx| Workspace::close_global(cx));
         });
         let other_window = {
@@ -1335,6 +1332,13 @@ mod tests {
                 .any(|context| context.contains("Input"))
         }));
         cx.simulate_input("unmatched search text");
+        assert!(cx.debug_bounds("settings-row-shortcut-fixture").is_none());
+        cx.simulate_keystrokes("escape");
+        assert_eq!(cx.read(|cx| cx.windows().len()), 2);
+        assert!(cx.debug_bounds("settings-row-shortcut-fixture").is_some());
+        cx.update(|_, cx| crate::zed::reload_keymaps(cx, Vec::new()));
+        cx.run_until_parked();
+        cx.simulate_input("unmatched after keymap reload");
         assert!(cx.debug_bounds("settings-row-shortcut-fixture").is_none());
         cx.simulate_keystrokes("escape");
         assert_eq!(cx.read(|cx| cx.windows().len()), 2);

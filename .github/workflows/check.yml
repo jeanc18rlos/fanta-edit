@@ -102,7 +102,10 @@ jobs:
                   "pane_layout_reserves_canvas_without_changing_hidden_panel_preferences",
                   "pane_layout_measures_the_pane_and_restores_wide_sidebars",
                   "pane_layout_preserves_valid_property_input_across_compaction",
-                  "pane_layout_preserves_invalid_property_input_across_compaction"
+                  "pane_layout_preserves_invalid_property_input_across_compaction",
+                  "audio_preview_completed_player_reaches_known_duration",
+                  "audio_preview_paused_and_seeked_player_keeps_incomplete_position",
+                  "audio_preview_close_resets_completed_position"
               ],
               "workspace": [
                   "test_close_window_reports_save_failure_and_retries",
@@ -130,7 +133,7 @@ jobs:
                   actual = [(full_name, status) for full_name, status in tests if full_name.rsplit("::", 1)[-1] == name]
                   checks[label][name] = {"actual": actual, "passed": len(actual) == 1 and actual[0][1] == "ok"}
           passed = all(stage_checks.values()) and all(result["passed"] for group in checks.values() for result in group.values())
-          report = {"passed": passed, "required_count": 33, "stages": stage_checks, "groups": checks,
+          report = {"passed": passed, "required_count": 36, "stages": stage_checks, "groups": checks,
                     "scope": "Actual full-suite offline editor/workspace execution; the separate30 Agent/ACP/Settings gate remains required. No native, GPU, service or performance acceptance."}
           (output / "required-core-regressions.json").write_text(json.dumps(report, indent=2) + "\n")
           print(json.dumps(report))
