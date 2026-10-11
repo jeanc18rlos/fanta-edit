@@ -8305,7 +8305,7 @@ mod tests {
                     _ => None,
                 })
                 .expect("completed tool retained");
-            assert_eq!(completed.status, ToolCallStatus::Completed);
+            assert!(matches!(completed.status, ToolCallStatus::Completed));
             assert_eq!(
                 completed.raw_output,
                 Some(serde_json::json!({"preserved": true}))
@@ -8419,10 +8419,10 @@ mod tests {
                 Some(current_turn)
             );
             assert!(!thread.had_error());
-            assert_eq!(
+            assert!(matches!(
                 thread.tool_call(&tool_id).expect("current tool").1.status,
                 ToolCallStatus::InProgress
-            );
+            ));
             let compaction = thread
                 .entries()
                 .iter()

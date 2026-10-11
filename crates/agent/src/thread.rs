@@ -3046,7 +3046,7 @@ impl Thread {
             if continuing_after_output_limit && let Some(message) = request.messages.last_mut() {
                 message.content = vec![OUTPUT_LIMIT_CONTINUATION_PROMPT.into()];
             }
-            if Self::claim_turn_request(&mut requests_remaining, &cancellation_rx)?.is_break() {
+            if Self::claim_turn_request(&mut requests_remaining, &mut cancellation_rx)?.is_break() {
                 return Ok(());
             }
             telemetry::event!(
@@ -3643,9 +3643,9 @@ impl Thread {
 
     fn claim_turn_request(
         requests_remaining: &mut usize,
-        cancellation_rx: &watch::Receiver<bool>,
+        cancellation_receiver: &mut watch::Receiver<bool>,
     ) -> Result<ControlFlow<()>> {
-        if *cancellation_rx.borrow() {
+        if *cancellation_receiver.borrow() {
             return Ok(ControlFlow::Break(()));
         }
         if *requests_remaining == 0 {
@@ -3658,7 +3658,7 @@ impl Thread {
     async fn perform_compaction_if_needed(
         this: &WeakEntity<Self>,
         event_stream: &ThreadEventStream,
-        cancellation_rx: watch::Receiver<bool>,
+        mut cancellation_rx: watch::Receiver<bool>,
         requests_remaining: &mut usize,
         cx: &mut AsyncApp,
     ) -> Result<ControlFlow<()>> {
@@ -3678,7 +3678,7 @@ impl Thread {
             return Ok(ControlFlow::Continue(()));
         };
 
-        if Self::claim_turn_request(requests_remaining, &cancellation_rx)?.is_break() {
+        if Self::claim_turn_request(requests_remaining, &mut cancellation_rx)?.is_break() {
             return Ok(ControlFlow::Break(()));
         }
         let result = Self::stream_compaction(
@@ -8738,11 +8738,11 @@ mod tests {
         assert!(model.pending_completions().is_empty());
         assert!(thread.read_with(cx, |thread, _| thread.running_turn.is_none()));
         assert_budget_stop(events, acp::StopReason::Cancelled).await;
-        let (mut sender, receiver) = watch::channel(false);
+        let (mut sender, mut receiver) = watch::channel(false);
         sender.send(true).expect("cancellation receiver");
         let mut requests_remaining = 0;
         assert!(
-            Thread::claim_turn_request(&mut requests_remaining, &receiver)
+            Thread::claim_turn_request(&mut requests_remaining, &mut receiver)
                 .expect("cancellation precedes exhaustion")
                 .is_break()
         );

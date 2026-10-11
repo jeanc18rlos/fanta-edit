@@ -143,6 +143,19 @@ draft tests and its full hosted checks; it remains separate from app acceptance.
 The candidate additionally restores the Settings-window key context, with three
 default-feature keyboard regressions, and adds a shared 64-dispatch native Agent
 turn limit, with seven Agent and two ACP regressions. Those tests are unexecuted.
+At the next combined head `534d3a6aabcd219513d11c626aa38eae05e71482`,
+main Check and Store compilation and both release-lint configurations fail with
+`E0596` at `agent/thread.rs:3648`: the watch receiver's `borrow` API requires a
+mutable reference. The 25 core regressions do not execute on this head. The
+separate default-feature job also fails compilation: Agent-dependent commands
+report `E0596`, and ACP test builds report `E0369` because two new assertions
+compare `ToolCallStatus`, which has no `PartialEq` implementation. None of its
+30 required tests executes. Narrow corrections pass the actual receiver by
+mutable reference and assert the same ACP status variants with `matches!`;
+source review and formatting do not establish corrected compilation or test
+execution. The 13 editor test failures on `b2804d58` remain recorded above.
+No new fix is installed in Current37.
+
 The graphics-generator backport retains Skia 0.84 and its original MIT license;
 fresh forced-source default/Metal builds and actual bundled notices remain
 required. A normal prebuilt lint pass does not establish that fallback works.
