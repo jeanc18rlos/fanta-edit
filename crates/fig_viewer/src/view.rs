@@ -5848,6 +5848,7 @@ impl FigView {
         let item = self.item.read(cx);
         item.project_root().is_some()
             && item.is_dirty()
+            && !item.unchanged_autosave_failed()
             && !item.has_conflict()
             && !item.external_reconciliation_pending()
             && !item.content_preview_active()
@@ -12011,6 +12012,338 @@ mod tests {
                 "a successful save clears the report"
             )
         });
+    }
+
+    struct AutosaveDirectoryFault {
+        permissions: Vec<(std::path::PathBuf, std::fs::Permissions)>,
+    }
+
+    impl AutosaveDirectoryFault {
+        fn apply(root: &std::path::Path) -> Result<Self> {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fn collect(
+                directory: &std::path::Path,
+                permissions: &mut Vec<(std::path::PathBuf, std::fs::Permissions)>,
+            ) -> Result<()> {
+                permissions.push((
+                    directory.to_path_buf(),
+                    std::fs::metadata(directory)?.permissions(),
+                ));
+                for entry in std::fs::read_dir(directory)? {
+                    let entry = entry?;
+                    let kind = entry.file_type()?;
+                    anyhow::ensure!(!kind.is_symlink(), "unexpected symlink in save fixture");
+                    if kind.is_dir() {
+                        collect(&entry.path(), permissions)?;
+                    }
+                }
+                Ok(())
+            }
+            let mut fault = Self {
+                permissions: Vec::new(),
+            };
+            collect(root, &mut fault.permissions)?;
+            for (directory, permissions) in &fault.permissions {
+                std::fs::set_permissions(
+                    directory,
+                    std::fs::Permissions::from_mode(permissions.mode() & !0o222),
+                )?;
+            }
+            Ok(fault)
+        }
+
+        fn restore(&mut self) -> Result<()> {
+            for (directory, permissions) in &self.permissions {
+                std::fs::set_permissions(directory, permissions.clone())?;
+            }
+            self.permissions.clear();
+            Ok(())
+        }
+    }
+
+    impl Drop for AutosaveDirectoryFault {
+        fn drop(&mut self) {
+            for (directory, permissions) in &self.permissions {
+                if let Err(error) = std::fs::set_permissions(directory, permissions.clone()) {
+                    log::error!(
+                        "restoring save fixture {} failed: {error}",
+                        directory.display()
+                    );
+                }
+            }
+        }
+    }
+
+    fn autosave_project_files(
+        root: &std::path::Path,
+    ) -> Result<BTreeMap<std::path::PathBuf, Vec<u8>>> {
+        fn collect(
+            root: &std::path::Path,
+            directory: &std::path::Path,
+            files: &mut BTreeMap<std::path::PathBuf, Vec<u8>>,
+        ) -> Result<()> {
+            for entry in std::fs::read_dir(directory)? {
+                let entry = entry?;
+                let kind = entry.file_type()?;
+                anyhow::ensure!(!kind.is_symlink(), "unexpected symlink in save fixture");
+                if kind.is_dir() {
+                    collect(root, &entry.path(), files)?;
+                } else {
+                    files.insert(
+                        entry.path().strip_prefix(root)?.to_path_buf(),
+                        std::fs::read(entry.path())?,
+                    );
+                }
+            }
+            Ok(())
+        }
+        let mut files = BTreeMap::new();
+        collect(root, root, &mut files)?;
+        Ok(files)
+    }
+
+    fn assert_autosave_persisted_draft(
+        root: &std::path::Path,
+        item: &Entity<FigItem>,
+        cx: &TestAppContext,
+    ) -> Result<()> {
+        let (persisted, assets) = fanta_format::read_project_tree(root)?;
+        item.read_with(cx, |item, _| -> Result<()> {
+            let document = item.document.ready().context("ready save fixture")?;
+            assert_eq!(
+                serde_json::to_value(&persisted.scene)?,
+                serde_json::to_value(&document.doc.scene)?
+            );
+            assert_eq!(&assets, document.raw_assets.as_ref());
+            Ok(())
+        })
+    }
+
+    fn settle_autosave_and_resync(cx: &mut TestAppContext) {
+        // Advance several separate deadlines so the resync's Edited event can
+        // expose a re-armed debounce, rather than only testing the first timer.
+        for _ in 0..4 {
+            cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+            cx.run_until_parked();
+        }
+    }
+
+    #[gpui::test]
+    async fn unchanged_failed_autosave_stays_dirty_without_repeated_writes(
+        cx: &mut TestAppContext,
+    ) {
+        let result: Result<()> = async {
+            let (_directory, root, item, view) = autosave_fixture(cx).await;
+            let baseline = fanta_format::read_project_tree(&root)?.0;
+            item.update(cx, |item, _| item.set_merge_base_for_test(baseline));
+            let files = autosave_project_files(&root)?;
+            let mut fault = AutosaveDirectoryFault::apply(&root)?;
+            add_rect(&item, cx);
+            settle_autosave_and_resync(cx);
+            let notice = view.read_with(cx, |view, _| view.reported_save_failure.clone());
+            assert!(
+                notice
+                    .as_ref()
+                    .is_some_and(|error| error.to_ascii_lowercase().contains("permission denied"))
+            );
+            item.read_with(cx, |item, _| {
+                assert_eq!(item.save_attempts_for_test(), 1);
+                assert!(item.is_dirty());
+                assert!(!item.external_reconciliation_pending());
+                assert!(!item.has_conflict());
+            });
+            assert_eq!(autosave_project_files(&root)?, files);
+            fault.restore()?;
+            settle_autosave_and_resync(cx);
+            item.read_with(cx, |item, _| {
+                assert_eq!(
+                    item.save_attempts_for_test(),
+                    1,
+                    "permission recovery alone does not retry"
+                );
+                assert!(item.is_dirty());
+            });
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.reported_save_failure, notice);
+                assert!(view.autosave_task.is_none());
+            });
+            assert_eq!(autosave_project_files(&root)?, files);
+            Ok(())
+        }
+        .await;
+        result.expect("an unchanged failed autosave retains its draft and notice without looping");
+    }
+
+    #[gpui::test]
+    async fn explicit_save_retries_the_unchanged_failed_autosave(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            let (_directory, root, item, view) = autosave_fixture(cx).await;
+            let baseline = fanta_format::read_project_tree(&root)?.0;
+            item.update(cx, |item, _| item.set_merge_base_for_test(baseline));
+            let files = autosave_project_files(&root)?;
+            let mut fault = AutosaveDirectoryFault::apply(&root)?;
+            add_rect(&item, cx);
+            settle_autosave_and_resync(cx);
+            let error = view
+                .update(cx, |view, cx| view.save_document(cx))
+                .await
+                .expect_err("explicit retry still reaches the read-only directory");
+            assert!(error.chain().any(|error| {
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+            }));
+            settle_autosave_and_resync(cx);
+            assert_eq!(
+                item.read_with(cx, |item, _| item.save_attempts_for_test()),
+                2
+            );
+            assert_eq!(autosave_project_files(&root)?, files);
+            assert!(view.read_with(cx, |view, _| view.reported_save_failure.is_some()));
+            fault.restore()?;
+            view.update(cx, |view, cx| view.save_document(cx)).await?;
+            cx.run_until_parked();
+            assert_eq!(
+                item.read_with(cx, |item, _| item.save_attempts_for_test()),
+                3
+            );
+            assert!(!item.read_with(cx, |item, _| item.is_dirty()));
+            assert!(view.read_with(cx, |view, _| view.reported_save_failure.is_none()));
+            assert_eq!(fanta_format::read_project_tree(&root)?.0.scene.len(), 2);
+            assert_autosave_persisted_draft(&root, &item, cx)?;
+            add_rect(&item, cx);
+            settle_autosave_and_resync(cx);
+            assert_eq!(
+                item.read_with(cx, |item, _| item.save_attempts_for_test()),
+                4
+            );
+            assert!(!item.read_with(cx, |item, _| item.is_dirty()));
+            assert_eq!(fanta_format::read_project_tree(&root)?.0.scene.len(), 3);
+            assert_autosave_persisted_draft(&root, &item, cx)?;
+            Ok(())
+        }
+        .await;
+        result.expect("explicit Save bypasses the failure stamp and success restores autosaving");
+    }
+
+    #[gpui::test]
+    async fn new_edit_retries_after_an_autosave_failure(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            let (_directory, root, item, view) = autosave_fixture(cx).await;
+            let baseline = fanta_format::read_project_tree(&root)?.0;
+            item.update(cx, |item, _| item.set_merge_base_for_test(baseline));
+            let mut fault = AutosaveDirectoryFault::apply(&root)?;
+            add_rect(&item, cx);
+            settle_autosave_and_resync(cx);
+            assert_eq!(
+                item.read_with(cx, |item, _| item.save_attempts_for_test()),
+                1
+            );
+            assert!(view.read_with(cx, |view, _| view.reported_save_failure.is_some()));
+            fault.restore()?;
+            add_rect(&item, cx);
+            settle_autosave_and_resync(cx);
+            assert_eq!(
+                item.read_with(cx, |item, _| item.save_attempts_for_test()),
+                2
+            );
+            assert!(!item.read_with(cx, |item, _| item.is_dirty()));
+            assert!(view.read_with(cx, |view, _| view.reported_save_failure.is_none()));
+            assert_eq!(fanta_format::read_project_tree(&root)?.0.scene.len(), 3);
+            assert_autosave_persisted_draft(&root, &item, cx)?;
+            Ok(())
+        }
+        .await;
+        result.expect("a new committed edit remains eligible for automatic persistence");
+    }
+
+    #[gpui::test]
+    async fn newer_edit_during_failed_autosave_remains_eligible(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            let (_directory, root, item, view) = autosave_fixture(cx).await;
+            let baseline = fanta_format::read_project_tree(&root)?.0;
+            item.update(cx, |item, _| item.set_merge_base_for_test(baseline));
+            let mut fault = AutosaveDirectoryFault::apply(&root)?;
+            let (arrived, resume) = item.read_with(cx, |item, _| item.pause_next_save_for_test());
+            add_rect(&item, cx);
+            cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+            cx.run_until_parked();
+            arrived.await?;
+            add_rect(&item, cx);
+            resume.send(()).expect("resume the older snapshot's writer");
+            cx.run_until_parked();
+            assert_eq!(
+                item.read_with(cx, |item, _| item.save_attempts_for_test()),
+                1
+            );
+            assert!(view.read_with(cx, |view, _| {
+                view.reported_save_failure
+                    .as_ref()
+                    .is_some_and(|error| error.to_ascii_lowercase().contains("permission denied"))
+            }));
+            assert_eq!(fanta_format::read_project_tree(&root)?.0.scene.len(), 1);
+            fault.restore()?;
+            settle_autosave_and_resync(cx);
+            assert_eq!(
+                item.read_with(cx, |item, _| item.save_attempts_for_test()),
+                2
+            );
+            assert!(!item.read_with(cx, |item, _| item.is_dirty()));
+            assert!(view.read_with(cx, |view, _| view.reported_save_failure.is_none()));
+            assert_eq!(fanta_format::read_project_tree(&root)?.0.scene.len(), 3);
+            assert_autosave_persisted_draft(&root, &item, cx)?;
+            Ok(())
+        }
+        .await;
+        result.expect("an older failed snapshot must not suppress newer in-flight edits");
+    }
+
+    #[gpui::test]
+    async fn queued_identical_autosave_is_suppressed_after_the_first_failure(
+        cx: &mut TestAppContext,
+    ) {
+        let result: Result<()> = async {
+            let (_directory, root, item, _view) = autosave_fixture(cx).await;
+            let baseline = fanta_format::read_project_tree(&root)?.0;
+            item.update(cx, |item, _| item.set_merge_base_for_test(baseline));
+            let files = autosave_project_files(&root)?;
+            let mut fault = AutosaveDirectoryFault::apply(&root)?;
+            add_rect(&item, cx);
+            let (arrived, resume) = item.read_with(cx, |item, _| item.pause_next_save_for_test());
+            let first = item.update(cx, |item, cx| item.save(SaveKind::Auto, cx));
+            arrived.await?;
+            let queued = item.update(cx, |item, cx| item.save(SaveKind::Auto, cx));
+            add_rect(&item, cx);
+            resume.send(()).expect("resume the first automatic writer");
+            let error = first
+                .await
+                .expect_err("the first write reaches the denied directory");
+            assert!(error.chain().any(|error| {
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+            }));
+            assert!(queued.await?.is_none());
+            assert_eq!(
+                item.read_with(cx, |item, _| item.save_attempts_for_test()),
+                1
+            );
+            assert!(item.read_with(cx, |item, _| item.is_dirty()));
+            assert_eq!(autosave_project_files(&root)?, files);
+            fault.restore()?;
+            settle_autosave_and_resync(cx);
+            assert_eq!(
+                item.read_with(cx, |item, _| item.save_attempts_for_test()),
+                2
+            );
+            assert!(!item.read_with(cx, |item, _| item.is_dirty()));
+            assert_eq!(fanta_format::read_project_tree(&root)?.0.scene.len(), 3);
+            assert_autosave_persisted_draft(&root, &item, cx)?;
+            Ok(())
+        }
+        .await;
+        result.expect("a queued duplicate must not enter the writer after an unchanged failure");
     }
 
     /// A drag longer than the debounce must not have an intermediate position

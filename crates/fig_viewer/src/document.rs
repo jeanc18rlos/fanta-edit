@@ -61,6 +61,8 @@ impl ProjectReads {
 struct ProjectWrites {
     state: Mutex<ProjectWriteState>,
     #[cfg(test)]
+    started: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
     next_save_barrier: Mutex<Option<SaveTestBarrier>>,
 }
 
@@ -213,6 +215,7 @@ pub struct FigItem {
     pub(crate) document: FigDocumentState,
     project_root: Option<PathBuf>,
     dirty: bool,
+    failed_autosave: Option<(PathBuf, u64)>,
     /// Dirty state before the first transient preview frame. Cleared by a
     /// committed edit; canceling a preview restores it so opening and closing
     /// an inspector gesture without a change does not dirty the document.
@@ -1543,6 +1546,7 @@ impl project::ProjectItem for FigItem {
                     },
                     project_root,
                     dirty: false,
+                    failed_autosave: None,
                     content_preview: None,
                     external_change_pending: false,
                     pending_external_full_reload: false,
@@ -1629,6 +1633,27 @@ impl FigItem {
 
     pub fn has_ready_document(&self) -> bool {
         self.document.ready().is_some()
+    }
+
+    pub(crate) fn unchanged_autosave_failed(&self) -> bool {
+        self.document.ready().is_some_and(|document| {
+            self.autosave_failed_for(self.project_root.as_deref(), document.render_generation())
+        })
+    }
+
+    fn autosave_failed_for(&self, root: Option<&Path>, generation: u64) -> bool {
+        self.failed_autosave
+            .as_ref()
+            .is_some_and(|(failed_root, failed_generation)| {
+                root == Some(failed_root.as_path()) && generation == *failed_generation
+            })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn save_attempts_for_test(&self) -> usize {
+        self.project_writes
+            .started
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub(crate) fn has_unpersisted_source_layout(&self) -> bool {
@@ -2943,6 +2968,10 @@ impl FigItem {
             return Task::ready(Err(anyhow::anyhow!("the document is still loading")));
         };
 
+        if kind == SaveKind::Auto && self.unchanged_autosave_failed() {
+            return Task::ready(Ok(None));
+        }
+
         let mut changed_artifacts = changed_artifact_ids(
             &document.doc,
             self.merge_base.as_ref(),
@@ -2981,7 +3010,7 @@ impl FigItem {
             .take();
         cx.spawn(async move |this, cx| {
             write_lease.wait_for_turn().await;
-            let (target, materializing, write_cache, workspace_session) = this.update(cx, |this, _| {
+            let prepared = this.update(cx, |this, _| {
                 anyhow::ensure!(
                     !this.source_edit_locked || computed_source_layout,
                     "the FNX source is dirty; save it through the code workspace before saving the canvas"
@@ -2994,19 +3023,29 @@ impl FigItem {
                     .project_root
                     .clone()
                     .unwrap_or_else(|| available_project_dir(&this.abs_path));
+                // Another view may have queued this same snapshot before the
+                // first failure, even if the live document has since advanced.
+                if kind == SaveKind::Auto
+                    && this.autosave_failed_for(Some(target.as_path()), generation)
+                {
+                    return Ok(None);
+                }
                 anyhow::ensure!(
                     !materializing || !fanta_format::is_project_dir(&target),
                     "a Fanta project already exists at {}; open it directly instead of overwriting it with {}",
                     target.display(),
                     this.abs_path.display()
                 );
-                Ok::<_, anyhow::Error>((
+                Ok::<_, anyhow::Error>(Some((
                     target,
                     materializing,
                     this.write_cache.take().unwrap_or_default(),
                     this.workspace_session.take(),
-                ))
+                )))
             })??;
+            let Some((target, materializing, write_cache, workspace_session)) = prepared else {
+                return Ok(None);
+            };
             // The persisted clone travels through the write and comes back
             // to become the merge base — one clone per save, not two.
             let (result, saved_doc, saved_assets, write_cache, workspace_session) = cx
@@ -3023,6 +3062,11 @@ impl FigItem {
                         if save_barrier.as_ref().is_some_and(|barrier| !barrier.after_write) {
                             save_barrier.take().expect("before-write barrier").wait().await;
                         }
+                        #[cfg(test)]
+                        _write_lease.writes.started.fetch_add(
+                            1,
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
                         let result = (|| -> Result<fanta_format::WriteReport> {
                             if materializing {
                                 let report = write_project_cached_report(
@@ -3113,6 +3157,7 @@ impl FigItem {
             this.update(cx, |this, cx| {
                 this.workspace_session = workspace_session;
                 if let Ok(report) = &result {
+                    this.failed_autosave = None;
                     for path in &report.removed {
                         this.own_write_hashes.remove(path);
                         this.own_write_removed.insert(path.clone());
@@ -3149,6 +3194,13 @@ impl FigItem {
                     }
                     cx.notify();
                 } else if this.project_root.is_some() {
+                    if kind == SaveKind::Auto {
+                        // Resync can emit Edited without changing content. Keep
+                        // that safety path, but don't retry this failed snapshot
+                        // until an edit or an explicit Save. Previews also advance
+                        // this generation; it is not a persisted-byte hash.
+                        this.failed_autosave = Some((target.clone(), generation));
+                    }
                     this.schedule_resync(cx);
                 }
                 this.schedule_watcher_check(cx);
@@ -3264,6 +3316,7 @@ impl FigItem {
                     this.path = manifest_path;
                     this.abs_path = root.join("fanta.json");
                     this.project_root = Some(root.clone());
+                    this.failed_autosave = None;
                     this.merge_base = Some(document);
                     this.last_saved_assets = Some(saved_assets);
                     this.last_saved_scene = Some(scene_watermark);
@@ -3382,6 +3435,7 @@ pub(crate) fn ready_item_with_root_for_test(
         document: FigDocumentState::Ready(FigDocument::from_doc(doc, BTreeMap::new())),
         project_root,
         dirty: false,
+        failed_autosave: None,
         content_preview: None,
         external_change_pending: false,
         pending_external_full_reload: false,
@@ -8966,6 +9020,7 @@ mod tests {
             document: FigDocumentState::Ready(FigDocument::from_doc(doc, BTreeMap::new())),
             project_root,
             dirty: false,
+            failed_autosave: None,
             content_preview: None,
             external_change_pending: false,
             pending_external_full_reload: false,
