@@ -1403,6 +1403,13 @@
     },
   },
   {
+    "context": "SettingsWindow > Input",
+    "use_key_equivalents": true,
+    "bindings": {
+      "escape": "input::Escape",
+    },
+  },
+  {
     "context": "StashDiff > Editor",
     "use_key_equivalents": true,
     "bindings": {

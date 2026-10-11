@@ -25,7 +25,7 @@
 //!
 //! [`node_math`]: crate::node_math
 
-use crate::context::ToolContext;
+use crate::context::{HitTestRefiner, ToolContext};
 use crate::event::{Button, KeyEvent, LogicalKey, ModifierKeys, PointerEvent, ToolEvent};
 use crate::node_math::{
     self, AnchorId, AnchorInfo, HandleSide, closest_point_on_path, enumerate_anchors,
@@ -242,9 +242,14 @@ impl NodeEditTool {
                 return;
             }
         }
-        if let Some(id) =
-            Self::vector_at_screen(ctx.doc, ctx.viewport, ctx.screen_size, ctx.scope(), screen)
-        {
+        if let Some(id) = Self::vector_at_screen_with_refiner(
+            ctx.doc,
+            ctx.viewport,
+            ctx.screen_size,
+            ctx.scope(),
+            screen,
+            ctx.hit_test_refiner,
+        ) {
             if self.target != Some(id) {
                 self.selected.clear();
             }
@@ -260,6 +265,17 @@ impl NodeEditTool {
         scope: Option<NodeId>,
         screen: DVec2,
     ) -> Option<NodeId> {
+        Self::vector_at_screen_with_refiner(doc, viewport, screen_size, scope, screen, None)
+    }
+
+    pub fn vector_at_screen_with_refiner(
+        doc: &Doc,
+        viewport: &Viewport,
+        screen_size: DVec2,
+        scope: Option<NodeId>,
+        screen: DVec2,
+        hit_test_refiner: Option<HitTestRefiner>,
+    ) -> Option<NodeId> {
         let to_world = |point| fanta_canvas::screen_to_world(point, viewport, screen_size);
         let world = to_world(screen);
         let radius = DVec2::splat(SEGMENT_HIT_PX);
@@ -270,6 +286,7 @@ impl NodeEditTool {
         let candidates = doc.scene.rect_query_where(hit_bounds, |id, bounds| {
             bounds.intersects(&hit_bounds)
                 && eligible_selection_target(doc, scope, id)
+                && hit_test_refiner.is_none_or(|refiner| refiner(&doc.scene, id, world))
                 && doc.scene.ancestors_of(id).all(|ancestor| {
                     let NodeData::Group(group) = &ancestor.data else {
                         return true;

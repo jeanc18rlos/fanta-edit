@@ -78,6 +78,7 @@ use uuid::Uuid;
 
 const TOOL_CANCELED_MESSAGE: &str = "Tool canceled by user";
 const MAX_OUTPUT_LIMIT_CONTINUATIONS: usize = 3;
+const MAX_TURN_REQUESTS: usize = 64;
 const OUTPUT_LIMIT_CONTINUATION_PROMPT: &str = "The previous response reached its output limit. Continue the authorized task. Interrupted tool edits have been rolled back; read the affected file before retrying. Use smaller complete write_file calls, or a complete minimal file followed by targeted edit_file calls, so every tool input is valid JSON and every saved FNX file is complete and valid. Preserve user drafts and finish the remaining work with canvas verification.";
 
 const MAX_FANTA_SPEC_BYTES: usize = 64 * 1024;
@@ -1294,6 +1295,8 @@ fn auto_resolve_permission_outcome(
 enum CompletionError {
     #[error("max tokens")]
     MaxTokens,
+    #[error("automatic request limit reached")]
+    MaxTurnRequests,
     #[error("refusal")]
     Refusal,
     #[error(transparent)]
@@ -2902,6 +2905,9 @@ impl Thread {
                             Ok(CompletionError::MaxTokens) => {
                                 event_stream.send_stop(acp::StopReason::MaxTokens);
                             }
+                            Ok(CompletionError::MaxTurnRequests) => {
+                                event_stream.send_stop(acp::StopReason::MaxTurnRequests);
+                            }
                             Ok(CompletionError::Other(error)) | Err(error) => {
                                 event_stream.send_error(error);
                             }
@@ -2925,6 +2931,7 @@ impl Thread {
         mut cancellation_rx: watch::Receiver<bool>,
         cx: &mut AsyncApp,
     ) -> Result<()> {
+        let mut requests_remaining = MAX_TURN_REQUESTS;
         let mut attempt = 0;
         let mut intent = CompletionIntent::UserPrompt;
         let mut output_limit_continuations = 0;
@@ -2932,10 +2939,17 @@ impl Thread {
         // Set when a refusal fallback occurs so subsequent iterations use the fallback model.
         let mut refusal_fallback_model: Option<Arc<dyn LanguageModel>> = None;
         loop {
+            if *cancellation_rx.borrow() {
+                return Ok(());
+            }
+            if requests_remaining == 0 {
+                return Err(CompletionError::MaxTurnRequests.into());
+            }
             match Self::perform_compaction_if_needed(
                 this,
                 event_stream,
                 cancellation_rx.clone(),
+                &mut requests_remaining,
                 cx,
             )
             .await
@@ -2979,6 +2993,12 @@ impl Thread {
                                             this.pending_compaction_telemetry.as_mut()
                                         {
                                             telemetry.retries += 1;
+                                        }
+                                        if requests_remaining == 0 {
+                                            this.emit_compaction_telemetry_outcome(
+                                                "failed",
+                                                Some(error_message),
+                                            );
                                         }
                                     })?;
                                     continue;
@@ -3025,6 +3045,9 @@ impl Thread {
             })??;
             if continuing_after_output_limit && let Some(message) = request.messages.last_mut() {
                 message.content = vec![OUTPUT_LIMIT_CONTINUATION_PROMPT.into()];
+            }
+            if Self::claim_turn_request(&mut requests_remaining, &mut cancellation_rx)?.is_break() {
+                return Ok(());
             }
             telemetry::event!(
                 "Agent Thread Completion",
@@ -3618,10 +3641,25 @@ impl Thread {
         Ok(ControlFlow::Continue(()))
     }
 
+    fn claim_turn_request(
+        requests_remaining: &mut usize,
+        cancellation_receiver: &mut watch::Receiver<bool>,
+    ) -> Result<ControlFlow<()>> {
+        if *cancellation_receiver.borrow() {
+            return Ok(ControlFlow::Break(()));
+        }
+        if *requests_remaining == 0 {
+            return Err(CompletionError::MaxTurnRequests.into());
+        }
+        *requests_remaining -= 1;
+        Ok(ControlFlow::Continue(()))
+    }
+
     async fn perform_compaction_if_needed(
         this: &WeakEntity<Self>,
         event_stream: &ThreadEventStream,
-        cancellation_rx: watch::Receiver<bool>,
+        mut cancellation_rx: watch::Receiver<bool>,
+        requests_remaining: &mut usize,
         cx: &mut AsyncApp,
     ) -> Result<ControlFlow<()>> {
         let Some((model, request, insertion_ix)) = this.update(cx, |this, cx| {
@@ -3640,7 +3678,10 @@ impl Thread {
             return Ok(ControlFlow::Continue(()));
         };
 
-        Self::stream_compaction(
+        if Self::claim_turn_request(requests_remaining, &mut cancellation_rx)?.is_break() {
+            return Ok(ControlFlow::Break(()));
+        }
+        let result = Self::stream_compaction(
             this,
             event_stream,
             cancellation_rx,
@@ -3649,7 +3690,16 @@ impl Thread {
             CompactionInsertion::Auto { insertion_ix },
             cx,
         )
-        .await
+        .await?;
+        if result.is_continue() && *requests_remaining == 0 {
+            // No later completion in this turn can report the post-compaction token count.
+            this.update(cx, |this, _| {
+                if let Some(telemetry) = this.pending_compaction_telemetry.take() {
+                    telemetry.emit("succeeded", None, None);
+                }
+            })?;
+        }
+        Ok(result)
     }
 
     async fn stream_compaction(
@@ -8360,6 +8410,518 @@ mod tests {
                 );
             });
         }
+    }
+
+    fn finish_budget_tool_request(
+        model: &FakeLanguageModel,
+        request: &LanguageModelRequest,
+        index: usize,
+        name: &str,
+    ) {
+        model.send_completion_stream_event(
+            request,
+            LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+                id: format!("budget-tool-{index}").into(),
+                name: name.into(),
+                raw_input: "{}".into(),
+                input: json!({}),
+                is_input_complete: true,
+                thought_signature: None,
+            }),
+        );
+        model.send_completion_stream_event(
+            request,
+            LanguageModelCompletionEvent::Stop(StopReason::ToolUse),
+        );
+        model.end_completion_stream(request);
+    }
+
+    async fn assert_budget_stop(
+        mut events: mpsc::UnboundedReceiver<Result<ThreadEvent>>,
+        expected: acp::StopReason,
+    ) {
+        let mut stops = Vec::new();
+        while let Some(event) = events.next().await {
+            if let ThreadEvent::Stop(reason) = event.expect("turn event") {
+                stops.push(reason);
+            }
+        }
+        assert_eq!(stops, vec![expected]);
+    }
+
+    #[gpui::test]
+    async fn test_turn_request_budget_bounds_tool_rounds_and_resets_for_new_user_turn(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+        cx.update(|cx| design_surface::register(Rc::new(TestDesignSurface), cx));
+        let events = thread
+            .update(cx, |thread, cx| {
+                thread.set_profile(AgentProfileId(builtin_profiles::PLAN.into()), cx);
+                thread.set_model(model.clone(), cx);
+                thread.add_tool(DesignStateTool);
+                thread.send(ClientUserMessageId::new(), vec!["Inspect repeatedly"], cx)
+            })
+            .expect("turn");
+        for index in 0..MAX_TURN_REQUESTS {
+            cx.run_until_parked();
+            let requests = model.pending_completions();
+            assert_eq!(requests.len(), 1);
+            let request = requests.first().expect("bounded request");
+            finish_budget_tool_request(
+                &model,
+                request,
+                index,
+                if index % 2 == 0 {
+                    "design_state"
+                } else {
+                    "unknown_tool"
+                },
+            );
+        }
+        cx.run_until_parked();
+        assert!(model.pending_completions().is_empty());
+        thread.read_with(cx, |thread, _| {
+            assert!(thread.running_turn.is_none());
+            let mut paired = 0;
+            for message in &thread.messages {
+                if let Message::Agent(message) = message.as_ref() {
+                    for content in &message.content {
+                        if let AgentMessageContent::ToolUse(tool) = content {
+                            let result = message.tool_results.get(&tool.id).expect("paired tool");
+                            assert_eq!(result.tool_name, tool.name);
+                            assert_eq!(result.is_error, tool.name.as_ref() == "unknown_tool");
+                            paired += 1;
+                        }
+                    }
+                }
+            }
+            assert_eq!(paired, MAX_TURN_REQUESTS);
+        });
+        assert_budget_stop(events, acp::StopReason::MaxTurnRequests).await;
+
+        let events = thread
+            .update(cx, |thread, cx| {
+                thread.send(ClientUserMessageId::new(), vec!["Continue explicitly"], cx)
+            })
+            .expect("new user turn");
+        for index in 0..MAX_TURN_REQUESTS {
+            cx.run_until_parked();
+            let request = model.pending_completions().pop().expect("fresh budget");
+            if index + 1 == MAX_TURN_REQUESTS {
+                model.send_completion_stream_text_chunk(&request, "Finished at the boundary.");
+                model.send_completion_stream_event(
+                    &request,
+                    LanguageModelCompletionEvent::Stop(StopReason::EndTurn),
+                );
+                model.end_completion_stream(&request);
+            } else {
+                finish_budget_tool_request(&model, &request, index, "unknown_tool");
+            }
+        }
+        cx.run_until_parked();
+        assert!(model.pending_completions().is_empty());
+        assert!(thread.read_with(cx, |thread, _| thread.running_turn.is_none()));
+        assert_budget_stop(events, acp::StopReason::EndTurn).await;
+    }
+
+    #[gpui::test]
+    async fn test_turn_request_budget_survives_retry_and_output_counter_resets(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+        let events = thread
+            .update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread.send(
+                    ClientUserMessageId::new(),
+                    vec!["Continue through transient failures"],
+                    cx,
+                )
+            })
+            .expect("turn");
+        for index in 0..MAX_TURN_REQUESTS {
+            cx.run_until_parked();
+            let request = model.pending_completions().pop().expect("bounded request");
+            match index % 3 {
+                0 => {
+                    model.send_completion_stream_error(
+                        &request,
+                        LanguageModelCompletionError::UpstreamProviderError {
+                            message: "Transient service outage".into(),
+                            status: http_client::StatusCode::SERVICE_UNAVAILABLE,
+                            retry_after: Some(Duration::ZERO),
+                        },
+                    );
+                    model.end_completion_stream(&request);
+                }
+                1 => {
+                    model.send_completion_stream_event(
+                        &request,
+                        LanguageModelCompletionEvent::Stop(StopReason::MaxTokens),
+                    );
+                    model.end_completion_stream(&request);
+                }
+                _ => finish_budget_tool_request(&model, &request, index, "unknown_tool"),
+            }
+        }
+        cx.run_until_parked();
+        assert!(model.pending_completions().is_empty());
+        assert!(thread.read_with(cx, |thread, _| thread.running_turn.is_none()));
+        assert_budget_stop(events, acp::StopReason::MaxTurnRequests).await;
+    }
+
+    #[gpui::test]
+    async fn test_turn_request_budget_bounds_refusal_fallback_cycles(cx: &mut TestAppContext) {
+        use language_model::fake_provider::FakeLanguageModelProvider;
+        let (thread, _) = setup_thread_for_test(cx).await;
+        let first = Arc::new(
+            FakeLanguageModel::with_id_and_thinking("fake", "first", "First", false)
+                .with_refusal_fallback("second"),
+        );
+        let second = Arc::new(
+            FakeLanguageModel::with_id_and_thinking("fake", "second", "Second", false)
+                .with_refusal_fallback("first"),
+        );
+        cx.update(|cx| {
+            language_model::init(cx);
+            LanguageModelRegistry::global(cx).update(cx, |registry, cx| {
+                registry.register_provider(
+                    Arc::new(
+                        FakeLanguageModelProvider::default()
+                            .with_models(vec![first.clone(), second.clone()]),
+                    ),
+                    cx,
+                );
+            });
+        });
+        let events = thread
+            .update(cx, |thread, cx| {
+                thread.set_model(first.clone(), cx);
+                thread.send(ClientUserMessageId::new(), vec!["Use a fallback"], cx)
+            })
+            .expect("turn");
+        for index in 0..MAX_TURN_REQUESTS {
+            cx.run_until_parked();
+            let (model, other) = if index % 2 == 0 {
+                (&first, &second)
+            } else {
+                (&second, &first)
+            };
+            assert!(other.pending_completions().is_empty());
+            let request = model.pending_completions().pop().expect("fallback request");
+            model.send_completion_stream_event(
+                &request,
+                LanguageModelCompletionEvent::Stop(StopReason::Refusal),
+            );
+            model.end_completion_stream(&request);
+        }
+        cx.run_until_parked();
+        assert!(first.pending_completions().is_empty());
+        assert!(second.pending_completions().is_empty());
+        assert!(thread.read_with(cx, |thread, _| thread.running_turn.is_none()));
+        assert_budget_stop(events, acp::StopReason::MaxTurnRequests).await;
+    }
+
+    #[gpui::test]
+    async fn test_turn_request_budget_includes_auto_compaction_and_its_retry(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+        let old_user = ClientUserMessageId::new();
+        thread.update(cx, |thread, cx| {
+            thread.set_model(model.clone(), cx);
+            thread
+                .messages
+                .push(user_text_message(old_user.clone(), "old user"));
+            thread.messages.push(agent_text_message("old assistant"));
+            thread.request_token_usage.insert(
+                old_user,
+                TokenUsage {
+                    input_tokens: 960_000,
+                    ..Default::default()
+                },
+            );
+        });
+        let events = thread
+            .update(cx, |thread, cx| {
+                thread.send(ClientUserMessageId::new(), vec!["Continue the design"], cx)
+            })
+            .expect("turn");
+        for index in 0..2 {
+            cx.run_until_parked();
+            let request = model
+                .pending_completions()
+                .pop()
+                .expect("compaction request");
+            assert_eq!(
+                request.intent,
+                Some(CompletionIntent::ThreadContextSummarization)
+            );
+            if index == 0 {
+                model.send_completion_stream_error(
+                    &request,
+                    LanguageModelCompletionError::UpstreamProviderError {
+                        message: "Transient compaction failure".into(),
+                        status: http_client::StatusCode::SERVICE_UNAVAILABLE,
+                        retry_after: Some(Duration::ZERO),
+                    },
+                );
+            } else {
+                model.send_completion_stream_text_chunk(
+                    &request,
+                    "Preserved summary of completed work.",
+                );
+            }
+            model.end_completion_stream(&request);
+        }
+        for index in 2..MAX_TURN_REQUESTS {
+            cx.run_until_parked();
+            let request = model.pending_completions().pop().expect("main request");
+            assert_ne!(
+                request.intent,
+                Some(CompletionIntent::ThreadContextSummarization)
+            );
+            finish_budget_tool_request(&model, &request, index, "unknown_tool");
+        }
+        cx.run_until_parked();
+        assert!(model.pending_completions().is_empty());
+        thread.read_with(cx, |thread, _| {
+            assert!(thread.running_turn.is_none());
+            assert_eq!(
+                thread
+                    .messages
+                    .iter()
+                    .filter(|message| matches!(message.as_ref(), Message::Compaction(_)))
+                    .count(),
+                1
+            );
+        });
+        assert_budget_stop(events, acp::StopReason::MaxTurnRequests).await;
+    }
+
+    #[gpui::test]
+    async fn test_turn_request_budget_cancellation_wins_at_retry_boundary(cx: &mut TestAppContext) {
+        let (thread, _) = setup_thread_for_test(cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+        let events = thread
+            .update(cx, |thread, cx| {
+                thread.set_model(model.clone(), cx);
+                thread.send(ClientUserMessageId::new(), vec!["Stop at the boundary"], cx)
+            })
+            .expect("turn");
+        for index in 0..MAX_TURN_REQUESTS {
+            cx.run_until_parked();
+            let request = model.pending_completions().pop().expect("bounded request");
+            if index + 1 == MAX_TURN_REQUESTS {
+                model.send_completion_stream_error(
+                    &request,
+                    LanguageModelCompletionError::UpstreamProviderError {
+                        message: "Retry later".into(),
+                        status: http_client::StatusCode::SERVICE_UNAVAILABLE,
+                        retry_after: Some(Duration::from_secs(60)),
+                    },
+                );
+                model.end_completion_stream(&request);
+            } else {
+                finish_budget_tool_request(&model, &request, index, "unknown_tool");
+            }
+        }
+        cx.run_until_parked();
+        assert!(thread.read_with(cx, |thread, _| thread.running_turn.is_some()));
+        thread.update(cx, |thread, cx| thread.cancel(cx)).await;
+        cx.executor().advance_clock(Duration::from_secs(60));
+        cx.run_until_parked();
+        assert!(model.pending_completions().is_empty());
+        assert!(thread.read_with(cx, |thread, _| thread.running_turn.is_none()));
+        assert_budget_stop(events, acp::StopReason::Cancelled).await;
+        let (mut sender, mut receiver) = watch::channel(false);
+        sender.send(true).expect("cancellation receiver");
+        let mut requests_remaining = 0;
+        assert!(
+            Thread::claim_turn_request(&mut requests_remaining, &mut receiver)
+                .expect("cancellation precedes exhaustion")
+                .is_break()
+        );
+    }
+
+    #[gpui::test]
+    async fn test_turn_request_budget_last_slot_compaction_and_cancellation(
+        cx: &mut TestAppContext,
+    ) {
+        for (cancel, fail_compaction) in [(false, false), (true, false), (false, true)] {
+            let (thread, _) = setup_thread_for_test(cx).await;
+            let model = Arc::new(FakeLanguageModel::default());
+            let user_id = ClientUserMessageId::new();
+            let events = thread
+                .update(cx, |thread, cx| {
+                    thread.set_model(model.clone(), cx);
+                    thread.send(user_id.clone(), vec!["Compact at the boundary"], cx)
+                })
+                .expect("turn");
+            for index in 0..MAX_TURN_REQUESTS - 1 {
+                cx.run_until_parked();
+                let request = model.pending_completions().pop().expect("main request");
+                finish_budget_tool_request(&model, &request, index, "unknown_tool");
+            }
+            thread.update(cx, |thread, _| {
+                thread.request_token_usage.insert(
+                    user_id,
+                    TokenUsage {
+                        input_tokens: 960_000,
+                        ..Default::default()
+                    },
+                );
+            });
+            cx.run_until_parked();
+            let request = model
+                .pending_completions()
+                .pop()
+                .expect("last slot compaction");
+            assert_eq!(
+                request.intent,
+                Some(CompletionIntent::ThreadContextSummarization)
+            );
+            if cancel {
+                thread.update(cx, |thread, cx| thread.cancel(cx)).await;
+            } else if fail_compaction {
+                model.send_completion_stream_error(
+                    &request,
+                    LanguageModelCompletionError::UpstreamProviderError {
+                        message: "Final compaction failed".into(),
+                        status: http_client::StatusCode::SERVICE_UNAVAILABLE,
+                        retry_after: Some(Duration::ZERO),
+                    },
+                );
+            } else {
+                model.send_completion_stream_text_chunk(&request, "Preserved completed work.");
+            }
+            model.end_completion_stream(&request);
+            cx.run_until_parked();
+            assert!(
+                model.pending_completions().is_empty(),
+                "compaction must not grant a main request"
+            );
+            thread.read_with(cx, |thread, _| {
+                assert!(thread.running_turn.is_none());
+                assert!(thread.pending_compaction_telemetry.is_none());
+                assert_eq!(
+                    thread
+                        .messages
+                        .iter()
+                        .filter(|message| matches!(message.as_ref(), Message::Compaction(_)))
+                        .count(),
+                    usize::from(!cancel && !fail_compaction)
+                );
+            });
+            assert_budget_stop(
+                events,
+                if cancel {
+                    acp::StopReason::Cancelled
+                } else {
+                    acp::StopReason::MaxTurnRequests
+                },
+            )
+            .await;
+        }
+    }
+
+    #[gpui::test]
+    async fn test_turn_request_budget_exhaustion_preserves_partial_tool_cleanup(
+        cx: &mut TestAppContext,
+    ) {
+        let (thread, _) = setup_thread_for_test(cx).await;
+        let filesystem = fs::FakeFs::new(cx.executor());
+        filesystem
+            .insert_tree("/root", json!({"page.fnx": "<Page />\n"}))
+            .await;
+        let project = Project::test(filesystem, [std::path::Path::new("/root")], cx).await;
+        let model = Arc::new(FakeLanguageModel::default());
+        model.set_supports_streaming_tools(true);
+        let events = thread
+            .update(cx, |thread, cx| {
+                thread.project = project.clone();
+                thread.set_profile(AgentProfileId(builtin_profiles::FULL_ACCESS.into()), cx);
+                thread.set_model(model.clone(), cx);
+                thread.add_tool(WriteFileTool::new(
+                    project.clone(),
+                    cx.weak_entity(),
+                    thread.action_log.clone(),
+                    project.read(cx).languages().clone(),
+                ));
+                thread.send(
+                    ClientUserMessageId::new(),
+                    vec!["Preserve completed work"],
+                    cx,
+                )
+            })
+            .expect("turn");
+        for index in 0..MAX_TURN_REQUESTS - 1 {
+            cx.run_until_parked();
+            let request = model.pending_completions().pop().expect("main request");
+            finish_budget_tool_request(&model, &request, index, "unknown_tool");
+        }
+        cx.run_until_parked();
+        let request = model.pending_completions().pop().expect("last request");
+        let tool_use = LanguageModelToolUse {
+            id: "last-partial-write".into(),
+            name: "write_file".into(),
+            raw_input: "{\"path\":\"root/page.fnx\"".into(),
+            input: json!({"path": "root/page.fnx"}),
+            is_input_complete: false,
+            thought_signature: None,
+        };
+        model.send_completion_stream_event(
+            &request,
+            LanguageModelCompletionEvent::ToolUse(tool_use.clone()),
+        );
+        cx.run_until_parked();
+        model.send_completion_stream_event(
+            &request,
+            LanguageModelCompletionEvent::ToolUse(LanguageModelToolUse {
+                raw_input: "{\"path\":\"root/page.fnx\",\"content\":\"<Page>\n".into(),
+                input: json!({"path": "root/page.fnx", "content": "<Page>\n"}),
+                ..tool_use.clone()
+            }),
+        );
+        cx.run_until_parked();
+        let buffer = project.update(cx, |project, cx| {
+            let path = project
+                .find_project_path("root/page.fnx", cx)
+                .expect("path");
+            project.get_open_buffer(&path, cx).expect("streamed buffer")
+        });
+        assert_eq!(buffer.read_with(cx, |buffer, _| buffer.text()), "<Page>\n");
+        model.send_completion_stream_event(
+            &request,
+            LanguageModelCompletionEvent::Stop(StopReason::MaxTokens),
+        );
+        model.end_completion_stream(&request);
+        cx.run_until_parked();
+        buffer.read_with(cx, |buffer, _| {
+            assert_eq!(buffer.text(), "<Page />\n");
+            assert!(!buffer.is_dirty());
+        });
+        thread.read_with(cx, |thread, _| {
+            assert!(thread.running_turn.is_none());
+            let results: Vec<_> = thread
+                .messages
+                .iter()
+                .filter_map(|message| {
+                    let Message::Agent(message) = message.as_ref() else {
+                        return None;
+                    };
+                    message.tool_results.get(&tool_use.id)
+                })
+                .collect();
+            assert_eq!(results.len(), 1);
+            assert!(results.first().expect("paired interrupted write").is_error);
+        });
+        assert!(model.pending_completions().is_empty());
+        assert_budget_stop(events, acp::StopReason::MaxTurnRequests).await;
     }
 
     #[gpui::test]

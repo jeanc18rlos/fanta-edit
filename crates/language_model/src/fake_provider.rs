@@ -121,6 +121,7 @@ pub struct FakeLanguageModel {
     supports_server_side_compaction: AtomicBool,
     max_token_count: AtomicU64,
     max_output_tokens: AtomicU64,
+    refusal_fallback_model_id: Option<&'static str>,
 }
 
 impl Default for FakeLanguageModel {
@@ -139,6 +140,7 @@ impl Default for FakeLanguageModel {
             supports_server_side_compaction: AtomicBool::new(false),
             max_token_count: AtomicU64::new(1_000_000),
             max_output_tokens: AtomicU64::new(0),
+            refusal_fallback_model_id: None,
         }
     }
 }
@@ -157,6 +159,11 @@ impl FakeLanguageModel {
             supports_thinking: AtomicBool::new(supports_thinking),
             ..Default::default()
         }
+    }
+
+    pub fn with_refusal_fallback(mut self, model_id: &'static str) -> Self {
+        self.refusal_fallback_model_id = Some(model_id);
+        self
     }
 
     pub fn allow_requests(&self) {
@@ -291,6 +298,10 @@ impl LanguageModel for FakeLanguageModel {
 
     fn provider_name(&self) -> LanguageModelProviderName {
         self.provider_name.clone()
+    }
+
+    fn refusal_fallback_model_id(&self) -> Option<&'static str> {
+        self.refusal_fallback_model_id
     }
 
     fn supports_tools(&self) -> bool {

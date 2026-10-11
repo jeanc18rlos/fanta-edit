@@ -1,0 +1,16 @@
+Vendored skia-bindings 0.84.0 from the published crates.io archive.
+Archive SHA256: b612a544c0cc0da82271eac1c40b6b055fe3c5aa20bb7b3922f830c777d9aff0
+Original source: https://github.com/rust-skia/rust-skia/tree/8df1749a67a2800c290473920427249056c488e1/skia-bindings
+Original .cargo_vcs_info.json is retained to identify that package origin and preserve its official prebuilt archive lookup. It does not identify this modified vendor tree.
+
+Only build_support/skia_bindgen.rs is changed from the 49 archive files:
+- Replace the two narrow std::basic_string entries with std::basic_string.*.
+  https://github.com/rust-skia/rust-skia/pull/1197
+- Add std::__tree.*.
+  https://github.com/rust-skia/rust-skia/pull/1200
+These LLVM21 opaque-type generator fixes are backported without updating Skia, bindgen, features, native build settings, or generated bindings.
+
+LICENSE is the original root MIT license from commit 8df1749a67a2800c290473920427249056c488e1, SHA256 4b33ed5b329a3a79eb1243fd91373c68b0ae0b9df7503bfc50d0c5253adf1b9a. The published archive omits that file. Do not replace it with the application's first-party license.
+
+The Skia source compatibility workflow runs for pull requests changing the vendor or its build/license inputs so the first forced-source validation can run before this new workflow reaches the default branch. It also retains workflow_dispatch for later explicit runs. GitHub requires a workflow_dispatch workflow to exist on the default branch for its initial registration: https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_dispatch
+The workflow validates fresh forced-source default and Metal-feature builds. Normal prebuilt success is not source-generation validation. Native renderer/device acceptance is separate.

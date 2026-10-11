@@ -1,13 +1,22 @@
-# Screenshots
+# Public Alpha visual assets
 
-Images referenced by the root `README.md`. Captured from a release build of the
-branch, driven by hand on macOS 26.6.2.
+Launch recordings and screenshots must come from the accepted Fanta 1.0.0
+build. The old README's `canvas.png` and `code.png` files were absent. Their broken
+embeds were removed. Do not substitute historical QA images or a
+recreated editor UI as evidence of the released app.
 
-| File | What it shows |
-|---|---|
-| `canvas.png` | The design canvas: pages and layers rail, the inspector, the tool pill, and the agent panel beside it. |
-| `code.png` | The Code tab on the same page's `.fnx` source, which is the same design as readable JSX-like text. |
+| Asset after review | Use |
+| --- | --- |
+| `native-poster.jpg`, `source-poster.jpg`, `agent-poster.jpg` | Link to each complete silent captioned recording |
+| `native-before.png`, `native-export.png` | Canvas orientation and actual PNG export |
+| `source-code.png`, `source-diff.png` | Editable Code workspace and corresponding Git diff |
+| `agent-before.png`, `agent-after.png` | Verified connection and bounded result |
+| `native.gif`, `source.gif`, `agent.gif` | One observable action each, silent, 8–12 seconds |
 
-Keep them at the window's native size and do not crop the agent panel out of
-`canvas.png` — the point of the pair is that the canvas, the source and the
-agent are one window.
+Capture the full app window at approximately 16:10 with readable source and agent
+panels. Keep each image paired with its source commit, accepted app hash, recording
+hash and timestamp in the private media manifest. Check caption fit and remove
+secrets/private content before copying reviewed files here.
+
+Videos live on the website with poster links in Markdown. Documentation uses
+silent versions. Embed image paths only after the real asset exists.

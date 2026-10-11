@@ -19,7 +19,9 @@ mod serialization;
 mod timeline_adapter;
 
 use std::{
+    cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    rc::Rc,
     sync::Arc,
 };
 
@@ -41,7 +43,7 @@ use gpui::{
     div, px,
 };
 use language::Capability;
-use project::{Project, ProjectEntryId};
+use project::{Project, ProjectEntryId, ProjectPath};
 use settings::{Settings as _, update_settings_file};
 use smallvec::SmallVec;
 use ui::{ContextMenu, ContextMenuEntry, Divider, IconPosition, PopoverMenu, Tooltip, prelude::*};
@@ -49,7 +51,7 @@ use util::{ResultExt, paths::PathExt};
 use workspace::{
     ItemSettings, MultiWorkspace, Pane, Toast,
     item::{Item, ItemEvent, ProjectItem, SaveOptions, TabContentParams},
-    notifications::NotificationId,
+    notifications::{NotificationId, save_io_error_detail},
 };
 
 use crate::canvas::{
@@ -282,6 +284,7 @@ const MIN_INSPECTOR_SIDEBAR_WIDTH: f32 =
 #[cfg(not(feature = "fanta-gpui-ui"))]
 const MIN_INSPECTOR_SIDEBAR_WIDTH: f32 = 260.0;
 const MAX_SIDEBAR_WIDTH: f32 = 560.0;
+const MIN_PANE_CANVAS_WIDTH: f32 = 240.0;
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.);
 const SIDEBAR_BORDER_WIDTH: Pixels = px(1.);
 /// How long the canvas waits after the last committing edit before writing the
@@ -413,6 +416,10 @@ pub struct FigView {
     inspector_sidebar_visible: bool,
     layers_sidebar_width: Pixels,
     inspector_sidebar_width: Pixels,
+    pane_width: Option<Pixels>,
+    revealed_compact_sidebar: Option<SidebarKind>,
+    inspector_has_focus: bool,
+    inspector_focus_handle: FocusHandle,
     selected_page_index: Option<usize>,
     /// Root node of the explicitly selected page, used to re-resolve
     /// `selected_page_index` when a disk reload reorders or removes pages.
@@ -422,6 +429,7 @@ pub struct FigView {
     /// the pane so each opened path keeps its OWN tab even though every tab
     /// shares the project's one [`FigItem`].
     opened_entry_id: Option<ProjectEntryId>,
+    opened_project_path: Option<ProjectPath>,
     /// What this tab is scoped to. Re-asserted on focus so the shared
     /// document's single render root follows the focused tab, and updated by
     /// in-tab navigation ([`Self::select_page`]).
@@ -451,6 +459,7 @@ pub struct FigView {
     autosave_task: Option<Task<()>>,
     /// The save error the user has been shown and not yet seen cleared.
     reported_save_failure: Option<String>,
+    save_failure_notice: Rc<RefCell<Option<SharedString>>>,
     /// The selection handle the cursor is over, resolved on hover so
     /// `render` only reads it — hit-testing eight handles per redraw would
     /// run on every window frame, not just on pointer movement.
@@ -546,6 +555,7 @@ pub struct FigView {
 pub enum FigViewEvent {
     Edited,
     TitleChanged,
+    PropertyDraftChanged,
 }
 
 #[cfg(target_os = "macos")]
@@ -731,8 +741,12 @@ impl FigView {
         // open (the clicked entry and the scope its path implies); the shared
         // item cannot, since one item backs every tab of the project.
         let descriptor = crate::document::take_pending_view_descriptor(cx);
-        let opened_entry_id = descriptor.and_then(|descriptor| descriptor.entry_id);
-        let scope = descriptor.and_then(|descriptor| descriptor.scope);
+        let opened_entry_id = descriptor
+            .as_ref()
+            .and_then(|descriptor| descriptor.entry_id);
+        let scope = descriptor.as_ref().and_then(|descriptor| descriptor.scope);
+        let opened_project_path = descriptor.map(|descriptor| descriptor.path);
+        let save_failure_notice = item.read(cx).save_failure_notice.clone();
         let editor_session = cx.new(|_| EditorSession::new());
         // A variables-scoped tab starts in the variables space — the
         // `doc/variables.json` file IS the variables registry, so that's what
@@ -757,8 +771,7 @@ impl FigView {
         let file_inspector_subscription = cx.subscribe(
             &layers_sidebar,
             |this, _, event: &FileInspectorVisibilityChanged, cx| {
-                this.layers_sidebar_visible = event.0;
-                this.persist_sidebar_layout(cx);
+                this.set_layers_sidebar_visible(event.0, cx);
                 cx.notify();
             },
         );
@@ -837,9 +850,14 @@ impl FigView {
             inspector_sidebar_visible,
             layers_sidebar_width,
             inspector_sidebar_width,
+            pane_width: None,
+            revealed_compact_sidebar: None,
+            inspector_has_focus: false,
+            inspector_focus_handle: cx.focus_handle(),
             selected_page_index: None,
             selected_page_root: None,
             opened_entry_id,
+            opened_project_path,
             scope,
             is_focused: false,
             agent_navigation_focus: None,
@@ -854,6 +872,7 @@ impl FigView {
             canvas_pointer_down: false,
             autosave_task: None,
             reported_save_failure: None,
+            save_failure_notice,
             hover_resize_handle: None,
             space_pan: false,
             container_bounds: None,
@@ -934,13 +953,26 @@ impl FigView {
         }
     }
 
+    fn project_path_for_opened_entry(&self, cx: &App) -> Option<ProjectPath> {
+        self.opened_entry_id
+            .and_then(|entry| self.project.read(cx).path_for_entry(entry, cx))
+            .or_else(|| self.opened_project_path.clone())
+    }
+
     fn reconcile_opened_entry_with_project_root(&mut self, cx: &App) {
+        self.opened_project_path = self.project_path_for_opened_entry(cx);
         if let Some(root) = self.item.read(cx).project_root() {
             self.opened_entry_id = self.opened_entry_id.filter(|entry_id| {
                 let project = self.project.read(cx);
                 project
                     .path_for_entry(*entry_id, cx)
                     .and_then(|path| project.absolute_path(&path, cx))
+                    .is_some_and(|path| path.starts_with(root))
+            });
+            self.opened_project_path = self.opened_project_path.take().filter(|path| {
+                self.project
+                    .read(cx)
+                    .absolute_path(path, cx)
                     .is_some_and(|path| path.starts_with(root))
             });
         }
@@ -2480,6 +2512,42 @@ impl FigView {
         pending_edit
     }
 
+    fn after_property_draft_commit(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        resume: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) -> Task<Result<()>> + 'static,
+    ) -> Task<Result<()>> {
+        #[cfg(feature = "fanta-gpui-ui")]
+        if let Some(adapter) = self.gpui_design.as_ref() {
+            match adapter
+                .panel
+                .update(cx, |panel, cx| panel.try_commit_property_draft(window, cx))
+            {
+                Err(error) => return Task::ready(Err(error.into())),
+                Ok(true) => {
+                    let (sender, receiver) = futures::channel::oneshot::channel();
+                    cx.defer_in(window, move |view, window, cx| {
+                        let save = resume(view, window, cx);
+                        if sender.send(save).is_err() {
+                            log::debug!(
+                                "property save was cancelled before its edit intent settled"
+                            );
+                        }
+                    });
+                    return cx.spawn(async move |_, _| {
+                        receiver
+                            .await
+                            .context("property edit interrupted before save")?
+                            .await
+                    });
+                }
+                Ok(false) => {}
+            }
+        }
+        resume(self, window, cx)
+    }
+
     pub(crate) fn defer_after_preserved_design_draft(
         &mut self,
         _window: &mut Window,
@@ -3004,6 +3072,7 @@ impl FigView {
         );
         let overlays_before = self.tools.overlays.clone();
         let cursor_before = self.tools.cursor;
+        let crop_ready_before = self.tools.can_apply_crop();
 
         let active_tool = self.tools.kind();
         #[cfg(feature = "fanta-gpui-ui")]
@@ -3195,6 +3264,7 @@ impl FigView {
             || !crate::canvas::same_viewport(viewport_before, viewport)
             || self.tools.overlays != overlays_before
             || self.tools.cursor != cursor_before
+            || self.tools.can_apply_crop() != crop_ready_before
         {
             cx.notify();
         }
@@ -3378,7 +3448,7 @@ impl FigView {
             self.hovered_node = None;
             self.hover_resize_handle = None;
             self.sync_measurement_edit_barrier(cx);
-            self.inspector_sidebar_visible = true;
+            self.reveal_node_properties(cx);
             cx.notify();
             return;
         }
@@ -3417,7 +3487,7 @@ impl FigView {
                 .update(cx, |panel, cx| panel.set_inspecting(true, cx));
             self.layers_sidebar
                 .update(cx, |panel, cx| panel.set_inspecting(true, cx));
-            self.inspector_sidebar_visible = true;
+            self.reveal_node_properties(cx);
             self.invalidate_canvas_cache();
             cx.notify();
             return;
@@ -3562,6 +3632,9 @@ impl FigView {
 
     pub(crate) fn reveal_node_properties(&mut self, cx: &mut Context<Self>) {
         self.inspector_sidebar_visible = true;
+        if self.pane_sidebar_layout().inspector.is_none() {
+            self.revealed_compact_sidebar = Some(SidebarKind::Inspector);
+        }
         cx.notify();
     }
 
@@ -3604,12 +3677,13 @@ impl FigView {
                 doc.active_page(),
             )
             .or_else(|| {
-                fanta_tools::NodeEditTool::vector_at_screen(
+                fanta_tools::NodeEditTool::vector_at_screen_with_refiner(
                     doc,
                     &viewport,
                     screen_size,
                     doc.active_page(),
                     screen,
+                    Some(crate::canvas::accepts_authoring_hit),
                 )
             });
             while let Some(container) = hit
@@ -5847,7 +5921,9 @@ impl FigView {
     fn autosave_allowed(&self, cx: &App) -> bool {
         let item = self.item.read(cx);
         item.project_root().is_some()
+            && !self.has_pending_view_edits(cx)
             && item.is_dirty()
+            && !item.unchanged_autosave_failed()
             && !item.has_conflict()
             && !item.external_reconciliation_pending()
             && !item.content_preview_active()
@@ -5872,17 +5948,43 @@ impl FigView {
     /// stays up until a save succeeds ([`Self::clear_save_failure`]); debounced
     /// retries that keep failing do not raise it again (their errors differ
     /// only in details such as the transaction's temp directory).
-    fn report_save_failure(&mut self, error: String, cx: &mut Context<Self>) {
-        if self.reported_save_failure.is_some() {
+    fn report_save_failure(&mut self, error: &anyhow::Error, cx: &mut Context<Self>) {
+        if self.save_failure_notice.borrow().is_some() {
+            self.reported_save_failure
+                .get_or_insert_with(|| format!("{error:#}"));
             return;
         }
-        show_save_failure_notice_deferred(format!("Your design is not being saved: {error}"), cx);
-        self.reported_save_failure = Some(error);
+        let item = self.item.read(cx);
+        let name = item
+            .project_root()
+            .unwrap_or(&item.abs_path)
+            .file_name()
+            .map(|name| name.to_string_lossy().chars().take(48).collect::<String>())
+            .unwrap_or_else(|| "Design".into());
+        let reason = save_io_error_detail(error).unwrap_or_else(|| {
+            "The save failed. Your changes are still open. Check the log for details and try Save again.".into()
+        });
+        *self.save_failure_notice.borrow_mut() =
+            Some(format!("{name} could not be saved. {reason}").into());
+        self.reported_save_failure
+            .get_or_insert_with(|| format!("{error:#}"));
+        sync_save_failure_notice_deferred(
+            self.item.entity_id(),
+            self.save_failure_notice.clone(),
+            cx,
+        );
     }
 
     fn clear_save_failure(&mut self, cx: &mut Context<Self>) {
-        if self.reported_save_failure.take().is_some() {
-            dismiss_save_failure_notice_deferred(cx);
+        self.reported_save_failure = None;
+        // Saved subscriptions may run while the shared item is borrowed.
+        let visible = self.save_failure_notice.borrow_mut().take().is_some();
+        if visible {
+            sync_save_failure_notice_deferred(
+                self.item.entity_id(),
+                self.save_failure_notice.clone(),
+                cx,
+            );
         }
     }
 
@@ -5906,7 +6008,7 @@ impl FigView {
             if let Err(error) = save.await {
                 log::error!("autosaving the canvas failed: {error:#}");
                 view.update(cx, |this, cx| {
-                    this.report_save_failure(format!("{error:#}"), cx);
+                    this.report_save_failure(&error, cx);
                 })
                 .log_err();
             }
@@ -5951,8 +6053,7 @@ impl FigView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.layers_sidebar_visible = !self.layers_sidebar_visible;
-        self.persist_sidebar_layout(cx);
+        self.set_layers_sidebar_visible(!self.layers_sidebar_expanded(), cx);
         cx.notify();
     }
 
@@ -5968,12 +6069,112 @@ impl FigView {
                 .design
                 .update(cx, |design, cx| design.deactivate(window, cx));
         }
-        #[cfg(not(feature = "fanta-gpui-ui"))]
-        let _ = window;
         self.finish_panel_edits(cx);
-        self.inspector_sidebar_visible = !self.inspector_sidebar_visible;
-        self.persist_sidebar_layout(cx);
+        self.set_inspector_sidebar_visible(!self.inspector_sidebar_expanded(cx), window, cx);
         cx.notify();
+    }
+
+    fn pane_sidebar_layout(&self) -> PaneSidebarLayout {
+        pane_sidebar_layout(
+            self.pane_width,
+            self.layers_sidebar_visible
+                .then_some(self.layers_sidebar_width),
+            self.inspector_sidebar_visible
+                .then_some(self.inspector_sidebar_width),
+        )
+    }
+
+    fn layers_sidebar_expanded(&self) -> bool {
+        self.pane_sidebar_layout().layers.is_some()
+            || (self.layers_sidebar_visible
+                && self.revealed_compact_sidebar == Some(SidebarKind::Layers))
+    }
+
+    fn inspector_sidebar_expanded(&self, _cx: &App) -> bool {
+        let keep_draft = self.inspector_has_focus;
+        #[cfg(feature = "fanta-gpui-ui")]
+        let keep_draft = keep_draft
+            || self.gpui_design.as_ref().is_some_and(|adapter| {
+                adapter.panel.read(_cx).property_draft_state(_cx)
+                    != fanta_gpui::design::DesignPropertyDraftState::None
+            });
+        self.pane_sidebar_layout().inspector.is_some()
+            || (self.inspector_sidebar_visible
+                && (self.revealed_compact_sidebar == Some(SidebarKind::Inspector) || keep_draft))
+    }
+
+    fn displayed_sidebar_width(&self, sidebar: SidebarKind) -> Pixels {
+        let layout = self.pane_sidebar_layout();
+        let (docked, preferred) = match sidebar {
+            SidebarKind::Layers => (layout.layers, self.layers_sidebar_width),
+            SidebarKind::Inspector => (layout.inspector, self.inspector_sidebar_width),
+        };
+        docked.unwrap_or_else(|| {
+            let width = preferred.min(self.pane_width.unwrap_or(preferred));
+            match sidebar {
+                SidebarKind::Layers => width,
+                SidebarKind::Inspector => width.max(px(MIN_INSPECTOR_SIDEBAR_WIDTH)),
+            }
+        })
+    }
+
+    fn set_layers_sidebar_visible(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.layers_sidebar_visible && self.pane_sidebar_layout().layers.is_none() {
+            self.revealed_compact_sidebar = visible.then_some(SidebarKind::Layers);
+        } else {
+            self.layers_sidebar_visible = visible;
+            if visible && self.pane_sidebar_layout().layers.is_none() {
+                self.revealed_compact_sidebar = Some(SidebarKind::Layers);
+            }
+            self.persist_sidebar_layout(cx);
+        }
+    }
+
+    fn set_inspector_sidebar_visible(
+        &mut self,
+        visible: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.inspector_sidebar_visible && self.pane_sidebar_layout().inspector.is_none() {
+            self.revealed_compact_sidebar = visible.then_some(SidebarKind::Inspector);
+            if !visible {
+                self.inspector_has_focus = false;
+                self.focus_handle.focus(window, cx);
+            }
+        } else {
+            self.inspector_sidebar_visible = visible;
+            if visible && self.pane_sidebar_layout().inspector.is_none() {
+                self.revealed_compact_sidebar = Some(SidebarKind::Inspector);
+            }
+            self.persist_sidebar_layout(cx);
+        }
+    }
+
+    fn pane_width_probe(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let view = cx.weak_entity();
+        gpui::canvas(
+            move |bounds, _, cx| {
+                view.update(cx, |view, cx| {
+                    if view.pane_width != Some(bounds.size.width) {
+                        view.pane_width = Some(bounds.size.width);
+                        let layout = view.pane_sidebar_layout();
+                        if matches!(view.revealed_compact_sidebar, Some(SidebarKind::Layers))
+                            && layout.layers.is_some()
+                            || matches!(view.revealed_compact_sidebar, Some(SidebarKind::Inspector))
+                                && layout.inspector.is_some()
+                        {
+                            view.revealed_compact_sidebar = None;
+                        }
+                        cx.notify();
+                    }
+                })
+                .log_err();
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full()
     }
 
     fn persist_sidebar_layout(&self, cx: &mut Context<Self>) {
@@ -6018,20 +6219,20 @@ impl FigView {
 
     fn render_layers_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         self.layers_sidebar.update(cx, |panel, cx| {
-            panel.set_file_inspector_collapsed(!self.layers_sidebar_visible, cx);
+            panel.set_file_inspector_collapsed(!self.layers_sidebar_expanded(), cx);
         });
         let sidebar = div()
             .id("fanta-layers-sidebar")
             .relative()
-            .when(self.layers_sidebar_visible, |sidebar| {
+            .when(self.layers_sidebar_expanded(), |sidebar| {
                 sidebar
                     .h_full()
-                    .w(self.layers_sidebar_width)
+                    .w(self.displayed_sidebar_width(SidebarKind::Layers))
                     .flex_shrink_0()
                     .border_r(SIDEBAR_BORDER_WIDTH)
                     .border_color(cx.theme().colors().border)
             })
-            .when(!self.layers_sidebar_visible, |sidebar| {
+            .when(!self.layers_sidebar_expanded(), |sidebar| {
                 sidebar
                     .absolute()
                     .top_0()
@@ -6041,11 +6242,11 @@ impl FigView {
                     .occlude()
             })
             .child(self.layers_sidebar.clone())
-            .when(self.layers_sidebar_visible, |sidebar| {
+            .when(self.layers_sidebar_expanded(), |sidebar| {
                 sidebar.child(self.render_sidebar_resize_handle(SidebarKind::Layers, cx))
             });
         #[cfg(test)]
-        let sidebar = sidebar.when(self.layers_sidebar_visible, |sidebar| {
+        let sidebar = sidebar.when(self.layers_sidebar_expanded(), |sidebar| {
             sidebar.debug_selector(|| "fanta-layers-sidebar".to_owned())
         });
         sidebar.into_any_element()
@@ -6228,9 +6429,10 @@ impl FigView {
     ) -> AnyElement {
         let sidebar = div()
             .id("fanta-inspector-sidebar")
+            .track_focus(&self.inspector_focus_handle)
             .relative()
             .h_full()
-            .w(self.inspector_sidebar_width)
+            .w(self.displayed_sidebar_width(SidebarKind::Inspector))
             .flex_shrink_0()
             .border_l(SIDEBAR_BORDER_WIDTH)
             .border_color(cx.theme().colors().border)
@@ -6380,9 +6582,18 @@ impl FigView {
     fn render_workspace_tabs(&self, cx: &mut Context<Self>) -> AnyElement {
         let workspace = self.editor_workspace(cx);
         let view = cx.weak_entity();
-        let tabs = EditorWorkspaceTabs::new(workspace, move |workspace, _, cx| {
-            view.update(cx, |view, cx| view.set_editor_workspace(workspace, cx))
-                .log_err();
+        let tabs = EditorWorkspaceTabs::new(workspace, move |workspace, window, cx| {
+            view.update(cx, |view, cx| {
+                let previous_workspace = view.editor_workspace(cx);
+                view.set_editor_workspace(workspace, cx);
+                if previous_workspace == EditorWorkspace::Code
+                    && workspace == EditorWorkspace::Canvas
+                    && view.editor_workspace(cx) == EditorWorkspace::Canvas
+                {
+                    view.focus_handle(cx).focus(window, cx);
+                }
+            })
+            .log_err();
         })
         .variables_visible(!self.is_dev_mode(cx));
         h_flex()
@@ -6390,6 +6601,12 @@ impl FigView {
             .top(px(8.0))
             .left_0()
             .right_0()
+            .when(workspace == EditorWorkspace::Canvas, |tabs| {
+                let layout = self.pane_sidebar_layout();
+                tabs.left(layout.layers.unwrap_or_default())
+                    .right(layout.inspector.unwrap_or_default())
+                    .when(layout.layers.is_none(), |tabs| tabs.top(px(88.0)))
+            })
             .justify_center()
             .child(div().occlude().child(tabs))
             .into_any_element()
@@ -6705,20 +6922,20 @@ impl FigView {
                     .child(
                         IconButton::new(
                             "fig-toggle-layers-sidebar",
-                            if self.layers_sidebar_visible {
+                            if self.layers_sidebar_expanded() {
                                 IconName::ThreadsSidebarLeftOpen
                             } else {
                                 IconName::ThreadsSidebarLeftClosed
                             },
                         )
                         .icon_size(IconSize::Small)
-                        .toggle_state(self.layers_sidebar_visible)
-                        .icon_color(if self.layers_sidebar_visible {
+                        .toggle_state(self.layers_sidebar_expanded())
+                        .icon_color(if self.layers_sidebar_expanded() {
                             Color::Accent
                         } else {
                             Color::Muted
                         })
-                        .tooltip(Tooltip::text(if self.layers_sidebar_visible {
+                        .tooltip(Tooltip::text(if self.layers_sidebar_expanded() {
                             "Hide Layers"
                         } else {
                             "Show Layers"
@@ -6730,20 +6947,20 @@ impl FigView {
                     .child(
                         IconButton::new(
                             "fig-toggle-inspector-sidebar",
-                            if self.inspector_sidebar_visible {
+                            if self.inspector_sidebar_expanded(cx) {
                                 IconName::ThreadsSidebarRightOpen
                             } else {
                                 IconName::ThreadsSidebarRightClosed
                             },
                         )
                         .icon_size(IconSize::Small)
-                        .toggle_state(self.inspector_sidebar_visible)
-                        .icon_color(if self.inspector_sidebar_visible {
+                        .toggle_state(self.inspector_sidebar_expanded(cx))
+                        .icon_color(if self.inspector_sidebar_expanded(cx) {
                             Color::Accent
                         } else {
                             Color::Muted
                         })
-                        .tooltip(Tooltip::text(if self.inspector_sidebar_visible {
+                        .tooltip(Tooltip::text(if self.inspector_sidebar_expanded(cx) {
                             "Hide Inspector"
                         } else {
                             "Show Inspector"
@@ -6792,6 +7009,40 @@ fn resize_cursor(handle: fanta_canvas::ResizeHandle) -> CursorStyle {
         ResizeHandle::NorthWest | ResizeHandle::SouthEast => CursorStyle::ResizeUpLeftDownRight,
         ResizeHandle::NorthEast | ResizeHandle::SouthWest => CursorStyle::ResizeUpRightDownLeft,
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PaneSidebarLayout {
+    layers: Option<Pixels>,
+    inspector: Option<Pixels>,
+}
+
+fn pane_sidebar_layout(
+    pane_width: Option<Pixels>,
+    mut layers: Option<Pixels>,
+    mut inspector: Option<Pixels>,
+) -> PaneSidebarLayout {
+    let preferred_inspector = inspector;
+    if let Some(pane_width) = pane_width {
+        let budget = (pane_width - px(MIN_PANE_CANVAS_WIDTH)).max(px(0.0));
+        let total = layers.unwrap_or_default() + inspector.unwrap_or_default();
+        if total > budget {
+            if let Some(width) = layers.as_mut() {
+                *width = (*width - (total - budget)).max(px(MIN_LAYERS_SIDEBAR_WIDTH));
+            }
+            let remaining = budget - layers.unwrap_or_default();
+            if let Some(width) = inspector.as_mut() {
+                *width = (*width).min(remaining.max(px(MIN_INSPECTOR_SIDEBAR_WIDTH)));
+            }
+            if layers.unwrap_or_default() + inspector.unwrap_or_default() > budget {
+                layers = None;
+                inspector = preferred_inspector
+                    .filter(|_| budget >= px(MIN_INSPECTOR_SIDEBAR_WIDTH))
+                    .map(|width| budget.min(width));
+            }
+        }
+    }
+    PaneSidebarLayout { layers, inspector }
 }
 
 fn clamp_sidebar_width(width: Pixels, sidebar: SidebarKind) -> Pixels {
@@ -8205,6 +8456,7 @@ impl Render for FigView {
             cx.entity_id().as_u64(),
             crate::gesture_perf::UiStage::ViewRender,
         );
+        self.inspector_has_focus = self.inspector_focus_handle.contains_focused(window, cx);
         let development_read_only = self.is_dev_mode(cx);
         self.code_workspace.update(cx, |workspace, cx| {
             workspace.set_development_read_only(development_read_only, cx)
@@ -8518,28 +8770,30 @@ impl Render for FigView {
             })
             .when(!has_error && !is_loading, |this| {
                 let presenting_prototype = self.prototype_player.is_some();
-                let workspace_body = if presenting_prototype {
-                    self.render_prototype_presentation(window, cx)
-                } else if editor_workspace == EditorWorkspace::Variables {
-                    div()
-                        .id("fanta-variables-workspace-body")
-                        .size_full()
-                        .overflow_hidden()
-                        .child(self.variables_workspace.clone())
-                        .into_any_element()
-                } else if editor_workspace == EditorWorkspace::Code {
-                    div()
-                        .id("fanta-code-workspace-body")
-                        .size_full()
-                        .overflow_hidden()
-                        .child(self.code_workspace.clone())
-                        .into_any_element()
-                } else {
-                    div()
+                let workspace_body =
+                    if presenting_prototype {
+                        self.render_prototype_presentation(window, cx)
+                    } else if editor_workspace == EditorWorkspace::Variables {
+                        div()
+                            .id("fanta-variables-workspace-body")
+                            .size_full()
+                            .overflow_hidden()
+                            .child(self.variables_workspace.clone())
+                            .into_any_element()
+                    } else if editor_workspace == EditorWorkspace::Code {
+                        div()
+                            .id("fanta-code-workspace-body")
+                            .size_full()
+                            .overflow_hidden()
+                            .child(self.code_workspace.clone())
+                            .into_any_element()
+                    } else {
+                        div()
                         .id("fanta-canvas-workspace-body")
                         .size_full()
                         .relative()
                         .overflow_hidden()
+                        .child(self.pane_width_probe(cx))
                         .child(
                             v_flex()
                                 .size_full()
@@ -8551,8 +8805,8 @@ impl Render for FigView {
                                         .w_full()
                                         .overflow_hidden()
                                         .children(
-                                            self.layers_sidebar_visible
-                                                .then(|| self.render_layers_sidebar(cx)),
+                                            self.pane_sidebar_layout().layers
+                                                .map(|_| self.render_layers_sidebar(cx)),
                                         )
                                         .child(
                                             v_flex()
@@ -8678,8 +8932,8 @@ impl Render for FigView {
                                                 }),
                                         )
                                         .children(
-                                            self.inspector_sidebar_visible
-                                                .then(|| self.render_inspector_sidebar(cx)),
+                                            self.pane_sidebar_layout().inspector
+                                                .map(|_| self.render_inspector_sidebar(cx)),
                                         ),
                                 )
                                 .children((editor_mode == EditorMode::Motion).then(|| {
@@ -8695,7 +8949,7 @@ impl Render for FigView {
                             {
                                 self.gpui_properties
                                     .as_ref()
-                                    .filter(|_| !self.inspector_sidebar_visible)
+                                    .filter(|_| !self.inspector_sidebar_expanded(cx))
                                     .map(|_| {
                                         gpui::deferred(
                                             div()
@@ -8713,8 +8967,28 @@ impl Render for FigView {
                                 None::<AnyElement>
                             }
                         })
-                        .children((!self.layers_sidebar_visible).then(|| {
-                            gpui::deferred(self.render_layers_sidebar(cx)).with_priority(3)
+                        .children(self.pane_sidebar_layout().layers.is_none().then(|| {
+                            gpui::deferred(
+                                div().absolute().top_0().bottom_0().left_0()
+                                    .when(self.layers_sidebar_expanded(), |sidebar| {
+                                        sidebar.w(self.displayed_sidebar_width(SidebarKind::Layers))
+                                            .bg(cx.theme().colors().panel_background).occlude()
+                                    })
+                                    .child(self.render_layers_sidebar(cx)),
+                            ).with_priority(3)
+                        }))
+                        .children((self.pane_sidebar_layout().inspector.is_none()
+                            && self.inspector_sidebar_expanded(cx)).then(|| {
+                            gpui::deferred(
+                                div().id("fanta-inspector-overlay")
+                                    .debug_selector(|| "fanta-inspector-overlay".to_owned())
+                                    .absolute().top_0().bottom_0().right_0()
+                                    .w(self.pane_width.unwrap_or(self.inspector_sidebar_width)
+                                        .min(self.displayed_sidebar_width(SidebarKind::Inspector)))
+                                    .overflow_x_scroll()
+                                    .bg(cx.theme().colors().panel_background).occlude()
+                                    .child(self.render_inspector_sidebar(cx)),
+                            ).with_priority(4)
                         }))
                         .children(
                             self.item
@@ -8723,7 +8997,7 @@ impl Render for FigView {
                                 .then(|| self.render_source_edit_lock_banner(cx)),
                         )
                         .into_any_element()
-                };
+                    };
                 let workspace_body = div()
                     .size_full()
                     .relative()
@@ -9036,6 +9310,13 @@ impl Item for FigView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.save_failure_notice.borrow().is_some() {
+            sync_save_failure_notice_deferred(
+                self.item.entity_id(),
+                self.save_failure_notice.clone(),
+                cx,
+            );
+        }
         if let Some(workspace_entity) = workspace.weak_handle().upgrade() {
             self.workspace_activation_subscription = Some(cx.subscribe(
                 &workspace_entity,
@@ -9099,6 +9380,13 @@ impl Item for FigView {
     }
 
     fn on_removed(&self, _cx: &mut Context<Self>) {
+        if self.save_failure_notice.borrow().is_some() {
+            sync_save_failure_notice_deferred(
+                self.item.entity_id(),
+                self.save_failure_notice.clone(),
+                _cx,
+            );
+        }
         self.invalidate_local_media_origin();
         #[cfg(target_os = "macos")]
         {
@@ -9130,7 +9418,7 @@ impl Item for FigView {
                 f(ItemEvent::Edit);
                 f(ItemEvent::UpdateTab);
             }
-            FigViewEvent::TitleChanged => {
+            FigViewEvent::TitleChanged | FigViewEvent::PropertyDraftChanged => {
                 f(ItemEvent::UpdateTab);
             }
         }
@@ -9149,7 +9437,12 @@ impl Item for FigView {
         // of a project, so the default (the item's own entry — its FIRST-open
         // path) would collapse every scoped open onto that first tab; report
         // the entry this view was actually opened from instead.
-        match self.opened_entry_id {
+        let opened_entry_id = self
+            .project_path_for_opened_entry(cx)
+            .and_then(|path| self.project.read(cx).entry_for_path(&path, cx))
+            .map(|entry| entry.id)
+            .or(self.opened_entry_id);
+        match opened_entry_id {
             Some(entry_id) => [entry_id].into_iter().collect(),
             None => {
                 let project = self.project.read(cx);
@@ -9200,8 +9493,7 @@ impl Item for FigView {
         let item = self.item.read(cx);
         let project = self.project.read(cx);
         let source_path = self
-            .opened_entry_id
-            .and_then(|entry| project.path_for_entry(entry, cx))
+            .project_path_for_opened_entry(cx)
             .and_then(|path| project.absolute_path(&path, cx));
         let path = source_path.as_deref().unwrap_or_else(|| item.abs_path());
         ItemSettings::get_global(cx)
@@ -9239,8 +9531,48 @@ impl Item for FigView {
             })
     }
 
+    fn has_pending_view_edits(&self, _cx: &App) -> bool {
+        #[cfg(feature = "fanta-gpui-ui")]
+        if let Some(adapter) = self.gpui_design.as_ref() {
+            return matches!(
+                adapter.panel.read(_cx).property_draft_state(_cx),
+                fanta_gpui::design::DesignPropertyDraftState::Valid
+                    | fanta_gpui::design::DesignPropertyDraftState::Invalid
+            );
+        }
+        false
+    }
+
+    fn prepare_for_save_or_close(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        #[cfg(feature = "fanta-gpui-ui")]
+        if let Some(adapter) = self.gpui_design.as_ref() {
+            let unchanged = adapter.panel.update(_cx, |panel, cx| {
+                if panel.property_draft_state(cx)
+                    == fanta_gpui::design::DesignPropertyDraftState::Unchanged
+                {
+                    match panel.try_commit_property_draft(_window, cx) {
+                        Ok(_) => true,
+                        Err(error) => {
+                            log::error!("unchanged property could not finish: {error}");
+                            panel.preserve_property_draft_for_host_action();
+                            false
+                        }
+                    }
+                } else {
+                    panel.preserve_property_draft_for_host_action();
+                    false
+                }
+            });
+            if unchanged {
+                self.finish_gpui_design_edits(_cx);
+            }
+        }
+    }
+
     fn is_dirty(&self, cx: &App) -> bool {
-        self.item.read(cx).is_dirty() || self.code_workspace.read(cx).source_is_dirty(cx)
+        self.has_pending_view_edits(cx)
+            || self.item.read(cx).is_dirty()
+            || self.code_workspace.read(cx).source_is_dirty(cx)
     }
 
     fn has_conflict(&self, cx: &App) -> bool {
@@ -9283,81 +9615,87 @@ impl Item for FigView {
         &mut self,
         project: Entity<Project>,
         path: project::ProjectPath,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        if let Some(error) = self.pending_bound_text_error(cx) {
-            return Task::ready(Err(anyhow::anyhow!(error)));
-        }
-        if self.annotation_state.controller.has_pending_authoring() {
-            return Task::ready(Err(anyhow::anyhow!(
-                "Add, save or cancel the annotation first. Its draft was kept."
-            )));
-        }
-        if self.measurement_controller.has_pending_authoring() {
-            return Task::ready(Err(anyhow::anyhow!(
-                "Finish or cancel the measurement drag first. Its preview was kept."
-            )));
-        }
-        if self.prototype_player.is_some() {
-            self.exit_prototype_session(cx);
-        }
-        self.finish_document_edits(cx);
-        self.autosave_task = None;
-        self.item
-            .update(cx, |item, cx| item.save_as(project, path, cx))
+        self.after_property_draft_commit(window, cx, move |view, _window, cx| {
+            if let Some(error) = view.pending_bound_text_error(cx) {
+                return Task::ready(Err(anyhow::anyhow!(error)));
+            }
+            if view.annotation_state.controller.has_pending_authoring() {
+                return Task::ready(Err(anyhow::anyhow!(
+                    "Add, save or cancel the annotation first. Its draft was kept."
+                )));
+            }
+            if view.measurement_controller.has_pending_authoring() {
+                return Task::ready(Err(anyhow::anyhow!(
+                    "Finish or cancel the measurement drag first. Its preview was kept."
+                )));
+            }
+            if view.prototype_player.is_some() {
+                view.exit_prototype_session(cx);
+            }
+            view.finish_document_edits(cx);
+            view.autosave_task = None;
+            view.item
+                .update(cx, |item, cx| item.save_as(project, path, cx))
+        })
     }
 
     fn save(
         &mut self,
-        _options: SaveOptions,
+        options: SaveOptions,
         _project: Entity<Project>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
-        if let Some(error) = self.pending_bound_text_error(cx) {
-            return Task::ready(Err(anyhow::anyhow!(error)));
+        if options.autosave && self.has_pending_view_edits(cx) {
+            return Task::ready(Ok(()));
         }
-        if self.annotation_state.controller.has_pending_authoring() {
-            return Task::ready(Err(anyhow::anyhow!(
-                "Add, save or cancel the annotation first. Its draft was kept."
-            )));
-        }
-        if self.measurement_controller.has_pending_authoring() {
-            return Task::ready(Err(anyhow::anyhow!(
-                "Finish or cancel the measurement drag first. Its preview was kept."
-            )));
-        }
-
-        if self.prototype_player.is_some() {
-            self.exit_prototype_session(cx);
-        }
-        let source_is_dirty = self.code_workspace.read(cx).source_is_dirty(cx);
-        let canvas_is_dirty = self.item.read(cx).is_dirty();
-        if source_is_dirty && canvas_is_dirty {
-            if self.editor_workspace(cx) == EditorWorkspace::Code {
-                let discard_canvas = self.item.update(cx, |item, cx| {
-                    item.discard_canvas_edits_for_source_resolution(cx)
-                });
-                let code_workspace = self.code_workspace.clone();
-                return cx.spawn(async move |_, cx| {
-                    discard_canvas.await?;
-                    let save_source = code_workspace.update(cx, |workspace, cx| {
-                        workspace
-                            .save_source_edit(cx)
-                            .unwrap_or_else(|| Task::ready(Ok(())))
-                    });
-                    save_source.await
-                });
+        self.after_property_draft_commit(window, cx, move |view, _window, cx| {
+            if let Some(error) = view.pending_bound_text_error(cx) {
+                return Task::ready(Err(anyhow::anyhow!(error)));
+            }
+            if view.annotation_state.controller.has_pending_authoring() {
+                return Task::ready(Err(anyhow::anyhow!(
+                    "Add, save or cancel the annotation first. Its draft was kept."
+                )));
+            }
+            if view.measurement_controller.has_pending_authoring() {
+                return Task::ready(Err(anyhow::anyhow!(
+                    "Finish or cancel the measurement drag first. Its preview was kept."
+                )));
             }
 
-            self.finish_document_edits(cx);
-            let discard_source = self
-                .code_workspace
-                .update(cx, |workspace, cx| workspace.discard_source_edit(cx));
-            let item = self.item.clone();
-            let project = self.project.clone();
-            return cx.spawn(async move |_, cx| {
+            if view.prototype_player.is_some() {
+                view.exit_prototype_session(cx);
+            }
+            let source_is_dirty = view.code_workspace.read(cx).source_is_dirty(cx);
+            let canvas_is_dirty = view.item.read(cx).is_dirty();
+            if source_is_dirty && canvas_is_dirty {
+                if view.editor_workspace(cx) == EditorWorkspace::Code {
+                    let discard_canvas = view.item.update(cx, |item, cx| {
+                        item.discard_canvas_edits_for_source_resolution(cx)
+                    });
+                    let code_workspace = view.code_workspace.clone();
+                    return cx.spawn(async move |_, cx| {
+                        discard_canvas.await?;
+                        let save_source = code_workspace.update(cx, |workspace, cx| {
+                            workspace
+                                .save_source_edit(cx)
+                                .unwrap_or_else(|| Task::ready(Ok(())))
+                        });
+                        save_source.await
+                    });
+                }
+
+                view.finish_document_edits(cx);
+                let discard_source = view
+                    .code_workspace
+                    .update(cx, |workspace, cx| workspace.discard_source_edit(cx));
+                let item = view.item.clone();
+                let project = view.project.clone();
+                return cx.spawn(async move |_, cx| {
                 discard_source.await?;
                 let save_document = item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
                 let Some(root) = save_document.await? else {
@@ -9374,35 +9712,36 @@ impl Item for FigView {
                 }
                 Ok(())
             });
-        }
-        if let Some(source_save) = self
-            .code_workspace
-            .update(cx, |workspace, cx| workspace.save_source_edit(cx))
-        {
-            return source_save;
-        }
-        let task = self.save_document(cx);
-        let project = self.project.clone();
-        cx.spawn(async move |_, cx| {
-            let Some(root) = task.await? else {
-                return Ok(());
-            };
-            log::info!("materialized Fanta project at {}", root.display());
-            // First-class Zed integration: surface the freshly written project
-            // as a *visible* worktree so its fanta.json / `.fnx` / asset files
-            // show up in the project panel and open as ordinary text. A failure
-            // here (e.g. a remote project that can't adopt a local folder) must
-            // not fail the save — the project already exists on disk.
-            let worktree = project.update(cx, |project, cx| {
-                project.find_or_create_worktree(root.clone(), true, cx)
-            });
-            if let Err(error) = worktree.await {
-                log::error!(
-                    "adding materialized Fanta project {} to the workspace failed: {error:#}",
-                    root.display()
-                );
             }
-            Ok(())
+            if let Some(source_save) = view
+                .code_workspace
+                .update(cx, |workspace, cx| workspace.save_source_edit(cx))
+            {
+                return source_save;
+            }
+            let task = view.save_document(cx);
+            let project = view.project.clone();
+            cx.spawn(async move |_, cx| {
+                let Some(root) = task.await? else {
+                    return Ok(());
+                };
+                log::info!("materialized Fanta project at {}", root.display());
+                // First-class Zed integration: surface the freshly written project
+                // as a *visible* worktree so its fanta.json / `.fnx` / asset files
+                // show up in the project panel and open as ordinary text. A failure
+                // here (e.g. a remote project that can't adopt a local folder) must
+                // not fail the save — the project already exists on disk.
+                let worktree = project.update(cx, |project, cx| {
+                    project.find_or_create_worktree(root.clone(), true, cx)
+                });
+                if let Err(error) = worktree.await {
+                    log::error!(
+                        "adding materialized Fanta project {} to the workspace failed: {error:#}",
+                        root.display()
+                    );
+                }
+                Ok(())
+            })
         })
     }
 
@@ -9425,6 +9764,12 @@ impl Item for FigView {
 
         if self.prototype_player.is_some() {
             self.exit_prototype_session(cx);
+        }
+        #[cfg(feature = "fanta-gpui-ui")]
+        if let Some(adapter) = self.gpui_properties.as_ref() {
+            adapter
+                .design
+                .update(cx, |design, cx| design.deactivate(_window, cx));
         }
         self.finish_document_edits(cx);
         let discard_source = self
@@ -9451,11 +9796,13 @@ impl Item for FigView {
         Self: Sized,
     {
         let item = self.item.clone();
+        let save_failure_notice = self.save_failure_notice.clone();
         let project = self.project.clone();
         let viewport = self.viewport;
         let selected_page_index = self.selected_page_index;
         let selected_page_root = self.selected_page_root;
         let opened_entry_id = self.opened_entry_id;
+        let opened_project_path = self.project_path_for_opened_entry(cx);
         let scope = self.scope;
         let last_seen_root = self.last_seen_root;
         let layers_sidebar_visible = self.layers_sidebar_visible;
@@ -9479,8 +9826,7 @@ impl Item for FigView {
             let file_inspector_subscription = cx.subscribe(
                 &layers_sidebar,
                 |this, _, event: &FileInspectorVisibilityChanged, cx| {
-                    this.layers_sidebar_visible = event.0;
-                    this.persist_sidebar_layout(cx);
+                    this.set_layers_sidebar_visible(event.0, cx);
                     cx.notify();
                 },
             );
@@ -9541,9 +9887,14 @@ impl Item for FigView {
                 inspector_sidebar_visible,
                 layers_sidebar_width,
                 inspector_sidebar_width,
+                pane_width: None,
+                revealed_compact_sidebar: None,
+                inspector_has_focus: false,
+                inspector_focus_handle: cx.focus_handle(),
                 selected_page_index,
                 selected_page_root,
                 opened_entry_id,
+                opened_project_path,
                 scope,
                 is_focused: false,
                 agent_navigation_focus: None,
@@ -9558,6 +9909,7 @@ impl Item for FigView {
                 canvas_pointer_down: false,
                 autosave_task: None,
                 reported_save_failure: None,
+                save_failure_notice,
                 hover_resize_handle: None,
                 space_pan: false,
                 container_bounds: None,
@@ -11134,6 +11486,1018 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    async fn assert_native_figview_window_close(
+        save: bool,
+        autosave_while_prompt_open: bool,
+        cx: &mut TestAppContext,
+    ) -> Result<()> {
+        use gpui::UpdateGlobal;
+        use project::ProjectItem as _;
+
+        init_visual_test(cx);
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            cx.set_global(db::AppDatabase::test_new());
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.workspace.autosave = Some(settings::AutosaveSetting::Off);
+                    settings
+                        .session
+                        .get_or_insert_default()
+                        .restore_unsaved_buffers = Some(false);
+                });
+            });
+        });
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("Close Matrix");
+        let (mut initial, text_id, _) = text_selection_doc(false);
+        let mut control = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            150.0,
+            100.0,
+            40.0,
+            30.0,
+            Color::BLACK,
+        )));
+        control.parent = initial.active_page();
+        control.name = "Unchanged control".into();
+        initial.apply(Operation::create_node(control))?;
+        crate::document::write_project(&root, &initial, &BTreeMap::new())?;
+        let (original_on_disk, original_assets) = fanta_format::read_project_tree(&root)?;
+        let original_on_disk = serde_json::to_value(original_on_disk)?;
+
+        // Source buffers must observe the same files that the canvas writer changes.
+        let file_system = Arc::new(fs::RealFs::new(None, cx.executor()));
+        let project = Project::test(file_system, [root.as_path()], cx).await;
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("fixture worktree")
+                .read(cx)
+                .id()
+        });
+        let item = cx
+            .update(|cx| {
+                FigItem::try_open(
+                    &project,
+                    &project::ProjectPath {
+                        worktree_id,
+                        path: util::rel_path::rel_path("fanta.json").into(),
+                    },
+                    cx,
+                )
+            })
+            .expect("native project opener")
+            .await?;
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert!(item.has_ready_document());
+            assert_eq!(item.project_root(), Some(root.as_path()));
+            assert!(!item.is_dirty());
+        });
+
+        let window = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let multi_workspace = window.entity(cx)?;
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let session_id = workspace.read_with(cx, |workspace, _| workspace.session_id());
+        assert!(session_id.is_some());
+        let view = window.update(cx, |_, window, cx| {
+            let view = cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            });
+            window.activate_window();
+            view.update(cx, |view, cx| {
+                view.set_viewport_silent(Viewport::default());
+                view.focus_handle.focus(window, cx);
+            });
+            view
+        })?;
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1400.0), px(900.0)));
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear());
+        visual.update(|window, cx| {
+            view.update(cx, |view, cx| {
+                view.open_text_edit(text_id, TextEditSeed::SelectAll, window, cx);
+                assert!(view.text_edit.is_some(), "real text editor is open");
+                gpui::EntityInputHandler::replace_text_in_range(
+                    view,
+                    Some(0..11),
+                    "Close draft",
+                    window,
+                    cx,
+                );
+                view.commit_text_edit(cx);
+                assert!(view.text_edit.is_none());
+            });
+        });
+        visual.run_until_parked();
+        let (edited, assets) = item.read_with(&visual, |item, _| {
+            assert!(item.is_dirty(), "committed edit has not yet been saved");
+            let document = item.document().expect("edited document");
+            let NodeData::Text(text) = &document.doc.scene.get(text_id).expect("text node").data
+            else {
+                panic!("fixture text kind preserved")
+            };
+            assert_eq!(text.content, "Close draft");
+            (
+                document.doc.clone_for_persist(),
+                document.raw_assets.clone(),
+            )
+        });
+        let expected_root = directory.path().join("Expected saved projection");
+        crate::document::write_project(&expected_root, &edited, &assets)?;
+        let (expected_on_disk, expected_assets) = fanta_format::read_project_tree(&expected_root)?;
+        let expected_on_disk = serde_json::to_value(expected_on_disk)?;
+        assert_ne!(expected_on_disk, original_on_disk);
+        assert_eq!(
+            serde_json::to_value(fanta_format::read_project_tree(&root)?.0)?,
+            original_on_disk,
+            "the pre-prompt state must still contain the original text"
+        );
+
+        multi_workspace.update_in(&mut visual, |multi_workspace, window, cx| {
+            multi_workspace.close_window(&workspace::CloseWindow, window, cx);
+        });
+        visual.run_until_parked();
+        let prompt = visual.pending_prompt().expect("dirty native close prompt");
+        assert!(prompt.0.contains("save"), "actual save prompt: {prompt:?}");
+        workspace.read_with(&visual, |workspace, cx| {
+            assert_eq!(workspace.session_id(), session_id);
+            assert_eq!(workspace.project().entity_id(), project.entity_id());
+            assert_eq!(
+                workspace
+                    .active_item_as::<FigView>(cx)
+                    .map(|view| view.entity_id()),
+                Some(view.entity_id())
+            );
+        });
+        if autosave_while_prompt_open {
+            visual.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+            visual.run_until_parked();
+            assert!(
+                visual.has_pending_prompt(),
+                "autosave does not answer the prompt"
+            );
+            item.read_with(&visual, |item, _| assert!(!item.is_dirty()));
+            view.read_with(&visual, |view, _| assert!(view.autosave_task.is_none()));
+            let (saved, saved_assets) = fanta_format::read_project_tree(&root)?;
+            assert_eq!(serde_json::to_value(saved)?, expected_on_disk);
+            assert_eq!(saved_assets, expected_assets);
+        }
+        visual.simulate_prompt_answer(if save { "Save" } else { "Don't Save" });
+        visual.run_until_parked();
+
+        // Window-scoped updates require a live window; retained entities remain readable after close.
+        assert!(!visual.has_pending_prompt());
+        assert!(!visual.read(|cx| cx.windows().contains(&window.into())));
+        workspace.read_with(&visual, |workspace, cx| {
+            assert_eq!(
+                workspace.session_id(),
+                None,
+                "the original session was removed"
+            );
+            assert_eq!(workspace.project().entity_id(), project.entity_id());
+            assert_eq!(
+                workspace
+                    .active_item_as::<FigView>(cx)
+                    .map(|view| view.entity_id()),
+                Some(view.entity_id()),
+                "window close must not merely close the canvas tab"
+            );
+        });
+        view.read_with(&visual, |view, _| {
+            assert_eq!(view.item.entity_id(), item.entity_id())
+        });
+        item.read_with(&visual, |item, _| {
+            assert!(!item.is_dirty());
+            assert_eq!(item.project_root(), Some(root.as_path()));
+            let NodeData::Text(text) = &item
+                .doc()
+                .expect("retained document")
+                .scene
+                .get(text_id)
+                .expect("text")
+                .data
+            else {
+                panic!("fixture text kind preserved")
+            };
+            assert_eq!(
+                text.content,
+                if save { "Close draft" } else { "Hello world" }
+            );
+        });
+        let (actual, actual_assets) = fanta_format::read_project_tree(&root)?;
+        assert_eq!(
+            serde_json::to_value(actual)?,
+            if save {
+                expected_on_disk
+            } else {
+                original_on_disk
+            }
+        );
+        assert_eq!(
+            actual_assets,
+            if save {
+                expected_assets
+            } else {
+                original_assets
+            }
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn mounted_native_figview_save_closes_multi_workspace_window(cx: &mut TestAppContext) {
+        assert_native_figview_window_close(true, false, cx)
+            .await
+            .expect("Save persists the native canvas and removes its window");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn mounted_native_figview_discard_closes_multi_workspace_window(cx: &mut TestAppContext) {
+        assert_native_figview_window_close(false, false, cx)
+            .await
+            .expect("Don't Save reloads the native canvas and removes its window");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn mounted_native_figview_autosave_during_prompt_then_save_closes_window(
+        cx: &mut TestAppContext,
+    ) {
+        assert_native_figview_window_close(true, true, cx)
+            .await
+            .expect("Save finishes closing after the canvas autosaved while prompted");
+    }
+
+    #[cfg(all(target_os = "macos", feature = "fanta-gpui-ui"))]
+    async fn assert_property_draft_persistence(
+        draft: &str,
+        choice: &str,
+        shared_tab: bool,
+        cx: &mut TestAppContext,
+    ) -> Result<()> {
+        use fanta_gpui::design::DesignPropertyDraftState;
+        use gpui::UpdateGlobal;
+        use project::ProjectItem as _;
+        use workspace::item::ItemHandle;
+
+        init_visual_test(cx);
+        cx.executor().allow_parking();
+        cx.update(|cx| {
+            cx.set_global(db::AppDatabase::test_new());
+            SettingsStore::update_global(cx, |store, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.workspace.autosave = Some(settings::AutosaveSetting::Off);
+                    settings
+                        .session
+                        .get_or_insert_default()
+                        .restore_unsaved_buffers = Some(false);
+                });
+            });
+        });
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("Property draft");
+        let (mut initial, text_id, _) = text_selection_doc(false);
+        initial
+            .scene
+            .set_transform(text_id, Transform2D::translation(40.0, 60.0))?;
+        let asset_id = AssetId::new();
+        initial.asset_library.insert(
+            asset_id,
+            fanta_doc::ProjectAsset {
+                name: "Unchanged asset".into(),
+                kind: fanta_doc::ProjectAssetKind::Image,
+            },
+        );
+        let raw_assets = BTreeMap::from([(asset_id, b"unchanged fixture asset".to_vec())]);
+        crate::document::write_project(&root, &initial, &raw_assets)?;
+        let (original_disk, original_assets) = fanta_format::read_project_tree(&root)?;
+        let original_disk = serde_json::to_value(original_disk)?;
+        let project = Project::test(
+            Arc::new(fs::RealFs::new(None, cx.executor())),
+            [root.as_path()],
+            cx,
+        )
+        .await;
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("fixture worktree")
+                .read(cx)
+                .id()
+        });
+        let item = cx
+            .update(|cx| {
+                FigItem::try_open(
+                    &project,
+                    &project::ProjectPath {
+                        worktree_id,
+                        path: util::rel_path::rel_path("fanta.json").into(),
+                    },
+                    cx,
+                )
+            })
+            .expect("native project opener")
+            .await?;
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert!(item.has_ready_document());
+            assert_eq!(item.project_root(), Some(root.as_path()));
+            assert!(!item.is_dirty());
+        });
+        let window = cx.add_window(|window, cx| {
+            workspace::MultiWorkspace::test_new(project.clone(), window, cx)
+        });
+        let multi_workspace = window.entity(cx)?;
+        let workspace = multi_workspace.read_with(cx, |root, _| root.workspace().clone());
+        let (view, other) = window.update(cx, |_, window, cx| {
+            let view = cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx));
+            let other = if shared_tab {
+                let other = cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx));
+                other.update(cx, |other, cx| {
+                    other.inspector_sidebar_visible = false;
+                    cx.notify();
+                });
+                workspace.update(cx, |workspace, cx| {
+                    workspace.add_item_to_active_pane(
+                        Box::new(other.clone()),
+                        None,
+                        false,
+                        window,
+                        cx,
+                    );
+                    workspace.split_item(
+                        workspace::SplitDirection::Right,
+                        Box::new(view.clone()),
+                        window,
+                        cx,
+                    );
+                });
+                item.update(cx, |item, cx| {
+                    let old = item
+                        .doc()
+                        .expect("document")
+                        .scene
+                        .get(text_id)
+                        .expect("text")
+                        .name
+                        .clone();
+                    item.apply(
+                        Operation::SetName {
+                            id: text_id,
+                            old,
+                            new: "Shared committed edit".into(),
+                        },
+                        cx,
+                    )
+                })
+                .expect("shared committed edit");
+                Some(other)
+            } else {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.add_item_to_active_pane(
+                        Box::new(view.clone()),
+                        None,
+                        true,
+                        window,
+                        cx,
+                    );
+                });
+                None
+            };
+            window.activate_window();
+            view.update(cx, |view, cx| {
+                view.inspector_sidebar_visible = true;
+                view.set_viewport_silent(Viewport::default());
+                view.focus_handle.focus(window, cx);
+                cx.notify();
+            });
+            (view, other)
+        })?;
+        let assert_shared_views = |visual: &gpui::VisualTestContext| {
+            if let Some(other) = &other {
+                visual.read(|cx| {
+                    let panes = workspace.read(cx).panes();
+                    assert_eq!(panes.len(), 2);
+                    let mounted = panes
+                        .iter()
+                        .map(|pane| {
+                            pane.read(cx)
+                                .items()
+                                .map(|item| item.item_id())
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        mounted,
+                        vec![vec![other.entity_id()], vec![view.entity_id()]]
+                    );
+                    assert_ne!(view.entity_id(), other.entity_id());
+                    assert_eq!(view.read(cx).item.entity_id(), item.entity_id());
+                    assert_eq!(other.read(cx).item.entity_id(), item.entity_id());
+                });
+            }
+        };
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        assert_shared_views(&visual);
+        visual.simulate_resize(size(px(1400.0), px(1000.0)));
+        visual.run_until_parked();
+        item.update(&mut visual, |item, cx| {
+            item.with_document(cx, |document| {
+                assert!(document.doc.scene.contains(text_id));
+                document.doc.selection.select_only(text_id);
+                ((), DocChange::Selection)
+            })
+        })
+        .context("select the loaded text in its mounted canvas")?;
+        visual.run_until_parked();
+        view.update_in(&mut visual, |view, window, cx| {
+            assert_eq!(view.editor_workspace(cx), EditorWorkspace::Canvas);
+            assert_eq!(view.editor_mode(cx), EditorMode::Design);
+            assert!(view.is_editable(cx));
+            assert!(view.inspector_sidebar_visible);
+            view.refresh_gpui_design(cx);
+            view.refresh_properties_inspector(window, cx);
+            view.focus_handle.focus(window, cx);
+        });
+        visual.run_until_parked();
+        visual.read(|cx| {
+            assert_eq!(
+                workspace
+                    .read(cx)
+                    .active_item_as::<FigView>(cx)
+                    .expect("active inspector draft owner")
+                    .entity_id(),
+                view.entity_id()
+            );
+            let document = item.read(cx).doc().expect("loaded document");
+            assert_eq!(
+                document.selection.iter().copied().collect::<Vec<_>>(),
+                vec![text_id]
+            );
+            assert_eq!(
+                document.scene.get(text_id).expect("selected text").parent,
+                document.active_page()
+            );
+        });
+        visual.update(|window, cx| {
+            window.refresh();
+            window.draw(cx).clear();
+        });
+        let panel = view.read_with(&visual, |view, _| {
+            view.gpui_design
+                .as_ref()
+                .expect("Design panel")
+                .panel
+                .clone()
+        });
+        panel.read_with(&visual, |panel, _| {
+            let selection = panel.inspection_context().selection().items();
+            assert_eq!(selection.len(), 1, "mounted inspector selection");
+            assert_eq!(panel.node().id.as_ref(), text_id.to_string());
+            assert!(panel.inspection_context().permissions().can_edit());
+            assert_eq!((panel.node().x, panel.node().y), (40.0, 60.0));
+        });
+        let before = item.read_with(&visual, |item, _| item.doc().expect("document").clone());
+        let before_history = (before.history.undo_depth(), before.history.redo_depth());
+        let replace_input = |visual: &mut gpui::VisualTestContext, text: &str| {
+            visual.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+            let field = visual
+                .debug_bounds("fig-gpui-design-x")
+                .expect("rendered X field");
+            visual.simulate_click(field.center(), gpui::Modifiers::none());
+            visual.simulate_keystrokes("cmd-a");
+            visual.simulate_input(text);
+            visual.run_until_parked();
+        };
+        if draft == "40" {
+            let field = visual
+                .debug_bounds("fig-gpui-design-x")
+                .expect("rendered X field");
+            visual.simulate_click(field.center(), gpui::Modifiers::none());
+            visual.run_until_parked();
+        } else {
+            replace_input(&mut visual, "48");
+            if draft != "48" {
+                replace_input(&mut visual, draft);
+            }
+        }
+        let changed = draft != "40";
+        let invalid = draft == "-";
+        let state = if invalid {
+            DesignPropertyDraftState::Invalid
+        } else if changed {
+            DesignPropertyDraftState::Valid
+        } else {
+            DesignPropertyDraftState::Unchanged
+        };
+        assert_eq!(
+            panel.read_with(&visual, |panel, cx| panel.property_draft_state(cx)),
+            state
+        );
+        view.read_with(&visual, |view, cx| {
+            assert_eq!(view.has_pending_view_edits(cx), changed);
+            assert_eq!(view.is_dirty(cx), changed || shared_tab);
+            assert!(!view.autosave_allowed(cx));
+            if !shared_tab {
+                assert!(
+                    view.autosave_task.is_none(),
+                    "preview and draft status must not schedule saving"
+                );
+            }
+        });
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                item.is_dirty(),
+                changed || shared_tab,
+                "an active preview is dirty without committing history"
+            );
+            let doc = item.doc().expect("preview document");
+            assert_eq!(
+                (doc.history.undo_depth(), doc.history.redo_depth()),
+                before_history
+            );
+            let mut preview = before.clone();
+            preview
+                .scene
+                .set_transform(
+                    text_id,
+                    Transform2D::translation(if changed { 48.0 } else { 40.0 }, 60.0),
+                )
+                .expect("expected preview");
+            assert_eq!(
+                serde_json::to_value(doc).expect("preview document"),
+                serde_json::to_value(preview).expect("expected preview document")
+            );
+            assert_eq!(
+                item.document().expect("document").raw_assets.as_ref(),
+                &original_assets
+            );
+        });
+        assert_eq!(
+            serde_json::to_value(fanta_format::read_project_tree(&root)?.0)?,
+            original_disk
+        );
+        if shared_tab {
+            workspace.read_with(&visual, |workspace, cx| {
+                assert!(
+                    !workspace::Pane::skip_save_on_close(&view, workspace, cx),
+                    "another tab retains the shared edit, but cannot retain this input draft"
+                );
+            });
+        }
+        if changed {
+            visual.read(|cx| assert!(!ItemHandle::can_autosave(&view, cx)));
+            view.update_in(&mut visual, |view, window, cx| {
+                Item::save(
+                    view,
+                    SaveOptions {
+                        autosave: true,
+                        format: false,
+                        force_format: false,
+                    },
+                    project.clone(),
+                    window,
+                    cx,
+                )
+            })
+            .await?;
+            assert_eq!(
+                panel.read_with(&visual, |panel, cx| panel.property_draft_state(cx)),
+                state
+            );
+            assert_eq!(
+                serde_json::to_value(fanta_format::read_project_tree(&root)?.0)?,
+                original_disk
+            );
+        }
+        let mut saved = false;
+        if choice == "Explicit" {
+            let result = workspace
+                .update_in(&mut visual, |workspace, window, cx| {
+                    workspace.save_active_item(workspace::SaveIntent::Save, window, cx)
+                })
+                .await;
+            if invalid {
+                assert!(
+                    result
+                        .expect_err("invalid Save must refuse")
+                        .to_string()
+                        .contains("invalid property")
+                );
+                assert_eq!(
+                    panel.read_with(&visual, |panel, cx| panel.property_draft_state(cx)),
+                    state
+                );
+                assert_eq!(
+                    serde_json::to_value(fanta_format::read_project_tree(&root)?.0)?,
+                    original_disk
+                );
+                replace_input(&mut visual, "48");
+                workspace
+                    .update_in(&mut visual, |workspace, window, cx| {
+                        workspace.save_active_item(workspace::SaveIntent::Save, window, cx)
+                    })
+                    .await?;
+            } else {
+                result?;
+            }
+            saved = changed;
+        } else {
+            multi_workspace.update_in(&mut visual, |root, window, cx| {
+                root.close_window(&workspace::CloseWindow, window, cx)
+            });
+            visual.run_until_parked();
+            if changed {
+                let prompt = visual
+                    .pending_prompt()
+                    .expect("normal three-choice dirty prompt");
+                if shared_tab {
+                    assert_eq!(
+                        prompt.0,
+                        "Do you want to save all changes in the following files?"
+                    );
+                } else {
+                    assert!(prompt.0.contains("save"));
+                }
+                assert_shared_views(&visual);
+                assert_eq!(
+                    panel.read_with(&visual, |panel, cx| panel.property_draft_state(cx)),
+                    state,
+                    "prompt activation must not consume a valid or invalid draft"
+                );
+                assert_eq!(
+                    serde_json::to_value(fanta_format::read_project_tree(&root)?.0)?,
+                    original_disk
+                );
+                visual.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+                visual.run_until_parked();
+                assert!(visual.has_pending_prompt());
+                assert_eq!(
+                    serde_json::to_value(fanta_format::read_project_tree(&root)?.0)?,
+                    original_disk
+                );
+                visual.simulate_prompt_answer(choice);
+                visual.run_until_parked();
+                let save_requested = matches!(choice, "Save" | "Save all");
+                if choice == "Cancel" || (save_requested && invalid) {
+                    if invalid && save_requested {
+                        let error = visual
+                            .pending_prompt()
+                            .expect("visible close Save validation error");
+                        assert!(format!("{} {}", error.0, error.1).contains("invalid property"));
+                        visual.simulate_prompt_answer("OK");
+                        visual.run_until_parked();
+                    }
+                    assert!(visual.read(|cx| cx.windows().contains(&window.into())));
+                    assert_shared_views(&visual);
+                    assert_eq!(
+                        panel.read_with(&visual, |panel, cx| panel.property_draft_state(cx)),
+                        state
+                    );
+                    view.read_with(&visual, |view, cx| assert!(view.is_dirty(cx)));
+                    assert_eq!(
+                        serde_json::to_value(fanta_format::read_project_tree(&root)?.0)?,
+                        original_disk
+                    );
+                    multi_workspace.update_in(&mut visual, |root, window, cx| {
+                        root.close_window(&workspace::CloseWindow, window, cx)
+                    });
+                    visual.run_until_parked();
+                    assert!(visual.has_pending_prompt(), "retry still offers Discard");
+                    visual.simulate_prompt_answer(if shared_tab {
+                        "Discard all"
+                    } else {
+                        "Don't Save"
+                    });
+                    visual.run_until_parked();
+                } else {
+                    saved = save_requested;
+                }
+            }
+            assert!(!visual.has_pending_prompt());
+            assert!(
+                !visual.read(|cx| cx.windows().contains(&window.into())),
+                "the original whole window closed"
+            );
+        }
+        let (actual_disk, actual_assets) = fanta_format::read_project_tree(&root)?;
+        assert_eq!(actual_assets, original_assets);
+        if saved {
+            let mut expected = before.clone();
+            expected.apply(Operation::SetTransform {
+                id: text_id,
+                old: Transform2D::translation(40.0, 60.0),
+                new: Transform2D::translation(48.0, 60.0),
+            })?;
+            let now = i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)?
+                    .as_secs(),
+            )?;
+            item.read_with(&visual, |item, _| {
+                let actual = item.doc().expect("saved document");
+                assert!((before.metadata.modified_at..=now).contains(&actual.metadata.modified_at));
+                expected.metadata.modified_at = actual.metadata.modified_at;
+                assert_eq!(
+                    serde_json::to_value(actual).expect("actual"),
+                    serde_json::to_value(&expected).expect("expected")
+                );
+                assert_eq!(actual.history.undo_depth(), before_history.0 + 1);
+                assert_eq!(actual.history.redo_depth(), 0);
+                assert!(!item.is_dirty());
+            });
+            let expected_root = directory.path().join("Expected projection");
+            crate::document::write_project(&expected_root, &expected, &original_assets)?;
+            assert_eq!(
+                serde_json::to_value(actual_disk)?,
+                serde_json::to_value(fanta_format::read_project_tree(&expected_root)?.0)?
+            );
+        } else {
+            assert_eq!(serde_json::to_value(actual_disk)?, original_disk);
+            item.read_with(&visual, |item, _| {
+                assert!(!item.is_dirty());
+                let doc = item.doc().expect("restored document");
+                assert_eq!(doc.history.undo_depth(), 0);
+                assert_eq!(doc.history.redo_depth(), 0);
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(all(target_os = "macos", feature = "fanta-gpui-ui"))]
+    #[gpui::test]
+    async fn property_draft_explicit_save_commits_focused_input(cx: &mut TestAppContext) {
+        assert_property_draft_persistence("48", "Explicit", false, cx)
+            .await
+            .expect("focused Save");
+    }
+
+    #[cfg(all(target_os = "macos", feature = "fanta-gpui-ui"))]
+    #[gpui::test]
+    async fn property_draft_invalid_save_preserves_then_corrects_input(cx: &mut TestAppContext) {
+        assert_property_draft_persistence("-", "Explicit", false, cx)
+            .await
+            .expect("invalid Save and correction");
+    }
+
+    #[cfg(all(target_os = "macos", feature = "fanta-gpui-ui"))]
+    #[gpui::test]
+    async fn property_draft_window_save_commits_after_prompt_focus(cx: &mut TestAppContext) {
+        assert_property_draft_persistence("48", "Save", false, cx)
+            .await
+            .expect("window Save");
+    }
+
+    #[cfg(all(target_os = "macos", feature = "fanta-gpui-ui"))]
+    #[gpui::test]
+    async fn property_draft_invalid_window_save_keeps_discard_available(cx: &mut TestAppContext) {
+        assert_property_draft_persistence("-", "Save", false, cx)
+            .await
+            .expect("invalid close Save and Discard");
+    }
+
+    #[cfg(all(target_os = "macos", feature = "fanta-gpui-ui"))]
+    #[gpui::test]
+    async fn property_draft_window_cancel_then_discard_preserves_shared_item(
+        cx: &mut TestAppContext,
+    ) {
+        assert_property_draft_persistence("48", "Cancel", true, cx)
+            .await
+            .expect("shared pending view");
+    }
+
+    #[cfg(all(target_os = "macos", feature = "fanta-gpui-ui"))]
+    #[gpui::test]
+    async fn property_draft_shared_save_all_commits_later_pane_owner_first(
+        cx: &mut TestAppContext,
+    ) {
+        assert_property_draft_persistence("48", "Save all", true, cx)
+            .await
+            .expect("shared Save all settles the later pane's draft first");
+    }
+
+    #[cfg(all(target_os = "macos", feature = "fanta-gpui-ui"))]
+    #[gpui::test]
+    async fn property_draft_invalid_shared_save_all_keeps_discard_available(
+        cx: &mut TestAppContext,
+    ) {
+        assert_property_draft_persistence("-", "Save all", true, cx)
+            .await
+            .expect("invalid shared Save all preserves both views and offers Discard");
+    }
+
+    #[cfg(all(target_os = "macos", feature = "fanta-gpui-ui"))]
+    #[gpui::test]
+    async fn property_draft_invalid_window_cancel_then_discard(cx: &mut TestAppContext) {
+        assert_property_draft_persistence("-", "Cancel", false, cx)
+            .await
+            .expect("invalid Cancel and Discard");
+    }
+
+    #[cfg(all(target_os = "macos", feature = "fanta-gpui-ui"))]
+    #[gpui::test]
+    async fn property_draft_unchanged_focused_field_closes_without_prompt(cx: &mut TestAppContext) {
+        assert_property_draft_persistence("40", "Close", false, cx)
+            .await
+            .expect("unchanged field");
+        use crate::properties_snapshot::selection_world_geometry;
+        use fanta_gpui::design::DesignPropertyDraftState;
+
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        for horizontal in [true, false] {
+            let (mut doc, _, images) = bitmap_canvas_doc();
+            let mut baseline = fanta_doc::PathData::new();
+            baseline
+                .move_to(0.0, 55.0)
+                .quad_to(185.0, -35.0, 370.0, 55.0);
+            let mut text_path = fanta_doc::TextPathNode::new(baseline, "QA PATH");
+            text_path.style.size_px = 32.0;
+            let bounds = fanta_render::text_path_visual_bounds(&text_path).expect("shaped text");
+            let mut node = CanvasNode::new(NodeData::TextPath(text_path));
+            node.parent = doc.active_page();
+            node.transform =
+                Transform2D::translation(55.375 - bounds.min_x, 356.375 - bounds.min_y);
+            let id = node.id;
+            doc.apply(Operation::create_node(node)).expect("TextPath");
+            doc.history = Default::default();
+            let (item, view, _host, mut visual) = pane_layout_fixture(&project, doc, images, cx);
+            item.update(&mut visual, |item, cx| {
+                item.with_document(cx, |document| {
+                    document.doc.selection.select_only(id);
+                    ((), DocChange::Selection)
+                })
+                .expect("select mounted TextPath");
+            });
+            draw_pane_layout(&mut visual);
+            let panel = view.read_with(&visual, |view, _| {
+                view.gpui_design.as_ref().expect("Design").panel.clone()
+            });
+            let snapshot = |item: &FigItem| {
+                let document = item.document().expect("document");
+                (
+                    serde_json::to_value(&document.doc).expect("full document"),
+                    document.raw_assets.clone(),
+                    document.doc.scene.get(id).expect("TextPath").transform,
+                    selection_world_geometry(&document.doc, id).expect("visual bounds"),
+                    document.doc.history.undo_depth(),
+                    document.doc.history.redo_depth(),
+                    item.is_dirty(),
+                )
+            };
+            let before = item.read_with(&visual, |item, _| {
+                assert!(!item.is_dirty());
+                assert_eq!(item.doc().expect("document").history.undo_depth(), 0);
+                assert_eq!(item.doc().expect("document").history.redo_depth(), 0);
+                snapshot(item)
+            });
+            let original_doc =
+                item.read_with(&visual, |item, _| item.doc().expect("document").clone());
+            let original = before.3;
+            let coordinate = if horizontal { original.x } else { original.y };
+            let initial_text = if horizontal { "55.38" } else { "356.38" };
+            assert_ne!(
+                coordinate as f32,
+                initial_text.parse::<f32>().expect("rounded display")
+            );
+            let selector = if horizontal {
+                "fig-gpui-design-x"
+            } else {
+                "fig-gpui-design-y"
+            };
+            for terminal in ["blur", "enter", "invalid-cancel"] {
+                let field_center = visual
+                    .debug_bounds(selector)
+                    .expect("mounted position input")
+                    .center();
+                visual.simulate_click(field_center, gpui::Modifiers::none());
+                draw_pane_layout(&mut visual);
+                assert_eq!(
+                    panel.read_with(&visual, |panel, cx| panel.property_draft_state(cx)),
+                    DesignPropertyDraftState::Unchanged
+                );
+                item.read_with(&visual, |item, _| {
+                    assert_eq!(
+                        snapshot(item),
+                        before,
+                        "focus must not author a rounded seed"
+                    )
+                });
+                view.read_with(&visual, |view, cx| {
+                    assert!(!view.is_dirty(cx));
+                    assert!(!view.has_pending_view_edits(cx));
+                });
+                visual.simulate_keystrokes("cmd-a cmd-c");
+                assert_eq!(
+                    visual
+                        .read_from_clipboard()
+                        .expect("actual input")
+                        .text()
+                        .as_deref(),
+                    Some(initial_text)
+                );
+                match terminal {
+                    "blur" => view.update_in(&mut visual, |view, window, cx| {
+                        view.focus_handle.focus(window, cx)
+                    }),
+                    "enter" => visual.simulate_keystrokes("enter"),
+                    "invalid-cancel" => {
+                        visual.simulate_input("bad");
+                        draw_pane_layout(&mut visual);
+                        assert_eq!(
+                            panel.read_with(&visual, |panel, cx| panel.property_draft_state(cx)),
+                            DesignPropertyDraftState::Invalid
+                        );
+                        item.read_with(&visual, |item, _| {
+                            assert_eq!(snapshot(item), before, "invalid text must not preview")
+                        });
+                        view.read_with(&visual, |view, cx| {
+                            assert!(view.has_pending_view_edits(cx))
+                        });
+                        visual.simulate_keystrokes("escape");
+                    }
+                    _ => unreachable!(),
+                }
+                draw_pane_layout(&mut visual);
+                assert_eq!(
+                    panel.read_with(&visual, |panel, cx| panel.property_draft_state(cx)),
+                    DesignPropertyDraftState::None
+                );
+                item.read_with(&visual, |item, _| {
+                    assert_eq!(
+                        snapshot(item),
+                        before,
+                        "unchanged terminal must preserve authored state"
+                    )
+                });
+                view.read_with(&visual, |view, cx| assert!(!view.is_dirty(cx)));
+            }
+            let field_center = visual
+                .debug_bounds(selector)
+                .expect("position input")
+                .center();
+            visual.simulate_click(field_center, gpui::Modifiers::none());
+            visual.simulate_keystrokes("cmd-a");
+            let target = if horizontal { 72.125 } else { 392.125 };
+            visual.simulate_input(&target.to_string());
+            draw_pane_layout(&mut visual);
+            item.read_with(&visual, |item, _| {
+                let preview = snapshot(item);
+                assert!(preview.6, "a genuine preview remains dirty");
+                assert_eq!((preview.4, preview.5), (0, 0));
+                let actual = if horizontal { preview.3.x } else { preview.3.y };
+                assert!((actual - target).abs() < 1.0e-9);
+            });
+            visual.simulate_keystrokes("enter");
+            draw_pane_layout(&mut visual);
+            assert_eq!(
+                panel.read_with(&visual, |panel, cx| panel.property_draft_state(cx)),
+                DesignPropertyDraftState::None
+            );
+            item.read_with(&visual, |item, _| {
+                let after = snapshot(item);
+                assert!(after.6);
+                assert_eq!((after.4, after.5), (1, 0));
+                assert_eq!(after.1, before.1);
+                let geometry = after.3;
+                let actual = if horizontal { geometry.x } else { geometry.y };
+                let other = if horizontal {
+                    geometry.y - original.y
+                } else {
+                    geometry.x - original.x
+                };
+                assert!((actual - target).abs() < 1.0e-9);
+                assert!(other.abs() < 1.0e-9);
+                assert!((geometry.width - original.width).abs() < 1.0e-9);
+                assert!((geometry.height - original.height).abs() < 1.0e-9);
+                let doc = item.doc().expect("committed document");
+                let mut expected_scene = original_doc.scene.clone();
+                expected_scene
+                    .set_transform(id, after.2)
+                    .expect("expected position");
+                assert_eq!(
+                    serde_json::to_value(&doc.scene).expect("committed scene"),
+                    serde_json::to_value(expected_scene).expect("expected scene")
+                );
+                assert_eq!(doc.selection.iter().copied().collect::<Vec<_>>(), vec![id]);
+            });
+        }
+    }
+
+    #[cfg(target_os = "macos")]
     async fn canvas_audio_fixture(
         cx: &mut TestAppContext,
     ) -> Result<(
@@ -11955,10 +13319,8 @@ mod tests {
         let (_dir, root, item, view) = autosave_fixture(cx).await;
         // A loaded project knows the disk it came from; a failed save resyncs
         // against it.
-        let on_disk = fanta_format::read_project_tree(&root)
-            .expect("project on disk")
-            .0;
-        item.update(cx, |item, _| item.set_merge_base_for_test(on_disk));
+        let (on_disk, assets) = fanta_format::read_project_tree(&root).expect("project on disk");
+        item.update(cx, |item, _| item.set_merge_base_for_test(on_disk, assets));
         // Every directory, so no write (temp file plus rename) can land anywhere.
         fn collect_directories(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
             out.push(dir.to_path_buf());
@@ -12011,6 +13373,686 @@ mod tests {
                 "a successful save clears the report"
             )
         });
+    }
+
+    struct SaveFailureNoticeFixture {
+        _directory: tempfile::TempDir,
+        root: std::path::PathBuf,
+        project: Entity<Project>,
+        item: Entity<FigItem>,
+        view: Entity<FigView>,
+        workspace: Entity<workspace::Workspace>,
+        window: gpui::WindowHandle<MultiWorkspace>,
+    }
+
+    async fn save_failure_notice_fixture(
+        name: &str,
+        cx: &mut TestAppContext,
+    ) -> Result<SaveFailureNoticeFixture> {
+        use project::ProjectItem as _;
+
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join(name);
+        crate::document::write_project(&root, &doc_with_one_page(), &BTreeMap::new())?;
+        let file_system = Arc::new(fs::RealFs::new(None, cx.executor()));
+        let project = Project::test(file_system, [root.as_path()], cx).await;
+        let worktree_id = project.read_with(cx, |project, cx| {
+            project
+                .worktrees(cx)
+                .next()
+                .expect("fixture worktree")
+                .read(cx)
+                .id()
+        });
+        let item = cx
+            .update(|cx| {
+                FigItem::try_open(
+                    &project,
+                    &project::ProjectPath {
+                        worktree_id,
+                        path: util::rel_path::rel_path("fanta.json").into(),
+                    },
+                    cx,
+                )
+            })
+            .context("native fixture opener")?
+            .await?;
+        cx.run_until_parked();
+        assert!(item.read_with(cx, |item, _| item.has_ready_document()));
+        let window =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = window
+            .entity(cx)?
+            .read_with(cx, |root, _| root.workspace().clone());
+        let view = window.update(cx, |_, window, cx| {
+            let view = cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx));
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(view.clone()), None, true, window, cx);
+            });
+            window.activate_window();
+            view
+        })?;
+        cx.run_until_parked();
+        Ok(SaveFailureNoticeFixture {
+            _directory: directory,
+            root,
+            project,
+            item,
+            view,
+            workspace,
+            window,
+        })
+    }
+
+    fn save_failure_notice_document(
+        item: &Entity<FigItem>,
+        cx: &TestAppContext,
+    ) -> (
+        serde_json::Value,
+        BTreeMap<AssetId, Vec<u8>>,
+        usize,
+        usize,
+        bool,
+    ) {
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("ready notification fixture");
+            (
+                serde_json::to_value(&document.doc).expect("complete document"),
+                document.raw_assets.as_ref().clone(),
+                document.doc.history.undo_depth(),
+                document.doc.history.redo_depth(),
+                item.is_dirty(),
+            )
+        })
+    }
+
+    fn assert_save_failure_notice(
+        fixture: &SaveFailureNoticeFixture,
+        present: bool,
+        cx: &TestAppContext,
+    ) {
+        assert_eq!(
+            fixture.workspace.read_with(cx, |workspace, _| {
+                workspace
+                    .notification_ids()
+                    .contains(&save_failure_notice_id(fixture.item.entity_id()))
+            }),
+            present
+        );
+    }
+
+    fn report_notice_fixture_failure(view: &Entity<FigView>, cx: &mut TestAppContext) {
+        let error = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            .context("writing /private/fixture/.fanta-transaction-build-private");
+        view.update(cx, |view, cx| view.report_save_failure(&error, cx));
+    }
+
+    #[gpui::test]
+    async fn save_failure_notice_real_write_error_is_concise_and_recovery_is_scoped(
+        cx: &mut TestAppContext,
+    ) {
+        let result: Result<()> = async {
+            init_visual_test(cx);
+            cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+            let first = save_failure_notice_fixture("First design", cx).await?;
+            let other = save_failure_notice_fixture("Other design", cx).await?;
+            report_notice_fixture_failure(&other.view, cx);
+            cx.run_until_parked();
+            let files = autosave_project_files(&first.root)?;
+            let mut fault = AutosaveDirectoryFault::apply(&first.root)?;
+            add_rect(&first.item, cx);
+            let document = save_failure_notice_document(&first.item, cx);
+            settle_autosave_and_resync(cx);
+            assert_save_failure_notice(&first, true, cx);
+            assert_save_failure_notice(&other, true, cx);
+            first.view.read_with(cx, |view, _| {
+                assert!(
+                    view.reported_save_failure
+                        .as_ref()
+                        .is_some_and(|error| error.contains("Permission denied"))
+                );
+                let state = view.save_failure_notice.borrow();
+                let message = state.as_ref().expect("persistent concise notice");
+                assert!(message.contains("First design"));
+                assert!(message.contains("Write access was denied"));
+                assert!(message.contains("try Save again"));
+                assert!(message.len() < 200);
+                assert!(!message.contains(first.root.to_string_lossy().as_ref()));
+                assert!(!message.contains(".fanta-transaction"));
+            });
+            assert_eq!(autosave_project_files(&first.root)?, files);
+            assert_eq!(save_failure_notice_document(&first.item, cx), document);
+            fault.restore()?;
+            first
+                .view
+                .update(cx, |view, cx| view.save_document(cx))
+                .await?;
+            cx.run_until_parked();
+            assert_save_failure_notice(&first, false, cx);
+            assert_save_failure_notice(&other, true, cx);
+            assert_autosave_persisted_draft(&first.root, &first.item, cx)?;
+            Ok(())
+        }
+        .await;
+        result.expect(
+            "a real failed write is explained briefly without clearing another design's warning",
+        );
+    }
+
+    #[gpui::test]
+    async fn save_failure_notice_discard_removes_only_the_closed_document(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            init_visual_test(cx);
+            cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+            let first = save_failure_notice_fixture("Discard design", cx).await?;
+            let other = save_failure_notice_fixture("Keep design", cx).await?;
+            let files = autosave_project_files(&first.root)?;
+            let other_document = save_failure_notice_document(&other.item, cx);
+            add_rect(&first.item, cx);
+            report_notice_fixture_failure(&first.view, cx);
+            report_notice_fixture_failure(&other.view, cx);
+            cx.run_until_parked();
+            assert_save_failure_notice(&first, true, cx);
+            assert_save_failure_notice(&other, true, cx);
+            let close = first.window.update(cx, |_, window, cx| {
+                let pane = first.workspace.read(cx).active_pane().clone();
+                pane.update(cx, |pane, cx| {
+                    pane.close_item_by_id(
+                        first.view.entity_id(),
+                        workspace::SaveIntent::Skip,
+                        window,
+                        cx,
+                    )
+                })
+            })?;
+            close.await?;
+            cx.run_until_parked();
+            assert_eq!(
+                first.workspace.read_with(cx, |workspace, cx| workspace
+                    .items_of_type::<FigView>(cx)
+                    .count()),
+                0
+            );
+            assert_save_failure_notice(&first, false, cx);
+            assert_save_failure_notice(&other, true, cx);
+            assert!(
+                first
+                    .view
+                    .read_with(cx, |view, _| view.save_failure_notice.borrow().is_none())
+            );
+            assert_eq!(autosave_project_files(&first.root)?, files);
+            assert_eq!(
+                save_failure_notice_document(&other.item, cx),
+                other_document
+            );
+            Ok(())
+        }
+        .await;
+        result.expect(
+            "Discard clears only its document's notice even while the removed view is retained",
+        );
+    }
+
+    #[gpui::test]
+    async fn save_failure_notice_survives_one_shared_tab_until_the_last_removal(
+        cx: &mut TestAppContext,
+    ) {
+        let result: Result<()> = async {
+            init_visual_test(cx);
+            cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+            let fixture = save_failure_notice_fixture("Shared design", cx).await?;
+            let sibling = fixture.window.update(cx, |_, window, cx| {
+                let sibling = cx.new(|cx| {
+                    FigView::new(fixture.item.clone(), fixture.project.clone(), window, cx)
+                });
+                fixture.workspace.update(cx, |workspace, cx| {
+                    workspace.split_item(
+                        workspace::SplitDirection::Right,
+                        Box::new(sibling.clone()),
+                        window,
+                        cx,
+                    )
+                });
+                sibling
+            })?;
+            assert_ne!(fixture.view.entity_id(), sibling.entity_id());
+            assert_eq!(
+                sibling.read_with(cx, |view, _| view.item.entity_id()),
+                fixture.item.entity_id()
+            );
+            assert_eq!(
+                fixture.workspace.read_with(cx, |workspace, cx| workspace
+                    .items_of_type::<FigView>(cx)
+                    .count()),
+                2
+            );
+            let document = save_failure_notice_document(&fixture.item, cx);
+            let files = autosave_project_files(&fixture.root)?;
+            report_notice_fixture_failure(&fixture.view, cx);
+            cx.run_until_parked();
+            assert_save_failure_notice(&fixture, true, cx);
+            for (view, expected) in [(&fixture.view, true), (&sibling, false)] {
+                fixture.window.update(cx, |_, window, cx| {
+                    let panes = fixture.workspace.read(cx).panes().to_vec();
+                    for pane in panes {
+                        pane.update(cx, |pane, cx| {
+                            pane.remove_item(view.entity_id(), false, false, window, cx)
+                        });
+                    }
+                })?;
+                cx.run_until_parked();
+                assert_save_failure_notice(&fixture, expected, cx);
+            }
+            assert!(
+                fixture
+                    .view
+                    .read_with(cx, |view, _| view.save_failure_notice.borrow().is_none())
+            );
+            assert_eq!(save_failure_notice_document(&fixture.item, cx), document);
+            assert_eq!(autosave_project_files(&fixture.root)?, files);
+            Ok(())
+        }
+        .await;
+        result.expect("removing one tab preserves a shared document warning until its last mounted owner leaves");
+    }
+
+    #[gpui::test]
+    async fn save_failure_notice_deferred_show_cannot_outlive_save_or_removal(
+        cx: &mut TestAppContext,
+    ) {
+        let result: Result<()> = async {
+            init_visual_test(cx);
+            cx.update(|cx| cx.set_global(db::AppDatabase::test_new()));
+            let fixture = save_failure_notice_fixture("Deferred design", cx).await?;
+            let document = save_failure_notice_document(&fixture.item, cx);
+            let files = autosave_project_files(&fixture.root)?;
+            fixture.window.update(cx, |_, _, cx| {
+                let error = anyhow::anyhow!("queued diagnostic");
+                fixture
+                    .view
+                    .update(cx, |view, cx| view.report_save_failure(&error, cx));
+                fixture
+                    .item
+                    .update(cx, |_, cx| cx.emit(FigItemEvent::Saved));
+            })?;
+            cx.run_until_parked();
+            assert_save_failure_notice(&fixture, false, cx);
+            fixture.window.update(cx, |_, window, cx| {
+                let error = anyhow::anyhow!("queued diagnostic before removal");
+                fixture
+                    .view
+                    .update(cx, |view, cx| view.report_save_failure(&error, cx));
+                let pane = fixture.workspace.read(cx).active_pane().clone();
+                pane.update(cx, |pane, cx| {
+                    pane.remove_item(fixture.view.entity_id(), false, false, window, cx)
+                });
+            })?;
+            cx.run_until_parked();
+            assert_save_failure_notice(&fixture, false, cx);
+            assert!(
+                fixture
+                    .view
+                    .read_with(cx, |view, _| view.save_failure_notice.borrow().is_none())
+            );
+            assert_eq!(save_failure_notice_document(&fixture.item, cx), document);
+            assert_eq!(autosave_project_files(&fixture.root)?, files);
+            Ok(())
+        }
+        .await;
+        result.expect("queued notification work reconciles current document ownership and successful-save state");
+    }
+
+    struct AutosaveDirectoryFault {
+        permissions: Vec<(std::path::PathBuf, std::fs::Permissions)>,
+    }
+
+    impl AutosaveDirectoryFault {
+        fn apply(root: &std::path::Path) -> Result<Self> {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            fn collect(
+                directory: &std::path::Path,
+                permissions: &mut Vec<(std::path::PathBuf, std::fs::Permissions)>,
+            ) -> Result<()> {
+                permissions.push((
+                    directory.to_path_buf(),
+                    std::fs::metadata(directory)?.permissions(),
+                ));
+                for entry in std::fs::read_dir(directory)? {
+                    let entry = entry?;
+                    let kind = entry.file_type()?;
+                    anyhow::ensure!(!kind.is_symlink(), "unexpected symlink in save fixture");
+                    if kind.is_dir() {
+                        collect(&entry.path(), permissions)?;
+                    }
+                }
+                Ok(())
+            }
+            let mut fault = Self {
+                permissions: Vec::new(),
+            };
+            collect(root, &mut fault.permissions)?;
+            for (directory, permissions) in &fault.permissions {
+                std::fs::set_permissions(
+                    directory,
+                    std::fs::Permissions::from_mode(permissions.mode() & !0o222),
+                )?;
+            }
+            Ok(fault)
+        }
+
+        fn restore(&mut self) -> Result<()> {
+            for (directory, permissions) in &self.permissions {
+                std::fs::set_permissions(directory, permissions.clone())?;
+            }
+            self.permissions.clear();
+            Ok(())
+        }
+    }
+
+    impl Drop for AutosaveDirectoryFault {
+        fn drop(&mut self) {
+            for (directory, permissions) in &self.permissions {
+                if let Err(error) = std::fs::set_permissions(directory, permissions.clone()) {
+                    log::error!(
+                        "restoring save fixture {} failed: {error}",
+                        directory.display()
+                    );
+                }
+            }
+        }
+    }
+
+    fn autosave_project_files(
+        root: &std::path::Path,
+    ) -> Result<BTreeMap<std::path::PathBuf, Vec<u8>>> {
+        fn collect(
+            root: &std::path::Path,
+            directory: &std::path::Path,
+            files: &mut BTreeMap<std::path::PathBuf, Vec<u8>>,
+        ) -> Result<()> {
+            for entry in std::fs::read_dir(directory)? {
+                let entry = entry?;
+                let kind = entry.file_type()?;
+                anyhow::ensure!(!kind.is_symlink(), "unexpected symlink in save fixture");
+                if kind.is_dir() {
+                    collect(root, &entry.path(), files)?;
+                } else {
+                    files.insert(
+                        entry.path().strip_prefix(root)?.to_path_buf(),
+                        std::fs::read(entry.path())?,
+                    );
+                }
+            }
+            Ok(())
+        }
+        let mut files = BTreeMap::new();
+        collect(root, root, &mut files)?;
+        Ok(files)
+    }
+
+    fn assert_autosave_persisted_draft(
+        root: &std::path::Path,
+        item: &Entity<FigItem>,
+        cx: &TestAppContext,
+    ) -> Result<()> {
+        let (persisted, assets) = fanta_format::read_project_tree(root)?;
+        item.read_with(cx, |item, _| -> Result<()> {
+            let document = item.document.ready().context("ready save fixture")?;
+            assert_eq!(
+                serde_json::to_value(&persisted.scene)?,
+                serde_json::to_value(&document.doc.scene)?
+            );
+            assert_eq!(&assets, document.raw_assets.as_ref());
+            Ok(())
+        })
+    }
+
+    fn settle_autosave_and_resync(cx: &mut TestAppContext) {
+        // Advance several separate deadlines so the resync's Edited event can
+        // expose a re-armed debounce, rather than only testing the first timer.
+        for _ in 0..4 {
+            cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+            cx.run_until_parked();
+        }
+    }
+
+    #[gpui::test]
+    async fn unchanged_failed_autosave_stays_dirty_without_repeated_writes(
+        cx: &mut TestAppContext,
+    ) {
+        let result: Result<()> = async {
+            let (_directory, root, item, view) = autosave_fixture(cx).await;
+            let (baseline, assets) = fanta_format::read_project_tree(&root)?;
+            item.update(cx, |item, _| item.set_merge_base_for_test(baseline, assets));
+            let files = autosave_project_files(&root)?;
+            let mut fault = AutosaveDirectoryFault::apply(&root)?;
+            assert_eq!(
+                item.read_with(cx, |item, _| item.save_attempts_for_test()),
+                0
+            );
+            add_rect(&item, cx);
+            let generation = item.read_with(cx, |item, _| {
+                item.document
+                    .ready()
+                    .expect("ready fixture")
+                    .render_generation()
+            });
+            settle_autosave_and_resync(cx);
+            assert_eq!(
+                item.read_with(cx, |item, _| {
+                    item.document
+                        .ready()
+                        .expect("ready fixture")
+                        .render_generation()
+                }),
+                generation,
+                "unchanged-disk resync preserves the failed authored generation"
+            );
+            let notice = view.read_with(cx, |view, _| view.reported_save_failure.clone());
+            assert!(
+                notice
+                    .as_ref()
+                    .is_some_and(|error| error.to_ascii_lowercase().contains("permission denied"))
+            );
+            item.read_with(cx, |item, _| {
+                assert_eq!(item.save_attempts_for_test(), 1);
+                assert!(item.is_dirty());
+                assert!(!item.external_reconciliation_pending());
+                assert!(!item.has_conflict());
+            });
+            assert_eq!(autosave_project_files(&root)?, files);
+            fault.restore()?;
+            settle_autosave_and_resync(cx);
+            item.read_with(cx, |item, _| {
+                assert_eq!(
+                    item.save_attempts_for_test(),
+                    1,
+                    "permission recovery alone does not retry"
+                );
+                assert!(item.is_dirty());
+            });
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.reported_save_failure, notice);
+                assert!(view.autosave_task.is_none());
+            });
+            assert_eq!(autosave_project_files(&root)?, files);
+            Ok(())
+        }
+        .await;
+        result.expect("an unchanged failed autosave retains its draft and notice without looping");
+    }
+
+    #[gpui::test]
+    async fn explicit_save_retries_the_unchanged_failed_autosave(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            let (_directory, root, item, view) = autosave_fixture(cx).await;
+            let (baseline, assets) = fanta_format::read_project_tree(&root)?;
+            item.update(cx, |item, _| item.set_merge_base_for_test(baseline, assets));
+            let files = autosave_project_files(&root)?;
+            let mut fault = AutosaveDirectoryFault::apply(&root)?;
+            add_rect(&item, cx);
+            settle_autosave_and_resync(cx);
+            let error = view
+                .update(cx, |view, cx| view.save_document(cx))
+                .await
+                .expect_err("explicit retry still reaches the read-only directory");
+            assert!(error.chain().any(|error| {
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+            }));
+            settle_autosave_and_resync(cx);
+            assert_eq!(
+                item.read_with(cx, |item, _| item.save_attempts_for_test()),
+                2
+            );
+            assert_eq!(autosave_project_files(&root)?, files);
+            assert!(view.read_with(cx, |view, _| view.reported_save_failure.is_some()));
+            fault.restore()?;
+            view.update(cx, |view, cx| view.save_document(cx)).await?;
+            cx.run_until_parked();
+            assert_eq!(
+                item.read_with(cx, |item, _| item.save_attempts_for_test()),
+                3
+            );
+            assert!(!item.read_with(cx, |item, _| item.is_dirty()));
+            assert!(view.read_with(cx, |view, _| view.reported_save_failure.is_none()));
+            assert_eq!(fanta_format::read_project_tree(&root)?.0.scene.len(), 2);
+            assert_autosave_persisted_draft(&root, &item, cx)?;
+            add_rect(&item, cx);
+            settle_autosave_and_resync(cx);
+            assert_eq!(
+                item.read_with(cx, |item, _| item.save_attempts_for_test()),
+                4
+            );
+            assert!(!item.read_with(cx, |item, _| item.is_dirty()));
+            assert_eq!(fanta_format::read_project_tree(&root)?.0.scene.len(), 3);
+            assert_autosave_persisted_draft(&root, &item, cx)?;
+            Ok(())
+        }
+        .await;
+        result.expect("explicit Save bypasses the failure stamp and success restores autosaving");
+    }
+
+    #[gpui::test]
+    async fn new_edit_retries_after_an_autosave_failure(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            let (_directory, root, item, view) = autosave_fixture(cx).await;
+            let (baseline, assets) = fanta_format::read_project_tree(&root)?;
+            item.update(cx, |item, _| item.set_merge_base_for_test(baseline, assets));
+            let mut fault = AutosaveDirectoryFault::apply(&root)?;
+            add_rect(&item, cx);
+            settle_autosave_and_resync(cx);
+            assert_eq!(
+                item.read_with(cx, |item, _| item.save_attempts_for_test()),
+                1
+            );
+            assert!(view.read_with(cx, |view, _| view.reported_save_failure.is_some()));
+            fault.restore()?;
+            add_rect(&item, cx);
+            settle_autosave_and_resync(cx);
+            assert_eq!(
+                item.read_with(cx, |item, _| item.save_attempts_for_test()),
+                2
+            );
+            assert!(!item.read_with(cx, |item, _| item.is_dirty()));
+            assert!(view.read_with(cx, |view, _| view.reported_save_failure.is_none()));
+            assert_eq!(fanta_format::read_project_tree(&root)?.0.scene.len(), 3);
+            assert_autosave_persisted_draft(&root, &item, cx)?;
+            Ok(())
+        }
+        .await;
+        result.expect("a new committed edit remains eligible for automatic persistence");
+    }
+
+    #[gpui::test]
+    async fn newer_edit_during_failed_autosave_remains_eligible(cx: &mut TestAppContext) {
+        let result: Result<()> = async {
+            let (_directory, root, item, view) = autosave_fixture(cx).await;
+            let (baseline, assets) = fanta_format::read_project_tree(&root)?;
+            item.update(cx, |item, _| item.set_merge_base_for_test(baseline, assets));
+            let mut fault = AutosaveDirectoryFault::apply(&root)?;
+            let (arrived, resume) = item.read_with(cx, |item, _| item.pause_next_save_for_test());
+            add_rect(&item, cx);
+            cx.executor().advance_clock(AUTOSAVE_DEBOUNCE * 2);
+            cx.run_until_parked();
+            arrived.await?;
+            add_rect(&item, cx);
+            resume.send(()).expect("resume the older snapshot's writer");
+            cx.run_until_parked();
+            assert_eq!(
+                item.read_with(cx, |item, _| item.save_attempts_for_test()),
+                1
+            );
+            assert!(view.read_with(cx, |view, _| {
+                view.reported_save_failure
+                    .as_ref()
+                    .is_some_and(|error| error.to_ascii_lowercase().contains("permission denied"))
+            }));
+            assert_eq!(fanta_format::read_project_tree(&root)?.0.scene.len(), 1);
+            fault.restore()?;
+            settle_autosave_and_resync(cx);
+            assert_eq!(
+                item.read_with(cx, |item, _| item.save_attempts_for_test()),
+                2
+            );
+            assert!(!item.read_with(cx, |item, _| item.is_dirty()));
+            assert!(view.read_with(cx, |view, _| view.reported_save_failure.is_none()));
+            assert_eq!(fanta_format::read_project_tree(&root)?.0.scene.len(), 3);
+            assert_autosave_persisted_draft(&root, &item, cx)?;
+            Ok(())
+        }
+        .await;
+        result.expect("an older failed snapshot must not suppress newer in-flight edits");
+    }
+
+    #[gpui::test]
+    async fn queued_identical_autosave_is_suppressed_after_the_first_failure(
+        cx: &mut TestAppContext,
+    ) {
+        let result: Result<()> = async {
+            let (_directory, root, item, _view) = autosave_fixture(cx).await;
+            let (baseline, assets) = fanta_format::read_project_tree(&root)?;
+            item.update(cx, |item, _| item.set_merge_base_for_test(baseline, assets));
+            let files = autosave_project_files(&root)?;
+            let mut fault = AutosaveDirectoryFault::apply(&root)?;
+            add_rect(&item, cx);
+            let (arrived, resume) = item.read_with(cx, |item, _| item.pause_next_save_for_test());
+            let first = item.update(cx, |item, cx| item.save(SaveKind::Auto, cx));
+            arrived.await?;
+            let queued = item.update(cx, |item, cx| item.save(SaveKind::Auto, cx));
+            add_rect(&item, cx);
+            resume.send(()).expect("resume the first automatic writer");
+            let error = first
+                .await
+                .expect_err("the first write reaches the denied directory");
+            assert!(error.chain().any(|error| {
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+            }));
+            assert!(queued.await?.is_none());
+            assert_eq!(
+                item.read_with(cx, |item, _| item.save_attempts_for_test()),
+                1
+            );
+            assert!(item.read_with(cx, |item, _| item.is_dirty()));
+            assert_eq!(autosave_project_files(&root)?, files);
+            fault.restore()?;
+            settle_autosave_and_resync(cx);
+            assert_eq!(
+                item.read_with(cx, |item, _| item.save_attempts_for_test()),
+                2
+            );
+            assert!(!item.read_with(cx, |item, _| item.is_dirty()));
+            assert_eq!(fanta_format::read_project_tree(&root)?.0.scene.len(), 3);
+            assert_autosave_persisted_draft(&root, &item, cx)?;
+            Ok(())
+        }
+        .await;
+        result.expect("a queued duplicate must not enter the writer after an unchanged failure");
     }
 
     /// A drag longer than the debounce must not have an intermediate position
@@ -13337,6 +15379,437 @@ mod tests {
             assert!(view.motion_keyframe_drag.is_none());
             assert_eq!(view.editor_workspace(cx), EditorWorkspace::Variables);
         });
+    }
+
+    #[test]
+    fn pane_layout_reserves_canvas_without_changing_hidden_panel_preferences() {
+        let preferred_layers = Some(px(280.0));
+        let preferred_inspector = Some(px(400.0));
+        assert_eq!(
+            pane_sidebar_layout(Some(px(1400.0)), preferred_layers, preferred_inspector),
+            PaneSidebarLayout {
+                layers: preferred_layers,
+                inspector: preferred_inspector
+            }
+        );
+        assert_eq!(
+            pane_sidebar_layout(Some(px(588.0)), preferred_layers, preferred_inspector),
+            PaneSidebarLayout {
+                layers: None,
+                inspector: Some(px(348.0))
+            }
+        );
+        assert_eq!(
+            pane_sidebar_layout(Some(px(450.0)), preferred_layers, preferred_inspector),
+            PaneSidebarLayout {
+                layers: None,
+                inspector: None
+            }
+        );
+        assert_eq!(
+            pane_sidebar_layout(Some(px(588.0)), preferred_layers, None),
+            PaneSidebarLayout {
+                layers: preferred_layers,
+                inspector: None
+            }
+        );
+        assert_eq!(
+            pane_sidebar_layout(Some(px(588.0)), None, preferred_inspector),
+            PaneSidebarLayout {
+                layers: None,
+                inspector: Some(px(348.0))
+            }
+        );
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    struct PaneLayoutTestHost {
+        view: Entity<FigView>,
+        pane_width: Pixels,
+        mouse_trace: Option<std::rc::Rc<std::cell::RefCell<Vec<serde_json::Value>>>>,
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    impl Render for PaneLayoutTestHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            h_flex()
+                .size_full()
+                .when_some(self.mouse_trace.clone(), |host, mouse_trace| {
+                    host.child(
+                        gpui::canvas(
+                            |_, _, _| (),
+                            move |_, _, window, _| {
+                                window.on_mouse_event(
+                                    move |event: &MouseDownEvent, phase, window, _| {
+                                        let mut records = mouse_trace.borrow_mut();
+                                        if records.len() < 64 {
+                                            records.push(serde_json::json!({
+                                                "phase": format!("{phase:?}"),
+                                                "button": format!("{:?}", event.button),
+                                                "position": [f32::from(event.position.x), f32::from(event.position.y)],
+                                                "window_position": [f32::from(window.mouse_position().x), f32::from(window.mouse_position().y)],
+                                                "viewport": [f32::from(window.viewport_size().width), f32::from(window.viewport_size().height)],
+                                                "captured_hitbox": format!("{:?}", window.captured_hitbox()),
+                                            }));
+                                        }
+                                    },
+                                );
+                            },
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                })
+                .child(
+                    div()
+                        .w(self.pane_width)
+                        .h_full()
+                        .flex_shrink_0()
+                        .child(self.view.clone()),
+                )
+                .child(div().flex_1().h_full())
+        }
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn draw_pane_layout(visual: &mut gpui::VisualTestContext) {
+        for _ in 0..3 {
+            visual.run_until_parked();
+            visual.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+        }
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    fn pane_layout_fixture(
+        project: &Entity<Project>,
+        doc: Doc,
+        images: BTreeMap<AssetId, Vec<u8>>,
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<FigItem>,
+        Entity<FigView>,
+        Entity<PaneLayoutTestHost>,
+        gpui::VisualTestContext,
+    ) {
+        let item = crate::document::ready_item_for_test(
+            project,
+            std::path::PathBuf::from("/tmp/PaneLayout.fig"),
+            doc,
+            cx,
+        );
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let (_, mut assets) = document.doc_and_assets();
+                for (expected, bytes) in images {
+                    let (actual, _) = assets.add_image(bytes).expect("fixture image");
+                    assert_eq!(actual, expected);
+                }
+                ((), DocChange::None)
+            })
+            .expect("ready fixture document");
+        });
+        let window = cx.add_window({
+            let item = item.clone();
+            let project = project.clone();
+            move |window, cx| {
+                let view = cx.new(|cx| FigView::new(item, project, window, cx));
+                view.update(cx, |view, cx| {
+                    view.layers_sidebar_visible = true;
+                    view.inspector_sidebar_visible = true;
+                    view.layers_sidebar_width = px(280.0);
+                    view.inspector_sidebar_width = px(400.0);
+                    view.focus_handle.focus(window, cx);
+                });
+                window.activate_window();
+                PaneLayoutTestHost {
+                    view,
+                    pane_width: px(1400.0),
+                    mouse_trace: None,
+                }
+            }
+        });
+        let host = window.entity(cx).expect("pane host");
+        let view = host.read_with(cx, |host, _| host.view.clone());
+        let mut visual = gpui::VisualTestContext::from_window(window.into(), cx);
+        visual.simulate_resize(size(px(1536.0), px(1084.0)));
+        draw_pane_layout(&mut visual);
+        (item, view, host, visual)
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn pane_layout_measures_the_pane_and_restores_wide_sidebars(cx: &mut TestAppContext) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, _, images) = bitmap_canvas_doc();
+        let (item, view, host, mut visual) = pane_layout_fixture(&project, doc, images, cx);
+        let before = item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            (
+                serde_json::to_value(&document.doc).expect("document snapshot"),
+                document.raw_assets.clone(),
+                document.doc.history.undo_depth(),
+                document.doc.history.redo_depth(),
+                item.is_dirty(),
+            )
+        });
+        for (width, canvas_width, inspector_width) in [
+            (1400.0, 720.0, Some(400.0)),
+            (588.0, 240.0, Some(348.0)),
+            (450.0, 450.0, None),
+        ] {
+            host.update(&mut visual, |host, cx| {
+                host.pane_width = px(width);
+                cx.notify();
+            });
+            draw_pane_layout(&mut visual);
+            view.read_with(&visual, |view, _| {
+                assert_eq!(
+                    view.pane_width,
+                    Some(px(width)),
+                    "the window remains 1536 points wide"
+                );
+                assert!(view.layers_sidebar_visible && view.inspector_sidebar_visible);
+                assert_eq!(
+                    (view.layers_sidebar_width, view.inspector_sidebar_width),
+                    (px(280.0), px(400.0))
+                );
+            });
+            assert_eq!(
+                visual
+                    .debug_bounds("fig-container")
+                    .expect("canvas")
+                    .size
+                    .width,
+                px(canvas_width)
+            );
+            let inspector = visual.debug_bounds("fanta-inspector-sidebar");
+            assert_eq!(
+                inspector.map(|bounds| bounds.size.width),
+                inspector_width.map(px)
+            );
+            if width < 1400.0 {
+                assert!(visual.debug_bounds("file-inspector-toggle").is_some());
+            }
+        }
+        let toggle = visual
+            .debug_bounds("properties-inspector-toggle")
+            .expect("compact Inspector toggle")
+            .center();
+        visual.simulate_click(toggle, gpui::Modifiers::none());
+        draw_pane_layout(&mut visual);
+        let inspector = visual
+            .debug_bounds("fanta-inspector-sidebar")
+            .expect("revealed Inspector");
+        assert_eq!(inspector.size.width, px(400.0));
+        assert_eq!(inspector.right(), px(450.0));
+        assert_eq!(
+            visual
+                .debug_bounds("fig-container")
+                .expect("canvas remains allocated")
+                .size
+                .width,
+            px(450.0)
+        );
+        let toggle = visual
+            .debug_bounds("properties-inspector-toggle")
+            .expect("expanded Inspector toggle")
+            .center();
+        visual.simulate_click(toggle, gpui::Modifiers::none());
+        draw_pane_layout(&mut visual);
+        assert!(visual.debug_bounds("fanta-inspector-sidebar").is_none());
+        let toggle = visual
+            .debug_bounds("file-inspector-toggle")
+            .expect("compact Layers toggle")
+            .center();
+        visual.simulate_click(toggle, gpui::Modifiers::none());
+        draw_pane_layout(&mut visual);
+        assert_eq!(
+            visual
+                .debug_bounds("fanta-layers-sidebar")
+                .expect("revealed Layers")
+                .size
+                .width,
+            px(280.0)
+        );
+        host.update(&mut visual, |host, cx| {
+            host.pane_width = px(1400.0);
+            cx.notify();
+        });
+        draw_pane_layout(&mut visual);
+        assert_eq!(
+            visual
+                .debug_bounds("fanta-layers-sidebar")
+                .expect("restored Layers")
+                .size
+                .width,
+            px(280.0)
+        );
+        assert_eq!(
+            visual
+                .debug_bounds("fanta-inspector-sidebar")
+                .expect("restored Inspector")
+                .size
+                .width,
+            px(400.0)
+        );
+        assert_eq!(
+            visual
+                .debug_bounds("fig-container")
+                .expect("restored canvas")
+                .size
+                .width,
+            px(720.0)
+        );
+        item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            assert_eq!(
+                (
+                    serde_json::to_value(&document.doc).expect("document snapshot"),
+                    document.raw_assets.clone(),
+                    document.doc.history.undo_depth(),
+                    document.doc.history.redo_depth(),
+                    item.is_dirty()
+                ),
+                before
+            );
+        });
+        view.read_with(&visual, |view, _| {
+            assert!(view.layers_sidebar_visible && view.inspector_sidebar_visible);
+            assert_eq!(
+                (view.layers_sidebar_width, view.inspector_sidebar_width),
+                (px(280.0), px(400.0))
+            );
+        });
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    async fn assert_pane_layout_preserves_property_draft(draft: &str, cx: &mut TestAppContext) {
+        use fanta_gpui::design::DesignPropertyDraftState;
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, text, _) = text_selection_doc(false);
+        let (item, view, host, mut visual) =
+            pane_layout_fixture(&project, doc, BTreeMap::new(), cx);
+        item.update(&mut visual, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.selection.select_only(text);
+                ((), DocChange::Selection)
+            })
+            .expect("select mounted text");
+        });
+        draw_pane_layout(&mut visual);
+        let panel = view.read_with(&visual, |view, _| {
+            view.gpui_design.as_ref().expect("Design").panel.clone()
+        });
+        let field = visual
+            .debug_bounds("fig-gpui-design-x")
+            .expect("X input")
+            .center();
+        visual.simulate_click(field, gpui::Modifiers::none());
+        visual.simulate_keystrokes("cmd-a");
+        visual.simulate_input(draft);
+        visual.run_until_parked();
+        let focus = visual.update(|window, cx| window.focused(cx).expect("property input focus"));
+        let expected_state = if draft == "-" {
+            DesignPropertyDraftState::Invalid
+        } else {
+            DesignPropertyDraftState::Valid
+        };
+        assert_eq!(
+            panel.read_with(&visual, |panel, cx| panel.property_draft_state(cx)),
+            expected_state
+        );
+        let before = item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            (
+                serde_json::to_value(&document.doc).expect("draft preview"),
+                document.raw_assets.clone(),
+                document.doc.history.undo_depth(),
+                document.doc.history.redo_depth(),
+                item.is_dirty(),
+            )
+        });
+        for width in [588.0, 450.0, 1400.0] {
+            host.update(&mut visual, |host, cx| {
+                host.pane_width = px(width);
+                cx.notify();
+            });
+            draw_pane_layout(&mut visual);
+            visual.update(|window, _| {
+                assert!(
+                    focus.is_focused(window),
+                    "resizing preserves the actual input focus"
+                )
+            });
+            assert_eq!(
+                panel.read_with(&visual, |panel, cx| panel.property_draft_state(cx)),
+                expected_state
+            );
+            view.read_with(&visual, |view, _| {
+                assert_eq!(
+                    view.gpui_design
+                        .as_ref()
+                        .expect("same Design")
+                        .panel
+                        .entity_id(),
+                    panel.entity_id()
+                );
+                assert!(view.inspector_sidebar_visible && view.layers_sidebar_visible);
+                assert_eq!(
+                    (view.layers_sidebar_width, view.inspector_sidebar_width),
+                    (px(280.0), px(400.0))
+                );
+            });
+            let inspector = visual
+                .debug_bounds("fanta-inspector-sidebar")
+                .expect("draft remains visible");
+            let field = visual
+                .debug_bounds("fig-gpui-design-x")
+                .expect("same mounted input");
+            assert!(inspector.size.width >= px(MIN_INSPECTOR_SIDEBAR_WIDTH));
+            assert!(field.left() >= inspector.left() && field.right() <= inspector.right());
+            assert!(inspector.right() <= px(width));
+            visual.simulate_keystrokes("cmd-a cmd-c");
+            assert_eq!(
+                visual
+                    .read_from_clipboard()
+                    .expect("copied actual input")
+                    .text()
+                    .as_deref(),
+                Some(draft)
+            );
+            item.read_with(&visual, |item, _| {
+                let document = item.document().expect("document");
+                assert_eq!(
+                    (
+                        serde_json::to_value(&document.doc).expect("draft preview"),
+                        document.raw_assets.clone(),
+                        document.doc.history.undo_depth(),
+                        document.doc.history.redo_depth(),
+                        item.is_dirty()
+                    ),
+                    before
+                );
+            });
+        }
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn pane_layout_preserves_valid_property_input_across_compaction(cx: &mut TestAppContext) {
+        assert_pane_layout_preserves_property_draft("48", cx).await;
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn pane_layout_preserves_invalid_property_input_across_compaction(
+        cx: &mut TestAppContext,
+    ) {
+        assert_pane_layout_preserves_property_draft("-", cx).await;
     }
 
     async fn assert_mounted_sidebar_divider_drag(
@@ -15557,6 +18030,135 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn mounted_physical_leaf_entry_respects_rounded_ancestor_clips(cx: &mut TestAppContext) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        for kind in ["text", "vector", "bitmap"] {
+            for (clipping, local, enters) in [
+                (true, DVec2::new(1., 1.), false),
+                (true, DVec2::new(50., 50.), true),
+                (false, DVec2::new(1., 1.), true),
+            ] {
+                let (mut doc, node_id, assets) = bitmap_canvas_doc();
+                let data = match kind {
+                    "text" => NodeData::Text(TextNode::new("Visible text", 100., 100.)),
+                    "vector" => {
+                        NodeData::Vector(VectorNode::rect_solid(0., 0., 100., 100., Color::WHITE))
+                    }
+                    _ => {
+                        let mut bitmap = doc.scene.get(node_id).expect("bitmap").data.clone();
+                        assert!(bitmap.set_local_size(100., 100.));
+                        bitmap
+                    }
+                };
+                let transform =
+                    Transform2D::rotation(0.4).then(&Transform2D::translation(-50., -50.));
+                let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+                    clip_size: Some([100., 100.]),
+                    corner_radius: Some(50.),
+                    ..Default::default()
+                }));
+                frame.parent = doc.active_page();
+                frame.transform = transform;
+                frame.meta = serde_json::json!({"clip_content": clipping});
+                let frame_id = frame.id;
+                doc.scene.insert(frame).expect("rounded frame");
+                {
+                    let mut node = doc.scene.remove(node_id).expect("physical leaf");
+                    node.parent = Some(frame_id);
+                    node.transform = Transform2D::IDENTITY;
+                    node.data = data;
+                    doc.scene.insert(node).expect("reparented physical leaf");
+                }
+                doc.selection.select_only(node_id);
+                doc.history = Default::default();
+                let (item, view, mut visual) =
+                    mounted_canvas_interaction_fixture(&project, doc, assets, cx);
+                let snapshot = |item: &FigItem| {
+                    let document = item.document().expect("ready document");
+                    let mut doc = document.doc.clone();
+                    doc.selection.clear();
+                    (
+                        serde_json::to_value(doc).expect("authored document"),
+                        document.raw_assets.clone(),
+                    )
+                };
+                let original = item.read_with(&visual, |item, _| snapshot(item));
+                let position = view.read_with(&visual, |view, _| {
+                    let bounds = view.container_bounds.expect("mounted canvas");
+                    let viewport = view.viewport.expect("viewport");
+                    let (width, height) = bounds_size(bounds);
+                    let screen = fanta_canvas::world_to_screen(
+                        transform.transform_point(local),
+                        &viewport,
+                        DVec2::new(width, height),
+                    );
+                    bounds.origin + point(px(screen.x as f32), px(screen.y as f32))
+                });
+                visual.simulate_event(MouseDownEvent {
+                    button: MouseButton::Right,
+                    position,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                });
+                visual.simulate_event(MouseUpEvent {
+                    button: MouseButton::Right,
+                    position,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                });
+                visual.run_until_parked();
+                visual.update(|window, cx| window.draw(cx).clear());
+                view.read_with(&visual, |view, _| {
+                    assert!(view.canvas_context_menu.is_some(), "{kind}: real menu");
+                    assert!(view.text_edit.is_none());
+                    assert_eq!(view.active_tool(), ToolKind::Select);
+                });
+                item.read_with(&visual, |item, _| {
+                    assert_eq!(
+                        item.doc().expect("document").selection.contains(node_id),
+                        enters,
+                        "{kind}: menu at {local:?}, clipping {clipping}"
+                    );
+                    assert_eq!(snapshot(item), original);
+                    assert_eq!(item.doc().expect("document").history.undo_depth(), 0);
+                    assert!(!item.is_dirty());
+                });
+                visual.simulate_keystrokes("escape");
+                visual.run_until_parked();
+                item.update(&mut visual, |item, cx| {
+                    item.with_document(cx, |document| {
+                        document.doc.selection.select_only(node_id);
+                        ((), DocChange::Selection)
+                    });
+                });
+                visual.update(|window, cx| window.draw(cx).clear());
+                mounted_canvas_click(&mut visual, position, 2);
+                view.read_with(&visual, |view, _| {
+                    assert_eq!(
+                        view.text_edit.is_some(),
+                        enters && kind == "text",
+                        "{kind}: double-click at {local:?}, clipping {clipping}"
+                    );
+                    let tool = match (enters, kind) {
+                        (true, "vector") => ToolKind::NodeEdit,
+                        (true, "bitmap") => ToolKind::Crop,
+                        _ => ToolKind::Select,
+                    };
+                    assert_eq!(view.active_tool(), tool);
+                });
+                item.read_with(&visual, |item, _| {
+                    assert_eq!(snapshot(item), original);
+                    assert_eq!(item.doc().expect("document").history.undo_depth(), 0);
+                    assert!(!item.is_dirty());
+                });
+                visual.update(|window, _| window.remove_window());
+            }
+        }
+    }
+
+    #[gpui::test]
     async fn canvas_double_click_does_not_edit_covered_or_locked_text(cx: &mut TestAppContext) {
         init_test(cx);
         let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
@@ -17286,6 +19888,832 @@ mod tests {
     }
 
     #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn mounted_canvas_toolbar_fits_narrow_panes_and_scrolls_without_panning(
+        cx: &mut TestAppContext,
+    ) {
+        use fanta_gpui::toolbar::ToolbarMode;
+        use gpui::Modifiers;
+
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, _, images) = bitmap_canvas_doc();
+        let (item, view, host, mut visual) = pane_layout_fixture(&project, doc, images, cx);
+        let toolbar = view.read_with(&visual, |view, _| {
+            view.gpui_toolbar
+                .as_ref()
+                .expect("toolbar")
+                .panel
+                .entity_id()
+        });
+        let before = item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            (
+                serde_json::to_value(&document.doc).expect("document snapshot"),
+                document.raw_assets.clone(),
+                document.doc.history.undo_depth(),
+                document.doc.history.redo_depth(),
+                item.is_dirty(),
+            )
+        });
+        let assert_workspace_tabs = |visual: &mut gpui::VisualTestContext,
+                                     bounds: Bounds<Pixels>| {
+            let tabs = [
+                "fanta-collapsible-tab-fanta-editor-workspace-0",
+                "fanta-collapsible-tab-fanta-editor-workspace-1",
+                "fanta-collapsible-tab-fanta-editor-workspace-2",
+            ]
+            .map(|selector| visual.debug_bounds(selector).expect(selector));
+            for tab in &tabs {
+                assert!(tab.is_contained_within(&bounds), "{tab:?} / {bounds:?}");
+            }
+            let first = tabs.first().expect("Canvas tab");
+            let last = tabs.last().expect("Code tab");
+            let center = (first.left() + last.right()) / 2.0;
+            assert!(
+                (center - bounds.center().x).abs() <= px(1.0),
+                "workspace tabs must center on their current body: {tabs:?} / {bounds:?}"
+            );
+        };
+        for (mode_selector, mode, toolbar_mode, leading_selector, trailing_selector) in [
+            (
+                "toolbar-mode-design",
+                EditorMode::Design,
+                ToolbarMode::Design,
+                "toolbar-group-move-tools-trigger",
+                "toolbar-group-comment-tools-trigger",
+            ),
+            (
+                "toolbar-mode-motion",
+                EditorMode::Motion,
+                ToolbarMode::Motion,
+                "toolbar-tool-motion-select",
+                "toolbar-tool-text",
+            ),
+            (
+                "toolbar-mode-draw",
+                EditorMode::Draw,
+                ToolbarMode::Draw,
+                "toolbar-tool-hand",
+                "toolbar-tool-color-picker",
+            ),
+        ] {
+            let mode_control = visual
+                .debug_bounds("toolbar-mode-selector")
+                .expect("mode control");
+            visual.simulate_click(mode_control.center(), Modifiers::default());
+            draw_pane_layout(&mut visual);
+            let mode_choice = visual.debug_bounds(mode_selector).expect(mode_selector);
+            visual.simulate_click(mode_choice.center(), Modifiers::default());
+            draw_pane_layout(&mut visual);
+            assert!(visual.debug_bounds("toolbar-mode-menu").is_none());
+            let focus =
+                visual.update(|window, cx| window.focused(cx).expect("mode selection focus"));
+            for canvas_width in [720.0, 240.0, 256.0, 336.0, 720.0] {
+                host.update(&mut visual, |host, cx| {
+                    host.pane_width = px(canvas_width + 680.0);
+                    cx.notify();
+                });
+                draw_pane_layout(&mut visual);
+                let canvas = visual.debug_bounds("fig-container").expect("canvas");
+                assert_eq!(canvas.size.width, px(canvas_width));
+                assert_workspace_tabs(&mut visual, canvas);
+                let surface = visual
+                    .debug_bounds("editor-toolbar-surface")
+                    .expect("toolbar surface");
+                // The responsive surface may exactly fill the canvas width; GPUI's
+                // point containment excludes its bottom/right edges.
+                assert!(
+                    surface.left() >= canvas.left()
+                        && surface.top() >= canvas.top()
+                        && surface.right() <= canvas.right()
+                        && surface.bottom() <= canvas.bottom(),
+                    "{canvas_width}: {surface:?} / {canvas:?}"
+                );
+                assert!((surface.center().x - canvas.center().x).abs() <= px(1.0));
+                for selector in ["toolbar-mode-selector", "toolbar-tool-actions"] {
+                    let control = visual.debug_bounds(selector).expect(selector);
+                    assert!(
+                        control.is_contained_within(&surface),
+                        "{selector}: {control:?}"
+                    );
+                }
+                let viewport = visual
+                    .debug_bounds("toolbar-primary-viewport")
+                    .expect("scroll viewport");
+                assert!(viewport.is_contained_within(&surface));
+                if let Some(secondary) = visual.debug_bounds("toolbar-secondary-viewport") {
+                    assert!(secondary.is_contained_within(&surface));
+                }
+                let scroll_position = viewport.center();
+                let canvas_viewport = view.read_with(&visual, |view, _| view.viewport());
+                visual.simulate_event(ScrollWheelEvent {
+                    position: scroll_position,
+                    delta: ScrollDelta::Pixels(point(px(1000.0), px(0.0))),
+                    ..Default::default()
+                });
+                draw_pane_layout(&mut visual);
+                assert_eq!(
+                    view.read_with(&visual, |view, _| view.viewport()),
+                    canvas_viewport
+                );
+                let first = visual
+                    .debug_bounds(leading_selector)
+                    .expect("leading mode control");
+                assert!(
+                    first.is_contained_within(&viewport),
+                    "leading control: {first:?} / {viewport:?}"
+                );
+                let row = visual
+                    .debug_bounds("toolbar-primary-row")
+                    .expect("tool row");
+                if row.size.width > viewport.size.width + px(1.0) {
+                    assert!(visual.debug_bounds("toolbar-primary-fade-end").is_some());
+                    visual.simulate_event(ScrollWheelEvent {
+                        position: scroll_position,
+                        delta: ScrollDelta::Pixels(point(px(-1000.0), px(0.0))),
+                        ..Default::default()
+                    });
+                    draw_pane_layout(&mut visual);
+                    let moved = visual
+                        .debug_bounds("toolbar-primary-row")
+                        .expect("scrolled tool row");
+                    assert!(
+                        moved.left() < row.left(),
+                        "real wheel input must scroll the row"
+                    );
+                    let trailing = visual
+                        .debug_bounds(trailing_selector)
+                        .expect("trailing mode control");
+                    assert!(
+                        trailing.is_contained_within(&viewport),
+                        "trailing control: {trailing:?} / {viewport:?}"
+                    );
+                    assert!(visual.debug_bounds("toolbar-primary-fade-start").is_some());
+                    assert!(visual.debug_bounds("toolbar-primary-fade-end").is_none());
+                    assert_eq!(
+                        view.read_with(&visual, |view, _| view.viewport()),
+                        canvas_viewport
+                    );
+                    visual.simulate_event(ScrollWheelEvent {
+                        position: scroll_position,
+                        delta: ScrollDelta::Pixels(point(px(1000.0), px(0.0))),
+                        ..Default::default()
+                    });
+                    draw_pane_layout(&mut visual);
+                    let restored = visual
+                        .debug_bounds("toolbar-primary-row")
+                        .expect("restored tool row");
+                    assert!((restored.left() - row.left()).abs() <= px(1.0));
+                } else {
+                    let trailing = visual
+                        .debug_bounds(trailing_selector)
+                        .expect("accessible trailing mode control");
+                    assert!(trailing.is_contained_within(&viewport));
+                    // GPUI point containment excludes the bottom/right edges; a fitting
+                    // scroll row can share those edges with its viewport.
+                    assert!(
+                        row.left() >= viewport.left()
+                            && row.top() >= viewport.top()
+                            && row.right() <= viewport.right()
+                            && row.bottom() <= viewport.bottom(),
+                        "{mode:?} at {canvas_width}: row {row:?} / viewport {viewport:?}"
+                    );
+                    assert!(visual.debug_bounds("toolbar-primary-fade-start").is_none());
+                    assert!(visual.debug_bounds("toolbar-primary-fade-end").is_none());
+                }
+                if canvas_width == 720.0 && mode == EditorMode::Design {
+                    assert!(
+                        surface.size.width < canvas.size.width,
+                        "wide Design pill retains its intrinsic size"
+                    );
+                    let exposed_canvas = point(canvas.left() + px(2.0), surface.center().y);
+                    assert!(!surface.contains(&exposed_canvas));
+                    visual.simulate_event(ScrollWheelEvent {
+                        position: exposed_canvas,
+                        delta: ScrollDelta::Pixels(point(px(0.0), px(24.0))),
+                        ..Default::default()
+                    });
+                    draw_pane_layout(&mut visual);
+                    assert_ne!(
+                        view.read_with(&visual, |view, _| view.viewport()),
+                        canvas_viewport,
+                        "the transparent width-bound wrapper must not block exposed canvas input"
+                    );
+                    visual.simulate_event(ScrollWheelEvent {
+                        position: exposed_canvas,
+                        delta: ScrollDelta::Pixels(point(px(0.0), px(-24.0))),
+                        ..Default::default()
+                    });
+                    draw_pane_layout(&mut visual);
+                }
+                assert_eq!(
+                    view.read_with(&visual, |view, _| view.viewport()),
+                    canvas_viewport
+                );
+                visual.update(|window, _| assert!(focus.is_focused(window)));
+                view.read_with(&visual, |view, cx| {
+                    assert_eq!(view.editor_mode(cx), mode);
+                    assert_eq!(
+                        view.gpui_toolbar
+                            .as_ref()
+                            .expect("toolbar")
+                            .panel
+                            .read(cx)
+                            .mode(),
+                        toolbar_mode
+                    );
+                    assert_eq!(
+                        view.gpui_toolbar
+                            .as_ref()
+                            .expect("same toolbar")
+                            .panel
+                            .entity_id(),
+                        toolbar
+                    );
+                    assert!(view.layers_sidebar_visible && view.inspector_sidebar_visible);
+                    assert_eq!(
+                        (view.layers_sidebar_width, view.inspector_sidebar_width),
+                        (px(280.0), px(400.0))
+                    );
+                    assert_eq!(view.pane_width, Some(px(canvas_width + 680.0)));
+                });
+                item.read_with(&visual, |item, _| {
+                    let document = item.document().expect("document");
+                    assert_eq!(
+                        (
+                            serde_json::to_value(&document.doc).expect("document snapshot"),
+                            document.raw_assets.clone(),
+                            document.doc.history.undo_depth(),
+                            document.doc.history.redo_depth(),
+                            item.is_dirty(),
+                        ),
+                        before
+                    );
+                });
+            }
+        }
+        for (pane_width, canvas_width) in [
+            (1016.0, 336.0),
+            (588.0, 240.0),
+            (450.0, 450.0),
+            (1400.0, 720.0),
+        ] {
+            host.update(&mut visual, |host, cx| {
+                host.pane_width = px(pane_width);
+                cx.notify();
+            });
+            draw_pane_layout(&mut visual);
+            let canvas = visual.debug_bounds("fig-container").expect("canvas");
+            assert_eq!(canvas.size.width, px(canvas_width));
+            assert_workspace_tabs(&mut visual, canvas);
+            let layout = view.read_with(&visual, |view, _| view.pane_sidebar_layout());
+            let canvas_tab = visual
+                .debug_bounds("fanta-collapsible-tab-fanta-editor-workspace-0")
+                .expect("Canvas tab above compact header");
+            if layout.layers.is_none() {
+                assert!(
+                    canvas_tab.top() >= canvas.top() + px(80.0),
+                    "compact workspace controls must clear the collapsed Layers header"
+                );
+            } else {
+                assert!(canvas_tab.top() < canvas.top() + px(80.0));
+            }
+            let pane = Bounds::new(
+                point(
+                    canvas.left() - layout.layers.unwrap_or_default(),
+                    canvas.top(),
+                ),
+                size(px(pane_width), canvas.size.height),
+            );
+            for (selector, workspace) in [
+                (
+                    "fanta-collapsible-tab-fanta-editor-workspace-1",
+                    EditorWorkspace::Variables,
+                ),
+                (
+                    "fanta-collapsible-tab-fanta-editor-workspace-2",
+                    EditorWorkspace::Code,
+                ),
+            ] {
+                let tab = visual.debug_bounds(selector).expect("workspace tab");
+                visual.simulate_click(tab.center(), Modifiers::default());
+                draw_pane_layout(&mut visual);
+                assert_eq!(
+                    view.read_with(&visual, |view, cx| view.editor_workspace(cx)),
+                    workspace
+                );
+                assert_workspace_tabs(&mut visual, pane);
+                let canvas_tab = visual
+                    .debug_bounds("fanta-collapsible-tab-fanta-editor-workspace-0")
+                    .expect("return Canvas tab");
+                assert!(
+                    canvas_tab.top() < pane.top() + px(80.0),
+                    "non-Canvas workspace controls retain their original top position"
+                );
+                visual.simulate_click(canvas_tab.center(), Modifiers::default());
+                draw_pane_layout(&mut visual);
+                view.update_in(&mut visual, |view, window, cx| {
+                    assert_eq!(view.editor_workspace(cx), EditorWorkspace::Canvas);
+                    if workspace == EditorWorkspace::Code {
+                        assert!(view.focus_handle(cx).is_focused(window));
+                    }
+                    assert_eq!(view.editor_mode(cx), EditorMode::Draw);
+                    assert_eq!(
+                        view.gpui_toolbar
+                            .as_ref()
+                            .expect("same toolbar")
+                            .panel
+                            .entity_id(),
+                        toolbar
+                    );
+                    assert!(view.layers_sidebar_visible && view.inspector_sidebar_visible);
+                    assert_eq!(
+                        (view.layers_sidebar_width, view.inspector_sidebar_width),
+                        (px(280.0), px(400.0))
+                    );
+                });
+                let returned_canvas = visual
+                    .debug_bounds("fig-container")
+                    .expect("returned canvas");
+                assert_eq!(returned_canvas, canvas);
+                assert_workspace_tabs(&mut visual, returned_canvas);
+                item.read_with(&visual, |item, _| {
+                    let document = item.document().expect("document");
+                    assert_eq!(
+                        (
+                            serde_json::to_value(&document.doc).expect("document snapshot"),
+                            document.raw_assets.clone(),
+                            document.doc.history.undo_depth(),
+                            document.doc.history.redo_depth(),
+                            item.is_dirty(),
+                        ),
+                        before
+                    );
+                });
+            }
+        }
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    async fn assert_narrow_design_crop_controls(canvas_width: f32, cx: &mut TestAppContext) {
+        init_visual_test(cx);
+        cx.update(|cx| {
+            cx.bind_keys([
+                gpui::KeyBinding::new("home", menu::SelectFirst, Some("menu")),
+                gpui::KeyBinding::new("down", menu::SelectNext, Some("menu")),
+                gpui::KeyBinding::new("enter", menu::Confirm, Some("menu")),
+                gpui::KeyBinding::new("cmd-z", Undo, Some("FigViewer")),
+                gpui::KeyBinding::new("cmd-shift-z", Redo, Some("FigViewer")),
+            ]);
+        });
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, bitmap, images) = bitmap_canvas_doc();
+        let (item, view, host, mut visual) = pane_layout_fixture(&project, doc, images, cx);
+        let mouse_trace = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        host.update(&mut visual, |host, cx| {
+            host.pane_width = px(canvas_width + 680.0);
+            host.mouse_trace = Some(mouse_trace.clone());
+            cx.notify();
+        });
+        view.update(&mut visual, |view, cx| {
+            view.set_viewport_silent(Viewport::default());
+            view.click_diagnostics =
+                ClickDiagnostics::from_setting(Some(std::ffi::OsStr::new("1")));
+            cx.notify();
+        });
+        draw_pane_layout(&mut visual);
+        assert_eq!(
+            visual
+                .debug_bounds("fig-container")
+                .expect("narrow canvas")
+                .size
+                .width,
+            px(canvas_width)
+        );
+        assert_eq!(
+            view.read_with(&visual, |view, _| view.viewport()),
+            Some(Viewport::default())
+        );
+        let assert_controls = |visual: &mut gpui::VisualTestContext,
+                               hint_visible: bool,
+                               stage: &str| {
+            let canvas = visual.debug_bounds("fig-container").expect("canvas");
+            let controls = visual
+                .debug_bounds("design-crop-controls")
+                .expect("Crop controls");
+            assert!(
+                controls.is_contained_within(&canvas),
+                "{controls:?} / {canvas:?}"
+            );
+            let mut occupied = Vec::new();
+            for selector in [
+                "design-crop-ratio",
+                "design-crop-cancel",
+                "design-crop-apply",
+            ] {
+                let bounds = visual.debug_bounds(selector).expect(selector);
+                assert!(
+                    bounds.is_contained_within(&controls),
+                    "{selector}: {bounds:?} / {controls:?}"
+                );
+                assert!(bounds.size.width > px(0.0) && bounds.size.height > px(0.0));
+                occupied.push(bounds);
+            }
+            let hint = visual.debug_bounds("design-crop-hint");
+            view.read_with(visual, |view, _| {
+                assert_eq!(
+                    hint.is_some(), hint_visible,
+                    "{stage} at {canvas_width}: canvas={canvas:?}, controls={controls:?}, hint={hint:?}, tool={:?}, pressed={}, canvas_pressed={}, ready={}, viewport={:?}, container={:?}, overlays={:?}",
+                    view.active_tool(), view.primary_pressed, view.canvas_pointer_down,
+                    view.tools.can_apply_crop(), view.viewport(), view.container_bounds,
+                    view.tools.overlays,
+                );
+            });
+            if let Some(hint) = hint {
+                assert!(hint.is_contained_within(&controls), "hint must not clip");
+                occupied.push(hint);
+            }
+            for (index, bounds) in occupied.iter().enumerate() {
+                for other in occupied.iter().skip(index + 1) {
+                    assert!(
+                        !bounds.intersects(other),
+                        "controls must not overlap: {bounds:?} / {other:?}"
+                    );
+                }
+            }
+        };
+        let assert_crop_press = |visual: &mut gpui::VisualTestContext,
+                                 position: Point<Pixels>,
+                                 stage: &str| {
+            let diagnostic_regions: Vec<_> = [
+                "fig-container",
+                "design-crop-controls",
+                "design-crop-hint",
+                "design-crop-ratio",
+                "design-crop-cancel",
+                "design-crop-apply",
+                "fanta-canvas-toolbar",
+                "editor-toolbar",
+                "editor-toolbar-surface",
+                "fanta-inspector-overlay",
+                "fanta-layers-sidebar-resize-handle",
+                "fanta-inspector-sidebar-resize-handle",
+            ]
+            .into_iter()
+            .map(|selector| (selector, visual.debug_bounds(selector)))
+            .collect();
+            view.read_with(visual, |view, _| {
+                assert_eq!(view.active_tool(), ToolKind::Crop, "{stage}");
+                assert!(
+                    view.primary_pressed && view.canvas_pointer_down,
+                    "{stage} at {canvas_width}: position={position:?}, pressed={}, canvas_pressed={}, ready={}, viewport={:?}, container={:?}, overlays={:?}, diagnostic_records={:?}, regions={diagnostic_regions:?}, window_mouse_records(limit=64)={:?}",
+                    view.primary_pressed, view.canvas_pointer_down,
+                    view.tools.can_apply_crop(), view.viewport(), view.container_bounds,
+                    view.tools.overlays,
+                    view.click_diagnostics.as_ref().map(|diagnostics| &diagnostics.records),
+                    mouse_trace.borrow(),
+                );
+            });
+        };
+        let assert_crop_preview = |visual: &gpui::VisualTestContext, stage: &str| {
+            view.read_with(visual, |view, _| {
+                assert!(
+                    view.tools.overlays.iter().any(|overlay| matches!(
+                        overlay, fanta_tools::ToolOverlay::PreviewRect { .. }
+                    )),
+                    "{stage} at {canvas_width}: tool={:?}, pressed={}, canvas_pressed={}, ready={}, viewport={:?}, container={:?}, overlays={:?}",
+                    view.active_tool(), view.primary_pressed, view.canvas_pointer_down,
+                    view.tools.can_apply_crop(), view.viewport(), view.container_bounds,
+                    view.tools.overlays,
+                );
+            });
+        };
+        let position = view.read_with(&visual, |view, _| {
+            view.container_bounds.expect("canvas").center()
+        });
+        mounted_canvas_click(&mut visual, position, 1);
+        let (original_doc, original_assets, original_world) = item.read_with(&visual, |item, _| {
+            let document = item.document().expect("document");
+            (
+                document.doc.clone(),
+                document.raw_assets.clone(),
+                document.doc.scene.world_transform(bitmap),
+            )
+        });
+        let original = original_doc.scene.get(bitmap).expect("bitmap").clone();
+        let page = original.parent.expect("page");
+        let assert_unedited = |visual: &gpui::VisualTestContext| {
+            item.read_with(visual, |item, _| {
+                let document = item.document().expect("document");
+                assert_eq!(
+                    serde_json::to_value(&document.doc).expect("actual document"),
+                    serde_json::to_value(&original_doc).expect("original document")
+                );
+                assert_eq!(document.raw_assets, original_assets);
+                assert_eq!(
+                    (
+                        document.doc.history.undo_depth(),
+                        document.doc.history.redo_depth()
+                    ),
+                    (0, 0)
+                );
+                assert!(!item.is_dirty());
+            });
+        };
+        mounted_canvas_click(&mut visual, position, 2);
+        draw_pane_layout(&mut visual);
+        assert_controls(&mut visual, true, "entered Crop");
+        view.read_with(&visual, |view, _| {
+            assert_eq!(view.active_tool(), ToolKind::Crop);
+            assert!(!view.tools.can_apply_crop());
+        });
+        let apply = visual
+            .debug_bounds("design-crop-apply")
+            .expect("disabled Apply")
+            .center();
+        visual.simulate_click(apply, gpui::Modifiers::none());
+        draw_pane_layout(&mut visual);
+        assert_unedited(&visual);
+        let cancel_start = position + point(px(-40.0), px(-20.0));
+        let cancel_end = position + point(px(40.0), px(20.0));
+        visual.simulate_mouse_down(cancel_start, MouseButton::Left, gpui::Modifiers::none());
+        assert_crop_press(&mut visual, cancel_start, "cancel preview after press");
+        visual.simulate_mouse_move(cancel_end, MouseButton::Left, gpui::Modifiers::none());
+        assert_crop_preview(&visual, "cancel preview after move before redraw");
+        visual.simulate_mouse_up(cancel_end, MouseButton::Left, gpui::Modifiers::none());
+        assert_crop_preview(&visual, "cancel preview after release before redraw");
+        view.read_with(&visual, |view, _| {
+            assert!(
+                view.tools.can_apply_crop(),
+                "cancel preview after release at {canvas_width}: pressed={}, canvas_pressed={}, viewport={:?}, container={:?}, overlays={:?}",
+                view.primary_pressed, view.canvas_pointer_down, view.viewport(),
+                view.container_bounds, view.tools.overlays,
+            );
+        });
+        draw_pane_layout(&mut visual);
+        assert_controls(&mut visual, false, "released cancel preview after redraw");
+        view.read_with(&visual, |view, _| assert!(view.tools.can_apply_crop()));
+        assert_unedited(&visual);
+        let cancel = visual
+            .debug_bounds("design-crop-cancel")
+            .expect("Cancel preview")
+            .center();
+        visual.simulate_click(cancel, gpui::Modifiers::none());
+        draw_pane_layout(&mut visual);
+        assert_controls(&mut visual, true, "cancelled preview");
+        view.read_with(&visual, |view, _| {
+            assert_eq!(view.active_tool(), ToolKind::Crop);
+            assert!(!view.tools.can_apply_crop());
+            assert!(
+                !view
+                    .tools
+                    .overlays
+                    .iter()
+                    .any(|overlay| matches!(overlay, fanta_tools::ToolOverlay::PreviewRect { .. }))
+            );
+        });
+        assert_unedited(&visual);
+        let cancel = visual
+            .debug_bounds("design-crop-cancel")
+            .expect("Exit Crop")
+            .center();
+        visual.simulate_click(cancel, gpui::Modifiers::none());
+        draw_pane_layout(&mut visual);
+        assert!(visual.debug_bounds("design-crop-controls").is_none());
+        view.read_with(&visual, |view, _| {
+            assert_eq!(view.active_tool(), ToolKind::Select)
+        });
+        assert_unedited(&visual);
+        mounted_canvas_click(&mut visual, position, 2);
+        draw_pane_layout(&mut visual);
+        assert_controls(&mut visual, true, "re-entered Crop");
+        let ratio = visual.debug_bounds("design-crop-ratio").expect("Ratio");
+        visual.simulate_click(ratio.center(), gpui::Modifiers::none());
+        draw_pane_layout(&mut visual);
+        let square_ratio = visual
+            .debug_bounds("MENU_ITEM-1:1")
+            .expect("square crop ratio menu item");
+        visual.simulate_click(square_ratio.center(), gpui::Modifiers::none());
+        draw_pane_layout(&mut visual);
+        assert!(visual.debug_bounds("MENU_ITEM-1:1").is_none());
+        let start = position + point(px(-40.0), px(-20.0));
+        let end = position + point(px(40.0), px(20.0));
+        visual.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::none());
+        assert_crop_press(&mut visual, start, "apply preview after press");
+        visual.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::none());
+        assert_crop_preview(&visual, "apply preview after move before redraw");
+        view.read_with(&visual, |view, _| assert!(!view.tools.can_apply_crop()));
+        draw_pane_layout(&mut visual);
+        assert_crop_preview(&visual, "apply preview after move redraw before release");
+        assert!(
+            visual.debug_bounds("design-crop-hint").is_none(),
+            "apply preview after move redraw at {canvas_width}",
+        );
+        visual.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::none());
+        assert_crop_preview(&visual, "apply preview after release before redraw");
+        view.read_with(&visual, |view, cx| {
+            assert!(view.tools.can_apply_crop());
+            assert_eq!(view.editor_mode(cx), EditorMode::Design);
+            assert_eq!(view.active_tool(), ToolKind::Crop);
+            assert_eq!(
+                view.gpui_toolbar
+                    .as_ref()
+                    .expect("toolbar")
+                    .draw_options
+                    .crop_ratio
+                    .as_ref(),
+                "1:1"
+            );
+            let preview = view
+                .tools
+                .overlays
+                .iter()
+                .find_map(|overlay| match overlay {
+                    fanta_tools::ToolOverlay::PreviewRect { world_rect } => Some(*world_rect),
+                    _ => None,
+                })
+                .expect("pending crop");
+            assert_eq!(
+                preview,
+                fanta_doc::Bounds::from_xywh(-40.0, -20.0, 80.0, 80.0)
+            );
+        });
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                serde_json::to_value(item.doc().expect("document")).expect("preview document"),
+                serde_json::to_value(&original_doc).expect("original document")
+            );
+            assert!(!item.is_dirty());
+        });
+        view.update(&mut visual, |view, cx| {
+            view.dispatch_tool_event(
+                key_event(LogicalKey::ArrowLeft, gpui::Modifiers::none()),
+                cx,
+            );
+        });
+        view.read_with(&visual, |view, _| {
+            assert!(view.tools.overlays.is_empty());
+            assert!(view.tools.can_apply_crop());
+        });
+        draw_pane_layout(&mut visual);
+        assert!(visual.debug_bounds("design-crop-hint").is_none());
+        let now = || {
+            i64::try_from(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock after Unix epoch")
+                    .as_secs(),
+            )
+            .expect("timestamp fits document metadata")
+        };
+        let started = now();
+        draw_pane_layout(&mut visual);
+        assert_controls(&mut visual, false, "released apply preview after redraw");
+        let apply = visual
+            .debug_bounds("design-crop-apply")
+            .expect("Apply crop");
+        visual.simulate_click(apply.center(), gpui::Modifiers::none());
+        let crop = item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            let crop = single_selection(doc).expect("crop selected");
+            assert_ne!(crop, bitmap);
+            assert_eq!(doc.scene.len(), original_doc.scene.len() + 1);
+            assert_eq!(doc.scene.children_of(Some(page)), &[crop]);
+            assert_eq!(doc.scene.children_of(Some(crop)), &[bitmap]);
+            assert_eq!(doc.scene.get(bitmap).expect("bitmap").data, original.data);
+            assert_eq!(doc.scene.world_transform(bitmap), original_world);
+            crop
+        });
+        let mut expected = original_doc.clone();
+        let mut group = CanvasNode::new(NodeData::Group(GroupNode {
+            local_size: Some([80.0, 80.0]),
+            clip_size: Some([80.0, 80.0]),
+            ..Default::default()
+        }));
+        group.id = crop;
+        group.name = "Crop".into();
+        group.parent = Some(page);
+        group.index = original.index;
+        group.transform = Transform2D::translation(-40.0, -20.0);
+        let mut transaction = fanta_doc::Transaction::new("Crop");
+        transaction.push(Operation::create_node(group));
+        transaction.push(Operation::Reparent {
+            id: bitmap,
+            old_parent: Some(page),
+            old_index: original.index,
+            new_parent: Some(crop),
+            new_index: IndexKey::FIRST,
+        });
+        transaction.push(Operation::SetTransform {
+            id: bitmap,
+            old: original.transform,
+            new: Transform2D::translation(-60.0, -30.0),
+        });
+        expected
+            .apply_transaction(transaction)
+            .expect("expected crop transaction");
+        expected.selection.select_only(crop);
+        let assert_state = |visual: &gpui::VisualTestContext, expected: &Doc| {
+            item.read_with(visual, |item, _| {
+                let document = item.document().expect("document");
+                let actual = &document.doc;
+                assert!((started..=now()).contains(&actual.metadata.modified_at));
+                let mut expected = expected.clone();
+                // Only the wall-clock field varies between the independently constructed transaction and UI input.
+                expected.metadata.modified_at = actual.metadata.modified_at;
+                assert_eq!(
+                    serde_json::to_value(actual).expect("actual document"),
+                    serde_json::to_value(&expected).expect("expected document")
+                );
+                assert_eq!(document.raw_assets, original_assets);
+                assert_eq!(
+                    (actual.history.undo_depth(), actual.history.redo_depth()),
+                    (expected.history.undo_depth(), expected.history.redo_depth())
+                );
+                assert_eq!(actual.scene.world_transform(bitmap), original_world);
+                assert!(item.is_dirty());
+            });
+            view.read_with(visual, |view, cx| {
+                assert_eq!(view.editor_mode(cx), EditorMode::Design);
+                assert!(!view.tools.can_apply_crop());
+                assert!(!view.tools.overlays.iter().any(|overlay| matches!(
+                    overlay,
+                    fanta_tools::ToolOverlay::PreviewRect { .. }
+                )));
+            });
+        };
+        assert_eq!(expected.history.undo_depth(), 1);
+        assert_eq!(expected.history.redo_depth(), 0);
+        assert_state(&visual, &expected);
+        let applied = item.read_with(&visual, |item, _| {
+            serde_json::to_value(item.doc().expect("document")).expect("applied document")
+        });
+        draw_pane_layout(&mut visual);
+        let apply = visual
+            .debug_bounds("design-crop-apply")
+            .expect("Apply crop");
+        visual.simulate_click(apply.center(), gpui::Modifiers::none());
+        item.read_with(&visual, |item, _| {
+            assert_eq!(
+                serde_json::to_value(item.doc().expect("document")).expect("second apply"),
+                applied
+            );
+        });
+        assert_state(&visual, &expected);
+        visual.simulate_keystrokes("cmd-z");
+        assert!(expected.undo().expect("expected Undo"));
+        expected.selection.clear();
+        assert_eq!(expected.history.undo_depth(), 0);
+        assert_eq!(expected.history.redo_depth(), 1);
+        item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert!(doc.selection.is_empty());
+            assert_eq!(doc.scene.get(bitmap), Some(&original));
+            assert_eq!(
+                serde_json::to_value(&doc.scene).expect("undone scene"),
+                serde_json::to_value(&original_doc.scene).expect("original scene")
+            );
+        });
+        assert_state(&visual, &expected);
+        visual.simulate_keystrokes("cmd-shift-z");
+        assert!(expected.redo().expect("expected Redo"));
+        assert_eq!(expected.history.undo_depth(), 1);
+        assert_eq!(expected.history.redo_depth(), 0);
+        item.read_with(&visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert!(doc.selection.is_empty());
+            assert_eq!(doc.scene.children_of(Some(page)), &[crop]);
+            assert_eq!(doc.scene.children_of(Some(crop)), &[bitmap]);
+        });
+        assert_state(&visual, &expected);
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn mounted_canvas_crop_controls_fit_240_and_preserve_cancel_apply_history(
+        cx: &mut TestAppContext,
+    ) {
+        assert_narrow_design_crop_controls(240.0, cx).await;
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn mounted_canvas_crop_controls_fit_256_and_preserve_cancel_apply_history(
+        cx: &mut TestAppContext,
+    ) {
+        assert_narrow_design_crop_controls(256.0, cx).await;
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[gpui::test]
+    async fn mounted_canvas_crop_controls_fit_336_and_preserve_cancel_apply_history(
+        cx: &mut TestAppContext,
+    ) {
+        assert_narrow_design_crop_controls(336.0, cx).await;
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
     async fn assert_mounted_design_crop_controls(cx: &mut TestAppContext, context_menu: bool) {
         init_visual_test(cx);
         cx.update(|cx| {
@@ -17355,7 +20783,9 @@ mod tests {
         visual.update(|window, cx| window.draw(cx).clear());
         view.read_with(&visual, |view, _| {
             assert_eq!(view.active_tool(), ToolKind::Crop);
+            assert!(!view.tools.can_apply_crop());
         });
+        assert!(visual.debug_bounds("design-crop-hint").is_some());
         assert_unchanged(&visual);
         for selector in [
             "design-crop-ratio",
@@ -17368,6 +20798,15 @@ mod tests {
             .debug_bounds("design-crop-apply")
             .expect("Apply crop");
         visual.simulate_click(apply.center(), gpui::Modifiers::none());
+        view.update_in(&mut visual, |view, window, cx| {
+            view.handle_design_crop_toolbar_action(
+                &fanta_gpui::toolbar::ToolbarAction::DrawActionInvoked {
+                    action: fanta_gpui::toolbar::DrawToolbarAction::ApplyCrop,
+                },
+                window,
+                cx,
+            );
+        });
         assert_unchanged(&visual);
         let ratio = visual.debug_bounds("design-crop-ratio").expect("Ratio");
         visual.simulate_click(ratio.center(), gpui::Modifiers::none());
@@ -17411,13 +20850,16 @@ mod tests {
                 .expect("ratio-constrained crop preview");
             assert_eq!(preview.width(), 80.0);
             assert_eq!(preview.height(), 80.0);
+            assert!(view.tools.can_apply_crop());
         });
         assert_unchanged(&visual);
         visual.update(|window, cx| window.draw(cx).clear());
+        assert!(visual.debug_bounds("design-crop-hint").is_none());
         let cancel = visual.debug_bounds("design-crop-cancel").expect("Cancel");
         visual.simulate_click(cancel.center(), gpui::Modifiers::none());
         view.read_with(&visual, |view, _| {
             assert_eq!(view.active_tool(), ToolKind::Crop);
+            assert!(!view.tools.can_apply_crop());
             assert!(
                 !view
                     .tools
@@ -17428,6 +20870,7 @@ mod tests {
         });
         assert_unchanged(&visual);
         visual.update(|window, cx| window.draw(cx).clear());
+        assert!(visual.debug_bounds("design-crop-hint").is_some());
         let apply = visual
             .debug_bounds("design-crop-apply")
             .expect("Apply crop");
@@ -17505,8 +20948,12 @@ mod tests {
         let end = position + point(px(40.0), px(20.0));
         visual.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::none());
         visual.simulate_mouse_move(end, MouseButton::Left, gpui::Modifiers::none());
+        view.read_with(&visual, |view, _| assert!(!view.tools.can_apply_crop()));
+        visual.update(|window, cx| window.draw(cx).clear());
+        assert!(visual.debug_bounds("design-crop-hint").is_none());
         visual.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::none());
         view.read_with(&visual, |view, cx| {
+            assert!(view.tools.can_apply_crop());
             assert_eq!(view.editor_mode(cx), EditorMode::Design);
             assert_eq!(view.active_tool(), ToolKind::Crop);
             assert_eq!(
@@ -17539,6 +20986,18 @@ mod tests {
             );
             assert!(!item.is_dirty());
         });
+        view.update(&mut visual, |view, cx| {
+            view.dispatch_tool_event(
+                key_event(LogicalKey::ArrowLeft, gpui::Modifiers::none()),
+                cx,
+            );
+        });
+        view.read_with(&visual, |view, _| {
+            assert!(view.tools.overlays.is_empty());
+            assert!(view.tools.can_apply_crop());
+        });
+        visual.update(|window, cx| window.draw(cx).clear());
+        assert!(visual.debug_bounds("design-crop-hint").is_none());
         let now = || {
             i64::try_from(
                 std::time::SystemTime::now()
@@ -17612,6 +21071,7 @@ mod tests {
             });
             view.read_with(visual, |view, cx| {
                 assert_eq!(view.editor_mode(cx), EditorMode::Design);
+                assert!(!view.tools.can_apply_crop());
                 assert!(!view.tools.overlays.iter().any(|overlay| matches!(
                     overlay,
                     fanta_tools::ToolOverlay::PreviewRect { .. }
@@ -18487,8 +21947,8 @@ impl FigView {
             duration_ms,
             auto_keyframe: self.motion_auto_keyframe,
             time_comment_armed: self.comment_state.motion_time_comment_active(),
-            layers_sidebar_visible: self.layers_sidebar_visible,
-            inspector_sidebar_visible: self.inspector_sidebar_visible,
+            layers_sidebar_visible: self.layers_sidebar_expanded(),
+            inspector_sidebar_visible: self.inspector_sidebar_expanded(cx),
             // Live keymap text, like the tooltip the old native button had.
             fit_to_view_shortcut: ui::text_for_action(&FitToView, window, cx).map(Into::into),
         }
@@ -18577,10 +22037,19 @@ impl FigView {
             .track_focus(&self.native_toolbar_focus)
             .child(
                 v_flex()
+                    .w_full()
+                    .min_w_0()
                     .items_center()
                     .gap_2()
                     .when(self.design_crop_controls_visible(cx), |toolbar| {
-                        toolbar.child(self.render_design_crop_controls(cx))
+                        toolbar.child(
+                            h_flex()
+                                .w_full()
+                                .min_w_0()
+                                .px_2()
+                                .justify_center()
+                                .child(self.render_design_crop_controls(cx)),
+                        )
                     })
                     .child(adapter.panel.clone()),
             )
@@ -18624,6 +22093,13 @@ impl FigView {
         let view = cx.weak_entity();
         let ratios = adapter.draw_options.crop_ratios.clone();
         let ratio = adapter.draw_options.crop_ratio.clone();
+        let can_apply = self.tools.can_apply_crop();
+        let show_hint = !can_apply
+            && !self
+                .tools
+                .overlays
+                .iter()
+                .any(|overlay| matches!(overlay, fanta_tools::ToolOverlay::PreviewRect { .. }));
         let ratio_menu = PopoverMenu::new("design-crop-ratio-menu")
             .trigger(
                 Button::new("design-crop-ratio-button", format!("Ratio: {ratio}"))
@@ -18658,6 +22134,10 @@ impl FigView {
         h_flex()
             .id("design-crop-controls")
             .debug_selector(|| "design-crop-controls".to_owned())
+            .min_w_0()
+            .max_w_full()
+            .flex_wrap()
+            .justify_center()
             .occlude()
             .gap_2()
             .px_2()
@@ -18665,14 +22145,29 @@ impl FigView {
             .rounded_lg()
             .shadow_md()
             .bg(cx.theme().colors().panel_background)
+            .when(show_hint, |row| {
+                row.child(
+                    div()
+                        .debug_selector(|| "design-crop-hint".to_owned())
+                        .flex_none()
+                        .max_w_full()
+                        .child(
+                            Label::new("Drag on the canvas to select a crop")
+                                .size(LabelSize::Small)
+                                .color(Color::Muted),
+                        ),
+                )
+            })
             .child(
                 div()
                     .debug_selector(|| "design-crop-ratio".to_owned())
+                    .flex_none()
                     .child(ratio_menu),
             )
             .child(
                 div()
                     .debug_selector(|| "design-crop-cancel".to_owned())
+                    .flex_none()
                     .child(
                         Button::new("design-crop-cancel-button", "Cancel")
                             .size(ButtonSize::Compact)
@@ -18690,9 +22185,11 @@ impl FigView {
             .child(
                 div()
                     .debug_selector(|| "design-crop-apply".to_owned())
+                    .flex_none()
                     .child(
                         Button::new("design-crop-apply-button", "Apply crop")
                             .size(ButtonSize::Compact)
+                            .disabled(!can_apply)
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.handle_design_crop_toolbar_action(
                                     &ToolbarAction::DrawActionInvoked {
@@ -18713,7 +22210,7 @@ impl FigView {
     /// every other press would read as broken.
     #[cfg(feature = "fanta-gpui-ui")]
     fn reveal_layers_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.layers_sidebar_visible {
+        if !self.layers_sidebar_expanded() {
             self.toggle_layers_sidebar(&ToggleLayersSidebar, window, cx);
         }
         self.layers_sidebar.focus_handle(cx).focus(window, cx);
@@ -18957,10 +22454,12 @@ impl FigView {
                     DrawToolbarAction::Deselect => self.deselect_canvas(cx),
                     DrawToolbarAction::InvertSelection => self.invert_draw_selection(cx),
                     DrawToolbarAction::ApplyCrop if self.tools.kind() == ToolKind::Crop => {
-                        self.dispatch_tool_event(
-                            key_event(LogicalKey::Enter, window.modifiers()),
-                            cx,
-                        );
+                        if self.tools.can_apply_crop() {
+                            self.dispatch_tool_event(
+                                key_event(LogicalKey::Enter, window.modifiers()),
+                                cx,
+                            );
+                        }
                     }
                     DrawToolbarAction::CancelCrop if self.tools.kind() == ToolKind::Crop => {
                         self.dispatch_tool_event(
@@ -19144,7 +22643,7 @@ impl FigView {
                 );
                 return;
             };
-            if !self.inspector_sidebar_visible {
+            if !self.inspector_sidebar_expanded(cx) {
                 self.toggle_inspector_sidebar(&ToggleInspectorSidebar, window, cx);
             }
             self.refresh_properties_inspector(window, cx);
@@ -19164,7 +22663,7 @@ impl FigView {
             return;
         }
         self.set_editor_mode(EditorMode::Design, cx);
-        if !self.inspector_sidebar_visible {
+        if !self.inspector_sidebar_expanded(cx) {
             self.toggle_inspector_sidebar(&ToggleInspectorSidebar, window, cx);
         }
         self.refresh_properties_inspector(window, cx);
@@ -19199,7 +22698,7 @@ impl FigView {
             self.export_design_selection(window, cx);
             return;
         }
-        if !self.inspector_sidebar_visible {
+        if !self.inspector_sidebar_expanded(cx) {
             self.toggle_inspector_sidebar(&ToggleInspectorSidebar, window, cx);
         }
         let inspector = self.inspector_sidebar.downgrade();
@@ -19615,7 +23114,6 @@ impl FigView {
 /// One id shared by every canvas notice, so a second click replaces the
 /// standing message instead of stacking a queue of them.
 const CANVAS_NOTICE_ID: &str = "fanta-canvas-notice";
-const SAVE_FAILURE_NOTICE_ID: &str = "fanta-save-failure";
 
 /// How many selected layers a toolbar Agent prompt lists by id.
 #[cfg(feature = "fanta-gpui-ui")]
@@ -19717,25 +23215,52 @@ pub(crate) fn show_canvas_notice_deferred(message: String, cx: &mut App) {
     show_toast_deferred(CANVAS_NOTICE_ID, message, true, cx);
 }
 
-/// A save failure stays on screen until a save succeeds: an autohiding toast
-/// would let the user keep editing a document that never reaches disk.
-fn show_save_failure_notice_deferred(message: String, cx: &mut App) {
-    show_toast_deferred(SAVE_FAILURE_NOTICE_ID, message, false, cx);
+fn save_failure_notice_id(item: gpui::EntityId) -> NotificationId {
+    NotificationId::composite::<FigItem>(("save-failure", item))
 }
 
-fn dismiss_save_failure_notice_deferred(cx: &mut App) {
-    cx.defer(|cx| {
-        let id = NotificationId::named(SAVE_FAILURE_NOTICE_ID.into());
+fn sync_save_failure_notice_deferred(
+    item: gpui::EntityId,
+    state: Rc<RefCell<Option<SharedString>>>,
+    cx: &mut App,
+) {
+    cx.defer(move |cx| {
+        let mut workspaces = Vec::new();
         for window in cx.windows() {
-            if let Some(multi_workspace) = window.downcast::<MultiWorkspace>() {
-                multi_workspace
-                    .update(cx, |multi_workspace, _, cx| {
-                        for workspace in multi_workspace.workspaces() {
-                            workspace.update(cx, |workspace, cx| workspace.dismiss_toast(&id, cx));
-                        }
+            if let Some(window) = window.downcast::<MultiWorkspace>() {
+                if let Some(owners) = window
+                    .update(cx, |multi_workspace, _, _| {
+                        multi_workspace.workspaces().cloned().collect::<Vec<_>>()
                     })
-                    .log_err();
+                    .log_err()
+                {
+                    workspaces.extend(owners);
+                }
             }
+        }
+        let owners = workspaces
+            .into_iter()
+            .map(|workspace| {
+                let owns_item = workspace
+                    .read(cx)
+                    .items_of_type::<FigView>(cx)
+                    .any(|view| view.read(cx).item.entity_id() == item);
+                (workspace, owns_item)
+            })
+            .collect::<Vec<_>>();
+        if !owners.iter().any(|(_, owns_item)| *owns_item) {
+            state.borrow_mut().take();
+        }
+        let message = state.borrow().clone();
+        let id = save_failure_notice_id(item);
+        for (workspace, owns_item) in owners {
+            workspace.update(cx, |workspace, cx| {
+                if let Some(message) = message.as_ref().filter(|_| owns_item) {
+                    workspace.show_toast(Toast::new(id.clone(), message.to_string()), cx);
+                } else {
+                    workspace.dismiss_toast(&id, cx);
+                }
+            });
         }
     });
 }

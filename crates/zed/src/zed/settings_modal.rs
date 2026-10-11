@@ -1200,6 +1200,7 @@ impl Render for SettingsWindow {
             "Fanta legal"
         };
         div()
+            .key_context("SettingsWindow")
             .size_full()
             .flex()
             .flex_col()
@@ -1244,6 +1245,129 @@ impl Render for SettingsWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    fn mount_settings_shortcut_window(
+        page: SettingsPage,
+        cx: &mut gpui::TestAppContext,
+    ) -> (gpui::AnyWindowHandle, &mut gpui::VisualTestContext) {
+        cx.update(|cx| {
+            assets::Assets.load_test_fonts(cx);
+            let settings_store = SettingsStore::new(cx, &settings::default_settings());
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            gpui_component::init(cx);
+            fanta_gpui::init(cx);
+            crate::zed::reload_keymaps(cx, Vec::new());
+            cx.on_action(|_: &workspace::CloseWindow, cx| Workspace::close_global(cx));
+        });
+        let other_window = {
+            let other = cx.add_empty_window();
+            let handle = other.update(|window, _| window.window_handle());
+            other.deactivate_window();
+            handle
+        };
+        let (_, cx) = cx.add_window_view(move |window, cx| {
+            let data = SettingsViewData {
+                selected_page: page,
+                pages: vec![SettingsPageData::new(
+                    SettingsPage::General,
+                    vec![SettingsGroup::new(
+                        "Keyboard fixture",
+                        vec![SettingsItem::new(
+                            "shortcut-fixture",
+                            "Visible fixture",
+                            "Offline settings fixture",
+                            SettingsControl::Action {
+                                label: "Unused".into(),
+                            },
+                        )],
+                    )],
+                )],
+                ..SettingsViewData::default()
+            };
+            let screen =
+                cx.new(|cx| SettingsScreen::new("shortcut-settings", data.clone(), window, cx));
+            screen.read(cx).focus_handle(cx).focus(window, cx);
+            window.activate_window();
+            SettingsWindow {
+                screen,
+                data,
+                workspace: WeakEntity::new_invalid(),
+                source_window: None,
+                usage_range: BillingUsageRange::Days30,
+                billing_request: 0,
+                billing_action_pending: false,
+                billing_unlock_after_refresh: false,
+                _subscriptions: Vec::new(),
+                server_subscription: None,
+                _auth_task: Task::ready(()),
+            }
+        });
+        cx.simulate_resize(gpui::size(px(1120.), px(780.)));
+        cx.run_until_parked();
+        (other_window, cx)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn settings_window_cmd_w_closes_only_settings(cx: &mut gpui::TestAppContext) {
+        let (other_window, cx) = mount_settings_shortcut_window(SettingsPage::General, cx);
+        assert_eq!(cx.read(|cx| cx.windows().len()), 2);
+        cx.simulate_keystrokes("cmd-w");
+        assert_eq!(cx.read(|cx| cx.windows()), vec![other_window]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn settings_window_search_escape_keeps_window_and_cmd_w_closes(cx: &mut gpui::TestAppContext) {
+        let (other_window, cx) = mount_settings_shortcut_window(SettingsPage::General, cx);
+        assert!(cx.debug_bounds("settings-row-shortcut-fixture").is_some());
+        cx.update(|window, cx| window.focus_next(cx));
+        cx.run_until_parked();
+        assert!(cx.update(|window, _| {
+            window
+                .context_stack()
+                .iter()
+                .any(|context| context.contains("Input"))
+        }));
+        cx.simulate_input("unmatched search text");
+        assert!(cx.debug_bounds("settings-row-shortcut-fixture").is_none());
+        cx.simulate_keystrokes("escape");
+        assert_eq!(cx.read(|cx| cx.windows().len()), 2);
+        assert!(cx.debug_bounds("settings-row-shortcut-fixture").is_some());
+        cx.update(|_, cx| crate::zed::reload_keymaps(cx, Vec::new()));
+        cx.run_until_parked();
+        cx.simulate_input("unmatched after keymap reload");
+        assert!(cx.debug_bounds("settings-row-shortcut-fixture").is_none());
+        cx.simulate_keystrokes("escape");
+        assert_eq!(cx.read(|cx| cx.windows().len()), 2);
+        assert!(cx.debug_bounds("settings-row-shortcut-fixture").is_some());
+        cx.simulate_input("unmatched again");
+        cx.simulate_keystrokes("cmd-w");
+        assert_eq!(cx.read(|cx| cx.windows()), vec![other_window]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn settings_window_cmd_w_closes_with_mcp_input_focused(cx: &mut gpui::TestAppContext) {
+        let (other_window, cx) = mount_settings_shortcut_window(SettingsPage::McpTools, cx);
+        let add_local = cx
+            .debug_bounds("settings-mcp-add-local")
+            .expect("rendered Add local button");
+        cx.simulate_click(add_local.center(), gpui::Modifiers::none());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("settings-mcp-form").is_some());
+        assert!(cx.update(|window, _| {
+            window
+                .context_stack()
+                .iter()
+                .any(|context| context.contains("Input"))
+        }));
+        cx.simulate_input("Unsaved offline fixture");
+        cx.simulate_keystrokes("left right cmd-w");
+        assert_eq!(cx.read(|cx| cx.windows()), vec![other_window]);
+    }
 
     #[test]
     fn account_legal_actions_open_the_public_subscription_documents() {

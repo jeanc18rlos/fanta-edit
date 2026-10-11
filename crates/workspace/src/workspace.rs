@@ -81,7 +81,7 @@ use language::{Buffer, LanguageRegistry, Rope, language_settings::all_language_s
 pub use modal_layer::*;
 use node_runtime::NodeRuntime;
 use notifications::{
-    DetachAndPromptErr, Notifications, dismiss_app_notification,
+    DetachAndPromptErr, Notifications, dismiss_app_notification, save_io_error_detail,
     simple_message_notification::MessageNotification,
 };
 pub use pane::*;
@@ -1449,6 +1449,7 @@ pub struct Workspace {
     right_dock: Entity<Dock>,
     panes: Vec<Entity<Pane>>,
     panes_by_item: HashMap<EntityId, WeakEntity<Pane>>,
+    restored_project_roots: HashSet<PathBuf>,
     active_pane: Entity<Pane>,
     last_active_center_pane: Option<WeakEntity<Pane>>,
     last_active_view_id: Option<proto::ViewId>,
@@ -1896,6 +1897,7 @@ impl Workspace {
             center,
             panes: vec![center_pane.clone()],
             panes_by_item: Default::default(),
+            restored_project_roots: HashSet::default(),
             active_pane: center_pane.clone(),
             last_active_center_pane: Some(center_pane.downgrade()),
             last_active_view_id: None,
@@ -1963,6 +1965,30 @@ impl Workspace {
         open_mode: OpenMode,
         cx: &mut App,
     ) -> Task<anyhow::Result<OpenResult>> {
+        Self::new_local_with_restore_intent(
+            abs_paths,
+            app_state,
+            requesting_window,
+            env,
+            init,
+            open_mode,
+            false,
+            HashMap::default(),
+            cx,
+        )
+    }
+
+    pub(crate) fn new_local_with_restore_intent(
+        abs_paths: Vec<PathBuf>,
+        app_state: Arc<AppState>,
+        requesting_window: Option<WindowHandle<MultiWorkspace>>,
+        env: Option<HashMap<String, String>>,
+        init: Option<Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send>>,
+        open_mode: OpenMode,
+        restoring: bool,
+        mut captured_paths: HashMap<PathBuf, LocalFantaPath>,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<OpenResult>> {
         let project_handle = Project::local(
             app_state.client.clone(),
             app_state.node_runtime.clone(),
@@ -1977,19 +2003,64 @@ impl Workspace {
         let db = WorkspaceDb::global(cx);
         let kvp = db::kvp::KeyValueStore::global(cx);
         cx.spawn(async move |cx| {
+            let missing_paths = abs_paths
+                .iter()
+                .filter(|path| !captured_paths.contains_key(*path))
+                .cloned()
+                .collect::<Vec<_>>();
+            let (_, additional_paths) =
+                local_fanta_root_paths(&missing_paths, app_state.fs.as_ref()).await;
+            captured_paths.extend(additional_paths);
+            let mut manifest_roots = HashMap::default();
             let mut paths_to_open = Vec::with_capacity(abs_paths.len());
-            for path in abs_paths.into_iter() {
-                if let Some(canonical) = app_state.fs.canonicalize(&path).await.ok() {
-                    paths_to_open.push(canonical)
-                } else {
-                    paths_to_open.push(path)
+            for path in abs_paths {
+                let captured = captured_paths
+                    .get(&path)
+                    .context("missing captured local path")?;
+                remember_fanta_manifest_root(
+                    &mut manifest_roots,
+                    path,
+                    captured.manifest_root.clone(),
+                );
+                remember_fanta_manifest_root(
+                    &mut manifest_roots,
+                    captured.canonical_path.clone(),
+                    captured.manifest_root.clone(),
+                );
+                paths_to_open.push(captured.canonical_path.clone());
+            }
+            for (original, captured) in &captured_paths {
+                if let Some(root) = manifest_roots.get(&captured.canonical_path).cloned() {
+                    remember_fanta_manifest_root(&mut manifest_roots, original.clone(), root);
                 }
             }
-
-            let serialized_workspace = db.workspace_for_roots(paths_to_open.as_slice());
-
+            let explicit_manifests = paths_to_open
+                .iter()
+                .filter(|path| !restoring && manifest_roots.get(*path).is_some_and(Option::is_some))
+                .cloned()
+                .collect::<Vec<_>>();
+            let matching_paths = paths_to_open
+                .iter()
+                .map(|path| {
+                    manifest_roots
+                        .get(path)
+                        .cloned()
+                        .flatten()
+                        .unwrap_or_else(|| path.clone())
+                })
+                .collect::<Vec<_>>();
+            let serialized_workspace = db
+                .workspace_for_roots(paths_to_open.as_slice())
+                .or_else(|| db.workspace_for_roots(&matching_paths));
+            let mut restored_project_roots = HashSet::default();
             if let Some(paths) = serialized_workspace.as_ref().map(|ws| &ws.paths) {
+                restored_project_roots = saved_project_roots(paths, app_state.fs.as_ref()).await;
                 paths_to_open = paths.ordered_paths().cloned().collect();
+                for path in &explicit_manifests {
+                    if !paths_to_open.contains(path) {
+                        paths_to_open.push(path.clone());
+                    }
+                }
             }
 
             // Get project paths for all of the abs_paths
@@ -1997,14 +2068,38 @@ impl Workspace {
                 Vec::with_capacity(paths_to_open.len());
 
             for path in paths_to_open.into_iter() {
-                if let Some((_, project_entry)) = cx
+                let manifest_root = if let Some(root) = manifest_roots.get(&path) {
+                    root.clone()
+                } else {
+                    let root = fanta_manifest_root(&path, app_state.fs.as_ref()).await;
+                    manifest_roots.insert(path.clone(), root.clone());
+                    root
+                };
+                let implicit_manifest = serialized_workspace.is_some()
+                    && !explicit_manifests.contains(&path)
+                    && manifest_root.is_some();
+                if let Some((worktree, project_entry)) = cx
                     .update(|cx| {
-                        Workspace::project_path_for_path(project_handle.clone(), &path, true, cx)
+                        Workspace::project_path_for_captured_local_path(
+                            project_handle.clone(),
+                            &path,
+                            manifest_root,
+                            true,
+                            cx,
+                        )
                     })
                     .await
                     .log_err()
                 {
-                    project_paths.push((path, Some(project_entry)));
+                    if serialized_workspace
+                        .as_ref()
+                        .is_some_and(|saved| saved.paths.paths().contains(&path))
+                    {
+                        restored_project_roots.insert(
+                            worktree.read_with(cx, |worktree, _| worktree.abs_path().to_path_buf()),
+                        );
+                    }
+                    project_paths.push((path, (!implicit_manifest).then_some(project_entry)));
                 } else {
                     project_paths.push((path, None));
                 }
@@ -2076,6 +2171,7 @@ impl Workspace {
                             );
 
                             workspace.centered_layout = centered_layout;
+                            workspace.restored_project_roots = restored_project_roots.clone();
 
                             // Call init callback to add items before window renders
                             if let Some(init) = init {
@@ -2139,6 +2235,7 @@ impl Workspace {
                                     cx,
                                 );
                                 workspace.centered_layout = centered_layout;
+                                workspace.restored_project_roots = restored_project_roots;
 
                                 // Call init callback to add items before window renders
                                 if let Some(init) = init {
@@ -3425,7 +3522,22 @@ impl Workspace {
         }
     }
 
+    pub(crate) fn preserve_pending_view_edits(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let items = self
+            .items(cx)
+            .map(|item| item.boxed_clone())
+            .collect::<Vec<_>>();
+        for item in items {
+            item.prepare_for_save_or_close(window, cx);
+        }
+    }
+
     pub fn can_close_items(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.preserve_pending_view_edits(window, cx);
         let blocked = self.panes.iter().find_map(|pane| {
             pane.read(cx)
                 .items()
@@ -3598,7 +3710,9 @@ impl Workspace {
             window,
             cx,
         )
-        .detach_and_log_err(cx);
+        .detach_and_prompt_err("Failed to save all", window, cx, |error, _, _| {
+            save_io_error_detail(error)
+        });
     }
 
     fn send_keystrokes(
@@ -3702,6 +3816,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<bool>> {
+        self.preserve_pending_view_edits(window, cx);
         let closing = save_intent == SaveIntent::Close;
         if closing && !self.can_close_items(window, cx) {
             return Task::ready(Ok(false));
@@ -3784,6 +3899,11 @@ impl Workspace {
                 dirty_items
             };
 
+            let mut dirty_items = dirty_items;
+            cx.update(|_, cx| {
+                // A sibling can share the model while only one view owns its pending preview.
+                dirty_items.sort_by_key(|(_, item)| !item.has_pending_view_edits(cx));
+            })?;
             for (pane, item) in dirty_items {
                 let (singleton, project_entry_ids) = cx.update(|_, cx| {
                     (
@@ -3853,9 +3973,29 @@ impl Workspace {
     #[allow(clippy::type_complexity)]
     pub fn open_paths(
         &mut self,
+        abs_paths: Vec<PathBuf>,
+        options: OpenOptions,
+        pane: Option<WeakEntity<Pane>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Vec<Option<anyhow::Result<Box<dyn ItemHandle>>>>> {
+        self.open_paths_with_manifest_roots(
+            abs_paths,
+            options,
+            pane,
+            HashMap::default(),
+            window,
+            cx,
+        )
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn open_paths_with_manifest_roots(
+        &mut self,
         mut abs_paths: Vec<PathBuf>,
         options: OpenOptions,
         pane: Option<WeakEntity<Pane>>,
+        manifest_roots: HashMap<PathBuf, PathBuf>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Vec<Option<anyhow::Result<Box<dyn ItemHandle>>>>> {
@@ -3886,12 +4026,22 @@ impl Workspace {
                 let project_path = match visible {
                     Some(visible) => match this
                         .update(cx, |this, cx| {
-                            Workspace::project_path_for_path(
-                                this.project.clone(),
-                                abs_path,
-                                visible,
-                                cx,
-                            )
+                            if let Some(root) = manifest_roots.get(abs_path) {
+                                Workspace::project_path_for_captured_local_path(
+                                    this.project.clone(),
+                                    abs_path,
+                                    Some(root.clone()),
+                                    visible,
+                                    cx,
+                                )
+                            } else {
+                                Workspace::project_path_for_path(
+                                    this.project.clone(),
+                                    abs_path,
+                                    visible,
+                                    cx,
+                                )
+                            }
                         })
                         .log_err()
                     {
@@ -4119,6 +4269,23 @@ impl Workspace {
         visible: bool,
         cx: &mut App,
     ) -> Task<Result<(Entity<Worktree>, ProjectPath)>> {
+        if project.read(cx).is_local()
+            && abs_path
+                .file_name()
+                .is_some_and(|name| name == "fanta.json")
+        {
+            let abs_path = abs_path.to_path_buf();
+            let fs = project.read(cx).fs().clone();
+            return cx.spawn(async move |cx| {
+                let root = fanta_manifest_root(&abs_path, fs.as_ref()).await;
+                cx.update(|cx| {
+                    Self::project_path_for_captured_local_path(
+                        project, &abs_path, root, visible, cx,
+                    )
+                })
+                .await
+            });
+        }
         let entry = project.update(cx, |project, cx| {
             project.find_or_create_worktree(abs_path, visible, cx)
         });
@@ -4127,6 +4294,33 @@ impl Workspace {
             let worktree_id = worktree.read_with(cx, |t, _| t.id());
             Ok((worktree, ProjectPath { worktree_id, path }))
         })
+    }
+
+    fn project_path_for_captured_local_path(
+        project: Entity<Project>,
+        abs_path: &Path,
+        manifest_root: Option<PathBuf>,
+        visible: bool,
+        cx: &mut App,
+    ) -> Task<Result<(Entity<Worktree>, ProjectPath)>> {
+        let target = manifest_root.as_deref().unwrap_or(abs_path);
+        let entry = project.update(cx, |project, cx| {
+            project.find_or_create_worktree(target, visible, cx)
+        });
+        cx.spawn(async move |cx| {
+            let (worktree, path) = entry.await?;
+            let path = if manifest_root.is_some() {
+                path.join(util::rel_path::RelPath::unix("fanta.json")?)
+            } else {
+                path
+            };
+            let worktree_id = worktree.read_with(cx, |worktree, _| worktree.id());
+            Ok((worktree, ProjectPath { worktree_id, path }))
+        })
+    }
+
+    pub fn should_auto_open_fanta_project(&self, root: &Path) -> bool {
+        !self.restored_project_roots.contains(root)
     }
 
     pub fn items<'a>(&'a self, cx: &'a App) -> impl 'a + Iterator<Item = &'a Box<dyn ItemHandle>> {
@@ -4812,10 +5006,32 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<anyhow::Result<Box<dyn ItemHandle>>> {
+        self.open_abs_path_with_manifest_root(abs_path, options, None, window, cx)
+    }
+
+    pub(crate) fn open_abs_path_with_manifest_root(
+        &mut self,
+        abs_path: PathBuf,
+        options: OpenOptions,
+        manifest_root: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<Box<dyn ItemHandle>>> {
+        let manifest_roots = manifest_root
+            .map(|root| (abs_path.clone(), root))
+            .into_iter()
+            .collect();
         cx.spawn_in(window, async move |workspace, cx| {
             let open_paths_task_result = workspace
                 .update_in(cx, |workspace, window, cx| {
-                    workspace.open_paths(vec![abs_path.clone()], options, None, window, cx)
+                    workspace.open_paths_with_manifest_roots(
+                        vec![abs_path.clone()],
+                        options,
+                        None,
+                        manifest_roots,
+                        window,
+                        cx,
+                    )
                 })
                 .with_context(|| format!("open abs path {abs_path:?} task spawn"))?
                 .await;
@@ -7734,22 +7950,30 @@ impl Workspace {
             .on_action(cx.listener(|workspace, action: &Save, window, cx| {
                 workspace
                     .save_active_item(action.save_intent.unwrap_or(SaveIntent::Save), window, cx)
-                    .detach_and_prompt_err("Failed to save", window, cx, |_, _, _| None);
+                    .detach_and_prompt_err("Failed to save", window, cx, |error, _, _| {
+                        save_io_error_detail(error)
+                    });
             }))
             .on_action(cx.listener(|workspace, _: &FormatAndSave, window, cx| {
                 workspace
                     .save_active_item(SaveIntent::FormatAndSave, window, cx)
-                    .detach_and_prompt_err("Failed to save", window, cx, |_, _, _| None);
+                    .detach_and_prompt_err("Failed to save", window, cx, |error, _, _| {
+                        save_io_error_detail(error)
+                    });
             }))
             .on_action(cx.listener(|workspace, _: &SaveWithoutFormat, window, cx| {
                 workspace
                     .save_active_item(SaveIntent::SaveWithoutFormat, window, cx)
-                    .detach_and_prompt_err("Failed to save", window, cx, |_, _, _| None);
+                    .detach_and_prompt_err("Failed to save", window, cx, |error, _, _| {
+                        save_io_error_detail(error)
+                    });
             }))
             .on_action(cx.listener(|workspace, _: &SaveAs, window, cx| {
                 workspace
                     .save_active_item(SaveIntent::SaveAs, window, cx)
-                    .detach_and_prompt_err("Failed to save", window, cx, |_, _, _| None);
+                    .detach_and_prompt_err("Failed to save", window, cx, |error, _, _| {
+                        save_io_error_detail(error)
+                    });
             }))
             .on_action(
                 cx.listener(|workspace, _: &ActivatePreviousPane, window, cx| {
@@ -8685,6 +8909,82 @@ fn window_bounds_env_override() -> Option<Bounds<Pixels>> {
         })
 }
 
+pub(crate) async fn fanta_manifest_root(path: &Path, fs: &dyn Fs) -> Option<PathBuf> {
+    if path.file_name().is_none_or(|name| name != "fanta.json") {
+        return None;
+    }
+    let root = path.parent()?;
+    persistence::fanta_project_id_at(root, fs).await?;
+    Some(
+        fs.canonicalize(root)
+            .await
+            .unwrap_or_else(|_| root.to_path_buf()),
+    )
+}
+
+fn remember_fanta_manifest_root(
+    manifest_roots: &mut HashMap<PathBuf, Option<PathBuf>>,
+    path: PathBuf,
+    root: Option<PathBuf>,
+) {
+    if manifest_roots.get(&path).is_none_or(Option::is_none) {
+        manifest_roots.insert(path, root);
+    }
+}
+
+pub(crate) struct LocalFantaPath {
+    canonical_path: PathBuf,
+    manifest_root: Option<PathBuf>,
+}
+
+pub(crate) async fn local_fanta_root_paths(
+    paths: &[PathBuf],
+    fs: &dyn Fs,
+) -> (Vec<PathBuf>, HashMap<PathBuf, LocalFantaPath>) {
+    let mut aliases = Vec::with_capacity(paths.len());
+    for path in paths {
+        let canonical = fs.canonicalize(path).await.unwrap_or_else(|_| path.clone());
+        aliases.push((path, canonical));
+    }
+    let mut manifest_roots: HashMap<PathBuf, Option<PathBuf>> = HashMap::default();
+    let mut roots = Vec::with_capacity(paths.len());
+    let mut captured_paths = HashMap::default();
+    for (original, canonical) in aliases {
+        let manifest_root = if let Some(root) = manifest_roots.get(&canonical) {
+            root.clone()
+        } else {
+            let root = fanta_manifest_root(&canonical, fs).await;
+            manifest_roots.insert(canonical.clone(), root.clone());
+            root
+        };
+        roots.push(manifest_root.clone().unwrap_or_else(|| original.clone()));
+        captured_paths.insert(
+            original.clone(),
+            LocalFantaPath {
+                canonical_path: canonical,
+                manifest_root,
+            },
+        );
+    }
+    (roots, captured_paths)
+}
+
+async fn saved_project_roots(paths: &PathList, fs: &dyn Fs) -> HashSet<PathBuf> {
+    let mut roots = HashSet::default();
+    for path in paths.paths() {
+        let root = if path.file_name().is_some_and(|name| name == "fanta.json") {
+            path.parent().unwrap_or(path)
+        } else {
+            path.as_path()
+        };
+        roots.insert(root.to_path_buf());
+        if let Ok(canonical) = fs.canonicalize(root).await {
+            roots.insert(canonical);
+        }
+    }
+    roots
+}
+
 fn open_items(
     serialized_workspace: Option<SerializedWorkspace>,
     mut project_paths_to_open: Vec<(PathBuf, Option<ProjectPath>)>,
@@ -9534,13 +9834,15 @@ pub async fn restore_multiworkspace(
         .await
     } else {
         cx.update(|cx| {
-            Workspace::new_local(
+            Workspace::new_local_with_restore_intent(
                 active_workspace.paths.paths().to_vec(),
                 app_state.clone(),
                 None,
                 None,
                 None,
                 OpenMode::Activate,
+                true,
+                HashMap::default(),
                 cx,
             )
         })
@@ -9559,13 +9861,15 @@ pub async fn restore_multiworkspace(
                 let paths = key.path_list().paths().to_vec();
                 match cx
                     .update(|cx| {
-                        Workspace::new_local(
+                        Workspace::new_local_with_restore_intent(
                             paths,
                             app_state.clone(),
                             None,
                             None,
                             None,
                             OpenMode::Activate,
+                            true,
+                            HashMap::default(),
                             cx,
                         )
                     })
@@ -10237,6 +10541,21 @@ pub fn open_workspace_by_id(
             .with_context(|| format!("Workspace {workspace_id:?} not found"))?;
 
         let centered_layout = serialized_workspace.centered_layout;
+        let restored_project_roots =
+            saved_project_roots(&serialized_workspace.paths, app_state.fs.as_ref()).await;
+        for root in &restored_project_roots {
+            if persistence::fanta_project_id_at(root, app_state.fs.as_ref())
+                .await
+                .is_none()
+            {
+                continue;
+            }
+            project_handle
+                .update(cx, |project, cx| {
+                    project.find_or_create_worktree(root, true, cx)
+                })
+                .await?;
+        }
 
         let (window, workspace) = if let Some(window) = requesting_window {
             let workspace = window.update(cx, |multi_workspace, window, cx| {
@@ -10249,6 +10568,7 @@ pub fn open_workspace_by_id(
                         cx,
                     );
                     workspace.centered_layout = centered_layout;
+                    workspace.restored_project_roots = restored_project_roots.clone();
                     workspace
                 });
                 multi_workspace.add(workspace.clone(), &*window, cx);
@@ -10289,6 +10609,7 @@ pub fn open_workspace_by_id(
                             cx,
                         );
                         workspace.centered_layout = centered_layout;
+                        workspace.restored_project_roots = restored_project_roots;
                         workspace
                     });
                     cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
@@ -11545,6 +11866,81 @@ mod tests {
     use util::rel_path::rel_path;
 
     #[gpui::test]
+    async fn canvas_session_captured_manifest_identity_survives_later_read_failure(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        let root = PathBuf::from(path!("/project"));
+        let manifest = root.join("fanta.json");
+        file_system
+            .insert_tree(
+                &root,
+                json!({
+                    "fanta.json": r#"{"format":"fanta-project","project_id":"d_00000000000000000000000000"}"#,
+                }),
+            )
+            .await;
+        let original = file_system.load(&manifest).await.expect("valid manifest");
+        let captured_root = fanta_manifest_root(&manifest, file_system.as_ref()).await;
+        assert_eq!(captured_root.as_ref(), Some(&root));
+        let (matching_roots, mut captured_paths) =
+            local_fanta_root_paths(std::slice::from_ref(&manifest), file_system.as_ref()).await;
+        assert_eq!(matching_roots, vec![root.clone()]);
+        let captured = captured_paths.remove(&manifest).expect("captured request");
+        assert_eq!(captured.canonical_path, manifest);
+        assert_eq!(captured.manifest_root, captured_root);
+        file_system
+            .remove_file(&manifest, fs::RemoveOptions::default())
+            .await
+            .expect("remove manifest after classification");
+        assert!(file_system.load(&manifest).await.is_err());
+        assert!(
+            fanta_manifest_root(&manifest, file_system.as_ref())
+                .await
+                .is_none()
+        );
+
+        let project = Project::test(file_system.clone(), [], cx).await;
+        let (worktree, project_path) = cx
+            .update(|cx| {
+                Workspace::project_path_for_captured_local_path(
+                    project.clone(),
+                    &manifest,
+                    captured.manifest_root,
+                    true,
+                    cx,
+                )
+            })
+            .await
+            .expect("captured manifest path survives later read failure");
+        assert_eq!(
+            worktree.read_with(cx, |worktree, _| worktree.abs_path().to_path_buf()),
+            root
+        );
+        assert_eq!(project_path.path.as_ref(), rel_path("fanta.json"));
+        assert_eq!(
+            project_path.worktree_id,
+            worktree.read_with(cx, |worktree, _| worktree.id())
+        );
+        assert_eq!(
+            project.read_with(cx, |project, cx| {
+                project
+                    .worktree_for_id(project_path.worktree_id, cx)
+                    .map(|worktree| worktree.entity_id())
+            }),
+            Some(worktree.entity_id())
+        );
+        file_system
+            .insert_file(&manifest, original.into_bytes())
+            .await;
+        assert_eq!(
+            fanta_manifest_root(&manifest, file_system.as_ref()).await,
+            Some(root)
+        );
+    }
+
+    #[gpui::test]
     async fn test_tab_disambiguation(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -11811,6 +12207,234 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_close_window_reports_save_failure_and_retries(cx: &mut TestAppContext) {
+        close_window_after_save_failure(cx, true)
+            .await
+            .expect("failed save should allow a successful retry");
+    }
+
+    #[gpui::test]
+    async fn test_save_all_reports_failure_preserves_remaining_drafts_and_retries(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let file_system = FakeFs::new(cx.executor());
+        file_system
+            .insert_tree(
+                "/root",
+                json!({ "first.txt": "", "failing.txt": "", "last.txt": "", "clean.txt": "" }),
+            )
+            .await;
+        let project = Project::test(file_system, ["root".as_ref()], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())
+            .expect("mounted workspace");
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let drafts = [
+            (1, "first.txt", "first draft", true, None),
+            (
+                2,
+                "failing.txt",
+                "invalid draft",
+                true,
+                Some("The width must be a number"),
+            ),
+            (3, "last.txt", "remaining draft", true, None),
+            (4, "clean.txt", "saved content", false, None),
+        ]
+        .into_iter()
+        .map(|(identifier, path, state, dirty, failure)| {
+            let project_item = cx.update(|_, cx| {
+                let project_item = TestProjectItem::new(identifier, path, cx);
+                project_item.update(cx, |item, _| item.is_dirty = dirty);
+                project_item
+            });
+            let item = cx.new(|cx| {
+                let mut item = TestItem::new(cx)
+                    .with_dirty(dirty)
+                    .with_project_items(std::slice::from_ref(&project_item));
+                item.state = state.to_owned();
+                item.save_error = failure.map(ToOwned::to_owned);
+                item
+            });
+            workspace.update_in(cx, |workspace, window, cx| {
+                workspace.add_item_to_active_pane(Box::new(item.clone()), None, true, window, cx);
+            });
+            (project_item, item, state)
+        })
+        .collect::<Vec<_>>();
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear());
+        let session = workspace.read_with(cx, |workspace, _| workspace.session_id());
+        let expected_items = drafts
+            .iter()
+            .map(|(_, item, _)| item.entity_id())
+            .collect::<Vec<_>>();
+        let assert_state = |save_counts: [usize; 4], dirty: [bool; 4], cx: &VisualTestContext| {
+            workspace.read_with(cx, |workspace, cx| {
+                assert!(!workspace.removing);
+                assert_eq!(workspace.session_id(), session);
+                assert_eq!(
+                    workspace
+                        .items(cx)
+                        .map(|item| item.item_id())
+                        .collect::<Vec<_>>(),
+                    expected_items
+                );
+            });
+            for ((project_item, item, state), (save_count, dirty)) in
+                drafts.iter().zip(save_counts.into_iter().zip(dirty))
+            {
+                item.read_with(cx, |item, cx| {
+                    assert_eq!(item.state.as_str(), *state);
+                    assert_eq!(item.is_dirty, dirty);
+                    assert_eq!(project_item.read(cx).is_dirty, dirty);
+                    assert_eq!(item.save_count, save_count);
+                    assert_eq!(item.save_as_count, 0);
+                    assert_eq!(item.reload_count, 0);
+                });
+            }
+        };
+        assert_state([0, 0, 0, 0], [true, true, true, false], cx);
+
+        cx.dispatch_action(SaveAll { save_intent: None });
+        let (message, detail) = cx.pending_prompt().expect("Save All error must be visible");
+        assert_eq!(message, "Failed to save all");
+        assert_eq!(detail, "The width must be a number.");
+        assert_state([1, 1, 0, 0], [false, true, true, false], cx);
+
+        cx.simulate_prompt_answer("OK");
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        assert_state([1, 1, 0, 0], [false, true, true, false], cx);
+        for (_, item, _) in &drafts {
+            item.update(cx, |item, _| item.save_error = None);
+        }
+        cx.dispatch_action(SaveAll { save_intent: None });
+        assert!(!cx.has_pending_prompt());
+        assert_state([1, 2, 1, 0], [false, false, false, false], cx);
+        cx.update(|window, cx| window.draw(cx).clear());
+    }
+
+    #[gpui::test]
+    async fn test_close_window_reports_save_failure_and_can_discard(cx: &mut TestAppContext) {
+        close_window_after_save_failure(cx, false)
+            .await
+            .expect("failed save should allow explicit discard");
+    }
+
+    async fn close_window_after_save_failure(
+        cx: &mut TestAppContext,
+        retry_save: bool,
+    ) -> Result<()> {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/root", json!({ "draft.txt": "saved content" }))
+            .await;
+        let clean_project = Project::test(fs.clone(), ["root".as_ref()], cx).await;
+        let dirty_project = Project::test(fs, ["root".as_ref()], cx).await;
+        let window_handle =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(clean_project, window, cx));
+        cx.run_until_parked();
+        window_handle.update(cx, |multi_workspace, _, cx| {
+            multi_workspace.open_sidebar(cx)
+        })?;
+        let clean_workspace = window_handle
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone())?;
+        let dirty_workspace = window_handle.update(cx, |multi_workspace, window, cx| {
+            multi_workspace.test_add_workspace(dirty_project, window, cx)
+        })?;
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let clean_item = cx.new(TestItem::new);
+        clean_workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(clean_item.clone()), None, true, window, cx);
+        });
+        let project_item = cx.update(|_, cx| dirty_project_item(1, "draft.txt", cx));
+        let dirty_item = cx.new(|cx| {
+            let mut item = TestItem::new(cx)
+                .with_dirty(true)
+                .with_project_items(std::slice::from_ref(&project_item));
+            item.state = "unsaved draft".to_owned();
+            item.save_error = Some("injected save failure".to_owned());
+            item
+        });
+        dirty_workspace.update_in(cx, |workspace, window, cx| {
+            workspace.add_item_to_active_pane(Box::new(dirty_item.clone()), None, true, window, cx);
+        });
+        let sessions = [
+            clean_workspace.read_with(cx, |workspace, _| workspace.session_id()),
+            dirty_workspace.read_with(cx, |workspace, _| workspace.session_id()),
+        ];
+        assert!(sessions.iter().all(Option::is_some));
+        window_handle.update(cx, |multi_workspace, window, cx| {
+            multi_workspace.activate(clean_workspace.clone(), None, window, cx);
+            multi_workspace.close_window(&CloseWindow, window, cx);
+        })?;
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer("Save");
+        cx.run_until_parked();
+        let (message, detail) = cx.pending_prompt().context("save error must be visible")?;
+        assert_eq!(message, "Unable to close window");
+        assert!(detail.contains("injected save failure"));
+        assert!(detail.contains("Try saving again"));
+        window_handle.read_with(cx, |multi_workspace, _| {
+            assert_eq!(multi_workspace.workspaces().count(), 2);
+            assert_eq!(multi_workspace.workspace(), &dirty_workspace);
+        })?;
+        for (workspace, session) in [&clean_workspace, &dirty_workspace]
+            .into_iter()
+            .zip(&sessions)
+        {
+            workspace.read_with(cx, |workspace, cx| {
+                assert!(!workspace.removing);
+                assert_eq!(&workspace.session_id(), session);
+                assert_eq!(workspace.items(cx).count(), 1);
+            });
+        }
+        dirty_item.read_with(cx, |item, cx| {
+            assert_eq!(item.state, "unsaved draft");
+            assert!(item.is_dirty);
+            assert!(project_item.read(cx).is_dirty);
+            assert_eq!(item.save_count, 1);
+            assert_eq!(item.save_as_count, 0);
+            assert_eq!(item.reload_count, 0);
+        });
+        clean_item.read_with(cx, |item, _| {
+            assert_eq!(item.save_count, 0);
+            assert_eq!(item.reload_count, 0);
+            assert!(!item.is_dirty);
+        });
+        cx.simulate_prompt_answer("OK");
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        if retry_save {
+            dirty_item.update(cx, |item, _| item.save_error = None);
+        }
+        window_handle.update(cx, |multi_workspace, window, cx| {
+            multi_workspace.close_window(&CloseWindow, window, cx);
+        })?;
+        cx.run_until_parked();
+        assert!(cx.has_pending_prompt());
+        cx.simulate_prompt_answer(if retry_save { "Save" } else { "Don't Save" });
+        cx.run_until_parked();
+        assert!(!cx.has_pending_prompt());
+        assert!(window_handle.update(cx, |_, _, _| ()).is_err());
+        dirty_item.read_with(cx, |item, cx| {
+            assert_eq!(item.state, "unsaved draft");
+            assert!(!item.is_dirty);
+            assert_eq!(item.save_count, if retry_save { 2 } else { 1 });
+            assert_eq!(item.reload_count, usize::from(!retry_save));
+            if retry_save {
+                assert!(!project_item.read(cx).is_dirty);
+            }
+        });
+        Ok(())
+    }
+
+    #[gpui::test]
     async fn test_multi_workspace_close_window_multiple_workspaces_cancel(cx: &mut TestAppContext) {
         init_test(cx);
 
@@ -11867,6 +12491,12 @@ mod tests {
             })
             .unwrap();
 
+        let sessions = [
+            workspace_a.read_with(cx, |workspace, _| workspace.session_id()),
+            workspace_b.read_with(cx, |workspace, _| workspace.session_id()),
+        ];
+        assert!(sessions.iter().all(Option::is_some));
+
         // Dispatch CloseWindow — workspace A will pass, workspace B will prompt
         multi_workspace_handle
             .update(cx, |mw, window, cx| {
@@ -11895,6 +12525,19 @@ mod tests {
             multi_workspace_handle.update(cx, |_, _, _| ()).is_ok(),
             "window should still exist after cancelling one workspace's close"
         );
+        for (workspace, session) in [&workspace_a, &workspace_b].into_iter().zip(&sessions) {
+            workspace.read_with(cx, |workspace, cx| {
+                assert!(!workspace.removing);
+                assert_eq!(&workspace.session_id(), session);
+                assert_eq!(workspace.items(cx).count(), 1);
+            });
+        }
+        item_b.read_with(cx, |item, _| {
+            assert!(item.is_dirty);
+            assert_eq!(item.save_count, 0);
+            assert_eq!(item.save_as_count, 0);
+            assert_eq!(item.reload_count, 0);
+        });
     }
 
     #[gpui::test]

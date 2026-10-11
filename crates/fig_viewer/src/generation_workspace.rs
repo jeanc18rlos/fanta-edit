@@ -544,6 +544,18 @@ impl AudioPlaybackView {
         self
     }
 
+    fn playback_position(&self) -> Duration {
+        let Some(player) = self.player.as_ref() else {
+            return Duration::ZERO;
+        };
+        if player.empty()
+            && let Some(duration) = self.duration
+        {
+            return duration;
+        }
+        player.get_pos()
+    }
+
     fn ensure_player(&mut self) -> Result<()> {
         if self.player.as_ref().is_some_and(|player| !player.empty()) {
             return Ok(());
@@ -702,11 +714,7 @@ impl AudioPlaybackView {
 #[cfg(target_os = "macos")]
 impl Render for AudioPlaybackView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let position = self
-            .player
-            .as_ref()
-            .map(rodio::Player::get_pos)
-            .unwrap_or_default();
+        let position = self.playback_position();
         let duration = self.duration.unwrap_or_default();
         let ratio = if duration.is_zero() {
             0.0
@@ -1919,9 +1927,12 @@ impl GenerationWorkspace {
         let active_id = active_run.and_then(RunSummary::generation_id);
         if let Some(run) = active_run {
             let kind = run.mode.generation_kind().expect("creation run kind");
-            let server_title = active_id
-                .and_then(|id| self.gallery.iter().find(|record| record.id == id))
-                .and_then(|record| record.title.as_deref());
+            let gallery_record =
+                active_id.and_then(|id| self.gallery.iter().find(|record| record.id == id));
+            let server_title = gallery_record.and_then(|record| record.title.as_deref());
+            let created_at = gallery_record
+                .map(|record| record.created_at.clone())
+                .unwrap_or_default();
             let title = creation_title_for_model(
                 preferred_gallery_title(self.active_title.as_deref(), server_title),
                 Some(&run.prompt),
@@ -1944,7 +1955,8 @@ impl GenerationWorkspace {
                         model_label.clone(),
                         GenerationOutputStatus::Running,
                     )
-                    .prompt(run.prompt.clone()),
+                    .prompt(run.prompt.clone())
+                    .created_at(created_at.clone()),
                 );
             }
             for (index, output) in self.outputs.iter().enumerate() {
@@ -1956,6 +1968,7 @@ impl GenerationWorkspace {
                     model_label.clone(),
                     GenerationOutputStatus::Succeeded,
                 )
+                .created_at(created_at.clone())
                 .detail(output.mime.clone())
                 .can_add_to_project(self.canvas_item.is_some() && output.can_add_to_project());
                 if !run.prompt.is_empty() {
@@ -6565,6 +6578,106 @@ mod tests {
         );
         assert!(preview.error.is_none());
         assert!(preview.player.is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    fn offline_audio_preview() -> (AudioPlaybackView, rodio::queue::SourcesQueueOutput) {
+        let samples = rodio::buffer::SamplesBuffer::new(
+            rodio::ChannelCount::new(1).expect("one channel"),
+            rodio::SampleRate::new(44_100).expect("positive sample rate"),
+            vec![0.25; 132_300],
+        );
+        let duration = rodio::Source::total_duration(&samples).expect("finite samples");
+        assert_eq!(duration, Duration::from_secs(3));
+        let (player, output) = rodio::Player::new();
+        player.append(samples);
+        let bytes: Arc<[u8]> =
+            Arc::from(&include_bytes!("../tests/fixtures/one_second_tone.mp3")[..]);
+        let mut preview = AudioPlaybackView::new(bytes, "Offline audio".into());
+        assert!(preview.error.is_none());
+        preview.duration = Some(duration);
+        preview.player = Some(player);
+        (preview, output)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn audio_preview_completed_player_reaches_known_duration() {
+        let (mut preview, mut output) = offline_audio_preview();
+        assert_eq!(preview.playback_position(), Duration::ZERO);
+        for _ in 0..=132_300 {
+            assert!(output.next().is_some());
+        }
+        let player = preview.player.as_ref().expect("offline player");
+        assert!(player.empty());
+        let sampled_position = player.get_pos();
+        assert_eq!(sampled_position.as_secs(), 2);
+        assert!(sampled_position < Duration::from_secs(3));
+        assert_eq!(preview.playback_position(), Duration::from_secs(3));
+        preview.duration = None;
+        assert_eq!(preview.playback_position(), sampled_position);
+        preview.duration = Some(Duration::from_secs(3));
+        let (replay, mut replay_output) = offline_audio_preview();
+        preview.player = replay.player;
+        assert_eq!(preview.playback_position(), Duration::ZERO);
+        assert_eq!(replay_output.next(), Some(0.25));
+        assert!(!preview.player.as_ref().expect("replay player").empty());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn audio_preview_paused_and_seeked_player_keeps_incomplete_position() {
+        let (mut preview, mut output) = offline_audio_preview();
+        preview.player.as_ref().expect("offline player").pause();
+        for _ in 0..440 {
+            assert_eq!(output.next(), Some(0.0));
+        }
+        assert_eq!(preview.playback_position(), Duration::ZERO);
+        preview.player.as_ref().expect("offline player").play();
+        for _ in 0..44_100 {
+            assert!(output.next().is_some());
+        }
+        preview.player.as_ref().expect("offline player").pause();
+        for _ in 0..440 {
+            assert!(output.next().is_some());
+        }
+        let paused_position = preview.playback_position();
+        assert!(paused_position >= Duration::from_secs(1));
+        assert!(paused_position < Duration::from_secs(2));
+        for _ in 0..440 {
+            assert_eq!(output.next(), Some(0.0));
+        }
+        assert_eq!(preview.playback_position(), paused_position);
+        assert!(!preview.player.as_ref().expect("offline player").empty());
+        rodio::Source::try_seek(&mut output, Duration::from_millis(1_500))
+            .expect("seek the offline source without an audio device");
+        for _ in 0..440 {
+            assert_eq!(output.next(), Some(0.0));
+        }
+        assert_eq!(preview.playback_position(), Duration::from_millis(1_500));
+        preview.duration = None;
+        assert_eq!(preview.playback_position(), Duration::from_millis(1_500));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    fn audio_preview_close_resets_completed_position(cx: &mut gpui::TestAppContext) {
+        let (preview, mut output) = offline_audio_preview();
+        for _ in 0..=132_300 {
+            assert!(output.next().is_some());
+        }
+        assert_eq!(preview.playback_position(), Duration::from_secs(3));
+        let preview = cx.new(|_| preview);
+        preview.update(cx, |preview, cx| preview.close(cx));
+        preview.read_with(cx, |preview, _| {
+            assert!(preview.player.is_none());
+            assert!(preview.output.is_none());
+            assert!(!preview.playing);
+            assert!(!preview.scrubbing);
+            assert!(preview.progress_task.is_none());
+            assert_eq!(preview.playback_position(), Duration::ZERO);
+            assert_eq!(preview.duration, Some(Duration::from_secs(3)));
+        });
     }
 
     #[test]

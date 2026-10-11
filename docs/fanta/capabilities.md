@@ -1,6 +1,9 @@
 # Fanta capability guide
 
-Source inventory updated **9 October 2026**; acceptance evidence below is dated.
+For installation and a first workflow, use the [current Public Alpha guide](../alpha/PUBLIC_ALPHA.md), [ten-minute exercise and demos](../alpha/DEMO_GUIDE.md), and [agent quickstart](agent-quickstart.md). Reviewed screenshots and recordings will be linked there after capture from the accepted release build.
+
+Source inventory updated **11 October 2026**; bounded native evidence updated
+**11 October 2026**. Acceptance evidence below is dated.
 This describes the current editor implementation; release verification is tracked
 separately in
 [the capability coverage report](../alpha/CAPABILITY_COVERAGE.md). Earlier alpha
@@ -34,14 +37,129 @@ conflicts, but cannot make a concurrent external write and rename atomic; see
 - Use the left panel to find and switch pages, rename, reorder, duplicate or
   delete pages, select layers, expand nesting, and drag layers into a different
   parent or position. Page roots and component recursion have edit guards.
-- Canvas edits support Undo/Redo and debounced autosave. Save commits active
-  valid property edits; failures remain visible. Save As creates a separate
-  project and rejects occupied or unsafe destinations. Clean canvas tabs restore
-  their project and page/component scope when the workspace reopens. Unsaved
-  canvas or source content still requires the normal close/save decision.
+- Canvas edits support Undo/Redo and debounced autosave. Active canvas text can
+  be saved directly; focused numeric-input behavior is qualified below.
+  Autosave can persist an edit while a close prompt is
+  open; **Don't Save** does not roll back changes already written. Save As creates
+  a separate project and rejects occupied or unsafe destinations. Session restore
+  records project and page/component scope, but build39 failed closed-tab
+  membership: normal Quit and a cold launch without manual Open restored two
+  design tabs after all had been closed. Saved project bytes remained exact.
+  Subsequent hosted and bounded build42 checks are recorded below; broader
+  scoped restore remains unaccepted.
+  Unsaved canvas or source content still requires the normal close/save decision.
+  A bounded build37 Save/close/warm-reopen journey succeeds, but the original
+  reported inert Save/Discard incident is not reproduced or explained. In a
+  separate build37 test with writes denied, CmdS displayed a permission error.
+  Save in the close prompt retained the dirty draft and logged an error without
+  a separate close-error dialog; retrying the prompt and choosing Don't Save
+  returned to welcome. Restoring permissions and reopening showed the original
+  saved text. In a later check, restoring writes allowed retry Save to finish
+  and the new text to reopen; autosave had already persisted it before the
+  choice. Active text CmdS and clean Quit/cold reopening also pass on that one
+  owned fixture, without proving rollback or the original incident's cause.
+  A separate build37 check found that a focused X-field draft was not committed
+  by CmdS and was lost on window Close without a prompt. Pressing Enter before
+  Save committed the value on that build; this historical failure remains
+  recorded. Later bounded build39 checks on an owned fixture passed focused
+  numeric CmdS without Enter and valid focused-input Close → Save. Invalid
+  input was retained when Save was rejected; Close Without Saving then closed
+  the tab, and warm reopening showed the last saved value. Build41 repeats these
+  bounded focused-property Save/close results on an owned Text fixture, including
+  invalid-input Cancel/Discard and valid Close Save restoring the original FNX.
+  These checks do not explain the original Spectrum incident or prove native
+  acceptance of later source changes. Both canonical and push hosted Check runs for `37c4073d` on
+  11 October pass all 66 required names, including all nine property-draft cases
+  for invalid input and shared views. Earlier complete-Check failures remain
+  recorded; those exact source checks are green. Hosted success and bounded native
+  journeys still do not establish full release readiness. See the
+  [acceptance record](../alpha/CAPABILITY_COVERAGE.md), which
+  retains the [build37 failure](../alpha/CAPABILITY_COVERAGE.md#current37-native-checks--11-october).
+- A separate build41 write-failure check on an owned Text project retains the
+  dirty draft on denied Save and close errors. Cancel keeps the draft; closing
+  without saving removes the owner tab and its warning. Restoring write access
+  permits explicit retry; Undo and Save restore authored content. **Alert polish
+  remains open:** manual Save and close alerts expose long internal paths, and
+  the tab-close error uses an `untitled` label. Explicit Save All retained the
+  draft but showed no action-level dialog; a later autosave notice is separate
+  feedback. Concise, named errors and a Save All dialog are now in source;
+  their recorded `29890b774` hosted regressions pass. Later build43 native
+  samples below verify bounded manual/tab/window error presentation; broader
+  failure routes remain pending. These owned fault checks do not establish
+  atomic multi-document Save or the original Spectrum incident's cause.
+- A later 11 October update records both `a51d57c2` hosted Check runs as failed;
+  the earlier `37c4073d` success above remains tied to that source. Subsequent
+  `29890b774` results are listed below. Its captured explicit-Open regression
+  reaches successful read-failure recovery but fails when repeated Open after
+  manifest recreation adds a duplicate tab. The later `ab9faf717` per-view
+  entry-identity regression passes in both hosted runs; no matching installed-app
+  recreation behavior is claimed. See the
+  [dated terminal update](../alpha/CAPABILITY_COVERAGE.md#terminal-a51d-checks-and-captured-open-successor--11-october).
+- **Later 11 October acceptance:** internal build42, exact `a51d57c2`, passes
+  bounded Spectrum focused Save/Cancel/Discard with full pre-choice comparisons,
+  warm reopening and authored restoration. Closing all tabs then a cold launch
+  restores zero tabs; explicit Open and repeat Open retain one. Sampled
+  light/dark inspectors fit at 320/400 points. Native Crop Apply/Undo/Redo restores
+  the document and all six assets; only the restored state is reopened. Later
+  disabled-Apply/drag/Cancel, ellipse point/history, mixed-menu, invalid-X
+  rejection/Close Without Saving and locked-leaf canvas samples pass within their stated
+  scope. Earlier Boolean entry failures remain unexplained despite later traced
+  success. Merely focusing TextPath X now reproduces a shifted, dirty preview;
+  Escape restores it and saved files remain unchanged. A source repair prevents
+  untouched fields from changing values and preserves the precision of real
+  position edits. The `ab9faf717` host fractional and transformed-parent tests
+  pass. The original dependency untouched-blur failure remains recorded; its
+  test-only window activation successor `3e78` now passes all nine required cases.
+  Host86c pins that revision but its new Crop diagnostic fails test compilation.
+  Later build44 ab9/a795 passes bounded fractional and transformed-parent native
+  checks below; it does not validate fa47 or every transform/font case.
+  Both published `29890b774` Check runs pass 72/77 and fail five runtime cases.
+  Matching lint and Skia source checks pass separately. Build42 does not accept later Save All/error feedback,
+  captured-Open or the prepared identity/test corrections. See the
+  [dated successor record](../alpha/CAPABILITY_COVERAGE.md#build42-native-samples-and-29890b-test-successor--11-october).
+- **Build43 bounded follow-up:** the internal package is exact `1f838bf20`.
+  An owned ordinary Text integer field passes focused CmdS, Save All, close Save
+  and warm reopening. Denied-write alerts give readable permission guidance;
+  tab-close errors name the design file and retain Cancel/Close Without Saving,
+  while window-close errors explain that the window remains open. Cancel retains
+  the dirty X48 draft; retry Save after restoring permissions persists it without
+  retyping. Discard closes the tab, and final authored bytes are restored apart
+  from normal `metadata.modified_at`. This does not establish multi-document Save
+  All, fractional TextPath, cold restart or later-source acceptance. Sampled
+  Text/Frame/Section/Image entry routes work within the recorded scope. A later
+  batch adds TextPath text Save/Undo, Group drill and Boolean operand entry with
+  four handles, without an anchor edit. Two panes of one design pass later-pane
+  focused integer Save All and earlier-pane Undo/Save All restoration; this does
+  not establish multi-document failure ordering or shared Discard. Crop
+  Cancel clears a pending preview but keeps the tool active; a subsequent Cancel
+  or Escape exits it. This is separate from the three failing hosted Crop cases.
+  See the [current scoped results](../alpha/CAPABILITY_COVERAGE.md#published-86c-checks-and-rounded-clip-successor--11-october).
+- **Rounded-corner targeting repair in fa47:** invisible physical Text, Vector
+  and Bitmap children behind a rounded ancestor clip are excluded from authoring
+  hits. Vector fallback applies the same filter to every candidate and retains
+  a visible path underneath. Existing parent-frame bounds and selected controls
+  keep their authoring behavior. Three new geometry/tool/mounted-entry tests and
+  the existing transformed-parent TextPath test join the required 81-name gate.
+  All four have actual passes in both fa47 Check runs; each has 78/81 required
+  passes and the same three Crop failures. Matching native rounded-clip acceptance remains pending.
+- **Build44 bounded follow-up (ab9/a795):** untouched and edited fractional
+  TextPath inputs, one transformed parent, Group text edit/Save/Undo and Crop
+  Apply/history pass on owned fixtures. Full authored restoration is verified
+  apart from modification metadata. Boolean point Undo restores canonical
+  geometry and properties but may serialize `Vector` instead of `Rect` shorthand;
+  byte spelling is separate from semantic Undo, with no demonstrated data loss.
+  In a denied-write check, explicit Save/close errors retain X48 through Cancel;
+  restored permissions allow close Save without retyping. Separate-document Save
+  All, OS-error Discard and cold recovery are not covered by that route. These
+  internal QA results do not establish fa47 or shipping acceptance. See the
+  [current scoped results](../alpha/CAPABILITY_COVERAGE.md#current-fa47-hosted-results-and-build44-native-samples--11-october).
 - The **Code** workspace edits FNX and supported JSON sources. Saving valid
   source updates the canvas; invalid drafts preserve the last valid file and
-  scene. Embedded Find searches the active FNX/JSON editor; **Discard draft**
+  scene. Multi-buffer Save is sequential, not atomic: in a bounded build39 check,
+  valid FNX was saved before a second invalid JSON draft was rejected. Cancel
+  retained the invalid draft; Discard closed it and kept the FNX already saved.
+  This is not rollback of earlier writes. Embedded Find searches the active
+  FNX/JSON editor; **Discard draft**
   discards only the selected buffer. Source Save preserves authored Undo, and
   ordinary saved-canvas source refresh remains its own undoable text transaction.
   An unsaved source buffer locks conflicting visual edits. Selecting a layer
@@ -107,6 +225,32 @@ also supports tip, hardness and flow settings; Pencil and Eraser expose their
 applicable subsets. The toolbar Color picker opens the selected fill or page
 background picker.
 
+In an editable Design canvas, activating Crop also shows **Ratio**, **Cancel**
+and **Apply crop** controls. Drag inside the image to create the crop region,
+then Apply. On build37, one freeform Bitmap Apply/Undo/Redo/final Undo/Cancel
+journey restores full project content except its modification timestamp. The
+earlier missing-controls failures remain recorded; other crop modes and cold
+reopening are not covered by that journey. On build39, both side panels left a
+256-point canvas that clipped the toolbar's leading control; a 336-point canvas
+clipped the Crop hint and placed Apply beyond the right edge. Bitmap drill-in,
+Crop entry and Cancel passed, without Apply in that journey. Build41 also passes
+wrapped-image Crop entry, Apply followed by Undo, and a separate preview Cancel;
+Cancel leaves Crop mode active. Its preview moves the action bar, so an old
+Cancel click position can instead hit Apply. At an actual 336-point canvas,
+Apply, the bottom toolbar and the top Canvas/Variables/Code controls still clip.
+The responsive implementation bounds toolbar/Crop controls and positions the
+top workspace tabs within the canvas. In both `ab9faf717` Check runs, the mounted
+toolbar regression passes its mode, scrolling and workspace-switching checks.
+The three mounted Crop regressions at 240, 256 and 336 points execute but fail
+at the first intended drag press after disabled Apply; their later preview,
+Apply and history assertions are not reached. Both later fa47 Check runs pass
+78/81 required names and retain those three failures: raw window delivery
+reaches an oversized Crop panel that occludes the canvas drag point; the hint
+collapses to zero width at 336. The source-reviewed one-line `flex_none` hint
+fix is included in the successor to fa47; matching execution remains pending.
+Build44 separately passes bounded Apply/Undo/Redo/restoration, without proving
+those CI logical widths or the candidate fix.
+
 On development QA `0f71b3961d`, one real three-second H.264 fixture passes bounded
 Play/Pause, paused Seek, Trim Cancel and Trim Apply with single Undo/Redo and
 cold saved-state checks. Its poster matches an independent frame reference,
@@ -150,6 +294,11 @@ fills and gradients, strokes, effects, corners, typography, auto-layout/grid,
 variables, components and export. Page selection has page-specific properties. Audio and specialist leaves show
 their own type labels and expose supported position, dimensions, appearance,
 effects and export controls; these controls preserve the underlying content.
+**Video properties**, **Audio properties** and specialist properties entries
+reveal this inspector; they do not switch modes or open dedicated media editors.
+For a supported single Video or Audio selection, playback controls appear below
+the canvas in **Motion** or **Prototype**. Audio preview also requires an active
+canvas window; a missing preview is not diagnosed by the Properties action alone.
 Booleans expose operation, fill and stroke controls. Paint recoloring retains
 the imported geometry; geometry or operation changes recompute it from operands.
 Constraint data can be retained by the document, but constraint controls are
@@ -222,7 +371,7 @@ double-click to drill into its container before another pair enters editing.
 | Bitmap/image node | Activate Crop. Draw the crop region. | Enter applies; Escape cancels the pending crop. |
 | Group, frame, section or boolean | Drill into the next selectable child level. | A subsequent double-click can activate the selected leaf. |
 | Component instance | Edit a virtual text override when the pointer hits editable instance text; otherwise reveal its properties inspector. | Finish text editing or inspect instance properties. |
-| Video or audio | Reveal the properties inspector. | Use the supported media or preview controls for playback; double-click keeps the current mode. |
+| Video or audio | Reveal the properties inspector without changing mode. | Select the supported media in Motion or Prototype for playback controls below the canvas. |
 | Node graph, 3D, AI artifact or embed | Reveal the properties inspector. | No specialized editor is implied for placeholder types. |
 
 Locked, hidden, obscured and other-page scene nodes do not enter editing. Shift,
@@ -434,9 +583,14 @@ Vector JPG, collision preservation and two simultaneous presets, including 2×
 PNG. Bitmap JPG retains its original four-pixel failure and separate limited
 flat-block pass. The later quality-95 correction passes the hosted regression
 using the original fixture, crop, pixel mask and tolerances; quality 90 fails
-that same test. This does not replace a native retest on the latest app or prove
-general JPEG fidelity, and higher quality can increase file size. Imported or
-advanced effects and broader batches still need format-specific checks.
+that same test. A later build37 Bitmap export produces PNG, JPG, SVG and PDF
+with unchanged project content and assets. PNG pixels, SVG embedded/rendered
+pixels and the PDF embedded bitmap match the source. PDF raster rendering has
+retained edge differences; JPEG passes only a declared 1,200-pixel cell-interior
+check, not the original regression mask. Exporting the selected Bitmap yields
+its full image; this does not establish clipped parent-frame export. General
+JPEG fidelity, advanced effects and broader batches remain format-specific
+checks, and higher quality can increase file size.
 
 The built-in designer can inspect/edit the canvas, use project `fanta.md`
 instructions, prepare design assets, follow source edits and report agent
@@ -474,9 +628,31 @@ model supports those inputs.
   Resolve the saved request before submitting another. Account changes and
   unavailable models are checked during recovery.
 
-Available models come from the signed-in account's catalog. Real-provider
-submit/poll/save/place, restart recovery, credits and payment behavior still
-require service acceptance; mock recovery tests do not establish availability.
+Available models come from the signed-in account's catalog. A bounded 9 October
+internal build33 Seedream image journey passes generation, placement, Undo/Redo,
+Save and reopening, with one matching five-credit usage row. It does not prove
+ordinary balance debit, exactly-once upstream execution or other providers.
+In-flight recovery, broader generation and payment behavior remain unverified;
+mock recovery tests do not establish availability. See the
+[dated acceptance scope](../alpha/CAPABILITY_COVERAGE.md#current-acceptance-status).
+
+A separate **11 October build37** check completed normal browser sign-in with
+the human-selected production account and loaded 18 image models. One
+FLUX1.1Pro request quoted six credits, returned a Ready image and showed the
+balance change from 344 to 338. Native download produced a decoded 1024×768 JPEG;
+Refresh and Open preview retained the matching result. After clean Quit and a
+new process, the account restored without browser sign-in, the balance remained
+338, and Refresh returned the same three Ready creations and 18 models. Opening
+the existing preview made no new generation request. This is one bounded
+account/model journey, not database exactly-once, network-loss recovery, Agent,
+other-model or Add-to-project acceptance. The owned project remained unchanged.
+
+A later build37 check used **Add to project** once for that existing image in
+an independent project clone. Save and warm reopen retained the library image;
+one placement and Save retained its matching bytes, and Undo and Save restored
+the original page while keeping the library image. The original project stayed
+unchanged and the balance remained 338. Cold import restoration and other models
+remain unverified.
 
 Implementation: [export](../../crates/fig_viewer/src/export.rs),
 [agent operations](../../crates/fig_viewer/src/agent_surface.rs),
@@ -495,6 +671,19 @@ agent profile before sending a request. Tool permissions, retries and auxiliary
 requests matter: a model's output limit or a restrictive profile is not a total
 spending cap. See [AI_DESIGNER.md](../alpha/AI_DESIGNER.md) for canvas permissions.
 
+The current source limits each native Agent turn to 64 model dispatches shared
+by automatic continuations, retries, fallback and automatic compaction. Reaching
+the limit stops the turn with a visible message while preserving completed work;
+a new user turn gets a fresh limit. Manual compaction, title generation, tools,
+subagents and provider-internal retries are outside this limit. This is not a
+dollar or token limit. Both canonical and push Check runs for `37c4073d` on
+11 October pass all 66 required names, including the nine request-limit
+regressions. Earlier failed runs remain recorded. Paid native Agent
+behavior remains unverified. A positive account balance does not reserve the
+full turn's potential cost, and safe billing of repeated chat requests is not
+established. See the [coverage report](../alpha/CAPABILITY_COVERAGE.md) for the
+separate test and production limits.
+
 There are two distinct MCP directions:
 
 - The **local live MCP** server lets external agents inspect/edit this editor,
@@ -507,10 +696,14 @@ There are two distinct MCP directions:
   HTTP or local-command servers have their own configuration and access rules;
   local commands are restricted in Mac App Store builds.
 
-Bounded native checks have observed an existing account, billing reads and model
+Earlier bounded native checks observed an existing account, billing reads and model
 rows. They do not establish fresh browser/callback sign-in, trustworthy current
 prices/caps for a paid request, live managed-MCP execution, payments or general
-account recovery. No paid AI request is accepted by this coverage record.
+account recovery. The bounded image-generation result above does not establish
+Agent chat or a total spending cap.
+The later build37 sign-in, six-credit image debit and cold session/history check
+above are separate positive evidence; they do not establish those remaining
+service or spending guarantees.
 
 Implementation: [account and billing UI](../../crates/zed/src/zed/settings_modal.rs),
 [MCP settings](../../crates/zed/src/zed/settings_mcp.rs),
@@ -519,9 +712,10 @@ Implementation: [account and billing UI](../../crates/zed/src/zed/settings_modal
 
 ## Boundaries
 
-Node-graph, generic AI-artifact and embed node types exist in the format, but the
-canvas renderer currently draws placeholders for those types. A 3D node has a
-renderer hook; this inventory does not establish a complete shipped 3D editor.
+Node-graph, 3D, generic AI-artifact and embed node types exist in the format, but
+the canvas renderer currently draws placeholders for those types. The 3D card
+shows a studio cube, not the stored model payload. Their properties entries open
+the shared inspector, not dedicated content editors.
 Existing 3D payloads and assets are preserved when unrelated canvas changes are
 saved and reopened. Neither storage support nor a node enum constitutes a
 finished user workflow.
@@ -536,15 +730,34 @@ regression and a slower 100% instance result; fit-all instance timings were
 rejected because the target produced no visible pixel motion. The sampled
 fit-all image p95 remains above 16 ms. Matched native gesture, complete Save and
 memory measurements are still required; the below-16-ms native drag target
-remains unproven. See the [coverage report](../alpha/CAPABILITY_COVERAGE.md) for
-exact evidence and earlier failures.
+remains unproven. The user's 11 October hands-on Spectrum check accepts its
+current performance; this qualitative result is separate from those unmeasured
+benchmarks and does not request another optimization pass. See the
+[coverage report](../alpha/CAPABILITY_COVERAGE.md) for exact evidence and earlier
+failures.
 
 Mac App Store builds restrict local process execution, external agents and
 related inherited editor features; see [MAC_APP_STORE.md](../alpha/MAC_APP_STORE.md).
 The selected release target is a direct-download Mac app. Packaging now checks
 the app inside the produced DMG against the staged bundle and enforces the
-configured signature/notarization checks. The 9 October internal optimized
-**build33**, from `79cc2ef8c094149e8496476c1cb53e2945b8b54a`, passes hosted and
+configured signature/notarization checks. Latest completed internal **build41**,
+exact `c46a1b41bcd00222cbdba5e9a1ce450fc0658c10`, passes hosted package/source,
+checksum, local mounted-package, CLI and isolated persistent-QA preparation
+checks. Its bounded native focused-property Save/close, TextPath/Group editing,
+Boolean vector entry, Bitmap Crop and sampled inspector layouts pass; narrow
+336-point controls still clip. Build41 predates the fully green `37c4073d` source
+checks and its Settings Escape/audio changes, and the responsive-controls
+and closed-tab restoration fixes in this release candidate. Earlier build39 at `0732a74e` retains its
+scoped native journeys and closed-tab restart failure; build41 did not retest
+that cold-session path. Both internal packages are unsigned/ad-hoc QA, not
+Developer ID/notarized releases. Earlier **build37**, exact
+`22f734193844eab66485e3cb322b529c2965e297`, now passes hosted and local package,
+checksum, CLI and isolated-QA verification. Its bounded 11 October native checks
+cover selected inspector, Crop, media playback, export and save/close routes;
+see the [latest acceptance record](../alpha/CAPABILITY_COVERAGE.md#current37-native-checks--11-october).
+It remains ad-hoc signed, not a Developer ID/notarized release. The following
+**build33** result is historical, not validation of later fixes. That internal optimized artifact, from
+`79cc2ef8c094149e8496476c1cb53e2945b8b54a`, passes hosted and
 local mounted-package verification, CLI checks and isolated QA derivation. It
 is an arm64, ad-hoc-signed artifact (`signed=false`), not a Developer ID/notarized
 release. These checks do not replace native capability acceptance. The

@@ -117,6 +117,10 @@ impl CropTool {
 }
 
 impl Tool for CropTool {
+    fn pending_crop_bounds(&self) -> Option<Bounds> {
+        self.pending
+    }
+
     fn name(&self) -> &'static str {
         "crop"
     }

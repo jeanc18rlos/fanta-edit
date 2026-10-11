@@ -1626,6 +1626,22 @@ where
     }
 }
 
+pub fn save_io_error_detail(error: &anyhow::Error) -> Option<String> {
+    let error = error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())?;
+    Some(match error.kind() {
+        std::io::ErrorKind::PermissionDenied =>
+            "Write access was denied. Check the project folder's permissions, then try Save again.".to_owned(),
+        std::io::ErrorKind::NotFound =>
+            "The project location could not be found. Restore it, then try Save again.".to_owned(),
+        _ => match error.raw_os_error() {
+            Some(code) => format!("The write failed (system error {code}). Check the project location and try Save again."),
+            None => "The write failed. Check the project location and try Save again. Details are in the log.".into(),
+        },
+    })
+}
+
 pub trait DetachAndPromptErr<R> {
     fn prompt_err(
         self,

@@ -9,7 +9,7 @@ use crate::{
         TabContentParams, TabTooltipContent, WeakItemHandle,
     },
     move_item,
-    notifications::NotifyResultExt,
+    notifications::{NotifyResultExt, save_io_error_detail},
     toolbar::Toolbar,
     workspace_settings::{AutosaveSetting, FocusFollowsMouse, TabBarSettings, WorkspaceSettings},
 };
@@ -1930,6 +1930,9 @@ impl Pane {
     // save it. That said, if you still have the buffer open in a different pane
     // we can close this one without fear of losing data.
     pub fn skip_save_on_close(item: &dyn ItemHandle, workspace: &Workspace, cx: &App) -> bool {
+        if item.has_pending_view_edits(cx) {
+            return false;
+        }
         let mut dirty_project_item_ids = Vec::new();
         item.for_each_project_item(cx, &mut |project_item_id, project_item| {
             if project_item.is_dirty() {
@@ -1959,6 +1962,7 @@ impl Pane {
     ) -> String {
         let mut file_names = BTreeSet::default();
         for item in items {
+            let item_name = item.tab_content_text(0, cx);
             item.for_each_project_item(cx, &mut |_, project_item| {
                 if !project_item.is_dirty() {
                     return;
@@ -1966,7 +1970,13 @@ impl Pane {
                 let filename = project_item
                     .project_path(cx)
                     .and_then(|path| path.path.file_name().map(ToOwned::to_owned));
-                file_names.insert(filename.unwrap_or("untitled".to_string()));
+                file_names.insert(filename.unwrap_or_else(|| {
+                    if item_name.is_empty() {
+                        "untitled".to_string()
+                    } else {
+                        item_name.to_string()
+                    }
+                }));
             });
         }
         if file_names.len() > 6 {
@@ -2029,6 +2039,7 @@ impl Pane {
         let mut items_to_close = Vec::new();
         for item in &self.items {
             if should_close(item.item_id()) {
+                item.prepare_for_save_or_close(window, cx);
                 items_to_close.push(item.boxed_clone());
             }
         }
@@ -2042,7 +2053,13 @@ impl Pane {
             // This will cause Zed to expand the content of the currently active item
             //
             // Beyond that sort in order of project path, with untitled files and multibuffers coming last.
-            (active_item_id == Some(item.item_id()), path.is_none(), path)
+            // A view-owned preview must settle before another view saves or reloads its model.
+            (
+                !item.has_pending_view_edits(cx),
+                active_item_id == Some(item.item_id()),
+                path.is_none(),
+                path,
+            )
         });
 
         let workspace = self.workspace.clone();
@@ -2107,14 +2124,22 @@ impl Pane {
                             }
                         }
                         Err(err) => {
+                            log::error!("saving before closing failed: {err:#}");
                             let answer = pane.update_in(cx, |_, window, cx| {
                                 let detail = Self::file_names_for_prompt(
                                     &mut [&item_to_close].into_iter(),
                                     cx,
                                 );
+                                let (message, detail) = match save_io_error_detail(&err) {
+                                    Some(reason) => (
+                                        "Unable to save file".to_owned(),
+                                        format!("{detail}\n\n{reason}"),
+                                    ),
+                                    None => (format!("Unable to save file: {err}"), detail),
+                                };
                                 window.prompt(
                                     PromptLevel::Warning,
-                                    &format!("Unable to save file: {}", &err),
+                                    &message,
                                     Some(&detail),
                                     &["Close Without Saving", "Cancel"],
                                     cx,
@@ -2322,6 +2347,7 @@ impl Pane {
 
         const DELETED_MESSAGE: &str = "This file has been deleted on disk since you started editing it. Do you want to recreate it?";
 
+        cx.update(|window, cx| item.prepare_for_save_or_close(window, cx))?;
         let path_style = project.read_with(cx, |project, cx| project.path_style(cx));
         if save_intent == SaveIntent::Skip {
             let is_saveable_singleton = cx.update(|_window, cx| {

@@ -215,7 +215,7 @@ impl FigView {
         let editable = self.is_editable(cx);
         let auto_keyframe = self.motion_auto_keyframe;
         let auto_keyframe_available = editable && self.active_motion_clip.is_some();
-        let collapsed = !self.inspector_sidebar_visible;
+        let collapsed = !self.inspector_sidebar_expanded(cx);
         let can_present = self.item.read(cx).document().is_some_and(|document| {
             crate::prototype_player::prototype_entry_frame(&document.doc).is_some()
         });
@@ -437,8 +437,7 @@ impl FigView {
                         .update(cx, |design, cx| design.deactivate(window, cx));
                 }
                 self.finish_panel_edits(cx);
-                self.inspector_sidebar_visible = !collapsed;
-                self.persist_sidebar_layout(cx);
+                self.set_inspector_sidebar_visible(!collapsed, window, cx);
                 cx.notify();
             }
             PropertiesInspectorAction::Zoom(ZoomControlsAction::ZoomChangeRequested {

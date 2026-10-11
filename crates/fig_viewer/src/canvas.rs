@@ -3442,15 +3442,15 @@ pub(crate) fn accepts_authoring_hit(
     let Some(node) = scene.get(id) else {
         return false;
     };
-    let fanta_doc::NodeData::TextPath(text_path) = &node.data else {
-        return true;
-    };
     if scene
         .ancestors_of(id)
         .any(|ancestor| !inspect_descendants_visible_at(scene, ancestor, world_point))
     {
         return false;
     }
+    let fanta_doc::NodeData::TextPath(text_path) = &node.data else {
+        return true;
+    };
     if accepts_precise_hit(scene, id, world_point) {
         return true;
     }
@@ -5555,6 +5555,197 @@ mod geometry_tests {
             ),
             Some(rectangle_id)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rounded_ancestor_clips_filter_physical_authoring_hits() -> anyhow::Result<()> {
+        for data in [
+            NodeData::Text(fanta_doc::TextNode::new("Visible text", 100., 100.)),
+            NodeData::Vector(VectorNode::rect_solid(0., 0., 100., 100., Color::WHITE)),
+            NodeData::Bitmap(fanta_doc::BitmapNode {
+                asset: fanta_doc::AssetId::new(),
+                natural_size: [100, 100],
+                local_size: [100., 100.],
+                crop: None,
+                fit: fanta_doc::ImageFitMode::Fill,
+                tint: None,
+            }),
+        ] {
+            let mut scene = Scene::new();
+            let background = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                -200.,
+                -200.,
+                500.,
+                500.,
+                Color::BLACK,
+            )));
+            let background_id = background.id;
+            scene.insert(background)?;
+            let transform = Transform2D::scale_xy(1.4, 0.8).then(&Transform2D::rotation(0.4));
+            let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+                clip_size: Some([100., 100.]),
+                corner_radius: Some(50.),
+                ..Default::default()
+            }));
+            frame.index = scene.next_root_index();
+            frame.transform = transform;
+            let frame_id = frame.id;
+            scene.insert(frame)?;
+            let mut child = CanvasNode::new(data);
+            child.parent = Some(frame_id);
+            let child_id = child.id;
+            scene.insert(child)?;
+            let corner = transform.transform_point(DVec2::new(1., 1.));
+            let center = transform.transform_point(DVec2::new(50., 50.));
+            assert_eq!(
+                inspect_world_point(&scene, corner, None),
+                Some(background_id),
+            );
+            assert_eq!(
+                fanta_canvas::hit_test_deep(
+                    &scene,
+                    corner,
+                    fanta_canvas::HitPrecision::Path,
+                    None,
+                ).first().copied(),
+                Some(child_id),
+            );
+            assert_ne!(
+                precise_hit_test(&scene, corner, fanta_canvas::HitPrecision::Path, None),
+                Some(child_id),
+            );
+            assert_eq!(
+                precise_hit_test(&scene, center, fanta_canvas::HitPrecision::Path, None),
+                Some(child_id),
+            );
+            scene.get_mut(frame_id).expect("frame").meta =
+                serde_json::json!({"clip_content": false});
+            assert_eq!(
+                precise_hit_test(&scene, corner, fanta_canvas::HitPrecision::Path, None),
+                Some(child_id),
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rounded_ancestor_vector_fallback_preserves_tolerance_and_visible_candidates()
+    -> anyhow::Result<()> {
+        use fanta_tools::{
+            Button, ModifierKeys, NodeEditTool, PointerEvent, Tool as _, ToolContext, ToolEvent,
+        };
+
+        for zoom in [0.5, 1., 4.] {
+            let mut doc = fanta_doc::Doc::new();
+            let mut path = PathData::new();
+            path.move_to(0., 0.).line_to(100., 0.);
+            let vector = VectorNode {
+                path: path.clone(),
+                strokes: [fanta_doc::Stroke::solid(Color::BLACK, 1.)]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            };
+            let underneath = CanvasNode::new(NodeData::Vector(vector.clone()));
+            let underneath_id = underneath.id;
+            doc.scene.insert(underneath)?;
+            let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+                clip_size: Some([100., 100.]),
+                corner_radius: Some(50.),
+                ..Default::default()
+            }));
+            frame.index = doc.scene.next_root_index();
+            let frame_id = frame.id;
+            doc.scene.insert(frame)?;
+            let mut clipped = CanvasNode::new(NodeData::Vector(vector));
+            clipped.parent = Some(frame_id);
+            let clipped_id = clipped.id;
+            doc.scene.insert(clipped)?;
+            let clipped_before = doc.scene.get(clipped_id).expect("clipped path").clone();
+            let mut viewport = fanta_doc::Viewport {
+                zoom,
+                ..Default::default()
+            };
+            let screen_size = DVec2::new(800., 600.);
+            let point_on_line =
+                fanta_canvas::world_to_screen(DVec2::new(10., 0.), &viewport, screen_size);
+            let near = point_on_line + DVec2::new(0., 4.);
+            assert_eq!(
+                NodeEditTool::vector_at_screen(&doc, &viewport, screen_size, None, near),
+                Some(clipped_id)
+            );
+            assert_eq!(
+                NodeEditTool::vector_at_screen_with_refiner(
+                    &doc,
+                    &viewport,
+                    screen_size,
+                    None,
+                    near,
+                    Some(accepts_authoring_hit)
+                ),
+                Some(underneath_id),
+            );
+            assert_eq!(
+                NodeEditTool::vector_at_screen_with_refiner(
+                    &doc,
+                    &viewport,
+                    screen_size,
+                    None,
+                    point_on_line + DVec2::new(0., 7.),
+                    Some(accepts_authoring_hit)
+                ),
+                None,
+            );
+            let mut tool = NodeEditTool::new();
+            {
+                let mut context = ToolContext::new(
+                    &mut doc,
+                    &mut viewport,
+                    fanta_canvas::SnapEngine::default(),
+                    screen_size,
+                )
+                .with_hit_test_refiner(accepts_authoring_hit);
+                tool.handle_event(
+                    &mut context,
+                    ToolEvent::Pointer(PointerEvent::Press {
+                        screen: near.to_array(),
+                        button: Button::Primary,
+                        modifiers: ModifierKeys::empty(),
+                        count: 1,
+                    }),
+                );
+                assert_eq!(tool.target(), Some(underneath_id));
+                assert_eq!(context.doc.scene.get(clipped_id), Some(&clipped_before));
+                assert_eq!(context.doc.history.undo_depth(), 1);
+                assert!(context.doc.undo()?);
+                assert_eq!(
+                    context
+                        .doc
+                        .scene
+                        .get(underneath_id)
+                        .expect("underneath")
+                        .data
+                        .as_vector()
+                        .expect("vector")
+                        .path,
+                    path
+                );
+            }
+            doc.scene.get_mut(frame_id).expect("frame").meta =
+                serde_json::json!({"clip_content": false});
+            assert_eq!(
+                NodeEditTool::vector_at_screen_with_refiner(
+                    &doc,
+                    &viewport,
+                    screen_size,
+                    None,
+                    near,
+                    Some(accepts_authoring_hit)
+                ),
+                Some(clipped_id),
+            );
+        }
         Ok(())
     }
 

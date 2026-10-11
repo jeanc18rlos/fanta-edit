@@ -308,6 +308,12 @@ pub trait Item: Focusable + EventEmitter<Self::Event> + Render + Sized {
         None
     }
 
+    fn has_pending_view_edits(&self, _: &App) -> bool {
+        false
+    }
+
+    fn prepare_for_save_or_close(&mut self, _: &mut Window, _: &mut Context<Self>) {}
+
     fn is_dirty(&self, _: &App) -> bool {
         false
     }
@@ -565,6 +571,8 @@ pub trait ItemHandle: 'static + Send {
     fn item_id(&self) -> EntityId;
     fn to_any_view(&self) -> AnyView;
     fn close_blocker(&self, cx: &App) -> Option<SharedString>;
+    fn has_pending_view_edits(&self, cx: &App) -> bool;
+    fn prepare_for_save_or_close(&self, window: &mut Window, cx: &mut App);
     fn is_dirty(&self, cx: &App) -> bool;
     fn capability(&self, cx: &App) -> Capability;
     fn toggle_read_only(&self, window: &mut Window, cx: &mut App);
@@ -626,7 +634,11 @@ pub trait ItemHandle: 'static + Send {
     ) -> Vec<(SharedString, Box<dyn Action>)>;
     fn can_autosave(&self, cx: &App) -> bool {
         let is_deleted = self.project_entry_ids(cx).is_empty();
-        self.is_dirty(cx) && !self.has_conflict(cx) && self.can_save(cx) && !is_deleted
+        !self.has_pending_view_edits(cx)
+            && self.is_dirty(cx)
+            && !self.has_conflict(cx)
+            && self.can_save(cx)
+            && !is_deleted
     }
 }
 
@@ -1082,6 +1094,14 @@ impl<T: Item> ItemHandle for Entity<T> {
         self.read(cx).close_blocker(cx)
     }
 
+    fn has_pending_view_edits(&self, cx: &App) -> bool {
+        self.read(cx).has_pending_view_edits(cx)
+    }
+
+    fn prepare_for_save_or_close(&self, window: &mut Window, cx: &mut App) {
+        self.update(cx, |item, cx| item.prepare_for_save_or_close(window, cx));
+    }
+
     fn is_dirty(&self, cx: &App) -> bool {
         self.read(cx).is_dirty(cx)
     }
@@ -1502,6 +1522,7 @@ pub mod test {
         pub label: String,
         pub close_blocker: Option<SharedString>,
         pub save_count: usize,
+        pub save_error: Option<String>,
         pub save_as_count: usize,
         pub reload_count: usize,
         pub is_dirty: bool,
@@ -1594,6 +1615,7 @@ pub mod test {
                 label: String::new(),
                 close_blocker: None,
                 save_count: 0,
+                save_error: None,
                 save_as_count: 0,
                 reload_count: 0,
                 is_dirty: false,
@@ -1782,6 +1804,7 @@ pub mod test {
                     state: self.state.clone(),
                     label: self.label.clone(),
                     save_count: self.save_count,
+                    save_error: self.save_error.clone(),
                     save_as_count: self.save_as_count,
                     reload_count: self.reload_count,
                     close_blocker: self.close_blocker.clone(),
@@ -1841,6 +1864,9 @@ pub mod test {
             cx: &mut Context<Self>,
         ) -> Task<anyhow::Result<()>> {
             self.save_count += 1;
+            if let Some(error) = &self.save_error {
+                return Task::ready(Err(anyhow::anyhow!(error.clone())));
+            }
             self.is_dirty = false;
             for item in &self.project_items {
                 item.update(cx, |item, _| {

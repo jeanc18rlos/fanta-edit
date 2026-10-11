@@ -1,4 +1,5 @@
 use anyhow::Result;
+use collections::HashMap;
 use fs::Fs;
 
 use gpui::{
@@ -29,6 +30,7 @@ use ui::{CommonAnimationExt as _, ContextMenu, right_click_menu};
 const SIDEBAR_RESIZE_HANDLE_SIZE: Pixels = px(6.0);
 pub(super) const PROJECT_OPEN_FRAME_WAIT: Duration = Duration::from_millis(200);
 
+use crate::notifications::{DetachAndPromptErr, save_io_error_detail};
 use crate::open_remote_project_with_existing_connection;
 use crate::{
     CloseIntent, CloseWindow, DockPosition, Event as WorkspaceEvent, Item, ModalView, OpenMode,
@@ -595,6 +597,11 @@ impl MultiWorkspace {
         cx: &mut Context<Self>,
     ) -> bool {
         for workspace in workspaces {
+            workspace.update(cx, |workspace, cx| {
+                workspace.preserve_pending_view_edits(window, cx)
+            });
+        }
+        for workspace in workspaces {
             if !workspace.update(cx, |workspace, cx| workspace.can_close_items(window, cx)) {
                 for retained in workspaces {
                     retained.update(cx, |workspace, cx| workspace.cancel_close(window, cx));
@@ -609,18 +616,31 @@ impl MultiWorkspace {
 
     pub fn close_window(&mut self, _: &CloseWindow, window: &mut Window, cx: &mut Context<Self>) {
         cx.spawn_in(window, async move |this, cx| {
-            let workspaces = this.update(cx, |multi_workspace, _cx| {
-                multi_workspace.workspaces().cloned().collect::<Vec<_>>()
+            let workspaces = this.update(cx, |multi_workspace, cx| {
+                let mut workspaces = multi_workspace.workspaces().cloned().collect::<Vec<_>>();
+                workspaces.sort_by_key(|workspace| {
+                    !workspace.read(cx).items(cx).any(|item| item.has_pending_view_edits(cx))
+                });
+                workspaces
             })?;
 
+            for workspace in &workspaces {
+                workspace.update_in(cx, |workspace, window, cx| workspace.preserve_pending_view_edits(window, cx))?;
+            }
             for workspace in workspaces {
                 let should_continue = workspace
                     .update_in(cx, |workspace, window, cx| {
                         workspace.prepare_to_close(CloseIntent::CloseWindow, window, cx)
                     })?
-                    .await?;
-                if !should_continue {
-                    this.update_in(cx, |this, window, cx| this.can_close(window, cx))?;
+                    .await;
+                if !should_continue.as_ref().is_ok_and(|&allowed| allowed) {
+                    this.update_in(cx, |this, window, cx| {
+                        for retained in this.workspaces() {
+                            retained.update(cx, |workspace, cx| workspace.cancel_close(window, cx));
+                        }
+                        this.can_close(window, cx);
+                    })?;
+                    should_continue?;
                     return anyhow::Ok(());
                 }
             }
@@ -633,7 +653,12 @@ impl MultiWorkspace {
 
             anyhow::Ok(())
         })
-        .detach_and_log_err(cx);
+        .detach_and_prompt_err("Unable to close window", window, cx, |error, _, _| {
+            let detail = save_io_error_detail(error).unwrap_or_else(|| format!("{error:#}"));
+            Some(format!(
+                "The window is still open. Try saving again, or close it again and choose Don't Save.\n\n{detail}"
+            ))
+        });
     }
 
     fn subscribe_to_workspace(
@@ -1198,7 +1223,17 @@ impl MultiWorkspace {
             }
 
             cx.update(|cx| {
-                Workspace::new_local(paths, app_state, None, None, None, OpenMode::NewWindow, cx)
+                Workspace::new_local_with_restore_intent(
+                    paths,
+                    app_state,
+                    None,
+                    None,
+                    None,
+                    OpenMode::NewWindow,
+                    true,
+                    Default::default(),
+                    cx,
+                )
             })
             .await?;
 
@@ -1434,6 +1469,31 @@ impl MultiWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Workspace>>> {
+        self.find_or_create_local_workspace_with_captured_paths(
+            path_list,
+            project_group,
+            excluding,
+            init,
+            open_mode,
+            source_workspace,
+            None,
+            window,
+            cx,
+        )
+    }
+
+    fn find_or_create_local_workspace_with_captured_paths(
+        &mut self,
+        path_list: PathList,
+        project_group: Option<ProjectGroupKey>,
+        excluding: &[Entity<Workspace>],
+        init: Option<Box<dyn FnOnce(&mut Workspace, &mut Window, &mut Context<Workspace>) + Send>>,
+        open_mode: OpenMode,
+        source_workspace: Option<WeakEntity<Workspace>>,
+        captured_paths: Option<(Vec<PathBuf>, HashMap<PathBuf, crate::LocalFantaPath>)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<Entity<Workspace>>> {
         if let Some(workspace) = self.workspace_for_paths_excluding(&path_list, None, excluding, cx)
         {
             self.activate(workspace.clone(), source_workspace, window, cx);
@@ -1447,6 +1507,7 @@ impl MultiWorkspace {
         let excluding = excluding.to_vec();
 
         cx.spawn(async move |_this, cx| {
+            let restoring = project_group.is_some();
             let effective_path_list = if let Some(project_group) = project_group {
                 let metadata_tasks: Vec<_> = paths
                     .iter()
@@ -1470,16 +1531,22 @@ impl MultiWorkspace {
                 PathList::new(&paths)
             };
 
+            let (matching_paths, captured_paths) = match captured_paths {
+                Some(captured_paths) => captured_paths,
+                None => {
+                    crate::local_fanta_root_paths(
+                        effective_path_list.paths(),
+                        app_state.fs.as_ref(),
+                    )
+                    .await
+                }
+            };
+            let matching_paths = PathList::new(&matching_paths);
             if let Some(requesting_window) = requesting_window
                 && let Some(workspace) = requesting_window
                     .update(cx, |multi_workspace, window, cx| {
                         multi_workspace
-                            .workspace_for_paths_excluding(
-                                &effective_path_list,
-                                None,
-                                &excluding,
-                                cx,
-                            )
+                            .workspace_for_paths_excluding(&matching_paths, None, &excluding, cx)
                             .inspect(|workspace| {
                                 multi_workspace.activate(
                                     workspace.clone(),
@@ -1497,13 +1564,15 @@ impl MultiWorkspace {
 
             let result = cx
                 .update(|cx| {
-                    Workspace::new_local(
+                    Workspace::new_local_with_restore_intent(
                         effective_path_list.paths().to_vec(),
                         app_state,
                         requesting_window,
                         None,
                         init,
                         open_mode,
+                        restoring,
+                        captured_paths,
                         cx,
                     )
                 })
@@ -2127,6 +2196,7 @@ impl MultiWorkspace {
                 log::debug!("project loading no longer waits for its first frame");
             }
         });
+        let fs = self.workspace().read(cx).app_state().fs.clone();
         let open = if self.multi_workspace_enabled(cx) {
             let empty_workspace = if self
                 .active_workspace
@@ -2156,18 +2226,44 @@ impl MultiWorkspace {
                     }
                 }
 
+                let captured_paths = crate::local_fanta_root_paths(&paths, fs.as_ref()).await;
+                let explicit_manifests = paths
+                    .iter()
+                    .filter_map(|path| {
+                        let captured = captured_paths.1.get(path)?;
+                        Some((
+                            captured.canonical_path.clone(),
+                            captured.manifest_root.clone()?,
+                        ))
+                    })
+                    .collect::<Vec<_>>();
                 let create_task = this.update_in(cx, |this, window, cx| {
-                    this.find_or_create_local_workspace(
+                    this.find_or_create_local_workspace_with_captured_paths(
                         PathList::new(&paths),
                         None,
                         empty_workspace.as_slice(),
                         None,
                         OpenMode::Activate,
+                        None,
+                        Some(captured_paths),
                         window,
                         cx,
                     )
                 })?;
                 let new_workspace = create_task.await?;
+                for (path, root) in explicit_manifests {
+                    new_workspace
+                        .update_in(cx, |workspace, window, cx| {
+                            workspace.open_abs_path_with_manifest_root(
+                                path,
+                                Default::default(),
+                                Some(root),
+                                window,
+                                cx,
+                            )
+                        })?
+                        .await?;
+                }
 
                 if let Some(empty_workspace) = empty_workspace {
                     if !this.update_in(cx, |this, window, cx| {

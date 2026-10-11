@@ -62,6 +62,100 @@ jobs:
             --stage engine --stage import --stage source-order --stage editor --stage workspace --stage ui \
             --output-dir "${RUNNER_TEMP}/fanta-release-verification"
 
+      - name: Verify every required editor and workspace regression actually passed
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          python3 - <<'PYCORE'
+          import csv, json, os, re
+          from pathlib import Path
+          output = Path(os.environ["RUNNER_TEMP"]) / "fanta-release-verification"
+          output.mkdir(parents=True, exist_ok=True)
+          expected = {
+              "editor": [
+                  "property_draft_explicit_save_commits_focused_input",
+                  "property_draft_invalid_save_preserves_then_corrects_input",
+                  "property_draft_window_save_commits_after_prompt_focus",
+                  "property_draft_invalid_window_save_keeps_discard_available",
+                  "property_draft_window_cancel_then_discard_preserves_shared_item",
+                  "property_draft_invalid_window_cancel_then_discard",
+                  "property_draft_unchanged_focused_field_closes_without_prompt",
+                  "property_draft_shared_save_all_commits_later_pane_owner_first",
+                  "property_draft_invalid_shared_save_all_keeps_discard_available",
+                  "unchanged_failed_autosave_stays_dirty_without_repeated_writes",
+                  "explicit_save_retries_the_unchanged_failed_autosave",
+                  "new_edit_retries_after_an_autosave_failure",
+                  "newer_edit_during_failed_autosave_remains_eligible",
+                  "queued_identical_autosave_is_suppressed_after_the_first_failure",
+                  "mounted_native_figview_save_closes_multi_workspace_window",
+                  "mounted_native_figview_discard_closes_multi_workspace_window",
+                  "mounted_native_figview_autosave_during_prompt_then_save_closes_window",
+                  "mounted_design_crop_context_menu_controls_preserve_cancelled_document",
+                  "mounted_design_crop_double_click_controls_preserve_cancelled_document",
+                  "mounted_design_crop_apply_button_commits_once_and_roundtrips_history",
+                  "draw_region_survives_tool_switch_and_masks_crop",
+                  "source_recovery_canvas_tab_restores_save_keyboard_route",
+                  "save_failure_notice_real_write_error_is_concise_and_recovery_is_scoped",
+                  "save_failure_notice_discard_removes_only_the_closed_document",
+                  "save_failure_notice_survives_one_shared_tab_until_the_last_removal",
+                  "save_failure_notice_deferred_show_cannot_outlive_save_or_removal",
+                  "pane_layout_reserves_canvas_without_changing_hidden_panel_preferences",
+                  "pane_layout_measures_the_pane_and_restores_wide_sidebars",
+                  "pane_layout_preserves_valid_property_input_across_compaction",
+                  "pane_layout_preserves_invalid_property_input_across_compaction",
+                  "audio_preview_completed_player_reaches_known_duration",
+                  "audio_preview_paused_and_seeked_player_keeps_incomplete_position",
+                  "audio_preview_close_resets_completed_position",
+                  "mounted_canvas_toolbar_fits_narrow_panes_and_scrolls_without_panning",
+                  "mounted_canvas_crop_controls_fit_240_and_preserve_cancel_apply_history",
+                  "mounted_canvas_crop_controls_fit_256_and_preserve_cancel_apply_history",
+                  "mounted_canvas_crop_controls_fit_336_and_preserve_cancel_apply_history",
+                  "canvas_session_explicit_manifest_reuses_workspace_and_closed_tab",
+                  "canvas_session_empty_restore_allows_only_newly_added_project_auto_open",
+                  "canvas_session_legacy_manifest_root_restores_once_then_keeps_empty_layout",
+                  "canvas_session_manifest_normalization_preserves_ordinary_and_malformed_files",
+                  "canvas_session_explicit_reused_open_survives_later_manifest_read_failure",
+                  "rounded_ancestor_clips_filter_physical_authoring_hits",
+                  "rounded_ancestor_vector_fallback_preserves_tolerance_and_visible_candidates",
+                  "mounted_physical_leaf_entry_respects_rounded_ancestor_clips",
+                  "text_path_position_matches_visual_bounds_and_undo_under_transformed_parent"
+              ],
+              "workspace": [
+                  "test_close_window_reports_save_failure_and_retries",
+                  "test_close_window_reports_save_failure_and_can_discard",
+                  "test_multi_workspace_close_window_multiple_workspaces_cancel",
+                  "canvas_session_captured_manifest_identity_survives_later_read_failure",
+                  "test_save_all_reports_failure_preserves_remaining_drafts_and_retries"
+              ]
+          }
+          required_stages = ("engine", "import", "source-order", "editor", "workspace", "ui")
+          stage_path = output / "results.tsv"
+          stages = []
+          if stage_path.exists():
+              with stage_path.open() as stream:
+                  stages = list(csv.DictReader(stream, delimiter="\t"))
+          stage_checks = {}
+          for stage in required_stages:
+              rows = [row for row in stages if row.get("stage") == stage]
+              stage_checks[stage] = len(rows) == 1 and rows[0].get("result") == "PASS" and rows[0].get("exit_code") == "0"
+          checks = {}
+          for label, names in expected.items():
+              path = output / (label + ".log")
+              text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", path.read_text(errors="replace")) if path.exists() else ""
+              tests = re.findall(r"^test ([A-Za-z0-9_:]+) \.\.\. (ok|FAILED|ignored)(?:,.*)?$", text, re.MULTILINE)
+              checks[label] = {}
+              for name in names:
+                  actual = [(full_name, status) for full_name, status in tests if full_name.rsplit("::", 1)[-1] == name]
+                  checks[label][name] = {"actual": actual, "passed": len(actual) == 1 and actual[0][1] == "ok"}
+          passed = all(stage_checks.values()) and all(result["passed"] for group in checks.values() for result in group.values())
+          report = {"passed": passed, "required_count": 51, "stages": stage_checks, "groups": checks,
+                    "scope": "Actual full-suite offline editor/workspace execution; the separate30 Agent/ACP/Settings gate remains required. No native, GPU, service or performance acceptance."}
+          (output / "required-core-regressions.json").write_text(json.dumps(report, indent=2) + "\n")
+          print(json.dumps(report))
+          if not passed:
+              raise SystemExit("Required core regressions or release verification stages did not all pass")
+          PYCORE
+
       - name: Preserve release verification evidence
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -149,6 +243,213 @@ jobs:
 
       - name: Test blocked project execution paths
         run: cargo test --locked -p project --test integration --features mac_app_store,test-support test_mac_app_store_
+
+  release-blocker-regressions:
+    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.native_video_only }}
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Prepare release blocker evidence
+        id: evidence
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/release-blocker-regressions"
+          mkdir -p "$evidence/config"
+          git show -s --format=raw HEAD > "$evidence/checkout.txt"
+          git rev-parse HEAD HEAD^{tree} > "$evidence/checkout-identity.txt"
+          python3 - "$evidence" <<'PYCONFIG'
+          import hashlib, json, pathlib, subprocess, sys
+          output = pathlib.Path(sys.argv[1])
+          configuration = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".github/workflows/check.yml", "script/clippy", "crates/agent/Cargo.toml", "crates/acp_thread/Cargo.toml", "crates/language_model/Cargo.toml", "crates/zed/Cargo.toml"]
+          sources = ["crates/agent/src/thread.rs", "crates/acp_thread/src/acp_thread.rs", "crates/language_model/src/fake_provider.rs", "crates/zed/src/zed/settings_modal.rs"]
+          records = []
+          for name in configuration + sources:
+              path = pathlib.Path(name)
+              data = path.read_bytes()
+              records.append({"path": name, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(), "blob": subprocess.check_output(["git", "rev-parse", "HEAD:" + name], text=True).strip()})
+              if name in configuration:
+                  target = output / "config" / name
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(data)
+          (output / "source-bindings.json").write_text(json.dumps(records, indent=2) + "\n")
+          PYCONFIG
+          printf 'Default-feature tests; no mac_app_store or --all-features. Test profile is debug; script/clippy uses release/all-targets/deny-warnings.\n' > "$evidence/scope.txt"
+          : > "$evidence/results.tsv"
+
+      - name: Install the repository Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup show active-toolchain 2>&1 | tee "${RUNNER_TEMP}/release-blocker-regressions/toolchain.log"
+          rustc --version --verbose 2>&1 | tee -a "${RUNNER_TEMP}/release-blocker-regressions/toolchain.log"
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: macos-check
+
+      - name: Test native Agent request limits
+        if: ${{ !cancelled() && steps.evidence.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          evidence="${RUNNER_TEMP}/release-blocker-regressions"
+          printf '%s\n' 'cargo test --locked -p agent --lib test_turn_request_budget_' > "$evidence/agent.command.txt"
+          set +e
+          cargo test --locked -p agent --lib test_turn_request_budget_ 2>&1 | tee "$evidence/agent.log"
+          statuses=("${PIPESTATUS[@]}")
+          printf 'agent\t%s\t%s\n' "${statuses[0]}" "${statuses[1]}" >> "$evidence/results.tsv"
+          (( statuses[0] == 0 && statuses[1] == 0 ))
+
+      - name: Test ACP request-limit completion
+        if: ${{ !cancelled() && steps.evidence.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          evidence="${RUNNER_TEMP}/release-blocker-regressions"
+          printf '%s\n' 'cargo test --locked -p acp_thread --lib test_turn_request_budget_' > "$evidence/acp-thread.command.txt"
+          set +e
+          cargo test --locked -p acp_thread --lib test_turn_request_budget_ 2>&1 | tee "$evidence/acp-thread.log"
+          statuses=("${PIPESTATUS[@]}")
+          printf 'acp-thread\t%s\t%s\n' "${statuses[0]}" "${statuses[1]}" >> "$evidence/results.tsv"
+          (( statuses[0] == 0 && statuses[1] == 0 ))
+
+      - name: Test direct-download Settings keyboard closure
+        if: ${{ !cancelled() && steps.evidence.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          evidence="${RUNNER_TEMP}/release-blocker-regressions"
+          printf '%s\n' 'cargo test --locked -p zed --bin fanta settings_window_' > "$evidence/settings-window.command.txt"
+          set +e
+          cargo test --locked -p zed --bin fanta settings_window_ 2>&1 | tee "$evidence/settings-window.log"
+          statuses=("${PIPESTATUS[@]}")
+          printf 'settings-window\t%s\t%s\n' "${statuses[0]}" "${statuses[1]}" >> "$evidence/results.tsv"
+          (( statuses[0] == 0 && statuses[1] == 0 ))
+
+      - name: Test existing output-limit regressions
+        if: ${{ !cancelled() && steps.evidence.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          evidence="${RUNNER_TEMP}/release-blocker-regressions"
+          printf '%s\n' 'cargo test --locked -p agent --lib test_output_limit_' > "$evidence/output-limit.command.txt"
+          set +e
+          cargo test --locked -p agent --lib test_output_limit_ 2>&1 | tee "$evidence/output-limit.log"
+          statuses=("${PIPESTATUS[@]}")
+          printf 'output-limit\t%s\t%s\n' "${statuses[0]}" "${statuses[1]}" >> "$evidence/results.tsv"
+          (( statuses[0] == 0 && statuses[1] == 0 ))
+
+      - name: Test existing compaction regressions
+        if: ${{ !cancelled() && steps.evidence.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          evidence="${RUNNER_TEMP}/release-blocker-regressions"
+          printf '%s\n' 'cargo test --locked -p agent --lib test_compaction_' > "$evidence/compaction.command.txt"
+          set +e
+          cargo test --locked -p agent --lib test_compaction_ 2>&1 | tee "$evidence/compaction.log"
+          statuses=("${PIPESTATUS[@]}")
+          printf 'compaction\t%s\t%s\n' "${statuses[0]}" "${statuses[1]}" >> "$evidence/results.tsv"
+          (( statuses[0] == 0 && statuses[1] == 0 ))
+
+      - name: Test existing manual-compaction-cancel regressions
+        if: ${{ !cancelled() && steps.evidence.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          evidence="${RUNNER_TEMP}/release-blocker-regressions"
+          printf '%s\n' 'cargo test --locked -p agent --lib test_manual_compact_cancelled_leaves_no_marker' > "$evidence/manual-compaction-cancel.command.txt"
+          set +e
+          cargo test --locked -p agent --lib test_manual_compact_cancelled_leaves_no_marker 2>&1 | tee "$evidence/manual-compaction-cancel.log"
+          statuses=("${PIPESTATUS[@]}")
+          printf 'manual-compaction-cancel\t%s\t%s\n' "${statuses[0]}" "${statuses[1]}" >> "$evidence/results.tsv"
+          (( statuses[0] == 0 && statuses[1] == 0 ))
+
+      - name: Test existing acp-stale-cancel regressions
+        if: ${{ !cancelled() && steps.evidence.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          evidence="${RUNNER_TEMP}/release-blocker-regressions"
+          printf '%s\n' 'cargo test --locked -p acp_thread --lib test_stale_cancelled_response_does_not_cancel_current_compaction' > "$evidence/acp-stale-cancel.command.txt"
+          set +e
+          cargo test --locked -p acp_thread --lib test_stale_cancelled_response_does_not_cancel_current_compaction 2>&1 | tee "$evidence/acp-stale-cancel.log"
+          statuses=("${PIPESTATUS[@]}")
+          printf 'acp-stale-cancel\t%s\t%s\n' "${statuses[0]}" "${statuses[1]}" >> "$evidence/results.tsv"
+          (( statuses[0] == 0 && statuses[1] == 0 ))
+
+      - name: Test existing acp-max-tokens regressions
+        if: ${{ !cancelled() && steps.evidence.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          evidence="${RUNNER_TEMP}/release-blocker-regressions"
+          printf '%s\n' 'cargo test --locked -p acp_thread --lib test_max_tokens_cancels_pending_session_elicitation' > "$evidence/acp-max-tokens.command.txt"
+          set +e
+          cargo test --locked -p acp_thread --lib test_max_tokens_cancels_pending_session_elicitation 2>&1 | tee "$evidence/acp-max-tokens.log"
+          statuses=("${PIPESTATUS[@]}")
+          printf 'acp-max-tokens\t%s\t%s\n' "${statuses[0]}" "${statuses[1]}" >> "$evidence/results.tsv"
+          (( statuses[0] == 0 && statuses[1] == 0 ))
+
+      - name: Lint release blocker crates with default features
+        if: ${{ !cancelled() && steps.evidence.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -uo pipefail
+          evidence="${RUNNER_TEMP}/release-blocker-regressions"
+          printf '%s\n' 'FANTA_CLIPPY_DEFAULT_FEATURES=1 ./script/clippy --locked -p agent -p acp_thread -p language_model -p zed' > "$evidence/default-clippy.command.txt"
+          set +e
+          FANTA_CLIPPY_DEFAULT_FEATURES=1 ./script/clippy --locked -p agent -p acp_thread -p language_model -p zed 2>&1 | tee "$evidence/default-clippy.log"
+          statuses=("${PIPESTATUS[@]}")
+          printf 'default-clippy\t%s\t%s\n' "${statuses[0]}" "${statuses[1]}" >> "$evidence/results.tsv"
+          (( statuses[0] == 0 && statuses[1] == 0 ))
+
+      - name: Verify every required regression actually passed
+        if: ${{ !cancelled() && steps.evidence.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "${RUNNER_TEMP}/release-blocker-regressions" <<'PYRESULTS'
+          import json, pathlib, re, sys
+          output = pathlib.Path(sys.argv[1])
+          expected = {'agent': ['test_turn_request_budget_bounds_tool_rounds_and_resets_for_new_user_turn', 'test_turn_request_budget_survives_retry_and_output_counter_resets', 'test_turn_request_budget_bounds_refusal_fallback_cycles', 'test_turn_request_budget_includes_auto_compaction_and_its_retry', 'test_turn_request_budget_cancellation_wins_at_retry_boundary', 'test_turn_request_budget_last_slot_compaction_and_cancellation', 'test_turn_request_budget_exhaustion_preserves_partial_tool_cleanup'], 'acp-thread': ['test_turn_request_budget_stop_is_visible_and_preserves_completed_entries', 'test_turn_request_budget_stale_stop_preserves_the_current_turn'], 'settings-window': ['settings_window_cmd_w_closes_only_settings', 'settings_window_search_escape_keeps_window_and_cmd_w_closes', 'settings_window_cmd_w_closes_with_mcp_input_focused'], 'output-limit': ['test_output_limit_automatically_continues_to_end_turn', 'test_output_limit_continuation_has_consecutive_failure_cap', 'test_output_limit_waits_for_streamed_write_rollback_before_retry', 'test_output_limit_transport_retry_preserves_instruction_and_budget', 'test_output_limit_cleanup_also_rolls_back_partial_write_before_refusal', 'test_output_limit_budget_resets_after_complete_tool_batch', 'test_output_limit_completes_interrupted_nonstreaming_tool_call'], 'compaction': ['test_compaction_keeps_reference_images_outside_the_text_budget', 'test_compaction_threshold_uses_percentage_setting', 'test_compaction_threshold_accounts_for_max_output_tokens', 'test_compaction_threshold_respects_enabled_setting', 'test_compaction_threshold_respects_token_settings', 'test_compaction_unavailable_for_small_context_window', 'test_compaction_inserts_before_new_user_and_requests_compacted_window', 'test_compaction_usage_counts_toward_cumulative_usage'], 'manual-compaction-cancel': ['test_manual_compact_cancelled_leaves_no_marker'], 'acp-stale-cancel': ['test_stale_cancelled_response_does_not_cancel_current_compaction'], 'acp-max-tokens': ['test_max_tokens_cancels_pending_session_elicitation']}
+          results = {}
+          for line in (output / "results.tsv").read_text().splitlines():
+              label, command_exit, log_exit = line.split("\t")
+              if label in results:
+                  raise SystemExit("Duplicate command result: " + label)
+              results[label] = [int(command_exit), int(log_exit)]
+          checks = {}
+          passed = set(results) == set(expected) | {"default-clippy"} and all(value == [0, 0] for value in results.values())
+          for label, names in expected.items():
+              path = output / (label + ".log")
+              text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", path.read_text(errors="replace")) if path.exists() else ""
+              tests = re.findall(r"^test ([A-Za-z0-9_:]+) \.\.\. (ok|FAILED|ignored)(?:,.*)?$", text, re.MULTILINE)
+              summaries = re.findall(r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored;", text, re.MULTILINE)
+              found = [name.rsplit("::", 1)[-1] for name, status in tests if status == "ok"]
+              valid = len(tests) == len(names) and sorted(found) == sorted(names) and summaries == [("ok", str(len(names)), "0", "0")]
+              checks[label] = {"expected_names": names, "actual_tests": tests, "actual_summaries": summaries, "passed": valid}
+              passed = passed and valid
+          report = {"passed": bool(passed), "command_results": results, "groups": checks, "scope": "Offline default-feature mounted/model tests only; no paid service, native app, Store, GPU, or performance acceptance."}
+          (output / "required-test-results.json").write_text(json.dumps(report, indent=2) + "\n")
+          print(json.dumps(report))
+          if not passed:
+              raise SystemExit("Required release blocker tests or lint did not all pass")
+          PYRESULTS
+
+      - name: Preserve release blocker evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-blocker-regressions-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/release-blocker-regressions
+          if-no-files-found: error
+          retention-days: 14
 
   native-video:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.native_video_only }}

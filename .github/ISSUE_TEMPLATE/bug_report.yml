@@ -1,0 +1,43 @@
+name: Report a bug
+description: Report a reproducible problem in Fanta Public Alpha.
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Search existing issues first. Do not include private designs, credentials, account details or payment information. Send account and billing questions to support@fantaisa.net.
+  - type: input
+    id: version
+    attributes:
+      label: Fanta version and build
+      description: Copy the version and build from About Fanta.
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: macOS version and Mac model
+      placeholder: macOS version, Apple Silicon model
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Include a small project you own and can share, if it helps reproduce the problem.
+      placeholder: |
+        1. Open …
+        2. Select …
+        3. Change …
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Expected and actual result
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Screenshot, recording or related Discord report
+      description: Remove personal information and secrets before attaching evidence.
