@@ -9,7 +9,7 @@ body:
     id: version
     attributes:
       label: Fanta version and build
-      description: Copy the version and build from About Fanta.
+      description: Copy the version and build from About Fanta. For a source build, include its commit.
     validations:
       required: true
   - type: input
@@ -39,5 +39,5 @@ body:
   - type: textarea
     id: evidence
     attributes:
-      label: Screenshot, recording or related Discord report
-      description: Remove personal information and secrets before attaching evidence.
+      label: Screenshots, recording, logs or related Discord report
+      description: Logs are in ~/Library/Logs/Fanta/. Remove private designs, account details, API keys and other secrets before attaching evidence.

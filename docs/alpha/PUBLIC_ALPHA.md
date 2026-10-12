@@ -1,13 +1,39 @@
 # Fanta 1.0.0 Public Alpha
 
-Current distribution guide, prepared **11 October 2026** for the **12 October**
-launch. The public download becomes available after the final release checks
-pass. [The download page](https://www.fantaisa.net/download) is the current source
-for availability, installer, checksum, tested macOS versions and support.
+Current distribution guide, updated **12 October 2026**. The signed package has
+passed the distribution and tested installation checks below. Public
+availability remains **preparing / on hold** while website review and publication
+checks are unfinished. Three captioned workflows and a launch overview have
+been reviewed on this signed app. [The download page](https://www.fantaisa.net/download)
+reports current availability; use its installer link only once availability is
+announced.
 
 The release uses version **1.0.0**, internal channel **stable** and public label
 **Public Alpha**. It targets Apple Silicon Macs. Billing stays governed by the
 current catalog. Automatic updates are disabled.
+
+## Accepted package and publication status
+
+The Apple Silicon **Build45** package is Developer ID signed, accepted by Apple's
+notarization service and stapled. Its source is
+`57d86330289153ead8a3bdbd114e1fa530a74e03`. The accepted `Fanta-aarch64.dmg`
+has this SHA-256:
+
+```text
+5e6b68605bbb601e70778acb2b8fcf72186d1b9a368b7947554f316ab96b87b8
+```
+
+On **12 October 2026**, an authenticated Chrome download of the draft installer
+retained quarantine and passed Gatekeeper as Notarized Developer ID. The
+installed app passed native edit, Save, normal Quit and reopen checks. A Finder
+**Replace** with the same signed build preserved the saved change on reopening;
+the installed bundle matched all 498 records of the accepted signed bundle.
+
+These checks cover the authenticated draft download and same-build replacement.
+They do not establish anonymous public download, a clean-account installation
+or migration from an older version. [The reviewed recordings](DEMO_GUIDE.md)
+use this signed app; package and recording acceptance do not make the release
+publicly available.
 
 ## Download and install
 
@@ -26,18 +52,18 @@ current catalog. Automatic updates are disabled.
    app downloaded from the internet.
 5. Complete the [ten-minute sample exercise](DEMO_GUIDE.md#the-ten-minute-exercise).
 
-The public installer must be signed with Developer ID, accepted by Apple's
-notarization service and stapled before publication. A Gatekeeper refusal is a
-support issue. Stop and report the dialog instead of removing quarantine or
-bypassing security checks. Unsigned internal QA packages are separate artifacts
-and are not the public installation route.
+The accepted package has passed Developer ID signing, Apple notarization,
+stapling and Gatekeeper checks. A Gatekeeper refusal is a support issue. Stop
+and report the dialog instead of removing quarantine or bypassing security
+checks. Earlier unsigned or ad-hoc-signed internal QA packages retain their
+original identities and are not the public installation route.
 
 ## Requirements
 
 - An Apple Silicon Mac. There is no Intel or universal installer for this launch.
-- A macOS version listed as tested on the download page for this exact package.
-  Internal QA previously ran on macOS 26.6.2, but that alone does not establish
-  acceptance of the final installer or a minimum supported version.
+- The signed Build45 package was tested on an Apple Silicon Mac running
+  **macOS 27.0 (26A428)**. A minimum supported macOS version has not been
+  established. Check the download page for the tested versions of each package.
 - Enough free disk space for the app, your project and imported assets.
 - Network access and configured credentials for external agents or hosted
   generation. Local design editing does not consume hosted generation credits.
@@ -62,6 +88,14 @@ published installer with different bytes under the same identity.
 - Code supports FNX and managed JSON in saved projects. Invalid drafts retain
   the last valid file and canvas. Save across several buffers is sequential and
   does not roll back an earlier successful save.
+- **Code refresh warning in Build45:** a 12 October 2026 recording showed
+  `Could not refresh saved source: oneshot canceled` after a canvas Save. The
+  saved FNX retained the edit, and closing and reopening that project restored
+  the Code view. If this warning appears, verify the saved change and resolve
+  any unsaved drafts before closing, then reopen the project before editing
+  source. Report a persistent warning or a mismatch between saved source and
+  canvas. This one recovery does not establish that every refresh warning is
+  harmless.
 - A source draft can lock conflicting canvas edits until you save or discard it.
   **Saved Code** in Dev mode is read-only.
 - Review trust prompts when opening a project from another person. Do not enable
@@ -77,6 +111,8 @@ acceptance scopes. Earlier [0.1.0-alpha.1 release notes](RELEASE_NOTES.md) and
 
 ## Support
 
+Join [Fanta Community on Discord](https://discord.gg/qrFtymBYxk) for installation
+help, workflow questions and project showcases.
 Use verified community and GitHub reporting links on the download page for
 reproducible product problems. Include version, macOS, steps, expected behavior
 and screenshots. Remove secrets and private designs from logs and attachments.
