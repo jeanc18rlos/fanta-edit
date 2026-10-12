@@ -3,6 +3,12 @@
 Current source guidance, **11 October 2026**. Connection instructions should come
 from the installed app to target its executable and user-data directory.
 
+The [12 October recorded example](../alpha/DEMO_GUIDE.md#an-agent-edits-your-design)
+uses an external Opus 5.5 agent through Fanta MCP for one bounded CTA edit.
+It shows the resulting native layers, saved FNX and Undo/Redo in the accepted
+signed app. The request runs through the external client; only the actual result
+and its inspection appear in the app footage.
+
 ## Connect and verify
 
 1. Open the intended saved project in Fanta. Keep that instance running.
@@ -74,5 +80,6 @@ Share only a project you intend the connected agent to read.
 
 For connection problems, check the same Fanta instance is open, its local server
 is enabled, and the copied user-data directory matches. Recopy the instructions
-after an app-path change. Send private credential/account problems to
+after an app-path change. Ask in [Fanta Community](https://discord.gg/qrFtymBYxk)
+for connection and workflow help. Send private credential/account problems to
 [support@fantaisa.net](mailto:support@fantaisa.net).

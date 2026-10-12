@@ -1,6 +1,6 @@
 # Fanta capability guide
 
-For installation and a first workflow, use the [current Public Alpha guide](../alpha/PUBLIC_ALPHA.md), [ten-minute exercise and demos](../alpha/DEMO_GUIDE.md), and [agent quickstart](agent-quickstart.md). Reviewed screenshots and recordings will be linked there after capture from the accepted release build.
+For installation and a first workflow, use the [current Public Alpha guide](../alpha/PUBLIC_ALPHA.md), [ten-minute exercise and demos](../alpha/DEMO_GUIDE.md), and [agent quickstart](agent-quickstart.md). The exercise includes reviewed footage of the accepted signed Build45 app, original sample files, screenshots and silent action GIFs. Earlier native QA images retain their original provenance. The signed package has passed notarization, stapling and tested installation, save/reopen and same-build replacement checks. Public availability remains on hold pending website review and publication checks. [Exact package identity and acceptance scope](../alpha/PUBLIC_ALPHA.md#accepted-package-and-publication-status).
 
 Source inventory updated **11 October 2026**; bounded native evidence updated
 **11 October 2026**. Acceptance evidence below is dated.
@@ -171,6 +171,14 @@ conflicts, but cannot make a concurrent external write and rename atomic; see
   preserves the full unsaved draft, controlled external file bytes and timestamp,
   and observed last-accepted canvas geometry and source lock. This does not
   establish conflict resolution, recovery Undo, multiple windows or all edits.
+  **12 October 2026, signed Build45:** a recorded canvas Save was followed by
+  `Could not refresh saved source: oneshot canceled` in Code. The saved FNX
+  retained the edit; closing and reopening the project restored a clean source
+  view. If this warning appears, verify the saved change and resolve any unsaved
+  drafts before closing, then reopen before editing source. Report a persistent
+  warning or a saved-source/canvas mismatch. The trigger and frequency are not
+  established by this one observed recovery. See
+  [current release limitations](../alpha/PUBLIC_ALPHA.md#current-limitations).
 - Structural canvas saves preserve future FNX attributes on surviving nodes and
   keep authored comments when inserting or reparenting content. Explicit source
   edits remain authoritative. Deletion or type changes that would erase
@@ -740,7 +748,7 @@ Mac App Store builds restrict local process execution, external agents and
 related inherited editor features; see [MAC_APP_STORE.md](../alpha/MAC_APP_STORE.md).
 The selected release target is a direct-download Mac app. Packaging now checks
 the app inside the produced DMG against the staged bundle and enforces the
-configured signature/notarization checks. Latest completed internal **build41**,
+configured signature/notarization checks. Earlier accepted internal **build41**,
 exact `c46a1b41bcd00222cbdba5e9a1ce450fc0658c10`, passes hosted package/source,
 checksum, local mounted-package, CLI and isolated persistent-QA preparation
 checks. Its bounded native focused-property Save/close, TextPath/Group editing,
@@ -763,14 +771,19 @@ is an arm64, ad-hoc-signed artifact (`signed=false`), not a Developer ID/notariz
 release. These checks do not replace native capability acceptance. The
 [coverage report](../alpha/CAPABILITY_COVERAGE.md#final-source-and-internal-package--9-october)
 retains its exact source and evidence links.
-Public download, clean-Mac installation, update and rollback remain unverified.
+The current signed **Build45** package has passed signing, notarization, stapling,
+Gatekeeper, tested installation, Save/Quit/reopen and same-build manual
+replacement checks. [Current package identity and acceptance scope](../alpha/PUBLIC_ALPHA.md#accepted-package-and-publication-status).
+Public availability remains **preparing / on hold**. Anonymous public download,
+clean-account installation, migration from an older version and rollback remain
+unverified.
 A bounded check of the approved production service, using an isolated profile
 and unchanged development `0f71b3961d` binary, shows an existing account, loaded
 billing data and persistence through one cold process restart. It does not
 establish fresh sign-in, recovery, general Settings navigation, AI/credits, live
 MCP or payment; no purchase or AI request was made. The recorded stale Settings
 display remains unresolved. Media breadth, native performance, installed
-capability coverage, distribution and remaining authenticated-service journeys
+capability coverage, anonymous public download and remaining authenticated-service journeys
 are still release gates. Deliberately
 disabled inherited services are recorded in
 [disabled-services-binnacle.md](disabled-services-binnacle.md).
