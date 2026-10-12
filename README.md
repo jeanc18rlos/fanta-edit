@@ -9,8 +9,8 @@ The **Fanta 1.0.0 Public Alpha** distribution targets Apple Silicon Macs.
 The final Build45 package is Developer ID signed, Apple-notarized and stapled;
 bounded quarantined installation, save/reopen and same-build replacement passed.
 Three captioned workflows and a launch overview have been reviewed on the same
-signed build. Public availability remains **on hold** while website review and
-publication checks are unfinished. The download page reports current availability.
+signed build. The **Public Alpha is available**. Use the download page for the
+verified installer, checksum, tested requirements and current limitations.
 
 [Download and installation](https://www.fantaisa.net/download) ·
 [Three demos and the ten-minute exercise](docs/alpha/DEMO_GUIDE.md) ·

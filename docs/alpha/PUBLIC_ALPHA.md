@@ -1,12 +1,10 @@
 # Fanta 1.0.0 Public Alpha
 
-Current distribution guide, updated **12 October 2026**. The signed package has
-passed the distribution and tested installation checks below. Public
-availability remains **preparing / on hold** while website review and publication
-checks are unfinished. Three captioned workflows and a launch overview have
-been reviewed on this signed app. [The download page](https://www.fantaisa.net/download)
-reports current availability; use its installer link only once availability is
-announced.
+Current distribution guide, updated **12 October 2026**. The **Public Alpha is
+available**. The signed package has passed the distribution and tested
+installation checks below. Three captioned workflows and a launch overview
+have been reviewed on this signed app. Use [the download page](https://www.fantaisa.net/download)
+for the verified installer, checksum and current requirements.
 
 The release uses version **1.0.0**, internal channel **stable** and public label
 **Public Alpha**. It targets Apple Silicon Macs. Billing stays governed by the
