@@ -3014,12 +3014,17 @@ impl FigItem {
             &mut changed_artifacts,
             document.pending_layout_output_nodes.iter().copied(),
         );
+        let captured_saved_scene = self.last_saved_scene;
+        let pending_layout_nodes: Vec<_> = document
+            .pending_layout_output_nodes
+            .iter()
+            .copied()
+            .collect();
         // The write needs the content, not the presence state: the undo
         // stack's subtree snapshots can outweigh the scene, and cloning them
         // once per autosave was the save path's memory high-water mark.
         let doc = document.doc.clone_for_persist();
         let raw_assets = document.raw_assets.clone();
-        let previous_assets = self.last_saved_assets.clone();
         let generation = document.render_generation();
         let scene_watermark = (
             document.doc.scene.instance_id(),
@@ -3068,14 +3073,30 @@ impl FigItem {
                     target.display(),
                     this.abs_path.display()
                 );
+                // A queued write may commit a different baseline after this
+                // snapshot was captured, including a layer already undone here.
+                if this.last_saved_scene != captured_saved_scene {
+                    changed_artifacts = changed_artifact_ids_from_baseline(
+                        &doc,
+                        this.merge_base.as_ref(),
+                        None,
+                    );
+                    extend_artifact_owners(
+                        &doc,
+                        &mut changed_artifacts,
+                        pending_layout_nodes.iter().copied(),
+                    );
+                }
                 Ok::<_, anyhow::Error>(Some((
                     target,
                     materializing,
                     this.write_cache.take().unwrap_or_default(),
                     this.workspace_session.take(),
+                    this.merge_base.as_ref().map(Doc::clone_for_persist),
+                    this.last_saved_assets.clone(),
                 )))
             })??;
-            let Some((target, materializing, write_cache, workspace_session)) = prepared else {
+            let Some((target, materializing, write_cache, workspace_session, baseline_document, previous_assets)) = prepared else {
                 return Ok(None);
             };
             // The persisted clone travels through the write and comes back
@@ -3122,6 +3143,28 @@ impl FigItem {
                             let session = workspace_session
                                 .as_mut()
                                 .context("The Fanta source session is unavailable")?;
+                            let mut asset_preconditions = std::collections::BTreeMap::new();
+                            if let Some(previous_assets) = &previous_assets {
+                                add_asset_write_preconditions(
+                                    &target,
+                                    &mut asset_preconditions,
+                                    previous_assets,
+                                    &raw_assets,
+                                )?;
+                                if let Some(baseline_document) = &baseline_document
+                                    && (Arc::ptr_eq(previous_assets, &raw_assets)
+                                        || previous_assets.as_ref() == raw_assets.as_ref())
+                                    && let Some(report) = session.try_save_document_artifacts(
+                                        &doc,
+                                        baseline_document,
+                                        &changed_artifacts,
+                                        &asset_preconditions,
+                                    )?
+                                {
+                                    write_cache = fanta_format::ProjectWriteCache::default();
+                                    return Ok(report);
+                                }
+                            }
                             for id in &changed_artifacts {
                                 let Some(indexed_hash) = session.file_index.get(id).copied() else {
                                     continue;
@@ -3141,14 +3184,7 @@ impl FigItem {
                             session.adopt_document_artifacts(&doc, &changed_artifacts)?;
                             let sources = session.validated_source_overrides_for_document(&doc)?;
                             let mut expected_disk = session.source_write_preconditions(&doc)?;
-                            if let Some(previous_assets) = &previous_assets {
-                                add_asset_write_preconditions(
-                                    &target,
-                                    &mut expected_disk,
-                                    previous_assets,
-                                    &raw_assets,
-                                )?;
-                            }
+                            expected_disk.extend(asset_preconditions);
                             let report = write_project_cached_report_with_sources(
                                 &target,
                                 &doc,
@@ -4130,35 +4166,47 @@ fn watcher_paths_differ_from_own_writes(
     false
 }
 
+fn all_artifact_ids(document: &Doc) -> BTreeSet<fanta_format::ArtifactId> {
+    document
+        .pages()
+        .iter()
+        .copied()
+        .map(fanta_format::ArtifactId::Page)
+        .chain(
+            document
+                .components
+                .defs
+                .keys()
+                .copied()
+                .map(fanta_format::ArtifactId::Component),
+        )
+        .collect()
+}
+
 fn changed_artifact_ids(
     document: &Doc,
     base: Option<&Doc>,
     watermark: Option<(u64, u64)>,
 ) -> BTreeSet<fanta_format::ArtifactId> {
-    let all = || {
-        document
-            .pages()
-            .iter()
-            .copied()
-            .map(fanta_format::ArtifactId::Page)
-            .chain(
-                document
-                    .components
-                    .defs
-                    .keys()
-                    .copied()
-                    .map(fanta_format::ArtifactId::Component),
-            )
-            .collect()
-    };
     let Some((instance, revision)) = watermark else {
-        return all();
+        return all_artifact_ids(document);
     };
+    if instance != document.scene.instance_id() {
+        return all_artifact_ids(document);
+    }
+    changed_artifact_ids_from_baseline(document, base, document.scene.changes_since(revision))
+}
+
+fn changed_artifact_ids_from_baseline(
+    document: &Doc,
+    base: Option<&Doc>,
+    scene_delta: Option<fanta_doc::scene::SceneDelta>,
+) -> BTreeSet<fanta_format::ArtifactId> {
+    let all = || all_artifact_ids(document);
     let Some(base) = base else {
         return all();
     };
-    if instance != document.scene.instance_id()
-        || base.pages() != document.pages()
+    if base.pages() != document.pages()
         || base.variables != document.variables
         || base.active_modes != document.active_modes
         || base.components.sets != document.components.sets
@@ -4184,7 +4232,7 @@ fn changed_artifact_ids(
         }
         changed.insert(fanta_format::ArtifactId::Component(*id));
     }
-    if let Some(delta) = document.scene.changes_since(revision) {
+    if let Some(delta) = scene_delta {
         extend_artifact_owners(
             document,
             &mut changed,
@@ -4247,7 +4295,7 @@ fn changed_structural_nodes(document: &Doc, other: &Doc) -> Option<Vec<NodeId>> 
     let mut changed = Vec::new();
     while let Some((id, parent)) = pending.pop() {
         let node = document.scene.get(id)?;
-        if node.parent != parent || !visited.insert(id) {
+        if node.id != id || node.parent != parent || !visited.insert(id) {
             return None;
         }
         if !document.scene.shares_node(&other.scene, id) {
@@ -8599,6 +8647,206 @@ mod tests {
             state.last_write.is_none(),
             "completed chains must not accumulate"
         );
+    }
+
+    #[gpui::test]
+    async fn save_generation_queued_undo_updates_only_the_affected_source(cx: &mut TestAppContext) {
+        let fixture = save_generation_fixture(cx).await;
+        let component = fixture.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let mut page = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(
+                    fanta_doc::GroupNode::default(),
+                ));
+                page.name = "Unrelated page".into();
+                let page_id = page.id;
+                document
+                    .doc
+                    .apply(Operation::create_node(page))
+                    .expect("unrelated page root");
+                document.doc.add_page(page_id);
+                let mut master = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(
+                    fanta_doc::GroupNode::default(),
+                ));
+                master.parent = Some(page_id);
+                master.name = "Unrelated master".into();
+                let master_id = master.id;
+                document
+                    .doc
+                    .apply(Operation::create_node(master))
+                    .expect("unrelated master root");
+                let component = fanta_doc::ComponentId::new();
+                document.doc.components.defs.insert(
+                    component,
+                    fanta_doc::ComponentDef::new(component, master_id, "Unrelated master"),
+                );
+                (component, DocChange::Content)
+            })
+            .expect("loaded document")
+        });
+        fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect("establish saved baseline");
+        let unopened_sources = fixture.item.update(cx, |item, _| {
+            let session = item.workspace_session.as_mut().expect("source session");
+            let sources = session
+                .artifacts
+                .iter()
+                .filter(|(id, _)| **id != fanta_format::ArtifactId::Page(fixture.page))
+                .filter_map(|(id, meta)| {
+                    let name = match id {
+                        fanta_format::ArtifactId::Page(_) => "page.fnx",
+                        fanta_format::ArtifactId::Component(_) => "master.fnx",
+                        _ => return None,
+                    };
+                    let path = fixture.root.join(&meta.design_dir).join(name);
+                    let bytes = std::fs::read(&path).expect("unrelated source");
+                    Some((path, bytes))
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                session
+                    .artifacts
+                    .contains_key(&fanta_format::ArtifactId::Component(component))
+            );
+            session.open.clear();
+            sources
+        });
+        let created = fixture.item.update(cx, |item, cx| {
+            let mut layer = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(
+                fanta_doc::GroupNode::default(),
+            ));
+            layer.parent = Some(fixture.page);
+            layer.name = "Created before queued undo".into();
+            let created = layer.id;
+            item.apply(Operation::create_node(layer), cx)
+                .expect("create layer");
+            created
+        });
+        let (arrived, resume) = pause_next_save(&fixture.item, cx);
+        let first = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        arrived.await.expect("first writer paused");
+        assert!(
+            fixture
+                .item
+                .update(cx, |item, cx| item.undo(cx))
+                .expect("undo creation")
+        );
+        assert!(!fixture.item.read_with(cx, |item, _| {
+            item.doc().expect("document").scene.contains(created)
+        }));
+        let mut second = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        cx.run_until_parked();
+        assert!(futures::poll!(&mut second).is_pending());
+        resume.send(()).expect("release first writer");
+        first.await.expect("save created layer snapshot");
+        second.await.expect("save queued undo snapshot");
+        cx.run_until_parked();
+        let (saved, _) =
+            fanta_format::read_project_tree(&fixture.root).expect("reopen queued undo");
+        assert!(
+            !saved.scene.contains(created),
+            "the later snapshot removes the predecessor's layer"
+        );
+        fixture.item.read_with(cx, |item, _| {
+            assert!(!item.is_dirty());
+            assert!(
+                !item
+                    .merge_base
+                    .as_ref()
+                    .expect("saved baseline")
+                    .scene
+                    .contains(created)
+            );
+            assert_eq!(
+                serde_json::to_value(&saved.scene).expect("saved scene"),
+                serde_json::to_value(&item.doc().expect("document").scene).expect("live scene"),
+            );
+            assert_eq!(
+                item.workspace_session
+                    .as_ref()
+                    .expect("source session")
+                    .open
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([fanta_format::ArtifactId::Page(fixture.page)]),
+                "queued clone comparison must not reopen unrelated sources",
+            );
+        });
+        for (path, bytes) in unopened_sources {
+            assert_eq!(std::fs::read(path).expect("preserved source"), bytes);
+        }
+    }
+
+    #[gpui::test]
+    async fn save_generation_queued_save_uses_predecessors_asset_baseline(cx: &mut TestAppContext) {
+        let fixture = save_generation_fixture(cx).await;
+        fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect("establish saved baseline");
+        let (node, asset, bytes) = place_image_during_save(&fixture, cx);
+        let (arrived, resume) = pause_next_save(&fixture.item, cx);
+        let first = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        arrived.await.expect("asset writer paused");
+        fixture.item.update(cx, |item, cx| {
+            let old = item
+                .doc()
+                .expect("document")
+                .scene
+                .get(fixture.text)
+                .expect("text")
+                .name
+                .clone();
+            item.apply(
+                Operation::SetName {
+                    id: fixture.text,
+                    old,
+                    new: "Queued text edit".into(),
+                },
+                cx,
+            )
+            .expect("edit while image save is pending");
+        });
+        let mut second = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        cx.run_until_parked();
+        assert!(futures::poll!(&mut second).is_pending());
+        resume.send(()).expect("release asset writer");
+        first.await.expect("save newly added asset");
+        second
+            .await
+            .expect("queued save uses committed asset hashes");
+        cx.run_until_parked();
+        let (saved, assets) =
+            fanta_format::read_project_tree(&fixture.root).expect("reopen queued asset save");
+        assert!(saved.scene.contains(node));
+        assert_eq!(
+            saved.scene.get(fixture.text).expect("text").name,
+            "Queued text edit"
+        );
+        assert_eq!(assets.get(&asset), Some(&bytes));
+        fixture.item.read_with(cx, |item, _| {
+            assert!(!item.is_dirty());
+            assert!(!item.has_conflict());
+            assert_eq!(
+                item.last_saved_assets
+                    .as_ref()
+                    .expect("saved assets")
+                    .get(&asset),
+                Some(&bytes)
+            );
+        });
     }
 
     #[gpui::test]

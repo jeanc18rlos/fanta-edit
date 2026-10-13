@@ -106,16 +106,27 @@ pub fn decode_subtree_with(
 pub fn reconcile_sidecar(
     text: &str,
     sidecar: &FnxSidecar,
-    mut next_id: impl FnMut() -> String,
+    next_id: impl FnMut() -> String,
 ) -> Result<FnxSidecar, FnxError> {
     let root = parse_doc(text)?;
+    reconcile_sidecar_from_tree(&root, sidecar, next_id)
+}
+
+/// Reconcile identities against an already parsed canonical tree. Parse-time
+/// shape, position and size desugaring must precede this; reference resolution
+/// follows it, as in [`reconcile_sidecar`].
+pub fn reconcile_sidecar_from_tree(
+    root: &FnxElement,
+    sidecar: &FnxSidecar,
+    mut next_id: impl FnMut() -> String,
+) -> Result<FnxSidecar, FnxError> {
     let root_index = sidecar
         .ids
         .first()
         .map(|entry| entry.index.clone())
         .filter(|index| !index.is_null())
         .unwrap_or_else(|| Value::from(1.0));
-    let elements = flatten_elements(&root, root_index);
+    let elements = flatten_elements(root, root_index);
     let explicit_ids: Vec<Option<&str>> = elements
         .iter()
         .map(|element| match element.element.attrs.get("id") {

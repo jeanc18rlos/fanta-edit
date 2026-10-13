@@ -163,6 +163,26 @@ pub fn nodes_from_tree(
     Ok(out)
 }
 
+/// Rebuild nodes while consuming a disposable parsed tree. Attribute values,
+/// including large vector paths, move into the node map instead of being cloned.
+pub fn nodes_from_tree_owned(
+    root: FnxElement,
+    sidecar: &[IdEntry],
+    root_parent: Option<&str>,
+) -> Result<Vec<Value>, FnxError> {
+    let count = count_elements(&root);
+    if count != sidecar.len() {
+        return Err(FnxError::SidecarMismatch {
+            sidecar: sidecar.len(),
+            elements: count,
+        });
+    }
+    let mut out = Vec::with_capacity(count);
+    let mut cursor = 0usize;
+    walk_owned(root, root_parent, sidecar, &mut cursor, &mut out)?;
+    Ok(out)
+}
+
 fn count_elements(el: &FnxElement) -> usize {
     1 + el.children.iter().map(count_elements).sum::<usize>()
 }
@@ -184,6 +204,32 @@ fn walk(
     Ok(())
 }
 
+fn walk_owned(
+    element: FnxElement,
+    parent: Option<&str>,
+    sidecar: &[IdEntry],
+    cursor: &mut usize,
+    out: &mut Vec<Value>,
+) -> Result<(), FnxError> {
+    let entry = &sidecar[*cursor];
+    *cursor += 1;
+    let node_type = element_type(&element, &entry.id)?;
+    let FnxElement {
+        attrs, children, ..
+    } = element;
+    out.push(node_value(
+        attrs.into_iter().collect(),
+        node_type,
+        &entry.id,
+        parent,
+        &entry.index,
+    ));
+    for child in children {
+        walk_owned(child, Some(&entry.id), sidecar, cursor, out)?;
+    }
+    Ok(())
+}
+
 /// One element + its structural facts → a node JSON object, reproducing the
 /// exact serde shape (all four structural keys always present).
 fn element_to_value(
@@ -192,6 +238,15 @@ fn element_to_value(
     parent: Option<&str>,
     index: &Value,
 ) -> Result<Value, FnxError> {
+    let node_type = element_type(el, id)?;
+    let mut obj = Map::new();
+    for (key, value) in &el.attrs {
+        obj.insert(key.clone(), value.clone());
+    }
+    Ok(node_value(obj, node_type, id, parent, index))
+}
+
+fn element_type(el: &FnxElement, id: &str) -> Result<&'static str, FnxError> {
     let ty = type_for_tag(&el.tag).ok_or_else(|| FnxError::UnknownTag(el.tag.clone()))?;
     if let Some(explicit_id) = el.attrs.get("id") {
         if explicit_id.as_str() != Some(id) {
@@ -200,10 +255,16 @@ fn element_to_value(
             )));
         }
     }
-    let mut obj = Map::new();
-    for (k, v) in &el.attrs {
-        obj.insert(k.clone(), v.clone());
-    }
+    Ok(ty)
+}
+
+fn node_value(
+    mut obj: Map<String, Value>,
+    ty: &str,
+    id: &str,
+    parent: Option<&str>,
+    index: &Value,
+) -> Value {
     obj.insert("type".to_owned(), Value::String(ty.to_owned()));
     obj.insert("id".to_owned(), Value::String(id.to_owned()));
     obj.insert(
@@ -211,5 +272,5 @@ fn element_to_value(
         parent.map_or(Value::Null, |p| Value::String(p.to_owned())),
     );
     obj.insert("index".to_owned(), index.clone());
-    Ok(Value::Object(obj))
+    Value::Object(obj)
 }

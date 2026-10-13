@@ -16,10 +16,10 @@ use crate::project::component_dirs::{
 use crate::project::layout::SET_JSON;
 use crate::project::layout::{
     ACTIVE_MODES_JSON, AUDIO_DIR, COMPONENTS_DIR, DEF_JSON, DOC_DIR, FANTA_JSON, FLOW_START_JSON,
-    FLOWS_JSON, GRAPHICS_DIR, GRAPHICS_JSON, METADATA_JSON, MOTION_DIR, MOTION_JSON, PAGE_JSON,
-    PAGES_DIR, PRESENTATION_JSON, PROTOTYPES_DIR, ProjectManifest, VARIABLES_JSON, id_from_key,
-    is_project_dir, json_bytes, read_json_file, read_json_or, read_manifest, sorted_entries,
-    write_json_file,
+    FLOWS_JSON, GRAPHICS_DIR, GRAPHICS_JSON, MASTER_IDS, METADATA_JSON, MOTION_DIR, MOTION_JSON,
+    PAGE_JSON, PAGES_DIR, PRESENTATION_JSON, PROJECT_VERSION, PROTOTYPES_DIR, ProjectManifest,
+    VARIABLES_JSON, id_from_key, is_project_dir, json_bytes, read_json_file, read_json_or,
+    read_manifest, sorted_entries, write_json_file,
 };
 use crate::project::read::{component_id_of_dir, page_id_of_dir, select_design_winners};
 use fanta_doc::{
@@ -28,7 +28,7 @@ use fanta_doc::{
 use fanta_fnx::{ArtifactKind, RefTable, artifact_file_names};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -76,6 +76,7 @@ struct IndexedFileHashes {
     files: BTreeMap<String, [u8; 32]>,
     content_hash: ContentHash,
     order: Vec<String>,
+    source_identity_verified: bool,
 }
 
 impl IndexedFileHashes {
@@ -83,23 +84,33 @@ impl IndexedFileHashes {
         let file_hashes = hash_files(files);
         // The reconciliation base can lag behind disk during a conflict. Reuse
         // only an aggregate recorded alongside these exact per-file hashes.
-        let content_hash = previous
-            .filter(|previous| {
-                previous.files == file_hashes
-                    && previous
-                        .order
-                        .iter()
-                        .map(String::as_str)
-                        .eq(files.iter().map(|(name, _)| name.as_str()))
-            })
+        let unchanged = previous.filter(|previous| {
+            previous.files == file_hashes
+                && previous
+                    .order
+                    .iter()
+                    .map(String::as_str)
+                    .eq(files.iter().map(|(name, _)| name.as_str()))
+        });
+        let content_hash = unchanged
             .map(|previous| previous.content_hash)
             .unwrap_or_else(|| hash_file_set(files));
+        let source_identity_verified = unchanged
+            .map(|previous| previous.source_identity_verified)
+            .unwrap_or_else(|| design_source_identity_is_current(files));
         Self {
             files: file_hashes,
             content_hash,
             order: files.iter().map(|(name, _)| name.clone()).collect(),
+            source_identity_verified,
         }
     }
+}
+
+struct PreparedArtifactSave {
+    artifacts: BTreeMap<ArtifactId, Vec<(String, Vec<u8>)>>,
+    files: BTreeMap<PathBuf, Vec<u8>>,
+    expected_disk: BTreeMap<PathBuf, Option<[u8; 32]>>,
 }
 
 #[derive(Debug)]
@@ -347,16 +358,22 @@ impl WorkspaceSession {
                 .map(|(id, from_header, entry, _, _, _)| (*id, *from_header, entry.as_path()))
                 .collect();
             let winners = select_design_winners(&ranked);
-            for (index, (cid, _, entry, slug, design_dir, def)) in
-                candidates.into_iter().enumerate()
+            let selected: Vec<_> = candidates
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, candidate)| winners.contains(&index).then_some(candidate))
+                .collect();
+            let entries: Vec<_> = selected
+                .iter()
+                .map(|(_, _, entry, _, _, _)| entry.as_path())
+                .collect();
+            let indexed =
+                index_initial_component_files(&entries, manifest.version == PROJECT_VERSION)?;
+            for ((cid, _, _, slug, design_dir, def), file_hashes) in
+                selected.into_iter().zip(indexed)
             {
-                if !winners.contains(&index) {
-                    continue;
-                }
                 components.insert_def(def, design_dir.clone());
                 let id = ArtifactId::Component(cid);
-                let files = read_indexed_file_set(&entry, ArtifactKind::Component)?;
-                let file_hashes = IndexedFileHashes::new(&files, None);
                 let disk_hash = file_hashes.content_hash;
                 let meta = ArtifactMeta {
                     id: id.clone(),
@@ -529,6 +546,300 @@ impl WorkspaceSession {
             _ => return false,
         };
         files.files.contains_key(source)
+    }
+
+    /// Save ordinary edits without projecting or retaining untouched sources.
+    /// Binary assets must be unchanged; their reconciled hashes are supplied by
+    /// the host. Uncertain ownership, legacy sources, or project-wide changes
+    /// return `None` so the host can use the whole-project writer.
+    pub fn try_save_document_artifacts(
+        &mut self,
+        document: &fanta_doc::Doc,
+        baseline: &fanta_doc::Doc,
+        changed_artifacts: &BTreeSet<ArtifactId>,
+        additional_disk_preconditions: &BTreeMap<PathBuf, Option<[u8; 32]>>,
+    ) -> Result<Option<crate::project::write::WriteReport>, SessionError> {
+        let Some(prepared) = self.prepare_document_artifact_save(
+            document,
+            baseline,
+            changed_artifacts,
+            additional_disk_preconditions,
+        )?
+        else {
+            return Ok(None);
+        };
+        let (report, projected_hashes) = crate::project::write::write_project_artifacts_checked(
+            &self.root,
+            document,
+            &prepared.files,
+            &prepared.expected_disk,
+        )?;
+        self.accept_document_artifact_save(document, prepared, &projected_hashes)?;
+        Ok(Some(report))
+    }
+
+    fn prepare_document_artifact_save(
+        &mut self,
+        document: &fanta_doc::Doc,
+        baseline: &fanta_doc::Doc,
+        changed_artifacts: &BTreeSet<ArtifactId>,
+        additional_disk_preconditions: &BTreeMap<PathBuf, Option<[u8; 32]>>,
+    ) -> Result<Option<PreparedArtifactSave>, SessionError> {
+        if document.id != self.project_id
+            || baseline.id != document.id
+            || self.manifest != ProjectManifest::for_doc(document)
+            || self.manifest != ProjectManifest::for_doc(baseline)
+            || document.pages != baseline.pages
+            || !components_match_for_artifact_save(
+                &document.components,
+                &baseline.components,
+                &self.components.defs,
+                changed_artifacts,
+            )
+            || document.variables != baseline.variables
+            || document.variables != self.shared.variables
+            || document.active_modes != baseline.active_modes
+            || document.active_modes != self.shared.active_modes
+            || document.asset_library != baseline.asset_library
+            || document.motion != baseline.motion
+            || document.flow_start != baseline.flow_start
+            || document.flows != baseline.flows
+            || document.presentation != baseline.presentation
+            || self.asset_index_disk_hash.is_none()
+            || changed_artifacts
+                .iter()
+                .any(|id| !self.artifacts.contains_key(id) || !self.file_index.contains_key(id))
+        {
+            return Ok(None);
+        }
+        let baseline_metadata = serde_json::to_value(&baseline.metadata)
+            .map_err(|error| SessionError::other(error.to_string()))?;
+        if baseline_metadata != self.shared.metadata {
+            return Ok(None);
+        }
+        let (pages, components) = crate::project::write::projected_design_dirs(document);
+        let design_count = self
+            .artifacts
+            .keys()
+            .filter(|id| matches!(id, ArtifactId::Page(_) | ArtifactId::Component(_)))
+            .count();
+        if design_count != pages.len() + components.len() {
+            return Ok(None);
+        }
+        for (id, meta) in &self.artifacts {
+            let (directory, root, header_name) = match id {
+                ArtifactId::Page(page) => (pages.get(page), Some(*page), PAGE_JSON),
+                ArtifactId::Component(component) => (
+                    components.get(component),
+                    document
+                        .components
+                        .def(*component)
+                        .map(|definition| definition.root),
+                    DEF_JSON,
+                ),
+                _ => continue,
+            };
+            let Some(root) = root else {
+                return Ok(None);
+            };
+            let Some(previous_root) = baseline.scene.get(root) else {
+                return Ok(None);
+            };
+            let Some(current_root) = document.scene.get(root) else {
+                return Ok(None);
+            };
+            if directory != Some(&meta.design_dir)
+                || previous_root.parent != current_root.parent
+                || previous_root.index != current_root.index
+                || previous_root.name != current_root.name
+            {
+                return Ok(None);
+            }
+            let Some(indexed) = self.file_hash_index.get(id) else {
+                return Ok(None);
+            };
+            if !indexed.source_identity_verified
+                || indexed.files.len() != artifact_file_names(meta.kind).len()
+                || indexed.files.get(header_name).copied()
+                    != Some(sha256_bytes(&json_bytes(&expected_artifact_header(
+                        baseline, id,
+                    )?)?))
+            {
+                return Ok(None);
+            }
+        }
+        if !artifact_save_scope_is_complete(document, baseline, changed_artifacts) {
+            return Ok(None);
+        }
+        for (id, session) in &self.open {
+            if !matches!(session.kind, ArtifactKind::Page | ArtifactKind::Component) {
+                continue;
+            }
+            match session.state {
+                ArtifactDirty::Clean => {}
+                ArtifactDirty::DirtyCanvas if changed_artifacts.contains(id) => {}
+                ArtifactDirty::DirtyCanvas => return Ok(None),
+                _ => {
+                    return Err(SessionError::InvalidState(format!(
+                        "{} has uncommitted source or a conflict",
+                        id.debug_label()
+                    )));
+                }
+            }
+        }
+        let mut expected_disk = self.source_write_preconditions(document)?;
+        for (path, hash) in additional_disk_preconditions {
+            if let Some(previous) = expected_disk.insert(path.clone(), *hash)
+                && previous != *hash
+            {
+                return Err(SessionError::SaveBlocked(SaveBlocked::DiskChangedAgain));
+            }
+        }
+        for id in changed_artifacts {
+            let Some(indexed_hash) = self.file_index.get(id).copied() else {
+                return Err(SessionError::ArtifactNotFound(id.debug_label()));
+            };
+            self.open_artifact(id.clone())?;
+            if self.artifact(id).map(|artifact| artifact.disk_hash) != Some(indexed_hash) {
+                return Err(SessionError::SaveBlocked(SaveBlocked::DiskChangedAgain));
+            }
+        }
+        self.adopt_document_artifacts(document, changed_artifacts)?;
+        let mut artifacts = BTreeMap::new();
+        let mut files = BTreeMap::new();
+        for id in changed_artifacts {
+            let session = self
+                .open
+                .get_mut(id)
+                .ok_or_else(|| SessionError::ArtifactNotFound(id.debug_label()))?;
+            session.synchronize_retained_source_with_scene()?;
+            let header = json_bytes(&expected_artifact_header(document, id)?)?;
+            let mut projected = session.project_to_files()?;
+            let names = artifact_file_names(session.kind);
+            for (name, bytes) in &mut projected {
+                if name == names.last().copied().unwrap_or("") {
+                    *bytes = header.clone();
+                } else if name.ends_with(".fnx") {
+                    *bytes = crate::project::write::placed_source(&session.meta.design_dir, bytes);
+                } else if name == MASTER_IDS
+                    && let ArtifactId::Component(component) = id
+                {
+                    *bytes = component_sidecar_with_document_parent(
+                        document,
+                        *component,
+                        std::mem::take(bytes),
+                    )?;
+                }
+                files.insert(session.meta.design_dir.join(name), bytes.clone());
+            }
+            if !design_source_identity_is_current(&projected) {
+                return Err(SessionError::InvalidSource(format!(
+                    "{} projected an incoherent source identity",
+                    id.debug_label()
+                )));
+            }
+            artifacts.insert(id.clone(), projected);
+        }
+        Ok(Some(PreparedArtifactSave {
+            artifacts,
+            files,
+            expected_disk,
+        }))
+    }
+
+    fn accept_document_artifact_save(
+        &mut self,
+        document: &fanta_doc::Doc,
+        prepared: PreparedArtifactSave,
+        projected_hashes: &BTreeMap<PathBuf, [u8; 32]>,
+    ) -> Result<(), SessionError> {
+        let mut expected_disk = prepared.expected_disk;
+        expected_disk.extend(
+            projected_hashes
+                .iter()
+                .map(|(path, hash)| (path.clone(), Some(*hash))),
+        );
+        let mut accepted = Vec::new();
+        for (id, files) in prepared.artifacts {
+            let session = self
+                .open
+                .get(&id)
+                .ok_or_else(|| SessionError::ArtifactNotFound(id.debug_label()))?;
+            let header = expected_artifact_header(document, &id)?;
+            let node_map = match session.state {
+                ArtifactDirty::DirtyCanvas => {
+                    let mut node_map = session.projected_node_map()?;
+                    node_map.header = header;
+                    Arc::new(node_map)
+                }
+                ArtifactDirty::Clean if session.base_nodes.header == header => {
+                    Arc::clone(&session.base_nodes)
+                }
+                ArtifactDirty::Clean => {
+                    let mut node_map = (*session.base_nodes).clone();
+                    node_map.header = header;
+                    Arc::new(node_map)
+                }
+                _ => {
+                    return Err(SessionError::InvalidState(format!(
+                        "{} has uncommitted source or a conflict",
+                        id.debug_label()
+                    )));
+                }
+            };
+            let file_hashes = IndexedFileHashes::new(&files, self.file_hash_index.get(&id));
+            accepted.push((id, node_map, file_hashes));
+        }
+        let shared_hash = hash_workspace_shared_on_disk(&self.root)?;
+        let metadata = serde_json::to_value(&document.metadata)
+            .map_err(|error| SessionError::other(error.to_string()))?;
+        crate::project::write::with_project_read_lock(&self.root, || {
+            crate::project::write::validate_expected_disk_content(&self.root, &expected_disk)
+        })
+        .map_err(|error| match error {
+            crate::error::FormatError::InvalidProjectTree(_) => {
+                SessionError::SaveBlocked(SaveBlocked::DiskChangedAgain)
+            }
+            error => SessionError::Format(error),
+        })?;
+        // A failed write or post-write validation must not advance component
+        // revision caches or invalidate the master's accepted context.
+        self.adopt_document_shared(document);
+        for (id, node_map, file_hashes) in accepted {
+            let disk_hash = file_hashes.content_hash;
+            if let Some(session) = self.open.get_mut(&id) {
+                session.meta.disk_hash = disk_hash;
+                session.disk_hash = disk_hash;
+                session.base_hash = disk_hash;
+                session.base_nodes = node_map;
+                session.state = ArtifactDirty::Clean;
+                session.ir_stale = false;
+                session.scene_stale = false;
+                session.text = None;
+            }
+            if let Some(meta) = self.artifacts.get_mut(&id) {
+                meta.disk_hash = disk_hash;
+            }
+            self.file_index.insert(id.clone(), disk_hash);
+            self.file_hash_index.insert(id, file_hashes);
+        }
+        self.shared.metadata = metadata;
+        self.shared.disk_hash = shared_hash;
+        self.shared.base_hash = shared_hash;
+        self.shared.base_json = json!({
+            "variables": document.variables,
+            "active_modes": document.active_modes,
+        });
+        self.shared.dirty = WorkspaceDirty::Clean;
+        if let Some(hash) = projected_hashes.get(Path::new(FANTA_JSON)) {
+            self.manifest_disk_hash = *hash;
+        }
+        for (path, hash) in &mut self.other_singleton_disk_hashes {
+            if let Some(projected_hash) = projected_hashes.get(path) {
+                *hash = Some(*projected_hash);
+            }
+        }
+        Ok(())
     }
 
     /// Source and identity bytes for the open page/component sessions. The
@@ -993,6 +1304,11 @@ impl WorkspaceSession {
                 .map_err(|error| SessionError::other(error.to_string()))?
         };
         for (relative, value) in [
+            (
+                PathBuf::from(DOC_DIR).join(crate::project::layout::ASSET_LIBRARY_JSON),
+                serde_json::to_value(&document.asset_library)
+                    .map_err(|error| SessionError::other(error.to_string()))?,
+            ),
             (PathBuf::from(DOC_DIR).join(MOTION_JSON), motion),
             (
                 PathBuf::from(DOC_DIR).join(FLOW_START_JSON),
@@ -1552,6 +1868,7 @@ impl WorkspaceSession {
                 files: hash_files(&files),
                 content_hash: h,
                 order: files.iter().map(|(name, _)| name.clone()).collect(),
+                source_identity_verified: design_source_identity_is_current(&files),
             },
         );
         Ok(())
@@ -1727,6 +2044,7 @@ impl WorkspaceSession {
                 files: hash_files(&pairs),
                 content_hash: disk_hash,
                 order: pairs.iter().map(|(name, _)| name.clone()).collect(),
+                source_identity_verified: false,
             },
         );
         self.artifacts.insert(id.clone(), meta);
@@ -1947,11 +2265,22 @@ fn with_document_root_parent(
     component: fanta_doc::ComponentId,
     (source, ids): (Vec<u8>, Vec<u8>),
 ) -> Result<(Vec<u8>, Vec<u8>), SessionError> {
+    Ok((
+        source,
+        component_sidecar_with_document_parent(document, component, ids)?,
+    ))
+}
+
+fn component_sidecar_with_document_parent(
+    document: &fanta_doc::Doc,
+    component: fanta_doc::ComponentId,
+    ids: Vec<u8>,
+) -> Result<Vec<u8>, SessionError> {
     let Some(root) = document.components.def(component).map(|def| def.root) else {
-        return Ok((source, ids));
+        return Ok(ids);
     };
     let Some(node) = document.scene.get(root) else {
-        return Ok((source, ids));
+        return Ok(ids);
     };
     let parent = node
         .parent
@@ -1969,13 +2298,13 @@ fn with_document_root_parent(
     let mut sidecar: fanta_fnx::FnxSidecar = serde_json::from_slice(&ids)
         .map_err(|error| SessionError::other(format!("component sidecar: {error}")))?;
     if sidecar.root_parent == parent {
-        return Ok((source, ids));
+        return Ok(ids);
     }
     sidecar.root_parent = parent;
     let ids = json_bytes(
         &serde_json::to_value(&sidecar).map_err(|error| SessionError::other(error.to_string()))?,
     )?;
-    Ok((source, ids))
+    Ok(ids)
 }
 
 /// Workspace files outside any artifact that a save rewrites and that a
@@ -1984,6 +2313,7 @@ fn with_document_root_parent(
 /// `components/sets.json`).
 fn singleton_disk_hashes(root: &Path) -> Result<BTreeMap<PathBuf, Option<[u8; 32]>>, SessionError> {
     let mut paths = vec![
+        PathBuf::from(DOC_DIR).join(crate::project::layout::ASSET_LIBRARY_JSON),
         PathBuf::from(DOC_DIR).join(MOTION_JSON),
         PathBuf::from(DOC_DIR).join(FLOW_START_JSON),
         PathBuf::from(DOC_DIR).join(FLOWS_JSON),
@@ -2023,6 +2353,198 @@ fn set_files_of(document: &fanta_doc::Doc) -> Result<Vec<(PathBuf, Value)>, Sess
 
 fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
+}
+
+fn design_source_identity_is_current(files: &[(String, Vec<u8>)]) -> bool {
+    let source = files
+        .iter()
+        .find(|(name, _)| name == "page.fnx" || name == "master.fnx");
+    let ids = files
+        .iter()
+        .find(|(name, _)| name == "page.ids.json" || name == "master.ids.json");
+    let Some((_, source)) = source else {
+        return false;
+    };
+    let Some((_, ids)) = ids else {
+        return false;
+    };
+    let Ok(source) = std::str::from_utf8(source) else {
+        return false;
+    };
+    let Ok(sidecar) = serde_json::from_slice::<fanta_fnx::FnxSidecar>(ids) else {
+        return false;
+    };
+    sidecar.ids.iter().all(|entry| {
+        id_from_key::<fanta_doc::NodeId>(&entry.id).is_ok()
+            && (entry.index.is_null() || entry.index.is_number())
+    }) && sidecar
+        .root_parent
+        .as_ref()
+        .is_none_or(|parent| id_from_key::<fanta_doc::NodeId>(parent).is_ok())
+        && matches!(
+            fanta_fnx::sidecar_matches_source(source, &sidecar),
+            Ok(true)
+        )
+}
+
+fn components_match_for_artifact_save(
+    current: &fanta_doc::ComponentLibrary,
+    baseline: &fanta_doc::ComponentLibrary,
+    indexed: &fanta_doc::ComponentLibrary,
+    changed_artifacts: &BTreeSet<ArtifactId>,
+) -> bool {
+    if current.sets != baseline.sets
+        || current.sets != indexed.sets
+        || current.defs.len() != baseline.defs.len()
+        || current.defs.len() != indexed.defs.len()
+    {
+        return false;
+    }
+    let structural_definition = |definition: &fanta_doc::ComponentDef| {
+        let mut definition = definition.clone();
+        definition.rev = 0;
+        definition.preview_rev = 0;
+        definition
+    };
+    current.defs.iter().all(|(id, current)| {
+        let (Some(baseline), Some(indexed)) = (baseline.defs.get(id), indexed.defs.get(id)) else {
+            return false;
+        };
+        if current == baseline && current == indexed {
+            return true;
+        }
+        let structural = structural_definition(current);
+        structural == structural_definition(baseline)
+            && structural == structural_definition(indexed)
+            && ((current.rev == baseline.rev && current.rev == indexed.rev)
+                || changed_artifacts.contains(&ArtifactId::Component(*id)))
+    })
+}
+
+fn artifact_save_scope_is_complete(
+    document: &fanta_doc::Doc,
+    baseline: &fanta_doc::Doc,
+    changed_artifacts: &BTreeSet<ArtifactId>,
+) -> bool {
+    let Some(current_owners) = artifact_save_owners(document) else {
+        return false;
+    };
+    let Some(previous_owners) = artifact_save_owners(baseline) else {
+        return false;
+    };
+    changed_artifacts
+        .iter()
+        .all(|id| matches!(id, ArtifactId::Page(_) | ArtifactId::Component(_)))
+        && current_owners.iter().all(|(id, owner)| {
+            document.scene.shares_node(&baseline.scene, *id) || changed_artifacts.contains(owner)
+        })
+        && previous_owners.iter().all(|(id, owner)| {
+            document.scene.shares_node(&baseline.scene, *id) || changed_artifacts.contains(owner)
+        })
+}
+
+fn artifact_save_owners(
+    document: &fanta_doc::Doc,
+) -> Option<HashMap<fanta_doc::NodeId, ArtifactId>> {
+    let mut roots = HashMap::new();
+    for page in document.pages() {
+        if document.scene.get(*page)?.parent.is_some()
+            || roots.insert(*page, ArtifactId::Page(*page)).is_some()
+        {
+            return None;
+        }
+    }
+    for (component, definition) in &document.components.defs {
+        document.scene.get(definition.root)?;
+        if roots
+            .insert(definition.root, ArtifactId::Component(*component))
+            .is_some()
+        {
+            return None;
+        }
+    }
+    let mut owners = HashMap::with_capacity(document.scene.len());
+    let mut pending = Vec::new();
+    let mut visited = HashSet::new();
+    for root in document.scene.roots() {
+        pending.push((*root, None, roots.get(root)?.clone()));
+    }
+    while let Some((id, parent, owner)) = pending.pop() {
+        let node = document.scene.get(id)?;
+        if node.id != id || node.parent != parent || !visited.insert(id) {
+            return None;
+        }
+        let children = document.scene.children_of(Some(id));
+        if !children.is_empty() && !node.can_have_children() {
+            return None;
+        }
+        let owner = roots.get(&id).cloned().unwrap_or(owner);
+        owners.insert(id, owner.clone());
+        pending.extend(
+            children
+                .iter()
+                .rev()
+                .map(|child| (*child, Some(id), owner.clone())),
+        );
+    }
+    (owners.len() == document.scene.len()).then_some(owners)
+}
+
+fn index_initial_component_files(
+    entries: &[&Path],
+    parallel: bool,
+) -> Result<Vec<IndexedFileHashes>, SessionError> {
+    const PARALLEL_MINIMUM_COMPONENTS: usize = 256;
+    const INDEX_WORKERS: usize = 4;
+
+    let index = |entries: &[&Path]| {
+        entries
+            .iter()
+            .map(|entry| {
+                let files = read_indexed_file_set(entry, ArtifactKind::Component)?;
+                Ok(IndexedFileHashes::new(&files, None))
+            })
+            .collect::<Result<Vec<_>, SessionError>>()
+    };
+    if !parallel || entries.len() < PARALLEL_MINIMUM_COMPONENTS {
+        return index(entries);
+    }
+
+    std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(INDEX_WORKERS);
+        for chunk in entries.chunks(entries.len().div_ceil(INDEX_WORKERS)) {
+            let worker = std::thread::Builder::new().spawn_scoped(scope, move || index(chunk));
+            workers.push((chunk, worker));
+        }
+        let mut indexed = Vec::with_capacity(entries.len());
+        let mut first_error = None;
+        // All joins must complete before any result is published or returned;
+        // sorted chunk order preserves the serial path's first input error.
+        for (chunk, worker) in workers {
+            let result = match worker {
+                Ok(worker) => worker.join().unwrap_or_else(|_| {
+                    Err(SessionError::other(format!(
+                        "component indexing worker panicked while checking {}",
+                        chunk
+                            .first()
+                            .map_or_else(|| Path::new("components"), |entry| *entry)
+                            .display()
+                    )))
+                }),
+                Err(error) => Err(SessionError::Io(error)),
+            };
+            match result {
+                Ok(mut hashes) if first_error.is_none() => indexed.append(&mut hashes),
+                Ok(_) => {}
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(indexed),
+        }
+    })
 }
 
 fn read_indexed_file_set(
@@ -2150,6 +2672,122 @@ mod tests {
     use super::*;
 
     #[test]
+    fn large_component_index_matches_serial_hashes_and_identity_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let mut document = fanta_doc::Doc::new();
+        let page =
+            document
+                .scene
+                .insert(fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(
+                    fanta_doc::GroupNode::default(),
+                )))?;
+        document.add_page(page);
+        for position in 0..300 {
+            let mut master = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(
+                fanta_doc::GroupNode::default(),
+            ));
+            master.name = format!("Master {position:04}");
+            master.parent = Some(page);
+            let root = document.scene.insert(master)?;
+            let mut shape = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Vector(
+                fanta_doc::VectorNode::rect_solid(0.0, 0.0, 20.0, 30.0, fanta_doc::Color::BLACK),
+            ));
+            shape.parent = Some(root);
+            document.scene.insert(shape)?;
+            let component = ComponentId::new();
+            document.components.defs.insert(
+                component,
+                fanta_doc::ComponentDef::new(component, root, format!("Master {position:04}")),
+            );
+        }
+        crate::write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        let fresh = WorkspaceSession::open(directory.path())?;
+        assert!(fresh.open.is_empty());
+        assert_eq!(fresh.components.defs, document.components);
+        assert_eq!(fresh.file_index.len(), 301);
+        let paths: Vec<_> = fresh
+            .artifacts
+            .iter()
+            .filter(|(id, _)| matches!(id, ArtifactId::Component(_)))
+            .map(|(_, meta)| directory.path().join(&meta.design_dir))
+            .collect();
+        let entries: Vec<_> = paths.iter().map(PathBuf::as_path).collect();
+        let assert_same = |current: &WorkspaceSession| -> Result<(), Box<dyn std::error::Error>> {
+            let serial = index_initial_component_files(&entries, false)?;
+            let parallel = index_initial_component_files(&entries, true)?;
+            assert_eq!(serial.len(), entries.len());
+            assert_eq!(parallel.len(), entries.len());
+            for ((entry, serial), parallel) in entries.iter().zip(&serial).zip(&parallel) {
+                assert_eq!(serial.content_hash, parallel.content_hash);
+                assert_eq!(serial.files, parallel.files);
+                assert_eq!(serial.order, parallel.order);
+                assert_eq!(
+                    serial.source_identity_verified,
+                    parallel.source_identity_verified
+                );
+                let relative = entry.strip_prefix(directory.path())?;
+                let metadata = current
+                    .artifacts
+                    .values()
+                    .find(|meta| meta.design_dir == relative)
+                    .expect("selected component metadata");
+                let indexed = current
+                    .file_hash_index
+                    .get(&metadata.id)
+                    .expect("indexed files");
+                assert_eq!(
+                    current.file_index.get(&metadata.id),
+                    Some(&serial.content_hash)
+                );
+                assert_eq!(indexed.files, serial.files);
+                assert_eq!(indexed.order, serial.order);
+                assert_eq!(
+                    indexed.source_identity_verified,
+                    serial.source_identity_verified
+                );
+            }
+            Ok(())
+        };
+        assert_same(&fresh)?;
+        assert!(
+            fresh
+                .file_hash_index
+                .values()
+                .all(|hashes| hashes.source_identity_verified)
+        );
+
+        let damaged = entries.get(23).expect("first chunk component");
+        let missing = entries.get(241).expect("last chunk component");
+        std::fs::write(damaged.join(MASTER_IDS), b"{")?;
+        std::fs::remove_file(missing.join(MASTER_IDS))?;
+        let changed = WorkspaceSession::open(directory.path())?;
+        assert_same(&changed)?;
+        assert_eq!(changed.components.defs, fresh.components.defs);
+        assert_eq!(changed.artifacts.len(), fresh.artifacts.len());
+        assert!(changed.open.is_empty());
+        for entry in [damaged, missing] {
+            let relative = entry.strip_prefix(directory.path())?;
+            let metadata = changed
+                .artifacts
+                .values()
+                .find(|meta| meta.design_dir == relative)
+                .expect("component with damaged identity");
+            assert!(!changed.file_hash_index[&metadata.id].source_identity_verified);
+        }
+
+        let manifest_path = directory.path().join(FANTA_JSON);
+        let mut manifest: Value = serde_json::from_slice(&std::fs::read(&manifest_path)?)?;
+        manifest["version"] = json!(PROJECT_VERSION - 1);
+        std::fs::write(manifest_path, json_bytes(&manifest)?)?;
+        let legacy = WorkspaceSession::open(directory.path())?;
+        assert_same(&legacy)?;
+        assert_eq!(legacy.file_index, changed.file_index);
+        assert_eq!(legacy.components.defs, changed.components.defs);
+        Ok(())
+    }
+
+    #[test]
     fn indexed_file_hashes_require_the_same_order_names_and_exact_bytes() {
         let files = vec![
             ("page.fnx".to_owned(), b"source".to_vec()),
@@ -2177,6 +2815,115 @@ mod tests {
             assert_eq!(indexed.files, hash_files(&current));
             if current != files {
                 assert_ne!(indexed.content_hash, previous.content_hash);
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_artifact_acceptance_rejects_post_write_changes_atomically() {
+        for name in [
+            "page.fnx",
+            "page.ids.json",
+            "page.json",
+            "doc/asset_library.json",
+        ] {
+            for remove in [false, true] {
+                let directory = tempfile::tempdir().expect("project directory");
+                let mut document = fanta_doc::Doc::new();
+                let mut pages = Vec::new();
+                for name in ["Edited", "Unopened"] {
+                    let mut root = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(
+                        fanta_doc::GroupNode::default(),
+                    ));
+                    root.name = name.into();
+                    let page = document.scene.insert(root).expect("page root");
+                    document.add_page(page);
+                    pages.push(page);
+                }
+                let mut master = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(
+                    fanta_doc::GroupNode::default(),
+                ));
+                master.name = "Master".into();
+                master.parent = pages.last().copied();
+                let master = document.scene.insert(master).expect("master root");
+                let component = fanta_doc::ComponentId::new();
+                document.components.defs.insert(
+                    component,
+                    fanta_doc::ComponentDef::new(component, master, "Master"),
+                );
+                crate::write_project_tree(directory.path(), &document, &BTreeMap::new())
+                    .expect("initial project");
+                let (mut document, _) =
+                    crate::read_project_tree(directory.path()).expect("project");
+                let baseline = document.clone_for_persist();
+                let edited = *pages.first().expect("edited page");
+                let unopened = *pages.last().expect("unopened page");
+                document.scene.get_mut(edited).expect("page root").transform =
+                    fanta_doc::Transform2D::translation(11.0, 17.0);
+                document
+                    .scene
+                    .get_mut(master)
+                    .expect("master root")
+                    .transform = fanta_doc::Transform2D::translation(23.0, 31.0);
+                assert_eq!(
+                    document
+                        .components
+                        .bump_rev_for_node(&document.scene, master),
+                    1
+                );
+                let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
+                let prepared = workspace
+                    .prepare_document_artifact_save(
+                        &document,
+                        &baseline,
+                        &[ArtifactId::Page(edited), ArtifactId::Component(component)]
+                            .into_iter()
+                            .collect(),
+                        &BTreeMap::new(),
+                    )
+                    .expect("prepare save")
+                    .expect("ordinary edit");
+                let (_, projected_hashes) = crate::project::write::write_project_artifacts_checked(
+                    directory.path(),
+                    &document,
+                    &prepared.files,
+                    &prepared.expected_disk,
+                )
+                .expect("checked write");
+                let before_index = workspace.file_index.clone();
+                let before_shared = workspace.shared.disk_hash;
+                let before_components = workspace.components.defs.clone();
+                let before_generation = workspace.workspace_generation;
+                let before_base = Arc::clone(&workspace.open[&ArtifactId::Page(edited)].base_nodes);
+                let relative = if name.starts_with("doc/") {
+                    PathBuf::from(name)
+                } else {
+                    workspace.artifacts[&ArtifactId::Page(unopened)]
+                        .design_dir
+                        .join(name)
+                };
+                let path = directory.path().join(relative);
+                let original = std::fs::read(&path).expect("unopened file");
+                if remove {
+                    std::fs::remove_file(&path).expect("external deletion");
+                } else {
+                    let mut external = original.clone();
+                    *external.first_mut().expect("nonempty file") ^= 1;
+                    std::fs::write(&path, external).expect("same-size external edit");
+                }
+                assert!(matches!(
+                    workspace.accept_document_artifact_save(&document, prepared, &projected_hashes),
+                    Err(SessionError::SaveBlocked(SaveBlocked::DiskChangedAgain)),
+                ));
+                assert_eq!(workspace.file_index, before_index);
+                assert_eq!(workspace.shared.disk_hash, before_shared);
+                assert_eq!(workspace.components.defs, before_components);
+                assert_eq!(workspace.workspace_generation, before_generation);
+                let edited_session = &workspace.open[&ArtifactId::Page(edited)];
+                assert!(Arc::ptr_eq(&edited_session.base_nodes, &before_base));
+                assert!(matches!(edited_session.state, ArtifactDirty::DirtyCanvas));
+                assert!(!workspace.open.contains_key(&ArtifactId::Page(unopened)));
+                std::fs::write(path, original).expect("restore external file");
             }
         }
     }

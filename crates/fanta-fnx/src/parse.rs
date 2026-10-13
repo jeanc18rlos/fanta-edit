@@ -21,6 +21,61 @@ pub fn parse_doc(src: &str) -> Result<FnxElement, FnxError> {
     parse_doc_with(src, &RefTable::default())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn byte_scanning_preserves_unicode_and_vertical_tab_whitespace() {
+        let source = "<Frame\u{b}name=\"雪🙂\"\u{2003}>\u{85}{/* keep 雪🙂 */}\n<Text\u{b}content=\"héllo 雪🙂\" />\u{2003}</Frame>";
+        let root = parse_doc(source).expect("existing whitespace grammar");
+        assert_eq!(root.attrs.get("name"), Some(&Value::from("雪🙂")));
+        assert_eq!(
+            root.children
+                .first()
+                .and_then(|child| child.attrs.get("content")),
+            Some(&Value::from("héllo 雪🙂"))
+        );
+    }
+
+    #[test]
+    fn borrowed_attribute_spans_preserve_large_json_payloads() {
+        let values: Vec<_> = (0..4096)
+            .map(|index| serde_json::json!({"position": [index, -0.25], "label": "雪"}))
+            .collect();
+        let payload = serde_json::to_string(&values).expect("payload JSON");
+        let source = format!("<Vector name=\"Large geometry\" future_hint={{{payload}}} />");
+        let root = parse_doc(&source).expect("borrowed payload parse");
+        assert_eq!(root.attrs.get("future_hint"), Some(&Value::Array(values)));
+    }
+
+    #[test]
+    fn json_diagnostics_map_byte_offsets_to_unicode_columns() {
+        let source = r#"<Frame name="雪🙂" future_hint={{"label": "é", bad: 1}} />"#;
+        let bad_key = source.find("bad:").expect("bad key");
+        let column = source[..bad_key].chars().count() + 1;
+        let error = parse_doc(source).expect_err("malformed JSON").to_string();
+        assert!(
+            error.contains(&format!("line 1, column {column}:")),
+            "{error}"
+        );
+        assert!(error.contains("key must be a string"), "{error}");
+
+        let source =
+            r##"<Frame name="雪🙂" background={{"color": fnxColor("#FFFFFF"), bad: 1}} />"##;
+        let brace = source.find("={{").expect("attribute brace") + 1;
+        let column = source[..brace].chars().count() + 1;
+        let error = parse_doc(source)
+            .expect_err("error after color expansion")
+            .to_string();
+        assert!(
+            error.contains(&format!("line 1, column {column}:")),
+            "{error}"
+        );
+        assert!(error.contains("key must be a string"), "{error}");
+    }
+}
+
 /// [`parse_doc`] with a name-resolution context: `component="Button"` and
 /// `$Collection/Name` binding paths desugar into their canonical ULIDs (see
 /// [`crate::refs`]).
@@ -47,17 +102,14 @@ pub fn parse_doc_with(src: &str, refs: &RefTable) -> Result<FnxElement, FnxError
     Ok(root)
 }
 
-struct Scanner {
-    chars: Vec<char>,
+struct Scanner<'a> {
+    source: &'a str,
     pos: usize,
 }
 
-impl Scanner {
-    fn new(src: &str) -> Self {
-        Self {
-            chars: src.chars().collect(),
-            pos: 0,
-        }
+impl<'a> Scanner<'a> {
+    fn new(source: &'a str) -> Self {
+        Self { source, pos: 0 }
     }
 
     fn err(&self, msg: impl Into<String>) -> FnxError {
@@ -77,36 +129,38 @@ impl Scanner {
     /// caret padding mirrors tabs so alignment survives them.
     fn err_at(&self, pos: usize, msg: impl Into<String>) -> FnxError {
         const WINDOW: usize = 60;
-        let pos = pos.min(self.chars.len());
-        let mut line = 1usize;
-        let mut line_start = 0usize;
-        for (i, &c) in self.chars[..pos].iter().enumerate() {
-            if c == '\n' {
-                line += 1;
-                line_start = i + 1;
-            }
+        let mut pos = pos.min(self.source.len());
+        while !self.source.is_char_boundary(pos) {
+            pos -= 1;
         }
-        let column = pos - line_start + 1;
-        let line_end = self.chars[line_start..]
-            .iter()
-            .position(|&c| c == '\n')
-            .map(|off| line_start + off)
-            .unwrap_or(self.chars.len());
-
-        let window_start = line_start.max(pos.saturating_sub(WINDOW));
-        let window_end = line_end.min(pos + WINDOW);
+        let before = &self.source[..pos];
+        let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
+        let line_start = before.rfind('\n').map_or(0, |position| position + 1);
+        let line_end = self.source[pos..]
+            .find('\n')
+            .map_or(self.source.len(), |offset| pos + offset);
+        let column = self.source[line_start..pos].chars().count() + 1;
+        let window_start = self.source[line_start..pos]
+            .char_indices()
+            .rev()
+            .nth(WINDOW - 1)
+            .map_or(line_start, |(offset, _)| line_start + offset);
+        let window_end = self.source[pos..line_end]
+            .char_indices()
+            .nth(WINDOW)
+            .map_or(line_end, |(offset, _)| pos + offset);
         let prefix = if window_start > line_start {
             "… "
         } else {
             ""
         };
         let suffix = if window_end < line_end { " …" } else { "" };
-        let excerpt: String = self.chars[window_start..window_end].iter().collect();
+        let excerpt = &self.source[window_start..window_end];
         let pad: String = std::iter::repeat_n(' ', prefix.chars().count())
             .chain(
-                self.chars[window_start..pos]
-                    .iter()
-                    .map(|&c| if c == '\t' { '\t' } else { ' ' }),
+                self.source[window_start..pos]
+                    .chars()
+                    .map(|character| if character == '\t' { '\t' } else { ' ' }),
             )
             .collect();
         FnxError::Parse(format!(
@@ -137,23 +191,21 @@ impl Scanner {
             }
         };
         let trimmed = expanded.trim();
-        let lead_chars = {
-            let lead_bytes = expanded.len() - expanded.trim_start().len();
-            expanded[..lead_bytes].chars().count()
-        };
-        // (line, column) → char offset into the trimmed expanded text.
+        let lead_bytes = expanded.len() - expanded.trim_start().len();
+        // serde_json reports byte columns; convert to display columns only
+        // when constructing the diagnostic, after mapping back into source.
         let value_offset = trimmed
             .split('\n')
             .take(error.line().saturating_sub(1))
-            .map(|l| l.chars().count() + 1)
+            .map(|line| line.len() + 1)
             .sum::<usize>()
             + error.column().saturating_sub(1);
-        let expanded_offset = lead_chars + value_offset;
+        let expanded_offset = lead_bytes + value_offset;
         let first_diff = inner
-            .chars()
-            .zip(expanded.chars())
+            .bytes()
+            .zip(expanded.bytes())
             .position(|(a, b)| a != b)
-            .unwrap_or_else(|| inner.chars().count().min(expanded.chars().count()));
+            .unwrap_or_else(|| inner.len().min(expanded.len()));
         if expanded_offset <= first_diff {
             // +1 steps over the opening `{` the captured inner text excludes.
             self.err_at(
@@ -165,15 +217,15 @@ impl Scanner {
         }
     }
 
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.pos).copied()
+    fn peek(&self) -> Option<u8> {
+        self.source.as_bytes().get(self.pos).copied()
     }
 
-    fn peek2(&self) -> Option<char> {
-        self.chars.get(self.pos + 1).copied()
+    fn peek2(&self) -> Option<u8> {
+        self.source.as_bytes().get(self.pos + 1).copied()
     }
 
-    fn bump(&mut self) -> Option<char> {
+    fn bump(&mut self) -> Option<u8> {
         let c = self.peek();
         if c.is_some() {
             self.pos += 1;
@@ -182,9 +234,14 @@ impl Scanner {
     }
 
     fn skip_ws(&mut self) {
-        while let Some(c) = self.peek() {
-            if c.is_whitespace() {
+        while let Some(byte) = self.peek() {
+            if byte.is_ascii_whitespace() || byte == b'\x0b' {
                 self.pos += 1;
+            } else if !byte.is_ascii()
+                && let Some(character) = self.source[self.pos..].chars().next()
+                && character.is_whitespace()
+            {
+                self.pos += character.len_utf8();
             } else {
                 break;
             }
@@ -193,21 +250,21 @@ impl Scanner {
 
     /// Advance to the first `<` — the root element's open tag.
     fn skip_to_root(&mut self) -> Result<(), FnxError> {
-        while let Some(c) = self.peek() {
-            if c == '<' {
-                return Ok(());
-            }
-            self.pos += 1;
-        }
-        Err(self.err("no element found"))
+        self.pos = self
+            .source
+            .as_bytes()
+            .iter()
+            .position(|byte| *byte == b'<')
+            .ok_or_else(|| self.err_at(self.source.len(), "no element found"))?;
+        Ok(())
     }
 
-    fn expect(&mut self, c: char) -> Result<(), FnxError> {
+    fn expect(&mut self, c: u8) -> Result<(), FnxError> {
         if self.peek() == Some(c) {
             self.pos += 1;
             Ok(())
         } else {
-            Err(self.err(format!("expected '{c}'")))
+            Err(self.err(format!("expected '{}'", char::from(c))))
         }
     }
 
@@ -216,7 +273,7 @@ impl Scanner {
     fn ident(&mut self) -> Result<String, FnxError> {
         let start = self.pos;
         while let Some(c) = self.peek() {
-            if c.is_ascii_alphanumeric() || c == '_' {
+            if c.is_ascii_alphanumeric() || c == b'_' {
                 self.pos += 1;
             } else {
                 break;
@@ -225,24 +282,24 @@ impl Scanner {
         if self.pos == start {
             return Err(self.err("expected identifier"));
         }
-        Ok(self.chars[start..self.pos].iter().collect())
+        Ok(self.source[start..self.pos].to_owned())
     }
 
     fn element(&mut self) -> Result<FnxElement, FnxError> {
         self.skip_ws();
-        self.expect('<')?;
+        self.expect(b'<')?;
         let tag = self.ident()?;
         let mut el = FnxElement::new(tag.clone());
         loop {
             self.skip_ws();
             match self.peek() {
-                Some('/') => {
-                    self.expect('/')?;
-                    self.expect('>')?;
+                Some(b'/') => {
+                    self.expect(b'/')?;
+                    self.expect(b'>')?;
                     return Ok(el);
                 }
-                Some('>') => {
-                    self.expect('>')?;
+                Some(b'>') => {
+                    self.expect(b'>')?;
                     break;
                 }
                 Some(_) => {
@@ -252,7 +309,7 @@ impl Scanner {
                         return Err(self.err_at(key_start, format!("duplicate attribute {key}")));
                     }
                     self.skip_ws();
-                    self.expect('=')?;
+                    self.expect(b'=')?;
                     self.skip_ws();
                     let value = self.attr_value()?;
                     el.attrs.insert(key, value);
@@ -263,15 +320,15 @@ impl Scanner {
         // Children until the matching close tag.
         loop {
             self.skip_child_trivia()?;
-            if self.peek() == Some('<') && self.peek2() == Some('/') {
-                self.expect('<')?;
-                self.expect('/')?;
+            if self.peek() == Some(b'<') && self.peek2() == Some(b'/') {
+                self.expect(b'<')?;
+                self.expect(b'/')?;
                 let close = self.ident()?;
                 if close != tag {
                     return Err(self.err(format!("</{close}> closing <{tag}>")));
                 }
                 self.skip_ws();
-                self.expect('>')?;
+                self.expect(b'>')?;
                 return Ok(el);
             }
             if self.peek().is_none() {
@@ -284,37 +341,36 @@ impl Scanner {
     fn skip_child_trivia(&mut self) -> Result<(), FnxError> {
         loop {
             self.skip_ws();
-            if self.chars.get(self.pos..self.pos + 3) != Some(&['{', '/', '*']) {
+            if !self.source[self.pos..].starts_with("{/*") {
                 return Ok(());
             }
             self.pos += 3;
-            while self.pos + 2 < self.chars.len()
-                && self.chars[self.pos..self.pos + 3] != ['*', '/', '}']
-            {
-                self.pos += 1;
-            }
-            if self.pos + 2 >= self.chars.len() {
-                return Err(self.err("unterminated JSX comment"));
-            }
-            self.pos += 3;
+            let Some(end) = self.source[self.pos..].find("*/}") else {
+                return Err(self.err_at(self.source.len(), "unterminated JSX comment"));
+            };
+            self.pos += end + 3;
         }
     }
 
     fn attr_value(&mut self) -> Result<Value, FnxError> {
         match self.peek() {
-            Some('"') => {
+            Some(b'"') => {
                 let token_start = self.pos;
                 let raw = self.json_string_token()?;
-                serde_json::from_str(&raw)
+                serde_json::from_str(raw)
                     .map_err(|e| self.err_at(token_start, format!("bad string: {e}")))
             }
-            Some('{') => {
+            Some(b'{') => {
                 let brace_pos = self.pos;
                 // Expand `#RRGGBB[AA]` color literals back to JSON, then parse.
                 let inner = self.braced()?;
-                let expanded = crate::color::expand_color_literals(&inner);
+                let expanded = if inner.contains("fnxColor") || inner.contains('#') {
+                    std::borrow::Cow::Owned(crate::color::expand_color_literals(inner))
+                } else {
+                    std::borrow::Cow::Borrowed(inner)
+                };
                 serde_json::from_str(expanded.trim())
-                    .map_err(|e| self.json_value_err(brace_pos, &inner, &expanded, &e))
+                    .map_err(|e| self.json_value_err(brace_pos, inner, &expanded, &e))
             }
             _ => Err(self.err("expected attribute value")),
         }
@@ -322,48 +378,47 @@ impl Scanner {
 
     /// Capture a `"…"` token verbatim (including quotes), honoring `\"` escapes,
     /// so it can be handed to `serde_json` as a JSON string literal.
-    fn json_string_token(&mut self) -> Result<String, FnxError> {
+    fn json_string_token(&mut self) -> Result<&'a str, FnxError> {
         let start = self.pos;
-        self.expect('"')?;
+        self.expect(b'"')?;
         loop {
             match self.bump() {
-                Some('\\') => {
+                Some(b'\\') => {
                     self.bump();
                 }
-                Some('"') => break,
+                Some(b'"') => break,
                 Some(_) => {}
                 None => return Err(self.err("unterminated string")),
             }
         }
-        Ok(self.chars[start..self.pos].iter().collect())
+        Ok(&self.source[start..self.pos])
     }
 
     /// Capture the text between a balanced `{ … }` (excluding the outer braces),
     /// tracking string literals so braces inside strings don't miscount.
-    fn braced(&mut self) -> Result<String, FnxError> {
-        self.expect('{')?;
+    fn braced(&mut self) -> Result<&'a str, FnxError> {
+        self.expect(b'{')?;
         let start = self.pos;
         let mut depth = 1usize;
         let mut in_str = false;
         while let Some(c) = self.bump() {
             if in_str {
                 match c {
-                    '\\' => {
+                    b'\\' => {
                         self.bump();
                     }
-                    '"' => in_str = false,
+                    b'"' => in_str = false,
                     _ => {}
                 }
                 continue;
             }
             match c {
-                '"' => in_str = true,
-                '{' => depth += 1,
-                '}' => {
+                b'"' => in_str = true,
+                b'{' => depth += 1,
+                b'}' => {
                     depth -= 1;
                     if depth == 0 {
-                        let inner: String = self.chars[start..self.pos - 1].iter().collect();
-                        return Ok(inner);
+                        return Ok(&self.source[start..self.pos - 1]);
                     }
                 }
                 _ => {}

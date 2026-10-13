@@ -262,6 +262,85 @@ pub fn write_project_tree_cached_with_sources_checked(
     write_project_tree_cached_impl(dir, doc, assets, cache, None, sources, Some(expected_disk))
 }
 
+pub(crate) fn write_project_artifacts_checked(
+    dir: &Path,
+    doc: &Doc,
+    artifact_files: &BTreeMap<PathBuf, Vec<u8>>,
+    expected_disk: &BTreeMap<PathBuf, Option<[u8; 32]>>,
+) -> Result<(WriteReport, BTreeMap<PathBuf, [u8; 32]>)> {
+    let syncs_before = SUCCESSFUL_PROJECT_SYNCS.get();
+    validate_expected_disk_paths(expected_disk)?;
+    let mut files = ProjectedFiles::new();
+    files.insert(
+        PathBuf::from(FANTA_JSON),
+        Arc::new(json_bytes(&serde_json::to_value(
+            ProjectManifest::for_doc(doc),
+        )?)?),
+    );
+    project_doc_singletons(&mut files, doc)?;
+    for (relative, bytes) in artifact_files {
+        if !expected_disk.contains_key(relative) || !is_generated_artifact(relative) {
+            return Err(FormatError::InvalidProjectTree(format!(
+                "incremental save has no reconciled artifact path {}",
+                relative.display()
+            )));
+        }
+        files.insert(relative.clone(), Arc::new(bytes.clone()));
+    }
+    if let Some(relative) = files
+        .keys()
+        .find(|relative| !expected_disk.contains_key(*relative))
+    {
+        return Err(FormatError::InvalidProjectTree(format!(
+            "incremental save has no reconciled file {}",
+            relative.display()
+        )));
+    }
+    let lock = project_lock(dir)?;
+    let guard = lock
+        .lock()
+        .map_err(|_| FormatError::InvalidProjectTree("project I/O lock is poisoned".to_owned()))?;
+    recover_project_transaction_locked(dir, true)?;
+    validate_expected_disk_content(dir, expected_disk)?;
+    for relative in files.keys() {
+        ensure_no_symlink_ancestors(dir, relative)?;
+    }
+    let keep = expected_disk.keys().map(PathBuf::as_path).collect();
+    if let Some(untracked) = stale_managed_files(dir, &keep)?.first() {
+        return Err(FormatError::InvalidProjectTree(format!(
+            "{} requires full project-tree reconciliation",
+            untracked.relative.display()
+        )));
+    }
+    let mut writes = Vec::new();
+    for (relative, bytes) in &files {
+        plan_write(dir, relative, bytes, &mut writes)?;
+    }
+    validate_expected_disk_content(dir, expected_disk)?;
+    let projected_hashes = files
+        .iter()
+        .map(|(relative, bytes)| (relative.clone(), Sha256::digest(bytes.as_slice()).into()))
+        .collect();
+    let mut report = WriteReport {
+        written: writes.iter().map(|write| write.relative.clone()).collect(),
+        written_hashes: writes
+            .iter()
+            .map(|write| (write.relative.clone(), write.new_hash))
+            .collect(),
+        ..WriteReport::default()
+    };
+    if writes.len() == 1 {
+        apply_single_change(dir, &writes, &[])?;
+    } else if !writes.is_empty() {
+        apply_project_transaction(dir, &writes, &[])?;
+    }
+    drop(guard);
+    crate::project::layout::ensure_project_editor_support(dir)?;
+    report.written.sort();
+    report.sync_count = SUCCESSFUL_PROJECT_SYNCS.get().wrapping_sub(syncs_before);
+    Ok((report, projected_hashes))
+}
+
 /// Apply live source and disk preconditions with a custom media registry.
 pub fn write_project_tree_cached_with_sources_checked_and_media_registry(
     dir: &Path,
@@ -1480,18 +1559,64 @@ fn validate_expected_disk_paths(expected_disk: &BTreeMap<PathBuf, Option<[u8; 32
     Ok(())
 }
 
-fn validate_expected_disk_content(
+pub(crate) fn validate_expected_disk_content(
     dir: &Path,
     expected_disk: &BTreeMap<PathBuf, Option<[u8; 32]>>,
 ) -> Result<()> {
-    for (relative, digest) in expected_disk {
+    const PARALLEL_MINIMUM_FILES: usize = 256;
+    const VALIDATION_WORKERS: usize = 4;
+
+    let validate = |relative: &Path, digest: &Option<[u8; 32]>| {
         let expected = digest
             .as_ref()
             .map(|digest| FileState::Regular(hash_hex(digest)))
             .unwrap_or(FileState::Missing);
-        validate_unchanged(dir, relative, &expected)?;
+        validate_unchanged(dir, relative, &expected)
+    };
+    if expected_disk.len() < PARALLEL_MINIMUM_FILES {
+        for (relative, digest) in expected_disk {
+            validate(relative, digest)?;
+        }
+        return Ok(());
     }
-    Ok(())
+
+    let entries: Vec<_> = expected_disk.iter().collect();
+    std::thread::scope(|scope| {
+        let mut workers = Vec::with_capacity(VALIDATION_WORKERS);
+        for chunk in entries.chunks(entries.len().div_ceil(VALIDATION_WORKERS)) {
+            let worker = std::thread::Builder::new().spawn_scoped(scope, move || {
+                for &(relative, digest) in chunk {
+                    validate(relative, digest)?;
+                }
+                Ok(())
+            });
+            workers.push((chunk, worker));
+        }
+        let mut first_error = None;
+        // Join every worker before returning; implicit scoped joins propagate
+        // panics, and completion order must not change the first sorted error.
+        for (chunk, worker) in workers {
+            let result = match worker {
+                Ok(worker) => worker.join().unwrap_or_else(|_| {
+                    Err(FormatError::InvalidProjectTree(format!(
+                        "disk validation worker panicked while checking {}",
+                        chunk
+                            .first()
+                            .map_or(dir, |(relative, _)| relative.as_path())
+                            .display()
+                    )))
+                }),
+                Err(error) => Err(FormatError::Io(error)),
+            };
+            if first_error.is_none() {
+                first_error = result.err();
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    })
 }
 
 fn stale_managed_files(dir: &Path, keep: &BTreeSet<&Path>) -> Result<Vec<PlannedRemoval>> {
@@ -2701,6 +2826,72 @@ mod tests {
             assert!(matches!(error, FormatError::InvalidProjectTree(_)));
             assert!(!directory.path().join(FANTA_JSON).exists());
         }
+    }
+
+    #[test]
+    fn parallel_disk_validation_checks_exact_bytes_missing_files_and_sorted_errors() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let original = b"original file content\n";
+        let original_hash: [u8; 32] = Sha256::digest(original).into();
+        let mut expected_disk = BTreeMap::new();
+        for position in 0..300 {
+            let relative = PathBuf::from(format!("pages/page-{position:04}/page.fnx"));
+            fs::create_dir_all(directory.path().join(format!("pages/page-{position:04}")))?;
+            fs::write(directory.path().join(&relative), original)?;
+            expected_disk.insert(relative, Some(original_hash));
+        }
+        let absent = PathBuf::from("pages/absent/page.fnx");
+        expected_disk.insert(absent.clone(), None);
+        validate_expected_disk_content(directory.path(), &expected_disk)?;
+
+        let first = PathBuf::from("pages/page-0023/page.fnx");
+        let last = PathBuf::from("pages/page-0241/page.fnx");
+        let mut external = original.to_vec();
+        if let Some(byte) = external.first_mut() {
+            *byte ^= 1;
+        }
+        for relative in [&first, &last] {
+            fs::write(directory.path().join(relative), &external)?;
+        }
+        let error = validate_expected_disk_content(directory.path(), &expected_disk)
+            .expect_err("same-size edits in separate chunks must fail");
+        assert!(error.to_string().contains(&first.display().to_string()));
+        assert!(!error.to_string().contains(&last.display().to_string()));
+        assert_eq!(fs::read(directory.path().join(&first))?, external);
+        assert_eq!(fs::read(directory.path().join(&last))?, external);
+
+        fs::remove_file(directory.path().join(&first))?;
+        let error = validate_expected_disk_content(directory.path(), &expected_disk)
+            .expect_err("an earlier deletion takes precedence over later corruption");
+        assert!(error.to_string().contains(&first.display().to_string()));
+        fs::write(directory.path().join(&first), original)?;
+        let error = validate_expected_disk_content(directory.path(), &expected_disk)
+            .expect_err("the later same-size edit remains detectable");
+        assert!(error.to_string().contains(&last.display().to_string()));
+        fs::write(directory.path().join(&last), original)?;
+        validate_expected_disk_content(directory.path(), &expected_disk)?;
+
+        fs::create_dir_all(directory.path().join("pages/absent"))?;
+        fs::write(directory.path().join(&absent), original)?;
+        let error = validate_expected_disk_content(directory.path(), &expected_disk)
+            .expect_err("a previously absent file cannot appear unnoticed");
+        assert!(error.to_string().contains(&absent.display().to_string()));
+        fs::remove_file(directory.path().join(&absent))?;
+
+        #[cfg(unix)]
+        {
+            fs::remove_file(directory.path().join(&first))?;
+            std::os::unix::fs::symlink(
+                directory.path().join(&last),
+                directory.path().join(&first),
+            )?;
+            let error = validate_expected_disk_content(directory.path(), &expected_disk)
+                .expect_err("an identical symlink target cannot replace a regular file");
+            assert!(error.to_string().contains(&first.display().to_string()));
+            fs::remove_file(directory.path().join(&first))?;
+            fs::write(directory.path().join(&first), original)?;
+        }
+        validate_expected_disk_content(directory.path(), &expected_disk)
     }
 
     #[test]

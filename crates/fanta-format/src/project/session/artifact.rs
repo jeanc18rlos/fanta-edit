@@ -26,6 +26,7 @@ use fanta_fnx::{
     artifact_file_names,
 };
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -786,9 +787,9 @@ impl ArtifactSession {
         let (ir, text) = if self.ir_stale {
             let ir = self.projected_source_ir(header.clone())?;
             let text = self.source.rebuild_tree(&self.ir, &ir)?.render();
-            (ir, text)
+            (Cow::Owned(ir), text)
         } else {
-            (self.ir.clone(), self.source.render())
+            (Cow::Borrowed(&self.ir), self.source.render())
         };
         let (fnx_name, ids_name, header_name) = file_names(self.kind);
         let mut files = Vec::new();
