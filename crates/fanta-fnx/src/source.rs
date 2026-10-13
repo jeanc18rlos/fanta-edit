@@ -10,7 +10,7 @@ use crate::api::FnxSidecar;
 use crate::convert::FnxError;
 use crate::ir::ArtifactIr;
 use crate::model::{FnxElement, SUGAR_TAGS};
-use crate::print::{render_attr, render_close_tag, render_open_tag};
+use crate::print::{render_attr, render_close_tag, render_open_tag_with_children};
 use crate::refs::RefTable;
 use crate::sugar::shape_sugar_spelling;
 use std::collections::BTreeMap;
@@ -39,6 +39,169 @@ pub struct FnxSourceMirror {
     /// `emit_names`. Shared via `Arc` so the owning session can rebuild one
     /// table on variable changes and hand every retained mirror the same one.
     refs: Arc<RefTable>,
+}
+
+/// Validate attribute JSON and check explicit identities and structural
+/// fingerprints without retaining the other node attributes. A false result
+/// requires normal sidecar reconciliation, including legacy fingerprints.
+pub fn sidecar_matches_source(source: &str, sidecar: &FnxSidecar) -> Result<bool, FnxError> {
+    let spans = SourceScanner::new(source).scan()?;
+    if spans.len() != sidecar.ids.len() {
+        return Ok(false);
+    }
+    let mut parents = Vec::<(usize, usize)>::new();
+    let mut identities = std::collections::BTreeSet::new();
+    for (position, (span, entry)) in spans.iter().zip(&sidecar.ids).enumerate() {
+        while parents
+            .last()
+            .is_some_and(|(_, close)| span.open.start >= *close)
+        {
+            parents.pop();
+        }
+        let parent = parents
+            .last()
+            .map(|(parent, _)| u32::try_from(*parent))
+            .transpose()
+            .map_err(|error| FnxError::Parse(error.to_string()))?;
+        let opening = source
+            .get(span.open.clone())
+            .ok_or_else(|| FnxError::Parse("invalid opening-tag span".into()))?;
+        let layout = OpenTagLayout::parse(opening)?;
+        let shape_sugar = matches!(layout.tag.as_str(), "Rect" | "Ellipse");
+        let canonical_tag = if shape_sugar {
+            "Vector"
+        } else {
+            layout.tag.as_str()
+        };
+        if crate::model::type_for_tag(canonical_tag).is_none()
+            || entry.tag.as_deref() != Some(canonical_tag)
+            || entry.parent_index != parent
+            || (layout.attrs.contains_key("transform")
+                && (layout.attrs.contains_key("x") || layout.attrs.contains_key("y")))
+        {
+            return Ok(false);
+        }
+        for attribute in layout.attrs.values() {
+            let value = opening
+                .get(attribute.value.clone())
+                .ok_or_else(|| FnxError::Parse("invalid attribute span".into()))?;
+            if let Some(value) = value
+                .strip_prefix('{')
+                .and_then(|value| value.strip_suffix('}'))
+            {
+                if value.contains("fnxColor") || value.contains('#') {
+                    let expanded = crate::color::expand_color_literals(value);
+                    serde_json::from_str::<ValidatedJson>(&expanded)
+                } else {
+                    serde_json::from_str::<ValidatedJson>(value)
+                }
+            } else {
+                serde_json::from_str::<ValidatedJson>(value)
+            }
+            .map_err(|error| FnxError::Parse(error.to_string()))?;
+        }
+        if shape_sugar {
+            // Shape desugaring leaves identities and structure unchanged, but
+            // rejects an authored path or dimensions that are not finite numbers.
+            if layout.attrs.contains_key("path") {
+                return Ok(false);
+            }
+            for key in ["width", "height"] {
+                let Some(attribute) = layout.attrs.get(key) else {
+                    return Ok(false);
+                };
+                let value = opening
+                    .get(attribute.value.clone())
+                    .ok_or_else(|| FnxError::Parse("invalid attribute span".into()))?;
+                let value = value
+                    .strip_prefix('{')
+                    .and_then(|value| value.strip_suffix('}'))
+                    .unwrap_or(value);
+                if !serde_json::from_str::<f64>(value).is_ok_and(f64::is_finite) {
+                    return Ok(false);
+                }
+            }
+        }
+        let string_attribute = |key: &str| -> Result<Option<String>, FnxError> {
+            let Some(attribute) = layout.attrs.get(key) else {
+                return Ok(None);
+            };
+            let value = opening
+                .get(attribute.value.clone())
+                .ok_or_else(|| FnxError::Parse("invalid attribute span".into()))?;
+            let value = value
+                .strip_prefix('{')
+                .and_then(|value| value.strip_suffix('}'))
+                .unwrap_or(value);
+            serde_json::from_str::<String>(value)
+                .map(Some)
+                .map_err(|error| FnxError::Parse(error.to_string()))
+        };
+        if string_attribute("id")?.as_deref() != Some(entry.id.as_str())
+            || string_attribute("name")? != entry.name
+            || !identities.insert(entry.id.as_str())
+        {
+            return Ok(false);
+        }
+        if let Some(close) = &span.close {
+            parents.push((position, close.start));
+        }
+    }
+    Ok(true)
+}
+
+struct ValidatedJson;
+
+impl<'de> serde::Deserialize<'de> for ValidatedJson {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // IgnoredAny skips numeric range and string decoding checks. Use the
+        // same scalar parsing as Value without retaining arrays or objects.
+        deserializer.deserialize_any(Self)
+    }
+}
+
+impl<'de> serde::de::Visitor<'de> for ValidatedJson {
+    type Value = Self;
+
+    fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, _value: bool) -> Result<Self, E> {
+        Ok(Self)
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, _value: i64) -> Result<Self, E> {
+        Ok(Self)
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, _value: u64) -> Result<Self, E> {
+        Ok(Self)
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, _value: f64) -> Result<Self, E> {
+        Ok(Self)
+    }
+
+    fn visit_str<E: serde::de::Error>(self, _value: &str) -> Result<Self, E> {
+        Ok(Self)
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self, E> {
+        Ok(Self)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut sequence: A) -> Result<Self, A::Error> {
+        while sequence.next_element::<Self>()?.is_some() {}
+        Ok(Self)
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self, A::Error> {
+        while map.next_key::<Self>()?.is_some() {
+            map.next_value::<Self>()?;
+        }
+        Ok(Self)
+    }
 }
 
 impl FnxSourceMirror {
@@ -136,8 +299,7 @@ impl FnxSourceMirror {
     /// table opted into `emit_names` — mirroring what the canonical printer
     /// would emit, so a patched tag never regresses a `$path`/name spelling
     /// back to a raw ULID.
-    fn ref_shaped(&self, element: &FnxElement) -> FnxElement {
-        let mut shaped = element.clone();
+    fn ref_shaped(&self, mut shaped: FnxElement) -> FnxElement {
         if self.refs.emit_names() {
             crate::refs::sugar_element(&mut shaped, &self.refs);
         }
@@ -303,8 +465,8 @@ impl FnxSourceMirror {
         // A full-tag reprint uses canonical attribute spelling, but reference
         // spellings still re-sugar (names / `$paths`) so a fallback reprint of
         // an instance keeps the readable form the printer would emit.
-        let element = self.ref_shaped(element);
-        let open = render_open_tag(&element);
+        let element = self.ref_shaped(opening_tag_element(element));
+        let open = render_open_tag_with_children(&element, has_children);
         let mut changed = self.pieces[node.open] != open;
         self.pieces[node.open] = open;
         if let Some(close_piece) = node.close {
@@ -345,6 +507,9 @@ impl FnxSourceMirror {
                 "node {id} changed source structure; an attribute patch is unsafe"
             )));
         }
+        if previous.attrs == next.attrs {
+            return Ok(false);
+        }
 
         let layout = OpenTagLayout::parse(&self.pieces[node.open])?;
         // The author spelled this node with shape sugar (`<Rect>`/`<Ellipse>`).
@@ -364,15 +529,15 @@ impl FnxSourceMirror {
                 _ => return self.patch_element(id, next),
             }
         } else {
-            (previous.clone(), next.clone())
+            (opening_tag_element(previous), opening_tag_element(next))
         };
         // Re-sugar reference spellings on BOTH sides before diffing: an
         // unchanged reference then compares equal in whichever spelling the
         // author used (no spurious edit), and a genuinely changed one is
         // rewritten in the printer's readable form — e.g. binding a new
         // variable prints its `$Collection/Name` path, not a raw ULID.
-        let previous = self.ref_shaped(&previous);
-        let next = self.ref_shaped(&next);
+        let previous = self.ref_shaped(previous);
+        let next = self.ref_shaped(next);
         let opening = &self.pieces[node.open];
         let previous = source_shaped(previous, &layout);
         let next = source_shaped(next, &layout);
@@ -486,6 +651,16 @@ impl OpenTagLayout {
                 (None, _) => return Err(scanner.error("unterminated opening tag")),
             }
         }
+    }
+}
+
+fn opening_tag_element(element: &FnxElement) -> FnxElement {
+    // Each child owns a separate source span. Tag shaping must not repeatedly
+    // clone or traverse their subtrees while rebuilding a parent tag.
+    FnxElement {
+        tag: element.tag.clone(),
+        attrs: element.attrs.clone(),
+        children: Vec::new(),
     }
 }
 
@@ -622,10 +797,6 @@ impl<'a> StructuralSourceBuilder<'a> {
             }
         }
 
-        let mut shaped = element.clone();
-        crate::sugar::sugar_shapes(&mut shaped);
-        crate::sugar::sugar_transform(&mut shaped);
-        crate::refs::sugar_refs(&mut shaped, self.refs);
         let reusable = old_position.filter(|position| {
             let old_element = self.previous_elements[*position].0;
             old_element.tag == element.tag
@@ -635,7 +806,18 @@ impl<'a> StructuralSourceBuilder<'a> {
             let span = &self.spans[position];
             out.push_str(&self.source[span.open.clone()]);
         } else {
-            out.push_str(&render_open_tag(&shaped));
+            let mut shaped = opening_tag_element(element);
+            // Only childless vectors qualify for shape sugar. Shallow tag
+            // shaping must preserve the original node's eligibility.
+            if element.children.is_empty() {
+                crate::sugar::sugar_shapes(&mut shaped);
+            }
+            crate::sugar::sugar_transform(&mut shaped);
+            crate::refs::sugar_refs(&mut shaped, self.refs);
+            out.push_str(&render_open_tag_with_children(
+                &shaped,
+                !element.children.is_empty(),
+            ));
         }
         if element.children.is_empty() {
             return Ok(());
@@ -675,12 +857,12 @@ impl<'a> StructuralSourceBuilder<'a> {
             if self.previous_elements[position].0.tag == element.tag {
                 out.push_str(&self.source[close.clone()]);
             } else {
-                out.push_str(&render_close_tag(&shaped));
+                out.push_str(&render_close_tag(element));
             }
         } else {
             out.push('\n');
             out.push_str(&"  ".repeat(depth));
-            out.push_str(&render_close_tag(&shaped));
+            out.push_str(&render_close_tag(element));
         }
         Ok(())
     }
@@ -940,6 +1122,127 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_witness_checks_full_json_without_retaining_node_payloads() {
+        let source = r##"<Frame id="root" name="Root" x={12.5} background={{"color": fnxColor("#FFFFFF"), "kind": "solid"}}><Text id={"child"} name="Label" content="héllo" future_hint={{"segments": [[1, 2.5, -3e2]], "quoted": "a\"b", "enabled": true, "empty": null}} /></Frame>"##;
+        assert!(parse_doc(source).is_ok());
+        assert!(sidecar_matches_source(source, &sidecar()).expect("coherent modern source"));
+        assert_eq!(
+            crate::reconcile_sidecar(source, &sidecar(), || "unexpected".into())
+                .expect("existing reconciliation"),
+            sidecar()
+        );
+    }
+
+    #[test]
+    fn sidecar_witness_rejects_stale_identity_and_structural_fingerprints() {
+        let source = r#"<Frame id="root" name="Root"><Text id="child" name="Label" /></Frame>"#;
+        let mut stale = sidecar();
+        stale.ids[0].id = "other".into();
+        assert!(!sidecar_matches_source(source, &stale).expect("stale root"));
+        let mut stale = sidecar();
+        stale.ids[1].id = "other".into();
+        assert!(!sidecar_matches_source(source, &stale).expect("stale descendant"));
+        let mut stale = sidecar();
+        stale.ids[1].parent_index = None;
+        assert!(!sidecar_matches_source(source, &stale).expect("stale parent"));
+        let mut stale = sidecar();
+        stale.ids[1].name = Some("Previous".into());
+        assert!(!sidecar_matches_source(source, &stale).expect("stale name"));
+        let mut stale = sidecar();
+        stale.ids[1].tag = None;
+        assert!(!sidecar_matches_source(source, &stale).expect("legacy fingerprint"));
+        let mut stale = sidecar();
+        stale.ids.swap(0, 1);
+        assert!(!sidecar_matches_source(source, &stale).expect("stale order"));
+        let mut stale = sidecar();
+        stale.ids.pop();
+        assert!(!sidecar_matches_source(source, &stale).expect("missing entry"));
+        assert!(
+            !sidecar_matches_source(&source.replace(" id=\"child\"", ""), &sidecar())
+                .expect("legacy source uses normal reconciliation")
+        );
+        let reparented = r#"<Frame id="root" name="Root"><Text id="child" name="Label"><Text id="grandchild" name="Nested" /></Text></Frame>"#;
+        let mut stale = sidecar();
+        stale.ids.push(IdEntry {
+            id: "grandchild".into(),
+            index: Value::from(2.0),
+            tag: Some("Text".into()),
+            name: Some("Nested".into()),
+            parent_index: Some(0),
+        });
+        assert!(!sidecar_matches_source(reparented, &stale).expect("reparented source"));
+    }
+
+    #[test]
+    fn sidecar_witness_preserves_invalid_attribute_errors() {
+        for attribute in [
+            "opacity={oops}",
+            "local_size={[broken]}",
+            r#"future_hint="invalid\q""#,
+            "future_hint={1e400}",
+            r#"future_hint={{"nested": [1e400]}}"#,
+            r##"background={{"color": fnxColor("#INVALID")}}"##,
+            "x={1} transform={[1, 0, 0, 1, 0, 0]}",
+        ] {
+            let source = format!(
+                "<Frame id=\"root\" name=\"Root\" {attribute}><Text id=\"child\" name=\"Label\" /></Frame>"
+            );
+            assert!(parse_doc(&source).is_err(), "{attribute}");
+            assert!(
+                !matches!(sidecar_matches_source(&source, &sidecar()), Ok(true)),
+                "{attribute}"
+            );
+        }
+    }
+
+    #[test]
+    fn sidecar_witness_checks_canonical_shape_fingerprints_and_dimensions() {
+        let mut canonical = sidecar();
+        canonical.ids[1].tag = Some("Vector".into());
+        for tag in ["Rect", "Ellipse"] {
+            for dimensions in [
+                "width={10} height={20}",
+                "width={0} height={0}",
+                "width={-10} height={-20}",
+                "width={1e308} height={1e308}",
+            ] {
+                let source = format!(
+                    "<Frame id=\"root\" name=\"Root\"><{tag} id=\"child\" name=\"Label\" {dimensions} /></Frame>"
+                );
+                assert!(parse_doc(&source).is_ok(), "{tag} {dimensions}");
+                assert!(
+                    sidecar_matches_source(&source, &canonical).expect("canonical shape"),
+                    "{tag} {dimensions}"
+                );
+                assert_eq!(
+                    crate::reconcile_sidecar(&source, &canonical, || "unexpected".into())
+                        .expect("existing reconciliation"),
+                    canonical
+                );
+            }
+            for attributes in [
+                "width={10}",
+                "height={20}",
+                r#"width={"10"} height={20}"#,
+                r#"width={10} height="20""#,
+                "width={10} height={null}",
+                "width={1e400} height={20}",
+                "width={10} height={20} path={null}",
+                "width={10} height={20} x={1} transform={[1, 0, 0, 1, 0, 0]}",
+            ] {
+                let source = format!(
+                    "<Frame id=\"root\" name=\"Root\"><{tag} id=\"child\" name=\"Label\" {attributes} /></Frame>"
+                );
+                assert!(parse_doc(&source).is_err(), "{tag} {attributes}");
+                assert!(
+                    !matches!(sidecar_matches_source(&source, &canonical), Ok(true)),
+                    "{tag} {attributes}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn patching_one_element_preserves_all_unrelated_source_bytes() {
         let source = "// custom wrapper stays\nexport default () => (\n  <Frame   name=\"Root\">\n\t<Text name=\"Label\" content=\"héllo\" />\n  </Frame>\n);\n";
         let mut mirror = FnxSourceMirror::from_source(source, &sidecar()).unwrap();
@@ -959,6 +1262,101 @@ mod tests {
         assert!(patched.contains("<Frame   name=\"Root\">"));
         assert!(patched.contains("<Text name=\"Label\" content=\"changed\" />"));
         assert_eq!(patched.matches("<Text").count(), 1);
+    }
+
+    #[test]
+    fn parent_tag_patches_shape_only_their_own_attributes() {
+        let mut root = parse_doc(
+            r#"<Rect id="root" name="Root" width={10} height={20}><Text id="child" name="Label" content="Keep this child" /></Rect>"#,
+        )
+        .expect("canonical vector parent");
+        let source = crate::print_doc("Parent", &root);
+        let mut identities = sidecar();
+        identities.ids[0].tag = Some("Vector".into());
+        let mut mirror = FnxSourceMirror::from_source(&source, &identities).expect("mirror");
+        let original_child = root.children.first().expect("child").clone();
+        let tag = opening_tag_element(&root);
+        assert_eq!(tag.attrs, root.attrs);
+        assert!(
+            tag.children.is_empty(),
+            "tag shaping must not copy descendants"
+        );
+
+        let previous = root.clone();
+        root.attrs.insert("name".into(), Value::from("Renamed"));
+        assert!(
+            mirror
+                .patch_element_delta("root", &previous, &root)
+                .expect("parent attribute delta")
+        );
+        root.attrs.insert("opacity".into(), Value::from(0.5));
+        assert!(
+            mirror
+                .patch_element("root", &root)
+                .expect("parent tag patch")
+        );
+        let patched = mirror.render();
+        assert!(patched.contains("<Vector ") && patched.contains("</Vector>"));
+        assert!(!patched.contains("<Rect "));
+        let parsed = parse_doc(&patched).expect("preserved parent form");
+        assert_eq!(parsed, root);
+        assert_eq!(parsed.children.first(), Some(&original_child));
+    }
+
+    #[test]
+    fn structural_parent_insertions_preserve_child_presence_and_vector_tag() {
+        for populated in [false, true] {
+            let source = if populated {
+                r#"<Frame id="root" name="Root"><Text id="child" name="Label" /></Frame>"#
+            } else {
+                r#"<Frame id="root" name="Root" />"#
+            };
+            let mut identities = sidecar();
+            if !populated {
+                identities.ids.pop();
+            }
+            let previous = ArtifactIr::from_source(ArtifactKind::Page, "Root", source, identities)
+                .expect("previous IR");
+            let mut next = previous.clone();
+            let mut root = next.root().clone();
+            root.children.push(
+                parse_doc(
+                    r#"<Rect id="vector" name="Parent" width={10} height={20}><Text id="nested" name="Nested" /></Rect>"#,
+                )
+                .expect("inserted vector parent"),
+            );
+            let mut identities = next.sidecar().clone();
+            let vector_position = u32::try_from(identities.ids.len()).expect("small fixture");
+            identities.ids.extend([
+                IdEntry {
+                    id: "vector".into(),
+                    index: Value::from(2.0),
+                    tag: Some("Vector".into()),
+                    name: Some("Parent".into()),
+                    parent_index: Some(0),
+                },
+                IdEntry {
+                    id: "nested".into(),
+                    index: Value::from(1.0),
+                    tag: Some("Text".into()),
+                    name: Some("Nested".into()),
+                    parent_index: Some(vector_position),
+                },
+            ]);
+            next.replace_structure(root, identities).expect("next IR");
+            let mirror = FnxSourceMirror::from_source(source, previous.sidecar()).expect("mirror");
+            let rebuilt = mirror
+                .rebuild_tree(&previous, &next)
+                .expect("insert parent")
+                .render();
+            assert!(rebuilt.contains("<Vector ") && rebuilt.contains("</Vector>"));
+            assert!(!rebuilt.contains("<Rect "));
+            assert!(rebuilt.contains("</Frame>"));
+            assert_eq!(
+                parse_doc(&rebuilt).expect("preserved parent forms"),
+                *next.root()
+            );
+        }
     }
 
     #[test]

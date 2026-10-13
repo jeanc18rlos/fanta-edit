@@ -669,7 +669,27 @@ impl WorkspaceSession {
                 };
                 let text = std::str::from_utf8(&source)
                     .map_err(|error| SessionError::other(error.to_string()))?;
-                let sidecar = crate::project::read::persisted_fnx_sidecar(text, ids.as_deref())?;
+                let coherent_sidecar = ids
+                    .as_deref()
+                    .and_then(|bytes| serde_json::from_slice::<fanta_fnx::FnxSidecar>(bytes).ok())
+                    .filter(|sidecar| {
+                        sidecar.ids.iter().all(|entry| {
+                            id_from_key::<fanta_doc::NodeId>(&entry.id).is_ok()
+                                && (entry.index.is_null() || entry.index.is_number())
+                        }) && sidecar
+                            .root_parent
+                            .as_ref()
+                            .is_none_or(|parent| id_from_key::<fanta_doc::NodeId>(parent).is_ok())
+                    })
+                    .filter(|sidecar| {
+                        // Legacy identities, stale fingerprints and syntax the
+                        // scanner cannot recognize need the existing repair path.
+                        matches!(fanta_fnx::sidecar_matches_source(text, sidecar), Ok(true))
+                    });
+                let sidecar = match coherent_sidecar {
+                    Some(sidecar) => sidecar,
+                    None => crate::project::read::persisted_fnx_sidecar(text, ids.as_deref())?,
+                };
                 let ids = crate::project::layout::json_bytes(
                     &serde_json::to_value(sidecar)
                         .map_err(|error| SessionError::other(error.to_string()))?,

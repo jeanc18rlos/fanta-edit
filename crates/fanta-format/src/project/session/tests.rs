@@ -92,6 +92,77 @@ fn missing_legacy_sidecar_does_not_assign_new_node_identities() {
 }
 
 #[test]
+fn unopened_source_overrides_repair_stale_modern_identities_and_keep_authored_bytes() {
+    let (directory, page) = page_fixture();
+    let source_path = crate::locate_page_source(directory.path(), page).expect("source");
+    let sidecar_path = source_path.with_file_name("page.ids.json");
+    let original = std::fs::read_to_string(&source_path).expect("source text");
+    let authored = format!("// Keep this note\n{original}");
+    std::fs::write(&source_path, &authored).expect("authored source");
+    let original_ids: fanta_fnx::FnxSidecar =
+        serde_json::from_slice(&std::fs::read(&sidecar_path).expect("sidecar"))
+            .expect("sidecar JSON");
+    for variant in 0..4 {
+        let mut stale = original_ids.clone();
+        match variant {
+            0 => stale.ids.first_mut().expect("root").id = NodeId::new().0.to_string(),
+            1 => stale.ids.swap(0, 1),
+            2 => {
+                stale.ids.pop();
+            }
+            _ => stale.ids.get_mut(1).expect("child").parent_index = None,
+        }
+        std::fs::write(
+            &sidecar_path,
+            serde_json::to_vec(&stale).expect("stale sidecar JSON"),
+        )
+        .expect("stale sidecar");
+        let (document, _) = crate::read_project_tree(directory.path()).expect("recover source");
+        let mut workspace = WorkspaceSession::open(directory.path()).expect("index stale sidecar");
+        let design_dir = workspace.artifacts[&ArtifactId::Page(page)]
+            .design_dir
+            .clone();
+        let overrides = workspace
+            .validated_source_overrides_for_document(&document)
+            .expect("repair unopened sidecar");
+        assert!(workspace.open.is_empty());
+        assert_eq!(overrides[&design_dir].0, authored.as_bytes());
+        let actual: fanta_fnx::FnxSidecar =
+            serde_json::from_slice(&overrides[&design_dir].1).expect("repaired sidecar");
+        let expected = crate::project::read::persisted_fnx_sidecar(
+            &authored,
+            Some(&serde_json::to_vec(&stale).expect("stale sidecar")),
+        )
+        .expect("existing repair path");
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn unopened_source_overrides_reject_invalid_nonidentity_attributes() {
+    let (directory, page) = page_fixture();
+    let source_path = crate::locate_page_source(directory.path(), page).expect("source");
+    let (document, _) = crate::read_project_tree(directory.path()).expect("original document");
+    let original = std::fs::read_to_string(&source_path).expect("source text");
+    for attribute in [
+        "future_hint={not_json}",
+        "future_hint={1e400}",
+        r#"future_hint="invalid\q""#,
+        "transform={[1, 0, 0, 1, 0, 0]}",
+    ] {
+        let invalid = original.replacen("<Frame ", &format!("<Frame {attribute} "), 1);
+        std::fs::write(&source_path, invalid).expect("invalid source");
+        let mut workspace = WorkspaceSession::open(directory.path()).expect("index invalid source");
+        assert!(
+            workspace
+                .validated_source_overrides_for_document(&document)
+                .is_err(),
+            "{attribute}"
+        );
+    }
+}
+
+#[test]
 fn valid_legacy_sidecar_keeps_identity_and_order() {
     let (directory, page) = page_fixture();
     let (original, _) = crate::read_project_tree(directory.path()).expect("original project");

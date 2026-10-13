@@ -72,6 +72,10 @@ fn print_element(el: &FnxElement, depth: usize, out: &mut String) {
 }
 
 pub(crate) fn render_open_tag(el: &FnxElement) -> String {
+    render_open_tag_with_children(el, !el.children.is_empty())
+}
+
+pub(crate) fn render_open_tag_with_children(el: &FnxElement, has_children: bool) -> String {
     let mut out = String::new();
     out.push('<');
     out.push_str(&el.tag);
@@ -81,10 +85,10 @@ pub(crate) fn render_open_tag(el: &FnxElement) -> String {
         out.push('=');
         out.push_str(&render_attr(value));
     }
-    if el.children.is_empty() {
-        out.push_str(" />");
-    } else {
+    if has_children {
         out.push('>');
+    } else {
+        out.push_str(" />");
     }
     out
 }
