@@ -132,7 +132,6 @@ jobs:
           MACOS_INSTALLER_CERTIFICATE: ${{ env.FANTA_APP_STORE == 'true' && secrets.MACOS_APP_STORE_INSTALLER_CERTIFICATE || '' }}
           MACOS_INSTALLER_CERTIFICATE_PASSWORD: ${{ env.FANTA_APP_STORE == 'true' && secrets.MACOS_APP_STORE_INSTALLER_CERTIFICATE_PASSWORD || '' }}
           MACOS_APP_STORE_PROFILE: ${{ env.FANTA_APP_STORE == 'true' && secrets.MACOS_APP_STORE_PROFILE || '' }}
-          FANTA_REVENUECAT_PUBLIC_API_KEY: ${{ env.FANTA_APP_STORE == 'true' && secrets.FANTA_REVENUECAT_PUBLIC_API_KEY || '' }}
           MACOS_APP_STORE_SIGNING_IDENTITY: ${{ secrets.MACOS_APP_STORE_SIGNING_IDENTITY }}
           MACOS_APP_STORE_INSTALLER_IDENTITY: ${{ secrets.MACOS_APP_STORE_INSTALLER_IDENTITY }}
           FANTA_APP_STORE_VERSION: '1.0'
@@ -190,7 +189,9 @@ jobs:
           test ! -e "$app_path/Contents/MacOS/cli"
           test ! -e "$app_path/Contents/MacOS/git"
           test ! -e "$app_path/Contents/Resources/git"
-          test -s "$app_path/Contents/Resources/RevenueCat-LICENSE.txt"
+          test ! -e "$app_path/Contents/Frameworks/libFantaRevenueCatBridge.dylib"
+          test ! -e "$app_path/Contents/Resources/RevenueCat_RevenueCat.bundle"
+          test ! -e "$app_path/Contents/Resources/RevenueCat-LICENSE.txt"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_path/Contents/Info.plist")" = dev.fanta.Fanta
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_path/Contents/Info.plist")" = 1.0
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_path/Contents/Info.plist")" = "$EXPECTED_BUILD_NUMBER"

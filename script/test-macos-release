@@ -168,10 +168,9 @@ esac
                                 cwd=self.root, env={**self.environment, 'FANTA_RELEASE_CHANNEL': 'stable',
                                 'FANTA_APP_STORE_VERSION': '1.4', 'FANTA_APP_STORE_BUILD_NUMBER': '47.2'},
                                 capture_output=True, text=True)
-        self.assertEqual(result.returncode, 97 if store else 99, result.stdout + result.stderr)
+        self.assertEqual(result.returncode, 99, result.stdout + result.stderr)
         self.assertEqual(self.log.read_text().splitlines(),
-                         ['cargo', 'rustc', 'licenses', 'rustup', 'cargo', 'cargo',
-                          'store-boundary' if store else 'security'])
+                         ['cargo', 'rustc', 'licenses', 'rustup', 'cargo', 'cargo', 'security'])
         self.assertEqual(manifest.read_bytes(), original_manifest)
         self.assertFalse(manifest.with_suffix('.toml.backup').exists())
         app = self.root / 'target/aarch64-apple-darwin/release/app-store-dev/Fanta.app' if store else self.app
