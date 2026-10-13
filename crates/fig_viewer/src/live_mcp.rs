@@ -670,10 +670,12 @@ impl McpServerTool for ReportActivityTool {
 
 /// Overview of the open Fanta design document: project name and root, pages
 /// (index, name, root id, node counts, `.fnx` source path), the active page
-/// and its content bounds, components, current selection and its bounds,
+/// and its content bounds, a bounded component preview, current selection and its bounds,
 /// viewport, whether the canvas is editable right now, and short `hints`.
 /// Pass `empty_space: [width, height]` to also get a free `{x, y}` on the
 /// page for a new top-level frame of that size.
+/// When `more_components` is true, use `get_design_system` with `offset` and
+/// `limit` to discover the remaining components.
 #[derive(Debug, Default, Clone, Serialize, Deserialize, JsonSchema)]
 struct GetEditorStateArgs {
     /// `[width, height]` of a box to find room for; the result then carries
@@ -751,7 +753,10 @@ impl McpServerTool for GetGuidelinesTool {
 }
 
 /// Inspect reusable component properties/variant sets, variable collections, modes,
-/// paginated typed token values, and optional selected-node bindings. Read before creating a design system.
+/// paginated components, variant sets and typed token values, and optional
+/// selected-node bindings. Use offset and limit (default 100, maximum 200),
+/// advancing offset while the corresponding more_* flag is true.
+/// Read before creating a design system.
 #[derive(Clone)]
 struct GetDesignSystemTool;
 
@@ -766,7 +771,7 @@ impl McpServerTool for GetDesignSystemTool {
         let value = with_surface(cx, move |surface, cx| surface.design_system(input.0, cx))?;
         bounded_text_response(
             value,
-            "Choose a collection and lower limit; use offset for subsequent variable pages.",
+            "Lower limit; use offset for subsequent component, variant-set and variable pages. Choose a collection to filter variables.",
         )
     }
 }

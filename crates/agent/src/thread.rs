@@ -3377,12 +3377,8 @@ impl Thread {
             };
             if project.is_local()
                 && let Some(surface) = design_surface::active(cx)
-                && let Some(state) = surface.state(cx).log_err()
-                && let Some(root) = state
-                    .get("project_root")
-                    .and_then(serde_json::Value::as_str)
+                && let Some(root) = surface.project_root(cx).log_err().flatten()
             {
-                let root = PathBuf::from(root);
                 if root.is_absolute()
                     && thread
                         .project
@@ -3422,14 +3418,9 @@ impl Thread {
             let Some(surface) = design_surface::active(cx) else {
                 return Ok(None);
             };
-            let state = surface.state(cx)?;
-            let Some(project_root) = state
-                .get("project_root")
-                .and_then(serde_json::Value::as_str)
-            else {
+            let Some(project_root) = surface.project_root(cx)? else {
                 return Ok(None);
             };
-            let project_root = PathBuf::from(project_root);
             anyhow::ensure!(
                 project_root.is_absolute(),
                 "the active Fanta project root is not an absolute path"
@@ -7638,7 +7629,9 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_fanta_specs_load_each_turn_from_the_active_project(cx: &mut TestAppContext) {
+    async fn test_fanta_specs_load_each_turn_without_reading_design_overview(
+        cx: &mut TestAppContext,
+    ) {
         let (thread, _) = setup_thread_for_test(cx).await;
         let filesystem = fs::FakeFs::new(cx.executor());
         filesystem
@@ -7661,7 +7654,7 @@ mod tests {
         .await;
         let model = Arc::new(FakeLanguageModel::default());
         cx.update(|cx| {
-            design_surface::register(Rc::new(TestDesignSurface), cx);
+            design_surface::register(Rc::new(TestDesignSurface::RootOnly), cx);
             thread.update(cx, |thread, cx| {
                 thread.project = project;
                 thread.set_model(model.clone(), cx);
@@ -7774,10 +7767,20 @@ mod tests {
         );
     }
 
-    struct TestDesignSurface;
+    enum TestDesignSurface {
+        Overview,
+        RootOnly,
+    }
 
     impl design_surface::DesignSurface for TestDesignSurface {
+        fn project_root(&self, _: &mut App) -> Result<Option<PathBuf>> {
+            Ok(Some(PathBuf::from("/design")))
+        }
+
         fn state(&self, _: &mut App) -> Result<serde_json::Value> {
+            if matches!(self, Self::RootOnly) {
+                anyhow::bail!("prompt preparation must not read the design overview");
+            }
             Ok(json!({"overview": true, "project_root": "/design"}))
         }
 
@@ -7834,7 +7837,7 @@ mod tests {
     }
 
     #[gpui::test]
-    async fn test_design_progress_creates_branch_and_preserves_user_changes(
+    async fn test_design_progress_creates_branch_without_reading_design_overview(
         cx: &mut TestAppContext,
     ) {
         let (thread, _) = setup_thread_for_test(cx).await;
@@ -7854,7 +7857,7 @@ mod tests {
         );
         let project = Project::test(filesystem.clone(), [Path::new("/design")], cx).await;
         cx.update(|cx| {
-            design_surface::register(Rc::new(TestDesignSurface), cx);
+            design_surface::register(Rc::new(TestDesignSurface::RootOnly), cx);
             thread.update(cx, |thread, cx| {
                 thread.project = project;
                 thread.set_profile(AgentProfileId(builtin_profiles::FULL_ACCESS.into()), cx);
@@ -7940,7 +7943,7 @@ mod tests {
             .await;
         let project = Project::test(filesystem.clone(), [Path::new("/design")], cx).await;
         cx.update(|cx| {
-            design_surface::register(Rc::new(TestDesignSurface), cx);
+            design_surface::register(Rc::new(TestDesignSurface::Overview), cx);
             thread.update(cx, |thread, _| thread.project = project);
         });
         for profile in [builtin_profiles::PLAN, builtin_profiles::REVIEW] {
@@ -8001,7 +8004,7 @@ mod tests {
         )
         .await;
         cx.update(|cx| {
-            design_surface::register(Rc::new(TestDesignSurface), cx);
+            design_surface::register(Rc::new(TestDesignSurface::Overview), cx);
             thread.update(cx, |thread, cx| {
                 thread.project = project;
                 thread.set_profile(AgentProfileId(builtin_profiles::FULL_ACCESS.into()), cx);
@@ -8092,7 +8095,7 @@ mod tests {
                 .repository_and_path_for_project_path(&path, cx)
                 .expect("unrelated repository");
             repository.update(cx, |repository, cx| repository.set_as_active_repository(cx));
-            design_surface::register(Rc::new(TestDesignSurface), cx);
+            design_surface::register(Rc::new(TestDesignSurface::Overview), cx);
             thread.update(cx, |thread, cx| {
                 thread.project = project;
                 thread.set_profile(AgentProfileId(builtin_profiles::FULL_ACCESS.into()), cx);
@@ -8134,7 +8137,7 @@ mod tests {
         let (thread, _) = setup_thread_for_test(cx).await;
         let model = Arc::new(FakeLanguageModel::default());
         cx.update(|cx| {
-            design_surface::register(Rc::new(TestDesignSurface), cx);
+            design_surface::register(Rc::new(TestDesignSurface::Overview), cx);
             thread.update(cx, |thread, cx| thread.set_model(model.clone(), cx));
         });
 
@@ -8218,7 +8221,7 @@ mod tests {
     #[gpui::test]
     async fn test_plan_blocks_comment_replies_and_review_allows_them(cx: &mut TestAppContext) {
         let (thread, _) = setup_thread_for_test(cx).await;
-        cx.update(|cx| design_surface::register(Rc::new(TestDesignSurface), cx));
+        cx.update(|cx| design_surface::register(Rc::new(TestDesignSurface::Overview), cx));
         for (profile, reply_allowed) in [
             (builtin_profiles::PLAN, false),
             (builtin_profiles::REVIEW, true),
@@ -8455,7 +8458,7 @@ mod tests {
     ) {
         let (thread, _) = setup_thread_for_test(cx).await;
         let model = Arc::new(FakeLanguageModel::default());
-        cx.update(|cx| design_surface::register(Rc::new(TestDesignSurface), cx));
+        cx.update(|cx| design_surface::register(Rc::new(TestDesignSurface::Overview), cx));
         let events = thread
             .update(cx, |thread, cx| {
                 thread.set_profile(AgentProfileId(builtin_profiles::PLAN.into()), cx);
@@ -9303,7 +9306,7 @@ mod tests {
     async fn test_output_limit_budget_resets_after_complete_tool_batch(cx: &mut TestAppContext) {
         let (thread, _) = setup_thread_for_test(cx).await;
         let model = Arc::new(FakeLanguageModel::default());
-        cx.update(|cx| design_surface::register(Rc::new(TestDesignSurface), cx));
+        cx.update(|cx| design_surface::register(Rc::new(TestDesignSurface::Overview), cx));
         let _events = thread
             .update(cx, |thread, cx| {
                 thread.set_profile(AgentProfileId(builtin_profiles::PLAN.into()), cx);
@@ -9363,7 +9366,7 @@ mod tests {
     ) {
         let (thread, _) = setup_thread_for_test(cx).await;
         let model = Arc::new(FakeLanguageModel::default());
-        cx.update(|cx| design_surface::register(Rc::new(TestDesignSurface), cx));
+        cx.update(|cx| design_surface::register(Rc::new(TestDesignSurface::Overview), cx));
         let mut events = thread
             .update(cx, |thread, cx| {
                 thread.set_profile(AgentProfileId(builtin_profiles::PLAN.into()), cx);

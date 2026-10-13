@@ -189,6 +189,11 @@ jobs:
       - name: Test the agent panel toggle
         run: cargo test --locked -p agent_ui --lib test_toggle_closes_visible_agent_panel_when_center_pane_has_focus
 
+      - name: Test design prompt preparation
+        run: |
+          cargo test --locked -p agent --lib test_fanta_specs
+          cargo test --locked -p agent --lib test_design_progress
+
       - name: Test sidebar behavior and project ownership
         run: cargo test --locked -p sidebar --lib
 
