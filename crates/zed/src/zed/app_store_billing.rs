@@ -8,7 +8,6 @@ use settings::Settings as _;
 use std::sync::Arc;
 use workspace::with_active_or_new_workspace;
 
-const APPLE_SUBSCRIPTIONS_URL: &str = "https://apps.apple.com/account/subscriptions";
 pub(super) fn request_account_deletion(cx: &mut App) {
     with_active_or_new_workspace(cx, |_, window, cx| {
         let client = Client::global(cx);
@@ -35,7 +34,7 @@ async fn confirm_and_delete_account(
     let user = fetch_backend_user(&client, &token, &server_url).await?;
     let account = user.email.as_deref().unwrap_or(&user.id);
     let description = format!(
-        "Deleting {account} permanently removes your Fanta account, personal cloud designs and unused credits, and ends your access to shared organizations. This does not cancel an Apple subscription: Apple can keep charging you after your Fanta access ends. Cancel any Fanta subscription in your Apple Account first."
+        "Deleting {account} permanently removes your Fanta account, personal cloud designs and unused credits, and ends your access to shared organizations. Review and cancel any active subscription in billing before deleting your account."
     );
     let response = cx.update(|window, cx| {
         window.prompt(
@@ -49,7 +48,15 @@ async fn confirm_and_delete_account(
     match response.await? {
         0 => return Ok(()),
         1 => {
-            cx.update(|_, cx| cx.open_url(APPLE_SUBSCRIPTIONS_URL))?;
+            super::settings_billing::perform_billing_action(
+                fanta_gpui::billing::BillingAction::ManageSubscriptionRequested,
+                client,
+                token,
+                server_url,
+                fanta_gpui::billing::BillingUsageRange::Days30,
+                cx,
+            )
+            .await?;
             return Ok(());
         }
         2 => {}
@@ -84,7 +91,7 @@ async fn confirm_and_delete_account(
     show_message(
         cx,
         "Fanta account deleted",
-        "Your Fanta account was deleted. If you had an Apple subscription, cancel it in your Apple Account to stop future billing.",
+        "Your Fanta account was deleted.",
     )
     .await?;
     Ok(())
