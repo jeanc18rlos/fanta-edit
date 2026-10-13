@@ -8,7 +8,7 @@
 
 use crate::api::FnxSidecar;
 use crate::convert::FnxError;
-use crate::ir::ArtifactIr;
+use crate::ir::{ArtifactIr, PreparedStructuralPatch};
 use crate::model::{FnxElement, SUGAR_TAGS};
 use crate::print::{render_attr, render_close_tag, render_open_tag_with_children};
 use crate::refs::RefTable;
@@ -30,7 +30,8 @@ struct NodePieces {
 /// repeated canvas operations do not reprint the complete file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FnxSourceMirror {
-    pieces: Vec<String>,
+    // Candidate structures share untouched tags, including large vector paths.
+    pieces: Vec<Arc<str>>,
     nodes: BTreeMap<String, NodePieces>,
     /// The name↔id context this mirror re-sugars reference spellings with when
     /// a canvas patch reprints an attribute: a recolor that swaps a bound
@@ -261,9 +262,9 @@ impl FnxSourceMirror {
                     "overlapping or out-of-range FNX source token".into(),
                 ));
             }
-            pieces.push(source[cursor..token.range.start].to_owned());
+            pieces.push(Arc::from(&source[cursor..token.range.start]));
             let piece = pieces.len();
-            pieces.push(source[token.range.clone()].to_owned());
+            pieces.push(Arc::from(&source[token.range.clone()]));
             let node = nodes.entry(token.id).or_insert(NodePieces {
                 open: usize::MAX,
                 close: None,
@@ -274,7 +275,7 @@ impl FnxSourceMirror {
             }
             cursor = token.range.end;
         }
-        pieces.push(source[cursor..].to_owned());
+        pieces.push(Arc::from(&source[cursor..]));
         if nodes.values().any(|node| node.open == usize::MAX) {
             return Err(FnxError::Parse(
                 "FNX source index contains a node without an opening tag".into(),
@@ -308,7 +309,7 @@ impl FnxSourceMirror {
 
     /// Materialize the current source bytes.
     pub fn render(&self) -> String {
-        let capacity = self.pieces.iter().map(String::len).sum();
+        let capacity = self.pieces.iter().map(|piece| piece.len()).sum();
         let mut source = String::with_capacity(capacity);
         for piece in &self.pieces {
             source.push_str(piece);
@@ -324,8 +325,8 @@ impl FnxSourceMirror {
             let node = self.nodes.get(&entry.id).ok_or_else(|| {
                 FnxError::Parse(format!("source mirror has no node id {}", entry.id))
             })?;
-            let opening = &mut self.pieces[node.open];
-            let layout = OpenTagLayout::parse(opening)?;
+            let mut opening = self.pieces[node.open].to_string();
+            let layout = OpenTagLayout::parse(&opening)?;
             if layout.attrs.contains_key("id") {
                 continue;
             }
@@ -334,6 +335,7 @@ impl FnxSourceMirror {
                 render_attr(&serde_json::Value::String(entry.id.clone()))
             );
             opening.insert_str(layout.insert_at, &attribute);
+            self.pieces[node.open] = Arc::from(opening);
             changed = true;
         }
         Ok(changed)
@@ -416,6 +418,169 @@ impl FnxSourceMirror {
         Ok(rebuilt)
     }
 
+    /// The caller must establish that `previous` is this mirror's synchronized
+    /// semantic tree. The identity/generation checks detect a stale patch;
+    /// reparsing unchanged attributes here would defeat source-scoped adoption.
+    pub fn prepare_structural_patch(
+        &self,
+        previous: &ArtifactIr,
+        patch: &PreparedStructuralPatch,
+    ) -> Result<Self, FnxError> {
+        if !patch.matches(previous)
+            || self.nodes.len() != previous.sidecar().ids.len()
+            || previous
+                .sidecar()
+                .ids
+                .iter()
+                .any(|entry| !self.nodes.contains_key(&entry.id))
+        {
+            return Err(FnxError::Parse(
+                "structural source baseline is stale".into(),
+            ));
+        }
+        let mut patched = self.clone();
+        for (id, element) in &patch.replacements {
+            if let Some(before) = previous.element(id) {
+                patched.patch_element_delta_with_children(
+                    id,
+                    before,
+                    element,
+                    !before.children.is_empty(),
+                )?;
+            }
+        }
+        let mut rebuilt = Self {
+            pieces: vec![Arc::clone(
+                self.pieces
+                    .first()
+                    .ok_or_else(|| FnxError::Parse("source wrapper is absent".into()))?,
+            )],
+            nodes: BTreeMap::new(),
+            refs: Arc::clone(&self.refs),
+        };
+        let root = patch
+            .order
+            .first()
+            .ok_or_else(|| FnxError::Parse("structural source has no root".into()))?;
+        let mut pending = vec![(root.as_str(), 2usize, false)];
+        while let Some((id, depth, closing)) = pending.pop() {
+            let element = patch
+                .element(previous, id)
+                .ok_or_else(|| FnxError::Parse(format!("structural source lost node {id}")))?;
+            let children = patch.children.get(id).ok_or_else(|| {
+                FnxError::Parse(format!("structural source lost children of {id}"))
+            })?;
+            let retained = patched.nodes.get(id);
+            if closing {
+                let (tail, close) = if let Some(close) = retained.and_then(|node| node.close) {
+                    (
+                        Arc::clone(patched.pieces.get(close.saturating_sub(1)).ok_or_else(
+                            || FnxError::Parse("retained closing trivia is absent".into()),
+                        )?),
+                        Arc::clone(patched.pieces.get(close).ok_or_else(|| {
+                            FnxError::Parse("retained closing tag is absent".into())
+                        })?),
+                    )
+                } else {
+                    (
+                        Arc::from(format!("\n{}", "  ".repeat(depth))),
+                        Arc::from(render_close_tag(element)),
+                    )
+                };
+                rebuilt.pieces.push(tail);
+                let position = rebuilt.pieces.len();
+                rebuilt.pieces.push(close);
+                rebuilt
+                    .nodes
+                    .get_mut(id)
+                    .ok_or_else(|| FnxError::Parse("new closing tag lost its opening".into()))?
+                    .close = Some(position);
+                continue;
+            }
+            if id != root {
+                let leading = if let Some(node) = retained {
+                    Arc::clone(patched.pieces.get(node.open.saturating_sub(1)).ok_or_else(
+                        || FnxError::Parse("retained leading trivia is absent".into()),
+                    )?)
+                } else {
+                    Arc::from(format!("\n{}", "  ".repeat(depth)))
+                };
+                rebuilt.pieces.push(leading);
+            }
+            let has_children = !children.is_empty();
+            let opening = if let Some(node) = retained {
+                let opening = patched
+                    .pieces
+                    .get(node.open)
+                    .ok_or_else(|| FnxError::Parse("retained opening tag is absent".into()))?;
+                if node.close.is_none()
+                    && has_children
+                    && SUGAR_TAGS.contains(&OpenTagLayout::parse(opening)?.tag.as_str())
+                {
+                    let shaped = self.ref_shaped(opening_tag_element(element));
+                    Arc::from(render_open_tag_with_children(&shaped, true))
+                } else if node.close.is_some() == has_children {
+                    Arc::clone(opening)
+                } else {
+                    let mut opening = opening.to_string();
+                    if has_children {
+                        let suffix = opening
+                            .strip_suffix("/>")
+                            .ok_or_else(|| {
+                                FnxError::Parse("retained leaf tag is malformed".into())
+                            })?
+                            .len();
+                        opening.replace_range(suffix.., ">");
+                    } else {
+                        let suffix = opening
+                            .strip_suffix('>')
+                            .ok_or_else(|| {
+                                FnxError::Parse("retained parent tag is malformed".into())
+                            })?
+                            .len();
+                        opening.replace_range(suffix.., "/>");
+                    }
+                    Arc::from(opening)
+                }
+            } else {
+                let mut shaped = opening_tag_element(element);
+                if !has_children {
+                    crate::sugar::sugar_shapes(&mut shaped);
+                }
+                crate::sugar::sugar_transform(&mut shaped);
+                crate::refs::sugar_refs(&mut shaped, &self.refs);
+                Arc::from(render_open_tag_with_children(&shaped, has_children))
+            };
+            let position = rebuilt.pieces.len();
+            rebuilt.pieces.push(opening);
+            rebuilt.nodes.insert(
+                id.to_owned(),
+                NodePieces {
+                    open: position,
+                    close: None,
+                },
+            );
+            if has_children {
+                pending.push((id, depth, true));
+                pending.extend(
+                    children
+                        .iter()
+                        .rev()
+                        .map(|child| (child.as_str(), depth + 1, false)),
+                );
+            }
+        }
+        rebuilt.pieces.push(Arc::clone(
+            self.pieces
+                .last()
+                .ok_or_else(|| FnxError::Parse("source suffix is absent".into()))?,
+        ));
+        if self.child_comments()? != rebuilt.child_comments()? {
+            return Err(FnxError::Parse("cannot preserve authored FNX comments exactly in this canvas edit; edit the FNX source instead".into()));
+        }
+        Ok(rebuilt)
+    }
+
     fn child_comments(&self) -> Result<BTreeMap<String, usize>, FnxError> {
         let tag_pieces: std::collections::BTreeSet<_> = self
             .nodes
@@ -450,12 +615,20 @@ impl FnxSourceMirror {
     /// Structural changes (switching between self-closing and parent form)
     /// require a subtree patch and are intentionally rejected here.
     pub fn patch_element(&mut self, id: &str, element: &FnxElement) -> Result<bool, FnxError> {
+        self.patch_element_with_children(id, element, !element.children.is_empty())
+    }
+
+    fn patch_element_with_children(
+        &mut self,
+        id: &str,
+        element: &FnxElement,
+        has_children: bool,
+    ) -> Result<bool, FnxError> {
         let node = self
             .nodes
             .get(id)
             .ok_or_else(|| FnxError::Parse(format!("source mirror has no node id {id}")))?
             .clone();
-        let has_children = !element.children.is_empty();
         if has_children != node.close.is_some() {
             return Err(FnxError::Parse(format!(
                 "node {id} changed source structure; a tag-only patch is unsafe"
@@ -467,12 +640,12 @@ impl FnxSourceMirror {
         // an instance keeps the readable form the printer would emit.
         let element = self.ref_shaped(opening_tag_element(element));
         let open = render_open_tag_with_children(&element, has_children);
-        let mut changed = self.pieces[node.open] != open;
-        self.pieces[node.open] = open;
+        let mut changed = self.pieces[node.open].as_ref() != open;
+        self.pieces[node.open] = Arc::from(open);
         if let Some(close_piece) = node.close {
             let close = render_close_tag(&element);
-            changed |= self.pieces[close_piece] != close;
-            self.pieces[close_piece] = close;
+            changed |= self.pieces[close_piece].as_ref() != close;
+            self.pieces[close_piece] = Arc::from(close);
         }
         Ok(changed)
     }
@@ -492,17 +665,25 @@ impl FnxSourceMirror {
         previous: &FnxElement,
         next: &FnxElement,
     ) -> Result<bool, FnxError> {
+        self.patch_element_delta_with_children(id, previous, next, !next.children.is_empty())
+    }
+
+    fn patch_element_delta_with_children(
+        &mut self,
+        id: &str,
+        previous: &FnxElement,
+        next: &FnxElement,
+        has_children: bool,
+    ) -> Result<bool, FnxError> {
         if previous.tag != next.tag {
-            return self.patch_element(id, next);
+            return self.patch_element_with_children(id, next, has_children);
         }
         let node = self
             .nodes
             .get(id)
             .ok_or_else(|| FnxError::Parse(format!("source mirror has no node id {id}")))?
             .clone();
-        if previous.children.is_empty() != next.children.is_empty()
-            || next.children.is_empty() != node.close.is_none()
-        {
+        if previous.children.is_empty() == has_children || has_children != node.close.is_some() {
             return Err(FnxError::Parse(format!(
                 "node {id} changed source structure; an attribute patch is unsafe"
             )));
@@ -526,7 +707,7 @@ impl FnxSourceMirror {
                 shape_sugar_spelling(next, &layout.tag),
             ) {
                 (Some(previous), Some(next)) => (previous, next),
-                _ => return self.patch_element(id, next),
+                _ => return self.patch_element_with_children(id, next, has_children),
             }
         } else {
             (opening_tag_element(previous), opening_tag_element(next))
@@ -583,12 +764,12 @@ impl FnxSourceMirror {
             return Ok(false);
         }
         edits.sort_unstable_by_key(|edit| std::cmp::Reverse(edit.range.start));
-        let mut patched = opening.clone();
+        let mut patched = opening.to_string();
         for edit in edits {
             patched.replace_range(edit.range, &edit.replacement);
         }
-        let changed = patched != *opening;
-        self.pieces[node.open] = patched;
+        let changed = patched != opening.as_ref();
+        self.pieces[node.open] = Arc::from(patched);
         Ok(changed)
     }
 }
@@ -1400,6 +1581,171 @@ mod tests {
         assert!(rebuilt.contains("<Text id=\"child\" name=\"Label\" content=\"héllo\" />"));
         assert!(rebuilt.contains("id=\"new-child\""));
         assert_eq!(parse_doc(&rebuilt).expect("parse"), *next.root());
+    }
+
+    #[test]
+    fn incremental_structure_preserves_payloads_source_slots_comments_and_external_parent() {
+        use crate::ir::StructuralNodeChange;
+        use serde_json::json;
+
+        let nodes = vec![
+            json!({"id":"root","type":"group","parent":"outside","index":1,"name":"Root"}),
+            json!({"id":"left","type":"group","parent":"root","index":1,"name":"Left"}),
+            json!({"id":"right","type":"group","parent":"root","index":2,"name":"Right"}),
+            json!({"id":"vector","type":"vector","parent":"left","index":1,"name":"Vector","future_geometry":vec![3; 8192]}),
+            json!({"id":"sibling","type":"text","parent":"root","index":3,"name":"Sibling","opacity":0.4,"future_hint":"retain"}),
+        ];
+        let canonical =
+            ArtifactIr::from_nodes(crate::ArtifactKind::Page, "Page", &nodes).expect("IR");
+        let source = canonical.print();
+        let identity = "id=\"vector\"";
+        let opening = source[..source.find(identity).expect("vector identity")]
+            .rfind('<')
+            .expect("vector opening");
+        let mut source = source;
+        source.insert_str(opening, "{/* pinned vector comment */}\n      ");
+        source.insert_str(0, "// exact wrapper\n");
+        let mut ir = ArtifactIr::from_source(
+            crate::ArtifactKind::Page,
+            "Page",
+            &source,
+            canonical.sidecar().clone(),
+        )
+        .expect("authored IR");
+        let mut mirror = FnxSourceMirror::from_source(&source, ir.sidecar()).expect("mirror");
+        let vector_slot =
+            Arc::clone(&mirror.pieces[mirror.nodes.get("vector").expect("vector slot").open]);
+        let geometry_pointer = ir
+            .element("vector")
+            .expect("vector")
+            .attrs
+            .get("future_geometry")
+            .and_then(Value::as_array)
+            .expect("geometry")
+            .as_ptr();
+        let value = |ir: &ArtifactIr, id: &str| {
+            ir.to_nodes()
+                .expect("nodes")
+                .into_iter()
+                .find(|node| node.get("id").and_then(Value::as_str) == Some(id))
+                .expect("node")
+        };
+        for step in 0..4 {
+            let changes = match step {
+                0 => {
+                    let before = value(&ir, "vector");
+                    let mut after = before.clone();
+                    after["parent"] = json!("right");
+                    vec![StructuralNodeChange {
+                        id: "vector".into(),
+                        before: Some(before),
+                        after: Some(after),
+                    }]
+                }
+                1 => {
+                    let before = value(&ir, "sibling");
+                    let mut after = before.clone();
+                    after
+                        .as_object_mut()
+                        .expect("node object")
+                        .remove("opacity");
+                    vec![
+                        StructuralNodeChange {
+                            id: "inserted".into(),
+                            before: None,
+                            after: Some(
+                                json!({"id":"inserted","type":"text","parent":"left","index":1,"name":"Inserted"}),
+                            ),
+                        },
+                        StructuralNodeChange {
+                            id: "sibling".into(),
+                            before: Some(before),
+                            after: Some(after),
+                        },
+                    ]
+                }
+                2 => {
+                    let before = value(&ir, "right");
+                    let mut after = before.clone();
+                    after["index"] = json!(0.5);
+                    vec![StructuralNodeChange {
+                        id: "right".into(),
+                        before: Some(before),
+                        after: Some(after),
+                    }]
+                }
+                _ => vec![StructuralNodeChange {
+                    id: "inserted".into(),
+                    before: Some(value(&ir, "inserted")),
+                    after: None,
+                }],
+            };
+            let patch = ir.prepare_structural_patch(&changes).expect("prepare");
+            let next = mirror
+                .prepare_structural_patch(&ir, &patch)
+                .expect("prepare source");
+            ir.commit_structural_patch(patch).expect("commit");
+            mirror = next;
+            let rendered = mirror.render();
+            assert_eq!(parse_doc(&rendered).expect("source parse"), *ir.root());
+            assert_eq!(
+                crate::decode_subtree(&rendered, ir.sidecar()).expect("decode"),
+                ir.to_nodes().expect("IR nodes")
+            );
+            assert!(rendered.starts_with("// exact wrapper\n"));
+            assert_eq!(rendered.matches("{/* pinned vector comment */}").count(), 1);
+            assert_eq!(ir.sidecar().root_parent.as_deref(), Some("outside"));
+            assert!(
+                Arc::ptr_eq(
+                    &vector_slot,
+                    &mirror.pieces[mirror.nodes.get("vector").expect("vector slot").open]
+                ),
+                "the unchanged large source tag must retain its allocation"
+            );
+            assert_eq!(
+                geometry_pointer,
+                ir.element("vector")
+                    .expect("vector")
+                    .attrs
+                    .get("future_geometry")
+                    .and_then(Value::as_array)
+                    .expect("geometry")
+                    .as_ptr(),
+                "the unchanged semantic payload must move without deep cloning"
+            );
+        }
+        assert_eq!(
+            ir.root()
+                .children
+                .first()
+                .and_then(|element| element.attrs.get("id")),
+            Some(&json!("right"))
+        );
+        assert!(!mirror.render().contains("opacity={0.4}"));
+        assert_eq!(
+            ir.element("sibling")
+                .expect("sibling")
+                .attrs
+                .get("future_hint"),
+            Some(&json!("retain"))
+        );
+        let before = mirror.render();
+        let patch = ir
+            .prepare_structural_patch(&[StructuralNodeChange {
+                id: "vector".into(),
+                before: Some(value(&ir, "vector")),
+                after: None,
+            }])
+            .expect("valid topology");
+        assert!(
+            mirror
+                .prepare_structural_patch(&ir, &patch)
+                .expect_err("deletion must retain authored comments")
+                .to_string()
+                .contains("comment")
+        );
+        assert_eq!(mirror.render(), before);
+        assert!(ir.element("vector").is_some());
     }
 
     #[test]

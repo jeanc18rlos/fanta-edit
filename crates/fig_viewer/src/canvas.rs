@@ -651,8 +651,8 @@ pub(crate) enum GpuFrame {
 
 /// A cheap identity of everything a render reads from the document BESIDES the
 /// scene graph: the component library and the variable registry + active
-/// modes. Equal fingerprints mean a render-thread copy of those inputs is still
-/// current, and the variables half is what the renderer's instance memo keys
+/// modes. The GPU memo supplements the coarse component counters with an exact
+/// library witness; the variables half is what the renderer's instance memo keys
 /// its mode-dependent expansions on (`RenderInputs::mode_generation`) — the
 /// document's render generation, which moves on every drag frame, is far too
 /// coarse for either job.
@@ -662,6 +662,9 @@ struct InputsFingerprint {
     /// bumps its def's `rev` and an in-flight preview inside a master bumps its
     /// `preview_rev`; adding or removing a def changes a count.
     components: (usize, u64, usize),
+    /// Metadata can change without moving a count or revision. This generation
+    /// advances only after the GPU memo's exact library comparison differs.
+    components_generation: u64,
     /// Hash of the variable registry and the doc-level active modes.
     variables: u64,
 }
@@ -670,6 +673,7 @@ impl InputsFingerprint {
     fn of(doc: &fanta_doc::Doc) -> Self {
         Self {
             components: Self::components_of(doc),
+            components_generation: 0,
             variables: hash_variables(&doc.variables, &doc.active_modes),
         }
     }
@@ -688,11 +692,65 @@ impl InputsFingerprint {
 /// [`GpuCanvas::inputs_fingerprint`]'s memo: the fingerprint and the two
 /// document generations it was computed at.
 #[cfg(target_os = "macos")]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct FingerprintMemo {
     render_generation: u64,
     variables_generation: u64,
     fingerprint: InputsFingerprint,
+    components: ComponentLibrary,
+}
+
+#[cfg(target_os = "macos")]
+impl FingerprintMemo {
+    fn new(doc: &fanta_doc::Doc, render_generation: u64, variables_generation: u64) -> Self {
+        Self {
+            render_generation,
+            variables_generation,
+            fingerprint: InputsFingerprint {
+                components_generation: 1,
+                ..InputsFingerprint::of(doc)
+            },
+            components: doc.components.clone(),
+        }
+    }
+
+    fn refresh(
+        &mut self,
+        doc: &fanta_doc::Doc,
+        render_generation: u64,
+        variables_generation: u64,
+    ) -> InputsFingerprint {
+        if self.render_generation == render_generation {
+            return self.fingerprint;
+        }
+        if self.components != doc.components {
+            self.components
+                .defs
+                .retain(|id, _| doc.components.defs.contains_key(id));
+            for (id, definition) in &doc.components.defs {
+                if self.components.defs.get(id) != Some(definition) {
+                    self.components.defs.insert(*id, definition.clone());
+                }
+            }
+            self.components
+                .sets
+                .retain(|id, _| doc.components.sets.contains_key(id));
+            for (id, set) in &doc.components.sets {
+                if self.components.sets.get(id) != Some(set) {
+                    self.components.sets.insert(*id, set.clone());
+                }
+            }
+            self.fingerprint.components = InputsFingerprint::components_of(doc);
+            self.fingerprint.components_generation =
+                self.fingerprint.components_generation.wrapping_add(1);
+        }
+        if self.variables_generation != variables_generation {
+            self.fingerprint.variables = hash_variables(&doc.variables, &doc.active_modes);
+        }
+        self.render_generation = render_generation;
+        self.variables_generation = variables_generation;
+        self.fingerprint
+    }
 }
 
 /// Hash the registry and active modes through their serde projection: the
@@ -735,6 +793,7 @@ struct SnapshotStamp {
     scene_instance: u64,
     scene_revision: u64,
     generation: u64,
+    render_root: Option<NodeId>,
     /// Identity of the installed asset resolver (it can be swapped for an
     /// overlay without any counter moving; images that finish decoding into
     /// the same resolver are shared with the snapshot through the `Arc`).
@@ -755,11 +814,17 @@ impl SnapshotStamp {
             scene_instance: document.doc.scene.instance_id(),
             scene_revision: document.doc.scene.revision(),
             generation: document.render_generation(),
+            render_root: None,
             asset_resolver: document
                 .asset_resolver
                 .as_ref()
                 .map(|resolver| Arc::as_ptr(resolver) as *const () as usize),
         }
+    }
+
+    fn with_root(mut self, root: Option<NodeId>) -> Self {
+        self.render_root = root;
+        self
     }
 }
 
@@ -784,7 +849,10 @@ impl SceneSnapshot {
     fn capture(document: &FigDocument, stamp: SnapshotStamp) -> Self {
         Self {
             stamp,
-            scene: document.doc.scene.clone(),
+            scene: stamp
+                .render_root
+                .and_then(|root| document.doc.render_scene_for(root))
+                .unwrap_or_else(|| document.doc.scene.clone()),
             components: document.doc.components.clone(),
             variables: document.doc.variables.clone(),
             active_modes: document.doc.active_modes.clone(),
@@ -889,6 +957,7 @@ fn plan_snapshot_sync(
     }
     if worker.stamp.scene_instance != stamp.scene_instance
         || worker.stamp.asset_resolver != stamp.asset_resolver
+        || worker.stamp.render_root != stamp.render_root
         || worker.fingerprint != fingerprint
     {
         return SnapshotSync::Recopy;
@@ -961,7 +1030,7 @@ impl TranslationProof {
                 .scene
                 .get(gesture.moving)
                 .map(|node| node.transform),
-            stamp: SnapshotStamp::of(document),
+            stamp: SnapshotStamp::of(document).with_root(Some(page)),
             page,
             components: document.doc.components.clone(),
             variables: document.doc.variables.clone(),
@@ -977,7 +1046,7 @@ impl TranslationProof {
     }
 
     fn patch(&mut self, document: &FigDocument, page: NodeId) -> Option<ScenePatch> {
-        let stamp = SnapshotStamp::of(document);
+        let stamp = SnapshotStamp::of(document).with_root(Some(page));
         if page != self.page
             || stamp.scene_instance != self.stamp.scene_instance
             || stamp.asset_resolver != self.stamp.asset_resolver
@@ -1894,9 +1963,11 @@ pub(crate) struct GpuCanvas {
     /// (full copy or patch). `None` until the first copy, and again after the
     /// render thread reports it lost the copy.
     worker_snapshot: Option<WorkerSnapshot>,
+    rendered_node_ids: std::collections::HashSet<NodeId>,
     /// [`InputsFingerprint`] of the document, tagged with the render
     /// generation and the variables generation it was computed at. The
-    /// components half follows every edit; the variables half — a
+    /// component library is compared exactly once per changed generation; the
+    /// variables half — a
     /// serialization of the whole registry — is reused until a variable or
     /// mode edit moves the variables generation, so a drag frame (which moves
     /// only the render generation) never re-hashes the registry.
@@ -1980,6 +2051,7 @@ impl GpuCanvas {
             retired: VecDeque::new(),
             to_recycle: Vec::new(),
             worker_snapshot: None,
+            rendered_node_ids: std::collections::HashSet::new(),
             inputs_fingerprint: None,
             translation: None,
             translation_proof: None,
@@ -2109,27 +2181,11 @@ impl GpuCanvas {
     fn inputs_fingerprint(&mut self, document: &FigDocument) -> InputsFingerprint {
         let render_generation = document.render_generation();
         let variables_generation = document.variables_generation();
-        if let Some(memo) = self.inputs_fingerprint
-            && memo.render_generation == render_generation
-        {
-            return memo.fingerprint;
-        }
-        let variables = match self.inputs_fingerprint {
-            Some(memo) if memo.variables_generation == variables_generation => {
-                memo.fingerprint.variables
-            }
-            _ => hash_variables(&document.doc.variables, &document.doc.active_modes),
-        };
-        let fingerprint = InputsFingerprint {
-            components: InputsFingerprint::components_of(&document.doc),
-            variables,
-        };
-        self.inputs_fingerprint = Some(FingerprintMemo {
-            render_generation,
-            variables_generation,
-            fingerprint,
-        });
-        fingerprint
+        self.inputs_fingerprint
+            .get_or_insert_with(|| {
+                FingerprintMemo::new(&document.doc, render_generation, variables_generation)
+            })
+            .refresh(&document.doc, render_generation, variables_generation)
     }
 
     fn install_frame(
@@ -2357,7 +2413,8 @@ impl GpuCanvas {
                 self.render_blocking(LiveInputs::of(document), request)?;
             }
             PaintPlan::PresentAndRender => {
-                let stamp = SnapshotStamp::of(document);
+                let stamp = SnapshotStamp::of(document)
+                    .with_root(motion.is_none().then_some(page_root).flatten());
                 let fingerprint = self.inputs_fingerprint(document);
                 let request = RenderRequest {
                     key,
@@ -2416,16 +2473,10 @@ impl GpuCanvas {
                 self.rejected_translation = Some(gesture);
                 self.translation_proof = None;
                 log::info!("retained translation UI proof refused gesture={gesture:?}");
-                return (
-                    RenderSource::Snapshot(Some(Box::new(SceneSnapshot::capture(document, stamp)))),
-                    None,
-                );
+                return (self.capture_snapshot(document, stamp), None);
             } else {
                 self.translation_proof = Some(TranslationProof::capture(document, gesture, page));
-                return (
-                    RenderSource::Snapshot(Some(Box::new(SceneSnapshot::capture(document, stamp)))),
-                    Some(gesture),
-                );
+                return (self.capture_snapshot(document, stamp), Some(gesture));
             }
         } else {
             if self.translation_proof.is_some() {
@@ -2441,7 +2492,7 @@ impl GpuCanvas {
     /// out empty (the generation moved for something the copy does not hold)
     /// costs nothing — the copy is reused and only the UI-side stamp advances.
     fn snapshot_source(
-        &self,
+        &mut self,
         document: &FigDocument,
         stamp: SnapshotStamp,
         fingerprint: InputsFingerprint,
@@ -2452,21 +2503,41 @@ impl GpuCanvas {
             match plan_snapshot_sync(self.worker_snapshot.as_ref(), stamp, fingerprint, scene) {
                 SnapshotSync::Reuse => RenderSource::Snapshot(None),
                 SnapshotSync::Patch(delta) if delta.is_empty() => RenderSource::Snapshot(None),
-                SnapshotSync::Patch(delta) => match build_scene_patch(scene, &delta, stamp) {
-                    Some(patch) => {
-                        crate::report_slow("canvas scene patch", started);
-                        return RenderSource::Patch(Box::new(patch));
+                SnapshotSync::Patch(mut delta) => {
+                    delta
+                        .transforms
+                        .retain(|id| self.rendered_node_ids.contains(id));
+                    delta.nodes.retain(|id| self.rendered_node_ids.contains(id));
+                    if stamp.render_root.is_some()
+                        && document
+                            .doc
+                            .render_delta_requires_dependency_refresh(&delta)
+                    {
+                        return self.capture_snapshot(document, stamp);
                     }
-                    None => RenderSource::Snapshot(Some(Box::new(SceneSnapshot::capture(
-                        document, stamp,
-                    )))),
-                },
-                SnapshotSync::Recopy => {
-                    RenderSource::Snapshot(Some(Box::new(SceneSnapshot::capture(document, stamp))))
+                    match build_scene_patch(scene, &delta, stamp) {
+                        Some(patch) => {
+                            crate::report_slow("canvas scene patch", started);
+                            return RenderSource::Patch(Box::new(patch));
+                        }
+                        None => self.capture_snapshot(document, stamp),
+                    }
                 }
+                SnapshotSync::Recopy => self.capture_snapshot(document, stamp),
             };
         crate::report_slow("canvas scene snapshot", started);
         source
+    }
+
+    fn capture_snapshot(&mut self, document: &FigDocument, stamp: SnapshotStamp) -> RenderSource {
+        let snapshot = SceneSnapshot::capture(document, stamp);
+        self.rendered_node_ids = snapshot
+            .scene
+            .roots()
+            .iter()
+            .flat_map(|root| snapshot.scene.descendants_of(*root))
+            .collect();
+        RenderSource::Snapshot(Some(Box::new(snapshot)))
     }
 }
 
@@ -7267,6 +7338,7 @@ mod tests {
             scene_instance: scene.instance_id(),
             scene_revision: scene.revision(),
             generation,
+            render_root: None,
             asset_resolver: None,
         }
     }
@@ -7899,6 +7971,204 @@ mod tests {
             plan_snapshot_sync(Some(&worker), stamp_of(&scene, 2), changed, &scene),
             SnapshotSync::Recopy
         );
+    }
+
+    #[test]
+    fn exact_component_witness_recopies_metadata_edits_with_unchanged_counters() -> Result<()> {
+        for mutation in 0..6 {
+            let (mut document, _, _, containing, unrelated) = translation_document()?;
+            let set = ComponentId::new();
+            document.doc.components.sets.insert(
+                set,
+                fanta_doc::ComponentSet {
+                    id: set,
+                    name: "Variants".into(),
+                    axes: Vec::new(),
+                    members: vec![containing, unrelated],
+                    default_variant: containing,
+                    root: None,
+                },
+            );
+            let variables_generation = document.variables_generation();
+            let mut memo = FingerprintMemo::new(&document.doc, 0, variables_generation);
+            let worker = WorkerSnapshot {
+                stamp: stamp_of(&document.doc.scene, 0),
+                fingerprint: memo.fingerprint,
+            };
+            match mutation {
+                0 => document
+                    .doc
+                    .components
+                    .defs
+                    .get_mut(&containing)
+                    .expect("component")
+                    .name
+                    .push('!'),
+                1 => document
+                    .doc
+                    .components
+                    .defs
+                    .get_mut(&containing)
+                    .expect("component")
+                    .props
+                    .push(fanta_doc::ComponentPropDef {
+                        id: fanta_doc::ComponentPropId::new(),
+                        name: "Label".into(),
+                        kind: fanta_doc::ComponentPropKind::Text,
+                        formatter: fanta_doc::ComponentPropFormatter::Auto,
+                        default: fanta_doc::VarValue::String {
+                            value: "Updated".into(),
+                        },
+                        bindings: Vec::new(),
+                    }),
+                2 => document
+                    .doc
+                    .components
+                    .sets
+                    .get_mut(&set)
+                    .expect("set")
+                    .members
+                    .swap(0, 1),
+                3 => {
+                    document
+                        .doc
+                        .components
+                        .sets
+                        .get_mut(&set)
+                        .expect("set")
+                        .default_variant = unrelated;
+                }
+                4 => {
+                    document.doc.components.defs.remove(&unrelated);
+                    let replacement = ComponentId::new();
+                    document.doc.components.defs.insert(
+                        replacement,
+                        fanta_doc::ComponentDef::new(replacement, NodeId::new(), "Replacement"),
+                    );
+                }
+                5 => {
+                    let mut replacement = document.doc.components.sets.remove(&set).expect("set");
+                    replacement.id = ComponentId::new();
+                    document
+                        .doc
+                        .components
+                        .sets
+                        .insert(replacement.id, replacement);
+                }
+                _ => unreachable!(),
+            }
+            let fingerprint = memo.refresh(&document.doc, 1, variables_generation);
+            assert_eq!(memo.components, document.doc.components);
+            assert_eq!(fingerprint.components, worker.fingerprint.components);
+            assert_ne!(
+                fingerprint.components_generation, worker.fingerprint.components_generation,
+                "metadata mutation {mutation}"
+            );
+            let stamp = stamp_of(&document.doc.scene, 1);
+            assert!(
+                document
+                    .doc
+                    .scene
+                    .changes_since(worker.stamp.scene_revision)
+                    .expect("known changes")
+                    .is_empty()
+            );
+            assert_eq!(
+                plan_snapshot_sync(Some(&worker), stamp, fingerprint, &document.doc.scene),
+                SnapshotSync::Recopy
+            );
+            let snapshot = SceneSnapshot::capture(&document, stamp);
+            assert_eq!(snapshot.components, document.doc.components);
+            assert_eq!(
+                memo.refresh(&document.doc, 1, variables_generation),
+                fingerprint,
+                "unchanged frames reuse the memo"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn exact_component_witness_retains_transform_patches_and_refuses_mixed_edits() -> Result<()> {
+        let (mut document, _, moving, containing, unrelated) = translation_document()?;
+        let untouched = document
+            .doc
+            .components
+            .defs
+            .get_mut(&unrelated)
+            .expect("unrelated component");
+        untouched.name = "Untouched library metadata".repeat(4_096);
+        untouched.props = (0..1_024)
+            .map(|index| fanta_doc::ComponentPropDef {
+                id: fanta_doc::ComponentPropId::new(),
+                name: format!("Untouched label {index}"),
+                kind: fanta_doc::ComponentPropKind::Text,
+                formatter: fanta_doc::ComponentPropFormatter::Auto,
+                default: fanta_doc::VarValue::String {
+                    value: "Untouched property default".repeat(16),
+                },
+                bindings: Vec::new(),
+            })
+            .collect();
+        let variables_generation = document.variables_generation();
+        let mut memo = FingerprintMemo::new(&document.doc, 0, variables_generation);
+        let untouched = memo.components.defs.get(&unrelated).expect("witness");
+        let untouched_name = untouched.name.as_ptr();
+        let untouched_props = untouched.props.as_ptr();
+        let worker = WorkerSnapshot {
+            stamp: stamp_of(&document.doc.scene, 0),
+            fingerprint: memo.fingerprint,
+        };
+        document
+            .doc
+            .scene
+            .set_transform(moving, Transform2D::translation(8.0, 2.0))?;
+        let fingerprint = memo.refresh(&document.doc, 1, variables_generation);
+        assert_eq!(fingerprint, worker.fingerprint);
+        let stamp = stamp_of(&document.doc.scene, 1);
+        let delta = match plan_snapshot_sync(Some(&worker), stamp, fingerprint, &document.doc.scene)
+        {
+            SnapshotSync::Patch(delta) => delta,
+            other => panic!("expected a transform patch, got {other:?}"),
+        };
+        assert_eq!(delta.transforms, vec![moving]);
+        assert!(delta.nodes.is_empty());
+        let worker = WorkerSnapshot { stamp, fingerprint };
+        document
+            .doc
+            .scene
+            .get_mut(moving)
+            .expect("moving layer")
+            .flags |= fanta_doc::NodeFlags::HIDDEN;
+        document
+            .doc
+            .components
+            .defs
+            .get_mut(&containing)
+            .expect("component")
+            .name
+            .push('!');
+        let delta = document
+            .doc
+            .scene
+            .changes_since(worker.stamp.scene_revision)
+            .expect("known changes");
+        assert_eq!(delta.nodes, vec![moving]);
+        let fingerprint = memo.refresh(&document.doc, 2, variables_generation);
+        let untouched = memo.components.defs.get(&unrelated).expect("witness");
+        assert_eq!(untouched.name.as_ptr(), untouched_name);
+        assert_eq!(untouched.props.as_ptr(), untouched_props);
+        assert_eq!(memo.components, document.doc.components);
+        assert_eq!(fingerprint.components, worker.fingerprint.components);
+        let stamp = stamp_of(&document.doc.scene, 2);
+        assert_eq!(
+            plan_snapshot_sync(Some(&worker), stamp, fingerprint, &document.doc.scene),
+            SnapshotSync::Recopy
+        );
+        let snapshot = SceneSnapshot::capture(&document, stamp);
+        assert_eq!(snapshot.components, document.doc.components);
+        assert_eq!(snapshot.scene.get(moving), document.doc.scene.get(moving));
+        Ok(())
     }
 
     #[test]

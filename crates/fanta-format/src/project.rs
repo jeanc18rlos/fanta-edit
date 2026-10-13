@@ -142,6 +142,11 @@ mod tests {
             document.pages().contains(&page),
             "Wireframes page is registered"
         );
+        let started = Instant::now();
+        let render_scene = document.render_scene_for(page);
+        let render_scene_seconds = started.elapsed().as_secs_f64();
+        let render_scene_nodes = render_scene.as_ref().map(fanta_doc::Scene::len);
+        drop(render_scene);
         let component_roots: BTreeSet<_> = document
             .components
             .defs
@@ -305,6 +310,8 @@ mod tests {
             "nodes": document.scene.len(), "components": document.components.defs.len(),
             "pages": document.pages().len(), "load_seconds": load_seconds,
             "index_seconds": index_seconds, "saves": measurements,
+            "render_scene_seconds": render_scene_seconds,
+            "render_scene_nodes": render_scene_nodes,
         });
         if let Ok(output) = std::env::var("FANTA_PERF_OUTPUT") {
             std::fs::write(output, serde_json::to_vec_pretty(&result)?)?;

@@ -5,12 +5,11 @@
 use super::effects::group_clips_children;
 use super::renderer::PreparedInstance;
 use super::{
-    Arc, BlendMode, Bounds, Canvas, CanvasNode, ExpandedNode, HashMap, InstanceCacheKey,
+    Arc, BlendMode, Bounds, Canvas, CanvasNode, ExpandedNode, HashMap, IdHashMap, InstanceCacheKey,
     InstanceNode, NodeData, NodeFlags, NodeId, RenderCtx, Scene, apply_background_blur,
-    begin_effects_layer, draw_inner_shadows, draw_unresolved_outline, effects_layer_bounds,
-    opacity_folds_into_paint, paint_child_sequence, paint_node_content, paint_node_foreground,
-    resolve_overlay, shadow_expanded_local_bounds, to_sk_matrix, visible_effects,
-    with_shaped_layout,
+    begin_effects_layer, draw_inner_shadows, draw_unresolved_outline, opacity_folds_into_paint,
+    paint_child_sequence, paint_node_content, paint_node_foreground, resolve_overlay,
+    shadow_expanded_local_bounds, to_sk_matrix, visible_effects, with_shaped_layout,
 };
 
 // ---------------------------------------------------------------------------
@@ -81,6 +80,11 @@ pub(crate) fn render_instance(
             true,
             &expanded.nodes,
             &expanded.children,
+            ctx.inputs
+                .motion
+                .is_none()
+                .then_some(expanded.bounds.as_ref())
+                .flatten(),
             ctx,
         );
         ctx.instance_mode_anchor = previous_mode_anchor;
@@ -102,6 +106,12 @@ pub(crate) fn expand_instance_memoized(
         ctx.inputs.active_modes,
         mode_anchor,
     );
+    ctx.instance_cache
+        .record_component(ctx.inputs.components, inst.component);
+    if ctx.layer_cache_lookups {
+        ctx.layer_cache
+            .record_component(ctx.inputs.components, inst.component);
+    }
     // The RESOLVED master's revisions (a variant instance's `component` is the
     // *set* id, which is not itself a def — `def(set)` is `None` and would
     // wrongly report rev 0, never invalidating on a member edit). `rev` moves
@@ -121,30 +131,41 @@ pub(crate) fn expand_instance_memoized(
     // a nested transient clone (fresh id, not in the scene) hashes directly.
     let stamp = ctx
         .scene
-        .contains(instance_id)
-        .then(|| ctx.scene.node_stamp(instance_id));
+        .get(instance_id)
+        .and_then(|node| node.data.as_instance())
+        .filter(|authored| std::ptr::eq(*authored, inst))
+        .map(|_| ctx.scene.node_stamp(instance_id));
     let key = InstanceCacheKey {
         instance: instance_id,
+        node_stamp: stamp,
+        root: resolved_component
+            .as_ref()
+            .map(|resolved| resolved.resolved_root)
+            .filter(|root| ctx.scene.contains(*root)),
+        component: resolved_component
+            .as_ref()
+            .map(|resolved| resolved.resolved_component),
         rev,
         preview_rev,
         override_hash: ctx.instance_cache.override_hash(instance_id, stamp, inst),
         mode_generation: ctx.inputs.mode_generation,
         mode_pins: hash_mode_pins(ctx.scene, mode_anchor),
     };
-    if let Some(cached) = ctx.instance_cache.lookup(&key) {
-        return cached;
-    }
     if let Some(budget) = &mut ctx.metrics.sampling_budget
         && let Some(component) = resolved_component
     {
         // The walk sees clones only AFTER expansion/layout. Reserve the whole
         // resolved master first so a wide recursive component cannot allocate
-        // a fresh wide subtree at every level before the walk reaches its cap.
+        // or repeatedly walk a wide subtree before the walk reaches its cap.
+        // Sharing immutable nodes does not reduce sampling's expansion quota.
         for _ in ctx.scene.descendants_of(component.resolved_root) {
             if !budget.reserve_expanded_node() {
                 return Arc::new(PreparedInstance::default());
             }
         }
+    }
+    if let Some(cached) = ctx.instance_cache.lookup(&key, inst) {
+        return cached;
     }
     let expanded = Arc::new(prepare_instance(
         ctx.scene,
@@ -153,7 +174,7 @@ pub(crate) fn expand_instance_memoized(
         &expansion_context,
     ));
     ctx.metrics.instance_indexes_built += 1;
-    ctx.instance_cache.insert(key, Arc::clone(&expanded));
+    ctx.instance_cache.insert(key, inst, Arc::clone(&expanded));
     expanded
 }
 
@@ -276,8 +297,11 @@ fn expanded_subtree_bounds(
     node: &CanvasNode,
     expanded: &[ExpandedNode],
     children: &HashMap<NodeId, Vec<usize>>,
-    scene: &Scene,
+    cached: Option<&IdHashMap<NodeId, Option<Bounds>>>,
 ) -> Option<Bounds> {
+    if let Some(bounds) = cached.and_then(|cached| cached.get(&node.id)) {
+        return *bounds;
+    }
     match &node.data {
         NodeData::Group(_) | NodeData::Boolean(_)
             if node.is_boolean()
@@ -302,7 +326,7 @@ fn expanded_subtree_bounds(
                     continue;
                 };
                 let child = &entry.node;
-                let Some(b) = expanded_subtree_bounds(child, expanded, children, scene) else {
+                let Some(b) = expanded_subtree_bounds(child, expanded, children, cached) else {
                     continue;
                 };
                 let Some(in_parent) = b.try_transformed(&child.transform) else {
@@ -315,8 +339,23 @@ fn expanded_subtree_bounds(
             }
             acc
         }
-        _ => effects_layer_bounds(node, None, scene),
+        NodeData::TextPath(text_path) => super::text_path_bounds(text_path),
+        data => data.local_bounds(),
     }
+}
+
+pub(crate) fn prepare_expansion_bounds(
+    expanded: &[ExpandedNode],
+    children: &HashMap<NodeId, Vec<usize>>,
+) -> IdHashMap<NodeId, Option<Bounds>> {
+    let mut bounds = IdHashMap::default();
+    // Expansion emits parents before descendants. Reverse order makes each
+    // container's union use already-computed child bounds, without recursion.
+    for entry in expanded.iter().rev() {
+        let computed = expanded_subtree_bounds(&entry.node, expanded, children, Some(&bounds));
+        bounds.insert(entry.node.id, computed);
+    }
+    bounds
 }
 
 /// Map each expanded clone's parent id → its child clone indices, so the
@@ -349,6 +388,7 @@ pub(crate) fn render_expanded(
     is_root: bool,
     expanded: &[ExpandedNode],
     children: &HashMap<NodeId, Vec<usize>>,
+    cached_bounds: Option<&IdHashMap<NodeId, Option<Bounds>>>,
     ctx: &mut RenderCtx,
 ) {
     if ctx
@@ -359,7 +399,15 @@ pub(crate) fn render_expanded(
     {
         return;
     }
-    render_expanded_inner(canvas, node, is_root, expanded, children, ctx);
+    render_expanded_inner(
+        canvas,
+        node,
+        is_root,
+        expanded,
+        children,
+        cached_bounds,
+        ctx,
+    );
     if let Some(budget) = &mut ctx.metrics.sampling_budget {
         budget.leave();
     }
@@ -371,6 +419,7 @@ fn render_expanded_inner(
     is_root: bool,
     expanded: &[ExpandedNode],
     children: &HashMap<NodeId, Vec<usize>>,
+    cached_bounds: Option<&IdHashMap<NodeId, Option<Bounds>>>,
     ctx: &mut RenderCtx,
 ) {
     ctx.metrics.nodes_visited += 1;
@@ -452,7 +501,7 @@ fn render_expanded_inner(
             boolean_shape
                 .as_ref()
                 .and_then(|shape| shape.bounds(node))
-                .or_else(|| expanded_subtree_bounds(node, expanded, children, ctx.scene)),
+                .or_else(|| expanded_subtree_bounds(node, expanded, children, cached_bounds)),
         );
     if used_layer {
         ctx.metrics.effect_layers += 1;
@@ -505,7 +554,7 @@ fn render_expanded_inner(
             // shadow-expanded, mapped through the child's transform.
             |ctx, &i| {
                 let child = &expanded.get(i)?.node;
-                let local = expanded_subtree_bounds(child, expanded, children, ctx.scene)?;
+                let local = expanded_subtree_bounds(child, expanded, children, cached_bounds)?;
                 shadow_expanded_local_bounds(
                     local,
                     &child.effects,
@@ -515,7 +564,15 @@ fn render_expanded_inner(
                 .try_transformed(&child.transform)
             },
             |canvas, ctx, &i| {
-                render_expanded(canvas, &expanded[i].node, false, expanded, children, ctx)
+                render_expanded(
+                    canvas,
+                    &expanded[i].node,
+                    false,
+                    expanded,
+                    children,
+                    cached_bounds,
+                    ctx,
+                )
             },
         );
     }
@@ -663,11 +720,17 @@ mod tests {
             },
         ];
         let children = build_child_index(&expanded);
-        let scene = Scene::new();
-
         assert_eq!(
-            expanded_subtree_bounds(&expanded[0].node, &expanded, &children, &scene),
+            expanded_subtree_bounds(&expanded[0].node, &expanded, &children, None),
             Some(Bounds::from_xywh(0.0, -4.0, 35.0, 14.0))
+        );
+        let prepared = PreparedInstance::new(expanded);
+        assert_eq!(
+            prepared
+                .bounds
+                .as_ref()
+                .and_then(|bounds| bounds.get(&root_id)),
+            Some(&Some(Bounds::from_xywh(0.0, -4.0, 35.0, 14.0)))
         );
     }
 }

@@ -5,6 +5,7 @@
 //! and the per-frame state plumbing.
 //!
 //! [`InstanceCache`]: InstanceCache
+use super::layer_cache::{CacheByteCounter, ComponentDependencies};
 use super::walk::render_scoped_root;
 use super::{
     AlphaType, Arc, AssetResolver, BTreeMap, Canvas, Color, ColorType, ComponentLibrary,
@@ -240,36 +241,26 @@ impl<'a> RenderInputs<'a> {
     }
 }
 
-/// Memoized instance expansions, keyed per spec 07 §2 P3 by
-/// `(instance NodeId, ComponentDef.rev, override-hash, mode generation)`.
-///
-/// The cached value is the *structural* expansion — the transient subtree of
-/// fresh-id [`ExpandedNode`]s as `expand_instance` returns it, before the
-/// paint-time binding overlay. That overlay is re-applied every frame (it is
-/// cheap and mode-dependent), so the memo only saves the deep-clone +
-/// override-application work, which is the expensive part of a deep instance
-/// tree.
-///
-/// Invalidation is automatic: editing a master bumps its `ComponentDef.rev`
-/// (see `ComponentLibrary::bump_rev_for_node`), which changes the key; changing
-/// the instance's own overrides changes the override-hash; a mode switch bumps
-/// `mode_generation`, and a frame mode pin above the instance changes the
-/// pin-hash. Entries are keyed by instance id and hold one expansion each, so a
-/// key change REPLACES the instance's entry instead of leaving the old one
-/// behind. Entries no instance looked up for [`INSTANCE_CACHE_IDLE_FRAMES`]
-/// frames are dropped (that is how the fresh-id clones of nested instances,
-/// orphaned when their outer expansion re-expands, get freed), and
-/// `clear_instance_cache` drops it wholesale (e.g. on document switch).
-#[derive(Default)]
+/// Bounded structural expansions shared by equivalent placed instances.
+/// Per-placement bindings retain no nodes; master revisions, exact component
+/// metadata, overrides and effective modes guard the immutable shared values.
+/// Removed bindings cannot pin an evicted value. Oversized values draw directly
+/// without entering the cache, and idle values expire after 240 frames.
 pub(crate) struct InstanceCache {
     pub(crate) entries: IdHashMap<NodeId, InstanceCacheEntry>,
+    shared: HashMap<InstanceCacheKey, SharedInstanceEntry>,
+    components: ComponentDependencies,
+    retained_nodes: usize,
+    retained_bytes: usize,
+    node_budget: usize,
+    byte_budget: usize,
     /// [`hash_overrides`] memoized per live-scene instance as
     /// `(node stamp, hash)`: the hash inputs (`component`, `overrides`,
     /// `prop_values`, `derived`) live on the scene node, whose stamp moves on
     /// every data edit, so an unchanged stamp guarantees an unchanged hash and
     /// a steady-state frame serializes nothing. Purged of removed ids when the
     /// scene's removal revision moves.
-    override_hashes: IdHashMap<NodeId, (u64, u64)>,
+    override_hashes: IdHashMap<NodeId, (u64, u64, u64)>,
     removal_seen: u64,
     /// Frame serial for idle eviction.
     frame: u64,
@@ -278,8 +269,31 @@ pub(crate) struct InstanceCache {
 /// One instance's memoized expansion and the key it was built under.
 pub(crate) struct InstanceCacheEntry {
     pub(crate) key: InstanceCacheKey,
-    pub(crate) expanded: Arc<PreparedInstance>,
     last_used: u64,
+}
+
+struct SharedInstanceEntry {
+    instance: InstanceNode,
+    expanded: Arc<PreparedInstance>,
+    bytes: usize,
+    last_used: u64,
+}
+
+impl Default for InstanceCache {
+    fn default() -> Self {
+        Self {
+            entries: IdHashMap::default(),
+            shared: HashMap::new(),
+            components: ComponentDependencies::default(),
+            retained_nodes: 0,
+            retained_bytes: 0,
+            node_budget: 32_768,
+            byte_budget: 64 << 20,
+            override_hashes: IdHashMap::default(),
+            removal_seen: 0,
+            frame: 0,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -287,6 +301,7 @@ pub(crate) struct PreparedInstance {
     pub(crate) nodes: Vec<ExpandedNode>,
     pub(crate) children: HashMap<NodeId, Vec<usize>>,
     pub(crate) root: Option<usize>,
+    pub(crate) bounds: Option<IdHashMap<NodeId, Option<fanta_doc::Bounds>>>,
 }
 
 impl PreparedInstance {
@@ -295,10 +310,19 @@ impl PreparedInstance {
         // be replaced and evicted with that expansion, preserving its tie order.
         let children = super::instance::build_child_index(&nodes);
         let root = nodes.iter().position(|entry| entry.def_path.is_empty());
+        // Remaining bindings can change geometry at paint time; text paths
+        // also depend on font metrics for which the renderer has no epoch.
+        let bounds = nodes
+            .iter()
+            .all(|entry| {
+                entry.node.bindings.is_empty() && !matches!(entry.node.data, NodeData::TextPath(_))
+            })
+            .then(|| super::instance::prepare_expansion_bounds(&nodes, &children));
         Self {
             nodes,
             children,
             root,
+            bounds,
         }
     }
 }
@@ -312,6 +336,9 @@ pub(crate) const INSTANCE_CACHE_IDLE_FRAMES: u64 = 240;
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct InstanceCacheKey {
     pub(crate) instance: NodeId,
+    pub(crate) node_stamp: Option<u64>,
+    pub(crate) root: Option<NodeId>,
+    pub(crate) component: Option<fanta_doc::ComponentId>,
     pub(crate) rev: u64,
     /// The resolved master's transient-preview revision, which moves while a
     /// drag/text/properties preview writes straight into the scene without
@@ -330,6 +357,10 @@ pub(crate) struct InstanceCacheKey {
 impl InstanceCache {
     fn clear(&mut self) {
         self.entries.clear();
+        self.shared.clear();
+        self.components.clear();
+        self.retained_nodes = 0;
+        self.retained_bytes = 0;
         self.override_hashes.clear();
     }
 
@@ -339,24 +370,125 @@ impl InstanceCache {
 
     /// The memoized expansion for `key`'s instance, if it was built under
     /// exactly this key.
-    pub(crate) fn lookup(&mut self, key: &InstanceCacheKey) -> Option<Arc<PreparedInstance>> {
-        let entry = self.entries.get_mut(&key.instance)?;
-        if entry.key != *key {
+    pub(crate) fn lookup(
+        &mut self,
+        key: &InstanceCacheKey,
+        instance: &InstanceNode,
+    ) -> Option<Arc<PreparedInstance>> {
+        let shared_key = Self::shared_key(*key);
+        let bound = self
+            .entries
+            .get(&key.instance)
+            .is_some_and(|entry| entry.key == *key && key.node_stamp.is_some());
+        let entry = self.shared.get_mut(&shared_key)?;
+        // Cross-placement sharing must check the actual override data: unlike
+        // a stamped live binding, a hash alone cannot prove two inputs equal.
+        if !bound && entry.instance != *instance {
             return None;
         }
         entry.last_used = self.frame;
-        Some(Arc::clone(&entry.expanded))
+        let expanded = Arc::clone(&entry.expanded);
+        self.bind(*key);
+        Some(expanded)
     }
 
-    pub(crate) fn insert(&mut self, key: InstanceCacheKey, expanded: Arc<PreparedInstance>) {
+    fn shared_key(key: InstanceCacheKey) -> InstanceCacheKey {
+        InstanceCacheKey {
+            instance: key.root.unwrap_or(key.instance),
+            node_stamp: None,
+            ..key
+        }
+    }
+
+    fn bind(&mut self, key: InstanceCacheKey) {
+        if let Some(previous) = self
+            .entries
+            .get(&key.instance)
+            .map(|entry| Self::shared_key(entry.key))
+            && previous != Self::shared_key(key)
+            && !self
+                .entries
+                .iter()
+                .any(|(id, entry)| *id != key.instance && Self::shared_key(entry.key) == previous)
+        {
+            self.remove_shared(previous);
+        }
+        if !self.entries.contains_key(&key.instance) && self.entries.len() >= 4_096 {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(id, _)| *id)
+            {
+                self.entries.remove(&oldest);
+            }
+        }
         self.entries.insert(
             key.instance,
             InstanceCacheEntry {
                 key,
-                expanded,
                 last_used: self.frame,
             },
         );
+    }
+
+    fn remove_shared(&mut self, key: InstanceCacheKey) {
+        if let Some(entry) = self.shared.remove(&key) {
+            self.retained_nodes -= entry.expanded.nodes.len();
+            self.retained_bytes -= entry.bytes;
+            self.entries
+                .retain(|_, binding| Self::shared_key(binding.key) != key);
+        }
+    }
+
+    pub(crate) fn insert(
+        &mut self,
+        key: InstanceCacheKey,
+        instance: &InstanceNode,
+        expanded: Arc<PreparedInstance>,
+    ) {
+        let bytes = prepared_instance_bytes(&expanded, instance);
+        let nodes = expanded.nodes.len();
+        if nodes > self.node_budget || bytes > self.byte_budget {
+            self.entries.remove(&key.instance);
+            return;
+        }
+        let shared_key = Self::shared_key(key);
+        self.remove_shared(shared_key);
+        while self.shared.len() >= 2_048
+            || self.retained_nodes.saturating_add(nodes) > self.node_budget
+            || self.retained_bytes.saturating_add(bytes) > self.byte_budget
+        {
+            let Some(oldest) = self
+                .shared
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(key, _)| *key)
+            else {
+                break;
+            };
+            self.remove_shared(oldest);
+        }
+        self.retained_nodes += nodes;
+        self.retained_bytes += bytes;
+        self.shared.insert(
+            shared_key,
+            SharedInstanceEntry {
+                instance: instance.clone(),
+                expanded,
+                bytes,
+                last_used: self.frame,
+            },
+        );
+        self.bind(key);
+    }
+
+    pub(crate) fn record_component(
+        &mut self,
+        components: &ComponentLibrary,
+        reference: fanta_doc::ComponentId,
+    ) {
+        self.components.record(components, reference);
     }
 
     /// [`hash_overrides`] for `instance`, served from the stamp memo when
@@ -371,13 +503,25 @@ impl InstanceCache {
         let Some(stamp) = stamp else {
             return hash_overrides(instance);
         };
-        if let Some(&(memo_stamp, hash)) = self.override_hashes.get(&instance_id)
-            && memo_stamp == stamp
+        if let Some((memo_stamp, hash, last_used)) = self.override_hashes.get_mut(&instance_id)
+            && *memo_stamp == stamp
         {
-            return hash;
+            *last_used = self.frame;
+            return *hash;
         }
         let hash = hash_overrides(instance);
-        self.override_hashes.insert(instance_id, (stamp, hash));
+        if !self.override_hashes.contains_key(&instance_id) && self.override_hashes.len() >= 4_096 {
+            if let Some(oldest) = self
+                .override_hashes
+                .iter()
+                .min_by_key(|(_, (_, _, last_used))| *last_used)
+                .map(|(id, _)| *id)
+            {
+                self.override_hashes.remove(&oldest);
+            }
+        }
+        self.override_hashes
+            .insert(instance_id, (stamp, hash, self.frame));
         hash
     }
 
@@ -385,7 +529,32 @@ impl InstanceCache {
     /// `mode_generation`s and entries idle for [`INSTANCE_CACHE_IDLE_FRAMES`],
     /// and purge the override-hash memo of removed nodes (gated on the scene's
     /// removal revision so steady frames never scan it).
-    fn begin_frame(&mut self, scene: &Scene, mode_generation: u64) {
+    fn begin_frame(&mut self, scene: &Scene, mode_generation: u64, components: &ComponentLibrary) {
+        if !self.components.matches(components) {
+            match self.components.changed_references(components) {
+                Some(changed) => {
+                    let stale: Vec<_> = self
+                        .shared
+                        .iter()
+                        .filter(|(key, entry)| {
+                            changed.contains(&entry.instance.component)
+                                || key
+                                    .component
+                                    .is_some_and(|component| changed.contains(&component))
+                        })
+                        .map(|(key, _)| *key)
+                        .collect();
+                    for key in stale {
+                        self.remove_shared(key);
+                    }
+                    self.components.clear();
+                    for entry in self.shared.values() {
+                        self.components.record(components, entry.instance.component);
+                    }
+                }
+                None => self.clear(),
+            }
+        }
         self.frame = self.frame.wrapping_add(1);
         let frame = self.frame;
         if self.entries.values().any(|entry| {
@@ -397,11 +566,110 @@ impl InstanceCache {
                     && frame.wrapping_sub(entry.last_used) <= INSTANCE_CACHE_IDLE_FRAMES
             });
         }
+        let stale: Vec<_> = self
+            .shared
+            .iter()
+            .filter(|(key, entry)| {
+                key.mode_generation != mode_generation
+                    || frame.wrapping_sub(entry.last_used) > INSTANCE_CACHE_IDLE_FRAMES
+            })
+            .map(|(key, _)| *key)
+            .collect();
+        for key in stale {
+            self.remove_shared(key);
+        }
+        self.override_hashes.retain(|_, (_, _, last_used)| {
+            frame.wrapping_sub(*last_used) <= INSTANCE_CACHE_IDLE_FRAMES
+        });
         let removal = scene.removal_revision();
         if self.removal_seen != removal {
             self.override_hashes.retain(|id, _| scene.contains(*id));
             self.removal_seen = removal;
         }
+    }
+}
+
+fn prepared_instance_bytes(expanded: &PreparedInstance, instance: &InstanceNode) -> usize {
+    let mut counter = CacheByteCounter(0);
+    let mut opaque_bytes = instance_json_heap_bytes(instance);
+    if opaque_bytes == usize::MAX {
+        return usize::MAX;
+    }
+    if serde_json::to_writer(&mut counter, instance).is_err() {
+        return usize::MAX;
+    }
+    for entry in &expanded.nodes {
+        opaque_bytes = opaque_bytes.saturating_add(node_json_heap_bytes(&entry.node));
+        if opaque_bytes == usize::MAX {
+            return usize::MAX;
+        }
+        if serde_json::to_writer(&mut counter, &entry.node).is_err()
+            || serde_json::to_writer(&mut counter, &entry.def_path).is_err()
+        {
+            return usize::MAX;
+        }
+    }
+    // JSON is measured without retaining another payload. The multiplier
+    // allows for native numeric storage, capacities and map/index overhead.
+    counter
+        .0
+        .saturating_mul(4)
+        .saturating_add(opaque_bytes)
+        .saturating_add(
+            expanded
+                .nodes
+                .len()
+                .saturating_mul(std::mem::size_of::<ExpandedNode>() + 256),
+        )
+}
+
+fn instance_json_heap_bytes(instance: &InstanceNode) -> usize {
+    instance.overrides.iter().fold(0usize, |bytes, entry| {
+        let added = match &entry.value {
+            fanta_doc::OverrideValue::Field { value } => json_heap_bytes(value, 0),
+            _ => 0,
+        };
+        bytes.saturating_add(added)
+    })
+}
+
+fn node_json_heap_bytes(node: &fanta_doc::CanvasNode) -> usize {
+    let payload = match &node.data {
+        NodeData::Instance(instance) => instance_json_heap_bytes(instance),
+        NodeData::NodeGraph(graph) => graph.graph.nodes.values().fold(0usize, |bytes, workflow| {
+            bytes.saturating_add(json_heap_bytes(&workflow.params, 0))
+        }),
+        NodeData::Model3d(model) => json_heap_bytes(&model.overrides, 0),
+        NodeData::AiArtifact(artifact) => json_heap_bytes(&artifact.params, 0),
+        NodeData::Embed(embed) => json_heap_bytes(&embed.payload, 0),
+        _ => 0,
+    };
+    json_heap_bytes(&node.meta, 0).saturating_add(payload)
+}
+
+fn json_heap_bytes(value: &serde_json::Value, depth: usize) -> usize {
+    if depth >= 128 {
+        return usize::MAX;
+    }
+    match value {
+        serde_json::Value::String(string) => string.capacity(),
+        serde_json::Value::Array(values) => values.iter().fold(
+            values
+                .capacity()
+                .saturating_mul(std::mem::size_of::<serde_json::Value>()),
+            |bytes, value| bytes.saturating_add(json_heap_bytes(value, depth + 1)),
+        ),
+        serde_json::Value::Object(values) => values.iter().fold(
+            values.len().saturating_mul(
+                std::mem::size_of::<serde_json::Value>() + std::mem::size_of::<String>() + 64,
+            ),
+            |bytes, (key, value)| {
+                bytes
+                    .saturating_add(key.capacity())
+                    .saturating_add(json_heap_bytes(value, depth + 1))
+            },
+        ),
+        _ => 0,
     }
 }
 
@@ -901,8 +1169,8 @@ impl RasterRenderer {
         self.clear_layer_cache();
     }
 
-    /// Number of distinct instance expansions currently memoized. For tests and
-    /// memory diagnostics.
+    /// Number of placed or nested instance bindings currently memoized. Several
+    /// equivalent bindings can share one immutable expansion.
     pub fn instance_cache_len(&self) -> usize {
         self.instance_cache.len()
     }
@@ -1041,7 +1309,7 @@ impl RasterRenderer {
         }
         self.sync_scene_instance(scene);
         self.instance_cache
-            .begin_frame(scene, inputs.mode_generation);
+            .begin_frame(scene, inputs.mode_generation, inputs.components);
         self.boolean_cache.purge_removed(scene);
         self.path_cache.purge_removed(scene);
         let background = self.background;
@@ -1241,7 +1509,7 @@ impl RasterRenderer {
 
         self.sync_scene_instance(scene);
         self.instance_cache
-            .begin_frame(scene, inputs.mode_generation);
+            .begin_frame(scene, inputs.mode_generation, inputs.components);
         self.boolean_cache.purge_removed(scene);
         self.path_cache.purge_removed(scene);
         let background = self.background;
@@ -1373,6 +1641,8 @@ impl RasterRenderer {
             return;
         }
         self.sync_scene_instance(scene);
+        self.instance_cache
+            .begin_frame(scene, inputs.mode_generation, inputs.components);
         let display_scale = self.display_scale;
         let resolver = self.asset_resolver.clone();
         let cache = &mut self.image_cache;
@@ -1427,6 +1697,8 @@ impl RasterRenderer {
             return;
         }
         self.sync_scene_instance(scene);
+        self.instance_cache
+            .begin_frame(scene, inputs.mode_generation, inputs.components);
         let display_scale = self.display_scale;
         let resolver = self.asset_resolver.clone();
         let cache = &mut self.image_cache;
@@ -1868,6 +2140,9 @@ mod instance_cache_tests {
     fn key(instance: NodeId, override_hash: u64, mode_generation: u64) -> InstanceCacheKey {
         InstanceCacheKey {
             instance,
+            node_stamp: Some(1),
+            root: Some(instance),
+            component: None,
             rev: 1,
             preview_rev: 0,
             override_hash,
@@ -1903,6 +2178,31 @@ mod instance_cache_tests {
         ]);
         assert_eq!(prepared.root, Some(1));
         assert_eq!(prepared.children.get(&root_id), Some(&vec![0, 2]));
+    }
+
+    #[test]
+    fn prepared_bounds_exclude_paint_bindings_and_font_dependent_text_paths() {
+        let mut node = fanta_doc::CanvasNode::new(NodeData::Group(Default::default()));
+        node.bindings.insert(
+            fanta_doc::BoundProp::ClipWidth,
+            fanta_doc::VariableId::new(),
+        );
+        let bound = PreparedInstance::new(vec![ExpandedNode {
+            node,
+            def_path: Default::default(),
+        }]);
+        assert!(bound.bounds.is_none());
+
+        let mut path = fanta_doc::PathData::new();
+        path.move_to(0.0, 0.0).line_to(100.0, 0.0);
+        let node = fanta_doc::CanvasNode::new(NodeData::TextPath(fanta_doc::TextPathNode::new(
+            path, "Label",
+        )));
+        let text = PreparedInstance::new(vec![ExpandedNode {
+            node,
+            def_path: Default::default(),
+        }]);
+        assert!(text.bounds.is_none());
     }
 
     #[test]
@@ -1954,48 +2254,178 @@ mod instance_cache_tests {
 
     #[test]
     fn a_changed_key_replaces_the_instances_entry_instead_of_leaking() {
+        let input = instance(ComponentId::new());
         let mut cache = InstanceCache::default();
         let id = NodeId::new();
-        cache.insert(key(id, 1, 0), Arc::new(PreparedInstance::default()));
-        assert!(cache.lookup(&key(id, 1, 0)).is_some());
+        cache.insert(key(id, 1, 0), &input, Arc::new(PreparedInstance::default()));
+        assert!(cache.lookup(&key(id, 1, 0), &input).is_some());
         assert!(
-            cache.lookup(&key(id, 2, 0)).is_none(),
+            cache.lookup(&key(id, 2, 0), &input).is_none(),
             "a new override hash misses"
         );
-        cache.insert(key(id, 2, 0), Arc::new(PreparedInstance::default()));
+        cache.insert(key(id, 2, 0), &input, Arc::new(PreparedInstance::default()));
         assert_eq!(cache.len(), 1, "one entry per instance");
-        assert!(cache.lookup(&key(id, 1, 0)).is_none());
-        assert!(cache.lookup(&key(id, 2, 0)).is_some());
+        assert!(cache.lookup(&key(id, 1, 0), &input).is_none());
+        assert!(cache.lookup(&key(id, 2, 0), &input).is_some());
+    }
+
+    #[test]
+    fn equivalent_placements_share_one_expansion_and_hash_collisions_do_not() {
+        let input = instance(ComponentId::new());
+        let first = key(NodeId::new(), 1, 0);
+        let second = InstanceCacheKey {
+            instance: NodeId::new(),
+            ..first
+        };
+        let prepared = Arc::new(PreparedInstance::default());
+        let mut cache = InstanceCache::default();
+        cache.insert(first, &input, Arc::clone(&prepared));
+        let reused = cache.lookup(&second, &input).expect("shared expansion");
+        assert!(Arc::ptr_eq(&reused, &prepared));
+        assert_eq!(cache.entries.len(), 2);
+        assert_eq!(cache.shared.len(), 1);
+
+        let mut different = input.clone();
+        different.local_size[0] += 1.0;
+        let collision = InstanceCacheKey {
+            instance: NodeId::new(),
+            ..first
+        };
+        assert!(cache.lookup(&collision, &different).is_none());
+        let edited = InstanceCacheKey {
+            node_stamp: Some(2),
+            ..first
+        };
+        assert!(
+            cache.lookup(&edited, &different).is_none(),
+            "a changed live stamp rechecks exact data even when hashes collide"
+        );
+    }
+
+    #[test]
+    fn shared_expansion_budgets_evict_bindings_and_bypass_oversized_payloads() {
+        let input = instance(ComponentId::new());
+        let prepared = || {
+            Arc::new(PreparedInstance::new(vec![ExpandedNode {
+                node: fanta_doc::CanvasNode::new(NodeData::Group(Default::default())),
+                def_path: Default::default(),
+            }]))
+        };
+        let mut cache = InstanceCache {
+            node_budget: 2,
+            ..InstanceCache::default()
+        };
+        let first = key(NodeId::new(), 1, 0);
+        let second = key(NodeId::new(), 1, 0);
+        let third = key(NodeId::new(), 1, 0);
+        let scene = Scene::new();
+        let library = ComponentLibrary::default();
+        cache.begin_frame(&scene, 0, &library);
+        cache.insert(first, &input, prepared());
+        cache.begin_frame(&scene, 0, &library);
+        cache.insert(second, &input, prepared());
+        cache.begin_frame(&scene, 0, &library);
+        assert!(cache.lookup(&first, &input).is_some());
+        cache.insert(third, &input, prepared());
+        assert!(cache.lookup(&second, &input).is_none());
+        assert!(!cache.entries.contains_key(&second.instance));
+        assert_eq!(cache.retained_nodes, 2);
+
+        let oversized = Arc::new(PreparedInstance::new(
+            (0..3)
+                .map(|_| ExpandedNode {
+                    node: fanta_doc::CanvasNode::new(NodeData::Group(Default::default())),
+                    def_path: Default::default(),
+                })
+                .collect(),
+        ));
+        let large_key = key(NodeId::new(), 1, 0);
+        cache.insert(large_key, &input, oversized);
+        assert!(cache.lookup(&large_key, &input).is_none());
+        assert_eq!(cache.retained_nodes, 2);
+
+        cache.clear();
+        let payload = prepared();
+        cache.byte_budget = prepared_instance_bytes(&payload, &input);
+        cache.insert(first, &input, payload);
+        cache.begin_frame(&scene, 0, &library);
+        cache.insert(second, &input, prepared());
+        assert!(cache.lookup(&first, &input).is_none());
+        assert!(cache.retained_bytes <= cache.byte_budget);
+        cache.byte_budget = 0;
+        cache.insert(third, &input, prepared());
+        assert!(cache.lookup(&third, &input).is_none());
+    }
+
+    #[test]
+    fn expansion_budget_accounts_for_native_opaque_json_arrays() {
+        let mut input = instance(ComponentId::new());
+        let mut node = fanta_doc::CanvasNode::new(NodeData::Group(Default::default()));
+        node.meta = serde_json::Value::Array(vec![serde_json::Value::from(0); 4_096]);
+        let array_bytes = 4_096 * std::mem::size_of::<serde_json::Value>();
+        let prepared = Arc::new(PreparedInstance::new(vec![ExpandedNode {
+            node,
+            def_path: Default::default(),
+        }]));
+        assert!(prepared_instance_bytes(&prepared, &input) > array_bytes);
+        let mut cache = InstanceCache {
+            byte_budget: array_bytes - 1,
+            ..InstanceCache::default()
+        };
+        let cache_key = key(NodeId::new(), 1, 0);
+        cache.insert(cache_key, &input, Arc::clone(&prepared));
+        assert!(cache.lookup(&cache_key, &input).is_none());
+        input.overrides.push(Override {
+            target_path: Default::default(),
+            target_prop: fanta_doc::BoundProp::Visible,
+            value: OverrideValue::Field {
+                value: serde_json::Value::Array(vec![serde_json::Value::from(0); 4_096]),
+            },
+        });
+        assert!(prepared_instance_bytes(&prepared, &input) > 2 * array_bytes);
     }
 
     #[test]
     fn entries_from_another_mode_generation_or_idle_too_long_are_evicted() {
         let scene = Scene::new();
+        let input = instance(ComponentId::new());
         let mut cache = InstanceCache::default();
         let live = NodeId::new();
         let stale_mode = NodeId::new();
-        cache.begin_frame(&scene, 7);
-        cache.insert(key(live, 1, 7), Arc::new(PreparedInstance::default()));
-        cache.insert(key(stale_mode, 1, 6), Arc::new(PreparedInstance::default()));
-        cache.begin_frame(&scene, 7);
-        assert!(cache.lookup(&key(stale_mode, 1, 6)).is_none());
-        assert!(cache.lookup(&key(live, 1, 7)).is_some());
+        cache.begin_frame(&scene, 7, &ComponentLibrary::default());
+        cache.insert(
+            key(live, 1, 7),
+            &input,
+            Arc::new(PreparedInstance::default()),
+        );
+        cache.insert(
+            key(stale_mode, 1, 6),
+            &input,
+            Arc::new(PreparedInstance::default()),
+        );
+        cache.begin_frame(&scene, 7, &ComponentLibrary::default());
+        assert!(cache.lookup(&key(stale_mode, 1, 6), &input).is_none());
+        assert!(cache.lookup(&key(live, 1, 7), &input).is_some());
 
         let idle = NodeId::new();
-        cache.insert(key(idle, 1, 7), Arc::new(PreparedInstance::default()));
+        cache.insert(
+            key(idle, 1, 7),
+            &input,
+            Arc::new(PreparedInstance::default()),
+        );
         for _ in 0..INSTANCE_CACHE_IDLE_FRAMES {
-            cache.begin_frame(&scene, 7);
+            cache.begin_frame(&scene, 7, &ComponentLibrary::default());
             // `live` is looked up every frame and must survive.
-            assert!(cache.lookup(&key(live, 1, 7)).is_some());
+            assert!(cache.lookup(&key(live, 1, 7), &input).is_some());
         }
         // Probe the map directly: a lookup would count as a use.
         assert!(cache.entries.contains_key(&idle), "still inside the window");
-        cache.begin_frame(&scene, 7);
+        cache.begin_frame(&scene, 7, &ComponentLibrary::default());
         assert!(
             !cache.entries.contains_key(&idle),
             "one frame past the window"
         );
-        assert!(cache.lookup(&key(live, 1, 7)).is_some());
+        assert!(cache.lookup(&key(live, 1, 7), &input).is_some());
     }
 
     #[test]
@@ -2006,16 +2436,16 @@ mod instance_cache_tests {
         let id = node.id;
         scene.insert(node).unwrap();
         let mut cache = InstanceCache::default();
-        cache.begin_frame(&scene, 0);
+        cache.begin_frame(&scene, 0, &ComponentLibrary::default());
         let Some(fanta_doc::NodeData::Instance(inst)) = scene.get(id).map(|node| &node.data) else {
             panic!("instance node");
         };
         cache.override_hash(id, Some(scene.node_stamp(id)), inst);
         assert_eq!(cache.override_hashes.len(), 1);
-        cache.begin_frame(&scene, 0);
+        cache.begin_frame(&scene, 0, &ComponentLibrary::default());
         assert_eq!(cache.override_hashes.len(), 1, "no removal, no scan");
         scene.remove(id).unwrap();
-        cache.begin_frame(&scene, 0);
+        cache.begin_frame(&scene, 0, &ComponentLibrary::default());
         assert!(cache.override_hashes.is_empty());
     }
 }

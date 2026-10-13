@@ -23,11 +23,11 @@ use fanta_doc::{
 };
 use fanta_fnx::{
     ArtifactIr, ArtifactKind, FnxElement, FnxSidecar, FnxSourceMirror, RefTable,
-    artifact_file_names,
+    StructuralNodeChange, artifact_file_names,
 };
 use serde_json::{Map, Value};
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -177,6 +177,9 @@ impl ArtifactSession {
         if let Some(changed) = self.shared_scene_delta(&scoped) {
             return self.adopt_shared_scene(scoped, changed);
         }
+        if let Some(changes) = self.structural_scene_changes(&scoped)? {
+            return self.adopt_structural_scene(scoped, changes, None);
+        }
         self.adopt_scoped_doc_full(scoped)
     }
 
@@ -204,7 +207,18 @@ impl ArtifactSession {
             _ => None,
         };
         if let Some(scoped) = scopes.scope(self.kind, self.scoped.root, component) {
-            return self.adopt_scoped_doc(scoped?);
+            let scoped = scoped?;
+            if self.kind == ArtifactKind::Component
+                && self.ir.sidecar().root_parent
+                    != document
+                        .scene
+                        .get(self.scoped.root)
+                        .and_then(|node| node.parent)
+                        .map(|parent| parent.0.to_string())
+            {
+                return self.adopt_scoped_doc_full(scoped);
+            }
+            return self.adopt_scoped_doc(scoped);
         }
         let nodes = super::materialize::collect_subtree_nodes(document, self.scoped.root)?;
         let ir = ArtifactIr::from_nodes(self.kind, self.fn_name.clone(), &nodes)?;
@@ -297,11 +311,25 @@ impl ArtifactSession {
 
         // Editor hot path: a non-structural transaction on a provably-synced
         // scene validates and installs in place with node-scoped rollback,
-        // skipping the O(artifact) session clone entirely. Structural edits and
-        // any drifted state keep the correct-first clone-then-swap below.
+        // skipping the O(artifact) session clone entirely. Unproven transitions
+        // keep the clone-then-swap path below.
         let structural = transaction.ops.iter().any(is_structural_op);
         if !structural && self.scene_in_sync() {
             return self.apply_non_structural_in_place(transaction);
+        }
+        if structural && self.scene_in_sync() {
+            let mut scoped = ScopedDoc {
+                doc: self.scoped.doc.clone_for_persist(),
+                root: self.scoped.root,
+            };
+            scoped.doc.selection = self.scoped.doc.selection.clone();
+            scoped
+                .doc
+                .apply_transaction(transaction.clone())
+                .map_err(|error| SessionError::other(format!("apply: {error}")))?;
+            if let Some(changes) = self.structural_scene_changes(&scoped)? {
+                return self.adopt_structural_scene(scoped, changes, Some(transaction));
+            }
         }
 
         let mut scratch = self.clone();
@@ -914,6 +942,128 @@ impl ArtifactSession {
                 "the incremental adoption left the retained source out of sync"
             );
         }
+        Ok(source_sync)
+    }
+
+    fn structural_scene_changes(
+        &self,
+        next: &ScopedDoc,
+    ) -> Result<Option<Vec<StructuralNodeChange>>, SessionError> {
+        if !self.scene_in_sync()
+            || !matches!(self.kind, ArtifactKind::Page | ArtifactKind::Component)
+            || !matches!(
+                self.state,
+                ArtifactDirty::Clean | ArtifactDirty::DirtyCanvas
+            )
+        {
+            return Ok(None);
+        }
+        let root = self.scoped.root;
+        let current = &self.scoped.doc.scene;
+        let incoming = &next.doc.scene;
+        if current.get(root) != incoming.get(root)
+            || current.roots() != [root]
+            || incoming.roots() != [root]
+            || current.len() != self.ir.sidecar().ids.len()
+        {
+            return Ok(None);
+        }
+        incoming
+            .validate()
+            .map_err(|error| SessionError::DocAssemble(error.to_string()))?;
+        let mut ids: BTreeSet<_> = current.descendants_of(root).skip(1).collect();
+        ids.extend(incoming.descendants_of(root).skip(1));
+        let mut changes = Vec::new();
+        let mut structural = false;
+        for id in ids {
+            if incoming.shares_node(current, id) {
+                continue;
+            }
+            let before = current.get(id);
+            let after = incoming.get(id);
+            // The first adoption comes from independently decoded source. Value
+            // equality proves those unchanged nodes without projecting their
+            // vector payloads into a second JSON representation.
+            if before == after {
+                continue;
+            }
+            if let (Some(before), Some(after)) = (before, after) {
+                if std::mem::discriminant(&before.data) != std::mem::discriminant(&after.data) {
+                    return Ok(None);
+                }
+                structural |= before.parent != after.parent || before.index != after.index;
+            } else {
+                structural = true;
+            }
+            let to_value = |node: Option<&CanvasNode>| {
+                node.map(serde_json::to_value)
+                    .transpose()
+                    .map_err(|error| SessionError::other(error.to_string()))
+            };
+            let before = to_value(before)?;
+            let after = to_value(after)?;
+            if let Some(after) = &after {
+                serde_json::from_value::<CanvasNode>(after.clone())
+                    .map_err(|error| SessionError::DocAssemble(error.to_string()))?;
+            }
+            if let Some(before) = &before {
+                self.validate_source_node_change(&id.0.to_string(), before, after.as_ref())?;
+            }
+            changes.push(StructuralNodeChange {
+                id: id.0.to_string(),
+                before,
+                after,
+            });
+        }
+        Ok(structural.then_some(changes))
+    }
+
+    fn adopt_structural_scene(
+        &mut self,
+        mut scoped: ScopedDoc,
+        changes: Vec<StructuralNodeChange>,
+        transaction: Option<Transaction>,
+    ) -> Result<SourceSync, SessionError> {
+        let patch = self.ir.prepare_structural_patch(&changes)?;
+        let source = self.source.prepare_structural_patch(&self.ir, &patch)?;
+        #[cfg(debug_assertions)]
+        {
+            let retained = ArtifactIr::from_source_with(
+                self.kind,
+                self.fn_name.clone(),
+                &source.render(),
+                patch.sidecar().clone(),
+                &self.ref_table,
+            )?;
+            let retained = self.retained_scene_projection_from_ir(&retained)?;
+            let (_, scene) = project_scene_to_node_map(
+                &scoped,
+                self.kind,
+                &self.fn_name,
+                self.projected_canvas_header()?,
+            )?;
+            debug_assert!(
+                retained.nodes == scene.nodes,
+                "incremental structural adoption left source out of sync"
+            );
+        }
+        self.ir.commit_structural_patch(patch)?;
+        if let Some(transaction) = transaction {
+            let mut history = std::mem::replace(&mut self.scoped.doc.history, History::new());
+            history.record_applied_transaction(transaction);
+            scoped.doc.history = history;
+        }
+        self.scoped = scoped;
+        self.source = source;
+        self.ir_stale = false;
+        self.scene_stale = false;
+        self.state = ArtifactDirty::DirtyCanvas;
+        self.working_generation = self.working_generation.wrapping_add(1);
+        let source_sync = SourceSync::Rebuilt {
+            reason: SourceRebuildReason::StructuralOperation,
+        };
+        self.last_source_sync = source_sync.clone();
+        self.mark_scene_synced();
         Ok(source_sync)
     }
 
@@ -1743,8 +1893,15 @@ impl ArtifactSession {
     }
 
     fn retained_scene_projection(&self) -> Result<NodeMapEdition, SessionError> {
+        self.retained_scene_projection_from_ir(&self.ir)
+    }
+
+    fn retained_scene_projection_from_ir(
+        &self,
+        ir: &ArtifactIr,
+    ) -> Result<NodeMapEdition, SessionError> {
         let mut nodes = Map::new();
-        for value in self.ir.to_nodes()? {
+        for value in ir.to_nodes()? {
             let node: CanvasNode = serde_json::from_value(value)
                 .map_err(|error| SessionError::DocAssemble(error.to_string()))?;
             let id = node.id;

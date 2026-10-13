@@ -3,6 +3,7 @@
 //! as an unwrapped `fanta-project` directory.
 
 use std::{
+    borrow::Cow,
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     io::Read as _,
@@ -466,6 +467,7 @@ pub struct FigDocument {
     pub doc: Doc,
     pub pages: Vec<FigPage>,
     pub default_page_index: usize,
+    page_registry: PageRegistryIndex,
     pub(crate) solved_pages: HashSet<NodeId>,
     layout_state: layout::LayoutState,
     pending_layout_output_nodes: BTreeSet<NodeId>,
@@ -545,6 +547,11 @@ fn next_variables_generation() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+fn next_page_registry_revision() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 pub struct FigPage {
     pub root: Option<NodeId>,
     pub name: SharedString,
@@ -554,6 +561,89 @@ pub struct FigPage {
     /// every component master). Kept in `pages` so a component can be focused by
     /// switching to it, yet filtered out of the user-facing page list.
     pub hidden: bool,
+}
+
+struct PageRegistryIndex {
+    authored_roots: Vec<NodeId>,
+    authored_root_set: HashSet<NodeId>,
+    component_roots: BTreeMap<fanta_doc::ComponentId, (NodeId, bool)>,
+    component_by_root: HashMap<NodeId, fanta_doc::ComponentId>,
+    page_indices: HashMap<Option<NodeId>, usize>,
+    revision: u64,
+    #[cfg(test)]
+    validations: usize,
+}
+
+impl PageRegistryIndex {
+    fn new(doc: &Doc) -> Self {
+        let mut component_by_root = HashMap::with_capacity(doc.components.defs.len());
+        let component_roots = doc
+            .components
+            .defs
+            .iter()
+            .map(|(id, definition)| {
+                // A shared root has always used the first definition in id
+                // order, including when that root is also an authored page.
+                component_by_root.entry(definition.root).or_insert(*id);
+                (*id, (definition.root, doc.scene.contains(definition.root)))
+            })
+            .collect();
+        Self {
+            authored_roots: doc.pages().to_vec(),
+            authored_root_set: doc.pages().iter().copied().collect(),
+            component_roots,
+            component_by_root,
+            page_indices: HashMap::new(),
+            revision: next_page_registry_revision(),
+            #[cfg(test)]
+            validations: 0,
+        }
+    }
+
+    fn matches(&self, doc: &Doc) -> bool {
+        self.authored_roots == doc.pages()
+            && self.component_roots.len() == doc.components.defs.len()
+            && self.component_roots.iter().zip(&doc.components.defs).all(
+                |((previous_id, (root, present)), (id, definition))| {
+                    previous_id == id
+                        && *root == definition.root
+                        && *present == doc.scene.contains(*root)
+                },
+            )
+    }
+
+    fn editor_roots(&self) -> Vec<Option<NodeId>> {
+        let mut roots = if self.authored_roots.is_empty() {
+            vec![None]
+        } else {
+            self.authored_roots.iter().copied().map(Some).collect()
+        };
+        let mut components: Vec<_> = self
+            .component_roots
+            .values()
+            .filter_map(|(root, present)| {
+                (*present && !self.authored_root_set.contains(root)).then_some(*root)
+            })
+            .collect();
+        components.sort_unstable();
+        components.dedup();
+        roots.extend(components.into_iter().map(Some));
+        roots
+    }
+
+    fn index_pages(&mut self, pages: &[FigPage]) {
+        self.page_indices.clear();
+        self.page_indices.reserve(pages.len());
+        for (index, page) in pages.iter().enumerate() {
+            self.page_indices.entry(page.root).or_insert(index);
+        }
+    }
+}
+
+enum PageRegistryChange {
+    None,
+    Root(NodeId),
+    All,
 }
 
 impl FigDocument {
@@ -628,7 +718,9 @@ impl FigDocument {
                     .map(|resolver| resolver as Arc<dyn AssetResolver>);
                 (gpui_images, embedded_assets, asset_resolver, None)
             };
-        let pages = collect_pages(&doc, &visible_page_roots);
+        let mut page_registry = PageRegistryIndex::new(&doc);
+        let pages = collect_pages(&doc, &page_registry, &mut HashMap::new());
+        page_registry.index_pages(&pages);
         let default_page_index = default_page_root
             .and_then(|root| pages.iter().position(|page| page.root == Some(root)))
             .or_else(|| pages.iter().position(|page| !page.hidden))
@@ -654,6 +746,7 @@ impl FigDocument {
             doc,
             pages,
             default_page_index,
+            page_registry,
             solved_pages,
             layout_state,
             pending_layout_output_nodes,
@@ -974,10 +1067,19 @@ impl FigDocument {
     }
 
     fn sync_page_registry(&mut self) -> bool {
-        let roots = editor_page_roots(&self.doc);
-        let unchanged = self.pages.iter().map(|page| page.root).eq(roots);
-        if unchanged {
-            return false;
+        #[cfg(test)]
+        {
+            self.page_registry.validations += 1;
+        }
+        if self.page_registry.matches(&self.doc) {
+            let mut changed = false;
+            for (index, page) in self.pages.iter_mut().enumerate() {
+                changed |= update_page_metadata(&self.doc, &self.page_registry, page, index);
+            }
+            if changed {
+                self.page_registry.revision = next_page_registry_revision();
+            }
+            return changed;
         }
         let default_root = self
             .pages
@@ -985,16 +1087,16 @@ impl FigDocument {
             .and_then(|page| page.root);
         let mut previous: HashMap<_, _> = std::mem::take(&mut self.pages)
             .into_iter()
-            .filter_map(|page| page.root.map(|root| (root, page)))
+            .map(|page| (page.root, page))
             .collect();
-        self.pages = collect_pages(&self.doc, &visible_page_roots(&self.doc));
-        for page in &mut self.pages {
-            if let Some(root) = page.root
-                && let Some(previous) = previous.remove(&root)
-            {
-                page.bounds = previous.bounds;
-            }
+        let mut registry = PageRegistryIndex::new(&self.doc);
+        #[cfg(test)]
+        {
+            registry.validations = self.page_registry.validations;
         }
+        self.pages = collect_pages(&self.doc, &registry, &mut previous);
+        registry.index_pages(&self.pages);
+        self.page_registry = registry;
         self.default_page_index = self
             .pages
             .iter()
@@ -1006,7 +1108,8 @@ impl FigDocument {
             })
             .unwrap_or(0);
         if self.doc.active_page().is_some_and(|root| {
-            !self.doc.pages().contains(&root) && !self.doc.is_component_root(root)
+            !self.page_registry.authored_root_set.contains(&root)
+                && !self.page_registry.component_by_root.contains_key(&root)
         }) {
             // Undo or cancellation can remove a followed master's definition
             // while its scene node remains; recover a valid viewing scope.
@@ -1032,6 +1135,90 @@ impl FigDocument {
             .collect::<Vec<_>>();
         self.doc.selection.replace_with(surviving_selection);
         true
+    }
+
+    fn page_registry_change_for_operation(&self, operation: &Operation) -> PageRegistryChange {
+        match operation {
+            Operation::SetName { id, .. } | Operation::SetMeta { id, .. } => {
+                PageRegistryChange::Root(*id)
+            }
+            Operation::SetComponentName { id, .. } => self
+                .doc
+                .components
+                .def(*id)
+                .map_or(PageRegistryChange::None, |definition| {
+                    PageRegistryChange::Root(definition.root)
+                }),
+            Operation::CreateNode { node } | Operation::CreateInstance { node }
+                if !self.page_registry.component_by_root.contains_key(&node.id)
+                    && !self.page_registry.authored_root_set.contains(&node.id) =>
+            {
+                PageRegistryChange::None
+            }
+            Operation::DeleteSubtree { snapshot }
+                if snapshot.first().is_some_and(|node| {
+                    // Removal follows the actual child index. A caller's
+                    // snapshot may omit a nested master which is still removed.
+                    self.doc.scene.descendants_of(node.id).all(|id| {
+                        !self.page_registry.component_by_root.contains_key(&id)
+                            && !self.page_registry.authored_root_set.contains(&id)
+                    })
+                }) =>
+            {
+                PageRegistryChange::None
+            }
+            Operation::Reparent { .. }
+            | Operation::SetIndex { .. }
+            | Operation::SetTransform { .. }
+            | Operation::SetOpacity { .. }
+            | Operation::SetBlendMode { .. }
+            | Operation::SetEffects { .. }
+            | Operation::SetBlurs { .. }
+            | Operation::SetFlags { .. }
+            | Operation::SetMask { .. }
+            | Operation::SetMaskType { .. }
+            | Operation::SetLayoutChild { .. }
+            | Operation::SetConstraints { .. }
+            | Operation::ReplaceData { .. }
+            | Operation::SetComponentProps { .. }
+            | Operation::DefineComponentSet { .. }
+            | Operation::DeleteComponentSet { .. }
+            | Operation::SetVariantMembership { .. }
+            | Operation::SetComponentSet { .. }
+            | Operation::SetInstanceOverride { .. }
+            | Operation::SwapInstance { .. } => PageRegistryChange::None,
+            // Public registry maps and arbitrary document callbacks cannot be
+            // proven unchanged by scene or component rendering revisions.
+            _ => PageRegistryChange::All,
+        }
+    }
+
+    fn sync_page_registry_after_operation(&mut self, change: PageRegistryChange) -> bool {
+        match change {
+            PageRegistryChange::None => false,
+            PageRegistryChange::All => self.sync_page_registry(),
+            PageRegistryChange::Root(root) => {
+                let Some(index) = self.page_index_for_root(Some(root)) else {
+                    return false;
+                };
+                let Some(page) = self.pages.get_mut(index) else {
+                    return self.sync_page_registry();
+                };
+                let changed = update_page_metadata(&self.doc, &self.page_registry, page, index);
+                if changed {
+                    self.page_registry.revision = next_page_registry_revision();
+                }
+                changed
+            }
+        }
+    }
+
+    pub fn page_registry_revision(&self) -> u64 {
+        self.page_registry.revision
+    }
+
+    pub(crate) fn page_index_for_root(&self, root: Option<NodeId>) -> Option<usize> {
+        self.page_registry.page_indices.get(&root).copied()
     }
 
     fn refresh_page_bounds(&mut self, page_index: usize) {
@@ -1064,7 +1251,7 @@ impl FigDocument {
             }
         }
         self.refresh_layout_baseline();
-        if let Some(index) = self.pages.iter().position(|page| page.root == page_root) {
+        if let Some(index) = self.page_index_for_root(page_root) {
             self.refresh_page_bounds(index);
         }
     }
@@ -1074,11 +1261,7 @@ impl FigDocument {
             log::error!("refreshing layout inputs: {error:#}");
             self.layout_state = layout::LayoutState::new(&self.doc);
         }
-        if let Some(index) = self
-            .pages
-            .iter()
-            .position(|page| page.root == self.doc.active_page())
-        {
+        if let Some(index) = self.page_index_for_root(self.doc.active_page()) {
             self.refresh_page_bounds(index);
         }
     }
@@ -2641,12 +2824,13 @@ impl FigItem {
             .document
             .ready_mut()
             .context("the document is still loading")?;
+        let registry_change = document.page_registry_change_for_operation(&operation);
         document
             .doc
             .apply(operation)
             .context("applying canvas operation")?;
         let active_page = document.doc.active_page();
-        if document.sync_page_registry() {
+        if document.sync_page_registry_after_operation(registry_change) {
             self.last_scope = self.last_scope.filter(|scope| document.valid_scope(*scope));
             cx.emit(FigItemEvent::PageRegistryChanged);
         }
@@ -4629,61 +4813,66 @@ fn default_page_root(doc: &Doc, visible_page_roots: &[NodeId]) -> Option<NodeId>
     })
 }
 
-fn editor_page_roots(doc: &Doc) -> Vec<Option<NodeId>> {
-    let mut roots = if doc.pages().is_empty() {
-        vec![None]
-    } else {
-        doc.pages().iter().copied().map(Some).collect()
-    };
-    let mut components = doc
-        .components
-        .defs
-        .values()
-        .map(|definition| definition.root)
-        .filter(|root| doc.scene.contains(*root) && !doc.pages().contains(root))
-        .collect::<Vec<_>>();
-    components.sort_unstable();
-    components.dedup();
-    roots.extend(components.into_iter().map(Some));
-    roots
-}
-
-fn collect_pages(doc: &Doc, visible_page_roots: &[NodeId]) -> Vec<FigPage> {
+fn collect_pages(
+    doc: &Doc,
+    registry: &PageRegistryIndex,
+    previous: &mut HashMap<Option<NodeId>, FigPage>,
+) -> Vec<FigPage> {
     // Every page is included so the canvas can navigate to a hidden library
     // page (to focus a component master); `hidden` marks the ones the Pages
     // panel filters out. `index + 1` numbers unnamed pages by their absolute
     // position, which stays stable as pages are added/removed.
-    let visible: HashSet<NodeId> = visible_page_roots.iter().copied().collect();
-    editor_page_roots(doc)
+    registry
+        .editor_roots()
         .into_iter()
         .enumerate()
         .map(|(index, root)| {
-            let Some(root) = root else {
-                return FigPage {
-                    root: None,
-                    name: "Document".into(),
-                    bounds: page_bounds(doc, None),
-                    hidden: false,
-                };
-            };
-            let component = doc
-                .components
-                .defs
-                .values()
-                .find(|definition| definition.root == root);
-            FigPage {
-                root: Some(root),
-                name: component
-                    .map(|definition| definition.name.as_str())
-                    .or_else(|| doc.page_name(root))
-                    .filter(|name| !name.is_empty())
-                    .map(SharedString::from)
-                    .unwrap_or_else(|| format!("Page {}", index + 1).into()),
-                bounds: page_bounds(doc, Some(root)),
-                hidden: !doc.pages().contains(&root) || !visible.contains(&root),
-            }
+            let mut page = previous.remove(&root).unwrap_or_else(|| FigPage {
+                root,
+                name: SharedString::default(),
+                bounds: page_bounds(doc, root),
+                hidden: false,
+            });
+            update_page_metadata(doc, registry, &mut page, index);
+            page
         })
         .collect()
+}
+
+fn update_page_metadata(
+    doc: &Doc,
+    registry: &PageRegistryIndex,
+    page: &mut FigPage,
+    index: usize,
+) -> bool {
+    let (name, hidden) = match page.root {
+        None => (Cow::Borrowed("Document"), false),
+        Some(root) => {
+            let name = registry
+                .component_by_root
+                .get(&root)
+                .and_then(|id| doc.components.def(*id))
+                .map(|definition| definition.name.as_str())
+                .or_else(|| doc.page_name(root))
+                .filter(|name| !name.is_empty())
+                .map(Cow::Borrowed)
+                .unwrap_or_else(|| Cow::Owned(format!("Page {}", index + 1)));
+            let hidden = !registry.authored_root_set.contains(&root)
+                || doc
+                    .scene
+                    .get(root)
+                    .and_then(|node| node.meta.get("hidden_page"))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true);
+            (name, hidden)
+        }
+    };
+    let changed = page.name.as_ref() != name.as_ref() || page.hidden != hidden;
+    if page.name.as_ref() != name.as_ref() {
+        page.name = name.into_owned().into();
+    }
+    page.hidden = hidden;
+    changed
 }
 
 fn page_content_area(doc: &Doc, page_root: Option<NodeId>) -> f64 {
@@ -6186,6 +6375,323 @@ mod tests {
         })
         .expect("define component");
         (doc, page_root, component, master_root)
+    }
+
+    fn metadata_library(count: usize) -> (Doc, NodeId, Vec<(fanta_doc::ComponentId, NodeId)>) {
+        let mut doc = doc_with_one_page();
+        let page = *doc.pages().first().expect("authored page");
+        let mut components = Vec::with_capacity(count);
+        for index in 0..count {
+            let mut node =
+                fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(fanta_doc::GroupNode {
+                    local_size: Some([20.0, 30.0]),
+                    ..Default::default()
+                }));
+            node.name = format!("Master layer {index}");
+            let root = node.id;
+            doc.scene.insert(node).expect("master root");
+            let id = fanta_doc::ComponentId::from_u128(index as u128 + 1);
+            doc.components.defs.insert(
+                id,
+                fanta_doc::ComponentDef::new(id, root, format!("Component {index}")),
+            );
+            components.push((id, root));
+        }
+        (doc, page, components)
+    }
+
+    #[test]
+    fn page_metadata_indexes_preserve_author_order_and_shared_master_roots() {
+        let (mut doc, first, components) = metadata_library(260);
+        let mut hidden = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
+        hidden.name = "Internal library".into();
+        hidden.meta = serde_json::json!({"hidden_page": true});
+        let second = doc.scene.insert(hidden).expect("hidden page");
+        doc.add_page(second);
+        let alias = fanta_doc::ComponentId::from_u128(500);
+        doc.components.defs.insert(
+            alias,
+            fanta_doc::ComponentDef::new(alias, first, "Authored page alias"),
+        );
+        let duplicate = fanta_doc::ComponentId::from_u128(501);
+        let (original, shared_root) = *components.first().expect("first master");
+        doc.components.defs.insert(
+            duplicate,
+            fanta_doc::ComponentDef::new(duplicate, shared_root, "Later duplicate"),
+        );
+        let missing = fanta_doc::ComponentId::from_u128(502);
+        let absent_root = NodeId::new();
+        doc.components.defs.insert(
+            missing,
+            fanta_doc::ComponentDef::new(missing, absent_root, "Missing master"),
+        );
+        let document = FigDocument::from_doc(doc, BTreeMap::new());
+        let mut expected: Vec<_> = components.iter().map(|(_, root)| *root).collect();
+        expected.sort_unstable();
+        assert_eq!(document.pages.len(), expected.len() + 2);
+        assert_eq!(document.pages[0].root, Some(first));
+        assert_eq!(document.pages[0].name.as_ref(), "Authored page alias");
+        assert!(!document.pages[0].hidden);
+        assert_eq!(document.pages[1].root, Some(second));
+        assert!(document.pages[1].hidden);
+        assert_eq!(
+            document.pages[2..]
+                .iter()
+                .map(|page| page.root.expect("master root"))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(document.pages[2..].iter().all(|page| page.hidden));
+        for (index, entry) in document.pages.iter().enumerate() {
+            assert_eq!(document.page_index_for_root(entry.root), Some(index));
+        }
+        let index = document
+            .page_index_for_root(Some(shared_root))
+            .expect("shared master");
+        assert_eq!(
+            document.pages[index].name.as_ref(),
+            document.doc.components.defs[&original].name
+        );
+        assert_eq!(document.page_index_for_root(Some(absent_root)), None);
+    }
+
+    #[test]
+    fn arbitrary_registry_changes_refresh_metadata_without_rebuilding_surviving_entries() {
+        let (doc, page, components) = metadata_library(260);
+        let (component, root) = components[137];
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        let index = document
+            .page_index_for_root(Some(root))
+            .expect("master index");
+        let bounds = fanta_doc::Bounds::from_xywh(13.0, 17.0, 19.0, 23.0);
+        document.pages[index].bounds = bounds;
+        let pages_pointer = document.pages.as_ptr();
+        let revision = document.page_registry_revision();
+        document
+            .doc
+            .components
+            .defs
+            .get_mut(&component)
+            .expect("definition")
+            .name = "External component rename".into();
+        document.doc.scene.get_mut(page).expect("page").meta =
+            serde_json::json!({"hidden_page": true});
+        assert!(document.sync_page_registry());
+        assert_ne!(document.page_registry_revision(), revision);
+        assert_eq!(document.pages.as_ptr(), pages_pointer);
+        assert_eq!(document.pages[index].bounds, bounds);
+        assert_eq!(
+            document.pages[index].name.as_ref(),
+            "External component rename"
+        );
+        assert!(document.pages[0].hidden);
+        let revision = document.page_registry_revision();
+        document
+            .doc
+            .components
+            .defs
+            .get_mut(&component)
+            .expect("definition")
+            .rev += 1;
+        assert!(!document.sync_page_registry());
+        assert_eq!(document.page_registry_revision(), revision);
+        assert_eq!(document.pages.as_ptr(), pages_pointer);
+
+        let old_root = root;
+        let mut replacement =
+            fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
+        replacement.name = "Replacement root".into();
+        let root = document.doc.scene.insert(replacement).expect("replacement");
+        document
+            .doc
+            .components
+            .defs
+            .get_mut(&component)
+            .expect("definition")
+            .root = root;
+        assert!(document.sync_page_registry());
+        assert_eq!(document.page_index_for_root(Some(old_root)), None);
+        assert!(document.page_index_for_root(Some(root)).is_some());
+        for (index, entry) in document.pages.iter().enumerate() {
+            assert_eq!(document.page_index_for_root(entry.root), Some(index));
+        }
+        let replacement = FigDocument::from_doc(document.doc.clone_for_persist(), BTreeMap::new());
+        assert_ne!(
+            replacement.page_registry_revision(),
+            document.page_registry_revision()
+        );
+    }
+
+    #[test]
+    fn component_root_presence_updates_keep_the_implicit_canvas() -> Result<()> {
+        let mut doc = Doc::new();
+        let mut root =
+            fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(fanta_doc::GroupNode {
+                local_size: Some([37.0, 53.0]),
+                ..Default::default()
+            }));
+        root.name = "Master layer".into();
+        let id = root.id;
+        let component = fanta_doc::ComponentId::new();
+        doc.components.defs.insert(
+            component,
+            fanta_doc::ComponentDef::new(component, id, "Appearing master"),
+        );
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        assert_eq!(document.pages.len(), 1);
+        assert_eq!(document.page_index_for_root(None), Some(0));
+        assert_eq!(document.pages[0].name.as_ref(), "Document");
+        let implicit_bounds = fanta_doc::Bounds::from_xywh(11.0, 13.0, 41.0, 61.0);
+        document.pages[0].bounds = implicit_bounds;
+        let operation = Operation::create_node(root);
+        let change = document.page_registry_change_for_operation(&operation);
+        document.doc.apply(operation)?;
+        let mut child = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Vector(
+            fanta_doc::VectorNode::rect_solid(0.0, 0.0, 37.0, 53.0, fanta_doc::Color::BLACK),
+        ));
+        child.parent = Some(id);
+        document.doc.apply(Operation::create_node(child))?;
+        assert!(document.sync_page_registry_after_operation(change));
+        assert_eq!(document.pages[0].bounds, implicit_bounds);
+        let index = document.page_index_for_root(Some(id)).expect("new master");
+        assert_eq!(index, 1);
+        assert_eq!(document.pages[index].name.as_ref(), "Appearing master");
+        assert!(document.pages[index].hidden);
+        assert_eq!(document.pages[index].bounds.width(), 37.0);
+        let operation = Operation::DeleteSubtree {
+            snapshot: vec![document.doc.scene.get(id).cloned().expect("master")],
+        };
+        let change = document.page_registry_change_for_operation(&operation);
+        document.doc.apply(operation)?;
+        assert!(document.sync_page_registry_after_operation(change));
+        assert_eq!(document.pages.len(), 1);
+        assert_eq!(document.page_index_for_root(Some(id)), None);
+        assert_eq!(document.page_index_for_root(None), Some(0));
+        assert_eq!(document.pages[0].bounds, implicit_bounds);
+        Ok(())
+    }
+
+    #[test]
+    fn partial_delete_snapshots_remove_nested_master_navigation_metadata() -> Result<()> {
+        let (mut doc, page, components) = metadata_library(1);
+        let (component, master) = components[0];
+        let mut container =
+            fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
+        container.parent = Some(page);
+        let container = doc.scene.insert(container)?;
+        doc.scene
+            .set_parent(master, Some(container), fanta_doc::IndexKey::default())?;
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        assert!(document.page_index_for_root(Some(master)).is_some());
+        let operation = Operation::DeleteSubtree {
+            snapshot: vec![
+                document
+                    .doc
+                    .scene
+                    .get(container)
+                    .cloned()
+                    .expect("container"),
+            ],
+        };
+        let change = document.page_registry_change_for_operation(&operation);
+        document.doc.apply(operation)?;
+        assert!(!document.doc.scene.contains(master));
+        assert!(document.doc.components.defs.contains_key(&component));
+        assert!(document.sync_page_registry_after_operation(change));
+        assert_eq!(document.page_index_for_root(Some(master)), None);
+        assert_eq!(document.pages.len(), 1);
+        assert_eq!(document.pages[0].root, Some(page));
+        Ok(())
+    }
+
+    #[gpui::test]
+    async fn ordinary_canvas_operations_skip_library_metadata_validation(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, page, components) = metadata_library(1024);
+        let (component, master) = components[901];
+        let item = ready_item_for_test(&project, PathBuf::from("/tmp/Library.fig"), doc, cx);
+        let (revision, validations) = item.read_with(cx, |item, _| {
+            let document = item.document().expect("document");
+            (
+                document.page_registry_revision(),
+                document.page_registry.validations,
+            )
+        });
+        item.update(cx, |item, cx| {
+            item.apply(
+                Operation::SetTransform {
+                    id: master,
+                    old: fanta_doc::Transform2D::IDENTITY,
+                    new: fanta_doc::Transform2D::translation(31.0, 47.0),
+                },
+                cx,
+            )
+            .expect("move a master");
+            let mut node =
+                fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
+            node.parent = Some(page);
+            let id = node.id;
+            item.apply(Operation::create_node(node), cx)
+                .expect("create ordinary layer");
+            let snapshot = item
+                .doc()
+                .expect("document")
+                .scene
+                .get(id)
+                .cloned()
+                .expect("layer");
+            item.apply(
+                Operation::DeleteSubtree {
+                    snapshot: vec![snapshot],
+                },
+                cx,
+            )
+            .expect("delete ordinary layer");
+        });
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("document");
+            assert_eq!(document.page_registry_revision(), revision);
+            assert_eq!(document.page_registry.validations, validations);
+            assert!(document.doc.components.defs[&component].rev > 0);
+            assert_eq!(document.pages.len(), 1025);
+        });
+        item.update(cx, |item, cx| {
+            item.apply(
+                Operation::SetComponentName {
+                    id: component,
+                    old: "Component 901".into(),
+                    new: "Renamed component".into(),
+                },
+                cx,
+            )
+            .expect("rename a component");
+        });
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("document");
+            let index = document.page_index_for_root(Some(master)).expect("master");
+            assert_eq!(document.pages[index].name.as_ref(), "Renamed component");
+            assert_ne!(document.page_registry_revision(), revision);
+            assert_eq!(document.page_registry.validations, validations);
+        });
+        assert!(
+            item.update(cx, |item, cx| item.undo(cx))
+                .expect("undo rename")
+        );
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("document");
+            let index = document.page_index_for_root(Some(master)).expect("master");
+            assert_eq!(document.pages[index].name.as_ref(), "Component 901");
+        });
+        assert!(
+            item.update(cx, |item, cx| item.redo(cx))
+                .expect("redo rename")
+        );
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("document");
+            let index = document.page_index_for_root(Some(master)).expect("master");
+            assert_eq!(document.pages[index].name.as_ref(), "Renamed component");
+        });
     }
 
     #[test]

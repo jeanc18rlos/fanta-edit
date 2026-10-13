@@ -697,6 +697,298 @@ fn instance_child_index_reuses_across_transform_frames() -> Result<(), Box<dyn s
 }
 
 #[test]
+fn equivalent_instances_share_prepared_trees_and_keep_override_pixels_independent()
+-> Result<(), Box<dyn std::error::Error>> {
+    use fanta_doc::{BoundProp, Override, OverrideValue};
+    let (mut doc, placed, blue) = indexed_instance_fixture()?;
+    let mut sibling = doc.scene.get(placed).expect("placed instance").clone();
+    sibling.id = NodeId::new();
+    sibling.transform = Transform2D::translation(2.0, -16.0);
+    let sibling_id = sibling.id;
+    doc.apply(Operation::create_node(sibling))?;
+    let mut renderer = RasterRenderer::new(64, 64)?;
+    let (cold, original) = assert_indexed_instance_matches_fresh(&mut renderer, &doc)?;
+    assert_eq!(
+        cold.instance_indexes_built, 1,
+        "two placements share a preparation"
+    );
+    assert_eq!(
+        renderer.instance_cache_len(),
+        2,
+        "placement bindings stay distinct"
+    );
+    let (warm, _) = assert_indexed_instance_matches_fresh(&mut renderer, &doc)?;
+    assert_eq!(warm.instance_indexes_built, 0);
+
+    let master = doc.components.defs.values().next().expect("component").root;
+    let path = fanta_doc::def_local_path(&doc.scene, master, blue);
+    let node = doc.scene.get_mut(sibling_id).expect("sibling");
+    let instance = node.data.as_instance_mut().expect("instance");
+    instance.overrides.push(Override {
+        target_path: path,
+        target_prop: BoundProp::Visible,
+        value: OverrideValue::Visible { value: false },
+    });
+    let (changed, pixels) = assert_indexed_instance_matches_fresh(&mut renderer, &doc)?;
+    assert_eq!(
+        changed.instance_indexes_built, 1,
+        "only the changed input prepares"
+    );
+    assert!(
+        pixels != original,
+        "the visibility override changes rendered pixels"
+    );
+    assert_eq!(
+        rgba_at(&pixels, 64, 25, 32),
+        [0, 0, 255, 255],
+        "first placement remains blue"
+    );
+    Ok(())
+}
+
+#[test]
+fn component_metadata_edits_reprepare_only_dependent_expansions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut doc, placed, _) = indexed_instance_fixture()?;
+    let first = doc
+        .components
+        .defs
+        .keys()
+        .next()
+        .copied()
+        .expect("first component");
+    let second = ComponentId::new();
+    let mut master = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+        0.0,
+        0.0,
+        20.0,
+        20.0,
+        Color::WHITE,
+    )));
+    master.transform = Transform2D::translation(20_000.0, 0.0);
+    let master_id = master.id;
+    doc.apply(Operation::create_node(master))?;
+    doc.components
+        .defs
+        .insert(second, ComponentDef::new(second, master_id, "Second"));
+    let mut sibling = doc.scene.get(placed).expect("placed instance").clone();
+    sibling.id = NodeId::new();
+    sibling.transform = Transform2D::translation(5.0, -16.0);
+    sibling.data.as_instance_mut().expect("instance").component = second;
+    doc.apply(Operation::create_node(sibling))?;
+    let unused = ComponentId::new();
+    doc.components
+        .defs
+        .insert(unused, ComponentDef::new(unused, NodeId::new(), "Unused"));
+    let mut renderer = RasterRenderer::new(64, 64)?;
+    let (cold, _) = assert_indexed_instance_matches_fresh(&mut renderer, &doc)?;
+    assert_eq!(cold.instance_indexes_built, 2);
+    for revision_only in [true, false] {
+        let definition = doc.components.defs.get_mut(&first).expect("first");
+        if revision_only {
+            definition.preview_rev += 1;
+        } else {
+            definition.name.push('!');
+        }
+        let (changed, _) = assert_indexed_instance_matches_fresh(&mut renderer, &doc)?;
+        assert_eq!(
+            changed.instance_indexes_built, 1,
+            "second component remains warm"
+        );
+    }
+    doc.components
+        .defs
+        .get_mut(&unused)
+        .expect("unused")
+        .name
+        .push('!');
+    let (unchanged, _) = assert_indexed_instance_matches_fresh(&mut renderer, &doc)?;
+    assert_eq!(unchanged.instance_indexes_built, 0);
+    Ok(())
+}
+
+#[test]
+fn scoped_render_scene_preserves_nested_swaps_and_ancestor_modes()
+-> Result<(), Box<dyn std::error::Error>> {
+    use fanta_doc::{
+        BoundProp, Mode, Override, OverrideValue, VarValue, Variable, VariableCollection,
+        VariableId, VariableType,
+    };
+    let mut doc = Doc::new();
+    let collection = VariableCollectionId::new();
+    let light = ModeId::new();
+    let dark = ModeId::new();
+    let color = VariableId::new();
+    doc.variables.collections.insert(
+        collection,
+        VariableCollection {
+            id: collection,
+            name: "Theme".into(),
+            modes: vec![
+                Mode {
+                    id: light,
+                    name: "Light".into(),
+                },
+                Mode {
+                    id: dark,
+                    name: "Dark".into(),
+                },
+            ],
+            default_mode: light,
+            variable_order: vec![color],
+        },
+    );
+    doc.variables.variables.insert(
+        color,
+        Variable {
+            id: color,
+            collection,
+            name: "Color".into(),
+            ty: VariableType::Color,
+            values_by_mode: BTreeMap::from([
+                (
+                    light,
+                    VarValue::Color {
+                        value: Color::WHITE,
+                    },
+                ),
+                (
+                    dark,
+                    VarValue::Color {
+                        value: Color::rgb(0, 0, 255),
+                    },
+                ),
+            ]),
+            scopes: Vec::new(),
+        },
+    );
+    let mut ancestor = CanvasNode::new(NodeData::Group(GroupNode {
+        explicit_modes: BTreeMap::from([(collection, dark)]),
+        ..Default::default()
+    }));
+    ancestor.transform = Transform2D::translation(11.0, 9.0);
+    let ancestor_id = ancestor.id;
+    doc.apply(Operation::create_node(ancestor))?;
+    let mut page = CanvasNode::new(NodeData::Group(GroupNode {
+        clip_size: Some([40.0, 30.0]),
+        ..Default::default()
+    }));
+    page.parent = Some(ancestor_id);
+    page.transform = Transform2D::translation(-30.0, -20.0);
+    let page_id = page.id;
+    doc.apply(Operation::create_node(page))?;
+    let mut unrelated = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    unrelated.parent = Some(ancestor_id);
+    let unrelated_id = unrelated.id;
+    doc.apply(Operation::create_node(unrelated))?;
+
+    let mut definitions = Vec::new();
+    for bound in [false, true] {
+        let component = ComponentId::new();
+        let mut master = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            16.0,
+            16.0,
+            Color::rgb(0, 255, 0),
+        )));
+        master.transform = Transform2D::translation(10_000.0, 0.0);
+        if bound {
+            master
+                .bindings
+                .insert(BoundProp::FillColor { index: 0 }, color);
+        }
+        let root = master.id;
+        doc.apply(Operation::create_node(master))?;
+        doc.components
+            .defs
+            .insert(component, ComponentDef::new(component, root, "Inner"));
+        definitions.push((component, root));
+    }
+    let [(original, original_root), (replacement, replacement_root)] = definitions.as_slice()
+    else {
+        panic!("two inner components")
+    };
+    let outer = ComponentId::new();
+    let mut master = CanvasNode::new(NodeData::Group(GroupNode {
+        clip_size: Some([16.0, 16.0]),
+        ..Default::default()
+    }));
+    master.transform = Transform2D::translation(20_000.0, 0.0);
+    let outer_root = master.id;
+    doc.apply(Operation::create_node(master))?;
+    let mut nested = CanvasNode::new(NodeData::Instance(InstanceNode {
+        component: *original,
+        overrides: Vec::new(),
+        prop_values: Default::default(),
+        derived: Vec::new(),
+        local_size: [16.0, 16.0],
+    }));
+    nested.parent = Some(outer_root);
+    let nested_id = nested.id;
+    doc.apply(Operation::create_node(nested))?;
+    doc.components
+        .defs
+        .insert(outer, ComponentDef::new(outer, outer_root, "Outer"));
+    let mut placed = CanvasNode::new(NodeData::Instance(InstanceNode {
+        component: outer,
+        overrides: Vec::new(),
+        prop_values: Default::default(),
+        derived: Vec::new(),
+        local_size: [16.0, 16.0],
+    }));
+    placed.parent = Some(page_id);
+    let placed_id = placed.id;
+    doc.apply(Operation::create_node(placed))?;
+
+    for (target, mode, expected) in [
+        (*replacement, dark, [0, 0, 255, 255]),
+        (*replacement, light, [255, 255, 255, 255]),
+        (*original, dark, [0, 255, 0, 255]),
+    ] {
+        doc.scene
+            .get_mut(ancestor_id)
+            .expect("ancestor")
+            .data
+            .as_group_mut()
+            .expect("frame")
+            .explicit_modes
+            .insert(collection, mode);
+        doc.scene
+            .get_mut(placed_id)
+            .expect("placed")
+            .data
+            .as_instance_mut()
+            .expect("instance")
+            .overrides = vec![Override {
+            target_path: smallvec::smallvec![nested_id],
+            target_prop: BoundProp::Visible,
+            value: OverrideValue::SwapInstance { component: target },
+        }];
+        let scoped = doc
+            .render_scene_for(page_id)
+            .expect("bounded dependency scene");
+        assert!(scoped.contains(ancestor_id));
+        assert!(scoped.contains(outer_root));
+        assert!(!scoped.contains(unrelated_id));
+        assert_eq!(scoped.contains(*replacement_root), target == *replacement);
+        assert_eq!(scoped.contains(*original_root), target == *original);
+        let inputs = RenderInputs::for_doc(&doc);
+        let mut full = RasterRenderer::new(64, 64)?;
+        let mut pruned = RasterRenderer::new(64, 64)?;
+        full.render_page_with(&doc.scene, &doc.viewport, Some(page_id), &inputs);
+        pruned.render_page_with(&scoped, &doc.viewport, Some(page_id), &inputs);
+        let pixels = pruned.copy_rgba();
+        assert!(
+            pixels == full.copy_rgba(),
+            "scoped and complete scenes paint identical pixels"
+        );
+        assert_eq!(rgba_at(&pixels, 64, 21, 31), expected);
+    }
+    Ok(())
+}
+
+#[test]
 fn instance_child_index_rebuilds_on_master_reorder_preview_and_undo()
 -> Result<(), Box<dyn std::error::Error>> {
     let (mut doc, _, blue) = indexed_instance_fixture()?;

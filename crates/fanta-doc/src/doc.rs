@@ -756,6 +756,124 @@ impl Doc {
         }
     }
 
+    pub fn render_scene_for(&self, root: NodeId) -> Option<Scene> {
+        use crate::{
+            InstanceExpansionContext, InstanceNode, expand_instance_with_context,
+            resolved_component_with_context,
+        };
+        use std::borrow::Cow;
+        use std::collections::{HashMap, VecDeque};
+
+        struct PendingInstance<'a> {
+            instance: Cow<'a, InstanceNode>,
+            mode_anchor: NodeId,
+            component_chain: Vec<NodeId>,
+        }
+
+        self.scene.get(root)?;
+        let mut roots = BTreeSet::from([root]);
+        let mut pending = VecDeque::new();
+        for id in self.scene.descendants_of(root) {
+            if node_has_external_render_source(self.scene.get(id)?) {
+                return None;
+            }
+            if let NodeData::Instance(instance) = &self.scene.get(id)?.data {
+                pending.push_back(PendingInstance {
+                    instance: Cow::Borrowed(instance),
+                    mode_anchor: id,
+                    component_chain: Vec::new(),
+                });
+            }
+        }
+        let mut nested_masters = HashMap::new();
+        let mut inspected_instances = 0usize;
+        let mut expanded_nodes = 0usize;
+        while let Some(instance) = pending.pop_front() {
+            inspected_instances += 1;
+            if inspected_instances > 16_384 {
+                return None;
+            }
+            let context = InstanceExpansionContext::new(
+                &self.variables,
+                &self.active_modes,
+                instance.mode_anchor,
+            );
+            let Some(component) = resolved_component_with_context(
+                &self.scene,
+                &self.components,
+                &instance.instance,
+                &context,
+            ) else {
+                continue;
+            };
+            let master_root = component.resolved_root;
+            self.scene.get(master_root)?;
+            if instance.component_chain.contains(&master_root) {
+                return None;
+            }
+            roots.insert(master_root);
+            let (has_nested_instances, master_nodes, external_source) =
+                *nested_masters.entry(master_root).or_insert_with(|| {
+                    let mut nested = false;
+                    let mut count = 0usize;
+                    let mut external = false;
+                    for id in self.scene.descendants_of(master_root) {
+                        count += 1;
+                        if let Some(node) = self.scene.get(id) {
+                            nested |= matches!(node.data, NodeData::Instance(_));
+                            external |= node_has_external_render_source(node);
+                        }
+                    }
+                    (nested, count, external)
+                });
+            if external_source {
+                return None;
+            }
+            if !has_nested_instances {
+                continue;
+            }
+            expanded_nodes = expanded_nodes.checked_add(master_nodes)?;
+            if expanded_nodes > 65_536 || pending.len().saturating_add(master_nodes) > 16_384 {
+                return None;
+            }
+            // Expand only masters with nested instances: property defaults,
+            // swaps and variable aliases can change their effective targets.
+            let expanded = expand_instance_with_context(
+                &self.scene,
+                &self.components,
+                &instance.instance,
+                &context,
+            );
+            let mut component_chain = instance.component_chain;
+            component_chain.push(master_root);
+            for entry in expanded {
+                if node_has_external_render_source(&entry.node) {
+                    return None;
+                }
+                if let NodeData::Instance(nested) = entry.node.data {
+                    pending.push_back(PendingInstance {
+                        instance: Cow::Owned(nested),
+                        mode_anchor: instance.mode_anchor,
+                        component_chain: component_chain.clone(),
+                    });
+                }
+            }
+        }
+        self.scene.extract_subtrees_with_ancestors(roots)
+    }
+
+    pub fn render_delta_requires_dependency_refresh(
+        &self,
+        delta: &crate::scene::SceneDelta,
+    ) -> bool {
+        delta.nodes.iter().any(|id| {
+            self.scene.get(*id).is_none_or(|node| {
+                matches!(node.data, NodeData::Instance(_) | NodeData::Group(_))
+                    || node_has_external_render_source(node)
+            })
+        })
+    }
+
     /// Serialize to the canonical `.fant.json` projection.
     pub fn to_json_string(&self) -> serde_json::Result<String> {
         serde_json::to_string(self)
@@ -880,6 +998,38 @@ fn migrate_v1_to_v2(value: &mut serde_json::Value) {
     }
 }
 
+fn node_has_external_render_source(node: &crate::CanvasNode) -> bool {
+    let pattern = |fill: &crate::Fill| matches!(fill, crate::Fill::Pattern { .. });
+    let pattern_stroke = |stroke: &crate::Stroke| pattern(&stroke.paint);
+    match &node.data {
+        NodeData::Group(group) => {
+            group.background.as_ref().is_some_and(pattern)
+                || group.background_fills.iter().any(pattern)
+                || group.strokes.iter().any(pattern_stroke)
+        }
+        NodeData::Vector(vector) => {
+            vector.fills.iter().any(pattern) || vector.strokes.iter().any(pattern_stroke)
+        }
+        NodeData::Boolean(boolean) => {
+            boolean.fills.iter().any(pattern) || boolean.strokes.iter().any(pattern_stroke)
+        }
+        NodeData::Instance(instance) => {
+            instance.overrides.iter().any(|entry| match &entry.value {
+                crate::OverrideValue::Fills { fills } => fills.iter().any(pattern),
+                crate::OverrideValue::Strokes { strokes } => strokes.iter().any(pattern_stroke),
+                crate::OverrideValue::Field { .. } => true,
+                _ => false,
+            }) || instance.derived.iter().any(|entry| {
+                entry
+                    .fills
+                    .as_ref()
+                    .is_some_and(|fills| fills.iter().any(pattern))
+            })
+        }
+        _ => false,
+    }
+}
+
 impl Default for Doc {
     fn default() -> Self {
         Self::new()
@@ -993,6 +1143,158 @@ mod tests {
     use crate::node::{CanvasNode, GroupNode, NodeData, Reaction, Trigger, VectorNode};
     use crate::variables::{Variable, VariableCollection};
     use crate::{BoundProp, NodeId, ReactionId, Stroke, color::Color};
+
+    fn render_test_instance(component: crate::ComponentId) -> crate::InstanceNode {
+        crate::InstanceNode {
+            component,
+            overrides: Vec::new(),
+            prop_values: BTreeMap::new(),
+            derived: Vec::new(),
+            local_size: [20.0, 20.0],
+        }
+    }
+
+    #[test]
+    fn render_scene_follows_nested_swaps_and_excludes_unrelated_geometry() {
+        let mut document = Doc::new();
+        let page = add_root_group(&mut document, "Home");
+        document.add_page(page);
+        let other_page = add_root_group(&mut document, "Other");
+        document.add_page(other_page);
+        let library = add_root_group(&mut document, "Library");
+        let mut components = Vec::new();
+        for name in ["Container", "Original", "Replacement", "Unused"] {
+            let mut root = CanvasNode::new(NodeData::Group(GroupNode::default()));
+            root.parent = Some(library);
+            root.name = name.into();
+            let root_id = document.scene.insert(root).expect("master root");
+            let component = crate::ComponentId::new();
+            document.components.defs.insert(
+                component,
+                crate::ComponentDef::new(component, root_id, name),
+            );
+            components.push((component, root_id));
+        }
+        let [
+            (container, container_root),
+            (original, original_root),
+            (replacement, replacement_root),
+            (_, unused_root),
+        ] = components.as_slice()
+        else {
+            panic!("four fixture components");
+        };
+        let mut nested = CanvasNode::new(NodeData::Instance(render_test_instance(*original)));
+        nested.parent = Some(*container_root);
+        let nested_id = document.scene.insert(nested).expect("nested instance");
+        let mut placed_instance = render_test_instance(*container);
+        placed_instance.overrides.push(crate::Override {
+            target_path: crate::def_local_path(&document.scene, *container_root, nested_id),
+            target_prop: BoundProp::Visible,
+            value: crate::OverrideValue::SwapInstance {
+                component: *replacement,
+            },
+        });
+        let mut placement = CanvasNode::new(NodeData::Instance(placed_instance.clone()));
+        placement.parent = Some(page);
+        let placement_id = document.scene.insert(placement).expect("placement");
+        let snapshot = document
+            .render_scene_for(page)
+            .expect("render dependency closure");
+        snapshot.validate().expect("valid dependency scene");
+        assert!(snapshot.contains(page));
+        assert!(snapshot.contains(library));
+        assert!(snapshot.contains(*container_root));
+        assert!(snapshot.contains(*replacement_root));
+        assert!(!snapshot.contains(*original_root));
+        assert!(!snapshot.contains(*unused_root));
+        assert!(!snapshot.contains(other_page));
+        assert!(snapshot.shares_node(&document.scene, placement_id));
+        let full_context = crate::InstanceExpansionContext::new(
+            &document.variables,
+            &document.active_modes,
+            placement_id,
+        );
+        let expected = crate::expand_instance_with_context(
+            &document.scene,
+            &document.components,
+            &placed_instance,
+            &full_context,
+        );
+        let actual = crate::expand_instance_with_context(
+            &snapshot,
+            &document.components,
+            &placed_instance,
+            &full_context,
+        );
+        let values = |expanded: Vec<crate::ExpandedNode>| {
+            expanded
+                .into_iter()
+                .map(|entry| (entry.def_path, entry.node.data, entry.node.transform))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values(actual), values(expected));
+        let master_snapshot = document
+            .render_scene_for(*container_root)
+            .expect("master scope");
+        assert!(master_snapshot.contains(*original_root));
+        assert!(!master_snapshot.contains(*replacement_root));
+    }
+
+    #[test]
+    fn render_scene_falls_back_for_external_patterns_opaque_overrides_and_cycles() {
+        let mut document = Doc::new();
+        let page = add_root_group(&mut document, "Home");
+        let source = add_root_group(&mut document, "External pattern");
+        let pattern: crate::Fill = serde_json::from_value(serde_json::json!({
+            "kind": "pattern", "pattern": { "source_node_id": source }
+        }))
+        .expect("pattern fill");
+        let group = document
+            .scene
+            .get_mut(page)
+            .expect("page")
+            .data
+            .as_group_mut()
+            .expect("group");
+        group.background = Some(pattern);
+        assert!(document.render_scene_for(page).is_none());
+        document
+            .scene
+            .get_mut(page)
+            .expect("page")
+            .data
+            .as_group_mut()
+            .expect("group")
+            .background = None;
+        let master = add_root_group(&mut document, "Recursive master");
+        let component = crate::ComponentId::new();
+        document.components.defs.insert(
+            component,
+            crate::ComponentDef::new(component, master, "Recursive"),
+        );
+        let mut nested = CanvasNode::new(NodeData::Instance(render_test_instance(component)));
+        nested.parent = Some(master);
+        document.scene.insert(nested).expect("recursive child");
+        let mut instance = render_test_instance(component);
+        let mut placement = CanvasNode::new(NodeData::Instance(instance.clone()));
+        placement.parent = Some(page);
+        let placement_id = document.scene.insert(placement).expect("placement");
+        assert!(document.render_scene_for(page).is_none());
+        instance.overrides.push(crate::Override {
+            target_path: Default::default(),
+            target_prop: BoundProp::Visible,
+            value: crate::OverrideValue::Field {
+                value: serde_json::json!({"opacity": 0.5}),
+            },
+        });
+        document
+            .scene
+            .get_mut(placement_id)
+            .expect("placement")
+            .data = NodeData::Instance(instance);
+        assert!(document.render_scene_for(page).is_none());
+    }
 
     #[test]
     fn deleting_variable_bakes_bindings_replaces_aliases_and_undoes_exactly() {

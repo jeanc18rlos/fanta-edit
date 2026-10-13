@@ -24,6 +24,43 @@ fn group_node() -> CanvasNode {
 }
 
 #[test]
+fn selected_subtrees_share_payloads_and_preserve_ancestor_geometry() {
+    let mut scene = Scene::new();
+    let mut ancestor = group_node();
+    ancestor.transform = Transform2D::translation(150.0, 80.0);
+    let ancestor_id = scene.insert(ancestor).expect("ancestor");
+    let mut selected = group_node();
+    selected.parent = Some(ancestor_id);
+    selected.transform = Transform2D::translation(12.0, 24.0);
+    let selected_id = scene.insert(selected).expect("selected root");
+    let mut child = rect_node(0.0, 0.0, 30.0, 40.0);
+    child.parent = Some(selected_id);
+    let child_id = scene.insert(child).expect("selected child");
+    let mut unrelated = rect_node(0.0, 0.0, 400.0, 500.0);
+    unrelated.parent = Some(ancestor_id);
+    let unrelated_id = scene.insert(unrelated).expect("unselected sibling");
+    scene.get_mut(child_id).expect("child").opacity = crate::UnitInterval::new(0.75);
+    let snapshot = scene
+        .extract_subtrees_with_ancestors([selected_id])
+        .expect("closed subtree");
+    snapshot.validate().expect("valid snapshot");
+    assert_eq!(snapshot.len(), 3);
+    assert!(!snapshot.contains(unrelated_id));
+    for id in [ancestor_id, selected_id, child_id] {
+        assert!(snapshot.shares_node(&scene, id));
+        assert_eq!(snapshot.world_transform(id), scene.world_transform(id));
+        assert_eq!(snapshot.node_stamp(id), scene.node_stamp(id));
+    }
+    assert_eq!(snapshot.children_of(Some(ancestor_id)), &[selected_id]);
+    assert_eq!(snapshot.children_of(Some(selected_id)), &[child_id]);
+    assert!(
+        scene
+            .extract_subtrees_with_ancestors([NodeId::new()])
+            .is_none()
+    );
+}
+
+#[test]
 fn curve_body_hits_survive_parent_transforms_and_spatial_index_refresh() {
     for cubic in [false, true] {
         let mut scene = Scene::new();

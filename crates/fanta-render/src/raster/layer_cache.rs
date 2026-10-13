@@ -71,9 +71,139 @@ use super::{
     AlphaType, Bounds, Canvas, IdHashMap, ImageInfo, NodeId, Paint, Rect, RenderCtx,
     padded_layer_rect,
 };
-use fanta_doc::{ComponentLibrary, Scene};
+use fanta_doc::{ComponentDef, ComponentId, ComponentLibrary, ComponentSet, Scene};
 use skia_safe::{IRect, Matrix, SamplingOptions};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
+
+#[derive(Default)]
+pub(crate) struct ComponentDependencies {
+    definitions: BTreeMap<ComponentId, Option<ComponentDef>>,
+    sets: BTreeMap<ComponentId, Option<ComponentSet>>,
+    bytes: usize,
+    incomplete: bool,
+}
+
+pub(crate) struct CacheByteCounter(pub(crate) usize);
+
+impl std::io::Write for CacheByteCounter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl ComponentDependencies {
+    pub(crate) fn matches(&self, components: &ComponentLibrary) -> bool {
+        !self.incomplete
+            && self
+                .definitions
+                .iter()
+                .all(|(id, definition)| definition.as_ref() == components.defs.get(id))
+            && self
+                .sets
+                .iter()
+                .all(|(id, set)| set.as_ref() == components.sets.get(id))
+    }
+
+    pub(crate) fn changed_references(
+        &self,
+        components: &ComponentLibrary,
+    ) -> Option<HashSet<ComponentId>> {
+        if self.incomplete {
+            return None;
+        }
+        let mut changed: HashSet<_> = self
+            .definitions
+            .iter()
+            .filter(|(id, definition)| definition.as_ref() != components.defs.get(id))
+            .map(|(id, _)| *id)
+            .collect();
+        for (id, set) in &self.sets {
+            if set.as_ref() != components.sets.get(id)
+                || set.as_ref().is_some_and(|set| {
+                    set.members
+                        .iter()
+                        .chain(std::iter::once(&set.default_variant))
+                        .any(|member| changed.contains(member))
+                })
+            {
+                changed.insert(*id);
+            }
+        }
+        Some(changed)
+    }
+
+    pub(crate) fn record(&mut self, components: &ComponentLibrary, reference: ComponentId) {
+        if self.definitions.contains_key(&reference)
+            && (components.defs.contains_key(&reference) || self.sets.contains_key(&reference))
+        {
+            return;
+        }
+        if !self.record_definition(components, reference) {
+            return;
+        }
+        if components.defs.contains_key(&reference) {
+            return;
+        }
+        let set = components.sets.get(&reference);
+        let mut counter = CacheByteCounter(0);
+        if serde_json::to_writer(&mut counter, &set).is_err() || !self.reserve(counter.0) {
+            self.incomplete = true;
+            return;
+        }
+        self.sets.insert(reference, set.cloned());
+        if let Some(set) = components.sets.get(&reference) {
+            // Selection reads every member's property schema and membership,
+            // including candidates which are not the selected master.
+            for id in set
+                .members
+                .iter()
+                .chain(std::iter::once(&set.default_variant))
+            {
+                if !self.record_definition(components, *id) {
+                    break;
+                }
+            }
+        }
+    }
+
+    fn record_definition(&mut self, components: &ComponentLibrary, id: ComponentId) -> bool {
+        if self.definitions.contains_key(&id) {
+            return true;
+        }
+        let definition = components.defs.get(&id);
+        let mut counter = CacheByteCounter(0);
+        if serde_json::to_writer(&mut counter, &definition).is_err() || !self.reserve(counter.0) {
+            self.incomplete = true;
+            return false;
+        }
+        self.definitions.insert(id, definition.cloned());
+        true
+    }
+
+    fn reserve(&mut self, serialized_bytes: usize) -> bool {
+        let bytes = serialized_bytes.saturating_mul(4).saturating_add(256);
+        if self.definitions.len().saturating_add(self.sets.len()) >= 4_096
+            || self.bytes.saturating_add(bytes) > 16 << 20
+        {
+            self.incomplete = true;
+            return false;
+        }
+        self.bytes += bytes;
+        true
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.definitions.clear();
+        self.sets.clear();
+        self.bytes = 0;
+        self.incomplete = false;
+    }
+}
 
 /// The largest layer, in device pixels, the cache will hold as one entry
 /// (4 Mpx ≈ 16 MB RGBA). Bigger layers — a page-spanning blurred backdrop
@@ -146,7 +276,7 @@ pub(crate) struct LayerCache {
     budget_bytes: usize,
     epoch: Option<LayerEpoch>,
     seen_revision: Option<u64>,
-    components: ComponentLibrary,
+    components: ComponentDependencies,
     hot_nodes: HashSet<NodeId>,
     moved_roots: HashSet<NodeId>,
     /// Frame serial for LRU ordering.
@@ -178,7 +308,7 @@ impl Default for LayerCache {
             budget_bytes: LAYER_CACHE_DEFAULT_BUDGET_BYTES,
             epoch: None,
             seen_revision: None,
-            components: ComponentLibrary::default(),
+            components: ComponentDependencies::default(),
             hot_nodes: HashSet::new(),
             moved_roots: HashSet::new(),
             frame: 0,
@@ -212,7 +342,7 @@ impl LayerCache {
         effective_scale: f32,
         root_translation: (f64, f64),
     ) -> bool {
-        let components_changed = self.components != *components;
+        let components_changed = !self.components.matches(components);
         let epoch_changed = self.epoch != Some(epoch) || components_changed;
         self.hot_nodes.clear();
         self.moved_roots.clear();
@@ -243,9 +373,6 @@ impl LayerCache {
                     self.remove(affected);
                 }
             }
-        }
-        if components_changed {
-            self.components.clone_from(components);
         }
         self.epoch = Some(epoch);
         self.seen_revision = Some(scene.revision());
@@ -286,9 +413,18 @@ impl LayerCache {
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
         self.bytes = 0;
+        self.components.clear();
         self.seen_revision = None;
         self.hot_nodes.clear();
         self.moved_roots.clear();
+    }
+
+    pub(crate) fn record_component(
+        &mut self,
+        components: &ComponentLibrary,
+        reference: ComponentId,
+    ) {
+        self.components.record(components, reference);
     }
 
     fn remove(&mut self, id: NodeId) {
@@ -625,6 +761,175 @@ pub(crate) const UNCULLED_WORLD: Bounds = Bounds {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn component_dependencies_ignore_unused_definitions_and_guard_variant_candidates() {
+        let referenced = ComponentId::new();
+        let unused = ComponentId::new();
+        let missing = ComponentId::new();
+        let mut library = ComponentLibrary::new();
+        library.defs.insert(
+            referenced,
+            ComponentDef::new(referenced, NodeId::new(), "Used"),
+        );
+        library
+            .defs
+            .insert(unused, ComponentDef::new(unused, NodeId::new(), "Unused"));
+        let mut dependencies = ComponentDependencies::default();
+        dependencies.record(&library, referenced);
+        library
+            .defs
+            .get_mut(&unused)
+            .expect("unused")
+            .name
+            .push('!');
+        assert!(dependencies.matches(&library));
+        library
+            .defs
+            .get_mut(&referenced)
+            .expect("referenced")
+            .preview_rev += 1;
+        assert!(!dependencies.matches(&library));
+
+        let set = ComponentId::new();
+        library.sets.insert(
+            set,
+            ComponentSet {
+                id: set,
+                name: "Variants".into(),
+                axes: Vec::new(),
+                members: vec![referenced, missing],
+                default_variant: referenced,
+                root: None,
+            },
+        );
+        dependencies.clear();
+        dependencies.record(&library, set);
+        assert!(dependencies.matches(&library));
+        library.defs.insert(
+            missing,
+            ComponentDef::new(missing, NodeId::new(), "New candidate"),
+        );
+        assert!(
+            !dependencies.matches(&library),
+            "a previously missing candidate may now match"
+        );
+        dependencies.clear();
+        dependencies.record(&library, set);
+        library
+            .defs
+            .get_mut(&missing)
+            .expect("candidate")
+            .name
+            .push('!');
+        assert!(
+            !dependencies.matches(&library),
+            "even an unselected candidate is read during resolution"
+        );
+        dependencies.clear();
+        dependencies.record(&library, set);
+        library.sets.get_mut(&set).expect("set").default_variant = missing;
+        assert!(!dependencies.matches(&library));
+    }
+
+    #[test]
+    fn unused_library_metadata_changes_keep_cached_layer_pixels() {
+        let mut surface = skia_safe::surfaces::raster_n32_premul((4, 4)).expect("surface");
+        let scene = Scene::new();
+        let mut library = ComponentLibrary::new();
+        let unused = ComponentId::new();
+        library
+            .defs
+            .insert(unused, ComponentDef::new(unused, NodeId::new(), "Unused"));
+        let mut cache = LayerCache::default();
+        cache.begin_frame(
+            surface.canvas(),
+            &scene,
+            &library,
+            epoch(&scene, 0),
+            1.0,
+            (0.0, 0.0),
+        );
+        let id = NodeId::new();
+        assert!(cache.store(
+            id,
+            raster_image(2, 2),
+            [1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            (0, 0)
+        ));
+        library.defs.get_mut(&unused).expect("unused").rev += 1;
+        assert!(cache.begin_frame(
+            surface.canvas(),
+            &scene,
+            &library,
+            epoch(&scene, 0),
+            1.0,
+            (0.0, 0.0)
+        ));
+        assert!(matches!(
+            cache.lookup(surface.canvas(), id, &Paint::default()),
+            LayerLookup::Hit
+        ));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn oversized_component_metadata_requires_a_cold_frame_without_retaining_the_payload() {
+        let id = ComponentId::new();
+        let mut library = ComponentLibrary::new();
+        let definition = ComponentDef::new(id, NodeId::new(), "x".repeat(5 << 20));
+        library.defs.insert(id, definition);
+        let mut dependencies = ComponentDependencies::default();
+        dependencies.record(&library, id);
+        assert!(dependencies.incomplete);
+        assert!(dependencies.definitions.is_empty());
+        assert_eq!(dependencies.bytes, 0);
+        assert!(!dependencies.matches(&library));
+        dependencies.clear();
+        assert!(dependencies.matches(&library));
+    }
+
+    #[test]
+    fn candidate_definition_witness_does_not_hide_a_later_set_reference() {
+        let parent = ComponentId::new();
+        let child = ComponentId::new();
+        let member = ComponentId::new();
+        let mut library = ComponentLibrary::new();
+        library
+            .defs
+            .insert(member, ComponentDef::new(member, NodeId::new(), "Member"));
+        for (id, members) in [(parent, vec![member, child]), (child, vec![member])] {
+            library.sets.insert(
+                id,
+                ComponentSet {
+                    id,
+                    name: "Set".into(),
+                    axes: Vec::new(),
+                    members,
+                    default_variant: member,
+                    root: None,
+                },
+            );
+        }
+        let mut dependencies = ComponentDependencies::default();
+        dependencies.record(&library, parent);
+        assert!(dependencies.definitions.contains_key(&child));
+        assert!(!dependencies.sets.contains_key(&child));
+        dependencies.record(&library, child);
+        assert!(dependencies.sets.contains_key(&child));
+        library
+            .sets
+            .get_mut(&child)
+            .expect("child set")
+            .default_variant = ComponentId::new();
+        assert!(!dependencies.matches(&library));
+        assert!(
+            dependencies
+                .changed_references(&library)
+                .expect("complete")
+                .contains(&child)
+        );
+    }
 
     fn raster_image(w: i32, h: i32) -> skia_safe::Image {
         let info = ImageInfo::new_n32_premul((w, h), None);

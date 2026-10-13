@@ -12,7 +12,7 @@ use crate::parse::{parse_doc, parse_doc_with};
 use crate::print::{print_doc, print_doc_with};
 use crate::refs::RefTable;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 /// One artifact's readable IR: tag tree + identity sidecar.
@@ -24,6 +24,45 @@ pub struct ArtifactIr {
     root: FnxElement,
     sidecar: FnxSidecar,
     index: Arc<ElementIndex>,
+    revision: u64,
+}
+
+pub struct StructuralNodeChange {
+    pub id: String,
+    pub before: Option<Value>,
+    pub after: Option<Value>,
+}
+
+pub struct PreparedStructuralPatch {
+    previous_sidecar: FnxSidecar,
+    previous_index: Arc<ElementIndex>,
+    previous_revision: u64,
+    previous_order: Vec<String>,
+    previous_children: HashMap<String, Vec<String>>,
+    pub(crate) order: Vec<String>,
+    pub(crate) children: HashMap<String, Vec<String>>,
+    pub(crate) replacements: BTreeMap<String, FnxElement>,
+    sidecar: FnxSidecar,
+}
+
+impl PreparedStructuralPatch {
+    pub fn sidecar(&self) -> &FnxSidecar {
+        &self.sidecar
+    }
+
+    pub(crate) fn element<'a>(
+        &'a self,
+        previous: &'a ArtifactIr,
+        id: &str,
+    ) -> Option<&'a FnxElement> {
+        self.replacements.get(id).or_else(|| previous.element(id))
+    }
+
+    pub(crate) fn matches(&self, previous: &ArtifactIr) -> bool {
+        self.previous_sidecar == previous.sidecar
+            && self.previous_revision == previous.revision
+            && Arc::ptr_eq(&self.previous_index, &previous.index)
+    }
 }
 
 impl PartialEq for ArtifactIr {
@@ -116,6 +155,7 @@ impl ArtifactIr {
             root,
             sidecar,
             index,
+            revision: 0,
         }
     }
 
@@ -259,7 +299,318 @@ impl ArtifactIr {
         self.root = root;
         self.sidecar = sidecar;
         self.index = Arc::new(ElementIndex::build(&self.root, &self.sidecar));
+        self.revision = self.revision.wrapping_add(1);
         Ok(())
+    }
+
+    /// `before` values must represent the retained nodes' typed projection.
+    /// Fields absent from both snapshots remain owned by the authored IR.
+    pub fn prepare_structural_patch(
+        &self,
+        changes: &[StructuralNodeChange],
+    ) -> Result<PreparedStructuralPatch, FnxError> {
+        let root_id = self
+            .sidecar
+            .ids
+            .first()
+            .ok_or_else(|| FnxError::Parse("structural patch has no artifact root".into()))?
+            .id
+            .clone();
+        let mut entries = HashMap::with_capacity(self.sidecar.ids.len() + changes.len());
+        let mut parents = HashMap::with_capacity(self.sidecar.ids.len() + changes.len());
+        let mut previous_children = HashMap::<String, Vec<String>>::new();
+        let previous_order: Vec<_> = self
+            .sidecar
+            .ids
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect();
+        for (position, entry) in self.sidecar.ids.iter().enumerate() {
+            let element = self.element(&entry.id).ok_or_else(|| {
+                FnxError::Parse(format!("structural patch lost retained node {}", entry.id))
+            })?;
+            if element.attrs.get("id").and_then(Value::as_str) != Some(entry.id.as_str()) {
+                return Err(FnxError::Parse("retained tree identity is stale".into()));
+            }
+            let parent = self
+                .index
+                .parent_position(position)
+                .ok_or_else(|| FnxError::Parse("retained tree topology is stale".into()))?;
+            let parent = parent
+                .map(|parent| {
+                    self.sidecar
+                        .ids
+                        .get(parent)
+                        .map(|entry| entry.id.clone())
+                        .ok_or_else(|| FnxError::Parse("retained tree parent is absent".into()))
+                })
+                .transpose()?;
+            if let Some(parent) = &parent {
+                previous_children
+                    .entry(parent.clone())
+                    .or_default()
+                    .push(entry.id.clone());
+            }
+            previous_children.entry(entry.id.clone()).or_default();
+            let mut entry = entry.clone();
+            entry.tag = Some(element.tag.clone());
+            entry.name = element
+                .attrs
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            parents.insert(entry.id.clone(), parent);
+            entries.insert(entry.id.clone(), entry);
+        }
+        let mut replacements = BTreeMap::new();
+        let mut touched = HashSet::new();
+        for change in changes {
+            if !touched.insert(change.id.as_str()) {
+                return Err(FnxError::Parse(format!(
+                    "duplicate structural change {}",
+                    change.id
+                )));
+            }
+            let existing = entries.get(&change.id);
+            if existing.is_some() != change.before.is_some() {
+                return Err(FnxError::Parse(format!(
+                    "structural change has a stale baseline for {}",
+                    change.id
+                )));
+            }
+            if let Some(before) = &change.before {
+                if before.get("id").and_then(Value::as_str) != Some(change.id.as_str()) {
+                    return Err(FnxError::Parse(
+                        "structural baseline identity disagrees".into(),
+                    ));
+                }
+                if change.id != root_id
+                    && (before.get("parent").and_then(Value::as_str)
+                        != parents.get(&change.id).and_then(|parent| parent.as_deref())
+                        || before
+                            .get("index")
+                            .and_then(Value::as_f64)
+                            .map(f64::to_bits)
+                            != existing
+                                .and_then(|entry| entry.index.as_f64())
+                                .map(f64::to_bits))
+                {
+                    return Err(FnxError::Parse(format!(
+                        "structural baseline topology disagrees for {}",
+                        change.id
+                    )));
+                }
+            }
+            let Some(after) = &change.after else {
+                if change.id == root_id {
+                    return Err(FnxError::Parse("cannot remove an artifact root".into()));
+                }
+                entries.remove(&change.id);
+                parents.remove(&change.id);
+                continue;
+            };
+            if after.get("id").and_then(Value::as_str) != Some(change.id.as_str()) {
+                return Err(FnxError::Parse(
+                    "structural replacement identity disagrees".into(),
+                ));
+            }
+            let projected = element_of(after)?;
+            let replacement = if let Some(before) = &change.before {
+                let retained = self.element(&change.id).ok_or_else(|| {
+                    FnxError::Parse(format!("retained node {} is absent", change.id))
+                })?;
+                let before = element_of(before)?;
+                if before.tag == projected.tag && before.attrs == projected.attrs {
+                    None
+                } else {
+                    let mut replacement = FnxElement {
+                        tag: retained.tag.clone(),
+                        attrs: retained.attrs.clone(),
+                        children: Vec::new(),
+                    };
+                    if before.tag != projected.tag {
+                        replacement.tag = projected.tag.clone();
+                    }
+                    for key in before
+                        .attrs
+                        .keys()
+                        .chain(projected.attrs.keys())
+                        .collect::<HashSet<_>>()
+                    {
+                        if before.attrs.get(key) == projected.attrs.get(key) {
+                            continue;
+                        }
+                        match projected.attrs.get(key) {
+                            Some(value) => {
+                                replacement.attrs.insert(key.clone(), value.clone());
+                            }
+                            None => {
+                                replacement.attrs.remove(key);
+                            }
+                        }
+                    }
+                    Some(replacement)
+                }
+            } else {
+                Some(projected)
+            };
+            let parent = after
+                .get("parent")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if change.id == root_id {
+                if parent.is_some() && parent != self.sidecar.root_parent {
+                    return Err(FnxError::Parse("cannot reparent an artifact root".into()));
+                }
+                parents.insert(change.id.clone(), None);
+            } else {
+                parents.insert(change.id.clone(), parent);
+            }
+            let element = replacement
+                .as_ref()
+                .or_else(|| self.element(&change.id))
+                .ok_or_else(|| FnxError::Parse("structural replacement lost its element".into()))?;
+            entries.insert(
+                change.id.clone(),
+                crate::model::IdEntry {
+                    id: change.id.clone(),
+                    index: after.get("index").cloned().unwrap_or(Value::Null),
+                    tag: Some(element.tag.clone()),
+                    name: element
+                        .attrs
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    parent_index: None,
+                },
+            );
+            if let Some(replacement) = replacement {
+                replacements.insert(change.id.clone(), replacement);
+            }
+        }
+        let mut children = HashMap::<String, Vec<String>>::with_capacity(entries.len());
+        for id in entries.keys() {
+            children.entry(id.clone()).or_default();
+            if id == &root_id {
+                continue;
+            }
+            let parent = parents
+                .get(id)
+                .and_then(|parent| parent.as_ref())
+                .filter(|parent| entries.contains_key(*parent))
+                .ok_or_else(|| {
+                    FnxError::Parse(format!(
+                        "structural patch leaves node {id} without its parent"
+                    ))
+                })?;
+            children.entry(parent.clone()).or_default().push(id.clone());
+        }
+        for siblings in children.values_mut() {
+            siblings.sort_by(|left, right| {
+                let index = |id: &String| {
+                    entries
+                        .get(id)
+                        .and_then(|entry| entry.index.as_f64())
+                        .unwrap_or(0.0)
+                };
+                index(left)
+                    .total_cmp(&index(right))
+                    .then_with(|| left.cmp(right))
+            });
+        }
+        let mut order = Vec::with_capacity(entries.len());
+        let mut sidecar = FnxSidecar {
+            root_parent: self.sidecar.root_parent.clone(),
+            ids: Vec::with_capacity(entries.len()),
+        };
+        let mut pending = vec![(root_id, None)];
+        let mut visited = HashSet::with_capacity(entries.len());
+        while let Some((id, parent_index)) = pending.pop() {
+            if !visited.insert(id.clone()) {
+                return Err(FnxError::Parse("structural patch contains a cycle".into()));
+            }
+            let position =
+                u32::try_from(order.len()).map_err(|error| FnxError::Parse(error.to_string()))?;
+            let mut entry = entries
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| FnxError::Parse("structural patch root is absent".into()))?;
+            entry.parent_index = parent_index;
+            sidecar.ids.push(entry);
+            order.push(id.clone());
+            pending.extend(
+                children
+                    .get(&id)
+                    .into_iter()
+                    .flatten()
+                    .rev()
+                    .map(|child| (child.clone(), Some(position))),
+            );
+        }
+        if visited.len() != entries.len() {
+            return Err(FnxError::Parse(
+                "structural patch contains an orphan or cycle".into(),
+            ));
+        }
+        Ok(PreparedStructuralPatch {
+            previous_sidecar: self.sidecar.clone(),
+            previous_index: Arc::clone(&self.index),
+            previous_revision: self.revision,
+            previous_order,
+            previous_children,
+            order,
+            children,
+            replacements,
+            sidecar,
+        })
+    }
+
+    /// Install a prepared topology while moving unchanged attribute payloads.
+    /// A stale witness or assembly failure leaves the previous IR installed.
+    pub fn commit_structural_patch(
+        &mut self,
+        patch: PreparedStructuralPatch,
+    ) -> Result<(), FnxError> {
+        if !patch.matches(self) {
+            return Err(FnxError::Parse(
+                "structural patch baseline changed before commit".into(),
+            ));
+        }
+        let root = std::mem::replace(&mut self.root, FnxElement::new("Frame"));
+        let mut nodes = flatten_owned_tree(root, &patch.previous_order);
+        let mut replaced = BTreeMap::new();
+        let mut inserted = Vec::new();
+        for (id, replacement) in patch.replacements {
+            match nodes.insert(id.clone(), replacement) {
+                Some(previous) => {
+                    replaced.insert(id, previous);
+                }
+                None => inserted.push(id),
+            }
+        }
+        match assemble_owned_tree(&patch.order, &patch.children, &mut nodes) {
+            Ok(root) => {
+                self.root = root;
+                self.sidecar = patch.sidecar;
+                self.index = Arc::new(ElementIndex::build(&self.root, &self.sidecar));
+                self.revision = self.revision.wrapping_add(1);
+                Ok(())
+            }
+            Err(error) => {
+                for (id, previous) in replaced {
+                    nodes.insert(id, previous);
+                }
+                for id in inserted {
+                    nodes.remove(&id);
+                }
+                self.root = assemble_owned_tree(
+                    &patch.previous_order,
+                    &patch.previous_children,
+                    &mut nodes,
+                )?;
+                Err(error)
+            }
+        }
     }
 
     /// Replace one node's tag and attribute projection while retaining its
@@ -306,6 +657,7 @@ impl ArtifactIr {
                 .and_then(Value::as_str)
                 .map(str::to_owned);
         }
+        self.revision = self.revision.wrapping_add(1);
         Ok(())
     }
 
@@ -381,8 +733,72 @@ impl ArtifactIr {
                 .and_then(Value::as_str)
                 .map(str::to_owned);
         }
+        self.revision = self.revision.wrapping_add(1);
         Ok(())
     }
+}
+
+fn flatten_owned_tree(root: FnxElement, order: &[String]) -> HashMap<String, FnxElement> {
+    let mut nodes = HashMap::with_capacity(order.len());
+    let mut pending = vec![root];
+    for id in order {
+        if let Some(mut element) = pending.pop() {
+            pending.extend(std::mem::take(&mut element.children).into_iter().rev());
+            nodes.insert(id.clone(), element);
+        }
+    }
+    nodes
+}
+
+fn flatten_assembled_nodes(
+    nodes: &mut HashMap<String, FnxElement>,
+    children: &HashMap<String, Vec<String>>,
+) {
+    let mut pending: Vec<_> = std::mem::take(nodes).into_iter().collect();
+    while let Some((id, mut element)) = pending.pop() {
+        pending.extend(
+            children
+                .get(&id)
+                .into_iter()
+                .flatten()
+                .cloned()
+                .zip(std::mem::take(&mut element.children)),
+        );
+        nodes.insert(id, element);
+    }
+}
+
+fn assemble_owned_tree(
+    order: &[String],
+    children: &HashMap<String, Vec<String>>,
+    nodes: &mut HashMap<String, FnxElement>,
+) -> Result<FnxElement, FnxError> {
+    let root = order
+        .first()
+        .ok_or_else(|| FnxError::Parse("structural tree has no root".into()))?;
+    if let Some(id) = order.iter().find(|id| !nodes.contains_key(*id)) {
+        return Err(FnxError::Parse(format!("structural tree lost node {id}")));
+    }
+    for id in order.iter().rev() {
+        let Some(mut element) = nodes.remove(id) else {
+            flatten_assembled_nodes(nodes, children);
+            return Err(FnxError::Parse(format!("structural tree lost parent {id}")));
+        };
+        for child in children.get(id).into_iter().flatten() {
+            let Some(child_element) = nodes.remove(child) else {
+                nodes.insert(id.clone(), element);
+                flatten_assembled_nodes(nodes, children);
+                return Err(FnxError::Parse(format!(
+                    "structural tree lost child {child}"
+                )));
+            };
+            element.children.push(child_element);
+        }
+        nodes.insert(id.clone(), element);
+    }
+    nodes
+        .remove(root)
+        .ok_or_else(|| FnxError::Parse("structural tree lost its root".into()))
 }
 
 fn validate_unique_ids(sidecar: &FnxSidecar) -> Result<(), FnxError> {
@@ -592,6 +1008,69 @@ mod tests {
         ir.replace_structure(root, sidecar).unwrap();
         assert_eq!(ir.element("node-1").unwrap().attrs["name"], "Child 1");
         assert_eq!(ir.element("node-0").unwrap().attrs["name"], "Child 0");
+    }
+
+    #[test]
+    fn structural_patch_validation_and_commit_failures_are_atomic() {
+        let nodes = vec![
+            serde_json::json!({"id":"root","type":"group","parent":null,"index":1,"name":"Root"}),
+            serde_json::json!({"id":"child","type":"group","parent":"root","index":1,"name":"Child"}),
+        ];
+        let mut ir = ArtifactIr::from_nodes(ArtifactKind::Page, "Page", &nodes).expect("IR");
+        let before = ir.clone();
+        for parent in ["absent", "child"] {
+            let mut after = nodes[1].clone();
+            after["parent"] = serde_json::json!(parent);
+            assert!(
+                ir.prepare_structural_patch(&[StructuralNodeChange {
+                    id: "child".into(),
+                    before: Some(nodes[1].clone()),
+                    after: Some(after),
+                }])
+                .is_err()
+            );
+            assert_eq!(ir, before);
+        }
+        let make_insert = || StructuralNodeChange {
+            id: "inserted".into(),
+            before: None,
+            after: Some(
+                serde_json::json!({"id":"inserted","type":"text","parent":"root","index":2,"name":"Inserted"}),
+            ),
+        };
+        for corrupt_order in [true, false] {
+            let mut patch = ir
+                .prepare_structural_patch(&[make_insert()])
+                .expect("prepare");
+            if corrupt_order {
+                patch.order.push("missing".into());
+            } else {
+                patch
+                    .children
+                    .get_mut("root")
+                    .expect("root children")
+                    .push("missing".into());
+            }
+            assert!(ir.commit_structural_patch(patch).is_err());
+            assert_eq!(ir, before);
+            assert_eq!(
+                ir.to_nodes().expect("restored nodes"),
+                before.to_nodes().expect("original nodes")
+            );
+        }
+        let patch = ir
+            .prepare_structural_patch(&[make_insert()])
+            .expect("prepare");
+        let mut changed = nodes[1].clone();
+        changed["opacity"] = serde_json::json!(0.5);
+        ir.patch_node_delta("child", &nodes[1], &changed)
+            .expect("property edit");
+        let edited = ir.clone();
+        assert!(ir.commit_structural_patch(patch).is_err());
+        assert_eq!(
+            ir, edited,
+            "a stale plan must not overwrite a later property edit"
+        );
     }
 
     #[test]

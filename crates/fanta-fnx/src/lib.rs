@@ -38,7 +38,7 @@ pub use api::{
 };
 pub use canonicalize::{canonicalize_legacy_source, with_module_depth};
 pub use convert::{FnxError, FnxTree, nodes_from_tree, nodes_from_tree_owned, tree_from_nodes};
-pub use ir::ArtifactIr;
+pub use ir::{ArtifactIr, PreparedStructuralPatch, StructuralNodeChange};
 pub use kind::{ArtifactKind, ImportTarget, artifact_file_names, import_allowed};
 pub use model::{FnxElement, IdEntry, tag_for_type, type_for_tag};
 pub use parse::{parse_doc, parse_doc_with};

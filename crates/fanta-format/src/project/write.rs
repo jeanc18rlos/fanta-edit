@@ -301,7 +301,6 @@ pub(crate) fn write_project_artifacts_checked(
         .lock()
         .map_err(|_| FormatError::InvalidProjectTree("project I/O lock is poisoned".to_owned()))?;
     recover_project_transaction_locked(dir, true)?;
-    validate_expected_disk_content(dir, expected_disk)?;
     for relative in files.keys() {
         ensure_no_symlink_ancestors(dir, relative)?;
     }
@@ -316,6 +315,8 @@ pub(crate) fn write_project_artifacts_checked(
     for (relative, bytes) in &files {
         plan_write(dir, relative, bytes, &mut writes)?;
     }
+    // Planning only reads disk. Check the complete baseline after those reads,
+    // immediately before mutation, instead of reading every file twice here.
     validate_expected_disk_content(dir, expected_disk)?;
     let projected_hashes = files
         .iter()

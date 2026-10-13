@@ -350,6 +350,51 @@ impl Scene {
         Some(scene)
     }
 
+    pub fn extract_subtrees_with_ancestors(
+        &self,
+        roots: impl IntoIterator<Item = NodeId>,
+    ) -> Option<Scene> {
+        let mut selected = std::collections::HashSet::new();
+        for root in roots {
+            self.nodes.get(&root)?;
+            selected.extend(self.descendants_of(root));
+            selected.extend(self.ancestors_of(root).map(|ancestor| ancestor.id));
+        }
+        let mut scene = Scene::new();
+        for id in &selected {
+            let node = self.nodes.get(id)?;
+            if node.id != *id
+                || node
+                    .parent
+                    .is_some_and(|parent| !selected.contains(&parent))
+            {
+                return None;
+            }
+            scene.nodes.insert(*id, Arc::clone(node));
+            if let Some(stamp) = self.node_stamps.get(id) {
+                scene.node_stamps.insert(*id, *stamp);
+            }
+        }
+        // Ancestors preserve frame modes and world transforms, but their
+        // unselected siblings must not enlarge the render-thread snapshot.
+        for parent in std::iter::once(None).chain(selected.iter().copied().map(Some)) {
+            if let Some(children) = self.child_index.get(&parent) {
+                let children: Vec<_> = children
+                    .iter()
+                    .copied()
+                    .filter(|child| selected.contains(child))
+                    .collect();
+                if !children.is_empty() {
+                    scene.child_index.insert(parent, children);
+                }
+            }
+        }
+        scene.stamp_floor = self.stamp_floor.clone();
+        scene.removal_revision = self.removal_revision.clone();
+        scene.revision = self.revision.clone();
+        Some(scene)
+    }
+
     /// Whether `self` and `other` hold the very same payload for `id` — true
     /// only for a node neither scene has rewritten since one was derived from
     /// the other ([`Self::extract_subtree`], `Clone`).

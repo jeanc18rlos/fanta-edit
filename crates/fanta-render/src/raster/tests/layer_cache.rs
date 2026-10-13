@@ -680,6 +680,15 @@ fn component_metadata_modes_and_asset_ownership_invalidate_layers()
     doc.components
         .defs
         .insert(component, ComponentDef::new(component, master, "Master"));
+    let mut placed = CanvasNode::new(NodeData::Instance(fanta_doc::InstanceNode {
+        component,
+        overrides: Vec::new(),
+        prop_values: Default::default(),
+        derived: Vec::new(),
+        local_size: [30.0, 20.0],
+    }));
+    placed.transform = Transform2D::translation(50.0, 45.0);
+    doc.apply(Operation::create_node(placed))?;
     let viewport = vp(0.0, 0.0);
     let mut renderer = RasterRenderer::new(W, H)?;
     let mut mode_generation = 0;
@@ -869,7 +878,7 @@ fn layer_cache_component_guard_comparison_diagnostic() -> Result<(), Box<dyn std
                 .expect("last definition")
                 .name
                 .push('!');
-            assert!(!cache.begin_frame(surface.canvas(), &scene, &library, epoch, 1.0, (0.0, 0.0)));
+            assert!(cache.begin_frame(surface.canvas(), &scene, &library, epoch, 1.0, (0.0, 0.0)));
             assert!(cache.begin_frame(surface.canvas(), &scene, &library, epoch, 1.0, (0.0, 0.0)));
         }
     }

@@ -5226,6 +5226,171 @@ fn structural_source_fields_survive_create_undo_redo_and_cold() {
 }
 
 #[test]
+fn incremental_structural_host_adoption_reuses_retained_payloads_and_reopens_exact_scene() {
+    let (directory, page, child, destination) = structural_source_fixture(true, true);
+    let path = crate::locate_page_source(directory.path(), page).expect("source path");
+    let blob = serde_json::to_string(&vec![7; 8192]).expect("source-only payload");
+    let source = std::fs::read_to_string(&path).expect("source").replacen(
+        "name=\"Home\"",
+        &format!("name=\"Home\" future_blob={{{blob}}}"),
+        1,
+    );
+    std::fs::write(&path, source).expect("authored payload");
+    let (mut document, _) = crate::read_project_tree(directory.path()).expect("document");
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
+    let artifact = ArtifactId::Page(page);
+    workspace.open_artifact(artifact.clone()).expect("page");
+    let retained_pointer = workspace
+        .artifact(&artifact)
+        .expect("session")
+        .ir()
+        .root()
+        .attrs
+        .get("future_blob")
+        .and_then(Value::as_array)
+        .expect("source-only payload")
+        .as_ptr();
+    let mut inserted = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    inserted.parent = Some(destination);
+    inserted.name = "Incremental structural probe".into();
+    let inserted_id = inserted.id;
+    for step in 0..4 {
+        match step {
+            0 => {
+                document.scene.insert(inserted.clone()).expect("create");
+            }
+            1 => {
+                document
+                    .scene
+                    .set_parent(inserted_id, Some(page), fanta_doc::IndexKey::from_raw(9.0))
+                    .expect("reparent");
+            }
+            2 => {
+                document
+                    .scene
+                    .set_index(inserted_id, fanta_doc::IndexKey::from_raw(-1.0))
+                    .expect("reorder");
+            }
+            _ => {
+                document.scene.remove(inserted_id).expect("delete");
+            }
+        }
+        let session = workspace.artifact_mut(&artifact).expect("session");
+        session
+            .adopt_document(&document)
+            .expect("structural adoption");
+        assert_eq!(
+            retained_pointer,
+            session
+                .ir()
+                .root()
+                .attrs
+                .get("future_blob")
+                .and_then(Value::as_array)
+                .expect("retained payload")
+                .as_ptr(),
+            "structural adoption must not deep-clone the unaffected IR payload"
+        );
+        structural_source_assert_fields(&session.source_text(), child);
+        assert_eq!(
+            session
+                .source_text()
+                .matches("{/* child note: keep once */}")
+                .count(),
+            1
+        );
+        workspace.save_artifact(artifact.clone()).expect("save");
+        let (reopened, _) = crate::read_project_tree(directory.path()).expect("cold read");
+        assert_eq!(
+            serde_json::to_value(&reopened.scene).expect("saved scene"),
+            serde_json::to_value(&document.scene).expect("live scene"),
+            "create/reparent/reorder/delete step {step}"
+        );
+    }
+    let session = workspace.artifact_mut(&artifact).expect("session");
+    let history_depth = session.doc().history.undo_depth();
+    let mut direct = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    direct.parent = Some(destination);
+    direct.name = "Direct source transaction".into();
+    session
+        .apply(Operation::create_node(direct.clone()))
+        .expect("direct creation");
+    session
+        .apply(Operation::DeleteSubtree {
+            snapshot: vec![direct],
+        })
+        .expect("direct deletion");
+    assert_eq!(session.doc().history.undo_depth(), history_depth + 2);
+    assert_eq!(
+        retained_pointer,
+        session
+            .ir()
+            .root()
+            .attrs
+            .get("future_blob")
+            .and_then(Value::as_array)
+            .expect("retained payload")
+            .as_ptr(),
+        "direct structural source transactions must avoid an artifact clone too"
+    );
+    let before_source = session.source_text();
+    let before_scene = serde_json::to_value(&session.doc().scene).expect("before scene");
+    let before_generation = session.working_generation();
+    let before_disk = artifact_ownership_file_bytes(directory.path());
+    document
+        .scene
+        .remove(child)
+        .expect("host attempts unsafe deletion");
+    let error = workspace
+        .artifact_mut(&artifact)
+        .expect("session")
+        .adopt_document(&document)
+        .expect_err("future source fields cannot be silently deleted");
+    assert!(error.to_string().contains("source attribute"), "{error}");
+    let session = workspace.artifact(&artifact).expect("session");
+    assert_eq!(session.source_text(), before_source);
+    assert_eq!(
+        serde_json::to_value(&session.doc().scene).expect("after scene"),
+        before_scene
+    );
+    assert_eq!(session.working_generation(), before_generation);
+    assert_eq!(artifact_ownership_file_bytes(directory.path()), before_disk);
+}
+
+#[test]
+fn incremental_structural_component_adoption_preserves_external_root_parent() {
+    let (directory, mut document, _, _, _) = incremental_save_fixture();
+    let (component, definition) = document.components.defs.iter().next().expect("master");
+    let component = *component;
+    let root = definition.root;
+    let parent = document.scene.get(root).expect("master root").parent;
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
+    let artifact = ArtifactId::Component(component);
+    workspace.open_artifact(artifact.clone()).expect("master");
+    let mut inserted = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    inserted.parent = Some(root);
+    inserted.name = "New nested layer".into();
+    let inserted_id = document.scene.insert(inserted).expect("nested layer");
+    for remove in [false, true] {
+        if remove {
+            document.scene.remove(inserted_id).expect("delete");
+        }
+        let session = workspace.artifact_mut(&artifact).expect("session");
+        session.adopt_document(&document).expect("adopt");
+        assert_eq!(
+            session.ir().sidecar().root_parent,
+            parent.map(|parent| parent.0.to_string())
+        );
+        workspace.save_artifact(artifact.clone()).expect("save");
+        let (reopened, _) = crate::read_project_tree(directory.path()).expect("cold read");
+        assert_eq!(
+            serde_json::to_value(&reopened.scene).expect("saved scene"),
+            serde_json::to_value(&document.scene).expect("live scene")
+        );
+    }
+}
+
+#[test]
 fn structural_source_fields_host_adoption_preserves_future_fields_but_removes_known_value() {
     let (directory, page, child, _) = structural_source_fixture(true, true);
     let (mut document, assets) =
