@@ -421,8 +421,8 @@ fn local_outline(doc: &Doc, id: NodeId) -> Result<skia_safe::Path> {
                 if child_node.flags.contains(fanta_doc::NodeFlags::HIDDEN) {
                     continue;
                 }
-                let mut outline = local_outline(doc, *child)?;
-                outline.transform(&fanta_render::to_sk_matrix(&child_node.transform));
+                let outline = local_outline(doc, *child)?
+                    .with_transform(&fanta_render::to_sk_matrix(&child_node.transform));
                 combined = Some(match combined {
                     Some(previous) => previous
                         .op(&outline, operation)
@@ -784,11 +784,12 @@ fn stroke_geometry(
                 width * 2.
             }) as f32,
         );
-        let mut path = skia_safe::Path::new();
+        let mut path = skia_safe::PathBuilder::new();
         ensure!(
             skia_safe::path_utils::fill_path_with_paint(outline, &paint, &mut path, None, None),
             "Could not outline this stroke"
         );
+        let path = path.detach();
         match stroke.align {
             fanta_doc::StrokeAlign::Center => Ok(path),
             fanta_doc::StrokeAlign::Inside => path
@@ -836,7 +837,7 @@ fn stroke_geometry(
         if width <= 0. {
             continue;
         }
-        let mut wedge = skia_safe::Path::new();
+        let mut wedge = skia_safe::PathBuilder::new();
         for (index, point) in points.into_iter().enumerate() {
             if index == 0 {
                 wedge.move_to(point);
@@ -846,7 +847,7 @@ fn stroke_geometry(
         }
         wedge.close();
         let side = ring(width)?
-            .op(&wedge, skia_safe::PathOp::Intersect)
+            .op(&wedge.detach(), skia_safe::PathOp::Intersect)
             .context("Could not outline an individual border")?;
         combined = combined
             .op(&side, skia_safe::PathOp::Union)

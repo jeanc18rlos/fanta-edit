@@ -33,6 +33,8 @@
 //! stamps alone cannot make this distinction because transform-only edits do
 //! not stamp ordinary geometry. Layers containing cross-tree pattern sources
 //! stay volatile, since their dependencies are not scene ancestors.
+//! GPU entries also require the same live recorder/context. Hosts must clear
+//! caches before replacing a backend: a freed recorder's address can be reused.
 //!
 //! Per entry, the local→device matrix at render time is kept. A lookup is a
 //! **hit** only when the current matrix equals it up to an INTEGER device
@@ -268,6 +270,15 @@ pub(crate) enum LayerLookup {
     Hit,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LayerCacheDomain {
+    Raster,
+    #[cfg(feature = "metal")]
+    Ganesh(skia_safe::gpu::DirectContextId),
+    #[cfg(feature = "metal")]
+    Graphite(usize),
+}
+
 /// The cross-frame effect-layer cache. Owned by the renderer next to the
 /// image / path / boolean caches; see the module docs.
 pub(crate) struct LayerCache {
@@ -298,6 +309,7 @@ pub(crate) struct LayerCache {
     /// serves both kinds, so a lookup only serves entries of the canvas's
     /// kind. Probed per frame by [`Self::begin_frame`].
     canvas_is_gpu: Option<bool>,
+    domain: Option<LayerCacheDomain>,
 }
 
 impl Default for LayerCache {
@@ -316,6 +328,7 @@ impl Default for LayerCache {
             enabled: true,
             populated_this_frame: 0,
             canvas_is_gpu: None,
+            domain: None,
         }
     }
 }
@@ -343,7 +356,9 @@ impl LayerCache {
         root_translation: (f64, f64),
     ) -> bool {
         let components_changed = !self.components.matches(components);
-        let epoch_changed = self.epoch != Some(epoch) || components_changed;
+        let domain = canvas_cache_domain(canvas);
+        let domain_changed = domain.is_none() || self.domain != domain;
+        let epoch_changed = self.epoch != Some(epoch) || components_changed || domain_changed;
         self.hot_nodes.clear();
         self.moved_roots.clear();
         let delta = (!epoch_changed)
@@ -375,6 +390,7 @@ impl LayerCache {
             }
         }
         self.epoch = Some(epoch);
+        self.domain = domain;
         self.seen_revision = Some(scene.revision());
         self.frame = self.frame.wrapping_add(1);
         self.populated_this_frame = 0;
@@ -401,9 +417,7 @@ impl LayerCache {
                 AlphaType::Premul,
                 base.color_space(),
             );
-            canvas
-                .new_surface(&info, None)
-                .map(|mut s| s.image_snapshot().is_texture_backed())
+            canvas_backend_is_gpu(canvas, &info)
         } else {
             None
         };
@@ -601,8 +615,9 @@ impl LayerCache {
 /// store the image in `ctx.layer_cache` for later frames (unless the body
 /// proved volatile). Returns `true` when the layer was rendered this way.
 ///
-/// Returns `false` WITHOUT calling `body` — the caller then takes the direct
-/// save-layer path — when the layer cannot be cached faithfully or usefully:
+/// Returns `false` before painting when the layer cannot be cached faithfully
+/// or usefully; a failed snapshot after offscreen painting also returns `false`
+/// so the caller can paint the complete layer directly:
 /// - the CTM has perspective (the cache keys on an affine matrix);
 /// - the current clip is empty (nothing would composite);
 /// - its filtered output would exceed [`LAYER_CACHE_MAX_ENTRY_PX`] or the
@@ -674,7 +689,7 @@ pub(crate) fn render_layer_via_cache(
     // The canvas's own surface props (dither etc.); the save-layer pushed
     // inside picks its pixel geometry the same way a direct save-layer does.
     let props = canvas.top_props();
-    let Some(mut surface) = canvas.new_surface(&info, Some(&props)) else {
+    let Some(mut surface) = compatible_offscreen_surface(canvas, &info, Some(&props)) else {
         return false;
     };
     let offscreen = surface.canvas();
@@ -694,7 +709,9 @@ pub(crate) fn render_layer_via_cache(
     let volatile = ctx.layer_volatile;
     ctx.layer_volatile = outer_volatile || volatile;
     offscreen.restore();
-    let image = surface.image_snapshot();
+    let Some(image) = immutable_surface_snapshot(&mut surface) else {
+        return false;
+    };
 
     // Composite: identity CTM (the image is in device pixels), the layer
     // paint's alpha + blend, under the caller's clip.
@@ -712,6 +729,73 @@ pub(crate) fn render_layer_via_cache(
             .store(id, image, affine_of(&m), (dev_out.left, dev_out.top));
     }
     true
+}
+
+fn compatible_offscreen_surface(
+    canvas: &Canvas,
+    info: &ImageInfo,
+    properties: Option<&skia_safe::SurfaceProps>,
+) -> Option<skia_safe::Surface> {
+    let surface = canvas.new_surface(info, properties)?;
+    #[cfg(feature = "metal")]
+    {
+        use skia_safe::wrapper::PointerWrapper;
+        let mut surface = surface;
+        match (canvas.recorder(), surface.canvas().recorder()) {
+            (Some(parent), Some(child)) if std::ptr::eq(parent.inner(), child.inner()) => {}
+            (None, None) => {}
+            _ => return None,
+        }
+        Some(surface)
+    }
+    #[cfg(not(feature = "metal"))]
+    Some(surface)
+}
+
+fn canvas_backend_is_gpu(canvas: &Canvas, info: &ImageInfo) -> Option<bool> {
+    #[cfg(feature = "metal")]
+    if canvas.recorder().is_some() {
+        return Some(true);
+    }
+    let mut surface = compatible_offscreen_surface(canvas, info, None)?;
+    immutable_surface_snapshot(&mut surface).map(|image| image.is_texture_backed())
+}
+
+fn canvas_cache_domain(_canvas: &Canvas) -> Option<LayerCacheDomain> {
+    #[cfg(feature = "metal")]
+    {
+        let canvas = _canvas;
+        use skia_safe::wrapper::PointerWrapper;
+        if let Some(recorder) = canvas.recorder() {
+            return Some(LayerCacheDomain::Graphite(
+                recorder.inner() as *const _ as usize
+            ));
+        }
+        if let Some(context) = canvas.direct_context() {
+            return Some(LayerCacheDomain::Ganesh(context.id()));
+        }
+        if canvas.recording_context().is_some() {
+            return None;
+        }
+    }
+    Some(LayerCacheDomain::Raster)
+}
+
+pub(crate) fn immutable_surface_snapshot(
+    surface: &mut skia_safe::Surface,
+) -> Option<skia_safe::Image> {
+    #[cfg(feature = "metal")]
+    if surface.canvas().recorder().is_some() {
+        // A Graphite image sharing this surface's texture would change when
+        // the surface is reused. Cached layers and retained frames need a copy.
+        return skia_safe::gpu::graphite::surfaces::as_image_copy(
+            surface,
+            None,
+            skia_safe::gpu::Mipmapped::No,
+        );
+    }
+    let bounds = IRect::from_wh(surface.width(), surface.height());
+    surface.image_snapshot_with_bounds(bounds)
 }
 
 /// Bytes a `w × h` RGBA8 layer image occupies.
@@ -761,6 +845,189 @@ pub(crate) const UNCULLED_WORLD: Bounds = Bounds {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn immutable_cpu_layer_snapshot_survives_source_surface_reuse() {
+        let mut source = skia_safe::surfaces::raster_n32_premul((8, 8)).expect("source");
+        source.canvas().clear(skia_safe::Color::RED);
+        let snapshot = immutable_surface_snapshot(&mut source).expect("snapshot");
+        source.canvas().clear(skia_safe::Color::BLUE);
+        let mut output = skia_safe::surfaces::raster_n32_premul((8, 8)).expect("output");
+        output.canvas().draw_image(&snapshot, (0, 0), None);
+        let info = ImageInfo::new(
+            (8, 8),
+            skia_safe::ColorType::RGBA8888,
+            AlphaType::Premul,
+            None,
+        );
+        let mut pixels = vec![0; 8 * 8 * 4];
+        assert!(output.read_pixels(&info, &mut pixels, 8 * 4, (0, 0)));
+        assert!(
+            pixels
+                .chunks_exact(4)
+                .all(|pixel| pixel == [255, 0, 0, 255])
+        );
+    }
+
+    #[test]
+    fn snapshot_and_backend_probe_refuse_nonrendering_surfaces() {
+        let mut surface = skia_safe::surfaces::null((8, 8)).expect("null surface");
+        let info = ImageInfo::new_n32_premul((1, 1), None);
+        assert!(immutable_surface_snapshot(&mut surface).is_none());
+        assert!(canvas_backend_is_gpu(surface.canvas(), &info).is_none());
+    }
+
+    #[cfg(all(target_os = "macos", feature = "metal"))]
+    #[test]
+    #[ignore = "requires actual macOS Graphite/Metal; execute explicitly with --features metal --ignored"]
+    #[allow(unsafe_code)]
+    fn graphite_layer_snapshot_keeps_immutable_pixels_and_compatible_recorder()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use metal::foreign_types::ForeignType;
+        use skia_safe::gpu::graphite::{self, mtl};
+        let device = metal::Device::system_default().ok_or("Metal device is required")?;
+        let queue = device.new_command_queue();
+        // SAFETY: these handles come from owned Metal objects, which remain
+        // alive until every context, recorder and surface below has dropped.
+        let backend = unsafe {
+            mtl::BackendContext::new(
+                device.as_ptr() as mtl::Handle,
+                queue.as_ptr() as mtl::Handle,
+            )
+        };
+        let mut context =
+            mtl::context_factory::make_metal(&backend, None).ok_or("Graphite context")?;
+        let mut recorder = context.make_recorder(None).ok_or("Graphite recorder")?;
+        let info = ImageInfo::new(
+            (8, 8),
+            skia_safe::ColorType::RGBA8888,
+            AlphaType::Premul,
+            None,
+        );
+        let mut source = graphite::surfaces::render_target(
+            &mut recorder,
+            &info,
+            skia_safe::gpu::Mipmapped::No,
+            None,
+            None,
+        )
+        .ok_or("source surface")?;
+        let mut output = compatible_offscreen_surface(source.canvas(), &info, None)
+            .ok_or("compatible offscreen")?;
+        assert!(output.canvas().recorder().is_some());
+        assert_eq!(canvas_backend_is_gpu(output.canvas(), &info), Some(true));
+        source.canvas().clear(skia_safe::Color::RED);
+        let snapshot = immutable_surface_snapshot(&mut source).ok_or("immutable snapshot")?;
+        assert!(snapshot.is_texture_backed());
+        let scene = Scene::new();
+        let components = ComponentLibrary::new();
+        let mut cache = LayerCache::default();
+        let id = NodeId::new();
+        cache.begin_frame(
+            output.canvas(),
+            &scene,
+            &components,
+            epoch(&scene, 0),
+            1.0,
+            (0.0, 0.0),
+        );
+        assert!(cache.store(id, snapshot, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], (0, 0)));
+        for color in [skia_safe::Color::BLUE, skia_safe::Color::GREEN] {
+            source.canvas().clear(color);
+            output.canvas().clear(skia_safe::Color::TRANSPARENT);
+            cache.begin_frame(
+                output.canvas(),
+                &scene,
+                &components,
+                epoch(&scene, 0),
+                1.0,
+                (0.0, 0.0),
+            );
+            assert!(matches!(
+                cache.lookup(output.canvas(), id, &Paint::default()),
+                LayerLookup::Hit
+            ));
+            let mut recording = recorder.snap().ok_or("snap recording")?;
+            let status =
+                context.insert_recording(&graphite::InsertRecordingInfo::new(&mut recording));
+            if status != graphite::InsertStatus::Success {
+                return Err(format!("insert recording: {status:?}").into());
+            }
+            if !context.submit_and_wait() {
+                return Err("Graphite submit failed".into());
+            }
+            let mut pixels = vec![0; 8 * 8 * 4];
+            assert!(context.read_pixels(&mut output, &info, &mut pixels, 8 * 4, (0, 0)));
+            assert!(
+                pixels
+                    .chunks_exact(4)
+                    .all(|pixel| pixel == [255, 0, 0, 255])
+            );
+            assert_eq!(cache.len(), 1);
+        }
+        let mut foreign_context =
+            mtl::context_factory::make_metal(&backend, None).ok_or("foreign Graphite context")?;
+        let mut foreign_recorder = foreign_context
+            .make_recorder(None)
+            .ok_or("foreign Graphite recorder")?;
+        let mut foreign = graphite::surfaces::render_target(
+            &mut foreign_recorder,
+            &info,
+            skia_safe::gpu::Mipmapped::No,
+            None,
+            None,
+        )
+        .ok_or("foreign surface")?;
+        assert!(canvas_cache_domain(output.canvas()) != canvas_cache_domain(foreign.canvas()));
+        assert!(!cache.begin_frame(
+            foreign.canvas(),
+            &scene,
+            &components,
+            epoch(&scene, 0),
+            1.0,
+            (0.0, 0.0),
+        ));
+        assert_eq!(cache.len(), 0);
+        assert!(matches!(
+            cache.lookup(foreign.canvas(), id, &Paint::default()),
+            LayerLookup::Miss
+        ));
+        let snapshot = immutable_surface_snapshot(&mut foreign).ok_or("foreign snapshot")?;
+        assert!(cache.store(id, snapshot, [1.0, 0.0, 0.0, 1.0, 0.0, 0.0], (0, 0)));
+        // SAFETY: the same owned device and queue outlive the Ganesh context
+        // and its surface as well as the two still-live Graphite contexts.
+        let ganesh_backend = unsafe {
+            skia_safe::gpu::mtl::BackendContext::new(device.as_ptr().cast(), queue.as_ptr().cast())
+        };
+        let mut ganesh_context = skia_safe::gpu::direct_contexts::make_metal(&ganesh_backend, None)
+            .ok_or("Ganesh context")?;
+        let mut ganesh = skia_safe::gpu::surfaces::render_target(
+            &mut ganesh_context,
+            skia_safe::gpu::Budgeted::No,
+            &info,
+            None,
+            skia_safe::gpu::SurfaceOrigin::TopLeft,
+            None,
+            None,
+            None,
+        )
+        .ok_or("Ganesh surface")?;
+        assert!(canvas_cache_domain(foreign.canvas()) != canvas_cache_domain(ganesh.canvas()));
+        assert!(!cache.begin_frame(
+            ganesh.canvas(),
+            &scene,
+            &components,
+            epoch(&scene, 0),
+            1.0,
+            (0.0, 0.0),
+        ));
+        assert_eq!(cache.len(), 0);
+        assert!(matches!(
+            cache.lookup(ganesh.canvas(), id, &Paint::default()),
+            LayerLookup::Miss
+        ));
+        Ok(())
+    }
 
     #[test]
     fn component_dependencies_ignore_unused_definitions_and_guard_variant_candidates() {

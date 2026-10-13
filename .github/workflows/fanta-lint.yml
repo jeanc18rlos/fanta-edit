@@ -8,7 +8,7 @@ on:
       - 'script/verify-fanta-release'
       - 'Cargo.toml'
       - 'Cargo.lock'
-      - 'vendor/skia-bindings-0.84.0/**'
+      - 'vendor/skia-bindings-0.153.3/**'
       - 'rust-toolchain.toml'
       - '.cargo/**'
       - 'crates/fanta-doc/**'

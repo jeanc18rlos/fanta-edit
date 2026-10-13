@@ -109,7 +109,7 @@ fn downloads_caches_and_shapes_a_real_google_font() {
     );
     let mgr = skia_safe::FontMgr::default();
     let face = mgr
-        .new_from_data(&bytes, None)
+        .new_from_data(skia_safe::Data::new_copy(&bytes), None)
         .expect("cached Roboto bytes decode as a typeface");
     assert!(
         face.family_name().to_ascii_lowercase().contains("roboto"),

@@ -6,7 +6,8 @@
 use crate::color::{to_sk_color, to_sk_color4f};
 use fanta_doc::{BlendMode, Fill, Gradient, GradientStop, Stroke, StrokeCap, StrokeJoin};
 use skia_safe::{
-    Matrix, Paint, Point, Shader, TileMode, paint::Cap, paint::Join, paint::Style as PaintStyle,
+    Matrix, Paint, Point, Shader, TileMode, gradient, paint::Cap, paint::Join,
+    paint::Style as PaintStyle,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -87,20 +88,6 @@ pub(crate) fn apply_blend_mode(paint: &mut Paint, mode: BlendMode) {
     paint.set_blend_mode(sk);
 }
 
-/// `RuntimeEffect::make_for_*` in skia-safe 0.84 take their options as
-/// `impl for<'a, 'b> Into<Option<&'a Options<'b>>>`, which no concrete
-/// `Option<&Options>` satisfies (see the diamond-gradient note below). A local
-/// marker with a lifetime-generic `From` does: it always means "no options".
-struct DefaultRuntimeEffectOptions;
-
-impl<'a, 'b> From<DefaultRuntimeEffectOptions>
-    for Option<&'a skia_safe::runtime_effect::Options<'b>>
-{
-    fn from(_: DefaultRuntimeEffectOptions) -> Self {
-        None
-    }
-}
-
 thread_local! {
     /// Linear Burn as a separable blend, composited with the W3C formula on
     /// Skia's premultiplied inputs: `B(cs, cb) = max(0, cs + cb - 1)` on
@@ -117,7 +104,7 @@ thread_local! {
                 src.a + dst.a * (1.0 - src.a));
         }
         "#,
-        DefaultRuntimeEffectOptions,
+        None,
     )
     .expect("the Linear Burn blender compiles")
     .make_blender(skia_safe::Data::new_empty(), None)
@@ -418,14 +405,11 @@ fn build_gradient_shader(g: &Gradient, [x, y, w, h]: [f32; 4]) -> Option<Shader>
                 return None;
             }
             let (colors, positions) = stops_to_arrays(stops)?;
-            Shader::linear_gradient(
-                (p0, p1),
-                colors.as_slice(),
-                Some(positions.as_slice()),
-                TileMode::Clamp,
-                None,
-                None,
-            )
+            let gradient = gradient::Gradient::new(
+                gradient::Colors::new(&colors, Some(&positions), TileMode::Clamp, None),
+                gradient::Interpolation::default(),
+            );
+            gradient::shaders::linear_gradient((p0, p1), &gradient, None)
         }
         Gradient::Radial {
             center,
@@ -450,6 +434,10 @@ fn build_gradient_shader(g: &Gradient, [x, y, w, h]: [f32; 4]) -> Option<Shader>
             // Skia apply the ellipse via `local_matrix`, so a degenerate
             // `w == h` collapses back to the faithful circle.
             let (colors, positions) = stops_to_arrays(stops)?;
+            let gradient = gradient::Gradient::new(
+                gradient::Colors::new(&colors, Some(&positions), TileMode::Clamp, None),
+                gradient::Interpolation::default(),
+            );
             let mut local_matrix = node_local_matrix(x, y, w, h);
             // Full axis handles (a rotated and/or anisotropic radial): the
             // ellipse is `center` plus the two axis vectors to the handle
@@ -460,23 +448,15 @@ fn build_gradient_shader(g: &Gradient, [x, y, w, h]: [f32; 4]) -> Option<Shader>
             // (zero-area axes) fall back to the aspect-only ellipse.
             if let Some(axes) = (*handles).and_then(|ends| handle_axes_matrix(*center, ends)) {
                 local_matrix.pre_concat(&axes);
-                return Shader::radial_gradient(
-                    Point::new(0.0, 0.0),
-                    1.0,
-                    colors.as_slice(),
-                    Some(positions.as_slice()),
-                    TileMode::Clamp,
-                    None,
+                return gradient::shaders::radial_gradient(
+                    (Point::new(0.0, 0.0), 1.0),
+                    &gradient,
                     Some(&local_matrix),
                 );
             }
-            Shader::radial_gradient(
-                Point::new(center[0], center[1]),
-                *radius,
-                colors.as_slice(),
-                Some(positions.as_slice()),
-                TileMode::Clamp,
-                None,
+            gradient::shaders::radial_gradient(
+                (Point::new(center[0], center[1]), *radius),
+                &gradient,
                 Some(&local_matrix),
             )
         }
@@ -498,15 +478,16 @@ fn build_gradient_shader(g: &Gradient, [x, y, w, h]: [f32; 4]) -> Option<Shader>
             // about its real center.
             let unit_center = Point::new(center[0], center[1]);
             let (colors, positions) = stops_to_arrays(stops)?;
+            let gradient = gradient::Gradient::new(
+                gradient::Colors::new(&colors, Some(&positions), TileMode::Clamp, None),
+                gradient::Interpolation::default(),
+            );
             let local_matrix = node_local_matrix(x, y, w, h);
             let start_deg = start_angle.to_degrees();
-            Shader::sweep_gradient(
+            gradient::shaders::sweep_gradient(
                 unit_center,
-                colors.as_slice(),
-                Some(positions.as_slice()),
-                TileMode::Clamp,
-                Some((start_deg, start_deg + 360.0)),
-                None,
+                (start_deg, start_deg + 360.0),
+                &gradient,
                 Some(&local_matrix),
             )
         }
@@ -533,9 +514,7 @@ fn build_gradient_shader(g: &Gradient, [x, y, w, h]: [f32; 4]) -> Option<Shader>
             // small unit-square bitmap and map it onto the node rect with the
             // same `node_local_matrix` the radial branch uses, so a non-square
             // node stretches the diamond by the node aspect — but the
-            // iso-contours are real rhombi. A baked tile keeps us off
-            // skia-safe 0.84's `RuntimeEffect::make_for_shader`, whose options
-            // argument has an unsatisfiable higher-ranked lifetime bound.
+            // iso-contours are real rhombi.
             // Axis `handles` (a rotated/anisotropic diamond) ride the same
             // baked tile through an extra affine — see `diamond_shader`.
             diamond_shader(

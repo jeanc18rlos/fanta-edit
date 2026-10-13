@@ -56,24 +56,16 @@ pub(crate) fn rounded_rect_path(
             // skia_safe::RRect radii order is TL, TR, BR, BL — matching ours.
             let radii = scaled.map(|r| skia_safe::Point::new(r, r));
             let rrect = skia_safe::RRect::new_rect_radii(rect, &radii);
-            let mut p = skia_safe::Path::new();
-            p.add_rrect(rrect, None);
-            p
+            skia_safe::Path::rrect(rrect, None)
         }
         None => match corner_radius {
             Some(r) if r > 0.0 => {
                 // A uniform radius overflows all four edges equally, so the
                 // pairwise scale reduces to the old half-min-dimension clamp.
                 let r = (r as f32).clamp(0.0, (w.min(h) * 0.5).max(0.0));
-                let mut p = skia_safe::Path::new();
-                p.add_round_rect(rect, (r, r), None);
-                p
+                skia_safe::Path::rrect(skia_safe::RRect::new_rect_xy(rect, r, r), None)
             }
-            _ => {
-                let mut p = skia_safe::Path::new();
-                p.add_rect(rect, None);
-                p
-            }
+            _ => skia_safe::Path::rect(rect, None),
         },
     }
 }
@@ -111,25 +103,28 @@ fn superellipse_rect_path(rect: Rect, radii: [f32; 4], smoothing: f32) -> skia_s
     let n = 2.0 + smoothing.clamp(0.0, 1.0) * 4.0;
     let e = 2.0 / n;
     const SEGS: usize = 16;
-    let mut p = skia_safe::Path::new();
+    let mut p = skia_safe::PathBuilder::new();
     // One corner: line to `SEGS` sampled superellipse points; `dir(c,s)` maps the
     // (cosᵉ, sinᵉ) pair to the unit offset from the corner's rounding pivot.
-    let corner =
-        |p: &mut skia_safe::Path, px: f32, py: f32, r: f32, dir: fn(f32, f32) -> (f32, f32)| {
-            if r <= 0.01 {
-                // Sharp corner: the pivot collapses onto the box corner; one point.
-                let (dx, dy) = dir(1.0, 0.0);
-                p.line_to((px + dx * r, py + dy * r));
-                return;
-            }
-            for i in 1..=SEGS {
-                let t = i as f32 / SEGS as f32 * std::f32::consts::FRAC_PI_2;
-                let c = t.cos().abs().powf(e);
-                let s = t.sin().abs().powf(e);
-                let (dx, dy) = dir(c, s);
-                p.line_to((px + dx * r, py + dy * r));
-            }
-        };
+    let corner = |p: &mut skia_safe::PathBuilder,
+                  px: f32,
+                  py: f32,
+                  r: f32,
+                  dir: fn(f32, f32) -> (f32, f32)| {
+        if r <= 0.01 {
+            // Sharp corner: the pivot collapses onto the box corner; one point.
+            let (dx, dy) = dir(1.0, 0.0);
+            p.line_to((px + dx * r, py + dy * r));
+            return;
+        }
+        for i in 1..=SEGS {
+            let t = i as f32 / SEGS as f32 * std::f32::consts::FRAC_PI_2;
+            let c = t.cos().abs().powf(e);
+            let s = t.sin().abs().powf(e);
+            let (dx, dy) = dir(c, s);
+            p.line_to((px + dx * r, py + dy * r));
+        }
+    };
     p.move_to((x0 + tl, y0));
     p.line_to((x1 - tr, y0));
     corner(&mut p, x1 - tr, y0 + tr, tr, |c, s| (s, -c)); // TR
@@ -140,7 +135,7 @@ fn superellipse_rect_path(rect: Rect, radii: [f32; 4], smoothing: f32) -> skia_s
     p.line_to((x0, y0 + tl));
     corner(&mut p, x0 + tl, y0 + tl, tl, |c, s| (-c, -s)); // TL
     p.close();
-    p
+    p.detach()
 }
 
 /// Stroke `sk_path` with each [`Stroke`] in `strokes`, honoring Figma stroke
@@ -292,10 +287,11 @@ fn draw_image_stroke(
     if doubled {
         geom.set_stroke_width((stroke.width * 2.0) as f32);
     }
-    let mut outline = skia_safe::Path::new();
+    let mut outline = skia_safe::PathBuilder::new();
     if !skia_safe::path_utils::fill_path_with_paint(sk_path, &geom, &mut outline, None, None) {
         return false;
     }
+    let outline = outline.detach();
 
     let resolver = ctx.resolver;
     let [bx, by, bw, bh] = local_bounds_f32;
@@ -354,10 +350,11 @@ fn draw_pattern_stroke(
     if !matches!(stroke.align, fanta_doc::StrokeAlign::Center) {
         geometry.set_stroke_width((stroke.width * 2.0) as f32);
     }
-    let mut outline = skia_safe::Path::new();
+    let mut outline = skia_safe::PathBuilder::new();
     if !skia_safe::path_utils::fill_path_with_paint(sk_path, &geometry, &mut outline, None, None) {
         return false;
     }
+    let outline = outline.detach();
     let [x, y, width, height] = local_bounds_f32;
     let bounds = Bounds::from_xywh(x as f64, y as f64, width as f64, height as f64);
     let Some(paint) = pattern_paint(bounds, pattern, *opacity, *blend, ctx) else {
@@ -397,10 +394,11 @@ fn draw_video_stroke(
     if !matches!(stroke.align, fanta_doc::StrokeAlign::Center) {
         geometry.set_stroke_width((stroke.width * 2.0) as f32);
     }
-    let mut outline = skia_safe::Path::new();
+    let mut outline = skia_safe::PathBuilder::new();
     if !skia_safe::path_utils::fill_path_with_paint(sk_path, &geometry, &mut outline, None, None) {
         return false;
     }
+    let outline = outline.detach();
     let [x, y, width, height] = local_bounds_f32;
     let outset = match stroke.align {
         fanta_doc::StrokeAlign::Inside => 0.0,
@@ -447,10 +445,11 @@ fn draw_shader_stroke(
     if !matches!(stroke.align, fanta_doc::StrokeAlign::Center) {
         geometry.set_stroke_width((stroke.width * 2.0) as f32);
     }
-    let mut outline = skia_safe::Path::new();
+    let mut outline = skia_safe::PathBuilder::new();
     if !skia_safe::path_utils::fill_path_with_paint(sk_path, &geometry, &mut outline, None, None) {
         return false;
     }
+    let outline = outline.detach();
     let [x, y, width, height] = local_bounds_f32;
     let bounds = Bounds::from_xywh(x as f64, y as f64, width as f64, height as f64);
     let Some(paint) = shader_paint(bounds, shader, *opacity, *blend, ctx.paint_alpha) else {
@@ -739,17 +738,17 @@ pub(crate) fn draw_per_side_border(
         canvas.clip_path(path, skia_safe::ClipOp::Intersect, true);
     }
     let mut drew = false;
-    let mut video_bands = video_bounds.map(|_| skia_safe::Path::new());
+    let mut video_bands = video_bounds.map(|_| skia_safe::PathBuilder::new());
     for rectangle in rectangles.into_iter().flatten() {
         if let Some(path) = &mut video_bands {
-            path.add_rect(rectangle, None);
+            path.add_rect(rectangle, None, None);
         } else {
             canvas.draw_rect(rectangle, &paint);
         }
         drew = true;
     }
     if let (
-        Some(path),
+        Some(mut path),
         Some(bounds),
         Fill::Video {
             video,
@@ -758,6 +757,7 @@ pub(crate) fn draw_per_side_border(
         },
     ) = (video_bands, video_bounds, &stroke.paint)
     {
+        let path = path.detach();
         if !draw_video_fill(canvas, &path, bounds, video, *opacity, *blend, ctx) {
             canvas.draw_path(&path, &paint);
         }
@@ -883,13 +883,13 @@ fn per_side_border_rounded_paths(
     // outer corners pushed `reach` outward along the corner diagonals, inner
     // corners `depth` inward along the same diagonals.
     let quad = |pts: [(f32, f32); 4]| {
-        let mut p = skia_safe::Path::new();
+        let mut p = skia_safe::PathBuilder::new();
         p.move_to(pts[0]);
         p.line_to(pts[1]);
         p.line_to(pts[2]);
         p.line_to(pts[3]);
         p.close();
-        p
+        p.detach()
     };
     let wedges = [
         // Top: between the TL and TR corner diagonals.
@@ -932,7 +932,7 @@ fn per_side_border_rounded_paths(
         ring_paint.set_style(skia_safe::paint::Style::Stroke);
         ring_paint.set_stroke_width(centered_width);
         ring_paint.set_stroke_join(skia_safe::paint::Join::Round);
-        let mut ring = skia_safe::Path::new();
+        let mut ring = skia_safe::PathBuilder::new();
         if !skia_safe::path_utils::fill_path_with_paint(
             shape_path,
             &ring_paint,
@@ -942,6 +942,7 @@ fn per_side_border_rounded_paths(
         ) {
             return None;
         }
+        let ring = ring.detach();
         match stroke.align {
             fanta_doc::StrokeAlign::Center => Some(ring),
             fanta_doc::StrokeAlign::Inside => ring.op(shape_path, skia_safe::PathOp::Intersect),
@@ -1011,13 +1012,13 @@ fn outset_silhouette(shape_path: &skia_safe::Path, offset: f32) -> Option<skia_s
     // Round joins so the offset corner is the concentric arc (the parallel curve
     // of a rounded corner), matching Figma's `radius + width` outer rounding.
     ring_paint.set_stroke_join(skia_safe::paint::Join::Round);
-    let mut ring = skia_safe::Path::new();
+    let mut ring = skia_safe::PathBuilder::new();
     if !skia_safe::path_utils::fill_path_with_paint(shape_path, &ring_paint, &mut ring, None, None)
     {
         return None;
     }
     // shape ∪ ring = the outline grown outward by `offset` (corners rounded).
-    shape_path.op(&ring, skia_safe::PathOp::Union)
+    shape_path.op(&ring.detach(), skia_safe::PathOp::Union)
 }
 
 /// The effective Skia outline of a vector node — exactly the path
@@ -1298,9 +1299,9 @@ fn stroke_outline_contains_point(
     paint: &Paint,
     point: skia_safe::Point,
 ) -> bool {
-    let mut outline = skia_safe::Path::new();
+    let mut outline = skia_safe::PathBuilder::new();
     skia_safe::path_utils::fill_path_with_paint(path, paint, &mut outline, None, None)
-        && outline.contains(point)
+        && outline.detach().contains(point)
 }
 
 #[allow(clippy::too_many_arguments)]

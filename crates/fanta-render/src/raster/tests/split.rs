@@ -173,11 +173,14 @@ fn assert_parity_with_inputs(
     assert!(!metrics.incomplete_artwork && !metrics.effect_failed);
     let mut actual = surface();
     actual.canvas().clear(skia_safe::Color::TRANSPARENT);
+    let failure_directory =
+        std::env::var_os("FANTA_SPLIT_FAILURE_DIR").map(std::path::PathBuf::from);
+    let mut phase_pixels = failure_directory.as_ref().map(|_| Vec::new());
     for phase in [SplitPhase::Below, SplitPhase::Middle, SplitPhase::Above] {
         let metrics = if spec.requires_ordered_paint() && phase != SplitPhase::Below {
             let mut recorder = skia_safe::PictureRecorder::new();
             let recording = recorder
-                .begin_recording(skia_safe::Rect::from_wh(WIDTH as f32, HEIGHT as f32), None);
+                .begin_recording(skia_safe::Rect::from_wh(WIDTH as f32, HEIGHT as f32), false);
             let metrics = renderer
                 .paint_split_to_canvas(
                     recording, WIDTH, HEIGHT, &doc.scene, viewport, inputs, &spec, phase,
@@ -218,6 +221,9 @@ fn assert_parity_with_inputs(
                 )
             }
             .expect("phase");
+            if let Some(phase_pixels) = &mut phase_pixels {
+                phase_pixels.push((phase, pixels(&mut layer)));
+            }
             actual
                 .canvas()
                 .draw_image(layer.image_snapshot(), (0, 0), None);
@@ -231,54 +237,56 @@ fn assert_parity_with_inputs(
     }
     let expected_pixels = pixels(&mut expected);
     let actual_pixels = pixels(&mut actual);
-    if spec.requires_ordered_paint() {
-        let mut direct = surface();
-        let matrix = direct.canvas().local_to_device();
-        let clip = direct.canvas().device_clip_bounds();
-        let saves = direct.canvas().save_count();
-        for phase in [SplitPhase::Below, SplitPhase::Middle, SplitPhase::Above] {
-            let metrics = renderer
-                .paint_split_to_canvas(
-                    direct.canvas(),
-                    WIDTH,
-                    HEIGHT,
-                    &doc.scene,
-                    viewport,
-                    inputs,
-                    &spec,
-                    phase,
-                )
-                .expect("direct ordered phase");
-            assert!(!metrics.incomplete_artwork && !metrics.effect_failed);
-            assert_eq!(direct.canvas().local_to_device(), matrix);
-            assert_eq!(direct.canvas().device_clip_bounds(), clip);
-            assert_eq!(direct.canvas().save_count(), saves);
-        }
-        let direct_pixels = pixels(&mut direct);
-        let maximum = direct_pixels
-            .iter()
-            .zip(&expected_pixels)
-            .map(|(actual, expected)| actual.abs_diff(*expected))
-            .max()
-            .expect("direct pixels");
-        assert!(
-            maximum <= 2,
-            "direct ordered maximum channel difference {maximum}"
-        );
+    let mut direct = surface();
+    let matrix = direct.canvas().local_to_device();
+    let clip = direct.canvas().device_clip_bounds();
+    let saves = direct.canvas().save_count();
+    for phase in [SplitPhase::Below, SplitPhase::Middle, SplitPhase::Above] {
+        let metrics = renderer
+            .paint_split_to_canvas(
+                direct.canvas(),
+                WIDTH,
+                HEIGHT,
+                &doc.scene,
+                viewport,
+                inputs,
+                &spec,
+                phase,
+            )
+            .expect("direct phase");
+        assert!(!metrics.incomplete_artwork && !metrics.effect_failed);
+        assert_eq!(direct.canvas().local_to_device(), matrix);
+        assert_eq!(direct.canvas().device_clip_bounds(), clip);
+        assert_eq!(direct.canvas().save_count(), saves);
     }
+    let direct_pixels = pixels(&mut direct);
+    let direct_maximum = direct_pixels
+        .iter()
+        .zip(&expected_pixels)
+        .map(|(actual, expected)| actual.abs_diff(*expected))
+        .max()
+        .expect("direct pixels");
     let differences: Vec<_> = expected_pixels
         .iter()
         .zip(&actual_pixels)
         .map(|(left, right)| left.abs_diff(*right))
         .collect();
     let maximum = differences.iter().copied().max().expect("nonempty image");
-    if maximum > 2
-        && let Some(directory) = std::env::var_os("FANTA_SPLIT_FAILURE_DIR")
+    if (maximum > 2 || direct_maximum > 2)
+        && let Some(directory) = failure_directory
     {
-        let directory = std::path::PathBuf::from(directory);
         std::fs::create_dir_all(&directory).expect("failure directory");
         std::fs::write(directory.join("expected.rgba"), &expected_pixels).expect("expected pixels");
         std::fs::write(directory.join("actual.rgba"), &actual_pixels).expect("actual pixels");
+        std::fs::write(directory.join("direct.rgba"), &direct_pixels).expect("direct pixels");
+        for (phase, pixels) in phase_pixels.expect("requested phase diagnostics") {
+            let filename = match phase {
+                SplitPhase::Below => "below.rgba",
+                SplitPhase::Middle => "middle.rgba",
+                SplitPhase::Above => "above.rgba",
+            };
+            std::fs::write(directory.join(filename), pixels).expect("phase pixels");
+        }
         std::fs::write(
             directory.join("scene.json"),
             serde_json::to_vec_pretty(doc).expect("failure scene"),
@@ -290,13 +298,23 @@ fn assert_parity_with_inputs(
                 "page": page, "moving": moving, "center": viewport.center,
                 "zoom": viewport.zoom, "display_scale": display_scale,
                 "width": WIDTH, "height": HEIGHT, "maximum": maximum,
+                "direct_maximum": direct_maximum,
+                "requires_ordered_paint": spec.requires_ordered_paint(),
             }))
             .expect("render parameters"),
         )
         .expect("render parameter file");
     }
     assert!(
-        maximum <= 2,
+        direct_maximum <= 2,
+        "direct maximum channel difference {direct_maximum}"
+    );
+    // Flattening three independent N32 premultiplied phases introduces extra
+    // color/alpha rounding at each source-over boundary. The direct paint check
+    // above retains the tighter geometry and paint-order comparison.
+    let flattened_limit = if spec.requires_ordered_paint() { 2 } else { 3 };
+    assert!(
+        maximum <= flattened_limit,
         "max channel difference {maximum}; changed channels {}",
         differences
             .iter()
@@ -1550,7 +1568,7 @@ fn split_ancestor_clip_without_paint_keeps_empty_above_and_rejects_missing_insta
     assert!(pixels(&mut target).into_iter().all(|channel| channel == 0));
     let mut recorder = skia_safe::PictureRecorder::new();
     let recording =
-        recorder.begin_recording(skia_safe::Rect::from_wh(WIDTH as f32, HEIGHT as f32), None);
+        recorder.begin_recording(skia_safe::Rect::from_wh(WIDTH as f32, HEIGHT as f32), false);
     renderer
         .paint_split_to_canvas(
             recording,

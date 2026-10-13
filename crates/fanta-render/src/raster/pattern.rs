@@ -5,8 +5,8 @@ use fanta_doc::{
     BlendMode, Fill, PatternFill, PatternHorizontalAlignment, PatternTileType, Transform2D,
 };
 use skia_safe::{
-    Canvas, FilterMode, Matrix, Paint, Path, Picture, PictureRecorder, Rect, SamplingOptions,
-    TileMode, canvas::SrcRectConstraint, surfaces,
+    Canvas, FilterMode, Matrix, Paint, Path, PathBuilder, Picture, PictureRecorder, Rect,
+    SamplingOptions, TileMode, canvas::SrcRectConstraint, surfaces,
 };
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -370,7 +370,7 @@ fn hex_clip_path(width: f32, height: f32, tile_type: PatternTileType) -> Option<
             (0.0, height * 0.5),
         ],
     };
-    let mut path = Path::new();
+    let mut path = PathBuilder::new();
     if let Some(&(x, y)) = points.first() {
         path.move_to((x, y));
         for &(x, y) in &points[1..] {
@@ -378,7 +378,7 @@ fn hex_clip_path(width: f32, height: f32, tile_type: PatternTileType) -> Option<
         }
         path.close();
     }
-    Some(path)
+    Some(path.detach())
 }
 
 fn draw_motif_tile(
@@ -450,7 +450,7 @@ fn make_motif(
     }
     let motif_bounds = Rect::from_wh(motif_width, motif_height);
     let mut recorder = PictureRecorder::new();
-    let canvas = recorder.begin_recording(motif_bounds, None);
+    let canvas = recorder.begin_recording(motif_bounds, false);
     let hex = hex_clip_path(width, height, tile_type);
     match tile_type {
         PatternTileType::Rectangular => {

@@ -66,3 +66,6 @@ crates/docs_preprocessor/actions.json
 # Release prep scratch (contains PII; never commit)
 RELEASE_PII_CLEANUP.md
 crates/zed/Cargo.toml.bundletest
+
+# Skia downloads its engine sources and dependencies during native builds.
+/vendor/skia-bindings-*/skia/

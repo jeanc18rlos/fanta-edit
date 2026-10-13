@@ -50,7 +50,9 @@ use fanta_doc::{
     VariableRegistry,
 };
 #[cfg(target_os = "macos")]
-use fanta_render::{AssetResolver, RetainedGpuTarget, RetainedTranslationSession};
+use fanta_render::{
+    AssetResolver, RetainedGpuTarget, RetainedGraphiteContext, RetainedTranslationSession,
+};
 use fanta_render::{MediaPlayback, RasterRenderer, RenderInputs};
 use fanta_tools::{SnapGuideAxis, ToolOverlay};
 #[cfg(target_os = "macos")]
@@ -68,7 +70,10 @@ use image::{Frame, RgbaImage};
 #[cfg(target_os = "macos")]
 use skia_safe::{
     AlphaType, ColorType,
-    gpu::{self, SurfaceOrigin, backend_render_targets, backend_textures, direct_contexts, mtl},
+    gpu::{
+        self, SurfaceOrigin, backend_render_targets, backend_textures, direct_contexts, graphite,
+        mtl,
+    },
 };
 use smallvec::SmallVec;
 use ui::prelude::*;
@@ -1135,15 +1140,189 @@ impl CanvasTarget {
         }
     }
 
-    fn complete(&mut self, context: &mut gpu::DirectContext) -> Result<()> {
-        match self {
-            Self::Normal(_) => {
-                context.flush_submit_and_sync_cpu();
+    fn complete(&mut self, backend: &mut SkiaGpuBackend) -> Result<()> {
+        match backend {
+            SkiaGpuBackend::Graphite(context) => context
+                .submit_and_wait()
+                .map_err(|error| anyhow!("Graphite canvas GPU completion failed: {error:?}")),
+            SkiaGpuBackend::Ganesh(context) => {
+                match self {
+                    Self::Normal(_) => {
+                        context.flush_submit_and_sync_cpu();
+                    }
+                    Self::Retained(target) => target
+                        .flush_and_submit(gpu::SyncCpu::Yes)
+                        .map_err(|error| anyhow!("canvas GPU completion failed: {error:?}"))?,
+                }
+                anyhow::ensure!(!context.abandoned(), "Skia Metal context was abandoned");
                 Ok(())
             }
-            Self::Retained(target) => target
-                .flush_and_submit(gpu::SyncCpu::Yes)
-                .map_err(|error| anyhow!("canvas GPU completion failed: {error:?}")),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+enum SkiaGpuBackend {
+    Graphite(RetainedGraphiteContext),
+    Ganesh(gpu::DirectContext),
+}
+
+#[cfg(target_os = "macos")]
+impl SkiaGpuBackend {
+    fn new(device: &metal::Device, command_queue: &metal::CommandQueue) -> Result<Self> {
+        let preference = match std::env::var("FANTA_SKIA_BACKEND") {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(error) => return Err(error).context("reading FANTA_SKIA_BACKEND"),
+        };
+        let readback = std::env::var_os("FANTA_BGBLUR_READBACK").is_some();
+        let use_graphite = match preference.as_deref() {
+            None | Some("graphite") => !readback,
+            Some("ganesh") => false,
+            Some(value) => return Err(anyhow!("unknown FANTA_SKIA_BACKEND: {value}")),
+        };
+        if use_graphite {
+            match Self::make_graphite(device, command_queue) {
+                Ok(backend) => {
+                    log::info!("Fanta Skia GPU backend: Graphite Metal");
+                    return Ok(backend);
+                }
+                Err(error) => log::warn!(
+                    "Graphite Metal initialization failed; using Ganesh Metal: {error:#}"
+                ),
+            }
+        } else if readback {
+            log::info!("Using Ganesh Metal for the background-blur readback diagnostic");
+        }
+        let backend = unsafe {
+            mtl::BackendContext::new(
+                device.as_ptr() as mtl::Handle,
+                command_queue.as_ptr() as mtl::Handle,
+            )
+        };
+        let mut context = direct_contexts::make_metal(&backend, None)
+            .ok_or_else(|| anyhow!("creating Skia Ganesh Metal context failed"))?;
+        context.set_resource_cache_limit(MacGpuRenderer::GPU_RESOURCE_CACHE_BYTES);
+        log::info!("Fanta Skia GPU backend: Ganesh Metal");
+        Ok(Self::Ganesh(context))
+    }
+
+    fn make_graphite(device: &metal::Device, command_queue: &metal::CommandQueue) -> Result<Self> {
+        let backend = unsafe {
+            graphite::mtl::BackendContext::new(
+                device.as_ptr() as graphite::mtl::Handle,
+                command_queue.as_ptr() as graphite::mtl::Handle,
+            )
+        };
+        let context = graphite::mtl::context_factory::make_metal(&backend, None)
+            .ok_or_else(|| anyhow!("creating Skia Graphite Metal context failed"))?;
+        RetainedGraphiteContext::new(context)
+            .map(Self::Graphite)
+            .map_err(|error| anyhow!("creating Graphite recorder failed: {error:?}"))
+    }
+
+    fn finish_pending_work(&mut self) -> Result<()> {
+        match self {
+            Self::Graphite(context) => context
+                .submit_and_wait()
+                .map_err(|error| anyhow!("Graphite GPU submission failed: {error:?}")),
+            Self::Ganesh(context) => {
+                context.flush(None);
+                anyhow::ensure!(
+                    context.submit(gpu::SyncCpu::Yes) && !context.abandoned(),
+                    "Ganesh GPU submission failed"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    unsafe fn wrap_image(
+        &mut self,
+        texture: *const std::ffi::c_void,
+        dimensions: (i32, i32),
+    ) -> Result<skia_safe::Image> {
+        match self {
+            Self::Graphite(context) => {
+                let backend_texture = unsafe {
+                    graphite::mtl::backend_textures::make_metal(
+                        dimensions,
+                        texture as graphite::mtl::Handle,
+                    )
+                };
+                context
+                    .wrap_image(
+                        &backend_texture,
+                        ColorType::BGRA8888,
+                        AlphaType::Premul,
+                        None,
+                    )
+                    .map_err(|error| anyhow!("wrapping Graphite video texture failed: {error:?}"))
+            }
+            Self::Ganesh(context) => {
+                let texture_info = unsafe { mtl::TextureInfo::new(texture as mtl::Handle) };
+                let backend_texture = unsafe {
+                    backend_textures::make_mtl(
+                        dimensions,
+                        gpu::Mipmapped::No,
+                        &texture_info,
+                        "Fanta video frame",
+                    )
+                };
+                gpu::images::borrow_texture_from(
+                    context,
+                    &backend_texture,
+                    SurfaceOrigin::TopLeft,
+                    ColorType::BGRA8888,
+                    AlphaType::Premul,
+                    None,
+                )
+                .ok_or_else(|| anyhow!("wrapping Ganesh video texture failed"))
+            }
+        }
+    }
+
+    unsafe fn wrap_target(
+        &mut self,
+        texture: *const std::ffi::c_void,
+        dimensions: (i32, i32),
+        retained: bool,
+    ) -> Result<CanvasTarget> {
+        match self {
+            Self::Graphite(context) => {
+                let backend_texture = unsafe {
+                    graphite::mtl::backend_textures::make_metal(
+                        dimensions,
+                        texture as graphite::mtl::Handle,
+                    )
+                };
+                context
+                    .wrap_top_left(&backend_texture, ColorType::BGRA8888, None)
+                    .map(CanvasTarget::Retained)
+                    .map_err(|error| anyhow!("wrapping Graphite Metal target failed: {error:?}"))
+            }
+            Self::Ganesh(context) => {
+                let texture_info = unsafe { mtl::TextureInfo::new(texture as mtl::Handle) };
+                let target = backend_render_targets::make_mtl(dimensions, &texture_info);
+                if retained {
+                    RetainedGpuTarget::wrap_top_left(context, &target, ColorType::BGRA8888, None)
+                        .map(CanvasTarget::Retained)
+                        .map_err(|error| {
+                            anyhow!("wrapping retained Metal target failed: {error:?}")
+                        })
+                } else {
+                    gpu::surfaces::wrap_backend_render_target(
+                        context,
+                        &target,
+                        SurfaceOrigin::TopLeft,
+                        ColorType::BGRA8888,
+                        None,
+                        None,
+                    )
+                    .map(CanvasTarget::Normal)
+                    .ok_or_else(|| anyhow!("wrapping Metal texture as Skia surface failed"))
+                }
+            }
         }
     }
 }
@@ -1291,7 +1470,7 @@ impl From<CanvasVideoFrame> for RenderVideoFrame {
 
 #[cfg(target_os = "macos")]
 struct ImportedVideoFrame {
-    // Skia 0.84 has no borrowed-texture release callback. Field order keeps
+    // The borrowed-texture wrappers have no release callback. Field order keeps
     // the image's texture reference from outliving the CoreVideo lease.
     image: skia_safe::Image,
     _texture: CVMetalTexture,
@@ -1532,7 +1711,8 @@ fn with_stable_font_generation<T>(
 struct MacGpuRenderer {
     translation: WorkerTranslation,
     raster_renderer: RasterRenderer,
-    direct_context: skia_safe::gpu::DirectContext,
+    backend: Option<SkiaGpuBackend>,
+    failed: bool,
     texture_cache: CVMetalTextureCache,
     _device: metal::Device,
     _command_queue: metal::CommandQueue,
@@ -1540,6 +1720,21 @@ struct MacGpuRenderer {
     /// Recycled pixel buffers matching `size`. Reusing them avoids a
     /// multi-megabyte IOSurface allocation per frame.
     buffer_pool: Vec<CVPixelBuffer>,
+    frame_texture_leases: Vec<CVMetalTexture>,
+    frame_buffer_leases: Vec<CVPixelBuffer>,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for MacGpuRenderer {
+    fn drop(&mut self) {
+        // A failed submission may still own GPU work. Destroy pending recordings
+        // and drain the queue before releasing buffers that CoreVideo can reuse.
+        self.translation.session = None;
+        drop(self.backend.take());
+        let command_buffer = self._command_queue.new_command_buffer();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1556,20 +1751,7 @@ impl MacGpuRenderer {
         let device = metal::Device::system_default()
             .ok_or_else(|| anyhow!("Metal system default device is unavailable"))?;
         let command_queue = device.new_command_queue();
-        let backend = unsafe {
-            // Ganesh retains the Objective-C device and queue handles while the
-            // DirectContext lives; this renderer stores both owners alongside it.
-            mtl::BackendContext::new(
-                device.as_ptr() as mtl::Handle,
-                command_queue.as_ptr() as mtl::Handle,
-            )
-        };
-        let mut direct_context = direct_contexts::make_metal(&backend, None)
-            .ok_or_else(|| anyhow!("creating Skia Metal context failed"))?;
-        // Ganesh's 256 MB default evicts a dense page's image textures every
-        // frame (22 assets on the sample Design page mip to ~450 MB), forcing
-        // a re-upload per render; the layer cache shares the same budget.
-        direct_context.set_resource_cache_limit(Self::GPU_RESOURCE_CACHE_BYTES);
+        let backend = SkiaGpuBackend::new(&device, &command_queue)?;
         let texture_cache = CVMetalTextureCache::new(None, device.clone(), None)
             .map_err(|status| anyhow!("creating CoreVideo Metal texture cache failed: {status}"))?;
         let mut raster_renderer =
@@ -1584,13 +1766,22 @@ impl MacGpuRenderer {
         Ok(Self {
             translation: WorkerTranslation::default(),
             raster_renderer,
-            direct_context,
+            backend: Some(backend),
+            failed: false,
             texture_cache,
             _device: device,
             _command_queue: command_queue,
             size,
             buffer_pool: Vec::new(),
+            frame_texture_leases: Vec::new(),
+            frame_buffer_leases: Vec::new(),
         })
+    }
+
+    fn backend(&mut self) -> Result<&mut SkiaGpuBackend> {
+        self.backend
+            .as_mut()
+            .context("Skia GPU backend is unavailable")
     }
 
     /// Return a buffer the compositor has finished with to the pool. Buffers
@@ -1642,26 +1833,10 @@ impl MacGpuRenderer {
         if handle.is_null() {
             return Err(anyhow!("CoreVideo returned a null video texture"));
         }
-        // CoreVideo owns this texture. Borrow it only on the owning Skia
-        // context, retaining both its lease and source buffer through the flush.
-        let texture_info = unsafe { mtl::TextureInfo::new(handle as mtl::Handle) };
-        let backend_texture = unsafe {
-            backend_textures::make_mtl(
-                (width, height),
-                gpu::Mipmapped::No,
-                &texture_info,
-                "Fanta video frame",
-            )
-        };
-        let image = gpu::images::borrow_texture_from(
-            &mut self.direct_context,
-            &backend_texture,
-            SurfaceOrigin::TopLeft,
-            ColorType::BGRA8888,
-            AlphaType::Premul,
-            None,
-        )
-        .ok_or_else(|| anyhow!("wrapping video Metal texture as Skia image failed"))?;
+        self.frame_texture_leases.push(texture.clone());
+        // CoreVideo owns this texture; its lease remains alive until the
+        // backend finishes the GPU work that samples it.
+        let image = unsafe { self.backend()?.wrap_image(handle.cast(), (width, height)) }?;
         Ok(ImportedVideoFrame {
             image,
             _texture: texture,
@@ -1681,6 +1856,41 @@ impl MacGpuRenderer {
         FramePath,
         Option<crate::gesture_perf::FrameSample>,
     )> {
+        anyhow::ensure!(!self.failed, "Skia renderer failed and must be recreated");
+        let result = self.render_frame_inner(inputs, request);
+        if result.is_err() {
+            // A failed recording can still reference this frame's borrowed
+            // textures. Never submit that recording in a subsequent request.
+            self.failed = true;
+        } else {
+            self.frame_texture_leases.clear();
+            self.frame_buffer_leases.clear();
+        }
+        result
+    }
+
+    fn render_frame_inner(
+        &mut self,
+        inputs: FrameInputs<'_>,
+        request: &RenderRequest,
+    ) -> Result<(
+        CVPixelBuffer,
+        Duration,
+        FramePath,
+        Option<crate::gesture_perf::FrameSample>,
+    )> {
+        self.frame_buffer_leases.extend(
+            request
+                .video
+                .iter()
+                .map(|frame| frame.buffer.0.clone())
+                .chain(
+                    request
+                        .video_fills
+                        .iter()
+                        .map(|frame| frame.buffer.0.clone()),
+                ),
+        );
         self.translation.sync(request.translation);
         let size = request.key.size;
         self.resize(size)?;
@@ -1722,6 +1932,7 @@ impl MacGpuRenderer {
             });
 
         let pixel_buffer = self.take_buffer(size)?;
+        self.frame_buffer_leases.push(pixel_buffer.clone());
         let color_texture = self
             .texture_cache
             .create_texture_from_image(
@@ -1738,33 +1949,15 @@ impl MacGpuRenderer {
             self.recycle(pixel_buffer);
             return Err(anyhow!("CoreVideo returned a null Metal texture"));
         }
+        self.frame_texture_leases.push(color_texture);
 
-        let texture_info = unsafe { mtl::TextureInfo::new(texture as mtl::Handle) };
-        let backend_render_target =
-            backend_render_targets::make_mtl((size.0 as i32, size.1 as i32), &texture_info);
-        let mut target = if request.translation.is_some() {
-            CanvasTarget::Retained(
-                RetainedGpuTarget::wrap_top_left(
-                    &mut self.direct_context,
-                    &backend_render_target,
-                    ColorType::BGRA8888,
-                    None,
-                )
-                .map_err(|error| anyhow!("wrapping retained Metal target: {error:?}"))?,
+        let mut target = unsafe {
+            self.backend()?.wrap_target(
+                texture.cast(),
+                (size.0 as i32, size.1 as i32),
+                request.translation.is_some(),
             )
-        } else {
-            CanvasTarget::Normal(
-                gpu::surfaces::wrap_backend_render_target(
-                    &mut self.direct_context,
-                    &backend_render_target,
-                    SurfaceOrigin::TopLeft,
-                    ColorType::BGRA8888,
-                    None,
-                    None,
-                )
-                .ok_or_else(|| anyhow!("wrapping Metal texture as Skia surface failed"))?,
-            )
-        };
+        }?;
 
         let render_viewport = Viewport {
             center: request.key.viewport_center,
@@ -1816,12 +2009,9 @@ impl MacGpuRenderer {
                     Ok(session) => {
                         // Private Below/Above preparation is not necessarily a
                         // dependency of this external target until composition.
-                        self.direct_context.flush(None);
-                        if !self.direct_context.submit(gpu::SyncCpu::Yes)
-                            || self.direct_context.abandoned()
-                        {
-                            return Err(anyhow!("retained preparation GPU submission failed"));
-                        }
+                        self.backend()?
+                            .finish_pending_work()
+                            .context("completing retained preparation")?;
                         build_wall_us = Some(crate::gesture_perf::duration_micros(
                             build_started.elapsed(),
                         ));
@@ -1872,10 +2062,9 @@ impl MacGpuRenderer {
         if let Some(gesture) = request.translation
             && path == FramePath::Normal
         {
-            self.direct_context.flush(None);
-            if !self.direct_context.submit(gpu::SyncCpu::Yes) || self.direct_context.abandoned() {
-                return Err(anyhow!("refused retained work could not finish safely"));
-            }
+            self.backend()?
+                .finish_pending_work()
+                .context("completing refused retained work")?;
             path = FramePath::Refused(gesture);
         }
         let normal_started = (!matches!(path, FramePath::Retained(_))).then(Instant::now);
@@ -1897,7 +2086,7 @@ impl MacGpuRenderer {
             None
         };
         let flush_started = crate::gesture_perf::optional_timer(request.perf_tag.is_some());
-        target.complete(&mut self.direct_context)?;
+        target.complete(self.backend()?)?;
         let flush_duration = flush_started.map(|started| started.elapsed());
         let normal_cost = normal_started.map(|started| started.elapsed());
         drop(target);

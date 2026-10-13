@@ -227,8 +227,7 @@ fn vector_outline(vector: &VectorNode, flags: NodeFlags) -> Path {
     if let Some([width, height]) =
         crate::bounds::vector_viewport_clip(vector, flags, || vector.path.rough_bounds())
     {
-        let mut clip = Path::new();
-        clip.add_rect(skia_safe::Rect::from_wh(width as f32, height as f32), None);
+        let clip = Path::rect(skia_safe::Rect::from_wh(width as f32, height as f32), None);
         if let Some(clipped) = outline.op(&clip, PathOp::Intersect) {
             outline = clipped;
         }
@@ -241,7 +240,7 @@ fn operand_outline(scene: &Scene, id: NodeId, depth: usize) -> Result<Option<Pat
     if node.flags.contains(NodeFlags::HIDDEN) {
         return Ok(None);
     }
-    let mut local = match &node.data {
+    let local = match &node.data {
         NodeData::Vector(vector) => vector_outline(vector, node.flags),
         NodeData::Boolean(boolean) => fold_checked(scene, id, boolean.op, depth)?,
         NodeData::Group(group) => {
@@ -270,8 +269,7 @@ fn operand_outline(scene: &Scene, id: NodeId, depth: usize) -> Result<Option<Pat
         NodeData::TextPath(text) => super::text_path_outline(text).into_exact().ok_or(())?,
         _ => return Err(()),
     };
-    local.transform(&to_sk_matrix(&node.transform));
-    Ok(Some(local))
+    Ok(Some(local.make_transform(&to_sk_matrix(&node.transform))))
 }
 
 fn sk_path_bounds(path: &Path) -> Bounds {

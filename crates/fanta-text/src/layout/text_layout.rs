@@ -758,7 +758,7 @@ impl TextLayout {
         let lines = self.lines();
         let paragraph_starts = self.paragraph_starts();
         let spacing = spacing.max(0.0);
-        let mut outline = skia_safe::Path::new();
+        let mut outline = skia_safe::PathBuilder::new();
         let line_count = self.paragraph.line_number();
         for line in 0..line_count {
             let (unconverted_glyphs, path) = self.paragraph.get_path_at(line);
@@ -781,7 +781,7 @@ impl TextLayout {
                         .saturating_sub(1)
                 })
                 .unwrap_or(0);
-            outline.add_path(
+            outline.add_path_with_offset(
                 &path,
                 (
                     offset[0] as f32,
@@ -790,17 +790,19 @@ impl TextLayout {
                 None,
             );
         }
+        let mut outline = outline.detach();
 
         if let Some([x, y, width, height]) = clip {
             if width <= 0.0 || height <= 0.0 {
                 return None;
             }
-            let mut clip_path = skia_safe::Path::new();
+            let mut clip_path = skia_safe::PathBuilder::new();
             clip_path.add_rect(
                 skia_safe::Rect::from_xywh(x as f32, y as f32, width as f32, height as f32),
                 None,
+                None,
             );
-            outline = outline.op(&clip_path, skia_safe::PathOp::Intersect)?;
+            outline = outline.op(&clip_path.detach(), skia_safe::PathOp::Intersect)?;
         }
 
         path_data_from_sk_path(&outline)

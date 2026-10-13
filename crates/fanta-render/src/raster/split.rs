@@ -683,6 +683,8 @@ pub enum RetainedError {
         "retained rendering requires the same compatible GPU context, format and surface properties"
     )]
     ChangedBackend,
+    #[error("the retained GPU backend cannot prove compatible surface or recorder ownership")]
+    UnsupportedBackend,
     #[error("the retained GPU context was abandoned")]
     BackendLost,
     #[error("the retained GPU target could not submit its work")]
@@ -706,12 +708,12 @@ enum RetainedBackend {
 #[cfg(feature = "metal")]
 #[derive(Clone)]
 struct RetainedGpuSurface {
-    context: skia_safe::gpu::DirectContext,
+    context: RetainedGpuContext,
     info: skia_safe::ImageInfo,
     properties: skia_safe::SurfaceProps,
-    sample_count: usize,
+    sample_count: Option<usize>,
     format: RetainedGpuFormat,
-    // Ganesh context use must stay on its creating render thread.
+    // Both Skia GPU engines must stay on their creating render thread.
     _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
@@ -719,6 +721,186 @@ struct RetainedGpuSurface {
 #[derive(Clone, PartialEq, Eq)]
 enum RetainedGpuFormat {
     Metal(skia_safe::gpu::mtl::PixelFormat),
+    GraphiteMetal(std::rc::Rc<skia_safe::gpu::graphite::TextureInfo>),
+}
+
+#[cfg(feature = "metal")]
+#[derive(Clone)]
+enum RetainedGpuContext {
+    Ganesh(skia_safe::gpu::DirectContext),
+    Graphite(RetainedGraphiteContext),
+}
+
+#[cfg(feature = "metal")]
+struct RetainedGraphiteState {
+    recorder: skia_safe::gpu::graphite::Recorder,
+    context: skia_safe::gpu::graphite::Context,
+    failed: bool,
+}
+
+#[cfg(feature = "metal")]
+impl RetainedGraphiteState {
+    fn ensure_available(&self) -> Result<(), RetainedError> {
+        if self.failed {
+            Err(RetainedError::BackendSubmission)
+        } else if self.context.is_device_lost() {
+            Err(RetainedError::BackendLost)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// Owns one Graphite context and recorder on their creating thread. Targets and
+/// retained sessions keep this owner alive until their surfaces have dropped.
+#[cfg(feature = "metal")]
+#[derive(Clone)]
+pub struct RetainedGraphiteContext {
+    state: std::rc::Rc<std::cell::RefCell<RetainedGraphiteState>>,
+    identity: u64,
+}
+
+#[cfg(feature = "metal")]
+impl RetainedGraphiteContext {
+    pub fn new(mut context: skia_safe::gpu::graphite::Context) -> Result<Self, RetainedError> {
+        if context.is_device_lost() {
+            return Err(RetainedError::BackendLost);
+        }
+        let recorder = context
+            .make_recorder(None)
+            .ok_or(RetainedError::Allocation)?;
+        if recorder.backend() != skia_safe::gpu::BackendApi::Metal {
+            return Err(RetainedError::UnsupportedBackend);
+        }
+        static NEXT_IDENTITY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Ok(Self {
+            state: std::rc::Rc::new(std::cell::RefCell::new(RetainedGraphiteState {
+                recorder,
+                context,
+                failed: false,
+            })),
+            identity: NEXT_IDENTITY.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        })
+    }
+
+    pub fn wrap_top_left(
+        &mut self,
+        texture: &skia_safe::gpu::graphite::BackendTexture,
+        color_type: skia_safe::ColorType,
+        color_space: Option<skia_safe::ColorSpace>,
+    ) -> Result<RetainedGpuTarget, RetainedError> {
+        if !texture.is_valid()
+            || texture.backend() != skia_safe::gpu::BackendApi::Metal
+            || !matches!(
+                color_type,
+                skia_safe::ColorType::BGRA8888 | skia_safe::ColorType::RGBA8888
+            )
+        {
+            return Err(RetainedError::ChangedBackend);
+        }
+        let format = texture.info();
+        if !format.is_valid() {
+            return Err(RetainedError::ChangedBackend);
+        }
+        let mut surface = {
+            let mut state = self
+                .state
+                .try_borrow_mut()
+                .map_err(|_| RetainedError::UnsupportedBackend)?;
+            state.ensure_available()?;
+            skia_safe::gpu::graphite::surfaces::wrap_backend_texture(
+                &mut state.recorder,
+                texture,
+                color_type,
+                color_space,
+                None,
+            )
+            .ok_or(RetainedError::ChangedBackend)?
+        };
+        let backend = RetainedGpuSurface::capture_graphite(
+            &mut surface,
+            self.clone(),
+            std::rc::Rc::new(format),
+        )?;
+        Ok(RetainedGpuTarget { surface, backend })
+    }
+
+    pub fn wrap_image(
+        &mut self,
+        texture: &skia_safe::gpu::graphite::BackendTexture,
+        color_type: skia_safe::ColorType,
+        alpha_type: skia_safe::AlphaType,
+        color_space: Option<skia_safe::ColorSpace>,
+    ) -> Result<skia_safe::Image, RetainedError> {
+        if !texture.is_valid() || texture.backend() != skia_safe::gpu::BackendApi::Metal {
+            return Err(RetainedError::ChangedBackend);
+        }
+        let mut state = self
+            .state
+            .try_borrow_mut()
+            .map_err(|_| RetainedError::UnsupportedBackend)?;
+        state.ensure_available()?;
+        skia_safe::gpu::graphite::images::wrap_texture(
+            &mut state.recorder,
+            texture,
+            color_type,
+            alpha_type,
+            color_space,
+        )
+        .ok_or(RetainedError::ChangedBackend)
+    }
+
+    pub fn submit_and_wait(&mut self) -> Result<(), RetainedError> {
+        let mut state = self
+            .state
+            .try_borrow_mut()
+            .map_err(|_| RetainedError::UnsupportedBackend)?;
+        state.ensure_available()?;
+        let result = (|| {
+            let mut recording = state.recorder.snap().ok_or(RetainedError::Allocation)?;
+            let status = state.context.insert_recording(
+                &skia_safe::gpu::graphite::InsertRecordingInfo::new(&mut recording),
+            );
+            if status != skia_safe::gpu::graphite::InsertStatus::Success {
+                return Err(RetainedError::BackendSubmission);
+            }
+            if !state.context.submit_and_wait() {
+                return Err(RetainedError::BackendSubmission);
+            }
+            state.ensure_available()
+        })();
+        if result.is_err() {
+            // Failed recording insertion may leave pending work referencing
+            // this frame's borrowed textures. Never replay it in a later frame.
+            state.failed = true;
+        }
+        result
+    }
+
+    fn ensure_available(&self) -> Result<(), RetainedError> {
+        let state = self
+            .state
+            .try_borrow()
+            .map_err(|_| RetainedError::UnsupportedBackend)?;
+        state.ensure_available()
+    }
+
+    fn owns_surface(&self, surface: &mut skia_safe::Surface) -> Result<(), RetainedError> {
+        use skia_safe::wrapper::PointerWrapper as _;
+        let state = self
+            .state
+            .try_borrow()
+            .map_err(|_| RetainedError::UnsupportedBackend)?;
+        state.ensure_available()?;
+        let recorder = surface
+            .canvas()
+            .recorder()
+            .ok_or(RetainedError::UnsupportedBackend)?;
+        if !std::ptr::eq(state.recorder.inner(), recorder.inner()) {
+            return Err(RetainedError::ChangedBackend);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "metal")]
@@ -760,27 +942,78 @@ impl RetainedGpuSurface {
             return Err(RetainedError::ChangedBackend);
         }
         Ok(Self {
-            context,
+            context: RetainedGpuContext::Ganesh(context),
             info,
             properties: *surface.props(),
-            sample_count: target.sample_count(),
+            sample_count: Some(target.sample_count()),
             format: RetainedGpuFormat::capture(target.backend_format())?,
             _thread_bound: std::marker::PhantomData,
         })
     }
 
+    fn capture_graphite(
+        surface: &mut skia_safe::Surface,
+        context: RetainedGraphiteContext,
+        format: std::rc::Rc<skia_safe::gpu::graphite::TextureInfo>,
+    ) -> Result<Self, RetainedError> {
+        context.owns_surface(surface)?;
+        let info = surface.image_info();
+        if !matches!(
+            info.color_type(),
+            skia_safe::ColorType::BGRA8888 | skia_safe::ColorType::RGBA8888
+        ) || info.alpha_type() != skia_safe::AlphaType::Premul
+        {
+            return Err(RetainedError::ChangedBackend);
+        }
+        Ok(Self {
+            context: RetainedGpuContext::Graphite(context),
+            info,
+            properties: *surface.props(),
+            sample_count: None,
+            format: RetainedGpuFormat::GraphiteMetal(format),
+            _thread_bound: std::marker::PhantomData,
+        })
+    }
+
+    fn validate_surface(&mut self, surface: &mut skia_safe::Surface) -> Result<(), RetainedError> {
+        match &self.context {
+            RetainedGpuContext::Ganesh(_) => self.validate(&mut Self::capture(surface)?),
+            RetainedGpuContext::Graphite(context) => {
+                context.owns_surface(surface)?;
+                if self.info != surface.image_info() || self.properties != *surface.props() {
+                    return Err(RetainedError::ChangedBackend);
+                }
+                Ok(())
+            }
+        }
+    }
+
     fn ensure_available(&mut self) -> Result<(), RetainedError> {
-        if self.context.abandoned() {
-            Err(RetainedError::BackendLost)
-        } else {
-            Ok(())
+        match &mut self.context {
+            RetainedGpuContext::Ganesh(context) => {
+                if context.abandoned() {
+                    Err(RetainedError::BackendLost)
+                } else {
+                    Ok(())
+                }
+            }
+            RetainedGpuContext::Graphite(context) => context.ensure_available(),
         }
     }
 
     fn validate(&mut self, current: &mut Self) -> Result<(), RetainedError> {
         self.ensure_available()?;
         current.ensure_available()?;
-        if self.context.id() != current.context.id()
+        let same_context = match (&self.context, &current.context) {
+            (RetainedGpuContext::Ganesh(left), RetainedGpuContext::Ganesh(right)) => {
+                left.id() == right.id()
+            }
+            (RetainedGpuContext::Graphite(left), RetainedGpuContext::Graphite(right)) => {
+                left.identity == right.identity && std::rc::Rc::ptr_eq(&left.state, &right.state)
+            }
+            _ => false,
+        };
+        if !same_context
             || self.info != current.info
             || self.properties != current.properties
             || self.sample_count != current.sample_count
@@ -856,9 +1089,14 @@ impl RetainedGpuTarget {
         sync_cpu: skia_safe::gpu::SyncCpu,
     ) -> Result<(), RetainedError> {
         self.backend.ensure_available()?;
-        self.backend.context.flush_surface(&mut self.surface);
-        if !self.backend.context.submit(sync_cpu) {
-            return Err(RetainedError::BackendSubmission);
+        match &mut self.backend.context {
+            RetainedGpuContext::Ganesh(context) => {
+                context.flush_surface(&mut self.surface);
+                if !context.submit(sync_cpu) {
+                    return Err(RetainedError::BackendSubmission);
+                }
+            }
+            RetainedGpuContext::Graphite(context) => context.submit_and_wait()?,
         }
         self.backend.ensure_available()
     }
@@ -868,6 +1106,10 @@ impl RetainedBackend {
     fn validate_surface(&mut self, surface: &mut skia_safe::Surface) -> Result<(), RetainedError> {
         match self {
             Self::Cpu => {
+                #[cfg(feature = "metal")]
+                if surface.canvas().recorder().is_some() {
+                    return Err(RetainedError::ChangedBackend);
+                }
                 if surface.recording_context().is_none() {
                     Ok(())
                 } else {
@@ -875,7 +1117,7 @@ impl RetainedBackend {
                 }
             }
             #[cfg(feature = "metal")]
-            Self::Gpu(backend) => backend.validate(&mut RetainedGpuSurface::capture(surface)?),
+            Self::Gpu(backend) => backend.validate_surface(surface),
         }
     }
 
@@ -1148,8 +1390,10 @@ impl RetainedTranslationSession {
         let below = retained_surface_snapshot(&mut below_surface)?;
         let below_micros = elapsed_micros(below_started);
         let mut recorder = skia_safe::PictureRecorder::new();
-        let recording =
-            recorder.begin_recording(skia_safe::Rect::from_wh(size.0 as f32, size.1 as f32), None);
+        let recording = recorder.begin_recording(
+            skia_safe::Rect::from_wh(size.0 as f32, size.1 as f32),
+            false,
+        );
         let above_started = std::time::Instant::now();
         let above_metrics = renderer.paint_split_to_canvas(
             recording,
@@ -1404,11 +1648,7 @@ impl RetainedTranslationSession {
 fn retained_surface_snapshot(
     surface: &mut skia_safe::Surface,
 ) -> Result<skia_safe::Image, RetainedError> {
-    // The no-bounds Skia wrapper unwraps allocation failure; full bounds have the same snapshot/COW semantics.
-    let bounds = skia_safe::IRect::from_wh(surface.width(), surface.height());
-    surface
-        .image_snapshot_with_bounds(bounds)
-        .ok_or(RetainedError::Allocation)
+    super::layer_cache::immutable_surface_snapshot(surface).ok_or(RetainedError::Allocation)
 }
 
 fn require_complete(metrics: &super::RenderMetrics) -> Result<(), RetainedError> {
@@ -1719,6 +1959,436 @@ mod retained_storage_tests {
         let moving_id = moving.id;
         scene.insert(moving).expect("moving");
         (scene, page_id, moving_id)
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[allow(unsafe_code)]
+    fn graphite_test_context(
+        device: &metal::Device,
+        queue: &metal::CommandQueue,
+    ) -> RetainedGraphiteContext {
+        use metal::foreign_types::ForeignType as _;
+        // SAFETY: the test retains the device and queue through every target,
+        // recorder, context and completed submission; the binding also retains them.
+        let backend = unsafe {
+            skia_safe::gpu::graphite::mtl::BackendContext::new(
+                device.as_ptr().cast(),
+                queue.as_ptr().cast(),
+            )
+        };
+        let context = skia_safe::gpu::graphite::mtl::context_factory::make_metal(&backend, None)
+            .expect("actual Graphite Metal context");
+        RetainedGraphiteContext::new(context).expect("owned recorder")
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[allow(unsafe_code)]
+    fn graphite_test_target(
+        context: &mut RetainedGraphiteContext,
+        device: &metal::Device,
+    ) -> (metal::Texture, RetainedGpuTarget) {
+        use metal::foreign_types::ForeignType as _;
+        let descriptor = metal::TextureDescriptor::new();
+        descriptor.set_texture_type(metal::MTLTextureType::D2);
+        descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+        descriptor.set_width(32);
+        descriptor.set_height(32);
+        descriptor.set_storage_mode(metal::MTLStorageMode::Private);
+        descriptor
+            .set_usage(metal::MTLTextureUsage::RenderTarget | metal::MTLTextureUsage::ShaderRead);
+        let texture = device.new_texture(&descriptor);
+        // SAFETY: the returned texture lease stays alive until after its target
+        // is dropped and all GPU work completes on the owning test thread.
+        let backend = unsafe {
+            skia_safe::gpu::graphite::mtl::backend_textures::make_metal(
+                (32, 32),
+                texture.as_ptr().cast(),
+            )
+        };
+        let target = context
+            .wrap_top_left(&backend, skia_safe::ColorType::BGRA8888, None)
+            .expect("wrapped Graphite target");
+        // Binding the lease first makes the target drop before the texture,
+        // including assertion-failure unwinding in the native tests.
+        (texture, target)
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    fn graphite_target_pixels(target: &mut RetainedGpuTarget) -> Vec<u8> {
+        let RetainedGpuContext::Graphite(owner) = &target.backend.context else {
+            panic!("Graphite target");
+        };
+        let info = skia_safe::ImageInfo::new(
+            (32, 32),
+            skia_safe::ColorType::RGBA8888,
+            skia_safe::AlphaType::Premul,
+            None,
+        );
+        let mut pixels = vec![0; 32 * 32 * 4];
+        let mut state = owner.state.try_borrow_mut().expect("idle owner");
+        assert!(
+            state
+                .context
+                .read_pixels(&mut target.surface, &info, &mut pixels, 32 * 4, (0, 0))
+        );
+        pixels
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    #[ignore = "requires actual macOS Graphite/Metal; execute explicitly with --features metal --ignored"]
+    fn graphite_retained_frames_match_fresh_pixels_and_refuse_foreign_recorders() {
+        metal::objc::rc::autoreleasepool(|| {
+            let device = metal::Device::system_default().expect("Metal device");
+            let queue = device.new_command_queue();
+            let mut owner = graphite_test_context(&device, &queue);
+            let state = std::rc::Rc::downgrade(&owner.state);
+            let (_texture, mut target) = graphite_test_target(&mut owner, &device);
+            let (_full_texture, mut full_target) = graphite_test_target(&mut owner, &device);
+            drop(owner);
+            assert!(
+                state.upgrade().is_some(),
+                "targets retain their recorder and context"
+            );
+            let (mut scene, page, moving) = storage_fixture();
+            let viewport = fanta_doc::Viewport::default();
+            let inputs = RenderInputs::empty();
+            let mut renderer = super::super::RasterRenderer::new(32, 32).expect("renderer");
+            let mut full = super::super::RasterRenderer::new(32, 32).expect("full renderer");
+            let mut session = RetainedTranslationSession::prepare_for_target(
+                &mut renderer,
+                &mut target,
+                &scene,
+                page,
+                moving,
+                &viewport,
+                &inputs,
+                None,
+                0,
+            )
+            .expect("compatible retained preparation");
+            let mut original = None;
+            for offset in [0.0, 4.5, -2.0] {
+                scene
+                    .set_transform(moving, fanta_doc::Transform2D::translation(offset, 0.0))
+                    .expect("move selected layer");
+                let frame = session
+                    .render_for_target(
+                        &mut renderer,
+                        &mut target,
+                        &scene,
+                        &viewport,
+                        &inputs,
+                        None,
+                        0,
+                    )
+                    .expect("retained frame");
+                let mut paint = skia_safe::Paint::default();
+                paint.set_blend_mode(skia_safe::BlendMode::Src);
+                target.canvas().expect("target canvas").draw_image(
+                    &frame.image,
+                    (0, 0),
+                    Some(&paint),
+                );
+                full.render_to_canvas(
+                    full_target.canvas().expect("full canvas"),
+                    32,
+                    32,
+                    &scene,
+                    &viewport,
+                    Some(page),
+                    &inputs,
+                );
+                target
+                    .flush_and_submit(skia_safe::gpu::SyncCpu::Yes)
+                    .expect("both surfaces completed");
+                let retained_pixels = graphite_target_pixels(&mut target);
+                assert_eq!(retained_pixels, graphite_target_pixels(&mut full_target));
+                if original.is_none() {
+                    original = Some((frame.image, retained_pixels));
+                }
+            }
+            let (original_image, original_pixels) = original.expect("initial retained frame");
+            let mut paint = skia_safe::Paint::default();
+            paint.set_blend_mode(skia_safe::BlendMode::Src);
+            target
+                .canvas()
+                .expect("canvas")
+                .draw_image(original_image, (0, 0), Some(&paint));
+            target
+                .flush_and_submit(skia_safe::gpu::SyncCpu::Yes)
+                .expect("frozen image completed");
+            assert_eq!(
+                graphite_target_pixels(&mut target),
+                original_pixels,
+                "the first copy stays frozen while the retained output is reused"
+            );
+            let mut foreign_owner = graphite_test_context(&device, &queue);
+            let (_foreign_texture, mut foreign) = graphite_test_target(&mut foreign_owner, &device);
+            foreign
+                .canvas()
+                .expect("foreign canvas")
+                .clear(skia_safe::Color::RED);
+            foreign
+                .flush_and_submit(skia_safe::gpu::SyncCpu::Yes)
+                .expect("foreign sentinel completed");
+            let sentinel = graphite_target_pixels(&mut foreign);
+            assert!(matches!(
+                session.render_for_target(
+                    &mut renderer,
+                    &mut foreign,
+                    &scene,
+                    &viewport,
+                    &inputs,
+                    None,
+                    0
+                ),
+                Err(RetainedError::ChangedBackend)
+            ));
+            assert_eq!(graphite_target_pixels(&mut foreign), sentinel);
+            drop(session);
+            drop(target);
+            drop(full_target);
+            assert!(
+                state.upgrade().is_none(),
+                "surface owners release after the final target/session"
+            );
+        });
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    #[ignore = "requires actual macOS Graphite/Metal; execute explicitly with --features metal --ignored"]
+    fn graphite_owned_context_refuses_poisoned_work_and_cpu_surface_adoption() {
+        metal::objc::rc::autoreleasepool(|| {
+            let device = metal::Device::system_default().expect("Metal device");
+            let queue = device.new_command_queue();
+            let mut owner = graphite_test_context(&device, &queue);
+            let (_texture, mut target) = graphite_test_target(&mut owner, &device);
+            assert!(matches!(
+                RetainedBackend::Cpu.validate_surface(&mut target.surface),
+                Err(RetainedError::ChangedBackend)
+            ));
+            let mut raster = skia_safe::surfaces::raster_n32_premul((32, 32)).expect("raster");
+            assert!(matches!(
+                owner.owns_surface(&mut raster),
+                Err(RetainedError::UnsupportedBackend)
+            ));
+            let RetainedGpuContext::Graphite(context) = &target.backend.context else {
+                panic!("Graphite target");
+            };
+            context.state.try_borrow_mut().expect("idle owner").failed = true;
+            assert!(matches!(
+                target.canvas(),
+                Err(RetainedError::BackendSubmission)
+            ));
+            assert!(matches!(
+                target.image_snapshot(),
+                Err(RetainedError::BackendSubmission)
+            ));
+            assert!(matches!(
+                owner.submit_and_wait(),
+                Err(RetainedError::BackendSubmission)
+            ));
+        });
+    }
+
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    #[test]
+    #[ignore = "requires actual macOS Graphite/Metal; execute explicitly with --features metal --ignored"]
+    fn graphite_default_provider_draws_raster_images_shaders_and_mipmaps_per_recorder() {
+        metal::objc::rc::autoreleasepool(|| {
+            let device = metal::Device::system_default().expect("Metal device");
+            let queue = device.new_command_queue();
+            let mut owner = graphite_test_context(&device, &queue);
+            let (_texture, mut target) = graphite_test_target(&mut owner, &device);
+            let mut pixels = Vec::with_capacity(64 * 64 * 4);
+            for y in 0..64 {
+                for x in 0..64 {
+                    pixels.extend_from_slice(if (x / 4 + y / 4) % 2 == 0 {
+                        &[240, 30, 70, 255]
+                    } else {
+                        &[20, 170, 230, 255]
+                    });
+                }
+            }
+            let info = skia_safe::ImageInfo::new(
+                (64, 64),
+                skia_safe::ColorType::RGBA8888,
+                skia_safe::AlphaType::Unpremul,
+                None,
+            );
+            let image = skia_safe::images::raster_from_data(
+                &info,
+                skia_safe::Data::new_copy(&pixels),
+                64 * 4,
+            )
+            .expect("raster input image");
+            let image = image.with_default_mipmaps().expect("raster mip pyramid");
+            assert!(!image.is_texture_backed());
+            assert!(image.has_mipmaps());
+            let draw = |canvas: &skia_safe::Canvas, side: f32, mipmapped: skia_safe::MipmapMode| {
+                let sampling =
+                    skia_safe::SamplingOptions::new(skia_safe::FilterMode::Linear, mipmapped);
+                canvas.clear(skia_safe::Color::TRANSPARENT);
+                canvas.draw_image_rect_with_sampling_options(
+                    &image,
+                    None,
+                    skia_safe::Rect::from_xywh(0.0, 0.0, side, side),
+                    sampling,
+                    &skia_safe::Paint::default(),
+                );
+                let matrix = skia_safe::Matrix::new_all(
+                    side / 64.0,
+                    0.0,
+                    16.0,
+                    0.0,
+                    side / 64.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                );
+                let shader = image
+                    .to_shader(
+                        (skia_safe::TileMode::Clamp, skia_safe::TileMode::Clamp),
+                        sampling,
+                        &matrix,
+                    )
+                    .expect("raster-backed image shader");
+                let mut paint = skia_safe::Paint::default();
+                paint.set_shader(shader);
+                canvas.draw_rect(skia_safe::Rect::from_xywh(16.0, 0.0, side, side), &paint);
+            };
+            let mut last_pixels = Vec::new();
+            for (side, mipmapped) in [
+                (16.0, skia_safe::MipmapMode::None),
+                (16.0, skia_safe::MipmapMode::Linear),
+                (8.0, skia_safe::MipmapMode::Nearest),
+                (16.0, skia_safe::MipmapMode::Linear),
+            ] {
+                let mut reference =
+                    skia_safe::surfaces::raster_n32_premul((32, 32)).expect("reference");
+                draw(reference.canvas(), side, mipmapped);
+                draw(target.canvas().expect("Graphite canvas"), side, mipmapped);
+                owner
+                    .submit_and_wait()
+                    .expect("completed raster uploads and shader paint");
+                let actual = graphite_target_pixels(&mut target);
+                let read_info = skia_safe::ImageInfo::new(
+                    (32, 32),
+                    skia_safe::ColorType::RGBA8888,
+                    skia_safe::AlphaType::Premul,
+                    None,
+                );
+                let mut expected = vec![0; actual.len()];
+                assert!(reference.read_pixels(&read_info, &mut expected, 32 * 4, (0, 0)));
+                assert!(
+                    actual
+                        .iter()
+                        .zip(&expected)
+                        .all(|(actual, expected)| actual.abs_diff(*expected) <= 2),
+                    "bitmap and shader minification must match raster at side {side}, mip {mipmapped:?}"
+                );
+                for x in [2, 18] {
+                    assert_eq!(
+                        actual[(2 * 32 + x) * 4 + 3],
+                        255,
+                        "both the bitmap and raster shader draw real pixels"
+                    );
+                }
+                last_pixels = actual;
+            }
+            let mut second_owner = graphite_test_context(&device, &queue);
+            let (_second_texture, mut second_target) =
+                graphite_test_target(&mut second_owner, &device);
+            draw(
+                second_target.canvas().expect("second recorder canvas"),
+                16.0,
+                skia_safe::MipmapMode::Linear,
+            );
+            second_owner
+                .submit_and_wait()
+                .expect("independent recorder upload");
+            assert_eq!(
+                graphite_target_pixels(&mut second_target),
+                last_pixels,
+                "a second recorder must upload the same raster identity in its own GPU domain"
+            );
+
+            let asset = AssetId::new();
+            let mut resolver = crate::asset::InMemoryAssetResolver::new();
+            resolver.insert(asset, DecodedImage::new(Arc::new(pixels), 64, 64));
+            let resolver = Arc::new(resolver);
+            let mut scene = Scene::new();
+            let page = scene
+                .insert(CanvasNode::new(NodeData::Group(
+                    fanta_doc::GroupNode::default(),
+                )))
+                .expect("page");
+            let mut bitmap = CanvasNode::new(NodeData::Bitmap(fanta_doc::BitmapNode {
+                asset,
+                natural_size: [64, 64],
+                local_size: [16.0, 16.0],
+                crop: None,
+                fit: fanta_doc::ImageFitMode::Stretch,
+                tint: None,
+            }));
+            bitmap.parent = Some(page);
+            bitmap.transform = fanta_doc::Transform2D::translation(-16.0, -16.0);
+            scene.insert(bitmap).expect("bitmap");
+            let mut vector =
+                fanta_doc::VectorNode::rect_solid(0.0, 0.0, 16.0, 16.0, fanta_doc::Color::WHITE);
+            vector.fills = smallvec::smallvec![Fill::Image {
+                asset,
+                mode: fanta_doc::ImageFitMode::Stretch,
+                opacity: 1.0,
+                crop: None,
+                scale: None,
+                rotation: None,
+                blend: BlendMode::Normal,
+                adjust: Default::default(),
+            }];
+            let mut painted = CanvasNode::new(NodeData::Vector(vector));
+            painted.parent = Some(page);
+            painted.transform = fanta_doc::Transform2D::translation(0.0, -16.0);
+            scene.insert(painted).expect("image fill");
+            let inputs = RenderInputs::empty();
+            let mut gpu_renderer =
+                super::super::RasterRenderer::new(32, 32).expect("GPU renderer state");
+            gpu_renderer.background = fanta_doc::Color::BLACK;
+            gpu_renderer.set_asset_resolver(resolver.clone());
+            let mut cpu_renderer =
+                super::super::RasterRenderer::new(32, 32).expect("CPU reference");
+            cpu_renderer.background = fanta_doc::Color::BLACK;
+            cpu_renderer.set_asset_resolver(resolver);
+            for zoom in [1.0, 0.5, 2.0, 1.0] {
+                let viewport = fanta_doc::Viewport {
+                    center: [0.0, 0.0],
+                    zoom,
+                };
+                gpu_renderer.render_to_canvas(
+                    target.canvas().expect("target"),
+                    32,
+                    32,
+                    &scene,
+                    &viewport,
+                    Some(page),
+                    &inputs,
+                );
+                owner.submit_and_wait().expect("Fanta raster cache uploads");
+                cpu_renderer.render_page_with(&scene, &viewport, Some(page), &inputs);
+                let actual = graphite_target_pixels(&mut target);
+                let expected = cpu_renderer.copy_rgba();
+                assert!(
+                    actual
+                        .iter()
+                        .zip(&expected)
+                        .all(|(actual, expected)| actual.abs_diff(*expected) <= 2),
+                    "Fanta bitmap/image-fill and warm pyramid cache must match at zoom {zoom}"
+                );
+            }
+        });
     }
 
     #[test]

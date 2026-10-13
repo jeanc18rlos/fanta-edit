@@ -37,7 +37,7 @@ pub(super) fn register_external_font_dirs(
             let Ok(bytes) = fs::read(&path) else {
                 continue;
             };
-            let Some(face) = mgr.new_from_data(&bytes, None) else {
+            let Some(face) = mgr.new_from_data(skia_safe::Data::new_copy(&bytes), None) else {
                 continue;
             };
             provider.register_typeface(face, None);

@@ -111,12 +111,12 @@ pub use renderer::{
     MediaPlayback, RasterRenderer, RenderError, RenderInputs, RenderMetrics, SvgRenderOptions,
     SvgRenderOutput,
 };
-#[cfg(feature = "metal")]
-pub use split::RetainedGpuTarget;
 pub use split::{
     RetainedBuildMetrics, RetainedError, RetainedFrame, RetainedFrameMetrics,
     RetainedTranslationSession, SplitError, SplitPhase, SplitSpec,
 };
+#[cfg(feature = "metal")]
+pub use split::{RetainedGpuTarget, RetainedGraphiteContext};
 pub use text::{
     text_caret_rect, text_first_baseline, text_hit_test, text_line_height, text_node_outline,
     text_selection_rects,

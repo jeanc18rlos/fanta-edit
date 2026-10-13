@@ -136,7 +136,7 @@ pub(super) fn register_bundled(
 ) {
     let mut register_set = |bytes_list: &[&[u8]]| {
         for bytes in bytes_list {
-            let Some(base) = mgr.new_from_data(bytes, None) else {
+            let Some(base) = mgr.new_from_data(skia_safe::Data::new_copy(bytes), None) else {
                 continue;
             };
             if fam.variable {
@@ -182,7 +182,8 @@ mod tests {
         for fam in BUNDLED {
             for bytes in fam.upright.iter().chain(fam.italic.iter()) {
                 assert!(
-                    mgr.new_from_data(bytes, None).is_some(),
+                    mgr.new_from_data(skia_safe::Data::new_copy(bytes), None)
+                        .is_some(),
                     "bundled {} face failed to decode ({} bytes)",
                     fam.name,
                     bytes.len()
@@ -199,7 +200,7 @@ mod tests {
         // default instance and we skip the assertion).
         let mgr: FontMgr = FontMgr::default();
         let base = mgr
-            .new_from_data(SOURCE_SANS_UPRIGHT[0], None)
+            .new_from_data(skia_safe::Data::new_copy(SOURCE_SANS_UPRIGHT[0]), None)
             .expect("Source Sans variable decodes");
         let regular = instance_at_weight(&base, 400);
         let bold = instance_at_weight(&base, 700);

@@ -5,7 +5,7 @@
 
 use fanta_doc::Color;
 use skia_safe::{
-    BlurStyle, Canvas, MaskFilter, Paint, Path, Point, RRect, Rect, TileMode, gradient_shader,
+    BlurStyle, Canvas, MaskFilter, Paint, PathBuilder, Point, RRect, Rect, TileMode, gradient,
     paint::Style,
 };
 
@@ -94,15 +94,17 @@ pub(crate) fn draw_studio_fill(canvas: &Canvas, size: [f64; 2]) {
     let (w, h) = (size[0] as f32, size[1] as f32);
     let mut p = Paint::default();
     p.set_anti_alias(true);
-    if let Some(shader) = gradient_shader::linear(
+    let colors = [
+        skia_safe::Color4f::from(to_sk_color(Color::rgb(250, 250, 252))),
+        skia_safe::Color4f::from(to_sk_color(Color::rgb(231, 232, 238))),
+    ];
+    let gradient = gradient::Gradient::new(
+        gradient::Colors::new_evenly_spaced(&colors, TileMode::Clamp, None),
+        gradient::Interpolation::default(),
+    );
+    if let Some(shader) = gradient::shaders::linear_gradient(
         (Point::new(0.0, 0.0), Point::new(0.0, h)),
-        &[
-            to_sk_color(Color::rgb(250, 250, 252)),
-            to_sk_color(Color::rgb(231, 232, 238)),
-        ][..],
-        None,
-        TileMode::Clamp,
-        None,
+        &gradient,
         None,
     ) {
         p.set_shader(shader);
@@ -252,12 +254,12 @@ fn draw_audio_button(canvas: &Canvas, cx: f32, cy: f32, r: f32, accent: Color, p
         );
     } else {
         let t = r * 0.5;
-        let mut tri = Path::new();
+        let mut tri = PathBuilder::new();
         tri.move_to((cx - t * 0.4, cy - t));
         tri.line_to((cx - t * 0.4, cy + t));
         tri.line_to((cx + t * 0.82, cy));
         tri.close();
-        canvas.draw_path(&tri, &fill(glyph));
+        canvas.draw_path(&tri.detach(), &fill(glyph));
     }
 }
 
@@ -363,7 +365,7 @@ pub(crate) fn draw_cube(canvas: &Canvas, size: [f64; 2]) {
     };
 
     for (face, shade) in CUBE_FACES {
-        let mut path = Path::new();
+        let mut path = PathBuilder::new();
         let (ax, ay) = proj(face[0]);
         path.move_to((ax, ay));
         for &v in &face[1..] {
@@ -372,7 +374,7 @@ pub(crate) fn draw_cube(canvas: &Canvas, size: [f64; 2]) {
         }
         path.close();
         canvas.draw_path(
-            &path,
+            &path.detach(),
             &fill(Color::rgb(shade, shade.saturating_add(16), 235)),
         );
     }
@@ -416,12 +418,12 @@ pub(crate) fn draw_play_overlay(canvas: &Canvas, size: [f64; 2]) {
         p
     });
     let t = r * 0.46;
-    let mut tri = Path::new();
+    let mut tri = PathBuilder::new();
     tri.move_to((cx - t * 0.45, cy - t));
     tri.line_to((cx - t * 0.45, cy + t));
     tri.line_to((cx + t, cy));
     tri.close();
-    canvas.draw_path(&tri, &fill(Color::rgba(255, 255, 255, 245)));
+    canvas.draw_path(&tri.detach(), &fill(Color::rgba(255, 255, 255, 245)));
 }
 
 /// A thin progress bar pinned to the bottom of a playing video card — the video
@@ -465,12 +467,12 @@ pub(crate) fn draw_video_card(canvas: &Canvas, size: [f64; 2]) {
     let r = (w.min(h) * 0.16).clamp(10.0, 40.0);
     canvas.draw_circle((cx, cy), r, &fill(Color::rgba(255, 255, 255, 28)));
     let t = r * 0.5;
-    let mut tri = Path::new();
+    let mut tri = PathBuilder::new();
     tri.move_to((cx - t * 0.5, cy - t));
     tri.line_to((cx - t * 0.5, cy + t));
     tri.line_to((cx + t, cy));
     tri.close();
-    canvas.draw_path(&tri, &fill(Color::rgba(255, 255, 255, 235)));
+    canvas.draw_path(&tri.detach(), &fill(Color::rgba(255, 255, 255, 235)));
 }
 
 #[cfg(test)]
@@ -582,15 +584,17 @@ mod tests {
             clip_media(c, sz);
             let mut p = Paint::default();
             p.set_anti_alias(true);
-            if let Some(sh) = gradient_shader::linear(
+            let colors = [
+                skia_safe::Color4f::from(to_sk_color(Color::rgb(196, 222, 244))),
+                skia_safe::Color4f::from(to_sk_color(Color::rgb(58, 120, 70))),
+            ];
+            let gradient = gradient::Gradient::new(
+                gradient::Colors::new_evenly_spaced(&colors, TileMode::Clamp, None),
+                gradient::Interpolation::default(),
+            );
+            if let Some(sh) = gradient::shaders::linear_gradient(
                 (Point::new(0.0, 0.0), Point::new(0.0, 240.0)),
-                &[
-                    to_sk_color(Color::rgb(196, 222, 244)),
-                    to_sk_color(Color::rgb(58, 120, 70)),
-                ][..],
-                None,
-                TileMode::Clamp,
-                None,
+                &gradient,
                 None,
             ) {
                 p.set_shader(sh);

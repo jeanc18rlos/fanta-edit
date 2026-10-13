@@ -21,7 +21,8 @@
 //! backend-compatible private surfaces. The host owns GPU submission and presentation.
 
 #![allow(clippy::result_large_err)]
-#![forbid(unsafe_code)]
+#![cfg_attr(not(test), forbid(unsafe_code))]
+#![cfg_attr(test, deny(unsafe_code))]
 
 pub mod asset;
 mod bounds;
@@ -43,8 +44,6 @@ pub use paint::{fill_to_paint, stroke_to_paint};
 pub use path::to_sk_path;
 // `vector_outline_sk_path`: track svg-prod — the effective vector outline,
 // shared with the app's flatten/outline/simplify geometry ops.
-#[cfg(feature = "metal")]
-pub use raster::RetainedGpuTarget;
 pub use raster::{
     MediaPlayback, RasterRenderer, RenderError, RenderInputs, RenderMetrics, RetainedBuildMetrics,
     RetainedError, RetainedFrame, RetainedFrameMetrics, RetainedTranslationSession, SplitError,
@@ -58,4 +57,6 @@ pub use raster::{
     text_path_visual_selection_edge, text_selection_rects, vector_contains_point,
     vector_outline_sk_path,
 };
+#[cfg(feature = "metal")]
+pub use raster::{RetainedGpuTarget, RetainedGraphiteContext};
 pub use transform::to_sk_matrix;

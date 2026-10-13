@@ -2,7 +2,7 @@ use super::text::{to_text_style, with_layout_engine};
 use super::{Bounds, Canvas, Paint, TextBuffer, TextStyle, to_sk_color};
 use fanta_doc::{MeasuredPath, TextPathAlignment, TextPathDirection, TextPathNode, TextPathSide};
 use fanta_text::{ShapedGlyphRun, ShapedTextCluster};
-use skia_safe::{Font, Matrix, Path, Point, Rect, paint::Style as PaintStyle};
+use skia_safe::{Font, Matrix, Path, PathBuilder, Point, Rect, paint::Style as PaintStyle};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -480,8 +480,8 @@ fn layout_text_path(node: &TextPathNode) -> Option<TextPathLayout> {
     let mut decorations = Vec::new();
     let mut clusters = Vec::new();
     let mut visual_carets = Vec::new();
-    let mut silhouette = Path::new();
-    let mut containment_path = Path::new();
+    let mut silhouette = PathBuilder::new();
+    let mut containment_path = PathBuilder::new();
     let mut visual_bounds = None;
     let mut unsupported_outline = false;
     for cluster in source_clusters {
@@ -544,17 +544,17 @@ fn layout_text_path(node: &TextPathNode) -> Option<TextPathLayout> {
                     + frame.normal[1] * glyph.paint_y,
             ];
             let transform = glyph_transform(frame.tangent, frame.normal, translation)?;
-            if let Some(mut outline) = glyph.font.get_path(glyph.glyph_id) {
-                outline.transform(&transform);
+            if let Some(outline) = glyph.font.get_path(glyph.glyph_id) {
+                let outline = outline.make_transform(&transform);
                 include_path_bounds(&mut visual_bounds, &outline);
-                silhouette.add_path(&outline, (0.0, 0.0), None);
-                containment_path.add_path(&outline, (0.0, 0.0), None);
+                silhouette.add_path(&outline, None);
+                containment_path.add_path(&outline, None);
             } else if !cluster_is_whitespace {
                 cluster_has_unsupported_outline = true;
-                if let Some(mut bounds_path) = glyph_bounds_path(glyph.bounds) {
-                    bounds_path.transform(&transform);
+                if let Some(bounds_path) = glyph_bounds_path(glyph.bounds) {
+                    let bounds_path = bounds_path.make_transform(&transform);
                     include_path_bounds(&mut visual_bounds, &bounds_path);
-                    containment_path.add_path(&bounds_path, (0.0, 0.0), None);
+                    containment_path.add_path(&bounds_path, None);
                 }
             }
             glyphs.push(PlacedGlyph {
@@ -572,7 +572,7 @@ fn layout_text_path(node: &TextPathNode) -> Option<TextPathLayout> {
                     include_bounds(&mut visual_bounds, bounds);
                 }
                 if let Some(path) = quad_path(quad) {
-                    containment_path.add_path(&path, (0.0, 0.0), None);
+                    containment_path.add_path(&path, None);
                 }
             }
         }
@@ -580,8 +580,8 @@ fn layout_text_path(node: &TextPathNode) -> Option<TextPathLayout> {
             if glyph.style.color.a != 0 {
                 for decoration in decoration_paths(glyph, cluster.advance, &cluster_transform) {
                     include_path_bounds(&mut visual_bounds, &decoration.path);
-                    silhouette.add_path(&decoration.path, (0.0, 0.0), None);
-                    containment_path.add_path(&decoration.path, (0.0, 0.0), None);
+                    silhouette.add_path(&decoration.path, None);
+                    containment_path.add_path(&decoration.path, None);
                     decorations.push(decoration);
                 }
             }
@@ -596,14 +596,14 @@ fn layout_text_path(node: &TextPathNode) -> Option<TextPathLayout> {
         visual_carets.reverse();
     }
 
-    let outline = classify_outline(silhouette, unsupported_outline);
+    let outline = classify_outline(silhouette.detach(), unsupported_outline);
     (!visual_carets.is_empty()).then_some(TextPathLayout {
         glyphs,
         decorations,
         clusters,
         visual_carets,
         outline,
-        containment_path,
+        containment_path: containment_path.detach(),
         visual_bounds,
     })
 }
@@ -1089,13 +1089,13 @@ fn quad_path(points: [[f64; 2]; 4]) -> Option<Path> {
     {
         return None;
     }
-    let mut path = Path::new();
+    let mut path = PathBuilder::new();
     path.move_to((points[0][0] as f32, points[0][1] as f32));
     for point in &points[1..] {
         path.line_to((point[0] as f32, point[1] as f32));
     }
     path.close();
-    Some(path)
+    Some(path.detach())
 }
 
 fn include_bounds(bounds: &mut Option<Bounds>, addition: Bounds) {
@@ -1187,8 +1187,7 @@ fn glyph_bounds_path(bounds: [f64; 4]) -> Option<Path> {
     {
         return None;
     }
-    let mut path = Path::new();
-    path.add_rect(
+    Some(Path::rect(
         Rect::new(
             bounds[0] as f32,
             bounds[1] as f32,
@@ -1196,8 +1195,7 @@ fn glyph_bounds_path(bounds: [f64; 4]) -> Option<Path> {
             bounds[3] as f32,
         ),
         None,
-    );
-    Some(path)
+    ))
 }
 
 fn decoration_paths(glyph: &SourceGlyph, advance: f64, transform: &Matrix) -> Vec<ColoredPath> {
@@ -1258,9 +1256,8 @@ fn decoration_rect(
         advance,
         position + thickness * 0.5,
     ];
-    let mut path = glyph_bounds_path(bounds)?;
-    path.transform(transform);
-    Some(path)
+    let path = glyph_bounds_path(bounds)?;
+    Some(path.make_transform(transform))
 }
 
 fn glyph_paint(color: fanta_doc::Color) -> Paint {
@@ -1762,8 +1759,7 @@ mod tests {
 
     #[test]
     fn unsupported_glyph_outline_never_becomes_a_rectangular_effect_silhouette() {
-        let mut partial_vector_outline = Path::new();
-        partial_vector_outline.add_rect(Rect::from_xywh(1.0, 2.0, 3.0, 4.0), None);
+        let partial_vector_outline = Path::rect(Rect::from_xywh(1.0, 2.0, 3.0, 4.0), None);
         let unsupported = classify_outline(partial_vector_outline, true);
         assert!(matches!(unsupported, TextPathOutline::UnsupportedGlyph));
         assert!(unsupported.into_exact().is_none());

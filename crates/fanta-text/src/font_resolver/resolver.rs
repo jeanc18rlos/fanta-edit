@@ -370,7 +370,9 @@ impl FontResolver {
     }
 
     fn register_downloaded_bytes(&self, requested: &str, bytes: &[u8]) -> Option<String> {
-        let base = self.system.new_from_data(bytes, None)?;
+        let base = self
+            .system
+            .new_from_data(skia_safe::Data::new_copy(bytes), None)?;
 
         // Register under the requested name on a fresh clone of the provider
         // handle (which shares the same underlying Skia object the engine's

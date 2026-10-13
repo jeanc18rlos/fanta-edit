@@ -79,7 +79,7 @@ import hashlib
 from pathlib import Path
 import tomllib
 
-root = Path("vendor/skia-bindings-0.84.0")
+root = Path("vendor/skia-bindings-0.153.3")
 manifest = tomllib.loads((root / "Cargo.toml").read_text())
 if manifest["package"]["license"] != "MIT":
     raise SystemExit("Vendored skia-bindings must retain its original MIT license declaration")
@@ -95,7 +95,7 @@ git ls-files -z -- "Cargo.toml" "**/Cargo.toml" | while IFS= read -r -d '' cargo
     [[ -f "$cargo_toml" ]] || continue
     check_manifest_for_agpl "$cargo_toml"
 
-    if [[ "$cargo_toml" == "vendor/skia-bindings-0.84.0/Cargo.toml" ]]; then
+    if [[ "$cargo_toml" == "vendor/skia-bindings-0.153.3/Cargo.toml" ]]; then
         check_vendored_skia_license
         continue
     fi
