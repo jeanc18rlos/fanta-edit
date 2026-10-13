@@ -1017,7 +1017,13 @@ fn node_has_external_render_source(node: &crate::CanvasNode) -> bool {
             instance.overrides.iter().any(|entry| match &entry.value {
                 crate::OverrideValue::Fills { fills } => fills.iter().any(pattern),
                 crate::OverrideValue::Strokes { strokes } => strokes.iter().any(pattern_stroke),
-                crate::OverrideValue::Field { .. } => true,
+                crate::OverrideValue::Field { value } => value.as_object().is_none_or(|fields| {
+                    // These channels change text or geometry, and cannot add a
+                    // component target or paint that reads another scene tree.
+                    fields.keys().any(|field| {
+                        !matches!(field.as_str(), "style" | "clip_size" | "local_size")
+                    })
+                }),
                 _ => false,
             }) || instance.derived.iter().any(|entry| {
                 entry
@@ -1293,6 +1299,51 @@ mod tests {
             .get_mut(placement_id)
             .expect("placement")
             .data = NodeData::Instance(instance);
+        assert!(document.render_scene_for(page).is_none());
+    }
+
+    #[test]
+    fn render_scene_scopes_geometry_and_text_style_field_overrides() {
+        let mut document = Doc::new();
+        let page = add_root_group(&mut document, "Home");
+        let master = add_root_group(&mut document, "Master");
+        let unused = add_root_group(&mut document, "Unused master");
+        let component = crate::ComponentId::new();
+        document.components.defs.insert(
+            component,
+            crate::ComponentDef::new(component, master, "Master"),
+        );
+        let mut instance = render_test_instance(component);
+        instance.overrides.push(crate::Override {
+            target_path: Default::default(),
+            target_prop: BoundProp::Visible,
+            value: crate::OverrideValue::Field {
+                value: serde_json::json!({
+                    "clip_size": [120.0, 80.0],
+                    "local_size": [140.0, 100.0],
+                    "style": {"font_family": "Inter", "size_px": 24.0}
+                }),
+            },
+        });
+        let mut placement = CanvasNode::new(NodeData::Instance(instance));
+        placement.parent = Some(page);
+        let placement = document.scene.insert(placement).expect("placement");
+        let snapshot = document.render_scene_for(page).expect("scoped fields");
+        assert!(snapshot.contains(master));
+        assert!(snapshot.contains(placement));
+        assert!(!snapshot.contains(unused));
+        let NodeData::Instance(instance) =
+            &mut document.scene.get_mut(placement).expect("placement").data
+        else {
+            panic!("instance");
+        };
+        instance.overrides.push(crate::Override {
+            target_path: Default::default(),
+            target_prop: BoundProp::Visible,
+            value: crate::OverrideValue::Field {
+                value: serde_json::json!({"background_fills": []}),
+            },
+        });
         assert!(document.render_scene_for(page).is_none());
     }
 

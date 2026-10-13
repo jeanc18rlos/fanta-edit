@@ -960,11 +960,20 @@ fn scoped_render_scene_preserves_nested_swaps_and_ancestor_modes()
             .data
             .as_instance_mut()
             .expect("instance")
-            .overrides = vec![Override {
-            target_path: smallvec::smallvec![nested_id],
-            target_prop: BoundProp::Visible,
-            value: OverrideValue::SwapInstance { component: target },
-        }];
+            .overrides = vec![
+            Override {
+                target_path: smallvec::smallvec![nested_id],
+                target_prop: BoundProp::Visible,
+                value: OverrideValue::SwapInstance { component: target },
+            },
+            Override {
+                target_path: Default::default(),
+                target_prop: BoundProp::Visible,
+                value: OverrideValue::Field {
+                    value: serde_json::json!({"clip_size": [16.0, 12.0]}),
+                },
+            },
+        ];
         let scoped = doc
             .render_scene_for(page_id)
             .expect("bounded dependency scene");
