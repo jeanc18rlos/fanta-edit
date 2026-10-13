@@ -8457,17 +8457,18 @@ impl Render for FigView {
             crate::gesture_perf::UiStage::ViewRender,
         );
         self.inspector_has_focus = self.inspector_focus_handle.contains_focused(window, cx);
-        let development_read_only = self.is_dev_mode(cx);
-        self.code_workspace.update(cx, |workspace, cx| {
-            workspace.set_development_read_only(development_read_only, cx)
-        });
         // Deferred open from the text tool's commit, which arrives through a
         // window-level mouse listener without a `Window`. Everything is
         // selected so the first keystroke replaces the placeholder.
         if let Some(node) = self.pending_text_edit.take() {
             self.open_text_edit(node, TextEditSeed::SelectAll, window, cx);
         }
+        let development_read_only = self.is_dev_mode(cx);
         let editor_workspace = self.editor_workspace(cx);
+        self.code_workspace.update(cx, |workspace, cx| {
+            workspace.set_development_read_only(development_read_only, cx);
+            workspace.set_visible(editor_workspace == EditorWorkspace::Code, window, cx);
+        });
         if editor_workspace == EditorWorkspace::Canvas {
             self.maybe_prewarm_fonts(cx);
         }

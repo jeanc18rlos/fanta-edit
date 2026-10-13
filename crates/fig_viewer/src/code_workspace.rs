@@ -99,6 +99,8 @@ pub struct FantaCodeWorkspace {
     search_bar: Entity<BufferSearchBar>,
     search_editor: Option<Entity<Editor>>,
     selected_file: CodeWorkspaceFile,
+    visible: bool,
+    saved_sources_pending: bool,
     requested_page: Option<NodeId>,
     /// The root whose source the panes are currently showing — a page root or
     /// a component master root. Recorded so the selection sync can rank a
@@ -144,6 +146,15 @@ impl FantaCodeWorkspace {
             &item,
             window,
             |this: &mut Self, _, event: &FigItemEvent, window, cx| {
+                if !this.visible {
+                    if matches!(event, FigItemEvent::Saved) {
+                        this.saved_sources_pending = true;
+                    }
+                    if matches!(event, FigItemEvent::StateChanged | FigItemEvent::Saved) {
+                        this.update_fnx_editability(cx);
+                    }
+                    return;
+                }
                 if matches!(
                     event,
                     FigItemEvent::StateChanged | FigItemEvent::SelectionChanged
@@ -183,13 +194,15 @@ impl FantaCodeWorkspace {
             },
         );
         let requested_page = item.read(cx).doc().and_then(|doc| doc.active_page());
-        let mut workspace = Self {
+        Self {
             item,
             project,
             focus_handle: cx.focus_handle(),
             search_bar: cx.new(|cx| BufferSearchBar::new(None, window, cx)),
             search_editor: None,
             selected_file: CodeWorkspaceFile::Fnx,
+            visible: false,
+            saved_sources_pending: false,
             requested_page,
             source_root: None,
             last_synced_selection: None,
@@ -215,9 +228,37 @@ impl FantaCodeWorkspace {
             json_load_task: None,
             _item_subscription: item_subscription,
             _project_subscription: project_subscription,
-        };
-        workspace.refresh_from_item(window, cx);
-        workspace
+        }
+    }
+
+    pub(crate) fn set_visible(
+        &mut self,
+        visible: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.visible == visible {
+            return;
+        }
+        self.visible = visible;
+        if !visible {
+            return;
+        }
+        let active_page = self.item.read(cx).doc().and_then(|doc| doc.active_page());
+        // Hidden source drafts still own the canvas edit barrier. Refreshing
+        // a changed source path here would drop those buffers and their edits.
+        if !self.source_is_dirty(cx) {
+            self.refresh_page(active_page, window, cx);
+            self.refresh_pending_saved_sources(window, cx);
+        } else if active_page != self.requested_page {
+            self.error_message =
+                Some("Save or discard the source edit before switching pages.".into());
+        }
+        self.update_fnx_editability(cx);
+        self.last_synced_selection = None;
+        self.sync_selection_to_source(window, cx);
+        self.follow_source_location(window, cx);
+        cx.notify();
     }
 
     pub(crate) fn set_source_writer(
@@ -248,7 +289,7 @@ impl FantaCodeWorkspace {
     }
 
     fn follow_source_location(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.follow_source_writer || !self.source_writer_matches_file() {
+        if !self.visible || !self.follow_source_writer || !self.source_writer_matches_file() {
             return;
         }
         let Some(location) = self.project.read(cx).agent_location() else {
@@ -626,6 +667,22 @@ impl FantaCodeWorkspace {
         self.fnx_path != fnx_path || self.json_path != json_path
     }
 
+    fn refresh_pending_saved_sources(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.visible
+            || !self.saved_sources_pending
+            || self.loading_fnx
+            || self.loading_json
+            || self.source_is_dirty(cx)
+            || (self.fnx_source_buffer.is_none() && self.json_source_buffer.is_none())
+        {
+            return;
+        }
+        // Project may return a cached clean buffer. Keep the deferred Saved
+        // event until both asynchronous opens can include it in the refresh.
+        self.saved_sources_pending = false;
+        self.reload_saved_sources(window, cx);
+    }
+
     fn reload_saved_sources(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let buffers: HashSet<_> = [
             self.fnx_source_buffer.as_ref(),
@@ -658,6 +715,9 @@ impl FantaCodeWorkspace {
     }
 
     fn refresh_from_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.visible {
+            return;
+        }
         let (project_root, page, component) = {
             let item = self.item.read(cx);
             let page = self
@@ -793,6 +853,7 @@ impl FantaCodeWorkspace {
                             Some(format!("Could not open {}: {error:#}", path.display()).into());
                     }
                 }
+                this.refresh_pending_saved_sources(window, cx);
                 cx.notify();
             }) {
                 log::debug!("dropping FNX editor load for closed workspace: {error:#}");
@@ -836,6 +897,7 @@ impl FantaCodeWorkspace {
                             Some(format!("Could not open {}: {error:#}", path.display()).into());
                     }
                 }
+                this.refresh_pending_saved_sources(window, cx);
                 cx.notify();
             }) {
                 log::debug!("dropping JSON editor load for closed workspace: {error:#}");
@@ -878,8 +940,12 @@ impl FantaCodeWorkspace {
         };
         let text_changed = previous_version.is_some_and(|previous| previous != version);
         let dirty = self.source_is_dirty(cx);
-        self.item
-            .update(cx, |item, cx| item.set_source_edit_locked(dirty, cx));
+        // A clean JSON buffer can arrive before an already-dirty shared FNX
+        // buffer. Only release the shared lock after both loads have settled.
+        if dirty || (!self.loading_fnx && !self.loading_json) {
+            self.item
+                .update(cx, |item, cx| item.set_source_edit_locked(dirty, cx));
+        }
         if dirty && text_changed {
             self.error_message = None;
         }
@@ -923,7 +989,10 @@ impl FantaCodeWorkspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let file = if self.json_path.as_deref() == Some(path) {
+        let file = if self.json_path.as_deref() == Some(path)
+            || path.file_name().is_some_and(|name| {
+                name == OsStr::new("page.json") || name == OsStr::new("def.json")
+            }) {
             CodeWorkspaceFile::Json
         } else {
             CodeWorkspaceFile::Fnx
@@ -985,7 +1054,7 @@ impl FantaCodeWorkspace {
     /// sidecar read touches the disk, so both are paid once per *changed*
     /// selection, never once per frame.
     fn sync_selection_to_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected_file != CodeWorkspaceFile::Fnx {
+        if !self.visible || self.selected_file != CodeWorkspaceFile::Fnx {
             return;
         }
         let (Some(editor), Some(fnx_path)) = (self.fnx_editor.clone(), self.fnx_path.clone())
@@ -1596,7 +1665,10 @@ mod tests {
         let workspace_item = item.clone();
         let workspace_project = project.clone();
         let workspace = cx.add_window(move |window, cx| {
-            FantaCodeWorkspace::new(workspace_item, workspace_project, window, cx)
+            let mut workspace =
+                FantaCodeWorkspace::new(workspace_item, workspace_project, window, cx);
+            workspace.set_visible(true, window, cx);
+            workspace
         });
         cx.run_until_parked();
         (item, workspace)
@@ -1613,6 +1685,125 @@ mod tests {
         let project = open_test_project(root, cx).await;
         let (item, workspace) = open_code_workspace_for_project(project.clone(), cx).await;
         (project, item, workspace)
+    }
+
+    #[gpui::test]
+    async fn deferred_source_workspace_preserves_shared_dirty_buffers(cx: &mut TestAppContext) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("project");
+        let page = write_project(temporary.path());
+        let (project, item, active) = open_code_workspace(temporary.path(), cx).await;
+        let dirty_buffer = active
+            .read_with(cx, |workspace, _| {
+                workspace.fnx_source_buffer.clone().expect("FNX buffer")
+            })
+            .expect("workspace");
+        dirty_buffer.update(cx, |buffer, cx| {
+            buffer.edit([(0..0, "// shared unsaved draft\n")], None, cx);
+        });
+        cx.run_until_parked();
+        assert!(item.read_with(cx, |item, _| item.source_edit_locked()));
+
+        let deferred = cx.add_window({
+            let item = item.clone();
+            move |window, cx| FantaCodeWorkspace::new(item, project, window, cx)
+        });
+        item.update(cx, |_, cx| {
+            cx.emit(FigItemEvent::StateChanged);
+            cx.emit(FigItemEvent::Saved);
+        });
+        cx.run_until_parked();
+        deferred
+            .read_with(cx, |workspace, _| {
+                assert!(!workspace.visible);
+                assert!(workspace.fnx_source_buffer.is_none());
+                assert!(workspace.json_source_buffer.is_none());
+                assert!(workspace.fnx_load_task.is_none());
+                assert!(workspace.json_load_task.is_none());
+            })
+            .expect("deferred workspace");
+        assert!(item.read_with(cx, |item, _| item.source_edit_locked()));
+
+        deferred
+            .update(cx, |workspace, window, cx| {
+                workspace.reveal_source_path(&page_json_path(temporary.path(), page), window, cx);
+                assert_eq!(workspace.selected_file, CodeWorkspaceFile::Json);
+                assert!(workspace.fnx_source_buffer.is_none());
+                assert!(workspace.json_source_buffer.is_none());
+            })
+            .expect("reveal a header before activation");
+
+        let lock_released = std::rc::Rc::new(std::cell::Cell::new(false));
+        let subscription = cx.update(|cx| {
+            let lock_released = lock_released.clone();
+            cx.subscribe(&item, move |item, event, cx| {
+                if matches!(event, FigItemEvent::SourceEditLockChanged)
+                    && !item.read(cx).source_edit_locked()
+                {
+                    lock_released.set(true);
+                }
+            })
+        });
+        deferred
+            .update(cx, |workspace, window, cx| {
+                workspace.set_visible(true, window, cx);
+            })
+            .expect("activate deferred source");
+        cx.run_until_parked();
+        deferred
+            .read_with(cx, |workspace, cx| {
+                assert_eq!(workspace.fnx_source_buffer.as_ref(), Some(&dirty_buffer));
+                assert!(workspace.json_source_buffer.is_some());
+                assert!(workspace.source_is_dirty(cx));
+                assert!(workspace.item.read(cx).source_edit_locked());
+            })
+            .expect("shared draft after activation");
+        assert!(
+            !lock_released.get(),
+            "activation must retain the shared lock"
+        );
+        drop(subscription);
+    }
+
+    #[gpui::test]
+    async fn deferred_saved_source_refresh_waits_for_shared_buffers(cx: &mut TestAppContext) {
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("project");
+        let page = write_project(temporary.path());
+        let path = page_source_path(temporary.path(), page);
+        let (project, item, active) = open_code_workspace(temporary.path(), cx).await;
+        let cached = active
+            .update(cx, |workspace, window, cx| {
+                workspace.set_visible(false, window, cx);
+                workspace.fnx_source_buffer.clone().expect("cached source")
+            })
+            .expect("hide opened source");
+        let old = cached.read_with(cx, |buffer, _| buffer.text());
+        let new = old.replace("name=\"Original\"", "name=\"Latest saved source\"");
+        assert_ne!(new, old);
+        let deferred = cx.add_window({
+            let item = item.clone();
+            move |window, cx| FantaCodeWorkspace::new(item, project, window, cx)
+        });
+        std::fs::write(&path, &new).expect("external source save");
+        item.update(cx, |_, cx| cx.emit(FigItemEvent::Saved));
+        deferred
+            .update(cx, |workspace, window, cx| {
+                assert!(workspace.saved_sources_pending);
+                assert!(workspace.fnx_source_buffer.is_none());
+                workspace.set_visible(true, window, cx);
+                assert!(workspace.saved_sources_pending);
+            })
+            .expect("activate deferred source");
+        cx.run_until_parked();
+        deferred
+            .read_with(cx, |workspace, cx| {
+                assert_eq!(workspace.fnx_source_buffer.as_ref(), Some(&cached));
+                assert_eq!(cached.read(cx).text(), new);
+                assert!(!workspace.saved_sources_pending);
+                assert!(!workspace.source_is_dirty(cx));
+            })
+            .expect("refreshed shared source");
     }
 
     #[gpui::test]
@@ -2050,7 +2241,11 @@ mod tests {
         );
         let workspace = cx.add_window({
             let item = item.clone();
-            move |window, cx| FantaCodeWorkspace::new(item, project, window, cx)
+            move |window, cx| {
+                let mut workspace = FantaCodeWorkspace::new(item, project, window, cx);
+                workspace.set_visible(true, window, cx);
+                workspace
+            }
         });
         workspace
             .read_with(cx, |workspace, _| {
@@ -3652,6 +3847,7 @@ mod tests {
     }
     async fn mounted_source_recovery_fixture<'a>(
         root: &Path,
+        open_code: bool,
         cx: &'a mut TestAppContext,
     ) -> (
         Entity<crate::view::FigView>,
@@ -3724,21 +3920,201 @@ mod tests {
             window.refresh();
             window.draw(cx).clear();
         });
-        let button = cx
-            .debug_bounds("fanta-collapsible-tab-fanta-editor-workspace-2")
-            .unwrap_or_else(|| {
-                panic!(
-                    "Code tab; canvas bounds {:?}, inspector {:?}",
-                    cx.debug_bounds("fig-container"),
-                    cx.debug_bounds("fanta-inspector-sidebar")
-                )
+        if open_code {
+            let button = cx
+                .debug_bounds("fanta-collapsible-tab-fanta-editor-workspace-2")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Code tab; canvas bounds {:?}, inspector {:?}",
+                        cx.debug_bounds("fig-container"),
+                        cx.debug_bounds("fanta-inspector-sidebar")
+                    )
+                });
+            cx.simulate_click(button.center(), gpui::Modifiers::none());
+            cx.run_until_parked();
+            code.update_in(cx, |code, window, cx| {
+                code.select_file(CodeWorkspaceFile::Fnx, window, cx)
             });
-        cx.simulate_click(button.center(), gpui::Modifiers::none());
-        cx.run_until_parked();
-        code.update_in(cx, |code, window, cx| {
-            code.select_file(CodeWorkspaceFile::Fnx, window, cx)
-        });
+        }
         (view, code, item, cx)
+    }
+
+    #[gpui::test]
+    async fn canvas_defers_source_buffers_and_code_activation_catches_up(cx: &mut TestAppContext) {
+        use crate::editor_session::EditorWorkspace;
+
+        init_test(cx);
+        let temporary = tempfile::tempdir().expect("project");
+        let (page, child) = write_project_with_children(temporary.path());
+        let (mut document, assets) =
+            fanta_format::read_project_tree(temporary.path()).expect("document");
+        let mut other = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        other.name = "Other".into();
+        let other_page = other.id;
+        document.scene.insert(other).expect("second page");
+        document.add_page(other_page);
+        fanta_format::write_project_tree(temporary.path(), &document, &assets).expect("two pages");
+
+        let (view, code, item, cx) =
+            mounted_source_recovery_fixture(temporary.path(), false, cx).await;
+        let home_index = item.read_with(cx, |item, _| {
+            item.document()
+                .expect("document")
+                .pages
+                .iter()
+                .position(|entry| entry.root == Some(page))
+                .expect("Home page index")
+        });
+        view.update(cx, |view, cx| view.select_page(home_index, cx));
+        item.update(cx, |_, cx| {
+            cx.emit(FigItemEvent::StateChanged);
+            cx.emit(FigItemEvent::Saved);
+        });
+        cx.run_until_parked();
+        code.read_with(cx, |code, cx| {
+            assert!(!code.visible);
+            assert_eq!(item.read(cx).doc().and_then(Doc::active_page), Some(page));
+            assert!(code.fnx_editor.is_none());
+            assert!(code.json_editor.is_none());
+            assert!(code.fnx_load_task.is_none());
+            assert!(code.json_load_task.is_none());
+            let store = code.project.read(cx).buffer_store().read(cx);
+            assert_eq!(store.buffers().count(), 0);
+            assert_eq!(store.loading_buffers().count(), 0);
+        });
+
+        let set_workspace = |workspace, cx: &mut gpui::VisualTestContext| {
+            view.update(cx, |view, cx| view.set_editor_workspace(workspace, cx));
+            cx.update(|window, cx| {
+                window.refresh();
+                window.draw(cx).clear();
+            });
+            cx.run_until_parked();
+        };
+        set_workspace(EditorWorkspace::Code, cx);
+        let (fnx_buffer, json_buffer, fnx_editor) = code.read_with(cx, |code, _| {
+            assert!(code.visible);
+            assert_eq!(
+                code.fnx_path,
+                Some(page_source_path(temporary.path(), page))
+            );
+            assert_eq!(code.json_path, Some(page_json_path(temporary.path(), page)));
+            (
+                code.fnx_source_buffer.clone().expect("FNX buffer"),
+                code.json_source_buffer.clone().expect("JSON buffer"),
+                code.fnx_editor.clone().expect("FNX editor"),
+            )
+        });
+        fnx_buffer.update(cx, |buffer, cx| {
+            buffer.edit([(0..0, "// retained hidden draft\n")], None, cx);
+        });
+        cx.run_until_parked();
+        let draft = fnx_buffer.read_with(cx, |buffer, _| buffer.text());
+        set_workspace(EditorWorkspace::Canvas, cx);
+        item.update(cx, |_, cx| {
+            cx.emit(FigItemEvent::StateChanged);
+            cx.emit(FigItemEvent::Saved);
+        });
+        cx.run_until_parked();
+        set_workspace(EditorWorkspace::Code, cx);
+        code.read_with(cx, |code, cx| {
+            assert_eq!(code.fnx_source_buffer.as_ref(), Some(&fnx_buffer));
+            assert_eq!(code.json_source_buffer.as_ref(), Some(&json_buffer));
+            assert_eq!(code.fnx_editor.as_ref(), Some(&fnx_editor));
+            assert_eq!(fnx_buffer.read(cx).text(), draft);
+            assert!(code.source_is_dirty(cx));
+            assert!(item.read(cx).source_edit_locked());
+        });
+        code.update(cx, |code, cx| code.discard_source_edit(cx))
+            .await
+            .expect("discard retained draft");
+        cx.run_until_parked();
+
+        set_workspace(EditorWorkspace::Canvas, cx);
+        item.update(cx, |item, cx| {
+            item.apply(
+                fanta_doc::Operation::SetName {
+                    id: child,
+                    old: "Second child".into(),
+                    new: "Saved while hidden".into(),
+                },
+                cx,
+            )
+            .expect("canvas edit");
+        });
+        item.update(cx, |item, cx| {
+            item.save(crate::document::SaveKind::Auto, cx)
+        })
+        .await
+        .expect("save hidden canvas edit");
+        cx.run_until_parked();
+        code.read_with(cx, |code, _| {
+            assert!(!code.visible);
+            assert!(code.saved_sources_pending);
+            assert_eq!(code.fnx_editor.as_ref(), Some(&fnx_editor));
+        });
+        set_workspace(EditorWorkspace::Code, cx);
+        code.read_with(cx, |code, cx| {
+            assert_eq!(code.fnx_editor.as_ref(), Some(&fnx_editor));
+            assert!(fnx_buffer.read(cx).text().contains("Saved while hidden"));
+            assert!(!code.source_is_dirty(cx));
+            assert!(!item.read(cx).source_edit_locked());
+        });
+
+        set_workspace(EditorWorkspace::Canvas, cx);
+        let other_index = item.read_with(cx, |item, _| {
+            item.document()
+                .expect("document")
+                .pages
+                .iter()
+                .position(|entry| entry.root == Some(other_page))
+                .expect("other page index")
+        });
+        view.update(cx, |view, cx| view.select_page(other_index, cx));
+        item.update(cx, |item, cx| {
+            item.apply(
+                fanta_doc::Operation::SetName {
+                    id: other_page,
+                    old: "Other".into(),
+                    new: "Saved other page".into(),
+                },
+                cx,
+            )
+            .expect("rename hidden page");
+        });
+        item.update(cx, |item, cx| {
+            item.save(crate::document::SaveKind::Auto, cx)
+        })
+        .await
+        .expect("save latest page");
+        cx.run_until_parked();
+        code.read_with(cx, |code, cx| {
+            assert!(!code.visible);
+            assert_eq!(
+                item.read(cx).doc().and_then(Doc::active_page),
+                Some(other_page)
+            );
+            assert_eq!(code.requested_page, Some(page));
+            assert_eq!(code.fnx_source_buffer.as_ref(), Some(&fnx_buffer));
+        });
+        set_workspace(EditorWorkspace::Code, cx);
+        code.read_with(cx, |code, cx| {
+            assert_eq!(code.requested_page, Some(other_page));
+            assert_eq!(
+                code.fnx_path,
+                Some(page_source_path(temporary.path(), other_page))
+            );
+            assert!(
+                code.fnx_source_buffer
+                    .as_ref()
+                    .expect("latest FNX")
+                    .read(cx)
+                    .text()
+                    .contains("Saved other page")
+            );
+            assert!(code.json_editor.is_some());
+            assert!(code.error_message.is_none());
+        });
     }
 
     #[cfg(feature = "fanta-gpui-ui")]
@@ -3768,7 +4144,8 @@ mod tests {
         let draft = original.replacen("Accepted row", "Unsaved draft row", 1);
         assert_ne!(draft, original, "the test must create a real source edit");
 
-        let (view, code, item, cx) = mounted_source_recovery_fixture(temporary.path(), cx).await;
+        let (view, code, item, cx) =
+            mounted_source_recovery_fixture(temporary.path(), true, cx).await;
         item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
                 document.doc.selection.replace_with([row]);
@@ -4018,7 +4395,8 @@ mod tests {
         init_test(cx);
         let temporary = tempfile::tempdir().expect("project");
         let (page, child) = write_spacing_project(temporary.path());
-        let (view, code, item, cx) = mounted_source_recovery_fixture(temporary.path(), cx).await;
+        let (view, code, item, cx) =
+            mounted_source_recovery_fixture(temporary.path(), true, cx).await;
         code.update_in(cx, |code, window, cx| {
             assert!(
                 code.active_editor()
@@ -4082,7 +4460,8 @@ mod tests {
         let (page, child) = write_spacing_project(temporary.path());
         let path = page_source_path(temporary.path(), page);
         let original = std::fs::read_to_string(&path).expect("FNX");
-        let (view, code, item, cx) = mounted_source_recovery_fixture(temporary.path(), cx).await;
+        let (view, code, item, cx) =
+            mounted_source_recovery_fixture(temporary.path(), true, cx).await;
         code.update_in(cx, |code, window, cx| {
             code.fnx_editor
                 .as_ref()
@@ -4242,7 +4621,7 @@ mod tests {
             let path = page_source_path(temporary.path(), page);
             let original = std::fs::read_to_string(&path).expect("FNX");
             let (_view, code, item, cx) =
-                mounted_source_recovery_fixture(temporary.path(), test_cx).await;
+                mounted_source_recovery_fixture(temporary.path(), true, test_cx).await;
             code.update_in(cx, |code, window, cx| {
                 code.fnx_editor
                     .as_ref()
