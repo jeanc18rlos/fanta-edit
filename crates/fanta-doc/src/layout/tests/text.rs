@@ -3,6 +3,90 @@
 
 use super::*;
 
+#[test]
+fn expanded_layout_cancellation_stops_measurement_and_completed_layout_matches() {
+    let root = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    let root_id = root.id;
+    let mut expansion = vec![crate::ExpandedNode {
+        node: root,
+        def_path: Default::default(),
+    }];
+    for position in 0..256 {
+        let mut text = TextNode::new("Auto width label", 999.0, 20.0);
+        text.auto_resize = TextAutoResize::WidthAndHeight;
+        let mut child = CanvasNode::new(NodeData::Text(text));
+        child.parent = Some(root_id);
+        child.index = crate::IndexKey::from_raw(f64::from(position));
+        let path = [child.id].into_iter().collect();
+        expansion.push(crate::ExpandedNode {
+            node: child,
+            def_path: path,
+        });
+    }
+    let mut cancelled = expansion.clone();
+    let measured = std::cell::Cell::new(0);
+    let complete = solve_expanded_cancellable(
+        &mut cancelled,
+        &mut |_| {
+            measured.set(measured.get() + 1);
+            (105.0, 16.0)
+        },
+        &|| measured.get() >= 2,
+    );
+    assert!(!complete);
+    assert_eq!(
+        measured.get(),
+        2,
+        "new camera stops expensive text preparation"
+    );
+    let mut expected = expansion.clone();
+    solve_expanded(&mut expected, &mut |_| (105.0, 16.0));
+    assert!(solve_expanded_cancellable(
+        &mut expansion,
+        &mut |_| (105.0, 16.0),
+        &|| false,
+    ));
+    assert_eq!(expansion, expected);
+    let tree = ExpandedTree::new(&mut expansion);
+    assert_eq!(tree.children(root_id).len(), 256);
+    for child in tree.children(root_id) {
+        assert!(tree.node(child).is_some());
+    }
+}
+
+#[test]
+fn expanded_tree_index_preserves_equal_sibling_order_during_geometry_changes() {
+    let root = CanvasNode::new(NodeData::Group(GroupNode::default()));
+    let root_id = root.id;
+    let mut expansion = vec![crate::ExpandedNode {
+        node: root,
+        def_path: Default::default(),
+    }];
+    let mut identifiers = Vec::new();
+    for index in [0.4, 2.0, 0.4, -1.0] {
+        let mut child = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        child.parent = Some(root_id);
+        child.index = crate::IndexKey::from_raw(index);
+        identifiers.push(child.id);
+        expansion.push(crate::ExpandedNode {
+            def_path: [child.id].into_iter().collect(),
+            node: child,
+        });
+    }
+    let mut tree = ExpandedTree::new(&mut expansion);
+    let first = *identifiers.first().expect("first sibling");
+    tree.node_mut(first).expect("indexed child").transform = Transform2D::translation(50.0, 12.0);
+    let expected = [3, 0, 2, 1]
+        .into_iter()
+        .map(|position| *identifiers.get(position).expect("sibling position"))
+        .collect::<Vec<_>>();
+    assert_eq!(tree.children(root_id), expected);
+    assert_eq!(
+        tree.node(first).expect("child").transform,
+        Transform2D::translation(50.0, 12.0)
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Auto-width text via injected measure
 // ---------------------------------------------------------------------------

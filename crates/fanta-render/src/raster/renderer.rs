@@ -5,6 +5,7 @@
 //! and the per-frame state plumbing.
 //!
 //! [`InstanceCache`]: InstanceCache
+use super::camera_cache::{CameraCache, CameraCacheResult};
 use super::layer_cache::{CacheByteCounter, ComponentDependencies};
 use super::walk::render_scoped_root;
 use super::{
@@ -44,6 +45,7 @@ pub struct RenderMetrics {
     /// per-node geometry-stamp invalidation: a steady frame reports 0, an
     /// edit to one node reports 1, never the scene size.
     pub paths_built: u32,
+    pub bounds_prepared: u32,
     /// Instance child indexes prepared on expansion misses; cache hits reuse them.
     pub instance_indexes_built: u32,
     /// Node-level effects save-layers pushed this frame (opacity, drop shadow,
@@ -73,6 +75,12 @@ pub struct RenderMetrics {
     /// An observable filter/allocation/readback failure omitted a backdrop effect.
     pub effect_failed: bool,
     pub(crate) sampling_budget: Option<crate::sampling::SamplingWorkBudget>,
+    pub(crate) camera_recording: bool,
+    pub(crate) volatile_artwork: bool,
+    pub(crate) camera_unsupported: bool,
+    pub(crate) camera_bounds: Option<super::Bounds>,
+    pub(crate) camera_visible: Option<super::Bounds>,
+    pub(crate) camera_cancelled: bool,
 }
 
 /// Serialization controls for the headless SVG canvas.
@@ -305,6 +313,33 @@ pub(crate) struct PreparedInstance {
 }
 
 impl PreparedInstance {
+    pub(crate) fn new_cancellable(
+        nodes: Vec<ExpandedNode>,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Option<Self> {
+        let mut children: HashMap<NodeId, Vec<usize>> = HashMap::new();
+        let mut root = None;
+        for (index, entry) in nodes.iter().enumerate() {
+            if should_cancel() {
+                return None;
+            }
+            if let Some(parent) = entry.node.parent {
+                children.entry(parent).or_default().push(index);
+            }
+            if root.is_none() && entry.def_path.is_empty() {
+                root = Some(index);
+            }
+        }
+        // Painting can bound resolved leaves directly. Avoid an uncancellable
+        // recursive preparation pass before the latest camera can be serviced.
+        Some(Self {
+            nodes,
+            children,
+            root,
+            bounds: None,
+        })
+    }
+
     pub(crate) fn new(nodes: Vec<ExpandedNode>) -> Self {
         // These indices refer to the immutable expansion's slots, so they must
         // be replaced and evicted with that expansion, preserving its tie order.
@@ -715,10 +750,9 @@ impl BooleanCache {
 /// bumps `scene.revision()` and re-keys, so stale entries are never looked up
 /// again and are dropped by [`evict_stale`] each render.
 ///
-/// Only *live scene* nodes are cached: transient instance-expansion clones have
-/// no scene id (their `paint_node_content` call passes `scene_id: None`) and a
-/// node whose variable/motion overlay replaced it this frame is bypassed by the
-/// caller, so per-frame geometry never pins a cache entry.
+/// Transient expansion clones and resolved overlays share a bounded cache
+/// only after their complete geometry matches, since their IDs/stamps do not
+/// identify the geometry that is actually painted.
 ///
 /// [`vector_outline_sk_path`]: super::vector_outline_sk_path
 /// [`to_sk_fill_path`]: super::to_sk_fill_path
@@ -727,6 +761,7 @@ impl BooleanCache {
 pub(crate) struct PathCache {
     pub(crate) entries: IdHashMap<NodeId, (u64, CachedVectorPaths)>,
     pub(crate) removal_seen: u64,
+    pub(crate) shared: super::vector::SharedVectorPathCache,
 }
 
 /// The Skia paths [`draw_vector`](super::draw_vector) needs for one vector
@@ -750,6 +785,7 @@ pub(crate) struct CachedVectorPaths {
 impl PathCache {
     fn clear(&mut self) {
         self.entries.clear();
+        self.shared.clear();
     }
 
     /// Purge entries for nodes that left the scene — gated on the scene's
@@ -912,6 +948,8 @@ pub struct RasterRenderer {
     ///
     /// [`Scene::instance_id`]: fanta_doc::Scene::instance_id
     last_scene_instance_id: Option<u64>,
+    camera_cache: CameraCache,
+    camera_local_bounds: IdHashMap<NodeId, Option<super::Bounds>>,
 }
 
 impl RasterRenderer {
@@ -919,6 +957,12 @@ impl RasterRenderer {
     /// laying out newly visible text can register a downloaded font face.
     pub fn current_font_generation() -> Option<u64> {
         super::text::with_layout_engine(fanta_text::LayoutEngine::font_generation)
+    }
+
+    /// Observe this thread's font epoch without accessing its layout engine
+    /// from another thread when checking a parked frame's validity.
+    pub fn current_font_generation_observer() -> fanta_text::FontGenerationObserver {
+        super::text::with_layout_engine(fanta_text::LayoutEngine::font_generation_observer)
     }
 
     /// Construct a renderer for `width` × `height` pixels. Returns `Err` for a
@@ -953,6 +997,8 @@ impl RasterRenderer {
             layer_cache: LayerCache::default(),
             pixel_snap_pan: false,
             last_scene_instance_id: None,
+            camera_cache: CameraCache::default(),
+            camera_local_bounds: IdHashMap::default(),
         })
     }
 
@@ -1033,6 +1079,7 @@ impl RasterRenderer {
         {
             return;
         }
+        self.camera_cache.clear();
         self.asset_resolver = Some(resolver);
         self.pattern_cache.clear();
         self.layer_cache.clear();
@@ -1043,6 +1090,7 @@ impl RasterRenderer {
     /// callers can call this to reclaim image memory (e.g. when switching
     /// documents) or after swapping the asset resolver for an unrelated store.
     pub fn clear_image_cache(&mut self) {
+        self.camera_cache.clear();
         self.layer_cache.clear();
         self.image_cache.clear();
         self.pattern_cache.clear();
@@ -1071,6 +1119,7 @@ impl RasterRenderer {
     /// feeds the asset GC, which is keyed by asset id). Returns whether an entry
     /// was present.
     pub fn invalidate_image(&mut self, id: fanta_doc::AssetId) -> bool {
+        self.camera_cache.clear();
         self.pattern_cache.clear();
         self.layer_cache.clear();
         self.image_cache.remove(id)
@@ -1082,6 +1131,15 @@ impl RasterRenderer {
     /// reclaim memory after switching documents or doing a big component edit.
     pub fn clear_instance_cache(&mut self) {
         self.instance_cache.clear();
+    }
+
+    pub(super) fn clear_camera_dependencies(&mut self) {
+        self.camera_local_bounds.clear();
+        self.instance_cache.clear();
+        self.pattern_cache.clear();
+        // A retained effect layer may contain pattern pixels whose source was
+        // painted with layer dependency recording disabled.
+        self.layer_cache.clear();
     }
 
     /// Drop all cached boolean-operation folded paths. They will be recomputed
@@ -1345,6 +1403,8 @@ impl RasterRenderer {
             inputs,
             true,
             None,
+            None,
+            None,
             &mut metrics,
         );
 
@@ -1384,8 +1444,290 @@ impl RasterRenderer {
         inputs: &RenderInputs,
     ) -> RenderMetrics {
         self.render_to_canvas_configured(
-            canvas, target_w, target_h, scene, viewport, page_root, inputs, true, None,
+            canvas, target_w, target_h, scene, viewport, page_root, inputs, true, None, None,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn render_camera_fallback(
+        &mut self,
+        canvas: &Canvas,
+        target_w: u32,
+        target_h: u32,
+        scene: &Scene,
+        viewport: &Viewport,
+        page_root: Option<NodeId>,
+        inputs: &RenderInputs,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> RenderMetrics {
+        self.render_to_canvas_configured(
+            canvas,
+            target_w,
+            target_h,
+            scene,
+            viewport,
+            page_root,
+            inputs,
+            true,
+            None,
+            Some(should_cancel),
+        )
+    }
+
+    /// Drop retained page images when host dependencies change outside document revisions.
+    pub fn clear_camera_cache(&mut self) {
+        self.camera_cache.clear();
+        self.camera_local_bounds.clear();
+    }
+
+    pub(super) fn clear_camera_bounds(&mut self) {
+        self.camera_local_bounds.clear();
+    }
+
+    #[cfg(test)]
+    pub(super) fn prepared_camera_bounds_count(&self) -> usize {
+        self.camera_local_bounds.len()
+    }
+
+    /// Retain visible artwork in GPU tiles at the exact scale. Missing coverage
+    /// replays an exact visible paint recording while tiles are populated; it
+    /// never displays an enlarged page preview. Backdrop effects use normal rendering.
+    /// Raster canvases use normal rendering: CPU curve clipping is device-dependent and
+    /// does not preserve the pixels of an arbitrarily cropped retained tile.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_camera_to_canvas(
+        &mut self,
+        canvas: &Canvas,
+        target_w: u32,
+        target_h: u32,
+        scene: &Scene,
+        viewport: &Viewport,
+        page_root: Option<NodeId>,
+        inputs: &RenderInputs,
+        content_generation: u64,
+        camera_interacting: bool,
+    ) -> CameraCacheResult {
+        self.render_camera_to_canvas_cancellable(
+            canvas,
+            target_w,
+            target_h,
+            scene,
+            viewport,
+            page_root,
+            inputs,
+            content_generation,
+            camera_interacting,
+            &|| false,
+        )
+    }
+
+    /// The host must drain recorded GPU work before releasing leases, including
+    /// cancelled calls. Cancellation never certifies the target's partial pixels.
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_camera_to_canvas_cancellable(
+        &mut self,
+        canvas: &Canvas,
+        target_w: u32,
+        target_h: u32,
+        scene: &Scene,
+        viewport: &Viewport,
+        page_root: Option<NodeId>,
+        inputs: &RenderInputs,
+        content_generation: u64,
+        camera_interacting: bool,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> CameraCacheResult {
+        if !super::camera_cache::is_gpu_canvas(canvas) {
+            return super::camera_cache::fallback(
+                self, canvas, target_w, target_h, scene, viewport, page_root, inputs,
+            );
+        }
+        let mut cache = std::mem::take(&mut self.camera_cache);
+        let result = cache.render(
+            self,
+            canvas,
+            target_w,
+            target_h,
+            scene,
+            viewport,
+            page_root,
+            inputs,
+            content_generation,
+            camera_interacting,
+            should_cancel,
+        );
+        self.camera_cache = cache;
+        result
+    }
+
+    /// Populate at most one retained tile after a sharp frame has been published.
+    /// This never paints the supplied canvas or traverses the authoring scene.
+    /// The caller must drain recorded GPU work before releasing its target or leases,
+    /// even when a newer camera cancels maintenance. One tile does not bound GPU wait time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn maintain_camera_cache(
+        &mut self,
+        canvas: &Canvas,
+        target_w: u32,
+        target_h: u32,
+        scene: &Scene,
+        viewport: &Viewport,
+        page_root: Option<NodeId>,
+        inputs: &RenderInputs,
+        content_generation: u64,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> CameraCacheResult {
+        if !super::camera_cache::is_gpu_canvas(canvas) {
+            return CameraCacheResult {
+                metrics: RenderMetrics::default(),
+                cache: Default::default(),
+                needs_refresh: false,
+                complete_detail: true,
+                cancelled: should_cancel(),
+            };
+        }
+        let mut cache = std::mem::take(&mut self.camera_cache);
+        let result = cache.maintain(
+            self,
+            canvas,
+            target_w,
+            target_h,
+            scene,
+            viewport,
+            page_root,
+            inputs,
+            content_generation,
+            should_cancel,
+        );
+        self.camera_cache = cache;
+        result
+    }
+
+    #[cfg(test)]
+    pub(super) fn record_camera_picture(
+        &mut self,
+        scene: &Scene,
+        scale: f64,
+        page_root: Option<NodeId>,
+        inputs: &RenderInputs,
+    ) -> Result<(skia_safe::Picture, RenderMetrics), Box<RenderMetrics>> {
+        self.record_camera_picture_with_region(scene, scale, page_root, inputs, None, &|| false)
+    }
+
+    pub(super) fn record_camera_region(
+        &mut self,
+        scene: &Scene,
+        scale: f64,
+        page_root: Option<NodeId>,
+        inputs: &RenderInputs,
+        coverage: Rect,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<(skia_safe::Picture, RenderMetrics), Box<RenderMetrics>> {
+        self.record_camera_picture_with_region(
+            scene,
+            scale,
+            page_root,
+            inputs,
+            Some(coverage),
+            should_cancel,
+        )
+    }
+
+    fn record_camera_picture_with_region(
+        &mut self,
+        scene: &Scene,
+        scale: f64,
+        page_root: Option<NodeId>,
+        inputs: &RenderInputs,
+        coverage: Option<Rect>,
+        should_cancel: &dyn Fn() -> bool,
+    ) -> Result<(skia_safe::Picture, RenderMetrics), Box<RenderMetrics>> {
+        let started = Instant::now();
+        self.sync_scene_instance(scene);
+        self.instance_cache
+            .begin_frame(scene, inputs.mode_generation, inputs.components);
+        self.boolean_cache.purge_removed(scene);
+        self.path_cache.purge_removed(scene);
+        let mut recorder = skia_safe::PictureRecorder::new();
+        // RTree computes the finished bounds from the actual paint commands, including
+        // expanded instances and filters. Authoring boxes alone omit that overflow.
+        let limit = f32::MAX / 4.0;
+        let canvas = recorder.begin_recording(
+            coverage.unwrap_or(Rect::new(-limit, -limit, limit, limit)),
+            true,
+        );
+        let mut metrics = RenderMetrics {
+            camera_recording: true,
+            camera_visible: coverage.map(|coverage| super::Bounds {
+                min_x: f64::from(coverage.left) / scale,
+                min_y: f64::from(coverage.top) / scale,
+                max_x: f64::from(coverage.right) / scale,
+                max_y: f64::from(coverage.bottom) / scale,
+            }),
+            ..Default::default()
+        };
+        let viewport = Viewport {
+            center: [1.0 / scale, 1.0 / scale],
+            zoom: scale / self.display_scale,
+        };
+        Self::draw_scene_onto(
+            canvas,
+            2,
+            2,
+            self.background,
+            self.display_scale,
+            self.asset_resolver.as_deref(),
+            &mut self.image_cache,
+            &mut self.instance_cache,
+            &mut self.boolean_cache,
+            &mut self.path_cache,
+            &mut self.pattern_cache,
+            &mut self.layer_cache,
+            true,
+            scene,
+            &viewport,
+            page_root,
+            inputs,
+            true,
+            None,
+            coverage.map(|_| &mut self.camera_local_bounds),
+            Some(should_cancel),
+            &mut metrics,
+        );
+        metrics.frame_micros = started.elapsed().as_micros() as u64;
+        if metrics.incomplete_artwork
+            || metrics.non_artwork_content
+            || metrics.effect_failed
+            || metrics.volatile_artwork
+            || metrics.camera_unsupported
+            || metrics.camera_cancelled
+        {
+            return Err(Box::new(metrics));
+        }
+        // Mask save-layers affect transparent black and make Skia's automatic RTree
+        // bound as large as its input cull. Resolved subtree bounds keep those controls
+        // inside the complete finite artwork coverage before the RTree is finalized.
+        let bounds = match coverage {
+            Some(coverage) => coverage,
+            None => match metrics.camera_bounds {
+                Some(bounds) => super::camera_cache::bounds_rect(bounds),
+                None => return Err(Box::new(metrics)),
+            },
+        };
+        let Some(picture) = recorder.finish_recording_as_picture(Some(&bounds)) else {
+            return Err(Box::new(metrics));
+        };
+        metrics.frame_micros = started.elapsed().as_micros() as u64;
+        Ok((picture, metrics))
+    }
+
+    pub(super) fn camera_background(
+        &self,
+        scene: &Scene,
+        page_root: Option<NodeId>,
+        inputs: &RenderInputs,
+    ) -> Color {
+        page_background_color(scene, page_root, inputs).unwrap_or(self.background)
     }
 
     /// Draw one prepared phase onto a transparent surface (Below includes the
@@ -1488,6 +1830,7 @@ impl RasterRenderer {
                 phase,
                 clear_target,
             }),
+            None,
         ))
     }
 
@@ -1503,6 +1846,7 @@ impl RasterRenderer {
         inputs: &RenderInputs,
         supports_offscreen_layers: bool,
         split: Option<super::split::SplitPass<'_>>,
+        should_cancel: Option<&dyn Fn() -> bool>,
     ) -> RenderMetrics {
         let started = Instant::now();
         let mut metrics = RenderMetrics::default();
@@ -1547,6 +1891,8 @@ impl RasterRenderer {
             inputs,
             supports_offscreen_layers,
             split,
+            None,
+            should_cancel,
             &mut metrics,
         );
 
@@ -1601,6 +1947,7 @@ impl RasterRenderer {
             page_root,
             inputs,
             false,
+            None,
             None,
         );
         let data = svg_canvas.end();
@@ -1778,6 +2125,8 @@ impl RasterRenderer {
         canvas.scale((effective_scale, effective_scale));
         canvas.translate((-viewport.center[0] as f32, -viewport.center[1] as f32));
         let mut ctx = RenderCtx {
+            should_cancel: None,
+            filtered_ancestor: false,
             split: None,
             scene,
             resolver,
@@ -1844,6 +2193,8 @@ impl RasterRenderer {
         inputs: &RenderInputs,
         supports_offscreen_layers: bool,
         split: Option<super::split::SplitPass<'_>>,
+        mut prepared_bounds: Option<&mut IdHashMap<NodeId, Option<super::Bounds>>>,
+        should_cancel: Option<&dyn Fn() -> bool>,
         metrics: &mut RenderMetrics,
     ) {
         // A page root carrying a solid background is the document's canvas
@@ -1858,7 +2209,10 @@ impl RasterRenderer {
         } else {
             page_background.unwrap_or(background)
         };
-        if split.is_none_or(|split| split.clear_target || split.phase == super::SplitPhase::Below) {
+        if !metrics.camera_recording
+            && split
+                .is_none_or(|split| split.clear_target || split.phase == super::SplitPhase::Below)
+        {
             canvas.clear(to_sk_color(clear));
         }
 
@@ -1870,7 +2224,18 @@ impl RasterRenderer {
         // inverting exactly the transform applied below. See
         // [`visible_world_rect`] for the algebra; nodes whose world AABB misses
         // this rect are culled before they (or their subtree) are drawn.
-        let visible = visible_world_rect(target_w, target_h, display_scale, viewport);
+        let visible = if let Some(visible) = metrics.camera_visible {
+            visible
+        } else if metrics.camera_recording {
+            super::Bounds {
+                min_x: f64::NEG_INFINITY,
+                min_y: f64::NEG_INFINITY,
+                max_x: f64::INFINITY,
+                max_y: f64::INFINITY,
+            }
+        } else {
+            visible_world_rect(target_w, target_h, display_scale, viewport)
+        };
 
         // Apply the viewport transform: translate so `viewport.center` maps to
         // the (physical) screen center, then scale by `viewport.zoom *
@@ -1902,7 +2267,8 @@ impl RasterRenderer {
         // Motion playback moves nodes
         // without touching any epoch input, so a motion frame neither
         // consults nor fills the cache.
-        let layer_cache_populate = split.is_none()
+        let layer_cache_populate = !metrics.camera_recording
+            && split.is_none()
             && layer_cache.begin_frame(
                 canvas,
                 scene,
@@ -1917,13 +2283,16 @@ impl RasterRenderer {
                 effective_scale,
                 (root_tx, root_ty),
             );
-        let layer_cache_lookups = split.is_none()
+        let layer_cache_lookups = !metrics.camera_recording
+            && split.is_none()
             && supports_offscreen_layers
             && inputs.motion.is_none()
             && layer_cache.is_enabled();
 
         // Walk roots in z-order. Sub-tree recursion via the helper below.
         let mut ctx = RenderCtx {
+            should_cancel,
+            filtered_ancestor: false,
             split,
             scene,
             resolver,
@@ -1937,7 +2306,10 @@ impl RasterRenderer {
             instance_mode_anchor: None,
             resolved_local_transforms: IdHashMap::default(),
             resolved_world_transforms: IdHashMap::default(),
-            resolved_local_bounds: IdHashMap::default(),
+            resolved_local_bounds: prepared_bounds
+                .as_deref_mut()
+                .map(std::mem::take)
+                .unwrap_or_default(),
             visible,
             effective_scale,
             page_background_root: page_background.and(page_root),
@@ -1962,6 +2334,12 @@ impl RasterRenderer {
             }
         }
 
+        ctx.metrics.volatile_artwork |= ctx.layer_volatile;
+        if let Some(prepared_bounds) = prepared_bounds {
+            // Interrupted unions never insert an ancestor entry. Fully completed
+            // child entries remain exact and useful for the next camera request.
+            *prepared_bounds = std::mem::take(&mut ctx.resolved_local_bounds);
+        }
         canvas.restore();
     }
 

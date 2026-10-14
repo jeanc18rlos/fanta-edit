@@ -37,6 +37,7 @@ pub mod transform;
 pub use asset::{AssetResolver, DecodedImage, InMemoryAssetResolver, LazyAssetResolver};
 pub use bounds::visual_world_bounds;
 pub use color::{to_sk_color, to_sk_color4f};
+pub use fanta_text::FontGenerationObserver;
 pub use image::{
     FitRects, ImageCache, crop_to_pixels, draw_decoded_image, draw_image_cached, fit_src_dst,
 };
@@ -45,18 +46,18 @@ pub use path::to_sk_path;
 // `vector_outline_sk_path`: track svg-prod — the effective vector outline,
 // shared with the app's flatten/outline/simplify geometry ops.
 pub use raster::{
-    MediaPlayback, RasterRenderer, RenderError, RenderInputs, RenderMetrics, RetainedBuildMetrics,
-    RetainedError, RetainedFrame, RetainedFrameMetrics, RetainedTranslationSession, SplitError,
-    SplitPhase, SplitSpec, SvgRenderOptions, SvgRenderOutput, TextPathAffinity,
-    TextPathCaretSegment, TextPathPosition, TextPathSelectionQuad, TextPathVisualDirection,
-    measure_text_node, rounded_rect_contains_point, solve_doc_layout, solve_scene_layout,
-    text_caret_rect, text_first_baseline, text_hit_test, text_line_height, text_node_outline,
-    text_path_caret_segment, text_path_caret_segment_at, text_path_contains_point,
-    text_path_hit_test, text_path_hit_test_position, text_path_selection_quads,
-    text_path_visual_bounds, text_path_visual_line_edge, text_path_visual_neighbor,
-    text_path_visual_selection_edge, text_selection_rects, vector_contains_point,
-    vector_outline_sk_path,
+    CameraCacheMetrics, CameraCacheResult, MediaPlayback, RasterRenderer, RenderError,
+    RenderInputs, RenderMetrics, RetainedBuildMetrics, RetainedError, RetainedFrame,
+    RetainedFrameMetrics, RetainedTranslationSession, SplitError, SplitPhase, SplitSpec,
+    SvgRenderOptions, SvgRenderOutput, TextPathAffinity, TextPathCaretSegment, TextPathPosition,
+    TextPathSelectionQuad, TextPathVisualDirection, measure_text_node, rounded_rect_contains_point,
+    solve_doc_layout, solve_scene_layout, text_caret_rect, text_first_baseline, text_hit_test,
+    text_line_height, text_node_outline, text_path_caret_segment, text_path_caret_segment_at,
+    text_path_contains_point, text_path_hit_test, text_path_hit_test_position,
+    text_path_selection_quads, text_path_visual_bounds, text_path_visual_line_edge,
+    text_path_visual_neighbor, text_path_visual_selection_edge, text_selection_rects,
+    vector_contains_point, vector_outline_sk_path,
 };
 #[cfg(feature = "metal")]
-pub use raster::{RetainedGpuTarget, RetainedGraphiteContext};
+pub use raster::{GraphiteSubmissionMetrics, RetainedGpuTarget, RetainedGraphiteContext};
 pub use transform::to_sk_matrix;

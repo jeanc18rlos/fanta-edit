@@ -16,6 +16,123 @@ const MAX_CACHED_SOURCES: usize = 16;
 const MAX_CACHED_MOTIFS: usize = 64;
 const MAX_PATTERN_DEPTH: usize = 8;
 
+#[cfg(test)]
+mod context_tests {
+    use super::super::renderer::{BooleanCache, InstanceCache, PathCache};
+    use super::super::{ImageCache, LayerCache, RenderInputs, RenderMetrics};
+    use super::*;
+    use fanta_doc::{CanvasNode, Color, Doc, GroupNode, IdHashMap, VectorNode};
+
+    #[test]
+    fn pattern_subrender_restores_page_bounds_and_refuses_cancelled_source_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut doc = Doc::new();
+        let root = CanvasNode::new(NodeData::Group(GroupNode {
+            background: Some(Fill::solid(Color::WHITE)),
+            ..GroupNode::default()
+        }));
+        let source_id = root.id;
+        doc.scene.insert(root)?;
+        for position in 0..32 {
+            let mut child = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                f64::from(position),
+                0.0,
+                1.0,
+                8.0,
+                Color::rgb(40, 80, 160),
+            )));
+            child.parent = Some(source_id);
+            if position == 0 {
+                child.blurs.push(fanta_doc::Blur::layer(300.0));
+            }
+            doc.scene.insert(child)?;
+        }
+        let pattern = PatternFill {
+            source_node_id: source_id,
+            tile_type: PatternTileType::Rectangular,
+            scaling_factor: 1.0,
+            spacing: Default::default(),
+            horizontal_alignment: PatternHorizontalAlignment::Start,
+        };
+        let inputs = RenderInputs::for_doc(&doc);
+        let page_scale = 0.125;
+        let visible = Bounds::from_xywh(-100.0, -100.0, 200.0, 200.0);
+        let preserved: IdHashMap<_, _> = [(
+            source_id,
+            Some(Bounds::from_xywh(-500.0, -400.0, 1000.0, 800.0)),
+        )]
+        .into_iter()
+        .collect();
+        for cancel in [false, true] {
+            let mut images = ImageCache::default();
+            let mut instances = InstanceCache::default();
+            let mut booleans = BooleanCache::default();
+            let mut paths = PathCache::default();
+            let mut patterns = PatternCache::default();
+            let mut layers = LayerCache::default();
+            let mut metrics = RenderMetrics {
+                camera_recording: true,
+                camera_visible: Some(visible),
+                ..Default::default()
+            };
+            let checks = std::cell::Cell::new(0);
+            let should_cancel = || {
+                checks.set(checks.get() + 1);
+                cancel && checks.get() >= 12
+            };
+            let mut ctx = RenderCtx {
+                should_cancel: Some(&should_cancel),
+                split: None,
+                scene: &doc.scene,
+                resolver: None,
+                cache: &mut images,
+                instance_cache: &mut instances,
+                boolean_cache: &mut booleans,
+                path_cache: &mut paths,
+                pattern_cache: &mut patterns,
+                pattern_stack: Vec::new(),
+                inputs: &inputs,
+                instance_mode_anchor: None,
+                resolved_local_transforms: IdHashMap::default(),
+                resolved_world_transforms: IdHashMap::default(),
+                resolved_local_bounds: preserved.clone(),
+                visible,
+                effective_scale: page_scale,
+                filtered_ancestor: false,
+                page_background_root: Some(source_id),
+                supports_offscreen_layers: true,
+                paint_alpha: 1.0,
+                layer_cache: &mut layers,
+                layer_cache_lookups: false,
+                layer_cache_populate: false,
+                live_video_fill_subtrees: IdHashMap::default(),
+                layer_volatile: false,
+                metrics: &mut metrics,
+            };
+            let source = render_source(&pattern, &mut ctx);
+            assert_eq!(
+                ctx.resolved_local_bounds, preserved,
+                "source-scale bounds must not replace or extend the page memo"
+            );
+            assert_eq!(ctx.effective_scale, page_scale);
+            assert_eq!(ctx.visible, visible);
+            assert!(ctx.pattern_stack.is_empty());
+            if cancel {
+                assert!(ctx.metrics.camera_cancelled);
+                assert!(source.is_none());
+                assert!(
+                    ctx.pattern_cache.sources.is_empty(),
+                    "an interrupted surface cannot become reusable pattern artwork"
+                );
+            } else {
+                assert!(source.is_some());
+                assert_eq!(ctx.pattern_cache.sources.len(), 1);
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct SourceKey {
     id: NodeId,
@@ -315,6 +432,9 @@ fn render_source(
         &mut ctx.effective_scale,
         width as f32 / bounds.width() as f32,
     );
+    // Visual subtree unions include scale-capped filter reach. Source-raster
+    // entries cannot certify bounds at the page's different device scale.
+    let old_bounds = std::mem::take(&mut ctx.resolved_local_bounds);
     let old_background = ctx.page_background_root.take();
     let old_layers = std::mem::replace(&mut ctx.supports_offscreen_layers, true);
     let old_lookup = std::mem::replace(&mut ctx.layer_cache_lookups, false);
@@ -332,8 +452,12 @@ fn render_source(
     ctx.page_background_root = old_background;
     ctx.supports_offscreen_layers = old_layers;
     ctx.effective_scale = old_scale;
+    ctx.resolved_local_bounds = old_bounds;
     ctx.visible = old_visible;
     canvas.restore();
+    if ctx.metrics.camera_cancelled {
+        return None;
+    }
     let image = surface.image_snapshot();
     let source = if !volatile && ctx.inputs.motion.is_none() {
         ctx.pattern_cache.put_source(

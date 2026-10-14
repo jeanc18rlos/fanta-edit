@@ -7,6 +7,169 @@ use super::{
     pattern_paint, scale_paint_alpha, shader_paint, stroke_to_paint, to_sk_color, to_sk_fill_path,
     to_sk_path,
 };
+use lru::LruCache;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
+
+const SHARED_PATH_CACHE_CAP: NonZeroUsize = NonZeroUsize::MIN.saturating_add(4_095);
+const SHARED_PATH_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+struct VectorGeometryEntry {
+    path: fanta_doc::PathData,
+    corner_radius: Option<f64>,
+    corner_radii: Option<[f64; 4]>,
+    corner_smoothing: f32,
+    compiled: CachedVectorPaths,
+    bytes: usize,
+}
+
+pub(crate) struct SharedVectorPathCache {
+    entries: LruCache<u64, VectorGeometryEntry>,
+    bytes: usize,
+    maximum_bytes: usize,
+}
+
+impl Default for SharedVectorPathCache {
+    fn default() -> Self {
+        Self::new(SHARED_PATH_CACHE_CAP, SHARED_PATH_CACHE_BYTES)
+    }
+}
+
+impl SharedVectorPathCache {
+    fn new(capacity: NonZeroUsize, maximum_bytes: usize) -> Self {
+        Self {
+            entries: LruCache::new(capacity),
+            bytes: 0,
+            maximum_bytes,
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
+
+    fn get_or_build(
+        &mut self,
+        path: &fanta_doc::PathData,
+        corner_radius: Option<f64>,
+        corner_radii: Option<[f64; 4]>,
+        corner_smoothing: f32,
+    ) -> (CachedVectorPaths, bool) {
+        let key = vector_geometry_key(path, corner_radius, corner_radii, corner_smoothing);
+        self.get_or_build_with_key(key, path, corner_radius, corner_radii, corner_smoothing)
+    }
+
+    fn get_or_build_with_key(
+        &mut self,
+        key: u64,
+        path: &fanta_doc::PathData,
+        corner_radius: Option<f64>,
+        corner_radii: Option<[f64; 4]>,
+        corner_smoothing: f32,
+    ) -> (CachedVectorPaths, bool) {
+        if let Some(entry) = self.entries.get(&key)
+            // Expanded nodes and overlays do not have stable scene stamps.
+            // Compare their resolved geometry, never their transient IDs or
+            // the hash alone, before sharing immutable compiled paths.
+            && entry.path == *path
+            && entry.corner_radius == corner_radius
+            && entry.corner_radii == corner_radii
+            && entry.corner_smoothing == corner_smoothing
+        {
+            return (entry.compiled.clone(), false);
+        }
+        let compiled = build_vector_paths(path, corner_radius, corner_radii, corner_smoothing);
+        let compiled_bytes = compiled.outline.approximate_bytes_used().saturating_add(
+            compiled
+                .fill
+                .as_ref()
+                .map_or(0, skia_safe::Path::approximate_bytes_used),
+        );
+        if vector_source_heap_bytes(path).saturating_add(compiled_bytes) <= self.maximum_bytes {
+            let path = path.clone();
+            let bytes = std::mem::size_of::<VectorGeometryEntry>()
+                .saturating_add(64)
+                .saturating_add(vector_source_heap_bytes(&path))
+                .saturating_add(compiled_bytes);
+            if bytes <= self.maximum_bytes {
+                if let Some(previous) = self.entries.pop(&key) {
+                    self.bytes = self.bytes.saturating_sub(previous.bytes);
+                }
+                while self.bytes.saturating_add(bytes) > self.maximum_bytes {
+                    let Some((_, previous)) = self.entries.pop_lru() else {
+                        break;
+                    };
+                    self.bytes = self.bytes.saturating_sub(previous.bytes);
+                }
+                self.bytes = self.bytes.saturating_add(bytes);
+                if let Some((_, previous)) = self.entries.push(
+                    key,
+                    VectorGeometryEntry {
+                        path,
+                        corner_radius,
+                        corner_radii,
+                        corner_smoothing,
+                        compiled: compiled.clone(),
+                        bytes,
+                    },
+                ) {
+                    self.bytes = self.bytes.saturating_sub(previous.bytes);
+                }
+            }
+        }
+        (compiled, true)
+    }
+}
+
+pub(super) fn vector_source_heap_bytes(path: &fanta_doc::PathData) -> usize {
+    path.segments
+        .capacity()
+        .saturating_mul(std::mem::size_of::<fanta_doc::PathSegment>())
+        .saturating_add(
+            path.subpath_rules
+                .capacity()
+                .saturating_mul(std::mem::size_of::<fanta_doc::FillRule>()),
+        )
+}
+
+pub(super) fn vector_geometry_key(
+    path: &fanta_doc::PathData,
+    corner_radius: Option<f64>,
+    corner_radii: Option<[f64; 4]>,
+    corner_smoothing: f32,
+) -> u64 {
+    use fanta_doc::PathSegment;
+    let mut hasher = DefaultHasher::new();
+    path.fill_rule.hash(&mut hasher);
+    path.subpath_rules.hash(&mut hasher);
+    path.segments.len().hash(&mut hasher);
+    for segment in &path.segments {
+        std::mem::discriminant(segment).hash(&mut hasher);
+        match segment {
+            PathSegment::Move { to } | PathSegment::Line { to } => {
+                to.map(f64::to_bits).hash(&mut hasher);
+            }
+            PathSegment::Quad { ctrl, to } => {
+                ctrl.map(f64::to_bits).hash(&mut hasher);
+                to.map(f64::to_bits).hash(&mut hasher);
+            }
+            PathSegment::Cubic { ctrl1, ctrl2, to } => {
+                ctrl1.map(f64::to_bits).hash(&mut hasher);
+                ctrl2.map(f64::to_bits).hash(&mut hasher);
+                to.map(f64::to_bits).hash(&mut hasher);
+            }
+            PathSegment::Close => {}
+        }
+    }
+    corner_radius.map(f64::to_bits).hash(&mut hasher);
+    corner_radii
+        .map(|radii| radii.map(f64::to_bits))
+        .hash(&mut hasher);
+    corner_smoothing.to_bits().hash(&mut hasher);
+    hasher.finish()
+}
 
 /// Whether a [`PathData`] is an axis-aligned rectangle (the shape `corner_radius`
 /// is allowed to round). Recognizes the canonical `Move + 3×Line + Close`
@@ -1321,7 +1484,7 @@ pub(crate) fn draw_vector(
     // edit anywhere else leaves it untouched (the pre-stamp design re-keyed
     // every entry on every document edit). `cache_id` is `None` for transient
     // instance-expansion clones and for nodes whose variable/motion overlay
-    // replaced them this frame (per-frame geometry); those rebuild directly.
+    // replaced them this frame; those prove their actual geometry instead.
     // `skia_safe::Path` clones are copy-on-write, so a cache hit costs a
     // refcount bump, not a geometry rebuild.
     let paths = match cache_id {
@@ -1338,7 +1501,16 @@ pub(crate) fn draw_vector(
                 }
             }
         }
-        None => build_vector_paths(path, corner_radius, corner_radii, corner_smoothing),
+        None => {
+            let (compiled, built) = ctx.path_cache.shared.get_or_build(
+                path,
+                corner_radius,
+                corner_radii,
+                corner_smoothing,
+            );
+            ctx.metrics.paths_built += u32::from(built);
+            compiled
+        }
     };
     let bounds = paths.rough_bounds;
     let local_bounds_f32 = bounds_to_f32(&bounds);
@@ -1358,6 +1530,242 @@ pub(crate) fn draw_vector(
         );
     } else {
         stroke_sk_path(canvas, sk_path, strokes, local_bounds_f32, ctx);
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use crate::raster::{RasterRenderer, RenderInputs};
+    use fanta_doc::{
+        BoundProp, CanvasNode, ComponentDef, ComponentId, Doc, FillRule, GroupNode, InstanceNode,
+        Mode, ModeId, NodeData, Operation, PathData, Transform2D, VarValue, Variable,
+        VariableCollection, VariableCollectionId, VariableId, VariableType, VectorNode,
+    };
+    use std::collections::BTreeMap;
+
+    fn assert_compiled_equal(actual: &CachedVectorPaths, expected: &CachedVectorPaths) {
+        assert_eq!(actual.outline, expected.outline);
+        assert_eq!(actual.fill, expected.fill);
+        assert_eq!(actual.rough_bounds, expected.rough_bounds);
+        assert_eq!(actual.is_rect, expected.is_rect);
+    }
+
+    #[test]
+    fn shared_paths_preserve_curves_mixed_winding_and_all_corner_parameters() {
+        let mut path = PathData::rect(0.0, 0.0, 60.0, 40.0);
+        let mut cache = SharedVectorPathCache::default();
+        for (radius, radii, smoothing) in [
+            (None, None, 0.0),
+            (Some(12.0), None, 0.0),
+            (Some(12.0), Some([2.0, 8.0, 13.0, 20.0]), 0.0),
+            (Some(12.0), Some([2.0, 8.0, 13.0, 20.0]), 0.75),
+        ] {
+            let expected = build_vector_paths(&path, radius, radii, smoothing);
+            let (first, built) = cache.get_or_build(&path, radius, radii, smoothing);
+            assert!(built);
+            assert_compiled_equal(&first, &expected);
+            let (second, built) = cache.get_or_build(&path.clone(), radius, radii, smoothing);
+            assert!(!built, "equivalent transient clones reuse their paths");
+            assert_compiled_equal(&second, &expected);
+        }
+        path.move_to(8.0, 8.0)
+            .quad_to(18.0, 0.0, 48.0, 8.0)
+            .cubic_to(58.0, 12.0, 48.0, 30.0, 8.0, 30.0)
+            .close();
+        for rules in [
+            vec![],
+            vec![FillRule::NonZero, FillRule::EvenOdd],
+            vec![FillRule::EvenOdd, FillRule::NonZero],
+        ] {
+            path.subpath_rules = rules;
+            for rule in [FillRule::NonZero, FillRule::EvenOdd] {
+                path.fill_rule = rule;
+                let expected = build_vector_paths(&path, None, None, 0.0);
+                let (first, built) = cache.get_or_build(&path, None, None, 0.0);
+                assert!(built);
+                assert_compiled_equal(&first, &expected);
+                let (second, built) = cache.get_or_build(&path, None, None, 0.0);
+                assert!(!built);
+                assert_compiled_equal(&second, &expected);
+            }
+        }
+    }
+
+    #[test]
+    fn shared_paths_reject_hash_collisions_and_obey_byte_and_entry_limits() {
+        let first = PathData::rect(0.0, 0.0, 20.0, 20.0);
+        let second = PathData::rect(0.0, 0.0, 40.0, 20.0);
+        let mut cache = SharedVectorPathCache::new(NonZeroUsize::MIN, SHARED_PATH_CACHE_BYTES);
+        cache.get_or_build_with_key(1, &first, None, None, 0.0);
+        let (compiled, built) = cache.get_or_build_with_key(1, &second, None, None, 0.0);
+        assert!(built);
+        assert_compiled_equal(&compiled, &build_vector_paths(&second, None, None, 0.0));
+        assert!(!cache.get_or_build_with_key(1, &second, None, None, 0.0).1);
+        assert!(
+            cache
+                .get_or_build_with_key(1, &second, Some(3.0), None, 0.0)
+                .1
+        );
+        assert!(cache.get_or_build_with_key(1, &first, None, None, 0.0).1);
+        let bytes = cache.bytes;
+        let mut byte_limited = SharedVectorPathCache::new(SHARED_PATH_CACHE_CAP, bytes);
+        byte_limited.get_or_build(&first, None, None, 0.0);
+        byte_limited.get_or_build(&second, None, None, 0.0);
+        assert!(byte_limited.bytes <= bytes);
+        assert_eq!(byte_limited.entries.len(), 1);
+        let mut oversized = first.clone();
+        for index in 0..200 {
+            oversized.line_to(f64::from(index), 100.0);
+        }
+        let (compiled, built) = byte_limited.get_or_build(&oversized, None, None, 0.0);
+        assert!(built);
+        assert_compiled_equal(&compiled, &build_vector_paths(&oversized, None, None, 0.0));
+        assert!(byte_limited.get_or_build(&oversized, None, None, 0.0).1);
+        assert_eq!(byte_limited.entries.len(), 1);
+        assert!(byte_limited.bytes <= bytes);
+        let mut uncached = SharedVectorPathCache::new(SHARED_PATH_CACHE_CAP, 0);
+        assert!(uncached.get_or_build(&first, None, None, 0.0).1);
+        assert!(uncached.entries.is_empty());
+    }
+
+    #[test]
+    fn bound_component_vectors_reuse_geometry_and_follow_color_and_radius_edits()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut document = Doc::new();
+        let collection = VariableCollectionId::new();
+        let mode = ModeId::new();
+        let color = VariableId::new();
+        let radius = VariableId::new();
+        document.variables.collections.insert(
+            collection,
+            VariableCollection {
+                id: collection,
+                name: "Theme".into(),
+                modes: vec![Mode {
+                    id: mode,
+                    name: "Default".into(),
+                }],
+                default_mode: mode,
+                variable_order: vec![color, radius],
+            },
+        );
+        for (id, name, ty, value) in [
+            (
+                color,
+                "Color",
+                VariableType::Color,
+                VarValue::Color {
+                    value: Color::rgb(255, 0, 0),
+                },
+            ),
+            (
+                radius,
+                "Radius",
+                VariableType::Float,
+                VarValue::Float { value: 0.0 },
+            ),
+        ] {
+            document.variables.variables.insert(
+                id,
+                Variable {
+                    id,
+                    collection,
+                    name: name.into(),
+                    ty,
+                    values_by_mode: BTreeMap::from([(mode, value)]),
+                    scopes: Vec::new(),
+                },
+            );
+        }
+        let mut page = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([64.0, 64.0]),
+            ..Default::default()
+        }));
+        page.transform = Transform2D::translation(-32.0, -32.0);
+        let page_id = page.id;
+        document.apply(Operation::create_node(page))?;
+        let mut master = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            20.0,
+            20.0,
+            Color::WHITE,
+        )));
+        master
+            .bindings
+            .insert(BoundProp::FillColor { index: 0 }, color);
+        master.bindings.insert(BoundProp::CornerRadius, radius);
+        let master_id = master.id;
+        document.apply(Operation::create_node(master))?;
+        let component = ComponentId::new();
+        document
+            .components
+            .defs
+            .insert(component, ComponentDef::new(component, master_id, "Box"));
+        for x in [8.0, 36.0] {
+            let mut instance = CanvasNode::new(NodeData::Instance(InstanceNode {
+                component,
+                overrides: Vec::new(),
+                prop_values: Default::default(),
+                derived: Vec::new(),
+                local_size: [20.0, 20.0],
+            }));
+            instance.parent = Some(page_id);
+            instance.transform = Transform2D::translation(x, 8.0);
+            document.apply(Operation::create_node(instance))?;
+        }
+        let mut renderer = RasterRenderer::new(64, 64)?;
+        let render = |renderer: &mut RasterRenderer, document: &Doc, generation| {
+            let mut inputs = RenderInputs::for_doc(document);
+            inputs.mode_generation = generation;
+            renderer.render_page_with(&document.scene, &document.viewport, Some(page_id), &inputs)
+        };
+        let first = render(&mut renderer, &document, 1);
+        assert_eq!(
+            first.paths_built, 1,
+            "equivalent component geometry is compiled once"
+        );
+        let first_pixels = renderer.copy_rgba();
+        assert_eq!(render(&mut renderer, &document, 1).paths_built, 0);
+        assert_eq!(renderer.copy_rgba(), first_pixels);
+        let variable = document
+            .variables
+            .variables
+            .get_mut(&color)
+            .ok_or("missing color")?;
+        variable.values_by_mode.insert(
+            mode,
+            VarValue::Color {
+                value: Color::rgb(0, 0, 255),
+            },
+        );
+        assert_eq!(
+            render(&mut renderer, &document, 2).paths_built,
+            0,
+            "paint bindings do not invalidate geometry"
+        );
+        let colored_pixels = renderer.copy_rgba();
+        assert_ne!(colored_pixels, first_pixels);
+        let mut cold = RasterRenderer::new(64, 64)?;
+        render(&mut cold, &document, 2);
+        assert_eq!(colored_pixels, cold.copy_rgba());
+        let variable = document
+            .variables
+            .variables
+            .get_mut(&radius)
+            .ok_or("missing radius")?;
+        variable
+            .values_by_mode
+            .insert(mode, VarValue::Float { value: 8.0 });
+        assert_eq!(render(&mut renderer, &document, 3).paths_built, 1);
+        let rounded_pixels = renderer.copy_rgba();
+        assert_ne!(rounded_pixels, colored_pixels);
+        let mut cold = RasterRenderer::new(64, 64)?;
+        render(&mut cold, &document, 3);
+        assert_eq!(rounded_pixels, cold.copy_rgba());
+        assert_eq!(render(&mut renderer, &document, 3).paths_built, 0);
+        Ok(())
     }
 }
 

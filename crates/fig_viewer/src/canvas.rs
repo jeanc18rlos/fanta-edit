@@ -5,10 +5,9 @@
 //! On macOS the scene raster runs on a dedicated render thread (see
 //! [`GpuCanvas`]): paint always presents the newest completed frame —
 //! reprojected against the live viewport when they differ — and only ever
-//! blocks on a render when the last frame was cheap AND the request shows
-//! nothing that frame did not already cover (an edit, a pan inside the render
-//! margin), so blocking is invisible. A pan into new content therefore never
-//! waits for a raster, however heavy the page.
+//! blocks on cheap content edits at an unchanged camera. Camera changes use
+//! the worker's stable snapshot and can cancel obsolete rendering at safe
+//! boundaries without borrowing the document from the UI thread.
 
 use std::collections::HashMap;
 #[cfg(target_os = "macos")]
@@ -17,13 +16,21 @@ use std::rc::Rc;
 use std::sync::Arc;
 #[cfg(target_os = "macos")]
 use std::{
-    collections::{BTreeMap, VecDeque},
-    sync::{Mutex, mpsc},
+    collections::BTreeMap,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 
+use crate::document::FigDocument;
+use crate::editor_session::EditorMode;
+use crate::measurements::{MeasurementOverlay, ScreenMeasurement};
 #[cfg(target_os = "macos")]
 use crate::tools::TranslationGesture;
+use crate::view::FigView;
 use anyhow::{Context as _, Result, anyhow};
 #[cfg(target_os = "macos")]
 use core_foundation::{
@@ -77,11 +84,8 @@ use skia_safe::{
 };
 use smallvec::SmallVec;
 use ui::prelude::*;
-
-use crate::document::FigDocument;
-use crate::editor_session::EditorMode;
-use crate::measurements::{MeasurementOverlay, ScreenMeasurement};
-use crate::view::FigView;
+#[cfg(target_os = "macos")]
+use util::ResultExt;
 
 const HANDLE_SIZE: f32 = 7.0;
 const MEASUREMENT_HANDLE_DIAMETER: f32 = 8.0;
@@ -110,9 +114,6 @@ const PILL_HEIGHT: Pixels = px(16.0);
 /// edges before the next fresh render lands.
 #[cfg(target_os = "macos")]
 const RENDER_MARGIN: f32 = 160.0;
-
-#[cfg(target_os = "macos")]
-const PAN_REFRESH_MARGIN: f64 = 48.0;
 
 /// Renders one page of the document plus interaction overlays, filling the
 /// available space.
@@ -314,6 +315,7 @@ struct SurfaceKey {
     motion_frame: Option<MotionFrameKey>,
     video_frame: Option<VideoFrameKey>,
     video_fill_frame: Option<u64>,
+    camera_interacting: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -342,7 +344,7 @@ impl SurfaceKey {
 
 /// What to do with the cached frame for a newly requested one, on a scene
 /// cheap enough to render synchronously.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 #[derive(Debug, PartialEq, Eq)]
 enum FrameDecision {
     /// The cached frame matches the request exactly; hand it back as fresh.
@@ -364,7 +366,7 @@ enum FrameDecision {
 /// everything the element must show. A partially covering frame would flash
 /// background at the leading edges until the next fresh render, which reads as
 /// edge jumping while panning or zooming out.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", test))]
 fn frame_decision(
     cached: &SurfaceKey,
     requested: &SurfaceKey,
@@ -378,14 +380,7 @@ fn frame_decision(
     if cached.size == requested.size && cached.same_content(requested) && within_render_interval {
         let scale = requested.viewport_zoom / cached.viewport_zoom.max(f64::EPSILON);
         let covers_view = frame_covers_request(cached, requested, frame_logical, visible_logical);
-        // Zooming OUT quickly leaves the cached frame's coverage (its margin
-        // is thin), which used to force a FULL scene render on every input
-        // event — the exact "zooming degrades" cliff. A shrinking reprojected
-        // frame with briefly exposed background at the edges is the same
-        // blurry-then-sharp trade zoom-in already makes, so accept it while
-        // the throttle is closed instead of stalling the gesture.
-        let zooming_out = scale < 1.0;
-        if (covers_view || zooming_out)
+        if covers_view
             && (1.0 / GpuCanvas::MAX_REPROJECT_SCALE..=GpuCanvas::MAX_REPROJECT_SCALE)
                 .contains(&scale)
         {
@@ -426,24 +421,6 @@ fn frame_covers_request(
     let offset_x = (cached.viewport_center[0] - requested.viewport_center[0]).abs();
     let offset_y = (cached.viewport_center[1] - requested.viewport_center[1]).abs();
     offset_x <= slack_x && offset_y <= slack_y
-}
-
-#[cfg(target_os = "macos")]
-fn frame_has_refresh_margin(
-    cached: &SurfaceKey,
-    requested: &SurfaceKey,
-    frame_logical: (f64, f64),
-    visible_logical: (f64, f64),
-) -> bool {
-    frame_covers_request(
-        cached,
-        requested,
-        frame_logical,
-        (
-            visible_logical.0 + PAN_REFRESH_MARGIN * 2.0,
-            visible_logical.1 + PAN_REFRESH_MARGIN * 2.0,
-        ),
-    )
 }
 
 /// How expensive the last measured scene render was, which decides whether
@@ -525,12 +502,15 @@ fn retained_cost_after_install(
     cost: RenderCost,
     duration: Duration,
     path: FramePath,
+    scene_rendered: bool,
 ) -> RenderCost {
+    // Cached image composition does not measure the cost of editing its
+    // source scene; treating it as cheap would block the next full-scene drag.
     match path {
-        FramePath::Normal | FramePath::Refused(_) => {
+        FramePath::Normal | FramePath::Refused(_) if scene_rendered => {
             cost_after_install(previous, installed, cost, duration)
         }
-        FramePath::Retained(_) => match previous {
+        FramePath::Normal | FramePath::Refused(_) | FramePath::Retained(_) => match previous {
             Some(previous) if previous.same_content_class(installed) => cost,
             _ => RenderCost::Unknown,
         },
@@ -543,13 +523,7 @@ fn retained_cost_after_install(
 enum PaintPlan {
     /// The newest frame matches the request; present it as-is.
     Present,
-    /// Unchanged covered view inside the reproject window: present the newest
-    /// frame and repaint until the sharp frame is due.
-    Reproject,
-    /// Cheap scene, render thread idle, and the request shows nothing beyond
-    /// the newest frame's coverage (an edit, a covered pan, a zoom-in): block
-    /// paint on a render straight from the live document, then present it
-    /// fresh.
+    /// A cheap content edit at the same camera, rendered from the live document.
     RenderBlocking,
     /// Expensive or unmeasured scene, or a request revealing content the
     /// newest frame never covered, render thread idle: present the newest
@@ -568,33 +542,17 @@ fn reused_paint_classification(plan: &PaintPlan, reprojected: Option<bool>) -> O
     }
 }
 
-/// The pure presentation policy behind [`GpuCanvas`]: given the newest
-/// completed frame, the request, and the render thread's state, decide what
-/// paint does. Unit-testable without a Metal device.
-///
-/// The invariant that matters for interaction smoothness: while the render
-/// thread is busy, or whenever the scene is expensive, paint NEVER blocks — a
-/// pan tick presents the newest frame shifted under the live viewport and, at
-/// most, enqueues one coalesced (latest-wins) fresh render.
-///
-/// `cost` describes the newest frame's content, and only holds for requests
-/// that frame already covers (see [`frame_covers_request`]): a pan past the
-/// render margin, a zoom-out, another page, or a reloaded document (a new
-/// scene instance) all reveal content the renderer may never have walked,
-/// whose first frame pays cold text shaping and image uploads — seconds, on
-/// a large page — so those never run inline however cheap the last frame
-/// was. What blocks on a cheap scene is exactly the case that is safe AND
-/// pays for itself: an edit or a covered viewport change, rendered from the
-/// live document without a scene snapshot.
+/// Camera updates always use the worker snapshot so retained GPU artwork has
+/// one stable scene identity. Only cheap edits at the same camera may borrow
+/// the live document; mixing live and snapshot sources for pans would clear
+/// the camera cache whenever a warm frame became cheap.
 #[cfg(target_os = "macos")]
 fn plan_paint(
     newest: Option<&SurfaceKey>,
     requested: &SurfaceKey,
     render_in_flight: bool,
     cost: RenderCost,
-    frame_logical: (f64, f64),
-    visible_logical: (f64, f64),
-    within_render_interval: bool,
+    _needs_refresh: bool,
 ) -> PaintPlan {
     if newest.is_some_and(|newest| *newest == *requested) {
         return PaintPlan::Present;
@@ -602,84 +560,85 @@ fn plan_paint(
     if render_in_flight {
         return PaintPlan::PresentAndWait;
     }
-    let measured = newest.filter(|newest| newest.same_content_class(requested));
-    let unchanged =
-        measured.filter(|newest| newest.size == requested.size && newest.same_content(requested));
-    if let Some(newest) = unchanged {
-        let covers_view = frame_covers_request(newest, requested, frame_logical, visible_logical);
-        let has_refresh_margin =
-            frame_has_refresh_margin(newest, requested, frame_logical, visible_logical);
-        if newest.viewport_zoom == requested.viewport_zoom
-            && newest.viewport_center != requested.viewport_center
-            && covers_view
-            && !has_refresh_margin
-        {
-            // Refill the margin while the old pixels still cover the view.
-            // Newly exposed fringe can need cold image/text work, so never block.
-            return PaintPlan::PresentAndRender;
-        }
-        if cost == RenderCost::Expensive
-            && has_refresh_margin
-            && frame_decision(
-                newest,
-                requested,
-                frame_logical,
-                visible_logical,
-                within_render_interval,
-            ) == FrameDecision::Reproject
-        {
-            return PaintPlan::Reproject;
-        }
-    }
-    match (cost, measured) {
-        (RenderCost::Cheap, Some(newest)) => match frame_decision(
-            newest,
-            requested,
-            frame_logical,
-            visible_logical,
-            within_render_interval,
-        ) {
-            FrameDecision::ReuseCached => PaintPlan::Present,
-            FrameDecision::Reproject => PaintPlan::Reproject,
-            FrameDecision::RenderFresh
-                if newest.size == requested.size
-                    && frame_covers_request(newest, requested, frame_logical, visible_logical) =>
-            {
-                PaintPlan::RenderBlocking
-            }
-            FrameDecision::RenderFresh => PaintPlan::PresentAndRender,
-        },
-        (RenderCost::Cheap, None) | (RenderCost::Unknown | RenderCost::Expensive, _) => {
-            PaintPlan::PresentAndRender
-        }
+    if cost == RenderCost::Cheap
+        && newest.is_some_and(|newest| {
+            newest.same_content_class(requested)
+                && !newest.same_content(requested)
+                && newest.size == requested.size
+                && newest.viewport_center == requested.viewport_center
+                && newest.viewport_zoom == requested.viewport_zoom
+                && newest.camera_interacting == requested.camera_interacting
+        })
+    {
+        PaintPlan::RenderBlocking
+    } else {
+        PaintPlan::PresentAndRender
     }
 }
 
-/// The reproject window that follows a fresh render costing
-/// `last_render_duration`: while it is open, covered mid-interaction paints
-/// reuse the newest frame instead of rendering again.
-///
-/// A fixed 33 ms window assumed a render is cheaper than a display frame. On a
-/// heavy page zoomed out (thousands of visible nodes) a render can take tens of
-/// milliseconds; with a fixed window nearly every pan tick then blocks on a
-/// full render (145 ms renders left the window open only ~18% of the time),
-/// so the gesture froze between sparse fresh frames. Scaling the window with
-/// the measured cost bounds the share of wall time spent inside blocking
-/// renders to roughly `1 / (1 + REPROJECT_COST_FACTOR)`, i.e. ~25%: cheap
-/// renders (≤ 11 ms) keep the display-rate 33 ms floor, expensive ones space
-/// themselves out and the reprojected frame (pixel-exact for a pure pan) covers
-/// the ticks in between. The ceiling keeps a pathological render from starving
-/// the sharp frame for longer than a quarter second. Expensive scenes also
-/// reuse covered frames during this window, while approaching the margin or
-/// revealing new content starts an off-thread render immediately.
 #[cfg(target_os = "macos")]
-fn render_interval(last_render_duration: Duration) -> Duration {
-    last_render_duration
-        .saturating_mul(GpuCanvas::REPROJECT_COST_FACTOR)
-        .clamp(
-            GpuCanvas::MIN_RENDER_INTERVAL,
-            GpuCanvas::MAX_RENDER_INTERVAL,
-        )
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FramePresentation {
+    Fresh,
+    Reprojected,
+    Held,
+    Unavailable,
+}
+
+#[cfg(target_os = "macos")]
+fn frame_presentation(
+    cached: &SurfaceKey,
+    cached_logical: (f64, f64),
+    requested: &SurfaceKey,
+    requested_logical: (f64, f64),
+    visible_logical: (f64, f64),
+    scale_factor: f32,
+) -> FramePresentation {
+    if !cached.same_content_class(requested) {
+        return FramePresentation::Unavailable;
+    }
+    if cached == requested
+        && logical_extent_matches(cached_logical, requested_logical, scale_factor)
+    {
+        return FramePresentation::Fresh;
+    }
+    let scale = requested.viewport_zoom / cached.viewport_zoom.max(f64::EPSILON);
+    if frame_covers_request(cached, requested, cached_logical, visible_logical)
+        && (1.0 / GpuCanvas::MAX_REPROJECT_SCALE..=GpuCanvas::MAX_REPROJECT_SCALE).contains(&scale)
+    {
+        FramePresentation::Reprojected
+    } else {
+        // The worker's overview supplies new coverage. Until that first
+        // completed frame arrives, shrinking or shifting a partial surface
+        // would expose blank edges rather than actual document content.
+        FramePresentation::Held
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn logical_extent_matches(cached: (f64, f64), requested: (f64, f64), scale_factor: f32) -> bool {
+    // The physical target rounds layout dimensions upward. At an unchanged
+    // target size, that rounding is less than one device pixel per axis.
+    let tolerance = 1.0 / f64::from(scale_factor.max(f32::EPSILON));
+    (cached.0 - requested.0).abs() <= tolerance && (cached.1 - requested.1).abs() <= tolerance
+}
+
+#[cfg(target_os = "macos")]
+fn should_install_completed_frame(
+    completed: &SurfaceKey,
+    newest: Option<&SurfaceKey>,
+    latest: Option<&SurfaceKey>,
+) -> bool {
+    let camera_matches = latest.is_none_or(|latest| {
+        completed.same_content_class(latest)
+            && completed.size == latest.size
+            && completed.viewport_center == latest.viewport_center
+            && completed.viewport_zoom == latest.viewport_zoom
+    });
+    camera_matches
+        && !newest
+            .zip(latest)
+            .is_some_and(|(newest, latest)| newest == latest && completed != latest)
 }
 
 /// One frame's worth of pixels for the canvas.
@@ -687,6 +646,7 @@ fn render_interval(last_render_duration: Duration) -> Duration {
 pub(crate) enum GpuFrame {
     /// Rendered at the requested viewport; paint it 1:1 over the element.
     Fresh(CVPixelBuffer),
+    Held(CVPixelBuffer),
     /// The newest completed frame, rendered at `viewport` over `logical`
     /// logical pixels, standing in for a request it does not match exactly.
     /// The caller scales/offsets it to approximate the requested viewport; a
@@ -879,6 +839,66 @@ impl SnapshotStamp {
         self.render_root = root;
         self
     }
+
+    fn same_document(&self, other: &Self) -> bool {
+        self.with_root(None) == other.with_root(None)
+    }
+}
+
+#[cfg(target_os = "macos")]
+const RETAINED_SNAPSHOT_NODE_LIMIT: usize = 65_536;
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct OwnedPageSnapshots {
+    active: Option<Box<SceneSnapshot>>,
+    previous: Option<Box<SceneSnapshot>>,
+}
+
+#[cfg(target_os = "macos")]
+impl OwnedPageSnapshots {
+    fn install(&mut self, fresh: Box<SceneSnapshot>) {
+        self.install_with_limit(fresh, RETAINED_SNAPSHOT_NODE_LIMIT);
+    }
+
+    fn install_with_limit(&mut self, fresh: Box<SceneSnapshot>, node_limit: usize) {
+        let previous = self.active.take().filter(|previous| {
+            previous.stamp.same_document(&fresh.stamp)
+                && previous.stamp.render_root != fresh.stamp.render_root
+                && previous.scene.len() <= node_limit
+                && fresh.scene.len() <= node_limit
+        });
+        self.previous = previous;
+        self.active = Some(fresh);
+    }
+
+    fn select(&mut self, stamp: SnapshotStamp) -> bool {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.stamp == stamp)
+        {
+            return true;
+        }
+        if self
+            .previous
+            .as_ref()
+            .is_some_and(|previous| previous.stamp == stamp)
+        {
+            std::mem::swap(&mut self.active, &mut self.previous);
+            return true;
+        }
+        false
+    }
+}
+
+#[cfg(target_os = "macos")]
+async fn camera_maintenance_after_idle(
+    executor: gpui::BackgroundExecutor,
+    ticket: CameraTicket,
+) -> bool {
+    executor.timer(Duration::from_millis(64)).await;
+    !ticket.cancelled()
 }
 
 /// Everything a scene render reads from the document, copied out so the
@@ -960,6 +980,15 @@ impl SceneSnapshot {
 struct WorkerSnapshot {
     stamp: SnapshotStamp,
     fingerprint: InputsFingerprint,
+}
+
+#[cfg(target_os = "macos")]
+fn retained_worker_matches(
+    worker: &WorkerSnapshot,
+    stamp: SnapshotStamp,
+    fingerprint: InputsFingerprint,
+) -> bool {
+    worker.stamp == stamp && worker.fingerprint == fingerprint
 }
 
 /// The edits that bring the render thread's scene copy from its stamp to
@@ -1151,8 +1180,12 @@ impl TranslationProof {
 #[cfg(target_os = "macos")]
 fn retained_translation_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED
-        .get_or_init(|| std::env::var("FANTA_RETAINED_TRANSLATION").is_ok_and(|value| value == "1"))
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("FANTA_RETAINED_TRANSLATION").as_deref(),
+            Ok("0")
+        )
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -1188,10 +1221,14 @@ impl CanvasTarget {
         }
     }
 
-    fn complete(&mut self, backend: &mut SkiaGpuBackend) -> Result<()> {
+    fn complete(
+        &mut self,
+        backend: &mut SkiaGpuBackend,
+    ) -> Result<Option<fanta_render::GraphiteSubmissionMetrics>> {
         match backend {
             SkiaGpuBackend::Graphite(context) => context
-                .submit_and_wait()
+                .submit_and_wait_profiled()
+                .map(Some)
                 .map_err(|error| anyhow!("Graphite canvas GPU completion failed: {error:?}")),
             SkiaGpuBackend::Ganesh(context) => {
                 match self {
@@ -1203,7 +1240,7 @@ impl CanvasTarget {
                         .map_err(|error| anyhow!("canvas GPU completion failed: {error:?}"))?,
                 }
                 anyhow::ensure!(!context.abandoned(), "Skia Metal context was abandoned");
-                Ok(())
+                Ok(None)
             }
         }
     }
@@ -1529,6 +1566,8 @@ struct ImportedVideoFrame {
 enum RenderSource {
     /// The render thread's own snapshot; `Some` installs a fresh copy first.
     Snapshot(Option<Box<SceneSnapshot>>),
+    Reuse(SnapshotStamp),
+    Cached(SnapshotStamp),
     /// The render thread's own snapshot, brought up to date with these edits
     /// first. A failed apply drops the snapshot and answers
     /// [`RenderReply::SnapshotLost`] instead of a frame.
@@ -1551,18 +1590,171 @@ struct RenderRequest {
     mode_generation: u64,
     translation: Option<TranslationGesture>,
     perf_tag: Option<crate::gesture_perf::RequestTag>,
+    camera: Option<CameraTicket>,
+    pipeline: FramePipelineTiming,
+    maintenance: bool,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy, Default)]
+struct FramePipelineTiming {
+    request_id: u64,
+    input_at: Option<Instant>,
+    dispatched_at: Option<Instant>,
+    worker_started_at: Option<Instant>,
+    camera_adopted_at: Option<Instant>,
+    published_at: Option<Instant>,
+    allocation_wall: Duration,
+    texture_import_wall: Duration,
+    target_wrap_wall: Duration,
+    renderer_wall: Duration,
+    submission_wall: Duration,
+    graphite_snap_wall: Option<Duration>,
+    graphite_insert_wall: Option<Duration>,
+    graphite_submit_wait_wall: Option<Duration>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct LatestCameraMailbox {
+    sequence: AtomicU64,
+    stopped: AtomicBool,
+    state: Mutex<CameraMailboxState>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct CameraMailboxState {
+    key: Option<SurfaceKey>,
+    scale_factor: f32,
+    viewport: Option<Viewport>,
+    input_at: Option<Instant>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone)]
+struct CameraTicket {
+    mailbox: Arc<LatestCameraMailbox>,
+    sequence: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl CameraTicket {
+    fn cancelled(&self) -> bool {
+        self.mailbox.stopped.load(Ordering::Acquire)
+            || self.mailbox.sequence.load(Ordering::Acquire) != self.sequence
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl LatestCameraMailbox {
+    fn note_input(&self, viewport: Viewport, input_at: Instant) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.viewport == Some(viewport) {
+            return;
+        }
+        state.viewport = Some(viewport);
+        state.input_at = Some(input_at);
+        if let Some(key) = &mut state.key {
+            key.viewport_center = viewport.center;
+            key.viewport_zoom = viewport.zoom;
+            key.camera_interacting = false;
+        }
+        self.sequence.fetch_add(1, Ordering::Release);
+    }
+
+    fn publish(self: &Arc<Self>, key: SurfaceKey, scale_factor: f32) -> CameraTicket {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state
+            .key
+            .is_some_and(|previous| !previous.same_content(&key))
+        {
+            state.input_at = None;
+        }
+        let viewport = Viewport {
+            center: key.viewport_center,
+            zoom: key.viewport_zoom,
+        };
+        if state.viewport != Some(viewport) {
+            state.viewport = Some(viewport);
+            state.input_at = None;
+        }
+        if state.key != Some(key) || state.scale_factor != scale_factor {
+            state.key = Some(key);
+            state.scale_factor = scale_factor;
+            self.sequence.fetch_add(1, Ordering::Release);
+        }
+        CameraTicket {
+            mailbox: self.clone(),
+            sequence: self.sequence.load(Ordering::Acquire),
+        }
+    }
+
+    fn retarget(&self, request: &mut RenderRequest) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let Some(key) = state.key.filter(|key| key.same_content(&request.key)) else {
+            return false;
+        };
+        if self.stopped.load(Ordering::Acquire) {
+            return false;
+        }
+        request.key = key;
+        request.scale_factor = state.scale_factor;
+        request.pipeline.input_at = state.input_at;
+        request.pipeline.camera_adopted_at = Some(Instant::now());
+        if let Some(ticket) = &mut request.camera {
+            ticket.sequence = self.sequence.load(Ordering::Acquire);
+        }
+        true
+    }
+
+    fn invalidate(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.key = None;
+        state.input_at = None;
+        self.sequence.fetch_add(1, Ordering::Release);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn elapsed_between(start: Option<Instant>, end: Option<Instant>) -> Option<u64> {
+    start
+        .zip(end)
+        .and_then(|(start, end)| end.checked_duration_since(start))
+        .map(crate::gesture_perf::duration_micros)
 }
 
 #[cfg(target_os = "macos")]
 struct RenderJob {
     source: RenderSource,
     request: RenderRequest,
-    /// Buffers the compositor is done with, going back to the pool.
-    recycled: Vec<SendBuffer>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone, Copy)]
+struct FrameProgress {
+    needs_refresh: bool,
+    complete_detail: bool,
+    scene_rendered: bool,
+    cancelled: bool,
+    pipeline: FramePipelineTiming,
+    font_generation: Option<u64>,
 }
 
 #[cfg(target_os = "macos")]
 enum RenderReply {
+    Maintenance {
+        key: SurfaceKey,
+        result: Result<FrameProgress>,
+        font_observer: fanta_render::FontGenerationObserver,
+    },
+    Cancelled {
+        key: SurfaceKey,
+        perf_tag: Option<crate::gesture_perf::RequestTag>,
+        pipeline: FramePipelineTiming,
+        started: bool,
+        font_observer: fanta_render::FontGenerationObserver,
+    },
     Frame {
         key: SurfaceKey,
         scale_factor: f32,
@@ -1571,8 +1763,10 @@ enum RenderReply {
             Duration,
             FramePath,
             Option<crate::gesture_perf::FrameSample>,
+            FrameProgress,
         )>,
         perf_tag: Option<crate::gesture_perf::RequestTag>,
+        font_observer: fanta_render::FontGenerationObserver,
     },
     /// A [`RenderSource::Patch`] could not be applied (or found no snapshot to
     /// apply to); the render thread dropped its copy and rendered nothing. Not
@@ -1580,6 +1774,7 @@ enum RenderReply {
     SnapshotLost {
         error: anyhow::Error,
         perf_tag: Option<crate::gesture_perf::RequestTag>,
+        font_observer: fanta_render::FontGenerationObserver,
     },
     /// The render thread could not bring up Metal/Skia; the canvas falls back
     /// to the CPU raster path.
@@ -1644,7 +1839,7 @@ impl std::future::Future for WakeWait<'_> {
 }
 
 /// The render thread body: owns the Metal queue, Skia context, raster caches,
-/// buffer pool, and the scene snapshot for the view's whole lifetime, and
+/// and the scene snapshot for the view's whole lifetime, and
 /// serves one job at a time. Every job runs inside its own autorelease pool
 /// (and the whole body inside an outer one for bring-up and tear-down) since
 /// this thread has no run loop of its own.
@@ -1673,63 +1868,122 @@ fn render_thread_loop(
             return;
         }
     };
-    let mut snapshot: Option<Box<SceneSnapshot>> = None;
+    let mut snapshots = OwnedPageSnapshots::default();
     while let Ok(job) = jobs.recv() {
         let RenderJob {
             source,
-            request,
-            recycled,
+            mut request,
         } = job;
+        request.pipeline.worker_started_at = Some(Instant::now());
+        let font_observer = RasterRenderer::current_font_generation_observer();
         let reply = metal::objc::rc::autoreleasepool(|| {
-            for buffer in recycled {
-                renderer.recycle(buffer.0);
-            }
-            let result = match source {
+            let mut live_inputs = None;
+            let inputs = match source {
                 RenderSource::Snapshot(fresh) => {
                     if let Some(fresh) = fresh {
-                        // The stale copy (if any) drops here, off the UI thread.
-                        snapshot = Some(fresh);
+                        snapshots.install(fresh);
                     }
-                    match snapshot.as_deref() {
-                        Some(snapshot) => renderer.render_frame(snapshot.inputs(), &request),
-                        None => Err(anyhow!("render thread has no scene snapshot")),
+                    snapshots.active.as_deref().map(SceneSnapshot::inputs)
+                }
+                RenderSource::Cached(stamp) => {
+                    if !snapshots.select(stamp) {
+                        return RenderReply::SnapshotLost {
+                            error: anyhow!("retained page snapshot is unavailable"),
+                            perf_tag: request.perf_tag,
+                            font_observer: font_observer.clone(),
+                        };
                     }
+                    snapshots.active.as_deref().map(SceneSnapshot::inputs)
+                }
+                RenderSource::Reuse(stamp) => {
+                    if let Some(active) = &mut snapshots.active {
+                        if !active.stamp.same_document(&stamp) {
+                            snapshots.previous = None;
+                        }
+                        active.stamp = stamp;
+                    }
+                    snapshots.active.as_deref().map(SceneSnapshot::inputs)
                 }
                 RenderSource::Patch(patch) => {
-                    let applied = match snapshot.as_deref_mut() {
+                    snapshots.previous = None;
+                    let applied = match snapshots.active.as_deref_mut() {
                         Some(snapshot) => snapshot.apply(*patch),
                         None => Err(anyhow!("render thread has no scene snapshot to patch")),
                     };
                     match applied {
-                        Ok(()) => match snapshot.as_deref() {
-                            Some(snapshot) => renderer.render_frame(snapshot.inputs(), &request),
-                            None => Err(anyhow!("render thread has no scene snapshot")),
-                        },
+                        Ok(()) => snapshots.active.as_deref().map(SceneSnapshot::inputs),
                         Err(error) => {
                             // A half-applied copy is not a document state
                             // anyone ever had; drop it rather than render it.
-                            snapshot = None;
+                            snapshots.active = None;
                             return RenderReply::SnapshotLost {
                                 error,
                                 perf_tag: request.perf_tag,
+                                font_observer: font_observer.clone(),
                             };
                         }
                     }
                 }
                 RenderSource::Live(live) => {
-                    // SAFETY: the UI thread is blocked in `render_blocking`
-                    // until this job's reply is received.
-                    let inputs = unsafe { live.inputs() };
-                    renderer.render_frame(inputs, &request)
+                    live_inputs = Some(live);
+                    None
                 }
             };
+            let inputs = inputs.or_else(|| {
+                // SAFETY: the UI thread is blocked in `render_blocking` until
+                // this reply, and `live_inputs` retains its resolver lease.
+                live_inputs.as_ref().map(|live| unsafe { live.inputs() })
+            });
+            // Apply the source even for an obsolete camera: the UI's next patch
+            // is based on the snapshot this job promised to install.
+            if let Some(mailbox) = request.camera.as_ref().map(|ticket| ticket.mailbox.clone())
+                && if request.maintenance {
+                    request.camera.as_ref().is_some_and(CameraTicket::cancelled)
+                } else {
+                    !mailbox.retarget(&mut request)
+                }
+            {
+                return RenderReply::Cancelled {
+                    key: request.key,
+                    perf_tag: request.perf_tag,
+                    pipeline: request.pipeline,
+                    started: false,
+                    font_observer: font_observer.clone(),
+                };
+            }
+            let result = inputs
+                .context("render thread has no scene snapshot")
+                .and_then(|inputs| renderer.render_frame(inputs, &request));
+            if request.maintenance {
+                return RenderReply::Maintenance {
+                    key: request.key,
+                    result: result.map(|(_, _, _, _, progress)| progress),
+                    font_observer: font_observer.clone(),
+                };
+            }
+            if result
+                .as_ref()
+                .is_ok_and(|(_, _, _, _, progress)| progress.cancelled)
+                || (result.is_ok() && request.camera.as_ref().is_some_and(CameraTicket::cancelled))
+            {
+                return RenderReply::Cancelled {
+                    key: request.key,
+                    perf_tag: request.perf_tag,
+                    pipeline: request.pipeline,
+                    started: true,
+                    font_observer: font_observer.clone(),
+                };
+            }
+            let published_at = Instant::now();
             RenderReply::Frame {
                 key: request.key,
                 scale_factor: request.scale_factor,
-                result: result.map(|(buffer, duration, path, metrics)| {
-                    (SendBuffer(buffer), duration, path, metrics)
+                result: result.map(|(buffer, duration, path, metrics, mut progress)| {
+                    progress.pipeline.published_at = Some(published_at);
+                    (SendBuffer(buffer), duration, path, metrics, progress)
                 }),
                 perf_tag: request.perf_tag,
+                font_observer: font_observer.clone(),
             }
         });
         if replies.send(reply).is_err() {
@@ -1754,7 +2008,7 @@ fn with_stable_font_generation<T>(
 }
 
 /// The Skia-Metal raster engine, owned by the render thread: renders one
-/// frame at a time into IOSurface-backed pixel buffers from its pool.
+/// frame at a time into immutable IOSurface-backed pixel buffers.
 #[cfg(target_os = "macos")]
 struct MacGpuRenderer {
     translation: WorkerTranslation,
@@ -1765,11 +2019,9 @@ struct MacGpuRenderer {
     _device: metal::Device,
     _command_queue: metal::CommandQueue,
     size: (u32, u32),
-    /// Recycled pixel buffers matching `size`. Reusing them avoids a
-    /// multi-megabyte IOSurface allocation per frame.
-    buffer_pool: Vec<CVPixelBuffer>,
     frame_texture_leases: Vec<CVMetalTexture>,
     frame_buffer_leases: Vec<CVPixelBuffer>,
+    camera_epoch: Option<u64>,
 }
 
 #[cfg(target_os = "macos")]
@@ -1787,9 +2039,6 @@ impl Drop for MacGpuRenderer {
 
 #[cfg(target_os = "macos")]
 impl MacGpuRenderer {
-    /// Enough to keep the steady-state cycle (one frame rendering, the newest
-    /// presented, two retired) allocation-free without hoarding IOSurfaces.
-    const BUFFER_POOL_LIMIT: usize = 2;
     /// Ganesh resource-cache budget shared by image textures and the engine's
     /// effect-layer cache. Sized so a dense page's mipped image set (~450 MB
     /// on the sample Design page) plus ~100 MB of cached layers stay resident.
@@ -1820,9 +2069,9 @@ impl MacGpuRenderer {
             _device: device,
             _command_queue: command_queue,
             size,
-            buffer_pool: Vec::new(),
             frame_texture_leases: Vec::new(),
             frame_buffer_leases: Vec::new(),
+            camera_epoch: None,
         })
     }
 
@@ -1830,16 +2079,6 @@ impl MacGpuRenderer {
         self.backend
             .as_mut()
             .context("Skia GPU backend is unavailable")
-    }
-
-    /// Return a buffer the compositor has finished with to the pool. Buffers
-    /// of a stale size (the element was resized meanwhile) are dropped.
-    fn recycle(&mut self, buffer: CVPixelBuffer) {
-        let matches_size = buffer.get_width() == self.size.0 as usize
-            && buffer.get_height() == self.size.1 as usize;
-        if matches_size && self.buffer_pool.len() < Self::BUFFER_POOL_LIMIT {
-            self.buffer_pool.push(buffer);
-        }
     }
 
     fn resize(&mut self, size: (u32, u32)) -> Result<()> {
@@ -1853,15 +2092,7 @@ impl MacGpuRenderer {
             .resize(size.0, size.1)
             .context("resizing Skia renderer state")?;
         self.size = size;
-        self.buffer_pool.clear();
         Ok(())
-    }
-
-    fn take_buffer(&mut self, size: (u32, u32)) -> Result<CVPixelBuffer> {
-        if let Some(buffer) = self.buffer_pool.pop() {
-            return Ok(buffer);
-        }
-        create_bgra_pixel_buffer(size.0, size.1)
     }
 
     fn import_video_frame(&mut self, buffer: &CVPixelBuffer) -> Result<ImportedVideoFrame> {
@@ -1891,7 +2122,7 @@ impl MacGpuRenderer {
         })
     }
 
-    /// Render one frame for `request` from `inputs` into a pooled buffer.
+    /// Render one frame for `request` from `inputs` into a fresh buffer.
     /// Returns the buffer with its GPU work complete (the compositor samples
     /// the IOSurface as soon as it is presented) and the wall time it took.
     fn render_frame(
@@ -1903,6 +2134,7 @@ impl MacGpuRenderer {
         Duration,
         FramePath,
         Option<crate::gesture_perf::FrameSample>,
+        FrameProgress,
     )> {
         anyhow::ensure!(!self.failed, "Skia renderer failed and must be recreated");
         let result = self.render_frame_inner(inputs, request);
@@ -1926,7 +2158,10 @@ impl MacGpuRenderer {
         Duration,
         FramePath,
         Option<crate::gesture_perf::FrameSample>,
+        FrameProgress,
     )> {
+        let mut pipeline = request.pipeline;
+        let font_generation = RasterRenderer::current_font_generation();
         self.frame_buffer_leases.extend(
             request
                 .video
@@ -1940,6 +2175,10 @@ impl MacGpuRenderer {
                 ),
         );
         self.translation.sync(request.translation);
+        if self.camera_epoch != Some(request.key.epoch) {
+            self.raster_renderer.clear_camera_cache();
+            self.camera_epoch = Some(request.key.epoch);
+        }
         let size = request.key.size;
         self.resize(size)?;
         if let Some(asset_resolver) = inputs.asset_resolver {
@@ -1979,33 +2218,42 @@ impl MacGpuRenderer {
                 )])
             });
 
-        let pixel_buffer = self.take_buffer(size)?;
+        // GPUI samples completed frames asynchronously on another Metal queue.
+        // Counting producer frames cannot fence that consumer, so an IOSurface
+        // must not be overwritten without an explicit consumer fence.
+        let allocation_started = Instant::now();
+        let target_size = if request.maintenance { (1, 1) } else { size };
+        let pixel_buffer = create_bgra_pixel_buffer(target_size.0, target_size.1)?;
+        pipeline.allocation_wall = allocation_started.elapsed();
         self.frame_buffer_leases.push(pixel_buffer.clone());
+        let texture_import_started = Instant::now();
         let color_texture = self
             .texture_cache
             .create_texture_from_image(
                 pixel_buffer.as_concrete_TypeRef(),
                 None,
                 metal::MTLPixelFormat::BGRA8Unorm,
-                size.0 as usize,
-                size.1 as usize,
+                target_size.0 as usize,
+                target_size.1 as usize,
                 0,
             )
             .map_err(|status| anyhow!("creating CoreVideo Metal texture failed: {status}"))?;
         let texture = unsafe { CVMetalTextureGetTexture(color_texture.as_concrete_TypeRef()) };
         if texture.is_null() {
-            self.recycle(pixel_buffer);
             return Err(anyhow!("CoreVideo returned a null Metal texture"));
         }
         self.frame_texture_leases.push(color_texture);
+        pipeline.texture_import_wall = texture_import_started.elapsed();
 
+        let target_wrap_started = Instant::now();
         let mut target = unsafe {
             self.backend()?.wrap_target(
                 texture.cast(),
-                (size.0 as i32, size.1 as i32),
+                (target_size.0 as i32, target_size.1 as i32),
                 request.translation.is_some(),
             )
         }?;
+        pipeline.target_wrap_wall = target_wrap_started.elapsed();
 
         let render_viewport = Viewport {
             center: request.key.viewport_center,
@@ -2026,6 +2274,15 @@ impl MacGpuRenderer {
         let mut path = FramePath::Normal;
         let mut retained_metrics = None;
         let mut build_wall_us = None;
+        let mut progress = FrameProgress {
+            needs_refresh: false,
+            complete_detail: true,
+            scene_rendered: false,
+            cancelled: false,
+            pipeline,
+            font_generation: None,
+        };
+        let mut camera_cache = None;
         if let Some(gesture) = request.translation
             && !self.translation.rejected
             && let CanvasTarget::Retained(target) = &mut target
@@ -2117,26 +2374,63 @@ impl MacGpuRenderer {
         }
         let normal_started = (!matches!(path, FramePath::Retained(_))).then(Instant::now);
         let metrics = if normal_started.is_some() {
-            Some(
-                self.raster_renderer.render_to_canvas(
-                    target
-                        .canvas()
-                        .map_err(|error| anyhow!("canvas backend unavailable: {error:?}"))?,
+            let canvas = target.canvas().context("canvas backend unavailable")?;
+            let should_cancel = || request.camera.as_ref().is_some_and(CameraTicket::cancelled);
+            let rendered = if request.maintenance {
+                self.raster_renderer.maintain_camera_cache(
+                    canvas,
                     size.0,
                     size.1,
                     inputs.scene,
                     &render_viewport,
                     request.key.page_root,
                     &render_inputs,
-                ),
-            )
+                    request.key.revision,
+                    &should_cancel,
+                )
+            } else {
+                self.raster_renderer.render_camera_to_canvas_cancellable(
+                    canvas,
+                    size.0,
+                    size.1,
+                    inputs.scene,
+                    &render_viewport,
+                    request.key.page_root,
+                    &render_inputs,
+                    request.key.revision,
+                    request.key.camera_interacting,
+                    &should_cancel,
+                )
+            };
+            progress = FrameProgress {
+                needs_refresh: rendered.needs_refresh,
+                complete_detail: rendered.complete_detail,
+                scene_rendered: rendered.cache.scene_walks != 0,
+                cancelled: rendered.cancelled,
+                pipeline,
+                font_generation: None,
+            };
+            camera_cache = Some(rendered.cache);
+            Some(rendered.metrics)
         } else {
             None
         };
+        pipeline.renderer_wall = render_started.elapsed();
         let diagnostics = crate::perf_enabled();
         let flush_started =
             crate::gesture_perf::optional_timer(request.perf_tag.is_some() || diagnostics);
-        target.complete(self.backend()?)?;
+        let submission_started = Instant::now();
+        let submission = target.complete(self.backend()?)?;
+        pipeline.submission_wall = submission_started.elapsed();
+        if let Some(submission) = submission {
+            pipeline.graphite_snap_wall = Some(submission.snap_wall);
+            pipeline.graphite_insert_wall = Some(submission.insert_wall);
+            pipeline.graphite_submit_wait_wall = Some(submission.submit_wait_wall);
+        }
+        progress.pipeline = pipeline;
+        progress.font_generation = font_generation
+            .filter(|generation| RasterRenderer::current_font_generation() == Some(*generation));
+        progress.cancelled |= request.camera.as_ref().is_some_and(CameraTicket::cancelled);
         let flush_duration = flush_started.map(|started| started.elapsed());
         let normal_cost = normal_started.map(|started| started.elapsed());
         drop(target);
@@ -2153,11 +2447,13 @@ impl MacGpuRenderer {
                 Some(SkiaGpuBackend::Ganesh(_)) => "ganesh",
                 None => "unavailable",
             };
-            log::info!(
-                "fanta_canvas_frame {}",
+            let mut frame_fields = serde_json::Map::new();
+            for fields in [
                 serde_json::json!({
                     "backend": backend,
+                    "maintenance": request.maintenance,
                     "path": match path {
+                        FramePath::Normal if camera_cache.as_ref().is_some_and(|cache| cache.picture_drawn || cache.tiles_drawn > 0) => "camera_cache",
                         FramePath::Normal => "normal",
                         FramePath::Retained(_) => "retained",
                         FramePath::Refused(_) => "refused",
@@ -2167,20 +2463,57 @@ impl MacGpuRenderer {
                     "viewport_zoom": request.key.viewport_zoom,
                     "physical_size": size,
                     "scene": request.key.scene,
-                    "generation": request.key.revision,
-                    "scene_walk_wall_us": metrics.map(|metrics| metrics.frame_micros),
+                    "generation": request.key.revision
+                }),
+                serde_json::json!({                    "request_id": pipeline.request_id,
+                    "camera_sequence": request.camera.as_ref().map(|ticket| ticket.sequence),
+                    "queue_wall_us": elapsed_between(pipeline.dispatched_at, pipeline.worker_started_at),
+                    "input_to_worker_wall_us": elapsed_between(pipeline.input_at, pipeline.worker_started_at),
+                    "input_to_camera_adopted_wall_us": elapsed_between(pipeline.input_at, pipeline.camera_adopted_at),
+                    "allocation_wall_us": crate::gesture_perf::duration_micros(pipeline.allocation_wall),
+                    "texture_import_wall_us": crate::gesture_perf::duration_micros(pipeline.texture_import_wall),
+                    "target_wrap_wall_us": crate::gesture_perf::duration_micros(pipeline.target_wrap_wall),
+                    "renderer_wall_us": crate::gesture_perf::duration_micros(pipeline.renderer_wall),
+                    "submission_wall_us": crate::gesture_perf::duration_micros(pipeline.submission_wall),
+                    "graphite_snap_wall_us": pipeline.graphite_snap_wall.map(crate::gesture_perf::duration_micros),
+                    "graphite_insert_wall_us": pipeline.graphite_insert_wall.map(crate::gesture_perf::duration_micros),
+                    "graphite_submit_wait_wall_us": pipeline.graphite_submit_wait_wall.map(crate::gesture_perf::duration_micros),
+                    "input_to_gpu_complete_wall_us": elapsed_between(pipeline.input_at, Some(Instant::now())),
+                    "cancelled": progress.cancelled
+                }),
+                serde_json::json!({                    "camera_interacting": request.key.camera_interacting,
+                    "scene_walk_wall_us": camera_cache.as_ref().map(|cache| cache.scene_walk_wall_us),
+                    "camera_cpu_wall_us": metrics.map(|metrics| metrics.frame_micros),
                     "flush_sync_wall_us": flush_duration.map(crate::gesture_perf::duration_micros),
                     "render_wall_us": crate::gesture_perf::duration_micros(duration),
                     "nodes_visited": metrics.map(|metrics| metrics.nodes_visited),
                     "nodes_drawn": metrics.map(|metrics| metrics.nodes_drawn),
                     "nodes_culled": metrics.map(|metrics| metrics.nodes_culled),
+                    "bounds_prepared": metrics.map(|metrics| metrics.bounds_prepared),
                     "paths_built": metrics.map(|metrics| metrics.paths_built),
                     "instance_indexes_built": metrics.map(|metrics| metrics.instance_indexes_built),
                     "layer_cache_hits": metrics.map(|metrics| metrics.layer_cache_hits),
                     "layer_cache_misses": metrics.map(|metrics| metrics.layer_cache_misses),
                     "incomplete_artwork": metrics.map(|metrics| metrics.incomplete_artwork),
                     "effect_failed": metrics.map(|metrics| metrics.effect_failed),
-                })
+                    "needs_refresh": progress.needs_refresh,
+                    "complete_detail": progress.complete_detail,
+                    "scene_rendered": progress.scene_rendered,
+                    "overview_drawn": camera_cache.as_ref().map(|cache| cache.overview_drawn),
+                    "picture_drawn": camera_cache.as_ref().map(|cache| cache.picture_drawn),
+                    "tiles_drawn": camera_cache.as_ref().map(|cache| cache.tiles_drawn),
+                    "tiles_built": camera_cache.as_ref().map(|cache| cache.tiles_built),
+                    "scene_walks": camera_cache.as_ref().map(|cache| cache.scene_walks),
+                    "camera_cache_bytes": camera_cache.as_ref().map(|cache| cache.retained_bytes)
+                }),
+            ] {
+                if let serde_json::Value::Object(fields) = fields {
+                    frame_fields.extend(fields);
+                }
+            }
+            log::info!(
+                "fanta_canvas_frame {}",
+                serde_json::Value::Object(frame_fields)
             );
         }
         let sample = flush_duration.map(|flush_duration| crate::gesture_perf::FrameSample {
@@ -2195,7 +2528,13 @@ impl MacGpuRenderer {
             viewport_zoom: request.key.viewport_zoom,
             display_scale: request.scale_factor,
         });
-        Ok((pixel_buffer, normal_cost.unwrap_or(duration), path, sample))
+        Ok((
+            pixel_buffer,
+            normal_cost.unwrap_or(duration),
+            path,
+            sample,
+            progress,
+        ))
     }
 }
 
@@ -2206,10 +2545,86 @@ struct CompletedFrame {
     key: SurfaceKey,
     /// The frame's logical extent, for reprojection after an element resize.
     logical: (f64, f64),
+    progress: FrameProgress,
+    stamp: Option<SnapshotStamp>,
+    scene_cost: RenderCost,
+    dependency_proof: Option<FrameDependencyProof>,
+    font_proof: Option<FrameFontProof>,
+}
+
+#[cfg(target_os = "macos")]
+struct FrameFontProof {
+    fonts: fanta_render::FontGenerationObserver,
+    generation: Option<u64>,
+}
+
+#[cfg(target_os = "macos")]
+impl FrameFontProof {
+    fn matches(&self, fonts: Option<&fanta_render::FontGenerationObserver>) -> bool {
+        self.generation.is_some_and(|generation| {
+            fonts.is_some_and(|fonts| {
+                self.fonts.same_provider(fonts) && fonts.current() == Some(generation)
+            })
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct FrameDependencyProof {
+    fingerprint: InputsFingerprint,
+    fonts: fanta_render::FontGenerationObserver,
+    font_generation: u64,
+}
+
+#[cfg(target_os = "macos")]
+impl FrameDependencyProof {
+    fn matches(
+        &self,
+        fingerprint: InputsFingerprint,
+        fonts: Option<&fanta_render::FontGenerationObserver>,
+    ) -> bool {
+        self.fingerprint == fingerprint
+            && fonts.is_some_and(|fonts| {
+                self.fonts.same_provider(fonts) && fonts.current() == Some(self.font_generation)
+            })
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct LatestFrameRequest {
+    key: SurfaceKey,
+    logical: (f64, f64),
+    scale_factor: f32,
+}
+
+#[cfg(target_os = "macos")]
+fn retained_page_frame_matches(
+    stored_stamp: Option<SnapshotStamp>,
+    stored_key: &SurfaceKey,
+    stored_logical: (f64, f64),
+    stamp: SnapshotStamp,
+    key: &SurfaceKey,
+    frame_logical: (f64, f64),
+    visible_logical: (f64, f64),
+    scale_factor: f32,
+) -> bool {
+    stored_stamp == Some(stamp)
+        && stored_key.same_content(key)
+        && matches!(
+            frame_presentation(
+                stored_key,
+                stored_logical,
+                key,
+                frame_logical,
+                visible_logical,
+                scale_factor
+            ),
+            FramePresentation::Fresh | FramePresentation::Reprojected
+        )
 }
 
 /// The UI-thread side of the canvas: the newest completed frame, the render
-/// thread's channels, the presented-buffer retirement queue, and the
+/// thread's channels and the
 /// cheap-vs-expensive policy state. Owned by [`FigView`].
 ///
 /// [`FigView`]: crate::view::FigView
@@ -2228,18 +2643,24 @@ pub(crate) struct GpuCanvas {
     /// The request the render thread is working on, if any. At most one.
     in_flight: Option<SurfaceKey>,
     newest: Option<CompletedFrame>,
-    /// Buffers handed to the compositor recently. They only graduate to the
-    /// render thread's pool after `IN_FLIGHT_FRAMES` newer frames were
-    /// presented, because the window server may still be scanning them out —
-    /// rendering into one too early tears or corrupts the displayed frame.
-    retired: VecDeque<CVPixelBuffer>,
-    /// Graduated buffers waiting to ride along with the next job.
-    to_recycle: Vec<SendBuffer>,
+    previous_page_frame: Option<CompletedFrame>,
+    worker_fonts: Option<fanta_render::FontGenerationObserver>,
+    latest_request: Option<LatestFrameRequest>,
+    camera_mailbox: Arc<LatestCameraMailbox>,
+    request_id: u64,
+    held_since: Option<Instant>,
+    paint_presentation: Option<&'static str>,
+    last_painted_publication: Option<Instant>,
     /// The snapshot the render thread currently holds, as the UI last left it
     /// (full copy or patch). `None` until the first copy, and again after the
     /// render thread reports it lost the copy.
     worker_snapshot: Option<WorkerSnapshot>,
     rendered_node_ids: std::collections::HashSet<NodeId>,
+    previous_page_snapshot: Option<(WorkerSnapshot, std::collections::HashSet<NodeId>)>,
+    maintenance_request: Option<RenderRequest>,
+    maintenance_task: Option<Task<()>>,
+    maintenance_sequence: Option<u64>,
+    maintenance_ready: bool,
     /// [`InputsFingerprint`] of the document, tagged with the render
     /// generation and the variables generation it was computed at. The
     /// component library is compared exactly once per changed generation; the
@@ -2253,26 +2674,11 @@ pub(crate) struct GpuCanvas {
     rejected_translation: Option<TranslationGesture>,
     normal_cost_key: Option<SurfaceKey>,
     cost: RenderCost,
-    last_render_at: Option<Instant>,
-    /// Wall time of the most recent scene render. Drives the adaptive
-    /// reproject window — see [`render_interval`].
-    last_render_duration: Duration,
     epoch: u64,
 }
 
 #[cfg(target_os = "macos")]
 impl GpuCanvas {
-    const IN_FLIGHT_FRAMES: usize = 2;
-    /// Floor on how often a covered scene is re-rendered while the viewport is
-    /// animating. Frames in between reuse the previous render reprojected. The
-    /// live window grows with the measured render cost (see
-    /// [`render_interval`]) up to [`Self::MAX_RENDER_INTERVAL`].
-    const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(33);
-    /// Ceiling on the adaptive reproject window.
-    const MAX_RENDER_INTERVAL: Duration = Duration::from_millis(250);
-    /// Reproject for this many multiples of the last render's duration before
-    /// paying for the next fresh frame mid-interaction.
-    const REPROJECT_COST_FACTOR: u32 = 3;
     /// Beyond this zoom ratio a reprojected frame is too blurry or too sparse
     /// to stand in for a cheap scene's fresh render.
     const MAX_REPROJECT_SCALE: f64 = 3.0;
@@ -2315,6 +2721,16 @@ impl GpuCanvas {
             }
         });
 
+        Self::with_channels(gesture_perf, jobs, replies, reply_task, failed)
+    }
+
+    fn with_channels(
+        gesture_perf: Option<crate::gesture_perf::SharedGesturePerf>,
+        jobs: mpsc::Sender<RenderJob>,
+        replies: mpsc::Receiver<RenderReply>,
+        reply_task: Task<()>,
+        failed: Option<String>,
+    ) -> Self {
         Self {
             gesture_perf,
             jobs,
@@ -2324,20 +2740,41 @@ impl GpuCanvas {
             consecutive_failures: 0,
             in_flight: None,
             newest: None,
-            retired: VecDeque::new(),
-            to_recycle: Vec::new(),
+            previous_page_frame: None,
+            worker_fonts: None,
+            latest_request: None,
+            camera_mailbox: Arc::new(LatestCameraMailbox::default()),
+            request_id: 0,
+            held_since: None,
+            paint_presentation: None,
+            last_painted_publication: None,
             worker_snapshot: None,
             rendered_node_ids: std::collections::HashSet::new(),
+            previous_page_snapshot: None,
+            maintenance_request: None,
+            maintenance_task: None,
+            maintenance_sequence: None,
+            maintenance_ready: false,
             inputs_fingerprint: None,
             translation: None,
             translation_proof: None,
             rejected_translation: None,
             normal_cost_key: None,
             cost: RenderCost::Unknown,
-            last_render_at: None,
-            last_render_duration: Duration::ZERO,
             epoch: 0,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let (jobs, _) = mpsc::channel();
+        let (_, replies) = mpsc::channel();
+        Self::with_channels(None, jobs, replies, Task::ready(()), None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn epoch_for_test(&self) -> u64 {
+        self.epoch
     }
 
     /// The GPU path is usable (the render thread came up and keeps working).
@@ -2348,6 +2785,32 @@ impl GpuCanvas {
     /// Force the next paint to render anew even if nothing else changed.
     pub(crate) fn invalidate(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
+        self.previous_page_snapshot = None;
+        self.previous_page_frame = None;
+        self.invalidate_presentation();
+    }
+
+    pub(crate) fn invalidate_presentation(&mut self) {
+        self.maintenance_request = None;
+        self.maintenance_task = None;
+        self.maintenance_sequence = None;
+        self.maintenance_ready = false;
+        self.camera_mailbox.invalidate();
+    }
+
+    pub(crate) fn note_camera_input(&self, viewport: Viewport) {
+        let input_at = Instant::now();
+        self.camera_mailbox.note_input(viewport, input_at);
+        if crate::perf_enabled() {
+            log::info!(
+                "fanta_canvas_input {}",
+                serde_json::json!({
+                    "camera_sequence": self.camera_mailbox.sequence.load(Ordering::Acquire),
+                    "viewport_center": viewport.center,
+                    "viewport_zoom": viewport.zoom,
+                })
+            );
+        }
     }
 
     /// Drain every reply the render thread has produced. Returns whether any
@@ -2375,15 +2838,67 @@ impl GpuCanvas {
 
     fn handle_reply(&mut self, reply: RenderReply) {
         match reply {
+            RenderReply::Maintenance {
+                key,
+                result,
+                font_observer,
+            } => {
+                self.worker_fonts = Some(font_observer);
+                self.in_flight = None;
+                match result {
+                    Ok(progress) => {
+                        self.consecutive_failures = 0;
+                        if !progress.cancelled
+                            && let Some(frame) =
+                                self.newest.as_mut().filter(|frame| frame.key == key)
+                        {
+                            frame.progress.needs_refresh = progress.needs_refresh;
+                        }
+                    }
+                    Err(error) => {
+                        self.failed = Some(format!("camera cache maintenance failed: {error:#}"));
+                        log::warn!("camera cache maintenance failed: {error:#}");
+                    }
+                }
+            }
+            RenderReply::Cancelled {
+                key,
+                perf_tag,
+                pipeline,
+                started,
+                font_observer,
+            } => {
+                self.worker_fonts = Some(font_observer);
+                self.in_flight = None;
+                if let Some((perf, tag)) = self.gesture_perf.as_ref().zip(perf_tag)
+                    && !perf.borrow_mut().complete(tag, Err("camera_superseded"))
+                {
+                    log::warn!("duplicate or unknown superseded canvas request");
+                }
+                if crate::perf_enabled() {
+                    log::info!(
+                        "fanta_canvas_cancelled {}",
+                        serde_json::json!({
+                            "viewport_center": key.viewport_center,
+                            "viewport_zoom": key.viewport_zoom,
+                            "request_id": pipeline.request_id,
+                            "started": started,
+                            "dispatch_to_cancel_wall_us": elapsed_between(pipeline.dispatched_at, Some(Instant::now())),
+                        })
+                    );
+                }
+            }
             RenderReply::Frame {
                 key,
                 scale_factor,
                 result,
                 perf_tag,
+                font_observer,
             } => {
+                self.worker_fonts = Some(font_observer);
                 self.in_flight = None;
                 match result {
-                    Ok((buffer, duration, path, sample)) => {
+                    Ok((buffer, duration, path, sample, progress)) => {
                         if let Some((perf, tag)) = self.gesture_perf.as_ref().zip(perf_tag)
                             && !perf
                                 .borrow_mut()
@@ -2392,14 +2907,34 @@ impl GpuCanvas {
                             log::warn!("duplicate or unknown canvas gesture completion");
                         }
                         self.consecutive_failures = 0;
-                        if !accepts_translation_frame(path, self.translation) {
-                            self.to_recycle.push(buffer);
-                        } else {
+                        if accepts_translation_frame(path, self.translation) {
                             if let FramePath::Refused(gesture) = path {
                                 self.rejected_translation = Some(gesture);
                                 self.translation_proof = None;
                             }
-                            self.install_frame(key, scale_factor, buffer.0, duration, path);
+                            let newest = self.newest.as_ref().filter(|frame| {
+                                self.latest_request.as_ref().is_some_and(|latest| {
+                                    logical_extent_matches(
+                                        frame.logical,
+                                        latest.logical,
+                                        latest.scale_factor,
+                                    )
+                                })
+                            });
+                            if should_install_completed_frame(
+                                &key,
+                                newest.map(|frame| &frame.key),
+                                self.latest_request.as_ref().map(|latest| &latest.key),
+                            ) {
+                                self.install_frame(
+                                    key,
+                                    scale_factor,
+                                    buffer.0,
+                                    duration,
+                                    path,
+                                    progress,
+                                );
+                            }
                         }
                     }
                     Err(error) => {
@@ -2419,7 +2954,12 @@ impl GpuCanvas {
                     }
                 }
             }
-            RenderReply::SnapshotLost { error, perf_tag } => {
+            RenderReply::SnapshotLost {
+                error,
+                perf_tag,
+                font_observer,
+            } => {
+                self.worker_fonts = Some(font_observer);
                 if let Some((perf, tag)) = self.gesture_perf.as_ref().zip(perf_tag)
                     && !perf.borrow_mut().complete(tag, Err("snapshot_lost"))
                 {
@@ -2427,6 +2967,7 @@ impl GpuCanvas {
                 }
                 self.in_flight = None;
                 self.worker_snapshot = None;
+                self.previous_page_snapshot = None;
                 log::warn!("the canvas render thread dropped its scene copy: {error:#}");
             }
             RenderReply::InitFailed(error) => {
@@ -2471,41 +3012,62 @@ impl GpuCanvas {
         buffer: CVPixelBuffer,
         duration: Duration,
         path: FramePath,
+        progress: FrameProgress,
     ) {
         let scale = f64::from(scale_factor.max(f32::EPSILON));
         let logical = (f64::from(key.size.0) / scale, f64::from(key.size.1) / scale);
         let previous = self.newest.take();
+        let worker = self.worker_snapshot.filter(|worker| {
+            let stamp = worker.stamp;
+            (stamp.scene_instance, stamp.scene_revision) == key.scene
+                && stamp.generation == key.revision
+                && stamp.render_root == key.page_root
+        });
         self.cost = retained_cost_after_install(
             previous.as_ref().map(|frame| &frame.key),
             &key,
             self.cost,
             duration,
             path,
+            progress.scene_rendered,
         );
-        if let Some(previous) = previous {
-            self.retire(previous.buffer);
-        }
         self.newest = Some(CompletedFrame {
             buffer,
             key,
             logical,
+            progress,
+            stamp: worker.map(|worker| worker.stamp),
+            scene_cost: self.cost,
+            dependency_proof: worker
+                .zip(progress.font_generation)
+                .zip(self.worker_fonts.clone())
+                .map(|((worker, font_generation), fonts)| FrameDependencyProof {
+                    fingerprint: worker.fingerprint,
+                    fonts,
+                    font_generation,
+                }),
+            font_proof: self.worker_fonts.clone().map(|fonts| FrameFontProof {
+                fonts,
+                generation: progress.font_generation,
+            }),
         });
+        if previous.as_ref().is_some_and(|frame| {
+            frame.key.page_root != key.page_root
+                && frame.key.scene == key.scene
+                && frame.key.revision == key.revision
+                && frame.key.epoch == key.epoch
+                && frame.buffer.get_data_size() <= 64 << 20
+        }) {
+            self.previous_page_frame = previous;
+        }
         if !matches!(path, FramePath::Retained(_)) {
             self.normal_cost_key = Some(key);
-            self.last_render_duration = duration;
         }
-        self.last_render_at = Some(Instant::now());
     }
 
-    /// Queue a previously presented buffer for reuse once enough newer frames
-    /// have shipped that the compositor cannot still be reading it.
-    fn retire(&mut self, buffer: CVPixelBuffer) {
-        self.retired.push_back(buffer);
-        while self.retired.len() > Self::IN_FLIGHT_FRAMES {
-            if let Some(buffer) = self.retired.pop_front() {
-                self.to_recycle.push(SendBuffer(buffer));
-            }
-        }
+    fn restore_retained_page_cost(&mut self, key: SurfaceKey, cost: RenderCost) {
+        self.cost = cost;
+        self.normal_cost_key = Some(key);
     }
 
     /// Hand the render thread one job. Coalesced by construction: paint only
@@ -2521,18 +3083,39 @@ impl GpuCanvas {
             RenderSource::Patch(_) => RenderSourceKind::Patch,
             RenderSource::Snapshot(Some(_)) => RenderSourceKind::SnapshotFresh,
             RenderSource::Snapshot(None) => RenderSourceKind::SnapshotReuse,
+            RenderSource::Cached(_) => RenderSourceKind::SnapshotReuse,
+            RenderSource::Reuse(_) => RenderSourceKind::SnapshotReuse,
         };
-        request.perf_tag = self
-            .gesture_perf
-            .as_ref()
-            .and_then(|perf| perf.borrow_mut().reserve(kind));
+        request.perf_tag = (!request.maintenance)
+            .then(|| {
+                self.gesture_perf
+                    .as_ref()
+                    .and_then(|perf| perf.borrow_mut().reserve(kind))
+            })
+            .flatten();
+        if !request.maintenance {
+            self.maintenance_request = (!matches!(source, RenderSource::Live(_))
+                && request.motion.is_none()
+                && request.video.is_none()
+                && request.video_fills.is_empty()
+                && request.translation.is_none())
+            .then(|| request.clone());
+        }
         let perf_tag = request.perf_tag;
         let key = request.key;
-        let job = RenderJob {
-            source,
-            request,
-            recycled: std::mem::take(&mut self.to_recycle),
-        };
+        request.camera = Some(self.camera_mailbox.publish(key, request.scale_factor));
+        self.request_id = self.request_id.wrapping_add(1);
+        request.pipeline.request_id = self.request_id;
+        request.pipeline.dispatched_at = Some(Instant::now());
+        request.pipeline.input_at = self
+            .camera_mailbox
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .input_at;
+        let camera_sequence = request.camera.as_ref().map(|ticket| ticket.sequence);
+        let job_maintenance = request.maintenance;
+        let job = RenderJob { source, request };
         if self.jobs.send(job).is_err() {
             if let Some(perf) = &self.gesture_perf {
                 perf.borrow_mut().dispatch_failed("worker_send_failed");
@@ -2549,11 +3132,14 @@ impl GpuCanvas {
                 "fanta_canvas_dispatch {}",
                 serde_json::json!({
                     "source": kind,
+                    "maintenance": job_maintenance,
                     "page": key.page_root,
                     "viewport_center": key.viewport_center,
                     "viewport_zoom": key.viewport_zoom,
                     "scene": key.scene,
                     "generation": key.revision,
+                    "request_id": self.request_id,
+                    "camera_sequence": camera_sequence,
                 })
             );
         }
@@ -2579,6 +3165,7 @@ impl GpuCanvas {
                             result.as_ref().err().map(|error| format!("{error:#}")),
                         ),
                         RenderReply::InitFailed(error) => (true, Some(format!("{error:#}"))),
+                        RenderReply::Cancelled { .. } => (true, None),
                         _ => (false, None),
                     };
                     self.handle_reply(reply);
@@ -2603,26 +3190,35 @@ impl GpuCanvas {
         }
     }
 
-    /// The frame to paint for `requested`: the newest completed frame, fresh
-    /// when it matches and reprojected otherwise. Nothing when the newest
-    /// frame shows a different page — its pixels would be wrong content, not
-    /// merely stale.
-    fn present(&self, requested: &SurfaceKey) -> Option<GpuFrame> {
+    /// Use completed coverage while the latest camera job is pending.
+    fn present(
+        &self,
+        requested: &SurfaceKey,
+        frame_logical: (f64, f64),
+        visible_logical: (f64, f64),
+        scale_factor: f32,
+    ) -> Option<GpuFrame> {
         let newest = self.newest.as_ref()?;
-        if newest.key.page_root != requested.page_root {
-            return None;
+        match frame_presentation(
+            &newest.key,
+            newest.logical,
+            requested,
+            frame_logical,
+            visible_logical,
+            scale_factor,
+        ) {
+            FramePresentation::Unavailable => None,
+            FramePresentation::Fresh => Some(GpuFrame::Fresh(newest.buffer.clone())),
+            FramePresentation::Held => Some(GpuFrame::Held(newest.buffer.clone())),
+            FramePresentation::Reprojected => Some(GpuFrame::Reprojected {
+                buffer: newest.buffer.clone(),
+                viewport: Viewport {
+                    center: newest.key.viewport_center,
+                    zoom: newest.key.viewport_zoom,
+                },
+                logical: newest.logical,
+            }),
         }
-        if newest.key == *requested {
-            return Some(GpuFrame::Fresh(newest.buffer.clone()));
-        }
-        Some(GpuFrame::Reprojected {
-            buffer: newest.buffer.clone(),
-            viewport: Viewport {
-                center: newest.key.viewport_center,
-                zoom: newest.key.viewport_zoom,
-            },
-            logical: newest.logical,
-        })
     }
 
     /// One paint pass: pick up replies, plan against the newest frame, do the
@@ -2641,12 +3237,9 @@ impl GpuCanvas {
         video: Option<CanvasVideoFrame>,
         video_fills: Vec<CanvasVideoFillFrame>,
         translation: Option<TranslationGesture>,
+        camera_interacting: bool,
     ) -> Result<(Option<GpuFrame>, bool)> {
         self.sync_translation(translation);
-        self.pump_replies();
-        if let Some(reason) = &self.failed {
-            return Err(anyhow!("{reason}"));
-        }
         let key = SurfaceKey {
             size,
             viewport_center: viewport.center,
@@ -2661,10 +3254,50 @@ impl GpuCanvas {
             motion_frame: motion.as_ref().map(MotionFrameKey::from),
             video_frame: video.as_ref().map(VideoFrameKey::from),
             video_fill_frame: video_fill_frame_fingerprint(&video_fills),
+            camera_interacting,
         };
-        let within_render_interval = self
-            .last_render_at
-            .is_some_and(|at| at.elapsed() < render_interval(self.last_render_duration));
+        self.latest_request = Some(LatestFrameRequest {
+            key,
+            logical: frame_logical,
+            scale_factor,
+        });
+        self.camera_mailbox.publish(key, scale_factor);
+        self.pump_replies();
+        let fingerprint = self.inputs_fingerprint(document);
+        if self.in_flight.is_none()
+            && self
+                .newest
+                .as_ref()
+                .is_none_or(|frame| frame.key.page_root != key.page_root)
+            && self.previous_page_frame.as_ref().is_some_and(|frame| {
+                frame
+                    .dependency_proof
+                    .as_ref()
+                    .is_some_and(|proof| proof.matches(fingerprint, self.worker_fonts.as_ref()))
+                    && retained_page_frame_matches(
+                        frame.stamp,
+                        &frame.key,
+                        frame.logical,
+                        SnapshotStamp::of(document).with_root(page_root),
+                        &key,
+                        frame_logical,
+                        visible_logical,
+                        scale_factor,
+                    )
+            })
+        {
+            std::mem::swap(&mut self.newest, &mut self.previous_page_frame);
+            if let Some((key, cost)) = self
+                .newest
+                .as_ref()
+                .map(|frame| (frame.key, frame.scene_cost))
+            {
+                self.restore_retained_page_cost(key, cost);
+            }
+        }
+        if let Some(reason) = &self.failed {
+            return Err(anyhow!("{reason}"));
+        }
         let translation = self.translation.filter(|gesture| {
             retained_cost_eligible(self.cost, self.normal_cost_key.as_ref(), &key)
                 && self.rejected_translation != Some(*gesture)
@@ -2673,19 +3306,27 @@ impl GpuCanvas {
                 && video_fills.is_empty()
                 && page_root.is_some()
         });
+        let newest = self.newest.as_ref().filter(|frame| {
+            logical_extent_matches(frame.logical, frame_logical, scale_factor)
+                && frame
+                    .font_proof
+                    .as_ref()
+                    .is_some_and(|proof| proof.matches(self.worker_fonts.as_ref()))
+                && frame
+                    .dependency_proof
+                    .as_ref()
+                    .is_none_or(|proof| proof.matches(fingerprint, self.worker_fonts.as_ref()))
+        });
         let plan = plan_paint(
-            self.newest.as_ref().map(|frame| &frame.key),
+            newest.map(|frame| &frame.key),
             &key,
             self.in_flight.is_some(),
             self.cost,
-            frame_logical,
-            visible_logical,
-            within_render_interval,
+            newest.is_some_and(|frame| frame.progress.needs_refresh),
         );
-        let mut repaint = false;
+        let repaint = false;
         match plan {
             PaintPlan::Present | PaintPlan::PresentAndWait => {}
-            PaintPlan::Reproject => repaint = true,
             PaintPlan::RenderBlocking => {
                 let request = RenderRequest {
                     key,
@@ -2699,6 +3340,9 @@ impl GpuCanvas {
                     mode_generation: self.inputs_fingerprint(document).variables,
                     translation: None,
                     perf_tag: None,
+                    camera: None,
+                    pipeline: FramePipelineTiming::default(),
+                    maintenance: false,
                 };
                 self.render_blocking(LiveInputs::of(document), request)?;
             }
@@ -2718,6 +3362,9 @@ impl GpuCanvas {
                     mode_generation: fingerprint.variables,
                     translation,
                     perf_tag: None,
+                    camera: None,
+                    pipeline: FramePipelineTiming::default(),
+                    maintenance: false,
                 };
                 let (source, translation) =
                     self.translation_source(document, stamp, fingerprint, translation, page_root);
@@ -2729,7 +3376,35 @@ impl GpuCanvas {
                 self.worker_snapshot = Some(WorkerSnapshot { stamp, fingerprint });
             }
         }
-        let frame = self.present(&key);
+        if plan == PaintPlan::Present
+            && self.in_flight.is_none()
+            && self.maintenance_ready
+            && self.maintenance_sequence
+                == Some(self.camera_mailbox.sequence.load(Ordering::Acquire))
+            && self
+                .newest
+                .as_ref()
+                .is_some_and(|frame| frame.progress.needs_refresh)
+            && let Some(mut request) = self
+                .maintenance_request
+                .clone()
+                .filter(|request| request.key == key)
+        {
+            request.maintenance = true;
+            request.translation = None;
+            self.dispatch(RenderSource::Snapshot(None), request)?;
+        }
+        let frame = self.present(&key, frame_logical, visible_logical, scale_factor);
+        self.paint_presentation = frame.as_ref().map(|frame| match frame {
+            GpuFrame::Fresh(_) => "fresh",
+            GpuFrame::Reprojected { .. } => "reprojected",
+            GpuFrame::Held(_) => "held",
+        });
+        if self.paint_presentation == Some("held") {
+            self.held_since.get_or_insert_with(Instant::now);
+        } else {
+            self.held_since = None;
+        }
         if let Some(perf) = &self.gesture_perf
             && let Some(reprojected) = reused_paint_classification(
                 &plan,
@@ -2741,6 +3416,52 @@ impl GpuCanvas {
             perf.borrow_mut().reused_paint(reprojected);
         }
         Ok((frame, repaint))
+    }
+
+    fn record_element_paint(&mut self, started: Instant, finished: Instant) {
+        if !crate::perf_enabled() {
+            return;
+        }
+        let Some(latest) = &self.latest_request else {
+            return;
+        };
+        let frame = self.newest.as_ref();
+        let pipeline = frame.map(|frame| frame.progress.pipeline);
+        let matches_latest = frame.is_some_and(|frame| frame.key == latest.key);
+        let first_paint = pipeline.is_some_and(|pipeline| {
+            pipeline.published_at.is_some()
+                && pipeline.published_at != self.last_painted_publication
+        });
+        let input_at = self
+            .camera_mailbox
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .input_at;
+        log::info!(
+            "fanta_canvas_paint {}",
+            serde_json::json!({
+                "measurement_boundary": "element_paint_finished_not_displayed",
+                "latency_kind": "camera_input_only",
+                "request_id": pipeline.map(|pipeline| pipeline.request_id),
+                "camera_sequence": self.camera_mailbox.sequence.load(Ordering::Acquire),
+                "requested_center": latest.key.viewport_center,
+                "requested_zoom": latest.key.viewport_zoom,
+                "frame_center": frame.map(|frame| frame.key.viewport_center),
+                "frame_zoom": frame.map(|frame| frame.key.viewport_zoom),
+                "presentation": self.paint_presentation.unwrap_or("unavailable"),
+                "matches_latest": matches_latest,
+                "first_paint": first_paint,
+                "complete_detail": frame.map(|frame| frame.progress.complete_detail),
+                "element_paint_wall_us": elapsed_between(Some(started), Some(finished)),
+                "held_wall_us": elapsed_between(self.held_since, Some(finished)),
+                "latest_input_age_us": elapsed_between(input_at, Some(finished)),
+                "input_to_paint_wall_us": matches_latest.then(|| elapsed_between(input_at, Some(finished))).flatten(),
+                "publish_to_paint_wall_us": pipeline.and_then(|pipeline| elapsed_between(pipeline.published_at, Some(finished))),
+                "dispatch_to_paint_wall_us": pipeline.and_then(|pipeline| elapsed_between(pipeline.dispatched_at, Some(finished))),
+            })
+        );
+        self.last_painted_publication = pipeline.and_then(|pipeline| pipeline.published_at);
     }
 
     fn translation_source(
@@ -2789,10 +3510,27 @@ impl GpuCanvas {
     ) -> RenderSource {
         let scene = &document.doc.scene;
         let started = Instant::now();
+        if self
+            .previous_page_snapshot
+            .as_ref()
+            .is_some_and(|(worker, _)| retained_worker_matches(worker, stamp, fingerprint))
+        {
+            let Some((previous, ids)) = self.previous_page_snapshot.take() else {
+                return self.capture_snapshot(document, stamp);
+            };
+            self.previous_page_snapshot = self
+                .worker_snapshot
+                .map(|worker| (worker, std::mem::replace(&mut self.rendered_node_ids, ids)));
+            self.worker_snapshot = Some(previous);
+            return RenderSource::Cached(stamp);
+        }
         let source =
             match plan_snapshot_sync(self.worker_snapshot.as_ref(), stamp, fingerprint, scene) {
-                SnapshotSync::Reuse => RenderSource::Snapshot(None),
-                SnapshotSync::Patch(delta) if delta.is_empty() => RenderSource::Snapshot(None),
+                SnapshotSync::Reuse => RenderSource::Reuse(stamp),
+                SnapshotSync::Patch(delta) if delta.is_empty() => {
+                    self.previous_page_snapshot = None;
+                    RenderSource::Reuse(stamp)
+                }
                 SnapshotSync::Patch(mut delta) => {
                     delta
                         .transforms
@@ -2807,6 +3545,7 @@ impl GpuCanvas {
                     }
                     match build_scene_patch(scene, &delta, stamp) {
                         Some(patch) => {
+                            self.previous_page_snapshot = None;
                             crate::report_slow("canvas scene patch", started);
                             return RenderSource::Patch(Box::new(patch));
                         }
@@ -2821,6 +3560,15 @@ impl GpuCanvas {
 
     fn capture_snapshot(&mut self, document: &FigDocument, stamp: SnapshotStamp) -> RenderSource {
         let snapshot = SceneSnapshot::capture(document, stamp);
+        self.previous_page_snapshot = self
+            .worker_snapshot
+            .filter(|worker| {
+                worker.stamp.same_document(&stamp)
+                    && worker.stamp.render_root != stamp.render_root
+                    && self.rendered_node_ids.len() <= RETAINED_SNAPSHOT_NODE_LIMIT
+                    && snapshot.scene.len() <= RETAINED_SNAPSHOT_NODE_LIMIT
+            })
+            .map(|worker| (worker, std::mem::take(&mut self.rendered_node_ids)));
         self.rendered_node_ids = snapshot
             .scene
             .roots()
@@ -2840,6 +3588,8 @@ impl GpuCanvas {
 #[cfg(target_os = "macos")]
 impl Drop for GpuCanvas {
     fn drop(&mut self) {
+        self.camera_mailbox.stopped.store(true, Ordering::Release);
+        self.camera_mailbox.invalidate();
         if let Some(perf) = &self.gesture_perf {
             perf.borrow_mut().fail_pending("gpu_canvas_dropped");
         }
@@ -2881,12 +3631,56 @@ impl FigView {
             return;
         };
         gpu.sync_translation(translation);
-        if gpu.pump_replies() {
-            if let Some(reason) = gpu.failed.as_deref() {
-                log::warn!("falling back to the CPU canvas: {reason}");
-            }
-            cx.notify();
+        // Only paint knows the current camera and layout extent. Installing
+        // here could replace a matching frame with an older pan completion.
+        cx.notify();
+    }
+
+    fn schedule_camera_maintenance(&mut self, cx: &mut Context<Self>) {
+        let Some(gpu) = &mut self.gpu_canvas else {
+            return;
+        };
+        let Some(latest) = &gpu.latest_request else {
+            return;
+        };
+        if !gpu.newest.as_ref().is_some_and(|frame| {
+            frame.key == latest.key
+                && frame.progress.complete_detail
+                && frame.progress.needs_refresh
+        }) || gpu
+            .maintenance_request
+            .as_ref()
+            .is_none_or(|request| request.key != latest.key)
+        {
+            return;
         }
+        let sequence = gpu.camera_mailbox.sequence.load(Ordering::Acquire);
+        if gpu.maintenance_sequence == Some(sequence) {
+            return;
+        }
+        gpu.maintenance_sequence = Some(sequence);
+        gpu.maintenance_ready = false;
+        let ticket = CameraTicket {
+            mailbox: gpu.camera_mailbox.clone(),
+            sequence,
+        };
+        gpu.maintenance_task = Some(cx.spawn(async move |view, cx| {
+            if !camera_maintenance_after_idle(cx.background_executor().clone(), ticket.clone())
+                .await
+            {
+                return;
+            }
+            view.update(cx, |view, cx| {
+                if let Some(gpu) = &mut view.gpu_canvas
+                    && gpu.maintenance_sequence == Some(sequence)
+                    && !ticket.cancelled()
+                {
+                    gpu.maintenance_ready = true;
+                    cx.notify();
+                }
+            })
+            .log_err();
+        }));
     }
 }
 
@@ -3272,6 +4066,8 @@ impl Element for CanvasElement {
         window: &mut Window,
         cx: &mut App,
     ) {
+        #[cfg(target_os = "macos")]
+        let element_paint_started = crate::gesture_perf::optional_timer(crate::perf_enabled());
         let Some(listeners) = prepaint.take() else {
             return;
         };
@@ -3369,6 +4165,8 @@ impl Element for CanvasElement {
             // construction needs the entity context, which the borrow pins.
             #[cfg(target_os = "macos")]
             let gpu_available = this.ensure_gpu_canvas(render_size, cx);
+            #[cfg(target_os = "macos")]
+            let camera_interacting = false;
             let item = this.item().clone();
             let item = item.read(cx);
             let document = item
@@ -3409,6 +4207,7 @@ impl Element for CanvasElement {
                     video.clone(),
                     video_fills.clone(),
                     translation,
+                    camera_interacting,
                 ) {
                     Ok((frame, repaint)) => {
                         this.clear_rendered_canvas();
@@ -3448,7 +4247,7 @@ impl Element for CanvasElement {
             #[cfg(target_os = "macos")]
             Ok((PaintCanvas::Surface { frame, viewport }, repaint)) => {
                 match frame {
-                    Some(GpuFrame::Fresh(surface)) => {
+                    Some(GpuFrame::Fresh(surface) | GpuFrame::Held(surface)) => {
                         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
                             window.paint_surface(frame_bounds, surface);
                         });
@@ -3491,6 +4290,18 @@ impl Element for CanvasElement {
         }
 
         self.paint_overlays(bounds, window, cx);
+        #[cfg(target_os = "macos")]
+        self.view
+            .update(cx, |view, cx| view.schedule_camera_maintenance(cx));
+        #[cfg(target_os = "macos")]
+        if let Some(started) = element_paint_started {
+            let finished = Instant::now();
+            self.view.update(cx, |view, _| {
+                if let Some(gpu) = &mut view.gpu_canvas {
+                    gpu.record_element_paint(started, finished);
+                }
+            });
+        }
     }
 }
 
@@ -6846,7 +7657,153 @@ mod tests {
             motion_frame: None,
             video_frame: None,
             video_fill_frame: None,
+            camera_interacting: false,
         }
+    }
+
+    fn camera_request(key: SurfaceKey, mailbox: &Arc<LatestCameraMailbox>) -> RenderRequest {
+        RenderRequest {
+            key,
+            scale_factor: 2.0,
+            motion: None,
+            video: None,
+            video_fills: Vec::new(),
+            mode_generation: 0,
+            translation: None,
+            perf_tag: None,
+            camera: Some(mailbox.publish(key, 2.0)),
+            pipeline: FramePipelineTiming::default(),
+            maintenance: false,
+        }
+    }
+
+    #[test]
+    fn camera_input_cancels_a_busy_worker_before_another_paint() -> Result<()> {
+        let mailbox = Arc::new(LatestCameraMailbox::default());
+        let first = surface_key([0.0, 0.0], 0.1, 7);
+        let request = camera_request(first, &mailbox);
+        let ticket = request.camera.context("camera ticket")?;
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        let worker = std::thread::Builder::new().spawn({
+            let entered = entered.clone();
+            let resume = resume.clone();
+            move || {
+                entered.wait();
+                resume.wait();
+                ticket.cancelled()
+            }
+        })?;
+        entered.wait();
+        mailbox.note_input(viewport([40_000.0, 0.0], 0.1), Instant::now());
+        resume.wait();
+        let cancelled = worker
+            .join()
+            .map_err(|_| anyhow!("camera probe panicked"))?;
+        assert!(
+            cancelled,
+            "input must reach a running worker without paint or a render job"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn queued_camera_retargets_latest_pan_zoom_and_preserves_content_proof() -> Result<()> {
+        let mailbox = Arc::new(LatestCameraMailbox::default());
+        let first = surface_key([0.0, 0.0], 0.1, 7);
+        let mut request = camera_request(first, &mailbox);
+        let input_at = Instant::now();
+        let latest = viewport([80_000.0, -300.0], 0.173);
+        mailbox.note_input(latest, input_at);
+        assert!(request.camera.as_ref().context("ticket")?.cancelled());
+        assert!(mailbox.retarget(&mut request));
+        assert_eq!(request.key.viewport_center, latest.center);
+        assert_eq!(request.key.viewport_zoom, latest.zoom);
+        assert!(
+            !request.key.camera_interacting,
+            "navigation stays at exact scale"
+        );
+        assert_eq!(request.pipeline.input_at, Some(input_at));
+        assert!(
+            !request
+                .camera
+                .as_ref()
+                .context("retargeted ticket")?
+                .cancelled()
+        );
+        let sequence = mailbox.sequence.load(Ordering::Acquire);
+        mailbox.note_input(latest, input_at + Duration::from_millis(1));
+        assert_eq!(mailbox.sequence.load(Ordering::Acquire), sequence);
+
+        let mut resized = request.key;
+        resized.size = (1500, 1600);
+        mailbox.publish(resized, 1.5);
+        assert!(mailbox.retarget(&mut request));
+        assert_eq!(request.key.size, resized.size);
+        assert_eq!(request.scale_factor, 1.5);
+        let before_edit = request.key;
+        let mut edited = before_edit;
+        edited.revision += 1;
+        mailbox.publish(edited, 1.5);
+        assert!(
+            mailbox
+                .state
+                .lock()
+                .map_err(|_| anyhow!("mailbox poisoned"))?
+                .input_at
+                .is_none()
+        );
+        assert!(
+            !mailbox.retarget(&mut request),
+            "camera retargeting cannot render newer content from an older snapshot"
+        );
+        assert_eq!(request.key, before_edit);
+        assert!(
+            request
+                .camera
+                .as_ref()
+                .context("old content ticket")?
+                .cancelled()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn camera_mailbox_invalidations_and_teardown_cancel_without_a_job() -> Result<()> {
+        let mailbox = Arc::new(LatestCameraMailbox::default());
+        let mut request = camera_request(surface_key([0.0, 0.0], 0.1, 7), &mailbox);
+        mailbox.note_input(viewport([10.0, 0.0], 0.1), Instant::now());
+        mailbox.invalidate();
+        assert!(
+            mailbox
+                .state
+                .lock()
+                .map_err(|_| anyhow!("mailbox poisoned"))?
+                .input_at
+                .is_none()
+        );
+        assert!(request.camera.as_ref().context("ticket")?.cancelled());
+        assert!(!mailbox.retarget(&mut request));
+        request = camera_request(request.key, &mailbox);
+        mailbox.stopped.store(true, Ordering::Release);
+        assert!(
+            request
+                .camera
+                .as_ref()
+                .context("replacement ticket")?
+                .cancelled()
+        );
+        assert!(!mailbox.retarget(&mut request));
+        Ok(())
+    }
+
+    #[test]
+    fn pipeline_elapsed_time_rejects_missing_and_inverted_stages() {
+        let start = Instant::now();
+        let finish = start + Duration::from_millis(4);
+        assert_eq!(elapsed_between(Some(start), Some(finish)), Some(4_000));
+        assert_eq!(elapsed_between(Some(finish), Some(start)), None);
+        assert_eq!(elapsed_between(None, Some(finish)), None);
     }
 
     /// The frame is rendered with a 160-logical-px margin on each side of a
@@ -6854,6 +7811,198 @@ mod tests {
     /// pan slack per axis.
     const FRAME_LOGICAL: (f64, f64) = (1320.0, 1320.0);
     const VISIBLE_LOGICAL: (f64, f64) = (1000.0, 1000.0);
+
+    #[test]
+    fn cached_presentation_never_exposes_uncovered_edges_or_another_page() {
+        let cached = surface_key([0.0, 0.0], 1.0, 7);
+        assert_eq!(
+            frame_presentation(
+                &cached,
+                FRAME_LOGICAL,
+                &cached,
+                FRAME_LOGICAL,
+                VISIBLE_LOGICAL,
+                1.0,
+            ),
+            FramePresentation::Fresh
+        );
+        let covered = surface_key([100.0, -100.0], 1.0, 7);
+        assert_eq!(
+            frame_presentation(
+                &cached,
+                FRAME_LOGICAL,
+                &covered,
+                FRAME_LOGICAL,
+                VISIBLE_LOGICAL,
+                1.0,
+            ),
+            FramePresentation::Reprojected
+        );
+        let uncovered = surface_key([161.0, 0.0], 1.0, 7);
+        assert_eq!(
+            frame_presentation(
+                &cached,
+                FRAME_LOGICAL,
+                &uncovered,
+                FRAME_LOGICAL,
+                VISIBLE_LOGICAL,
+                1.0,
+            ),
+            FramePresentation::Held
+        );
+        assert_eq!(
+            frame_presentation(
+                &cached,
+                (800.0, 800.0),
+                &cached,
+                FRAME_LOGICAL,
+                VISIBLE_LOGICAL,
+                1.0,
+            ),
+            FramePresentation::Held,
+            "coverage must use the completed surface extent after resize"
+        );
+        let mut other_page = cached;
+        other_page.page_root = Some(NodeId::from_u128(1));
+        assert_eq!(
+            frame_presentation(
+                &cached,
+                FRAME_LOGICAL,
+                &other_page,
+                FRAME_LOGICAL,
+                VISIBLE_LOGICAL,
+                1.0,
+            ),
+            FramePresentation::Unavailable
+        );
+        let mut reloaded = cached;
+        reloaded.scene.0 += 1;
+        assert_eq!(
+            frame_presentation(
+                &cached,
+                FRAME_LOGICAL,
+                &reloaded,
+                FRAME_LOGICAL,
+                VISIBLE_LOGICAL,
+                1.0,
+            ),
+            FramePresentation::Unavailable
+        );
+    }
+
+    #[test]
+    fn a_stale_pan_completion_cannot_replace_the_matching_current_camera() {
+        let first = surface_key([0.0, 0.0], 0.1, 7);
+        let distant = surface_key([40_000.0, 0.0], 0.1, 7);
+        assert_eq!(
+            plan_paint(Some(&first), &distant, false, RenderCost::Expensive, false),
+            PaintPlan::PresentAndRender
+        );
+        assert_eq!(
+            plan_paint(Some(&first), &first, true, RenderCost::Expensive, false),
+            PaintPlan::Present
+        );
+        assert!(
+            !should_install_completed_frame(&distant, Some(&first), Some(&first)),
+            "returning to the existing exact camera must retain its pixels"
+        );
+        assert!(
+            should_install_completed_frame(&first, Some(&first), Some(&first)),
+            "same-camera detail refinement must still install"
+        );
+        assert_eq!(
+            plan_paint(Some(&first), &first, false, RenderCost::Expensive, true),
+            PaintPlan::Present,
+            "tile maintenance cannot delay a matching sharp frame"
+        );
+        let third = surface_key([80_000.0, 0.0], 0.1, 7);
+        assert!(
+            !should_install_completed_frame(&distant, Some(&first), Some(&third)),
+            "an obsolete camera must not replace pixels while the current camera is pending"
+        );
+        assert_eq!(
+            plan_paint(Some(&distant), &third, false, RenderCost::Expensive, false),
+            PaintPlan::PresentAndRender
+        );
+        assert!(!should_install_completed_frame(
+            &distant,
+            None,
+            Some(&first)
+        ));
+    }
+
+    #[test]
+    fn fractional_layout_rounding_reuses_the_same_physical_target() {
+        for scale_factor in [1.0_f32, 2.0] {
+            let mut key = surface_key([0.0, 0.0], 1.0, 7);
+            key.size = (2641, 2121);
+            let logical = (
+                f64::from(key.size.0) / f64::from(scale_factor),
+                f64::from(key.size.1) / f64::from(scale_factor),
+            );
+            let fractional = (
+                logical.0 - 0.75 / f64::from(scale_factor),
+                logical.1 - 0.25 / f64::from(scale_factor),
+            );
+            assert!(logical_extent_matches(logical, fractional, scale_factor));
+            assert_eq!(
+                frame_presentation(
+                    &key,
+                    logical,
+                    &key,
+                    fractional,
+                    VISIBLE_LOGICAL,
+                    scale_factor
+                ),
+                FramePresentation::Fresh
+            );
+            let newest = logical_extent_matches(logical, fractional, scale_factor).then_some(&key);
+            assert_eq!(
+                plan_paint(newest, &key, false, RenderCost::Expensive, false),
+                PaintPlan::Present,
+                "rounding must not perpetually dispatch another frame"
+            );
+            assert!(!logical_extent_matches(
+                logical,
+                (logical.0 - 1.25 / f64::from(scale_factor), logical.1),
+                scale_factor
+            ));
+            assert!(
+                !logical_extent_matches(logical, (logical.0 * 2.0, logical.1 * 2.0), scale_factor),
+                "a real display-scale change cannot reuse the target extent"
+            );
+            let resized = SurfaceKey {
+                size: (2642, 2121),
+                ..key
+            };
+            assert_eq!(
+                plan_paint(Some(&key), &resized, false, RenderCost::Cheap, false),
+                PaintPlan::PresentAndRender,
+                "physical target size still compares exactly"
+            );
+        }
+    }
+
+    #[test]
+    fn camera_cache_maintenance_never_replaces_a_matching_presentation() {
+        let key = surface_key([0.0, 0.0], 0.1, 7);
+        for cost in [
+            RenderCost::Unknown,
+            RenderCost::Cheap,
+            RenderCost::Expensive,
+        ] {
+            for in_flight in [false, true] {
+                assert_eq!(
+                    plan_paint(Some(&key), &key, in_flight, cost, true),
+                    PaintPlan::Present
+                );
+            }
+            assert_eq!(
+                plan_paint(Some(&key), &key, false, cost, false),
+                PaintPlan::Present
+            );
+        }
+    }
 
     #[test]
     fn identical_key_reuses_the_cached_frame_even_outside_the_interval() {
@@ -7106,29 +8255,28 @@ mod tests {
     }
 
     #[test]
-    fn zooming_out_reprojects_within_the_throttle_despite_thin_coverage() {
-        // Zooming out grows the needed world coverage past the cached frame's
-        // margin almost immediately. That must NOT fall off the throttle onto
-        // a full render per input event (the old degradation cliff): while the
-        // interval is closed the shrinking frame reprojects with briefly
-        // exposed edges, and the sharp frame lands when the throttle opens.
+    fn uncovered_zoom_out_never_shrinks_a_partial_surface_into_the_view() {
         let cached = surface_key([0.0, 0.0], 1.0, 7);
-        let zoomed_out = surface_key([0.0, 0.0], 0.5, 7);
-        assert_eq!(
-            frame_decision(&cached, &zoomed_out, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
-            FrameDecision::Reproject
-        );
-        // Past the reproject scale cap the frame is too sparse to be useful.
-        let far_out = surface_key([0.0, 0.0], 1.0 / (GpuCanvas::MAX_REPROJECT_SCALE * 1.01), 7);
-        assert_eq!(
-            frame_decision(&cached, &far_out, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
-            FrameDecision::RenderFresh
-        );
-        // And with the throttle open, the sharp frame renders.
-        assert_eq!(
-            frame_decision(&cached, &zoomed_out, FRAME_LOGICAL, VISIBLE_LOGICAL, false),
-            FrameDecision::RenderFresh
-        );
+        for zoom in [0.5, 1.0 / (GpuCanvas::MAX_REPROJECT_SCALE * 1.01)] {
+            let requested = surface_key([0.0, 0.0], zoom, 7);
+            for within in [false, true] {
+                assert_eq!(
+                    frame_decision(&cached, &requested, FRAME_LOGICAL, VISIBLE_LOGICAL, within),
+                    FrameDecision::RenderFresh
+                );
+                assert_eq!(
+                    frame_presentation(
+                        &cached,
+                        FRAME_LOGICAL,
+                        &requested,
+                        FRAME_LOGICAL,
+                        VISIBLE_LOGICAL,
+                        1.0,
+                    ),
+                    FramePresentation::Held
+                );
+            }
+        }
     }
 
     #[test]
@@ -7151,72 +8299,6 @@ mod tests {
             frame_decision(&cached, &requested, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
             FrameDecision::RenderFresh
         );
-    }
-
-    #[test]
-    fn reproject_window_scales_with_render_cost_between_floor_and_ceiling() {
-        use std::time::Duration;
-        // Cheap renders keep the display-rate floor.
-        assert_eq!(
-            render_interval(Duration::from_millis(3)),
-            GpuCanvas::MIN_RENDER_INTERVAL
-        );
-        assert_eq!(
-            render_interval(Duration::ZERO),
-            GpuCanvas::MIN_RENDER_INTERVAL
-        );
-        // A 32 ms render earns three renders' worth of reprojected frames.
-        assert_eq!(
-            render_interval(Duration::from_millis(32)),
-            Duration::from_millis(96)
-        );
-        // Pathological renders are capped so the sharp frame still lands.
-        assert_eq!(
-            render_interval(Duration::from_millis(145)),
-            GpuCanvas::MAX_RENDER_INTERVAL
-        );
-    }
-
-    #[test]
-    fn a_low_zoom_pan_keeps_reprojecting_across_a_slow_render_window() {
-        // Zoomed out to 10% after a 145 ms render: the old fixed 33 ms window
-        // let only ~2 pan ticks reproject before the next blocking render.
-        // With the cost-scaled window a trackpad pan (16 ms ticks, 10 logical
-        // px per tick = 100 world px at zoom 0.1) reprojects for the whole
-        // 250 ms ceiling — every tick stays inside the 1,600-world-px slack —
-        // and only the first tick past the window renders fresh.
-        use std::time::Duration;
-        let interval = render_interval(Duration::from_millis(145));
-        let cached = surface_key([0.0, 0.0], 0.1, 7);
-        let mut decisions = Vec::new();
-        for tick in 1..=20u32 {
-            let elapsed = Duration::from_millis(16 * u64::from(tick));
-            let within = elapsed < interval;
-            let requested = surface_key([100.0 * f64::from(tick), 0.0], 0.1, 7);
-            decisions.push((
-                elapsed,
-                frame_decision(&cached, &requested, FRAME_LOGICAL, VISIBLE_LOGICAL, within),
-            ));
-        }
-        let (reprojected, fresh): (Vec<_>, Vec<_>) = decisions
-            .iter()
-            .partition(|(_, decision)| *decision == FrameDecision::Reproject);
-        assert!(
-            reprojected.len() >= 15,
-            "expected the pan to reproject through the window, got {decisions:?}"
-        );
-        assert!(
-            reprojected.iter().all(|(elapsed, _)| *elapsed < interval)
-                && fresh.iter().all(|(elapsed, _)| *elapsed >= interval),
-            "reprojection must end exactly when the window closes: {decisions:?}"
-        );
-        // Under the old fixed window the same pan would have rendered fresh
-        // from the third tick on.
-        let fixed_window_reprojects = decisions
-            .iter()
-            .filter(|(elapsed, _)| *elapsed < GpuCanvas::MIN_RENDER_INTERVAL)
-            .count();
-        assert!(fixed_window_reprojects <= 2);
     }
 
     #[test]
@@ -7261,17 +8343,9 @@ mod tests {
         requested: &SurfaceKey,
         in_flight: bool,
         cost: RenderCost,
-        within: bool,
+        _within: bool,
     ) -> PaintPlan {
-        plan_paint(
-            newest,
-            requested,
-            in_flight,
-            cost,
-            FRAME_LOGICAL,
-            VISIBLE_LOGICAL,
-            within,
-        )
+        plan_paint(newest, requested, in_flight, cost, false)
     }
 
     #[test]
@@ -7318,11 +8392,7 @@ mod tests {
                 None
             );
         }
-        for policy in [
-            PaintPlan::Present,
-            PaintPlan::PresentAndWait,
-            PaintPlan::Reproject,
-        ] {
+        for policy in [PaintPlan::Present, PaintPlan::PresentAndWait] {
             assert_eq!(reused_paint_classification(&policy, Some(true)), Some(true));
             assert_eq!(reused_paint_classification(&policy, None), None);
         }
@@ -7342,7 +8412,7 @@ mod tests {
                         RenderCost::Expensive,
                         within
                     ),
-                    PaintPlan::Reproject | PaintPlan::PresentAndRender
+                    PaintPlan::PresentAndRender
                 ));
                 assert_eq!(
                     plan(
@@ -7360,38 +8430,31 @@ mod tests {
     }
 
     #[test]
-    fn expensive_covered_pans_reuse_pixels_until_the_idle_refresh_is_due() {
+    fn expensive_camera_changes_dispatch_immediately_when_the_worker_is_idle() {
         let cached = surface_key([0.0, 0.0], 1.0, 7);
         let requested = surface_key([50.0, -40.0], 1.0, 7);
-        let interval = render_interval(Duration::from_millis(80));
-        for elapsed in [
-            Duration::ZERO,
-            Duration::from_millis(16),
-            interval - Duration::from_millis(1),
-        ] {
+        for within in [false, true] {
             assert_eq!(
                 plan(
                     Some(&cached),
                     &requested,
                     false,
                     RenderCost::Expensive,
-                    elapsed < interval
+                    within
                 ),
-                PaintPlan::Reproject,
-                "covered pan at {elapsed:?}"
+                PaintPlan::PresentAndRender
+            );
+            assert_eq!(
+                plan(
+                    Some(&cached),
+                    &requested,
+                    true,
+                    RenderCost::Expensive,
+                    within
+                ),
+                PaintPlan::PresentAndWait
             );
         }
-        assert_eq!(
-            plan(
-                Some(&cached),
-                &requested,
-                false,
-                RenderCost::Expensive,
-                false
-            ),
-            PaintPlan::PresentAndRender,
-            "the existing repaint chain eventually requests the sharp idle frame"
-        );
         assert_eq!(
             plan(
                 Some(&requested),
@@ -7400,15 +8463,13 @@ mod tests {
                 RenderCost::Expensive,
                 false
             ),
-            PaintPlan::Present,
-            "the repaint chain stops once the current viewport is installed"
+            PaintPlan::Present
         );
         let mut edited = requested;
         edited.revision += 1;
         assert_eq!(
             plan(Some(&cached), &edited, false, RenderCost::Expensive, true),
-            PaintPlan::PresentAndRender,
-            "content changes do not wait for a pan interval"
+            PaintPlan::PresentAndRender
         );
     }
 
@@ -7427,8 +8488,8 @@ mod tests {
             for cost in [RenderCost::Cheap, RenderCost::Expensive] {
                 assert_eq!(
                     plan(Some(&cached), &inner, false, cost, true),
-                    PaintPlan::Reproject,
-                    "the interior still has {PAN_REFRESH_MARGIN} logical pixels of reserve"
+                    PaintPlan::PresentAndRender,
+                    "expensive camera changes never wait for an idle interval"
                 );
                 for within in [false, true] {
                     assert_eq!(
@@ -7447,44 +8508,22 @@ mod tests {
     }
 
     #[test]
-    fn expensive_zoom_reuses_only_covered_pixels_with_a_refresh_reserve() {
+    fn expensive_zoom_changes_dispatch_immediately_at_every_scale() {
         let cached = surface_key([0.0, 0.0], 1.0, 7);
-        for zoom in [0.9, 1.1] {
+        for zoom in [0.5, 0.9, 1.1, GpuCanvas::MAX_REPROJECT_SCALE * 1.01] {
             let requested = surface_key([0.0, 0.0], zoom, 7);
-            assert_eq!(
-                plan(
-                    Some(&cached),
-                    &requested,
-                    false,
-                    RenderCost::Expensive,
-                    true
-                ),
-                PaintPlan::Reproject
-            );
-            assert_eq!(
-                plan(
-                    Some(&cached),
-                    &requested,
-                    false,
-                    RenderCost::Expensive,
-                    false
-                ),
-                PaintPlan::PresentAndRender
-            );
-        }
-        for zoom in [0.5, GpuCanvas::MAX_REPROJECT_SCALE * 1.01] {
-            let requested = surface_key([0.0, 0.0], zoom, 7);
-            assert_eq!(
-                plan(
-                    Some(&cached),
-                    &requested,
-                    false,
-                    RenderCost::Expensive,
-                    true
-                ),
-                PaintPlan::PresentAndRender,
-                "newly revealed or overly scaled content must render immediately"
-            );
+            for within in [false, true] {
+                assert_eq!(
+                    plan(
+                        Some(&cached),
+                        &requested,
+                        false,
+                        RenderCost::Expensive,
+                        within
+                    ),
+                    PaintPlan::PresentAndRender
+                );
+            }
         }
     }
 
@@ -7516,29 +8555,24 @@ mod tests {
     }
 
     #[test]
-    fn a_cheap_scene_reprojects_inside_the_window_and_blocks_outside_it() {
+    fn cheap_camera_updates_keep_the_worker_source_and_content_edits_may_borrow_live() {
         let cached = surface_key([0.0, 0.0], 1.0, 7);
-        let covered = surface_key([100.0, 0.0], 1.0, 7);
-        assert_eq!(
-            plan(Some(&cached), &covered, false, RenderCost::Cheap, true),
-            PaintPlan::Reproject
-        );
-        assert_eq!(
-            plan(Some(&cached), &covered, false, RenderCost::Cheap, false),
-            PaintPlan::RenderBlocking
-        );
-        // An edit renders inline on a cheap scene: no snapshot round trip.
+        for (center, zoom) in [([100.0, 0.0], 1.0), ([0.0, 0.0], 0.1), ([0.0, 0.0], 4.5)] {
+            let requested = surface_key(center, zoom, 7);
+            assert_eq!(
+                plan(Some(&cached), &requested, false, RenderCost::Cheap, true),
+                PaintPlan::PresentAndRender
+            );
+        }
         let edited = surface_key([0.0, 0.0], 1.0, 8);
         assert_eq!(
             plan(Some(&cached), &edited, false, RenderCost::Cheap, true),
             PaintPlan::RenderBlocking
         );
-        // So does a zoom-in past the reproject cap: it reveals nothing the
-        // newest frame did not already walk.
-        let zoomed_in = surface_key([0.0, 0.0], GpuCanvas::MAX_REPROJECT_SCALE * 1.5, 7);
+        let mixed = surface_key([100.0, 0.0], 1.0, 8);
         assert_eq!(
-            plan(Some(&cached), &zoomed_in, false, RenderCost::Cheap, true),
-            PaintPlan::RenderBlocking
+            plan(Some(&cached), &mixed, false, RenderCost::Cheap, true),
+            PaintPlan::PresentAndRender
         );
     }
 
@@ -7565,11 +8599,11 @@ mod tests {
                 "uncovered pan, within {within}"
             );
         }
-        // Zoom-out: reprojected while the throttle is closed, then off-thread.
+        // Zoom-out reveals new coverage and always renders off-thread.
         let zoomed_out = surface_key([0.0, 0.0], 0.5, 7);
         assert_eq!(
             plan(Some(&cached), &zoomed_out, false, RenderCost::Cheap, true),
-            PaintPlan::Reproject
+            PaintPlan::PresentAndRender
         );
         assert_eq!(
             plan(Some(&cached), &zoomed_out, false, RenderCost::Cheap, false),
@@ -7758,6 +8792,311 @@ mod tests {
         }
     }
 
+    #[test]
+    fn returning_to_a_page_reuses_its_owned_scene_and_rejects_changed_content() -> Result<()> {
+        let mut doc = fanta_doc::Doc::new();
+        let first = doc.scene.insert(rect(0.0, 0.0))?;
+        let second = doc.scene.insert(rect(20.0, 0.0))?;
+        let third = doc.scene.insert(rect(40.0, 0.0))?;
+        doc.pages.extend([first, second, third]);
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        let stamp = SnapshotStamp::of(&document);
+        let first_stamp = stamp.with_root(Some(first));
+        let first_snapshot = Box::new(SceneSnapshot::capture(&document, first_stamp));
+        let instance = first_snapshot.scene.instance_id();
+        let mut snapshots = OwnedPageSnapshots::default();
+        snapshots.install(first_snapshot);
+        snapshots.install(Box::new(SceneSnapshot::capture(
+            &document,
+            stamp.with_root(Some(second)),
+        )));
+        assert!(snapshots.select(first_stamp));
+        assert_eq!(
+            snapshots
+                .active
+                .as_ref()
+                .context("first retained scope")?
+                .scene
+                .instance_id(),
+            instance
+        );
+        assert!(snapshots.select(stamp.with_root(Some(second))));
+        let fingerprint = InputsFingerprint::of(&document.doc);
+        let first_worker = WorkerSnapshot {
+            stamp: first_stamp,
+            fingerprint,
+        };
+        assert!(retained_worker_matches(
+            &first_worker,
+            first_stamp,
+            fingerprint
+        ));
+        let mut changed = fingerprint;
+        changed.components_generation = changed.components_generation.wrapping_add(1);
+        assert!(!retained_worker_matches(
+            &first_worker,
+            first_stamp,
+            changed
+        ));
+        changed = fingerprint;
+        changed.variables ^= 1;
+        assert!(!retained_worker_matches(
+            &first_worker,
+            first_stamp,
+            changed
+        ));
+        let mut changed_assets = first_stamp;
+        changed_assets.asset_resolver = Some(123);
+        assert!(!snapshots.select(changed_assets));
+        document
+            .doc
+            .scene
+            .set_transform(first, Transform2D::translation(9.0, 4.0))?;
+        let changed_stamp = SnapshotStamp::of(&document).with_root(Some(first));
+        assert!(!snapshots.select(changed_stamp));
+        snapshots.install(Box::new(SceneSnapshot::capture(&document, changed_stamp)));
+        assert!(snapshots.previous.is_none());
+        assert_eq!(
+            snapshots
+                .active
+                .as_ref()
+                .context("updated scope")?
+                .scene
+                .get(first),
+            document.doc.scene.get(first)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retained_page_snapshots_keep_only_two_scopes_with_a_node_limit() -> Result<()> {
+        let mut doc = fanta_doc::Doc::new();
+        let first = doc.scene.insert(rect(0.0, 0.0))?;
+        let second = doc.scene.insert(rect(20.0, 0.0))?;
+        let third = doc.scene.insert(rect(40.0, 0.0))?;
+        doc.pages.extend([first, second, third]);
+        let document = FigDocument::from_doc(doc, BTreeMap::new());
+        let stamp = SnapshotStamp::of(&document);
+        let mut snapshots = OwnedPageSnapshots::default();
+        for root in [first, second, third] {
+            snapshots.install(Box::new(SceneSnapshot::capture(
+                &document,
+                stamp.with_root(Some(root)),
+            )));
+        }
+        assert!(!snapshots.select(stamp.with_root(Some(first))));
+        assert!(snapshots.select(stamp.with_root(Some(second))));
+        assert!(snapshots.select(stamp.with_root(Some(third))));
+        snapshots.install_with_limit(
+            Box::new(SceneSnapshot::capture(
+                &document,
+                stamp.with_root(Some(first)),
+            )),
+            0,
+        );
+        assert!(
+            snapshots.previous.is_none(),
+            "over-budget scopes do not retain a dormant copy"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retained_page_frames_require_exact_content_and_covered_sharp_pixels() {
+        let scene = Scene::new();
+        let mut key = surface_key([0.0, 0.0], 1.0, 7);
+        key.page_root = Some(NodeId::new());
+        let stamp = stamp_of(&scene, 7).with_root(key.page_root);
+        let matches = |requested: SurfaceKey, requested_stamp: SnapshotStamp| {
+            retained_page_frame_matches(
+                Some(stamp),
+                &key,
+                FRAME_LOGICAL,
+                requested_stamp,
+                &requested,
+                FRAME_LOGICAL,
+                VISIBLE_LOGICAL,
+                1.0,
+            )
+        };
+        assert!(matches(key, stamp));
+        let mut requested = key;
+        requested.viewport_center = [40.0, 0.0];
+        assert!(matches(requested, stamp));
+        requested.viewport_center = [10_000.0, 0.0];
+        assert!(!matches(requested, stamp));
+        requested = key;
+        requested.epoch += 1;
+        assert!(!matches(requested, stamp));
+        requested = key;
+        requested.revision += 1;
+        assert!(!matches(requested, stamp));
+        let mut requested_stamp = stamp;
+        requested_stamp.asset_resolver = Some(123);
+        assert!(!matches(key, requested_stamp));
+    }
+
+    #[test]
+    fn restoring_an_expensive_page_keeps_its_next_content_edit_off_the_ui_thread() {
+        let mut first = surface_key([0.0, 0.0], 0.1, 7);
+        first.page_root = Some(NodeId::new());
+        let second = SurfaceKey {
+            page_root: Some(NodeId::new()),
+            ..first
+        };
+        let mut gpu = GpuCanvas::for_test();
+        gpu.cost = RenderCost::Cheap;
+        gpu.normal_cost_key = Some(second);
+        gpu.restore_retained_page_cost(first, RenderCost::Expensive);
+        let edited = SurfaceKey {
+            revision: first.revision + 1,
+            ..first
+        };
+        assert_eq!(gpu.normal_cost_key, Some(first));
+        assert!(retained_cost_eligible(
+            gpu.cost,
+            gpu.normal_cost_key.as_ref(),
+            &edited
+        ));
+        assert_eq!(
+            plan_paint(Some(&first), &edited, false, gpu.cost, false),
+            PaintPlan::PresentAndRender
+        );
+        gpu.restore_retained_page_cost(second, RenderCost::Cheap);
+        let edited = SurfaceKey {
+            revision: second.revision + 1,
+            ..second
+        };
+        assert_eq!(
+            plan_paint(Some(&second), &edited, false, gpu.cost, false),
+            PaintPlan::RenderBlocking
+        );
+    }
+
+    #[test]
+    fn retained_page_pixels_require_matching_font_provider_epoch_and_metadata() -> Result<()> {
+        let fingerprint = InputsFingerprint::of(&fanta_doc::Doc::new());
+        let fonts = RasterRenderer::current_font_generation_observer();
+        let generation = fonts
+            .current()
+            .context("unsaturated worker font provider")?;
+        let mut proof = FrameDependencyProof {
+            fingerprint,
+            fonts: fonts.clone(),
+            font_generation: generation,
+        };
+        assert!(proof.matches(fingerprint, Some(&fonts)));
+        assert!(!proof.matches(fingerprint, None));
+        let independent = fanta_text::LayoutEngine::new().font_generation_observer();
+        assert!(!proof.matches(fingerprint, Some(&independent)));
+        let mut changed = fingerprint;
+        changed.components_generation = changed.components_generation.wrapping_add(1);
+        assert!(!proof.matches(changed, Some(&fonts)));
+        changed = fingerprint;
+        changed.variables ^= 1;
+        assert!(!proof.matches(changed, Some(&fonts)));
+        proof.font_generation = generation.wrapping_add(1);
+        assert!(
+            !proof.matches(fingerprint, Some(&fonts)),
+            "equal document counters do not prove equal live font registrations"
+        );
+        assert_eq!(
+            plan_paint(
+                None,
+                &surface_key([0.0, 0.0], 0.1, 7),
+                false,
+                RenderCost::Cheap,
+                false
+            ),
+            PaintPlan::PresentAndRender
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn live_frame_font_proof_requires_a_stable_epoch_without_snapshot_metadata() -> Result<()> {
+        let fonts = RasterRenderer::current_font_generation_observer();
+        let generation = fonts.current().context("unsaturated font provider")?;
+        let mut proof = FrameFontProof {
+            fonts: fonts.clone(),
+            generation: Some(generation),
+        };
+        assert!(
+            proof.matches(Some(&fonts)),
+            "Live frames can be satisfied without a source snapshot fingerprint"
+        );
+        proof.generation = None;
+        assert!(
+            !proof.matches(Some(&fonts)),
+            "font registration during a first frame requires a stable redraw"
+        );
+        proof.generation = Some(generation.wrapping_add(1));
+        assert!(
+            !proof.matches(Some(&fonts)),
+            "a later cancelled job cannot leave old-font pixels satisfied"
+        );
+        proof.generation = Some(generation);
+        assert!(!proof.matches(None));
+        Ok(())
+    }
+
+    #[gpui::test]
+    fn camera_maintenance_waits_for_idle_and_cancels_on_new_input(cx: &mut gpui::TestAppContext) {
+        let mailbox = Arc::new(LatestCameraMailbox::default());
+        let key = surface_key([0.0, 0.0], 0.1, 7);
+        let ticket = mailbox.publish(key, 1.0);
+        let completed = Arc::new(AtomicBool::new(false));
+        let eligible = Arc::new(AtomicBool::new(false));
+        let executor = cx.background_executor.clone();
+        let task = executor.spawn({
+            let executor = executor.clone();
+            let completed = completed.clone();
+            let eligible = eligible.clone();
+            async move {
+                eligible.store(
+                    camera_maintenance_after_idle(executor, ticket).await,
+                    Ordering::Release,
+                );
+                completed.store(true, Ordering::Release);
+            }
+        });
+        cx.run_until_parked();
+        assert!(!completed.load(Ordering::Acquire));
+        mailbox.note_input(viewport([10.0, 0.0], 0.1), Instant::now());
+        cx.executor().advance_clock(Duration::from_millis(64));
+        cx.run_until_parked();
+        assert!(completed.load(Ordering::Acquire));
+        assert!(!eligible.load(Ordering::Acquire));
+        drop(task);
+        let ticket = mailbox.publish(
+            SurfaceKey {
+                viewport_center: [10.0, 0.0],
+                ..key
+            },
+            1.0,
+        );
+        completed.store(false, Ordering::Release);
+        let task = executor.spawn({
+            let executor = executor.clone();
+            let completed = completed.clone();
+            let eligible = eligible.clone();
+            async move {
+                eligible.store(
+                    camera_maintenance_after_idle(executor, ticket).await,
+                    Ordering::Release,
+                );
+                completed.store(true, Ordering::Release);
+            }
+        });
+        cx.run_until_parked();
+        assert!(!completed.load(Ordering::Acquire));
+        cx.executor().advance_clock(Duration::from_millis(64));
+        cx.run_until_parked();
+        assert!(completed.load(Ordering::Acquire));
+        assert!(eligible.load(Ordering::Acquire));
+        drop(task);
+    }
+
     fn retained_worker_pixels(buffer: &CVPixelBuffer) -> Result<Vec<u8>> {
         let image = copy_video_frame(buffer)?;
         let width = i32::try_from(buffer.get_width())?;
@@ -7839,6 +9178,9 @@ mod tests {
                 mode_generation: 0,
                 translation: Some(gesture),
                 perf_tag: None,
+                camera: None,
+                pipeline: FramePipelineTiming::default(),
+                maintenance: false,
             };
             let mut first_buffer = None;
             let mut first_pixels = None;
@@ -7867,10 +9209,10 @@ mod tests {
                     translation: None,
                     ..request.clone()
                 };
-                let (normal_buffer, _, normal_path, _) =
+                let (normal_buffer, _, normal_path, _, _) =
                     full.render_frame(snapshot.inputs(), &full_request)?;
                 assert_eq!(normal_path, FramePath::Normal);
-                let (buffer, _, path, _) = retained.render_frame(snapshot.inputs(), &request)?;
+                let (buffer, _, path, _, _) = retained.render_frame(snapshot.inputs(), &request)?;
                 assert_eq!(path, FramePath::Retained(gesture));
                 let normal_pixels = retained_worker_pixels(&normal_buffer)?;
                 let pixels = retained_worker_pixels(&buffer)?;
@@ -7928,14 +9270,14 @@ mod tests {
             snapshot = SceneSnapshot::capture(&document, SnapshotStamp::of(&document));
             request.key.scene = (snapshot.scene.instance_id(), snapshot.scene.revision());
             for _ in 0..2 {
-                let (normal_buffer, _, _, _) = full.render_frame(
+                let (normal_buffer, _, _, _, _) = full.render_frame(
                     snapshot.inputs(),
                     &RenderRequest {
                         translation: None,
                         ..request.clone()
                     },
                 )?;
-                let (buffer, _, path, _) = retained.render_frame(snapshot.inputs(), &request)?;
+                let (buffer, _, path, _, _) = retained.render_frame(snapshot.inputs(), &request)?;
                 assert_eq!(path, FramePath::Refused(gesture));
                 assert!(retained.translation.rejected);
                 assert!(retained.translation.session.is_none());
@@ -7946,7 +9288,7 @@ mod tests {
                 );
             }
             request.translation = None;
-            let (_, _, path, _) = retained.render_frame(snapshot.inputs(), &request)?;
+            let (_, _, path, _, _) = retained.render_frame(snapshot.inputs(), &request)?;
             assert_eq!(path, FramePath::Normal);
             assert!(retained.translation.gesture.is_none());
             assert!(retained.translation.session.is_none());
@@ -8263,7 +9605,8 @@ mod tests {
                     &after,
                     cost,
                     Duration::from_micros(1),
-                    path
+                    path,
+                    false,
                 ),
                 cost
             );
@@ -8275,7 +9618,8 @@ mod tests {
                 &after,
                 RenderCost::Cheap,
                 Duration::ZERO,
-                path
+                path,
+                false,
             ),
             RenderCost::Unknown
         );
@@ -8285,11 +9629,78 @@ mod tests {
                 &before,
                 RenderCost::Expensive,
                 Duration::from_millis(30),
-                FramePath::Refused(translation_token(&document, moving))
+                FramePath::Refused(translation_token(&document, moving)),
+                true,
             ),
             RenderCost::Expensive
         );
         Ok(())
+    }
+
+    #[test]
+    fn cached_camera_composites_preserve_scene_cost_and_retained_drag_eligibility() {
+        let previous = surface_key([0.0, 0.0], 0.1, 1);
+        let current = surface_key([500.0, -200.0], 0.1, 1);
+        for cost in [
+            RenderCost::Unknown,
+            RenderCost::Cheap,
+            RenderCost::Expensive,
+        ] {
+            assert_eq!(
+                retained_cost_after_install(
+                    Some(&previous),
+                    &current,
+                    cost,
+                    Duration::from_micros(1),
+                    FramePath::Normal,
+                    false
+                ),
+                cost
+            );
+        }
+        let cost = retained_cost_after_install(
+            Some(&previous),
+            &current,
+            RenderCost::Expensive,
+            Duration::from_micros(1),
+            FramePath::Normal,
+            false,
+        );
+        let edited = SurfaceKey {
+            revision: 2,
+            ..current
+        };
+        assert!(retained_cost_eligible(cost, Some(&current), &edited));
+        assert_eq!(
+            plan_paint(Some(&current), &edited, false, cost, false),
+            PaintPlan::PresentAndRender,
+            "cheap GPU image composition must not trigger a blocking full-scene drag"
+        );
+        assert_eq!(
+            retained_cost_after_install(
+                Some(&previous),
+                &current,
+                RenderCost::Expensive,
+                Duration::from_micros(1),
+                FramePath::Normal,
+                true
+            ),
+            RenderCost::Cheap,
+            "an actually cheap scene render may still reclassify"
+        );
+        let mut other_page = current;
+        other_page.page_root = Some(NodeId::new());
+        assert_eq!(
+            retained_cost_after_install(
+                Some(&previous),
+                &other_page,
+                RenderCost::Expensive,
+                Duration::from_micros(1),
+                FramePath::Normal,
+                false
+            ),
+            RenderCost::Unknown
+        );
     }
 
     fn rect(x: f64, y: f64) -> CanvasNode {
@@ -8325,6 +9736,54 @@ mod tests {
             plan_snapshot_sync(Some(&worker), worker.stamp, worker.fingerprint, &scene),
             SnapshotSync::Reuse
         );
+    }
+
+    #[test]
+    fn camera_updates_preserve_the_worker_scene_and_snapshot_generation() -> Result<()> {
+        let (mut document, page, _, _, _) = translation_document()?;
+        let stamp = SnapshotStamp::of(&document).with_root(Some(page));
+        let snapshot = SceneSnapshot::capture(&document, stamp);
+        let fingerprint = InputsFingerprint::of(&document.doc);
+        let worker = WorkerSnapshot { stamp, fingerprint };
+        let scene_identity = (snapshot.scene.instance_id(), snapshot.scene.revision());
+        let mut previous = surface_key([0.0, 0.0], 0.1, document.render_generation());
+        previous.page_root = Some(page);
+        previous.scene = (
+            document.doc.scene.instance_id(),
+            document.doc.scene.revision(),
+        );
+        for tick in 1..=60 {
+            let camera = viewport(
+                [f64::from(tick) * 500.0, -f64::from(tick) * 70.0],
+                if tick % 2 == 0 { 0.125 } else { 0.1 },
+            );
+            document.doc.viewport = camera;
+            let requested = SurfaceKey {
+                viewport_center: camera.center,
+                viewport_zoom: camera.zoom,
+                camera_interacting: tick % 2 != 0,
+                ..previous
+            };
+            assert_eq!(
+                plan_paint(Some(&previous), &requested, false, RenderCost::Cheap, false),
+                PaintPlan::PresentAndRender
+            );
+            assert_eq!(
+                plan_snapshot_sync(
+                    Some(&worker),
+                    SnapshotStamp::of(&document).with_root(Some(page)),
+                    InputsFingerprint::of(&document.doc),
+                    &document.doc.scene
+                ),
+                SnapshotSync::Reuse
+            );
+            assert_eq!(
+                (snapshot.scene.instance_id(), snapshot.scene.revision()),
+                scene_identity
+            );
+            previous = requested;
+        }
+        Ok(())
     }
 
     #[test]

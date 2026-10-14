@@ -19,6 +19,25 @@ use super::external::register_external_font_dirs;
 use super::generic::GenericFamily;
 use super::substitute::{proprietary_substitute, substitute_metric_ratio};
 
+/// A read-only observer that can cross threads without sharing a Skia provider.
+#[derive(Clone, Debug)]
+pub struct FontGenerationObserver {
+    generation: Arc<AtomicU64>,
+}
+
+impl FontGenerationObserver {
+    /// Saturation cannot certify unchanged font inputs.
+    pub fn current(&self) -> Option<u64> {
+        let generation = self.generation.load(Ordering::Acquire);
+        (generation != u64::MAX).then_some(generation)
+    }
+
+    /// Independent providers may have equal epochs but different registered faces.
+    pub fn same_provider(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.generation, &other.generation)
+    }
+}
+
 /// Resolves font-family names to an ordered Skia family list, owning the asset
 /// [`TypefaceFontProvider`] that carries the bundled (and any downloaded) faces.
 ///
@@ -72,6 +91,13 @@ impl FontResolver {
     pub fn generation(&self) -> Option<u64> {
         let generation = self.generation.load(Ordering::Acquire);
         (generation != u64::MAX).then_some(generation)
+    }
+
+    /// Observe registration changes without retaining or exposing the Skia provider.
+    pub fn font_generation_observer(&self) -> FontGenerationObserver {
+        FontGenerationObserver {
+            generation: self.generation.clone(),
+        }
     }
 
     /// The asset font provider, to install on a Skia `FontCollection` as its
@@ -448,7 +474,11 @@ mod tests {
         let resolver = FontResolver::new();
         let shared = resolver.clone();
         let independent = FontResolver::new();
+        let observer = resolver.font_generation_observer();
+        assert!(observer.same_provider(&shared.font_generation_observer()));
+        assert!(!observer.same_provider(&independent.font_generation_observer()));
         assert_eq!(resolver.generation(), Some(0));
+        assert_eq!(observer.current(), Some(0));
         resolver.resolve_families(INTER_FAMILY);
         assert_eq!(resolver.generation(), Some(0));
         assert!(
@@ -467,6 +497,15 @@ mod tests {
                 .is_some()
         );
         assert_eq!(resolver.generation(), Some(1));
+        assert_eq!(
+            std::thread::spawn({
+                let observer = observer.clone();
+                move || observer.current()
+            })
+            .join()
+            .expect("read-only observer thread"),
+            Some(1)
+        );
         assert_eq!(shared.generation(), Some(1));
         assert_eq!(independent.generation(), Some(0));
         let provider: FontMgr = shared.provider().clone().into();
@@ -483,6 +522,7 @@ mod tests {
         );
         assert_eq!(resolver.generation(), None);
         assert_eq!(shared.generation(), None);
+        assert_eq!(observer.current(), None);
         assert!(
             resolver
                 .register_downloaded_bytes("Retained saturated second face", bytes)

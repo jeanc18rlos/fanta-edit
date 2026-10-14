@@ -1246,7 +1246,7 @@ impl FigView {
                                 this.selected_page_index = selected_page_index;
                                 this.viewport = None;
                                 this.hovered_node = None;
-                                this.invalidate_canvas_cache();
+                                this.invalidate_canvas_presentation();
                             }
                         }
                         cx.emit(FigViewEvent::TitleChanged);
@@ -2713,11 +2713,27 @@ impl FigView {
         }
     }
 
+    fn invalidate_canvas_presentation(&mut self) {
+        self.rendered_canvas = None;
+        self.prototype_render_cache = None;
+        self.chrome_cache.replace(None);
+        #[cfg(target_os = "macos")]
+        if let Some(gpu) = self.gpu_canvas.as_mut() {
+            gpu.invalidate_presentation();
+        }
+    }
+
     pub(crate) fn is_editable(&self, cx: &App) -> bool {
         !self.is_art_read_only(cx) && self.item.read(cx).is_editable()
     }
 
     fn set_viewport(&mut self, viewport: Viewport, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        if self.viewport != Some(viewport)
+            && let Some(gpu) = &self.gpu_canvas
+        {
+            gpu.note_camera_input(viewport);
+        }
         if self.annotation_state.controller.is_moving() || self.measurement_controller.is_dragging()
         {
             self.annotation_state.controller.freeze_move();
@@ -3243,6 +3259,12 @@ impl FigView {
             }
         });
 
+        #[cfg(target_os = "macos")]
+        if self.viewport != Some(viewport)
+            && let Some(gpu) = &self.gpu_canvas
+        {
+            gpu.note_camera_input(viewport);
+        }
         self.viewport = Some(viewport);
         if is_preview_move
             && content_changed
@@ -5824,7 +5846,7 @@ impl FigView {
             self.freeze_measurement_drag(cx);
             self.comment_state.clear_pending_motion_anchor();
             self.invalidate_local_media_origin();
-            self.invalidate_canvas_cache();
+            self.invalidate_canvas_presentation();
             cx.emit(FigViewEvent::TitleChanged);
         }
         cx.notify();
@@ -5899,7 +5921,7 @@ impl FigView {
         if changed_for_view {
             self.viewport = None;
             self.hovered_node = None;
-            self.invalidate_canvas_cache();
+            self.invalidate_canvas_presentation();
         }
         self.sync_measurement_edit_barrier(cx);
         if changed_for_view {
@@ -14924,6 +14946,105 @@ mod tests {
             view.select_page(1, cx);
         });
         view.read_with(cx, |view, _| assert_eq!(view.viewport, Some(zoomed)));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn mounted_page_tab_activation_preserves_scene_generation_and_gpu_epoch(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, first_page, second_page) = doc_with_two_pages();
+        let item =
+            crate::document::ready_item_for_test(&project, "/tmp/PageTabs.fig".into(), doc, cx);
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.ensure_page_solved(0);
+                document.ensure_page_solved(1);
+                ((), DocChange::None)
+            });
+        });
+        let (workspace, visual) = cx.add_window_view(|window, cx| {
+            workspace::Workspace::test_new(project.clone(), window, cx)
+        });
+        let (first, second) = visual.update(|window, cx| {
+            let first = cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx));
+            let second = cx.new(|cx| FigView::new(item.clone(), project, window, cx));
+            first.update(cx, |view, _| {
+                view.scope = Some(FigScope::Page(first_page));
+                view.gpu_canvas = Some(GpuCanvas::for_test());
+            });
+            second.update(cx, |view, _| {
+                view.scope = Some(FigScope::Page(second_page));
+                view.gpu_canvas = Some(GpuCanvas::for_test());
+            });
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(first.clone()), None, true, window, cx);
+                workspace.add_item_to_active_pane(Box::new(second.clone()), None, true, window, cx);
+            });
+            window.activate_window();
+            (first, second)
+        });
+        visual.run_until_parked();
+        for (view, center) in [(&first, [120.0, -40.0]), (&second, [-80.0, 30.0])] {
+            view.update(visual, |view, _| {
+                view.viewport = Some(Viewport { center, zoom: 2.0 })
+            });
+        }
+        let baseline = item.read_with(visual, |item, _| {
+            let document = item.document().expect("document");
+            (
+                document.doc.scene.instance_id(),
+                document.doc.scene.revision(),
+                document.render_generation(),
+            )
+        });
+        for (view, root, center) in [
+            (&first, first_page, [120.0, -40.0]),
+            (&second, second_page, [-80.0, 30.0]),
+            (&first, first_page, [120.0, -40.0]),
+        ] {
+            visual.update(|window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    assert!(workspace.activate_item(view, true, true, window, cx));
+                });
+                window.draw(cx).clear();
+            });
+            visual.run_until_parked();
+            view.read_with(visual, |view, cx| {
+                assert_eq!(view.viewport, Some(Viewport { center, zoom: 2.0 }));
+                assert_eq!(view.last_seen_root, Some(root));
+                assert_eq!(
+                    view.gpu_canvas
+                        .as_ref()
+                        .expect("GPU state")
+                        .epoch_for_test(),
+                    0
+                );
+                let document = view.item.read(cx).document().expect("document");
+                assert_eq!(document.doc.active_page(), Some(root));
+                assert_eq!(
+                    (
+                        document.doc.scene.instance_id(),
+                        document.doc.scene.revision(),
+                        document.render_generation()
+                    ),
+                    baseline
+                );
+            });
+        }
+        first.update(visual, |view, cx| {
+            view.select_page(1, cx);
+            view.select_page(0, cx);
+            assert_eq!(
+                view.gpu_canvas
+                    .as_ref()
+                    .expect("GPU state")
+                    .epoch_for_test(),
+                0
+            );
+        });
     }
 
     #[gpui::test]
