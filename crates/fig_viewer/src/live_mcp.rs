@@ -311,28 +311,28 @@ impl context_server::types::Request for Ping {
 /// it.
 pub(crate) fn register(workspace: &mut Workspace) {
     workspace.register_action(
-        |_workspace, _: &zed_actions::fanta::ConnectExternalAgent, window, cx| {
+        |workspace, _: &zed_actions::fanta::ConnectExternalAgent, _, cx| {
             let executable = match std::env::current_exe() {
                 Ok(executable) => executable,
                 Err(error) => {
                     log::error!("locating the Fanta executable failed: {error:#}");
-                    crate::view::show_canvas_notice(
+                    crate::view::show_workspace_canvas_notice(
+                        workspace,
                         format!("Fanta could not locate its own executable: {error}"),
-                        window,
                         cx,
                     );
                     return;
                 }
             };
             if !FantaLiveMcpSettings::get_global(cx).enabled {
-                crate::view::show_canvas_notice("Enable fanta_live_mcp.enabled to connect an external agent".into(), window, cx);
+                crate::view::show_workspace_canvas_notice(workspace, "Enable fanta_live_mcp.enabled to connect an external agent".into(), cx);
                 return;
             }
             let instructions = connection_instructions(&executable, paths::data_dir());
             cx.write_to_clipboard(ClipboardItem::new_string(instructions));
-            crate::view::show_canvas_notice(
+            crate::view::show_workspace_canvas_notice(
+                workspace,
                 "Connection instructions copied for Codex and Claude Code. Keep this project open in Fanta.".into(),
-                window,
                 cx,
             );
         },

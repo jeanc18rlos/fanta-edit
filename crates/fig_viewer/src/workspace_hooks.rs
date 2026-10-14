@@ -39,7 +39,7 @@ pub fn init(cx: &mut App) {
         };
         crate::new_design::register(workspace);
         workspace.register_action(
-            |workspace, _: &zed_actions::fanta::RevealProjectInFileManager, window, cx| {
+            |workspace, _: &zed_actions::fanta::RevealProjectInFileManager, _, cx| {
                 let root = workspace
                     .active_item_as::<FigView>(cx)
                     .and_then(|view| {
@@ -60,9 +60,9 @@ pub fn init(cx: &mut App) {
                 if let Some(root) = root {
                     cx.reveal_path(&root);
                 } else {
-                    crate::view::show_canvas_notice(
+                    crate::view::show_workspace_canvas_notice(
+                        workspace,
                         "Open or save a project before revealing its folder.".into(),
-                        window,
                         cx,
                     );
                 }
@@ -255,4 +255,148 @@ fn design_is_open(workspace: &Workspace, root: &Path, cx: &App) -> bool {
 
 fn canonical(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui::{Focusable as _, TestAppContext, WindowHandle};
+    use project::FakeFs;
+    use settings::SettingsStore;
+    use workspace::{MultiWorkspace, notifications::NotificationId};
+
+    use super::*;
+
+    fn init_test(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            zlog::init_test();
+            assets::Assets.load_test_fonts(cx);
+            let settings_store = SettingsStore::test(cx);
+            cx.set_global(settings_store);
+            theme_settings::init(theme::LoadThemes::JustBase, cx);
+            release_channel::init(semver::Version::new(0, 0, 0), cx);
+            editor::init(cx);
+            #[cfg(feature = "fanta-gpui-ui")]
+            {
+                gpui_component::init(cx);
+                fanta_gpui::init(cx);
+                crate::theme_bridge::init(cx);
+            }
+            init(cx);
+        });
+    }
+
+    /// A window with no project and no canvas, focused inside its workspace so
+    /// the actions `init` registered are reachable from the dispatch path.
+    async fn empty_workspace(
+        cx: &mut TestAppContext,
+    ) -> (WindowHandle<MultiWorkspace>, Entity<Workspace>) {
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let window = cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = window
+            .entity(cx)
+            .expect("workspace window")
+            .read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        // An untyped window update: drawing renders the root `MultiWorkspace`,
+        // which a typed `window.update` would already hold.
+        cx.update_window(window.into(), |_, window, cx| {
+            workspace.read(cx).focus_handle(cx).focus(window, cx);
+            window.draw(cx).clear();
+        })
+        .expect("focus the workspace");
+        cx.run_until_parked();
+        (window, workspace)
+    }
+
+    fn canvas_notice() -> NotificationId {
+        NotificationId::named(crate::view::CANVAS_NOTICE_ID.into())
+    }
+
+    fn shows_canvas_notice(workspace: &Entity<Workspace>, cx: &TestAppContext) -> bool {
+        workspace.read_with(cx, |workspace, _| {
+            workspace.notification_ids().contains(&canvas_notice())
+        })
+    }
+
+    #[gpui::test]
+    async fn revealing_a_window_without_a_project_explains_why(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (window, workspace) = empty_workspace(cx).await;
+
+        cx.dispatch_action(
+            window.into(),
+            zed_actions::fanta::RevealProjectInFileManager,
+        );
+        cx.run_until_parked();
+
+        assert!(
+            shows_canvas_notice(&workspace, cx),
+            "with nothing to reveal, the action says what to open first"
+        );
+    }
+
+    #[gpui::test]
+    async fn connecting_an_external_agent_copies_instructions_or_explains_why_not(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let (window, workspace) = empty_workspace(cx).await;
+
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |content| {
+                content.fanta_live_mcp.get_or_insert_default().enabled = Some(false);
+            });
+        });
+        cx.dispatch_action(window.into(), zed_actions::fanta::ConnectExternalAgent);
+        cx.run_until_parked();
+        assert!(
+            shows_canvas_notice(&workspace, cx),
+            "a disabled live MCP server is explained"
+        );
+        assert!(
+            cx.read_from_clipboard().is_none(),
+            "nothing is copied while the server is disabled"
+        );
+
+        workspace.update(cx, |workspace, cx| {
+            workspace.dismiss_notification(&canvas_notice(), cx)
+        });
+        cx.update_global::<SettingsStore, _>(|store, cx| {
+            store.update_user_settings(cx, |content| {
+                content.fanta_live_mcp.get_or_insert_default().enabled = Some(true);
+            });
+        });
+        cx.dispatch_action(window.into(), zed_actions::fanta::ConnectExternalAgent);
+        cx.run_until_parked();
+        let copied = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .unwrap_or_default();
+        assert!(
+            copied.contains("--mcp-stdio"),
+            "the connection instructions are copied: {copied}"
+        );
+        assert!(shows_canvas_notice(&workspace, cx), "the copy is confirmed");
+    }
+
+    #[gpui::test]
+    async fn a_new_design_in_an_occupied_folder_explains_why(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (window, workspace) = empty_workspace(cx).await;
+        let occupied = tempfile::tempdir().expect("tempdir");
+        std::fs::write(occupied.path().join("notes.txt"), b"mine").expect("occupy the folder");
+
+        cx.dispatch_action(window.into(), zed_actions::fanta::NewDesign);
+        cx.run_until_parked();
+        cx.simulate_new_path_selection(|_| Some(occupied.path().to_path_buf()));
+        cx.run_until_parked();
+
+        assert!(
+            shows_canvas_notice(&workspace, cx),
+            "the refusal to scaffold into an occupied folder is shown"
+        );
+        assert!(
+            !occupied.path().join("fanta.json").exists(),
+            "nothing is written into the occupied folder"
+        );
+    }
 }

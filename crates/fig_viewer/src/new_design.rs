@@ -66,10 +66,10 @@ fn prompt_and_create(workspace: &mut Workspace, window: &mut Window, cx: &mut Co
                 "creating a Fanta project at {} failed: {error:#}",
                 root.display()
             );
-            workspace.update_in(cx, |_, window, cx| {
-                crate::view::show_canvas_notice(
+            workspace.update(cx, |workspace, cx| {
+                crate::view::show_workspace_canvas_notice(
+                    workspace,
                     format!("The design could not be created: {error:#}"),
-                    window,
                     cx,
                 );
             })?;
