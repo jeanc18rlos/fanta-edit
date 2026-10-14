@@ -46,6 +46,78 @@ pub(crate) fn with_layout_engine<R>(f: impl FnOnce(&LayoutEngine) -> R) -> R {
 
 /// Keep recently measured or painted runs warm when new text exceeds the cap.
 const LAYOUT_CACHE_CAP: NonZeroUsize = NonZeroUsize::MIN.saturating_add(16_383);
+const TEXT_GEOMETRY_CACHE_CAP: NonZeroUsize = NonZeroUsize::MIN.saturating_add(4_095);
+const TEXT_GEOMETRY_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+struct CachedTextLayout {
+    node: TextNode,
+    layout: TextLayout,
+}
+
+struct TextGeometry {
+    outline: Option<Option<fanta_doc::PathData>>,
+    paint_bounds: Result<Option<fanta_doc::Bounds>, TextPaintBoundsUnavailable>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TextPaintBoundsUnavailable;
+
+struct TextGeometryEntry {
+    node: TextNode,
+    font_generation: u64,
+    geometry: TextGeometry,
+    bytes: usize,
+}
+
+struct TextGeometryCache {
+    entries: LruCache<u64, TextGeometryEntry>,
+    bytes: usize,
+    maximum_bytes: usize,
+}
+
+impl Default for TextGeometryCache {
+    fn default() -> Self {
+        Self::new(TEXT_GEOMETRY_CACHE_CAP, TEXT_GEOMETRY_CACHE_BYTES)
+    }
+}
+
+impl TextGeometryCache {
+    fn new(capacity: NonZeroUsize, maximum_bytes: usize) -> Self {
+        Self {
+            entries: LruCache::new(capacity),
+            bytes: 0,
+            maximum_bytes,
+        }
+    }
+
+    fn get(&mut self, key: u64, node: &TextNode, font_generation: u64) -> Option<&TextGeometry> {
+        self.entries.get(&key).and_then(|entry| {
+            // A hash only locates a candidate; clips, styles and font changes
+            // must be proven equal before reusing an authored silhouette.
+            (entry.font_generation == font_generation && entry.node == *node)
+                .then_some(&entry.geometry)
+        })
+    }
+
+    fn insert(&mut self, key: u64, entry: TextGeometryEntry) {
+        if entry.bytes > self.maximum_bytes {
+            return;
+        }
+        if let Some(previous) = self.entries.pop(&key) {
+            self.bytes = self.bytes.saturating_sub(previous.bytes);
+        }
+        while self.bytes.saturating_add(entry.bytes) > self.maximum_bytes {
+            let Some((_, previous)) = self.entries.pop_lru() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(previous.bytes);
+        }
+        self.bytes = self.bytes.saturating_add(entry.bytes);
+        if let Some((_, previous)) = self.entries.push(key, entry) {
+            self.bytes = self.bytes.saturating_sub(previous.bytes);
+        }
+    }
+}
 
 thread_local! {
     /// Per-thread cache of shaped [`TextLayout`]s, keyed by a hash of the
@@ -65,7 +137,9 @@ thread_local! {
     /// first-visit page switch shapes each run ONCE (in the measure pass) instead
     /// of twice (measure + cold draw). The key is computed identically on both
     /// paths so they genuinely share entries.
-    static LAYOUT_CACHE: RefCell<LruCache<u64, TextLayout>> = RefCell::new(LruCache::new(LAYOUT_CACHE_CAP));
+    static LAYOUT_CACHE: RefCell<LruCache<u64, CachedTextLayout>> = RefCell::new(LruCache::new(LAYOUT_CACHE_CAP));
+    static LAYOUT_FONT_GENERATION: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static TEXT_GEOMETRY_CACHE: RefCell<TextGeometryCache> = RefCell::new(TextGeometryCache::default());
 }
 
 /// Compute the `(wrap_width, align)` a [`TextNode`] shapes at. Shared by measure
@@ -121,7 +195,7 @@ fn shape_key(node: &TextNode, wrap_width: f64, align: Align) -> u64 {
     h.finish()
 }
 
-fn hash_doc_text_style(s: &fanta_doc::TextStyle, h: &mut DefaultHasher) {
+pub(super) fn hash_doc_text_style(s: &fanta_doc::TextStyle, h: &mut DefaultHasher) {
     s.font_family.hash(h);
     s.size_px.to_bits().hash(h);
     s.weight.hash(h);
@@ -218,13 +292,53 @@ fn shape_layout(node: &TextNode) -> TextLayout {
 pub(crate) fn with_shaped_layout<R>(node: &TextNode, f: impl FnOnce(&TextLayout) -> R) -> R {
     let (wrap_width, align) = shape_params(node);
     let key = shape_key(node, wrap_width, align);
+    let font_generation = with_layout_engine(LayoutEngine::font_generation);
+    if font_generation.is_none() {
+        return f(&shape_layout(node));
+    }
     LAYOUT_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        // Shape on a miss (the expensive path); reuse the shaped paragraph on
-        // every subsequent measure/draw of the same run.
-        let layout = cache.get_or_insert(key, || shape_layout(node));
-        f(layout)
+        LAYOUT_FONT_GENERATION.with(|previous| {
+            // A registered face may change fallback metrics even for a run
+            // that does not name that family, so invalidate every paragraph.
+            if previous.get() != font_generation {
+                cache.clear();
+                previous.set(font_generation);
+            }
+        });
+        if let Some(entry) = cache.get(&key)
+            && shaping_inputs_match(&entry.node, node)
+        {
+            return f(&entry.layout);
+        }
+        let layout = shape_layout(node);
+        let result = f(&layout);
+        if with_layout_engine(LayoutEngine::font_generation) == font_generation {
+            drop(cache.put(
+                key,
+                CachedTextLayout {
+                    node: node.clone(),
+                    layout,
+                },
+            ));
+        }
+        result
     })
+}
+
+fn shaping_inputs_match(previous: &TextNode, node: &TextNode) -> bool {
+    let (previous_width, previous_align) = shape_params(previous);
+    let (width, align) = shape_params(node);
+    previous_width.to_bits() == width.to_bits()
+        && previous_align == align
+        && previous.content == node.content
+        && previous.style == node.style
+        && previous.style_runs == node.style_runs
+        && previous.max_lines == node.max_lines
+        && previous.truncate == node.truncate
+        && previous.paragraph_indent.to_bits() == node.paragraph_indent.to_bits()
+        && truncates_at_box_height(previous).then_some(previous.local_size[1].to_bits())
+            == truncates_at_box_height(node).then_some(node.local_size[1].to_bits())
 }
 
 /// The height `node`'s glyphs actually occupy when painted: the shaped layout
@@ -317,19 +431,148 @@ pub fn text_first_baseline(node: &TextNode) -> f64 {
 }
 
 /// The glyph outlines of `node`'s text as a single vector path in node-local
-/// pixels — the "convert text to path / outline text" primitive. Shapes a fresh
-/// layout (the shared render cache is immutable; Skia builds glyph paths via a
-/// `&mut` paragraph) with the node's exact wrap width + alignment, then unions
-/// every line's glyph contours, offset by the same vertical-alignment paint
-/// origin [`draw_text_node`] uses — so the resulting path renders pixel-identical
-/// to the text it replaces. `None` for empty content / no geometry.
+/// pixels — the "convert text to path / outline text" primitive. Reuses the
+/// exact glyph geometry until its text inputs or resolved fonts change.
+/// `None` for empty content / no geometry.
 pub fn text_node_outline(node: &TextNode) -> Option<fanta_doc::PathData> {
+    with_text_geometry(node, true, |geometry| geometry.outline.clone().flatten())
+}
+
+#[cfg(test)]
+pub(crate) fn text_node_ink_bounds(node: &TextNode) -> Option<fanta_doc::Bounds> {
+    text_node_paint_bounds(node).expect("native paint bounds proved")
+}
+
+pub(crate) fn text_node_paint_bounds(
+    node: &TextNode,
+) -> Result<Option<fanta_doc::Bounds>, TextPaintBoundsUnavailable> {
+    with_text_geometry(node, false, |geometry| geometry.paint_bounds)
+}
+
+fn text_geometry_key(node: &TextNode) -> u64 {
+    let (width, align) = shape_params(node);
+    let mut hasher = DefaultHasher::new();
+    shape_key(node, width, align).hash(&mut hasher);
+    node.local_size.map(f64::to_bits).hash(&mut hasher);
+    std::mem::discriminant(&node.align).hash(&mut hasher);
+    std::mem::discriminant(&node.vertical_align).hash(&mut hasher);
+    std::mem::discriminant(&node.auto_resize).hash(&mut hasher);
+    node.paragraph_spacing.to_bits().hash(&mut hasher);
+    hasher.finish()
+}
+
+fn with_text_geometry<R>(
+    node: &TextNode,
+    include_outline: bool,
+    query: impl FnOnce(&TextGeometry) -> R,
+) -> R {
     if node.content.is_empty() {
-        return None;
+        return query(&TextGeometry {
+            outline: Some(None),
+            paint_bounds: Ok(None),
+        });
     }
-    // Shape through the same path the cache uses so truncation/indent match
-    // the painted glyphs (a fresh layout, though — Skia builds glyph paths via
-    // a `&mut` paragraph, and the shared cache is immutable).
+    let font_generation = with_layout_engine(LayoutEngine::font_generation);
+    let key = text_geometry_key(node);
+    TEXT_GEOMETRY_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(font_generation) = font_generation
+            && let Some(geometry) = cache.get(key, node, font_generation)
+            && (!include_outline || geometry.outline.is_some())
+        {
+            return query(geometry);
+        }
+        let geometry = build_text_geometry(node, include_outline);
+        let result = query(&geometry);
+        // Font resolution can register a downloaded face while shaping. An
+        // overlapping registration cannot certify the result's font epoch.
+        if let Some(font_generation) = font_generation
+            && with_layout_engine(LayoutEngine::font_generation) == Some(font_generation)
+        {
+            let source_bytes = text_source_heap_bytes(node);
+            let geometry_bytes = text_geometry_heap_bytes(&geometry);
+            if source_bytes.saturating_add(geometry_bytes) <= cache.maximum_bytes {
+                let node = node.clone();
+                let bytes = std::mem::size_of::<TextGeometryEntry>()
+                    .saturating_add(64)
+                    .saturating_add(text_source_heap_bytes(&node))
+                    .saturating_add(geometry_bytes);
+                cache.insert(
+                    key,
+                    TextGeometryEntry {
+                        node,
+                        font_generation,
+                        geometry,
+                        bytes,
+                    },
+                );
+            }
+        }
+        result
+    })
+}
+
+fn text_source_heap_bytes(node: &TextNode) -> usize {
+    node.style_runs.iter().fold(
+        node.content
+            .capacity()
+            .saturating_add(text_style_heap_bytes(&node.style))
+            .saturating_add(
+                node.style_runs
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<fanta_doc::TextStyleRun>()),
+            ),
+        |bytes, run| bytes.saturating_add(text_style_heap_bytes(&run.style)),
+    )
+}
+
+pub(super) fn text_style_heap_bytes(style: &fanta_doc::TextStyle) -> usize {
+    style.font_variations.iter().fold(
+        style.font_family.capacity().saturating_add(
+            style
+                .font_variations
+                .capacity()
+                .saturating_mul(std::mem::size_of::<fanta_doc::FontVariation>()),
+        ),
+        |bytes, variation| bytes.saturating_add(variation.axis.capacity()),
+    )
+}
+
+fn text_geometry_heap_bytes(geometry: &TextGeometry) -> usize {
+    geometry
+        .outline
+        .as_ref()
+        .and_then(Option::as_ref)
+        .map_or(0, |outline| {
+            outline
+                .segments
+                .capacity()
+                .saturating_mul(std::mem::size_of::<fanta_doc::PathSegment>())
+                .saturating_add(
+                    outline
+                        .subpath_rules
+                        .capacity()
+                        .saturating_mul(std::mem::size_of::<fanta_doc::FillRule>()),
+                )
+        })
+}
+
+fn build_text_geometry(node: &TextNode, include_outline: bool) -> TextGeometry {
+    if !include_outline {
+        let paint_bounds = with_shaped_layout(node, |layout| {
+            paragraph_paint_bounds(
+                node,
+                layout,
+                vertical_paint_offset(node, painted_text_height(node, layout)),
+            )
+        });
+        return TextGeometry {
+            outline: None,
+            paint_bounds,
+        };
+    }
+    // The paint cache owns immutable Paragraphs; glyph extraction needs a
+    // mutable Paragraph and must not mutate a layout borrowed by caret/paint.
     let mut layout = shape_layout(node);
     // Match `draw_text_node`'s vertical-align origin, paragraph shifts, and its
     // fixed-box clip so the outline is the alpha silhouette that was painted.
@@ -337,7 +580,82 @@ pub fn text_node_outline(node: &TextNode) -> Option<fanta_doc::PathData> {
     let [width, height] = node.local_size;
     let clip = (node.auto_resize == TextAutoResize::None && width > 0.0 && height > 0.0)
         .then_some([0.0, 0.0, width, height]);
-    layout.outline_with_spacing_and_clip([0.0, dy], node.paragraph_spacing.max(0.0), clip)
+    let paint_bounds = paragraph_paint_bounds(node, &layout, dy);
+    let outline = include_outline.then(|| {
+        layout.outline_with_spacing_and_clip([0.0, dy], node.paragraph_spacing.max(0.0), clip)
+    });
+    TextGeometry {
+        outline,
+        paint_bounds,
+    }
+}
+
+fn paragraph_paint_bounds(
+    node: &TextNode,
+    layout: &TextLayout,
+    vertical_offset: f64,
+) -> Result<Option<fanta_doc::Bounds>, TextPaintBoundsUnavailable> {
+    let [width, height] = node.local_size;
+    let spacing = node.paragraph_spacing.max(0.0);
+    if !vertical_offset.is_finite()
+        || !(vertical_offset as f32).is_finite()
+        || !spacing.is_finite()
+        || !(spacing as f32).is_finite()
+    {
+        return Err(TextPaintBoundsUnavailable);
+    }
+    let limit = f32::MAX / 4.0;
+    let (wrap_width, _) = shape_params(node);
+    if vertical_offset.abs() >= f64::from(limit)
+        || (wrap_width.is_finite() && wrap_width.abs() >= f64::from(limit))
+        || node.paragraph_indent.abs() >= f64::from(limit)
+    {
+        return Err(TextPaintBoundsUnavailable);
+    }
+    let recording_bounds = Rect::new(-limit, -limit, limit, limit);
+    let mut recorder = skia_safe::PictureRecorder::new();
+    let canvas = recorder.begin_recording(recording_bounds, true);
+    if node.auto_resize == TextAutoResize::None && width > 0.0 && height > 0.0 {
+        if !(width as f32).is_finite() || !(height as f32).is_finite() {
+            return Err(TextPaintBoundsUnavailable);
+        }
+        canvas.clip_rect(
+            Rect::from_xywh(0.0, 0.0, width as f32, height as f32),
+            None,
+            true,
+        );
+    }
+    if spacing > 0.0 {
+        layout.paint_spaced(canvas, [0.0, vertical_offset], spacing);
+    } else {
+        layout.paint(canvas, [0.0, vertical_offset]);
+    }
+    // RTree-enabled finish joins the native draw bounds and tightens the
+    // recording's cull rect. Glyph blobs, bitmap glyphs and decorations all
+    // contribute their actual paint bounds without becoming editable paths.
+    let picture = recorder
+        .finish_recording_as_picture(None)
+        .ok_or(TextPaintBoundsUnavailable)?;
+    let bounds = picture.cull_rect();
+    if !bounds.is_finite()
+        || !bounds.width().is_finite()
+        || !bounds.height().is_finite()
+        || bounds.left <= recording_bounds.left
+        || bounds.top <= recording_bounds.top
+        || bounds.right >= recording_bounds.right
+        || bounds.bottom >= recording_bounds.bottom
+    {
+        return Err(TextPaintBoundsUnavailable);
+    }
+    if bounds.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(fanta_doc::Bounds {
+        min_x: f64::from(bounds.left),
+        min_y: f64::from(bounds.top),
+        max_x: f64::from(bounds.right),
+        max_y: f64::from(bounds.bottom),
+    }))
 }
 
 /// Test-only reset of the shared shaped-text cache, so a test can assert exact
@@ -453,8 +771,154 @@ mod cache_tests {
     use super::*;
     use crate::raster::{RasterRenderer, RenderError};
 
+    struct GeometryCacheScope {
+        previous: TextGeometryCache,
+    }
+
+    impl GeometryCacheScope {
+        fn new() -> Self {
+            Self {
+                previous: TEXT_GEOMETRY_CACHE
+                    .with(|cache| std::mem::take(&mut *cache.borrow_mut())),
+            }
+        }
+    }
+
+    impl Drop for GeometryCacheScope {
+        fn drop(&mut self) {
+            TEXT_GEOMETRY_CACHE.with(|cache| {
+                std::mem::swap(&mut *cache.borrow_mut(), &mut self.previous);
+            });
+        }
+    }
+
+    fn geometry_entry(node: &TextNode, font_generation: u64) -> TextGeometryEntry {
+        let node = node.clone();
+        let geometry = build_text_geometry(&node, true);
+        let bytes = std::mem::size_of::<TextGeometryEntry>()
+            + 64
+            + text_source_heap_bytes(&node)
+            + text_geometry_heap_bytes(&geometry);
+        TextGeometryEntry {
+            node,
+            font_generation,
+            geometry,
+            bytes,
+        }
+    }
+
+    #[test]
+    fn retained_text_ink_preserves_rich_text_clipping_spacing_and_layout_edits() {
+        let _scope = GeometryCacheScope::new();
+        let mut node = TextNode::new("Italic\nUnderline", 185.0, 100.0);
+        node.style.size_px = 24.0;
+        node.style.italic = true;
+        node.vertical_align = VAlign::Bottom;
+        node.paragraph_spacing = 9.0;
+        let mut style = node.style.clone();
+        style.underline = true;
+        style.weight = 700;
+        node.style_runs.push(fanta_doc::TextStyleRun {
+            start: 7,
+            end: node.content.len(),
+            style,
+        });
+        let mut variants = vec![node.clone()];
+        let mut clipped = node.clone();
+        clipped.local_size = [120.0, 65.0];
+        variants.push(clipped);
+        let mut centered = node.clone();
+        centered.vertical_align = VAlign::Center;
+        variants.push(centered);
+        let mut spaced = node.clone();
+        spaced.paragraph_spacing = 20.0;
+        variants.push(spaced);
+        let mut truncated = node.clone();
+        truncated.truncate = true;
+        truncated.max_lines = Some(1);
+        variants.push(truncated);
+        let mut auto_width = node.clone();
+        auto_width.auto_resize = TextAutoResize::WidthAndHeight;
+        variants.push(auto_width);
+        let mut styled = node.clone();
+        styled.style_runs.clear();
+        styled.style.italic = false;
+        variants.push(styled);
+        for node in variants {
+            let expected = build_text_geometry(&node, true);
+            assert!(
+                expected.outline.as_ref().is_some_and(Option::is_some),
+                "bundled glyphs have outlines"
+            );
+            assert_eq!(text_node_outline(&node), expected.outline.clone().flatten());
+            assert_eq!(text_node_paint_bounds(&node), expected.paint_bounds);
+            assert_eq!(text_node_outline(&node), expected.outline.clone().flatten());
+            let count = TEXT_GEOMETRY_CACHE.with(|cache| cache.borrow().entries.len());
+            for _ in 0..8 {
+                assert_eq!(text_node_paint_bounds(&node), expected.paint_bounds);
+            }
+            assert_eq!(
+                TEXT_GEOMETRY_CACHE.with(|cache| cache.borrow().entries.len()),
+                count
+            );
+        }
+        let mut indented = node.clone();
+        indented.paragraph_indent = 7.0;
+        for node in [indented, TextNode::new(" ", 120.0, 65.0)] {
+            let expected = build_text_geometry(&node, true);
+            assert_eq!(text_node_outline(&node), expected.outline.clone().flatten());
+            assert_eq!(text_node_paint_bounds(&node), expected.paint_bounds);
+            assert_eq!(text_node_outline(&node), expected.outline.clone().flatten());
+        }
+        let empty = TextNode::new(" ", 120.0, 65.0);
+        assert!(text_node_outline(&empty).is_none());
+        assert!(text_node_ink_bounds(&empty).is_none());
+    }
+
+    #[test]
+    fn text_geometry_requires_exact_source_and_font_epoch_even_on_hash_collision() {
+        let mut cache = TextGeometryCache::default();
+        let first = TextNode::new("First glyphs", 160.0, 80.0);
+        let second = TextNode::new("Other glyphs", 160.0, 80.0);
+        let first_entry = geometry_entry(&first, 4);
+        let expected = first_entry.geometry.outline.clone();
+        cache.insert(17, first_entry);
+        assert_eq!(
+            cache.get(17, &first, 4).map(|value| &value.outline),
+            Some(&expected)
+        );
+        assert!(cache.get(17, &second, 4).is_none());
+        assert!(cache.get(17, &first, 5).is_none());
+        let mut moved_clip = first.clone();
+        moved_clip.local_size[1] = 90.0;
+        assert!(cache.get(17, &moved_clip, 4).is_none());
+    }
+
+    #[test]
+    fn text_geometry_byte_budget_evicts_and_does_not_retain_oversize_outlines() {
+        let first = TextNode::new("First glyphs", 160.0, 80.0);
+        let second = TextNode::new("Other glyphs", 160.0, 80.0);
+        let first_entry = geometry_entry(&first, 0);
+        let second_entry = geometry_entry(&second, 0);
+        let maximum_bytes = first_entry.bytes.max(second_entry.bytes);
+        let mut cache = TextGeometryCache::new(TEXT_GEOMETRY_CACHE_CAP, maximum_bytes);
+        cache.insert(1, first_entry);
+        cache.insert(2, second_entry);
+        assert!(cache.get(1, &first, 0).is_none());
+        assert!(cache.get(2, &second, 0).is_some());
+        assert!(cache.bytes <= maximum_bytes);
+        let oversized = TextNode::new("A large outlined paragraph ".repeat(40), 320.0, 800.0);
+        let oversized = geometry_entry(&oversized, 0);
+        assert!(oversized.bytes > maximum_bytes);
+        cache.insert(3, oversized);
+        assert!(!cache.entries.contains(&3));
+        assert!(cache.get(2, &second, 0).is_some());
+        assert!(cache.bytes <= maximum_bytes);
+    }
+
     struct CacheScope {
-        previous: LruCache<u64, TextLayout>,
+        previous: LruCache<u64, CachedTextLayout>,
+        previous_font_generation: Option<u64>,
     }
 
     impl CacheScope {
@@ -463,6 +927,8 @@ mod cache_tests {
                 previous: LAYOUT_CACHE.with(|cache| {
                     std::mem::replace(&mut *cache.borrow_mut(), LruCache::new(capacity))
                 }),
+                previous_font_generation: LAYOUT_FONT_GENERATION
+                    .with(|generation| generation.get()),
             }
         }
     }
@@ -472,12 +938,183 @@ mod cache_tests {
             LAYOUT_CACHE.with(|cache| {
                 std::mem::swap(&mut *cache.borrow_mut(), &mut self.previous);
             });
+            LAYOUT_FONT_GENERATION.with(|generation| generation.set(self.previous_font_generation));
         }
+    }
+
+    #[test]
+    fn changed_font_epoch_invalidates_painted_paragraphs_and_keeps_measurement_parity()
+    -> Result<(), RenderError> {
+        let _scope = CacheScope::new(LAYOUT_CACHE_CAP);
+        let first = TextNode::new("Font metrics", 180.0, 80.0);
+        let unrelated = TextNode::new("Fallback metrics", 180.0, 80.0);
+        let measurement = crate::raster::instance::measure_text_node(&first);
+        crate::raster::instance::measure_text_node(&unrelated);
+        assert_eq!(layout_cache_len(), 2);
+        let mut renderer = RasterRenderer::new(180, 80)?;
+        draw_text_node(renderer.canvas(), &first);
+        let pixels = renderer.copy_rgba();
+        let generation =
+            with_layout_engine(LayoutEngine::font_generation).expect("unsaturated fonts");
+        LAYOUT_FONT_GENERATION.with(|previous| previous.set(Some(generation.wrapping_add(1))));
+        assert_eq!(
+            crate::raster::instance::measure_text_node(&first),
+            measurement
+        );
+        assert_eq!(
+            layout_cache_len(),
+            1,
+            "old fallback layouts cannot survive a font epoch change"
+        );
+        let mut renderer = RasterRenderer::new(180, 80)?;
+        draw_text_node(renderer.canvas(), &first);
+        assert_eq!(pixels, renderer.copy_rgba());
+        Ok(())
     }
 
     fn key(node: &TextNode) -> u64 {
         let (width, align) = shape_params(node);
         shape_key(node, width, align)
+    }
+
+    #[test]
+    fn paint_bounds_share_verified_shaping_without_extracting_editable_paths() {
+        let _scope = CacheScope::new(LAYOUT_CACHE_CAP);
+        let _geometry_scope = GeometryCacheScope::new();
+        let target = TextNode::new("Labels with ordinary spaces", 220.0, 80.0);
+        let other = TextNode::new("I", 220.0, 80.0);
+        let expected = build_text_geometry(&target, true).paint_bounds;
+        let generation = with_layout_engine(LayoutEngine::font_generation);
+        LAYOUT_FONT_GENERATION.with(|previous| previous.set(generation));
+        LAYOUT_CACHE.with(|cache| {
+            drop(cache.borrow_mut().put(
+                key(&target),
+                CachedTextLayout {
+                    node: other.clone(),
+                    layout: shape_layout(&other),
+                },
+            ));
+        });
+        assert_eq!(text_node_paint_bounds(&target), expected);
+        LAYOUT_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            let cached = cache.peek(&key(&target)).expect("cached paragraph");
+            assert!(shaping_inputs_match(&cached.node, &target));
+        });
+        TEXT_GEOMETRY_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            let cached = cache
+                .entries
+                .peek(&text_geometry_key(&target))
+                .expect("cached paint bounds");
+            assert!(
+                cached.geometry.outline.is_none(),
+                "ink metadata must not extract vector paths"
+            );
+        });
+        crate::raster::instance::measure_text_node(&target);
+        assert_eq!(
+            layout_cache_len(),
+            1,
+            "paint metadata shares measure/draw shaping"
+        );
+        assert_eq!(text_node_paint_bounds(&target), expected);
+    }
+
+    #[test]
+    fn paragraph_paint_bounds_contain_real_glyph_decorations_spacing_indent_and_emoji_pixels()
+    -> Result<(), RenderError> {
+        let _geometry_scope = GeometryCacheScope::new();
+        let mut base = TextNode::new("Italic labels\nSecond paragraph", 180.0, 150.0);
+        base.auto_resize = TextAutoResize::Height;
+        base.style.size_px = 28.0;
+        base.style.italic = true;
+        base.paragraph_spacing = 14.0;
+        base.paragraph_indent = 11.0;
+        base.vertical_align = VAlign::Center;
+        let mut underlined = base.clone();
+        underlined.style.underline = true;
+        let mut struck = base.clone();
+        struck.style.strikethrough = true;
+        let mut rich = base.clone();
+        let mut style = rich.style.clone();
+        style.size_px = 36.0;
+        style.underline = true;
+        style.strikethrough = true;
+        rich.style_runs.push(fanta_doc::TextStyleRun {
+            start: 14,
+            end: rich.content.len(),
+            style,
+        });
+        let mut clipped = underlined.clone();
+        clipped.auto_resize = TextAutoResize::None;
+        clipped.local_size = [110.0, 45.0];
+        clipped.vertical_align = VAlign::Bottom;
+        let mut emoji = TextNode::new("A 😀 B", 180.0, 80.0);
+        emoji.auto_resize = TextAutoResize::Height;
+        emoji.style.size_px = 40.0;
+        for (index, node) in [base, underlined, struck, rich, clipped, emoji]
+            .into_iter()
+            .enumerate()
+        {
+            let bounds = text_node_paint_bounds(&node)
+                .expect("finite paragraph paint proof")
+                .expect("fixture paints");
+            assert!(bounds.is_finite());
+            assert!(
+                bounds.width() < 512.0 && bounds.height() < 512.0,
+                "RTree must tighten its infinite recording cull"
+            );
+            for scale in [0.5, 1.0, 2.0] {
+                let mut renderer = RasterRenderer::new(512, 512)?;
+                renderer.canvas().translate((96.0, 96.0));
+                renderer.canvas().scale((scale, scale));
+                draw_text_node(renderer.canvas(), &node);
+                let pixels = renderer.copy_rgba();
+                let mut count = 0;
+                for (pixel_index, pixel) in pixels.chunks_exact(4).enumerate() {
+                    if pixel.last().copied() == Some(0) {
+                        continue;
+                    }
+                    count += 1;
+                    let x = (pixel_index % 512) as f64;
+                    let y = (pixel_index / 512) as f64;
+                    let scale = f64::from(scale);
+                    assert!(
+                        x + 1.0 > 96.0 + bounds.min_x * scale
+                            && x < 96.0 + bounds.max_x * scale
+                            && y + 1.0 > 96.0 + bounds.min_y * scale
+                            && y < 96.0 + bounds.max_y * scale,
+                        "painted pixel ({x},{y}) escapes paragraph {index} ink bounds {bounds:?} at scale {scale}"
+                    );
+                }
+                assert!(count > 0, "paragraph {index} paints at scale {scale}");
+            }
+            assert_eq!(text_node_paint_bounds(&node), Ok(Some(bounds)));
+            TEXT_GEOMETRY_CACHE.with(|cache| {
+                let cache = cache.borrow();
+                let cached = cache
+                    .entries
+                    .peek(&text_geometry_key(&node))
+                    .expect("paint metadata retained");
+                assert!(cached.geometry.outline.is_none());
+            });
+        }
+        assert_eq!(
+            text_node_paint_bounds(&TextNode::new("", 80.0, 80.0)),
+            Ok(None)
+        );
+        assert_eq!(
+            text_node_paint_bounds(&TextNode::new("   ", 80.0, 80.0)),
+            Ok(None)
+        );
+        let mut invalid = TextNode::new("Invalid", 80.0, f64::INFINITY);
+        invalid.vertical_align = VAlign::Bottom;
+        assert_eq!(
+            text_node_paint_bounds(&invalid),
+            Err(TextPaintBoundsUnavailable)
+        );
+        Ok(())
     }
 
     #[test]

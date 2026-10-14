@@ -85,15 +85,52 @@ impl LayoutTree for crate::scene::Scene {
 /// Children are derived from each clone's `parent` (fresh ids), z-ordered by the
 /// node's `index` to match the renderer's paint order. Used by both consumers to
 /// solve auto-layout *inside* an expanded component subtree before walking it.
+/// The parent/order index is fixed for this solve: mutate geometry only, or
+/// rebuild the wrapper after changing hierarchy or sibling order.
 pub struct ExpandedTree<'a> {
     nodes: &'a mut [crate::resolve::ExpandedNode],
+    node_indices: crate::IdHashMap<NodeId, usize>,
+    children: crate::IdHashMap<NodeId, Vec<NodeId>>,
 }
 
 impl<'a> ExpandedTree<'a> {
     /// Wrap an expansion for layout. Solve from its root (the entry with an empty
     /// `def_path`), then read back the laid-out clones.
     pub fn new(nodes: &'a mut [crate::resolve::ExpandedNode]) -> Self {
-        Self { nodes }
+        Self::with_cancellation(nodes, None)
+    }
+
+    fn with_cancellation(
+        nodes: &'a mut [crate::resolve::ExpandedNode],
+        should_cancel: Option<&dyn Fn() -> bool>,
+    ) -> Self {
+        let mut node_indices = crate::IdHashMap::default();
+        let mut children: crate::IdHashMap<NodeId, Vec<NodeId>> = crate::IdHashMap::default();
+        for (position, entry) in nodes.iter().enumerate() {
+            if should_cancel.is_some_and(|should_cancel| should_cancel()) {
+                break;
+            }
+            node_indices.entry(entry.node.id).or_insert(position);
+            if let Some(parent) = entry.node.parent {
+                children.entry(parent).or_default().push(entry.node.id);
+            }
+        }
+        for siblings in children.values_mut() {
+            if should_cancel.is_some_and(|should_cancel| should_cancel()) {
+                break;
+            }
+            siblings.sort_by_key(|id| {
+                node_indices
+                    .get(id)
+                    .and_then(|position| nodes.get(*position))
+                    .map_or(crate::IndexKey::FIRST, |entry| entry.node.index)
+            });
+        }
+        Self {
+            nodes,
+            node_indices,
+            children,
+        }
     }
 
     /// The id of the expansion root (empty `def_path`), if present.
@@ -107,23 +144,17 @@ impl<'a> ExpandedTree<'a> {
 
 impl LayoutTree for ExpandedTree<'_> {
     fn node(&self, id: NodeId) -> Option<&CanvasNode> {
-        self.nodes.iter().find(|e| e.node.id == id).map(|e| &e.node)
+        self.node_indices
+            .get(&id)
+            .and_then(|position| self.nodes.get(*position))
+            .map(|entry| &entry.node)
     }
     fn node_mut(&mut self, id: NodeId) -> Option<&mut CanvasNode> {
-        self.nodes
-            .iter_mut()
-            .find(|e| e.node.id == id)
-            .map(|e| &mut e.node)
+        let position = *self.node_indices.get(&id)?;
+        self.nodes.get_mut(position).map(|entry| &mut entry.node)
     }
     fn children(&self, parent: NodeId) -> Vec<NodeId> {
-        let mut kids: Vec<(crate::index::IndexKey, NodeId)> = self
-            .nodes
-            .iter()
-            .filter(|e| e.node.parent == Some(parent))
-            .map(|e| (e.node.index, e.node.id))
-            .collect();
-        kids.sort_by_key(|a| a.0);
-        kids.into_iter().map(|(_, id)| id).collect()
+        self.children.get(&parent).cloned().unwrap_or_default()
     }
 }
 
@@ -134,6 +165,64 @@ pub fn solve_expanded(nodes: &mut [crate::resolve::ExpandedNode], measure: &mut 
     let mut tree = ExpandedTree::new(nodes);
     if let Some(root) = tree.root_id() {
         solve_auto_layout(&mut tree, root, measure);
+    }
+}
+
+/// Cancellation leaves only the caller's transient clones partially laid out;
+/// callers must discard them instead of publishing or caching an incomplete tree.
+pub fn solve_expanded_cancellable(
+    nodes: &mut [crate::resolve::ExpandedNode],
+    measure: &mut Measure,
+    should_cancel: &dyn Fn() -> bool,
+) -> bool {
+    let cancelled = std::cell::Cell::new(false);
+    let cancellation = || {
+        let stop = cancelled.get() || should_cancel();
+        cancelled.set(stop);
+        stop
+    };
+    let mut tree = ExpandedTree::with_cancellation(nodes, Some(&cancellation));
+    if cancellation() {
+        return false;
+    }
+    if let Some(root) = tree.root_id() {
+        let mut tree = CancellableLayoutTree {
+            tree: &mut tree,
+            should_cancel: &cancellation,
+        };
+        solve_auto_layout(&mut tree, root, measure);
+    }
+    !cancellation()
+}
+
+struct CancellableLayoutTree<'a, T> {
+    tree: &'a mut T,
+    should_cancel: &'a dyn Fn() -> bool,
+}
+
+impl<T: LayoutTree> LayoutTree for CancellableLayoutTree<'_, T> {
+    fn node(&self, id: NodeId) -> Option<&CanvasNode> {
+        if (self.should_cancel)() {
+            None
+        } else {
+            self.tree.node(id)
+        }
+    }
+
+    fn node_mut(&mut self, id: NodeId) -> Option<&mut CanvasNode> {
+        if (self.should_cancel)() {
+            None
+        } else {
+            self.tree.node_mut(id)
+        }
+    }
+
+    fn children(&self, parent: NodeId) -> Vec<NodeId> {
+        if (self.should_cancel)() {
+            Vec::new()
+        } else {
+            self.tree.children(parent)
+        }
     }
 }
 

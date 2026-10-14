@@ -17,7 +17,7 @@ fn tool_content_err(e: impl std::fmt::Display) -> LanguageModelToolResultContent
 ///
 /// With no arguments this returns the document overview: pages (with each
 /// page's `.fnx` source path), the active page and its content bounds,
-/// components (id, name, source), selection and its bounds, viewport, whether
+/// a bounded component preview (id, name, source), selection and its bounds, viewport, whether
 /// the canvas is editable, and short hints. Pass `page` to list that page's
 /// node tree in compact form (each node: id, kind, name, plus a frame's size
 /// and auto-layout mode, a text's content and font, a shape's fill, an
@@ -30,6 +30,10 @@ fn tool_content_err(e: impl std::fmt::Display) -> LanguageModelToolResultContent
 /// `offset`, and reports `child_count`, `children_offset`, `children_limit`
 /// and `more_children`; while `more_children` is true, call again with
 /// `offset` advanced to see the rest of the page.
+/// Broad nested trees can exceed the traversal budget even with a small
+/// top-level limit; lower depth or fetch relevant nodes by id in that case.
+/// The component preview reports `component_count` and `more_components`;
+/// use `design_system` with `offset` and `limit` to discover the rest.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct DesignStateToolInput {
     /// Node ids to fetch in full detail.
@@ -135,8 +139,10 @@ impl AgentTool for PrepareDesignAssetTool {
 
 /// Read the project's design-system foundations before creating or editing UI.
 /// Returns collections, modes, typed variables and aliases, component metadata,
-/// supported editing schema, and source paths. Use a collection and pagination
-/// to narrow a large library. Include bindings to inspect selected nodes.
+/// supported editing schema, and source paths. Components, variant sets and
+/// variables each use `offset` and `limit` (default 100, maximum 200); advance
+/// the offset while the corresponding `more_*` flag is true. Use a collection
+/// to filter variables. Include bindings to inspect selected nodes.
 pub struct DesignSystemTool;
 
 impl AgentTool for DesignSystemTool {
@@ -146,7 +152,7 @@ impl AgentTool for DesignSystemTool {
     const NAME: &'static str = "design_system";
 
     fn description() -> SharedString {
-        "Read the project's design system: collections, modes, typed variables and aliases, components, editing schema, and source paths. Inspect before creating foundations or repeated UI. Choose a collection and paginate large libraries; include_bindings inspects selected nodes.".into()
+        "Read the project's design system: collections, modes, typed variables and aliases, components, editing schema, and source paths. Inspect before creating foundations or repeated UI. Components, variant sets and variables are paginated with offset and limit (default 100, maximum 200); advance offset while the corresponding more_* flag is true. Choose a collection to filter variables; include_bindings inspects selected nodes.".into()
     }
 
     fn kind() -> acp::ToolKind {

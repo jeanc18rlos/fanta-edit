@@ -147,7 +147,7 @@ members = [
 ]
 default-members = ["crates/zed"]
 exclude = [
-    "vendor/skia-bindings-0.84.0",
+    "vendor/skia-bindings-0.153.3",
     "crates/collections",
     "crates/component",
     "crates/fanta-gpui",
@@ -651,7 +651,10 @@ shellexpand = "3.1"
 shlex = "1.3.0"
 simplelog = "0.12.2"
 slotmap = "1.0.6"
-skia-safe = { version = "0.84", features = ["textlayout"] }
+skia-safe = { version = "=0.153.3", features = ["textlayout"] }
+# Native shims skia-safe does not wrap (e.g. the Graphite pipeline executor).
+# Features stay with skia-safe so the shared native build is unchanged.
+skia-bindings = { version = "=0.153.3", default-features = false }
 smallvec = { version = "1.6", features = ["union", "const_new"] }
 smol = {package = "fanta-gpui-smol", version = "=0.5.0"}
 sqlformat = "0.2"
@@ -809,7 +812,7 @@ features = [
 ]
 
 [patch.crates-io]
-skia-bindings = { path = "vendor/skia-bindings-0.84.0" }
+skia-bindings = { path = "vendor/skia-bindings-0.153.3" }
 fanta-gpui = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "d4e410cfdf00f09e3cd2de35c87e58d89fa97090" }
 fanta-gpui-async-process = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "d4e410cfdf00f09e3cd2de35c87e58d89fa97090" }
 fanta-gpui-collections = { git = "https://github.com/squidred-dev/fanta-ui.git", rev = "d4e410cfdf00f09e3cd2de35c87e58d89fa97090" }
@@ -929,6 +932,21 @@ fanta-gpui-file-icons = { codegen-units = 1 }
 fanta-gpui-menu = { codegen-units = 1 }
 fanta-gpui-ui-input = { codegen-units = 1 }
 fanta-gpui-ui-macros = { opt-level = 3 }
+# skia-bindings passes this package's opt-level to the Skia engine build as
+# -O<level>; at the dev default (0) all of Skia — Graphite recording and
+# submission, pictures, mipmaps, text — runs unoptimized in development builds.
+skia-bindings = { opt-level = 3 }
+# A page's first canvas frame decodes its images. Unoptimized, a 12-megapixel
+# JPEG takes over a second instead of ~50 ms, which dominated page switches in
+# development builds.
+image = { opt-level = 3 }
+zune-core = { opt-level = 3 }
+zune-jpeg = { opt-level = 3 }
+png = { opt-level = 3 }
+fdeflate = { opt-level = 3 }
+miniz_oxide = { opt-level = 3 }
+simd-adler32 = { opt-level = 3 }
+crc32fast = { opt-level = 3 }
 
 [profile.release]
 debug = "limited"

@@ -1,0 +1,50 @@
+Upstream: https://github.com/rust-skia/rust-skia
+Published package: https://crates.io/api/v1/crates/skia-bindings/0.153.3/download
+Published package SHA256: eb325787c91b3f6c34a7c6f2b8a2297b20292d733ca53a08c233e5028aec49af
+Published package VCS commit: b7f043e0b1e2a850e702245de811f01df1f6b0ff
+Published package VCS path: skia-bindings
+Skia revision from package metadata: m153-0.101.2
+
+The vendored package retains all 58 files from the published archive byte-for-byte,
+except build.rs, build_support/skia_bindgen.rs and src/graphite.cpp.
+
+build_support/skia_bindgen.rs carries the exact upstream PR 1335 opaque-type
+additions for std::__rebind_alloc.* and std::__hash_table.*.
+Patch: https://github.com/rust-skia/rust-skia/pull/1335
+Merged commit: 16bc1d24ae3cc62474583f3388df6e3d883fafb3
+Issue: https://github.com/rust-skia/rust-skia/issues/1331
+This prevents bindgen 0.72.1 from emitting an unresolved _Traits alias when
+generating bindings against Apple clang 21 and macOS 27 libc++ headers.
+src/graphite.cpp supplies a fresh image-conversion provider for each recorder
+whose caller did not provide one. Skia m153 otherwise drops non-Graphite image
+draws, including raster-backed image shaders. The provider converts through
+SkImages::TextureFromImage and retains at most 512 entries / 512 MiB of the
+textureSize() estimate, keyed by original image uniqueID and mipmap requirement.
+Zero-size estimates and oversized textures are not retained. The recorder GPU
+default budget is raised to 1 GiB; nondefault caller budgets are preserved.
+Caller-provided image providers are preserved.
+An upload failure rejects the snapped recording with a native diagnostic instead
+of returning a frame with omitted artwork. Failed recordings clear cached images
+so discarded uploads cannot be reused. A non-owning thread-local registry follows
+Skia's recorder thread-affinity contract and is erased before recorder deletion.
+src/graphite.cpp also exports C_SkExecutor_MakeMultiListFIFOThreadPool, a
+factory for SkExecutor::MakeMultiListFIFOThreadPool, so a Graphite
+ContextOptions::fExecutor can compile pipelines on worker threads instead of
+inline inside Recorder::snap. The caller owns the pool and keeps it alive for
+every Context configured with it.
+The synchronous readback shim keeps asynchronous result state alive through heap
+shared ownership. Its callback never retains or writes the caller's buffer, so a
+failed submit or bounded completion timeout cannot leave a dangling callback.
+API contract: https://skia.googlesource.com/skia/+/refs/heads/chrome/m153/include/gpu/graphite/ImageProvider.h
+Default provider: https://skia.googlesource.com/skia/+/refs/heads/chrome/m153/src/gpu/graphite/Recorder.cpp
+build.rs bypasses upstream binary-cache downloads for Graphite so its compiled
+native shim cannot omit the local provider/readback changes. Graphite rejects
+no-compile and FORCE_SKIA_BINARIES_DOWNLOAD overrides. CPU-only binary-cache and
+documentation behavior are unchanged. SKIA_SOURCE_DIR + SKIA_LIBRARY_SEARCH_PATH
+can import engine archives, then compile the local native shim and bindings.
+No Skia engine source or Rust API wrapper is patched.
+
+LICENSE is added because the published archive omits the upstream root license.
+License source: https://raw.githubusercontent.com/rust-skia/rust-skia/b7f043e0b1e2a850e702245de811f01df1f6b0ff/LICENSE
+License SHA256: 4b33ed5b329a3a79eb1243fd91373c68b0ae0b9df7503bfc50d0c5253adf1b9a
+FANTA-PROVENANCE.txt is the only other added file.

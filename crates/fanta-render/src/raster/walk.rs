@@ -10,7 +10,7 @@ use super::{
     PatternCache, RenderInputs, RenderMetrics, Scene, Transform2D, apply_background_blur,
     draw_inner_shadows, effects_layer_bounds, opacity_folds_into_paint, padded_layer_rect,
     paint_node_content, paint_node_foreground, render_instance, resolve_bound_value,
-    shadow_expanded_local_bounds, text_path_bounds, to_sk_matrix, visible_effects,
+    text_path_bounds, to_sk_matrix, visible_effects,
 };
 
 // ---------------------------------------------------------------------------
@@ -21,6 +21,8 @@ use super::{
 /// so adding the cull rect, the image cache, the instance cache, and the
 /// doc-level inputs did not balloon every recursive call's argument list.
 pub(crate) struct RenderCtx<'a> {
+    pub(crate) should_cancel: Option<&'a dyn Fn() -> bool>,
+    pub(crate) filtered_ancestor: bool,
     pub(crate) split: Option<super::split::SplitPass<'a>>,
     pub(crate) scene: &'a Scene,
     pub(crate) resolver: Option<&'a dyn AssetResolver>,
@@ -176,18 +178,13 @@ fn resolved_world_transform(ctx: &mut RenderCtx, id: NodeId) -> Option<Transform
 /// geometry directly; unclipped groups and Boolean operands union resolved
 /// children so animated operands cannot be culled at their authored positions.
 fn resolved_local_bounds(ctx: &mut RenderCtx, id: NodeId) -> Option<Bounds> {
+    if cancel_camera_work(ctx) {
+        return None;
+    }
     if let Some(bounds) = ctx.resolved_local_bounds.get(&id) {
         return *bounds;
     }
-
-    if ctx.inputs.motion.is_none() {
-        let node = ctx.scene.get(id)?;
-        match &node.data {
-            NodeData::TextPath(_) | NodeData::Boolean(_) => {}
-            NodeData::Group(group) if !group_clips_children(node, group) => {}
-            _ => return ctx.scene.local_bounds(id),
-        }
-    }
+    ctx.metrics.bounds_prepared += 1;
 
     let (union_children, mut computed) = {
         let node = ctx.scene.get(id)?;
@@ -203,13 +200,22 @@ fn resolved_local_bounds(ctx: &mut RenderCtx, id: NodeId) -> Option<Bounds> {
                         .unwrap_or(true);
                 (
                     !clips_children,
-                    group
-                        .clip_size
-                        .or(group.local_size)
-                        .map(|[width, height]| Bounds::from_xywh(0.0, 0.0, width, height)),
+                    if ctx.page_background_root == Some(id) {
+                        group
+                            .clip_size
+                            .or(group.local_size)
+                            .map(|[width, height]| Bounds::from_xywh(0.0, 0.0, width, height))
+                    } else {
+                        super::content::frame_box_bounds(group, Some(id), ctx.scene)
+                    },
                 )
             }
             NodeData::Boolean(_) => (true, ctx.scene.local_bounds(id)),
+            NodeData::Vector(vector) => (
+                false,
+                crate::bounds::vector_visual_bounds(vector, node.flags),
+            ),
+            NodeData::Text(text) => (false, text_visual_bounds(text)),
             NodeData::TextPath(text_path) => (false, text_path_bounds(text_path)),
             data => (false, data.local_bounds()),
         }
@@ -219,14 +225,23 @@ fn resolved_local_bounds(ctx: &mut RenderCtx, id: NodeId) -> Option<Bounds> {
         let scene: &Scene = ctx.scene;
         let children: &[NodeId] = scene.children_of(Some(id));
         for &child in children {
+            if cancel_camera_work(ctx) {
+                return None;
+            }
             let Some(child_bounds) = resolved_local_bounds(ctx, child) else {
-                continue;
+                return None;
+            };
+            let child_bounds = {
+                let child_node = ctx.scene.get(child)?;
+                let scratch = resolve_overlay(ctx, child, child_node);
+                let child_node = scratch.as_deref().unwrap_or(child_node);
+                visual_local_bounds(child_node, child_bounds, ctx.effective_scale)?
             };
             let Some(child_transform) = resolved_local_transform(ctx, child) else {
-                continue;
+                return None;
             };
             let Some(in_parent) = child_bounds.try_transformed(&child_transform) else {
-                continue;
+                return None;
             };
             computed = Some(match computed {
                 Some(current) => current.union(&in_parent),
@@ -236,6 +251,127 @@ fn resolved_local_bounds(ctx: &mut RenderCtx, id: NodeId) -> Option<Bounds> {
     }
     ctx.resolved_local_bounds.insert(id, computed);
     computed
+}
+
+pub(crate) fn text_visual_bounds(text: &fanta_doc::TextNode) -> Option<Bounds> {
+    let [width, height] = text.local_size;
+    if text.auto_resize == fanta_doc::TextAutoResize::None
+        && width.is_finite()
+        && height.is_finite()
+        && width > 0.0
+        && height > 0.0
+    {
+        return Some(Bounds::from_xywh(0.0, 0.0, width, height));
+    }
+    match super::text::text_node_paint_bounds(text) {
+        Ok(Some(bounds)) => Some(bounds),
+        Ok(None) => Some(Bounds::ZERO),
+        Err(_) => None,
+    }
+}
+
+fn filtered_input_region(
+    visible: Bounds,
+    world: Transform2D,
+    filter: &skia_safe::ImageFilter,
+) -> Option<Bounds> {
+    let [a, b, c, d, x, y] = world.to_components();
+    let determinant = a * d - b * c;
+    if !determinant.is_finite() || determinant.abs() < f64::EPSILON {
+        return None;
+    }
+    let inverse = Transform2D::from_components([
+        d / determinant,
+        -b / determinant,
+        -c / determinant,
+        a / determinant,
+        (c * y - d * x) / determinant,
+        (b * x - a * y) / determinant,
+    ]);
+    let local = visible.try_transformed(&inverse)?;
+    if ![local.min_x, local.min_y, local.max_x, local.max_y]
+        .iter()
+        .all(|value| {
+            value.is_finite()
+                && *value > f64::from(i32::MIN) + 1.0
+                && *value < f64::from(i32::MAX) - 1.0
+        })
+    {
+        return None;
+    }
+    let output = skia_safe::IRect::from_ltrb(
+        local.min_x.floor() as i32,
+        local.min_y.floor() as i32,
+        local.max_x.ceil() as i32,
+        local.max_y.ceil() as i32,
+    );
+    let input = filter.filter_bounds(
+        output,
+        &skia_safe::Matrix::new_identity(),
+        skia_safe::image_filter::MapDirection::Reverse,
+        None,
+    );
+    if input.left == i32::MIN
+        || input.top == i32::MIN
+        || input.right == i32::MAX
+        || input.bottom == i32::MAX
+    {
+        return None;
+    }
+    Bounds {
+        min_x: f64::from(input.left),
+        min_y: f64::from(input.top),
+        max_x: f64::from(input.right),
+        max_y: f64::from(input.bottom),
+    }
+    .try_transformed(&world)
+}
+
+pub(crate) fn visual_local_bounds(
+    node: &CanvasNode,
+    bounds: Bounds,
+    effective_scale: f32,
+) -> Option<Bounds> {
+    let source =
+        crate::bounds::expand_for_strokes(bounds, node.data.strokes().unwrap_or(&[]), false);
+    let filter = effects_layer_paint(
+        node.opacity.get(),
+        node.blend_mode,
+        &node.effects,
+        &node.blurs,
+        node.flags.contains(NodeFlags::ISOLATED_BLEND),
+        effective_scale,
+    )
+    .and_then(|layer| layer.filter);
+    match filter {
+        Some(filter) if filter.can_compute_fast_bounds() => {
+            // Save-layer allocation padding contains transparent pixels. Growing
+            // that hint would keep invisible nodes alive; filter the actual ink,
+            // strokes and descendant paint bounds used to populate the layer.
+            let filtered = filter.compute_fast_bounds(super::camera_cache::bounds_rect(source));
+            filtered.is_finite().then_some(Bounds {
+                min_x: f64::from(filtered.left),
+                min_y: f64::from(filtered.top),
+                max_x: f64::from(filtered.right),
+                max_y: f64::from(filtered.bottom),
+            })
+        }
+        Some(_) => None,
+        None => Some(source),
+    }
+}
+
+pub(crate) fn cancel_camera_work(ctx: &mut RenderCtx) -> bool {
+    if ctx.metrics.camera_cancelled
+        || ctx
+            .should_cancel
+            .is_some_and(|should_cancel| should_cancel())
+    {
+        ctx.metrics.camera_cancelled = true;
+        true
+    } else {
+        false
+    }
 }
 
 pub(crate) fn render_scoped_root(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
@@ -262,6 +398,9 @@ pub(crate) fn render_scoped_root(canvas: &Canvas, id: NodeId, ctx: &mut RenderCt
 /// Geometry, visibility, culling, and painting read the same transient overlay
 /// (see [`resolve_overlay`]); the document is never mutated by rendering.
 pub(crate) fn render_node(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
+    if cancel_camera_work(ctx) {
+        return;
+    }
     if ctx
         .split
         .is_some_and(|split| !split.spec.includes(id, split.phase))
@@ -276,7 +415,14 @@ pub(crate) fn render_node(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
     {
         return;
     }
+    let camera_recording = ctx.metrics.camera_recording;
+    // Pattern sources render into their own raster coordinates. Their pixels are
+    // already bounded by the destination paint; they are not page-space coverage.
+    if !ctx.pattern_stack.is_empty() {
+        ctx.metrics.camera_recording = false;
+    }
     render_node_with_clip(canvas, id, ctx);
+    ctx.metrics.camera_recording = camera_recording;
     if let Some(budget) = &mut ctx.metrics.sampling_budget {
         budget.leave();
     }
@@ -292,7 +438,6 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
         return;
     }
 
-    let local_bounds = resolved_local_bounds(ctx, id);
     let Some(node) = ctx.scene.get(id) else {
         return;
     };
@@ -309,6 +454,34 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
     let opacity = node.opacity.get();
     if opacity <= 0.0 {
         return;
+    }
+    // A pass-through group with no own paint needs no subtree union before its
+    // children can be culled. Preparing that union at the page root visits the
+    // entire library even when the requested recording covers one viewport.
+    let unpainted_group = matches!(&node.data, NodeData::Group(group)
+        if !group_clips_children(node, group)
+            && (group.background.is_none() || ctx.page_background_root == Some(id))
+            && group.background_fills.is_empty()
+            && group.strokes.is_empty())
+        && opacity == 1.0
+        && node.blend_mode == BlendMode::Normal
+        && node.effects.is_empty()
+        && node.blurs.is_empty()
+        && !node.is_mask
+        && !node.flags.contains(NodeFlags::ISOLATED_BLEND);
+    let local_bounds = if ctx.metrics.camera_visible.is_some() && unpainted_group {
+        None
+    } else {
+        resolved_local_bounds(ctx, id)
+    };
+    if cancel_camera_work(ctx) {
+        return;
+    }
+    if ctx.metrics.camera_recording
+        && matches!(&node.data, NodeData::Text(text)
+            if !text.content.is_empty() && local_bounds.is_none())
+    {
+        ctx.metrics.camera_unsupported = true;
     }
     let boolean_shape = node
         .is_boolean()
@@ -343,9 +516,8 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
     // `local.try_transformed(&world_transform)`), which trims two hash lookups
     // per visited node from the walk.
     if let Some(local) = local_bounds {
-        let expanded =
-            shadow_expanded_local_bounds(local, &node.effects, &node.blurs, ctx.effective_scale)
-                .try_transformed(&world_transform);
+        let expanded = visual_local_bounds(node, local, ctx.effective_scale)
+            .and_then(|expanded| expanded.try_transformed(&world_transform));
         if expanded.is_some_and(|expanded| !expanded.intersects(&ctx.visible)) {
             ctx.metrics.nodes_culled += 1;
             return;
@@ -354,6 +526,19 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
 
     canvas.save();
     canvas.concat(&to_sk_matrix(&node.transform));
+    let outer_camera_bounds =
+        super::camera_cache::begin_camera_node(canvas, node, local_bounds, ctx.metrics);
+
+    if ctx.metrics.camera_recording
+        && node
+            .blurs
+            .iter()
+            .any(|blur| blur.kind == super::BlurKind::Background && blur.radius != 0.0)
+    {
+        // A recording has no real backdrop device; a no-op readback is not proof
+        // that replaying a retained raster would preserve this dependency.
+        ctx.metrics.camera_unsupported = true;
+    }
 
     // BACKGROUND blur ("frosted glass"): sample the backdrop already composited
     // behind this node, blur it, and blit it back inside the node's silhouette,
@@ -444,6 +629,20 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
             }
         }
         Some(layer) => {
+            let previous_visible = ctx.visible;
+            let previous_filtered_ancestor = ctx.filtered_ancestor;
+            if let Some(filter) = &layer.filter {
+                // A child outside the output viewport can still supply pixels
+                // needed by an ancestor's blur or offset shadow.
+                ctx.visible = filtered_input_region(ctx.visible, world_transform, filter)
+                    .unwrap_or(Bounds {
+                        min_x: f64::NEG_INFINITY,
+                        min_y: f64::NEG_INFINITY,
+                        max_x: f64::INFINITY,
+                        max_y: f64::INFINITY,
+                    });
+                ctx.filtered_ancestor = true;
+            }
             let content_bounds = match &node.data {
                 NodeData::Boolean(_) => local_bounds,
                 NodeData::Group(group) if !group_clips_children(node, group) => local_bounds,
@@ -499,9 +698,18 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
                     canvas.restore();
                 }
             }
+            ctx.visible = previous_visible;
+            ctx.filtered_ancestor = previous_filtered_ancestor;
         }
     }
 
+    super::camera_cache::end_camera_node(
+        canvas,
+        node,
+        outer_camera_bounds,
+        ctx.effective_scale,
+        ctx.metrics,
+    );
     canvas.restore();
 }
 
@@ -569,17 +777,14 @@ fn paint_node_body(
                 let node = scratch.as_deref().unwrap_or(node);
                 (node.is_mask && !node.flags.contains(NodeFlags::HIDDEN)).then_some(node.mask_type)
             },
-            // One child subtree's painted extent in THIS node's local space:
-            // the frame-resolved subtree bounds, expanded by the child's own
-            // drop-shadow / layer-blur reach (descendant shadows are absorbed
-            // by the shared device-pixel pad, like the cull box), mapped
-            // through the child's transform.
+            // Layer blur filters the merged shadow output, so mask layers need
+            // the composed filter's reach rather than the union of each effect.
             |ctx, &child| {
                 let local = resolved_local_bounds(ctx, child)?;
                 let node = ctx.scene.get(child)?;
                 let scratch = resolve_overlay(ctx, child, node);
                 let node = scratch.as_deref().unwrap_or(node);
-                shadow_expanded_local_bounds(local, &node.effects, &node.blurs, ctx.effective_scale)
+                visual_local_bounds(node, local, ctx.effective_scale)?
                     .try_transformed(&node.transform)
             },
             |canvas, ctx, &child| render_node(canvas, child, ctx),

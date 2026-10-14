@@ -7,7 +7,7 @@
 //! [`PathSegment`]: fanta_doc::PathSegment
 
 use fanta_doc::{FillRule, PathData, PathSegment};
-use skia_safe::{Path, PathFillType};
+use skia_safe::{Path, PathBuilder, PathFillType};
 
 /// The Skia path whose FILLED COVERAGE honors per-subpath fill rules
 /// ([`PathData::subpath_rules`], Figma's per-`fillGeometry` `windingRule`).
@@ -80,7 +80,7 @@ pub(crate) fn to_sk_fill_path(data: &PathData) -> Path {
 /// Skia's `SkPathFillType` happens exactly here so the two consumers can never
 /// disagree about what a self-intersecting / nested contour fills.
 pub fn to_sk_path(data: &PathData) -> Path {
-    let mut path = Path::new();
+    let mut path = PathBuilder::new();
     for seg in &data.segments {
         match *seg {
             PathSegment::Move { to } => {
@@ -115,7 +115,7 @@ pub fn to_sk_path(data: &PathData) -> Path {
         FillRule::NonZero => PathFillType::Winding,
         FillRule::EvenOdd => PathFillType::EvenOdd,
     });
-    path
+    path.detach()
 }
 
 #[cfg(test)]

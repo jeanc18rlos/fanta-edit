@@ -3,9 +3,12 @@ name: Skia source compatibility
 on:
   pull_request:
     paths:
-      - 'vendor/skia-bindings-0.84.0/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'vendor/skia-bindings-0.153.3/**'
+      - 'crates/fanta-render/**'
+      - 'crates/fanta-text/**'
+      - 'crates/fig_viewer/Cargo.toml'
       - 'script/clippy'
       - 'script/check-licenses'
       - 'script/generate-licenses'
@@ -58,7 +61,7 @@ jobs:
             shasum -a 256 Cargo.toml Cargo.lock rust-toolchain.toml .cargo/config.toml \
               script/clippy script/check-licenses script/generate-licenses \
               .github/workflows/skia-source-compatibility.yml
-            find vendor/skia-bindings-0.84.0 -type f -exec shasum -a 256 {} \;
+            find vendor/skia-bindings-0.153.3 -type f -exec shasum -a 256 {} \;
           } 2>&1 | tee "$evidence_directory/source.txt"
           test "$(uname -m)" = arm64
           test "$(xcodebuild -version)" = $'Xcode 26.6\nBuild version 17F113'
@@ -72,21 +75,41 @@ jobs:
           ./script/check-licenses 2>&1 | tee "$evidence_directory/license-check.log"
           cargo metadata --locked --format-version 1 > "$evidence_directory/metadata.json"
           python3 - <<'PY'
+          import hashlib
           import json
           import os
           from pathlib import Path
+          import tomllib
 
           evidence = Path(os.environ["RUNNER_TEMP"]) / "skia-source-evidence"
           metadata = json.loads((evidence / "metadata.json").read_text())
           bindings = [package for package in metadata["packages"] if package["name"] == "skia-bindings"]
           assert len(bindings) == 1
           package = bindings[0]
-          assert package["version"] == "0.84.0" and package["source"] is None
-          assert Path(package["manifest_path"]).resolve() == Path("vendor/skia-bindings-0.84.0/Cargo.toml").resolve()
+          assert package["version"] == "0.153.3" and package["source"] is None
+          assert Path(package["manifest_path"]).resolve() == Path("vendor/skia-bindings-0.153.3/Cargo.toml").resolve()
           assert package["id"] not in metadata["workspace_members"]
           safe = [package for package in metadata["packages"] if package["name"] == "skia-safe"]
-          assert len(safe) == 1 and safe[0]["version"] == "0.84.0"
+          assert len(safe) == 1 and safe[0]["version"] == "0.153.3"
           assert safe[0]["source"] == "registry+https://github.com/rust-lang/crates.io-index"
+          records = []
+          for package in [bindings[0], safe[0]]:
+              root = Path(package["manifest_path"]).parent
+              manifest = tomllib.loads((root / "Cargo.toml").read_text())
+              vcs = json.loads((root / ".cargo_vcs_info.json").read_text())
+              files = [root / "Cargo.toml", root / ".cargo_vcs_info.json"]
+              if package["name"] == "skia-bindings":
+                  generator = root / "build_support/skia_bindgen.rs"
+                  source = generator.read_text()
+                  assert all(pattern in source for pattern in ['"std::basic_string.*"', '"std::__tree.*"', '"std::__rebind_alloc.*"', '"std::__hash_table.*"'])
+                  files.extend([generator, root / "build.rs", root / "src/graphite.cpp", root / "LICENSE", root / "FANTA-PROVENANCE.txt"])
+              records.append({
+                  "name": package["name"], "version": package["version"],
+                  "source": package["source"], "vcs": vcs,
+                  "package_metadata": manifest.get("package", {}).get("metadata", {}),
+                  "files": [{"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()} for path in files],
+              })
+          (evidence / "upstream-source.json").write_text(json.dumps(records, indent=2) + "\n")
           PY
 
       - name: Compile default renderer from Skia source
@@ -102,15 +125,27 @@ jobs:
           grep -F 'GENERATING BINDINGS' "$evidence_directory/default.log"
           compgen -G "${RUNNER_TEMP}/skia-source-default/release/build/skia-bindings-*/out/skia/bindings.rs" > /dev/null
 
-      - name: Compile Metal-feature renderer from Skia source
+      - name: Compile Metal Graphite renderer from Skia source
         if: ${{ !cancelled() && steps.prepare.outcome == 'success' }}
         shell: bash
         run: |
           set -euo pipefail
           evidence_directory="${RUNNER_TEMP}/skia-source-evidence"
+          cargo metadata --locked --format-version 1 --features fanta-render/metal > "$evidence_directory/metal-metadata.json"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          metadata = json.loads((Path(os.environ["RUNNER_TEMP"]) / "skia-source-evidence/metal-metadata.json").read_text())
+          bindings = next(package for package in metadata["packages"] if package["name"] == "skia-bindings")
+          resolved = next(node for node in metadata["resolve"]["nodes"] if node["id"] == bindings["id"])
+          assert {"metal", "graphite", "ganesh", "textlayout"}.issubset(resolved["features"])
+          PY
           FORCE_SKIA_BUILD=1 FANTA_CLIPPY_DEFAULT_FEATURES=1 \
             CARGO_TARGET_DIR="${RUNNER_TEMP}/skia-source-metal" \
             ./script/clippy --locked -p fanta-render --features metal -vv 2>&1 | tee "$evidence_directory/metal.log"
+          grep -F 'COMPILING FANTA GRAPHITE IMAGE PROVIDER FROM SOURCE' "$evidence_directory/metal.log"
           grep -F 'STARTING A FULL BUILD' "$evidence_directory/metal.log"
           grep -F 'GENERATING BINDINGS' "$evidence_directory/metal.log"
           compgen -G "${RUNNER_TEMP}/skia-source-metal/release/build/skia-bindings-*/out/skia/bindings.rs" > /dev/null
@@ -122,7 +157,8 @@ jobs:
           set -euo pipefail
           evidence_directory="${RUNNER_TEMP}/skia-source-evidence"
           ./script/generate-licenses "$evidence_directory/licenses.md" 2>&1 | tee "$evidence_directory/license-generation.log"
-          grep -F '[skia-bindings 0.84.0]' "$evidence_directory/licenses.md"
+          grep -F '[skia-bindings 0.153.3]' "$evidence_directory/licenses.md"
+          grep -F '[skia-safe 0.153.3]' "$evidence_directory/licenses.md"
           grep -F 'Copyright (c) 2019 rust-skia Contributors' "$evidence_directory/licenses.md"
 
       - name: Preserve source-build outputs and generated bindings

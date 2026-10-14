@@ -3,6 +3,7 @@
 //! as an unwrapped `fanta-project` directory.
 
 use std::{
+    borrow::Cow,
     cell::RefCell,
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     io::Read as _,
@@ -352,6 +353,7 @@ pub enum FigItemEvent {
     EditedTransient,
     /// The selection or another non-persistent view state changed.
     SelectionChanged,
+    ViewportChanged(Option<EntityId>),
     PageRegistryChanged,
     /// The caret or character selection inside an active text-edit session
     /// changed, or its effective typography changed. This refreshes inspector
@@ -466,6 +468,7 @@ pub struct FigDocument {
     pub doc: Doc,
     pub pages: Vec<FigPage>,
     pub default_page_index: usize,
+    page_registry: PageRegistryIndex,
     pub(crate) solved_pages: HashSet<NodeId>,
     layout_state: layout::LayoutState,
     pending_layout_output_nodes: BTreeSet<NodeId>,
@@ -522,25 +525,67 @@ pub(crate) struct PagePrewarm {
 
 impl PagePrewarm {
     /// Decode the page's images into the shared resolver. Safe to run on any
-    /// thread; a frame that draws one of them first simply wins the decode.
+    /// thread; a frame that draws one of them first decodes it or waits for
+    /// the decode already under way.
     ///
-    /// Decodes one asset at a time, stopping as soon as this task is the last
-    /// owner of the resolver. The document that owns it can be replaced while
+    /// Each thread decodes one asset at a time, stopping as soon as this task
+    /// is the last owner of the resolver. The document that owns it can be replaced while
     /// the walk runs — a reload or a merge installs a brand-new `FigDocument`
     /// with a brand-new resolver — and from that moment nothing will ever read
     /// what this decodes, while the orphaned cache would still fill to the full
     /// decode budget alongside the replacement's own decode of the same images.
+    ///
+    /// The page's first frame decodes on demand at the same time, so the
+    /// assets are split across a few threads: a serial prewarm would rarely
+    /// stay ahead of the render thread's walk. The resolver lets each caller
+    /// wait for an asset another thread is decoding instead of repeating it.
     pub(crate) fn run(self) {
-        for asset in self.assets {
-            if Arc::strong_count(&self.resolver) <= 1 {
-                return;
+        let workers = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .saturating_sub(2)
+            .clamp(1, Self::MAX_WORKERS)
+            .min(self.assets.len());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let decode = || {
+            loop {
+                if Arc::strong_count(&self.resolver) <= 1 {
+                    return;
+                }
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(asset) = self.assets.get(index) else {
+                    return;
+                };
+                self.resolver.prewarm([*asset]);
             }
-            self.resolver.prewarm([asset]);
-        }
+        };
+        std::thread::scope(|scope| {
+            for worker in 1..workers {
+                if let Err(error) = std::thread::Builder::new()
+                    .name(format!("fanta-page-prewarm-{worker}"))
+                    .spawn_scoped(scope, decode)
+                {
+                    log::warn!("starting a page image prewarm thread failed: {error}");
+                    break;
+                }
+            }
+            decode();
+        });
+    }
+
+    const MAX_WORKERS: usize = 6;
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.assets.len()
     }
 }
 
 fn next_variables_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn next_page_registry_revision() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
@@ -554,6 +599,89 @@ pub struct FigPage {
     /// every component master). Kept in `pages` so a component can be focused by
     /// switching to it, yet filtered out of the user-facing page list.
     pub hidden: bool,
+}
+
+struct PageRegistryIndex {
+    authored_roots: Vec<NodeId>,
+    authored_root_set: HashSet<NodeId>,
+    component_roots: BTreeMap<fanta_doc::ComponentId, (NodeId, bool)>,
+    component_by_root: HashMap<NodeId, fanta_doc::ComponentId>,
+    page_indices: HashMap<Option<NodeId>, usize>,
+    revision: u64,
+    #[cfg(test)]
+    validations: usize,
+}
+
+impl PageRegistryIndex {
+    fn new(doc: &Doc) -> Self {
+        let mut component_by_root = HashMap::with_capacity(doc.components.defs.len());
+        let component_roots = doc
+            .components
+            .defs
+            .iter()
+            .map(|(id, definition)| {
+                // A shared root has always used the first definition in id
+                // order, including when that root is also an authored page.
+                component_by_root.entry(definition.root).or_insert(*id);
+                (*id, (definition.root, doc.scene.contains(definition.root)))
+            })
+            .collect();
+        Self {
+            authored_roots: doc.pages().to_vec(),
+            authored_root_set: doc.pages().iter().copied().collect(),
+            component_roots,
+            component_by_root,
+            page_indices: HashMap::new(),
+            revision: next_page_registry_revision(),
+            #[cfg(test)]
+            validations: 0,
+        }
+    }
+
+    fn matches(&self, doc: &Doc) -> bool {
+        self.authored_roots == doc.pages()
+            && self.component_roots.len() == doc.components.defs.len()
+            && self.component_roots.iter().zip(&doc.components.defs).all(
+                |((previous_id, (root, present)), (id, definition))| {
+                    previous_id == id
+                        && *root == definition.root
+                        && *present == doc.scene.contains(*root)
+                },
+            )
+    }
+
+    fn editor_roots(&self) -> Vec<Option<NodeId>> {
+        let mut roots = if self.authored_roots.is_empty() {
+            vec![None]
+        } else {
+            self.authored_roots.iter().copied().map(Some).collect()
+        };
+        let mut components: Vec<_> = self
+            .component_roots
+            .values()
+            .filter_map(|(root, present)| {
+                (*present && !self.authored_root_set.contains(root)).then_some(*root)
+            })
+            .collect();
+        components.sort_unstable();
+        components.dedup();
+        roots.extend(components.into_iter().map(Some));
+        roots
+    }
+
+    fn index_pages(&mut self, pages: &[FigPage]) {
+        self.page_indices.clear();
+        self.page_indices.reserve(pages.len());
+        for (index, page) in pages.iter().enumerate() {
+            self.page_indices.entry(page.root).or_insert(index);
+        }
+    }
+}
+
+enum PageRegistryChange {
+    None,
+    Root(NodeId),
+    All,
 }
 
 impl FigDocument {
@@ -628,7 +756,9 @@ impl FigDocument {
                     .map(|resolver| resolver as Arc<dyn AssetResolver>);
                 (gpui_images, embedded_assets, asset_resolver, None)
             };
-        let pages = collect_pages(&doc, &visible_page_roots);
+        let mut page_registry = PageRegistryIndex::new(&doc);
+        let pages = collect_pages(&doc, &page_registry, &mut HashMap::new());
+        page_registry.index_pages(&pages);
         let default_page_index = default_page_root
             .and_then(|root| pages.iter().position(|page| page.root == Some(root)))
             .or_else(|| pages.iter().position(|page| !page.hidden))
@@ -654,6 +784,7 @@ impl FigDocument {
             doc,
             pages,
             default_page_index,
+            page_registry,
             solved_pages,
             layout_state,
             pending_layout_output_nodes,
@@ -819,6 +950,35 @@ impl FigDocument {
             .position(|page| page.root == Some(current))
     }
 
+    /// The document half of [`FigItem::apply`], for benchmarks that drive a
+    /// bare document without an item entity.
+    #[cfg(test)]
+    pub(crate) fn apply_for_benchmark(&mut self, operation: Operation) -> Result<()> {
+        let registry_change = self.page_registry_change_for_operation(&operation);
+        self.doc
+            .apply(operation)
+            .context("applying canvas operation")?;
+        let active_page = self.doc.active_page();
+        self.sync_page_registry_after_operation(registry_change);
+        self.resolve_after_edit(active_page);
+        self.advance_render_generation();
+        self.mark_variables_changed();
+        Ok(())
+    }
+
+    /// The document half of [`FigItem::undo`].
+    #[cfg(test)]
+    pub(crate) fn undo_for_benchmark(&mut self) -> Result<bool> {
+        let did = self.doc.undo().context("undoing canvas operation")?;
+        if did {
+            self.sync_page_registry();
+            self.refresh_layout_baseline();
+            self.advance_render_generation();
+            self.mark_variables_changed();
+        }
+        Ok(did)
+    }
+
     pub fn ensure_page_solved(&mut self, page_index: usize) {
         let Some(page_root) = self.pages.get(page_index).and_then(|page| page.root) else {
             return;
@@ -974,10 +1134,19 @@ impl FigDocument {
     }
 
     fn sync_page_registry(&mut self) -> bool {
-        let roots = editor_page_roots(&self.doc);
-        let unchanged = self.pages.iter().map(|page| page.root).eq(roots);
-        if unchanged {
-            return false;
+        #[cfg(test)]
+        {
+            self.page_registry.validations += 1;
+        }
+        if self.page_registry.matches(&self.doc) {
+            let mut changed = false;
+            for (index, page) in self.pages.iter_mut().enumerate() {
+                changed |= update_page_metadata(&self.doc, &self.page_registry, page, index);
+            }
+            if changed {
+                self.page_registry.revision = next_page_registry_revision();
+            }
+            return changed;
         }
         let default_root = self
             .pages
@@ -985,16 +1154,16 @@ impl FigDocument {
             .and_then(|page| page.root);
         let mut previous: HashMap<_, _> = std::mem::take(&mut self.pages)
             .into_iter()
-            .filter_map(|page| page.root.map(|root| (root, page)))
+            .map(|page| (page.root, page))
             .collect();
-        self.pages = collect_pages(&self.doc, &visible_page_roots(&self.doc));
-        for page in &mut self.pages {
-            if let Some(root) = page.root
-                && let Some(previous) = previous.remove(&root)
-            {
-                page.bounds = previous.bounds;
-            }
+        let mut registry = PageRegistryIndex::new(&self.doc);
+        #[cfg(test)]
+        {
+            registry.validations = self.page_registry.validations;
         }
+        self.pages = collect_pages(&self.doc, &registry, &mut previous);
+        registry.index_pages(&self.pages);
+        self.page_registry = registry;
         self.default_page_index = self
             .pages
             .iter()
@@ -1006,7 +1175,8 @@ impl FigDocument {
             })
             .unwrap_or(0);
         if self.doc.active_page().is_some_and(|root| {
-            !self.doc.pages().contains(&root) && !self.doc.is_component_root(root)
+            !self.page_registry.authored_root_set.contains(&root)
+                && !self.page_registry.component_by_root.contains_key(&root)
         }) {
             // Undo or cancellation can remove a followed master's definition
             // while its scene node remains; recover a valid viewing scope.
@@ -1032,6 +1202,90 @@ impl FigDocument {
             .collect::<Vec<_>>();
         self.doc.selection.replace_with(surviving_selection);
         true
+    }
+
+    fn page_registry_change_for_operation(&self, operation: &Operation) -> PageRegistryChange {
+        match operation {
+            Operation::SetName { id, .. } | Operation::SetMeta { id, .. } => {
+                PageRegistryChange::Root(*id)
+            }
+            Operation::SetComponentName { id, .. } => self
+                .doc
+                .components
+                .def(*id)
+                .map_or(PageRegistryChange::None, |definition| {
+                    PageRegistryChange::Root(definition.root)
+                }),
+            Operation::CreateNode { node } | Operation::CreateInstance { node }
+                if !self.page_registry.component_by_root.contains_key(&node.id)
+                    && !self.page_registry.authored_root_set.contains(&node.id) =>
+            {
+                PageRegistryChange::None
+            }
+            Operation::DeleteSubtree { snapshot }
+                if snapshot.first().is_some_and(|node| {
+                    // Removal follows the actual child index. A caller's
+                    // snapshot may omit a nested master which is still removed.
+                    self.doc.scene.descendants_of(node.id).all(|id| {
+                        !self.page_registry.component_by_root.contains_key(&id)
+                            && !self.page_registry.authored_root_set.contains(&id)
+                    })
+                }) =>
+            {
+                PageRegistryChange::None
+            }
+            Operation::Reparent { .. }
+            | Operation::SetIndex { .. }
+            | Operation::SetTransform { .. }
+            | Operation::SetOpacity { .. }
+            | Operation::SetBlendMode { .. }
+            | Operation::SetEffects { .. }
+            | Operation::SetBlurs { .. }
+            | Operation::SetFlags { .. }
+            | Operation::SetMask { .. }
+            | Operation::SetMaskType { .. }
+            | Operation::SetLayoutChild { .. }
+            | Operation::SetConstraints { .. }
+            | Operation::ReplaceData { .. }
+            | Operation::SetComponentProps { .. }
+            | Operation::DefineComponentSet { .. }
+            | Operation::DeleteComponentSet { .. }
+            | Operation::SetVariantMembership { .. }
+            | Operation::SetComponentSet { .. }
+            | Operation::SetInstanceOverride { .. }
+            | Operation::SwapInstance { .. } => PageRegistryChange::None,
+            // Public registry maps and arbitrary document callbacks cannot be
+            // proven unchanged by scene or component rendering revisions.
+            _ => PageRegistryChange::All,
+        }
+    }
+
+    fn sync_page_registry_after_operation(&mut self, change: PageRegistryChange) -> bool {
+        match change {
+            PageRegistryChange::None => false,
+            PageRegistryChange::All => self.sync_page_registry(),
+            PageRegistryChange::Root(root) => {
+                let Some(index) = self.page_index_for_root(Some(root)) else {
+                    return false;
+                };
+                let Some(page) = self.pages.get_mut(index) else {
+                    return self.sync_page_registry();
+                };
+                let changed = update_page_metadata(&self.doc, &self.page_registry, page, index);
+                if changed {
+                    self.page_registry.revision = next_page_registry_revision();
+                }
+                changed
+            }
+        }
+    }
+
+    pub fn page_registry_revision(&self) -> u64 {
+        self.page_registry.revision
+    }
+
+    pub(crate) fn page_index_for_root(&self, root: Option<NodeId>) -> Option<usize> {
+        self.page_registry.page_indices.get(&root).copied()
     }
 
     fn refresh_page_bounds(&mut self, page_index: usize) {
@@ -1064,7 +1318,7 @@ impl FigDocument {
             }
         }
         self.refresh_layout_baseline();
-        if let Some(index) = self.pages.iter().position(|page| page.root == page_root) {
+        if let Some(index) = self.page_index_for_root(page_root) {
             self.refresh_page_bounds(index);
         }
     }
@@ -1074,11 +1328,7 @@ impl FigDocument {
             log::error!("refreshing layout inputs: {error:#}");
             self.layout_state = layout::LayoutState::new(&self.doc);
         }
-        if let Some(index) = self
-            .pages
-            .iter()
-            .position(|page| page.root == self.doc.active_page())
-        {
+        if let Some(index) = self.page_index_for_root(self.doc.active_page()) {
             self.refresh_page_bounds(index);
         }
     }
@@ -1427,9 +1677,8 @@ impl project::ProjectItem for FigItem {
                                 project_reads.load(|| match load_project_root {
                                     Some(root) => {
                                         report_load_progress(&progress, "Opening project files…");
-                                        let session = open_workspace_session(&root)?;
-                                        report_load_progress(&progress, "Loading pages and assets…");
-                                        let document = load_project_document(&root)?;
+                                        let (document, session) =
+                                            load_project_document_with_session(&root)?;
                                         Ok((document, None, Some(session), None))
                                     }
                                     // First open of a bare `.fig`: parse it AND
@@ -1727,6 +1976,26 @@ impl FigItem {
         self.project_root.as_deref()
     }
 
+    // The session retains saved slug and variant paths, avoiding a project
+    // directory scan for every component returned to an agent.
+    pub(crate) fn indexed_design_source(
+        &self,
+        design: fanta_format::ScopedDesign,
+    ) -> Option<PathBuf> {
+        let root = self.project_root()?;
+        let session = self.workspace_session.as_ref()?;
+        let artifact = fanta_format::ArtifactId::from_scoped(design);
+        if !session.has_indexed_source(&artifact) {
+            return None;
+        }
+        let metadata = session.artifacts.get(&artifact)?;
+        let file_name = match design {
+            fanta_format::ScopedDesign::Page(_) => "page.fnx",
+            fanta_format::ScopedDesign::Component(_) => "master.fnx",
+        };
+        Some(root.join(&metadata.design_dir).join(file_name))
+    }
+
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
@@ -1898,6 +2167,31 @@ impl FigItem {
                 ))
             });
             if let Ok(Some((root, paths, hashes, removed, epoch))) = snapshot {
+                if crate::perf_enabled() {
+                    let unknown_paths: Vec<_> = paths
+                        .iter()
+                        .filter_map(|path| path.strip_prefix(&root).ok())
+                        .filter(|relative| {
+                            !hashes.contains_key(*relative) && !removed.contains(*relative)
+                        })
+                        .collect();
+                    if !unknown_paths.is_empty() {
+                        log::warn!(
+                            "fanta watcher unknown paths: epoch={epoch}, count={}, sample={:?}",
+                            unknown_paths.len(),
+                            unknown_paths.iter().take(16).collect::<Vec<_>>()
+                        );
+                    }
+                }
+                // A legacy source can change between document read and
+                // indexing. Its later index cannot prove the loaded document
+                // contains the bytes behind an unproven startup event.
+                let unproven_startup_path = epoch == 0
+                    && paths.iter().any(|path| {
+                        path.strip_prefix(&root).is_ok_and(|relative| {
+                            !hashes.contains_key(relative) && !removed.contains(relative)
+                        })
+                    });
                 let paths_for_check = paths.clone();
                 let root_for_check = root.clone();
                 let changed = cx
@@ -1919,12 +2213,13 @@ impl FigItem {
                                 .ok()
                                 .is_some_and(|relative| relative.starts_with("assets"))
                         });
+                        let force_full = asset_changed || unproven_startup_path;
                         if this.source_edit_locked {
                             this.set_conflict(true, cx);
                         } else if this.dirty {
-                            this.schedule_merge_with_full(asset_changed, cx);
+                            this.schedule_merge_with_full(force_full, cx);
                         } else {
-                            this.schedule_reload_with_full(asset_changed, cx);
+                            this.schedule_reload_with_full(force_full, cx);
                         }
                     }
                 }) {
@@ -2339,10 +2634,6 @@ impl FigItem {
     /// its root node id) when it still exists. The viewport lives on the
     /// view and survives untouched; the selection resets with the new
     /// document.
-    fn apply_reloaded_document(&mut self, document: FigDocument, cx: &mut Context<Self>) {
-        self.apply_reloaded_document_with_session(document, None, cx);
-    }
-
     fn apply_reloaded_document_with_session(
         &mut self,
         mut document: FigDocument,
@@ -2484,9 +2775,11 @@ impl FigItem {
         let epoch = self.sync_epoch;
         let project_reads = self.project_reads.clone();
         cx.spawn(async move |this, cx| {
-            let document = match cx
+            let (document, session) = match cx
                 .background_spawn(async move {
-                    project_reads.load(|| load_project_document(&root)).await
+                    project_reads
+                        .load(|| load_project_document_with_session(&root))
+                        .await
                 })
                 .await
             {
@@ -2510,7 +2803,7 @@ impl FigItem {
                         !this.content_preview_active(),
                         "finish or cancel the active canvas preview before reloading"
                     );
-                    this.apply_reloaded_document(document, cx);
+                    this.apply_reloaded_document_with_session(document, Some(session), cx);
                 }
                 Ok::<(), anyhow::Error>(())
             })??;
@@ -2621,12 +2914,13 @@ impl FigItem {
             .document
             .ready_mut()
             .context("the document is still loading")?;
+        let registry_change = document.page_registry_change_for_operation(&operation);
         document
             .doc
             .apply(operation)
             .context("applying canvas operation")?;
         let active_page = document.doc.active_page();
-        if document.sync_page_registry() {
+        if document.sync_page_registry_after_operation(registry_change) {
             self.last_scope = self.last_scope.filter(|scope| document.valid_scope(*scope));
             cx.emit(FigItemEvent::PageRegistryChanged);
         }
@@ -2686,7 +2980,13 @@ impl FigItem {
             return None;
         }
         let document = self.document.ready_mut()?;
+        let previous_viewport = document.doc.viewport;
         let (result, change) = f(document);
+        if document.doc.viewport != previous_viewport {
+            cx.emit(FigItemEvent::ViewportChanged(
+                crate::agent_surface::active_view_for_item(cx.entity_id(), cx),
+            ));
+        }
         let mut finished_preview = false;
         match change {
             DocChange::None => {}
@@ -2865,7 +3165,7 @@ impl FigItem {
         &mut self,
         document: Result<FigDocument>,
         materialized: Option<MaterializedProject>,
-        session: Option<fanta_format::WorkspaceSession>,
+        mut session: Option<fanta_format::WorkspaceSession>,
         cx: &mut Context<Self>,
     ) {
         if self.sync_epoch != 0 {
@@ -2873,6 +3173,16 @@ impl FigItem {
             // and reloaded a newer document; installing this older snapshot
             // would regress it and poison merge_base for the next save.
             return;
+        }
+        if let Some(session) = &mut session {
+            // Startup scan echoes can arrive after the initial bytes were
+            // loaded. Check them against those exact bytes while preserving
+            // newer accepted writes and deletions already queued by this item.
+            for (path, hash) in session.take_loaded_file_hashes() {
+                if !self.own_write_removed.contains(&path) {
+                    self.own_write_hashes.entry(path).or_insert(hash);
+                }
+            }
         }
         self.write_cache = None;
         self.workspace_session = session;
@@ -2994,12 +3304,17 @@ impl FigItem {
             &mut changed_artifacts,
             document.pending_layout_output_nodes.iter().copied(),
         );
+        let captured_saved_scene = self.last_saved_scene;
+        let pending_layout_nodes: Vec<_> = document
+            .pending_layout_output_nodes
+            .iter()
+            .copied()
+            .collect();
         // The write needs the content, not the presence state: the undo
         // stack's subtree snapshots can outweigh the scene, and cloning them
         // once per autosave was the save path's memory high-water mark.
         let doc = document.doc.clone_for_persist();
         let raw_assets = document.raw_assets.clone();
-        let previous_assets = self.last_saved_assets.clone();
         let generation = document.render_generation();
         let scene_watermark = (
             document.doc.scene.instance_id(),
@@ -3048,14 +3363,30 @@ impl FigItem {
                     target.display(),
                     this.abs_path.display()
                 );
+                // A queued write may commit a different baseline after this
+                // snapshot was captured, including a layer already undone here.
+                if this.last_saved_scene != captured_saved_scene {
+                    changed_artifacts = changed_artifact_ids_from_baseline(
+                        &doc,
+                        this.merge_base.as_ref(),
+                        None,
+                    );
+                    extend_artifact_owners(
+                        &doc,
+                        &mut changed_artifacts,
+                        pending_layout_nodes.iter().copied(),
+                    );
+                }
                 Ok::<_, anyhow::Error>(Some((
                     target,
                     materializing,
                     this.write_cache.take().unwrap_or_default(),
                     this.workspace_session.take(),
+                    this.merge_base.as_ref().map(Doc::clone_for_persist),
+                    this.last_saved_assets.clone(),
                 )))
             })??;
-            let Some((target, materializing, write_cache, workspace_session)) = prepared else {
+            let Some((target, materializing, write_cache, workspace_session, baseline_document, previous_assets)) = prepared else {
                 return Ok(None);
             };
             // The persisted clone travels through the write and comes back
@@ -3102,6 +3433,28 @@ impl FigItem {
                             let session = workspace_session
                                 .as_mut()
                                 .context("The Fanta source session is unavailable")?;
+                            let mut asset_preconditions = std::collections::BTreeMap::new();
+                            if let Some(previous_assets) = &previous_assets {
+                                add_asset_write_preconditions(
+                                    &target,
+                                    &mut asset_preconditions,
+                                    previous_assets,
+                                    &raw_assets,
+                                )?;
+                                if let Some(baseline_document) = &baseline_document
+                                    && (Arc::ptr_eq(previous_assets, &raw_assets)
+                                        || previous_assets.as_ref() == raw_assets.as_ref())
+                                    && let Some(report) = session.try_save_document_artifacts(
+                                        &doc,
+                                        baseline_document,
+                                        &changed_artifacts,
+                                        &asset_preconditions,
+                                    )?
+                                {
+                                    write_cache = fanta_format::ProjectWriteCache::default();
+                                    return Ok(report);
+                                }
+                            }
                             for id in &changed_artifacts {
                                 let Some(indexed_hash) = session.file_index.get(id).copied() else {
                                     continue;
@@ -3121,14 +3474,7 @@ impl FigItem {
                             session.adopt_document_artifacts(&doc, &changed_artifacts)?;
                             let sources = session.validated_source_overrides_for_document(&doc)?;
                             let mut expected_disk = session.source_write_preconditions(&doc)?;
-                            if let Some(previous_assets) = &previous_assets {
-                                add_asset_write_preconditions(
-                                    &target,
-                                    &mut expected_disk,
-                                    previous_assets,
-                                    &raw_assets,
-                                )?;
-                            }
+                            expected_disk.extend(asset_preconditions);
                             let report = write_project_cached_report_with_sources(
                                 &target,
                                 &doc,
@@ -4071,43 +4417,123 @@ fn watcher_paths_differ_from_own_writes(
             return true;
         };
         if let Some(expected) = hashes.get(relative) {
-            if !matches!(
-                std::fs::symlink_metadata(path),
-                Ok(metadata) if metadata.file_type().is_file()
-            ) {
-                return true;
-            }
-            let Ok(file) = std::fs::File::open(path) else {
-                return true;
-            };
-            let Ok(metadata) = file.metadata() else {
-                return true;
-            };
-            if !metadata.is_file() {
-                return true;
-            }
-            let mut file = file;
-            let mut digest = Sha256::new();
-            let mut buffer = [0u8; 64 * 1024];
-            loop {
-                match file.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(size) => digest.update(&buffer[..size]),
-                    Err(_) => return true,
-                }
-            }
-            if digest.finalize().as_slice() != expected {
+            if !watcher_file_matches_hash(path, expected) {
                 return true;
             }
         } else if removed.contains(relative) {
             if std::fs::symlink_metadata(path).is_ok() {
                 return true;
             }
-        } else {
+        } else if !watcher_directory_matches_hashes(root, relative, hashes) {
             return true;
         }
     }
     false
+}
+
+fn watcher_file_matches_hash(path: &Path, expected: &[u8; 32]) -> bool {
+    if !matches!(
+        std::fs::symlink_metadata(path),
+        Ok(metadata) if metadata.file_type().is_file()
+    ) {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    if !matches!(file.metadata(), Ok(metadata) if metadata.is_file()) {
+        return false;
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(size) => digest.update(&buffer[..size]),
+            Err(_) => return false,
+        }
+    }
+    digest.finalize().as_slice() == expected
+}
+
+fn watcher_directory_matches_hashes(
+    root: &Path,
+    relative: &Path,
+    hashes: &BTreeMap<PathBuf, [u8; 32]>,
+) -> bool {
+    for ancestor in relative
+        .ancestors()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        if !matches!(
+            std::fs::symlink_metadata(root.join(ancestor)),
+            Ok(metadata) if metadata.file_type().is_dir()
+        ) {
+            return false;
+        }
+    }
+    let mut expected_children = BTreeMap::<std::ffi::OsString, Option<&[u8; 32]>>::new();
+    // Component-library startup scans report each directory independently.
+    // Its ordered prefix range keeps checking 9,000 directories proportional
+    // to their own files rather than repeatedly scanning the entire library.
+    for (known, hash) in hashes
+        .range(relative.to_path_buf()..)
+        .take_while(|(known, _)| known.starts_with(relative))
+    {
+        let Ok(suffix) = known.strip_prefix(relative) else {
+            return false;
+        };
+        let mut components = suffix.components();
+        let Some(std::path::Component::Normal(name)) = components.next() else {
+            return false;
+        };
+        let child_hash = components.next().is_none().then_some(hash);
+        if let Some(previous) = expected_children.insert(name.to_os_string(), child_hash)
+            && previous.is_some() != child_hash.is_some()
+        {
+            return false;
+        }
+    }
+    if expected_children.is_empty() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(root.join(relative)) else {
+        return false;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let name = entry.file_name();
+        let Some(expected) = expected_children.remove(&name) else {
+            return false;
+        };
+        let matches = match expected {
+            Some(hash) => watcher_file_matches_hash(&entry.path(), hash),
+            None => watcher_directory_matches_hashes(root, &relative.join(name), hashes),
+        };
+        if !matches {
+            return false;
+        }
+    }
+    expected_children.is_empty()
+}
+
+fn all_artifact_ids(document: &Doc) -> BTreeSet<fanta_format::ArtifactId> {
+    document
+        .pages()
+        .iter()
+        .copied()
+        .map(fanta_format::ArtifactId::Page)
+        .chain(
+            document
+                .components
+                .defs
+                .keys()
+                .copied()
+                .map(fanta_format::ArtifactId::Component),
+        )
+        .collect()
 }
 
 fn changed_artifact_ids(
@@ -4115,30 +4541,25 @@ fn changed_artifact_ids(
     base: Option<&Doc>,
     watermark: Option<(u64, u64)>,
 ) -> BTreeSet<fanta_format::ArtifactId> {
-    let all = || {
-        document
-            .pages()
-            .iter()
-            .copied()
-            .map(fanta_format::ArtifactId::Page)
-            .chain(
-                document
-                    .components
-                    .defs
-                    .keys()
-                    .copied()
-                    .map(fanta_format::ArtifactId::Component),
-            )
-            .collect()
-    };
     let Some((instance, revision)) = watermark else {
-        return all();
+        return all_artifact_ids(document);
     };
+    if instance != document.scene.instance_id() {
+        return all_artifact_ids(document);
+    }
+    changed_artifact_ids_from_baseline(document, base, document.scene.changes_since(revision))
+}
+
+fn changed_artifact_ids_from_baseline(
+    document: &Doc,
+    base: Option<&Doc>,
+    scene_delta: Option<fanta_doc::scene::SceneDelta>,
+) -> BTreeSet<fanta_format::ArtifactId> {
+    let all = || all_artifact_ids(document);
     let Some(base) = base else {
         return all();
     };
-    if instance != document.scene.instance_id()
-        || base.pages() != document.pages()
+    if base.pages() != document.pages()
         || base.variables != document.variables
         || base.active_modes != document.active_modes
         || base.components.sets != document.components.sets
@@ -4155,7 +4576,7 @@ fn changed_artifact_ids(
             continue;
         }
         // Master edits bump expansion revisions without changing reference names.
-        // Opening every artifact here retains a full name table per component.
+        // They do not require retaining source/IR sessions for unrelated masters.
         let mut previous = previous.clone();
         previous.rev = definition.rev;
         previous.preview_rev = definition.preview_rev;
@@ -4164,15 +4585,87 @@ fn changed_artifact_ids(
         }
         changed.insert(fanta_format::ArtifactId::Component(*id));
     }
-    let Some(delta) = document.scene.changes_since(revision) else {
-        return all();
-    };
-    extend_artifact_owners(
-        document,
-        &mut changed,
-        delta.nodes.into_iter().chain(delta.transforms),
-    );
+    if let Some(delta) = scene_delta {
+        extend_artifact_owners(
+            document,
+            &mut changed,
+            delta.nodes.into_iter().chain(delta.transforms),
+        );
+    } else {
+        // Master placement and registry changes can affect source ownership
+        // outside a changed subtree; retain the conservative path for them.
+        for definition in document.components.defs.values() {
+            match (
+                base.scene.get(definition.root),
+                document.scene.get(definition.root),
+            ) {
+                (Some(previous), Some(current))
+                    if previous.parent == current.parent && previous.index == current.index => {}
+                _ => return all(),
+            }
+        }
+        let Some(previous_nodes) = changed_structural_nodes(base, document) else {
+            return all();
+        };
+        let Some(current_nodes) = changed_structural_nodes(document, base) else {
+            return all();
+        };
+        // Deleted and moved layers still belong to their previous source as
+        // well as their destination. Only looking at the live scene misses it.
+        extend_artifact_owners(base, &mut changed, previous_nodes);
+        extend_artifact_owners(document, &mut changed, current_nodes);
+    }
     changed
+}
+
+fn changed_structural_nodes(document: &Doc, other: &Doc) -> Option<Vec<NodeId>> {
+    let artifact_roots: HashSet<_> = document
+        .pages()
+        .iter()
+        .copied()
+        .chain(
+            document
+                .components
+                .defs
+                .values()
+                .map(|definition| definition.root),
+        )
+        .collect();
+    if artifact_roots
+        .iter()
+        .any(|root| !document.scene.contains(*root))
+    {
+        return None;
+    }
+    let mut pending = Vec::new();
+    for root in document.scene.roots() {
+        if !artifact_roots.contains(root) {
+            return None;
+        }
+        pending.push((*root, None));
+    }
+    let mut visited = HashSet::with_capacity(document.scene.len());
+    let mut changed = Vec::new();
+    while let Some((id, parent)) = pending.pop() {
+        let node = document.scene.get(id)?;
+        if node.id != id || node.parent != parent || !visited.insert(id) {
+            return None;
+        }
+        if !document.scene.shares_node(&other.scene, id) {
+            changed.push(id);
+        }
+        if !node.can_have_children() && !document.scene.children_of(Some(id)).is_empty() {
+            return None;
+        }
+        pending.extend(
+            document
+                .scene
+                .children_of(Some(id))
+                .iter()
+                .map(|child| (*child, Some(id))),
+        );
+    }
+    (visited.len() == document.scene.len()).then_some(changed)
 }
 
 fn extend_artifact_owners(
@@ -4412,7 +4905,8 @@ impl fanta_format::FormatHandler for FigImportFormat {
     }
 }
 
-fn load_project_document(root: &Path) -> Result<FigDocument> {
+#[cfg(test)]
+pub(crate) fn load_project_document(root: &Path) -> Result<FigDocument> {
     let started = Instant::now();
     let (doc, assets) = fanta_format::read_project_tree(root)
         .with_context(|| format!("reading Fanta project at {}", root.display()))?;
@@ -4420,6 +4914,17 @@ fn load_project_document(root: &Path) -> Result<FigDocument> {
     let mut document = FigDocument::from_doc(doc, assets);
     document.prewarm_default_page_assets();
     Ok(document)
+}
+
+fn load_project_document_with_session(
+    root: &Path,
+) -> Result<(FigDocument, fanta_format::WorkspaceSession)> {
+    let _perf_span = crate::perf_span("document load: document and workspace session");
+    let (doc, assets, session) = fanta_format::WorkspaceSession::open_project_document(root)
+        .with_context(|| format!("reading Fanta project at {}", root.display()))?;
+    let mut document = FigDocument::from_doc(doc, assets);
+    document.prewarm_default_page_assets();
+    Ok((document, session))
 }
 
 type IncrementalProjectLoad = (
@@ -4451,8 +4956,7 @@ fn load_changed_project_document(
             }
         }
     }
-    let session = open_workspace_session(root)?;
-    let document = load_project_document(root)?;
+    let (document, session) = load_project_document_with_session(root)?;
     Ok(Some((document, session)))
 }
 
@@ -4484,66 +4988,74 @@ fn default_page_root(doc: &Doc, visible_page_roots: &[NodeId]) -> Option<NodeId>
         return Some(active_page);
     }
 
-    visible_page_roots.iter().copied().max_by(|left, right| {
-        page_content_area(doc, Some(*left)).total_cmp(&page_content_area(doc, Some(*right)))
-    })
+    visible_page_roots
+        .iter()
+        .copied()
+        .map(|root| (root, page_content_area(doc, Some(root))))
+        .max_by(|(_, left_area), (_, right_area)| left_area.total_cmp(right_area))
+        .map(|(root, _)| root)
 }
 
-fn editor_page_roots(doc: &Doc) -> Vec<Option<NodeId>> {
-    let mut roots = if doc.pages().is_empty() {
-        vec![None]
-    } else {
-        doc.pages().iter().copied().map(Some).collect()
-    };
-    let mut components = doc
-        .components
-        .defs
-        .values()
-        .map(|definition| definition.root)
-        .filter(|root| doc.scene.contains(*root) && !doc.pages().contains(root))
-        .collect::<Vec<_>>();
-    components.sort_unstable();
-    components.dedup();
-    roots.extend(components.into_iter().map(Some));
-    roots
-}
-
-fn collect_pages(doc: &Doc, visible_page_roots: &[NodeId]) -> Vec<FigPage> {
+fn collect_pages(
+    doc: &Doc,
+    registry: &PageRegistryIndex,
+    previous: &mut HashMap<Option<NodeId>, FigPage>,
+) -> Vec<FigPage> {
     // Every page is included so the canvas can navigate to a hidden library
     // page (to focus a component master); `hidden` marks the ones the Pages
     // panel filters out. `index + 1` numbers unnamed pages by their absolute
     // position, which stays stable as pages are added/removed.
-    let visible: HashSet<NodeId> = visible_page_roots.iter().copied().collect();
-    editor_page_roots(doc)
+    registry
+        .editor_roots()
         .into_iter()
         .enumerate()
         .map(|(index, root)| {
-            let Some(root) = root else {
-                return FigPage {
-                    root: None,
-                    name: "Document".into(),
-                    bounds: page_bounds(doc, None),
-                    hidden: false,
-                };
-            };
-            let component = doc
-                .components
-                .defs
-                .values()
-                .find(|definition| definition.root == root);
-            FigPage {
-                root: Some(root),
-                name: component
-                    .map(|definition| definition.name.as_str())
-                    .or_else(|| doc.page_name(root))
-                    .filter(|name| !name.is_empty())
-                    .map(SharedString::from)
-                    .unwrap_or_else(|| format!("Page {}", index + 1).into()),
-                bounds: page_bounds(doc, Some(root)),
-                hidden: !doc.pages().contains(&root) || !visible.contains(&root),
-            }
+            let mut page = previous.remove(&root).unwrap_or_else(|| FigPage {
+                root,
+                name: SharedString::default(),
+                bounds: page_bounds(doc, root),
+                hidden: false,
+            });
+            update_page_metadata(doc, registry, &mut page, index);
+            page
         })
         .collect()
+}
+
+fn update_page_metadata(
+    doc: &Doc,
+    registry: &PageRegistryIndex,
+    page: &mut FigPage,
+    index: usize,
+) -> bool {
+    let (name, hidden) = match page.root {
+        None => (Cow::Borrowed("Document"), false),
+        Some(root) => {
+            let name = registry
+                .component_by_root
+                .get(&root)
+                .and_then(|id| doc.components.def(*id))
+                .map(|definition| definition.name.as_str())
+                .or_else(|| doc.page_name(root))
+                .filter(|name| !name.is_empty())
+                .map(Cow::Borrowed)
+                .unwrap_or_else(|| Cow::Owned(format!("Page {}", index + 1)));
+            let hidden = !registry.authored_root_set.contains(&root)
+                || doc
+                    .scene
+                    .get(root)
+                    .and_then(|node| node.meta.get("hidden_page"))
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true);
+            (name, hidden)
+        }
+    };
+    let changed = page.name.as_ref() != name.as_ref() || page.hidden != hidden;
+    if page.name.as_ref() != name.as_ref() {
+        page.name = name.into_owned().into();
+    }
+    page.hidden = hidden;
+    changed
 }
 
 fn page_content_area(doc: &Doc, page_root: Option<NodeId>) -> f64 {
@@ -5409,6 +5921,316 @@ mod tests {
         }
     }
 
+    #[test]
+    fn master_save_invalidation_scopes_ordinary_structural_edits_in_a_large_library() {
+        for in_master in [false, true] {
+            for change in ["create", "delete", "reorder"] {
+                let (mut document, masters) = master_save_fixture(128);
+                let &(component, master) = masters.first().expect("master");
+                let page = *document.pages().first().expect("page");
+                let parent = if in_master { master } else { page };
+                let mut layer =
+                    fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
+                layer.parent = Some(parent);
+                layer.index = document.scene.next_child_index(Some(parent));
+                let layer_id = layer.id;
+                if change != "create" {
+                    document
+                        .apply(Operation::create_node(layer.clone()))
+                        .expect("baseline layer");
+                }
+                let base = document.clone_for_persist();
+                let watermark = (document.scene.instance_id(), document.scene.revision());
+                let operation = match change {
+                    "create" => Operation::create_node(layer),
+                    "delete" => Operation::DeleteSubtree {
+                        snapshot: vec![layer],
+                    },
+                    _ => Operation::SetIndex {
+                        id: layer_id,
+                        old: layer.index,
+                        new: fanta_doc::IndexKey::from_raw(1000.0),
+                    },
+                };
+                document.apply(operation).expect("structural layer edit");
+                assert!(document.scene.changes_since(watermark.1).is_none());
+                let expected = if in_master {
+                    fanta_format::ArtifactId::Component(component)
+                } else {
+                    fanta_format::ArtifactId::Page(page)
+                };
+                assert_eq!(
+                    changed_artifact_ids(&document, Some(&base), Some(watermark)),
+                    BTreeSet::from([expected]),
+                    "{change}, in master: {in_master}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn master_save_invalidation_includes_both_owners_of_a_moved_subtree() {
+        for destination in ["page", "master", "master_to_page"] {
+            let (mut document, masters) = master_save_fixture(8);
+            let first_page = *document.pages().first().expect("page");
+            let second_page =
+                fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
+            let second_page_id = second_page.id;
+            document
+                .apply(Operation::create_node(second_page))
+                .expect("second page root");
+            document.add_page(second_page_id);
+            let &(first_component, first_master) = masters.first().expect("first master");
+            let &(second_component, second_master) = masters.get(1).expect("second master");
+            let (old_parent, new_parent) = match destination {
+                "master" => (first_master, second_master),
+                "master_to_page" => (first_master, second_page_id),
+                _ => (first_page, second_page_id),
+            };
+            let mut layer =
+                fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
+            layer.parent = Some(old_parent);
+            layer.index = document.scene.next_child_index(Some(old_parent));
+            let layer_id = layer.id;
+            let old_index = layer.index;
+            document
+                .apply(Operation::create_node(layer))
+                .expect("layer");
+            let mut child =
+                fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
+            child.parent = Some(layer_id);
+            document
+                .apply(Operation::create_node(child))
+                .expect("nested child");
+            let base = document.clone_for_persist();
+            let watermark = Some((document.scene.instance_id(), document.scene.revision()));
+            document
+                .apply(Operation::Reparent {
+                    id: layer_id,
+                    old_parent: Some(old_parent),
+                    old_index,
+                    new_parent: Some(new_parent),
+                    new_index: document.scene.next_child_index(Some(new_parent)),
+                })
+                .expect("move subtree");
+            let expected = match destination {
+                "master" => BTreeSet::from([
+                    fanta_format::ArtifactId::Component(first_component),
+                    fanta_format::ArtifactId::Component(second_component),
+                ]),
+                "master_to_page" => BTreeSet::from([
+                    fanta_format::ArtifactId::Component(first_component),
+                    fanta_format::ArtifactId::Page(second_page_id),
+                ]),
+                _ => BTreeSet::from([
+                    fanta_format::ArtifactId::Page(first_page),
+                    fanta_format::ArtifactId::Page(second_page_id),
+                ]),
+            };
+            assert_eq!(
+                changed_artifact_ids(&document, Some(&base), watermark),
+                expected,
+                "destination: {destination}"
+            );
+        }
+    }
+
+    #[test]
+    fn master_save_invalidation_keeps_malformed_structures_conservative() {
+        let (mut document, _) = master_save_fixture(4);
+        let page = *document.pages().first().expect("page");
+        let mut layer = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
+        layer.parent = Some(page);
+        let layer_id = layer.id;
+        document
+            .apply(Operation::create_node(layer))
+            .expect("layer");
+        let base = document.clone_for_persist();
+        let watermark = Some((document.scene.instance_id(), document.scene.revision()));
+        document
+            .scene
+            .set_index(layer_id, fanta_doc::IndexKey::from_raw(2.0))
+            .expect("structural delta");
+        document.scene.get_mut(layer_id).expect("layer").parent = Some(NodeId::new());
+        let expected = document
+            .pages()
+            .iter()
+            .copied()
+            .map(fanta_format::ArtifactId::Page)
+            .chain(
+                document
+                    .components
+                    .defs
+                    .keys()
+                    .copied()
+                    .map(fanta_format::ArtifactId::Component),
+            )
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            changed_artifact_ids(&document, Some(&base), watermark),
+            expected
+        );
+    }
+
+    #[gpui::test]
+    async fn master_save_invalidation_preserves_sources_through_create_move_delete(
+        cx: &mut TestAppContext,
+    ) {
+        let project = empty_project(cx).await;
+        let directory = tempfile::tempdir().expect("temporary project");
+        let root = directory.path().join("Design");
+        let (mut document, masters) = master_save_fixture(16);
+        let first_page = *document.pages().first().expect("first page");
+        let mut second_page =
+            fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
+        second_page.name = "Destination".to_owned();
+        let second_page_id = second_page.id;
+        document
+            .apply(Operation::create_node(second_page))
+            .expect("second page root");
+        document.add_page(second_page_id);
+        let &(first_component, first_master) = masters.first().expect("first master");
+        let &(second_component, second_master) = masters.get(1).expect("second master");
+        let unrelated = masters.get(2).expect("unrelated master").0;
+        write_project(&root, &document, &BTreeMap::new()).expect("initial project");
+        let (_, paths) = fanta_format::projected_design_dirs(&document);
+        let unrelated_source = root
+            .join(paths.get(&unrelated).expect("component directory"))
+            .join("master.fnx");
+        let mut source = std::fs::read_to_string(&unrelated_source).expect("unrelated FNX");
+        source.push_str("\n// Retain authored trivia through ordinary structural edits.\n");
+        std::fs::write(&unrelated_source, &source).expect("authored source comment");
+        let item = ready_item(
+            &project,
+            root.join("fanta.json"),
+            Some(root.clone()),
+            document,
+            cx,
+        );
+        item.update(cx, |item, _| {
+            let document = item.document.ready().expect("ready document");
+            item.merge_base = Some(document.doc.clone_for_persist());
+            item.last_saved_scene = Some((
+                document.doc.scene.instance_id(),
+                document.doc.scene.revision(),
+            ));
+            item.last_saved_assets = Some(document.raw_assets.clone());
+            item.workspace_session =
+                Some(fanta_format::WorkspaceSession::open(&root).expect("indexed session"));
+        });
+        let mut layer =
+            fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(fanta_doc::GroupNode {
+                clip_size: Some([80.0, 40.0]),
+                ..Default::default()
+            }));
+        layer.name = "New layout".to_owned();
+        layer.parent = Some(first_page);
+        let layer_id = layer.id;
+        for step in [
+            "create",
+            "into_master",
+            "between_masters",
+            "to_page",
+            "delete",
+        ] {
+            item.update(cx, |item, cx| {
+                let operation = match step {
+                    "create" => Operation::create_node(layer.clone()),
+                    "into_master" | "between_masters" | "to_page" => {
+                        let document = item.doc().expect("document");
+                        let node = document.scene.get(layer_id).expect("created layer");
+                        let new_parent = match step {
+                            "into_master" => first_master,
+                            "between_masters" => second_master,
+                            _ => second_page_id,
+                        };
+                        Operation::Reparent {
+                            id: layer_id,
+                            old_parent: node.parent,
+                            old_index: node.index,
+                            new_parent: Some(new_parent),
+                            new_index: document.scene.next_child_index(Some(new_parent)),
+                        }
+                    }
+                    _ => {
+                        let document = item.doc().expect("document");
+                        Operation::DeleteSubtree {
+                            snapshot: document
+                                .scene
+                                .descendants_of(layer_id)
+                                .filter_map(|id| document.scene.get(id).cloned())
+                                .collect(),
+                        }
+                    }
+                };
+                item.apply(operation, cx).expect("structural edit");
+                if step == "create" {
+                    let mut child = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(
+                        fanta_doc::GroupNode {
+                            clip_size: Some([20.0, 20.0]),
+                            ..Default::default()
+                        },
+                    ));
+                    child.parent = Some(layer_id);
+                    child.name = "Nested content".to_owned();
+                    item.apply(Operation::create_node(child), cx)
+                        .expect("nested layer");
+                }
+            });
+            item.update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+                .await
+                .expect("save structural edit");
+            let (saved, assets) =
+                fanta_format::read_project_tree(&root).expect("read saved project");
+            item.read_with(cx, |item, _| {
+                assert!(!item.is_dirty(), "{step}");
+                let expected_open = match step {
+                    "create" => BTreeSet::from([fanta_format::ArtifactId::Page(first_page)]),
+                    "into_master" => BTreeSet::from([
+                        fanta_format::ArtifactId::Page(first_page),
+                        fanta_format::ArtifactId::Component(first_component),
+                    ]),
+                    "between_masters" => BTreeSet::from([
+                        fanta_format::ArtifactId::Page(first_page),
+                        fanta_format::ArtifactId::Component(first_component),
+                        fanta_format::ArtifactId::Component(second_component),
+                    ]),
+                    _ => BTreeSet::from([
+                        fanta_format::ArtifactId::Page(first_page),
+                        fanta_format::ArtifactId::Page(second_page_id),
+                        fanta_format::ArtifactId::Component(first_component),
+                        fanta_format::ArtifactId::Component(second_component),
+                    ]),
+                };
+                assert_eq!(
+                    item.workspace_session
+                        .as_ref()
+                        .expect("source session")
+                        .open
+                        .keys()
+                        .cloned()
+                        .collect::<BTreeSet<_>>(),
+                    expected_open,
+                    "{step}"
+                );
+                let document = item.doc().expect("document");
+                assert_eq!(
+                    serde_json::to_value(&saved.scene).expect("saved scene"),
+                    serde_json::to_value(&document.scene).expect("live scene"),
+                    "{step}"
+                );
+                assert_eq!(saved.components, document.components, "{step}");
+                assert_eq!(saved.variables, document.variables, "{step}");
+            });
+            assert!(assets.is_empty(), "{step}");
+            assert_eq!(
+                std::fs::read_to_string(&unrelated_source).expect("retained source"),
+                source,
+                "{step}"
+            );
+        }
+    }
+
     #[gpui::test]
     async fn master_save_invalidation_opens_only_edited_source_and_preserves_other_fnx(
         cx: &mut TestAppContext,
@@ -5736,6 +6558,323 @@ mod tests {
         })
         .expect("define component");
         (doc, page_root, component, master_root)
+    }
+
+    fn metadata_library(count: usize) -> (Doc, NodeId, Vec<(fanta_doc::ComponentId, NodeId)>) {
+        let mut doc = doc_with_one_page();
+        let page = *doc.pages().first().expect("authored page");
+        let mut components = Vec::with_capacity(count);
+        for index in 0..count {
+            let mut node =
+                fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(fanta_doc::GroupNode {
+                    local_size: Some([20.0, 30.0]),
+                    ..Default::default()
+                }));
+            node.name = format!("Master layer {index}");
+            let root = node.id;
+            doc.scene.insert(node).expect("master root");
+            let id = fanta_doc::ComponentId::from_u128(index as u128 + 1);
+            doc.components.defs.insert(
+                id,
+                fanta_doc::ComponentDef::new(id, root, format!("Component {index}")),
+            );
+            components.push((id, root));
+        }
+        (doc, page, components)
+    }
+
+    #[test]
+    fn page_metadata_indexes_preserve_author_order_and_shared_master_roots() {
+        let (mut doc, first, components) = metadata_library(260);
+        let mut hidden = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
+        hidden.name = "Internal library".into();
+        hidden.meta = serde_json::json!({"hidden_page": true});
+        let second = doc.scene.insert(hidden).expect("hidden page");
+        doc.add_page(second);
+        let alias = fanta_doc::ComponentId::from_u128(500);
+        doc.components.defs.insert(
+            alias,
+            fanta_doc::ComponentDef::new(alias, first, "Authored page alias"),
+        );
+        let duplicate = fanta_doc::ComponentId::from_u128(501);
+        let (original, shared_root) = *components.first().expect("first master");
+        doc.components.defs.insert(
+            duplicate,
+            fanta_doc::ComponentDef::new(duplicate, shared_root, "Later duplicate"),
+        );
+        let missing = fanta_doc::ComponentId::from_u128(502);
+        let absent_root = NodeId::new();
+        doc.components.defs.insert(
+            missing,
+            fanta_doc::ComponentDef::new(missing, absent_root, "Missing master"),
+        );
+        let document = FigDocument::from_doc(doc, BTreeMap::new());
+        let mut expected: Vec<_> = components.iter().map(|(_, root)| *root).collect();
+        expected.sort_unstable();
+        assert_eq!(document.pages.len(), expected.len() + 2);
+        assert_eq!(document.pages[0].root, Some(first));
+        assert_eq!(document.pages[0].name.as_ref(), "Authored page alias");
+        assert!(!document.pages[0].hidden);
+        assert_eq!(document.pages[1].root, Some(second));
+        assert!(document.pages[1].hidden);
+        assert_eq!(
+            document.pages[2..]
+                .iter()
+                .map(|page| page.root.expect("master root"))
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(document.pages[2..].iter().all(|page| page.hidden));
+        for (index, entry) in document.pages.iter().enumerate() {
+            assert_eq!(document.page_index_for_root(entry.root), Some(index));
+        }
+        let index = document
+            .page_index_for_root(Some(shared_root))
+            .expect("shared master");
+        assert_eq!(
+            document.pages[index].name.as_ref(),
+            document.doc.components.defs[&original].name
+        );
+        assert_eq!(document.page_index_for_root(Some(absent_root)), None);
+    }
+
+    #[test]
+    fn arbitrary_registry_changes_refresh_metadata_without_rebuilding_surviving_entries() {
+        let (doc, page, components) = metadata_library(260);
+        let (component, root) = components[137];
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        let index = document
+            .page_index_for_root(Some(root))
+            .expect("master index");
+        let bounds = fanta_doc::Bounds::from_xywh(13.0, 17.0, 19.0, 23.0);
+        document.pages[index].bounds = bounds;
+        let pages_pointer = document.pages.as_ptr();
+        let revision = document.page_registry_revision();
+        document
+            .doc
+            .components
+            .defs
+            .get_mut(&component)
+            .expect("definition")
+            .name = "External component rename".into();
+        document.doc.scene.get_mut(page).expect("page").meta =
+            serde_json::json!({"hidden_page": true});
+        assert!(document.sync_page_registry());
+        assert_ne!(document.page_registry_revision(), revision);
+        assert_eq!(document.pages.as_ptr(), pages_pointer);
+        assert_eq!(document.pages[index].bounds, bounds);
+        assert_eq!(
+            document.pages[index].name.as_ref(),
+            "External component rename"
+        );
+        assert!(document.pages[0].hidden);
+        let revision = document.page_registry_revision();
+        document
+            .doc
+            .components
+            .defs
+            .get_mut(&component)
+            .expect("definition")
+            .rev += 1;
+        assert!(!document.sync_page_registry());
+        assert_eq!(document.page_registry_revision(), revision);
+        assert_eq!(document.pages.as_ptr(), pages_pointer);
+
+        let old_root = root;
+        let mut replacement =
+            fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
+        replacement.name = "Replacement root".into();
+        let root = document.doc.scene.insert(replacement).expect("replacement");
+        document
+            .doc
+            .components
+            .defs
+            .get_mut(&component)
+            .expect("definition")
+            .root = root;
+        assert!(document.sync_page_registry());
+        assert_eq!(document.page_index_for_root(Some(old_root)), None);
+        assert!(document.page_index_for_root(Some(root)).is_some());
+        for (index, entry) in document.pages.iter().enumerate() {
+            assert_eq!(document.page_index_for_root(entry.root), Some(index));
+        }
+        let replacement = FigDocument::from_doc(document.doc.clone_for_persist(), BTreeMap::new());
+        assert_ne!(
+            replacement.page_registry_revision(),
+            document.page_registry_revision()
+        );
+    }
+
+    #[test]
+    fn component_root_presence_updates_keep_the_implicit_canvas() -> Result<()> {
+        let mut doc = Doc::new();
+        let mut root =
+            fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(fanta_doc::GroupNode {
+                local_size: Some([37.0, 53.0]),
+                ..Default::default()
+            }));
+        root.name = "Master layer".into();
+        let id = root.id;
+        let component = fanta_doc::ComponentId::new();
+        doc.components.defs.insert(
+            component,
+            fanta_doc::ComponentDef::new(component, id, "Appearing master"),
+        );
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        assert_eq!(document.pages.len(), 1);
+        assert_eq!(document.page_index_for_root(None), Some(0));
+        assert_eq!(document.pages[0].name.as_ref(), "Document");
+        let implicit_bounds = fanta_doc::Bounds::from_xywh(11.0, 13.0, 41.0, 61.0);
+        document.pages[0].bounds = implicit_bounds;
+        let operation = Operation::create_node(root);
+        let change = document.page_registry_change_for_operation(&operation);
+        document.doc.apply(operation)?;
+        let mut child = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Vector(
+            fanta_doc::VectorNode::rect_solid(0.0, 0.0, 37.0, 53.0, fanta_doc::Color::BLACK),
+        ));
+        child.parent = Some(id);
+        document.doc.apply(Operation::create_node(child))?;
+        assert!(document.sync_page_registry_after_operation(change));
+        assert_eq!(document.pages[0].bounds, implicit_bounds);
+        let index = document.page_index_for_root(Some(id)).expect("new master");
+        assert_eq!(index, 1);
+        assert_eq!(document.pages[index].name.as_ref(), "Appearing master");
+        assert!(document.pages[index].hidden);
+        assert_eq!(document.pages[index].bounds.width(), 37.0);
+        let operation = Operation::DeleteSubtree {
+            snapshot: vec![document.doc.scene.get(id).cloned().expect("master")],
+        };
+        let change = document.page_registry_change_for_operation(&operation);
+        document.doc.apply(operation)?;
+        assert!(document.sync_page_registry_after_operation(change));
+        assert_eq!(document.pages.len(), 1);
+        assert_eq!(document.page_index_for_root(Some(id)), None);
+        assert_eq!(document.page_index_for_root(None), Some(0));
+        assert_eq!(document.pages[0].bounds, implicit_bounds);
+        Ok(())
+    }
+
+    #[test]
+    fn partial_delete_snapshots_remove_nested_master_navigation_metadata() -> Result<()> {
+        let (mut doc, page, components) = metadata_library(1);
+        let (component, master) = components[0];
+        let mut container =
+            fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
+        container.parent = Some(page);
+        let container = doc.scene.insert(container)?;
+        doc.scene
+            .set_parent(master, Some(container), fanta_doc::IndexKey::default())?;
+        let mut document = FigDocument::from_doc(doc, BTreeMap::new());
+        assert!(document.page_index_for_root(Some(master)).is_some());
+        let operation = Operation::DeleteSubtree {
+            snapshot: vec![
+                document
+                    .doc
+                    .scene
+                    .get(container)
+                    .cloned()
+                    .expect("container"),
+            ],
+        };
+        let change = document.page_registry_change_for_operation(&operation);
+        document.doc.apply(operation)?;
+        assert!(!document.doc.scene.contains(master));
+        assert!(document.doc.components.defs.contains_key(&component));
+        assert!(document.sync_page_registry_after_operation(change));
+        assert_eq!(document.page_index_for_root(Some(master)), None);
+        assert_eq!(document.pages.len(), 1);
+        assert_eq!(document.pages[0].root, Some(page));
+        Ok(())
+    }
+
+    #[gpui::test]
+    async fn ordinary_canvas_operations_skip_library_metadata_validation(cx: &mut TestAppContext) {
+        init_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, page, components) = metadata_library(1024);
+        let (component, master) = components[901];
+        let item = ready_item_for_test(&project, PathBuf::from("/tmp/Library.fig"), doc, cx);
+        let (revision, validations) = item.read_with(cx, |item, _| {
+            let document = item.document().expect("document");
+            (
+                document.page_registry_revision(),
+                document.page_registry.validations,
+            )
+        });
+        item.update(cx, |item, cx| {
+            item.apply(
+                Operation::SetTransform {
+                    id: master,
+                    old: fanta_doc::Transform2D::IDENTITY,
+                    new: fanta_doc::Transform2D::translation(31.0, 47.0),
+                },
+                cx,
+            )
+            .expect("move a master");
+            let mut node =
+                fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
+            node.parent = Some(page);
+            let id = node.id;
+            item.apply(Operation::create_node(node), cx)
+                .expect("create ordinary layer");
+            let snapshot = item
+                .doc()
+                .expect("document")
+                .scene
+                .get(id)
+                .cloned()
+                .expect("layer");
+            item.apply(
+                Operation::DeleteSubtree {
+                    snapshot: vec![snapshot],
+                },
+                cx,
+            )
+            .expect("delete ordinary layer");
+        });
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("document");
+            assert_eq!(document.page_registry_revision(), revision);
+            assert_eq!(document.page_registry.validations, validations);
+            assert!(document.doc.components.defs[&component].rev > 0);
+            assert_eq!(document.pages.len(), 1025);
+        });
+        item.update(cx, |item, cx| {
+            item.apply(
+                Operation::SetComponentName {
+                    id: component,
+                    old: "Component 901".into(),
+                    new: "Renamed component".into(),
+                },
+                cx,
+            )
+            .expect("rename a component");
+        });
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("document");
+            let index = document.page_index_for_root(Some(master)).expect("master");
+            assert_eq!(document.pages[index].name.as_ref(), "Renamed component");
+            assert_ne!(document.page_registry_revision(), revision);
+            assert_eq!(document.page_registry.validations, validations);
+        });
+        assert!(
+            item.update(cx, |item, cx| item.undo(cx))
+                .expect("undo rename")
+        );
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("document");
+            let index = document.page_index_for_root(Some(master)).expect("master");
+            assert_eq!(document.pages[index].name.as_ref(), "Component 901");
+        });
+        assert!(
+            item.update(cx, |item, cx| item.redo(cx))
+                .expect("redo rename")
+        );
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("document");
+            let index = document.page_index_for_root(Some(master)).expect("master");
+            assert_eq!(document.pages[index].name.as_ref(), "Renamed component");
+        });
     }
 
     #[test]
@@ -7115,6 +8254,74 @@ mod tests {
     }
 
     #[test]
+    fn watcher_verifies_known_component_directory_contents_exactly() {
+        let directory = tempfile::tempdir().expect("temporary project");
+        let relative = PathBuf::from("components/master");
+        let design = directory.path().join(&relative);
+        std::fs::create_dir_all(design.join("nested")).expect("component directory");
+        let files: [(&str, &[u8]); 4] = [
+            ("master.fnx", b"<Frame name=\"Master\" />"),
+            ("master.ids.json", b"{\"ids\":[]}"),
+            ("def.json", b"{\"name\":\"Master\"}"),
+            ("nested/authored.json", b"{\"future\":true}"),
+        ];
+        let mut hashes = BTreeMap::new();
+        for (name, bytes) in files {
+            std::fs::write(design.join(name), bytes).expect("component file");
+            hashes.insert(relative.join(name), Sha256::digest(bytes).into());
+        }
+        let sibling = PathBuf::from("components/master-other/def.json");
+        hashes.insert(sibling, Sha256::digest(b"other component").into());
+        let paths = BTreeSet::from([design.clone()]);
+        let changed = || {
+            watcher_paths_differ_from_own_writes(
+                directory.path(),
+                &paths,
+                &hashes,
+                &BTreeSet::new(),
+            )
+        };
+        assert!(
+            !changed(),
+            "directory-only echoes must verify all known bytes"
+        );
+        std::fs::write(design.join("master.fnx"), b"<Frame name=\"Edited\" />")
+            .expect("changed source");
+        assert!(changed(), "source changes must still reload");
+        std::fs::write(design.join("master.fnx"), files[0].1).expect("restore source");
+        std::fs::write(design.join("new.json"), b"{}").expect("new child");
+        assert!(changed(), "new untracked children must still reload");
+        std::fs::remove_file(design.join("new.json")).expect("remove new child");
+        std::fs::remove_file(design.join("master.ids.json")).expect("deleted known child");
+        assert!(changed(), "deleted known children must still reload");
+        std::fs::write(design.join("master.ids.json"), files[1].1).expect("restore identities");
+        std::fs::create_dir(design.join("untracked")).expect("new empty child directory");
+        assert!(changed(), "untracked empty directories remain conservative");
+        std::fs::remove_dir(design.join("untracked")).expect("remove untracked directory");
+        #[cfg(unix)]
+        {
+            let target = directory.path().join("same-source.fnx");
+            std::fs::write(&target, files[0].1).expect("symlink target");
+            std::fs::remove_file(design.join("master.fnx")).expect("replace known file");
+            std::os::unix::fs::symlink(target, design.join("master.fnx"))
+                .expect("symlinked known child");
+            assert!(
+                changed(),
+                "matching symlink targets are not loaded-file proof"
+            );
+            std::fs::remove_file(design.join("master.fnx")).expect("remove symlink");
+            std::fs::write(design.join("master.fnx"), files[0].1).expect("restore regular file");
+        }
+        assert!(!changed());
+        assert!(watcher_paths_differ_from_own_writes(
+            directory.path(),
+            &BTreeSet::from([directory.path().join("unknown")]),
+            &hashes,
+            &BTreeSet::new()
+        ));
+    }
+
+    #[test]
     fn watcher_prefers_file_events_over_their_directory_echoes() {
         let directory = tempfile::tempdir().expect("temporary project");
         let design = directory.path().join("pages/home");
@@ -7398,6 +8605,235 @@ mod tests {
             "Saved after reconciliation"
         );
         assert_eq!(reopened_assets.get(&asset), Some(&bytes));
+    }
+
+    #[gpui::test]
+    async fn project_reload_queue_skips_unchanged_startup_file_events(cx: &mut TestAppContext) {
+        let (directory, item, mut initial, page) = reload_queue_fixture(cx).await;
+        let master = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
+        let master_id = initial.scene.insert(master).expect("component master");
+        let component = fanta_doc::ComponentId::new();
+        initial.components.defs.insert(
+            component,
+            fanta_doc::ComponentDef::new(component, master_id, "Directory master"),
+        );
+        let asset = AssetId::new();
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(2, 2)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("encode startup image");
+        write_project(
+            directory.path(),
+            &initial,
+            &BTreeMap::from([(asset, encoded.into_inner())]),
+        )
+        .expect("project with startup asset");
+        let (loaded, assets, session) =
+            fanta_format::WorkspaceSession::open_project_document(directory.path())
+                .expect("initial document and index");
+        let source = fanta_format::locate_page_source(directory.path(), page).expect("page source");
+        let component_directory = directory.path().join(
+            &session
+                .artifacts
+                .get(&fanta_format::ArtifactId::Component(component))
+                .expect("loaded component metadata")
+                .design_dir,
+        );
+        let metadata = directory.path().join("doc/metadata.json");
+        let mut metadata_bytes = std::fs::read(&metadata).expect("metadata");
+        metadata_bytes.push(b' ');
+        std::fs::write(&metadata, &metadata_bytes).expect("accepted metadata write");
+        let metadata_hash: [u8; 32] = Sha256::digest(metadata_bytes).into();
+        let removed = directory.path().join("doc/flow_start.json");
+        std::fs::remove_file(&removed).expect("accepted optional-file removal");
+        let paths = BTreeSet::from([
+            source.clone(),
+            source.with_file_name("page.json"),
+            source.with_file_name("page.ids.json"),
+            directory.path().join("fanta.json"),
+            metadata,
+            directory.path().join("doc/variables.json"),
+            directory.path().join("doc/active_modes.json"),
+            directory.path().join("assets/index.json"),
+            directory.path().join(format!("assets/images/{asset}.png")),
+            component_directory,
+            removed,
+        ]);
+        let reads = item.read_with(cx, |item, _| item.project_reads.clone());
+        item.update(cx, |item, cx| {
+            item.document = FigDocumentState::Loading {
+                message: "Loading test".into(),
+            };
+            item.workspace_session = None;
+            item.merge_base = None;
+            item.own_write_hashes
+                .insert(PathBuf::from("doc/metadata.json"), metadata_hash);
+            item.own_write_removed
+                .insert(PathBuf::from("doc/flow_start.json"));
+            item.queue_watcher_paths_for_test(paths, cx);
+        });
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 4);
+        cx.run_until_parked();
+        assert_eq!(reload_queue_started(&reads), 0);
+        item.update(cx, |item, cx| {
+            item.adopt_initial_load(
+                Ok(FigDocument::from_doc(loaded, assets)),
+                None,
+                Some(session),
+                cx,
+            );
+        });
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 4);
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert!(item.pending_watcher_paths.is_empty());
+            assert!(!item.watcher_check_in_flight);
+            assert!(!item.external_change_pending);
+            assert!(!item.has_conflict());
+            assert_eq!(
+                item.own_write_hashes.get(Path::new("doc/metadata.json")),
+                Some(&metadata_hash)
+            );
+            assert!(
+                !item
+                    .own_write_hashes
+                    .contains_key(Path::new("doc/flow_start.json"))
+            );
+            assert_eq!(
+                item.doc()
+                    .expect("initial document")
+                    .scene
+                    .get(page)
+                    .expect("page")
+                    .name,
+                "Page 1"
+            );
+        });
+        assert_eq!(
+            reload_queue_started(&reads),
+            0,
+            "byte-identical startup echoes must not rebuild the workspace index"
+        );
+    }
+
+    #[gpui::test]
+    async fn project_reload_queue_keeps_startup_edits_after_hash_seeding(cx: &mut TestAppContext) {
+        let (directory, item, _, page) = reload_queue_fixture(cx).await;
+        let (loaded, assets, session) =
+            fanta_format::WorkspaceSession::open_project_document(directory.path())
+                .expect("initial document and index");
+        let source = fanta_format::locate_page_source(directory.path(), page).expect("page source");
+        let source_text = std::fs::read_to_string(&source).expect("initial source");
+        let changed = source_text.replacen("Page 1", "Edited during load", 1);
+        assert_ne!(changed, source_text);
+        std::fs::write(&source, changed).expect("external edit before adoption");
+        let reads = item.read_with(cx, |item, _| item.project_reads.clone());
+        item.update(cx, |item, cx| {
+            item.document = FigDocumentState::Loading {
+                message: "Loading test".into(),
+            };
+            item.workspace_session = None;
+            item.merge_base = None;
+            item.queue_watcher_paths_for_test([source], cx);
+        });
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 4);
+        cx.run_until_parked();
+        assert_eq!(reload_queue_started(&reads), 0);
+        item.update(cx, |item, cx| {
+            item.adopt_initial_load(
+                Ok(FigDocument::from_doc(loaded, assets)),
+                None,
+                Some(session),
+                cx,
+            );
+        });
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 4);
+        cx.run_until_parked();
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 4);
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.doc()
+                    .expect("reloaded document")
+                    .scene
+                    .get(page)
+                    .expect("page")
+                    .name,
+                "Edited during load"
+            );
+            assert!(item.pending_watcher_paths.is_empty());
+            assert!(!item.external_change_pending);
+            assert!(!item.has_conflict());
+        });
+        assert_eq!(reload_queue_started(&reads), 1);
+    }
+
+    #[gpui::test]
+    async fn project_reload_queue_refreshes_unproven_legacy_startup_nodes(cx: &mut TestAppContext) {
+        let (directory, item, initial, page) = reload_queue_fixture(cx).await;
+        let source = fanta_format::locate_page_source(directory.path(), page).expect("page source");
+        std::fs::remove_file(&source).expect("legacy per-node source");
+        std::fs::remove_file(source.with_file_name("page.ids.json")).expect("legacy identities");
+        let nodes = source.parent().expect("page directory").join("nodes");
+        std::fs::create_dir(&nodes).expect("legacy node directory");
+        let node_path = nodes.join(format!("{page}.json"));
+        let mut node =
+            serde_json::to_value(initial.scene.get(page).expect("page")).expect("legacy page node");
+        std::fs::write(&node_path, serde_json::to_vec(&node).expect("node bytes"))
+            .expect("baseline legacy node");
+        let (loaded, assets) =
+            fanta_format::read_project_tree(directory.path()).expect("document baseline A");
+        node["name"] = "Legacy edit while loading".into();
+        std::fs::write(
+            &node_path,
+            serde_json::to_vec(&node).expect("changed node bytes"),
+        )
+        .expect("legacy node changed before index");
+        let (_, _, session) =
+            fanta_format::WorkspaceSession::open_project_document(directory.path())
+                .expect("later workspace index B");
+        let mut standalone =
+            fanta_format::WorkspaceSession::open(directory.path()).expect("standalone index");
+        assert!(standalone.take_loaded_file_hashes().is_empty());
+        let relative = node_path
+            .strip_prefix(directory.path())
+            .expect("relative node path")
+            .to_path_buf();
+        let reads = item.read_with(cx, |item, _| item.project_reads.clone());
+        item.update(cx, |item, cx| {
+            item.document = FigDocumentState::Loading {
+                message: "Loading test".into(),
+            };
+            item.workspace_session = None;
+            item.merge_base = None;
+            item.queue_watcher_paths_for_test([node_path], cx);
+            item.adopt_initial_load(
+                Ok(FigDocument::from_doc(loaded, assets)),
+                None,
+                Some(session),
+                cx,
+            );
+            assert!(!item.own_write_hashes.contains_key(&relative));
+        });
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 4);
+        cx.run_until_parked();
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 4);
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.doc()
+                    .expect("legacy document refreshed")
+                    .scene
+                    .get(page)
+                    .expect("page")
+                    .name,
+                "Legacy edit while loading"
+            );
+            assert!(item.pending_watcher_paths.is_empty());
+            assert!(!item.external_change_pending);
+            assert!(!item.has_conflict());
+        });
+        assert_eq!(reload_queue_started(&reads), 1);
     }
 
     #[gpui::test]
@@ -8197,6 +9633,206 @@ mod tests {
             state.last_write.is_none(),
             "completed chains must not accumulate"
         );
+    }
+
+    #[gpui::test]
+    async fn save_generation_queued_undo_updates_only_the_affected_source(cx: &mut TestAppContext) {
+        let fixture = save_generation_fixture(cx).await;
+        let component = fixture.item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                let mut page = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(
+                    fanta_doc::GroupNode::default(),
+                ));
+                page.name = "Unrelated page".into();
+                let page_id = page.id;
+                document
+                    .doc
+                    .apply(Operation::create_node(page))
+                    .expect("unrelated page root");
+                document.doc.add_page(page_id);
+                let mut master = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(
+                    fanta_doc::GroupNode::default(),
+                ));
+                master.parent = Some(page_id);
+                master.name = "Unrelated master".into();
+                let master_id = master.id;
+                document
+                    .doc
+                    .apply(Operation::create_node(master))
+                    .expect("unrelated master root");
+                let component = fanta_doc::ComponentId::new();
+                document.doc.components.defs.insert(
+                    component,
+                    fanta_doc::ComponentDef::new(component, master_id, "Unrelated master"),
+                );
+                (component, DocChange::Content)
+            })
+            .expect("loaded document")
+        });
+        fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect("establish saved baseline");
+        let unopened_sources = fixture.item.update(cx, |item, _| {
+            let session = item.workspace_session.as_mut().expect("source session");
+            let sources = session
+                .artifacts
+                .iter()
+                .filter(|(id, _)| **id != fanta_format::ArtifactId::Page(fixture.page))
+                .filter_map(|(id, meta)| {
+                    let name = match id {
+                        fanta_format::ArtifactId::Page(_) => "page.fnx",
+                        fanta_format::ArtifactId::Component(_) => "master.fnx",
+                        _ => return None,
+                    };
+                    let path = fixture.root.join(&meta.design_dir).join(name);
+                    let bytes = std::fs::read(&path).expect("unrelated source");
+                    Some((path, bytes))
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                session
+                    .artifacts
+                    .contains_key(&fanta_format::ArtifactId::Component(component))
+            );
+            session.open.clear();
+            sources
+        });
+        let created = fixture.item.update(cx, |item, cx| {
+            let mut layer = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(
+                fanta_doc::GroupNode::default(),
+            ));
+            layer.parent = Some(fixture.page);
+            layer.name = "Created before queued undo".into();
+            let created = layer.id;
+            item.apply(Operation::create_node(layer), cx)
+                .expect("create layer");
+            created
+        });
+        let (arrived, resume) = pause_next_save(&fixture.item, cx);
+        let first = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        arrived.await.expect("first writer paused");
+        assert!(
+            fixture
+                .item
+                .update(cx, |item, cx| item.undo(cx))
+                .expect("undo creation")
+        );
+        assert!(!fixture.item.read_with(cx, |item, _| {
+            item.doc().expect("document").scene.contains(created)
+        }));
+        let mut second = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        cx.run_until_parked();
+        assert!(futures::poll!(&mut second).is_pending());
+        resume.send(()).expect("release first writer");
+        first.await.expect("save created layer snapshot");
+        second.await.expect("save queued undo snapshot");
+        cx.run_until_parked();
+        let (saved, _) =
+            fanta_format::read_project_tree(&fixture.root).expect("reopen queued undo");
+        assert!(
+            !saved.scene.contains(created),
+            "the later snapshot removes the predecessor's layer"
+        );
+        fixture.item.read_with(cx, |item, _| {
+            assert!(!item.is_dirty());
+            assert!(
+                !item
+                    .merge_base
+                    .as_ref()
+                    .expect("saved baseline")
+                    .scene
+                    .contains(created)
+            );
+            assert_eq!(
+                serde_json::to_value(&saved.scene).expect("saved scene"),
+                serde_json::to_value(&item.doc().expect("document").scene).expect("live scene"),
+            );
+            assert_eq!(
+                item.workspace_session
+                    .as_ref()
+                    .expect("source session")
+                    .open
+                    .keys()
+                    .cloned()
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([fanta_format::ArtifactId::Page(fixture.page)]),
+                "queued clone comparison must not reopen unrelated sources",
+            );
+        });
+        for (path, bytes) in unopened_sources {
+            assert_eq!(std::fs::read(path).expect("preserved source"), bytes);
+        }
+    }
+
+    #[gpui::test]
+    async fn save_generation_queued_save_uses_predecessors_asset_baseline(cx: &mut TestAppContext) {
+        let fixture = save_generation_fixture(cx).await;
+        fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx))
+            .await
+            .expect("establish saved baseline");
+        let (node, asset, bytes) = place_image_during_save(&fixture, cx);
+        let (arrived, resume) = pause_next_save(&fixture.item, cx);
+        let first = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        arrived.await.expect("asset writer paused");
+        fixture.item.update(cx, |item, cx| {
+            let old = item
+                .doc()
+                .expect("document")
+                .scene
+                .get(fixture.text)
+                .expect("text")
+                .name
+                .clone();
+            item.apply(
+                Operation::SetName {
+                    id: fixture.text,
+                    old,
+                    new: "Queued text edit".into(),
+                },
+                cx,
+            )
+            .expect("edit while image save is pending");
+        });
+        let mut second = fixture
+            .item
+            .update(cx, |item, cx| item.save(SaveKind::Explicit, cx));
+        cx.run_until_parked();
+        assert!(futures::poll!(&mut second).is_pending());
+        resume.send(()).expect("release asset writer");
+        first.await.expect("save newly added asset");
+        second
+            .await
+            .expect("queued save uses committed asset hashes");
+        cx.run_until_parked();
+        let (saved, assets) =
+            fanta_format::read_project_tree(&fixture.root).expect("reopen queued asset save");
+        assert!(saved.scene.contains(node));
+        assert_eq!(
+            saved.scene.get(fixture.text).expect("text").name,
+            "Queued text edit"
+        );
+        assert_eq!(assets.get(&asset), Some(&bytes));
+        fixture.item.read_with(cx, |item, _| {
+            assert!(!item.is_dirty());
+            assert!(!item.has_conflict());
+            assert_eq!(
+                item.last_saved_assets
+                    .as_ref()
+                    .expect("saved assets")
+                    .get(&asset),
+                Some(&bytes)
+            );
+        });
     }
 
     #[gpui::test]
@@ -9062,6 +10698,107 @@ mod tests {
         });
         item.update(cx, |item, cx| item.subscribe_to_project(project, cx));
         item
+    }
+
+    #[gpui::test]
+    async fn indexed_design_sources_follow_saved_slugs_and_variant_paths(cx: &mut TestAppContext) {
+        async {
+            use fanta_doc::{ComponentId, ComponentSet, ComponentSetMembership, VariantAxis};
+            use fanta_format::ScopedDesign;
+
+            let project = empty_project(cx).await;
+            let directory = tempfile::tempdir()?;
+            let (mut doc, page, component, _) = doc_with_page_and_component();
+            let set = ComponentId::new();
+            doc.components.sets.insert(
+                set,
+                ComponentSet {
+                    id: set,
+                    name: "Button Kit".into(),
+                    axes: vec![VariantAxis {
+                        name: "Size".into(),
+                        values: vec!["Large".into()],
+                    }],
+                    members: vec![component],
+                    default_variant: component,
+                    root: None,
+                },
+            );
+            doc.components
+                .defs
+                .get_mut(&component)
+                .context("component")?
+                .variant_of = Some(ComponentSetMembership {
+                set,
+                axis_values: BTreeMap::from([("Size".into(), "Large".into())]),
+            });
+            fanta_format::write_project_tree(directory.path(), &doc, &BTreeMap::new())?;
+            let item = ready_item(
+                &project,
+                directory.path().join("fanta.json"),
+                Some(directory.path().to_path_buf()),
+                doc.clone(),
+                cx,
+            );
+            let session = fanta_format::WorkspaceSession::open(directory.path())?;
+            item.update(cx, |item, _| item.workspace_session = Some(session));
+            item.read_with(cx, |item, _| {
+                assert_eq!(
+                    item.indexed_design_source(ScopedDesign::Page(page)),
+                    Some(directory.path().join("pages/page-1/page.fnx"))
+                );
+                assert_eq!(
+                    item.indexed_design_source(ScopedDesign::Component(component)),
+                    Some(
+                        directory
+                            .path()
+                            .join("components/button-kit/large/master.fnx")
+                    )
+                );
+                assert_eq!(
+                    item.indexed_design_source(ScopedDesign::Component(ComponentId::new())),
+                    None
+                );
+            });
+
+            doc.scene.get_mut(page).context("page")?.name = "Photo Studio".into();
+            doc.components.sets.get_mut(&set).context("set")?.name = "Photo Buttons".into();
+            fanta_format::write_project_tree(directory.path(), &doc, &BTreeMap::new())?;
+            let renamed = fanta_format::WorkspaceSession::open(directory.path())?;
+            item.update(cx, |item, _| item.workspace_session = Some(renamed));
+            item.read_with(cx, |item, _| {
+                assert_eq!(
+                    item.indexed_design_source(ScopedDesign::Page(page)),
+                    Some(directory.path().join("pages/photo-studio/page.fnx"))
+                );
+                assert_eq!(
+                    item.indexed_design_source(ScopedDesign::Component(component)),
+                    Some(
+                        directory
+                            .path()
+                            .join("components/photo-buttons/large/master.fnx")
+                    )
+                );
+            });
+            item.update(cx, |item, _| {
+                item.workspace_session
+                    .as_mut()
+                    .context("session")?
+                    .artifacts
+                    .remove(&fanta_format::ArtifactId::Component(component))
+                    .context("indexed component")?;
+                assert_eq!(
+                    item.indexed_design_source(ScopedDesign::Component(component)),
+                    None
+                );
+                item.workspace_session = None;
+                assert_eq!(item.indexed_design_source(ScopedDesign::Page(page)), None);
+                Ok::<_, anyhow::Error>(())
+            })?;
+            Ok::<_, anyhow::Error>(())
+        }
+        .await
+        .expect("indexed sources remain accurate after layout changes");
     }
 
     #[gpui::test]

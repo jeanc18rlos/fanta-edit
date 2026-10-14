@@ -1476,6 +1476,7 @@ mod tests {
             .window
             .update(cx, |_, window, cx| {
                 code.update(cx, |code, cx| {
+                    code.set_visible(true, window, cx);
                     code.refresh_page(Some(fixture.pages[0]), window, cx);
                 })
             })

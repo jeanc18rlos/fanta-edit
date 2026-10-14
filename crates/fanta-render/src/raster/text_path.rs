@@ -1,20 +1,82 @@
-use super::text::{to_text_style, with_layout_engine};
+use super::text::{hash_doc_text_style, text_style_heap_bytes, to_text_style, with_layout_engine};
 use super::{Bounds, Canvas, Paint, TextBuffer, TextStyle, to_sk_color};
 use fanta_doc::{MeasuredPath, TextPathAlignment, TextPathDirection, TextPathNode, TextPathSide};
 use fanta_text::{ShapedGlyphRun, ShapedTextCluster};
-use skia_safe::{Font, Matrix, Path, Point, Rect, paint::Style as PaintStyle};
+use lru::LruCache;
+use skia_safe::{Font, Matrix, Path, PathBuilder, Point, Rect, paint::Style as PaintStyle};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::num::NonZeroUsize;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
 
 const GEOMETRY_EPSILON: f64 = 1e-9;
-const TEXT_PATH_CACHE_CAP: usize = 2048;
+const TEXT_PATH_CACHE_CAP: NonZeroUsize = NonZeroUsize::MIN.saturating_add(2_047);
+const TEXT_PATH_CACHE_BYTES: usize = 32 * 1024 * 1024;
+
+struct TextPathCacheEntry {
+    node: TextPathNode,
+    font_generation: u64,
+    layout: Option<TextPathLayout>,
+    bytes: usize,
+}
+
+struct TextPathCache {
+    entries: LruCache<u64, TextPathCacheEntry>,
+    bytes: usize,
+    maximum_bytes: usize,
+}
+
+impl Default for TextPathCache {
+    fn default() -> Self {
+        Self::new(TEXT_PATH_CACHE_CAP, TEXT_PATH_CACHE_BYTES)
+    }
+}
+
+impl TextPathCache {
+    fn new(capacity: NonZeroUsize, maximum_bytes: usize) -> Self {
+        Self {
+            entries: LruCache::new(capacity),
+            bytes: 0,
+            maximum_bytes,
+        }
+    }
+
+    fn get(
+        &mut self,
+        key: u64,
+        node: &TextPathNode,
+        font_generation: u64,
+    ) -> Option<&TextPathCacheEntry> {
+        self.entries
+            .get(&key)
+            .filter(|entry| entry.font_generation == font_generation && entry.node == *node)
+    }
+
+    fn insert(&mut self, key: u64, entry: TextPathCacheEntry) {
+        if entry.bytes > self.maximum_bytes {
+            return;
+        }
+        if let Some(previous) = self.entries.pop(&key) {
+            self.bytes = self.bytes.saturating_sub(previous.bytes);
+        }
+        while self.bytes.saturating_add(entry.bytes) > self.maximum_bytes {
+            let Some((_, previous)) = self.entries.pop_lru() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(previous.bytes);
+        }
+        self.bytes = self.bytes.saturating_add(entry.bytes);
+        if let Some((_, previous)) = self.entries.push(key, entry) {
+            self.bytes = self.bytes.saturating_sub(previous.bytes);
+        }
+    }
+}
 
 thread_local! {
-    static TEXT_PATH_LAYOUT_CACHE: RefCell<
-        std::collections::HashMap<Vec<u8>, Option<TextPathLayout>>,
-    > = RefCell::new(std::collections::HashMap::new());
+    static TEXT_PATH_LAYOUT_CACHE: RefCell<TextPathCache> = RefCell::new(TextPathCache::default());
 }
 
 #[derive(Clone)]
@@ -342,24 +404,119 @@ fn with_text_path_layout<R>(
     node: &TextPathNode,
     visit: impl FnOnce(&TextPathLayout) -> R,
 ) -> Option<R> {
-    let bytes = match serde_json::to_vec(node) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            let layout = layout_text_path(node)?;
-            return Some(visit(&layout));
-        }
-    };
+    let key = text_path_key(node);
+    let font_generation = with_layout_engine(fanta_text::LayoutEngine::font_generation);
     TEXT_PATH_LAYOUT_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if cache.len() >= TEXT_PATH_CACHE_CAP && !cache.contains_key(&bytes) {
-            cache.clear();
+        if let Some(font_generation) = font_generation
+            && let Some(entry) = cache.get(key, node, font_generation)
+        {
+            return entry.layout.as_ref().map(visit);
         }
-        cache
-            .entry(bytes)
-            .or_insert_with(|| layout_text_path(node))
-            .as_ref()
-            .map(visit)
+        let layout = layout_text_path(node);
+        let result = layout.as_ref().map(visit);
+        if let Some(font_generation) = font_generation
+            && with_layout_engine(fanta_text::LayoutEngine::font_generation)
+                == Some(font_generation)
+        {
+            let layout_bytes = layout.as_ref().map_or(0, text_path_layout_heap_bytes);
+            if text_path_source_heap_bytes(node).saturating_add(layout_bytes) <= cache.maximum_bytes
+            {
+                let node = node.clone();
+                let bytes = std::mem::size_of::<TextPathCacheEntry>()
+                    .saturating_add(64)
+                    .saturating_add(text_path_source_heap_bytes(&node))
+                    .saturating_add(layout_bytes);
+                cache.insert(
+                    key,
+                    TextPathCacheEntry {
+                        node,
+                        font_generation,
+                        layout,
+                        bytes,
+                    },
+                );
+            }
+        }
+        result
     })
+}
+
+fn text_path_key(node: &TextPathNode) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    super::vector::vector_geometry_key(&node.path, None, None, 0.0).hash(&mut hasher);
+    node.content.hash(&mut hasher);
+    hash_doc_text_style(&node.style, &mut hasher);
+    node.style_runs.len().hash(&mut hasher);
+    for run in &node.style_runs {
+        run.start.hash(&mut hasher);
+        run.end.hash(&mut hasher);
+        hash_doc_text_style(&run.style, &mut hasher);
+    }
+    node.start.segment().hash(&mut hasher);
+    node.start.position().to_bits().hash(&mut hasher);
+    std::mem::discriminant(&node.alignment).hash(&mut hasher);
+    std::mem::discriminant(&node.direction).hash(&mut hasher);
+    std::mem::discriminant(&node.side).hash(&mut hasher);
+    hasher.finish()
+}
+
+fn text_path_source_heap_bytes(node: &TextPathNode) -> usize {
+    node.style_runs.iter().fold(
+        super::vector::vector_source_heap_bytes(&node.path)
+            .saturating_add(node.content.capacity())
+            .saturating_add(text_style_heap_bytes(&node.style))
+            .saturating_add(
+                node.style_runs
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<fanta_doc::TextStyleRun>()),
+            ),
+        |bytes, run| bytes.saturating_add(text_style_heap_bytes(&run.style)),
+    )
+}
+
+fn text_path_layout_heap_bytes(layout: &TextPathLayout) -> usize {
+    let mut bytes = std::mem::size_of::<TextPathLayout>()
+        .saturating_add(
+            layout
+                .glyphs
+                .capacity()
+                .saturating_mul(std::mem::size_of::<PlacedGlyph>()),
+        )
+        .saturating_add(
+            layout
+                .decorations
+                .capacity()
+                .saturating_mul(std::mem::size_of::<ColoredPath>()),
+        )
+        .saturating_add(
+            layout
+                .clusters
+                .capacity()
+                .saturating_mul(std::mem::size_of::<PlacedCluster>()),
+        )
+        .saturating_add(
+            layout
+                .visual_carets
+                .capacity()
+                .saturating_mul(std::mem::size_of::<VisualCaret>()),
+        )
+        .saturating_add(layout.containment_path.approximate_bytes_used());
+    for decoration in &layout.decorations {
+        bytes = bytes.saturating_add(decoration.path.approximate_bytes_used());
+    }
+    for cluster in &layout.clusters {
+        bytes = bytes.saturating_add(
+            cluster
+                .carets
+                .capacity()
+                .saturating_mul(std::mem::size_of::<PlacedCaret>()),
+        );
+    }
+    if let TextPathOutline::Exact(path) = &layout.outline {
+        bytes = bytes.saturating_add(path.approximate_bytes_used());
+    }
+    bytes
 }
 
 fn layout_text_path(node: &TextPathNode) -> Option<TextPathLayout> {
@@ -480,8 +637,8 @@ fn layout_text_path(node: &TextPathNode) -> Option<TextPathLayout> {
     let mut decorations = Vec::new();
     let mut clusters = Vec::new();
     let mut visual_carets = Vec::new();
-    let mut silhouette = Path::new();
-    let mut containment_path = Path::new();
+    let mut silhouette = PathBuilder::new();
+    let mut containment_path = PathBuilder::new();
     let mut visual_bounds = None;
     let mut unsupported_outline = false;
     for cluster in source_clusters {
@@ -544,17 +701,17 @@ fn layout_text_path(node: &TextPathNode) -> Option<TextPathLayout> {
                     + frame.normal[1] * glyph.paint_y,
             ];
             let transform = glyph_transform(frame.tangent, frame.normal, translation)?;
-            if let Some(mut outline) = glyph.font.get_path(glyph.glyph_id) {
-                outline.transform(&transform);
+            if let Some(outline) = glyph.font.get_path(glyph.glyph_id) {
+                let outline = outline.make_transform(&transform);
                 include_path_bounds(&mut visual_bounds, &outline);
-                silhouette.add_path(&outline, (0.0, 0.0), None);
-                containment_path.add_path(&outline, (0.0, 0.0), None);
+                silhouette.add_path(&outline, None);
+                containment_path.add_path(&outline, None);
             } else if !cluster_is_whitespace {
                 cluster_has_unsupported_outline = true;
-                if let Some(mut bounds_path) = glyph_bounds_path(glyph.bounds) {
-                    bounds_path.transform(&transform);
+                if let Some(bounds_path) = glyph_bounds_path(glyph.bounds) {
+                    let bounds_path = bounds_path.make_transform(&transform);
                     include_path_bounds(&mut visual_bounds, &bounds_path);
-                    containment_path.add_path(&bounds_path, (0.0, 0.0), None);
+                    containment_path.add_path(&bounds_path, None);
                 }
             }
             glyphs.push(PlacedGlyph {
@@ -572,7 +729,7 @@ fn layout_text_path(node: &TextPathNode) -> Option<TextPathLayout> {
                     include_bounds(&mut visual_bounds, bounds);
                 }
                 if let Some(path) = quad_path(quad) {
-                    containment_path.add_path(&path, (0.0, 0.0), None);
+                    containment_path.add_path(&path, None);
                 }
             }
         }
@@ -580,8 +737,8 @@ fn layout_text_path(node: &TextPathNode) -> Option<TextPathLayout> {
             if glyph.style.color.a != 0 {
                 for decoration in decoration_paths(glyph, cluster.advance, &cluster_transform) {
                     include_path_bounds(&mut visual_bounds, &decoration.path);
-                    silhouette.add_path(&decoration.path, (0.0, 0.0), None);
-                    containment_path.add_path(&decoration.path, (0.0, 0.0), None);
+                    silhouette.add_path(&decoration.path, None);
+                    containment_path.add_path(&decoration.path, None);
                     decorations.push(decoration);
                 }
             }
@@ -596,14 +753,14 @@ fn layout_text_path(node: &TextPathNode) -> Option<TextPathLayout> {
         visual_carets.reverse();
     }
 
-    let outline = classify_outline(silhouette, unsupported_outline);
+    let outline = classify_outline(silhouette.detach(), unsupported_outline);
     (!visual_carets.is_empty()).then_some(TextPathLayout {
         glyphs,
         decorations,
         clusters,
         visual_carets,
         outline,
-        containment_path,
+        containment_path: containment_path.detach(),
         visual_bounds,
     })
 }
@@ -1089,13 +1246,13 @@ fn quad_path(points: [[f64; 2]; 4]) -> Option<Path> {
     {
         return None;
     }
-    let mut path = Path::new();
+    let mut path = PathBuilder::new();
     path.move_to((points[0][0] as f32, points[0][1] as f32));
     for point in &points[1..] {
         path.line_to((point[0] as f32, point[1] as f32));
     }
     path.close();
-    Some(path)
+    Some(path.detach())
 }
 
 fn include_bounds(bounds: &mut Option<Bounds>, addition: Bounds) {
@@ -1187,8 +1344,7 @@ fn glyph_bounds_path(bounds: [f64; 4]) -> Option<Path> {
     {
         return None;
     }
-    let mut path = Path::new();
-    path.add_rect(
+    Some(Path::rect(
         Rect::new(
             bounds[0] as f32,
             bounds[1] as f32,
@@ -1196,8 +1352,7 @@ fn glyph_bounds_path(bounds: [f64; 4]) -> Option<Path> {
             bounds[3] as f32,
         ),
         None,
-    );
-    Some(path)
+    ))
 }
 
 fn decoration_paths(glyph: &SourceGlyph, advance: f64, transform: &Matrix) -> Vec<ColoredPath> {
@@ -1258,9 +1413,8 @@ fn decoration_rect(
         advance,
         position + thickness * 0.5,
     ];
-    let mut path = glyph_bounds_path(bounds)?;
-    path.transform(transform);
-    Some(path)
+    let path = glyph_bounds_path(bounds)?;
+    Some(path.make_transform(transform))
 }
 
 fn glyph_paint(color: fanta_doc::Color) -> Paint {
@@ -1274,6 +1428,157 @@ fn glyph_paint(color: fanta_doc::Color) -> Paint {
 mod tests {
     use super::*;
     use fanta_doc::{PathData, TextPathStart};
+
+    struct CacheScope {
+        previous: TextPathCache,
+    }
+
+    impl CacheScope {
+        fn new(capacity: NonZeroUsize, maximum_bytes: usize) -> Self {
+            Self {
+                previous: TEXT_PATH_LAYOUT_CACHE.with(|cache| {
+                    std::mem::replace(
+                        &mut *cache.borrow_mut(),
+                        TextPathCache::new(capacity, maximum_bytes),
+                    )
+                }),
+            }
+        }
+    }
+
+    impl Drop for CacheScope {
+        fn drop(&mut self) {
+            TEXT_PATH_LAYOUT_CACHE.with(|cache| {
+                std::mem::swap(&mut *cache.borrow_mut(), &mut self.previous);
+            });
+        }
+    }
+
+    fn cache_entry(node: &TextPathNode, font_generation: u64) -> TextPathCacheEntry {
+        let node = node.clone();
+        let layout = layout_text_path(&node);
+        let bytes = std::mem::size_of::<TextPathCacheEntry>()
+            + 64
+            + text_path_source_heap_bytes(&node)
+            + layout.as_ref().map_or(0, text_path_layout_heap_bytes);
+        TextPathCacheEntry {
+            node,
+            font_generation,
+            layout,
+            bytes,
+        }
+    }
+
+    #[test]
+    fn text_path_overflow_retains_hot_layout_and_exact_pixels()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let _scope = CacheScope::new(NonZeroUsize::MIN.saturating_add(1), TEXT_PATH_CACHE_BYTES);
+        let first = line_node("Hot path glyphs");
+        let second = line_node("A second run");
+        let third = line_node("A third run");
+        let bounds = text_path_visual_bounds(&first);
+        let caret = text_path_caret_segment(&first, 4);
+        let selection = text_path_selection_quads(&first, 0..8);
+        let paint = || -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+            let mut renderer = crate::raster::RasterRenderer::new(640, 200)?;
+            draw_text_path_node(renderer.canvas(), &first);
+            Ok(renderer.copy_rgba())
+        };
+        let pixels = paint()?;
+        assert!(
+            pixels
+                .chunks_exact(4)
+                .any(|pixel| pixel.last().copied() != Some(0))
+        );
+        text_path_visual_bounds(&second);
+        assert_eq!(paint()?, pixels);
+        text_path_visual_bounds(&third);
+        TEXT_PATH_LAYOUT_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            assert_eq!(cache.entries.len(), 2);
+            assert!(cache.entries.contains(&text_path_key(&first)));
+            assert!(!cache.entries.contains(&text_path_key(&second)));
+            assert!(cache.entries.contains(&text_path_key(&third)));
+            assert!(cache.bytes <= TEXT_PATH_CACHE_BYTES);
+        });
+        assert_eq!(text_path_visual_bounds(&first), bounds);
+        assert_eq!(text_path_caret_segment(&first, 4), caret);
+        assert_eq!(text_path_selection_quads(&first, 0..8), selection);
+        assert_eq!(paint()?, pixels);
+        Ok(())
+    }
+
+    #[test]
+    fn text_path_typed_keys_preserve_curved_edits_and_exact_caret_geometry() {
+        let _scope = CacheScope::new(TEXT_PATH_CACHE_CAP, TEXT_PATH_CACHE_BYTES);
+        let mut path = PathData::new();
+        path.move_to(0.0, 100.0).quad_to(200.0, -40.0, 500.0, 100.0);
+        let mut original = TextPathNode::new(path, "Curved glyphs");
+        original.style.size_px = 28.0;
+        original.start = TextPathStart::new(0, 0.3).expect("valid position");
+        let mut variants = vec![original.clone()];
+        let mut reversed = original.clone();
+        reversed.direction = TextPathDirection::Reverse;
+        variants.push(reversed);
+        let mut flipped = original.clone();
+        flipped.side = TextPathSide::Flipped;
+        variants.push(flipped);
+        let mut centered = original.clone();
+        centered.alignment = TextPathAlignment::Center;
+        variants.push(centered);
+        let mut moved = original.clone();
+        moved.start = TextPathStart::new(0, 0.7).expect("valid position");
+        variants.push(moved);
+        let mut styled = original;
+        styled.style.underline = true;
+        styled.style.italic = true;
+        variants.push(styled);
+        for node in variants {
+            let expected = layout_text_path(&node).expect("fixture has geometry");
+            let geometry = |layout: &TextPathLayout| {
+                layout
+                    .clusters
+                    .iter()
+                    .flat_map(|cluster| &cluster.carets)
+                    .map(|caret| (caret.position, caret.segment))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(text_path_visual_bounds(&node), expected.visual_bounds);
+            assert_eq!(
+                with_text_path_layout(&node, geometry),
+                Some(geometry(&expected))
+            );
+            match (text_path_outline(&node), &expected.outline) {
+                (TextPathOutline::Exact(actual), TextPathOutline::Exact(expected)) => {
+                    assert_eq!(&actual, expected);
+                }
+                _ => panic!("bundled text has an exact outline"),
+            }
+        }
+    }
+
+    #[test]
+    fn text_path_cache_requires_source_and_font_proofs_and_refuses_oversized_layouts() {
+        let node = line_node("Cached glyphs");
+        let entry = cache_entry(&node, 4);
+        let maximum_bytes = entry.bytes;
+        let mut cache = TextPathCache::new(TEXT_PATH_CACHE_CAP, maximum_bytes);
+        cache.insert(19, entry);
+        assert!(cache.get(19, &node, 4).is_some());
+        assert!(cache.get(19, &node, 5).is_none());
+        let mut changed = node.clone();
+        changed.side = TextPathSide::Flipped;
+        assert!(cache.get(19, &changed, 4).is_none());
+        changed.content = "Changed glyphs".into();
+        assert!(cache.get(19, &changed, 4).is_none());
+        let oversized = line_node(&"A long curved paragraph ".repeat(80));
+        let oversized = cache_entry(&oversized, 4);
+        assert!(oversized.bytes > maximum_bytes);
+        cache.insert(20, oversized);
+        assert!(cache.get(19, &node, 4).is_some());
+        assert!(!cache.entries.contains(&20));
+        assert!(cache.bytes <= maximum_bytes);
+    }
 
     fn line_node(content: &str) -> TextPathNode {
         let mut path = PathData::new();
@@ -1762,8 +2067,7 @@ mod tests {
 
     #[test]
     fn unsupported_glyph_outline_never_becomes_a_rectangular_effect_silhouette() {
-        let mut partial_vector_outline = Path::new();
-        partial_vector_outline.add_rect(Rect::from_xywh(1.0, 2.0, 3.0, 4.0), None);
+        let partial_vector_outline = Path::rect(Rect::from_xywh(1.0, 2.0, 3.0, 4.0), None);
         let unsupported = classify_outline(partial_vector_outline, true);
         assert!(matches!(unsupported, TextPathOutline::UnsupportedGlyph));
         assert!(unsupported.into_exact().is_none());

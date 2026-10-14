@@ -102,4 +102,5 @@ core-foundation.workspace = true
 core-video.workspace = true
 foreign-types = "0.5"
 metal.workspace = true
+skia-bindings.workspace = true
 skia-safe = { workspace = true, features = ["metal"] }

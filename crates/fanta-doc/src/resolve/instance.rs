@@ -116,7 +116,7 @@ pub fn expand_instance(
     components: &ComponentLibrary,
     instance: &InstanceNode,
 ) -> Vec<ExpandedNode> {
-    expand_instance_inner(scene, components, instance, None)
+    expand_instance_inner(scene, components, instance, None, None)
 }
 
 /// Expand an instance while resolving variable aliases used by its component
@@ -129,7 +129,36 @@ pub fn expand_instance_with_context(
     instance: &InstanceNode,
     context: &InstanceExpansionContext<'_>,
 ) -> Vec<ExpandedNode> {
-    expand_instance_inner(scene, components, instance, Some(context))
+    expand_instance_inner(scene, components, instance, Some(context), None)
+}
+
+/// Return `None` when preparation was cancelled, distinct from a dangling
+/// component's valid empty expansion. Partial clones never escape to callers.
+pub fn expand_instance_with_context_cancellable(
+    scene: &Scene,
+    components: &ComponentLibrary,
+    instance: &InstanceNode,
+    context: &InstanceExpansionContext<'_>,
+    should_cancel: &dyn Fn() -> bool,
+) -> Option<Vec<ExpandedNode>> {
+    let cancelled = std::cell::Cell::new(false);
+    let cancellation = || {
+        let stop = cancelled.get() || should_cancel();
+        cancelled.set(stop);
+        stop
+    };
+    let expanded = expand_instance_inner(
+        scene,
+        components,
+        instance,
+        Some(context),
+        Some(&cancellation),
+    );
+    (!cancellation()).then_some(expanded)
+}
+
+fn expansion_cancelled(should_cancel: Option<&dyn Fn() -> bool>) -> bool {
+    should_cancel.is_some_and(|should_cancel| should_cancel())
 }
 
 fn expand_instance_inner(
@@ -137,11 +166,19 @@ fn expand_instance_inner(
     components: &ComponentLibrary,
     instance: &InstanceNode,
     context: Option<&InstanceExpansionContext<'_>>,
+    should_cancel: Option<&dyn Fn() -> bool>,
 ) -> Vec<ExpandedNode> {
-    let mut out = expand_instance_before_bindings(scene, components, instance, context);
+    let mut out =
+        expand_instance_before_bindings(scene, components, instance, context, should_cancel);
     if let Some(context) = context {
         for entry in &mut out {
+            if expansion_cancelled(should_cancel) {
+                return Vec::new();
+            }
             for (property, variable) in entry.node.bindings.clone() {
+                if expansion_cancelled(should_cancel) {
+                    return Vec::new();
+                }
                 if let Some(value) = resolve_bound_value(
                     context.variables,
                     scene,
@@ -170,7 +207,7 @@ pub fn instance_bindings_with_context(
     instance: &InstanceNode,
     context: &InstanceExpansionContext<'_>,
 ) -> BTreeMap<OverridePath, BTreeMap<BoundProp, VariableId>> {
-    expand_instance_before_bindings(scene, components, instance, Some(context))
+    expand_instance_before_bindings(scene, components, instance, Some(context), None)
         .into_iter()
         .filter_map(|entry| {
             (!entry.node.bindings.is_empty()).then_some((entry.def_path, entry.node.bindings))
@@ -183,7 +220,11 @@ fn expand_instance_before_bindings(
     components: &ComponentLibrary,
     instance: &InstanceNode,
     context: Option<&InstanceExpansionContext<'_>>,
+    should_cancel: Option<&dyn Fn() -> bool>,
 ) -> Vec<ExpandedNode> {
+    if expansion_cancelled(should_cancel) {
+        return Vec::new();
+    }
     let Some(def) = resolve_instance_def(scene, components, instance, context) else {
         return Vec::new();
     };
@@ -193,20 +234,35 @@ fn expand_instance_before_bindings(
     }
 
     // `descendants_of` yields the root first, then its subtree.
-    let orig_ids: Vec<NodeId> = scene.descendants_of(root).collect();
+    let mut orig_ids = Vec::new();
+    for original in scene.descendants_of(root) {
+        if expansion_cancelled(should_cancel) {
+            return Vec::new();
+        }
+        orig_ids.push(original);
+    }
 
     // Fresh id per original, so the transient subtree never collides with the
     // live scene and two instances of the same master stay independent.
     let mut remap: HashMap<NodeId, NodeId> = HashMap::with_capacity(orig_ids.len());
     for &o in &orig_ids {
+        if expansion_cancelled(should_cancel) {
+            return Vec::new();
+        }
         remap.insert(o, NodeId::new());
     }
 
     let mut out: Vec<ExpandedNode> = Vec::with_capacity(orig_ids.len());
     for &o in &orig_ids {
+        if expansion_cancelled(should_cancel) {
+            return Vec::new();
+        }
         let Some(orig) = scene.get(o) else { continue };
         let mut clone = orig.clone();
-        clone.id = remap[&o];
+        let Some(remapped) = remap.get(&o).copied() else {
+            continue;
+        };
+        clone.id = remapped;
         clone.parent = if o == root {
             None
         } else {
@@ -219,8 +275,8 @@ fn expand_instance_before_bindings(
     }
 
     pin_expansion_root_box(&mut out, instance);
-    apply_prop_bindings(scene, &mut out, def, instance, context);
-    apply_sparse_overrides(&mut out, instance);
+    apply_prop_bindings(scene, &mut out, def, instance, context, should_cancel);
+    apply_sparse_overrides(&mut out, instance, should_cancel);
 
     // Apply Figma's baked per-descendant resolved data (`derivedSymbolData`),
     // matched by the same def-local path. This OVERWRITES the cloned master's
@@ -243,6 +299,9 @@ fn expand_instance_before_bindings(
     // `edited` flag and skips exactly the fill write.
     let edited = def.rev != 0;
     for d in &instance.derived {
+        if expansion_cancelled(should_cancel) {
+            return Vec::new();
+        }
         // A sparse override is the user's explicit per-instance edit; the baked
         // derived entry is Figma's import-time snapshot of the SAME channels.
         // The explicit edit must win for exactly the channels it claims (text
@@ -530,8 +589,12 @@ fn apply_prop_bindings(
     def: &ComponentDef,
     instance: &InstanceNode,
     context: Option<&InstanceExpansionContext<'_>>,
+    should_cancel: Option<&dyn Fn() -> bool>,
 ) {
     for prop in &def.props {
+        if expansion_cancelled(should_cancel) {
+            return;
+        }
         if matches!(prop.kind, ComponentPropKind::Variant { .. }) || prop.bindings.is_empty() {
             continue;
         }
@@ -540,6 +603,9 @@ fn apply_prop_bindings(
             continue; // unresolved alias — leave the master value in place
         };
         for binding in &prop.bindings {
+            if expansion_cancelled(should_cancel) {
+                return;
+            }
             let bound = binding.prop;
             let rv = resolved.clone();
             apply_at_path(out, &binding.path, move |node| {
@@ -556,8 +622,15 @@ fn apply_prop_bindings(
 /// boundaries); we ROUTE the remainder onto the cloned nested instance's
 /// overrides so the renderer's next `expand_instance` recursion applies it — see
 /// [`route_nested`].
-fn apply_sparse_overrides(out: &mut [ExpandedNode], instance: &InstanceNode) {
+fn apply_sparse_overrides(
+    out: &mut [ExpandedNode],
+    instance: &InstanceNode,
+    should_cancel: Option<&dyn Fn() -> bool>,
+) {
     for ov in &instance.overrides {
+        if expansion_cancelled(should_cancel) {
+            return;
+        }
         if apply_at_path(out, &ov.target_path, |node| apply_override(node, &ov.value)) {
             continue;
         }

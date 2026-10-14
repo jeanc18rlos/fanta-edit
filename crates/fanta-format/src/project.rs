@@ -112,6 +112,234 @@ mod tests {
     use std::path::Path;
     use tempfile::tempdir;
 
+    #[test]
+    #[ignore = "diagnostic: use an isolated FANTA_PERF_PROJECT copy with a .codex-performance-fixture marker"]
+    fn spectrum_project_performance() -> anyhow::Result<()> {
+        use anyhow::Context as _;
+        use std::time::Instant;
+
+        let project = std::path::PathBuf::from(
+            std::env::var("FANTA_PERF_PROJECT").context("FANTA_PERF_PROJECT is required")?,
+        );
+        anyhow::ensure!(
+            project.join(".codex-performance-fixture").is_file(),
+            "performance saves require a marked project copy"
+        );
+        let combined = std::env::var_os("FANTA_PERF_COMBINED").is_some();
+        let (mut document, assets, mut workspace, load_seconds, index_seconds) = if combined {
+            let started = Instant::now();
+            let (document, assets, workspace) = WorkspaceSession::open_project_document(&project)?;
+            (
+                document,
+                assets,
+                workspace,
+                started.elapsed().as_secs_f64(),
+                0.0,
+            )
+        } else {
+            let started = Instant::now();
+            let (document, assets) = read_project_tree(&project)?;
+            let load_seconds = started.elapsed().as_secs_f64();
+            let started = Instant::now();
+            let workspace = WorkspaceSession::open(&project)?;
+            (
+                document,
+                assets,
+                workspace,
+                load_seconds,
+                started.elapsed().as_secs_f64(),
+            )
+        };
+        let page_header: Value =
+            serde_json::from_slice(&std::fs::read(project.join("pages/wireframes/page.json"))?)?;
+        let page = page_header
+            .get("id")
+            .and_then(Value::as_str)
+            .context("Wireframes page identity")?
+            .parse::<NodeId>()?;
+        anyhow::ensure!(
+            document.pages().contains(&page),
+            "Wireframes page is registered"
+        );
+        let started = Instant::now();
+        let render_scene = document.render_scene_for(page);
+        let render_scene_seconds = started.elapsed().as_secs_f64();
+        let render_scene_nodes = render_scene.as_ref().map(fanta_doc::Scene::len);
+        drop(render_scene);
+        let component_roots: BTreeSet<_> = document
+            .components
+            .defs
+            .values()
+            .map(|definition| definition.root)
+            .collect();
+        let node = document
+            .scene
+            .children_of(Some(page))
+            .iter()
+            .copied()
+            .find(|node| !component_roots.contains(node))
+            .context("an ordinary page-owned child is required")?;
+        let original_name = document
+            .scene
+            .get(node)
+            .context("benchmark layer")?
+            .name
+            .clone();
+        let mut original_document = document.clone_for_persist();
+        let mut asset_preconditions = BTreeMap::new();
+        let mut found_assets = BTreeSet::new();
+        for family in std::fs::read_dir(project.join("assets"))? {
+            let family = family?;
+            if !family.file_type()?.is_dir() {
+                continue;
+            }
+            for file in std::fs::read_dir(family.path())? {
+                use sha2::Digest as _;
+                let file = file?;
+                let path = file.path();
+                let Some(id) = path
+                    .file_stem()
+                    .and_then(|name| name.to_str())
+                    .and_then(|name| name.parse::<AssetId>().ok())
+                else {
+                    continue;
+                };
+                let bytes = assets.get(&id).context("known benchmark asset")?;
+                anyhow::ensure!(found_assets.insert(id), "duplicate benchmark asset");
+                asset_preconditions.insert(
+                    path.strip_prefix(&project)?.to_path_buf(),
+                    Some(sha2::Sha256::digest(bytes).into()),
+                );
+            }
+        }
+        anyhow::ensure!(
+            found_assets.len() == assets.len(),
+            "all benchmark assets are guarded"
+        );
+        let artifact = ArtifactId::Page(page);
+        let mut cache = ProjectWriteCache::default();
+        let mut measurements = Vec::new();
+        let mut previous_name = original_name.clone();
+        for name in [
+            "Codex first performance probe",
+            "Codex second performance probe",
+            &original_name,
+        ] {
+            let baseline = document.clone_for_persist();
+            document.apply(fanta_doc::Operation::SetName {
+                id: node,
+                old: previous_name,
+                new: name.to_owned(),
+            })?;
+            previous_name = name.to_owned();
+            let started = Instant::now();
+            let mut phases = serde_json::Map::new();
+            let phase = Instant::now();
+            let incremental = workspace.try_save_document_artifacts(
+                &document,
+                &baseline,
+                &BTreeSet::from([artifact.clone()]),
+                &asset_preconditions,
+            )?;
+            phases.insert(
+                "incremental".into(),
+                serde_json::json!(phase.elapsed().as_secs_f64()),
+            );
+            let incremental_used = incremental.is_some();
+            let report = if let Some(report) = incremental {
+                report
+            } else {
+                let phase = Instant::now();
+                workspace.open_artifact(artifact.clone())?;
+                phases.insert(
+                    "open".into(),
+                    serde_json::json!(phase.elapsed().as_secs_f64()),
+                );
+                let phase = Instant::now();
+                workspace.adopt_document_shared(&document);
+                workspace.adopt_document_artifacts(&document, [&artifact])?;
+                phases.insert(
+                    "adopt".into(),
+                    serde_json::json!(phase.elapsed().as_secs_f64()),
+                );
+                let phase = Instant::now();
+                let sources = workspace.validated_source_overrides_for_document(&document)?;
+                phases.insert(
+                    "sources".into(),
+                    serde_json::json!(phase.elapsed().as_secs_f64()),
+                );
+                let phase = Instant::now();
+                let mut preconditions = workspace.source_write_preconditions(&document)?;
+                preconditions.extend(asset_preconditions.clone());
+                phases.insert(
+                    "preconditions".into(),
+                    serde_json::json!(phase.elapsed().as_secs_f64()),
+                );
+                let phase = Instant::now();
+                let report = write_project_tree_cached_with_sources_checked(
+                    &project,
+                    &document,
+                    &assets,
+                    &mut cache,
+                    &sources,
+                    &preconditions,
+                )?;
+                phases.insert(
+                    "write".into(),
+                    serde_json::json!(phase.elapsed().as_secs_f64()),
+                );
+                let phase = Instant::now();
+                let asset_index_hash = report
+                    .written_hashes
+                    .get(Path::new("assets/index.json"))
+                    .copied()
+                    .or_else(|| workspace.asset_index_disk_hash())
+                    .context("asset index hash")?;
+                workspace.accept_written_sources(
+                    &document,
+                    asset_index_hash,
+                    &sources,
+                    &report.written_hashes,
+                )?;
+                phases.insert(
+                    "accept".into(),
+                    serde_json::json!(phase.elapsed().as_secs_f64()),
+                );
+                report
+            };
+            measurements.push(serde_json::json!({
+                "total_seconds": started.elapsed().as_secs_f64(),
+                "phases": phases, "written_files": report.written.len(), "incremental_used": incremental_used,
+                "node_count_unchanged": document.scene.len() == baseline.scene.len(),
+            }));
+        }
+        let (reloaded, reloaded_assets) = read_project_tree(&project)?;
+        let saved_document = document.clone_for_persist();
+        anyhow::ensure!(
+            serde_json::to_value(&reloaded)? == serde_json::to_value(&saved_document)?,
+            "reloaded document must match the saved snapshot"
+        );
+        original_document.metadata.modified_at = saved_document.metadata.modified_at;
+        anyhow::ensure!(
+            serde_json::to_value(&saved_document)? == serde_json::to_value(&original_document)?,
+            "benchmark must restore the original persisted content"
+        );
+        assert_eq!(reloaded_assets, assets);
+        let result = serde_json::json!({
+            "nodes": document.scene.len(), "components": document.components.defs.len(),
+            "pages": document.pages().len(), "load_seconds": load_seconds,
+            "index_seconds": index_seconds, "saves": measurements,
+            "load_mode": if combined { "combined" } else { "separate" },
+            "render_scene_seconds": render_scene_seconds,
+            "render_scene_nodes": render_scene_nodes,
+        });
+        if let Ok(output) = std::env::var("FANTA_PERF_OUTPUT") {
+            std::fs::write(output, serde_json::to_vec_pretty(&result)?)?;
+        }
+        eprintln!("{result}");
+        Ok(())
+    }
+
     // ---- fixtures ----------------------------------------------------------
 
     fn group(parent: Option<NodeId>, name: &str) -> CanvasNode {

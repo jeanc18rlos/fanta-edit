@@ -12,6 +12,7 @@ default-run = "fanta"
 workspace = true
 
 [features]
+default = ["mimalloc"]
 fanta-gpui-ui = ["fig_viewer/fanta-gpui-ui"]
 mac_app_store = ["agent_ui/mac_app_store", "client/mac_app_store", "context_server/mac_app_store", "paths/mac_app_store", "recent_projects/mac_app_store", "remote/mac_app_store", "workspace/mac_app_store", "fig_viewer/mac_app_store", "title_bar/mac_app_store", "gpui_platform/mac_app_store", "dep:fanta_revenuecat"]
 tracy = ["ztracing/tracy"]

@@ -33,8 +33,8 @@
 //! injects.
 
 use fanta_doc::AssetId;
-use std::collections::{BTreeMap, HashMap};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 /// Decoded, ready-to-upload image pixels.
 ///
@@ -163,10 +163,12 @@ pub type ImageDecoder = dyn Fn(AssetId, &[u8]) -> Option<DecodedImage> + Send + 
 /// the assets actually drawn — plus whatever the loader [`prewarm`]s — cost
 /// pixels; the encoded bytes stay shared with the save path.
 ///
-/// Shared between the render thread and the UI thread (screenshots, export),
-/// so it is `Send + Sync`, and the lock is never held across a decode: a
-/// miss decodes outside the lock and inserts afterwards (a concurrent decode
-/// of the same asset keeps whichever landed first).
+/// Shared between the render thread, prewarm threads and the UI thread
+/// (screenshots, export), so it is `Send + Sync`, and the lock is never held
+/// across a decode: a miss decodes outside the lock and inserts afterwards. A
+/// resolve that finds the asset already being decoded waits for that decode
+/// instead of repeating it, so a page prewarm racing the first frame's walk
+/// never decodes the same image twice.
 ///
 /// [`prewarm`]: Self::prewarm
 pub struct LazyAssetResolver {
@@ -174,6 +176,8 @@ pub struct LazyAssetResolver {
     decoder: Arc<ImageDecoder>,
     budget_bytes: usize,
     cache: Mutex<DecodedCache>,
+    /// Notified whenever an in-flight decode finishes (or unwinds).
+    decoded: Condvar,
 }
 
 #[derive(Default)]
@@ -194,6 +198,8 @@ struct DecodedCache {
     shared_bytes: HashMap<AssetId, Arc<Vec<u8>>>,
     /// Bytes held by [`Self::shared_bytes`].
     shared_bytes_total: usize,
+    /// Assets some thread is decoding right now.
+    in_flight: HashSet<AssetId>,
 }
 
 struct CacheEntry {
@@ -286,19 +292,16 @@ impl LazyAssetResolver {
             decoder,
             budget_bytes,
             cache: Mutex::new(DecodedCache::default()),
+            decoded: Condvar::new(),
         }
     }
 
-    /// Decode `ids` now (skipping ones already decoded or unknown), so the
-    /// first frame that draws them does not pay the decode. Meant for a
-    /// background load task, e.g. with the assets of the page that opens.
+    /// Decode `ids` now (skipping ones already decoded, being decoded, or
+    /// unknown), so the first frame that draws them does not pay the decode.
+    /// Meant for background tasks, e.g. with the assets of a page that opens.
     pub fn prewarm(&self, ids: impl IntoIterator<Item = AssetId>) {
         for id in ids {
-            let cached = self.lock().entries.contains_key(&id);
-            if cached {
-                continue;
-            }
-            self.decode_and_insert(id);
+            self.decode_and_insert(id, false);
         }
     }
 
@@ -336,23 +339,58 @@ impl LazyAssetResolver {
         self.cache.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn decode_and_insert(&self, id: AssetId) -> Option<DecodedImage> {
+    /// Decode `id` unless it is cached. When another thread is already
+    /// decoding it, `wait` waits for that decode; otherwise this returns
+    /// `None` at once (a prewarm has nothing to add).
+    fn decode_and_insert(&self, id: AssetId, wait: bool) -> Option<DecodedImage> {
         let bytes = self.encoded.get(&id)?;
+        {
+            let mut cache = self.lock();
+            loop {
+                if let Some(cached) = cache.touch(id) {
+                    return cached;
+                }
+                if !cache.in_flight.contains(&id) {
+                    break;
+                }
+                if !wait {
+                    return None;
+                }
+                cache = self
+                    .decoded
+                    .wait(cache)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            cache.in_flight.insert(id);
+        }
+        let in_flight = InFlightDecode { resolver: self, id };
         let image = (self.decoder)(id, bytes);
         let mut cache = self.lock();
         cache.insert(id, image, self.budget_bytes);
-        // Another thread may have raced us to the same asset; serve the
-        // entry that won so both callers hold the same allocation.
-        cache.touch(id).flatten()
+        let image = cache.touch(id).flatten();
+        drop(cache);
+        drop(in_flight);
+        image
+    }
+}
+
+/// Clears an asset's in-flight mark when its decode ends — including by
+/// unwinding out of a panicking decoder, so waiters never block forever.
+struct InFlightDecode<'a> {
+    resolver: &'a LazyAssetResolver,
+    id: AssetId,
+}
+
+impl Drop for InFlightDecode<'_> {
+    fn drop(&mut self) {
+        self.resolver.lock().in_flight.remove(&self.id);
+        self.resolver.decoded.notify_all();
     }
 }
 
 impl AssetResolver for LazyAssetResolver {
     fn resolve(&self, id: AssetId) -> Option<DecodedImage> {
-        if let Some(cached) = self.lock().touch(id) {
-            return cached;
-        }
-        self.decode_and_insert(id)
+        self.decode_and_insert(id, true)
     }
 
     fn resolve_bytes(&self, id: AssetId) -> Option<Arc<Vec<u8>>> {
@@ -541,6 +579,58 @@ mod tests {
         assert_eq!(decodes.load(Ordering::SeqCst), 2);
         resolver.resolve(b);
         assert_eq!(decodes.load(Ordering::SeqCst), 2, "prewarmed b is a hit");
+    }
+
+    #[test]
+    fn lazy_resolver_waits_for_an_in_flight_decode_instead_of_repeating_it() {
+        let id = AssetId::new();
+        let decodes = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new((Mutex::new(false), Condvar::new()));
+        let decoder: Arc<ImageDecoder> = Arc::new({
+            let decodes = decodes.clone();
+            let released = released.clone();
+            move |_id, bytes: &[u8]| {
+                decodes.fetch_add(1, Ordering::SeqCst);
+                let (flag, signal) = &*released;
+                let mut open = flag.lock().unwrap_or_else(PoisonError::into_inner);
+                while !*open {
+                    open = signal.wait(open).unwrap_or_else(PoisonError::into_inner);
+                }
+                let side = u32::from(*bytes.first()?);
+                Some(solid(side, side, [1, 2, 3, 4]))
+            }
+        });
+        let encoded: BTreeMap<AssetId, Vec<u8>> = [(id, vec![2])].into_iter().collect();
+        let resolver = Arc::new(LazyAssetResolver::with_budget(
+            Arc::new(encoded),
+            decoder,
+            usize::MAX,
+        ));
+        let first = std::thread::spawn({
+            let resolver = resolver.clone();
+            move || resolver.resolve(id)
+        });
+        while decodes.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+        resolver.prewarm([id]);
+        let second = std::thread::spawn(move || resolver.resolve(id));
+        // Give the second resolve time to find the decode in flight; if it
+        // arrives late it finds the cached result, which is equally valid.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        {
+            let (flag, signal) = &*released;
+            *flag.lock().unwrap_or_else(PoisonError::into_inner) = true;
+            signal.notify_all();
+        }
+        let first = first.join().expect("first resolve").expect("decoded");
+        let second = second.join().expect("second resolve").expect("decoded");
+        assert_eq!(
+            decodes.load(Ordering::SeqCst),
+            1,
+            "one decode serves every caller"
+        );
+        assert!(Arc::ptr_eq(&first.pixels_rgba, &second.pixels_rgba));
     }
 
     #[test]

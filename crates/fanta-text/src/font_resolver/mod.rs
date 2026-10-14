@@ -69,7 +69,7 @@ pub use bundled::{
     bundled_family_names, bundled_preview_bytes,
 };
 pub use generic::GenericFamily;
-pub use resolver::FontResolver;
+pub use resolver::{FontGenerationObserver, FontResolver};
 pub use substitute::{ADOBE_CLEAN_SANS_METRIC_RATIO, ADOBE_CLEAN_SERIF_METRIC_RATIO};
 
 /// Pre-download (to the on-disk cache) every family a document uses that isn't

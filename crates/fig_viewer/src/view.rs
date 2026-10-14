@@ -722,6 +722,9 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let view = cx.entity_id();
+        cx.on_release(move |_, cx| crate::agent_surface::clear_active_view(view, cx))
+            .detach();
         let item_subscription = Self::subscribe_to_item(&item, cx);
         let (layers_sidebar_visible, layers_sidebar_width) = {
             let settings = FantaDesignPanelSettings::get_global(cx);
@@ -944,7 +947,7 @@ impl FigView {
     }
 
     fn activate_design_scope(&mut self, cx: &mut Context<Self>) {
-        crate::agent_surface::set_active_item(self.item.downgrade(), cx);
+        crate::agent_surface::set_active_item_for_view(self.item.downgrade(), cx.entity_id(), cx);
         if let Some(scope) = self.scope {
             let requester = ScopeRequester::View(cx.entity_id());
             self.item.update(cx, |item, cx| {
@@ -1073,6 +1076,14 @@ impl FigView {
                     }
                 }
                 FigItemEvent::TextSelectionChanged => {}
+                FigItemEvent::ViewportChanged(requester) => {
+                    // MCP can navigate before a tab's deferred focus callbacks run.
+                    if requester.map_or(this.is_focused, |view| view == cx.entity_id())
+                        && let Some(viewport) = this.item.read(cx).doc().map(|doc| doc.viewport)
+                    {
+                        this.set_viewport(viewport, cx);
+                    }
+                }
                 // A save wrote the document without replacing it, so
                 // nothing view-side is stale: only the tab's dirty mark
                 // changes. Deliberately NOT `StateChanged`, which every
@@ -1235,7 +1246,7 @@ impl FigView {
                                 this.selected_page_index = selected_page_index;
                                 this.viewport = None;
                                 this.hovered_node = None;
-                                this.invalidate_canvas_cache();
+                                this.invalidate_canvas_presentation();
                             }
                         }
                         cx.emit(FigViewEvent::TitleChanged);
@@ -2702,11 +2713,27 @@ impl FigView {
         }
     }
 
+    fn invalidate_canvas_presentation(&mut self) {
+        self.rendered_canvas = None;
+        self.prototype_render_cache = None;
+        self.chrome_cache.replace(None);
+        #[cfg(target_os = "macos")]
+        if let Some(gpu) = self.gpu_canvas.as_mut() {
+            gpu.invalidate_presentation();
+        }
+    }
+
     pub(crate) fn is_editable(&self, cx: &App) -> bool {
         !self.is_art_read_only(cx) && self.item.read(cx).is_editable()
     }
 
     fn set_viewport(&mut self, viewport: Viewport, cx: &mut Context<Self>) {
+        #[cfg(target_os = "macos")]
+        if self.viewport != Some(viewport)
+            && let Some(gpu) = &self.gpu_canvas
+        {
+            gpu.note_camera_input(viewport);
+        }
         if self.annotation_state.controller.is_moving() || self.measurement_controller.is_dragging()
         {
             self.annotation_state.controller.freeze_move();
@@ -3232,6 +3259,12 @@ impl FigView {
             }
         });
 
+        #[cfg(target_os = "macos")]
+        if self.viewport != Some(viewport)
+            && let Some(gpu) = &self.gpu_canvas
+        {
+            gpu.note_camera_input(viewport);
+        }
         self.viewport = Some(viewport);
         if is_preview_move
             && content_changed
@@ -5813,7 +5846,7 @@ impl FigView {
             self.freeze_measurement_drag(cx);
             self.comment_state.clear_pending_motion_anchor();
             self.invalidate_local_media_origin();
-            self.invalidate_canvas_cache();
+            self.invalidate_canvas_presentation();
             cx.emit(FigViewEvent::TitleChanged);
         }
         cx.notify();
@@ -5846,7 +5879,7 @@ impl FigView {
         // The edited node stays behind on the old page; end the session
         // before the canvas stops rendering it.
         self.finish_document_edits(cx);
-        let Some(root) = self.item.update(cx, |item, cx| {
+        let Some((root, prewarm)) = self.item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
                 document.ensure_page_solved(index);
                 let root = document.pages.get(index).and_then(|page| page.root);
@@ -5854,8 +5887,9 @@ impl FigView {
                 if changed {
                     document.doc.selection.clear();
                 }
+                let prewarm = root.and_then(|root| document.take_page_prewarm(root));
                 (
-                    root,
+                    (root, prewarm),
                     if changed {
                         DocChange::Selection
                     } else {
@@ -5866,6 +5900,11 @@ impl FigView {
         }) else {
             return;
         };
+        if let Some(prewarm) = prewarm {
+            // Decoding the page's images inside its first frame would stall
+            // the render thread; the walk waits only for decodes under way.
+            cx.background_spawn(async move { prewarm.run() }).detach();
+        }
         let changed_for_view = self.last_seen_root != root;
         self.selected_page_index = Some(index);
         self.selected_page_root = root;
@@ -5888,7 +5927,7 @@ impl FigView {
         if changed_for_view {
             self.viewport = None;
             self.hovered_node = None;
-            self.invalidate_canvas_cache();
+            self.invalidate_canvas_presentation();
         }
         self.sync_measurement_edit_barrier(cx);
         if changed_for_view {
@@ -8457,17 +8496,18 @@ impl Render for FigView {
             crate::gesture_perf::UiStage::ViewRender,
         );
         self.inspector_has_focus = self.inspector_focus_handle.contains_focused(window, cx);
-        let development_read_only = self.is_dev_mode(cx);
-        self.code_workspace.update(cx, |workspace, cx| {
-            workspace.set_development_read_only(development_read_only, cx)
-        });
         // Deferred open from the text tool's commit, which arrives through a
         // window-level mouse listener without a `Window`. Everything is
         // selected so the first keystroke replaces the placeholder.
         if let Some(node) = self.pending_text_edit.take() {
             self.open_text_edit(node, TextEditSeed::SelectAll, window, cx);
         }
+        let development_read_only = self.is_dev_mode(cx);
         let editor_workspace = self.editor_workspace(cx);
+        self.code_workspace.update(cx, |workspace, cx| {
+            workspace.set_development_read_only(development_read_only, cx);
+            workspace.set_visible(editor_workspace == EditorWorkspace::Code, window, cx);
+        });
         if editor_workspace == EditorWorkspace::Canvas {
             self.maybe_prewarm_fonts(cx);
         }
@@ -9817,6 +9857,9 @@ impl Item for FigView {
         let active_motion_clip = self.active_motion_clip;
         let timeline_model = self.timeline_shell.read(cx).view_model().clone();
         Task::ready(Some(cx.new(|cx| {
+            let view = cx.entity_id();
+            cx.on_release(move |_, cx| crate::agent_surface::clear_active_view(view, cx))
+                .detach();
             let item_subscription = Self::subscribe_to_item(&item, cx);
             let editor_session =
                 cx.new(|_| EditorSession::with_state(editor_mode, editor_workspace));
@@ -14911,6 +14954,105 @@ mod tests {
         view.read_with(cx, |view, _| assert_eq!(view.viewport, Some(zoomed)));
     }
 
+    #[cfg(target_os = "macos")]
+    #[gpui::test]
+    async fn mounted_page_tab_activation_preserves_scene_generation_and_gpu_epoch(
+        cx: &mut TestAppContext,
+    ) {
+        init_visual_test(cx);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, first_page, second_page) = doc_with_two_pages();
+        let item =
+            crate::document::ready_item_for_test(&project, "/tmp/PageTabs.fig".into(), doc, cx);
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.ensure_page_solved(0);
+                document.ensure_page_solved(1);
+                ((), DocChange::None)
+            });
+        });
+        let (workspace, visual) = cx.add_window_view(|window, cx| {
+            workspace::Workspace::test_new(project.clone(), window, cx)
+        });
+        let (first, second) = visual.update(|window, cx| {
+            let first = cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx));
+            let second = cx.new(|cx| FigView::new(item.clone(), project, window, cx));
+            first.update(cx, |view, _| {
+                view.scope = Some(FigScope::Page(first_page));
+                view.gpu_canvas = Some(GpuCanvas::for_test());
+            });
+            second.update(cx, |view, _| {
+                view.scope = Some(FigScope::Page(second_page));
+                view.gpu_canvas = Some(GpuCanvas::for_test());
+            });
+            workspace.update(cx, |workspace, cx| {
+                workspace.add_item_to_active_pane(Box::new(first.clone()), None, true, window, cx);
+                workspace.add_item_to_active_pane(Box::new(second.clone()), None, true, window, cx);
+            });
+            window.activate_window();
+            (first, second)
+        });
+        visual.run_until_parked();
+        for (view, center) in [(&first, [120.0, -40.0]), (&second, [-80.0, 30.0])] {
+            view.update(visual, |view, _| {
+                view.viewport = Some(Viewport { center, zoom: 2.0 })
+            });
+        }
+        let baseline = item.read_with(visual, |item, _| {
+            let document = item.document().expect("document");
+            (
+                document.doc.scene.instance_id(),
+                document.doc.scene.revision(),
+                document.render_generation(),
+            )
+        });
+        for (view, root, center) in [
+            (&first, first_page, [120.0, -40.0]),
+            (&second, second_page, [-80.0, 30.0]),
+            (&first, first_page, [120.0, -40.0]),
+        ] {
+            visual.update(|window, cx| {
+                workspace.update(cx, |workspace, cx| {
+                    assert!(workspace.activate_item(view, true, true, window, cx));
+                });
+                window.draw(cx).clear();
+            });
+            visual.run_until_parked();
+            view.read_with(visual, |view, cx| {
+                assert_eq!(view.viewport, Some(Viewport { center, zoom: 2.0 }));
+                assert_eq!(view.last_seen_root, Some(root));
+                assert_eq!(
+                    view.gpu_canvas
+                        .as_ref()
+                        .expect("GPU state")
+                        .epoch_for_test(),
+                    0
+                );
+                let document = view.item.read(cx).document().expect("document");
+                assert_eq!(document.doc.active_page(), Some(root));
+                assert_eq!(
+                    (
+                        document.doc.scene.instance_id(),
+                        document.doc.scene.revision(),
+                        document.render_generation()
+                    ),
+                    baseline
+                );
+            });
+        }
+        first.update(visual, |view, cx| {
+            view.select_page(1, cx);
+            view.select_page(0, cx);
+            assert_eq!(
+                view.gpu_canvas
+                    .as_ref()
+                    .expect("GPU state")
+                    .epoch_for_test(),
+                0
+            );
+        });
+    }
+
     #[gpui::test]
     async fn source_edit_lock_keeps_page_navigation_on_the_edited_page(cx: &mut TestAppContext) {
         init_test(cx);
@@ -15126,6 +15268,126 @@ mod tests {
             assert_eq!(view.last_seen_root, Some(page_two));
             assert_eq!(view.selected_page_root, Some(page_two));
             assert_eq!(view.selected_page_index, Some(1));
+        });
+    }
+
+    #[gpui::test]
+    async fn external_viewport_changes_follow_the_active_canvas_despite_stale_focus(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(crate::agent_surface::init);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, _, _) = doc_with_two_pages();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Design.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let views = scratch
+            .update(cx, |_, window, cx| {
+                [
+                    cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx)),
+                    cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx)),
+                ]
+            })
+            .expect("views");
+        let original = Viewport {
+            center: [10.0, 20.0],
+            zoom: 2.0,
+        };
+        let requested = Viewport {
+            center: [100.0, 200.0],
+            zoom: 0.5,
+        };
+        for (index, view) in views.iter().enumerate() {
+            view.update(cx, |view, _| {
+                view.is_focused = index == 1;
+                view.viewport = Some(original);
+            });
+        }
+        views.first().expect("active view").update(cx, |view, cx| {
+            view.activate_design_scope(cx);
+        });
+        let initial_undo_depth = item.read_with(cx, |item, _| {
+            item.doc().expect("document").history.undo_depth()
+        });
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.viewport = requested;
+                ((), DocChange::None)
+            });
+        });
+        cx.run_until_parked();
+        for (index, view) in views.iter().enumerate() {
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.viewport,
+                    Some(if index == 0 { requested } else { original })
+                );
+            });
+        }
+        let [active_view, other_view] = views;
+        cx.update(|cx| {
+            crate::agent_surface::clear_active_view(other_view.entity_id(), cx);
+            assert_eq!(
+                crate::agent_surface::active_view_for_item(item.entity_id(), cx),
+                Some(active_view.entity_id())
+            );
+            crate::agent_surface::clear_active_view(active_view.entity_id(), cx);
+            assert_eq!(
+                crate::agent_surface::active_view_for_item(item.entity_id(), cx),
+                None
+            );
+        });
+        let fallback_requested = Viewport {
+            center: [300.0, 400.0],
+            zoom: 0.75,
+        };
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.viewport = fallback_requested;
+                ((), DocChange::None)
+            });
+        });
+        cx.run_until_parked();
+        active_view.read_with(cx, |view, _| assert_eq!(view.viewport, Some(requested)));
+        other_view.read_with(cx, |view, _| {
+            assert_eq!(view.viewport, Some(fallback_requested));
+        });
+        other_view.update(cx, |view, cx| view.activate_design_scope(cx));
+        active_view.update(cx, |view, cx| view.activate_design_scope(cx));
+        let other_weak = other_view.downgrade();
+        // GPUI runs release callbacks when application effects flush, not
+        // when the dispatcher merely parks after an out-of-update handle drop.
+        cx.update(|_| drop(other_view));
+        cx.run_until_parked();
+        assert!(other_weak.upgrade().is_none());
+        cx.read(|cx| {
+            assert_eq!(
+                crate::agent_surface::active_view_for_item(item.entity_id(), cx),
+                Some(active_view.entity_id())
+            );
+        });
+        let active_weak = active_view.downgrade();
+        cx.update(|_| drop(active_view));
+        cx.run_until_parked();
+        assert!(active_weak.upgrade().is_none());
+        cx.read(|cx| {
+            assert_eq!(
+                crate::agent_surface::active_view_for_item(item.entity_id(), cx),
+                None
+            );
+        });
+        item.read_with(cx, |item, _| {
+            assert!(!item.is_dirty());
+            assert!(!item.content_preview_active());
+            assert_eq!(
+                item.doc().expect("document").history.undo_depth(),
+                initial_undo_depth
+            );
         });
     }
 

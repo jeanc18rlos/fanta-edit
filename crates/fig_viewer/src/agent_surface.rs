@@ -4,7 +4,7 @@
 //! seam as user input (one history transaction per batch, rolled back on
 //! failure), so agent work is undoable like any canvas gesture.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -52,13 +52,16 @@ use crate::structure::{frame_selection_operations, group_operations, ungroup_ope
 /// The most recently opened or focused canvas item, shared between the
 /// registered provider and the [`FigView`](crate::FigView) instances that
 /// update it.
-struct ActiveDesignItem(Rc<RefCell<Option<WeakEntity<FigItem>>>>);
+struct ActiveDesignItem(
+    Rc<RefCell<Option<WeakEntity<FigItem>>>>,
+    Cell<Option<gpui::EntityId>>,
+);
 
 impl Global for ActiveDesignItem {}
 
 pub(crate) fn init(cx: &mut App) {
     let active = Rc::new(RefCell::new(None));
-    cx.set_global(ActiveDesignItem(active.clone()));
+    cx.set_global(ActiveDesignItem(active.clone(), Cell::new(None)));
     design_surface::register(Rc::new(FigDesignSurface { active }), cx);
 }
 
@@ -67,7 +70,43 @@ pub(crate) fn init(cx: &mut App) {
 /// user's attention.
 pub(crate) fn set_active_item(item: WeakEntity<FigItem>, cx: &mut App) {
     if let Some(state) = cx.try_global::<ActiveDesignItem>() {
+        let mut active = state.0.borrow_mut();
+        let same_live_item = active
+            .as_ref()
+            .and_then(WeakEntity::upgrade)
+            .zip(item.upgrade())
+            .is_some_and(|(active, item)| active.entity_id() == item.entity_id());
+        *active = Some(item);
+        if !same_live_item {
+            state.1.set(None);
+        }
+    }
+}
+
+pub(crate) fn set_active_item_for_view(
+    item: WeakEntity<FigItem>,
+    view: gpui::EntityId,
+    cx: &mut App,
+) {
+    if let Some(state) = cx.try_global::<ActiveDesignItem>() {
         *state.0.borrow_mut() = Some(item);
+        state.1.set(Some(view));
+    }
+}
+
+pub(crate) fn active_view_for_item(item: gpui::EntityId, cx: &App) -> Option<gpui::EntityId> {
+    let state = cx.try_global::<ActiveDesignItem>()?;
+    let active = state.0.borrow().as_ref()?.upgrade()?;
+    (active.entity_id() == item)
+        .then_some(state.1.get())
+        .flatten()
+}
+
+pub(crate) fn clear_active_view(view: gpui::EntityId, cx: &mut App) {
+    if let Some(state) = cx.try_global::<ActiveDesignItem>()
+        && state.1.get() == Some(view)
+    {
+        state.1.set(None);
     }
 }
 
@@ -109,6 +148,14 @@ pub(crate) fn page_scene(item: &FigItem, depth: u32, limit: usize) -> Result<Vec
     let doc = &document.doc;
     let page = &document.pages[resolve_page_index(document, None)?];
     let root = page.root.context("the page has no root node")?;
+    let mut depth = depth.min(16);
+    loop {
+        match check_page_listing_budget(doc, root, Some(depth), 0, limit) {
+            Ok(()) => break,
+            Err(_) if depth > 1 => depth -= 1,
+            Err(error) => return Err(error),
+        }
+    }
     let mut listing = paginated_node_summary(doc, root, Some(depth), true, 0, limit);
     crate::agent_style::attach_styles(doc, &mut listing);
     Ok(match listing.get_mut("children").map(Value::take) {
@@ -179,6 +226,10 @@ fn project_source_path(root: &Path, source: &Path) -> Result<PathBuf> {
 }
 
 impl DesignSurface for FigDesignSurface {
+    fn project_root(&self, cx: &mut App) -> Result<Option<PathBuf>> {
+        Ok(self.item()?.read(cx).project_root().map(Path::to_path_buf))
+    }
+
     fn prepare_asset(
         &self,
         request: design_surface::DesignAssetRequest,
@@ -486,9 +537,19 @@ impl DesignSurface for FigDesignSurface {
             "source_edit_locked": item.source_edit_locked(),
             "dirty": item.is_dirty(),
             "total_nodes": doc.scene.len(),
-            "pages": pages_json(&document.pages, doc, project_root),
+            "pages": pages_json(&document.pages, doc, project_root, |design| item.indexed_design_source(design)),
+            "page_count": doc.pages().len(),
+            "editor_canvas_count": document.pages.len(),
+            "active_page_index": resolve_page_index(document, None)?,
+            "active_root": doc.active_page().map(|root| root.to_string()),
             "active_page_bounds": bounds_json(content_bounds(doc, doc.active_page())),
-            "components": components_json(doc, project_root),
+            "components": components_json(doc, project_root, 0, COMPONENT_OVERVIEW_LIMIT, |design| item.indexed_design_source(design)),
+            "component_count": doc.components.defs.len(),
+            "components_offset": 0,
+            "components_limit": COMPONENT_OVERVIEW_LIMIT,
+            "more_components": doc.components.defs.len() > COMPONENT_OVERVIEW_LIMIT,
+            "components_truncated": doc.components.defs.len() > COMPONENT_OVERVIEW_LIMIT,
+            "component_discovery": "The component overview is bounded. Read design_system/get_design_system with limit and offset to discover the remaining components and variant sets.",
             "variable_collections": doc.variables.collections.len(),
             "variables": doc.variables.variables.len(),
             "design_system_sources": ["doc/variables.json", "doc/active_modes.json", "components/<set>/set.json"],
@@ -506,7 +567,9 @@ impl DesignSurface for FigDesignSurface {
         let item = self.item()?;
         let item = item.read(cx);
         let document = ready_document(item)?;
-        design_system_json(&document.doc, item.project_root(), query)
+        design_system_json(&document.doc, item.project_root(), query, |design| {
+            item.indexed_design_source(design)
+        })
     }
 
     fn find_empty_space(
@@ -579,6 +642,13 @@ impl DesignSurface for FigDesignSurface {
         let page_index = resolve_page_index(document, query.page)?;
         let page = &document.pages[page_index];
         let root = page.root.context("the page has no root node")?;
+        check_page_listing_budget(
+            doc,
+            root,
+            query.depth,
+            query.offset.unwrap_or(0),
+            query.limit.unwrap_or(DEFAULT_CHILD_LIMIT),
+        )?;
         let mut listing = paginated_node_summary(
             doc,
             root,
@@ -618,6 +688,9 @@ impl DesignSurface for FigDesignSurface {
         };
         if ops.is_empty() {
             return Task::ready(Err(anyhow!("the ops list is empty")));
+        }
+        if ops.iter().all(design_operation_is_presence) {
+            return Task::ready(apply_ops_to_item(&item, &ops, &label, cx));
         }
         let default_container = item.read(cx).doc().and_then(Doc::active_page);
         let batch = cx.new(|cx| {
@@ -667,6 +740,7 @@ impl DesignSurface for FigDesignSurface {
                                 document.doc.selection.iter().copied().collect();
                             batch.original_viewport = document.doc.viewport;
                             document.doc.history.begin(&label, &mut document.doc.scene);
+                            batch.progress.history_started = true;
                             batch.pending = true;
                             (true, DocChange::ContentPreview)
                         })
@@ -1157,21 +1231,34 @@ fn selection_ids(doc: &Doc) -> Vec<String> {
 /// point of a Fanta project is that an agent edits the source, so the state
 /// an agent reads has to say which file to open.
 ///
-/// Resolving a source path scans the project's `pages/` directory (design
-/// directories are slug-named, so paths cannot be derived from ids). That is
-/// fine for a tool call and must never happen in a `render`.
-fn pages_json(pages: &[FigPage], doc: &Doc, project_root: Option<&Path>) -> Vec<Value> {
+fn pages_json(
+    pages: &[FigPage],
+    doc: &Doc,
+    project_root: Option<&Path>,
+    source: impl Fn(fanta_format::ScopedDesign) -> Option<PathBuf>,
+) -> Vec<Value> {
     let active_page = doc.active_page();
+    let authored_pages = doc.pages().iter().copied().collect::<HashSet<_>>();
     pages
         .iter()
         .enumerate()
+        .filter(|(_, page)| {
+            page.root
+                .is_none_or(|root| authored_pages.contains(&root) || Some(root) == active_page)
+        })
         .map(|(index, page)| {
-            let source = page
-                .root
-                .zip(project_root)
-                .and_then(|(root, project_root)| {
-                    fanta_format::locate_page_source(project_root, root)
-                });
+            let source = page.root.and_then(|root| {
+                let design = if authored_pages.contains(&root) {
+                    Some(fanta_format::ScopedDesign::Page(root))
+                } else {
+                    doc.components
+                        .defs
+                        .values()
+                        .find(|definition| definition.root == root)
+                        .map(|definition| fanta_format::ScopedDesign::Component(definition.id))
+                };
+                design.and_then(&source)
+            });
             json!({
                 "index": index,
                 "name": truncate_summary_string(page.name.as_ref(), SUMMARY_LABEL_CHARS),
@@ -1188,15 +1275,24 @@ fn pages_json(pages: &[FigPage], doc: &Doc, project_root: Option<&Path>) -> Vec<
         .collect()
 }
 
+const COMPONENT_OVERVIEW_LIMIT: usize = 100;
+
 /// Component masters are not pages, so their sources live in their own list
 /// rather than overloading `pages`.
-fn components_json(doc: &Doc, project_root: Option<&Path>) -> Vec<Value> {
+fn components_json(
+    doc: &Doc,
+    project_root: Option<&Path>,
+    offset: usize,
+    limit: usize,
+    source: impl Fn(fanta_format::ScopedDesign) -> Option<PathBuf>,
+) -> Vec<Value> {
     doc.components
         .defs
         .values()
+        .skip(offset)
+        .take(limit)
         .map(|def| {
-            let source = project_root
-                .and_then(|project_root| fanta_format::locate_master_source(project_root, def.id));
+            let source = source(fanta_format::ScopedDesign::Component(def.id));
             json!({
                 "id": def.id.to_string(),
                 "name": truncate_summary_string(&def.name, SUMMARY_LABEL_CHARS),
@@ -1213,6 +1309,7 @@ fn design_system_json(
     doc: &Doc,
     project_root: Option<&Path>,
     query: DesignSystemQuery,
+    source: impl Fn(fanta_format::ScopedDesign) -> Option<PathBuf>,
 ) -> Result<Value> {
     let collection = query
         .collection
@@ -1240,11 +1337,18 @@ fn design_system_json(
         "variables": variables.iter().skip(offset).take(limit).collect::<Vec<_>>(),
         "variable_count": variables.len(), "offset": offset, "limit": limit,
         "more_variables": offset.saturating_add(limit) < variables.len(),
-        "components": components_json(doc, project_root),
-        "component_sets": doc.components.sets.values().collect::<Vec<_>>(),
+        "components": components_json(doc, project_root, offset, limit, source),
+        "component_count": doc.components.defs.len(),
+        "components_offset": offset, "components_limit": limit,
+        "more_components": offset.saturating_add(limit) < doc.components.defs.len(),
+        "component_sets": doc.components.sets.values().skip(offset).take(limit).collect::<Vec<_>>(),
+        "component_set_count": doc.components.sets.len(),
+        "component_sets_offset": offset, "component_sets_limit": limit,
+        "more_component_sets": offset.saturating_add(limit) < doc.components.sets.len(),
         "selection_bindings": bindings,
         "source_files": ["doc/variables.json", "doc/active_modes.json", "components/<set>/set.json"],
-        "hints": ["Create semantic variables before components, bind properties, then reuse component instances.",
+        "hints": ["The same offset and limit page variables, components, and component sets independently; collection filters variables only. Continue while the corresponding more_* flag is true.",
+          "Create semantic variables before components, bind properties, then reuse component instances.",
           "Names are exact and must be unique when used instead of ids. Prefer returned ids for follow-up edits.",
           "Variables use per-mode values. set_variable_mode selects a collection mode document-wide or pins a frame."]
     }))
@@ -1608,9 +1712,68 @@ fn resolve_page_index(document: &FigDocument, page: Option<usize>) -> Result<usi
         }
         return Ok(page);
     }
+    if let Some(active_root) = document.doc.active_page()
+        && let Some(index) = document
+            .pages
+            .iter()
+            .position(|page| page.root == Some(active_root))
+    {
+        return Ok(index);
+    }
     document
         .page_index(None)
         .context("the document has no pages")
+}
+
+const PAGE_LISTING_NODE_BUDGET: usize = 1_000;
+
+// A depth limit does not bound wide imported frames; check with a bounded,
+// iterative walk before allocating JSON or asking for every node's geometry.
+fn check_page_listing_budget(
+    doc: &Doc,
+    root: NodeId,
+    depth: Option<u32>,
+    offset: usize,
+    limit: usize,
+) -> Result<()> {
+    if depth == Some(0) {
+        return Ok(());
+    }
+    let children = doc.scene.children_of(Some(root));
+    let end = offset.saturating_add(limit).min(children.len());
+    let window = children.get(offset..end).unwrap_or_default();
+    let error = || {
+        anyhow!(
+            "the page listing exceeds the {PAGE_LISTING_NODE_BUDGET}-node traversal limit; \
+         lower depth, reduce limit with offset to page top-level layers, or fetch relevant nodes by ids"
+        )
+    };
+    if window.len().saturating_add(1) > PAGE_LISTING_NODE_BUDGET {
+        return Err(error());
+    }
+    let child_depth = depth.map(|depth| depth.saturating_sub(1));
+    let mut pending = window
+        .iter()
+        .map(|child| (*child, child_depth))
+        .collect::<Vec<_>>();
+    let mut visited = 1usize;
+    while let Some((node, depth)) = pending.pop() {
+        visited += 1;
+        if depth == Some(0) {
+            continue;
+        }
+        let children = doc.scene.children_of(Some(node));
+        if visited
+            .saturating_add(pending.len())
+            .saturating_add(children.len())
+            > PAGE_LISTING_NODE_BUDGET
+        {
+            return Err(error());
+        }
+        let child_depth = depth.map(|depth| depth.saturating_sub(1));
+        pending.extend(children.iter().map(|child| (*child, child_depth)));
+    }
+    Ok(())
 }
 
 /// [`node_summary`] with the listed node's direct children windowed to
@@ -1917,7 +2080,7 @@ fn prepare_screenshot(
     });
     let document = ready_document(item)?;
     Ok((
-        document.doc.clone(),
+        document.doc.clone_for_persist(),
         document.asset_resolver.clone(),
         document.pages[page_index].root,
         node,
@@ -2037,7 +2200,10 @@ fn apply_batch(
         default_container: doc.active_page(),
         ..BatchProgress::default()
     };
-    doc.history.begin(label, &mut doc.scene);
+    if !ops.iter().all(design_operation_is_presence) {
+        doc.history.begin(label, &mut doc.scene);
+        progress.history_started = true;
+    }
     for (index, operation) in ops.iter().enumerate() {
         progress.apply(doc, assets, index, operation);
         if progress.failure.is_some() {
@@ -2057,6 +2223,7 @@ struct BatchProgress {
     content_changed: bool,
     selection_changed: bool,
     failure: Option<(usize, String)>,
+    history_started: bool,
 }
 
 impl BatchProgress {
@@ -2110,7 +2277,9 @@ impl BatchProgress {
     ) -> BatchOutcome {
         match self.failure.take() {
             None => {
-                doc.history.commit(&mut doc.scene);
+                if self.history_started {
+                    doc.history.commit(&mut doc.scene);
+                }
                 if doc
                     .selection
                     .iter()
@@ -2136,7 +2305,9 @@ impl BatchProgress {
                 }
             }
             Some((index, mut message)) => {
-                if let Err(abort_error) = doc.abort_transaction() {
+                if self.history_started
+                    && let Err(abort_error) = doc.abort_transaction()
+                {
                     message = format!("{message}; rolling back also failed: {abort_error}");
                 }
                 for asset in self.ingested_assets.drain(..) {
@@ -2206,6 +2377,13 @@ impl StreamedDesignBatch {
 fn refresh_streamed_layout(document: &mut FigDocument) {
     document.refresh_layout_baseline();
     document.mark_variables_changed();
+}
+
+fn design_operation_is_presence(operation: &DesignOp) -> bool {
+    matches!(
+        operation,
+        DesignOp::SetViewport { .. } | DesignOp::Select { .. }
+    )
 }
 
 fn design_operation_is_variable(operation: &DesignOp) -> bool {
@@ -4644,6 +4822,42 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn item_only_activation_preserves_requester_only_for_the_same_live_document(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (item, _, project) = streamed_design_fixture(cx).await;
+        cx.update(init);
+        let requester = cx.new(|_| ());
+        cx.update(|cx| {
+            set_active_item_for_view(item.downgrade(), requester.entity_id(), cx);
+            set_active_item(item.downgrade(), cx);
+            assert_eq!(
+                active_view_for_item(item.entity_id(), cx),
+                Some(requester.entity_id())
+            );
+        });
+        let (document, _) = doc_with_page();
+        let other = crate::document::ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/Other.fig"),
+            document,
+            cx,
+        );
+        let other_weak = other.downgrade();
+        cx.update(|cx| {
+            set_active_item(other.downgrade(), cx);
+            assert_eq!(active_view_for_item(item.entity_id(), cx), None);
+            assert_eq!(active_view_for_item(other.entity_id(), cx), None);
+            set_active_item_for_view(other.downgrade(), requester.entity_id(), cx);
+        });
+        drop(other);
+        cx.update(|cx| {
+            set_active_item(other_weak, cx);
+            assert_eq!(cx.global::<ActiveDesignItem>().1.get(), None);
+        });
+    }
+
+    #[gpui::test]
     async fn inspecting_component_source_reports_its_component_scope(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -4719,6 +4933,85 @@ mod tests {
         }
         .await
         .expect("component source inspection should identify its component scope");
+    }
+
+    #[gpui::test]
+    async fn streamed_presence_does_not_start_a_content_preview(cx: &mut gpui::TestAppContext) {
+        let (item, surface, _) = streamed_design_fixture(cx).await;
+        let baseline = item.read_with(cx, |item, _| {
+            let document = item.document().expect("ready document");
+            (
+                document.render_generation(),
+                document.doc.scene.revision(),
+                document.variables_generation(),
+            )
+        });
+        let result = cx
+            .update(|cx| {
+                surface.apply_streamed(
+                    ops(json!([
+                        {"op":"set_viewport","center":[100.0,200.0],"zoom":0.5},
+                        {"op":"select","ids":[]}
+                    ])),
+                    "Navigate".into(),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("presence request");
+        assert_eq!(result["applied"], true);
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("ready document");
+            assert_eq!(document.doc.viewport.center, [100.0, 200.0]);
+            assert_eq!(document.doc.viewport.zoom, 0.5);
+            assert_eq!(document.doc.history.undo_depth(), 0);
+            assert_eq!(
+                (
+                    document.render_generation(),
+                    document.doc.scene.revision(),
+                    document.variables_generation(),
+                ),
+                baseline
+            );
+            assert!(!item.content_preview_active());
+            assert!(!item.is_dirty());
+        });
+    }
+
+    #[test]
+    fn presence_batches_preserve_an_open_content_transaction() -> Result<()> {
+        let (mut document, page) = doc_with_page();
+        let original_name = document.scene.get(page).context("page")?.name.clone();
+        document.history.begin("Original edit", &mut document.scene);
+        document.apply(Operation::SetName {
+            id: page,
+            old: original_name.clone(),
+            new: "Pending name".into(),
+        })?;
+        for operations in [
+            ops(json!([
+                {"op":"set_viewport","center":[100.0,200.0],"zoom":0.5},
+                {"op":"select","ids":[]}
+            ])),
+            ops(json!([{"op":"set_viewport","zoom":-1.0}])),
+        ] {
+            run_batch(&mut document, &operations, "Navigate");
+            assert_eq!(document.history.undo_depth(), 0);
+            assert_eq!(
+                document.scene.get(page).context("page")?.name,
+                "Pending name"
+            );
+        }
+        document.abort_transaction()?;
+        assert_eq!(
+            document.scene.get(page).context("page")?.name,
+            original_name
+        );
+        assert_eq!(document.viewport.center, [100.0, 200.0]);
+        assert_eq!(document.viewport.zoom, 0.5);
+        Ok(())
     }
 
     #[gpui::test]
@@ -5037,6 +5330,7 @@ mod tests {
                 include_bindings: true,
                 ..Default::default()
             },
+            |_| None,
         )?;
         assert_eq!(state["variable_count"], 1);
         assert_eq!(
@@ -5085,6 +5379,121 @@ mod tests {
         );
         assert_eq!(result.value["applied"], false);
         assert!(doc.variables.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn agent_design_system_pages_large_component_libraries_before_resolving_sources() -> Result<()>
+    {
+        use fanta_doc::{
+            ComponentDef, ComponentPropDef, ComponentPropId, ComponentPropKind, ComponentSet,
+        };
+
+        let (mut doc, page) = doc_with_page();
+        for index in 0..9_012 {
+            let id = ComponentId::from_u128(index + 1);
+            let mut definition = ComponentDef::new(id, page, format!("Component {index}"));
+            if index == 120 {
+                definition.props.push(ComponentPropDef {
+                    id: ComponentPropId::new(),
+                    name: "Label".into(),
+                    kind: ComponentPropKind::Text,
+                    formatter: Default::default(),
+                    default: VarValue::String {
+                        value: "Export".into(),
+                    },
+                    bindings: Vec::new(),
+                });
+            }
+            doc.components.defs.insert(id, definition);
+            if index < 250 {
+                let set = ComponentId::from_u128(10_000 + index);
+                doc.components.sets.insert(
+                    set,
+                    ComponentSet {
+                        id: set,
+                        name: format!("Set {index}"),
+                        axes: Vec::new(),
+                        members: vec![id],
+                        default_variant: id,
+                        root: None,
+                    },
+                );
+            }
+        }
+        let source_calls = std::cell::Cell::new(0);
+        let overview = components_json(&doc, None, 0, COMPONENT_OVERVIEW_LIMIT, |_| {
+            source_calls.set(source_calls.get() + 1);
+            None
+        });
+        assert_eq!(overview.len(), COMPONENT_OVERVIEW_LIMIT);
+        assert_eq!(source_calls.get(), COMPONENT_OVERVIEW_LIMIT);
+
+        source_calls.set(0);
+        let window = design_system_json(
+            &doc,
+            None,
+            DesignSystemQuery {
+                offset: Some(120),
+                limit: Some(23),
+                ..Default::default()
+            },
+            |_| {
+                source_calls.set(source_calls.get() + 1);
+                None
+            },
+        )?;
+        assert_eq!(source_calls.get(), 23);
+        assert_eq!(window["component_count"], 9_012);
+        assert_eq!(window["component_set_count"], 250);
+        assert_eq!(window["components_offset"], 120);
+        assert_eq!(window["components_limit"], 23);
+        assert_eq!(
+            window["components"].as_array().context("components")?.len(),
+            23
+        );
+        assert_eq!(
+            window["component_sets"].as_array().context("sets")?.len(),
+            23
+        );
+        assert_eq!(window["components"][0]["name"], "Component 120");
+        assert_eq!(window["component_sets"][0]["name"], "Set 120");
+        assert_eq!(window["components"][0]["properties"][0]["name"], "Label");
+        assert_eq!(window["more_components"], true);
+        assert_eq!(window["more_component_sets"], true);
+        assert_eq!(window["more_variables"], false);
+
+        let tail = design_system_json(
+            &doc,
+            None,
+            DesignSystemQuery {
+                offset: Some(9_010),
+                limit: Some(usize::MAX),
+                ..Default::default()
+            },
+            |_| None,
+        )?;
+        assert_eq!(tail["components"].as_array().context("tail")?.len(), 2);
+        assert_eq!(tail["components_limit"], 200);
+        assert_eq!(tail["more_components"], false);
+        assert_eq!(tail["more_component_sets"], false);
+
+        let past_end = design_system_json(
+            &doc,
+            None,
+            DesignSystemQuery {
+                offset: Some(usize::MAX),
+                ..Default::default()
+            },
+            |_| None,
+        )?;
+        assert!(
+            past_end["components"]
+                .as_array()
+                .context("past end")?
+                .is_empty()
+        );
+        assert_eq!(past_end["more_components"], false);
         Ok(())
     }
 
@@ -5534,7 +5943,12 @@ mod tests {
             hidden: false,
         }];
 
-        let located = pages_json(&pages, &doc, Some(temporary.path()));
+        let saved_source = fanta_format::locate_page_source(temporary.path(), page_id);
+        let located = pages_json(&pages, &doc, Some(temporary.path()), |design| {
+            (design == fanta_format::ScopedDesign::Page(page_id))
+                .then(|| saved_source.clone())
+                .flatten()
+        });
         let source = located[0]["source"]
             .as_str()
             .expect("the page names its source");
@@ -5542,7 +5956,82 @@ mod tests {
         assert!(source.starts_with("pages/"), "{source}");
 
         // A `.fig` import with no project on disk has no source to name.
-        assert_eq!(pages_json(&pages, &doc, None)[0]["source"], Value::Null);
+        assert_eq!(
+            pages_json(&pages, &doc, None, |_| None)[0]["source"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn page_overview_omits_inactive_component_canvases_and_keeps_active_source() -> Result<()> {
+        use fanta_doc::ComponentDef;
+        use fanta_format::ScopedDesign;
+
+        let mut doc = Doc::new();
+        let mut pages = Vec::new();
+        for index in 0..23 {
+            let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+            page.name = format!("Page {index}");
+            let root = page.id;
+            doc.scene.insert(page)?;
+            doc.add_page(root);
+            pages.push(FigPage {
+                root: Some(root),
+                name: format!("Page {index}").into(),
+                bounds: Bounds::ZERO,
+                hidden: false,
+            });
+        }
+        for index in 0..9_012 {
+            let master = CanvasNode::new(NodeData::Group(GroupNode::default()));
+            let root = master.id;
+            doc.scene.insert(master)?;
+            let id = ComponentId::from_u128(index + 1);
+            doc.components
+                .defs
+                .insert(id, ComponentDef::new(id, root, format!("Master {index}")));
+            pages.push(FigPage {
+                root: Some(root),
+                name: format!("Master {index}").into(),
+                bounds: Bounds::ZERO,
+                hidden: true,
+            });
+        }
+        let project = Path::new("/project");
+        let calls = std::cell::Cell::new(0);
+        let source = |design| {
+            calls.set(calls.get() + 1);
+            Some(match design {
+                ScopedDesign::Page(id) => project.join(format!("pages/{id}/page.fnx")),
+                ScopedDesign::Component(id) => project.join(format!("components/{id}/master.fnx")),
+            })
+        };
+        let overview = pages_json(&pages, &doc, Some(project), source);
+        assert_eq!(overview.len(), 23);
+        assert_eq!(calls.get(), 23);
+        for (index, page) in overview.iter().enumerate() {
+            assert_eq!(page["index"], index);
+        }
+
+        let active_index = 23 + 4_500;
+        let active_root = pages
+            .get(active_index)
+            .and_then(|page| page.root)
+            .context("master")?;
+        doc.set_active_page(Some(active_root));
+        calls.set(0);
+        let active_overview = pages_json(&pages, &doc, Some(project), source);
+        assert_eq!(active_overview.len(), 24);
+        assert_eq!(calls.get(), 24);
+        let master = active_overview.last().context("active master entry")?;
+        assert_eq!(master["index"], active_index);
+        assert_eq!(master["root"], active_root.to_string());
+        assert_eq!(master["active"], true);
+        assert_eq!(
+            master["source"],
+            format!("components/{}/master.fnx", ComponentId::from_u128(4_501))
+        );
+        Ok(())
     }
 
     #[test]
@@ -6751,6 +7240,264 @@ mod tests {
         assert_eq!(summary["child_count"], json!(4));
         assert!(summary.get("children").is_none());
         assert!(summary.get("more_children").is_none());
+    }
+
+    #[test]
+    fn page_listing_budget_limits_nested_breadth_and_allows_narrower_queries() -> Result<()> {
+        let (mut doc, page) = doc_with_page();
+        let mut frame = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        frame.parent = Some(page);
+        let frame_id = frame.id;
+        doc.scene.insert(frame)?;
+        for _ in 0..PAGE_LISTING_NODE_BUDGET {
+            let mut child = CanvasNode::new(NodeData::Group(GroupNode::default()));
+            child.parent = Some(frame_id);
+            child.index = doc.scene.next_child_index(Some(frame_id));
+            doc.scene.insert(child)?;
+        }
+        let mut sibling = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        sibling.parent = Some(page);
+        sibling.index = doc.scene.next_child_index(Some(page));
+        doc.scene.insert(sibling)?;
+
+        let error = check_page_listing_budget(&doc, page, Some(2), 0, 1)
+            .expect_err("one broad frame exceeds the total-node budget");
+        let message = error.to_string();
+        assert!(message.contains("depth"));
+        assert!(message.contains("limit"));
+        assert!(message.contains("ids"));
+        assert!(check_page_listing_budget(&doc, page, None, 0, 1).is_err());
+        check_page_listing_budget(&doc, page, Some(1), 0, 1)?;
+        check_page_listing_budget(&doc, page, Some(0), 0, usize::MAX)?;
+        check_page_listing_budget(&doc, page, None, 1, 1)?;
+        check_page_listing_budget(&doc, page, Some(u32::MAX), 99, usize::MAX)?;
+        Ok(())
+    }
+
+    #[gpui::test]
+    async fn planner_scene_shallows_broad_frames_without_hiding_their_child_count(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        async {
+            let (item, surface, _) = streamed_design_fixture(cx).await;
+            let frame = item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    let result = (|| {
+                        let page = document.doc.active_page().context("active page")?;
+                        let mut frame = CanvasNode::new(NodeData::Group(GroupNode {
+                            clip_size: Some([128.0, 48.0]),
+                            ..Default::default()
+                        }));
+                        frame.parent = Some(page);
+                        let frame_id = frame.id;
+                        document.doc.scene.insert(frame)?;
+                        for _ in 0..PAGE_LISTING_NODE_BUDGET {
+                            let mut child = CanvasNode::new(NodeData::Group(GroupNode::default()));
+                            child.parent = Some(frame_id);
+                            child.index = document.doc.scene.next_child_index(Some(frame_id));
+                            document.doc.scene.insert(child)?;
+                        }
+                        Ok::<_, anyhow::Error>(frame_id)
+                    })();
+                    (result, DocChange::Content)
+                })
+                .context("document")?
+            })?;
+            let scene = item.read_with(cx, |item, _| page_scene(item, u32::MAX, 50))?;
+            assert_eq!(scene.len(), 1);
+            let listed = scene.first().context("frame summary")?;
+            assert_eq!(listed["id"], frame.to_string());
+            assert_eq!(listed["child_count"], PAGE_LISTING_NODE_BUDGET);
+            assert!(listed.get("children").is_none());
+            let explicit = cx.update(|cx| {
+                surface.get_nodes(
+                    NodeQuery {
+                        depth: Some(2),
+                        limit: Some(1),
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            });
+            assert!(
+                explicit.is_err(),
+                "an explicit over-budget query remains an error"
+            );
+            Ok::<_, anyhow::Error>(())
+        }
+        .await
+        .expect("the planner can read dense imported pages safely");
+    }
+
+    #[gpui::test]
+    async fn default_agent_queries_follow_authored_and_component_canvas_focus(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        async {
+            let (_, _, project) = streamed_design_fixture(cx).await;
+            let (mut doc, first) = doc_with_page();
+            let mut second = CanvasNode::new(NodeData::Group(GroupNode::default()));
+            second.name = "Second page".into();
+            let second_root = second.id;
+            doc.scene.insert(second)?;
+            doc.add_page(second_root);
+            let mut master = CanvasNode::new(NodeData::Group(GroupNode::default()));
+            master.name = "Button".into();
+            let master_root = master.id;
+            doc.scene.insert(master)?;
+            let component = ComponentId::new();
+            doc.components.defs.insert(
+                component,
+                fanta_doc::ComponentDef::new(component, master_root, "Button"),
+            );
+            for (root, name, width, color) in [
+                (first, "First content", 200.0, Color::WHITE),
+                (second_root, "Second content", 100.0, Color::BLACK),
+                (master_root, "Button content", 80.0, Color::WHITE),
+            ] {
+                let mut node = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                    0.0, 0.0, width, 40.0, color,
+                )));
+                node.parent = Some(root);
+                node.name = name.into();
+                doc.scene.insert(node)?;
+            }
+            doc.set_active_page(Some(first));
+            let item = crate::document::ready_item_for_test(
+                &project,
+                PathBuf::from("/tmp/Focus.fig"),
+                doc,
+                cx,
+            );
+            let surface = FigDesignSurface {
+                active: Rc::new(RefCell::new(Some(item.downgrade()))),
+            };
+            assert_eq!(
+                item.read_with(cx, |item, _| item
+                    .document()
+                    .and_then(|document| document.page_index(None))),
+                Some(0)
+            );
+            for (root, name) in [
+                (second_root, "Second content"),
+                (master_root, "Button content"),
+            ] {
+                item.update(cx, |item, cx| {
+                    item.with_document(cx, |document| {
+                        document.doc.set_active_page(Some(root));
+                        ((), DocChange::Selection)
+                    })
+                });
+                let index = item
+                    .read_with(cx, |item, _| {
+                        item.document().and_then(|document| {
+                            document
+                                .pages
+                                .iter()
+                                .position(|page| page.root == Some(root))
+                        })
+                    })
+                    .context("focused canvas index")?;
+                let state = cx.update(|cx| surface.state(cx))?;
+                assert_eq!(state["active_page_index"], index);
+                assert_eq!(state["active_root"], root.to_string());
+                assert!(
+                    state["pages"]
+                        .as_array()
+                        .context("page overview")?
+                        .iter()
+                        .any(|page| page["root"] == root.to_string() && page["active"] == true)
+                );
+                let nodes = cx.update(|cx| surface.get_nodes(NodeQuery::default(), cx))?;
+                assert_eq!(nodes["root"]["id"], root.to_string());
+                assert_eq!(nodes["page"], index);
+                let scene = item.read_with(cx, |item, _| page_scene(item, 8, 50))?;
+                assert_eq!(scene.first().context("focused scene")?["name"], name);
+                let (_, _, screenshot_root, _) = item.update(cx, |item, cx| {
+                    prepare_screenshot(item, &ScreenshotTarget::default(), cx)
+                })?;
+                assert_eq!(screenshot_root, Some(root));
+                let explicit = cx.update(|cx| {
+                    surface.get_nodes(
+                        NodeQuery {
+                            page: Some(0),
+                            ..Default::default()
+                        },
+                        cx,
+                    )
+                })?;
+                assert_eq!(explicit["root"]["id"], first.to_string());
+            }
+            item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    document.doc.set_active_page(None);
+                    ((), DocChange::Selection)
+                })
+            });
+            let fallback = cx.update(|cx| surface.get_nodes(NodeQuery::default(), cx))?;
+            assert_eq!(fallback["root"]["id"], first.to_string());
+            Ok::<_, anyhow::Error>(())
+        }
+        .await
+        .expect("agent reads and screenshots follow the focused canvas");
+    }
+
+    #[gpui::test]
+    async fn agent_screenshot_excludes_undo_payloads_and_preserves_pixels(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        async {
+            let (item, _, _) = streamed_design_fixture(cx).await;
+            let result = cx.update(|cx| {
+                apply_ops_to_item(
+                    &item,
+                    &ops(json!([
+                        {"op":"create_node","node_type":"rectangle","x":0,"y":0,
+                         "width":128,"height":48,"fill":"#2255EE"}
+                    ])),
+                    "Create export button",
+                    cx,
+                )
+            })?;
+            let node = result["created"][0]
+                .as_str()
+                .context("created node")?
+                .parse::<NodeId>()?;
+            item.update(cx, |item, cx| {
+                item.with_document(cx, |document| {
+                    document.doc.selection.replace_with([node]);
+                    ((), DocChange::Selection)
+                })
+            });
+            let target = ScreenshotTarget {
+                max_dimension: Some(64),
+                ..Default::default()
+            };
+            let original = item.read_with(cx, |item, _| {
+                let doc = item.doc().context("document")?;
+                render_surface_screenshot(doc, None, doc.active_page(), None, target.clone())
+            })?;
+            let (snapshot, assets, root, selected_node) =
+                item.update(cx, |item, cx| prepare_screenshot(item, &target, cx))?;
+            assert_eq!(snapshot.history.undo_depth(), 0);
+            assert_eq!(snapshot.history.redo_depth(), 0);
+            assert!(snapshot.selection.is_empty());
+            assert_eq!(
+                render_surface_screenshot(&snapshot, assets, root, selected_node, target)?,
+                original
+            );
+            item.read_with(cx, |item, _| {
+                let doc = item.doc().expect("live document");
+                assert_eq!(doc.history.undo_depth(), 1);
+                assert_eq!(
+                    doc.selection.iter().copied().collect::<Vec<_>>(),
+                    vec![node]
+                );
+            });
+            Ok::<_, anyhow::Error>(())
+        }
+        .await
+        .expect("agent screenshots preserve rendering without copying undo state");
     }
 
     #[test]

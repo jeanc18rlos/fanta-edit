@@ -34,14 +34,14 @@ mod tests;
 
 pub use api::{
     FnxSidecar, decode_subtree, decode_subtree_with, encode_subtree, encode_subtree_with,
-    reconcile_sidecar,
+    reconcile_sidecar, reconcile_sidecar_from_tree,
 };
 pub use canonicalize::{canonicalize_legacy_source, with_module_depth};
-pub use convert::{FnxError, FnxTree, nodes_from_tree, tree_from_nodes};
-pub use ir::ArtifactIr;
+pub use convert::{FnxError, FnxTree, nodes_from_tree, nodes_from_tree_owned, tree_from_nodes};
+pub use ir::{ArtifactIr, PreparedStructuralPatch, StructuralNodeChange};
 pub use kind::{ArtifactKind, ImportTarget, artifact_file_names, import_allowed};
 pub use model::{FnxElement, IdEntry, tag_for_type, type_for_tag};
 pub use parse::{parse_doc, parse_doc_with};
 pub use print::{print_doc, print_doc_with};
 pub use refs::{RefTable, desugar_refs, sugar_refs};
-pub use source::FnxSourceMirror;
+pub use source::{FnxSourceMirror, sidecar_matches_source, source_reference_nodes_with};

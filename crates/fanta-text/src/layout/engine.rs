@@ -2,7 +2,7 @@
 //! [`TextBuffer`] into a [`TextLayout`].
 
 use crate::buffer::TextBuffer;
-use crate::font_resolver::{FontResolver, font_style};
+use crate::font_resolver::{FontGenerationObserver, FontResolver, font_style};
 use crate::layout::align::Align;
 use crate::layout::text_layout::TextLayout;
 use crate::style::TextStyle;
@@ -91,6 +91,11 @@ impl LayoutEngine {
     /// Epoch of the mutable font provider used by this engine and its clones.
     pub fn font_generation(&self) -> Option<u64> {
         self.resolver.generation()
+    }
+
+    /// Read registration changes from another thread without sharing this engine.
+    pub fn font_generation_observer(&self) -> FontGenerationObserver {
+        self.resolver.font_generation_observer()
     }
 
     /// Lay out `buffer` wrapping at `max_width` pixels.

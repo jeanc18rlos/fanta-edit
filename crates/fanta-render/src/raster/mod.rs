@@ -85,6 +85,7 @@
 // ---------------------------------------------------------------------------
 
 mod boolean;
+mod camera_cache;
 mod content;
 mod cull;
 mod effects;
@@ -106,13 +107,14 @@ mod tests;
 
 // Public surface — preserves the exact paths `crate::raster::*` (and, via
 // `lib.rs`, `fanta_render::*`) resolved before the split.
+pub use camera_cache::{CameraCacheMetrics, CameraCacheResult};
 pub use instance::{measure_text_node, solve_doc_layout, solve_scene_layout};
 pub use renderer::{
     MediaPlayback, RasterRenderer, RenderError, RenderInputs, RenderMetrics, SvgRenderOptions,
     SvgRenderOutput,
 };
 #[cfg(feature = "metal")]
-pub use split::RetainedGpuTarget;
+pub use split::{GraphiteSubmissionMetrics, RetainedGpuTarget, RetainedGraphiteContext};
 pub use split::{
     RetainedBuildMetrics, RetainedError, RetainedFrame, RetainedFrameMetrics,
     RetainedTranslationSession, SplitError, SplitPhase, SplitSpec,

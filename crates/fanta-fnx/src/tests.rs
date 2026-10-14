@@ -21,6 +21,110 @@ fn round_trip(nodes: &[Value]) -> Vec<Value> {
     nodes_from_tree(&root, &tree.sidecar, tree.root_parent.as_deref()).expect("recompose")
 }
 
+#[test]
+fn consuming_tree_conversion_moves_geometry_and_preserves_node_bytes() {
+    let mut tree = tree_from_nodes(&sample()).expect("tree");
+    let geometry: Vec<_> = (0..4096)
+        .map(|index| json!([index, 0.25, "雪🙂"]))
+        .collect();
+    let geometry_pointer = geometry.as_ptr();
+    tree.root
+        .attrs
+        .insert("future_geometry".into(), Value::Array(geometry));
+    tree.root
+        .attrs
+        .insert("type".into(), Value::from("ignored source type"));
+    tree.root
+        .attrs
+        .insert("parent".into(), Value::from("ignored source parent"));
+    tree.root.attrs.insert("index".into(), Value::from(-17));
+    tree.sidecar[0].index = Value::Null;
+    tree.sidecar[1].index = json!(0.9999999999999999);
+    let root_parent = Some("external-parent");
+    let borrowed = nodes_from_tree(&tree.root, &tree.sidecar, root_parent).expect("borrowed nodes");
+    let owned =
+        nodes_from_tree_owned(tree.root, &tree.sidecar, root_parent).expect("consumed nodes");
+    assert_eq!(owned, borrowed);
+    assert_eq!(
+        serde_json::to_vec(&owned).expect("owned bytes"),
+        serde_json::to_vec(&borrowed).expect("borrowed bytes")
+    );
+    assert_eq!(
+        owned
+            .first()
+            .and_then(|node| node.get("future_geometry"))
+            .and_then(Value::as_array)
+            .map(Vec::as_ptr),
+        Some(geometry_pointer),
+        "the geometry allocation must move into the node map"
+    );
+}
+
+#[test]
+fn consuming_tree_conversion_preserves_validation_errors() {
+    let tree = tree_from_nodes(&sample()).expect("tree");
+    for count in [0, tree.sidecar.len() - 1, tree.sidecar.len() + 1] {
+        let mut sidecar = tree.sidecar.clone();
+        sidecar.resize(count, tree.sidecar.first().expect("root identity").clone());
+        let borrowed = nodes_from_tree(&tree.root, &sidecar, None).expect_err("mismatched count");
+        let owned =
+            nodes_from_tree_owned(tree.root.clone(), &sidecar, None).expect_err("mismatched count");
+        assert_eq!(owned.to_string(), borrowed.to_string());
+    }
+    for unknown_tag in [false, true] {
+        let mut root = tree.root.clone();
+        root.attrs
+            .insert("id".into(), Value::from("wrong-explicit-id"));
+        if unknown_tag {
+            root.tag = "UnknownTag".into();
+        }
+        let borrowed = nodes_from_tree(&root, &tree.sidecar, None).expect_err("invalid element");
+        let owned = nodes_from_tree_owned(root, &tree.sidecar, None).expect_err("invalid element");
+        assert_eq!(owned.to_string(), borrowed.to_string());
+    }
+}
+
+#[test]
+fn parsed_tree_reconciliation_matches_source_reconciliation() {
+    let (source, sidecar) = encode_subtree(&sample(), "Root").expect("source");
+    let mut legacy = source.clone();
+    for entry in &sidecar.ids {
+        legacy = legacy.replace(&format!("id=\"{}\"", entry.id), "");
+    }
+    let inserted = legacy.replacen(
+        "</Frame>",
+        "<Text name=\"Added\" content=\"雪🙂\" /></Frame>",
+        1,
+    );
+    for edited in [
+        source.clone(),
+        legacy,
+        inserted,
+        source.replace("Card", "Renamed"),
+    ] {
+        let root = parse_doc(&edited).expect("canonical tree");
+        let expected =
+            reconcile_sidecar(&edited, &sidecar, sequential_minter()).expect("source identities");
+        let actual = reconcile_sidecar_from_tree(&root, &sidecar, sequential_minter())
+            .expect("tree identities");
+        assert_eq!(actual, expected);
+        assert_eq!(
+            serde_json::to_vec(&actual).expect("tree sidecar bytes"),
+            serde_json::to_vec(&expected).expect("source sidecar bytes")
+        );
+    }
+    let root_id = sidecar.ids.first().expect("root").id.as_str();
+    let child_id = sidecar.ids.get(1).expect("child").id.as_str();
+    let duplicate = source.replace(&format!("id=\"{child_id}\""), &format!("id=\"{root_id}\""));
+    let root = parse_doc(&duplicate).expect("duplicate source parses");
+    assert_eq!(
+        reconcile_sidecar_from_tree(&root, &sidecar, sequential_minter())
+            .expect_err("duplicate identity"),
+        reconcile_sidecar(&duplicate, &sidecar, sequential_minter())
+            .expect_err("duplicate identity")
+    );
+}
+
 /// A representative subtree: a frame root with nested frame, text, vector —
 /// exercising strings, numbers, bools, arrays, nested objects (incl. a color
 /// object), and an opaque `meta` blob.

@@ -23,10 +23,12 @@ use fanta_doc::{
 };
 use fanta_fnx::{
     ArtifactIr, ArtifactKind, FnxElement, FnxSidecar, FnxSourceMirror, RefTable,
-    artifact_file_names,
+    StructuralNodeChange, artifact_file_names,
 };
 use serde_json::{Map, Value};
-use std::collections::BTreeMap;
+use sha2::{Digest, Sha256};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
@@ -76,6 +78,21 @@ pub struct ArtifactSession {
     /// skip its two full-scene projections on the editor hot path. `None` (or
     /// any mismatch) degrades to the full reconciliation, never the reverse.
     last_synced_scene: Option<(u64, u64)>,
+    last_synced_projection: Option<(Arc<()>, Arc<()>)>,
+}
+
+pub(super) struct SourceIdentityWitness {
+    source_name: String,
+    source_hash: [u8; 32],
+    sidecar_name: String,
+    sidecar_hash: [u8; 32],
+}
+
+impl SourceIdentityWitness {
+    pub(super) fn matches(&self, hashes: &BTreeMap<String, [u8; 32]>) -> bool {
+        hashes.get(&self.source_name) == Some(&self.source_hash)
+            && hashes.get(&self.sidecar_name) == Some(&self.sidecar_hash)
+    }
 }
 
 impl ArtifactSession {
@@ -137,6 +154,13 @@ impl ArtifactSession {
                 self.scoped.doc.scene.instance_id(),
                 self.scoped.doc.scene.revision(),
             ))
+            && self
+                .last_synced_projection
+                .as_ref()
+                .is_some_and(|(ir, source)| {
+                    Arc::ptr_eq(ir, &self.ir.synchronization_token())
+                        && Arc::ptr_eq(source, &self.source.synchronization_token())
+                })
     }
 
     /// Record that scene and retained source agree RIGHT NOW. Call only at a
@@ -145,6 +169,10 @@ impl ArtifactSession {
         self.last_synced_scene = Some((
             self.scoped.doc.scene.instance_id(),
             self.scoped.doc.scene.revision(),
+        ));
+        self.last_synced_projection = Some((
+            self.ir.synchronization_token(),
+            self.source.synchronization_token(),
         ));
     }
 
@@ -176,6 +204,9 @@ impl ArtifactSession {
         if let Some(changed) = self.shared_scene_delta(&scoped) {
             return self.adopt_shared_scene(scoped, changed);
         }
+        if let Some(changes) = self.structural_scene_changes(&scoped)? {
+            return self.adopt_structural_scene(scoped, changes, None);
+        }
         self.adopt_scoped_doc_full(scoped)
     }
 
@@ -203,7 +234,18 @@ impl ArtifactSession {
             _ => None,
         };
         if let Some(scoped) = scopes.scope(self.kind, self.scoped.root, component) {
-            return self.adopt_scoped_doc(scoped?);
+            let scoped = scoped?;
+            if self.kind == ArtifactKind::Component
+                && self.ir.sidecar().root_parent
+                    != document
+                        .scene
+                        .get(self.scoped.root)
+                        .and_then(|node| node.parent)
+                        .map(|parent| parent.0.to_string())
+            {
+                return self.adopt_scoped_doc_full(scoped);
+            }
+            return self.adopt_scoped_doc(scoped);
         }
         let nodes = super::materialize::collect_subtree_nodes(document, self.scoped.root)?;
         let ir = ArtifactIr::from_nodes(self.kind, self.fn_name.clone(), &nodes)?;
@@ -296,11 +338,25 @@ impl ArtifactSession {
 
         // Editor hot path: a non-structural transaction on a provably-synced
         // scene validates and installs in place with node-scoped rollback,
-        // skipping the O(artifact) session clone entirely. Structural edits and
-        // any drifted state keep the correct-first clone-then-swap below.
+        // skipping the O(artifact) session clone entirely. Unproven transitions
+        // keep the clone-then-swap path below.
         let structural = transaction.ops.iter().any(is_structural_op);
         if !structural && self.scene_in_sync() {
             return self.apply_non_structural_in_place(transaction);
+        }
+        if structural && self.scene_in_sync() {
+            let mut scoped = ScopedDoc {
+                doc: self.scoped.doc.clone_for_persist(),
+                root: self.scoped.root,
+            };
+            scoped.doc.selection = self.scoped.doc.selection.clone();
+            scoped
+                .doc
+                .apply_transaction(transaction.clone())
+                .map_err(|error| SessionError::other(format!("apply: {error}")))?;
+            if let Some(changes) = self.structural_scene_changes(&scoped)? {
+                return self.adopt_structural_scene(scoped, changes, Some(transaction));
+            }
         }
 
         let mut scratch = self.clone();
@@ -747,6 +803,55 @@ impl ArtifactSession {
         Ok(files)
     }
 
+    pub(super) fn project_files_with_identity(
+        &self,
+    ) -> Result<(Vec<(String, Vec<u8>)>, Option<SourceIdentityWitness>), SessionError> {
+        let files = self.project_to_files()?;
+        if !self.scene_in_sync()
+            || self.ir_stale
+            || self.scene_stale
+            || !matches!(
+                self.state,
+                ArtifactDirty::Clean | ArtifactDirty::DirtyCanvas
+            )
+            || !self.source.retained_identity_matches(self.ir.sidecar())?
+            || self
+                .ir
+                .sidecar()
+                .ids
+                .iter()
+                .any(|entry| !entry.index.is_null() && !entry.index.is_number())
+            || self
+                .ir
+                .sidecar()
+                .root_parent
+                .as_ref()
+                .is_some_and(|parent| {
+                    serde_json::from_value::<NodeId>(Value::String(parent.clone())).is_err()
+                })
+        {
+            return Ok((files, None));
+        }
+        let (source_name, sidecar_name, _) = file_names(self.kind);
+        let source = files
+            .iter()
+            .find(|(name, _)| name == source_name)
+            .map(|(_, bytes)| bytes.as_slice())
+            .ok_or_else(|| SessionError::other("projected source is absent"))?;
+        let sidecar = files
+            .iter()
+            .find(|(name, _)| name == sidecar_name)
+            .map(|(_, bytes)| bytes.as_slice())
+            .ok_or_else(|| SessionError::other("projected sidecar is absent"))?;
+        let witness = SourceIdentityWitness {
+            source_name: source_name.into(),
+            source_hash: Sha256::digest(source).into(),
+            sidecar_name: sidecar_name.into(),
+            sidecar_hash: Sha256::digest(sidecar).into(),
+        };
+        Ok((files, Some(witness)))
+    }
+
     fn project_to_files_unplaced(&self) -> Result<Vec<(String, Vec<u8>)>, SessionError> {
         match &self.state {
             ArtifactDirty::Clean => {
@@ -782,13 +887,18 @@ impl ArtifactSession {
     }
 
     fn project_canvas_files(&self) -> Result<Vec<(String, Vec<u8>)>, SessionError> {
+        if !self.ir_stale && !self.source.references_match_current_table()? {
+            return Err(SessionError::InvalidSource(
+                "retained reference names no longer resolve to their original ids; save the shared registry through the complete document projection".into(),
+            ));
+        }
         let header = self.projected_canvas_header()?;
         let (ir, text) = if self.ir_stale {
             let ir = self.projected_source_ir(header.clone())?;
             let text = self.source.rebuild_tree(&self.ir, &ir)?.render();
-            (ir, text)
+            (Cow::Owned(ir), text)
         } else {
-            (self.ir.clone(), self.source.render())
+            (Cow::Borrowed(&self.ir), self.source.render())
         };
         let (fnx_name, ids_name, header_name) = file_names(self.kind);
         let mut files = Vec::new();
@@ -899,21 +1009,207 @@ impl ArtifactSession {
                 }
             }
         };
-        self.mark_scene_synced();
         if self.projected_canvas_header()? != header_before {
             self.state = ArtifactDirty::DirtyCanvas;
             self.working_generation = self.working_generation.wrapping_add(1);
         }
         #[cfg(debug_assertions)]
         {
-            let scene = self.scene_node_map()?;
-            let retained = self.retained_scene_projection()?;
-            debug_assert!(
-                retained.nodes == scene.nodes,
-                "the incremental adoption left the retained source out of sync"
-            );
+            if let SourceSync::PatchedNodes { nodes } = &source_sync {
+                for id in nodes {
+                    self.validate_retained_node(
+                        *id,
+                        self.ir.node_value(&id.0.to_string())?,
+                        &self.scoped,
+                    )?;
+                }
+            }
         }
+        self.mark_scene_synced();
         Ok(source_sync)
+    }
+
+    fn structural_scene_changes(
+        &self,
+        next: &ScopedDoc,
+    ) -> Result<Option<Vec<StructuralNodeChange>>, SessionError> {
+        if !self.scene_in_sync()
+            || !matches!(self.kind, ArtifactKind::Page | ArtifactKind::Component)
+            || !matches!(
+                self.state,
+                ArtifactDirty::Clean | ArtifactDirty::DirtyCanvas
+            )
+        {
+            return Ok(None);
+        }
+        let root = self.scoped.root;
+        let current = &self.scoped.doc.scene;
+        let incoming = &next.doc.scene;
+        if current.get(root) != incoming.get(root)
+            || current.roots() != [root]
+            || incoming.roots() != [root]
+            || current.len() != self.ir.sidecar().ids.len()
+        {
+            return Ok(None);
+        }
+        incoming
+            .validate()
+            .map_err(|error| SessionError::DocAssemble(error.to_string()))?;
+        let mut ids: BTreeSet<_> = current.descendants_of(root).skip(1).collect();
+        ids.extend(incoming.descendants_of(root).skip(1));
+        let mut changes = Vec::new();
+        let mut structural = false;
+        for id in ids {
+            if incoming.shares_node(current, id) {
+                continue;
+            }
+            let before = current.get(id);
+            let after = incoming.get(id);
+            // The first adoption comes from independently decoded source. Value
+            // equality proves those unchanged nodes without projecting their
+            // vector payloads into a second JSON representation.
+            if before == after {
+                continue;
+            }
+            if let (Some(before), Some(after)) = (before, after) {
+                if std::mem::discriminant(&before.data) != std::mem::discriminant(&after.data) {
+                    return Ok(None);
+                }
+                structural |= before.parent != after.parent || before.index != after.index;
+            } else {
+                structural = true;
+            }
+            let to_value = |node: Option<&CanvasNode>| {
+                node.map(serde_json::to_value)
+                    .transpose()
+                    .map_err(|error| SessionError::other(error.to_string()))
+            };
+            let before = to_value(before)?;
+            let after = to_value(after)?;
+            if let Some(after) = &after {
+                serde_json::from_value::<CanvasNode>(after.clone())
+                    .map_err(|error| SessionError::DocAssemble(error.to_string()))?;
+            }
+            if let Some(before) = &before {
+                self.validate_source_node_change(&id.0.to_string(), before, after.as_ref())?;
+            }
+            changes.push(StructuralNodeChange {
+                id: id.0.to_string(),
+                before,
+                after,
+            });
+        }
+        Ok(structural.then_some(changes))
+    }
+
+    fn adopt_structural_scene(
+        &mut self,
+        mut scoped: ScopedDoc,
+        changes: Vec<StructuralNodeChange>,
+        transaction: Option<Transaction>,
+    ) -> Result<SourceSync, SessionError> {
+        let patch = self.ir.prepare_structural_patch(&changes)?;
+        let source = self.source.prepare_structural_patch(&self.ir, &patch)?;
+        self.validate_structural_adoption(&scoped, &changes, &patch)?;
+        self.ir.commit_structural_patch(patch)?;
+        if let Some(transaction) = transaction {
+            let mut history = std::mem::replace(&mut self.scoped.doc.history, History::new());
+            history.record_applied_transaction(transaction);
+            scoped.doc.history = history;
+        }
+        self.scoped = scoped;
+        self.source = source;
+        self.ir_stale = false;
+        self.scene_stale = false;
+        self.state = ArtifactDirty::DirtyCanvas;
+        self.working_generation = self.working_generation.wrapping_add(1);
+        let source_sync = SourceSync::Rebuilt {
+            reason: SourceRebuildReason::StructuralOperation,
+        };
+        self.last_source_sync = source_sync.clone();
+        self.mark_scene_synced();
+        Ok(source_sync)
+    }
+
+    fn validate_structural_adoption(
+        &self,
+        scoped: &ScopedDoc,
+        changes: &[StructuralNodeChange],
+        patch: &fanta_fnx::PreparedStructuralPatch,
+    ) -> Result<(), SessionError> {
+        let sidecar = patch.sidecar();
+        if sidecar.ids.len() != scoped.doc.scene.len() {
+            return Err(SessionError::DocAssemble(
+                "structural source node count differs".into(),
+            ));
+        }
+        let changed: BTreeSet<_> = changes
+            .iter()
+            .filter(|change| change.after.is_some())
+            .map(|change| change.id.as_str())
+            .collect();
+        for (position, entry) in sidecar.ids.iter().enumerate() {
+            let id = serde_json::from_value::<NodeId>(Value::String(entry.id.clone()))
+                .map_err(|error| SessionError::DocAssemble(error.to_string()))?;
+            let node = scoped.doc.scene.get(id).ok_or_else(|| {
+                SessionError::DocAssemble(format!("structural source contains absent node {id}"))
+            })?;
+            let parent = entry
+                .parent_index
+                .map(|parent| {
+                    let parent = sidecar
+                        .ids
+                        .get(parent as usize)
+                        .ok_or_else(|| {
+                            SessionError::DocAssemble("structural source parent is absent".into())
+                        })?
+                        .id
+                        .clone();
+                    serde_json::from_value::<NodeId>(Value::String(parent))
+                        .map_err(|error| SessionError::DocAssemble(error.to_string()))
+                })
+                .transpose()?;
+            if node.parent != parent
+                || entry
+                    .index
+                    .as_f64()
+                    .is_some_and(|index| index.to_bits() != node.index.raw().to_bits())
+            {
+                return Err(SessionError::DocAssemble(format!(
+                    "structural source topology differs for {id}"
+                )));
+            }
+            if changed.contains(entry.id.as_str()) {
+                self.validate_retained_node(id, patch.node_value_at(&self.ir, position)?, scoped)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_retained_node(
+        &self,
+        id: NodeId,
+        mut value: Value,
+        scoped: &ScopedDoc,
+    ) -> Result<(), SessionError> {
+        if id == scoped.root
+            && let Some(object) = value.as_object_mut()
+        {
+            if self.kind == ArtifactKind::Page {
+                object.remove("clip_size");
+                object.remove("local_size");
+            } else if self.kind == ArtifactKind::Component {
+                object.insert("parent".to_owned(), Value::Null);
+            }
+        }
+        let retained: CanvasNode = serde_json::from_value(value)
+            .map_err(|error| SessionError::DocAssemble(error.to_string()))?;
+        if scoped.doc.scene.get(id) != Some(&retained) {
+            return Err(SessionError::DocAssemble(format!(
+                "retained source properties differ for {id}"
+            )));
+        }
+        Ok(())
     }
 
     /// The full adoption: project both scenes and reconcile their difference.
@@ -1666,24 +1962,33 @@ impl ArtifactSession {
         // projections below would only rediscover an empty delta. This is what
         // keeps a pointer-drag apply O(edit) instead of O(scene).
         if self.scene_in_sync() {
-            #[cfg(debug_assertions)]
-            {
-                // Debug builds re-derive the delta and assert the watermark
-                // told the truth — CI runs every session test through this.
-                let scene = self.scene_node_map()?;
-                let retained = self.retained_scene_projection()?;
-                debug_assert!(
-                    retained.nodes == scene.nodes,
-                    "scene watermark claimed sync but projections differ"
-                );
-            }
+            // The scene revision and both retained writers' owned tokens prove
+            // that the checked commit boundary has not changed since then.
             self.ir_stale = false;
             return Ok(SourceSync::Unchanged);
         }
 
+        let retained_writers_changed =
+            self.last_synced_projection
+                .as_ref()
+                .is_none_or(|(ir, source)| {
+                    !Arc::ptr_eq(ir, &self.ir.synchronization_token())
+                        || !Arc::ptr_eq(source, &self.source.synchronization_token())
+                });
+
         let scene = self.scene_node_map()?;
         let retained = self.retained_scene_projection()?;
         if retained.nodes == scene.nodes {
+            // A token mismatch can affect source-owned fields that typed
+            // CanvasNode intentionally omits. It cannot be certified by an
+            // empty typed delta; recheck the complete source only on this path.
+            if retained_writers_changed {
+                if !self.source.semantics_match(&self.ir)? {
+                    return Err(SessionError::InvalidSource(
+                        "retained source and IR differ after an unpaired writer".into(),
+                    ));
+                }
+            }
             self.ir_stale = false;
             self.mark_scene_synced();
             return Ok(SourceSync::Unchanged);
@@ -1724,6 +2029,12 @@ impl ArtifactSession {
             self.patch_source_values(previous, after)?
         };
 
+        if retained_writers_changed && !self.source.semantics_match(&self.ir)? {
+            return Err(SessionError::InvalidSource(
+                "retained source and IR differ after an unpaired writer".into(),
+            ));
+        }
+
         self.state = ArtifactDirty::DirtyCanvas;
         self.working_generation = self.working_generation.wrapping_add(1);
         self.last_source_sync = source_sync.clone();
@@ -1742,8 +2053,15 @@ impl ArtifactSession {
     }
 
     fn retained_scene_projection(&self) -> Result<NodeMapEdition, SessionError> {
+        self.retained_scene_projection_from_ir(&self.ir)
+    }
+
+    fn retained_scene_projection_from_ir(
+        &self,
+        ir: &ArtifactIr,
+    ) -> Result<NodeMapEdition, SessionError> {
         let mut nodes = Map::new();
-        for value in self.ir.to_nodes()? {
+        for value in ir.to_nodes()? {
             let node: CanvasNode = serde_json::from_value(value)
                 .map_err(|error| SessionError::DocAssemble(error.to_string()))?;
             let id = node.id;
@@ -2031,6 +2349,7 @@ pub fn load_artifact_session(
     // earlier tool (or a plain editor save) surfaces the same warning a fresh
     // text commit would.
     let last_diagnostics = unknown_attribute_diagnostics(&node_map_values(&node_map.nodes));
+    let projection = (ir.synchronization_token(), source.synchronization_token());
     Ok(ArtifactSession {
         id: meta.id.clone(),
         kind: meta.kind,
@@ -2060,6 +2379,7 @@ pub fn load_artifact_session(
         // Open materialized the scene FROM the retained source; they are in
         // sync by construction, so the first canvas apply skips reconciliation.
         last_synced_scene: Some((scene_instance, scene_revision)),
+        last_synced_projection: Some(projection),
     })
 }
 
@@ -2337,4 +2657,133 @@ fn filter_selection(sel: Selection, doc: &Doc) -> Selection {
     // Selection API may vary; keep as-is if nodes still exist is best-effort.
     let _ = doc;
     sel
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::project::session::WorkspaceSession;
+
+    #[test]
+    fn source_identity_witness_rejects_unpaired_ir_source_and_text_writers() {
+        let directory = tempfile::tempdir().expect("project");
+        let mut document = Doc::new();
+        let page = document
+            .scene
+            .insert(CanvasNode::new(fanta_doc::NodeData::Group(
+                fanta_doc::GroupNode::default(),
+            )))
+            .expect("page");
+        document.add_page(page);
+        let mut child =
+            CanvasNode::new(fanta_doc::NodeData::Group(fanta_doc::GroupNode::default()));
+        child.parent = Some(page);
+        let child = document.scene.insert(child).expect("child");
+        crate::write_project_tree(directory.path(), &document, &BTreeMap::new())
+            .expect("initial project");
+        let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
+        let artifact = ArtifactId::Page(page);
+        workspace.open_artifact(artifact.clone()).expect("session");
+        let mut baseline = workspace.artifact(&artifact).expect("session").clone();
+        baseline
+            .synchronize_retained_source_with_scene()
+            .expect("reconcile cloned scene identity");
+        assert!(
+            baseline
+                .project_files_with_identity()
+                .expect("projection")
+                .1
+                .is_some()
+        );
+
+        let mut ir_writer = baseline.clone();
+        ir_writer
+            .synchronize_retained_source_with_scene()
+            .expect("cloned IR baseline");
+        let mut value = ir_writer.ir.node_value(&page.0.to_string()).expect("node");
+        value["future_unpaired"] = serde_json::json!({"preserve":true});
+        ir_writer
+            .ir
+            .patch_node_value(&page.0.to_string(), &value)
+            .expect("IR write");
+        assert!(
+            ir_writer
+                .project_files_with_identity()
+                .expect("projection")
+                .1
+                .is_none()
+        );
+        assert!(matches!(
+            ir_writer.synchronize_retained_source_with_scene(),
+            Err(SessionError::InvalidSource(_))
+        ));
+
+        let mut source_writer = baseline.clone();
+        source_writer
+            .synchronize_retained_source_with_scene()
+            .expect("cloned source baseline");
+        let mut element = source_writer.ir.root().clone();
+        element.attrs.insert(
+            "future_unpaired".into(),
+            serde_json::json!({"preserve":true}),
+        );
+        source_writer
+            .source
+            .patch_element(&page.0.to_string(), &element)
+            .expect("source write");
+        let authored = source_writer.source.render();
+        assert!(
+            source_writer
+                .project_files_with_identity()
+                .expect("projection")
+                .1
+                .is_none()
+        );
+        assert!(matches!(
+            source_writer.synchronize_retained_source_with_scene(),
+            Err(SessionError::InvalidSource(_))
+        ));
+        assert_eq!(source_writer.source.render(), authored);
+
+        let mut combined_writer = baseline.clone();
+        combined_writer
+            .synchronize_retained_source_with_scene()
+            .expect("cloned combined baseline");
+        combined_writer
+            .source
+            .patch_element(&page.0.to_string(), &element)
+            .expect("source-owned edit on another node");
+        let mut value = combined_writer
+            .ir
+            .node_value(&child.0.to_string())
+            .expect("child");
+        value["opacity"] = serde_json::json!(0.125);
+        combined_writer
+            .ir
+            .patch_node_value(&child.0.to_string(), &value)
+            .expect("nonempty typed delta");
+        assert!(matches!(
+            combined_writer.synchronize_retained_source_with_scene(),
+            Err(SessionError::InvalidSource(_))
+        ));
+        assert!(
+            combined_writer
+                .project_files_with_identity()
+                .expect("uncertified projection")
+                .1
+                .is_none()
+        );
+
+        let mut text_writer = baseline;
+        text_writer
+            .set_text(text_writer.source_text())
+            .expect("text write");
+        assert!(
+            text_writer
+                .project_files_with_identity()
+                .expect("text projection")
+                .1
+                .is_none()
+        );
+    }
 }

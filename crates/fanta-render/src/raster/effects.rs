@@ -1161,12 +1161,10 @@ pub(crate) fn node_silhouette_path(
             if w <= 0.0 || h <= 0.0 {
                 return None;
             }
-            let mut path = skia_safe::Path::new();
-            path.add_rect(
+            Some(skia_safe::Path::rect(
                 skia_safe::Rect::from_xywh(0.0, 0.0, w as f32, h as f32),
                 None,
-            );
-            Some(path)
+            ))
         }
     }
 }

@@ -15,6 +15,51 @@ fn drop_shadow(color: Color, offset: [f64; 2], blur: f64) -> Shadow {
     }
 }
 
+#[test]
+fn unclipped_ancestor_does_not_cull_an_offscreen_childs_visible_shadow() {
+    let render = |nested: bool| {
+        let mut scene = Scene::new();
+        let parent = if nested {
+            Some(
+                scene
+                    .insert(CanvasNode::new(NodeData::Group(fanta_doc::GroupNode {
+                        background: Some(Fill::solid(Color::rgba(255, 255, 255, 0))),
+                        ..Default::default()
+                    })))
+                    .expect("unclipped painted ancestor"),
+            )
+        } else {
+            None
+        };
+        let mut child = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            -50.0,
+            -4.0,
+            8.0,
+            8.0,
+            Color::rgb(255, 0, 0),
+        )));
+        child.parent = parent;
+        child
+            .effects
+            .push(drop_shadow(Color::BLACK, [40.0, 0.0], 4.0));
+        scene.insert(child).expect("offscreen child");
+        let mut renderer = RasterRenderer::new(64, 64).expect("renderer");
+        renderer.background = Color::WHITE;
+        renderer.render(&scene, &Viewport::default());
+        renderer.copy_rgba()
+    };
+    let flat = render(false);
+    let nested = render(true);
+    assert!(
+        rgba_at(&flat, 64, 26, 32)[0] < 200,
+        "shadow reaches viewport"
+    );
+    assert_eq!(
+        nested, flat,
+        "an unclipped ancestor must preserve child effect overflow"
+    );
+}
+
 /// An inner shadow of `color` at `offset` with `blur` (no spread).
 fn inner_shadow(color: Color, offset: [f64; 2], blur: f64) -> Shadow {
     Shadow {

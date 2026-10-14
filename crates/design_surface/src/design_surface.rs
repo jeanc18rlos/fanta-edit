@@ -5,7 +5,11 @@
 //! agent tools resolve it per call. Ops and queries are typed DTOs so tool
 //! input schemas stay stable even if the editor's document model evolves.
 
-use std::{io::Read as _, path::Path, rc::Rc};
+use std::{
+    io::Read as _,
+    path::{Path, PathBuf},
+    rc::Rc,
+};
 
 use anyhow::Result;
 use gpui::{App, AppContext as _, Context, Entity, Global, Task};
@@ -905,8 +909,8 @@ pub const MAX_JSON_RESPONSE_BYTES: usize = 256 * 1024;
 /// An imported `.fig` page can hold thousands of top-level nodes, and listing
 /// all of them at once overruns [`MAX_JSON_RESPONSE_BYTES`] — which used to
 /// leave an agent with no way to enumerate the page at all, since ids are
-/// discovered by listing. A windowed default always answers; a caller who
-/// wants more asks for it explicitly and may be refused for size.
+/// discovered by listing. Windowing caps direct children; broad nested trees
+/// still need a smaller depth or limit to fit the traversal and response budgets.
 pub const DEFAULT_CHILD_LIMIT: usize = 200;
 
 /// Which nodes `DesignSurface::get_nodes` returns.
@@ -920,7 +924,8 @@ pub struct NodeQuery {
     #[serde(default)]
     pub page: Option<usize>,
     /// How many levels of children to include below each listed node.
-    /// Omit for the full subtree.
+    /// Omit for the full subtree. Large nested listings may exceed the
+    /// traversal budget; lower depth or limit, or fetch relevant ids instead.
     #[serde(default)]
     pub depth: Option<u32>,
     /// Include world-space bounding boxes.
@@ -960,14 +965,17 @@ pub enum NodeDetail {
 }
 
 /// Inspect existing component properties and variant sets, variable collections,
-/// modes, paginated typed token values and optional selected-node bindings.
+/// modes, paginated components, variant sets and typed token values, and
+/// optional selected-node bindings.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct DesignSystemQuery {
     /// Exact collection id or unique collection name; omit for all collections.
     #[serde(default)]
     pub collection: Option<String>,
+    /// Starting offset for components, variant sets and filtered variables.
     #[serde(default)]
     pub offset: Option<usize>,
+    /// Maximum entries per list (default 100, maximum 200).
     #[serde(default)]
     pub limit: Option<usize>,
     /// Include variable bindings of the currently selected nodes.
@@ -1331,6 +1339,13 @@ pub trait DesignSurface: 'static {
     fn read_design_spec(&self, _cx: &mut App) -> Result<Option<DesignSpec>> {
         Ok(None)
     }
+
+    /// Return the active saved project's root without constructing its overview.
+    /// Prompt preparation calls this before requesting any design metadata.
+    fn project_root(&self, _cx: &mut App) -> Result<Option<PathBuf>> {
+        Ok(None)
+    }
+
     /// Project/document overview: pages, active page, selection, viewport,
     /// node counts, and editability.
     fn state(&self, cx: &mut App) -> Result<serde_json::Value>;

@@ -5,13 +5,13 @@
 use super::effects::group_clips_children;
 use super::renderer::PreparedInstance;
 use super::{
-    Arc, BlendMode, Bounds, Canvas, CanvasNode, ExpandedNode, HashMap, InstanceCacheKey,
+    Arc, BlendMode, Bounds, Canvas, CanvasNode, ExpandedNode, HashMap, IdHashMap, InstanceCacheKey,
     InstanceNode, NodeData, NodeFlags, NodeId, RenderCtx, Scene, apply_background_blur,
-    begin_effects_layer, draw_inner_shadows, draw_unresolved_outline, effects_layer_bounds,
-    opacity_folds_into_paint, paint_child_sequence, paint_node_content, paint_node_foreground,
-    resolve_overlay, shadow_expanded_local_bounds, to_sk_matrix, visible_effects,
-    with_shaped_layout,
+    begin_effects_layer, draw_inner_shadows, draw_unresolved_outline, opacity_folds_into_paint,
+    paint_child_sequence, paint_node_content, paint_node_foreground, resolve_overlay, to_sk_matrix,
+    visible_effects, with_shaped_layout,
 };
+use skia_safe::QuickReject;
 
 // ---------------------------------------------------------------------------
 // Component-instance rendering
@@ -38,6 +38,9 @@ pub(crate) fn render_instance(
     inst: &InstanceNode,
     ctx: &mut RenderCtx,
 ) {
+    if super::walk::cancel_camera_work(ctx) {
+        return;
+    }
     let mode_anchor = if ctx.scene.get(instance_id).is_some() {
         instance_id
     } else {
@@ -54,6 +57,9 @@ pub(crate) fn render_instance(
     } else {
         expand_instance_memoized(ctx, instance_id, inst, mode_anchor)
     };
+    if super::walk::cancel_camera_work(ctx) {
+        return;
+    }
     if expanded.nodes.is_empty() {
         ctx.metrics.incomplete_artwork = true;
         // Genuinely unresolvable instance (master deleted / not loaded). Draw a
@@ -81,6 +87,11 @@ pub(crate) fn render_instance(
             true,
             &expanded.nodes,
             &expanded.children,
+            ctx.inputs
+                .motion
+                .is_none()
+                .then_some(expanded.bounds.as_ref())
+                .flatten(),
             ctx,
         );
         ctx.instance_mode_anchor = previous_mode_anchor;
@@ -102,6 +113,12 @@ pub(crate) fn expand_instance_memoized(
         ctx.inputs.active_modes,
         mode_anchor,
     );
+    ctx.instance_cache
+        .record_component(ctx.inputs.components, inst.component);
+    if ctx.layer_cache_lookups {
+        ctx.layer_cache
+            .record_component(ctx.inputs.components, inst.component);
+    }
     // The RESOLVED master's revisions (a variant instance's `component` is the
     // *set* id, which is not itself a def — `def(set)` is `None` and would
     // wrongly report rev 0, never invalidating on a member edit). `rev` moves
@@ -121,39 +138,78 @@ pub(crate) fn expand_instance_memoized(
     // a nested transient clone (fresh id, not in the scene) hashes directly.
     let stamp = ctx
         .scene
-        .contains(instance_id)
-        .then(|| ctx.scene.node_stamp(instance_id));
+        .get(instance_id)
+        .and_then(|node| node.data.as_instance())
+        .filter(|authored| std::ptr::eq(*authored, inst))
+        .map(|_| ctx.scene.node_stamp(instance_id));
     let key = InstanceCacheKey {
         instance: instance_id,
+        node_stamp: stamp,
+        root: resolved_component
+            .as_ref()
+            .map(|resolved| resolved.resolved_root)
+            .filter(|root| ctx.scene.contains(*root)),
+        component: resolved_component
+            .as_ref()
+            .map(|resolved| resolved.resolved_component),
         rev,
         preview_rev,
         override_hash: ctx.instance_cache.override_hash(instance_id, stamp, inst),
         mode_generation: ctx.inputs.mode_generation,
         mode_pins: hash_mode_pins(ctx.scene, mode_anchor),
     };
-    if let Some(cached) = ctx.instance_cache.lookup(&key) {
-        return cached;
-    }
     if let Some(budget) = &mut ctx.metrics.sampling_budget
         && let Some(component) = resolved_component
     {
         // The walk sees clones only AFTER expansion/layout. Reserve the whole
         // resolved master first so a wide recursive component cannot allocate
-        // a fresh wide subtree at every level before the walk reaches its cap.
+        // or repeatedly walk a wide subtree before the walk reaches its cap.
+        // Sharing immutable nodes does not reduce sampling's expansion quota.
         for _ in ctx.scene.descendants_of(component.resolved_root) {
             if !budget.reserve_expanded_node() {
                 return Arc::new(PreparedInstance::default());
             }
         }
     }
-    let expanded = Arc::new(prepare_instance(
-        ctx.scene,
-        ctx.inputs.components,
-        inst,
-        &expansion_context,
-    ));
+    if let Some(cached) = ctx.instance_cache.lookup(&key, inst) {
+        return cached;
+    }
+    let expanded = if let Some(should_cancel) = ctx.should_cancel {
+        let Some(mut nodes) = fanta_doc::expand_instance_with_context_cancellable(
+            ctx.scene,
+            ctx.inputs.components,
+            inst,
+            &expansion_context,
+            should_cancel,
+        ) else {
+            ctx.metrics.camera_cancelled = true;
+            return Arc::new(PreparedInstance::default());
+        };
+        if inst.derived.is_empty()
+            && !fanta_doc::solve_expanded_cancellable(
+                &mut nodes,
+                &mut measure_text_node,
+                should_cancel,
+            )
+        {
+            ctx.metrics.camera_cancelled = true;
+            return Arc::new(PreparedInstance::default());
+        }
+        let Some(prepared) = PreparedInstance::new_cancellable(nodes, should_cancel) else {
+            ctx.metrics.camera_cancelled = true;
+            return Arc::new(PreparedInstance::default());
+        };
+        Arc::new(prepared)
+    } else {
+        Arc::new(prepare_instance(
+            ctx.scene,
+            ctx.inputs.components,
+            inst,
+            &expansion_context,
+        ))
+    };
     ctx.metrics.instance_indexes_built += 1;
-    ctx.instance_cache.insert(key, Arc::clone(&expanded));
+    ctx.instance_cache.insert(key, inst, Arc::clone(&expanded));
     expanded
 }
 
@@ -276,8 +332,24 @@ fn expanded_subtree_bounds(
     node: &CanvasNode,
     expanded: &[ExpandedNode],
     children: &HashMap<NodeId, Vec<usize>>,
-    scene: &Scene,
+    cached: Option<&IdHashMap<NodeId, Option<Bounds>>>,
 ) -> Option<Bounds> {
+    expanded_subtree_bounds_cancellable(node, expanded, children, cached, None)
+}
+
+fn expanded_subtree_bounds_cancellable(
+    node: &CanvasNode,
+    expanded: &[ExpandedNode],
+    children: &HashMap<NodeId, Vec<usize>>,
+    cached: Option<&IdHashMap<NodeId, Option<Bounds>>>,
+    should_cancel: Option<&dyn Fn() -> bool>,
+) -> Option<Bounds> {
+    if should_cancel.is_some_and(|should_cancel| should_cancel()) {
+        return None;
+    }
+    if let Some(bounds) = cached.and_then(|cached| cached.get(&node.id)) {
+        return *bounds;
+    }
     match &node.data {
         NodeData::Group(_) | NodeData::Boolean(_)
             if node.is_boolean()
@@ -298,11 +370,20 @@ fn expanded_subtree_bounds(
                 _ => None,
             };
             for &i in children.get(&node.id).into_iter().flatten() {
+                if should_cancel.is_some_and(|should_cancel| should_cancel()) {
+                    return None;
+                }
                 let Some(entry) = expanded.get(i) else {
                     continue;
                 };
                 let child = &entry.node;
-                let Some(b) = expanded_subtree_bounds(child, expanded, children, scene) else {
+                let Some(b) = expanded_subtree_bounds_cancellable(
+                    child,
+                    expanded,
+                    children,
+                    cached,
+                    should_cancel,
+                ) else {
                     continue;
                 };
                 let Some(in_parent) = b.try_transformed(&child.transform) else {
@@ -315,8 +396,23 @@ fn expanded_subtree_bounds(
             }
             acc
         }
-        _ => effects_layer_bounds(node, None, scene),
+        NodeData::TextPath(text_path) => super::text_path_bounds(text_path),
+        data => data.local_bounds(),
     }
+}
+
+pub(crate) fn prepare_expansion_bounds(
+    expanded: &[ExpandedNode],
+    children: &HashMap<NodeId, Vec<usize>>,
+) -> IdHashMap<NodeId, Option<Bounds>> {
+    let mut bounds = IdHashMap::default();
+    // Expansion emits parents before descendants. Reverse order makes each
+    // container's union use already-computed child bounds, without recursion.
+    for entry in expanded.iter().rev() {
+        let computed = expanded_subtree_bounds(&entry.node, expanded, children, Some(&bounds));
+        bounds.insert(entry.node.id, computed);
+    }
+    bounds
 }
 
 /// Map each expanded clone's parent id → its child clone indices, so the
@@ -349,8 +445,12 @@ pub(crate) fn render_expanded(
     is_root: bool,
     expanded: &[ExpandedNode],
     children: &HashMap<NodeId, Vec<usize>>,
+    cached_bounds: Option<&IdHashMap<NodeId, Option<Bounds>>>,
     ctx: &mut RenderCtx,
 ) {
+    if super::walk::cancel_camera_work(ctx) {
+        return;
+    }
     if ctx
         .metrics
         .sampling_budget
@@ -359,7 +459,15 @@ pub(crate) fn render_expanded(
     {
         return;
     }
-    render_expanded_inner(canvas, node, is_root, expanded, children, ctx);
+    render_expanded_inner(
+        canvas,
+        node,
+        is_root,
+        expanded,
+        children,
+        cached_bounds,
+        ctx,
+    );
     if let Some(budget) = &mut ctx.metrics.sampling_budget {
         budget.leave();
     }
@@ -371,6 +479,7 @@ fn render_expanded_inner(
     is_root: bool,
     expanded: &[ExpandedNode],
     children: &HashMap<NodeId, Vec<usize>>,
+    cached_bounds: Option<&IdHashMap<NodeId, Option<Bounds>>>,
     ctx: &mut RenderCtx,
 ) {
     ctx.metrics.nodes_visited += 1;
@@ -402,10 +511,107 @@ fn render_expanded_inner(
         canvas.concat(&to_sk_matrix(&node.transform));
     }
 
+    if ctx.metrics.camera_visible.is_some()
+        && !ctx.filtered_ancestor
+        && ((!children
+            .get(&node.id)
+            .is_some_and(|children| !children.is_empty())
+            && matches!(node.data, NodeData::Vector(_) | NodeData::Text(_)))
+            || node
+                .data
+                .as_group()
+                .is_some_and(|group| group_clips_children(node, group)))
+    {
+        let local = match &node.data {
+            NodeData::Vector(vector) => crate::bounds::vector_visual_bounds(vector, node.flags),
+            NodeData::Text(text) => super::walk::text_visual_bounds(text),
+            NodeData::Group(_) => node.data.local_bounds(),
+            _ => None,
+        };
+        if let Some(local) = local {
+            let painted = super::walk::visual_local_bounds(node, local, ctx.effective_scale)
+                .map(super::camera_cache::bounds_rect);
+            if painted.is_some_and(|painted| painted.is_finite() && canvas.quick_reject(&painted)) {
+                ctx.metrics.nodes_culled += 1;
+                canvas.restore();
+                return;
+            }
+        }
+    }
+
+    let outer_camera_bounds = if ctx.metrics.camera_recording {
+        super::camera_cache::begin_camera_node(
+            canvas,
+            node,
+            expanded_subtree_bounds_cancellable(
+                node,
+                expanded,
+                children,
+                cached_bounds,
+                ctx.should_cancel,
+            ),
+            ctx.metrics,
+        )
+    } else {
+        None
+    };
+
+    if ctx.metrics.camera_recording
+        && matches!(&node.data, NodeData::Text(text)
+            if !text.content.is_empty() && super::walk::text_visual_bounds(text).is_none())
+    {
+        ctx.metrics.camera_unsupported = true;
+    }
+
+    if ctx.metrics.camera_recording
+        && node
+            .blurs
+            .iter()
+            .any(|blur| blur.kind == super::BlurKind::Background && blur.radius != 0.0)
+    {
+        // A recording has no real backdrop device; a no-op readback is not proof
+        // that replaying a retained raster would preserve this dependency.
+        ctx.metrics.camera_unsupported = true;
+    }
+
     // Background blur on a transient node — same treatment as the live walk:
     // sample+blur+blit the backdrop inside the silhouette BEFORE the effects
     // layer (so it reads the real backdrop, not this node's own layer). No scene
     // id, so a background-only group has no fallback silhouette and won't frost.
+    let group_silhouette = if node
+        .blurs
+        .iter()
+        .any(|blur| blur.kind == super::BlurKind::Background && blur.radius > 0.0)
+    {
+        node.data
+            .as_group()
+            .filter(|group| {
+                group.clip_size.is_none()
+                    && group.local_size.is_none()
+                    && (group.background.is_some()
+                        || !group.background_fills.is_empty()
+                        || !group.strokes.is_empty())
+            })
+            .and_then(|group| {
+                expanded_subtree_bounds_cancellable(
+                    node,
+                    expanded,
+                    children,
+                    cached_bounds,
+                    ctx.should_cancel,
+                )
+                .map(|bounds| {
+                    super::rounded_rect_path(
+                        super::bounds_to_f32(&bounds),
+                        group.corner_radius,
+                        group.corner_radii,
+                        group.corner_smoothing,
+                    )
+                })
+            })
+    } else {
+        None
+    };
     if ctx.supports_offscreen_layers {
         if apply_background_blur(
             canvas,
@@ -413,7 +619,7 @@ fn render_expanded_inner(
             None,
             ctx.scene,
             ctx.effective_scale,
-            boolean_silhouette.as_ref(),
+            boolean_silhouette.as_ref().or(group_silhouette.as_ref()),
         ) == super::effects::BackgroundBlurOutcome::Failed
         {
             ctx.metrics.effect_failed = true;
@@ -452,11 +658,21 @@ fn render_expanded_inner(
             boolean_shape
                 .as_ref()
                 .and_then(|shape| shape.bounds(node))
-                .or_else(|| expanded_subtree_bounds(node, expanded, children, ctx.scene)),
+                .or_else(|| {
+                    expanded_subtree_bounds_cancellable(
+                        node,
+                        expanded,
+                        children,
+                        cached_bounds,
+                        ctx.should_cancel,
+                    )
+                }),
         );
     if used_layer {
         ctx.metrics.effect_layers += 1;
     }
+    let previous_filtered_ancestor = ctx.filtered_ancestor;
+    ctx.filtered_ancestor |= used_layer && (visible.drop_shadow || visible.layer_blur);
 
     // Transient nodes have no scene id, so a background-only unclipped group
     // paints nothing (no bounds to fall back to) — correct for a transient
@@ -500,22 +716,43 @@ fn render_expanded_inner(
                 let n = &expanded[i].node;
                 (n.is_mask && !n.flags.contains(NodeFlags::HIDDEN)).then_some(n.mask_type)
             },
-            // A transient child subtree's painted extent in this node's local
-            // space, mirroring the live walk's bounds closure: subtree box,
-            // shadow-expanded, mapped through the child's transform.
+            // The transient source needs the same composed filter extent as
+            // the live walk to keep masked blur tails inside its layer.
             |ctx, &i| {
                 let child = &expanded.get(i)?.node;
-                let local = expanded_subtree_bounds(child, expanded, children, ctx.scene)?;
-                shadow_expanded_local_bounds(
-                    local,
-                    &child.effects,
-                    &child.blurs,
-                    ctx.effective_scale,
-                )
-                .try_transformed(&child.transform)
+                let scratch = resolve_overlay(ctx, child.id, child);
+                let child = scratch.as_deref().unwrap_or(child);
+                // Raw expansion boxes omit descendant effect and glyph overflow.
+                // An unbounded hint preserves the current clip when no finite
+                // masked source extent has been proved.
+                if child
+                    .data
+                    .as_group()
+                    .is_some_and(|group| !group_clips_children(child, group))
+                    || child.is_boolean()
+                {
+                    return None;
+                }
+                let local = match &child.data {
+                    NodeData::Vector(vector) => {
+                        crate::bounds::vector_visual_bounds(vector, child.flags)
+                    }
+                    NodeData::Text(text) => super::walk::text_visual_bounds(text),
+                    _ => child.data.local_bounds(),
+                }?;
+                super::walk::visual_local_bounds(child, local, ctx.effective_scale)?
+                    .try_transformed(&child.transform)
             },
             |canvas, ctx, &i| {
-                render_expanded(canvas, &expanded[i].node, false, expanded, children, ctx)
+                render_expanded(
+                    canvas,
+                    &expanded[i].node,
+                    false,
+                    expanded,
+                    children,
+                    cached_bounds,
+                    ctx,
+                )
             },
         );
     }
@@ -535,6 +772,14 @@ fn render_expanded_inner(
     if used_layer {
         canvas.restore();
     }
+    ctx.filtered_ancestor = previous_filtered_ancestor;
+    super::camera_cache::end_camera_node(
+        canvas,
+        node,
+        outer_camera_bounds,
+        ctx.effective_scale,
+        ctx.metrics,
+    );
     canvas.restore();
 }
 
@@ -542,6 +787,132 @@ fn render_expanded_inner(
 mod tests {
     use super::*;
     use fanta_doc::{AutoLayout, Color, GroupNode, Transform2D, VectorNode};
+
+    #[test]
+    fn expanded_unclipped_group_background_blur_frosts_its_content_box() {
+        use super::super::{RasterRenderer, RenderInputs};
+        use fanta_doc::{Blur, ComponentDef, ComponentId, Doc, Fill, Viewport};
+        fn insert(scene: &mut Scene, parent: Option<NodeId>, data: NodeData) -> NodeId {
+            let mut node = CanvasNode::new(data);
+            node.parent = parent;
+            node.index = scene.next_child_index(parent);
+            scene.insert(node).expect("fixture node")
+        }
+        fn render(blurred: bool) -> Vec<u8> {
+            let mut doc = Doc::new();
+            let master = insert(
+                &mut doc.scene,
+                None,
+                NodeData::Group(GroupNode {
+                    clip_size: Some([128.0, 128.0]),
+                    background: Some(Fill::solid(Color::WHITE)),
+                    ..Default::default()
+                }),
+            );
+            for row in 0..32 {
+                for column in 0..32 {
+                    if (row + column) % 2 == 0 {
+                        insert(
+                            &mut doc.scene,
+                            Some(master),
+                            NodeData::Vector(VectorNode::rect_solid(
+                                f64::from(column) * 4.0,
+                                f64::from(row) * 4.0,
+                                4.0,
+                                4.0,
+                                Color::BLACK,
+                            )),
+                        );
+                    }
+                }
+            }
+            let panel = insert(
+                &mut doc.scene,
+                Some(master),
+                NodeData::Group(GroupNode {
+                    background: Some(Fill::solid(Color::rgba(255, 255, 255, 0))),
+                    ..Default::default()
+                }),
+            );
+            if blurred {
+                doc.scene
+                    .get_mut(panel)
+                    .expect("panel")
+                    .blurs
+                    .push(Blur::background(8.0));
+            }
+            insert(
+                &mut doc.scene,
+                Some(panel),
+                NodeData::Vector(VectorNode::rect_solid(
+                    32.0,
+                    32.0,
+                    64.0,
+                    64.0,
+                    Color::TRANSPARENT,
+                )),
+            );
+            let component = ComponentId::new();
+            doc.components
+                .defs
+                .insert(component, ComponentDef::new(component, master, "Frost"));
+            let placed = insert(
+                &mut doc.scene,
+                None,
+                NodeData::Instance(InstanceNode {
+                    component,
+                    overrides: Vec::new(),
+                    prop_values: Default::default(),
+                    derived: Vec::new(),
+                    local_size: [128.0, 128.0],
+                }),
+            );
+            let mut renderer = RasterRenderer::new(128, 128).expect("renderer");
+            let metrics = renderer.render_page_with(
+                &doc.scene,
+                &Viewport {
+                    center: [64.0, 64.0],
+                    zoom: 1.0,
+                },
+                Some(placed),
+                &RenderInputs::for_doc(&doc),
+            );
+            assert!(!metrics.effect_failed && !metrics.incomplete_artwork);
+            renderer.copy_rgba()
+        }
+        let plain = render(false);
+        let frosted = render(true);
+        let variance = |pixels: &[u8]| {
+            let mut sum = 0.0;
+            let mut squares = 0.0;
+            for y in 48..80 {
+                for x in 48..80 {
+                    let value = f64::from(pixels[(y * 128 + x) * 4]);
+                    sum += value;
+                    squares += value * value;
+                }
+            }
+            squares / 1024.0 - (sum / 1024.0).powi(2)
+        };
+        assert!(
+            variance(&plain) > 1000.0,
+            "the unblurred checker must remain sharp"
+        );
+        assert!(
+            variance(&frosted) < variance(&plain) * 0.6,
+            "a component's un-sized group must apply its authored backdrop blur"
+        );
+        for y in 0..24 {
+            for x in 0..128 {
+                let offset = (y * 128 + x) * 4;
+                assert_eq!(
+                    &frosted[offset..offset + 4],
+                    &plain[offset..offset + 4],
+                    "frost must remain inside the resolved content box"
+                );
+            }
+        }
+    }
 
     #[test]
     fn solving_scene_layout_keeps_the_scene_patchable() {
@@ -663,11 +1034,17 @@ mod tests {
             },
         ];
         let children = build_child_index(&expanded);
-        let scene = Scene::new();
-
         assert_eq!(
-            expanded_subtree_bounds(&expanded[0].node, &expanded, &children, &scene),
+            expanded_subtree_bounds(&expanded[0].node, &expanded, &children, None),
             Some(Bounds::from_xywh(0.0, -4.0, 35.0, 14.0))
+        );
+        let prepared = PreparedInstance::new(expanded);
+        assert_eq!(
+            prepared
+                .bounds
+                .as_ref()
+                .and_then(|bounds| bounds.get(&root_id)),
+            Some(&Some(Bounds::from_xywh(0.0, -4.0, 35.0, 14.0)))
         );
     }
 }

@@ -27,7 +27,7 @@ jobs:
   check:
     if: ${{ github.event_name != 'workflow_dispatch' || !inputs.native_video_only }}
     runs-on: macos-26
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -189,13 +189,21 @@ jobs:
       - name: Test the agent panel toggle
         run: cargo test --locked -p agent_ui --lib test_toggle_closes_visible_agent_panel_when_center_pane_has_focus
 
+      - name: Test design prompt preparation
+        run: |
+          cargo test --locked -p agent --lib test_fanta_specs
+          cargo test --locked -p agent --lib test_design_progress
+
+      - name: Test design source validation and saves
+        run: cargo test --locked -p fanta-fnx -p fanta-format --lib
+
       - name: Test sidebar behavior and project ownership
         run: cargo test --locked -p sidebar --lib
 
   mac-app-store-runtime:
     if: ${{ github.event_name != 'workflow_dispatch' || !inputs.native_video_only }}
     runs-on: macos-26
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
