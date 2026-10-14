@@ -1412,6 +1412,8 @@ fn cache_domain(canvas: &Canvas) -> Option<CacheDomain> {
             return None;
         }
     }
+    #[cfg(not(feature = "metal"))]
+    let _canvas = canvas;
     Some(CacheDomain::Raster)
 }
 
