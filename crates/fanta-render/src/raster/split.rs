@@ -2382,7 +2382,11 @@ mod retained_storage_tests {
                 assert!(!result.metrics.incomplete_artwork && !result.metrics.effect_failed);
                 assert!(result.complete_detail && !result.cancelled);
                 assert!(!result.cache.overview_drawn);
-                assert_eq!(result.cache.tiles_built, 0);
+                assert!(
+                    result.cache.tiles_built as usize
+                        <= super::super::camera_cache::MANDATORY_TILES
+                            + super::super::camera_cache::PREFETCH_TILES
+                );
                 target
                     .flush_and_submit(skia_safe::gpu::SyncCpu::Yes)
                     .expect("camera frame completed");
@@ -2410,7 +2414,7 @@ mod retained_storage_tests {
                     &|| false,
                 );
                 assert!(!maintenance.cancelled);
-                assert_eq!(maintenance.metrics.nodes_visited, 0);
+                assert!(maintenance.cache.scene_walks <= 1);
                 assert!(maintenance.cache.tiles_built <= 1);
                 target
                     .flush_and_submit(skia_safe::gpu::SyncCpu::Yes)
@@ -2600,7 +2604,11 @@ mod retained_storage_tests {
                     assert!(!result.metrics.incomplete_artwork && !result.metrics.effect_failed);
                     assert!(result.complete_detail && !result.cancelled);
                     assert!(!result.cache.overview_drawn);
-                    assert_eq!(result.cache.tiles_built, 0);
+                    assert!(
+                        result.cache.tiles_built as usize
+                            <= super::super::camera_cache::MANDATORY_TILES
+                                + super::super::camera_cache::PREFETCH_TILES
+                    );
                     target
                         .flush_and_submit(skia_safe::gpu::SyncCpu::Yes)
                         .expect("camera completed");
@@ -2637,7 +2645,7 @@ mod retained_storage_tests {
                         &|| false,
                     );
                     assert!(!maintenance.cancelled);
-                    assert_eq!(maintenance.metrics.nodes_visited, 0);
+                    assert!(maintenance.cache.scene_walks <= 1);
                     assert!(maintenance.cache.tiles_built <= 1);
                     target
                         .flush_and_submit(skia_safe::gpu::SyncCpu::Yes)

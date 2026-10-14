@@ -1489,9 +1489,10 @@ impl RasterRenderer {
         self.camera_local_bounds.len()
     }
 
-    /// Retain visible artwork in GPU tiles at the exact scale. Missing coverage
-    /// replays an exact visible paint recording while tiles are populated; it
-    /// never displays an enlarged page preview. Backdrop effects use normal rendering.
+    /// Retain visible artwork in GPU tiles at the exact scale. The first frame at
+    /// a scale draws directly; later frames build missing tiles from exact paint
+    /// recordings of the exposed coverage and replay a recording where tiles are
+    /// still missing. It never displays an enlarged page preview. Backdrop effects use normal rendering.
     /// Raster canvases use normal rendering: CPU curve clipping is device-dependent and
     /// does not preserve the pixels of an arbitrarily cropped retained tile.
     #[allow(clippy::too_many_arguments)]
@@ -1561,7 +1562,8 @@ impl RasterRenderer {
     }
 
     /// Populate at most one retained tile after a sharp frame has been published.
-    /// This never paints the supplied canvas or traverses the authoring scene.
+    /// This never paints the supplied canvas; it walks the authoring scene at most
+    /// once, to record coverage for that tile.
     /// The caller must drain recorded GPU work before releasing its target or leases,
     /// even when a newer camera cancels maintenance. One tile does not bound GPU wait time.
     #[allow(clippy::too_many_arguments)]

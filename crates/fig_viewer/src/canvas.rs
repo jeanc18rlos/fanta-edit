@@ -271,27 +271,42 @@ enum PaintCanvas {
 
 /// Where a frame rendered at `cached` (covering `cached_logical` logical
 /// pixels) must be painted so its world content lines up under the `current`
-/// viewport over the `bounds` frame rect: scale it by the zoom ratio and shift
-/// it by the screen-space distance between the two centers.
+/// viewport of the same zoom over the `bounds` frame rect. The renderer snaps
+/// each frame's device translation to whole pixels, so the offset is the
+/// difference of the two snapped translations — the cached frame's and the
+/// one `bounds` would get: a whole number of device pixels that moves the
+/// frame without resampling it.
 #[cfg(target_os = "macos")]
 fn reprojected_bounds(
     bounds: Bounds<Pixels>,
     cached_logical: (f64, f64),
     cached: Viewport,
     current: Viewport,
+    scale_factor: f32,
 ) -> Bounds<Pixels> {
+    let scale_factor = f64::from(scale_factor.max(f32::EPSILON));
+    let device_scale = current.zoom * scale_factor;
+    let offset = |extent: f64, cached_extent: f64, cached_center: f64, current_center: f64| {
+        let current_translation =
+            (extent * scale_factor * 0.5 - device_scale * current_center).round();
+        let cached_translation =
+            (cached_extent * scale_factor * 0.5 - device_scale * cached_center).round();
+        (current_translation - cached_translation) / scale_factor
+    };
     let (width, height) = bounds_size(bounds);
-    let scale = current.zoom / cached.zoom.max(f64::EPSILON);
-    let center_x = (cached.center[0] - current.center[0]) * current.zoom + width * 0.5;
-    let center_y = (cached.center[1] - current.center[1]) * current.zoom + height * 0.5;
-    let projected_width = cached_logical.0 * scale;
-    let projected_height = cached_logical.1 * scale;
     Bounds {
         origin: point(
-            bounds.origin.x + px((center_x - projected_width * 0.5) as f32),
-            bounds.origin.y + px((center_y - projected_height * 0.5) as f32),
+            bounds.origin.x
+                + px(offset(width, cached_logical.0, cached.center[0], current.center[0]) as f32),
+            bounds.origin.y
+                + px(offset(
+                    height,
+                    cached_logical.1,
+                    cached.center[1],
+                    current.center[1],
+                ) as f32),
         ),
-        size: size(px(projected_width as f32), px(projected_height as f32)),
+        size: size(px(cached_logical.0 as f32), px(cached_logical.1 as f32)),
     }
 }
 
@@ -377,15 +392,13 @@ fn frame_decision(
     if *cached == *requested {
         return FrameDecision::ReuseCached;
     }
-    if cached.size == requested.size && cached.same_content(requested) && within_render_interval {
-        let scale = requested.viewport_zoom / cached.viewport_zoom.max(f64::EPSILON);
-        let covers_view = frame_covers_request(cached, requested, frame_logical, visible_logical);
-        if covers_view
-            && (1.0 / GpuCanvas::MAX_REPROJECT_SCALE..=GpuCanvas::MAX_REPROJECT_SCALE)
-                .contains(&scale)
-        {
-            return FrameDecision::Reproject;
-        }
+    if cached.size == requested.size
+        && cached.same_content(requested)
+        && within_render_interval
+        && cached.viewport_zoom == requested.viewport_zoom
+        && frame_covers_request(cached, requested, frame_logical, visible_logical)
+    {
+        return FrameDecision::Reproject;
     }
     FrameDecision::RenderFresh
 }
@@ -602,15 +615,14 @@ fn frame_presentation(
     {
         return FramePresentation::Fresh;
     }
-    let scale = requested.viewport_zoom / cached.viewport_zoom.max(f64::EPSILON);
-    if frame_covers_request(cached, requested, cached_logical, visible_logical)
-        && (1.0 / GpuCanvas::MAX_REPROJECT_SCALE..=GpuCanvas::MAX_REPROJECT_SCALE).contains(&scale)
+    if cached.viewport_zoom == requested.viewport_zoom
+        && frame_covers_request(cached, requested, cached_logical, visible_logical)
     {
         FramePresentation::Reprojected
     } else {
-        // The worker's overview supplies new coverage. Until that first
-        // completed frame arrives, shrinking or shifting a partial surface
-        // would expose blank edges rather than actual document content.
+        // A scaled frame would be a resampled, blurred preview, and a frame
+        // that does not cover the view would expose blank edges: the sharp
+        // frame stays where it was rendered until the exact one arrives.
         FramePresentation::Held
     }
 }
@@ -623,22 +635,30 @@ fn logical_extent_matches(cached: (f64, f64), requested: (f64, f64), scale_facto
     (cached.0 - requested.0).abs() <= tolerance && (cached.1 - requested.1).abs() <= tolerance
 }
 
+/// Whether a completed frame (dispatched as `completed_request`) replaces the
+/// newest one. Any completion of the requested content that was dispatched
+/// after the newest frame is installed even when the camera has moved on:
+/// under continuous input no completion matches the latest camera, and
+/// waiting for one leaves the canvas frozen until the input stops.
 #[cfg(target_os = "macos")]
 fn should_install_completed_frame(
     completed: &SurfaceKey,
-    newest: Option<&SurfaceKey>,
+    completed_request: u64,
+    newest: Option<(&SurfaceKey, u64)>,
     latest: Option<&SurfaceKey>,
 ) -> bool {
-    let camera_matches = latest.is_none_or(|latest| {
-        completed.same_content_class(latest)
-            && completed.size == latest.size
-            && completed.viewport_center == latest.viewport_center
-            && completed.viewport_zoom == latest.viewport_zoom
+    let presentable =
+        latest.is_none_or(|latest| completed.same_content(latest) && completed.size == latest.size);
+    let newer = newest.is_none_or(|(newest, request)| {
+        completed_request > request
+            || !newest.same_content_class(completed)
+            || newest.size != completed.size
     });
-    camera_matches
+    presentable
+        && newer
         && !newest
             .zip(latest)
-            .is_some_and(|(newest, latest)| newest == latest && completed != latest)
+            .is_some_and(|((newest, _), latest)| newest == latest && completed != latest)
 }
 
 /// One frame's worth of pixels for the canvas.
@@ -898,7 +918,7 @@ async fn camera_maintenance_after_idle(
     ticket: CameraTicket,
 ) -> bool {
     executor.timer(Duration::from_millis(64)).await;
-    !ticket.cancelled()
+    !ticket.superseded()
 }
 
 /// Everything a scene render reads from the document, copied out so the
@@ -1252,6 +1272,37 @@ enum SkiaGpuBackend {
     Ganesh(gpu::DirectContext),
 }
 
+/// The process-wide thread pool Graphite contexts compile pipelines on.
+///
+/// Without an executor, Graphite compiles every pipeline a recording needs
+/// for the first time serially inside `Recorder::snap` — hundreds of
+/// milliseconds when new content appears. With one, the compiles fan out
+/// across these threads and only `insert_recording` waits for the pipelines
+/// it encodes. The pool is created once and never destroyed, so it outlives
+/// every context configured with it, as Graphite requires.
+#[cfg(target_os = "macos")]
+fn graphite_pipeline_executor() -> *mut skia_bindings::SkExecutor {
+    struct PipelineExecutor(*mut skia_bindings::SkExecutor);
+    // SAFETY: SkExecutor thread pools are internally synchronized; the pointer
+    // is only ever handed to Graphite, never dereferenced here.
+    unsafe impl Send for PipelineExecutor {}
+    unsafe impl Sync for PipelineExecutor {}
+    static EXECUTOR: std::sync::OnceLock<PipelineExecutor> = std::sync::OnceLock::new();
+    EXECUTOR
+        .get_or_init(|| {
+            let threads = std::thread::available_parallelism()
+                .map_or(4, std::num::NonZeroUsize::get)
+                .saturating_sub(2)
+                .clamp(2, 8);
+            // Graphite queues draw-time compiles on work list 0, ahead of
+            // precompiles on work list 1.
+            PipelineExecutor(unsafe {
+                skia_bindings::C_SkExecutor_MakeMultiListFIFOThreadPool(2, threads as i32, true)
+            })
+        })
+        .0
+}
+
 #[cfg(target_os = "macos")]
 impl SkiaGpuBackend {
     fn new(device: &metal::Device, command_queue: &metal::CommandQueue) -> Result<Self> {
@@ -1299,7 +1350,10 @@ impl SkiaGpuBackend {
                 command_queue.as_ptr() as graphite::mtl::Handle,
             )
         };
-        let context = graphite::mtl::context_factory::make_metal(&backend, None)
+        let mut options = graphite::ContextOptions::new();
+        skia_safe::wrapper::ValueWrapper::inner_mut(&mut options).fExecutor =
+            graphite_pipeline_executor();
+        let context = graphite::mtl::context_factory::make_metal(&backend, &options)
             .ok_or_else(|| anyhow!("creating Skia Graphite Metal context failed"))?;
         RetainedGraphiteContext::new(context)
             .map(Self::Graphite)
@@ -1617,7 +1671,13 @@ struct FramePipelineTiming {
 #[cfg(target_os = "macos")]
 #[derive(Default)]
 struct LatestCameraMailbox {
+    /// Moves with every requested camera.
     sequence: AtomicU64,
+    /// Moves only when work for the previous request can no longer be
+    /// presented: other content, page, target size or scale factor. A camera
+    /// move alone must not cancel a visible render — under continuous input
+    /// every render would be abandoned and the canvas would never update.
+    content: AtomicU64,
     stopped: AtomicBool,
     state: Mutex<CameraMailboxState>,
 }
@@ -1636,13 +1696,21 @@ struct CameraMailboxState {
 struct CameraTicket {
     mailbox: Arc<LatestCameraMailbox>,
     sequence: u64,
+    content: u64,
 }
 
 #[cfg(target_os = "macos")]
 impl CameraTicket {
-    fn cancelled(&self) -> bool {
+    /// A newer camera has been requested since this ticket was issued.
+    fn superseded(&self) -> bool {
         self.mailbox.stopped.load(Ordering::Acquire)
             || self.mailbox.sequence.load(Ordering::Acquire) != self.sequence
+    }
+
+    /// The ticket's work can no longer be presented.
+    fn cancelled(&self) -> bool {
+        self.mailbox.stopped.load(Ordering::Acquire)
+            || self.mailbox.content.load(Ordering::Acquire) != self.content
     }
 }
 
@@ -1680,13 +1748,21 @@ impl LatestCameraMailbox {
             state.input_at = None;
         }
         if state.key != Some(key) || state.scale_factor != scale_factor {
+            let presentable = state
+                .key
+                .is_some_and(|previous| previous.same_content(&key) && previous.size == key.size)
+                && state.scale_factor == scale_factor;
             state.key = Some(key);
             state.scale_factor = scale_factor;
             self.sequence.fetch_add(1, Ordering::Release);
+            if !presentable {
+                self.content.fetch_add(1, Ordering::Release);
+            }
         }
         CameraTicket {
             mailbox: self.clone(),
             sequence: self.sequence.load(Ordering::Acquire),
+            content: self.content.load(Ordering::Acquire),
         }
     }
 
@@ -1704,6 +1780,7 @@ impl LatestCameraMailbox {
         request.pipeline.camera_adopted_at = Some(Instant::now());
         if let Some(ticket) = &mut request.camera {
             ticket.sequence = self.sequence.load(Ordering::Acquire);
+            ticket.content = self.content.load(Ordering::Acquire);
         }
         true
     }
@@ -1713,6 +1790,7 @@ impl LatestCameraMailbox {
         state.key = None;
         state.input_at = None;
         self.sequence.fetch_add(1, Ordering::Release);
+        self.content.fetch_add(1, Ordering::Release);
     }
 }
 
@@ -1938,7 +2016,10 @@ fn render_thread_loop(
             // is based on the snapshot this job promised to install.
             if let Some(mailbox) = request.camera.as_ref().map(|ticket| ticket.mailbox.clone())
                 && if request.maintenance {
-                    request.camera.as_ref().is_some_and(CameraTicket::cancelled)
+                    request
+                        .camera
+                        .as_ref()
+                        .is_some_and(CameraTicket::superseded)
                 } else {
                     !mailbox.retarget(&mut request)
                 }
@@ -2373,9 +2454,18 @@ impl MacGpuRenderer {
             path = FramePath::Refused(gesture);
         }
         let normal_started = (!matches!(path, FramePath::Retained(_))).then(Instant::now);
+        // Maintenance is speculative and yields to any newer camera; a visible
+        // frame is always finished unless its content can no longer be shown.
+        let abandoned = |ticket: &CameraTicket| {
+            if request.maintenance {
+                ticket.superseded()
+            } else {
+                ticket.cancelled()
+            }
+        };
         let metrics = if normal_started.is_some() {
             let canvas = target.canvas().context("canvas backend unavailable")?;
-            let should_cancel = || request.camera.as_ref().is_some_and(CameraTicket::cancelled);
+            let should_cancel = || request.camera.as_ref().is_some_and(abandoned);
             let rendered = if request.maintenance {
                 self.raster_renderer.maintain_camera_cache(
                     canvas,
@@ -2430,7 +2520,7 @@ impl MacGpuRenderer {
         progress.pipeline = pipeline;
         progress.font_generation = font_generation
             .filter(|generation| RasterRenderer::current_font_generation() == Some(*generation));
-        progress.cancelled |= request.camera.as_ref().is_some_and(CameraTicket::cancelled);
+        progress.cancelled |= request.camera.as_ref().is_some_and(abandoned);
         let flush_duration = flush_started.map(|started| started.elapsed());
         let normal_cost = normal_started.map(|started| started.elapsed());
         drop(target);
@@ -2679,9 +2769,6 @@ pub(crate) struct GpuCanvas {
 
 #[cfg(target_os = "macos")]
 impl GpuCanvas {
-    /// Beyond this zoom ratio a reprojected frame is too blurry or too sparse
-    /// to stand in for a cheap scene's fresh render.
-    const MAX_REPROJECT_SCALE: f64 = 3.0;
     /// A render at or under this cost may block paint (it fits a display
     /// frame); anything slower moves to the render thread.
     const SYNC_RENDER_BUDGET: Duration = Duration::from_millis(16);
@@ -2923,7 +3010,9 @@ impl GpuCanvas {
                             });
                             if should_install_completed_frame(
                                 &key,
-                                newest.map(|frame| &frame.key),
+                                progress.pipeline.request_id,
+                                newest
+                                    .map(|frame| (&frame.key, frame.progress.pipeline.request_id)),
                                 self.latest_request.as_ref().map(|latest| &latest.key),
                             ) {
                                 self.install_frame(
@@ -3663,6 +3752,7 @@ impl FigView {
         let ticket = CameraTicket {
             mailbox: gpu.camera_mailbox.clone(),
             sequence,
+            content: gpu.camera_mailbox.content.load(Ordering::Acquire),
         };
         gpu.maintenance_task = Some(cx.spawn(async move |view, cx| {
             if !camera_maintenance_after_idle(cx.background_executor().clone(), ticket.clone())
@@ -3673,7 +3763,7 @@ impl FigView {
             view.update(cx, |view, cx| {
                 if let Some(gpu) = &mut view.gpu_canvas
                     && gpu.maintenance_sequence == Some(sequence)
-                    && !ticket.cancelled()
+                    && !ticket.superseded()
                 {
                     gpu.maintenance_ready = true;
                     cx.notify();
@@ -4257,8 +4347,13 @@ impl Element for CanvasElement {
                         viewport: cached_viewport,
                         logical,
                     }) => {
-                        let projected =
-                            reprojected_bounds(frame_bounds, logical, cached_viewport, viewport);
+                        let projected = reprojected_bounds(
+                            frame_bounds,
+                            logical,
+                            cached_viewport,
+                            viewport,
+                            scale_factor,
+                        );
                         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
                             window.paint_surface(projected, buffer);
                         });
@@ -6305,6 +6400,9 @@ pub(crate) fn render_size_for_bounds(bounds: Bounds<Pixels>, scale_factor: f32) 
     (width, height)
 }
 
+#[cfg(all(test, target_os = "macos"))]
+mod navigation_bench;
+
 #[cfg(test)]
 mod geometry_tests {
     use super::*;
@@ -7623,7 +7721,7 @@ mod tests {
         };
         let cached = viewport([0.0, 0.0], 1.0);
         let current = viewport([10.0, 0.0], 1.0);
-        let projected = reprojected_bounds(bounds, (100.0, 100.0), cached, current);
+        let projected = reprojected_bounds(bounds, (100.0, 100.0), cached, current, 1.0);
         // Panning the viewport 10 world units right moves the old frame's
         // content 10 px left at zoom 1.
         assert!((f32::from(projected.origin.x) - -10.0).abs() < 1e-4);
@@ -7632,17 +7730,19 @@ mod tests {
     }
 
     #[test]
-    fn reprojection_scales_content_around_the_shared_center() {
+    fn reprojection_moves_by_whole_device_pixels_like_the_renderer() {
         let bounds = Bounds {
             origin: point(px(0.), px(0.)),
             size: size(px(100.), px(100.)),
         };
         let cached = viewport([0.0, 0.0], 1.0);
-        let current = viewport([0.0, 0.0], 2.0);
-        let projected = reprojected_bounds(bounds, (100.0, 100.0), cached, current);
-        // Doubling the zoom doubles the old frame around the element center.
-        assert!((f32::from(projected.size.width) - 200.0).abs() < 1e-4);
-        assert!((f32::from(projected.origin.x) - -50.0).abs() < 1e-4);
+        // 0.3 world units at 2x: the renderer snaps both frames' translations
+        // to whole device pixels, 100 and 99, so the frame moves one device
+        // pixel (half a logical pixel), never a resampling fraction.
+        let current = viewport([0.3, 0.0], 1.0);
+        let projected = reprojected_bounds(bounds, (100.0, 100.0), cached, current, 2.0);
+        assert!((f32::from(projected.origin.x) - -0.5).abs() < 1e-4);
+        assert!((f32::from(projected.size.width) - 100.0).abs() < 1e-4);
     }
 
     fn surface_key(center: [f64; 2], zoom: f64, revision: u64) -> SurfaceKey {
@@ -7678,7 +7778,7 @@ mod tests {
     }
 
     #[test]
-    fn camera_input_cancels_a_busy_worker_before_another_paint() -> Result<()> {
+    fn camera_input_supersedes_but_never_cancels_a_busy_visible_render() -> Result<()> {
         let mailbox = Arc::new(LatestCameraMailbox::default());
         let first = surface_key([0.0, 0.0], 0.1, 7);
         let request = camera_request(first, &mailbox);
@@ -7691,18 +7791,22 @@ mod tests {
             move || {
                 entered.wait();
                 resume.wait();
-                ticket.cancelled()
+                (ticket.superseded(), ticket.cancelled())
             }
         })?;
         entered.wait();
         mailbox.note_input(viewport([40_000.0, 0.0], 0.1), Instant::now());
         resume.wait();
-        let cancelled = worker
+        let (superseded, cancelled) = worker
             .join()
             .map_err(|_| anyhow!("camera probe panicked"))?;
         assert!(
-            cancelled,
+            superseded,
             "input must reach a running worker without paint or a render job"
+        );
+        assert!(
+            !cancelled,
+            "a visible render for an older camera of the same content still presents"
         );
         Ok(())
     }
@@ -7715,7 +7819,8 @@ mod tests {
         let input_at = Instant::now();
         let latest = viewport([80_000.0, -300.0], 0.173);
         mailbox.note_input(latest, input_at);
-        assert!(request.camera.as_ref().context("ticket")?.cancelled());
+        assert!(request.camera.as_ref().context("ticket")?.superseded());
+        assert!(!request.camera.as_ref().context("ticket")?.cancelled());
         assert!(mailbox.retarget(&mut request));
         assert_eq!(request.key.viewport_center, latest.center);
         assert_eq!(request.key.viewport_zoom, latest.zoom);
@@ -7729,7 +7834,7 @@ mod tests {
                 .camera
                 .as_ref()
                 .context("retargeted ticket")?
-                .cancelled()
+                .superseded()
         );
         let sequence = mailbox.sequence.load(Ordering::Acquire);
         mailbox.note_input(latest, input_at + Duration::from_millis(1));
@@ -7738,7 +7843,22 @@ mod tests {
         let mut resized = request.key;
         resized.size = (1500, 1600);
         mailbox.publish(resized, 1.5);
+        assert!(
+            request
+                .camera
+                .as_ref()
+                .context("pre-resize ticket")?
+                .cancelled(),
+            "a frame of the old target size can never be presented"
+        );
         assert!(mailbox.retarget(&mut request));
+        assert!(
+            !request
+                .camera
+                .as_ref()
+                .context("resized ticket")?
+                .cancelled()
+        );
         assert_eq!(request.key.size, resized.size);
         assert_eq!(request.scale_factor, 1.5);
         let before_edit = request.key;
@@ -7891,9 +8011,10 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_pan_completion_cannot_replace_the_matching_current_camera() {
+    fn newer_pan_completions_install_while_the_camera_keeps_moving() {
         let first = surface_key([0.0, 0.0], 0.1, 7);
         let distant = surface_key([40_000.0, 0.0], 0.1, 7);
+        let third = surface_key([80_000.0, 0.0], 0.1, 7);
         assert_eq!(
             plan_paint(Some(&first), &distant, false, RenderCost::Expensive, false),
             PaintPlan::PresentAndRender
@@ -7903,11 +8024,19 @@ mod tests {
             PaintPlan::Present
         );
         assert!(
-            !should_install_completed_frame(&distant, Some(&first), Some(&first)),
+            should_install_completed_frame(&distant, 2, Some((&first, 1)), Some(&third)),
+            "a completion dispatched after the newest frame installs although the camera moved on"
+        );
+        assert!(
+            !should_install_completed_frame(&distant, 1, Some((&first, 2)), Some(&third)),
+            "an older dispatch never replaces a newer frame"
+        );
+        assert!(
+            !should_install_completed_frame(&distant, 3, Some((&first, 2)), Some(&first)),
             "returning to the existing exact camera must retain its pixels"
         );
         assert!(
-            should_install_completed_frame(&first, Some(&first), Some(&first)),
+            should_install_completed_frame(&first, 3, Some((&first, 2)), Some(&first)),
             "same-camera detail refinement must still install"
         );
         assert_eq!(
@@ -7915,20 +8044,34 @@ mod tests {
             PaintPlan::Present,
             "tile maintenance cannot delay a matching sharp frame"
         );
-        let third = surface_key([80_000.0, 0.0], 0.1, 7);
-        assert!(
-            !should_install_completed_frame(&distant, Some(&first), Some(&third)),
-            "an obsolete camera must not replace pixels while the current camera is pending"
-        );
-        assert_eq!(
-            plan_paint(Some(&distant), &third, false, RenderCost::Expensive, false),
-            PaintPlan::PresentAndRender
-        );
-        assert!(!should_install_completed_frame(
+        assert!(should_install_completed_frame(
             &distant,
+            1,
             None,
             Some(&first)
         ));
+        let mut edited = third;
+        edited.revision += 1;
+        assert!(
+            !should_install_completed_frame(&distant, 4, Some((&first, 2)), Some(&edited)),
+            "a completion of superseded content is never installed"
+        );
+        let mut resized = third;
+        resized.size = (900, 700);
+        assert!(!should_install_completed_frame(
+            &distant,
+            4,
+            Some((&first, 2)),
+            Some(&resized)
+        ));
+        let mut other_page = first;
+        other_page.page_root = Some(NodeId::new());
+        let mut on_other_page = distant;
+        on_other_page.page_root = other_page.page_root;
+        assert!(
+            should_install_completed_frame(&on_other_page, 1, Some((&first, 2)), Some(&other_page)),
+            "the first frame of another page replaces the previous page regardless of order"
+        );
     }
 
     #[test]
@@ -8237,27 +8380,35 @@ mod tests {
     }
 
     #[test]
-    fn a_zoom_ratio_beyond_the_reproject_cap_renders_fresh() {
+    fn any_zoom_change_renders_fresh_instead_of_resampling() {
         // Zooming IN shrinks the needed world coverage, so the cached frame
-        // still covers the view — only the 3× scale cap forces the fresh
-        // render here.
+        // still covers the view; a scaled frame would still be a blurred
+        // preview, so the sharp frame is held until the exact one arrives.
         let cached = surface_key([0.0, 0.0], 1.0, 7);
-        let at_cap = surface_key([0.0, 0.0], GpuCanvas::MAX_REPROJECT_SCALE, 7);
-        let beyond_cap = surface_key([0.0, 0.0], GpuCanvas::MAX_REPROJECT_SCALE * 1.01, 7);
-        assert_eq!(
-            frame_decision(&cached, &at_cap, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
-            FrameDecision::Reproject
-        );
-        assert_eq!(
-            frame_decision(&cached, &beyond_cap, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
-            FrameDecision::RenderFresh
-        );
+        for zoom in [1.01, 1.5, 3.0] {
+            let requested = surface_key([0.0, 0.0], zoom, 7);
+            assert_eq!(
+                frame_decision(&cached, &requested, FRAME_LOGICAL, VISIBLE_LOGICAL, true),
+                FrameDecision::RenderFresh
+            );
+            assert_eq!(
+                frame_presentation(
+                    &cached,
+                    FRAME_LOGICAL,
+                    &requested,
+                    FRAME_LOGICAL,
+                    VISIBLE_LOGICAL,
+                    1.0,
+                ),
+                FramePresentation::Held
+            );
+        }
     }
 
     #[test]
     fn uncovered_zoom_out_never_shrinks_a_partial_surface_into_the_view() {
         let cached = surface_key([0.0, 0.0], 1.0, 7);
-        for zoom in [0.5, 1.0 / (GpuCanvas::MAX_REPROJECT_SCALE * 1.01)] {
+        for zoom in [0.5, 1.0 / 3.03] {
             let requested = surface_key([0.0, 0.0], zoom, 7);
             for within in [false, true] {
                 assert_eq!(
@@ -8310,7 +8461,7 @@ mod tests {
             size: size(px(200.), px(200.)),
         };
         let cached = viewport([0.0, 0.0], 1.0);
-        let projected = reprojected_bounds(bounds, (100.0, 100.0), cached, cached);
+        let projected = reprojected_bounds(bounds, (100.0, 100.0), cached, cached, 1.0);
         assert!((f32::from(projected.size.width) - 100.0).abs() < 1e-4);
         assert!((f32::from(projected.origin.x) - 50.0).abs() < 1e-4);
         assert!((f32::from(projected.origin.y) - 50.0).abs() < 1e-4);
@@ -8510,7 +8661,7 @@ mod tests {
     #[test]
     fn expensive_zoom_changes_dispatch_immediately_at_every_scale() {
         let cached = surface_key([0.0, 0.0], 1.0, 7);
-        for zoom in [0.5, 0.9, 1.1, GpuCanvas::MAX_REPROJECT_SCALE * 1.01] {
+        for zoom in [0.5, 0.9, 1.1, 3.03] {
             let requested = surface_key([0.0, 0.0], zoom, 7);
             for within in [false, true] {
                 assert_eq!(

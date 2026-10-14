@@ -5879,7 +5879,7 @@ impl FigView {
         // The edited node stays behind on the old page; end the session
         // before the canvas stops rendering it.
         self.finish_document_edits(cx);
-        let Some(root) = self.item.update(cx, |item, cx| {
+        let Some((root, prewarm)) = self.item.update(cx, |item, cx| {
             item.with_document(cx, |document| {
                 document.ensure_page_solved(index);
                 let root = document.pages.get(index).and_then(|page| page.root);
@@ -5887,8 +5887,9 @@ impl FigView {
                 if changed {
                     document.doc.selection.clear();
                 }
+                let prewarm = root.and_then(|root| document.take_page_prewarm(root));
                 (
-                    root,
+                    (root, prewarm),
                     if changed {
                         DocChange::Selection
                     } else {
@@ -5899,6 +5900,11 @@ impl FigView {
         }) else {
             return;
         };
+        if let Some(prewarm) = prewarm {
+            // Decoding the page's images inside its first frame would stall
+            // the render thread; the walk waits only for decodes under way.
+            cx.background_spawn(async move { prewarm.run() }).detach();
+        }
         let changed_for_view = self.last_seen_root != root;
         self.selected_page_index = Some(index);
         self.selected_page_root = root;

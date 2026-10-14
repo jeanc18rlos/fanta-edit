@@ -27,6 +27,11 @@ An upload failure rejects the snapped recording with a native diagnostic instead
 of returning a frame with omitted artwork. Failed recordings clear cached images
 so discarded uploads cannot be reused. A non-owning thread-local registry follows
 Skia's recorder thread-affinity contract and is erased before recorder deletion.
+src/graphite.cpp also exports C_SkExecutor_MakeMultiListFIFOThreadPool, a
+factory for SkExecutor::MakeMultiListFIFOThreadPool, so a Graphite
+ContextOptions::fExecutor can compile pipelines on worker threads instead of
+inline inside Recorder::snap. The caller owns the pool and keeps it alive for
+every Context configured with it.
 The synchronous readback shim keeps asynchronous result state alive through heap
 shared ownership. Its callback never retains or writes the caller's buffer, so a
 failed submit or bounded completion timeout cannot leave a dangling callback.

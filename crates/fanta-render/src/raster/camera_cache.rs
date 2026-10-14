@@ -6,13 +6,26 @@ use super::{
 use fanta_doc::{ModeId, VariableCollectionId};
 use skia_safe::canvas::SrcRectConstraint;
 use skia_safe::{AlphaType, BlendMode, Image, Paint, Picture, Rect, SamplingOptions};
-use std::collections::BTreeMap;
-use std::time::Instant;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, Instant};
 
 const TILE_SIZE: i32 = 512;
 const GUTTER: i32 = 4;
 const IMAGE_BUDGET: usize = 96 * 1024 * 1024;
 const PICTURE_BUDGET: usize = 64 * 1024 * 1024;
+/// Missing visible tiles a frame at an already-presented scale builds instead
+/// of replaying its whole recording. A larger gap (a jump, the first pan after
+/// a zoom) replays once and fills its tiles over the following frames.
+pub(super) const MANDATORY_TILES: usize = 6;
+/// CPU time a visible frame may spend building tiles beyond the mandatory
+/// ones: the rest of a large gap first, then tiles ahead of the motion.
+const TILE_BUDGET: Duration = Duration::from_millis(6);
+/// Tiles a moving frame builds ahead of the motion, so a steady pan finds its
+/// next tiles ready instead of building them when they become visible.
+pub(super) const PREFETCH_TILES: usize = 2;
+/// Extra tiles a region recording reaches in the direction of motion, so a
+/// steady pan records new regions less often.
+const LEAD_TILES: f32 = 2.0;
 
 #[derive(Debug, Clone, Default)]
 pub struct CameraCacheMetrics {
@@ -62,11 +75,83 @@ struct Tile {
     last_used: u64,
 }
 
+/// A display list of one device-space region at the level's scale.
+struct RegionRecording {
+    bounds: Rect,
+    picture: Picture,
+    last_used: u64,
+}
+
 struct DetailLevel {
     scale: f64,
-    picture: Option<Picture>,
-    bounds: Rect,
+    /// Recordings of the regions this scale has shown or prefetched: the
+    /// first view, then each gap a pan exposed, recorded once.
+    recordings: Vec<RegionRecording>,
     tiles: BTreeMap<(i32, i32), Tile>,
+    /// Tiles whose own recording was refused (backdrop sampling) or whose
+    /// image could not be allocated: frames showing them render normally.
+    refused_tiles: BTreeSet<(i32, i32)>,
+    /// The device translation of the last frame presented at this scale:
+    /// `None` until one was, and the source of the motion direction.
+    last_transform: Option<(f64, f64)>,
+}
+
+impl DetailLevel {
+    fn new(scale: f64) -> Self {
+        Self {
+            scale,
+            recordings: Vec::new(),
+            tiles: BTreeMap::new(),
+            refused_tiles: BTreeSet::new(),
+            last_transform: None,
+        }
+    }
+
+    fn records(&self, rect: Rect) -> bool {
+        self.recording_for(rect).is_some()
+    }
+
+    /// The most recent recording that contains `rect`.
+    fn recording_for(&self, rect: Rect) -> Option<&RegionRecording> {
+        self.recordings
+            .iter()
+            .rev()
+            .find(|recording| contains_rect(recording.bounds, rect))
+    }
+
+    fn touch_recording(&mut self, rect: Rect, frame: u64) -> Option<Picture> {
+        let recording = self
+            .recordings
+            .iter_mut()
+            .rev()
+            .find(|recording| contains_rect(recording.bounds, rect))?;
+        recording.last_used = frame;
+        Some(recording.picture.clone())
+    }
+
+    fn recording_bytes(&self) -> usize {
+        self.recordings
+            .iter()
+            .map(|recording| recording.picture.approximate_bytes_used())
+            .sum()
+    }
+}
+
+enum RegionRecord {
+    Recorded,
+    /// The recording device cannot certify the region (backdrop sampling).
+    Unsupported(Box<RenderMetrics>),
+    /// Recorded, but too large to retain or recorded across a font change.
+    Unretainable(Box<RenderMetrics>),
+    Cancelled(Box<RenderMetrics>),
+}
+
+enum TileBuild {
+    Built,
+    Refused,
+    /// No tile could be evicted to make room.
+    Full,
+    Cancelled(Box<RenderMetrics>),
 }
 
 struct ParkedPage {
@@ -244,12 +329,7 @@ impl CameraCache {
             // The bounds include the actual screen-capped filter reach, so their
             // memo must change with scale even though authored content is unchanged.
             renderer.clear_camera_bounds();
-            self.level = Some(DetailLevel {
-                scale,
-                picture: None,
-                bounds: Rect::default(),
-                tiles: BTreeMap::new(),
-            });
+            self.level = Some(DetailLevel::new(scale));
             self.refused = None;
         }
         self.frame = self.frame.wrapping_add(1);
@@ -310,61 +390,106 @@ impl CameraCache {
                 should_cancel,
             );
         };
+        if visible
+            .iter()
+            .any(|position| level.refused_tiles.contains(position))
+        {
+            return fallback_cancellable(
+                renderer,
+                canvas,
+                width,
+                height,
+                scene,
+                viewport,
+                page,
+                inputs,
+                should_cancel,
+            );
+        }
         let mut metrics = RenderMetrics::default();
         let mut cache_metrics = CameraCacheMetrics::default();
-        let fully_cached = visible
+        for position in &visible {
+            if let Some(tile) = level.tiles.get_mut(position) {
+                tile.last_used = self.frame;
+            }
+        }
+        // A zoom visits each scale once: its frames render directly, without
+        // a recording, a spatial index or tiles nothing would reuse. Tiles
+        // start once a scale is presented again; panning then reuses them.
+        if level.last_transform.is_none() {
+            level.last_transform = Some(transform);
+            let mut result = fallback_cancellable(
+                renderer,
+                canvas,
+                width,
+                height,
+                scene,
+                viewport,
+                page,
+                inputs,
+                should_cancel,
+            );
+            result.needs_refresh = result.complete_detail && !result.cancelled;
+            return result;
+        }
+        let motion = level
+            .last_transform
+            .map(|previous| (transform.0 - previous.0, transform.1 - previous.1));
+        let missing: Vec<(i32, i32)> = visible
             .iter()
-            .all(|position| level.tiles.contains_key(position));
-        if !fully_cached && (level.picture.is_none() || !contains_rect(level.bounds, required)) {
-            // Coverage is bounded in device pixels. It includes complete tile edges
-            // and a nearby fringe, never a page-wide low-resolution prerequisite.
-            let coverage = required.with_outset((TILE_SIZE as f32, TILE_SIZE as f32));
-            match renderer.record_camera_region(scene, scale, page, inputs, coverage, should_cancel)
-            {
-                Ok((picture, recorded)) => {
-                    metrics = recorded;
-                    cache_metrics.scene_walks = 1;
-                    cache_metrics.scene_walk_wall_us = metrics.frame_micros;
-                    if should_cancel() {
-                        return cancelled_result(metrics, cache_metrics);
-                    }
-                    if picture.approximate_bytes_used() > PICTURE_BUDGET
-                        || RasterRenderer::current_font_generation() != key.font_generation
-                    {
-                        return fallback_cancellable(
-                            renderer,
-                            canvas,
-                            width,
-                            height,
-                            scene,
-                            viewport,
-                            page,
-                            inputs,
-                            should_cancel,
-                        );
-                    }
-                    if self.parked.as_ref().is_some_and(|parked| {
-                        picture.approximate_bytes_used()
-                            + parked
-                                .level
-                                .as_ref()
-                                .and_then(|level| level.picture.as_ref())
-                                .map_or(0, Picture::approximate_bytes_used)
-                            > PICTURE_BUDGET
-                    }) {
-                        self.parked = None;
-                    }
-                    level.bounds = coverage;
-                    level.picture = Some(picture);
+            .copied()
+            .filter(|position| !level.tiles.contains_key(position))
+            .collect();
+        // A pan exposes a few tiles at a time: they are built now, from one
+        // recording of just the exposed gap. A fresh scale or a large gap
+        // replays one recording of the whole view instead.
+        let gap = missing.len() <= MANDATORY_TILES;
+        let coverage = if missing.is_empty() {
+            None
+        } else if gap {
+            missing
+                .iter()
+                .map(|position| tile_rect(*position))
+                .filter(|rect| !level.records(*rect))
+                .reduce(|union, rect| {
+                    let mut union = union;
+                    union.join(rect);
+                    union
+                })
+                .map(|union| ahead_of(union, motion))
+        } else if level.records(required) {
+            None
+        } else {
+            // Coverage is bounded in device pixels. It includes complete tile
+            // edges and a nearby fringe, never a page-wide prerequisite.
+            Some(ahead_of(
+                required.with_outset((TILE_SIZE as f32, TILE_SIZE as f32)),
+                motion,
+            ))
+        };
+        if let Some(coverage) = coverage {
+            match record_region(
+                level,
+                &mut self.parked,
+                renderer,
+                scene,
+                page,
+                inputs,
+                &key,
+                coverage,
+                self.frame,
+                should_cancel,
+                &mut cache_metrics,
+                &mut metrics,
+            ) {
+                RegionRecord::Recorded => {}
+                RegionRecord::Cancelled(recorded) => {
+                    return cancelled_result(*recorded, cache_metrics);
                 }
-                Err(recorded) => {
-                    if recorded.camera_cancelled || should_cancel() {
-                        cache_metrics.scene_walks = 1;
-                        cache_metrics.scene_walk_wall_us = recorded.frame_micros;
-                        return cancelled_result(*recorded, cache_metrics);
-                    }
-                    // Backdrop sampling cannot be certified by a recording device.
-                    // Refuse only this coverage; distant blur must not disable a page.
+                RegionRecord::Unsupported(recorded) => {
+                    // Backdrop sampling cannot be certified by a recording
+                    // device. Refuse only this coverage; a distant blur must
+                    // not disable a page.
                     self.refused = Some(coverage);
                     let mut result = fallback_cancellable(
                         renderer,
@@ -377,68 +502,192 @@ impl CameraCache {
                         inputs,
                         should_cancel,
                     );
-                    result.cache.scene_walks += 1;
-                    result.cache.scene_walk_wall_us += recorded.frame_micros;
-                    result.metrics.bounds_prepared += recorded.bounds_prepared;
-                    result.metrics.frame_micros = started.elapsed().as_micros() as u64;
-                    result.cancelled = should_cancel();
+                    add_walks(&mut result, &cache_metrics, &recorded, started);
+                    return result;
+                }
+                RegionRecord::Unretainable(recorded) => {
+                    let mut result = fallback_cancellable(
+                        renderer,
+                        canvas,
+                        width,
+                        height,
+                        scene,
+                        viewport,
+                        page,
+                        inputs,
+                        should_cancel,
+                    );
+                    add_walks(&mut result, &cache_metrics, &recorded, started);
                     return result;
                 }
             }
         }
-        let tile_bytes = ((TILE_SIZE + 2 * GUTTER) as usize).pow(2) * 4;
-        for position in &visible {
-            if let Some(tile) = level.tiles.get_mut(position) {
-                tile.last_used = self.frame;
+        if gap {
+            for position in &missing {
+                match build_tile(
+                    level,
+                    &mut self.parked,
+                    renderer,
+                    canvas,
+                    scene,
+                    page,
+                    inputs,
+                    &key,
+                    *position,
+                    tile_rect(*position),
+                    &visible,
+                    self.frame,
+                    should_cancel,
+                    &mut cache_metrics,
+                    &mut metrics,
+                ) {
+                    TileBuild::Built => {}
+                    TileBuild::Full => break,
+                    TileBuild::Cancelled(recorded) => {
+                        return cancelled_result(*recorded, cache_metrics);
+                    }
+                    TileBuild::Refused => {
+                        let mut result = fallback_cancellable(
+                            renderer,
+                            canvas,
+                            width,
+                            height,
+                            scene,
+                            viewport,
+                            page,
+                            inputs,
+                            should_cancel,
+                        );
+                        result.cache.scene_walks += cache_metrics.scene_walks;
+                        result.cache.scene_walk_wall_us += cache_metrics.scene_walk_wall_us;
+                        return result;
+                    }
+                }
             }
         }
+        {
+            // Spend what remains of the frame budget from existing recordings
+            // only (never a scene walk): the rest of a large visible gap
+            // first, then the tiles the motion reaches next.
+            let ahead = motion.map_or_else(Vec::new, |motion| tiles_ahead(&visible, motion));
+            let mut prefetched = 0;
+            for position in visible.iter().chain(&ahead) {
+                if started.elapsed() >= TILE_BUDGET {
+                    break;
+                }
+                let prefetch = !visible.contains(position);
+                if prefetch && prefetched >= PREFETCH_TILES {
+                    break;
+                }
+                if level.tiles.contains_key(position)
+                    || level.refused_tiles.contains(position)
+                    || !level.records(tile_rect(*position))
+                    || (prefetch && !has_room(level, self.parked.as_ref()))
+                {
+                    continue;
+                }
+                match build_tile(
+                    level,
+                    &mut self.parked,
+                    renderer,
+                    canvas,
+                    scene,
+                    page,
+                    inputs,
+                    &key,
+                    *position,
+                    tile_rect(*position),
+                    &visible,
+                    self.frame,
+                    should_cancel,
+                    &mut cache_metrics,
+                    &mut metrics,
+                ) {
+                    TileBuild::Built => prefetched += usize::from(prefetch),
+                    TileBuild::Full | TileBuild::Refused => break,
+                    TileBuild::Cancelled(recorded) => {
+                        return cancelled_result(*recorded, cache_metrics);
+                    }
+                }
+            }
+        }
+        level.last_transform = Some(transform);
         if should_cancel() {
             return cancelled_result(metrics, cache_metrics);
         }
-        let complete = visible
+        let gaps: Vec<(i32, i32)> = visible
             .iter()
-            .all(|position| level.tiles.contains_key(position));
+            .copied()
+            .filter(|position| !level.tiles.contains_key(position))
+            .collect();
+        let complete = gaps.is_empty();
+        // Mostly uncovered views replay one recording of the whole view;
+        // otherwise only the gaps replay, so the cost follows the uncovered
+        // area, not the whole view.
+        let whole = (gaps.len() * 2 > visible.len())
+            .then(|| level.touch_recording(required, self.frame))
+            .flatten();
         canvas.clear(to_sk_color(background));
-        canvas.save();
-        if complete {
+        if whole.is_none() {
             let mut paint = Paint::default();
             paint.set_blend_mode(BlendMode::Src);
+            let source = Rect::from_xywh(
+                GUTTER as f32,
+                GUTTER as f32,
+                TILE_SIZE as f32,
+                TILE_SIZE as f32,
+            );
             for position in &visible {
                 let Some(tile) = level.tiles.get(position) else {
                     continue;
                 };
-                let destination = Rect::from_xywh(
-                    (f64::from(position.0) * f64::from(TILE_SIZE) + transform.0) as f32,
-                    (f64::from(position.1) * f64::from(TILE_SIZE) + transform.1) as f32,
-                    TILE_SIZE as f32,
-                    TILE_SIZE as f32,
-                );
-                let source = Rect::from_xywh(
-                    GUTTER as f32,
-                    GUTTER as f32,
-                    TILE_SIZE as f32,
-                    TILE_SIZE as f32,
-                );
                 canvas.draw_image_rect_with_sampling_options(
                     &tile.image,
                     Some((&source, SrcRectConstraint::Strict)),
-                    destination,
+                    tile_destination(*position, transform),
                     SamplingOptions::default(),
                     &paint,
                 );
                 cache_metrics.tiles_drawn += 1;
             }
-        } else if let Some(picture) = &level.picture {
+        }
+        let mut replays = Vec::new();
+        if let Some(picture) = whole {
+            replays.push((None, picture));
+        } else {
+            for position in &gaps {
+                let Some(picture) = level.touch_recording(tile_rect(*position), self.frame) else {
+                    return fallback_cancellable(
+                        renderer,
+                        canvas,
+                        width,
+                        height,
+                        scene,
+                        viewport,
+                        page,
+                        inputs,
+                        should_cancel,
+                    );
+                };
+                replays.push((Some(tile_destination(*position, transform)), picture));
+            }
+        }
+        for (clip, picture) in &replays {
+            canvas.save();
+            if let Some(clip) = clip {
+                canvas.clip_rect(*clip, skia_safe::ClipOp::Intersect, false);
+            }
             canvas.translate((transform.0 as f32, transform.1 as f32));
             canvas.draw_picture(picture, None, None);
+            canvas.restore();
             cache_metrics.picture_drawn = true;
         }
-        canvas.restore();
-        cache_metrics.retained_bytes = level.tiles.len() * tile_bytes
-            + level
-                .picture
-                .as_ref()
-                .map_or(0, Picture::approximate_bytes_used)
+        let pending = !complete
+            || (has_room(level, self.parked.as_ref())
+                && ring_tiles(&visible).iter().any(|position| {
+                    !level.tiles.contains_key(position) && !level.refused_tiles.contains(position)
+                }));
+        cache_metrics.retained_bytes = level_bytes(Some(level))
             + self
                 .parked
                 .as_ref()
@@ -447,7 +696,7 @@ impl CameraCache {
         CameraCacheResult {
             metrics,
             cache: cache_metrics,
-            needs_refresh: !complete,
+            needs_refresh: pending,
             complete_detail: true,
             cancelled: false,
         }
@@ -456,7 +705,7 @@ impl CameraCache {
     #[allow(clippy::too_many_arguments)]
     pub(super) fn maintain(
         &mut self,
-        renderer: &RasterRenderer,
+        renderer: &mut RasterRenderer,
         canvas: &Canvas,
         width: u32,
         height: u32,
@@ -535,75 +784,66 @@ impl CameraCache {
         let Some(level) = self
             .level
             .as_mut()
-            .filter(|level| level.picture.is_some() && contains_rect(level.bounds, required))
+            .filter(|level| level.last_transform.is_some())
         else {
             return idle_result(metrics, cache_metrics, false);
         };
-        let missing = visible
+        if visible
             .iter()
-            .find(|position| !level.tiles.contains_key(position))
+            .any(|position| level.refused_tiles.contains(position))
+        {
+            return idle_result(metrics, cache_metrics, false);
+        }
+        // The visible gap first, nearest the center; then the ring around the
+        // view, which may need its own small recording — the camera is idle.
+        let ring = ring_tiles(&visible);
+        let room = has_room(level, self.parked.as_ref());
+        let next = visible
+            .iter()
+            .chain(ring.iter().filter(|_| room))
+            .find(|position| {
+                !level.tiles.contains_key(position) && !level.refused_tiles.contains(position)
+            })
             .copied();
-        if let Some(position) = missing {
-            let capacity = IMAGE_BUDGET / tile_bytes();
-            while level.tiles.len()
-                + self
-                    .parked
-                    .as_ref()
-                    .and_then(|parked| parked.level.as_ref())
-                    .map_or(0, |level| level.tiles.len())
-                >= capacity
-            {
-                let current_oldest = level
-                    .tiles
-                    .iter()
-                    .filter(|(position, _)| !visible.contains(position))
-                    .min_by_key(|(_, tile)| tile.last_used)
-                    .map(|(position, tile)| (*position, tile.last_used));
-                let parked_oldest = self
-                    .parked
-                    .as_ref()
-                    .and_then(|parked| parked.level.as_ref())
-                    .and_then(|level| level.tiles.iter().min_by_key(|(_, tile)| tile.last_used))
-                    .map(|(position, tile)| (*position, tile.last_used));
-                if let Some((position, _)) = parked_oldest.filter(|(_, used)| {
-                    current_oldest.is_none_or(|(_, current_used)| *used <= current_used)
-                }) {
-                    if let Some(parked) = self
-                        .parked
-                        .as_mut()
-                        .and_then(|parked| parked.level.as_mut())
-                    {
-                        parked.tiles.remove(&position);
-                    }
-                } else if let Some((position, _)) = current_oldest {
-                    level.tiles.remove(&position);
+        if let Some(position) = next {
+            self.frame = self.frame.wrapping_add(1);
+            match build_tile(
+                level,
+                &mut self.parked,
+                renderer,
+                canvas,
+                scene,
+                page,
+                inputs,
+                &key,
+                position,
+                // The first visible tile at a scale records the whole view in
+                // one walk; later ring tiles record only themselves.
+                if visible.contains(&position) {
+                    required.with_outset((TILE_SIZE as f32, TILE_SIZE as f32))
                 } else {
-                    return idle_result(metrics, cache_metrics, false);
+                    tile_rect(position)
+                },
+                &visible,
+                self.frame,
+                should_cancel,
+                &mut cache_metrics,
+                &mut metrics,
+            ) {
+                TileBuild::Built | TileBuild::Refused => {}
+                TileBuild::Full => return idle_result(metrics, cache_metrics, false),
+                TileBuild::Cancelled(recorded) => {
+                    return cancelled_result(*recorded, cache_metrics);
                 }
             }
-            if should_cancel() {
-                return cancelled_result(metrics, cache_metrics);
-            }
-            let Some(picture) = level.picture.as_ref() else {
-                return idle_result(metrics, cache_metrics, false);
-            };
-            let Some(image) = make_tile(canvas, picture, position, key.background) else {
-                self.refused = Some(level.bounds);
-                return idle_result(metrics, cache_metrics, false);
-            };
-            self.frame = self.frame.wrapping_add(1);
-            level.tiles.insert(
-                position,
-                Tile {
-                    image,
-                    last_used: self.frame,
-                },
-            );
-            cache_metrics.tiles_built = 1;
         }
+        let room = has_room(level, self.parked.as_ref());
         let pending = visible
             .iter()
-            .any(|position| !level.tiles.contains_key(position));
+            .chain(ring.iter().filter(|_| room))
+            .any(|position| {
+                !level.tiles.contains_key(position) && !level.refused_tiles.contains(position)
+            });
         cache_metrics.retained_bytes = level_bytes(Some(level))
             + self
                 .parked
@@ -617,17 +857,338 @@ impl CameraCache {
     }
 }
 
+/// Render one tile into its own image from a recording that covers it,
+/// recording `coverage` (which must contain the tile) first when none does.
+/// Evicts the least recently used tile outside `visible` when the image
+/// budget is full.
+#[allow(clippy::too_many_arguments)]
+fn build_tile(
+    level: &mut DetailLevel,
+    parked: &mut Option<ParkedPage>,
+    renderer: &mut RasterRenderer,
+    canvas: &Canvas,
+    scene: &Scene,
+    page: Option<NodeId>,
+    inputs: &RenderInputs,
+    key: &ContentKey,
+    position: (i32, i32),
+    coverage: Rect,
+    visible: &[(i32, i32)],
+    frame: u64,
+    should_cancel: &dyn Fn() -> bool,
+    cache_metrics: &mut CameraCacheMetrics,
+    metrics: &mut RenderMetrics,
+) -> TileBuild {
+    if !make_room(level, parked, visible) {
+        return TileBuild::Full;
+    }
+    let rect = tile_rect(position);
+    if !level.records(rect) {
+        let coverage = if contains_rect(coverage, rect) {
+            coverage
+        } else {
+            rect
+        };
+        match record_region(
+            level,
+            parked,
+            renderer,
+            scene,
+            page,
+            inputs,
+            key,
+            coverage,
+            frame,
+            should_cancel,
+            cache_metrics,
+            metrics,
+        ) {
+            RegionRecord::Recorded => {}
+            RegionRecord::Cancelled(recorded) => return TileBuild::Cancelled(recorded),
+            RegionRecord::Unsupported(_) => {
+                level.refused_tiles.insert(position);
+                return TileBuild::Refused;
+            }
+            RegionRecord::Unretainable(_) => return TileBuild::Refused,
+        }
+    }
+    let Some(image) = level
+        .touch_recording(rect, frame)
+        .and_then(|picture| make_tile(canvas, &picture, position, key.background))
+    else {
+        level.refused_tiles.insert(position);
+        return TileBuild::Refused;
+    };
+    level.tiles.insert(
+        position,
+        Tile {
+            image,
+            last_used: frame,
+        },
+    );
+    cache_metrics.tiles_built += 1;
+    TileBuild::Built
+}
+
+/// Record `coverage` at the level's scale and keep it, evicting the least
+/// recently used recordings (then the parked page) to stay in budget.
+#[allow(clippy::too_many_arguments)]
+fn record_region(
+    level: &mut DetailLevel,
+    parked: &mut Option<ParkedPage>,
+    renderer: &mut RasterRenderer,
+    scene: &Scene,
+    page: Option<NodeId>,
+    inputs: &RenderInputs,
+    key: &ContentKey,
+    coverage: Rect,
+    frame: u64,
+    should_cancel: &dyn Fn() -> bool,
+    cache_metrics: &mut CameraCacheMetrics,
+    metrics: &mut RenderMetrics,
+) -> RegionRecord {
+    let recorded =
+        renderer.record_camera_region(scene, level.scale, page, inputs, coverage, should_cancel);
+    let (picture, recorded) = match recorded {
+        Ok(recorded) => recorded,
+        Err(recorded) => {
+            cache_metrics.scene_walks += 1;
+            cache_metrics.scene_walk_wall_us += recorded.frame_micros;
+            return if recorded.camera_cancelled || should_cancel() {
+                RegionRecord::Cancelled(recorded)
+            } else {
+                RegionRecord::Unsupported(recorded)
+            };
+        }
+    };
+    accumulate(metrics, &recorded);
+    cache_metrics.scene_walks += 1;
+    cache_metrics.scene_walk_wall_us += recorded.frame_micros;
+    if should_cancel() {
+        return RegionRecord::Cancelled(Box::new(recorded));
+    }
+    let bytes = picture.approximate_bytes_used();
+    if bytes > PICTURE_BUDGET || RasterRenderer::current_font_generation() != key.font_generation {
+        return RegionRecord::Unretainable(Box::new(recorded));
+    }
+    while level.recording_bytes()
+        + parked.as_ref().map_or(0, |parked| {
+            parked
+                .level
+                .as_ref()
+                .map_or(0, DetailLevel::recording_bytes)
+        })
+        + bytes
+        > PICTURE_BUDGET
+    {
+        if let Some(oldest) = level
+            .recordings
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, recording)| recording.last_used)
+            .map(|(index, _)| index)
+        {
+            level.recordings.remove(oldest);
+        } else if parked.is_some() {
+            *parked = None;
+        } else {
+            break;
+        }
+    }
+    level.recordings.push(RegionRecording {
+        bounds: coverage,
+        picture,
+        last_used: frame,
+    });
+    RegionRecord::Recorded
+}
+
+fn add_walks(
+    result: &mut CameraCacheResult,
+    walks: &CameraCacheMetrics,
+    recorded: &RenderMetrics,
+    started: Instant,
+) {
+    result.cache.scene_walks += walks.scene_walks;
+    result.cache.scene_walk_wall_us += walks.scene_walk_wall_us;
+    result.metrics.bounds_prepared += recorded.bounds_prepared;
+    result.metrics.frame_micros = started.elapsed().as_micros() as u64;
+}
+
+fn tile_capacity() -> usize {
+    IMAGE_BUDGET / tile_bytes()
+}
+
+fn retained_tiles(level: &DetailLevel, parked: Option<&ParkedPage>) -> usize {
+    level.tiles.len()
+        + parked
+            .and_then(|parked| parked.level.as_ref())
+            .map_or(0, |level| level.tiles.len())
+}
+
+/// Whether another tile fits without evicting one; prefetched tiles never
+/// evict, so they cannot churn against each other.
+fn has_room(level: &DetailLevel, parked: Option<&ParkedPage>) -> bool {
+    retained_tiles(level, parked) < tile_capacity()
+}
+
+/// Evict least recently used tiles outside `visible` (the parked page's
+/// first when older) until another tile fits.
+fn make_room(
+    level: &mut DetailLevel,
+    parked: &mut Option<ParkedPage>,
+    visible: &[(i32, i32)],
+) -> bool {
+    while !has_room(level, parked.as_ref()) {
+        let current_oldest = level
+            .tiles
+            .iter()
+            .filter(|(position, _)| !visible.contains(position))
+            .min_by_key(|(_, tile)| tile.last_used)
+            .map(|(position, tile)| (*position, tile.last_used));
+        let parked_oldest = parked
+            .as_ref()
+            .and_then(|parked| parked.level.as_ref())
+            .and_then(|level| level.tiles.iter().min_by_key(|(_, tile)| tile.last_used))
+            .map(|(position, tile)| (*position, tile.last_used));
+        if let Some((position, _)) = parked_oldest.filter(|(_, used)| {
+            current_oldest.is_none_or(|(_, current_used)| *used <= current_used)
+        }) {
+            if let Some(parked) = parked.as_mut().and_then(|parked| parked.level.as_mut()) {
+                parked.tiles.remove(&position);
+            }
+        } else if let Some((position, _)) = current_oldest {
+            level.tiles.remove(&position);
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// The device-space rectangle a tile's image covers, gutter included.
+fn tile_rect(position: (i32, i32)) -> Rect {
+    Rect::from_xywh(
+        (position.0 * TILE_SIZE - GUTTER) as f32,
+        (position.1 * TILE_SIZE - GUTTER) as f32,
+        (TILE_SIZE + 2 * GUTTER) as f32,
+        (TILE_SIZE + 2 * GUTTER) as f32,
+    )
+}
+
+/// Where a tile lands on the target for the camera `transform`.
+fn tile_destination(position: (i32, i32), transform: (f64, f64)) -> Rect {
+    Rect::from_xywh(
+        (f64::from(position.0) * f64::from(TILE_SIZE) + transform.0) as f32,
+        (f64::from(position.1) * f64::from(TILE_SIZE) + transform.1) as f32,
+        TILE_SIZE as f32,
+        TILE_SIZE as f32,
+    )
+}
+
+/// `region` extended in the direction the view is moving, so a steady pan
+/// records new regions less often.
+fn ahead_of(region: Rect, motion: Option<(f64, f64)>) -> Rect {
+    let mut region = region;
+    if let Some((dx, dy)) = motion {
+        // Content moves against the view: a negative device shift means the
+        // view advances toward larger tile indices.
+        let lead = LEAD_TILES * TILE_SIZE as f32;
+        if dx < 0.0 {
+            region.right += lead;
+        } else if dx > 0.0 {
+            region.left -= lead;
+        }
+        if dy < 0.0 {
+            region.bottom += lead;
+        } else if dy > 0.0 {
+            region.top -= lead;
+        }
+    }
+    region
+}
+
+/// The tiles bordering the visible block.
+fn ring_tiles(visible: &[(i32, i32)]) -> Vec<(i32, i32)> {
+    let (Some(minimum_x), Some(maximum_x), Some(minimum_y), Some(maximum_y)) = (
+        visible.iter().map(|position| position.0).min(),
+        visible.iter().map(|position| position.0).max(),
+        visible.iter().map(|position| position.1).min(),
+        visible.iter().map(|position| position.1).max(),
+    ) else {
+        return Vec::new();
+    };
+    let center_x = f64::from(minimum_x + maximum_x) * 0.5;
+    let center_y = f64::from(minimum_y + maximum_y) * 0.5;
+    let mut ring = Vec::new();
+    for y in minimum_y.saturating_sub(1)..=maximum_y.saturating_add(1) {
+        for x in minimum_x.saturating_sub(1)..=maximum_x.saturating_add(1) {
+            if x < minimum_x || x > maximum_x || y < minimum_y || y > maximum_y {
+                ring.push((x, y));
+            }
+        }
+    }
+    ring.sort_by(|first, second| {
+        let distance = |position: &(i32, i32)| {
+            (f64::from(position.0) - center_x).powi(2) + (f64::from(position.1) - center_y).powi(2)
+        };
+        distance(first).total_cmp(&distance(second))
+    });
+    ring
+}
+
+/// Ring tiles on the side the view is moving toward, most direct first.
+fn tiles_ahead(visible: &[(i32, i32)], motion: (f64, f64)) -> Vec<(i32, i32)> {
+    let (dx, dy) = (-motion.0, -motion.1);
+    if dx == 0.0 && dy == 0.0 {
+        return Vec::new();
+    }
+    let (Some(minimum_x), Some(maximum_x), Some(minimum_y), Some(maximum_y)) = (
+        visible.iter().map(|position| position.0).min(),
+        visible.iter().map(|position| position.0).max(),
+        visible.iter().map(|position| position.1).min(),
+        visible.iter().map(|position| position.1).max(),
+    ) else {
+        return Vec::new();
+    };
+    let center_x = f64::from(minimum_x + maximum_x) * 0.5;
+    let center_y = f64::from(minimum_y + maximum_y) * 0.5;
+    let mut ahead: Vec<((i32, i32), f64)> = ring_tiles(visible)
+        .into_iter()
+        .filter_map(|position| {
+            let offset_x = f64::from(position.0) - center_x;
+            let offset_y = f64::from(position.1) - center_y;
+            let alignment = offset_x * dx + offset_y * dy;
+            (alignment > 0.0).then_some((position, alignment))
+        })
+        .collect();
+    ahead.sort_by(|first, second| second.1.total_cmp(&first.1));
+    ahead.into_iter().map(|(position, _)| position).collect()
+}
+
+fn accumulate(total: &mut RenderMetrics, recorded: &RenderMetrics) {
+    total.nodes_visited += recorded.nodes_visited;
+    total.nodes_drawn += recorded.nodes_drawn;
+    total.nodes_culled += recorded.nodes_culled;
+    total.paths_built += recorded.paths_built;
+    total.bounds_prepared += recorded.bounds_prepared;
+    total.instance_indexes_built += recorded.instance_indexes_built;
+    total.effect_layers += recorded.effect_layers;
+    total.opacity_folds += recorded.opacity_folds;
+    total.layer_cache_hits += recorded.layer_cache_hits;
+    total.layer_cache_misses += recorded.layer_cache_misses;
+    total.incomplete_artwork |= recorded.incomplete_artwork;
+    total.non_artwork_content |= recorded.non_artwork_content;
+    total.effect_failed |= recorded.effect_failed;
+}
+
 fn tile_bytes() -> usize {
     ((TILE_SIZE + 2 * GUTTER) as usize).pow(2) * 4
 }
 
 fn level_bytes(level: Option<&DetailLevel>) -> usize {
     level.map_or(0, |level| {
-        level.tiles.len() * tile_bytes()
-            + level
-                .picture
-                .as_ref()
-                .map_or(0, Picture::approximate_bytes_used)
+        level.tiles.len() * tile_bytes() + level.recording_bytes()
     })
 }
 
@@ -1136,7 +1697,7 @@ pub(super) mod tests {
             should_cancel: &dyn Fn() -> bool,
         ) -> CameraCacheResult {
             self.cache.maintain(
-                &self.renderer,
+                &mut self.renderer,
                 canvas,
                 WIDTH,
                 HEIGHT,
@@ -1179,9 +1740,16 @@ pub(super) mod tests {
                 1,
                 interacting,
             );
-            assert_eq!(
-                result.cache.tiles_built, 0,
-                "presentation never allocates tiles"
+            let scale = f64::from(viewport.zoom as f32);
+            let visible = visible_tiles(
+                WIDTH,
+                HEIGHT,
+                camera_transform(WIDTH, HEIGHT, viewport, scale),
+            )
+            .map_or(0, |visible| visible.len());
+            assert!(
+                result.cache.tiles_built as usize <= visible + PREFETCH_TILES,
+                "presentation builds at most the visible gap and a bounded prefetch"
             );
             assert!(result.cache.retained_bytes <= IMAGE_BUDGET + PICTURE_BUDGET);
             assert!(
@@ -1199,7 +1767,10 @@ pub(super) mod tests {
             let maintenance =
                 renderer.maintain_camera_cache(surface.canvas(), doc, page, viewport, &|| false);
             assert!(maintenance.cache.tiles_built <= 1);
-            assert_eq!(maintenance.cache.scene_walks, 0);
+            assert!(
+                maintenance.cache.scene_walks <= 1,
+                "maintenance records at most one tile of its own"
+            );
             assert!(!maintenance.cache.picture_drawn);
             assert_eq!(
                 pixels(surface),
@@ -1299,8 +1870,37 @@ pub(super) mod tests {
         result
     }
 
+    /// Raster tiles crop curves device-dependently: a handful of edge pixels
+    /// may differ by a few levels from an uncropped draw. GPU tiles are held
+    /// to exact parity by the Metal tests.
+    fn assert_raster_close(actual: &[u8], expected: &[u8], context: &str) {
+        let differing: Vec<(usize, u8)> = actual
+            .chunks_exact(4)
+            .zip(expected.chunks_exact(4))
+            .enumerate()
+            .map(|(index, (actual, expected))| (index, max_difference(actual, expected)))
+            .filter(|(_, difference)| *difference > 2)
+            .collect();
+        assert!(
+            differing.len() <= 8 && differing.iter().all(|(_, difference)| *difference <= 8),
+            "{context}: {} pixels differ, worst {:?}",
+            differing.len(),
+            differing.iter().max_by_key(|(_, difference)| *difference)
+        );
+    }
+
+    fn max_difference(first: &[u8], second: &[u8]) -> u8 {
+        first
+            .iter()
+            .zip(second)
+            .map(|(first, second)| first.abs_diff(*second))
+            .max()
+            .unwrap_or(0)
+    }
+
     #[test]
-    fn camera_presentation_defers_tiles_and_maintenance_never_repaints() {
+    fn camera_presentation_draws_a_new_scale_directly_then_tiles_it_and_maintenance_never_repaints()
+    {
         let (doc, page, _) = fixture();
         let viewport = Viewport {
             center: [512.0, 240.0],
@@ -1308,8 +1908,96 @@ pub(super) mod tests {
         };
         let mut renderer = renderer();
         let mut surface = target();
-        for frame in 0..3 {
-            let presented = renderer.render_camera_to_canvas(
+        let present = |renderer: &mut RasterCacheHarness, surface: &mut skia_safe::Surface| {
+            renderer.render_camera_to_canvas(
+                surface.canvas(),
+                WIDTH,
+                HEIGHT,
+                &doc.scene,
+                &viewport,
+                Some(page),
+                &RenderInputs::for_doc(&doc),
+                1,
+                false,
+            )
+        };
+        // A zoom visits each scale once, so its first frame draws directly
+        // instead of recording or building tiles nothing will reuse.
+        let first = present(&mut renderer, &mut surface);
+        assert_eq!(first.cache.tiles_built, 0);
+        assert!(first.complete_detail && !first.cache.picture_drawn && first.needs_refresh);
+        assert_eq!(first.cache.scene_walks, 1);
+        let direct = pixels(&mut surface);
+        let cancelled =
+            renderer.maintain_camera_cache(surface.canvas(), &doc, page, &viewport, &|| true);
+        assert!(cancelled.cancelled && cancelled.cache.tiles_built == 0);
+        assert_eq!(pixels(&mut surface), direct);
+        let recorded =
+            renderer.maintain_camera_cache(surface.canvas(), &doc, page, &viewport, &|| false);
+        assert_eq!(recorded.cache.tiles_built, 1);
+        assert_eq!(
+            recorded.cache.scene_walks, 1,
+            "one recording covers the view and its fringe"
+        );
+        assert!(!recorded.cache.picture_drawn && recorded.cache.tiles_drawn == 0);
+        assert_eq!(pixels(&mut surface), direct);
+        let second = present(&mut renderer, &mut surface);
+        assert!(
+            second.cache.tiles_built > 0 && second.cache.tiles_built as usize <= MANDATORY_TILES,
+            "a presented scale builds its small visible gap"
+        );
+        assert_eq!(second.cache.scene_walks, 0, "from the recording");
+        assert!(!second.cache.picture_drawn && second.cache.tiles_drawn > 0);
+        assert_raster_close(
+            &pixels(&mut surface),
+            &direct,
+            "tiles composite what the direct frame drew",
+        );
+        assert!(
+            second.needs_refresh,
+            "the ring around the view is still missing"
+        );
+        let sharp_pixels = pixels(&mut surface);
+        let maintenance =
+            renderer.maintain_camera_cache(surface.canvas(), &doc, page, &viewport, &|| false);
+        assert_eq!(maintenance.cache.tiles_built, 1);
+        assert_eq!(
+            maintenance.cache.scene_walks, 0,
+            "a ring tile inside the recording needs no walk"
+        );
+        assert_eq!(maintenance.metrics.nodes_visited, 0);
+        assert!(!maintenance.cache.picture_drawn && maintenance.cache.tiles_drawn == 0);
+        assert_eq!(pixels(&mut surface), sharp_pixels);
+        let checks = std::cell::Cell::new(0);
+        let interrupted =
+            renderer.maintain_camera_cache(surface.canvas(), &doc, page, &viewport, &|| {
+                checks.set(checks.get() + 1);
+                checks.get() >= 2
+            });
+        assert!(interrupted.cancelled && interrupted.cache.tiles_built == 1);
+        assert_eq!(pixels(&mut surface), sharp_pixels);
+        let resumed = refine(&mut renderer, &mut surface, &doc, page, &viewport, false);
+        assert_eq!(resumed.cache.scene_walks, 0);
+        assert!(resumed.cache.tiles_drawn > 0);
+    }
+
+    #[test]
+    fn camera_pan_builds_the_exposed_gap_and_prefetches_ahead_of_motion() {
+        let (doc, page, _) = fixture();
+        let mut renderer = renderer();
+        let mut surface = target();
+        let start = Viewport {
+            center: [512.0, 240.0],
+            zoom: 1.0,
+        };
+        refine(&mut renderer, &mut surface, &doc, page, &start, false);
+        let mut prefetched = 0;
+        for step in 1..=8 {
+            let viewport = Viewport {
+                center: [512.0 + f64::from(step) * 96.0, 240.0],
+                zoom: 1.0,
+            };
+            let result = renderer.render_camera_to_canvas(
                 surface.canvas(),
                 WIDTH,
                 HEIGHT,
@@ -1320,37 +2008,39 @@ pub(super) mod tests {
                 1,
                 false,
             );
-            assert_eq!(presented.cache.tiles_built, 0);
+            assert!(result.complete_detail && !result.cancelled);
             assert!(
-                presented.complete_detail
-                    && presented.cache.picture_drawn
-                    && presented.needs_refresh
+                !result.cache.picture_drawn,
+                "a steady pan composites tiles instead of replaying the view"
             );
-            assert_eq!(presented.cache.scene_walks, u32::from(frame == 0));
+            let level = renderer.cache.level.as_ref().expect("level");
+            let transform = camera_transform(WIDTH, HEIGHT, &viewport, 1.0);
+            let visible = visible_tiles(WIDTH, HEIGHT, transform).expect("visible");
+            prefetched += tiles_ahead(&visible, (-96.0, 0.0))
+                .iter()
+                .filter(|position| level.tiles.contains_key(position))
+                .count();
+            let mut reference = target();
+            let mut normal = self::renderer();
+            normal.render_to_canvas(
+                reference.canvas(),
+                WIDTH,
+                HEIGHT,
+                &doc.scene,
+                &viewport,
+                Some(page),
+                &RenderInputs::for_doc(&doc),
+            );
+            assert_raster_close(
+                &pixels(&mut surface),
+                &pixels(&mut reference),
+                &format!("panned tile composition matches normal rendering at {viewport:?}"),
+            );
         }
-        let sharp_pixels = pixels(&mut surface);
-        let cancelled =
-            renderer.maintain_camera_cache(surface.canvas(), &doc, page, &viewport, &|| true);
-        assert!(cancelled.cancelled && cancelled.cache.tiles_built == 0);
-        assert_eq!(pixels(&mut surface), sharp_pixels);
-        let maintenance =
-            renderer.maintain_camera_cache(surface.canvas(), &doc, page, &viewport, &|| false);
-        assert_eq!(maintenance.cache.tiles_built, 1);
-        assert_eq!(maintenance.cache.scene_walks, 0);
-        assert_eq!(maintenance.metrics.nodes_visited, 0);
-        assert!(!maintenance.cache.picture_drawn && maintenance.cache.tiles_drawn == 0);
-        assert_eq!(pixels(&mut surface), sharp_pixels);
-        let checks = std::cell::Cell::new(0);
-        let interrupted =
-            renderer.maintain_camera_cache(surface.canvas(), &doc, page, &viewport, &|| {
-                checks.set(checks.get() + 1);
-                checks.get() >= 3
-            });
-        assert!(interrupted.cancelled && interrupted.cache.tiles_built == 1);
-        assert_eq!(pixels(&mut surface), sharp_pixels);
-        let resumed = refine(&mut renderer, &mut surface, &doc, page, &viewport, false);
-        assert_eq!(resumed.cache.scene_walks, 0);
-        assert!(resumed.cache.tiles_drawn > 0);
+        assert!(
+            prefetched > 0,
+            "tiles ahead of the motion are ready before they show"
+        );
     }
 
     #[test]
@@ -1597,9 +2287,12 @@ pub(super) mod tests {
             1,
             false,
         );
-        assert!(!result.cache.overview_drawn && result.cache.picture_drawn);
-        assert!(result.complete_detail && result.needs_refresh);
-        assert_eq!(result.cache.scene_walks, 1);
+        assert!(
+            !result.cache.overview_drawn
+                && (result.cache.picture_drawn || result.cache.tiles_drawn > 0)
+        );
+        assert!(result.complete_detail);
+        assert!(result.cache.scene_walks >= 1, "the new world is recorded");
         let pixels = pixels(&mut surface);
         let center = ((HEIGHT / 2 * WIDTH + WIDTH / 2) * 4) as usize;
         assert_eq!(
@@ -1879,11 +2572,11 @@ pub(super) mod tests {
                 1,
                 true,
             );
-            assert!(result.complete_detail && result.cache.picture_drawn);
-            assert!(!result.cache.overview_drawn);
+            assert!(result.complete_detail && !result.cache.picture_drawn);
+            assert!(!result.cache.overview_drawn && result.cache.tiles_built == 0);
             assert_eq!(
                 result.cache.scene_walks, 1,
-                "only exact visible content is recorded"
+                "a zoom frame draws only the visible content, without a recording"
             );
             let mut reference = target();
             let mut cold = self::renderer();
@@ -1966,27 +2659,6 @@ pub(super) mod tests {
             ([5_100.0, 100.0], 1.0),
             ([5_100.0, 100.0], 0.73),
         ] {
-            let result = renderer.render_camera_to_canvas(
-                surface.canvas(),
-                WIDTH,
-                HEIGHT,
-                &doc.scene,
-                &Viewport { center, zoom },
-                Some(page),
-                &RenderInputs::for_doc(&doc),
-                1,
-                true,
-            );
-            assert!(result.complete_detail && result.cache.picture_drawn && !result.cancelled);
-            assert!(!result.cache.overview_drawn);
-            assert!(
-                result.metrics.nodes_visited < 120,
-                "offscreen descendants must not be walked"
-            );
-            assert!(
-                result.metrics.bounds_prepared < 120,
-                "culling must not conceal whole-page preparation"
-            );
             let mut reference = target();
             let mut normal = self::renderer();
             normal.render_to_canvas(
@@ -1998,7 +2670,40 @@ pub(super) mod tests {
                 Some(page),
                 &RenderInputs::for_doc(&doc),
             );
-            assert_eq!(pixels(&mut surface), pixels(&mut reference));
+            // The first frame at a scale draws directly; presenting it again
+            // records the visible gap, whose walk must cull the same way.
+            for presentation in 0..2 {
+                let result = renderer.render_camera_to_canvas(
+                    surface.canvas(),
+                    WIDTH,
+                    HEIGHT,
+                    &doc.scene,
+                    &Viewport { center, zoom },
+                    Some(page),
+                    &RenderInputs::for_doc(&doc),
+                    1,
+                    true,
+                );
+                assert!(result.complete_detail && !result.cancelled);
+                assert!(
+                    presentation == 0 || result.cache.tiles_drawn > 0,
+                    "a presented scale composites retained tiles"
+                );
+                assert!(!result.cache.overview_drawn);
+                assert!(
+                    result.metrics.nodes_visited < 120,
+                    "offscreen descendants must not be walked"
+                );
+                assert!(
+                    result.metrics.bounds_prepared < 120,
+                    "culling must not conceal whole-page preparation"
+                );
+                assert_raster_close(
+                    &pixels(&mut surface),
+                    &pixels(&mut reference),
+                    "culled frames match the normal renderer",
+                );
+            }
         }
     }
 
@@ -2044,6 +2749,19 @@ pub(super) mod tests {
             center: [320.0, 100.0],
             zoom: 1.0,
         };
+        // The first frame at a scale draws directly; the next one records.
+        let direct = renderer.render_camera_to_canvas(
+            surface.canvas(),
+            WIDTH,
+            HEIGHT,
+            &doc.scene,
+            &viewport,
+            Some(page),
+            &RenderInputs::for_doc(&doc),
+            1,
+            false,
+        );
+        assert!(direct.complete_detail && direct.cache.tiles_built == 0);
         let checks = Cell::new(0usize);
         let cancelled = renderer.cache.render(
             &mut renderer.renderer,
@@ -2079,7 +2797,7 @@ pub(super) mod tests {
             1,
             false,
         );
-        assert!(!resumed.cancelled && resumed.complete_detail && resumed.cache.picture_drawn);
+        assert!(!resumed.cancelled && resumed.complete_detail && resumed.cache.tiles_drawn > 0);
         let mut reference = target();
         let mut normal = self::renderer();
         normal.render_to_canvas(
@@ -2169,23 +2887,28 @@ pub(super) mod tests {
                 "viewport culling must retain the ancestor's required source halo"
             );
             let mut cached = renderer();
-            let first = cached.render_camera_to_canvas(
-                surface.canvas(),
-                WIDTH,
-                HEIGHT,
-                &doc.scene,
-                &viewport,
-                Some(page),
-                &RenderInputs::for_doc(&doc),
-                1,
-                false,
-            );
-            assert!(first.complete_detail && first.cache.picture_drawn && !first.cancelled);
-            assert_eq!(
-                pixels(&mut surface),
-                expected,
-                "bounded recording must retain source pixels outside its output coverage"
-            );
+            // The first frame at a scale draws directly; the second records
+            // the visible gap and tiles it.
+            for presentation in 0..2 {
+                let result = cached.render_camera_to_canvas(
+                    surface.canvas(),
+                    WIDTH,
+                    HEIGHT,
+                    &doc.scene,
+                    &viewport,
+                    Some(page),
+                    &RenderInputs::for_doc(&doc),
+                    1,
+                    false,
+                );
+                assert!(result.complete_detail && !result.cancelled);
+                assert!(presentation == 0 || result.cache.tiles_drawn > 0);
+                assert_eq!(
+                    pixels(&mut surface),
+                    expected,
+                    "bounded recording must retain source pixels outside its output coverage"
+                );
+            }
         }
     }
 
@@ -2289,19 +3012,24 @@ pub(super) mod tests {
             "an opaque viewport mask must preserve the complete filtered source"
         );
         let mut cached = renderer();
-        let first = cached.render_camera_to_canvas(
-            surface.canvas(),
-            WIDTH,
-            HEIGHT,
-            &doc.scene,
-            &viewport,
-            Some(page),
-            &RenderInputs::for_doc(&doc),
-            1,
-            false,
-        );
-        assert!(first.complete_detail && first.cache.picture_drawn && !first.cancelled);
-        assert_eq!(pixels(&mut surface), masked);
+        // The first frame at a scale draws directly; the second records the
+        // visible gap and tiles it.
+        for presentation in 0..2 {
+            let result = cached.render_camera_to_canvas(
+                surface.canvas(),
+                WIDTH,
+                HEIGHT,
+                &doc.scene,
+                &viewport,
+                Some(page),
+                &RenderInputs::for_doc(&doc),
+                1,
+                false,
+            );
+            assert!(result.complete_detail && !result.cancelled);
+            assert!(presentation == 0 || result.cache.tiles_drawn > 0);
+            assert_eq!(pixels(&mut surface), masked);
+        }
     }
 
     #[test]
@@ -2414,7 +3142,7 @@ pub(super) mod tests {
             1,
             false,
         );
-        assert!(initial.complete_detail && initial.cache.picture_drawn && initial.needs_refresh);
+        assert!(initial.complete_detail && initial.cache.tiles_built == 0 && initial.needs_refresh);
         refine(&mut renderer, &mut surface, &doc, page, &viewport, false);
         let near_blur = Viewport {
             center: [-49_600.0, -49_800.0],
@@ -2431,9 +3159,9 @@ pub(super) mod tests {
             1,
             false,
         );
-        assert_eq!(
-            refused.cache.scene_walks, 2,
-            "visible backdrop uses normal rendering"
+        assert!(
+            refused.cache.scene_walks >= 2,
+            "the refused recording is followed by normal rendering"
         );
         assert!(refused.complete_detail && !refused.needs_refresh && !refused.cache.overview_drawn);
         let repeated = renderer.render_camera_to_canvas(

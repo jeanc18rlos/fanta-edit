@@ -12,6 +12,7 @@
 #include "include/core/SkCanvas.h"
 #include "include/core/SkColorSpace.h"
 #include "include/core/SkContext.h"
+#include "include/core/SkExecutor.h"
 #include "include/core/SkImage.h"
 #include "include/core/SkRect.h"
 #include "include/core/SkSize.h"
@@ -320,6 +321,13 @@ extern "C" void C_ContextOptions_Construct(skgpu::graphite::ContextOptions* unin
 
 extern "C" void C_ContextOptions_destruct(skgpu::graphite::ContextOptions* self) {
     self->~ContextOptions();
+}
+
+// Without ContextOptions::fExecutor, Graphite compiles every new pipeline
+// inline inside Recorder::snap. The caller owns the returned pool and must keep
+// it alive for the lifetime of every Context configured with it.
+extern "C" SkExecutor* C_SkExecutor_MakeMultiListFIFOThreadPool(int numWorkLists, int threads, bool allowBorrowing) {
+    return SkExecutor::MakeMultiListFIFOThreadPool(numWorkLists, threads, allowBorrowing).release();
 }
 
 //

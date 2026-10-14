@@ -525,21 +525,58 @@ pub(crate) struct PagePrewarm {
 
 impl PagePrewarm {
     /// Decode the page's images into the shared resolver. Safe to run on any
-    /// thread; a frame that draws one of them first simply wins the decode.
+    /// thread; a frame that draws one of them first decodes it or waits for
+    /// the decode already under way.
     ///
-    /// Decodes one asset at a time, stopping as soon as this task is the last
-    /// owner of the resolver. The document that owns it can be replaced while
+    /// Each thread decodes one asset at a time, stopping as soon as this task
+    /// is the last owner of the resolver. The document that owns it can be replaced while
     /// the walk runs — a reload or a merge installs a brand-new `FigDocument`
     /// with a brand-new resolver — and from that moment nothing will ever read
     /// what this decodes, while the orphaned cache would still fill to the full
     /// decode budget alongside the replacement's own decode of the same images.
+    ///
+    /// The page's first frame decodes on demand at the same time, so the
+    /// assets are split across a few threads: a serial prewarm would rarely
+    /// stay ahead of the render thread's walk. The resolver lets each caller
+    /// wait for an asset another thread is decoding instead of repeating it.
     pub(crate) fn run(self) {
-        for asset in self.assets {
-            if Arc::strong_count(&self.resolver) <= 1 {
-                return;
+        let workers = std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .saturating_sub(2)
+            .clamp(1, Self::MAX_WORKERS)
+            .min(self.assets.len());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let decode = || {
+            loop {
+                if Arc::strong_count(&self.resolver) <= 1 {
+                    return;
+                }
+                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let Some(asset) = self.assets.get(index) else {
+                    return;
+                };
+                self.resolver.prewarm([*asset]);
             }
-            self.resolver.prewarm([asset]);
-        }
+        };
+        std::thread::scope(|scope| {
+            for worker in 1..workers {
+                if let Err(error) = std::thread::Builder::new()
+                    .name(format!("fanta-page-prewarm-{worker}"))
+                    .spawn_scoped(scope, decode)
+                {
+                    log::warn!("starting a page image prewarm thread failed: {error}");
+                    break;
+                }
+            }
+            decode();
+        });
+    }
+
+    const MAX_WORKERS: usize = 6;
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.assets.len()
     }
 }
 
@@ -911,6 +948,35 @@ impl FigDocument {
         self.pages
             .iter()
             .position(|page| page.root == Some(current))
+    }
+
+    /// The document half of [`FigItem::apply`], for benchmarks that drive a
+    /// bare document without an item entity.
+    #[cfg(test)]
+    pub(crate) fn apply_for_benchmark(&mut self, operation: Operation) -> Result<()> {
+        let registry_change = self.page_registry_change_for_operation(&operation);
+        self.doc
+            .apply(operation)
+            .context("applying canvas operation")?;
+        let active_page = self.doc.active_page();
+        self.sync_page_registry_after_operation(registry_change);
+        self.resolve_after_edit(active_page);
+        self.advance_render_generation();
+        self.mark_variables_changed();
+        Ok(())
+    }
+
+    /// The document half of [`FigItem::undo`].
+    #[cfg(test)]
+    pub(crate) fn undo_for_benchmark(&mut self) -> Result<bool> {
+        let did = self.doc.undo().context("undoing canvas operation")?;
+        if did {
+            self.sync_page_registry();
+            self.refresh_layout_baseline();
+            self.advance_render_generation();
+            self.mark_variables_changed();
+        }
+        Ok(did)
     }
 
     pub fn ensure_page_solved(&mut self, page_index: usize) {
@@ -4840,7 +4906,7 @@ impl fanta_format::FormatHandler for FigImportFormat {
 }
 
 #[cfg(test)]
-fn load_project_document(root: &Path) -> Result<FigDocument> {
+pub(crate) fn load_project_document(root: &Path) -> Result<FigDocument> {
     let started = Instant::now();
     let (doc, assets) = fanta_format::read_project_tree(root)
         .with_context(|| format!("reading Fanta project at {}", root.display()))?;
