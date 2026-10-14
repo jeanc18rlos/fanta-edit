@@ -20,8 +20,8 @@ use super::layout::{
     ACTIVE_MODES_JSON, ASSET_LIBRARY_JSON, ASSETS_DIR, COMPONENTS_DIR, DEF_JSON, DOC_DIR,
     FLOW_START_JSON, FLOWS_JSON, LOOSE_DIR, MASTER_FNX, MASTER_IDS, METADATA_JSON, MOTION_JSON,
     NODES_DIR, PAGE_FNX, PAGE_IDS, PAGE_JSON, PAGES_DIR, PRESENTATION_JSON, SET_JSON,
-    VARIABLES_JSON, id_from_key, is_project_dir, json_key, read_json_file, read_json_or,
-    read_manifest, sorted_entries,
+    VARIABLES_JSON, id_from_key, is_project_dir, json_key, read_json_file, read_manifest,
+    sorted_entries,
 };
 
 /// Load a project directory back into a [`Doc`] plus its asset blobs.
@@ -32,6 +32,40 @@ use super::layout::{
 /// are migrated in JSON space before deserialization.
 pub fn read_project_tree(dir: &Path) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>)> {
     read_project_tree_with_source_override(dir, None)
+}
+
+pub(crate) struct LoadedSourceIdentity {
+    pub(crate) source_hash: Option<[u8; 32]>,
+    pub(crate) sidecar_hash: Option<[u8; 32]>,
+    pub(crate) current: bool,
+}
+
+pub(crate) type LoadedSourceIdentities = BTreeMap<PathBuf, LoadedSourceIdentity>;
+
+type LoadedFileHashes = BTreeMap<PathBuf, Option<[u8; 32]>>;
+
+#[derive(Default)]
+pub(crate) struct LoadedProjectEvidence {
+    pub(crate) sources: LoadedSourceIdentities,
+    pub(crate) files: LoadedFileHashes,
+    pub(crate) pages: Vec<NodeId>,
+}
+
+pub(crate) fn read_project_tree_with_source_identities(
+    dir: &Path,
+) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>, LoadedProjectEvidence)> {
+    super::layout::with_project_read_lock(dir, || {
+        let mut evidence = LoadedProjectEvidence::default();
+        let (doc, assets) = read_project_tree_with_source_override_locked(
+            dir,
+            None,
+            None,
+            Some(&mut evidence.sources),
+            Some(&mut evidence.files),
+        )?;
+        evidence.pages = doc.pages().to_vec();
+        Ok((doc, assets, evidence))
+    })
 }
 
 pub(super) struct FnxSourceOverride<'a> {
@@ -45,7 +79,7 @@ pub(super) fn read_project_tree_with_source_override(
     source_override: Option<&FnxSourceOverride<'_>>,
 ) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>)> {
     super::layout::with_project_read_lock(dir, || {
-        read_project_tree_with_source_override_locked(dir, source_override, None)
+        read_project_tree_with_source_override_locked(dir, source_override, None, None, None)
     })
 }
 
@@ -59,7 +93,7 @@ pub(super) fn read_project_tree_with_json_override(
     source_override: &JsonSourceOverride<'_>,
 ) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>)> {
     super::layout::with_project_read_lock(dir, || {
-        read_project_tree_with_source_override_locked(dir, None, Some(source_override))
+        read_project_tree_with_source_override_locked(dir, None, Some(source_override), None, None)
     })
 }
 
@@ -75,16 +109,49 @@ fn read_project_json(
     Ok(value)
 }
 
-fn read_project_json_or(
+fn read_project_json_with_hash(
     path: &Path,
-    fallback: Value,
     source_override: Option<&JsonSourceOverride<'_>>,
-) -> Result<Value> {
-    let value = match source_override.filter(|source| source.path == path) {
-        Some(source) => source.value.clone(),
-        None => read_json_or(path, fallback)?,
-    };
+    capture_hash: bool,
+) -> Result<(Value, Option<[u8; 32]>)> {
+    if !capture_hash || source_override.is_some_and(|source| source.path == path) {
+        return read_project_json(path, source_override).map(|value| (value, None));
+    }
+    let text = std::fs::read_to_string(path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            FormatError::MissingFile {
+                name: path.display().to_string(),
+            }
+        } else {
+            FormatError::Io(error)
+        }
+    })?;
+    let value = serde_json::from_str(&text)
+        .map_err(|error| FormatError::InvalidProjectTree(format!("{}: {error}", path.display())))?;
     validate_project_json_shape(path, &value)?;
+    Ok((value, Some(Sha256::digest(text.as_bytes()).into())))
+}
+
+fn read_tracked_project_json(
+    path: &Path,
+    fallback: Option<Value>,
+    source_override: Option<&JsonSourceOverride<'_>>,
+    files: Option<&mut LoadedFileHashes>,
+) -> Result<Value> {
+    if !path.exists()
+        && source_override.is_none_or(|source| source.path != path)
+        && let Some(value) = fallback
+    {
+        validate_project_json_shape(path, &value)?;
+        if let Some(files) = files {
+            files.insert(path.to_path_buf(), None);
+        }
+        return Ok(value);
+    }
+    let (value, hash) = read_project_json_with_hash(path, source_override, files.is_some())?;
+    if let Some(files) = files {
+        files.insert(path.to_path_buf(), hash);
+    }
     Ok(value)
 }
 
@@ -108,6 +175,8 @@ fn read_project_tree_with_source_override_locked(
     dir: &Path,
     source_override: Option<&FnxSourceOverride<'_>>,
     json_override: Option<&JsonSourceOverride<'_>>,
+    mut source_identities: Option<&mut LoadedSourceIdentities>,
+    mut loaded_files: Option<&mut LoadedFileHashes>,
 ) -> Result<(Doc, BTreeMap<AssetId, Vec<u8>>)> {
     let manifest =
         match json_override.filter(|source| source.path == dir.join(super::layout::FANTA_JSON)) {
@@ -128,7 +197,18 @@ fn read_project_tree_with_source_override_locked(
                 }
                 manifest
             }
-            None => read_manifest(dir)?,
+            None => {
+                if let Some(files) = &mut loaded_files {
+                    let (manifest, source) = super::layout::read_manifest_with_source(dir)?;
+                    files.insert(
+                        dir.join(super::layout::FANTA_JSON),
+                        Some(Sha256::digest(source.as_bytes()).into()),
+                    );
+                    manifest
+                } else {
+                    read_manifest(dir)?
+                }
+            }
         };
     if manifest.schema_version > SCHEMA_VERSION {
         return Err(FormatError::UnsupportedSchema {
@@ -154,33 +234,71 @@ fn read_project_tree_with_source_override_locked(
     let doc_dir = dir.join(DOC_DIR);
     root.insert(
         "metadata".to_owned(),
-        read_project_json(&doc_dir.join(METADATA_JSON), json_override)?,
+        read_tracked_project_json(
+            &doc_dir.join(METADATA_JSON),
+            None,
+            json_override,
+            loaded_files.as_deref_mut(),
+        )?,
     );
     root.insert(
         "asset_library".to_owned(),
-        read_project_json_or(&doc_dir.join(ASSET_LIBRARY_JSON), json!({}), json_override)?,
+        read_tracked_project_json(
+            &doc_dir.join(ASSET_LIBRARY_JSON),
+            Some(json!({})),
+            json_override,
+            loaded_files.as_deref_mut(),
+        )?,
     );
-    let variables = read_project_json_or(&doc_dir.join(VARIABLES_JSON), json!({}), json_override)?;
+    let variables = read_tracked_project_json(
+        &doc_dir.join(VARIABLES_JSON),
+        Some(json!({})),
+        json_override,
+        loaded_files.as_deref_mut(),
+    )?;
     root.insert("variables".to_owned(), variables.clone());
     root.insert(
         "active_modes".to_owned(),
-        read_project_json_or(&doc_dir.join(ACTIVE_MODES_JSON), json!({}), json_override)?,
+        read_tracked_project_json(
+            &doc_dir.join(ACTIVE_MODES_JSON),
+            Some(json!({})),
+            json_override,
+            loaded_files.as_deref_mut(),
+        )?,
     );
     root.insert(
         "motion".to_owned(),
-        read_project_json_or(&doc_dir.join(MOTION_JSON), json!({}), json_override)?,
+        read_tracked_project_json(
+            &doc_dir.join(MOTION_JSON),
+            Some(json!({})),
+            json_override,
+            loaded_files.as_deref_mut(),
+        )?,
     );
-    let flow_start =
-        read_project_json_or(&doc_dir.join(FLOW_START_JSON), Value::Null, json_override)?;
+    let flow_start = read_tracked_project_json(
+        &doc_dir.join(FLOW_START_JSON),
+        Some(Value::Null),
+        json_override,
+        loaded_files.as_deref_mut(),
+    )?;
     if !flow_start.is_null() {
         root.insert("flow_start".to_owned(), flow_start);
     }
     root.insert(
         "flows".to_owned(),
-        read_project_json_or(&doc_dir.join(FLOWS_JSON), json!([]), json_override)?,
+        read_tracked_project_json(
+            &doc_dir.join(FLOWS_JSON),
+            Some(json!([])),
+            json_override,
+            loaded_files.as_deref_mut(),
+        )?,
     );
-    let presentation =
-        read_project_json_or(&doc_dir.join(PRESENTATION_JSON), Value::Null, json_override)?;
+    let presentation = read_tracked_project_json(
+        &doc_dir.join(PRESENTATION_JSON),
+        Some(Value::Null),
+        json_override,
+        loaded_files.as_deref_mut(),
+    )?;
     if !presentation.is_null() {
         root.insert("presentation".to_owned(), presentation);
     }
@@ -212,6 +330,8 @@ fn read_project_tree_with_source_override_locked(
             &refs,
             &mut nodes,
             &mut pending_layout,
+            source_identities.as_deref_mut(),
+            loaded_files.as_deref_mut(),
         )?,
     );
     read_component_masters(
@@ -222,6 +342,7 @@ fn read_project_tree_with_source_override_locked(
         &refs,
         &mut nodes,
         &mut pending_layout,
+        source_identities,
     )?;
     root.insert(
         "components".to_owned(),
@@ -239,7 +360,7 @@ fn read_project_tree_with_source_override_locked(
     if manifest.schema_version < SCHEMA_VERSION {
         value = migrate(value, manifest.schema_version, SCHEMA_VERSION)?;
     }
-    let assets = read_assets(dir, json_override)?;
+    let assets = read_assets(dir, json_override, loaded_files)?;
     // Consume the assembled values so geometry JSON is released as typed
     // paths are built. The manifest gate and migration above already establish
     // the current schema; path-aware deserialization retains field diagnostics.
@@ -271,6 +392,10 @@ fn read_project_tree_with_source_override_locked(
 /// directory contributes nothing — no `doc.pages` entry and, crucially, no
 /// nodes, so its stale batch can never overwrite the fresh dir's nodes in the
 /// shared scene map.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "combined loading adds optional exact-byte evidence to the existing reader context"
+)]
 fn read_pages(
     dir: &Path,
     version: u32,
@@ -279,6 +404,8 @@ fn read_pages(
     refs: &fanta_fnx::RefTable,
     nodes: &mut Map<String, Value>,
     pending_layout: &mut BTreeSet<NodeId>,
+    mut source_identities: Option<&mut LoadedSourceIdentities>,
+    mut loaded_files: Option<&mut LoadedFileHashes>,
 ) -> Result<Value> {
     struct PageDir {
         id: NodeId,
@@ -286,6 +413,7 @@ fn read_pages(
         entry: PathBuf,
         name: String,
         header: Value,
+        header_hash: Option<[u8; 32]>,
     }
     let pages_dir = dir.join(PAGES_DIR);
     let mut pages: Vec<(u64, String, Value)> = Vec::new();
@@ -304,7 +432,11 @@ fn read_pages(
             if !entry.join(PAGE_JSON).is_file() {
                 continue;
             }
-            let header = read_project_json(&entry.join(PAGE_JSON), json_override)?;
+            let (header, header_hash) = read_project_json_with_hash(
+                &entry.join(PAGE_JSON),
+                json_override,
+                loaded_files.is_some(),
+            )?;
             let (id, id_from_header) = match header.get("id").and_then(Value::as_str) {
                 Some(id) => {
                     let id = id.parse().map_err(|e| {
@@ -337,6 +469,7 @@ fn read_pages(
                 entry,
                 name,
                 header,
+                header_hash,
             });
         }
         let ranked: Vec<(NodeId, bool, &Path)> = candidates
@@ -355,6 +488,9 @@ fn read_pages(
             if !winners.contains(&index) {
                 continue;
             }
+            if let Some(files) = &mut loaded_files {
+                files.insert(candidate.entry.join(PAGE_JSON), candidate.header_hash);
+            }
             // A page always has at least its root node, so a missing `.fnx`
             // (with no `nodes/` fallback) in a v2 tree is corruption, not empty.
             let decoded_root = read_design_nodes(
@@ -368,6 +504,7 @@ fn read_pages(
                 refs,
                 nodes,
                 pending_layout,
+                source_identities.as_deref_mut(),
             )?;
             if let Some(decoded_root) = decoded_root
                 && decoded_root != candidate.id
@@ -601,6 +738,10 @@ fn scan_components(
 /// Materialize the master subtrees of a completed [`scan_components`] pass
 /// into the shared scene map. Runs after pages so both decode with the same
 /// fully-populated reference table.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "combined loading adds optional exact-byte evidence to the existing reader context"
+)]
 fn read_component_masters(
     scan: &ComponentScan,
     version: u32,
@@ -609,6 +750,7 @@ fn read_component_masters(
     refs: &fanta_fnx::RefTable,
     nodes: &mut Map<String, Value>,
     pending_layout: &mut BTreeSet<NodeId>,
+    source_identities: Option<&mut LoadedSourceIdentities>,
 ) -> Result<()> {
     if version < 5 || scan.winner_dirs.len() < 256 {
         return read_component_masters_serial(
@@ -619,9 +761,11 @@ fn read_component_masters(
             refs,
             nodes,
             pending_layout,
+            source_identities,
         );
     }
     type DecodedMaster = (Map<String, Value>, BTreeSet<NodeId>);
+    let collect_identities = source_identities.is_some();
     let decoded = std::thread::scope(|scope| {
         let mut workers = Vec::new();
         let mut spawn_error = None;
@@ -631,6 +775,7 @@ fn read_component_masters(
                 .name(format!("fanta-master-read-{worker}"))
                 .spawn_scoped(scope, move || {
                     let mut decoded = Vec::<DecodedMaster>::with_capacity(chunk.len());
+                    let mut identities = LoadedSourceIdentities::new();
                     for design in chunk {
                         let mut nodes = Map::new();
                         let mut pending = BTreeSet::new();
@@ -642,10 +787,11 @@ fn read_component_masters(
                             refs,
                             &mut nodes,
                             &mut pending,
+                            collect_identities.then_some(&mut identities),
                         )?;
                         decoded.push((nodes, pending));
                     }
-                    Ok::<_, FormatError>(decoded)
+                    Ok::<_, FormatError>((decoded, identities))
                 });
             match spawned {
                 Ok(handle) => workers.push(handle),
@@ -673,7 +819,8 @@ fn read_component_masters(
         // source order rather than the nondeterministic completion order.
         decoded.into_iter().collect::<Result<Vec<_>>>()
     })?;
-    for chunk in decoded {
+    let mut source_identities = source_identities;
+    for (chunk, identities) in decoded {
         for (decoded_nodes, omissions) in chunk {
             for (key, node) in decoded_nodes {
                 // A later source overwrites both the node and any earlier
@@ -683,10 +830,17 @@ fn read_component_masters(
             }
             pending_layout.extend(omissions);
         }
+        if let Some(source_identities) = &mut source_identities {
+            source_identities.extend(identities);
+        }
     }
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "combined loading adds optional exact-byte evidence to the existing reader context"
+)]
 fn read_component_masters_serial(
     scan: &ComponentScan,
     version: u32,
@@ -695,6 +849,7 @@ fn read_component_masters_serial(
     refs: &fanta_fnx::RefTable,
     nodes: &mut Map<String, Value>,
     pending_layout: &mut BTreeSet<NodeId>,
+    mut source_identities: Option<&mut LoadedSourceIdentities>,
 ) -> Result<()> {
     for design in &scan.winner_dirs {
         read_component_master(
@@ -705,11 +860,16 @@ fn read_component_masters_serial(
             refs,
             nodes,
             pending_layout,
+            source_identities.as_deref_mut(),
         )?;
     }
     Ok(())
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "combined loading adds optional exact-byte evidence to the existing reader context"
+)]
 fn read_component_master(
     (entry, expected_root): &(PathBuf, Option<NodeId>),
     version: u32,
@@ -718,6 +878,7 @@ fn read_component_master(
     refs: &fanta_fnx::RefTable,
     nodes: &mut Map<String, Value>,
     pending_layout: &mut BTreeSet<NodeId>,
+    source_identities: Option<&mut LoadedSourceIdentities>,
 ) -> Result<()> {
     // A dangling definition can legitimately have no remaining master source.
     let decoded_root = read_design_nodes(
@@ -731,6 +892,7 @@ fn read_component_master(
         refs,
         nodes,
         pending_layout,
+        source_identities,
     )?;
     if let (Some(expected_root), Some(decoded_root)) = (expected_root, decoded_root)
         && *expected_root != decoded_root
@@ -761,10 +923,26 @@ fn read_design_nodes(
     refs: &fanta_fnx::RefTable,
     nodes: &mut Map<String, Value>,
     pending_layout: &mut BTreeSet<NodeId>,
+    source_identities: Option<&mut LoadedSourceIdentities>,
 ) -> Result<Option<NodeId>> {
     let fnx_path = design_dir.join(fnx_name);
     let source_override = source_override.filter(|source| source.path == fnx_path);
     if source_override.is_none() && !fnx_path.is_file() {
+        if let Some(source_identities) = source_identities {
+            let sidecar_hash = match std::fs::read(design_dir.join(ids_name)) {
+                Ok(bytes) => Some(Sha256::digest(&bytes).into()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            source_identities.insert(
+                fnx_path.clone(),
+                LoadedSourceIdentity {
+                    source_hash: None,
+                    sidecar_hash,
+                    current: false,
+                },
+            );
+        }
         // No `.fnx`. A `nodes/` dir means either a v1 tree or a v2 design that
         // fell back to per-node JSON (an un-encodable bucket) — read it either
         // way. With neither file present, a `required` design (a page) in a v2
@@ -789,6 +967,8 @@ fn read_design_nodes(
     let mut root = fanta_fnx::parse_doc(&text).map_err(|error| {
         FormatError::InvalidProjectTree(format!("{}: {error}", fnx_path.display()))
     })?;
+    let mut identity_current = false;
+    let mut sidecar_hash = None;
     let sidecar: fanta_fnx::FnxSidecar = match source_override
         .and_then(|source_override| source_override.sidecar)
     {
@@ -805,10 +985,28 @@ fn read_design_nodes(
                         Err(error) => return Err(error.into()),
                     }
                 };
-            persisted_fnx_sidecar_from_tree(&text, &root, bytes.as_deref())
+            if source_identities.is_some() {
+                sidecar_hash = bytes.as_deref().map(|bytes| Sha256::digest(bytes).into());
+            }
+            persisted_fnx_sidecar_from_tree(
+                &text,
+                &root,
+                bytes.as_deref(),
+                source_identities.as_ref().map(|_| &mut identity_current),
+            )
         }
     }
     .map_err(|error| FormatError::InvalidProjectTree(format!("{}: {error}", fnx_path.display())))?;
+    if let Some(source_identities) = source_identities {
+        source_identities.insert(
+            fnx_path.clone(),
+            LoadedSourceIdentity {
+                source_hash: Some(Sha256::digest(text.as_bytes()).into()),
+                sidecar_hash,
+                current: identity_current,
+            },
+        );
+    }
     fanta_fnx::desugar_refs(&mut root, refs)
         .map_err(|e| FormatError::InvalidProjectTree(format!("{}: {e}", fnx_path.display())))?;
     let decoded =
@@ -1062,23 +1260,30 @@ fn reconcile_fnx_sidecar_from_tree(
     root: &fanta_fnx::FnxElement,
     sidecar: &fanta_fnx::FnxSidecar,
 ) -> Result<fanta_fnx::FnxSidecar> {
-    let mut seed_hasher = Sha256::new();
-    seed_hasher.update(b"fanta-fnx-node-ids-v2");
-    seed_hasher.update((source.len() as u64).to_le_bytes());
-    seed_hasher.update(source.as_bytes());
-    for entry in &sidecar.ids {
-        seed_hasher.update((entry.id.len() as u64).to_le_bytes());
-        seed_hasher.update(entry.id.as_bytes());
-    }
-    let seed = seed_hasher.finalize();
-    let mut ordinal = sidecar.ids.len() as u64;
-    let mut used_ids: HashSet<String> = sidecar.ids.iter().map(|entry| entry.id.clone()).collect();
+    let mut identity_generator: Option<([u8; 32], u64, HashSet<String>)> = None;
     fanta_fnx::reconcile_sidecar_from_tree(root, sidecar, || {
+        // Most loads preserve every identity. Hashing the whole source and
+        // copying its ids only helps when reconciliation must mint a new id.
+        let (seed, ordinal, used_ids) = identity_generator.get_or_insert_with(|| {
+            let mut seed_hasher = Sha256::new();
+            seed_hasher.update(b"fanta-fnx-node-ids-v2");
+            seed_hasher.update((source.len() as u64).to_le_bytes());
+            seed_hasher.update(source.as_bytes());
+            for entry in &sidecar.ids {
+                seed_hasher.update((entry.id.len() as u64).to_le_bytes());
+                seed_hasher.update(entry.id.as_bytes());
+            }
+            (
+                seed_hasher.finalize().into(),
+                sidecar.ids.len() as u64,
+                sidecar.ids.iter().map(|entry| entry.id.clone()).collect(),
+            )
+        });
         loop {
             let mut id_hasher = Sha256::new();
-            id_hasher.update(seed);
+            id_hasher.update(*seed);
             id_hasher.update(ordinal.to_le_bytes());
-            ordinal += 1;
+            *ordinal += 1;
             let digest = id_hasher.finalize();
             let mut bytes = [0u8; 16];
             bytes.copy_from_slice(&digest[..16]);
@@ -1112,13 +1317,14 @@ pub(crate) fn persisted_fnx_sidecar(
 ) -> Result<fanta_fnx::FnxSidecar> {
     let root = fanta_fnx::parse_doc(source)
         .map_err(|error| FormatError::InvalidProjectTree(error.to_string()))?;
-    persisted_fnx_sidecar_from_tree(source, &root, bytes)
+    persisted_fnx_sidecar_from_tree(source, &root, bytes, None)
 }
 
 fn persisted_fnx_sidecar_from_tree(
     source: &str,
     root: &fanta_fnx::FnxElement,
     bytes: Option<&[u8]>,
+    mut identity_current: Option<&mut bool>,
 ) -> Result<fanta_fnx::FnxSidecar> {
     let persisted = bytes
         .ok_or_else(|| FormatError::InvalidProjectTree("missing identity sidecar".into()))
@@ -1140,6 +1346,13 @@ fn persisted_fnx_sidecar_from_tree(
                 .is_some_and(|parent| id_from_key::<NodeId>(parent).is_err())
             {
                 return Err("invalid node identity or sibling order in identity sidecar".into());
+            }
+            let matches = parsed_tree_matches_sidecar(root, sidecar);
+            if let Some(current) = &mut identity_current {
+                **current = matches;
+            }
+            if matches {
+                return Ok(sidecar.clone());
             }
             reconcile_fnx_sidecar_from_tree(source, root, sidecar)
                 .map_err(|error| error.to_string())
@@ -1179,6 +1392,43 @@ fn persisted_fnx_sidecar_from_tree(
     }
 }
 
+fn parsed_tree_matches_sidecar(
+    root: &fanta_fnx::FnxElement,
+    sidecar: &fanta_fnx::FnxSidecar,
+) -> bool {
+    // Parsing already validated every attribute and desugared geometry. Only
+    // exact modern identity fingerprints can replace the indexer's second
+    // source scan; legacy or repaired sidecars remain unverified for saving.
+    let mut pending = vec![(root, None)];
+    let mut identities = HashSet::with_capacity(sidecar.ids.len());
+    let mut position = 0usize;
+    while let Some((element, parent)) = pending.pop() {
+        let Some(entry) = sidecar.ids.get(position) else {
+            return false;
+        };
+        if element.attrs.get("id").and_then(Value::as_str) != Some(entry.id.as_str())
+            || entry.tag.as_deref() != Some(element.tag.as_str())
+            || entry.name.as_deref() != element.attrs.get("name").and_then(Value::as_str)
+            || entry.parent_index != parent
+            || !identities.insert(entry.id.as_str())
+        {
+            return false;
+        }
+        let Ok(parent) = u32::try_from(position) else {
+            return false;
+        };
+        pending.extend(
+            element
+                .children
+                .iter()
+                .rev()
+                .map(|child| (child, Some(parent))),
+        );
+        position += 1;
+    }
+    position == sidecar.ids.len()
+}
+
 /// Read every `<node-id>.json` in `nodes_dir` into the flat scene map, keyed
 /// by the id's serde form. The filename is the id of record.
 fn read_nodes_into(
@@ -1212,6 +1462,7 @@ fn read_nodes_into(
 fn read_assets(
     dir: &Path,
     json_override: Option<&JsonSourceOverride<'_>>,
+    mut loaded_files: Option<&mut LoadedFileHashes>,
 ) -> Result<BTreeMap<AssetId, Vec<u8>>> {
     let mut assets = BTreeMap::new();
     let assets_dir = dir.join(ASSETS_DIR);
@@ -1221,14 +1472,23 @@ fn read_assets(
             Some(source) => Some(super::media::read_asset_index(&serde_json::to_vec(
                 source.value,
             )?)?),
-            None => index_path
-                .is_file()
-                .then(|| std::fs::read(&index_path))
-                .transpose()?
-                .map(|bytes| super::media::read_asset_index(&bytes))
-                .transpose()?,
+            None => {
+                let bytes = index_path
+                    .is_file()
+                    .then(|| std::fs::read(&index_path))
+                    .transpose()?;
+                if let Some(files) = &mut loaded_files {
+                    files.insert(
+                        index_path,
+                        bytes.as_deref().map(|bytes| Sha256::digest(bytes).into()),
+                    );
+                }
+                bytes
+                    .map(|bytes| super::media::read_asset_index(&bytes))
+                    .transpose()?
+            }
         };
-        collect_assets(&assets_dir, &mut assets, index.as_ref())?;
+        collect_assets(&assets_dir, &mut assets, index.as_ref(), loaded_files)?;
         if let Some(index) = index {
             index.verify_complete(&assets)?;
         }
@@ -1240,10 +1500,11 @@ fn collect_assets(
     dir: &Path,
     assets: &mut BTreeMap<AssetId, Vec<u8>>,
     index: Option<&super::media::AssetIndex>,
+    mut loaded_files: Option<&mut LoadedFileHashes>,
 ) -> Result<()> {
     for path in sorted_entries(dir)? {
         if path.is_dir() {
-            collect_assets(&path, assets, index)?;
+            collect_assets(&path, assets, index, loaded_files.as_deref_mut())?;
             continue;
         }
         if path.parent() == Some(dir)
@@ -1269,6 +1530,9 @@ fn collect_assets(
         }
         if let Some(index) = index {
             index.verify_entry(id, &bytes)?;
+        }
+        if let Some(files) = &mut loaded_files {
+            files.insert(path, Some(Sha256::digest(&bytes).into()));
         }
         assets.insert(id, bytes);
     }
@@ -1542,6 +1806,7 @@ mod tests {
             &refs,
             &mut serial_nodes,
             &mut serial_pending,
+            None,
         )?;
         let mut parallel_nodes = initial_nodes;
         let mut parallel_pending = initial_pending;
@@ -1553,6 +1818,7 @@ mod tests {
             &refs,
             &mut parallel_nodes,
             &mut parallel_pending,
+            None,
         )?;
         assert_eq!(parallel_nodes, serial_nodes);
         assert_eq!(
@@ -1619,20 +1885,118 @@ mod tests {
             &refs,
             &mut Map::new(),
             &mut BTreeSet::new(),
+            None,
         )
         .expect_err("invalid serial source")
         .to_string();
         let mut nodes = Map::new();
         let mut pending = BTreeSet::new();
-        let actual = read_component_masters(&scan, 5, None, None, &refs, &mut nodes, &mut pending)
-            .expect_err("invalid parallel source")
-            .to_string();
+        let actual =
+            read_component_masters(&scan, 5, None, None, &refs, &mut nodes, &mut pending, None)
+                .expect_err("invalid parallel source")
+                .to_string();
         assert_eq!(actual, expected);
         assert!(actual.contains("master-0007"), "{actual}");
         assert!(!actual.contains("master-0137"), "{actual}");
         assert!(
             nodes.is_empty() && pending.is_empty(),
             "failed workers cannot publish a partial scene"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_modern_sidecar_reuse_preserves_order_parent_and_duplicate_checks()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let root_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let child_id = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+        let source = format!(
+            "<Frame id=\"{root_id}\" name=\"Root\"><Text id=\"{child_id}\" name=\"Child\" content=\"雪\" future_hint={{[1,2,3]}} /></Frame>"
+        );
+        let parent = "01ARZ3NDEKTSV4RRFFQ69G5FAX";
+        let mut sidecar = fanta_fnx::reconcile_sidecar(
+            &source,
+            &fanta_fnx::FnxSidecar {
+                root_parent: Some(parent.into()),
+                ids: Vec::new(),
+            },
+            || NodeId::new().0.to_string(),
+        )?;
+        sidecar.ids.first_mut().ok_or("root identity")?.index = json!(0.125);
+        sidecar.ids.get_mut(1).ok_or("child identity")?.index = json!(7.75);
+        let parsed = fanta_fnx::parse_doc(&source)?;
+        let expected = fanta_fnx::reconcile_sidecar_from_tree(&parsed, &sidecar, || {
+            NodeId::new().0.to_string()
+        })?;
+        let bytes = serde_json::to_vec(&sidecar)?;
+        let mut current = false;
+        let actual =
+            persisted_fnx_sidecar_from_tree(&source, &parsed, Some(&bytes), Some(&mut current))?;
+        assert!(current);
+        assert_eq!(actual, sidecar);
+        assert_eq!(actual, expected);
+        assert_eq!(actual.root_parent.as_deref(), Some(parent));
+
+        let legacy = source.replace(&format!("id=\"{child_id}\""), "");
+        let mut current = true;
+        assert_eq!(
+            persisted_fnx_sidecar_from_tree(
+                &legacy,
+                &fanta_fnx::parse_doc(&legacy)?,
+                Some(&bytes),
+                Some(&mut current),
+            )?,
+            sidecar
+        );
+        assert!(
+            !current,
+            "missing explicit identities require reconciliation"
+        );
+        assert!(persisted_fnx_sidecar(&legacy, None).is_err());
+
+        let duplicate = source.replace(child_id, root_id);
+        let mut duplicate_sidecar = sidecar;
+        duplicate_sidecar.ids.get_mut(1).ok_or("child identity")?.id = root_id.into();
+        let mut current = true;
+        let error = persisted_fnx_sidecar_from_tree(
+            &duplicate,
+            &fanta_fnx::parse_doc(&duplicate)?,
+            Some(&serde_json::to_vec(&duplicate_sidecar)?),
+            Some(&mut current),
+        )
+        .expect_err("duplicate explicit ids must not take the exact-match path");
+        assert!(!current);
+        assert!(error.to_string().contains("duplicate explicit node id"));
+        Ok(())
+    }
+
+    #[test]
+    fn deferred_identity_generation_preserves_deterministic_missing_ids()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let source = "<Frame id=\"01ARZ3NDEKTSV4RRFFQ69G5FAV\" name=\"Root\"><Text id=\"01ARZ3NDEKTSV4RRFFQ69G5FAW\" name=\"Kept\" content=\"a\" /><Text name=\"New 雪\" content=\"b\" /></Frame>";
+        let baseline = "<Frame id=\"01ARZ3NDEKTSV4RRFFQ69G5FAV\" name=\"Root\"><Text id=\"01ARZ3NDEKTSV4RRFFQ69G5FAW\" name=\"Kept\" content=\"a\" /></Frame>";
+        let sidecar = fanta_fnx::reconcile_sidecar(
+            baseline,
+            &fanta_fnx::FnxSidecar {
+                root_parent: Some("01ARZ3NDEKTSV4RRFFQ69G5FAX".into()),
+                ids: Vec::new(),
+            },
+            || NodeId::new().0.to_string(),
+        )?;
+        let parsed = fanta_fnx::parse_doc(source)?;
+        let actual = reconcile_fnx_sidecar_from_tree(source, &parsed, &sidecar)?;
+        let expected = fanta_fnx::reconcile_sidecar_from_tree(&parsed, &sidecar, || {
+            "5C7N6VFCCQAMM0V3VJGS4B5JB8".into()
+        })?;
+        assert_eq!(actual, expected);
+        assert_eq!(actual.root_parent, sidecar.root_parent);
+        assert_eq!(
+            actual.ids.get(2).ok_or("inserted identity")?.id,
+            "5C7N6VFCCQAMM0V3VJGS4B5JB8"
+        );
+        assert_eq!(
+            reconcile_fnx_sidecar_from_tree(source, &parsed, &sidecar)?,
+            actual
         );
         Ok(())
     }
@@ -1684,6 +2048,7 @@ mod tests {
             }
             let mut nodes = Map::new();
             let mut pending = BTreeSet::new();
+            let mut identities = LoadedSourceIdentities::new();
             let root = read_design_nodes(
                 directory.path(),
                 PAGE_FNX,
@@ -1695,8 +2060,21 @@ mod tests {
                 &refs,
                 &mut nodes,
                 &mut pending,
+                Some(&mut identities),
             )?;
             assert_eq!(root, Some(page));
+            let identity = identities
+                .get(&source_path)
+                .ok_or("loaded source identity")?;
+            assert_eq!(identity.current, variant == 3);
+            assert_eq!(
+                identity.source_hash,
+                Some(<[u8; 32]>::from(Sha256::digest(current.as_bytes())))
+            );
+            assert_eq!(
+                identity.sidecar_hash,
+                bytes.as_deref().map(|bytes| Sha256::digest(bytes).into())
+            );
             assert_eq!(pending, expected_pending);
             for node in expected {
                 let key = node.get("id").and_then(Value::as_str).ok_or("node id")?;
@@ -1732,6 +2110,7 @@ mod tests {
                 &refs,
                 &mut nodes,
                 &mut pending,
+                None,
             )?,
             Some(page)
         );
@@ -1746,6 +2125,7 @@ mod tests {
             &fanta_fnx::RefTable::new(true),
             &mut Map::new(),
             &mut BTreeSet::new(),
+            None,
         )
         .expect_err("unknown component still fails after identity recovery");
         assert!(error.to_string().contains("Button"), "{error}");

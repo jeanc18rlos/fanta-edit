@@ -44,4 +44,4 @@ pub use model::{FnxElement, IdEntry, tag_for_type, type_for_tag};
 pub use parse::{parse_doc, parse_doc_with};
 pub use print::{print_doc, print_doc_with};
 pub use refs::{RefTable, desugar_refs, sugar_refs};
-pub use source::{FnxSourceMirror, sidecar_matches_source};
+pub use source::{FnxSourceMirror, sidecar_matches_source, source_reference_nodes_with};

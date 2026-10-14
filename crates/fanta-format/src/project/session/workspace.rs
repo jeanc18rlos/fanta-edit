@@ -1,7 +1,8 @@
 //! [`WorkspaceSession`] — project shell, open map, shared vars, fs routing.
 
 use super::artifact::{
-    ArtifactSession, MergePathResult, ResolveOutcome, load_artifact_session, read_file_set,
+    ArtifactSession, MergePathResult, ResolveOutcome, SourceIdentityWitness, load_artifact_session,
+    read_file_set,
 };
 use super::catalog::ComponentCatalog;
 use super::error::{SaveBlocked, SessionError};
@@ -81,6 +82,14 @@ struct IndexedFileHashes {
 
 impl IndexedFileHashes {
     fn new(files: &[(String, Vec<u8>)], previous: Option<&Self>) -> Self {
+        Self::with_source_identity(files, previous, None)
+    }
+
+    fn with_source_identity(
+        files: &[(String, Vec<u8>)],
+        previous: Option<&Self>,
+        identity: Option<&SourceIdentityWitness>,
+    ) -> Self {
         let file_hashes = hash_files(files);
         // The reconciliation base can lag behind disk during a conflict. Reuse
         // only an aggregate recorded alongside these exact per-file hashes.
@@ -95,9 +104,11 @@ impl IndexedFileHashes {
         let content_hash = unchanged
             .map(|previous| previous.content_hash)
             .unwrap_or_else(|| hash_file_set(files));
-        let source_identity_verified = unchanged
-            .map(|previous| previous.source_identity_verified)
-            .unwrap_or_else(|| design_source_identity_is_current(files));
+        let source_identity_verified = identity
+            .is_some_and(|identity| identity.matches(&file_hashes))
+            || unchanged
+                .map(|previous| previous.source_identity_verified)
+                .unwrap_or_else(|| design_source_identity_is_current(files));
         Self {
             files: file_hashes,
             content_hash,
@@ -105,10 +116,32 @@ impl IndexedFileHashes {
             source_identity_verified,
         }
     }
+
+    fn from_loaded_source(
+        files: &[(String, Vec<u8>)],
+        source_name: &str,
+        sidecar_name: &str,
+        identity: &crate::project::read::LoadedSourceIdentity,
+    ) -> Result<Self, SessionError> {
+        let hashes = hash_files(files);
+        if hashes.get(source_name).copied() != identity.source_hash
+            || hashes.get(sidecar_name).copied() != identity.sidecar_hash
+        {
+            return Err(SessionError::InvalidState(format!(
+                "{source_name} or {sidecar_name} changed while the project was loading"
+            )));
+        }
+        Ok(Self {
+            files: hashes,
+            content_hash: hash_file_set(files),
+            order: files.iter().map(|(name, _)| name.clone()).collect(),
+            source_identity_verified: identity.current,
+        })
+    }
 }
 
 struct PreparedArtifactSave {
-    artifacts: BTreeMap<ArtifactId, Vec<(String, Vec<u8>)>>,
+    artifacts: BTreeMap<ArtifactId, IndexedFileHashes>,
     files: BTreeMap<PathBuf, Vec<u8>>,
     expected_disk: BTreeMap<PathBuf, Option<[u8; 32]>>,
 }
@@ -189,6 +222,8 @@ pub struct WorkspaceSession {
     pub artifacts: BTreeMap<ArtifactId, ArtifactMeta>,
     pub open: BTreeMap<ArtifactId, ArtifactSession>,
     reference_table_cache: Option<CachedReferenceTable>,
+    source_reference_table: Arc<RefTable>,
+    loaded_file_hashes: BTreeMap<PathBuf, [u8; 32]>,
     pub file_index: BTreeMap<ArtifactId, ContentHash>,
     file_hash_index: BTreeMap<ArtifactId, IndexedFileHashes>,
     /// Optional workspace.fnx + dependency graph.
@@ -201,10 +236,66 @@ impl WorkspaceSession {
     /// Open a project: index pages/components + load shared vars. No page scenes.
     pub fn open(project_root: impl AsRef<Path>) -> Result<Self, SessionError> {
         let root = project_root.as_ref().canonicalize()?;
-        crate::project::layout::with_project_read_lock(&root, || Self::open_locked(root.clone()))
+        crate::project::layout::with_project_read_lock(&root, || {
+            Self::open_locked(root.clone(), None)
+        })
     }
 
-    fn open_locked(root: PathBuf) -> Result<Self, SessionError> {
+    /// Load the complete authoring document and its workspace index under one
+    /// read lock, reusing validation of the exact source and sidecar bytes.
+    pub fn open_project_document(
+        project_root: impl AsRef<Path>,
+    ) -> Result<(fanta_doc::Doc, BTreeMap<fanta_doc::AssetId, Vec<u8>>, Self), SessionError> {
+        let root = project_root.as_ref().canonicalize()?;
+        crate::project::layout::with_project_read_lock(&root, || {
+            #[cfg(test)]
+            let diagnostic_started = std::env::var_os("FANTA_PERF_PROJECT")
+                .is_some()
+                .then(std::time::Instant::now);
+            let (document, assets, evidence) =
+                crate::project::read::read_project_tree_with_source_identities(&root)?;
+            #[cfg(test)]
+            let reader_seconds = diagnostic_started.map(|started| started.elapsed().as_secs_f64());
+            #[cfg(test)]
+            let index_started = diagnostic_started.map(|_| std::time::Instant::now());
+            let session = Self::open_locked(root.clone(), Some(&evidence))?;
+            #[cfg(test)]
+            let index_seconds = index_started.map(|started| started.elapsed().as_secs_f64());
+            #[cfg(test)]
+            let registry_started = diagnostic_started.map(|_| std::time::Instant::now());
+            let metadata_changed = session.project_id != document.id
+                || (session.schema_version == document.schema_version
+                    && (session.components.defs != document.components
+                        || session.shared.variables != document.variables
+                        || session.shared.active_modes != document.active_modes));
+            #[cfg(test)]
+            if let Some(started) = diagnostic_started {
+                eprintln!(
+                    "{}",
+                    json!({
+                        "combined_load_stages": {
+                            "reader_seconds": reader_seconds,
+                            "index_seconds": index_seconds,
+                            "registry_seconds": registry_started.map(|started| started.elapsed().as_secs_f64()),
+                            "total_seconds": started.elapsed().as_secs_f64(),
+                        }
+                    })
+                );
+            }
+            if metadata_changed {
+                return Err(SessionError::InvalidState(
+                    "project metadata changed while the project was loading".into(),
+                ));
+            }
+            Ok((document, assets, session))
+        })
+    }
+
+    fn open_locked(
+        root: PathBuf,
+        loaded: Option<&crate::project::read::LoadedProjectEvidence>,
+    ) -> Result<Self, SessionError> {
+        let source_identities = loaded.map(|evidence| &evidence.sources);
         if !is_project_dir(&root) {
             return Err(SessionError::NotAProject { path: root });
         }
@@ -268,7 +359,7 @@ impl WorkspaceSession {
                     .and_then(|s| s.to_str())
                     .unwrap_or("")
                     .to_owned();
-                if slug.starts_with('_') {
+                if slug == crate::project::layout::LOOSE_DIR {
                     continue;
                 }
                 if !entry.join(PAGE_JSON).is_file() {
@@ -291,7 +382,24 @@ impl WorkspaceSession {
                 let id = ArtifactId::Page(page_id);
                 let design_dir = PathBuf::from(PAGES_DIR).join(&slug);
                 let files = read_indexed_file_set(&entry, ArtifactKind::Page)?;
-                let file_hashes = IndexedFileHashes::new(&files, None);
+                let file_hashes = match source_identities {
+                    Some(identities) => {
+                        let identity = identities
+                            .get(&entry.join(crate::project::layout::PAGE_FNX))
+                            .ok_or_else(|| {
+                                SessionError::InvalidState(
+                                    "page selection changed while the project was loading".into(),
+                                )
+                            })?;
+                        IndexedFileHashes::from_loaded_source(
+                            &files,
+                            crate::project::layout::PAGE_FNX,
+                            crate::project::layout::PAGE_IDS,
+                            identity,
+                        )?
+                    }
+                    None => IndexedFileHashes::new(&files, None),
+                };
                 let disk_hash = file_hashes.content_hash;
                 let meta = ArtifactMeta {
                     id: id.clone(),
@@ -367,8 +475,11 @@ impl WorkspaceSession {
                 .iter()
                 .map(|(_, _, entry, _, _, _)| entry.as_path())
                 .collect();
-            let indexed =
-                index_initial_component_files(&entries, manifest.version == PROJECT_VERSION)?;
+            let indexed = index_initial_component_files(
+                &entries,
+                manifest.version == PROJECT_VERSION,
+                source_identities,
+            )?;
             for ((cid, _, _, slug, design_dir, def), file_hashes) in
                 selected.into_iter().zip(indexed)
             {
@@ -461,7 +572,26 @@ impl WorkspaceSession {
         let workspace_ir = super::workspace_fnx::load_workspace_ir(&root)?;
         let motion = super::motion::read_motion_dual(&root)?;
 
-        Ok(Self {
+        let reference_table_cache =
+            CachedReferenceTable::new(&components.defs, &shared.variables, manifest.version >= 4);
+        let source_reference_table = Arc::clone(&reference_table_cache.table);
+        let loaded_file_hashes = loaded
+            .map(|evidence| {
+                evidence
+                    .files
+                    .iter()
+                    .filter_map(|(path, hash)| hash.map(|hash| (path, hash)))
+                    .map(|(path, hash)| {
+                        path.strip_prefix(&root)
+                            .map(|relative| (relative.to_path_buf(), hash))
+                            .map_err(|error| SessionError::other(error.to_string()))
+                    })
+                    .collect::<Result<BTreeMap<_, _>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+
+        let session = Self {
             root,
             project_id,
             schema_version: manifest.schema_version,
@@ -475,12 +605,68 @@ impl WorkspaceSession {
             components,
             artifacts,
             open: BTreeMap::new(),
-            reference_table_cache: None,
+            reference_table_cache: Some(reference_table_cache),
+            source_reference_table,
+            loaded_file_hashes,
             file_index,
             file_hash_index,
             workspace_ir,
             motion,
-        })
+        };
+        if let Some(evidence) = loaded {
+            session.validate_loaded_project_evidence(evidence)?;
+        }
+        Ok(session)
+    }
+
+    fn validate_loaded_project_evidence(
+        &self,
+        loaded: &crate::project::read::LoadedProjectEvidence,
+    ) -> Result<(), SessionError> {
+        if self.manifest.version == PROJECT_VERSION {
+            let pages: BTreeSet<_> = self
+                .artifacts
+                .keys()
+                .filter_map(|id| match id {
+                    ArtifactId::Page(page) => Some(*page),
+                    _ => None,
+                })
+                .collect();
+            if pages != loaded.pages.iter().copied().collect() {
+                return Err(SessionError::InvalidState(
+                    "the project page registry changed while the project was loading".into(),
+                ));
+            }
+        }
+        let headers: BTreeMap<_, _> = self
+            .artifacts
+            .iter()
+            .filter_map(|(id, meta)| {
+                matches!(id, ArtifactId::Page(_)).then(|| {
+                    (
+                        self.root.join(&meta.design_dir).join(PAGE_JSON),
+                        self.file_hash_index
+                            .get(id)
+                            .and_then(|hashes| hashes.files.get(PAGE_JSON))
+                            .copied(),
+                    )
+                })
+            })
+            .collect();
+        for (path, expected) in &loaded.files {
+            let actual = if path.file_name().is_some_and(|name| name == PAGE_JSON) {
+                headers.get(path).copied().flatten()
+            } else {
+                file_sha256_if_present(path)?
+            };
+            if actual != *expected {
+                return Err(SessionError::InvalidState(format!(
+                    "{} changed while the project was loading",
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub fn open_artifact(&mut self, id: ArtifactId) -> Result<ArtifactId, SessionError> {
@@ -546,6 +732,47 @@ impl WorkspaceSession {
             _ => return false,
         };
         files.files.contains_key(source)
+    }
+
+    /// Consume exact file hashes from opening the project so initial watcher
+    /// echoes can be checked without rebuilding the workspace index. Files
+    /// absent from this snapshot still require normal disk reconciliation.
+    pub fn take_loaded_file_hashes(&mut self) -> BTreeMap<PathBuf, [u8; 32]> {
+        let mut hashes = std::mem::take(&mut self.loaded_file_hashes);
+        if hashes.is_empty() {
+            return hashes;
+        }
+        for (id, indexed) in &self.file_hash_index {
+            if matches!(id, ArtifactId::Page(_) | ArtifactId::Component(_))
+                && let Some(artifact) = self.artifacts.get(id)
+            {
+                hashes.extend(
+                    indexed
+                        .files
+                        .iter()
+                        .filter(|(name, _)| {
+                            // Legacy node files have no full-reader byte
+                            // witness. Migrated definitions likewise lack the
+                            // current-schema semantic comparison at open.
+                            matches!(
+                                name.as_str(),
+                                "page.fnx" | "page.ids.json" | "master.fnx" | "master.ids.json"
+                            ) || (name.as_str() == DEF_JSON
+                                && self.schema_version == SCHEMA_VERSION)
+                        })
+                        .map(|(name, hash)| (artifact.design_dir.join(name), *hash)),
+                );
+            }
+        }
+        for (path, hash) in &self.other_singleton_disk_hashes {
+            if self.schema_version == SCHEMA_VERSION
+                && path.starts_with(COMPONENTS_DIR)
+                && let Some(hash) = hash
+            {
+                hashes.insert(path.clone(), *hash);
+            }
+        }
+        hashes
     }
 
     /// Save ordinary edits without projecting or retaining untouched sources.
@@ -714,7 +941,7 @@ impl WorkspaceSession {
                 .ok_or_else(|| SessionError::ArtifactNotFound(id.debug_label()))?;
             session.synchronize_retained_source_with_scene()?;
             let header = json_bytes(&expected_artifact_header(document, id)?)?;
-            let mut projected = session.project_to_files()?;
+            let (mut projected, identity) = session.project_files_with_identity()?;
             let names = artifact_file_names(session.kind);
             for (name, bytes) in &mut projected {
                 if name == names.last().copied().unwrap_or("") {
@@ -732,13 +959,18 @@ impl WorkspaceSession {
                 }
                 files.insert(session.meta.design_dir.join(name), bytes.clone());
             }
-            if !design_source_identity_is_current(&projected) {
+            let indexed = IndexedFileHashes::with_source_identity(
+                &projected,
+                self.file_hash_index.get(id),
+                identity.as_ref(),
+            );
+            if !indexed.source_identity_verified {
                 return Err(SessionError::InvalidSource(format!(
                     "{} projected an incoherent source identity",
                     id.debug_label()
                 )));
             }
-            artifacts.insert(id.clone(), projected);
+            artifacts.insert(id.clone(), indexed);
         }
         Ok(Some(PreparedArtifactSave {
             artifacts,
@@ -760,11 +992,16 @@ impl WorkspaceSession {
                 .map(|(path, hash)| (path.clone(), Some(*hash))),
         );
         let mut accepted = Vec::new();
-        for (id, files) in prepared.artifacts {
+        for (id, file_hashes) in prepared.artifacts {
             let session = self
                 .open
                 .get(&id)
                 .ok_or_else(|| SessionError::ArtifactNotFound(id.debug_label()))?;
+            if file_hashes.files.iter().any(|(name, hash)| {
+                projected_hashes.get(&session.meta.design_dir.join(name)) != Some(hash)
+            }) {
+                return Err(SessionError::SaveBlocked(SaveBlocked::DiskChangedAgain));
+            }
             let header = expected_artifact_header(document, &id)?;
             let node_map = match session.state {
                 ArtifactDirty::DirtyCanvas => {
@@ -787,7 +1024,6 @@ impl WorkspaceSession {
                     )));
                 }
             };
-            let file_hashes = IndexedFileHashes::new(&files, self.file_hash_index.get(&id));
             accepted.push((id, node_map, file_hashes));
         }
         let shared_hash = hash_workspace_shared_on_disk(&self.root)?;
@@ -893,6 +1129,9 @@ impl WorkspaceSession {
         &mut self,
         document: &fanta_doc::Doc,
     ) -> Result<BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>, SessionError> {
+        let reference_table = self.reference_table_for_document(document);
+        let vocabulary_changed = !Arc::ptr_eq(&self.source_reference_table, &reference_table)
+            && *self.source_reference_table != *reference_table;
         for session in self.open.values() {
             if matches!(session.kind, ArtifactKind::Page | ArtifactKind::Component)
                 && !matches!(
@@ -1007,6 +1246,9 @@ impl WorkspaceSession {
                 )?;
                 (source, ids)
             };
+            if vocabulary_changed {
+                validate_source_references(document, &bytes.0, &bytes.1, &reference_table)?;
+            }
             let bytes = match id {
                 ArtifactId::Component(component) => {
                     with_document_root_parent(document, *component, bytes)?
@@ -1144,6 +1386,9 @@ impl WorkspaceSession {
         source_overrides: &BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>,
         written_hashes: &BTreeMap<PathBuf, [u8; 32]>,
     ) -> Result<(), SessionError> {
+        let reference_table = self.reference_table_for_document(document);
+        let vocabulary_changed = !Arc::ptr_eq(&self.source_reference_table, &reference_table)
+            && *self.source_reference_table != *reference_table;
         let (pages, components) = crate::project::write::projected_design_dirs(document);
         let mut accepted = Vec::new();
         let mut removed = Vec::new();
@@ -1172,6 +1417,23 @@ impl WorkspaceSession {
                 continue;
             };
             let current = read_indexed_file_set(&self.root.join(projected_dir), meta.kind)?;
+            if vocabulary_changed {
+                let source = current
+                    .iter()
+                    .find(|(name, _)| name == source_name)
+                    .map(|(_, bytes)| bytes.as_slice())
+                    .ok_or_else(|| {
+                        SessionError::InvalidSource("written source is absent".into())
+                    })?;
+                let sidecar = current
+                    .iter()
+                    .find(|(name, _)| name == ids_name)
+                    .map(|(_, bytes)| bytes.as_slice())
+                    .ok_or_else(|| {
+                        SessionError::InvalidSource("written sidecar is absent".into())
+                    })?;
+                validate_source_references(document, source, sidecar, &reference_table)?;
+            }
             let file_hashes = IndexedFileHashes::new(&current, self.file_hash_index.get(id));
             let header = expected_artifact_header(document, id)?;
             let expected_header = json_bytes(&header)?;
@@ -1372,6 +1634,7 @@ impl WorkspaceSession {
         self.manifest_disk_hash = sha256_bytes(&manifest_bytes);
         self.asset_index_disk_hash = Some(expected_asset_index_hash);
         self.other_singleton_disk_hashes = singleton_disk_hashes(&self.root)?;
+        self.source_reference_table = self.reference_table_for_document(document);
         Ok(())
     }
 
@@ -1559,6 +1822,22 @@ impl WorkspaceSession {
         let table = Arc::clone(&cached.table);
         self.reference_table_cache = Some(cached);
         table
+    }
+
+    fn reference_table_for_document(&self, document: &fanta_doc::Doc) -> Arc<RefTable> {
+        self.reference_table_cache
+            .as_ref()
+            .filter(|cached| {
+                cached.matches(&document.components, &document.variables, self.emit_names())
+            })
+            .map(|cached| Arc::clone(&cached.table))
+            .unwrap_or_else(|| {
+                Arc::new(crate::project::refs_ctx::build_ref_table(
+                    &document.components,
+                    &document.variables,
+                    self.emit_names(),
+                ))
+            })
     }
 
     /// Layout-version policy for name-based reference EMISSION: v4 is the
@@ -2351,6 +2630,55 @@ fn set_files_of(document: &fanta_doc::Doc) -> Result<Vec<(PathBuf, Value)>, Sess
         .collect()
 }
 
+fn validate_source_references(
+    document: &fanta_doc::Doc,
+    source: &[u8],
+    sidecar: &[u8],
+    refs: &RefTable,
+) -> Result<(), SessionError> {
+    let source =
+        std::str::from_utf8(source).map_err(|error| SessionError::other(error.to_string()))?;
+    let sidecar = serde_json::from_slice::<fanta_fnx::FnxSidecar>(sidecar)
+        .map_err(|error| SessionError::other(error.to_string()))?;
+    for (node_id, references) in fanta_fnx::source_reference_nodes_with(source, &sidecar, refs)? {
+        let node_id = id_from_key::<fanta_doc::NodeId>(&node_id)?;
+        let node = document.scene.get(node_id).ok_or_else(|| {
+            SessionError::InvalidSource(format!(
+                "retained reference node {node_id} is absent from the document"
+            ))
+        })?;
+        if let Some(component) = references.attrs.get("component") {
+            let matches = match &node.data {
+                fanta_doc::NodeData::Instance(instance) => {
+                    *component
+                        == serde_json::to_value(instance.component)
+                            .map_err(|error| SessionError::other(error.to_string()))?
+                }
+                _ => false,
+            };
+            if !matches {
+                return Err(SessionError::InvalidSource(format!(
+                    "retained component name on node {node_id} resolves to a different id"
+                )));
+            }
+        }
+        if let Some(bindings) = references.attrs.get("bindings") {
+            let pairs =
+                serde_json::from_value::<Vec<(fanta_doc::BoundProp, VariableId)>>(bindings.clone())
+                    .map_err(|error| SessionError::InvalidSource(error.to_string()))?;
+            // CanvasNode's source adapter accepts arbitrary pair order and
+            // retains the last duplicate. Compare that exact map semantics.
+            let actual: BTreeMap<_, _> = pairs.into_iter().collect();
+            if actual != node.bindings {
+                return Err(SessionError::InvalidSource(format!(
+                    "retained variable names on node {node_id} resolve to different ids"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
@@ -2493,6 +2821,7 @@ fn artifact_save_owners(
 fn index_initial_component_files(
     entries: &[&Path],
     parallel: bool,
+    source_identities: Option<&crate::project::read::LoadedSourceIdentities>,
 ) -> Result<Vec<IndexedFileHashes>, SessionError> {
     const PARALLEL_MINIMUM_COMPONENTS: usize = 256;
     const INDEX_WORKERS: usize = 4;
@@ -2502,7 +2831,25 @@ fn index_initial_component_files(
             .iter()
             .map(|entry| {
                 let files = read_indexed_file_set(entry, ArtifactKind::Component)?;
-                Ok(IndexedFileHashes::new(&files, None))
+                match source_identities {
+                    Some(identities) => {
+                        let identity = identities
+                            .get(&entry.join(crate::project::layout::MASTER_FNX))
+                            .ok_or_else(|| {
+                                SessionError::InvalidState(
+                                    "component selection changed while the project was loading"
+                                        .into(),
+                                )
+                            })?;
+                        IndexedFileHashes::from_loaded_source(
+                            &files,
+                            crate::project::layout::MASTER_FNX,
+                            MASTER_IDS,
+                            identity,
+                        )
+                    }
+                    None => Ok(IndexedFileHashes::new(&files, None)),
+                }
             })
             .collect::<Result<Vec<_>, SessionError>>()
     };
@@ -2670,6 +3017,110 @@ fn hash_workspace_shared_on_disk(root: &Path) -> Result<ContentHash, SessionErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project::layout::{PAGE_FNX, PAGE_IDS};
+
+    #[test]
+    fn reference_validation_uses_the_authored_binding_maps_semantics() {
+        let mut document = fanta_doc::Doc::new();
+        let first = VariableId::new();
+        let second = VariableId::new();
+        let mut node =
+            fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(fanta_doc::GroupNode::default()));
+        node.bindings.insert(fanta_doc::BoundProp::Opacity, first);
+        node.bindings.insert(fanta_doc::BoundProp::Visible, second);
+        let node_id = document.scene.insert(node.clone()).expect("node");
+        document.add_page(node_id);
+        let ir = fanta_fnx::ArtifactIr::from_nodes(
+            ArtifactKind::Page,
+            "Bindings",
+            &[serde_json::to_value(&node).expect("node JSON")],
+        )
+        .expect("IR");
+        let sidecar = json_bytes(&serde_json::to_value(ir.sidecar()).expect("sidecar"))
+            .expect("sidecar bytes");
+        let mut pairs: Vec<_> = node
+            .bindings
+            .iter()
+            .map(|(property, variable)| (*property, *variable))
+            .collect();
+        pairs.reverse();
+        for duplicate in [false, true] {
+            let mut authored = pairs.clone();
+            if duplicate {
+                authored.insert(0, (fanta_doc::BoundProp::Visible, first));
+            }
+            let source = format!(
+                "<Group id=\"{}\" bindings={{{}}} />",
+                node_id.0,
+                serde_json::to_string(&authored).expect("authored binding pairs")
+            );
+            validate_source_references(
+                &document,
+                source.as_bytes(),
+                &sidecar,
+                &RefTable::new(false),
+            )
+            .expect("same binding map despite ordering or overwritten duplicate");
+        }
+    }
+
+    #[test]
+    fn emitted_identity_witness_only_certifies_exact_source_and_sidecar_bytes() {
+        let directory = tempfile::tempdir().expect("project");
+        let mut document = fanta_doc::Doc::new();
+        let page = document
+            .scene
+            .insert(fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(
+                fanta_doc::GroupNode::default(),
+            )))
+            .expect("page");
+        document.add_page(page);
+        crate::write_project_tree(directory.path(), &document, &BTreeMap::new())
+            .expect("project files");
+        let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
+        let artifact = ArtifactId::Page(page);
+        workspace.open_artifact(artifact.clone()).expect("session");
+        let (files, witness) = workspace
+            .artifact(&artifact)
+            .expect("session")
+            .project_files_with_identity()
+            .expect("projected files");
+        let witness = witness.expect("checked retained output");
+        let checked = IndexedFileHashes::with_source_identity(&files, None, Some(&witness));
+        assert!(checked.source_identity_verified);
+        let parsed = IndexedFileHashes::new(&files, None);
+        assert_eq!(checked.files, parsed.files);
+        assert_eq!(checked.content_hash, parsed.content_hash);
+        assert_eq!(checked.order, parsed.order);
+        assert_eq!(
+            checked.source_identity_verified,
+            parsed.source_identity_verified
+        );
+        for name in [PAGE_FNX, PAGE_IDS] {
+            let mut corrupted = files.clone();
+            let bytes = &mut corrupted
+                .iter_mut()
+                .find(|(file, _)| file == name)
+                .expect("file")
+                .1;
+            *bytes = if name == PAGE_FNX {
+                b"<Group id=\"forged\" future={bad} />".to_vec()
+            } else {
+                b"{\"ids\":[]}".to_vec()
+            };
+            let rejected =
+                IndexedFileHashes::with_source_identity(&corrupted, None, Some(&witness));
+            assert!(!rejected.source_identity_verified, "{name}");
+            let parsed = IndexedFileHashes::new(&corrupted, None);
+            assert_eq!(rejected.files, parsed.files);
+            assert_eq!(rejected.content_hash, parsed.content_hash);
+            assert_eq!(rejected.order, parsed.order);
+            assert_eq!(
+                rejected.source_identity_verified,
+                parsed.source_identity_verified
+            );
+        }
+    }
 
     #[test]
     fn large_component_index_matches_serial_hashes_and_identity_evidence()
@@ -2714,8 +3165,8 @@ mod tests {
             .collect();
         let entries: Vec<_> = paths.iter().map(PathBuf::as_path).collect();
         let assert_same = |current: &WorkspaceSession| -> Result<(), Box<dyn std::error::Error>> {
-            let serial = index_initial_component_files(&entries, false)?;
-            let parallel = index_initial_component_files(&entries, true)?;
+            let serial = index_initial_component_files(&entries, false, None)?;
+            let parallel = index_initial_component_files(&entries, true, None)?;
             assert_eq!(serial.len(), entries.len());
             assert_eq!(parallel.len(), entries.len());
             for ((entry, serial), parallel) in entries.iter().zip(&serial).zip(&parallel) {
@@ -2750,6 +3201,22 @@ mod tests {
             Ok(())
         };
         assert_same(&fresh)?;
+        let assert_combined = || -> Result<(), Box<dyn std::error::Error>> {
+            let (expected, expected_assets) = crate::read_project_tree(directory.path())?;
+            let (loaded, assets, combined) =
+                WorkspaceSession::open_project_document(directory.path())?;
+            assert_eq!(
+                serde_json::to_value(&loaded)?,
+                serde_json::to_value(&expected)?
+            );
+            assert_eq!(loaded.pending_layout, expected.pending_layout);
+            assert_eq!(assets, expected_assets);
+            assert!(combined.open.is_empty());
+            assert_eq!(combined.components.defs, loaded.components);
+            assert_same(&combined)?;
+            Ok(())
+        };
+        assert_combined()?;
         assert!(
             fresh
                 .file_hash_index
@@ -2763,6 +3230,7 @@ mod tests {
         std::fs::remove_file(missing.join(MASTER_IDS))?;
         let changed = WorkspaceSession::open(directory.path())?;
         assert_same(&changed)?;
+        assert_combined()?;
         assert_eq!(changed.components.defs, fresh.components.defs);
         assert_eq!(changed.artifacts.len(), fresh.artifacts.len());
         assert!(changed.open.is_empty());
@@ -2782,8 +3250,183 @@ mod tests {
         std::fs::write(manifest_path, json_bytes(&manifest)?)?;
         let legacy = WorkspaceSession::open(directory.path())?;
         assert_same(&legacy)?;
+        assert_combined()?;
         assert_eq!(legacy.file_index, changed.file_index);
         assert_eq!(legacy.components.defs, changed.components.defs);
+        Ok(())
+    }
+
+    #[test]
+    fn combined_loading_tracks_exact_asset_bytes_for_startup_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let document = fanta_doc::Doc::new();
+        let asset = fanta_doc::AssetId::new();
+        let bytes = b"\x89PNG\r\n\x1a\nexact loaded asset".to_vec();
+        crate::write_project_tree(
+            directory.path(),
+            &document,
+            &BTreeMap::from([(asset, bytes.clone())]),
+        )?;
+        let root = directory.path().canonicalize()?;
+        let asset_path = PathBuf::from(format!("assets/images/{asset}.png"));
+        let index_path = PathBuf::from("assets/index.json");
+        let (_, assets, evidence) =
+            crate::project::read::read_project_tree_with_source_identities(&root)?;
+        assert_eq!(assets.get(&asset), Some(&bytes));
+        let mut session = WorkspaceSession::open_locked(root.clone(), Some(&evidence))?;
+        let hashes = session.take_loaded_file_hashes();
+        assert_eq!(hashes.get(&asset_path), Some(&sha256_bytes(&bytes)));
+        assert_eq!(
+            hashes.get(&index_path),
+            Some(&sha256_bytes(&std::fs::read(root.join(&index_path))?))
+        );
+        for relative in [asset_path, index_path] {
+            let path = root.join(relative);
+            let original = std::fs::read(&path)?;
+            let mut changed = original.clone();
+            changed.push(b' ');
+            std::fs::write(&path, changed)?;
+            assert!(WorkspaceSession::open_locked(root.clone(), Some(&evidence)).is_err());
+            std::fs::write(path, original)?;
+        }
+        let (_, _, mut reopened) = WorkspaceSession::open_project_document(&root)?;
+        assert_eq!(reopened.take_loaded_file_hashes(), hashes);
+        Ok(())
+    }
+
+    #[test]
+    fn combined_loading_refuses_changed_bytes_and_invalid_unknown_attributes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let mut document = fanta_doc::Doc::new();
+        let page =
+            document
+                .scene
+                .insert(fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(
+                    Default::default(),
+                )))?;
+        document.add_page(page);
+        let mut child = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
+        child.name = "Authored child".into();
+        child.parent = Some(page);
+        let child_id = document.scene.insert(child)?;
+        crate::write_project_tree(directory.path(), &document, &BTreeMap::new())?;
+        let root = directory.path().canonicalize()?;
+        let first = WorkspaceSession::open(&root)?;
+        let original_dir = root.join(
+            &first
+                .artifacts
+                .get(&ArtifactId::Page(page))
+                .ok_or("page metadata")?
+                .design_dir,
+        );
+        let authored_dir = root.join(PAGES_DIR).join("_authored");
+        std::fs::rename(original_dir, &authored_dir)?;
+        let (_, _, identities) =
+            crate::project::read::read_project_tree_with_source_identities(&root)?;
+        let initial = WorkspaceSession::open_locked(root.clone(), Some(&identities))?;
+        let meta = initial
+            .artifacts
+            .get(&ArtifactId::Page(page))
+            .ok_or("page metadata")?;
+        let source_path = root
+            .join(&meta.design_dir)
+            .join(crate::project::layout::PAGE_FNX);
+        let sidecar_path = root
+            .join(&meta.design_dir)
+            .join(crate::project::layout::PAGE_IDS);
+        let source = std::fs::read_to_string(&source_path)?;
+        let sidecar = std::fs::read(&sidecar_path)?;
+        let header_path = authored_dir.join(PAGE_JSON);
+        let header = std::fs::read(&header_path)?;
+        let mut changed_header = header.clone();
+        changed_header.push(b' ');
+        std::fs::write(&header_path, changed_header)?;
+        assert!(WorkspaceSession::open_locked(root.clone(), Some(&identities)).is_err());
+        std::fs::write(&header_path, &header)?;
+
+        for relative in [
+            FANTA_JSON.to_string(),
+            format!("{DOC_DIR}/{METADATA_JSON}"),
+            format!("{DOC_DIR}/{VARIABLES_JSON}"),
+            format!("{DOC_DIR}/{ACTIVE_MODES_JSON}"),
+        ] {
+            let path = root.join(relative);
+            let original = std::fs::read(&path)?;
+            let mut changed = original.clone();
+            changed.push(b' ');
+            std::fs::write(&path, changed)?;
+            assert!(WorkspaceSession::open_locked(root.clone(), Some(&identities)).is_err());
+            std::fs::write(path, original)?;
+        }
+        let added_page = fanta_doc::NodeId::new();
+        let added_child = fanta_doc::NodeId::new();
+        let added_dir = root.join(PAGES_DIR).join("late-page");
+        std::fs::create_dir(&added_dir)?;
+        write_json_file(
+            &added_dir.join(PAGE_JSON),
+            &json!({ "id": added_page.to_string(), "name": "Late page", "order": 1 }),
+        )?;
+        std::fs::write(
+            added_dir.join(crate::project::layout::PAGE_FNX),
+            source
+                .replace(&page.0.to_string(), &added_page.0.to_string())
+                .replace(&child_id.0.to_string(), &added_child.0.to_string()),
+        )?;
+        assert!(WorkspaceSession::open_locked(root.clone(), Some(&identities)).is_err());
+        let (two_pages, _, _) = WorkspaceSession::open_project_document(&root)?;
+        assert_eq!(two_pages.pages().len(), 2);
+        std::fs::remove_dir_all(added_dir)?;
+        let removed_dir = root.join("removed-page");
+        std::fs::rename(&authored_dir, &removed_dir)?;
+        assert!(WorkspaceSession::open_locked(root.clone(), Some(&identities)).is_err());
+        std::fs::rename(removed_dir, &authored_dir)?;
+        for changed in [
+            source.replace("Authored child", "Renamed child"),
+            source.replace(
+                &child_id.0.to_string(),
+                &fanta_doc::NodeId::new().0.to_string(),
+            ),
+        ] {
+            assert_ne!(changed, source);
+            std::fs::write(&source_path, &changed)?;
+            assert!(WorkspaceSession::open_locked(root.clone(), Some(&identities)).is_err());
+            let (expected, _) = crate::read_project_tree(&root)?;
+            let (loaded, _, refreshed) = WorkspaceSession::open_project_document(&root)?;
+            assert_eq!(
+                serde_json::to_value(&loaded)?,
+                serde_json::to_value(expected)?
+            );
+            assert!(!refreshed.file_hash_index[&ArtifactId::Page(page)].source_identity_verified);
+        }
+        std::fs::write(&source_path, &source)?;
+        let mut changed_sidecar = sidecar.clone();
+        changed_sidecar.push(b' ');
+        std::fs::write(&sidecar_path, changed_sidecar)?;
+        assert!(WorkspaceSession::open_locked(root.clone(), Some(&identities)).is_err());
+        std::fs::write(&sidecar_path, &sidecar)?;
+
+        for attribute in [
+            "future_hint={not_json}",
+            "future_hint={1e400}",
+            r#"future_hint="\q""#,
+        ] {
+            let changed = source.replacen("<Frame", &format!("<Frame {attribute}"), 1);
+            assert_ne!(changed, source);
+            std::fs::write(&source_path, changed)?;
+            let expected = crate::read_project_tree(&root).expect_err("invalid attribute");
+            let actual = WorkspaceSession::open_project_document(&root)
+                .err()
+                .ok_or("invalid attribute must fail combined load")?;
+            assert_eq!(actual.to_string(), expected.to_string());
+        }
+        std::fs::write(&source_path, &source)?;
+        let (loaded, _, final_session) = WorkspaceSession::open_project_document(&root)?;
+        assert_eq!(loaded.scene.len(), document.scene.len());
+        assert!(final_session.file_hash_index[&ArtifactId::Page(page)].source_identity_verified);
+        assert_eq!(std::fs::read_to_string(source_path)?, source);
+        assert_eq!(std::fs::read(sidecar_path)?, sidecar);
         Ok(())
     }
 

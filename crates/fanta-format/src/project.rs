@@ -125,12 +125,31 @@ mod tests {
             project.join(".codex-performance-fixture").is_file(),
             "performance saves require a marked project copy"
         );
-        let started = Instant::now();
-        let (mut document, assets) = read_project_tree(&project)?;
-        let load_seconds = started.elapsed().as_secs_f64();
-        let started = Instant::now();
-        let mut workspace = WorkspaceSession::open(&project)?;
-        let index_seconds = started.elapsed().as_secs_f64();
+        let combined = std::env::var_os("FANTA_PERF_COMBINED").is_some();
+        let (mut document, assets, mut workspace, load_seconds, index_seconds) = if combined {
+            let started = Instant::now();
+            let (document, assets, workspace) = WorkspaceSession::open_project_document(&project)?;
+            (
+                document,
+                assets,
+                workspace,
+                started.elapsed().as_secs_f64(),
+                0.0,
+            )
+        } else {
+            let started = Instant::now();
+            let (document, assets) = read_project_tree(&project)?;
+            let load_seconds = started.elapsed().as_secs_f64();
+            let started = Instant::now();
+            let workspace = WorkspaceSession::open(&project)?;
+            (
+                document,
+                assets,
+                workspace,
+                load_seconds,
+                started.elapsed().as_secs_f64(),
+            )
+        };
         let page_header: Value =
             serde_json::from_slice(&std::fs::read(project.join("pages/wireframes/page.json"))?)?;
         let page = page_header
@@ -310,6 +329,7 @@ mod tests {
             "nodes": document.scene.len(), "components": document.components.defs.len(),
             "pages": document.pages().len(), "load_seconds": load_seconds,
             "index_seconds": index_seconds, "saves": measurements,
+            "load_mode": if combined { "combined" } else { "separate" },
             "render_scene_seconds": render_scene_seconds,
             "render_scene_nodes": render_scene_nodes,
         });

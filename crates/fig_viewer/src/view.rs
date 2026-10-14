@@ -722,6 +722,9 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let view = cx.entity_id();
+        cx.on_release(move |_, cx| crate::agent_surface::clear_active_view(view, cx))
+            .detach();
         let item_subscription = Self::subscribe_to_item(&item, cx);
         let (layers_sidebar_visible, layers_sidebar_width) = {
             let settings = FantaDesignPanelSettings::get_global(cx);
@@ -944,7 +947,7 @@ impl FigView {
     }
 
     fn activate_design_scope(&mut self, cx: &mut Context<Self>) {
-        crate::agent_surface::set_active_item(self.item.downgrade(), cx);
+        crate::agent_surface::set_active_item_for_view(self.item.downgrade(), cx.entity_id(), cx);
         if let Some(scope) = self.scope {
             let requester = ScopeRequester::View(cx.entity_id());
             self.item.update(cx, |item, cx| {
@@ -1073,6 +1076,14 @@ impl FigView {
                     }
                 }
                 FigItemEvent::TextSelectionChanged => {}
+                FigItemEvent::ViewportChanged(requester) => {
+                    // MCP can navigate before a tab's deferred focus callbacks run.
+                    if requester.map_or(this.is_focused, |view| view == cx.entity_id())
+                        && let Some(viewport) = this.item.read(cx).doc().map(|doc| doc.viewport)
+                    {
+                        this.set_viewport(viewport, cx);
+                    }
+                }
                 // A save wrote the document without replacing it, so
                 // nothing view-side is stale: only the tab's dirty mark
                 // changes. Deliberately NOT `StateChanged`, which every
@@ -9818,6 +9829,9 @@ impl Item for FigView {
         let active_motion_clip = self.active_motion_clip;
         let timeline_model = self.timeline_shell.read(cx).view_model().clone();
         Task::ready(Some(cx.new(|cx| {
+            let view = cx.entity_id();
+            cx.on_release(move |_, cx| crate::agent_surface::clear_active_view(view, cx))
+                .detach();
             let item_subscription = Self::subscribe_to_item(&item, cx);
             let editor_session =
                 cx.new(|_| EditorSession::with_state(editor_mode, editor_workspace));
@@ -15127,6 +15141,126 @@ mod tests {
             assert_eq!(view.last_seen_root, Some(page_two));
             assert_eq!(view.selected_page_root, Some(page_two));
             assert_eq!(view.selected_page_index, Some(1));
+        });
+    }
+
+    #[gpui::test]
+    async fn external_viewport_changes_follow_the_active_canvas_despite_stale_focus(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        cx.update(crate::agent_surface::init);
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let (doc, _, _) = doc_with_two_pages();
+        let item = crate::document::ready_item_for_test(
+            &project,
+            std::path::PathBuf::from("/tmp/Design.fig"),
+            doc,
+            cx,
+        );
+        let scratch = cx.add_window(|_, _| gpui::Empty);
+        let views = scratch
+            .update(cx, |_, window, cx| {
+                [
+                    cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx)),
+                    cx.new(|cx| FigView::new(item.clone(), project.clone(), window, cx)),
+                ]
+            })
+            .expect("views");
+        let original = Viewport {
+            center: [10.0, 20.0],
+            zoom: 2.0,
+        };
+        let requested = Viewport {
+            center: [100.0, 200.0],
+            zoom: 0.5,
+        };
+        for (index, view) in views.iter().enumerate() {
+            view.update(cx, |view, _| {
+                view.is_focused = index == 1;
+                view.viewport = Some(original);
+            });
+        }
+        views.first().expect("active view").update(cx, |view, cx| {
+            view.activate_design_scope(cx);
+        });
+        let initial_undo_depth = item.read_with(cx, |item, _| {
+            item.doc().expect("document").history.undo_depth()
+        });
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.viewport = requested;
+                ((), DocChange::None)
+            });
+        });
+        cx.run_until_parked();
+        for (index, view) in views.iter().enumerate() {
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.viewport,
+                    Some(if index == 0 { requested } else { original })
+                );
+            });
+        }
+        let [active_view, other_view] = views;
+        cx.update(|cx| {
+            crate::agent_surface::clear_active_view(other_view.entity_id(), cx);
+            assert_eq!(
+                crate::agent_surface::active_view_for_item(item.entity_id(), cx),
+                Some(active_view.entity_id())
+            );
+            crate::agent_surface::clear_active_view(active_view.entity_id(), cx);
+            assert_eq!(
+                crate::agent_surface::active_view_for_item(item.entity_id(), cx),
+                None
+            );
+        });
+        let fallback_requested = Viewport {
+            center: [300.0, 400.0],
+            zoom: 0.75,
+        };
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                document.doc.viewport = fallback_requested;
+                ((), DocChange::None)
+            });
+        });
+        cx.run_until_parked();
+        active_view.read_with(cx, |view, _| assert_eq!(view.viewport, Some(requested)));
+        other_view.read_with(cx, |view, _| {
+            assert_eq!(view.viewport, Some(fallback_requested));
+        });
+        other_view.update(cx, |view, cx| view.activate_design_scope(cx));
+        active_view.update(cx, |view, cx| view.activate_design_scope(cx));
+        let other_weak = other_view.downgrade();
+        // GPUI runs release callbacks when application effects flush, not
+        // when the dispatcher merely parks after an out-of-update handle drop.
+        cx.update(|_| drop(other_view));
+        cx.run_until_parked();
+        assert!(other_weak.upgrade().is_none());
+        cx.read(|cx| {
+            assert_eq!(
+                crate::agent_surface::active_view_for_item(item.entity_id(), cx),
+                Some(active_view.entity_id())
+            );
+        });
+        let active_weak = active_view.downgrade();
+        cx.update(|_| drop(active_view));
+        cx.run_until_parked();
+        assert!(active_weak.upgrade().is_none());
+        cx.read(|cx| {
+            assert_eq!(
+                crate::agent_surface::active_view_for_item(item.entity_id(), cx),
+                None
+            );
+        });
+        item.read_with(cx, |item, _| {
+            assert!(!item.is_dirty());
+            assert!(!item.content_preview_active());
+            assert_eq!(
+                item.doc().expect("document").history.undo_depth(),
+                initial_undo_depth
+            );
         });
     }
 

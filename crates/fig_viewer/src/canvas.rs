@@ -111,6 +111,9 @@ const PILL_HEIGHT: Pixels = px(16.0);
 #[cfg(target_os = "macos")]
 const RENDER_MARGIN: f32 = 160.0;
 
+#[cfg(target_os = "macos")]
+const PAN_REFRESH_MARGIN: f64 = 48.0;
+
 /// Renders one page of the document plus interaction overlays, filling the
 /// available space.
 pub(crate) struct CanvasElement {
@@ -425,6 +428,24 @@ fn frame_covers_request(
     offset_x <= slack_x && offset_y <= slack_y
 }
 
+#[cfg(target_os = "macos")]
+fn frame_has_refresh_margin(
+    cached: &SurfaceKey,
+    requested: &SurfaceKey,
+    frame_logical: (f64, f64),
+    visible_logical: (f64, f64),
+) -> bool {
+    frame_covers_request(
+        cached,
+        requested,
+        frame_logical,
+        (
+            visible_logical.0 + PAN_REFRESH_MARGIN * 2.0,
+            visible_logical.1 + PAN_REFRESH_MARGIN * 2.0,
+        ),
+    )
+}
+
 /// How expensive the last measured scene render was, which decides whether
 /// paint may block on the next one.
 #[cfg(target_os = "macos")]
@@ -522,9 +543,8 @@ fn retained_cost_after_install(
 enum PaintPlan {
     /// The newest frame matches the request; present it as-is.
     Present,
-    /// Cheap scene inside the reproject window: present the newest frame
-    /// reprojected and repaint soon (the sharp frame lands when the window
-    /// opens).
+    /// Unchanged covered view inside the reproject window: present the newest
+    /// frame and repaint until the sharp frame is due.
     Reproject,
     /// Cheap scene, render thread idle, and the request shows nothing beyond
     /// the newest frame's coverage (an edit, a covered pan, a zoom-in): block
@@ -583,6 +603,34 @@ fn plan_paint(
         return PaintPlan::PresentAndWait;
     }
     let measured = newest.filter(|newest| newest.same_content_class(requested));
+    let unchanged =
+        measured.filter(|newest| newest.size == requested.size && newest.same_content(requested));
+    if let Some(newest) = unchanged {
+        let covers_view = frame_covers_request(newest, requested, frame_logical, visible_logical);
+        let has_refresh_margin =
+            frame_has_refresh_margin(newest, requested, frame_logical, visible_logical);
+        if newest.viewport_zoom == requested.viewport_zoom
+            && newest.viewport_center != requested.viewport_center
+            && covers_view
+            && !has_refresh_margin
+        {
+            // Refill the margin while the old pixels still cover the view.
+            // Newly exposed fringe can need cold image/text work, so never block.
+            return PaintPlan::PresentAndRender;
+        }
+        if cost == RenderCost::Expensive
+            && has_refresh_margin
+            && frame_decision(
+                newest,
+                requested,
+                frame_logical,
+                visible_logical,
+                within_render_interval,
+            ) == FrameDecision::Reproject
+        {
+            return PaintPlan::Reproject;
+        }
+    }
     match (cost, measured) {
         (RenderCost::Cheap, Some(newest)) => match frame_decision(
             newest,
@@ -608,8 +656,8 @@ fn plan_paint(
 }
 
 /// The reproject window that follows a fresh render costing
-/// `last_render_duration`: while it is open, mid-interaction paints on a cheap
-/// scene reuse the newest frame reprojected instead of rendering again.
+/// `last_render_duration`: while it is open, covered mid-interaction paints
+/// reuse the newest frame instead of rendering again.
 ///
 /// A fixed 33 ms window assumed a render is cheaper than a display frame. On a
 /// heavy page zoomed out (thousands of visible nodes) a render can take tens of
@@ -621,9 +669,9 @@ fn plan_paint(
 /// renders (≤ 11 ms) keep the display-rate 33 ms floor, expensive ones space
 /// themselves out and the reprojected frame (pixel-exact for a pure pan) covers
 /// the ticks in between. The ceiling keeps a pathological render from starving
-/// the sharp frame for longer than a quarter second. (Renders past
-/// [`GpuCanvas::SYNC_RENDER_BUDGET`] no longer block at all — they move to the
-/// render thread — so in practice the window only throttles cheap scenes.)
+/// the sharp frame for longer than a quarter second. Expensive scenes also
+/// reuse covered frames during this window, while approaching the margin or
+/// revealing new content starts an off-thread render immediately.
 #[cfg(target_os = "macos")]
 fn render_interval(last_render_duration: Duration) -> Duration {
     last_render_duration
@@ -2085,7 +2133,9 @@ impl MacGpuRenderer {
         } else {
             None
         };
-        let flush_started = crate::gesture_perf::optional_timer(request.perf_tag.is_some());
+        let diagnostics = crate::perf_enabled();
+        let flush_started =
+            crate::gesture_perf::optional_timer(request.perf_tag.is_some() || diagnostics);
         target.complete(self.backend()?)?;
         let flush_duration = flush_started.map(|started| started.elapsed());
         let normal_cost = normal_started.map(|started| started.elapsed());
@@ -2096,6 +2146,43 @@ impl MacGpuRenderer {
         // on the render thread.
         let duration = render_started.elapsed();
         crate::report_slow("canvas scene render", render_started);
+        if diagnostics {
+            let metrics = metrics.as_ref();
+            let backend = match &self.backend {
+                Some(SkiaGpuBackend::Graphite(_)) => "graphite",
+                Some(SkiaGpuBackend::Ganesh(_)) => "ganesh",
+                None => "unavailable",
+            };
+            log::info!(
+                "fanta_canvas_frame {}",
+                serde_json::json!({
+                    "backend": backend,
+                    "path": match path {
+                        FramePath::Normal => "normal",
+                        FramePath::Retained(_) => "retained",
+                        FramePath::Refused(_) => "refused",
+                    },
+                    "page": request.key.page_root,
+                    "viewport_center": request.key.viewport_center,
+                    "viewport_zoom": request.key.viewport_zoom,
+                    "physical_size": size,
+                    "scene": request.key.scene,
+                    "generation": request.key.revision,
+                    "scene_walk_wall_us": metrics.map(|metrics| metrics.frame_micros),
+                    "flush_sync_wall_us": flush_duration.map(crate::gesture_perf::duration_micros),
+                    "render_wall_us": crate::gesture_perf::duration_micros(duration),
+                    "nodes_visited": metrics.map(|metrics| metrics.nodes_visited),
+                    "nodes_drawn": metrics.map(|metrics| metrics.nodes_drawn),
+                    "nodes_culled": metrics.map(|metrics| metrics.nodes_culled),
+                    "paths_built": metrics.map(|metrics| metrics.paths_built),
+                    "instance_indexes_built": metrics.map(|metrics| metrics.instance_indexes_built),
+                    "layer_cache_hits": metrics.map(|metrics| metrics.layer_cache_hits),
+                    "layer_cache_misses": metrics.map(|metrics| metrics.layer_cache_misses),
+                    "incomplete_artwork": metrics.map(|metrics| metrics.incomplete_artwork),
+                    "effect_failed": metrics.map(|metrics| metrics.effect_failed),
+                })
+            );
+        }
         let sample = flush_duration.map(|flush_duration| crate::gesture_perf::FrameSample {
             metrics,
             retained_frame_wall_us: retained_metrics
@@ -2168,7 +2255,7 @@ pub(crate) struct GpuCanvas {
     cost: RenderCost,
     last_render_at: Option<Instant>,
     /// Wall time of the most recent scene render. Drives the adaptive
-    /// reproject window on cheap scenes — see [`render_interval`].
+    /// reproject window — see [`render_interval`].
     last_render_duration: Duration,
     epoch: u64,
 }
@@ -2176,7 +2263,7 @@ pub(crate) struct GpuCanvas {
 #[cfg(target_os = "macos")]
 impl GpuCanvas {
     const IN_FLIGHT_FRAMES: usize = 2;
-    /// Floor on how often a cheap scene is re-rendered while the viewport is
+    /// Floor on how often a covered scene is re-rendered while the viewport is
     /// animating. Frames in between reuse the previous render reprojected. The
     /// live window grows with the measured render cost (see
     /// [`render_interval`]) up to [`Self::MAX_RENDER_INTERVAL`].
@@ -2428,16 +2515,17 @@ impl GpuCanvas {
         if let Some(reason) = &self.failed {
             return Err(anyhow!("{reason}"));
         }
-        request.perf_tag = self.gesture_perf.as_ref().and_then(|perf| {
-            use crate::gesture_perf::RenderSourceKind;
-            let kind = match &source {
-                RenderSource::Live(_) => RenderSourceKind::Live,
-                RenderSource::Patch(_) => RenderSourceKind::Patch,
-                RenderSource::Snapshot(Some(_)) => RenderSourceKind::SnapshotFresh,
-                RenderSource::Snapshot(None) => RenderSourceKind::SnapshotReuse,
-            };
-            perf.borrow_mut().reserve(kind)
-        });
+        use crate::gesture_perf::RenderSourceKind;
+        let kind = match &source {
+            RenderSource::Live(_) => RenderSourceKind::Live,
+            RenderSource::Patch(_) => RenderSourceKind::Patch,
+            RenderSource::Snapshot(Some(_)) => RenderSourceKind::SnapshotFresh,
+            RenderSource::Snapshot(None) => RenderSourceKind::SnapshotReuse,
+        };
+        request.perf_tag = self
+            .gesture_perf
+            .as_ref()
+            .and_then(|perf| perf.borrow_mut().reserve(kind));
         let perf_tag = request.perf_tag;
         let key = request.key;
         let job = RenderJob {
@@ -2455,6 +2543,19 @@ impl GpuCanvas {
         }
         if let Some((perf, tag)) = self.gesture_perf.as_ref().zip(perf_tag) {
             perf.borrow_mut().submitted(tag);
+        }
+        if crate::perf_enabled() {
+            log::info!(
+                "fanta_canvas_dispatch {}",
+                serde_json::json!({
+                    "source": kind,
+                    "page": key.page_root,
+                    "viewport_center": key.viewport_center,
+                    "viewport_zoom": key.viewport_zoom,
+                    "scene": key.scene,
+                    "generation": key.revision,
+                })
+            );
         }
         self.in_flight = Some(key);
         Ok(())
@@ -3368,7 +3469,7 @@ impl Element for CanvasElement {
                     None => {}
                 }
                 if repaint {
-                    // Cheap scene inside the reproject window: repaint
+                    // Covered scene inside the reproject window: repaint
                     // immediately so the sharp frame lands as soon as the
                     // window opens; the chain stops once the newest frame
                     // matches the viewport.
@@ -7229,14 +7330,11 @@ mod tests {
 
     #[test]
     fn a_pan_never_blocks_paint_on_an_expensive_scene() {
-        // Whatever the coverage or the reproject window: on an expensive
-        // scene the newest frame is presented (shifted) and one fresh render
-        // is requested — never rendered inline.
         let cached = surface_key([0.0, 0.0], 0.1, 7);
         for tick in 1..=40u32 {
             let requested = surface_key([500.0 * f64::from(tick), 0.0], 0.1, 7);
             for within in [false, true] {
-                assert_eq!(
+                assert!(matches!(
                     plan(
                         Some(&cached),
                         &requested,
@@ -7244,9 +7342,8 @@ mod tests {
                         RenderCost::Expensive,
                         within
                     ),
-                    PaintPlan::PresentAndRender,
-                    "tick {tick} within {within}"
-                );
+                    PaintPlan::Reproject | PaintPlan::PresentAndRender
+                ));
                 assert_eq!(
                     plan(
                         Some(&cached),
@@ -7259,6 +7356,135 @@ mod tests {
                     "tick {tick} within {within} (in flight)"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn expensive_covered_pans_reuse_pixels_until_the_idle_refresh_is_due() {
+        let cached = surface_key([0.0, 0.0], 1.0, 7);
+        let requested = surface_key([50.0, -40.0], 1.0, 7);
+        let interval = render_interval(Duration::from_millis(80));
+        for elapsed in [
+            Duration::ZERO,
+            Duration::from_millis(16),
+            interval - Duration::from_millis(1),
+        ] {
+            assert_eq!(
+                plan(
+                    Some(&cached),
+                    &requested,
+                    false,
+                    RenderCost::Expensive,
+                    elapsed < interval
+                ),
+                PaintPlan::Reproject,
+                "covered pan at {elapsed:?}"
+            );
+        }
+        assert_eq!(
+            plan(
+                Some(&cached),
+                &requested,
+                false,
+                RenderCost::Expensive,
+                false
+            ),
+            PaintPlan::PresentAndRender,
+            "the existing repaint chain eventually requests the sharp idle frame"
+        );
+        assert_eq!(
+            plan(
+                Some(&requested),
+                &requested,
+                false,
+                RenderCost::Expensive,
+                false
+            ),
+            PaintPlan::Present,
+            "the repaint chain stops once the current viewport is installed"
+        );
+        let mut edited = requested;
+        edited.revision += 1;
+        assert_eq!(
+            plan(Some(&cached), &edited, false, RenderCost::Expensive, true),
+            PaintPlan::PresentAndRender,
+            "content changes do not wait for a pan interval"
+        );
+    }
+
+    #[test]
+    fn pan_fringe_refreshes_before_coverage_ends_without_blocking_or_queueing() {
+        for zoom in [0.1, 1.0, 2.0] {
+            let cached = surface_key([0.0, 0.0], zoom, 7);
+            let inner = surface_key([112.0 / zoom, -112.0 / zoom], zoom, 7);
+            let fringe = surface_key([113.0 / zoom, -113.0 / zoom], zoom, 7);
+            assert!(frame_covers_request(
+                &cached,
+                &fringe,
+                FRAME_LOGICAL,
+                VISIBLE_LOGICAL
+            ));
+            for cost in [RenderCost::Cheap, RenderCost::Expensive] {
+                assert_eq!(
+                    plan(Some(&cached), &inner, false, cost, true),
+                    PaintPlan::Reproject,
+                    "the interior still has {PAN_REFRESH_MARGIN} logical pixels of reserve"
+                );
+                for within in [false, true] {
+                    assert_eq!(
+                        plan(Some(&cached), &fringe, false, cost, within),
+                        PaintPlan::PresentAndRender,
+                        "fringe refill must be asynchronous even after a cheap frame"
+                    );
+                    assert_eq!(
+                        plan(Some(&cached), &fringe, true, cost, within),
+                        PaintPlan::PresentAndWait,
+                        "a running refill is coalesced rather than queued"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn expensive_zoom_reuses_only_covered_pixels_with_a_refresh_reserve() {
+        let cached = surface_key([0.0, 0.0], 1.0, 7);
+        for zoom in [0.9, 1.1] {
+            let requested = surface_key([0.0, 0.0], zoom, 7);
+            assert_eq!(
+                plan(
+                    Some(&cached),
+                    &requested,
+                    false,
+                    RenderCost::Expensive,
+                    true
+                ),
+                PaintPlan::Reproject
+            );
+            assert_eq!(
+                plan(
+                    Some(&cached),
+                    &requested,
+                    false,
+                    RenderCost::Expensive,
+                    false
+                ),
+                PaintPlan::PresentAndRender
+            );
+        }
+        for zoom in [0.5, GpuCanvas::MAX_REPROJECT_SCALE * 1.01] {
+            let requested = surface_key([0.0, 0.0], zoom, 7);
+            assert_eq!(
+                plan(
+                    Some(&cached),
+                    &requested,
+                    false,
+                    RenderCost::Expensive,
+                    true
+                ),
+                PaintPlan::PresentAndRender,
+                "newly revealed or overly scaled content must render immediately"
+            );
         }
     }
 

@@ -40,6 +40,12 @@ pub struct FnxSourceMirror {
     /// `emit_names`. Shared via `Arc` so the owning session can rebuild one
     /// table on variable changes and hand every retained mirror the same one.
     refs: Arc<RefTable>,
+    original_refs: Arc<RefTable>,
+    // Registry renames change future spelling without changing the meaning of
+    // retained attributes. Store only rewritten references, not a registry
+    // snapshot for every edited tag.
+    reference_values: BTreeMap<String, BTreeMap<&'static str, serde_json::Value>>,
+    mutation_token: Arc<()>,
 }
 
 /// Validate attribute JSON and check explicit identities and structural
@@ -149,6 +155,56 @@ pub fn sidecar_matches_source(source: &str, sidecar: &FnxSidecar) -> Result<bool
         }
     }
     Ok(true)
+}
+
+/// Decode only component references and variable bindings for a checked
+/// source/identity pair. Large unrelated attribute payloads remain borrowed.
+pub fn source_reference_nodes_with(
+    source: &str,
+    sidecar: &FnxSidecar,
+    refs: &RefTable,
+) -> Result<Vec<(String, FnxElement)>, FnxError> {
+    let spans = SourceScanner::new(source).scan()?;
+    if spans.len() != sidecar.ids.len() {
+        return Err(FnxError::SidecarMismatch {
+            sidecar: sidecar.ids.len(),
+            elements: spans.len(),
+        });
+    }
+    let mut references = Vec::new();
+    for (span, entry) in spans.iter().zip(&sidecar.ids) {
+        let opening = source
+            .get(span.open.clone())
+            .ok_or_else(|| FnxError::Parse("invalid opening-tag span".into()))?;
+        let layout = OpenTagLayout::parse(opening)?;
+        let mut element = FnxElement::new(&layout.tag);
+        for key in ["component", "bindings"] {
+            let Some(attribute) = layout.attrs.get(key) else {
+                continue;
+            };
+            let spelling = opening
+                .get(attribute.value.clone())
+                .ok_or_else(|| FnxError::Parse("reference attribute span is absent".into()))?;
+            let spelling = spelling
+                .strip_prefix('{')
+                .and_then(|value| value.strip_suffix('}'))
+                .unwrap_or(spelling);
+            if key == "component" && !spelling.trim_start().starts_with('"') {
+                continue;
+            }
+            let value: serde_json::Value = serde_json::from_str(spelling)
+                .map_err(|error| FnxError::Parse(error.to_string()))?;
+            if key == "component" && !value.is_string() {
+                continue;
+            }
+            element.attrs.insert(key.into(), value);
+        }
+        if !element.attrs.is_empty() {
+            crate::refs::desugar_refs(&mut element, refs)?;
+            references.push((entry.id.clone(), element));
+        }
+    }
+    Ok(references)
 }
 
 struct ValidatedJson;
@@ -284,7 +340,10 @@ impl FnxSourceMirror {
         Ok(Self {
             pieces,
             nodes,
+            original_refs: Arc::clone(&refs),
             refs,
+            reference_values: BTreeMap::new(),
+            mutation_token: Arc::new(()),
         })
     }
 
@@ -294,6 +353,148 @@ impl FnxSourceMirror {
     /// untouched — the table only shapes FUTURE patches.
     pub fn set_ref_table(&mut self, refs: Arc<RefTable>) {
         self.refs = refs;
+    }
+
+    /// Concrete-source writers and retained-reference changes replace this
+    /// token; clones share it until their source actually changes.
+    pub fn synchronization_token(&self) -> Arc<()> {
+        Arc::clone(&self.mutation_token)
+    }
+
+    /// Reparse every retained attribute using the vocabulary that authored its
+    /// reference spelling. This exceptional check also covers source-owned
+    /// fields that a typed document projection intentionally omits.
+    pub fn semantics_match(&self, ir: &ArtifactIr) -> Result<bool, FnxError> {
+        let mut root = crate::parse::parse_doc(&self.render())?;
+        let mut pending = vec![&mut root];
+        let mut entries = ir.sidecar().ids.iter();
+        while let Some(element) = pending.pop() {
+            let Some(entry) = entries.next() else {
+                return Ok(false);
+            };
+            element
+                .attrs
+                .entry("id".into())
+                .or_insert_with(|| entry.id.clone().into());
+            self.resolve_retained_references(&entry.id, element)?;
+            pending.extend(element.children.iter_mut().rev());
+        }
+        Ok(entries.next().is_none() && root == *ir.root())
+    }
+
+    /// Verify that a fresh reader using today's registry will recover the
+    /// retained reference ids, even when an old display name was reused.
+    pub fn references_match_current_table(&self) -> Result<bool, FnxError> {
+        let unchanged_vocabulary = Arc::ptr_eq(&self.refs, &self.original_refs);
+        for (id, node) in &self.nodes {
+            if unchanged_vocabulary && !self.reference_values.contains_key(id) {
+                continue;
+            }
+            let opening = self
+                .pieces
+                .get(node.open)
+                .ok_or_else(|| FnxError::Parse("retained opening is absent".into()))?;
+            let layout = OpenTagLayout::parse(opening)?;
+            for key in ["component", "bindings"] {
+                let Some(attribute) = layout.attrs.get(key) else {
+                    continue;
+                };
+                let spelling = opening
+                    .get(attribute.value.clone())
+                    .ok_or_else(|| FnxError::Parse("reference attribute span is absent".into()))?;
+                let spelling = spelling
+                    .strip_prefix('{')
+                    .and_then(|value| value.strip_suffix('}'))
+                    .unwrap_or(spelling);
+                if key == "component" && !spelling.trim_start().starts_with('"') {
+                    continue;
+                }
+                let value: serde_json::Value = serde_json::from_str(spelling)
+                    .map_err(|error| FnxError::Parse(error.to_string()))?;
+                if key == "component" && !value.is_string() {
+                    continue;
+                }
+                let element = FnxElement::new(&layout.tag);
+                let retained = self
+                    .reference_values
+                    .get(id)
+                    .and_then(|values| values.get(key))
+                    .cloned()
+                    .map(Ok)
+                    .unwrap_or_else(|| {
+                        resolve_reference_value(&element, key, &value, &self.original_refs)
+                    })?;
+                match resolve_reference_value(&element, key, &value, &self.refs) {
+                    Ok(current) if current == retained => {}
+                    Ok(_) | Err(_) => return Ok(false),
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Check explicit identity and topology in retained tag slots. The caller
+    /// must already have validated attribute semantics; this avoids decoding
+    /// unchanged JSON again after a checked canvas patch.
+    pub fn retained_identity_matches(&self, sidecar: &FnxSidecar) -> Result<bool, FnxError> {
+        if self.nodes.len() != sidecar.ids.len() {
+            return Ok(false);
+        }
+        let mut parents = Vec::<(usize, usize)>::new();
+        let mut previous_open = None;
+        for (position, entry) in sidecar.ids.iter().enumerate() {
+            let Some(node) = self.nodes.get(&entry.id) else {
+                return Ok(false);
+            };
+            if previous_open.is_some_and(|previous| node.open <= previous) {
+                return Ok(false);
+            }
+            previous_open = Some(node.open);
+            while parents.last().is_some_and(|(_, close)| node.open >= *close) {
+                parents.pop();
+            }
+            let parent = parents
+                .last()
+                .map(|(parent, _)| u32::try_from(*parent))
+                .transpose()
+                .map_err(|error| FnxError::Parse(error.to_string()))?;
+            let opening = self
+                .pieces
+                .get(node.open)
+                .ok_or_else(|| FnxError::Parse("retained opening is absent".into()))?;
+            let layout = OpenTagLayout::parse(opening)?;
+            let string_attribute = |key: &str| -> Result<Option<String>, FnxError> {
+                let Some(attribute) = layout.attrs.get(key) else {
+                    return Ok(None);
+                };
+                let value = opening
+                    .get(attribute.value.clone())
+                    .ok_or_else(|| FnxError::Parse("retained attribute span is absent".into()))?;
+                let value = value
+                    .strip_prefix('{')
+                    .and_then(|value| value.strip_suffix('}'))
+                    .unwrap_or(value);
+                let value: serde_json::Value = serde_json::from_str(value)
+                    .map_err(|error| FnxError::Parse(error.to_string()))?;
+                Ok(value.as_str().map(str::to_owned))
+            };
+            let tag = if SUGAR_TAGS.contains(&layout.tag.as_str()) {
+                "Vector"
+            } else {
+                layout.tag.as_str()
+            };
+            if string_attribute("id")?.as_deref() != Some(entry.id.as_str())
+                || string_attribute("name")? != entry.name
+                || entry.tag.as_deref() != Some(tag)
+                || entry.parent_index != parent
+            {
+                return Ok(false);
+            }
+            if let Some(close) = node.close {
+                parents.push((position, close));
+            }
+        }
+        Ok(true)
     }
 
     /// The element with reference ids re-sugared into names, when the retained
@@ -336,6 +537,7 @@ impl FnxSourceMirror {
             );
             opening.insert_str(layout.insert_at, &attribute);
             self.pieces[node.open] = Arc::from(opening);
+            self.mutation_token = Arc::new(());
             changed = true;
         }
         Ok(changed)
@@ -457,6 +659,9 @@ impl FnxSourceMirror {
             )],
             nodes: BTreeMap::new(),
             refs: Arc::clone(&self.refs),
+            original_refs: Arc::clone(&self.original_refs),
+            reference_values: BTreeMap::new(),
+            mutation_token: Arc::new(()),
         };
         let root = patch
             .order
@@ -551,6 +756,22 @@ impl FnxSourceMirror {
                 crate::refs::sugar_refs(&mut shaped, &self.refs);
                 Arc::from(render_open_tag_with_children(&shaped, has_children))
             };
+            if retained.is_none_or(|node| !Arc::ptr_eq(&opening, &patched.pieces[node.open])) {
+                let references = patched.validate_opening_semantics(
+                    id,
+                    &opening,
+                    element,
+                    has_children,
+                    retained.map(|_| element),
+                )?;
+                if !references.is_empty() {
+                    rebuilt.reference_values.insert(id.to_owned(), references);
+                }
+            } else if let Some(references) = patched.reference_values.get(id) {
+                rebuilt
+                    .reference_values
+                    .insert(id.to_owned(), references.clone());
+            }
             let position = rebuilt.pieces.len();
             rebuilt.pieces.push(opening);
             rebuilt.nodes.insert(
@@ -579,6 +800,106 @@ impl FnxSourceMirror {
             return Err(FnxError::Parse("cannot preserve authored FNX comments exactly in this canvas edit; edit the FNX source instead".into()));
         }
         Ok(rebuilt)
+    }
+
+    fn validate_opening_semantics(
+        &self,
+        id: &str,
+        opening: &str,
+        expected: &FnxElement,
+        has_children: bool,
+        previous: Option<&FnxElement>,
+    ) -> Result<BTreeMap<&'static str, serde_json::Value>, FnxError> {
+        let source = if has_children {
+            let layout = OpenTagLayout::parse(opening)?;
+            format!("{opening}</{}>", layout.tag)
+        } else {
+            opening.to_owned()
+        };
+        let mut parsed = crate::parse::parse_doc(&source)?;
+        let layout = OpenTagLayout::parse(opening)?;
+        let retained = self
+            .nodes
+            .get(id)
+            .and_then(|node| self.pieces.get(node.open));
+        let retained_layout = retained
+            .map(|opening| OpenTagLayout::parse(opening))
+            .transpose()?;
+        let mut references = BTreeMap::new();
+        for key in ["component", "bindings"] {
+            let Some(value) = parsed.attrs.get(key) else {
+                continue;
+            };
+            if key == "component" && !value.is_string() {
+                continue;
+            }
+            let unchanged = previous
+                .is_some_and(|previous| previous.attrs.get(key) == expected.attrs.get(key))
+                && retained.zip(retained_layout.as_ref()).is_some_and(
+                    |(retained, retained_layout)| {
+                        retained_layout
+                            .attrs
+                            .get(key)
+                            .zip(layout.attrs.get(key))
+                            .is_some_and(|(before, after)| {
+                                retained.get(before.value.clone())
+                                    == opening.get(after.value.clone())
+                            })
+                    },
+                );
+            let value = if unchanged {
+                self.reference_values
+                    .get(id)
+                    .and_then(|references| references.get(key))
+                    .cloned()
+                    .map(Ok)
+                    .unwrap_or_else(|| {
+                        resolve_reference_value(&parsed, key, value, &self.original_refs)
+                    })?
+            } else {
+                resolve_reference_value(&parsed, key, value, &self.refs)?
+            };
+            parsed.attrs.insert(key.into(), value.clone());
+            references.insert(key, value);
+        }
+        if expected.attrs.contains_key("id") {
+            parsed
+                .attrs
+                .entry("id".to_owned())
+                .or_insert_with(|| id.into());
+        }
+        if parsed.tag != expected.tag || parsed.attrs != expected.attrs {
+            return Err(FnxError::Parse(format!(
+                "rewritten opening tag changed the semantics of node {id}"
+            )));
+        }
+        Ok(references)
+    }
+
+    fn resolve_retained_references(
+        &self,
+        id: &str,
+        element: &mut FnxElement,
+    ) -> Result<(), FnxError> {
+        for key in ["component", "bindings"] {
+            let Some(value) = element.attrs.get(key) else {
+                continue;
+            };
+            if key == "component" && !value.is_string() {
+                continue;
+            }
+            let value = self
+                .reference_values
+                .get(id)
+                .and_then(|references| references.get(key))
+                .cloned()
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    resolve_reference_value(element, key, value, &self.original_refs)
+                })?;
+            element.attrs.insert(key.into(), value);
+        }
+        Ok(())
     }
 
     fn child_comments(&self) -> Result<BTreeMap<String, usize>, FnxError> {
@@ -638,14 +959,30 @@ impl FnxSourceMirror {
         // A full-tag reprint uses canonical attribute spelling, but reference
         // spellings still re-sugar (names / `$paths`) so a fallback reprint of
         // an instance keeps the readable form the printer would emit.
+        let expected = element;
         let element = self.ref_shaped(opening_tag_element(element));
         let open = render_open_tag_with_children(&element, has_children);
+        let references =
+            self.validate_opening_semantics(id, &open, expected, has_children, None)?;
         let mut changed = self.pieces[node.open].as_ref() != open;
         self.pieces[node.open] = Arc::from(open);
         if let Some(close_piece) = node.close {
             let close = render_close_tag(&element);
             changed |= self.pieces[close_piece].as_ref() != close;
             self.pieces[close_piece] = Arc::from(close);
+        }
+        if changed
+            || self
+                .reference_values
+                .get(id)
+                .map_or(!references.is_empty(), |previous| previous != &references)
+        {
+            self.mutation_token = Arc::new(());
+        }
+        if references.is_empty() {
+            self.reference_values.remove(id);
+        } else {
+            self.reference_values.insert(id.to_owned(), references);
         }
         Ok(changed)
     }
@@ -675,6 +1012,8 @@ impl FnxSourceMirror {
         next: &FnxElement,
         has_children: bool,
     ) -> Result<bool, FnxError> {
+        let canonical_previous = previous;
+        let canonical_next = next;
         if previous.tag != next.tag {
             return self.patch_element_with_children(id, next, has_children);
         }
@@ -769,7 +1108,27 @@ impl FnxSourceMirror {
             patched.replace_range(edit.range, &edit.replacement);
         }
         let changed = patched != opening.as_ref();
+        let references = self.validate_opening_semantics(
+            id,
+            &patched,
+            canonical_next,
+            has_children,
+            Some(canonical_previous),
+        )?;
         self.pieces[node.open] = Arc::from(patched);
+        if changed
+            || self
+                .reference_values
+                .get(id)
+                .map_or(!references.is_empty(), |previous| previous != &references)
+        {
+            self.mutation_token = Arc::new(());
+        }
+        if references.is_empty() {
+            self.reference_values.remove(id);
+        } else {
+            self.reference_values.insert(id.to_owned(), references);
+        }
         Ok(changed)
     }
 }
@@ -778,6 +1137,24 @@ impl FnxSourceMirror {
 struct TextEdit {
     range: Range<usize>,
     replacement: String,
+}
+
+fn resolve_reference_value(
+    element: &FnxElement,
+    key: &str,
+    value: &serde_json::Value,
+    refs: &RefTable,
+) -> Result<serde_json::Value, FnxError> {
+    let mut reference = FnxElement::new(&element.tag);
+    if let Some(name) = element.attrs.get("name") {
+        reference.attrs.insert("name".into(), name.clone());
+    }
+    reference.attrs.insert(key.into(), value.clone());
+    crate::refs::desugar_refs(&mut reference, refs)?;
+    reference
+        .attrs
+        .remove(key)
+        .ok_or_else(|| FnxError::Parse(format!("reference resolution lost attribute {key}")))
 }
 
 #[derive(Debug)]
@@ -1421,6 +1798,189 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn synchronization_tokens_cover_source_edits_references_and_identity_migration() {
+        let source = r#"<Frame id="root" name="Root"><Text id="child" name="Label" /></Frame>"#;
+        let mut mirror = FnxSourceMirror::from_source(source, &sidecar()).expect("source");
+        let original = mirror.synchronization_token();
+        assert!(Arc::ptr_eq(
+            &original,
+            &mirror.clone().synchronization_token()
+        ));
+        let root = parse_doc(source).expect("tree");
+        let previous = root.children.first().expect("child");
+        let mut next = previous.clone();
+        next.attrs.insert("opacity".into(), serde_json::json!(0.5));
+        mirror
+            .patch_element_delta("child", previous, &next)
+            .expect("delta");
+        assert!(!Arc::ptr_eq(&original, &mirror.synchronization_token()));
+        let changed = mirror.synchronization_token();
+        let before = mirror.render();
+        let mut stale = next.clone();
+        stale
+            .attrs
+            .insert("name".into(), "Different baseline".into());
+        let mut candidate = stale.clone();
+        candidate
+            .attrs
+            .insert("opacity".into(), serde_json::json!(0.25));
+        assert!(
+            mirror
+                .patch_element_delta("child", &stale, &candidate)
+                .is_err()
+        );
+        assert_eq!(mirror.render(), before);
+        assert!(Arc::ptr_eq(&changed, &mirror.synchronization_token()));
+        next.attrs.insert("name".into(), "Reprinted".into());
+        mirror.patch_element("child", &next).expect("full tag");
+        assert!(!Arc::ptr_eq(&changed, &mirror.synchronization_token()));
+        let reprinted = mirror.synchronization_token();
+        mirror.set_ref_table(Arc::new(RefTable::default()));
+        assert!(Arc::ptr_eq(&reprinted, &mirror.synchronization_token()));
+        let mut legacy = FnxSourceMirror::from_source(
+            r#"<Frame name="Root"><Text name="Label" /></Frame>"#,
+            &sidecar(),
+        )
+        .expect("legacy");
+        let before_ids = legacy.synchronization_token();
+        assert!(legacy.insert_missing_ids(&sidecar()).expect("migrate"));
+        assert!(!Arc::ptr_eq(&before_ids, &legacy.synchronization_token()));
+        assert!(sidecar_matches_source(&legacy.render(), &sidecar()).expect("identity witness"));
+        assert!(
+            legacy
+                .retained_identity_matches(&sidecar())
+                .expect("retained identity")
+        );
+    }
+
+    #[test]
+    fn retained_reference_attributes_survive_renames_and_reused_names() {
+        let first = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+        let second = "01ARZ3NDEKTSV4RRFFQ69G5FAW";
+        let mut original = RefTable::new(true);
+        original.insert_component("Original", first);
+        original.insert_variable("Theme/Opacity", first);
+        let source = r#"<Frame id="root" name="Root"><Instance id="child" name="Placement" component="Original" bindings={{"opacity":"$Theme/Opacity"}} /></Frame>"#;
+        let mut identities = sidecar();
+        identities.ids[1].tag = Some("Instance".into());
+        identities.ids[1].name = Some("Placement".into());
+        let mut ir = ArtifactIr::from_source_with(
+            crate::ArtifactKind::Page,
+            "References",
+            source,
+            identities.clone(),
+            &original,
+        )
+        .expect("IR");
+        let mut mirror = FnxSourceMirror::from_source_with(source, &identities, Arc::new(original))
+            .expect("retained source");
+        let token = mirror.synchronization_token();
+        let mut renamed = RefTable::new(true);
+        renamed.insert_component("Renamed", first);
+        renamed.insert_component("Original", second);
+        renamed.insert_variable("Theme/Renamed", first);
+        renamed.insert_variable("Theme/Opacity", second);
+        mirror.set_ref_table(Arc::new(renamed));
+        assert!(Arc::ptr_eq(&token, &mirror.synchronization_token()));
+        assert!(
+            !mirror
+                .references_match_current_table()
+                .expect("reused names")
+        );
+        assert!(
+            mirror
+                .semantics_match(&ir)
+                .expect("original reference meaning")
+        );
+        let previous = ir.element("child").expect("instance").clone();
+        let mut next = previous.clone();
+        next.attrs.insert("name".into(), "After rename".into());
+        mirror
+            .patch_element_delta("child", &previous, &next)
+            .expect("unrelated edit");
+        let mut value = ir.node_value("child").expect("node");
+        value["name"] = "After rename".into();
+        ir.patch_node_value("child", &value).expect("IR edit");
+        assert!(mirror.render().contains("component=\"Original\""));
+        assert!(mirror.render().contains("$Theme/Opacity"));
+        assert!(mirror.semantics_match(&ir).expect("retained references"));
+        let previous = next.clone();
+        next.attrs.insert("component".into(), second.into());
+        mirror
+            .patch_element_delta("child", &previous, &next)
+            .expect("component swap");
+        value["component"] = second.into();
+        ir.patch_node_value("child", &value)
+            .expect("IR component swap");
+        assert!(
+            mirror
+                .semantics_match(&ir)
+                .expect("mixed reference vocabularies")
+        );
+        let previous = next.clone();
+        next.attrs.insert(
+            "bindings".into(),
+            serde_json::json!([[{"prop":"opacity"},second]]),
+        );
+        mirror
+            .patch_element_delta("child", &previous, &next)
+            .expect("binding swap");
+        value["bindings"] = next.attrs["bindings"].clone();
+        ir.patch_node_value("child", &value)
+            .expect("IR binding swap");
+        assert!(
+            mirror
+                .semantics_match(&ir)
+                .expect("updated reference meanings")
+        );
+        assert!(
+            mirror
+                .references_match_current_table()
+                .expect("current names")
+        );
+    }
+
+    #[test]
+    fn retained_identity_requires_explicit_ids_and_current_fingerprints() {
+        let source = r#"<Frame id="root" name="Root"><Text id="child" name="Label" /></Frame>"#;
+        let mirror = FnxSourceMirror::from_source(source, &sidecar()).expect("source");
+        assert!(
+            mirror
+                .retained_identity_matches(&sidecar())
+                .expect("identity")
+        );
+        for position in 0..2 {
+            let mut stale = sidecar();
+            stale.ids[position].name = Some("Renamed".into());
+            assert!(
+                !mirror
+                    .retained_identity_matches(&stale)
+                    .expect("stale name")
+            );
+            stale = sidecar();
+            stale.ids[position].tag = Some("Vector".into());
+            assert!(!mirror.retained_identity_matches(&stale).expect("stale tag"));
+        }
+        let mut stale = sidecar();
+        stale.ids[1].parent_index = None;
+        assert!(
+            !mirror
+                .retained_identity_matches(&stale)
+                .expect("stale topology")
+        );
+        let legacy = FnxSourceMirror::from_source(
+            r#"<Frame name="Root"><Text name="Label" /></Frame>"#,
+            &sidecar(),
+        )
+        .expect("legacy source");
+        assert!(
+            !legacy
+                .retained_identity_matches(&sidecar())
+                .expect("legacy identity")
+        );
     }
 
     #[test]

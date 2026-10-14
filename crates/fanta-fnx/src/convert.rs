@@ -232,7 +232,7 @@ fn walk_owned(
 
 /// One element + its structural facts → a node JSON object, reproducing the
 /// exact serde shape (all four structural keys always present).
-fn element_to_value(
+pub(crate) fn element_to_value(
     el: &FnxElement,
     id: &str,
     parent: Option<&str>,

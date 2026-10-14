@@ -917,6 +917,10 @@ pub fn is_project_dir(dir: &Path) -> bool {
 /// is [`FormatError::NotAProject`]; a newer layout version is
 /// [`FormatError::UnsupportedProjectVersion`].
 pub(crate) fn read_manifest(dir: &Path) -> Result<ProjectManifest> {
+    read_manifest_with_source(dir).map(|(manifest, _)| manifest)
+}
+
+pub(crate) fn read_manifest_with_source(dir: &Path) -> Result<(ProjectManifest, String)> {
     super::write::recover_project_transaction(dir)?;
     let not_a_project = || FormatError::NotAProject {
         path: dir.to_path_buf(),
@@ -932,7 +936,7 @@ pub(crate) fn read_manifest(dir: &Path) -> Result<ProjectManifest> {
             supported: PROJECT_VERSION,
         });
     }
-    Ok(manifest)
+    Ok((manifest, text))
 }
 
 /// The canonical byte form of a projected JSON file: pretty-printed with a

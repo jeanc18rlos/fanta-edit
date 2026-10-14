@@ -353,6 +353,7 @@ pub enum FigItemEvent {
     EditedTransient,
     /// The selection or another non-persistent view state changed.
     SelectionChanged,
+    ViewportChanged(Option<EntityId>),
     PageRegistryChanged,
     /// The caret or character selection inside an active text-edit session
     /// changed, or its effective typography changed. This refreshes inspector
@@ -1610,9 +1611,8 @@ impl project::ProjectItem for FigItem {
                                 project_reads.load(|| match load_project_root {
                                     Some(root) => {
                                         report_load_progress(&progress, "Opening project files…");
-                                        let session = open_workspace_session(&root)?;
-                                        report_load_progress(&progress, "Loading pages and assets…");
-                                        let document = load_project_document(&root)?;
+                                        let (document, session) =
+                                            load_project_document_with_session(&root)?;
                                         Ok((document, None, Some(session), None))
                                     }
                                     // First open of a bare `.fig`: parse it AND
@@ -2101,6 +2101,31 @@ impl FigItem {
                 ))
             });
             if let Ok(Some((root, paths, hashes, removed, epoch))) = snapshot {
+                if crate::perf_enabled() {
+                    let unknown_paths: Vec<_> = paths
+                        .iter()
+                        .filter_map(|path| path.strip_prefix(&root).ok())
+                        .filter(|relative| {
+                            !hashes.contains_key(*relative) && !removed.contains(*relative)
+                        })
+                        .collect();
+                    if !unknown_paths.is_empty() {
+                        log::warn!(
+                            "fanta watcher unknown paths: epoch={epoch}, count={}, sample={:?}",
+                            unknown_paths.len(),
+                            unknown_paths.iter().take(16).collect::<Vec<_>>()
+                        );
+                    }
+                }
+                // A legacy source can change between document read and
+                // indexing. Its later index cannot prove the loaded document
+                // contains the bytes behind an unproven startup event.
+                let unproven_startup_path = epoch == 0
+                    && paths.iter().any(|path| {
+                        path.strip_prefix(&root).is_ok_and(|relative| {
+                            !hashes.contains_key(relative) && !removed.contains(relative)
+                        })
+                    });
                 let paths_for_check = paths.clone();
                 let root_for_check = root.clone();
                 let changed = cx
@@ -2122,12 +2147,13 @@ impl FigItem {
                                 .ok()
                                 .is_some_and(|relative| relative.starts_with("assets"))
                         });
+                        let force_full = asset_changed || unproven_startup_path;
                         if this.source_edit_locked {
                             this.set_conflict(true, cx);
                         } else if this.dirty {
-                            this.schedule_merge_with_full(asset_changed, cx);
+                            this.schedule_merge_with_full(force_full, cx);
                         } else {
-                            this.schedule_reload_with_full(asset_changed, cx);
+                            this.schedule_reload_with_full(force_full, cx);
                         }
                     }
                 }) {
@@ -2542,10 +2568,6 @@ impl FigItem {
     /// its root node id) when it still exists. The viewport lives on the
     /// view and survives untouched; the selection resets with the new
     /// document.
-    fn apply_reloaded_document(&mut self, document: FigDocument, cx: &mut Context<Self>) {
-        self.apply_reloaded_document_with_session(document, None, cx);
-    }
-
     fn apply_reloaded_document_with_session(
         &mut self,
         mut document: FigDocument,
@@ -2687,9 +2709,11 @@ impl FigItem {
         let epoch = self.sync_epoch;
         let project_reads = self.project_reads.clone();
         cx.spawn(async move |this, cx| {
-            let document = match cx
+            let (document, session) = match cx
                 .background_spawn(async move {
-                    project_reads.load(|| load_project_document(&root)).await
+                    project_reads
+                        .load(|| load_project_document_with_session(&root))
+                        .await
                 })
                 .await
             {
@@ -2713,7 +2737,7 @@ impl FigItem {
                         !this.content_preview_active(),
                         "finish or cancel the active canvas preview before reloading"
                     );
-                    this.apply_reloaded_document(document, cx);
+                    this.apply_reloaded_document_with_session(document, Some(session), cx);
                 }
                 Ok::<(), anyhow::Error>(())
             })??;
@@ -2890,7 +2914,13 @@ impl FigItem {
             return None;
         }
         let document = self.document.ready_mut()?;
+        let previous_viewport = document.doc.viewport;
         let (result, change) = f(document);
+        if document.doc.viewport != previous_viewport {
+            cx.emit(FigItemEvent::ViewportChanged(
+                crate::agent_surface::active_view_for_item(cx.entity_id(), cx),
+            ));
+        }
         let mut finished_preview = false;
         match change {
             DocChange::None => {}
@@ -3069,7 +3099,7 @@ impl FigItem {
         &mut self,
         document: Result<FigDocument>,
         materialized: Option<MaterializedProject>,
-        session: Option<fanta_format::WorkspaceSession>,
+        mut session: Option<fanta_format::WorkspaceSession>,
         cx: &mut Context<Self>,
     ) {
         if self.sync_epoch != 0 {
@@ -3077,6 +3107,16 @@ impl FigItem {
             // and reloaded a newer document; installing this older snapshot
             // would regress it and poison merge_base for the next save.
             return;
+        }
+        if let Some(session) = &mut session {
+            // Startup scan echoes can arrive after the initial bytes were
+            // loaded. Check them against those exact bytes while preserving
+            // newer accepted writes and deletions already queued by this item.
+            for (path, hash) in session.take_loaded_file_hashes() {
+                if !self.own_write_removed.contains(&path) {
+                    self.own_write_hashes.entry(path).or_insert(hash);
+                }
+            }
         }
         self.write_cache = None;
         self.workspace_session = session;
@@ -4311,43 +4351,106 @@ fn watcher_paths_differ_from_own_writes(
             return true;
         };
         if let Some(expected) = hashes.get(relative) {
-            if !matches!(
-                std::fs::symlink_metadata(path),
-                Ok(metadata) if metadata.file_type().is_file()
-            ) {
-                return true;
-            }
-            let Ok(file) = std::fs::File::open(path) else {
-                return true;
-            };
-            let Ok(metadata) = file.metadata() else {
-                return true;
-            };
-            if !metadata.is_file() {
-                return true;
-            }
-            let mut file = file;
-            let mut digest = Sha256::new();
-            let mut buffer = [0u8; 64 * 1024];
-            loop {
-                match file.read(&mut buffer) {
-                    Ok(0) => break,
-                    Ok(size) => digest.update(&buffer[..size]),
-                    Err(_) => return true,
-                }
-            }
-            if digest.finalize().as_slice() != expected {
+            if !watcher_file_matches_hash(path, expected) {
                 return true;
             }
         } else if removed.contains(relative) {
             if std::fs::symlink_metadata(path).is_ok() {
                 return true;
             }
-        } else {
+        } else if !watcher_directory_matches_hashes(root, relative, hashes) {
             return true;
         }
     }
     false
+}
+
+fn watcher_file_matches_hash(path: &Path, expected: &[u8; 32]) -> bool {
+    if !matches!(
+        std::fs::symlink_metadata(path),
+        Ok(metadata) if metadata.file_type().is_file()
+    ) {
+        return false;
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    if !matches!(file.metadata(), Ok(metadata) if metadata.is_file()) {
+        return false;
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(size) => digest.update(&buffer[..size]),
+            Err(_) => return false,
+        }
+    }
+    digest.finalize().as_slice() == expected
+}
+
+fn watcher_directory_matches_hashes(
+    root: &Path,
+    relative: &Path,
+    hashes: &BTreeMap<PathBuf, [u8; 32]>,
+) -> bool {
+    for ancestor in relative
+        .ancestors()
+        .filter(|path| !path.as_os_str().is_empty())
+    {
+        if !matches!(
+            std::fs::symlink_metadata(root.join(ancestor)),
+            Ok(metadata) if metadata.file_type().is_dir()
+        ) {
+            return false;
+        }
+    }
+    let mut expected_children = BTreeMap::<std::ffi::OsString, Option<&[u8; 32]>>::new();
+    // Component-library startup scans report each directory independently.
+    // Its ordered prefix range keeps checking 9,000 directories proportional
+    // to their own files rather than repeatedly scanning the entire library.
+    for (known, hash) in hashes
+        .range(relative.to_path_buf()..)
+        .take_while(|(known, _)| known.starts_with(relative))
+    {
+        let Ok(suffix) = known.strip_prefix(relative) else {
+            return false;
+        };
+        let mut components = suffix.components();
+        let Some(std::path::Component::Normal(name)) = components.next() else {
+            return false;
+        };
+        let child_hash = components.next().is_none().then_some(hash);
+        if let Some(previous) = expected_children.insert(name.to_os_string(), child_hash)
+            && previous.is_some() != child_hash.is_some()
+        {
+            return false;
+        }
+    }
+    if expected_children.is_empty() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(root.join(relative)) else {
+        return false;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        let name = entry.file_name();
+        let Some(expected) = expected_children.remove(&name) else {
+            return false;
+        };
+        let matches = match expected {
+            Some(hash) => watcher_file_matches_hash(&entry.path(), hash),
+            None => watcher_directory_matches_hashes(root, &relative.join(name), hashes),
+        };
+        if !matches {
+            return false;
+        }
+    }
+    expected_children.is_empty()
 }
 
 fn all_artifact_ids(document: &Doc) -> BTreeSet<fanta_format::ArtifactId> {
@@ -4736,6 +4839,7 @@ impl fanta_format::FormatHandler for FigImportFormat {
     }
 }
 
+#[cfg(test)]
 fn load_project_document(root: &Path) -> Result<FigDocument> {
     let started = Instant::now();
     let (doc, assets) = fanta_format::read_project_tree(root)
@@ -4744,6 +4848,17 @@ fn load_project_document(root: &Path) -> Result<FigDocument> {
     let mut document = FigDocument::from_doc(doc, assets);
     document.prewarm_default_page_assets();
     Ok(document)
+}
+
+fn load_project_document_with_session(
+    root: &Path,
+) -> Result<(FigDocument, fanta_format::WorkspaceSession)> {
+    let _perf_span = crate::perf_span("document load: document and workspace session");
+    let (doc, assets, session) = fanta_format::WorkspaceSession::open_project_document(root)
+        .with_context(|| format!("reading Fanta project at {}", root.display()))?;
+    let mut document = FigDocument::from_doc(doc, assets);
+    document.prewarm_default_page_assets();
+    Ok((document, session))
 }
 
 type IncrementalProjectLoad = (
@@ -4775,8 +4890,7 @@ fn load_changed_project_document(
             }
         }
     }
-    let session = open_workspace_session(root)?;
-    let document = load_project_document(root)?;
+    let (document, session) = load_project_document_with_session(root)?;
     Ok(Some((document, session)))
 }
 
@@ -4808,9 +4922,12 @@ fn default_page_root(doc: &Doc, visible_page_roots: &[NodeId]) -> Option<NodeId>
         return Some(active_page);
     }
 
-    visible_page_roots.iter().copied().max_by(|left, right| {
-        page_content_area(doc, Some(*left)).total_cmp(&page_content_area(doc, Some(*right)))
-    })
+    visible_page_roots
+        .iter()
+        .copied()
+        .map(|root| (root, page_content_area(doc, Some(root))))
+        .max_by(|(_, left_area), (_, right_area)| left_area.total_cmp(right_area))
+        .map(|(root, _)| root)
 }
 
 fn collect_pages(
@@ -8071,6 +8188,74 @@ mod tests {
     }
 
     #[test]
+    fn watcher_verifies_known_component_directory_contents_exactly() {
+        let directory = tempfile::tempdir().expect("temporary project");
+        let relative = PathBuf::from("components/master");
+        let design = directory.path().join(&relative);
+        std::fs::create_dir_all(design.join("nested")).expect("component directory");
+        let files: [(&str, &[u8]); 4] = [
+            ("master.fnx", b"<Frame name=\"Master\" />"),
+            ("master.ids.json", b"{\"ids\":[]}"),
+            ("def.json", b"{\"name\":\"Master\"}"),
+            ("nested/authored.json", b"{\"future\":true}"),
+        ];
+        let mut hashes = BTreeMap::new();
+        for (name, bytes) in files {
+            std::fs::write(design.join(name), bytes).expect("component file");
+            hashes.insert(relative.join(name), Sha256::digest(bytes).into());
+        }
+        let sibling = PathBuf::from("components/master-other/def.json");
+        hashes.insert(sibling, Sha256::digest(b"other component").into());
+        let paths = BTreeSet::from([design.clone()]);
+        let changed = || {
+            watcher_paths_differ_from_own_writes(
+                directory.path(),
+                &paths,
+                &hashes,
+                &BTreeSet::new(),
+            )
+        };
+        assert!(
+            !changed(),
+            "directory-only echoes must verify all known bytes"
+        );
+        std::fs::write(design.join("master.fnx"), b"<Frame name=\"Edited\" />")
+            .expect("changed source");
+        assert!(changed(), "source changes must still reload");
+        std::fs::write(design.join("master.fnx"), files[0].1).expect("restore source");
+        std::fs::write(design.join("new.json"), b"{}").expect("new child");
+        assert!(changed(), "new untracked children must still reload");
+        std::fs::remove_file(design.join("new.json")).expect("remove new child");
+        std::fs::remove_file(design.join("master.ids.json")).expect("deleted known child");
+        assert!(changed(), "deleted known children must still reload");
+        std::fs::write(design.join("master.ids.json"), files[1].1).expect("restore identities");
+        std::fs::create_dir(design.join("untracked")).expect("new empty child directory");
+        assert!(changed(), "untracked empty directories remain conservative");
+        std::fs::remove_dir(design.join("untracked")).expect("remove untracked directory");
+        #[cfg(unix)]
+        {
+            let target = directory.path().join("same-source.fnx");
+            std::fs::write(&target, files[0].1).expect("symlink target");
+            std::fs::remove_file(design.join("master.fnx")).expect("replace known file");
+            std::os::unix::fs::symlink(target, design.join("master.fnx"))
+                .expect("symlinked known child");
+            assert!(
+                changed(),
+                "matching symlink targets are not loaded-file proof"
+            );
+            std::fs::remove_file(design.join("master.fnx")).expect("remove symlink");
+            std::fs::write(design.join("master.fnx"), files[0].1).expect("restore regular file");
+        }
+        assert!(!changed());
+        assert!(watcher_paths_differ_from_own_writes(
+            directory.path(),
+            &BTreeSet::from([directory.path().join("unknown")]),
+            &hashes,
+            &BTreeSet::new()
+        ));
+    }
+
+    #[test]
     fn watcher_prefers_file_events_over_their_directory_echoes() {
         let directory = tempfile::tempdir().expect("temporary project");
         let design = directory.path().join("pages/home");
@@ -8354,6 +8539,235 @@ mod tests {
             "Saved after reconciliation"
         );
         assert_eq!(reopened_assets.get(&asset), Some(&bytes));
+    }
+
+    #[gpui::test]
+    async fn project_reload_queue_skips_unchanged_startup_file_events(cx: &mut TestAppContext) {
+        let (directory, item, mut initial, page) = reload_queue_fixture(cx).await;
+        let master = fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(Default::default()));
+        let master_id = initial.scene.insert(master).expect("component master");
+        let component = fanta_doc::ComponentId::new();
+        initial.components.defs.insert(
+            component,
+            fanta_doc::ComponentDef::new(component, master_id, "Directory master"),
+        );
+        let asset = AssetId::new();
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(2, 2)
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .expect("encode startup image");
+        write_project(
+            directory.path(),
+            &initial,
+            &BTreeMap::from([(asset, encoded.into_inner())]),
+        )
+        .expect("project with startup asset");
+        let (loaded, assets, session) =
+            fanta_format::WorkspaceSession::open_project_document(directory.path())
+                .expect("initial document and index");
+        let source = fanta_format::locate_page_source(directory.path(), page).expect("page source");
+        let component_directory = directory.path().join(
+            &session
+                .artifacts
+                .get(&fanta_format::ArtifactId::Component(component))
+                .expect("loaded component metadata")
+                .design_dir,
+        );
+        let metadata = directory.path().join("doc/metadata.json");
+        let mut metadata_bytes = std::fs::read(&metadata).expect("metadata");
+        metadata_bytes.push(b' ');
+        std::fs::write(&metadata, &metadata_bytes).expect("accepted metadata write");
+        let metadata_hash: [u8; 32] = Sha256::digest(metadata_bytes).into();
+        let removed = directory.path().join("doc/flow_start.json");
+        std::fs::remove_file(&removed).expect("accepted optional-file removal");
+        let paths = BTreeSet::from([
+            source.clone(),
+            source.with_file_name("page.json"),
+            source.with_file_name("page.ids.json"),
+            directory.path().join("fanta.json"),
+            metadata,
+            directory.path().join("doc/variables.json"),
+            directory.path().join("doc/active_modes.json"),
+            directory.path().join("assets/index.json"),
+            directory.path().join(format!("assets/images/{asset}.png")),
+            component_directory,
+            removed,
+        ]);
+        let reads = item.read_with(cx, |item, _| item.project_reads.clone());
+        item.update(cx, |item, cx| {
+            item.document = FigDocumentState::Loading {
+                message: "Loading test".into(),
+            };
+            item.workspace_session = None;
+            item.merge_base = None;
+            item.own_write_hashes
+                .insert(PathBuf::from("doc/metadata.json"), metadata_hash);
+            item.own_write_removed
+                .insert(PathBuf::from("doc/flow_start.json"));
+            item.queue_watcher_paths_for_test(paths, cx);
+        });
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 4);
+        cx.run_until_parked();
+        assert_eq!(reload_queue_started(&reads), 0);
+        item.update(cx, |item, cx| {
+            item.adopt_initial_load(
+                Ok(FigDocument::from_doc(loaded, assets)),
+                None,
+                Some(session),
+                cx,
+            );
+        });
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 4);
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert!(item.pending_watcher_paths.is_empty());
+            assert!(!item.watcher_check_in_flight);
+            assert!(!item.external_change_pending);
+            assert!(!item.has_conflict());
+            assert_eq!(
+                item.own_write_hashes.get(Path::new("doc/metadata.json")),
+                Some(&metadata_hash)
+            );
+            assert!(
+                !item
+                    .own_write_hashes
+                    .contains_key(Path::new("doc/flow_start.json"))
+            );
+            assert_eq!(
+                item.doc()
+                    .expect("initial document")
+                    .scene
+                    .get(page)
+                    .expect("page")
+                    .name,
+                "Page 1"
+            );
+        });
+        assert_eq!(
+            reload_queue_started(&reads),
+            0,
+            "byte-identical startup echoes must not rebuild the workspace index"
+        );
+    }
+
+    #[gpui::test]
+    async fn project_reload_queue_keeps_startup_edits_after_hash_seeding(cx: &mut TestAppContext) {
+        let (directory, item, _, page) = reload_queue_fixture(cx).await;
+        let (loaded, assets, session) =
+            fanta_format::WorkspaceSession::open_project_document(directory.path())
+                .expect("initial document and index");
+        let source = fanta_format::locate_page_source(directory.path(), page).expect("page source");
+        let source_text = std::fs::read_to_string(&source).expect("initial source");
+        let changed = source_text.replacen("Page 1", "Edited during load", 1);
+        assert_ne!(changed, source_text);
+        std::fs::write(&source, changed).expect("external edit before adoption");
+        let reads = item.read_with(cx, |item, _| item.project_reads.clone());
+        item.update(cx, |item, cx| {
+            item.document = FigDocumentState::Loading {
+                message: "Loading test".into(),
+            };
+            item.workspace_session = None;
+            item.merge_base = None;
+            item.queue_watcher_paths_for_test([source], cx);
+        });
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 4);
+        cx.run_until_parked();
+        assert_eq!(reload_queue_started(&reads), 0);
+        item.update(cx, |item, cx| {
+            item.adopt_initial_load(
+                Ok(FigDocument::from_doc(loaded, assets)),
+                None,
+                Some(session),
+                cx,
+            );
+        });
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 4);
+        cx.run_until_parked();
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 4);
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.doc()
+                    .expect("reloaded document")
+                    .scene
+                    .get(page)
+                    .expect("page")
+                    .name,
+                "Edited during load"
+            );
+            assert!(item.pending_watcher_paths.is_empty());
+            assert!(!item.external_change_pending);
+            assert!(!item.has_conflict());
+        });
+        assert_eq!(reload_queue_started(&reads), 1);
+    }
+
+    #[gpui::test]
+    async fn project_reload_queue_refreshes_unproven_legacy_startup_nodes(cx: &mut TestAppContext) {
+        let (directory, item, initial, page) = reload_queue_fixture(cx).await;
+        let source = fanta_format::locate_page_source(directory.path(), page).expect("page source");
+        std::fs::remove_file(&source).expect("legacy per-node source");
+        std::fs::remove_file(source.with_file_name("page.ids.json")).expect("legacy identities");
+        let nodes = source.parent().expect("page directory").join("nodes");
+        std::fs::create_dir(&nodes).expect("legacy node directory");
+        let node_path = nodes.join(format!("{page}.json"));
+        let mut node =
+            serde_json::to_value(initial.scene.get(page).expect("page")).expect("legacy page node");
+        std::fs::write(&node_path, serde_json::to_vec(&node).expect("node bytes"))
+            .expect("baseline legacy node");
+        let (loaded, assets) =
+            fanta_format::read_project_tree(directory.path()).expect("document baseline A");
+        node["name"] = "Legacy edit while loading".into();
+        std::fs::write(
+            &node_path,
+            serde_json::to_vec(&node).expect("changed node bytes"),
+        )
+        .expect("legacy node changed before index");
+        let (_, _, session) =
+            fanta_format::WorkspaceSession::open_project_document(directory.path())
+                .expect("later workspace index B");
+        let mut standalone =
+            fanta_format::WorkspaceSession::open(directory.path()).expect("standalone index");
+        assert!(standalone.take_loaded_file_hashes().is_empty());
+        let relative = node_path
+            .strip_prefix(directory.path())
+            .expect("relative node path")
+            .to_path_buf();
+        let reads = item.read_with(cx, |item, _| item.project_reads.clone());
+        item.update(cx, |item, cx| {
+            item.document = FigDocumentState::Loading {
+                message: "Loading test".into(),
+            };
+            item.workspace_session = None;
+            item.merge_base = None;
+            item.queue_watcher_paths_for_test([node_path], cx);
+            item.adopt_initial_load(
+                Ok(FigDocument::from_doc(loaded, assets)),
+                None,
+                Some(session),
+                cx,
+            );
+            assert!(!item.own_write_hashes.contains_key(&relative));
+        });
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 4);
+        cx.run_until_parked();
+        cx.executor().advance_clock(RELOAD_DEBOUNCE * 4);
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            assert_eq!(
+                item.doc()
+                    .expect("legacy document refreshed")
+                    .scene
+                    .get(page)
+                    .expect("page")
+                    .name,
+                "Legacy edit while loading"
+            );
+            assert!(item.pending_watcher_paths.is_empty());
+            assert!(!item.external_change_pending);
+            assert!(!item.has_conflict());
+        });
+        assert_eq!(reload_queue_started(&reads), 1);
     }
 
     #[gpui::test]

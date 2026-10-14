@@ -25,6 +25,7 @@ pub struct ArtifactIr {
     sidecar: FnxSidecar,
     index: Arc<ElementIndex>,
     revision: u64,
+    mutation_token: Arc<()>,
 }
 
 pub struct StructuralNodeChange {
@@ -48,6 +49,18 @@ pub struct PreparedStructuralPatch {
 impl PreparedStructuralPatch {
     pub fn sidecar(&self) -> &FnxSidecar {
         &self.sidecar
+    }
+
+    pub fn node_value_at(&self, previous: &ArtifactIr, position: usize) -> Result<Value, FnxError> {
+        let entry = self
+            .sidecar
+            .ids
+            .get(position)
+            .ok_or_else(|| FnxError::Parse("structural node position is absent".into()))?;
+        let element = self
+            .element(previous, &entry.id)
+            .ok_or_else(|| FnxError::Parse(format!("structural node {} is absent", entry.id)))?;
+        value_at(element, &self.sidecar, position)
     }
 
     pub(crate) fn element<'a>(
@@ -156,6 +169,7 @@ impl ArtifactIr {
             sidecar,
             index,
             revision: 0,
+            mutation_token: Arc::new(()),
         }
     }
 
@@ -173,6 +187,23 @@ impl ArtifactIr {
 
     pub fn sidecar(&self) -> &FnxSidecar {
         &self.sidecar
+    }
+
+    /// Every semantic writer replaces this token. Holding it keeps an old
+    /// allocation alive, so a new tree cannot accidentally reuse its identity.
+    pub fn synchronization_token(&self) -> Arc<()> {
+        Arc::clone(&self.mutation_token)
+    }
+
+    pub fn node_value(&self, id: &str) -> Result<Value, FnxError> {
+        let position = self
+            .index
+            .position(id)
+            .ok_or_else(|| FnxError::Parse(format!("IR has no node id {id}")))?;
+        let element = self
+            .element(id)
+            .ok_or_else(|| FnxError::Parse(format!("IR lookup index is stale for node id {id}")))?;
+        value_at(element, &self.sidecar, position)
     }
 
     /// Build IR from a flat slice of node JSON values (page/component closure).
@@ -300,6 +331,7 @@ impl ArtifactIr {
         self.sidecar = sidecar;
         self.index = Arc::new(ElementIndex::build(&self.root, &self.sidecar));
         self.revision = self.revision.wrapping_add(1);
+        self.mutation_token = Arc::new(());
         Ok(())
     }
 
@@ -576,6 +608,8 @@ impl ArtifactIr {
                 "structural patch baseline changed before commit".into(),
             ));
         }
+        let previous_token = Arc::clone(&self.mutation_token);
+        self.mutation_token = Arc::new(());
         let root = std::mem::replace(&mut self.root, FnxElement::new("Frame"));
         let mut nodes = flatten_owned_tree(root, &patch.previous_order);
         let mut replaced = BTreeMap::new();
@@ -608,6 +642,7 @@ impl ArtifactIr {
                     &patch.previous_children,
                     &mut nodes,
                 )?;
+                self.mutation_token = previous_token;
                 Err(error)
             }
         }
@@ -658,6 +693,7 @@ impl ArtifactIr {
                 .map(str::to_owned);
         }
         self.revision = self.revision.wrapping_add(1);
+        self.mutation_token = Arc::new(());
         Ok(())
     }
 
@@ -734,8 +770,32 @@ impl ArtifactIr {
                 .map(str::to_owned);
         }
         self.revision = self.revision.wrapping_add(1);
+        self.mutation_token = Arc::new(());
         Ok(())
     }
+}
+
+fn value_at(
+    element: &FnxElement,
+    sidecar: &FnxSidecar,
+    position: usize,
+) -> Result<Value, FnxError> {
+    let entry = sidecar
+        .ids
+        .get(position)
+        .ok_or_else(|| FnxError::Parse("IR node position is absent".into()))?;
+    let parent = match entry.parent_index {
+        Some(parent) => Some(
+            sidecar
+                .ids
+                .get(parent as usize)
+                .ok_or_else(|| FnxError::Parse("IR node parent is absent".into()))?
+                .id
+                .as_str(),
+        ),
+        None => sidecar.root_parent.as_deref(),
+    };
+    crate::convert::element_to_value(element, &entry.id, parent, &entry.index)
 }
 
 fn flatten_owned_tree(root: FnxElement, order: &[String]) -> HashMap<String, FnxElement> {
@@ -1018,6 +1078,7 @@ mod tests {
         ];
         let mut ir = ArtifactIr::from_nodes(ArtifactKind::Page, "Page", &nodes).expect("IR");
         let before = ir.clone();
+        let original_token = ir.synchronization_token();
         for parent in ["absent", "child"] {
             let mut after = nodes[1].clone();
             after["parent"] = serde_json::json!(parent);
@@ -1030,6 +1091,7 @@ mod tests {
                 .is_err()
             );
             assert_eq!(ir, before);
+            assert!(Arc::ptr_eq(&original_token, &ir.synchronization_token()));
         }
         let make_insert = || StructuralNodeChange {
             id: "inserted".into(),
@@ -1053,6 +1115,7 @@ mod tests {
             }
             assert!(ir.commit_structural_patch(patch).is_err());
             assert_eq!(ir, before);
+            assert!(Arc::ptr_eq(&original_token, &ir.synchronization_token()));
             assert_eq!(
                 ir.to_nodes().expect("restored nodes"),
                 before.to_nodes().expect("original nodes")
@@ -1065,12 +1128,33 @@ mod tests {
         changed["opacity"] = serde_json::json!(0.5);
         ir.patch_node_delta("child", &nodes[1], &changed)
             .expect("property edit");
+        assert!(!Arc::ptr_eq(&original_token, &ir.synchronization_token()));
         let edited = ir.clone();
         assert!(ir.commit_structural_patch(patch).is_err());
         assert_eq!(
             ir, edited,
             "a stale plan must not overwrite a later property edit"
         );
+    }
+
+    #[test]
+    fn synchronization_tokens_and_single_node_projection_follow_semantic_writers() {
+        let mut ir = wide_ir(2);
+        let original = ir.synchronization_token();
+        let unchanged = ir.clone();
+        assert!(Arc::ptr_eq(&original, &unchanged.synchronization_token()));
+        for node in ir.to_nodes().expect("all nodes") {
+            let id = node.get("id").and_then(Value::as_str).expect("identity");
+            assert_eq!(ir.node_value(id).expect("single node"), node);
+        }
+        let mut changed = ir.node_value("node-1").expect("node");
+        changed["name"] = json!("Changed");
+        ir.patch_node_value("node-1", &changed).expect("patch");
+        assert!(!Arc::ptr_eq(&original, &ir.synchronization_token()));
+        let patched = ir.synchronization_token();
+        ir.replace_structure(ir.root().clone(), ir.sidecar().clone())
+            .expect("replace");
+        assert!(!Arc::ptr_eq(&patched, &ir.synchronization_token()));
     }
 
     #[test]

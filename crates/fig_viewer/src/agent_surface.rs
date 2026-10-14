@@ -4,7 +4,7 @@
 //! seam as user input (one history transaction per batch, rolled back on
 //! failure), so agent work is undoable like any canvas gesture.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -52,13 +52,16 @@ use crate::structure::{frame_selection_operations, group_operations, ungroup_ope
 /// The most recently opened or focused canvas item, shared between the
 /// registered provider and the [`FigView`](crate::FigView) instances that
 /// update it.
-struct ActiveDesignItem(Rc<RefCell<Option<WeakEntity<FigItem>>>>);
+struct ActiveDesignItem(
+    Rc<RefCell<Option<WeakEntity<FigItem>>>>,
+    Cell<Option<gpui::EntityId>>,
+);
 
 impl Global for ActiveDesignItem {}
 
 pub(crate) fn init(cx: &mut App) {
     let active = Rc::new(RefCell::new(None));
-    cx.set_global(ActiveDesignItem(active.clone()));
+    cx.set_global(ActiveDesignItem(active.clone(), Cell::new(None)));
     design_surface::register(Rc::new(FigDesignSurface { active }), cx);
 }
 
@@ -67,7 +70,43 @@ pub(crate) fn init(cx: &mut App) {
 /// user's attention.
 pub(crate) fn set_active_item(item: WeakEntity<FigItem>, cx: &mut App) {
     if let Some(state) = cx.try_global::<ActiveDesignItem>() {
+        let mut active = state.0.borrow_mut();
+        let same_live_item = active
+            .as_ref()
+            .and_then(WeakEntity::upgrade)
+            .zip(item.upgrade())
+            .is_some_and(|(active, item)| active.entity_id() == item.entity_id());
+        *active = Some(item);
+        if !same_live_item {
+            state.1.set(None);
+        }
+    }
+}
+
+pub(crate) fn set_active_item_for_view(
+    item: WeakEntity<FigItem>,
+    view: gpui::EntityId,
+    cx: &mut App,
+) {
+    if let Some(state) = cx.try_global::<ActiveDesignItem>() {
         *state.0.borrow_mut() = Some(item);
+        state.1.set(Some(view));
+    }
+}
+
+pub(crate) fn active_view_for_item(item: gpui::EntityId, cx: &App) -> Option<gpui::EntityId> {
+    let state = cx.try_global::<ActiveDesignItem>()?;
+    let active = state.0.borrow().as_ref()?.upgrade()?;
+    (active.entity_id() == item)
+        .then_some(state.1.get())
+        .flatten()
+}
+
+pub(crate) fn clear_active_view(view: gpui::EntityId, cx: &mut App) {
+    if let Some(state) = cx.try_global::<ActiveDesignItem>()
+        && state.1.get() == Some(view)
+    {
+        state.1.set(None);
     }
 }
 
@@ -650,6 +689,9 @@ impl DesignSurface for FigDesignSurface {
         if ops.is_empty() {
             return Task::ready(Err(anyhow!("the ops list is empty")));
         }
+        if ops.iter().all(design_operation_is_presence) {
+            return Task::ready(apply_ops_to_item(&item, &ops, &label, cx));
+        }
         let default_container = item.read(cx).doc().and_then(Doc::active_page);
         let batch = cx.new(|cx| {
             cx.on_release(|batch: &mut StreamedDesignBatch, cx| batch.cancel(cx))
@@ -698,6 +740,7 @@ impl DesignSurface for FigDesignSurface {
                                 document.doc.selection.iter().copied().collect();
                             batch.original_viewport = document.doc.viewport;
                             document.doc.history.begin(&label, &mut document.doc.scene);
+                            batch.progress.history_started = true;
                             batch.pending = true;
                             (true, DocChange::ContentPreview)
                         })
@@ -2157,7 +2200,10 @@ fn apply_batch(
         default_container: doc.active_page(),
         ..BatchProgress::default()
     };
-    doc.history.begin(label, &mut doc.scene);
+    if !ops.iter().all(design_operation_is_presence) {
+        doc.history.begin(label, &mut doc.scene);
+        progress.history_started = true;
+    }
     for (index, operation) in ops.iter().enumerate() {
         progress.apply(doc, assets, index, operation);
         if progress.failure.is_some() {
@@ -2177,6 +2223,7 @@ struct BatchProgress {
     content_changed: bool,
     selection_changed: bool,
     failure: Option<(usize, String)>,
+    history_started: bool,
 }
 
 impl BatchProgress {
@@ -2230,7 +2277,9 @@ impl BatchProgress {
     ) -> BatchOutcome {
         match self.failure.take() {
             None => {
-                doc.history.commit(&mut doc.scene);
+                if self.history_started {
+                    doc.history.commit(&mut doc.scene);
+                }
                 if doc
                     .selection
                     .iter()
@@ -2256,7 +2305,9 @@ impl BatchProgress {
                 }
             }
             Some((index, mut message)) => {
-                if let Err(abort_error) = doc.abort_transaction() {
+                if self.history_started
+                    && let Err(abort_error) = doc.abort_transaction()
+                {
                     message = format!("{message}; rolling back also failed: {abort_error}");
                 }
                 for asset in self.ingested_assets.drain(..) {
@@ -2326,6 +2377,13 @@ impl StreamedDesignBatch {
 fn refresh_streamed_layout(document: &mut FigDocument) {
     document.refresh_layout_baseline();
     document.mark_variables_changed();
+}
+
+fn design_operation_is_presence(operation: &DesignOp) -> bool {
+    matches!(
+        operation,
+        DesignOp::SetViewport { .. } | DesignOp::Select { .. }
+    )
 }
 
 fn design_operation_is_variable(operation: &DesignOp) -> bool {
@@ -4764,6 +4822,42 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn item_only_activation_preserves_requester_only_for_the_same_live_document(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (item, _, project) = streamed_design_fixture(cx).await;
+        cx.update(init);
+        let requester = cx.new(|_| ());
+        cx.update(|cx| {
+            set_active_item_for_view(item.downgrade(), requester.entity_id(), cx);
+            set_active_item(item.downgrade(), cx);
+            assert_eq!(
+                active_view_for_item(item.entity_id(), cx),
+                Some(requester.entity_id())
+            );
+        });
+        let (document, _) = doc_with_page();
+        let other = crate::document::ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/Other.fig"),
+            document,
+            cx,
+        );
+        let other_weak = other.downgrade();
+        cx.update(|cx| {
+            set_active_item(other.downgrade(), cx);
+            assert_eq!(active_view_for_item(item.entity_id(), cx), None);
+            assert_eq!(active_view_for_item(other.entity_id(), cx), None);
+            set_active_item_for_view(other.downgrade(), requester.entity_id(), cx);
+        });
+        drop(other);
+        cx.update(|cx| {
+            set_active_item(other_weak, cx);
+            assert_eq!(cx.global::<ActiveDesignItem>().1.get(), None);
+        });
+    }
+
+    #[gpui::test]
     async fn inspecting_component_source_reports_its_component_scope(
         cx: &mut gpui::TestAppContext,
     ) {
@@ -4839,6 +4933,85 @@ mod tests {
         }
         .await
         .expect("component source inspection should identify its component scope");
+    }
+
+    #[gpui::test]
+    async fn streamed_presence_does_not_start_a_content_preview(cx: &mut gpui::TestAppContext) {
+        let (item, surface, _) = streamed_design_fixture(cx).await;
+        let baseline = item.read_with(cx, |item, _| {
+            let document = item.document().expect("ready document");
+            (
+                document.render_generation(),
+                document.doc.scene.revision(),
+                document.variables_generation(),
+            )
+        });
+        let result = cx
+            .update(|cx| {
+                surface.apply_streamed(
+                    ops(json!([
+                        {"op":"set_viewport","center":[100.0,200.0],"zoom":0.5},
+                        {"op":"select","ids":[]}
+                    ])),
+                    "Navigate".into(),
+                    None,
+                    cx,
+                )
+            })
+            .await
+            .expect("presence request");
+        assert_eq!(result["applied"], true);
+        cx.run_until_parked();
+        item.read_with(cx, |item, _| {
+            let document = item.document().expect("ready document");
+            assert_eq!(document.doc.viewport.center, [100.0, 200.0]);
+            assert_eq!(document.doc.viewport.zoom, 0.5);
+            assert_eq!(document.doc.history.undo_depth(), 0);
+            assert_eq!(
+                (
+                    document.render_generation(),
+                    document.doc.scene.revision(),
+                    document.variables_generation(),
+                ),
+                baseline
+            );
+            assert!(!item.content_preview_active());
+            assert!(!item.is_dirty());
+        });
+    }
+
+    #[test]
+    fn presence_batches_preserve_an_open_content_transaction() -> Result<()> {
+        let (mut document, page) = doc_with_page();
+        let original_name = document.scene.get(page).context("page")?.name.clone();
+        document.history.begin("Original edit", &mut document.scene);
+        document.apply(Operation::SetName {
+            id: page,
+            old: original_name.clone(),
+            new: "Pending name".into(),
+        })?;
+        for operations in [
+            ops(json!([
+                {"op":"set_viewport","center":[100.0,200.0],"zoom":0.5},
+                {"op":"select","ids":[]}
+            ])),
+            ops(json!([{"op":"set_viewport","zoom":-1.0}])),
+        ] {
+            run_batch(&mut document, &operations, "Navigate");
+            assert_eq!(document.history.undo_depth(), 0);
+            assert_eq!(
+                document.scene.get(page).context("page")?.name,
+                "Pending name"
+            );
+        }
+        document.abort_transaction()?;
+        assert_eq!(
+            document.scene.get(page).context("page")?.name,
+            original_name
+        );
+        assert_eq!(document.viewport.center, [100.0, 200.0]);
+        assert_eq!(document.viewport.zoom, 0.5);
+        Ok(())
     }
 
     #[gpui::test]

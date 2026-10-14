@@ -3479,21 +3479,6 @@ fn shared_reference_table_reuses_values_and_restores_an_open_sources_vocabulary(
         workspace.artifact(&page).expect("page").source_text(),
         original_source
     );
-    fixture
-        .document
-        .components
-        .defs
-        .get_mut(&fixture.components[0])
-        .expect("component")
-        .name = original_name;
-    assert!(workspace.adopt_document_shared(&fixture.document));
-    let restored = Arc::clone(&workspace.artifact(&page).expect("page").ref_table);
-    assert_eq!(*restored, *original_table);
-    assert!(!Arc::ptr_eq(&restored, &renamed));
-    assert_eq!(
-        workspace.artifact(&page).expect("page").source_text(),
-        original_source
-    );
     let instance = *workspace
         .artifact(&page)
         .expect("page")
@@ -3508,6 +3493,46 @@ fn shared_reference_table_reuses_values_and_restores_an_open_sources_vocabulary(
             Operation::SetName {
                 id: instance,
                 old: "Placement".into(),
+                new: "During rename".into(),
+            },
+        )
+        .expect("patch while retained source uses the earlier vocabulary");
+    assert!(
+        workspace
+            .artifact(&page)
+            .expect("page")
+            .source_text()
+            .contains("During rename")
+    );
+    fixture
+        .document
+        .components
+        .defs
+        .get_mut(&fixture.components[0])
+        .expect("component")
+        .name = original_name;
+    assert!(workspace.adopt_document_shared(&fixture.document));
+    let restored = Arc::clone(&workspace.artifact(&page).expect("page").ref_table);
+    assert_eq!(*restored, *original_table);
+    assert!(!Arc::ptr_eq(&restored, &renamed));
+    assert_eq!(
+        workspace.artifact(&page).expect("page").source_text(),
+        original_source.replace("Placement", "During rename")
+    );
+    let instance = *workspace
+        .artifact(&page)
+        .expect("page")
+        .doc()
+        .scene
+        .children_of(Some(fixture.page))
+        .first()
+        .expect("instance");
+    workspace
+        .apply(
+            &page,
+            Operation::SetName {
+                id: instance,
+                old: "During rename".into(),
                 new: "After restore".into(),
             },
         )
@@ -3521,6 +3546,170 @@ fn shared_reference_table_reuses_values_and_restores_an_open_sources_vocabulary(
     assert_eq!(instance_data.component, fixture.components[0]);
     assert!(artifact.source_text().contains("After restore"));
     assert!(Arc::ptr_eq(&restored, &artifact.ref_table));
+}
+
+#[test]
+fn full_document_source_overrides_refuse_reference_alias_drift_before_writing() {
+    for open_state in [0, 1, 2] {
+        let mut fixture = shared_reference_fixture();
+        let (baseline, _) =
+            crate::read_project_tree(fixture.directory.path()).expect("baseline document");
+        let mut workspace = WorkspaceSession::open(fixture.directory.path()).expect("workspace");
+        let page = ArtifactId::Page(fixture.page);
+        if open_state != 0 {
+            workspace.open_artifact(page.clone()).expect("open page");
+        }
+        let source_path =
+            crate::locate_page_source(fixture.directory.path(), fixture.page).expect("page source");
+        let original_source = std::fs::read(&source_path).expect("source bytes");
+        let original_name = fixture.document.components.defs[&fixture.components[0]]
+            .name
+            .clone();
+        fixture
+            .document
+            .components
+            .defs
+            .get_mut(&fixture.components[0])
+            .expect("original component")
+            .name = "Renamed original".into();
+        fixture
+            .document
+            .components
+            .defs
+            .get_mut(&fixture.components[2])
+            .expect("other component")
+            .name = original_name;
+        assert!(workspace.adopt_document_shared(&fixture.document));
+        if open_state == 2 {
+            workspace
+                .apply(
+                    &page,
+                    Operation::SetName {
+                        id: fixture.page,
+                        old: "Reference page".into(),
+                        new: "Dirty page".into(),
+                    },
+                )
+                .expect("unrelated canvas edit");
+            fixture
+                .document
+                .scene
+                .get_mut(fixture.page)
+                .expect("page")
+                .name = "Dirty page".into();
+        }
+        let save = (|| -> Result<(), SessionError> {
+            let sources = workspace.validated_source_overrides_for_document(&fixture.document)?;
+            let preconditions = workspace.source_write_preconditions(&fixture.document)?;
+            crate::write_project_tree_cached_with_sources_checked(
+                fixture.directory.path(),
+                &fixture.document,
+                &BTreeMap::new(),
+                &mut crate::ProjectWriteCache::default(),
+                &sources,
+                &preconditions,
+            )?;
+            Ok(())
+        })();
+        assert!(
+            matches!(save, Err(SessionError::InvalidSource(_))),
+            "state {open_state}: {save:?}"
+        );
+        assert_eq!(
+            std::fs::read(source_path).expect("preserved source"),
+            original_source
+        );
+        let (reopened, _) =
+            crate::read_project_tree(fixture.directory.path()).expect("project remains readable");
+        assert_eq!(
+            serde_json::to_value(reopened).expect("reopened document"),
+            serde_json::to_value(baseline).expect("baseline document")
+        );
+    }
+}
+
+#[test]
+fn retained_reference_alias_reuse_cannot_change_ids_through_an_artifact_save() {
+    let mut fixture = shared_reference_fixture();
+    let mut workspace = WorkspaceSession::open(fixture.directory.path()).expect("workspace");
+    let page = ArtifactId::Page(fixture.page);
+    workspace.open_artifact(page.clone()).expect("page");
+    let source_path =
+        crate::locate_page_source(fixture.directory.path(), fixture.page).expect("source");
+    let original_source = std::fs::read(&source_path).expect("source bytes");
+    let instance = *workspace
+        .artifact(&page)
+        .expect("page")
+        .doc()
+        .scene
+        .children_of(Some(fixture.page))
+        .first()
+        .expect("instance");
+    let original_name = fixture.document.components.defs[&fixture.components[0]]
+        .name
+        .clone();
+    fixture
+        .document
+        .components
+        .defs
+        .get_mut(&fixture.components[0])
+        .expect("original component")
+        .name = "Renamed original".into();
+    fixture
+        .document
+        .components
+        .defs
+        .get_mut(&fixture.components[2])
+        .expect("other component")
+        .name = original_name;
+    assert!(workspace.adopt_document_shared(&fixture.document));
+    workspace
+        .apply(
+            &page,
+            Operation::SetName {
+                id: instance,
+                old: "Placement".into(),
+                new: "After alias reuse".into(),
+            },
+        )
+        .expect("unrelated canvas edit");
+    assert!(matches!(
+        workspace.save_artifact(page.clone()),
+        Err(SessionError::InvalidSource(_))
+    ));
+    assert_eq!(
+        std::fs::read(&source_path).expect("unchanged disk"),
+        original_source
+    );
+    let (reopened, _) =
+        crate::read_project_tree(fixture.directory.path()).expect("unchanged project reopens");
+    let NodeData::Instance(data) = &reopened.scene.get(instance).expect("placement").data else {
+        panic!("instance fixture")
+    };
+    assert_eq!(data.component, fixture.components[0]);
+
+    fixture
+        .document
+        .scene
+        .get_mut(instance)
+        .expect("placement")
+        .name = "After alias reuse".into();
+    crate::write_project_tree(
+        fixture.directory.path(),
+        &fixture.document,
+        &BTreeMap::new(),
+    )
+    .expect("complete document save rewrites current reference names");
+    let (reopened, _) =
+        crate::read_project_tree(fixture.directory.path()).expect("renamed project reopens");
+    let NodeData::Instance(data) = &reopened.scene.get(instance).expect("placement").data else {
+        panic!("instance fixture")
+    };
+    assert_eq!(data.component, fixture.components[0]);
+    assert_eq!(
+        reopened.scene.get(instance).expect("placement").name,
+        "After alias reuse"
+    );
 }
 
 #[test]
@@ -5223,6 +5412,44 @@ fn structural_source_fields_survive_create_undo_redo_and_cold() {
             }
         }
     }
+}
+
+#[test]
+fn retained_ir_writer_invalidates_scene_checkpoint_before_reconciliation() {
+    let (directory, page, child, _) = structural_source_fixture(true, true);
+    let mut workspace = WorkspaceSession::open(directory.path()).expect("workspace");
+    let artifact = ArtifactId::Page(page);
+    workspace.open_artifact(artifact.clone()).expect("page");
+    let session = workspace.artifact_mut(&artifact).expect("session");
+    let expected = session.doc().scene.get(child).expect("child").clone();
+    let mut changed = session
+        .ir
+        .node_value(&child.0.to_string())
+        .expect("retained node");
+    changed["opacity"] = serde_json::json!(0.125);
+    session
+        .ir
+        .patch_node_value(&child.0.to_string(), &changed)
+        .expect("IR writer");
+    session
+        .synchronize_retained_source_with_scene()
+        .expect("reconcile mutated IR");
+    let retained: CanvasNode = serde_json::from_value(
+        session
+            .ir
+            .node_value(&child.0.to_string())
+            .expect("reconciled node"),
+    )
+    .expect("typed node");
+    assert_eq!(retained, expected);
+    let reopened = ArtifactIr::from_source(
+        ArtifactKind::Page,
+        session.fn_name.clone(),
+        &session.source_text(),
+        session.ir.sidecar().clone(),
+    )
+    .expect("source parse");
+    assert_eq!(reopened, session.ir);
 }
 
 #[test]
