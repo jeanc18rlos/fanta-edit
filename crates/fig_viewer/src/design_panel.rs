@@ -327,6 +327,8 @@ pub struct FantaDesignPanel {
     #[cfg(feature = "fanta-gpui-ui")]
     asset_echo_key: Option<(DocId, u64, EditorMode, Option<NodeId>, bool)>,
     #[cfg(feature = "fanta-gpui-ui")]
+    asset_thumbnails: AssetThumbnails,
+    #[cfg(feature = "fanta-gpui-ui")]
     file_inspector: Option<Entity<fanta_gpui::file_inspector::FileInspectorSidebar>>,
     #[cfg(feature = "fanta-gpui-ui")]
     context_picker: Option<context_menu::ContextPicker>,
@@ -479,6 +481,8 @@ impl FantaDesignPanel {
             gpui_assets: None,
             #[cfg(feature = "fanta-gpui-ui")]
             asset_echo_key: None,
+            #[cfg(feature = "fanta-gpui-ui")]
+            asset_thumbnails: AssetThumbnails::default(),
             #[cfg(feature = "fanta-gpui-ui")]
             file_inspector: None,
             #[cfg(feature = "fanta-gpui-ui")]
@@ -1163,8 +1167,48 @@ impl Render for FantaDesignPanel {
     }
 }
 
+/// Small previews of the project's raster images for the assets panel. GPUI
+/// decodes an image at its full size to draw it at any size, so showing each
+/// asset itself in a 42-point row kept a full-resolution decode (and texture)
+/// of every image the panel had shown.
 #[cfg(feature = "fanta-gpui-ui")]
-fn project_assets_view_data(document: &FigDocument, editable: bool) -> AssetsViewData {
+#[derive(Default)]
+struct AssetThumbnails {
+    document: Option<DocId>,
+    images: std::collections::HashMap<AssetId, Arc<gpui::Image>>,
+    /// Images that could not be decoded; their rows keep the kind's icon.
+    unavailable: HashSet<AssetId>,
+    task: Option<gpui::Task<()>>,
+}
+
+/// Longest side of an asset preview: the assets panel draws them in 42-point
+/// squares, so this stays sharp up to 3× displays.
+#[cfg(feature = "fanta-gpui-ui")]
+const ASSET_THUMBNAIL_PIXELS: u32 = 128;
+
+#[cfg(feature = "fanta-gpui-ui")]
+fn asset_thumbnail(source: &gpui::Image) -> Option<Arc<gpui::Image>> {
+    let decoded = image::load_from_memory(&source.bytes).ok()?;
+    let thumbnail = decoded.thumbnail(ASSET_THUMBNAIL_PIXELS, ASSET_THUMBNAIL_PIXELS);
+    let mut png = Vec::new();
+    thumbnail
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .ok()?;
+    Some(Arc::new(gpui::Image::from_bytes(
+        gpui::ImageFormat::Png,
+        png,
+    )))
+}
+
+/// The assets panel's rows, plus the raster images whose previews are not
+/// made yet: each with the asset its preview is stored under and its source.
+#[cfg(feature = "fanta-gpui-ui")]
+fn project_assets_view_data(
+    document: &FigDocument,
+    editable: bool,
+    thumbnails: &AssetThumbnails,
+) -> (AssetsViewData, Vec<(AssetId, Arc<gpui::Image>)>) {
+    let mut missing_thumbnails = Vec::new();
     let pages = document
         .pages
         .iter()
@@ -1253,15 +1297,22 @@ fn project_assets_view_data(document: &FigDocument, editable: bool) -> AssetsVie
             .map(str::to_owned)
             .unwrap_or_else(|| format!("{} {}", asset_kind.label(), index + 1));
         let mut row = AssetRow::new(asset_id.to_string(), label, asset_kind);
-        row.thumbnail = document
-            .gpui_images
-            .get(&asset_id)
-            .or_else(|| {
-                video_previews
-                    .get(&asset_id)
-                    .and_then(|poster| document.gpui_images.get(poster))
+        let preview = document.gpui_images.get_key_value(&asset_id).or_else(|| {
+            video_previews
+                .get(&asset_id)
+                .and_then(|poster| document.gpui_images.get_key_value(poster))
+        });
+        row.thumbnail = preview
+            .and_then(|(source_asset, source)| {
+                if source.format == gpui::ImageFormat::Svg {
+                    return Some(source.clone());
+                }
+                let thumbnail = thumbnails.images.get(source_asset).cloned();
+                if thumbnail.is_none() && !thumbnails.unavailable.contains(source_asset) {
+                    missing_thumbnails.push((*source_asset, source.clone()));
+                }
+                thumbnail
             })
-            .cloned()
             .map(|image| AssetThumbnail::new(asset_id.to_string(), image));
         row.detail = bytes
             .map(|bytes| {
@@ -1291,11 +1342,14 @@ fn project_assets_view_data(document: &FigDocument, editable: bool) -> AssetsVie
         assets.push(row);
     }
     assets.sort_by(|left, right| left.label.as_ref().cmp(right.label.as_ref()));
-    AssetsViewData {
-        assets,
-        pages,
-        selected_page_id,
-    }
+    (
+        AssetsViewData {
+            assets,
+            pages,
+            selected_page_id,
+        },
+        missing_thumbnails,
+    )
 }
 
 #[cfg(feature = "fanta-gpui-ui")]
@@ -1332,7 +1386,7 @@ impl FantaDesignPanel {
         let Some(panel) = &self.gpui_assets else {
             return;
         };
-        let (key, data) = {
+        let (key, data, missing_thumbnails) = {
             let view = view.read(cx);
             let item = view.item().read(cx);
             let Some(document) = item.document() else {
@@ -1349,13 +1403,65 @@ impl FantaDesignPanel {
             if self.asset_echo_key == Some(key) {
                 return;
             }
-            (
-                key,
-                project_assets_view_data(document, item.is_editable() && !self.inspecting),
-            )
+            if self.asset_thumbnails.document != Some(document.doc.id) {
+                self.asset_thumbnails = AssetThumbnails {
+                    document: Some(document.doc.id),
+                    ..AssetThumbnails::default()
+                };
+            }
+            let (data, missing_thumbnails) = project_assets_view_data(
+                document,
+                item.is_editable() && !self.inspecting,
+                &self.asset_thumbnails,
+            );
+            (key, data, missing_thumbnails)
         };
         panel.update(cx, |panel, cx| panel.set_view_data(data, window, cx));
         self.asset_echo_key = Some(key);
+        self.make_asset_thumbnails(missing_thumbnails, window, cx);
+    }
+
+    /// Make the missing previews in the background, then show them.
+    fn make_asset_thumbnails(
+        &mut self,
+        missing: Vec<(AssetId, Arc<gpui::Image>)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if missing.is_empty() || self.asset_thumbnails.task.is_some() {
+            return;
+        }
+        let document = self.asset_thumbnails.document;
+        self.asset_thumbnails.task = Some(cx.spawn_in(window, async move |this, cx| {
+            let made = cx
+                .background_spawn(async move {
+                    missing
+                        .into_iter()
+                        .map(|(asset, source)| (asset, asset_thumbnail(&source)))
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update_in(cx, |this, window, cx| {
+                let thumbnails = &mut this.asset_thumbnails;
+                thumbnails.task = None;
+                if thumbnails.document != document {
+                    return;
+                }
+                for (asset, thumbnail) in made {
+                    match thumbnail {
+                        Some(thumbnail) => {
+                            thumbnails.images.insert(asset, thumbnail);
+                        }
+                        None => {
+                            thumbnails.unavailable.insert(asset);
+                        }
+                    }
+                }
+                this.asset_echo_key = None;
+                this.refresh_gpui_assets(window, cx);
+            })
+            .log_err();
+        }));
     }
 
     fn handle_assets_action(
@@ -1813,6 +1919,27 @@ mod tests {
                 .expect_err("a component cannot contain an instance of itself"),
             LayerDropError::RecursiveComponentInstance
         );
+    }
+
+    #[cfg(feature = "fanta-gpui-ui")]
+    #[test]
+    fn asset_thumbnails_are_small_and_keep_the_image_aspect() -> Result<()> {
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1000,
+            500,
+            image::Rgba([10, 20, 30, 255]),
+        ))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
+        let source = gpui::Image::from_bytes(gpui::ImageFormat::Png, png);
+        let thumbnail = asset_thumbnail(&source).ok_or_else(|| anyhow::anyhow!("no thumbnail"))?;
+        assert_eq!(thumbnail.format, gpui::ImageFormat::Png);
+        let decoded = image::load_from_memory(&thumbnail.bytes)?;
+        assert_eq!((decoded.width(), decoded.height()), (128, 64));
+
+        let junk = gpui::Image::from_bytes(gpui::ImageFormat::Png, vec![1, 2, 3]);
+        assert!(asset_thumbnail(&junk).is_none());
+        Ok(())
     }
 }
 

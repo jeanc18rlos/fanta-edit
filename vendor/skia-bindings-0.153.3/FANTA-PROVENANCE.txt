@@ -32,6 +32,13 @@ factory for SkExecutor::MakeMultiListFIFOThreadPool, so a Graphite
 ContextOptions::fExecutor can compile pipelines on worker threads instead of
 inline inside Recorder::snap. The caller owns the pool and keeps it alive for
 every Context configured with it.
+src/graphite.cpp also exports the Context and Recorder memory controls that
+skia-safe does not wrap: freeGpuResources, performDeferredCleanup,
+currentBudgetedBytes, currentPurgeableBytes, maxBudgetedBytes and
+setMaxBudgetedBytes, plus C_Recorder_fantaImageProviderBytes and
+C_Recorder_setFantaImageProviderMaximumBytes, which report and lower the
+provider's retained-texture byte cap (512 MiB unless lowered) for a recorder
+created through C_Context_makeRecorder.
 The synchronous readback shim keeps asynchronous result state alive through heap
 shared ownership. Its callback never retains or writes the caller's buffer, so a
 failed submit or bounded completion timeout cannot leave a dangling callback.

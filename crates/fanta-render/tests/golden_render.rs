@@ -231,7 +231,7 @@ fn render_scene() -> Vec<u8> {
             }
         })
         .collect();
-    let decoded = fanta_render::asset::DecodedImage::new(Arc::new(px), 4, 4);
+    let decoded = fanta_render::asset::DecodedImage::new(&px, 4, 4);
     let image_asset = AssetId::new();
     let mut resolver = InMemoryAssetResolver::new();
     resolver.insert(image_asset, decoded);

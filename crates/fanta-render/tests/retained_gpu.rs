@@ -213,9 +213,9 @@ fn fixture(instance: bool, scale: f32, transparent: bool) -> TestResult<ProbeCas
     resolver.insert(
         asset,
         DecodedImage::new(
-            Arc::new(vec![
+            &[
                 255, 80, 0, 255, 0, 210, 80, 180, 0, 70, 255, 80, 255, 255, 255, 255,
-            ]),
+            ],
             2,
             2,
         ),

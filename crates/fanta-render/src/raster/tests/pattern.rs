@@ -278,10 +278,11 @@ fn a_reused_resolver_can_finish_decoding_pattern_images_and_clear_uploaded_asset
     );
     assert_eq!(renderer.image_cache_len(), 0);
 
-    resolver.0.lock().expect("asset resolver lock").insert(
-        asset,
-        DecodedImage::new(Arc::new(vec![0, 255, 0, 255]), 1, 1),
-    );
+    resolver
+        .0
+        .lock()
+        .expect("asset resolver lock")
+        .insert(asset, DecodedImage::new(&[0, 255, 0, 255], 1, 1));
     renderer.set_asset_resolver(resolver.clone());
     let decoded = renderer.render(&doc.scene, &doc.viewport);
     assert!(!decoded.incomplete_artwork);

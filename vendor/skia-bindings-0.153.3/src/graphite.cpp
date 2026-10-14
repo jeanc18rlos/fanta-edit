@@ -127,14 +127,11 @@ public:
             return nullptr;
         }
         const size_t bytes = texture->textureSize();
-        if (bytes == 0 || bytes > kMaximumBytes) {
+        if (bytes == 0 || bytes > fMaximumBytes) {
             return texture;
         }
-        while (fRecent.size() >= kMaximumImages || fBytes > kMaximumBytes - bytes) {
-            auto& oldest = fRecent.back();
-            fBytes -= oldest.fBytes;
-            fImages.erase(oldest.fKey);
-            fRecent.pop_back();
+        while (fRecent.size() >= kMaximumImages || fBytes > fMaximumBytes - bytes) {
+            this->evictOldest();
         }
         fRecent.push_front({key, texture, bytes});
         fImages.emplace(key, fRecent.begin());
@@ -143,6 +140,17 @@ public:
     }
 
     bool conversionFailed() const { return fConversionFailed; }
+
+    size_t bytes() const { return fBytes; }
+
+    // Textures are only dropped from this cache; the recorder's resource cache
+    // decides when their GPU memory is actually released.
+    void setMaximumBytes(size_t bytes) {
+        fMaximumBytes = bytes;
+        while (!fRecent.empty() && fBytes > fMaximumBytes) {
+            this->evictOldest();
+        }
+    }
 
     void discardRecording() {
         // Cached textures may depend on uploads in the discarded recording.
@@ -158,8 +166,16 @@ private:
         sk_sp<SkImage> fImage;
         size_t fBytes;
     };
+
+    void evictOldest() {
+        auto& oldest = fRecent.back();
+        fBytes -= oldest.fBytes;
+        fImages.erase(oldest.fKey);
+        fRecent.pop_back();
+    }
+
     static constexpr size_t kMaximumImages = 512;
-    static constexpr size_t kMaximumBytes = 512 * (size_t{1} << 20);
+    size_t fMaximumBytes = 512 * (size_t{1} << 20);
     std::list<Entry> fRecent;
     std::unordered_map<uint64_t, std::list<Entry>::iterator> fImages;
     size_t fBytes = 0;
@@ -206,6 +222,30 @@ extern "C" void C_Context_deleteBackendTexture(skgpu::graphite::Context* self, c
 
 extern "C" bool C_Context_isDeviceLost(const skgpu::graphite::Context* self) {
     return self->isDeviceLost();
+}
+
+extern "C" void C_Context_freeGpuResources(skgpu::graphite::Context* self) {
+    self->freeGpuResources();
+}
+
+extern "C" void C_Context_performDeferredCleanup(skgpu::graphite::Context* self, int64_t msNotUsed) {
+    self->performDeferredCleanup(std::chrono::milliseconds(msNotUsed));
+}
+
+extern "C" size_t C_Context_currentBudgetedBytes(const skgpu::graphite::Context* self) {
+    return self->currentBudgetedBytes();
+}
+
+extern "C" size_t C_Context_currentPurgeableBytes(const skgpu::graphite::Context* self) {
+    return self->currentPurgeableBytes();
+}
+
+extern "C" size_t C_Context_maxBudgetedBytes(const skgpu::graphite::Context* self) {
+    return self->maxBudgetedBytes();
+}
+
+extern "C" void C_Context_setMaxBudgetedBytes(skgpu::graphite::Context* self, size_t bytes) {
+    self->setMaxBudgetedBytes(bytes);
 }
 
 // skgpu::graphite::Context is owned via std::unique_ptr (Context::MakeMetal etc.
@@ -370,6 +410,46 @@ extern "C" SkCanvas* C_Recorder_makeDeferredCanvas(skgpu::graphite::Recorder* se
 
 extern "C" skgpu::BackendApi C_Recorder_backend(const skgpu::graphite::Recorder* self) {
     return self->backend();
+}
+
+extern "C" void C_Recorder_freeGpuResources(skgpu::graphite::Recorder* self) {
+    self->freeGpuResources();
+}
+
+extern "C" void C_Recorder_performDeferredCleanup(skgpu::graphite::Recorder* self, int64_t msNotUsed) {
+    self->performDeferredCleanup(std::chrono::milliseconds(msNotUsed));
+}
+
+extern "C" size_t C_Recorder_currentBudgetedBytes(const skgpu::graphite::Recorder* self) {
+    return self->currentBudgetedBytes();
+}
+
+extern "C" size_t C_Recorder_currentPurgeableBytes(const skgpu::graphite::Recorder* self) {
+    return self->currentPurgeableBytes();
+}
+
+extern "C" size_t C_Recorder_maxBudgetedBytes(const skgpu::graphite::Recorder* self) {
+    return self->maxBudgetedBytes();
+}
+
+extern "C" void C_Recorder_setMaxBudgetedBytes(skgpu::graphite::Recorder* self, size_t bytes) {
+    self->setMaxBudgetedBytes(bytes);
+}
+
+// Bytes of converted image textures Fanta's provider retains for this
+// recorder, or 0 when the recorder uses a caller-provided provider.
+extern "C" size_t C_Recorder_fantaImageProviderBytes(skgpu::graphite::Recorder* self) {
+    auto found = fantaProviders.find(self);
+    return found == fantaProviders.end() ? 0 : found->second->bytes();
+}
+
+// Caps the converted image textures Fanta's provider retains for this
+// recorder, evicting least recently used ones above the new cap.
+extern "C" void C_Recorder_setFantaImageProviderMaximumBytes(skgpu::graphite::Recorder* self, size_t bytes) {
+    auto found = fantaProviders.find(self);
+    if (found != fantaProviders.end()) {
+        found->second->setMaximumBytes(bytes);
+    }
 }
 
 // skgpu::graphite::Recorder is owned via std::unique_ptr (Context::makeRecorder
