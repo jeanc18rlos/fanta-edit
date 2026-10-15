@@ -313,8 +313,8 @@ mod tests {
             choices,
             vec![
                 SharedString::from("Arial"),
-                SharedString::from("Inter"),
                 SharedString::from("Fanta Sans"),
+                SharedString::from("Inter"),
             ]
         );
     }
