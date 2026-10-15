@@ -17800,7 +17800,6 @@ dependencies = [
  "fanta-gpui-zlog",
  "fanta-gpui-ztracing",
  "fanta_languages",
- "fanta_revenuecat",
  "feature_flags",
  "fig_viewer",
  "fs",
