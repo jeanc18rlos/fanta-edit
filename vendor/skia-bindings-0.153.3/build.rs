@@ -60,7 +60,7 @@ fn main() -> Result<(), io::Error> {
                 "Fanta's Graphite image provider is absent from upstream prebuilt binaries; FORCE_SKIA_BINARIES_DOWNLOAD is incompatible",
             ));
         }
-        println!("COMPILING FANTA GRAPHITE IMAGE PROVIDER FROM SOURCE");
+        println!("FANTA GRAPHITE IMAGE PROVIDER: UPSTREAM PREBUILT BINARIES DISABLED");
     }
 
     let binaries_config =
@@ -298,6 +298,7 @@ mod env {
 #[cfg(feature = "binary-cache")]
 mod fanta_binary_cache {
     use std::{
+        collections::BTreeMap,
         fs, io,
         path::{Path, PathBuf},
         process::Command,
@@ -320,7 +321,6 @@ mod fanta_binary_cache {
     const ENVIRONMENT_INPUTS: &[&str] = &[
         "OPT_LEVEL",
         "DEBUG",
-        "CARGO_ENCODED_RUSTFLAGS",
         "CLANGCC",
         "CLANGCXX",
         "CRATE_CC_NO_DEFAULTS",
@@ -348,6 +348,29 @@ mod fanta_binary_cache {
     /// and reruns this script when their locked versions change, so the key only needs to read
     /// those versions.
     const BUILD_DEPENDENCY_INPUTS: &[&str] = &["bindgen", "cc", "clang-sys"];
+
+    /// The `-C`/`-Z` rustflags that cc-rs turns into C++ flags for the shim (`cc/src/flags.rs`).
+    /// No other rustflag reaches the native outputs. Hashing all of them would split the cache by
+    /// location: cargo joins `build.rustflags` from every ancestor `.cargo/config.toml`, so a
+    /// worktree nested in another checkout sees the flags twice.
+    const INHERITED_RUSTFLAGS: &[&str] = &[
+        "branch-protection",
+        "code-model",
+        "control-flow-guard",
+        "dwarf-version",
+        "embed-bitcode",
+        "force-frame-pointers",
+        "linker-plugin-lto",
+        "lto",
+        "no-redzone",
+        "no-vectorize-loops",
+        "no-vectorize-slp",
+        "profile-generate",
+        "profile-use",
+        "relocation-model",
+        "soft-float",
+        "stack-protector",
+    ];
 
     pub struct Entry {
         directory: PathBuf,
@@ -483,6 +506,15 @@ mod fanta_binary_cache {
                 hasher.write(value.as_bytes());
             }
         }
+        if let Some(encoded_rustflags) = cargo::env_var("CARGO_ENCODED_RUSTFLAGS") {
+            let flags = inherited_rustflags(&encoded_rustflags);
+            if !flags.is_empty() {
+                hasher.write(b"CARGO_ENCODED_RUSTFLAGS");
+                for flag in flags {
+                    hasher.write(flag.as_bytes());
+                }
+            }
+        }
         if let Some(gn_args) = cargo::env_var("SKIA_GN_ARGS") {
             let gn_args = gn_args
                 .split_whitespace()
@@ -529,6 +561,57 @@ mod fanta_binary_cache {
             binaries_config.key(repository_short_hash),
             hasher.finish()
         ))
+    }
+
+    /// The effective `INHERITED_RUSTFLAGS` in `CARGO_ENCODED_RUSTFLAGS`, tokenized like cc-rs. As
+    /// in cc-rs, a later occurrence of a flag overrides an earlier one, so flags that cargo
+    /// duplicated give the same result.
+    fn inherited_rustflags(encoded_rustflags: &str) -> Vec<String> {
+        // Prefixes that take the next argument as their value, as cc-rs lists them.
+        const SEPARATE_PREFIXES: &[&str] = &[
+            "-C",
+            "--codegen",
+            "-Z",
+            "-L",
+            "-l",
+            "-o",
+            "-W",
+            "--warn",
+            "-A",
+            "--allow",
+            "-D",
+            "--deny",
+            "-F",
+            "--forbid",
+        ];
+
+        let mut effective_values = BTreeMap::new();
+        let mut separate_prefix = None;
+        for argument in encoded_rustflags.split('\u{1f}') {
+            let option = match separate_prefix.take() {
+                Some("-C" | "--codegen" | "-Z") => Some(argument),
+                Some(_) => None,
+                None if SEPARATE_PREFIXES.contains(&argument) => {
+                    separate_prefix = Some(argument);
+                    continue;
+                }
+                None => argument
+                    .strip_prefix("--codegen=")
+                    .or_else(|| argument.strip_prefix("-C"))
+                    .or_else(|| argument.strip_prefix("-Z")),
+            };
+            let Some(option) = option else {
+                continue;
+            };
+            let (name, value) = option.split_once('=').unwrap_or((option, ""));
+            if INHERITED_RUSTFLAGS.contains(&name) {
+                effective_values.insert(name, value);
+            }
+        }
+        effective_values
+            .into_iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect()
     }
 
     /// Every locked version of `BUILD_DEPENDENCY_INPUTS`, read from the lockfile of the workspace
