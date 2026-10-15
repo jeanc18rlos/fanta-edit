@@ -82,6 +82,10 @@ jobs:
             xcrun -sdk macosx --find metallib
           } 2>&1 | tee "${RUNNER_TEMP}/fanta-lint/toolchain.log"
 
+      - uses: ./.github/actions/prepare-skia-source
+        with:
+          offline: 'true'
+
       - name: Lint the release editor and engine crates
         run: |
           ./script/verify-fanta-release --stage lint \

@@ -40,6 +40,10 @@ jobs:
         with:
           shared-key: macos-check
 
+      - uses: ./.github/actions/prepare-skia-source
+        with:
+          offline: 'true'
+
       - name: Check licenses
         run: ./script/check-licenses
 
@@ -216,6 +220,10 @@ jobs:
         with:
           shared-key: macos-check
 
+      - uses: ./.github/actions/prepare-skia-source
+        with:
+          offline: 'true'
+
       - name: Check the Mac App Store feature build
         run: cargo check --locked -p fanta --features mac_app_store
 
@@ -299,6 +307,10 @@ jobs:
       - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
         with:
           shared-key: macos-check
+
+      - uses: ./.github/actions/prepare-skia-source
+        with:
+          offline: 'true'
 
       - name: Test native Agent request limits
         if: ${{ !cancelled() && steps.evidence.outcome == 'success' }}
@@ -469,6 +481,9 @@ jobs:
           persist-credentials: false
       - name: Install the repository Rust toolchain
         run: rustup show active-toolchain
+      - uses: ./.github/actions/prepare-skia-source
+        with:
+          offline: 'true'
       - name: Test canvas video rendering
         id: native-library
         run: cargo test --locked -p fanta-render --lib live_video_
