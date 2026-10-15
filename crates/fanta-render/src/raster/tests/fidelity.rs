@@ -148,7 +148,7 @@ fn tile_scale_draws_tiles_at_natural_times_scale() {
     ];
     let mut resolver = InMemoryAssetResolver::new();
     let asset = fanta_doc::AssetId::new();
-    resolver.insert(asset, DecodedImage::new(StdArc::new(px), 2, 2));
+    resolver.insert(asset, DecodedImage::new(&px, 2, 2));
     let resolver = StdArc::new(resolver);
 
     let pixel_at = |scale: Option<f32>| -> [u8; 4] {
@@ -192,7 +192,7 @@ fn image_rotation_quarter_turns_the_fill() {
     let px: Vec<u8> = vec![255, 0, 0, 255, 0, 0, 255, 255];
     let mut resolver = InMemoryAssetResolver::new();
     let asset = fanta_doc::AssetId::new();
-    resolver.insert(asset, DecodedImage::new(StdArc::new(px), 2, 1));
+    resolver.insert(asset, DecodedImage::new(&px, 2, 1));
     let resolver = StdArc::new(resolver);
 
     let render = |rotation: Option<f32>| -> Vec<u8> {

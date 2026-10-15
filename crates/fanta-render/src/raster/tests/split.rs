@@ -630,9 +630,9 @@ fn split_requires_decoded_assets_and_preserves_bitmap_pixels() {
     resolver.insert(
         asset,
         crate::DecodedImage::new(
-            Arc::new(vec![
+            &[
                 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 128, 255, 255, 0, 200,
-            ]),
+            ],
             2,
             2,
         ),
@@ -707,7 +707,7 @@ fn split_frozen_assets_do_not_follow_async_resolver_changes_between_phases() {
         tint: None,
     });
     let resolver = Arc::new(Resolver(std::sync::Mutex::new(crate::DecodedImage::new(
-        Arc::new(vec![240, 20, 30, 255]),
+        &[240, 20, 30, 255],
         1,
         1,
     ))));
@@ -755,7 +755,7 @@ fn split_frozen_assets_do_not_follow_async_resolver_changes_between_phases() {
     };
     let before_resolver_change = render_phases(&mut renderer);
     *resolver.0.lock().expect("resolver lock") =
-        crate::DecodedImage::new(Arc::new(vec![20, 240, 30, 255]), 1, 1);
+        crate::DecodedImage::new(&[20, 240, 30, 255], 1, 1);
     let after_resolver_change = render_phases(&mut renderer);
     assert!(
         before_resolver_change == after_resolver_change,
@@ -1458,9 +1458,9 @@ fn split_ancestor_gradient_and_decoded_image_backgrounds_match_full_render() {
         fn resolve(&self, id: fanta_doc::AssetId) -> Option<crate::DecodedImage> {
             (id == self.0).then(|| {
                 crate::DecodedImage::new(
-                    Arc::new(vec![
+                    &[
                         240, 30, 20, 255, 20, 200, 80, 180, 30, 40, 210, 120, 180, 150, 30, 255,
-                    ]),
+                    ],
                     2,
                     2,
                 )
@@ -2677,7 +2677,7 @@ fn split_whole_instances_freeze_nested_bitmap_assets_between_phases() {
         -10.0,
     );
     let resolver = Arc::new(Resolver(std::sync::Mutex::new(crate::DecodedImage::new(
-        Arc::new(vec![240, 20, 30, 255]),
+        &[240, 20, 30, 255],
         1,
         1,
     ))));
@@ -2711,8 +2711,7 @@ fn split_whole_instances_freeze_nested_bitmap_assets_between_phases() {
     };
     let initial = render(&mut renderer);
     assert_eq!(rgba_at(&initial, WIDTH, 96, 80), [240, 20, 30, 255]);
-    *resolver.0.lock().expect("resolver") =
-        crate::DecodedImage::new(Arc::new(vec![20, 240, 30, 255]), 1, 1);
+    *resolver.0.lock().expect("resolver") = crate::DecodedImage::new(&[20, 240, 30, 255], 1, 1);
     assert_eq!(render(&mut renderer), initial);
     let mut fresh = RasterRenderer::new(WIDTH, HEIGHT).expect("fresh renderer");
     fresh.set_asset_resolver(resolver);
@@ -3931,7 +3930,7 @@ fn retained_translations_validate_asset_pixel_identity_even_with_the_same_resolv
         -20.0,
         -15.0,
     );
-    let original = crate::DecodedImage::new(Arc::new(vec![230, 20, 80, 255]), 1, 1);
+    let original = crate::DecodedImage::new(&[230, 20, 80, 255], 1, 1);
     let resolver = Arc::new(Resolver {
         image: Mutex::new(Some(original)),
     });
@@ -3963,11 +3962,8 @@ fn retained_translations_validate_asset_pixel_identity_even_with_the_same_resolv
         &viewport,
         Some(resolver.as_ref()),
     );
-    *resolver.image.lock().expect("resolver") = Some(crate::DecodedImage::new(
-        Arc::new(vec![20, 230, 80, 255]),
-        1,
-        1,
-    ));
+    *resolver.image.lock().expect("resolver") =
+        Some(crate::DecodedImage::new(&[20, 230, 80, 255], 1, 1));
     assert!(
         matches!(session.render(&mut renderer,&doc.scene,&viewport,&RenderInputs::for_doc(&doc),Some(resolver.as_ref()),0),Err(RetainedError::ChangedAsset(id)) if id==asset)
     );

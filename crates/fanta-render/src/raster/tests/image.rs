@@ -12,7 +12,7 @@ fn solid_resolver(rgba: [u8; 4]) -> (Arc<crate::asset::InMemoryAssetResolver>, f
     for _ in 0..4 {
         px.extend_from_slice(&rgba);
     }
-    let img = DecodedImage::new(Arc::new(px), 2, 2);
+    let img = DecodedImage::new(&px, 2, 2);
     let mut res = InMemoryAssetResolver::new();
     let id = fanta_doc::AssetId::new();
     res.insert(id, img);
@@ -198,7 +198,7 @@ fn quad_resolver() -> (Arc<crate::asset::InMemoryAssetResolver>, fanta_doc::Asse
         0, 0, 255, 255, // (0,1) blue
         255, 255, 255, 255, // (1,1) white
     ];
-    let img = DecodedImage::new(Arc::new(px), 2, 2);
+    let img = DecodedImage::new(&px, 2, 2);
     let mut res = InMemoryAssetResolver::new();
     let id = fanta_doc::AssetId::new();
     res.insert(id, img);

@@ -892,11 +892,10 @@ mod tests {
         let source = image::load_from_memory(encoded)?.to_rgba8();
         assert_eq!(source.dimensions(), (320, 180));
         let asset: AssetId = "a_01M455JDQQ9YXJBQBZ37RX7D59".parse()?;
-        let pixels = Arc::new(source.as_raw().clone());
         let mut resolver = InMemoryAssetResolver::new();
         assert!(
             resolver
-                .insert(asset, DecodedImage::new(Arc::clone(&pixels), 320, 180))
+                .insert(asset, DecodedImage::new(source.as_raw(), 320, 180))
                 .is_none()
         );
         let resolver = Arc::new(resolver);
@@ -926,7 +925,7 @@ mod tests {
         std::fs::write(&existing, b"existing export must survive")?;
         let batch = prepare_export_jobs(
             &doc,
-            Some(resolver),
+            Some(resolver.clone()),
             None,
             directory.path().to_path_buf(),
             &[
@@ -1000,7 +999,12 @@ mod tests {
             assert!(checked_pixels.contains(&original_failure));
         }
         assert_eq!(serde_json::to_value(&doc)?, original_document);
-        assert_eq!(pixels.as_ref(), source.as_raw());
+        assert_eq!(
+            AssetResolver::resolve(resolver.as_ref(), asset)
+                .context("the exported asset resolves")?
+                .pixels(),
+            source.as_raw().as_slice()
+        );
         assert_eq!(std::fs::read(&existing)?, b"existing export must survive");
         let mut actual_paths = std::fs::read_dir(&exports)?
             .map(|entry| entry.map(|entry| entry.path()))

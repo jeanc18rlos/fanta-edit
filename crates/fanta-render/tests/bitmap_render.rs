@@ -31,7 +31,7 @@ fn solid_image(w: u32, h: u32, rgba: [u8; 4]) -> DecodedImage {
     for _ in 0..(w * h) {
         px.extend_from_slice(&rgba);
     }
-    DecodedImage::new(Arc::new(px), w, h)
+    DecodedImage::new(&px, w, h)
 }
 
 /// A 2×1 image: left column `left`, right column `right`. Useful to prove the
@@ -40,7 +40,7 @@ fn two_column_image(left: [u8; 4], right: [u8; 4]) -> DecodedImage {
     let mut px = Vec::with_capacity(2 * 4);
     px.extend_from_slice(&left);
     px.extend_from_slice(&right);
-    DecodedImage::new(Arc::new(px), 2, 1)
+    DecodedImage::new(&px, 2, 1)
 }
 
 /// Build a resolver holding a single asset and return `(resolver, id)`.
@@ -153,7 +153,7 @@ fn no_resolver_installed_renders_placeholder() {
 fn malformed_buffer_falls_back_to_placeholder() {
     // Buffer length does not match width*height*4 → the renderer must not hand
     // it to Skia; it falls back to the placeholder.
-    let bad = DecodedImage::new(Arc::new(vec![255u8; 7]), 4, 4);
+    let bad = DecodedImage::new(&[255u8; 7], 4, 4);
     let (resolver, id) = resolver_with(bad);
     let mut doc = Doc::new();
     doc.apply(Operation::create_node(bitmap_node(

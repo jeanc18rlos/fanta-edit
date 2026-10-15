@@ -326,10 +326,7 @@ fn decode_assets(assets: HashMap<fanta_doc::AssetId, Vec<u8>>) -> InMemoryAssetR
             Ok(image) => {
                 let rgba = image.to_rgba8();
                 let (width, height) = rgba.dimensions();
-                resolver.insert(
-                    asset_id,
-                    DecodedImage::new(Arc::new(rgba.into_raw()), width, height),
-                );
+                resolver.insert(asset_id, DecodedImage::new(&rgba.into_raw(), width, height));
             }
             Err(error) => {
                 eprintln!("skipping undecodable image asset {asset_id}: {error:#}");

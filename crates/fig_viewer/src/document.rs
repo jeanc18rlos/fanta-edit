@@ -504,9 +504,8 @@ pub struct FigDocument {
     /// document swap. Unlike `render_generation` it does NOT move for a drag
     /// or text-edit preview frame.
     variables_generation: u64,
-    /// Page roots whose images have been (or are being) decoded ahead of
-    /// their first frame; each page is prewarmed once per document.
-    prewarmed_pages: HashSet<NodeId>,
+    /// The images each activated page draws, found by walking the page once.
+    page_image_assets: HashMap<NodeId, Arc<[AssetId]>>,
 }
 
 struct CachedAssetPresentation {
@@ -520,7 +519,7 @@ struct CachedAssetPresentation {
 /// [`FigDocument::take_page_prewarm`] to run off the UI thread.
 pub(crate) struct PagePrewarm {
     resolver: Arc<LazyAssetResolver>,
-    assets: Vec<AssetId>,
+    assets: Arc<[AssetId]>,
 }
 
 impl PagePrewarm {
@@ -795,7 +794,7 @@ impl FigDocument {
             agent_asset_overlay,
             render_generation: 0,
             variables_generation: next_variables_generation(),
-            prewarmed_pages: HashSet::new(),
+            page_image_assets: HashMap::new(),
         }
     }
 
@@ -826,7 +825,7 @@ impl FigDocument {
 
     /// Decode the images the opening page draws, so its first frame does not
     /// stall on decodes. Runs on the background load thread; every other
-    /// page's images are prewarmed when the page is first activated (see
+    /// page's images are prewarmed when the page is activated (see
     /// [`Self::take_page_prewarm`]).
     pub(crate) fn prewarm_default_page_assets(&mut self) {
         let Some(page_root) = self
@@ -843,17 +842,21 @@ impl FigDocument {
         }
     }
 
-    /// The decode work for `page_root`'s images the first time that page is
-    /// activated, or `None` when the page was already prewarmed (or there are
-    /// no embedded assets). Without this, a page switch decodes every image
-    /// the page draws serially inside its first frame on the render thread.
-    /// The caller runs the result on a background thread.
+    /// The decode work for `page_root`'s images when that page is activated,
+    /// or `None` when it draws no embedded image. Without this, a page switch
+    /// decodes every image the page draws serially inside its first frame on
+    /// the render thread. The caller runs the result on a background thread.
+    ///
+    /// Returned on every activation: the decode cache is bounded, so a page
+    /// opened again may have lost images to pages opened since, and decodes
+    /// that are still cached are skipped.
     pub(crate) fn take_page_prewarm(&mut self, page_root: NodeId) -> Option<PagePrewarm> {
         let resolver = self.embedded_assets.clone()?;
-        if !self.prewarmed_pages.insert(page_root) {
-            return None;
-        }
-        let assets = page_image_assets(&self.doc, page_root);
+        let assets = self
+            .page_image_assets
+            .entry(page_root)
+            .or_insert_with(|| page_image_assets(&self.doc, page_root).into())
+            .clone();
         if assets.is_empty() {
             return None;
         }
@@ -1188,8 +1191,8 @@ impl FigDocument {
         }
         self.solved_pages
             .retain(|root| self.doc.scene.contains(*root));
-        self.prewarmed_pages
-            .retain(|root| self.doc.scene.contains(*root));
+        self.page_image_assets
+            .retain(|root, _| self.doc.scene.contains(*root));
         let surviving_selection = self
             .doc
             .selection
@@ -1528,7 +1531,7 @@ impl AssetStores<'_> {
             .added
             .write()
             .unwrap()
-            .insert(id, DecodedImage::new(Arc::new(rgba), width, height));
+            .insert(id, DecodedImage::new(&rgba, width, height));
         *self.asset_resolver = Some(overlay.clone() as Arc<dyn AssetResolver>);
 
         if let Some(format) = format {
@@ -5108,9 +5111,11 @@ pub(crate) fn try_page_bounds(doc: &Doc, page_root: Option<NodeId>) -> Option<fa
 fn decode_embedded_image(asset_id: AssetId, bytes: &[u8]) -> Option<DecodedImage> {
     match image::load_from_memory(bytes) {
         Ok(image) => {
-            let image = image.to_rgba8();
+            // `into_rgba8` moves an RGBA8 decode instead of cloning it, so the
+            // copy into the shared buffer is the only one made.
+            let image = image.into_rgba8();
             let (width, height) = image.dimensions();
-            Some(DecodedImage::new(Arc::new(image.into_raw()), width, height))
+            Some(DecodedImage::new(image.as_raw(), width, height))
         }
         Err(error) => {
             log::warn!("failed to decode embedded .fig image asset {asset_id}: {error}");
@@ -6499,7 +6504,7 @@ mod tests {
                 Arc::new(encoded.clone()),
                 Arc::new(move |_id, _bytes: &[u8]| {
                     decodes.fetch_add(1, Ordering::SeqCst);
-                    Some(DecodedImage::new(Arc::new(vec![0u8; 4]), 1, 1))
+                    Some(DecodedImage::new(&[0u8; 4], 1, 1))
                 }),
             ))
         };
@@ -6508,7 +6513,7 @@ mod tests {
         // runs: nothing will read what it decodes, so it must decode nothing.
         let orphaned = PagePrewarm {
             resolver: build(),
-            assets: assets.clone(),
+            assets: assets.clone().into(),
         };
         orphaned.run();
         assert_eq!(
@@ -6521,7 +6526,7 @@ mod tests {
         let live = build();
         PagePrewarm {
             resolver: live.clone(),
-            assets: assets.clone(),
+            assets: assets.clone().into(),
         }
         .run();
         assert_eq!(decodes.load(Ordering::SeqCst), assets.len());
@@ -6892,7 +6897,9 @@ mod tests {
         let retained_bounds = fanta_doc::Bounds::from_xywh(12.0, 34.0, 56.0, 78.0);
         document.pages.first_mut().expect("first page").bounds = retained_bounds;
         document.solved_pages.extend([first, master]);
-        document.prewarmed_pages.extend([first, master]);
+        document
+            .page_image_assets
+            .extend([(first, Arc::from([])), (master, Arc::from([]))]);
         let index = document.add_page()?.expect("added page");
         let added = document.doc.pages()[index];
         assert_eq!(document.doc.history.next_undo_label(), Some("Add Page"));
@@ -6902,7 +6909,7 @@ mod tests {
         assert!(document.pages[1].hidden);
         assert_eq!(document.pages[0].bounds, retained_bounds);
         assert!(document.solved_pages.contains(&master));
-        assert!(document.prewarmed_pages.contains(&master));
+        assert!(document.page_image_assets.contains_key(&master));
         assert!(!document.sync_page_registry());
         assert!(document.doc.undo()?);
         assert!(document.sync_page_registry());
@@ -7253,7 +7260,7 @@ mod tests {
             .and_then(|resolver| resolver.resolve(poster_id))
             .context("poster resolves immediately")?;
         assert_eq!((pixels.width, pixels.height), (2, 3));
-        assert_eq!(pixels.pixels_rgba.as_slice(), [34, 197, 94, 255].repeat(6));
+        assert_eq!(pixels.pixels(), [34, 197, 94, 255].repeat(6));
         assert!(document.gpui_images.contains_key(&poster_id));
         assert!(document.doc.undo()?);
         assert!(!document.doc.scene.contains(node_id));
@@ -7287,7 +7294,7 @@ mod tests {
             .as_ref()
             .and_then(|resolver| resolver.resolve(poster_id))
             .context("reopened poster")?;
-        assert_eq!(restored_pixels.pixels_rgba, pixels.pixels_rgba);
+        assert_eq!(restored_pixels.pixels(), pixels.pixels());
         Ok(())
     }
 
@@ -7395,7 +7402,7 @@ mod tests {
             .as_ref()
             .and_then(|resolver| resolver.resolve(poster_id))
             .context("reopened poster")?;
-        assert_eq!(pixels.pixels_rgba.as_slice(), [225, 0, 225, 255].repeat(6));
+        assert_eq!(pixels.pixels(), [225, 0, 225, 255].repeat(6));
         fanta_format::write_project_tree(directory.path(), &reopened.doc, &reopened.raw_assets)?;
         let reopened_again = load_project_document(directory.path())?;
         assert_eq!(reopened_again.doc.scene.get(id), Some(&edited));

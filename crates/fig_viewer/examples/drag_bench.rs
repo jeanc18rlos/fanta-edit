@@ -557,10 +557,7 @@ fn decode_assets(assets: HashMap<AssetId, Vec<u8>>) -> (InMemoryAssetResolver, u
             Ok(image) => {
                 let rgba = image.to_rgba8();
                 let (width, height) = rgba.dimensions();
-                resolver.insert(
-                    asset,
-                    DecodedImage::new(Arc::new(rgba.into_raw()), width, height),
-                );
+                resolver.insert(asset, DecodedImage::new(&rgba.into_raw(), width, height));
                 decoded += 1;
             }
             Err(error) => {

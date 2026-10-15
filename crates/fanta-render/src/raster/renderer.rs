@@ -1102,6 +1102,18 @@ impl RasterRenderer {
         self.image_cache.len()
     }
 
+    /// CPU bytes held by the upload cache, pyramid levels included.
+    pub fn image_cache_bytes(&self) -> usize {
+        self.image_cache.retained_bytes()
+    }
+
+    /// Cap the upload cache: past `bytes`, the least recently drawn images are
+    /// dropped and resolved again when next drawn. `None` (the default) keeps
+    /// every image, which suits short-lived renderers.
+    pub fn set_image_cache_budget_bytes(&mut self, bytes: Option<usize>) {
+        self.image_cache.set_budget_bytes(bytes);
+    }
+
     /// Drop every cached uploaded image whose asset id is NOT in `keep`,
     /// returning how many were dropped. Called by the app's asset garbage
     /// collector so an orphaned asset's pixels (this cache holds the single

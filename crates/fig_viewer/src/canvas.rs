@@ -678,6 +678,15 @@ pub(crate) enum GpuFrame {
     },
 }
 
+#[cfg(target_os = "macos")]
+impl GpuFrame {
+    fn buffer(&self) -> &CVPixelBuffer {
+        match self {
+            Self::Fresh(buffer) | Self::Held(buffer) | Self::Reprojected { buffer, .. } => buffer,
+        }
+    }
+}
+
 // ============================================================================
 // Render inputs beyond the scene
 // ============================================================================
@@ -1272,6 +1281,18 @@ enum SkiaGpuBackend {
     Ganesh(gpu::DirectContext),
 }
 
+/// GPU memory a Graphite context's caches hold, in bytes.
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy, Debug, Default)]
+struct GraphiteMemory {
+    context_budgeted: usize,
+    context_purgeable: usize,
+    recorder_budgeted: usize,
+    recorder_purgeable: usize,
+    /// Converted image textures the recorder's image provider retains.
+    image_textures: usize,
+}
+
 /// The process-wide thread pool Graphite contexts compile pipelines on.
 ///
 /// Without an executor, Graphite compiles every pipeline a recording needs
@@ -1355,9 +1376,96 @@ impl SkiaGpuBackend {
             graphite_pipeline_executor();
         let context = graphite::mtl::context_factory::make_metal(&backend, &options)
             .ok_or_else(|| anyhow!("creating Skia Graphite Metal context failed"))?;
-        RetainedGraphiteContext::new(context)
-            .map(Self::Graphite)
-            .map_err(|error| anyhow!("creating Graphite recorder failed: {error:?}"))
+        let mut context = RetainedGraphiteContext::new(context)
+            .map_err(|error| anyhow!("creating Graphite recorder failed: {error:?}"))?;
+        context
+            .with_native(|_, recorder| {
+                use skia_safe::wrapper::PointerWrapper as _;
+                // SAFETY: the recorder is alive for the call, which runs on the
+                // render thread that created it.
+                unsafe {
+                    skia_bindings::C_Recorder_setMaxBudgetedBytes(
+                        recorder.inner_mut(),
+                        Self::GRAPHITE_RECORDER_BUDGET_BYTES,
+                    );
+                    skia_bindings::C_Recorder_setFantaImageProviderMaximumBytes(
+                        recorder.inner_mut(),
+                        Self::GRAPHITE_IMAGE_TEXTURE_BYTES,
+                    );
+                }
+            })
+            .map_err(|error| anyhow!("configuring the Graphite recorder failed: {error:?}"))?;
+        Ok(Self::Graphite(context))
+    }
+
+    /// The recorder's cache budget. Tiles, layers and image uploads the
+    /// renderer let go stay in this cache as purgeable textures until it is
+    /// full, so the budget, not the renderer's own caches, decides how much
+    /// GPU memory a session keeps after navigating. Skia's own default.
+    const GRAPHITE_RECORDER_BUDGET_BYTES: usize = 256 << 20;
+
+    /// Converted image textures the recorder's image provider keeps.
+    const GRAPHITE_IMAGE_TEXTURE_BYTES: usize = 256 << 20;
+
+    /// Releases cached GPU resources nothing has used for `unused_for`;
+    /// resources the renderer still holds are unaffected.
+    fn release_unused_gpu_memory(&mut self, unused_for: Duration) -> Result<()> {
+        match self {
+            Self::Graphite(context) => context
+                .with_native(|context, recorder| {
+                    use skia_safe::wrapper::PointerWrapper as _;
+                    let milliseconds = i64::try_from(unused_for.as_millis()).unwrap_or(i64::MAX);
+                    // SAFETY: the context and recorder are alive for the call,
+                    // which runs on the render thread that created them.
+                    unsafe {
+                        skia_bindings::C_Recorder_performDeferredCleanup(
+                            recorder.inner_mut(),
+                            milliseconds,
+                        );
+                        skia_bindings::C_Context_performDeferredCleanup(
+                            context.inner_mut(),
+                            milliseconds,
+                        );
+                    }
+                })
+                .map_err(|error| anyhow!("releasing Graphite memory failed: {error:?}")),
+            Self::Ganesh(context) => {
+                context.perform_deferred_cleanup(unused_for, None);
+                Ok(())
+            }
+        }
+    }
+
+    fn graphite_memory(&mut self) -> Option<GraphiteMemory> {
+        use skia_safe::wrapper::PointerWrapper as _;
+        let Self::Graphite(context) = self else {
+            return None;
+        };
+        context
+            .with_native(|context, recorder| {
+                // SAFETY: the context and recorder are alive for the call, which
+                // runs on the render thread that created them.
+                unsafe {
+                    GraphiteMemory {
+                        context_budgeted: skia_bindings::C_Context_currentBudgetedBytes(
+                            context.inner(),
+                        ),
+                        context_purgeable: skia_bindings::C_Context_currentPurgeableBytes(
+                            context.inner(),
+                        ),
+                        recorder_budgeted: skia_bindings::C_Recorder_currentBudgetedBytes(
+                            recorder.inner(),
+                        ),
+                        recorder_purgeable: skia_bindings::C_Recorder_currentPurgeableBytes(
+                            recorder.inner(),
+                        ),
+                        image_textures: skia_bindings::C_Recorder_fantaImageProviderBytes(
+                            recorder.inner_mut(),
+                        ),
+                    }
+                }
+            })
+            .ok()
     }
 
     fn finish_pending_work(&mut self) -> Result<()> {
@@ -1927,8 +2035,11 @@ fn render_thread_main(
     jobs: mpsc::Receiver<RenderJob>,
     replies: mpsc::Sender<RenderReply>,
     signal: Arc<WakeSignal>,
+    presentation: Arc<Mutex<PresentationPool>>,
 ) {
-    metal::objc::rc::autoreleasepool(|| render_thread_loop(size, jobs, replies, signal));
+    metal::objc::rc::autoreleasepool(|| {
+        render_thread_loop(size, jobs, replies, signal, presentation)
+    });
 }
 
 #[cfg(target_os = "macos")]
@@ -1937,8 +2048,9 @@ fn render_thread_loop(
     jobs: mpsc::Receiver<RenderJob>,
     replies: mpsc::Sender<RenderReply>,
     signal: Arc<WakeSignal>,
+    presentation: Arc<Mutex<PresentationPool>>,
 ) {
-    let mut renderer = match MacGpuRenderer::new(size) {
+    let mut renderer = match MacGpuRenderer::new(size, presentation.clone()) {
         Ok(renderer) => renderer,
         Err(error) => {
             let _ = replies.send(RenderReply::InitFailed(error));
@@ -1947,7 +2059,25 @@ fn render_thread_loop(
         }
     };
     let mut snapshots = OwnedPageSnapshots::default();
-    while let Ok(job) = jobs.recv() {
+    let mut released_since_last_job = true;
+    loop {
+        let job = if released_since_last_job {
+            match jobs.recv() {
+                Ok(job) => job,
+                Err(_) => break,
+            }
+        } else {
+            match jobs.recv_timeout(MacGpuRenderer::IDLE_RELEASE_DELAY) {
+                Ok(job) => job,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    metal::objc::rc::autoreleasepool(|| renderer.release_idle_gpu_memory());
+                    released_since_last_job = true;
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        };
+        released_since_last_job = false;
         let RenderJob {
             source,
             mut request,
@@ -2047,6 +2177,10 @@ fn render_thread_loop(
                 .is_ok_and(|(_, _, _, _, progress)| progress.cancelled)
                 || (result.is_ok() && request.camera.as_ref().is_some_and(CameraTicket::cancelled))
             {
+                // Its GPU work is complete and nothing ever presented it.
+                if let Ok((buffer, ..)) = result {
+                    lock_pool(&presentation).recycle(buffer);
+                }
                 return RenderReply::Cancelled {
                     key: request.key,
                     perf_tag: request.perf_tag,
@@ -2101,8 +2235,13 @@ struct MacGpuRenderer {
     _command_queue: metal::CommandQueue,
     size: (u32, u32),
     frame_texture_leases: Vec<CVMetalTexture>,
+    frame_target_leases: Vec<metal::Texture>,
     frame_buffer_leases: Vec<CVPixelBuffer>,
     camera_epoch: Option<u64>,
+    presentation: Arc<Mutex<PresentationPool>>,
+    /// Maintenance draws nothing anyone sees; its 1×1 target is reused, since
+    /// every job's GPU work completes before the next one starts.
+    maintenance_target: Option<CVPixelBuffer>,
 }
 
 #[cfg(target_os = "macos")]
@@ -2125,7 +2264,7 @@ impl MacGpuRenderer {
     /// on the sample Design page) plus ~100 MB of cached layers stay resident.
     const GPU_RESOURCE_CACHE_BYTES: usize = 1024 << 20;
 
-    fn new(size: (u32, u32)) -> Result<Self> {
+    fn new(size: (u32, u32), presentation: Arc<Mutex<PresentationPool>>) -> Result<Self> {
         let device = metal::Device::system_default()
             .ok_or_else(|| anyhow!("Metal system default device is unavailable"))?;
         let command_queue = device.new_command_queue();
@@ -2140,6 +2279,7 @@ impl MacGpuRenderer {
         // effect-layer cache hit across pans instead of re-rendering every
         // blurred/shadowed subtree per frame.
         raster_renderer.set_pixel_snap_pan(true);
+        raster_renderer.set_image_cache_budget_bytes(Some(Self::IMAGE_CACHE_BUDGET_BYTES));
 
         Ok(Self {
             translation: WorkerTranslation::default(),
@@ -2151,9 +2291,31 @@ impl MacGpuRenderer {
             _command_queue: command_queue,
             size,
             frame_texture_leases: Vec::new(),
+            frame_target_leases: Vec::new(),
             frame_buffer_leases: Vec::new(),
             camera_epoch: None,
+            presentation,
+            maintenance_target: None,
         })
+    }
+
+    /// Images the canvas keeps ready to draw. Tiles already hold what was
+    /// drawn, so an image is only needed again when tiles are rebuilt.
+    const IMAGE_CACHE_BUDGET_BYTES: usize = 256 << 20;
+
+    /// How long the render thread waits without a job before releasing GPU
+    /// memory nothing has used since.
+    const IDLE_RELEASE_DELAY: Duration = Duration::from_secs(1);
+
+    fn release_idle_gpu_memory(&mut self) {
+        if self.failed {
+            return;
+        }
+        if let Some(backend) = self.backend.as_mut() {
+            backend
+                .release_unused_gpu_memory(Self::IDLE_RELEASE_DELAY)
+                .log_err();
+        }
     }
 
     fn backend(&mut self) -> Result<&mut SkiaGpuBackend> {
@@ -2203,7 +2365,7 @@ impl MacGpuRenderer {
         })
     }
 
-    /// Render one frame for `request` from `inputs` into a fresh buffer.
+    /// Render one frame for `request` from `inputs` into a presentation buffer.
     /// Returns the buffer with its GPU work complete (the compositor samples
     /// the IOSurface as soon as it is presented) and the wall time it took.
     fn render_frame(
@@ -2225,6 +2387,7 @@ impl MacGpuRenderer {
             self.failed = true;
         } else {
             self.frame_texture_leases.clear();
+            self.frame_target_leases.clear();
             self.frame_buffer_leases.clear();
         }
         result
@@ -2299,31 +2462,29 @@ impl MacGpuRenderer {
                 )])
             });
 
-        // GPUI samples completed frames asynchronously on another Metal queue.
-        // Counting producer frames cannot fence that consumer, so an IOSurface
-        // must not be overwritten without an explicit consumer fence.
+        // GPUI samples completed frames asynchronously on another Metal queue,
+        // so a buffer is only drawn into again once the UI thread has seen it
+        // leave GPUI's frames (see `PresentationTracker`) and recycled it.
         let allocation_started = Instant::now();
         let target_size = if request.maintenance { (1, 1) } else { size };
-        let pixel_buffer = create_bgra_pixel_buffer(target_size.0, target_size.1)?;
+        let pixel_buffer = if request.maintenance {
+            match &self.maintenance_target {
+                Some(target) => target.clone(),
+                None => {
+                    let target = create_bgra_pixel_buffer(1, 1)?;
+                    self.maintenance_target = Some(target.clone());
+                    target
+                }
+            }
+        } else {
+            take_presentation_buffer(&self.presentation, size)?
+        };
         pipeline.allocation_wall = allocation_started.elapsed();
         self.frame_buffer_leases.push(pixel_buffer.clone());
         let texture_import_started = Instant::now();
-        let color_texture = self
-            .texture_cache
-            .create_texture_from_image(
-                pixel_buffer.as_concrete_TypeRef(),
-                None,
-                metal::MTLPixelFormat::BGRA8Unorm,
-                target_size.0 as usize,
-                target_size.1 as usize,
-                0,
-            )
-            .map_err(|status| anyhow!("creating CoreVideo Metal texture failed: {status}"))?;
-        let texture = unsafe { CVMetalTextureGetTexture(color_texture.as_concrete_TypeRef()) };
-        if texture.is_null() {
-            return Err(anyhow!("CoreVideo returned a null Metal texture"));
-        }
-        self.frame_texture_leases.push(color_texture);
+        let color_texture = iosurface_texture(&self._device, &pixel_buffer)?;
+        let texture = metal::foreign_types::ForeignType::as_ptr(&color_texture);
+        self.frame_target_leases.push(color_texture);
         pipeline.texture_import_wall = texture_import_started.elapsed();
 
         let target_wrap_started = Instant::now();
@@ -2537,6 +2698,10 @@ impl MacGpuRenderer {
                 Some(SkiaGpuBackend::Ganesh(_)) => "ganesh",
                 None => "unavailable",
             };
+            let graphite_memory = self
+                .backend
+                .as_mut()
+                .and_then(SkiaGpuBackend::graphite_memory);
             let mut frame_fields = serde_json::Map::new();
             for fields in [
                 serde_json::json!({
@@ -2596,6 +2761,18 @@ impl MacGpuRenderer {
                     "scene_walks": camera_cache.as_ref().map(|cache| cache.scene_walks),
                     "camera_cache_bytes": camera_cache.as_ref().map(|cache| cache.retained_bytes)
                 }),
+                serde_json::json!({
+                    "image_cache_entries": self.raster_renderer.image_cache_len(),
+                    "image_cache_bytes": self.raster_renderer.image_cache_bytes(),
+                    "layer_cache_bytes": self.raster_renderer.layer_cache_stats().1,
+                    "decoded_image_bytes": inputs.asset_resolver.and_then(|resolver| resolver.held_bytes()),
+                    "metal_allocated_bytes": self._device.current_allocated_size(),
+                    "graphite_context_budgeted_bytes": graphite_memory.map(|memory| memory.context_budgeted),
+                    "graphite_context_purgeable_bytes": graphite_memory.map(|memory| memory.context_purgeable),
+                    "graphite_recorder_budgeted_bytes": graphite_memory.map(|memory| memory.recorder_budgeted),
+                    "graphite_recorder_purgeable_bytes": graphite_memory.map(|memory| memory.recorder_purgeable),
+                    "graphite_image_texture_bytes": graphite_memory.map(|memory| memory.image_textures)
+                }),
             ] {
                 if let serde_json::Value::Object(fields) = fields {
                     frame_fields.extend(fields);
@@ -2628,10 +2805,147 @@ impl MacGpuRenderer {
     }
 }
 
+/// A completed frame's pixel buffer. Dropping it hands the buffer to the
+/// [`PresentationTracker`], which recycles it once GPUI cannot be sampling it.
+#[cfg(target_os = "macos")]
+struct FrameBuffer {
+    buffer: CVPixelBuffer,
+    retired: Rc<std::cell::RefCell<Vec<CVPixelBuffer>>>,
+}
+
+#[cfg(target_os = "macos")]
+impl std::ops::Deref for FrameBuffer {
+    type Target = CVPixelBuffer;
+
+    fn deref(&self) -> &CVPixelBuffer {
+        &self.buffer
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for FrameBuffer {
+    fn drop(&mut self) {
+        // Only the tracker borrows the queue, and it drops no frames while it
+        // does; failing that, the buffer is released instead of recycled.
+        if let Ok(mut retired) = self.retired.try_borrow_mut() {
+            retired.push(self.buffer.clone());
+        }
+    }
+}
+
+/// Recycles presentation buffers into the render thread's pool once GPUI can
+/// no longer be sampling them.
+///
+/// GPUI's scene holds a painted surface until its next frame, and the GPU
+/// work of the frame that painted it may still read it after that. A window
+/// waits for a drawable once three frames are in flight, so after four more
+/// paints that work has completed; the time guard covers paints that never
+/// reach a present.
+#[cfg(target_os = "macos")]
+struct PresentationTracker {
+    pool: Arc<Mutex<PresentationPool>>,
+    retired: Rc<std::cell::RefCell<Vec<CVPixelBuffer>>>,
+    paints: u64,
+    recent: Vec<RecentPaint>,
+}
+
+#[cfg(target_os = "macos")]
+struct RecentPaint {
+    buffer: CVPixelBuffer,
+    paint: u64,
+    painted_at: Instant,
+    /// The canvas let the buffer go; it is recycled when its window closes.
+    retired: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl PresentationTracker {
+    const RELEASE_PAINTS: u64 = 4;
+    const RELEASE_TIME: Duration = Duration::from_millis(50);
+
+    fn new(pool: Arc<Mutex<PresentationPool>>) -> Self {
+        Self {
+            pool,
+            retired: Rc::default(),
+            paints: 0,
+            recent: Vec::new(),
+        }
+    }
+
+    fn lease(&self, buffer: CVPixelBuffer) -> FrameBuffer {
+        FrameBuffer {
+            buffer,
+            retired: self.retired.clone(),
+        }
+    }
+
+    /// Lets go of a buffer the canvas never kept as a frame.
+    fn retire(&self, buffer: CVPixelBuffer) {
+        self.retired.borrow_mut().push(buffer);
+    }
+
+    /// Records one paint pass, which hands `presented` (if any) to GPUI, and
+    /// recycles the retired buffers no frame in flight can still be reading.
+    fn painted(&mut self, presented: Option<&CVPixelBuffer>) {
+        self.paints += 1;
+        let now = Instant::now();
+        if let Some(buffer) = presented {
+            match self
+                .recent
+                .iter_mut()
+                .find(|recent| same_buffer(&recent.buffer, buffer))
+            {
+                Some(recent) => {
+                    recent.paint = self.paints;
+                    recent.painted_at = now;
+                }
+                None => self.recent.push(RecentPaint {
+                    buffer: buffer.clone(),
+                    paint: self.paints,
+                    painted_at: now,
+                    retired: false,
+                }),
+            }
+        }
+        let retired = std::mem::take(&mut *self.retired.borrow_mut());
+        let mut recyclable = Vec::new();
+        for buffer in retired {
+            match self
+                .recent
+                .iter_mut()
+                .find(|recent| same_buffer(&recent.buffer, &buffer))
+            {
+                Some(recent) => recent.retired = true,
+                None => recyclable.push(buffer),
+            }
+        }
+        let paints = self.paints;
+        self.recent.retain(|recent| {
+            let released = paints - recent.paint >= Self::RELEASE_PAINTS
+                && now.duration_since(recent.painted_at) >= Self::RELEASE_TIME;
+            if released && recent.retired {
+                recyclable.push(recent.buffer.clone());
+            }
+            !released
+        });
+        if !recyclable.is_empty() {
+            let mut pool = lock_pool(&self.pool);
+            for buffer in recyclable {
+                pool.recycle(buffer);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn same_buffer(left: &CVPixelBuffer, right: &CVPixelBuffer) -> bool {
+    left.as_concrete_TypeRef() == right.as_concrete_TypeRef()
+}
+
 /// A completed frame held on the UI side.
 #[cfg(target_os = "macos")]
 struct CompletedFrame {
-    buffer: CVPixelBuffer,
+    buffer: FrameBuffer,
     key: SurfaceKey,
     /// The frame's logical extent, for reprojection after an element resize.
     logical: (f64, f64),
@@ -2765,6 +3079,7 @@ pub(crate) struct GpuCanvas {
     normal_cost_key: Option<SurfaceKey>,
     cost: RenderCost,
     epoch: u64,
+    presentation: PresentationTracker,
 }
 
 #[cfg(target_os = "macos")]
@@ -2789,9 +3104,13 @@ impl GpuCanvas {
         let (reply_tx, replies) = mpsc::channel();
         let signal = Arc::new(WakeSignal::default());
         let thread_signal = signal.clone();
+        let presentation = Arc::new(Mutex::new(PresentationPool::default()));
+        let thread_presentation = presentation.clone();
         let spawned = std::thread::Builder::new()
             .name("fanta-canvas-render".into())
-            .spawn(move || render_thread_main(size, job_rx, reply_tx, thread_signal));
+            .spawn(move || {
+                render_thread_main(size, job_rx, reply_tx, thread_signal, thread_presentation)
+            });
         let failed = spawned
             .err()
             .map(|error| format!("spawning the canvas render thread failed: {error}"));
@@ -2808,7 +3127,14 @@ impl GpuCanvas {
             }
         });
 
-        Self::with_channels(gesture_perf, jobs, replies, reply_task, failed)
+        Self::with_channels(
+            gesture_perf,
+            jobs,
+            replies,
+            reply_task,
+            failed,
+            presentation,
+        )
     }
 
     fn with_channels(
@@ -2817,6 +3143,7 @@ impl GpuCanvas {
         replies: mpsc::Receiver<RenderReply>,
         reply_task: Task<()>,
         failed: Option<String>,
+        presentation: Arc<Mutex<PresentationPool>>,
     ) -> Self {
         Self {
             gesture_perf,
@@ -2849,6 +3176,7 @@ impl GpuCanvas {
             normal_cost_key: None,
             cost: RenderCost::Unknown,
             epoch: 0,
+            presentation: PresentationTracker::new(presentation),
         }
     }
 
@@ -2856,7 +3184,7 @@ impl GpuCanvas {
     pub(crate) fn for_test() -> Self {
         let (jobs, _) = mpsc::channel();
         let (_, replies) = mpsc::channel();
-        Self::with_channels(None, jobs, replies, Task::ready(()), None)
+        Self::with_channels(None, jobs, replies, Task::ready(()), None, Arc::default())
     }
 
     #[cfg(test)]
@@ -2994,6 +3322,7 @@ impl GpuCanvas {
                             log::warn!("duplicate or unknown canvas gesture completion");
                         }
                         self.consecutive_failures = 0;
+                        let mut installed = false;
                         if accepts_translation_frame(path, self.translation) {
                             if let FramePath::Refused(gesture) = path {
                                 self.rejected_translation = Some(gesture);
@@ -3008,22 +3337,25 @@ impl GpuCanvas {
                                     )
                                 })
                             });
-                            if should_install_completed_frame(
+                            installed = should_install_completed_frame(
                                 &key,
                                 progress.pipeline.request_id,
                                 newest
                                     .map(|frame| (&frame.key, frame.progress.pipeline.request_id)),
                                 self.latest_request.as_ref().map(|latest| &latest.key),
-                            ) {
-                                self.install_frame(
-                                    key,
-                                    scale_factor,
-                                    buffer.0,
-                                    duration,
-                                    path,
-                                    progress,
-                                );
-                            }
+                            );
+                        }
+                        if installed {
+                            self.install_frame(
+                                key,
+                                scale_factor,
+                                buffer.0,
+                                duration,
+                                path,
+                                progress,
+                            );
+                        } else {
+                            self.presentation.retire(buffer.0);
                         }
                     }
                     Err(error) => {
@@ -3121,7 +3453,7 @@ impl GpuCanvas {
             progress.scene_rendered,
         );
         self.newest = Some(CompletedFrame {
-            buffer,
+            buffer: self.presentation.lease(buffer),
             key,
             logical,
             progress,
@@ -3314,6 +3646,45 @@ impl GpuCanvas {
     /// planned work (dispatch or block), and return what to present plus
     /// whether an immediate repaint should follow.
     fn paint_frame(
+        &mut self,
+        document: &FigDocument,
+        page_root: Option<NodeId>,
+        size: (u32, u32),
+        frame_logical: (f64, f64),
+        visible_logical: (f64, f64),
+        viewport: Viewport,
+        scale_factor: f32,
+        motion: Option<MotionEvaluation>,
+        video: Option<CanvasVideoFrame>,
+        video_fills: Vec<CanvasVideoFillFrame>,
+        translation: Option<TranslationGesture>,
+        camera_interacting: bool,
+    ) -> Result<(Option<GpuFrame>, bool)> {
+        let painted = self.plan_and_present(
+            document,
+            page_root,
+            size,
+            frame_logical,
+            visible_logical,
+            viewport,
+            scale_factor,
+            motion,
+            video,
+            video_fills,
+            translation,
+            camera_interacting,
+        );
+        self.presentation.painted(
+            painted
+                .as_ref()
+                .ok()
+                .and_then(|(frame, _)| frame.as_ref())
+                .map(GpuFrame::buffer),
+        );
+        painted
+    }
+
+    fn plan_and_present(
         &mut self,
         document: &FigDocument,
         page_root: Option<NodeId>,
@@ -3794,6 +4165,153 @@ fn create_bgra_pixel_buffer(width: u32, height: u32) -> Result<CVPixelBuffer> {
         Some(&options),
     )
     .map_err(|status| anyhow!("creating BGRA CVPixelBuffer failed: {status}"))
+}
+
+/// Spare presentation buffers the render thread draws new frames into.
+///
+/// GPUI imports every painted surface through a CoreVideo texture cache that
+/// keeps each texture, and with it the IOSurface, for a second after its last
+/// use. A fresh buffer per frame therefore kept a second of frames alive while
+/// panning: about 60 at 60 Hz, 1.5 GB on a large canvas. Drawing into recycled
+/// buffers bounds that to the buffers in circulation.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct PresentationPool {
+    size: Option<(u32, u32)>,
+    spares: Vec<SendBuffer>,
+}
+
+#[cfg(target_os = "macos")]
+impl PresentationPool {
+    /// A pan recycles about one buffer per frame; the cap only absorbs bursts.
+    const MAX_SPARES: usize = 4;
+
+    fn take(&mut self, size: (u32, u32)) -> Option<CVPixelBuffer> {
+        if self.size != Some(size) {
+            self.spares.clear();
+            self.size = Some(size);
+        }
+        self.spares.pop().map(|spare| spare.0)
+    }
+
+    /// Takes back a buffer nothing will sample again. Callers guarantee no
+    /// pending GPU work reads or writes it.
+    fn recycle(&mut self, buffer: CVPixelBuffer) {
+        // Spares and dropped buffers alike are volatile: GPUI's texture cache
+        // may keep a dropped one for another second, and volatile pages are
+        // neither charged to the process nor swapped under memory pressure.
+        set_surface_volatile(&buffer, true);
+        let size = (buffer.get_width() as u32, buffer.get_height() as u32);
+        if self.size == Some(size) && self.spares.len() < Self::MAX_SPARES {
+            self.spares.push(SendBuffer(buffer));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn lock_pool(pool: &Mutex<PresentationPool>) -> std::sync::MutexGuard<'_, PresentationPool> {
+    // Every pool operation leaves it consistent, so a poisoned lock is usable.
+    pool.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(target_os = "macos")]
+fn take_presentation_buffer(
+    pool: &Mutex<PresentationPool>,
+    size: (u32, u32),
+) -> Result<CVPixelBuffer> {
+    let spare = lock_pool(pool).take(size);
+    match spare {
+        Some(buffer) => {
+            // The frame is drawn over every pixel, so contents the system
+            // purged while the buffer was volatile do not matter.
+            set_surface_volatile(&buffer, false);
+            Ok(buffer)
+        }
+        None => create_bgra_pixel_buffer(size.0, size.1),
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[link(name = "IOSurface", kind = "framework")]
+unsafe extern "C" {
+    fn IOSurfaceSetPurgeable(
+        surface: *const std::ffi::c_void,
+        new_state: u32,
+        old_state: *mut u32,
+    ) -> i32;
+}
+
+#[cfg(target_os = "macos")]
+fn set_surface_volatile(buffer: &CVPixelBuffer, volatile: bool) {
+    const NON_VOLATILE: u32 = 0;
+    const VOLATILE: u32 = 1;
+    // SAFETY: the buffer is retained for the call; the IOSurface is borrowed.
+    let surface = unsafe {
+        core_video::pixel_buffer_io_surface::CVPixelBufferGetIOSurface(buffer.as_concrete_TypeRef())
+    };
+    if surface.is_null() {
+        return;
+    }
+    let mut previous = 0;
+    // SAFETY: `surface` is a live IOSurface owned by `buffer`.
+    let status = unsafe {
+        IOSurfaceSetPurgeable(
+            surface.cast(),
+            if volatile { VOLATILE } else { NON_VOLATILE },
+            &mut previous,
+        )
+    };
+    if status != 0 {
+        log::warn!("changing a presentation buffer's purgeable state failed: {status:#x}");
+    }
+}
+
+/// A Metal texture over `buffer`'s IOSurface. Unlike a CoreVideo texture
+/// cache, which keeps every texture it made for a second, the texture and its
+/// hold on the surface end when it is dropped.
+#[cfg(target_os = "macos")]
+fn iosurface_texture(device: &metal::DeviceRef, buffer: &CVPixelBuffer) -> Result<metal::Texture> {
+    use metal::foreign_types::ForeignType as _;
+    use metal::objc::{msg_send, sel, sel_impl};
+    // SAFETY: the buffer is retained for the call; the IOSurface is borrowed.
+    let surface = unsafe {
+        core_video::pixel_buffer_io_surface::CVPixelBufferGetIOSurface(buffer.as_concrete_TypeRef())
+    };
+    anyhow::ensure!(
+        !surface.is_null(),
+        "the presentation buffer has no IOSurface"
+    );
+    let descriptor = metal::TextureDescriptor::new();
+    descriptor.set_texture_type(metal::MTLTextureType::D2);
+    descriptor.set_pixel_format(metal::MTLPixelFormat::BGRA8Unorm);
+    descriptor.set_width(buffer.get_width() as u64);
+    descriptor.set_height(buffer.get_height() as u64);
+    descriptor.set_storage_mode(if device.has_unified_memory() {
+        metal::MTLStorageMode::Shared
+    } else {
+        metal::MTLStorageMode::Managed
+    });
+    descriptor.set_usage(
+        metal::MTLTextureUsage::RenderTarget
+            | metal::MTLTextureUsage::ShaderRead
+            | metal::MTLTextureUsage::ShaderWrite,
+    );
+    // SAFETY: a `new…` selector returns a +1 texture (or nil) that the
+    // returned wrapper owns.
+    let texture: *mut metal::MTLTexture = unsafe {
+        msg_send![
+            device,
+            newTextureWithDescriptor: descriptor.as_ref()
+            iosurface: surface
+            plane: 0u64
+        ]
+    };
+    anyhow::ensure!(
+        !texture.is_null(),
+        "creating a Metal texture over the presentation buffer failed"
+    );
+    // SAFETY: `texture` is non-null and owned by this +1 reference.
+    Ok(unsafe { metal::Texture::from_ptr(texture) })
 }
 
 #[cfg(target_os = "macos")]
@@ -9315,8 +9833,8 @@ mod tests {
             let gesture = translation_token(&document, moving);
             let mut proof = TranslationProof::capture(&document, gesture, page);
             let worker_scene = snapshot.scene.instance_id();
-            let mut full = MacGpuRenderer::new((128, 96))?;
-            let mut retained = MacGpuRenderer::new((128, 96))?;
+            let mut full = MacGpuRenderer::new((128, 96), Arc::default())?;
+            let mut retained = MacGpuRenderer::new((128, 96), Arc::default())?;
             let mut key = surface_key([0.0, 0.0], 1.0, 1);
             key.size = (128, 96);
             key.page_root = Some(page);

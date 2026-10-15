@@ -43,6 +43,7 @@ pub(crate) fn draw_video_fill(
             None,
             opacity,
             mods,
+            frame.has_mipmaps(),
         )
     } else if let Some(poster) = video.poster {
         draw_image_cached(

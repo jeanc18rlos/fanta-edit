@@ -107,6 +107,186 @@ struct ScenarioRecord {
     edits: Vec<EditRecord>,
     physical_footprint_mib: Option<f64>,
     physical_footprint_peak_mib: Option<f64>,
+    /// Sampled after the scenario settled.
+    memory: Option<MemorySample>,
+    /// Largest footprint and graphics footprint sampled at any tick of the
+    /// scenario, warmup included.
+    peak_footprint_mib: f64,
+    peak_graphics_mib: f64,
+}
+
+/// Process memory from the kernel's accounting, in MiB.
+#[derive(serde::Serialize, Clone, Copy, Default)]
+struct MemorySample {
+    footprint_mib: f64,
+    /// IOSurfaces and Metal resources charged to the process.
+    graphics_mib: f64,
+    /// Bytes in use across every malloc zone (Rust and Skia allocations alike
+    /// in the test binary, which keeps the system allocator).
+    heap_in_use_mib: f64,
+    compressed_mib: f64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct TaskVmInfo {
+    virtual_size: u64,
+    region_count: i32,
+    page_size: i32,
+    resident_size: u64,
+    resident_size_peak: u64,
+    device: u64,
+    device_peak: u64,
+    internal: u64,
+    internal_peak: u64,
+    external: u64,
+    external_peak: u64,
+    reusable: u64,
+    reusable_peak: u64,
+    purgeable_volatile_pmap: u64,
+    purgeable_volatile_resident: u64,
+    purgeable_volatile_virtual: u64,
+    compressed: u64,
+    compressed_peak: u64,
+    compressed_lifetime: u64,
+    phys_footprint: u64,
+    min_address: u64,
+    max_address: u64,
+    ledger_phys_footprint_peak: i64,
+    ledger_purgeable_nonvolatile: i64,
+    ledger_purgeable_novolatile_compressed: i64,
+    ledger_purgeable_volatile: i64,
+    ledger_purgeable_volatile_compressed: i64,
+    ledger_tag_network_nonvolatile: i64,
+    ledger_tag_network_nonvolatile_compressed: i64,
+    ledger_tag_network_volatile: i64,
+    ledger_tag_network_volatile_compressed: i64,
+    ledger_tag_media_footprint: i64,
+    ledger_tag_media_footprint_compressed: i64,
+    ledger_tag_media_nofootprint: i64,
+    ledger_tag_media_nofootprint_compressed: i64,
+    ledger_tag_graphics_footprint: i64,
+    ledger_tag_graphics_footprint_compressed: i64,
+    ledger_tag_graphics_nofootprint: i64,
+    ledger_tag_graphics_nofootprint_compressed: i64,
+    ledger_tag_neural_footprint: i64,
+    ledger_tag_neural_footprint_compressed: i64,
+    ledger_tag_neural_nofootprint: i64,
+    ledger_tag_neural_nofootprint_compressed: i64,
+    // The kernel fills the newest revision whose size fits, so the struct
+    // ends on a revision boundary (rev 4).
+    limit_bytes_remaining: u64,
+}
+
+#[repr(C)]
+#[derive(Default)]
+struct MallocStatistics {
+    blocks_in_use: u32,
+    size_in_use: usize,
+    max_size_in_use: usize,
+    size_allocated: usize,
+}
+
+unsafe extern "C" {
+    static mach_task_self_: u32;
+    fn task_info(task: u32, flavor: u32, info: *mut TaskVmInfo, count: *mut u32) -> i32;
+    fn malloc_zone_statistics(zone: *mut std::ffi::c_void, statistics: *mut MallocStatistics);
+}
+
+const TASK_VM_INFO: u32 = 22;
+
+fn memory_sample() -> Option<MemorySample> {
+    const MIB: f64 = 1024.0 * 1024.0;
+    let mut info = TaskVmInfo::default();
+    let mut count = (std::mem::size_of::<TaskVmInfo>() / std::mem::size_of::<u32>()) as u32;
+    // SAFETY: `count` is the size of `info` in 32-bit words, as task_info requires.
+    let status = unsafe { task_info(mach_task_self_, TASK_VM_INFO, &mut info, &mut count) };
+    if status != 0 {
+        return None;
+    }
+    let mut statistics = MallocStatistics::default();
+    // SAFETY: a null zone sums every registered malloc zone.
+    unsafe { malloc_zone_statistics(std::ptr::null_mut(), &mut statistics) };
+    Some(MemorySample {
+        footprint_mib: info.phys_footprint as f64 / MIB,
+        graphics_mib: (info.ledger_tag_graphics_footprint
+            + info.ledger_tag_graphics_footprint_compressed) as f64
+            / MIB,
+        heap_in_use_mib: statistics.size_in_use as f64 / MIB,
+        compressed_mib: info.compressed as f64 / MIB,
+    })
+}
+
+/// Stands in for GPUI's Metal renderer: each paint's surface is imported
+/// through a CoreVideo texture cache and sampled on another queue, and the
+/// scene keeps the surface until the next paint, as GPUI's renderer does.
+struct Compositor {
+    queue: metal::CommandQueue,
+    cache: CVMetalTextureCache,
+    readback: metal::Buffer,
+    scene: Option<CVPixelBuffer>,
+}
+
+impl Compositor {
+    fn new() -> Result<Self> {
+        let device = metal::Device::system_default().context("no Metal device")?;
+        let cache = CVMetalTextureCache::new(None, device.clone(), None)
+            .map_err(|status| anyhow!("creating the compositor texture cache failed: {status}"))?;
+        Ok(Self {
+            queue: device.new_command_queue(),
+            readback: device.new_buffer(4, metal::MTLResourceOptions::StorageModeShared),
+            cache,
+            scene: None,
+        })
+    }
+
+    fn draw(&mut self, frame: Option<&GpuFrame>) -> Result<()> {
+        self.scene = frame.map(|frame| match frame {
+            GpuFrame::Fresh(buffer) | GpuFrame::Held(buffer) => buffer.clone(),
+            GpuFrame::Reprojected { buffer, .. } => buffer.clone(),
+        });
+        let Some(buffer) = &self.scene else {
+            return Ok(());
+        };
+        let texture = self
+            .cache
+            .create_texture_from_image(
+                buffer.as_concrete_TypeRef(),
+                None,
+                metal::MTLPixelFormat::BGRA8Unorm,
+                buffer.get_width(),
+                buffer.get_height(),
+                0,
+            )
+            .map_err(|status| anyhow!("compositor texture import failed: {status}"))?;
+        let handle = unsafe { CVMetalTextureGetTexture(texture.as_concrete_TypeRef()) };
+        anyhow::ensure!(!handle.is_null(), "compositor texture is null");
+        // SAFETY: the CVMetalTexture keeps the texture alive while it is encoded.
+        let texture = unsafe {
+            <metal::TextureRef as foreign_types::ForeignTypeRef>::from_ptr(handle.cast())
+        };
+        let commands = self.queue.new_command_buffer();
+        let blit = commands.new_blit_command_encoder();
+        blit.copy_from_texture_to_buffer(
+            texture,
+            0,
+            0,
+            metal::MTLOrigin { x: 0, y: 0, z: 0 },
+            metal::MTLSize {
+                width: 1,
+                height: 1,
+                depth: 1,
+            },
+            &self.readback,
+            0,
+            4,
+            4,
+            metal::MTLBlitOption::empty(),
+        );
+        blit.end_encoding();
+        commands.commit();
+        Ok(())
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -138,6 +318,9 @@ struct Bench {
     viewport: Viewport,
     inputs: Vec<(Viewport, Instant)>,
     maintenance_timer: Option<(u64, Instant)>,
+    compositor: Compositor,
+    peak_footprint_mib: f64,
+    peak_graphics_mib: f64,
 }
 
 impl Bench {
@@ -157,10 +340,15 @@ impl Bench {
         let (jobs, job_rx) = mpsc::channel();
         let (reply_tx, replies) = mpsc::channel();
         let signal = Arc::new(WakeSignal::default());
+        let presentation = Arc::new(Mutex::new(PresentationPool::default()));
+        let thread_presentation = presentation.clone();
         let render_thread = std::thread::Builder::new()
             .name("fanta-canvas-render".into())
-            .spawn(move || render_thread_main(render_size, job_rx, reply_tx, signal))?;
-        let gpu = GpuCanvas::with_channels(None, jobs, replies, Task::ready(()), None);
+            .spawn(move || {
+                render_thread_main(render_size, job_rx, reply_tx, signal, thread_presentation)
+            })?;
+        let gpu =
+            GpuCanvas::with_channels(None, jobs, replies, Task::ready(()), None, presentation);
         let mut bench = Self {
             document,
             gpu,
@@ -175,9 +363,19 @@ impl Bench {
             viewport: Viewport::default(),
             inputs: Vec::new(),
             maintenance_timer: None,
+            compositor: Compositor::new()?,
+            peak_footprint_mib: 0.0,
+            peak_graphics_mib: 0.0,
         };
         bench.switch_page(page_index)?;
         Ok(bench)
+    }
+
+    fn sample_peak(&mut self) {
+        if let Some(sample) = memory_sample() {
+            self.peak_footprint_mib = self.peak_footprint_mib.max(sample.footprint_mib);
+            self.peak_graphics_mib = self.peak_graphics_mib.max(sample.graphics_mib);
+        }
     }
 
     fn now_ms(&self) -> f64 {
@@ -332,6 +530,8 @@ impl Bench {
             false,
         )?;
         let paint_ms = started.elapsed().as_secs_f64() * 1000.0;
+        self.compositor.draw(frame.as_ref())?;
+        self.sample_peak();
         self.schedule_maintenance();
         let presentation = match &frame {
             Some(GpuFrame::Fresh(_)) => "fresh",
@@ -513,7 +713,10 @@ impl Bench {
         Ok(())
     }
 
-    fn scenario(&self, name: &str) -> ScenarioRecord {
+    fn scenario(&mut self, name: &str) -> ScenarioRecord {
+        self.peak_footprint_mib = 0.0;
+        self.peak_graphics_mib = 0.0;
+        self.sample_peak();
         ScenarioRecord {
             name: name.to_string(),
             started_ms: self.now_ms(),
@@ -525,15 +728,61 @@ impl Bench {
             edits: Vec::new(),
             physical_footprint_mib: None,
             physical_footprint_peak_mib: None,
+            memory: None,
+            peak_footprint_mib: 0.0,
+            peak_graphics_mib: 0.0,
         }
     }
 
-    fn finish(&self, mut record: ScenarioRecord) -> ScenarioRecord {
+    fn finish(&mut self, mut record: ScenarioRecord) -> ScenarioRecord {
         record.finished_ms = self.now_ms();
         let (current, peak) = physical_footprint();
         record.physical_footprint_mib = current;
         record.physical_footprint_peak_mib = peak;
+        self.sample_peak();
+        record.memory = memory_sample();
+        record.peak_footprint_mib = self.peak_footprint_mib;
+        record.peak_graphics_mib = self.peak_graphics_mib;
+        if let Some(memory) = record.memory {
+            eprintln!(
+                "{}: footprint {:.0} MiB (peak {:.0}), graphics {:.0} MiB (peak {:.0}), heap {:.0} MiB",
+                record.name,
+                memory.footprint_mib,
+                record.peak_footprint_mib,
+                memory.graphics_mib,
+                record.peak_graphics_mib,
+                memory.heap_in_use_mib
+            );
+        }
         record
+    }
+
+    /// Opens every page of the Pages panel in turn and settles on it, as a
+    /// user browsing the whole document would, then returns to `return_to`.
+    fn run_visit_pages(&mut self, name: &str, return_to: usize) -> Result<ScenarioRecord> {
+        let mut record = self.scenario(name);
+        for index in (0..self.document.pages.len()).chain(std::iter::once(return_to)) {
+            if self
+                .document
+                .pages
+                .get(index)
+                .is_none_or(|page| page.root.is_none() || page.hidden)
+            {
+                continue;
+            }
+            self.switch_page(index)?;
+            let settled = self.settle(&mut record.ticks, &mut record.inputs, SETTLE_TIMEOUT)?;
+            let memory = memory_sample().unwrap_or_default();
+            eprintln!(
+                "{name}: {} settled {:?} ms, footprint {:.0} MiB, graphics {:.0} MiB, heap {:.0} MiB",
+                self.page_label(index).unwrap_or_default(),
+                settled.map(|ms| ms.round()),
+                memory.footprint_mib,
+                memory.graphics_mib,
+                memory.heap_in_use_mib
+            );
+        }
+        Ok(self.finish(record))
     }
 
     /// Warm the start camera, then play `path` one input per tick and paint
@@ -757,6 +1006,110 @@ fn parse_size(value: &str) -> Option<(f64, f64)> {
     Some((width.trim().parse().ok()?, height.trim().parse().ok()?))
 }
 
+/// Heap held by each part of a loaded project, measured as the heap growth of
+/// a deep copy of that part. Loads the way the app does, workspace session
+/// included.
+#[test]
+#[ignore = "memory attribution: needs FANTA_CAMERA_BENCH_PROJECT; run explicitly with --ignored"]
+fn document_memory_attribution() -> Result<()> {
+    let Some(project) = std::env::var_os("FANTA_CAMERA_BENCH_PROJECT").map(PathBuf::from) else {
+        eprintln!("FANTA_CAMERA_BENCH_PROJECT is unset; skipping the memory attribution");
+        return Ok(());
+    };
+    anyhow::ensure!(
+        project.join(".claude-benchmark-fixture").is_file(),
+        "the attribution only runs on a marked disposable project copy"
+    );
+    let heap = || memory_sample().map_or(0.0, |sample| sample.heap_in_use_mib);
+    let start = heap();
+    let (doc, assets, session) = fanta_format::WorkspaceSession::open_project_document(&project)?;
+    let loaded = heap();
+    eprintln!(
+        "document, assets and workspace session: {:.1} MiB",
+        loaded - start
+    );
+    let encoded: usize = assets.values().map(Vec::len).sum();
+    eprintln!(
+        "encoded assets: {:.1} MiB",
+        encoded as f64 / (1024.0 * 1024.0)
+    );
+    drop(session);
+    eprintln!("workspace session: {:.1} MiB", loaded - heap());
+
+    let scene = &doc.scene;
+    let mut kinds: BTreeMap<&'static str, (usize, f64)> = BTreeMap::new();
+    let mut ids = Vec::with_capacity(scene.len());
+    for root in scene.roots() {
+        ids.extend(scene.descendants_of(*root));
+    }
+    for id in &ids {
+        let Some(node) = scene.get(*id) else {
+            continue;
+        };
+        let before = heap();
+        let copy = std::hint::black_box(node.data.clone());
+        let entry = kinds.entry(node.data.kind_tag()).or_default();
+        entry.0 += 1;
+        entry.1 += heap() - before;
+        drop(copy);
+    }
+    for (kind, (count, mib)) in &kinds {
+        eprintln!("node data {kind}: {count} nodes, {mib:.1} MiB");
+    }
+    let before = heap();
+    let metas: Vec<serde_json::Value> = ids
+        .iter()
+        .filter_map(|id| scene.get(*id).map(|node| node.meta.clone()))
+        .collect();
+    eprintln!("node meta: {:.1} MiB", heap() - before);
+    drop(metas);
+    let before = heap();
+    let names: Vec<String> = ids
+        .iter()
+        .filter_map(|id| scene.get(*id).map(|node| node.name.clone()))
+        .collect();
+    eprintln!("node names: {:.1} MiB", heap() - before);
+    drop(names);
+    let before = heap();
+    let nodes: Vec<CanvasNode> = ids
+        .iter()
+        .filter_map(|id| scene.get(*id).cloned())
+        .collect();
+    eprintln!("all {} nodes: {:.1} MiB", nodes.len(), heap() - before);
+    drop(nodes);
+    let before = heap();
+    let components = doc.components.clone();
+    eprintln!(
+        "component library ({} definitions): {:.1} MiB",
+        components.defs.len(),
+        heap() - before
+    );
+    drop(components);
+    let before = heap();
+    let variables = doc.variables.clone();
+    eprintln!("variables: {:.1} MiB", heap() - before);
+    drop(variables);
+
+    let before = heap();
+    let document = FigDocument::from_doc(doc, assets);
+    eprintln!("FigDocument indexes: {:.1} MiB", heap() - before);
+    let before = heap();
+    let mut scoped = Vec::new();
+    for page in document.pages.iter().filter(|page| !page.hidden) {
+        let Some(root) = page.root else {
+            continue;
+        };
+        scoped.push(document.doc.render_scene_for(root));
+    }
+    eprintln!(
+        "render scenes of {} pages ({} scoped): {:.1} MiB",
+        scoped.len(),
+        scoped.iter().flatten().count(),
+        heap() - before
+    );
+    Ok(())
+}
+
 #[test]
 #[ignore = "benchmark: needs Metal and FANTA_CAMERA_BENCH_PROJECT; run explicitly with --ignored"]
 fn navigation_benchmark() -> Result<()> {
@@ -794,9 +1147,19 @@ fn navigation_benchmark() -> Result<()> {
         })
     };
 
+    let before_load = memory_sample().unwrap_or_default();
     let load_started = Instant::now();
     let document = load_project_document(&project)?;
     let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+    let loaded = memory_sample().unwrap_or_default();
+    eprintln!(
+        "before load: footprint {:.0} MiB, heap {:.0} MiB; loaded: footprint {:.0} MiB, graphics {:.0} MiB, heap {:.0} MiB",
+        before_load.footprint_mib,
+        before_load.heap_in_use_mib,
+        loaded.footprint_mib,
+        loaded.graphics_mib,
+        loaded.heap_in_use_mib
+    );
     let dependency_compare_us = {
         // What CameraCache::render pays per frame to prove its retained
         // pixels still match the component library, variables and modes.
@@ -900,6 +1263,10 @@ fn navigation_benchmark() -> Result<()> {
         scenarios.push(bench.run_page_switch("page_return_again", other_index)?);
         scenarios.push(bench.run_page_switch("page_return_back", page_index)?);
     }
+    if wants("visit_pages") {
+        eprintln!("running visit_pages");
+        scenarios.push(bench.run_visit_pages("visit_pages", page_index)?);
+    }
     if wants("edit_undo") {
         let start = Viewport {
             center: anchor,
@@ -931,6 +1298,15 @@ fn navigation_benchmark() -> Result<()> {
         scenarios.push(bench.run_edit_undo("edit_undo", target)?);
     }
 
+    if let Some(path) = std::env::var_os("FANTA_CAMERA_BENCH_FOOTPRINT").map(PathBuf::from) {
+        // Every region with its tag, for attributing graphics memory.
+        #[allow(clippy::disallowed_methods)]
+        let regions = std::process::Command::new("footprint")
+            .args(["-v", "-p", &std::process::id().to_string()])
+            .output()?;
+        std::fs::write(&path, regions.stdout)
+            .with_context(|| format!("writing {}", path.display()))?;
+    }
     let log = if logging {
         captured
             .lines

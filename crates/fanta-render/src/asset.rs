@@ -15,7 +15,7 @@
 //!
 //! ## Why straight (un-premultiplied) alpha
 //!
-//! [`DecodedImage::pixels_rgba`] is straight-alpha RGBA8 to match
+//! [`DecodedImage::pixels`] is straight-alpha RGBA8 to match
 //! [`RasterRenderer::copy_rgba`] (which reads back as `Unpremul`) and the
 //! node-graph contract (`RemoveBackground` preserves RGB under a zeroed
 //! alpha channel — only possible with straight alpha). Skia premultiplies on
@@ -38,30 +38,50 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 /// Decoded, ready-to-upload image pixels.
 ///
-/// `pixels_rgba` is straight-alpha RGBA8, row-major, with
-/// `len == width * height * 4`. The buffer is behind an [`Arc`] so the cache,
-/// the resolver, and the Skia image can share one allocation rather than
-/// copying megabytes per frame; it also gives the renderer a cheap identity
-/// (the `Arc` pointer) to key a future `SkImage` upload cache on, so a re-roll
-/// that swaps the buffer invalidates the stale GPU texture for free.
+/// The pixels are straight-alpha RGBA8, row-major, with
+/// `len == width * height * 4`. They live in a refcounted Skia buffer, so the
+/// resolver's cache, every clone, and the renderer's `SkImage` share one
+/// allocation: the renderer wraps these bytes instead of copying them. The
+/// buffer's address doubles as the decode's identity (see
+/// [`Self::shares_pixels`]), so a re-roll or re-decode is told apart for free.
 #[derive(Clone)]
 pub struct DecodedImage {
-    /// Straight-alpha RGBA8, row-major. `len == width * height * 4`.
-    pub pixels_rgba: Arc<Vec<u8>>,
+    pixels: skia_safe::Data,
     pub width: u32,
     pub height: u32,
 }
 
 impl DecodedImage {
-    /// Construct from raw parts. Convenience for callers and tests; does not
-    /// validate `len` (the renderer tolerates a malformed buffer by falling
-    /// back to the placeholder rather than panicking).
-    pub fn new(pixels_rgba: Arc<Vec<u8>>, width: u32, height: u32) -> Self {
+    /// Construct from raw parts. Does not validate the length (the renderer
+    /// tolerates a malformed buffer by falling back to the placeholder rather
+    /// than panicking).
+    pub fn new(pixels_rgba: &[u8], width: u32, height: u32) -> Self {
+        Self::from_data(skia_safe::Data::new_copy(pixels_rgba), width, height)
+    }
+
+    /// Construct over pixels already in a Skia buffer, without copying them.
+    pub fn from_data(pixels: skia_safe::Data, width: u32, height: u32) -> Self {
         Self {
-            pixels_rgba,
+            pixels,
             width,
             height,
         }
+    }
+
+    /// Straight-alpha RGBA8, row-major.
+    pub fn pixels(&self) -> &[u8] {
+        self.pixels.as_bytes()
+    }
+
+    /// The pixels' shared Skia buffer.
+    pub fn data(&self) -> &skia_safe::Data {
+        &self.pixels
+    }
+
+    /// Whether both images are the same decode, sharing one pixel buffer.
+    pub fn shares_pixels(&self, other: &Self) -> bool {
+        std::ptr::eq(self.pixels().as_ptr(), other.pixels().as_ptr())
+            && self.pixels().len() == other.pixels().len()
     }
 
     /// Whether the buffer length matches `width * height * 4`. The renderer
@@ -69,7 +89,7 @@ impl DecodedImage {
     /// otherwise read out of bounds inside Skia, so a bad asset degrades to the
     /// placeholder instead of unsafety.
     pub fn is_well_formed(&self) -> bool {
-        self.pixels_rgba.len() == (self.width as usize) * (self.height as usize) * 4
+        self.pixels().len() == (self.width as usize) * (self.height as usize) * 4
     }
 }
 
@@ -96,6 +116,12 @@ pub trait AssetResolver: Send + Sync {
     /// the source directly. Defaults to `None` so image-only resolvers — and
     /// renderer tests — need not implement it.
     fn resolve_bytes(&self, _id: AssetId) -> Option<std::sync::Arc<Vec<u8>>> {
+        None
+    }
+
+    /// Bytes this resolver holds beyond the document's own encoded assets, for
+    /// memory diagnostics. `None` when it does not track them.
+    fn held_bytes(&self) -> Option<usize> {
         None
     }
 }
@@ -142,10 +168,12 @@ impl AssetResolver for InMemoryAssetResolver {
     }
 }
 
-/// Default cap on decoded RGBA held by a [`LazyAssetResolver`]: 1.5 GiB.
+/// Default cap on decoded RGBA held by a [`LazyAssetResolver`]: 256 MiB.
 /// Above it the least-recently-resolved images are dropped and re-decoded on
-/// their next use.
-pub const DEFAULT_DECODED_BUDGET_BYTES: usize = 1536 * 1024 * 1024;
+/// their next use. A renderer keeps the images it draws in its own cache, which
+/// shares these buffers, so this mostly bounds decodes nobody has drawn yet:
+/// room for the pages being opened, not for every image ever opened.
+pub const DEFAULT_DECODED_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 
 /// Turns one asset's encoded bytes into straight-alpha RGBA8, or `None` when
 /// the bytes are not a decodable image (the resolver remembers the failure so
@@ -230,7 +258,7 @@ impl DecodedCache {
         }
         let tick = self.next_tick;
         self.next_tick += 1;
-        self.decoded_bytes += image.as_ref().map_or(0, |image| image.pixels_rgba.len());
+        self.decoded_bytes += image.as_ref().map_or(0, |image| image.pixels().len());
         self.entries.insert(id, CacheEntry { image, tick });
         self.recency.insert(tick, id);
         self.evict_to(budget_bytes, Some(id));
@@ -268,7 +296,7 @@ impl DecodedCache {
                 self.decoded_bytes -= evicted
                     .image
                     .as_ref()
-                    .map_or(0, |image| image.pixels_rgba.len());
+                    .map_or(0, |image| image.pixels().len());
             }
         }
     }
@@ -412,6 +440,10 @@ impl AssetResolver for LazyAssetResolver {
         cache.evict_to(self.budget_bytes, Some(id));
         Some(shared)
     }
+
+    fn held_bytes(&self) -> Option<usize> {
+        Some(LazyAssetResolver::held_bytes(self))
+    }
 }
 
 #[cfg(test)]
@@ -424,7 +456,7 @@ mod tests {
         for _ in 0..(w * h) {
             px.extend_from_slice(&rgba);
         }
-        DecodedImage::new(Arc::new(px), w, h)
+        DecodedImage::new(&px, w, h)
     }
 
     #[test]
@@ -432,14 +464,13 @@ mod tests {
         let mut r = InMemoryAssetResolver::new();
         let id = AssetId::new();
         let img = solid(4, 4, [255, 0, 0, 255]);
-        let original_ptr = Arc::as_ptr(&img.pixels_rgba);
-        assert!(r.insert(id, img).is_none());
+        assert!(r.insert(id, img.clone()).is_none());
 
         let got = r.resolve(id).expect("registered asset resolves");
         assert_eq!(got.width, 4);
         assert_eq!(got.height, 4);
-        // The resolve clone shares the Arc — no pixel copy.
-        assert_eq!(Arc::as_ptr(&got.pixels_rgba), original_ptr);
+        // The resolve clone shares the buffer — no pixel copy.
+        assert!(got.shares_pixels(&img));
         assert!(got.is_well_formed());
     }
 
@@ -458,14 +489,14 @@ mod tests {
         assert!(prev.is_some(), "replacing returns the old entry");
         assert_eq!(r.len(), 1, "replacing does not grow the map");
         let now = r.resolve(id).unwrap();
-        assert_eq!(now.pixels_rgba[0], 9);
+        assert_eq!(now.pixels()[0], 9);
     }
 
     #[test]
     fn well_formed_detects_length_mismatch() {
         let good = solid(2, 2, [0, 0, 0, 255]);
         assert!(good.is_well_formed());
-        let bad = DecodedImage::new(Arc::new(vec![0u8; 3]), 2, 2);
+        let bad = DecodedImage::new(&[0u8; 3], 2, 2);
         assert!(!bad.is_well_formed());
     }
 
@@ -514,7 +545,7 @@ mod tests {
         let first = resolver.resolve(id).unwrap();
         let second = resolver.resolve(id).unwrap();
         assert_eq!(decodes.load(Ordering::SeqCst), 1);
-        assert!(Arc::ptr_eq(&first.pixels_rgba, &second.pixels_rgba));
+        assert!(first.shares_pixels(&second));
         assert_eq!(resolver.decoded_bytes(), 2 * 2 * 4);
         assert!(resolver.resolve(AssetId::new()).is_none());
     }
@@ -630,7 +661,7 @@ mod tests {
             1,
             "one decode serves every caller"
         );
-        assert!(Arc::ptr_eq(&first.pixels_rgba, &second.pixels_rgba));
+        assert!(first.shares_pixels(&second));
     }
 
     #[test]
