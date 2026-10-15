@@ -150,6 +150,11 @@ macro_rules! id_type {
 
 id_type!(NodeId, "n", "Stable identity for a [`CanvasNode`].");
 id_type!(
+    StyleId,
+    "s",
+    "Persistent identity for an authored reusable style rule."
+);
+id_type!(
     AssetId,
     "a",
     "Reference to a binary blob (image, video, model, audio, ai cache)."

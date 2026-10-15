@@ -15,13 +15,20 @@
 
 #![forbid(unsafe_code)]
 
+pub mod gpu;
 mod overlay;
+mod playback;
 mod smart_animate;
 mod transition;
+pub use playback::{
+    ClipPlaybackMode, ClipPlaybackState, NodeOccurrence, PlaybackDiagnostic, PlaybackEvent,
+    PlaybackSchedule, PlaybackState,
+};
 
 use std::collections::{BTreeMap, HashMap};
+use std::rc::Rc;
 
-use fanta_canvas::viewport::{fit_bounds, screen_to_world};
+use fanta_canvas::viewport::{fit_bounds, pan, screen_to_world, zoom_at};
 use fanta_doc::{
     Action, AnimationClipId, ComponentId, ComponentPropKind, Doc, ModeId, MotionEvaluation,
     NodeData, NodeFlags, NodeId, OverlaySettings, PrototypeAnimation, ReactionId, Scene,
@@ -34,7 +41,7 @@ use glam::DVec2;
 use crate::overlay::{SCRIM_DIM, ScreenRect, apply_scrim, composite_over, place_overlay};
 use crate::smart_animate::SmartAnimate;
 use crate::transition::{
-    ActiveTransition, composite, composite_overlay, directional_offsets, ease, overlay_offset,
+    ActiveTransition, OverlayComposition, TransitionComposition, composite, composite_overlay, ease,
 };
 
 /// A present surface fits each frame edge-to-edge (no padding), like Figma's
@@ -55,6 +62,20 @@ pub enum PresentError {
     /// The render surface could not be allocated.
     #[error(transparent)]
     Render(#[from] RenderError),
+    #[error("elapsed time must be finite and nonnegative")]
+    InvalidElapsedTime,
+    #[error("animation clip is not present")]
+    ClipNotFound,
+    #[error("motion target {0} is absent or ambiguous in the requested scope")]
+    MotionTargetNotFound(NodeId),
+    #[error("animation playhead must be finite and nonnegative")]
+    InvalidPlayhead,
+    #[error("unknown variable or incompatible value")]
+    InvalidVariable,
+    #[error("unknown variable collection or mode")]
+    InvalidMode,
+    #[error("camera input must be finite and the zoom factor positive")]
+    InvalidCamera,
 }
 
 /// A pointer gesture, in the host's terms. The session maps these to the
@@ -83,7 +104,8 @@ pub enum KeyEvent {
 }
 
 /// What the host should do after handing the session an event.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct PresentResponse {
     /// The view changed — the host should re-render.
     pub needs_redraw: bool,
@@ -119,6 +141,8 @@ struct NavEntry {
 #[derive(Debug, Clone)]
 struct PendingTimer {
     root: NodeId,
+    layer: u64,
+    order: usize,
     source: NodeId,
     reaction: ReactionId,
     /// The reaction's full action sequence (primary first), executed in order
@@ -133,6 +157,7 @@ struct PendingTimer {
 #[derive(Debug, Clone)]
 struct OverlayEntry {
     root: NodeId,
+    layer: u64,
     settings: OverlaySettings,
     /// The viewport that renders the overlay frame at the base zoom, placed per
     /// `settings.position`.
@@ -211,6 +236,9 @@ struct ActivePrototypeAnimation {
     clip: AnimationClipId,
     delay: f64,
     elapsed: f64,
+    mode: ClipPlaybackMode,
+    paused: bool,
+    completion_emitted: bool,
 }
 
 impl ActivePrototypeAnimation {
@@ -219,17 +247,36 @@ impl ActivePrototypeAnimation {
             return None;
         }
         let clip = doc.motion.clip(self.clip)?;
-        let elapsed = ((self.elapsed - self.delay) * 1000.0)
-            .round()
-            .clamp(0.0, f64::from(u32::MAX)) as u32;
-        Some(elapsed.min(clip.duration_ms))
+        let elapsed_ms = ((self.elapsed - self.delay) * 1000.0).round().max(0.0);
+        let elapsed = elapsed_ms.min(f64::from(u32::MAX)) as u32;
+        Some(match self.mode {
+            ClipPlaybackMode::Once => elapsed.min(clip.duration_ms),
+            ClipPlaybackMode::Repeat if clip.duration_ms > 0 => {
+                (elapsed_ms % f64::from(clip.duration_ms)) as u32
+            }
+            ClipPlaybackMode::PingPong if clip.duration_ms > 0 => {
+                let duration = u64::from(clip.duration_ms);
+                let cycle = (elapsed_ms % (duration as f64 * 2.0)) as u64;
+                if cycle <= duration {
+                    cycle as u32
+                } else {
+                    (duration * 2 - cycle) as u32
+                }
+            }
+            _ => 0,
+        })
     }
 
     fn is_running(self, doc: &Doc) -> bool {
         let Some(clip) = doc.motion.clip(self.clip) else {
             return false;
         };
-        self.elapsed + TIME_EPSILON_SECONDS < self.delay + f64::from(clip.duration_ms) / 1000.0
+        !self.paused
+            && (self.elapsed + TIME_EPSILON_SECONDS < self.delay
+                || (clip.duration_ms > 0
+                    && (self.mode != ClipPlaybackMode::Once
+                        || self.elapsed + TIME_EPSILON_SECONDS
+                            < self.delay + f64::from(clip.duration_ms) / 1000.0)))
     }
 }
 
@@ -290,12 +337,16 @@ struct InstanceVariantRestore {
 }
 
 /// Plays a prototype over an immutable [`Doc`].
-pub struct PresentSession {
+pub struct PlaybackSession {
     doc: Doc,
     screen_size: DVec2,
+    display_scale: f64,
+    physical_size: (u32, u32),
 
     /// The current base frame's root node.
     current: NodeId,
+    current_layer: u64,
+    next_layer: u64,
     /// The current frame's viewport (fit to the frame; panned by `ScrollTo`).
     viewport: Viewport,
     /// Navigation history for `Back`.
@@ -313,7 +364,7 @@ pub struct PresentSession {
     /// Seconds since the session started (advanced by [`tick`](Self::tick)).
     clock: f64,
     /// The navigation transition currently animating, if any. While set,
-    /// [`present_rgba`](Self::present_rgba) composites the two endpoint frames.
+    /// [`PresentSession::present_rgba`] composites the two endpoint frames.
     active_transition: Option<ActiveTransition>,
     /// The prepared smart-animate plan for the active transition, when its style
     /// is [`TransitionStyle::SmartAnimate`] — a scratch scene tweened per tick.
@@ -330,6 +381,18 @@ pub struct PresentSession {
     /// Property-animation clip bound to the latest fired reaction. Completed
     /// clips remain here at their final playhead so the last sample is held.
     active_prototype_animation: Option<ActivePrototypeAnimation>,
+    active_motion_scope: Option<NodeOccurrence>,
+    active_motion_targets: Vec<NodeOccurrence>,
+    compiled_motion: Rc<fanta_doc::motion::CompiledMotionLibrary>,
+    paused: bool,
+    timers_suspended: bool,
+    playback_events: Vec<PlaybackEvent>,
+    occurrence_cache: std::cell::RefCell<playback::OccurrenceCache>,
+    text_context: Option<fanta_render::TextRenderContext>,
+    text_context_generation: u64,
+    resolution_errors: std::cell::RefCell<Vec<String>>,
+    timer_membership: std::collections::BTreeSet<(u64, NodeId, ReactionId)>,
+    dispatch_layer: Option<(u64, NodeId)>,
     /// Pending `AfterDelay` reactions on the active layers, counted down by
     /// [`tick`](Self::tick).
     timers: Vec<PendingTimer>,
@@ -378,15 +441,177 @@ pub struct PresentSession {
     active_scroll_animation: Option<ActiveScrollAnimation>,
 
     pending_url: Option<String>,
+}
 
+/// Adds Skia presentation to a renderer-independent playback session.
+pub struct PresentSession {
+    pub playback: PlaybackSession,
     renderer: RasterRenderer,
+    renderer_text_context_generation: u64,
+}
+
+impl std::ops::Deref for PresentSession {
+    type Target = PlaybackSession;
+
+    fn deref(&self) -> &Self::Target {
+        &self.playback
+    }
+}
+
+impl std::ops::DerefMut for PresentSession {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.playback
+    }
 }
 
 impl PresentSession {
+    pub fn new(doc: &Doc, start: Option<NodeId>, screen_size: DVec2) -> Result<Self, PresentError> {
+        Self::from_playback(PlaybackSession::new(doc, start, screen_size)?)
+    }
+
+    pub fn new_with_text_context(
+        doc: &Doc,
+        start: Option<NodeId>,
+        screen_size: DVec2,
+        text_context: fanta_render::TextRenderContext,
+    ) -> Result<Self, PresentError> {
+        Self::from_playback(PlaybackSession::new_with_text_context(
+            doc,
+            start,
+            screen_size,
+            text_context,
+        )?)
+    }
+
+    pub fn new_headless(
+        doc: &Doc,
+        start: Option<NodeId>,
+        screen_size: DVec2,
+    ) -> Result<PlaybackSession, PresentError> {
+        PlaybackSession::new(doc, start, screen_size)
+    }
+
+    pub fn from_playback(playback: PlaybackSession) -> Result<Self, PresentError> {
+        let (width, height) = playback.pixel_size();
+        let mut renderer = RasterRenderer::new(width, height)?;
+        renderer.display_scale = playback.display_scale;
+        if let Some(context) = &playback.text_context {
+            renderer.set_text_context(context.clone());
+        }
+        if let Some(config) = &playback.doc.presentation
+            && let Some(frame_color) = config.frame_color
+        {
+            renderer.background = frame_color;
+        }
+        let renderer_text_context_generation = playback.text_context_generation;
+        Ok(Self {
+            playback,
+            renderer,
+            renderer_text_context_generation,
+        })
+    }
+
+    pub fn resize(&mut self, screen_size: DVec2) -> Result<(), PresentError> {
+        self.resize_with_scale(screen_size, self.playback.display_scale)
+    }
+
+    pub fn resize_with_scale(
+        &mut self,
+        screen_size: DVec2,
+        display_scale: f64,
+    ) -> Result<(), PresentError> {
+        let screen_size = valid_screen_size(screen_size);
+        let display_scale = valid_display_scale(display_scale);
+        let width = (screen_size.x * display_scale).round().max(1.0) as u32;
+        let height = (screen_size.y * display_scale).round().max(1.0) as u32;
+        self.renderer.resize(width, height)?;
+        self.renderer.display_scale = display_scale;
+        self.playback.resize_with_scale(screen_size, display_scale)
+    }
+
+    pub fn set_text_context(&mut self, context: fanta_render::TextRenderContext) {
+        self.renderer.set_text_context(context.clone());
+        self.playback.set_text_context(context);
+        self.renderer_text_context_generation = self.playback.text_context_generation;
+    }
+
+    pub(crate) fn synchronize_renderer(&mut self) -> Result<(), RenderError> {
+        let (width, height) = self.playback.pixel_size();
+        self.renderer.resize(width, height)?;
+        self.renderer.display_scale = self.playback.display_scale;
+        if self.renderer_text_context_generation != self.playback.text_context_generation {
+            if let Some(context) = &self.playback.text_context {
+                self.renderer.set_text_context(context.clone());
+            }
+            self.renderer_text_context_generation = self.playback.text_context_generation;
+        }
+        Ok(())
+    }
+
+    fn record_render_error(&mut self, error: RenderError) {
+        self.playback
+            .playback_events
+            .push(PlaybackEvent::Diagnostic {
+                diagnostic: PlaybackDiagnostic {
+                    code: "renderFailed".into(),
+                    message: error.to_string(),
+                },
+            });
+    }
+
+    /// Install an asset resolver so image fills / bitmaps render (delegates to
+    /// the internal renderer). Optional — vector-only prototypes need none.
+    pub fn set_asset_resolver(
+        &mut self,
+        resolver: std::sync::Arc<dyn fanta_render::AssetResolver>,
+    ) {
+        self.renderer.set_asset_resolver(resolver);
+    }
+}
+
+impl PlaybackSession {
     /// Start a session. `start` names the first frame; `None` falls back to the
     /// doc's flow start, then its active page. `screen_size` is the present
     /// surface size in logical pixels.
     pub fn new(doc: &Doc, start: Option<NodeId>, screen_size: DVec2) -> Result<Self, PresentError> {
+        Self::new_with_context(doc, start, screen_size, None, None)
+    }
+
+    pub fn new_with_text_context(
+        doc: &Doc,
+        start: Option<NodeId>,
+        screen_size: DVec2,
+        text_context: fanta_render::TextRenderContext,
+    ) -> Result<Self, PresentError> {
+        Self::new_with_context(doc, start, screen_size, Some(text_context), None)
+    }
+
+    /// Start a session that samples clips through `compiled_motion` instead of
+    /// compiling its own, so players of one program share a single index.
+    /// `compiled_motion` must be compiled from `doc.motion`.
+    pub fn new_with_compiled_motion(
+        doc: &Doc,
+        start: Option<NodeId>,
+        screen_size: DVec2,
+        text_context: fanta_render::TextRenderContext,
+        compiled_motion: Rc<fanta_doc::motion::CompiledMotionLibrary>,
+    ) -> Result<Self, PresentError> {
+        Self::new_with_context(
+            doc,
+            start,
+            screen_size,
+            Some(text_context),
+            Some(compiled_motion),
+        )
+    }
+
+    fn new_with_context(
+        doc: &Doc,
+        start: Option<NodeId>,
+        screen_size: DVec2,
+        text_context: Option<fanta_render::TextRenderContext>,
+        compiled_motion: Option<Rc<fanta_doc::motion::CompiledMotionLibrary>>,
+    ) -> Result<Self, PresentError> {
         let screen_size = valid_screen_size(screen_size);
         let current = start
             .or_else(|| doc.flow_start())
@@ -395,7 +620,7 @@ impl PresentSession {
             // every frame at once). Fall back to the bare page only when it has
             // no frame children at all.
             .or_else(|| {
-                let page = doc.active_page()?;
+                let page = doc.active_page().or_else(|| doc.pages.first().copied())?;
                 doc.scene
                     .children_of(Some(page))
                     .iter()
@@ -414,21 +639,15 @@ impl PresentSession {
         }
         let width = (screen_size.x.max(1.0)) as u32;
         let height = (screen_size.y.max(1.0)) as u32;
-        let mut renderer = RasterRenderer::new(width, height)?;
-        // Honor the authored presentation device (Figma `prototypeDevice`):
-        // the surround/chrome color paints the letterbox area around the
-        // fitted frame. The device box itself is available to hosts via
-        // [`presentation`](Self::presentation) for real chrome/letterboxing.
-        if let Some(config) = &doc.presentation
-            && let Some(frame_color) = config.frame_color
-        {
-            renderer.background = frame_color;
-        }
         let viewport = frame_viewport(&doc.scene, current, screen_size);
         let mut session = Self {
             doc: doc.clone(),
             screen_size,
+            display_scale: 1.0,
+            physical_size: (width, height),
             current,
+            current_layer: 1,
+            next_layer: 2,
             viewport,
             back_stack: Vec::new(),
             overlays: Vec::new(),
@@ -442,6 +661,18 @@ impl PresentSession {
             active_overlay_exit: None,
             active_variant_transition: None,
             active_prototype_animation: None,
+            active_motion_scope: None,
+            active_motion_targets: Vec::new(),
+            compiled_motion: compiled_motion.unwrap_or_else(|| Rc::new(doc.motion.compile())),
+            paused: false,
+            timers_suspended: false,
+            playback_events: Vec::new(),
+            occurrence_cache: Default::default(),
+            text_context,
+            text_context_generation: 0,
+            resolution_errors: Default::default(),
+            timer_membership: Default::default(),
+            dispatch_layer: None,
             timers: Vec::new(),
             media_time: 0.0,
             media_playing: false,
@@ -455,20 +686,15 @@ impl PresentSession {
             hover_chain: Vec::new(),
             active_scroll_animation: None,
             pending_url: None,
-            renderer,
         };
         session.seed_initial_scroll_offsets(current);
         session.schedule_timers(current);
+        session.viewport = frame_viewport(
+            &session.resolved_layer(current, false).scene,
+            current,
+            screen_size,
+        );
         Ok(session)
-    }
-
-    /// Install an asset resolver so image fills / bitmaps render (delegates to
-    /// the internal renderer). Optional — vector-only prototypes need none.
-    pub fn set_asset_resolver(
-        &mut self,
-        resolver: std::sync::Arc<dyn fanta_render::AssetResolver>,
-    ) {
-        self.renderer.set_asset_resolver(resolver);
     }
 
     /// The current base frame.
@@ -508,9 +734,7 @@ impl PresentSession {
         &self.doc
     }
 
-    /// Restart playback at `start` while retaining the renderer and its asset /
-    /// instance caches. All ephemeral prototype state is reset, matching a new
-    /// session without cloning the document again.
+    /// Reset ephemeral prototype state without cloning the document again.
     pub fn restart_at(&mut self, start: NodeId) -> bool {
         if !self.doc.scene.contains(start) {
             return false;
@@ -523,6 +747,11 @@ impl PresentSession {
         self.active_modes = self.doc.active_modes.clone();
         self.mode_generation = self.mode_generation.wrapping_add(1);
         self.clock = 0.0;
+        self.paused = false;
+        self.timers_suspended = false;
+        self.timer_membership.clear();
+        self.playback_events.clear();
+        self.occurrence_cache.borrow_mut().layers.clear();
         self.active_transition = None;
         self.smart_animate = None;
         self.active_overlay_transition = None;
@@ -543,13 +772,66 @@ impl PresentSession {
         self.active_scroll_animation = None;
         self.pending_url = None;
         self.schedule_timers(start);
+        self.viewport = frame_viewport(
+            &self.resolved_layer(start, false).scene,
+            start,
+            self.screen_size,
+        );
         true
+    }
+
+    /// The camera over the current frame: its world-space center and zoom.
+    pub fn viewport(&self) -> Viewport {
+        self.viewport
+    }
+
+    /// Move the camera by a screen-space delta so the content follows the
+    /// pointer. Navigation, restart and [`Self::fit_view`] fit it again.
+    pub fn pan_view(&mut self, screen_delta: DVec2) -> Result<PresentResponse, PresentError> {
+        if !screen_delta.is_finite() {
+            return Err(PresentError::InvalidCamera);
+        }
+        self.viewport = pan(&self.viewport, screen_delta);
+        Ok(PresentResponse {
+            needs_redraw: true,
+            ..PresentResponse::default()
+        })
+    }
+
+    /// Scale the camera by `factor` around a screen-space anchor, within the
+    /// canvas zoom limits.
+    pub fn zoom_view(
+        &mut self,
+        screen_anchor: DVec2,
+        factor: f64,
+    ) -> Result<PresentResponse, PresentError> {
+        if !screen_anchor.is_finite() || !factor.is_finite() || factor <= 0.0 {
+            return Err(PresentError::InvalidCamera);
+        }
+        self.viewport = zoom_at(&self.viewport, screen_anchor, factor, self.screen_size);
+        Ok(PresentResponse {
+            needs_redraw: true,
+            ..PresentResponse::default()
+        })
+    }
+
+    /// Fit the camera to the current frame again.
+    pub fn fit_view(&mut self) -> PresentResponse {
+        self.viewport = frame_viewport(
+            &self.resolved_layer(self.current, false).scene,
+            self.current,
+            self.screen_size,
+        );
+        PresentResponse {
+            needs_redraw: true,
+            ..PresentResponse::default()
+        }
     }
 
     /// Resize the logical presentation surface without discarding navigation,
     /// timer, variable, media, or component-variant state.
     pub fn resize(&mut self, screen_size: DVec2) -> Result<(), PresentError> {
-        self.resize_with_scale(screen_size, self.renderer.display_scale)
+        self.resize_with_scale(screen_size, self.display_scale)
     }
 
     /// Resize the logical surface and set its logical-to-physical display
@@ -564,56 +846,89 @@ impl PresentSession {
         let width = (screen_size.x * display_scale).round().max(1.0) as u32;
         let height = (screen_size.y * display_scale).round().max(1.0) as u32;
         if self.screen_size == screen_size
-            && self.renderer.width() == width
-            && self.renderer.height() == height
-            && self.renderer.display_scale == display_scale
+            && self.physical_size == (width, height)
+            && self.display_scale == display_scale
         {
             return Ok(());
         }
         let old_screen_size = self.screen_size;
         let logical_size_changed = old_screen_size != screen_size;
-        self.renderer.resize(width, height)?;
-        self.renderer.display_scale = display_scale;
+        self.physical_size = (width, height);
+        self.display_scale = display_scale;
         if !logical_size_changed {
             return Ok(());
         }
+        let current_scene =
+            self.resolved_layer_with_identity(self.current, self.current_layer, false);
         self.viewport = rebase_viewport(
-            &self.doc.scene,
+            &current_scene.scene,
             self.current,
             self.viewport,
             old_screen_size,
             screen_size,
         );
-        for entry in &mut self.back_stack {
-            entry.viewport = rebase_viewport(
-                &self.doc.scene,
-                entry.frame,
-                entry.viewport,
-                old_screen_size,
-                screen_size,
-            );
+        let history_viewports: Vec<_> = self
+            .back_stack
+            .iter()
+            .map(|entry| {
+                let resolved = self.resolved_layer(entry.frame, false);
+                rebase_viewport(
+                    &resolved.scene,
+                    entry.frame,
+                    entry.viewport,
+                    old_screen_size,
+                    screen_size,
+                )
+            })
+            .collect();
+        for (entry, viewport) in self.back_stack.iter_mut().zip(history_viewports) {
+            entry.viewport = viewport;
         }
-        if let Some(active) = &mut self.active_transition {
-            active.from_viewport = rebase_viewport(
-                &self.doc.scene,
-                active.from_frame,
-                active.from_viewport,
-                old_screen_size,
-                screen_size,
-            );
-            active.to_viewport = rebase_viewport(
-                &self.doc.scene,
-                active.to_frame,
-                active.to_viewport,
-                old_screen_size,
-                screen_size,
-            );
+        let transition_viewports = self.active_transition.map(|active| {
+            let from = self.resolved_layer(active.from_frame, false);
+            let to = self.resolved_layer(active.to_frame, false);
+            (
+                rebase_viewport(
+                    &from.scene,
+                    active.from_frame,
+                    active.from_viewport,
+                    old_screen_size,
+                    screen_size,
+                ),
+                rebase_viewport(
+                    &to.scene,
+                    active.to_frame,
+                    active.to_viewport,
+                    old_screen_size,
+                    screen_size,
+                ),
+            )
+        });
+        if let (Some(active), Some((from, to))) =
+            (&mut self.active_transition, transition_viewports)
+        {
+            active.from_viewport = from;
+            active.to_viewport = to;
         }
+        let overlay_bounds: Vec<_> = self
+            .overlays
+            .iter()
+            .map(|overlay| {
+                self.resolved_layer_with_identity(overlay.root, overlay.layer, false)
+                    .scene
+                    .world_bounds(overlay.root)
+            })
+            .collect();
+        let exit_bounds = self.active_overlay_exit.as_ref().and_then(|exit| {
+            self.resolved_layer_with_identity(exit.entry.root, exit.entry.layer, false)
+                .scene
+                .world_bounds(exit.entry.root)
+        });
         self.screen_size = screen_size;
 
         let mut base_zoom = self.viewport.zoom;
-        for overlay in &mut self.overlays {
-            let Some(bounds) = self.doc.scene.world_bounds(overlay.root) else {
+        for (overlay, bounds) in self.overlays.iter_mut().zip(overlay_bounds) {
+            let Some(bounds) = bounds else {
                 continue;
             };
             let (viewport, screen_rect) =
@@ -622,25 +937,48 @@ impl PresentSession {
             overlay.screen_rect = screen_rect;
             base_zoom = viewport.zoom;
         }
-        if let Some(exit) = &mut self.active_overlay_exit
-            && let Some(bounds) = self.doc.scene.world_bounds(exit.entry.root)
-        {
+        if let (Some(exit), Some(bounds)) = (&mut self.active_overlay_exit, exit_bounds) {
             let (viewport, screen_rect) =
                 place_overlay(base_zoom, bounds, exit.entry.settings.position, screen_size);
             exit.entry.viewport = viewport;
             exit.entry.screen_rect = screen_rect;
         }
+        let variant_viewport = self.active_viewport();
+        if let Some(active) = &mut self.active_variant_transition {
+            for layer in &mut active.layers {
+                layer.viewport = variant_viewport;
+            }
+        }
+        self.prune_occurrence_cache(None);
         Ok(())
     }
 
-    /// Physical pixel dimensions of [`present_rgba`](Self::present_rgba).
+    /// Physical pixel dimensions required by the presentation adapter.
     pub fn pixel_size(&self) -> (u32, u32) {
-        (self.renderer.width(), self.renderer.height())
+        self.physical_size
+    }
+
+    pub fn screen_size(&self) -> DVec2 {
+        self.screen_size
+    }
+
+    pub fn display_scale(&self) -> f64 {
+        self.display_scale
     }
 
     /// Take the URL requested by the latest `OpenLink` action.
     pub fn take_open_url(&mut self) -> Option<String> {
         self.pending_url.take()
+    }
+
+    pub fn cancel_pointer_input(&mut self) -> PresentResponse {
+        self.hover_chain.clear();
+        self.suppress_next_click = false;
+        let pressed = self.restore_pressed_reaction();
+        let hovered = self.restore_hovered_reaction();
+        let mut response = merge_responses(pressed, hovered);
+        response.animating = self.is_animating();
+        response
     }
 
     /// Handle a pointer event at `point` (logical screen px).
@@ -668,7 +1006,7 @@ impl PresentSession {
             if let Some(overlay) = self.overlays.last() {
                 if overlay.settings.close_on_click_outside && !overlay.screen_rect.contains(point) {
                     if let Some(closed) = self.overlays.pop() {
-                        self.cancel_timers(closed.root);
+                        self.cancel_timers(closed.layer);
                         if self
                             .active_overlay_transition
                             .is_some_and(|active| active.root == closed.root)
@@ -677,6 +1015,7 @@ impl PresentSession {
                         }
                         self.active_overlay_exit = None;
                         self.active_prototype_animation = None;
+                        self.prune_occurrence_cache(None);
                     }
                     let restored = merge_responses(
                         self.restore_hovered_reaction(),
@@ -746,9 +1085,10 @@ impl PresentSession {
         // A key trigger isn't tied to a hit point: any node on the active layer
         // carrying a matching Key reaction fires. Scan the layer's subtree.
         let layer_root = self.layer_root();
+        let resolved = self.resolved_layer(layer_root, false);
         let mut fired = None;
-        for id in self.doc.scene.descendants_of(layer_root) {
-            if let Some(node) = self.doc.scene.get(id) {
+        for id in resolved.scene.descendants_of(layer_root) {
+            if let Some(node) = resolved.scene.get(id) {
                 if let Some(rx) = node
                     .reactions
                     .iter()
@@ -776,6 +1116,12 @@ impl PresentSession {
     /// transitions and the active reaction-bound property clip while firing
     /// `AfterDelay` reactions at their exact chronological boundaries.
     pub fn tick(&mut self, dt: f64) -> PresentResponse {
+        if !dt.is_finite() || dt < 0.0 || self.paused {
+            return PresentResponse::default();
+        }
+        if self.timers_suspended {
+            return self.advance_continuous(dt);
+        }
         let mut remaining = dt.max(0.0);
         let mut response = PresentResponse::default();
         let mut fired_events = 0usize;
@@ -815,7 +1161,7 @@ impl PresentSession {
                     true
                 }
             });
-            due.sort_by_key(|timer| (timer.root, timer.source, timer.reaction));
+            due.sort_by_key(|timer| (timer.layer, timer.order, timer.reaction));
 
             if due.is_empty() {
                 if remaining <= 0.0 {
@@ -830,24 +1176,34 @@ impl PresentSession {
                     continue;
                 }
                 fired_events += 1;
-                if timer.root != self.current
-                    && !self
-                        .overlays
-                        .iter()
-                        .any(|overlay| overlay.root == timer.root)
+                if !self
+                    .timer_membership
+                    .contains(&(timer.layer, timer.source, timer.reaction))
+                    || (timer.layer != self.current_layer
+                        && !self
+                            .overlays
+                            .iter()
+                            .any(|overlay| overlay.layer == timer.layer))
                 {
                     continue;
                 }
+                self.dispatch_layer = Some((timer.layer, timer.root));
                 let fired = self.execute_reaction(
                     timer.source,
                     &timer.actions,
                     timer.transition.as_ref(),
                     timer.animation.as_ref(),
                 );
+                self.dispatch_layer = None;
                 response = merge_responses(response, fired);
             }
 
             if fired_events >= MAX_TIMER_EVENTS_PER_TICK {
+                self.timers_suspended = true;
+                self.playback_events.push(PlaybackEvent::Diagnostic { diagnostic: PlaybackDiagnostic {
+                    code: "timerBudgetExceeded".into(),
+                    message: "Prototype timer event budget exceeded; timers are suspended until restart".into(),
+                }});
                 response = merge_responses(response, self.advance_continuous(remaining));
                 for timer in &mut self.timers {
                     timer.remaining -= remaining;
@@ -857,6 +1213,7 @@ impl PresentSession {
         }
 
         response.animating = self.is_animating();
+        self.prune_occurrence_cache(None);
         response
     }
 
@@ -964,8 +1321,22 @@ impl PresentSession {
         let animation_response = match &mut self.active_prototype_animation {
             Some(active) => {
                 let before = active.playhead_ms(&self.doc);
-                active.elapsed += dt;
+                if !active.paused {
+                    active.elapsed += dt;
+                }
                 let after = active.playhead_ms(&self.doc);
+                if !active.paused
+                    && !active.completion_emitted
+                    && self.doc.motion.clip(active.clip).is_some_and(|clip| {
+                        active.elapsed + TIME_EPSILON_SECONDS
+                            >= active.delay + f64::from(clip.duration_ms) / 1000.0
+                            && (active.mode == ClipPlaybackMode::Once || clip.duration_ms == 0)
+                    })
+                {
+                    active.completion_emitted = true;
+                    self.playback_events
+                        .push(PlaybackEvent::ClipCompleted { clip: active.clip });
+                }
                 PresentResponse {
                     needs_redraw: before != after,
                     animating: active.is_running(&self.doc),
@@ -1018,13 +1389,19 @@ impl PresentSession {
                 .active_prototype_animation
                 .is_some_and(|active| active.is_running(&self.doc))
     }
+}
 
+impl PresentSession {
     /// Render the current view and read back straight-alpha RGBA8 (headless /
     /// PNG path). Composites, in order: the base layer (an in-flight transition's
     /// two frames, else the current frame), then — for each open overlay — a
     /// backdrop scrim (if it dims) and the overlay frame on top.
     pub fn present_rgba(&mut self) -> Vec<u8> {
-        if let Some(mut active) = self.active_variant_transition.take() {
+        if let Err(error) = self.synchronize_renderer() {
+            self.record_render_error(error);
+            return Vec::new();
+        }
+        if let Some(mut active) = self.playback.active_variant_transition.take() {
             let eased = ease(active.clock.easing, active.clock.progress());
             let width = self.renderer.width() as usize;
             let height = self.renderer.height() as usize;
@@ -1040,7 +1417,7 @@ impl PresentSession {
                     if let Some(smart) = &mut layer.smart_animate {
                         smart.apply(eased);
                         let mut scene = smart.scene.clone();
-                        self.apply_destination_motion_to_materialized_root(
+                        self.playback.apply_destination_motion_to_materialized_root(
                             &mut scene,
                             smart.root,
                             &target_instance,
@@ -1059,7 +1436,7 @@ impl PresentSession {
                         false,
                     );
                     let mut incoming_scene = layer.to_scene.clone();
-                    self.apply_destination_motion_to_materialized_root(
+                    self.playback.apply_destination_motion_to_materialized_root(
                         &mut incoming_scene,
                         layer.to_root,
                         &target_instance,
@@ -1083,13 +1460,13 @@ impl PresentSession {
                 };
                 composite_over(&mut pixels, &animated);
             }
-            self.active_variant_transition = Some(active);
+            self.playback.active_variant_transition = Some(active);
             return pixels;
         }
 
         let mut buffer = self.base_rgba();
         // Clone the (small) overlay stack so the render borrow of `self` is free.
-        let overlays: Vec<OverlayEntry> = self.overlays.clone();
+        let overlays: Vec<OverlayEntry> = self.playback.overlays.clone();
         for (index, entry) in overlays.iter().enumerate() {
             let over = self.render_frame_rgba(entry.root, entry.viewport);
             let entering = self
@@ -1115,7 +1492,7 @@ impl PresentSession {
                 composite_over(&mut buffer, &over);
             }
         }
-        if let Some(exit) = self.active_overlay_exit.clone() {
+        if let Some(exit) = self.playback.active_overlay_exit.clone() {
             let visible =
                 exit.start_visible * (1.0 - ease(exit.clock.easing, exit.clock.progress()));
             if exit.entry.settings.background_dim {
@@ -1138,7 +1515,7 @@ impl PresentSession {
     /// The base layer beneath any overlays: the transition composite while one
     /// animates, otherwise the current frame rendered directly.
     fn base_rgba(&mut self) -> Vec<u8> {
-        let Some(active) = self.active_transition else {
+        let Some(active) = self.playback.active_transition else {
             let _ = self.render_current();
             return self.renderer.copy_rgba();
         };
@@ -1147,26 +1524,31 @@ impl PresentSession {
         // Smart animate: tween the scratch scene and render it directly (no
         // two-raster composite). Fields are borrowed disjointly so the scratch
         // scene, the render inputs, and the renderer can be touched at once.
-        if matches!(active.style, TransitionStyle::SmartAnimate) && self.smart_animate.is_some() {
-            let smart_scene = self.smart_animate.as_mut().map(|smart| {
+        if matches!(active.style, TransitionStyle::SmartAnimate)
+            && self.playback.smart_animate.is_some()
+        {
+            let smart_scene = self.playback.smart_animate.as_mut().map(|smart| {
                 smart.apply(eased);
                 (smart.scene.clone(), smart.root)
             });
             if let Some((mut scene, root)) = smart_scene {
-                Self::apply_scroll_offsets_to_scene(&self.scroll_offsets, &mut scene);
-                Self::apply_variant_overrides_to_scene(
-                    &self.variant_overrides,
-                    &self.instance_variant_overrides,
-                    &self.doc.components,
+                PlaybackSession::apply_scroll_offsets_to_scene(
+                    &self.playback.scroll_offsets,
+                    &mut scene,
+                );
+                PlaybackSession::apply_variant_overrides_to_scene(
+                    &self.playback.variant_overrides,
+                    &self.playback.instance_variant_overrides,
+                    &self.playback.doc.components,
                     &mut scene,
                     root,
                 );
-                let motion = self.prototype_motion_evaluation();
+                let motion = self.playback.prototype_motion_evaluation();
                 let inputs = RenderInputs {
-                    components: &self.doc.components,
-                    variables: &self.variables,
-                    active_modes: &self.active_modes,
-                    mode_generation: self.mode_generation,
+                    components: &self.playback.doc.components,
+                    variables: &self.playback.variables,
+                    active_modes: &self.playback.active_modes,
+                    mode_generation: self.playback.mode_generation,
                     motion: motion.as_ref(),
                     playback: None,
                     video_fill_frames: None,
@@ -1200,32 +1582,26 @@ impl PresentSession {
         include_motion: bool,
     ) -> Vec<u8> {
         // Built inline for the same borrow-splitting reason as `render_current`.
-        let motion = include_motion
-            .then(|| self.prototype_motion_evaluation())
-            .flatten();
+        let resolved = self.playback.resolved_layer(frame, include_motion);
         let inputs = RenderInputs {
-            components: &self.doc.components,
-            variables: &self.variables,
-            active_modes: &self.active_modes,
-            mode_generation: self.mode_generation,
-            motion: motion.as_ref(),
+            components: &self.playback.doc.components,
+            variables: &self.playback.variables,
+            active_modes: &self.playback.active_modes,
+            mode_generation: self.playback.mode_generation,
+            motion: None,
             playback: None,
             video_fill_frames: None,
             dark_ui: false,
         };
-        if let Some(patched) = self.build_runtime_scene(frame) {
-            self.renderer
-                .render_page_with(&patched, &viewport, Some(frame), &inputs);
-        } else {
-            self.renderer
-                .render_page_with(&self.doc.scene, &viewport, Some(frame), &inputs);
-        }
+        self.renderer
+            .render_page_with(&resolved.scene, &viewport, Some(frame), &inputs);
         self.renderer.copy_rgba()
     }
 
     fn render_surface_hiding(&mut self, hidden: &[NodeId]) -> Vec<u8> {
-        let mut buffer = self.render_frame_rgba_hiding(self.current, self.viewport, hidden);
-        let overlays = self.overlays.clone();
+        let mut buffer =
+            self.render_frame_rgba_hiding(self.playback.current, self.playback.viewport, hidden);
+        let overlays = self.playback.overlays.clone();
         for entry in overlays {
             if entry.settings.background_dim {
                 apply_scrim(&mut buffer, SCRIM_DIM);
@@ -1244,7 +1620,7 @@ impl PresentSession {
     ) -> Vec<u8> {
         let mut scene = self
             .build_runtime_scene(frame)
-            .unwrap_or_else(|| self.doc.scene.clone());
+            .unwrap_or_else(|| self.playback.doc.scene.clone());
         for hidden in hidden {
             if descends_from(&scene, *hidden, frame)
                 && let Some(node) = scene.get_mut(*hidden)
@@ -1252,12 +1628,12 @@ impl PresentSession {
                 node.flags.insert(NodeFlags::HIDDEN);
             }
         }
-        let motion = self.prototype_motion_evaluation_excluding(hidden);
+        let motion = self.playback.prototype_motion_evaluation_excluding(hidden);
         let inputs = RenderInputs {
-            components: &self.doc.components,
-            variables: &self.variables,
-            active_modes: &self.active_modes,
-            mode_generation: self.mode_generation,
+            components: &self.playback.doc.components,
+            variables: &self.playback.variables,
+            active_modes: &self.playback.active_modes,
+            mode_generation: self.playback.mode_generation,
             motion: motion.as_ref(),
             playback: None,
             video_fill_frames: None,
@@ -1276,13 +1652,13 @@ impl PresentSession {
         include_motion: bool,
     ) -> Vec<u8> {
         let motion = include_motion
-            .then(|| self.prototype_motion_evaluation())
+            .then(|| self.playback.prototype_motion_evaluation())
             .flatten();
         let inputs = RenderInputs {
-            components: &self.doc.components,
-            variables: &self.variables,
-            active_modes: &self.active_modes,
-            mode_generation: self.mode_generation,
+            components: &self.playback.doc.components,
+            variables: &self.playback.variables,
+            active_modes: &self.playback.active_modes,
+            mode_generation: self.playback.mode_generation,
             motion: motion.as_ref(),
             playback: None,
             video_fill_frames: None,
@@ -1295,34 +1671,38 @@ impl PresentSession {
 
     /// Render the current view onto the owned surface, returning metrics.
     pub fn render_current(&mut self) -> RenderMetrics {
+        if let Err(error) = self.synchronize_renderer() {
+            self.record_render_error(error);
+            let mut metrics = RenderMetrics::default();
+            metrics.effect_failed = true;
+            metrics.incomplete_artwork = true;
+            return metrics;
+        }
         // Built inline (not via a `&self` helper) so the borrow checker sees the
         // input borrows (`doc`/`variables`/`active_modes`) are disjoint from the
         // mutable `renderer` borrow.
         let playback = self.build_media_playback();
-        let motion = self.prototype_motion_evaluation();
+        let resolved = self.playback.resolved_layer(self.playback.current, true);
         let inputs = RenderInputs {
-            components: &self.doc.components,
-            variables: &self.variables,
-            active_modes: &self.active_modes,
-            mode_generation: self.mode_generation,
-            motion: motion.as_ref(),
+            components: &self.playback.doc.components,
+            variables: &self.playback.variables,
+            active_modes: &self.playback.active_modes,
+            mode_generation: self.playback.mode_generation,
+            motion: None,
             playback: Some(&playback),
             video_fill_frames: None,
             dark_ui: false,
         };
-        if let Some(patched) = self.build_runtime_scene(self.current) {
-            self.renderer
-                .render_page_with(&patched, &self.viewport, Some(self.current), &inputs)
-        } else {
-            self.renderer.render_page_with(
-                &self.doc.scene,
-                &self.viewport,
-                Some(self.current),
-                &inputs,
-            )
-        }
+        self.renderer.render_page_with(
+            &resolved.scene,
+            &self.playback.viewport,
+            Some(self.playback.current),
+            &inputs,
+        )
     }
+}
 
+impl PlaybackSession {
     /// Set or seek the global media playback time (seconds).
     pub fn set_media_time(&mut self, t: f64) {
         self.media_time = t.max(0.0);
@@ -1359,6 +1739,7 @@ impl PresentSession {
     /// The variant name is the authored value (e.g. "Hover", "Large").
     pub fn set_variant_override(&mut self, component: ComponentId, variant: String) {
         self.variant_overrides.insert(component, variant);
+        self.refresh_layer_timers();
     }
 
     /// Current variant overrides active in this prototype session.
@@ -1369,12 +1750,13 @@ impl PresentSession {
     /// Clear a specific variant override (revert to design default for playback).
     pub fn clear_variant_override(&mut self, component: ComponentId) {
         self.variant_overrides.remove(&component);
+        self.refresh_layer_timers();
     }
 
     fn prototype_motion_evaluation(&self) -> Option<MotionEvaluation> {
         let active = self.active_prototype_animation?;
         let playhead_ms = active.playhead_ms(&self.doc)?;
-        self.doc.motion.evaluate(active.clip, playhead_ms)
+        self.compiled_motion.evaluate(active.clip, playhead_ms)
     }
 
     fn prototype_motion_evaluation_excluding(
@@ -1525,7 +1907,7 @@ impl PresentSession {
     /// [`handle_pointer`](Self::handle_pointer) takes). Converts through the
     /// current frame's viewport and delegates.
     pub fn scroll_by_screen(&mut self, screen_point: DVec2, delta: [f64; 2]) -> Option<NodeId> {
-        let world = screen_to_world(screen_point, &self.viewport, self.screen_size);
+        let world = screen_to_world(screen_point, &self.active_viewport(), self.screen_size);
         self.scroll_by([world.x, world.y], delta)
     }
 
@@ -1535,13 +1917,18 @@ impl PresentSession {
     /// delta. Returns the container scrolled, or `None` when nothing under the
     /// point scrolls — the host can then fall back to panning its own surface.
     pub fn scroll_by(&mut self, world_point: [f64; 2], delta: [f64; 2]) -> Option<NodeId> {
-        let hit = self
-            .doc
+        if !world_point.into_iter().chain(delta).all(f64::is_finite) {
+            return None;
+        }
+        let resolved = self.reaction_layer(true);
+        let hit = resolved
             .scene
-            .hit_test(DVec2::new(world_point[0], world_point[1]))?;
+            .topmost_hit_where(DVec2::new(world_point[0], world_point[1]), |identity| {
+                descends_from(&resolved.scene, identity, resolved.root)
+            })?;
         let mut cursor = Some(hit);
         while let Some(id) = cursor {
-            let node = self.doc.scene.get(id)?;
+            let node = resolved.scene.get(id)?;
             if let NodeData::Group(group) = &node.data {
                 let direction = group.effective_scroll_direction();
                 if (direction.allows_x() && delta[0] != 0.0)
@@ -1562,7 +1949,13 @@ impl PresentSession {
     /// to `[0, content_extent - viewport_extent]` (the Figma model: content
     /// starts flush and can scroll until its far edge meets the viewport's).
     fn clamped_scroll_offset(&self, scrollable: NodeId, offset: [f64; 2]) -> [f64; 2] {
-        let Some(node) = self.doc.scene.get(scrollable) else {
+        let resolved = self.reaction_layer(false);
+        let scene = if self.doc.scene.contains(scrollable) {
+            &self.doc.scene
+        } else {
+            &resolved.scene
+        };
+        let Some(node) = scene.get(scrollable) else {
             return [0.0, 0.0];
         };
         let NodeData::Group(group) = &node.data else {
@@ -1579,14 +1972,14 @@ impl PresentSession {
         // Content extent: union of the children's boxes in frame-local space.
         // World AABBs mapped through the frame's inverse world transform —
         // exact for the axis-aligned common case, conservative under rotation.
-        let Some(world) = self.doc.scene.world_transform(scrollable) else {
+        let Some(world) = scene.world_transform(scrollable) else {
             return [0.0, 0.0];
         };
         let inverse = world.inverse();
         let mut content_max = [f64::MIN, f64::MIN];
         let mut any = false;
-        for child in self.doc.scene.children_of(Some(scrollable)).to_vec() {
-            let Some(bounds) = self.doc.scene.world_bounds(child) else {
+        for child in scene.children_of(Some(scrollable)).to_vec() {
+            let Some(bounds) = scene.world_bounds(child) else {
                 continue;
             };
             for corner in [
@@ -1636,7 +2029,9 @@ impl PresentSession {
     pub fn clear_scroll_offset(&mut self, scrollable: NodeId) {
         self.scroll_offsets.remove(&scrollable);
     }
+}
 
+impl PresentSession {
     /// Build per-node MediaPlayback for video/audio nodes based on current media_time.
     /// When not playing the map is empty (no progress updates).
     fn build_media_playback(
@@ -1644,13 +2039,18 @@ impl PresentSession {
     ) -> std::collections::HashMap<NodeId, fanta_render::MediaPlayback> {
         use fanta_doc::NodeData;
         let mut map = std::collections::HashMap::new();
-        if !self.media_playing {
+        if !self.playback.media_playing {
             return map;
         }
-        for id in self.doc.scene.descendants_of(self.current) {
-            if let Some(node) = self.doc.scene.get(id) {
+        for id in self
+            .playback
+            .doc
+            .scene
+            .descendants_of(self.playback.current)
+        {
+            if let Some(node) = self.playback.doc.scene.get(id) {
                 if let NodeData::Video(v) = &node.data {
-                    let t = self.node_media_time(id);
+                    let t = self.playback.node_media_time(id);
                     let start = v.time_range_us[0] as f64 / 1_000_000.0;
                     let end = v.time_range_us[1] as f64 / 1_000_000.0;
                     let local_t = ((t * v.speed as f64) + start).clamp(start, end);
@@ -1668,7 +2068,7 @@ impl PresentSession {
                         },
                     );
                 } else if let NodeData::Audio(a) = &node.data {
-                    let t = self.node_media_time(id);
+                    let t = self.playback.node_media_time(id);
                     let start = a.time_range_us[0] as f64 / 1_000_000.0;
                     let end = a.time_range_us[1] as f64 / 1_000_000.0;
                     let local_t = (t + start).clamp(start, end); // speed default 1.0 for audio
@@ -1698,7 +2098,9 @@ impl PresentSession {
     pub fn media_playback(&self) -> std::collections::HashMap<NodeId, fanta_render::MediaPlayback> {
         self.build_media_playback()
     }
+}
 
+impl PlaybackSession {
     /// The root of the layer that currently receives input: the topmost overlay
     /// if any, else the current base frame.
     fn layer_root(&self) -> NodeId {
@@ -1712,6 +2114,39 @@ impl PresentSession {
             .last()
             .map(|o| o.viewport)
             .unwrap_or(self.viewport)
+    }
+
+    fn physical_offset_to_screen(&self, offset: (f64, f64)) -> (f64, f64) {
+        (
+            offset.0.round() / self.display_scale,
+            offset.1.round() / self.display_scale,
+        )
+    }
+
+    fn transition_screen_offsets(
+        &self,
+        style: TransitionStyle,
+        progress: f64,
+    ) -> ((f64, f64), (f64, f64)) {
+        let (width, height) = self.physical_size;
+        match TransitionComposition::new(style, progress, f64::from(width), f64::from(height)) {
+            TransitionComposition::Layers {
+                outgoing_offset,
+                incoming_offset,
+                ..
+            } => (
+                self.physical_offset_to_screen(outgoing_offset),
+                self.physical_offset_to_screen(incoming_offset),
+            ),
+            _ => ((0.0, 0.0), (0.0, 0.0)),
+        }
+    }
+
+    fn overlay_screen_offset(&self, style: TransitionStyle, progress: f64) -> (f64, f64) {
+        let (width, height) = self.physical_size;
+        let composition =
+            OverlayComposition::new(style, progress, f64::from(width), f64::from(height));
+        self.physical_offset_to_screen(composition.offset)
     }
 
     fn hit_screen(&mut self, point: DVec2) -> Option<NodeId> {
@@ -1730,12 +2165,7 @@ impl PresentSession {
             {
                 return None;
             }
-            let offset = overlay_offset(
-                active.clock.style,
-                eased,
-                self.screen_size.x,
-                self.screen_size.y,
-            );
+            let offset = self.overlay_screen_offset(active.clock.style, eased);
             let mapped = point - DVec2::new(offset.0, offset.1);
             return self.hit_layer_at_screen(active.root, self.active_viewport(), mapped, true);
         }
@@ -1768,16 +2198,10 @@ impl PresentSession {
         }
 
         match active.style {
-            TransitionStyle::SlideIn { direction }
-            | TransitionStyle::Push { direction }
-            | TransitionStyle::MoveIn { direction } => {
-                let (outgoing, incoming) = directional_offsets(
-                    active.style,
-                    direction,
-                    eased,
-                    self.screen_size.x,
-                    self.screen_size.y,
-                );
+            TransitionStyle::SlideIn { .. }
+            | TransitionStyle::Push { .. }
+            | TransitionStyle::MoveIn { .. } => {
+                let (outgoing, incoming) = self.transition_screen_offsets(active.style, eased);
                 let incoming_point = point - DVec2::new(incoming.0, incoming.1);
                 self.hit_layer_at_screen(active.to_frame, active.to_viewport, incoming_point, true)
                     .or_else(|| {
@@ -1793,14 +2217,8 @@ impl PresentSession {
             // Out styles mirror the probe order too: the OUTGOING frame is
             // the moving top layer, so it wins hits where it still covers the
             // point; the revealed incoming frame catches the rest.
-            TransitionStyle::SlideOut { direction } | TransitionStyle::MoveOut { direction } => {
-                let (outgoing, incoming) = directional_offsets(
-                    active.style,
-                    direction,
-                    eased,
-                    self.screen_size.x,
-                    self.screen_size.y,
-                );
+            TransitionStyle::SlideOut { .. } | TransitionStyle::MoveOut { .. } => {
+                let (outgoing, incoming) = self.transition_screen_offsets(active.style, eased);
                 let outgoing_point = point - DVec2::new(outgoing.0, outgoing.1);
                 self.hit_layer_at_screen(
                     active.from_frame,
@@ -1849,16 +2267,11 @@ impl PresentSession {
         let hidden: Vec<NodeId> = active.layers.iter().map(|layer| layer.instance).collect();
         for layer in active.layers.iter().rev() {
             let hit = match active.clock.style {
-                TransitionStyle::SlideIn { direction }
-                | TransitionStyle::Push { direction }
-                | TransitionStyle::MoveIn { direction } => {
-                    let (outgoing, incoming) = directional_offsets(
-                        active.clock.style,
-                        direction,
-                        eased,
-                        self.screen_size.x,
-                        self.screen_size.y,
-                    );
+                TransitionStyle::SlideIn { .. }
+                | TransitionStyle::Push { .. }
+                | TransitionStyle::MoveIn { .. } => {
+                    let (outgoing, incoming) =
+                        self.transition_screen_offsets(active.clock.style, eased);
                     let incoming_point = point - DVec2::new(incoming.0, incoming.1);
                     self.hit_layer_at_screen(layer.instance, layer.viewport, incoming_point, true)
                         .or_else(|| {
@@ -1923,16 +2336,11 @@ impl PresentSession {
     }
 
     fn build_hit_scene(&self, layer_root: NodeId, include_motion: bool) -> Option<Scene> {
-        let motion = include_motion
-            .then(|| self.prototype_motion_evaluation())
-            .flatten();
-        let mut scene = match self.build_runtime_scene(layer_root) {
-            Some(scene) => scene,
-            None if motion.is_some() => self.doc.scene.clone(),
-            None => return None,
-        };
-        Self::apply_motion_to_hit_scene(&mut scene, motion);
-        Some(scene)
+        Some(
+            self.resolved_layer(layer_root, include_motion)
+                .scene
+                .clone(),
+        )
     }
 
     fn apply_motion_to_hit_scene(scene: &mut Scene, motion: Option<MotionEvaluation>) {
@@ -1961,9 +2369,10 @@ impl PresentSession {
     }
 
     fn matching_reaction(&self, hit: Option<NodeId>, want: TriggerKind) -> Option<MatchedReaction> {
+        let resolved = self.reaction_layer(true);
         let mut node = hit;
         while let Some(id) = node {
-            if let Some(cn) = self.doc.scene.get(id) {
+            if let Some(cn) = resolved.scene.get(id) {
                 if let Some(rx) = cn
                     .reactions
                     .iter()
@@ -1978,7 +2387,7 @@ impl PresentSession {
                     ));
                 }
             }
-            node = self.doc.scene.get(id).and_then(|n| n.parent);
+            node = resolved.scene.get(id).and_then(|n| n.parent);
         }
         None
     }
@@ -2027,6 +2436,7 @@ impl PresentSession {
     /// to the frame that was left — the multi-action rule applied across
     /// reactions).
     fn fire_mouse_leave(&mut self, hit: Option<NodeId>) -> PresentResponse {
+        let resolved = self.reaction_layer(false);
         let new_chain = self.ancestor_chain(hit);
         if new_chain == self.hover_chain {
             return PresentResponse::default();
@@ -2037,7 +2447,7 @@ impl PresentSession {
             if self.hover_chain.contains(exited) {
                 continue;
             }
-            let Some(node) = self.doc.scene.get(*exited) else {
+            let Some(node) = resolved.scene.get(*exited) else {
                 continue;
             };
             if let Some(rx) = node
@@ -2069,11 +2479,12 @@ impl PresentSession {
     /// empty when nothing is hit. This is what "the pointer is inside node X"
     /// means for enter/leave edges: hovering a child hovers every ancestor.
     fn ancestor_chain(&self, hit: Option<NodeId>) -> Vec<NodeId> {
+        let resolved = self.reaction_layer(true);
         let mut chain = Vec::new();
         let mut cursor = hit;
         while let Some(id) = cursor {
             chain.push(id);
-            cursor = self.doc.scene.get(id).and_then(|n| n.parent);
+            cursor = resolved.scene.get(id).and_then(|n| n.parent);
         }
         chain
     }
@@ -2130,6 +2541,7 @@ impl PresentSession {
             }
         }
         self.active_variant_transition = None;
+        self.refresh_layer_timers();
         PresentResponse {
             needs_redraw: true,
             ..PresentResponse::default()
@@ -2152,40 +2564,106 @@ impl PresentSession {
         transition: Option<&Transition>,
         animation: Option<&PrototypeAnimation>,
     ) -> PresentResponse {
+        let instance_ancestors = self.reaction_instance_ancestors(source);
+        let original_source = (!instance_ancestors.is_empty())
+            .then(|| self.reaction_layer(false).occurrences.get(&source).cloned())
+            .flatten();
+        let motion_scope = animation.and_then(|_| {
+            instance_ancestors
+                .first()
+                .map(|(_, occurrence)| occurrence.clone())
+        });
         let mut action_response = PresentResponse::default();
         for action in actions {
+            let previous_dispatch = self.dispatch_layer;
+            let action_source = if let Some(original) = &original_source {
+                let Some((identity, layer)) =
+                    self.surviving_reaction_source(source, original, &instance_ancestors)
+                else {
+                    self.playback_events.push(PlaybackEvent::Diagnostic {
+                        diagnostic: PlaybackDiagnostic {
+                            code: "reactionScopeMissing".into(),
+                            message:
+                                "The component instance owning this reaction is no longer active"
+                                    .into(),
+                        },
+                    });
+                    return action_response;
+                };
+                self.dispatch_layer = Some(layer);
+                identity
+            } else {
+                source
+            };
             let frame_before = self.current;
-            action_response =
-                merge_responses(action_response, self.execute(source, action, transition));
+            action_response = merge_responses(
+                action_response,
+                self.execute(action_source, action, transition),
+            );
+            let navigated = self.current != frame_before;
+            // Entering a frame clears the dispatch layer; restoring the
+            // departed layer would resolve the reaction's motion against it.
+            if !navigated {
+                self.dispatch_layer = previous_dispatch;
+            }
             if action_response.exited {
                 return action_response;
             }
-            if self.current != frame_before {
+            if navigated {
                 break;
             }
         }
         let animation_response = animation.map_or_else(PresentResponse::default, |animation| {
-            self.start_prototype_animation(animation)
+            self.start_prototype_animation(motion_scope, animation)
         });
         merge_responses(action_response, animation_response)
     }
 
-    fn start_prototype_animation(&mut self, animation: &PrototypeAnimation) -> PresentResponse {
-        let replaced_active_animation = self.active_prototype_animation.take().is_some();
-        if self.doc.motion.clip(animation.clip).is_none() {
-            return PresentResponse {
-                needs_redraw: replaced_active_animation,
-                ..PresentResponse::default()
-            };
-        }
+    fn start_prototype_animation(
+        &mut self,
+        scope: Option<NodeOccurrence>,
+        animation: &PrototypeAnimation,
+    ) -> PresentResponse {
+        let targets = match self.resolve_motion_targets(animation.clip, scope.as_ref()) {
+            Ok(targets) => targets,
+            Err(error) => {
+                self.playback_events.push(PlaybackEvent::Diagnostic {
+                    diagnostic: PlaybackDiagnostic {
+                        code: "invalidMotionTarget".into(),
+                        message: error.to_string(),
+                    },
+                });
+                return PresentResponse::default();
+            }
+        };
+        let replaced_active_animation = self.active_prototype_animation.is_some();
         let active = ActivePrototypeAnimation {
             clip: animation.clip,
             delay: f64::from(animation.delay_ms) / 1000.0,
             elapsed: 0.0,
+            mode: ClipPlaybackMode::Once,
+            paused: false,
+            completion_emitted: false,
         };
         let animating = active.is_running(&self.doc);
         let needs_redraw = replaced_active_animation || animation.delay_ms == 0;
         self.active_prototype_animation = Some(active);
+        self.active_motion_scope = scope;
+        self.active_motion_targets = targets;
+        if animation.delay_ms == 0
+            && self
+                .doc
+                .motion
+                .clip(animation.clip)
+                .is_some_and(|clip| clip.duration_ms == 0)
+        {
+            self.playback_events.push(PlaybackEvent::ClipCompleted {
+                clip: animation.clip,
+            });
+            if let Some(active) = &mut self.active_prototype_animation {
+                active.completion_emitted = true;
+            }
+        }
         PresentResponse {
             needs_redraw,
             animating,
@@ -2264,7 +2742,7 @@ impl PresentSession {
                     self.active_overlay_transition = None;
                     self.active_variant_transition = None;
                     self.active_prototype_animation = None;
-                    self.cancel_timers(closed.root);
+                    self.cancel_timers(closed.layer);
                     self.restore_hovered_reaction();
                     self.restore_pressed_reaction();
                     self.active_overlay_exit =
@@ -2280,6 +2758,7 @@ impl PresentSession {
                                 start_visible,
                             }
                         });
+                    self.prune_occurrence_cache(None);
                     PresentResponse {
                         needs_redraw: true,
                         navigated: true,
@@ -2330,6 +2809,7 @@ impl PresentSession {
                         );
                         (!layers.is_empty()).then_some(ActiveVariantTransition { layers, clock })
                     });
+                self.refresh_layer_timers();
                 PresentResponse {
                     needs_redraw: true,
                     animating: self.active_variant_transition.is_some(),
@@ -2344,8 +2824,13 @@ impl PresentSession {
                 }
             }
             Action::ScrollTo { target } => {
-                if let Some(bounds) = self.doc.scene.world_bounds(*target) {
-                    if let Some((scrollable, offset)) = self.scroll_target_offset(*target) {
+                let target = self.resolve_action_target(source, *target);
+                let resolved = self.reaction_layer(true);
+                if let Some(bounds) = target.and_then(|target| resolved.scene.world_bounds(target))
+                {
+                    if let Some((scrollable, offset)) =
+                        target.and_then(|target| self.scroll_target_offset(target))
+                    {
                         // ScrollAnimate (PR-6): ease the offset there instead
                         // of jumping. The destination is pre-clamped so the
                         // tween's endpoint is the exact offset a jump would
@@ -2402,10 +2887,12 @@ impl PresentSession {
     }
 
     fn scroll_target_offset(&self, target: NodeId) -> Option<(NodeId, [f64; 2])> {
-        let mut cursor = self.doc.scene.get(target)?.parent;
+        let resolved = self.reaction_layer(true);
+        let scene = &resolved.scene;
+        let mut cursor = scene.get(target)?.parent;
         let scrollable = loop {
             let id = cursor?;
-            let node = self.doc.scene.get(id)?;
+            let node = scene.get(id)?;
             // The nearest ancestor whose AUTHORED axes scroll (imported files
             // carry the real Figma overflow; the legacy `scrollable` bool
             // widens to Both for programmatic scenes).
@@ -2416,19 +2903,19 @@ impl PresentSession {
             }
             cursor = node.parent;
         };
-        let target_bounds = self.doc.scene.world_bounds(target)?;
+        let target_bounds = scene.world_bounds(target)?;
         let target_world = DVec2::new(
             (target_bounds.min_x + target_bounds.max_x) * 0.5,
             (target_bounds.min_y + target_bounds.max_y) * 0.5,
         );
-        let scrollable_world = self.doc.scene.world_transform(scrollable)?;
+        let scrollable_world = scene.world_transform(scrollable)?;
         let components = scrollable_world.to_components();
         let determinant = components[0] * components[3] - components[1] * components[2];
         if !determinant.is_finite() || determinant.abs() <= f64::EPSILON {
             return None;
         }
         let target_local = scrollable_world.inverse().transform_point(target_world);
-        let viewport_bounds = self.doc.scene.local_bounds(scrollable)?;
+        let viewport_bounds = scene.local_bounds(scrollable)?;
         let viewport_center = DVec2::new(
             (viewport_bounds.min_x + viewport_bounds.max_x) * 0.5,
             (viewport_bounds.min_y + viewport_bounds.max_y) * 0.5,
@@ -2438,9 +2925,14 @@ impl PresentSession {
     }
 
     fn source_instance(&self, mut source: NodeId, component: ComponentId) -> Option<NodeId> {
+        let resolved = self.reaction_layer(false);
         loop {
-            let node = self.doc.scene.get(source)?;
-            if let NodeData::Instance(instance) = &node.data {
+            let node = resolved.scene.get(source)?;
+            let authored_instance = resolved
+                .occurrences
+                .get(&source)
+                .and_then(|occurrence| self.doc.scene.get(occurrence.node));
+            if let Some(NodeData::Instance(instance)) = authored_instance.map(|node| &node.data) {
                 let instance_set =
                     variant_set_for_component(&self.doc.components, instance.component)
                         .unwrap_or(instance.component);
@@ -2590,7 +3082,8 @@ impl PresentSession {
         if !self.doc.scene.contains(frame) {
             return PresentResponse::default();
         }
-        let Some(bounds) = self.doc.scene.world_bounds(frame) else {
+        let resolved = self.resolved_layer_with_identity(frame, self.next_layer, false);
+        let Some(bounds) = resolved.scene.world_bounds(frame) else {
             return PresentResponse::default();
         };
         let base_zoom = self.active_viewport().zoom;
@@ -2600,10 +3093,12 @@ impl PresentSession {
         self.restore_pressed_reaction();
         self.overlays.push(OverlayEntry {
             root: frame,
+            layer: self.next_layer,
             settings: settings.clone(),
             viewport,
             screen_rect,
         });
+        self.next_layer = self.next_layer.wrapping_add(1);
         self.schedule_timers(frame);
         self.active_transition = None;
         self.smart_animate = None;
@@ -2612,6 +3107,7 @@ impl PresentSession {
         self.active_overlay_exit = None;
         self.active_overlay_transition = TransitionClock::from_transition(transition)
             .map(|clock| ActiveOverlayTransition { root: frame, clock });
+        self.prune_occurrence_cache(None);
         PresentResponse {
             needs_redraw: true,
             navigated: true,
@@ -2626,6 +3122,12 @@ impl PresentSession {
     /// the new value. Returns `false` (a no-op) for an unknown variable or one
     /// whose collection is missing.
     fn set_variable(&mut self, source: NodeId, variable: VariableId, value: VarValue) -> bool {
+        let resolved = self.reaction_layer(false);
+        let source = resolved
+            .occurrences
+            .get(&source)
+            .map(|source| source.instance_path.first().copied().unwrap_or(source.node))
+            .unwrap_or(source);
         let Some((collection_id, variable_type)) = self
             .variables
             .variable(variable)
@@ -2652,6 +3154,7 @@ impl PresentSession {
             Some(var) => {
                 var.values_by_mode.insert(mode, value);
                 self.mode_generation = self.mode_generation.wrapping_add(1);
+                self.refresh_layer_timers();
                 true
             }
             None => false,
@@ -2667,6 +3170,9 @@ impl PresentSession {
         // must not fire against the new frame's coordinate space.
         self.hover_chain.clear();
         self.current = frame;
+        self.dispatch_layer = None;
+        self.current_layer = self.next_layer;
+        self.next_layer = self.next_layer.wrapping_add(1);
         self.viewport = frame_viewport(&self.doc.scene, frame, self.screen_size);
         self.overlays.clear();
         self.active_overlay_transition = None;
@@ -2677,7 +3183,13 @@ impl PresentSession {
         self.scroll_offsets.clear();
         self.seed_initial_scroll_offsets(frame);
         self.timers.clear();
+        self.timer_membership.clear();
         self.schedule_timers(frame);
+        self.viewport = frame_viewport(
+            &self.resolved_layer(frame, false).scene,
+            frame,
+            self.screen_size,
+        );
     }
 
     /// Apply each scrollable descendant's authored initial `scroll_offset`
@@ -2703,13 +3215,29 @@ impl PresentSession {
     /// Queue the `AfterDelay` reactions found anywhere in `root`'s subtree as
     /// pending timers owned by `root`.
     fn schedule_timers(&mut self, root: NodeId) {
+        let layer = self.layer_identity(root);
+        self.schedule_timers_with_identity(root, layer);
+    }
+
+    fn schedule_timers_with_identity(&mut self, root: NodeId, layer: u64) {
         let mut scheduled = Vec::new();
-        for id in self.doc.scene.descendants_of(root) {
-            if let Some(node) = self.doc.scene.get(id) {
+        let resolved = self.resolved_layer_with_identity(root, layer, false);
+        let mut membership = std::collections::BTreeSet::new();
+        let mut source_orders = HashMap::new();
+        for (order, id) in resolved.scene.descendants_of(root).enumerate() {
+            source_orders.insert(id, order);
+            if let Some(node) = resolved.scene.get(id) {
                 for reaction in &node.reactions {
                     if let Trigger::AfterDelay { delay_ms } = &reaction.trigger {
+                        let identity = (layer, id, reaction.id);
+                        membership.insert(identity);
+                        if self.timer_membership.contains(&identity) {
+                            continue;
+                        }
                         scheduled.push(PendingTimer {
                             root,
+                            layer,
+                            order,
                             source: id,
                             reaction: reaction.id,
                             actions: reaction.actions().cloned().collect(),
@@ -2721,12 +3249,29 @@ impl PresentSession {
                 }
             }
         }
+        self.timers.retain_mut(|timer| {
+            if timer.layer != layer {
+                return true;
+            }
+            if !membership.contains(&(layer, timer.source, timer.reaction)) {
+                return false;
+            }
+            if let Some(order) = source_orders.get(&timer.source) {
+                timer.order = *order;
+            }
+            true
+        });
+        self.timer_membership
+            .retain(|(owner, _, _)| *owner != layer);
+        self.timer_membership.extend(membership);
         self.timers.extend(scheduled);
     }
 
     /// Drop every pending timer owned by `root` (its layer was closed).
-    fn cancel_timers(&mut self, root: NodeId) {
-        self.timers.retain(|timer| timer.root != root);
+    fn cancel_timers(&mut self, layer: u64) {
+        self.timers.retain(|timer| timer.layer != layer);
+        self.timer_membership
+            .retain(|(owner, _, _)| *owner != layer);
     }
 
     /// Arm a navigation transition, if the reaction carried an animating one.

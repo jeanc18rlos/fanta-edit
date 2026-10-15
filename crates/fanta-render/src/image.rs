@@ -54,9 +54,22 @@ pub struct ImageFillMods {
 ///
 /// [`clear`]: Self::clear
 /// [`remove`]: Self::remove
-#[derive(Default)]
 pub struct ImageCache {
     images: HashMap<AssetId, CachedImage>,
+    budget_bytes: usize,
+    bytes: usize,
+    tick: u64,
+}
+
+impl Default for ImageCache {
+    fn default() -> Self {
+        Self {
+            images: HashMap::new(),
+            budget_bytes: usize::MAX,
+            bytes: 0,
+            tick: 0,
+        }
+    }
 }
 
 /// One asset's cached images: the full-resolution upload plus its display
@@ -89,6 +102,8 @@ struct CachedImage {
     full: skia_safe::Image,
     /// Display pyramid, contiguous from level 1: `levels[i]` = level `i + 1`.
     levels: Vec<skia_safe::Image>,
+    bytes: usize,
+    last_used: u64,
 }
 
 impl ImageCache {
@@ -100,8 +115,35 @@ impl ImageCache {
     /// The cached full-resolution image for `id`, if already built. The hot
     /// path: callers check this before resolving/decoding pixels at all, so a
     /// cache hit never touches the asset resolver (see [`draw_image_cached`]).
-    fn get(&self, id: AssetId) -> Option<&skia_safe::Image> {
-        self.images.get(&id).map(|c| &c.full)
+    fn get(&mut self, id: AssetId) -> Option<&skia_safe::Image> {
+        self.tick = self.tick.wrapping_add(1);
+        let cached = self.images.get_mut(&id)?;
+        cached.last_used = self.tick;
+        Some(&cached.full)
+    }
+
+    pub fn set_budget_bytes(&mut self, budget_bytes: usize) {
+        self.budget_bytes = budget_bytes;
+        self.evict_to_budget(0, None);
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    fn evict_to_budget(&mut self, additional: usize, protected: Option<AssetId>) {
+        while self.bytes.saturating_add(additional) > self.budget_bytes {
+            let oldest = self
+                .images
+                .iter()
+                .filter(|(identity, _)| Some(**identity) != protected)
+                .min_by_key(|(identity, image)| (image.last_used, **identity))
+                .map(|(identity, _)| *identity);
+            let Some(oldest) = oldest else {
+                break;
+            };
+            self.remove(oldest);
+        }
     }
 
     /// Return the cached full-resolution image for `id`, building and
@@ -110,25 +152,28 @@ impl ImageCache {
     /// a `None` is *not* cached, so a buffer that becomes well-formed on a
     /// later frame can still upload.
     fn get_or_build(&mut self, id: AssetId, img: &DecodedImage) -> Option<&skia_safe::Image> {
-        use std::collections::hash_map::Entry;
-        // Build only on a genuine miss. The `Vacant` arm runs `build_sk_image`
-        // exactly once; a hit never builds. We deliberately do not use
-        // `or_insert_with` because building can *fail* (a malformed buffer), and
-        // a failed build must not insert a (sentinel) entry — so the miss arm
-        // bails with `?` and leaves the slot empty for a later well-formed frame.
-        match self.images.entry(id) {
-            Entry::Occupied(e) => Some(&e.into_mut().full),
-            Entry::Vacant(e) => {
-                let full = build_sk_image(img)?;
-                Some(
-                    &e.insert(CachedImage {
-                        full,
-                        levels: Vec::new(),
-                    })
-                    .full,
-                )
+        self.tick = self.tick.wrapping_add(1);
+        if !self.images.contains_key(&id) {
+            let full = build_sk_image(img)?;
+            let bytes = mipped_image_bytes(&full);
+            if bytes > self.budget_bytes {
+                return None;
             }
+            self.evict_to_budget(bytes, None);
+            self.bytes += bytes;
+            self.images.insert(
+                id,
+                CachedImage {
+                    full,
+                    levels: Vec::new(),
+                    bytes,
+                    last_used: self.tick,
+                },
+            );
         }
+        let cached = self.images.get_mut(&id)?;
+        cached.last_used = self.tick;
+        Some(&cached.full)
     }
 
     /// The display-pyramid image for `id` at `level` (`0` = the full image;
@@ -142,34 +187,50 @@ impl ImageCache {
     /// The returned handle is a refcount bump (`skia_safe::Image` is a shared
     /// pointer), so the borrow of the cache ends here.
     fn lod_level(&mut self, id: AssetId, level: u32) -> Option<skia_safe::Image> {
-        let cached = self.images.get_mut(&id)?;
-        if level == 0 {
-            return Some(cached.full.clone());
+        self.tick = self.tick.wrapping_add(1);
+        let mut cached = self.images.remove(&id)?;
+        cached.last_used = self.tick;
+        if level > 0 {
+            while cached.levels.len() < level as usize {
+                let Some(next) = build_pyramid_level(&cached.full, cached.levels.len() as u32 + 1)
+                else {
+                    break;
+                };
+                let bytes = mipped_image_bytes(&next);
+                self.evict_to_budget(bytes, Some(id));
+                if self.bytes.saturating_add(bytes) > self.budget_bytes {
+                    break;
+                }
+                self.bytes += bytes;
+                cached.bytes += bytes;
+                cached.levels.push(next);
+            }
         }
-        while cached.levels.len() < level as usize {
-            let Some(next) = build_pyramid_level(&cached.full, cached.levels.len() as u32 + 1)
-            else {
-                break;
-            };
-            cached.levels.push(next);
-        }
-        let idx = (level as usize).min(cached.levels.len());
-        Some(if idx == 0 {
+        let index = (level as usize).min(cached.levels.len());
+        let image = if index == 0 {
             cached.full.clone()
         } else {
-            cached.levels[idx - 1].clone()
-        })
+            cached.levels.get(index - 1)?.clone()
+        };
+        self.images.insert(id, cached);
+        Some(image)
     }
 
     /// Drop every cached image. Call when assets are bulk-invalidated (a new
     /// document is loaded, say) or to reclaim GPU/CPU image memory.
     pub fn clear(&mut self) {
         self.images.clear();
+        self.bytes = 0;
     }
 
     /// Drop a single asset's cached image. Returns whether an entry was present.
     pub fn remove(&mut self, id: AssetId) -> bool {
-        self.images.remove(&id).is_some()
+        if let Some(image) = self.images.remove(&id) {
+            self.bytes = self.bytes.saturating_sub(image.bytes);
+            true
+        } else {
+            false
+        }
     }
 
     /// Drop every cached image whose id is NOT in `keep`, returning how many
@@ -179,7 +240,15 @@ impl ImageCache {
     /// exactly the memory the GC exists to reclaim.
     pub fn retain(&mut self, keep: &std::collections::HashSet<AssetId>) -> usize {
         let before = self.images.len();
-        self.images.retain(|id, _| keep.contains(id));
+        let removed: Vec<_> = self
+            .images
+            .keys()
+            .copied()
+            .filter(|id| !keep.contains(id))
+            .collect();
+        for identity in removed {
+            self.remove(identity);
+        }
         before - self.images.len()
     }
 
@@ -192,6 +261,16 @@ impl ImageCache {
     pub fn is_empty(&self) -> bool {
         self.images.is_empty()
     }
+}
+
+fn mipped_image_bytes(image: &skia_safe::Image) -> usize {
+    let pixels = (image.width().max(0) as usize).saturating_mul(image.height().max(0) as usize);
+    let bytes = pixels.saturating_mul(4);
+    bytes.saturating_add(if image.has_mipmaps() {
+        bytes.div_ceil(3)
+    } else {
+        0
+    })
 }
 
 /// A source rectangle (in asset pixels) paired with the destination rectangle
@@ -680,7 +759,10 @@ pub fn draw_image_cached(
             };
             match cache.get_or_build(id, &decoded) {
                 Some(img) => img.clone(),
-                None => return false,
+                None => match build_sk_image(&decoded) {
+                    Some(image) => image,
+                    None => return false,
+                },
             }
         }
     };
@@ -968,6 +1050,36 @@ fn draw_tiled(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uploaded_image_budget_evicts_old_entries_and_rejects_oversized_retention() {
+        let mut cache = ImageCache::new();
+        cache.set_budget_bytes(48);
+        let first = AssetId::new();
+        let second = AssetId::new();
+        assert!(
+            cache
+                .get_or_build(first, &solid_image(2, 2, [255, 0, 0, 255]))
+                .is_some()
+        );
+        assert!(
+            cache
+                .get_or_build(second, &solid_image(2, 2, [0, 0, 255, 255]))
+                .is_some()
+        );
+        assert!(cache.bytes() <= 48);
+        cache.set_budget_bytes(24);
+        assert!(cache.get(first).is_none());
+        assert!(cache.get(second).is_some());
+        assert!(
+            cache
+                .get_or_build(AssetId::new(), &solid_image(4, 4, [0, 0, 255, 255]))
+                .is_none()
+        );
+        assert!(cache.bytes() <= 24);
+        cache.clear();
+        assert_eq!(cache.bytes(), 0);
+    }
     use std::sync::Arc;
 
     const EPS: f32 = 1e-3;

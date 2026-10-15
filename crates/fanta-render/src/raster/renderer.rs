@@ -950,6 +950,8 @@ pub struct RasterRenderer {
     last_scene_instance_id: Option<u64>,
     camera_cache: CameraCache,
     camera_local_bounds: IdHashMap<NodeId, Option<super::Bounds>>,
+    text_context: Option<super::text::TextRenderContext>,
+    whole_frame_readbacks: u64,
 }
 
 impl RasterRenderer {
@@ -999,7 +1001,16 @@ impl RasterRenderer {
             last_scene_instance_id: None,
             camera_cache: CameraCache::default(),
             camera_local_bounds: IdHashMap::default(),
+            text_context: None,
+            whole_frame_readbacks: 0,
         })
+    }
+
+    pub fn set_text_context(&mut self, context: super::text::TextRenderContext) {
+        self.text_context = Some(context);
+        self.clear_instance_cache();
+        self.clear_layer_cache();
+        self.clear_camera_cache();
     }
 
     /// Drop every cache whose entries are only valid for one scene instance
@@ -1094,6 +1105,18 @@ impl RasterRenderer {
         self.layer_cache.clear();
         self.image_cache.clear();
         self.pattern_cache.clear();
+    }
+
+    pub fn set_image_cache_budget_bytes(&mut self, bytes: usize) {
+        self.image_cache.set_budget_bytes(bytes);
+    }
+
+    pub fn image_cache_bytes(&self) -> usize {
+        self.image_cache.bytes()
+    }
+
+    pub fn whole_frame_readback_count(&self) -> u64 {
+        self.whole_frame_readbacks
     }
 
     /// Number of images currently held in the upload cache. Primarily for
@@ -1345,6 +1368,10 @@ impl RasterRenderer {
         page_root: Option<NodeId>,
         inputs: &RenderInputs,
     ) -> RenderMetrics {
+        let _text_context = self
+            .text_context
+            .as_ref()
+            .map(super::text::TextRenderContext::enter);
         // The CPU path draws onto the renderer's owned raster surface at its
         // own physical pixel size. We split `self`'s disjoint fields by hand —
         // `surface` (→ canvas) is distinct from `image_cache` / `instance_cache`
@@ -1538,6 +1565,10 @@ impl RasterRenderer {
         camera_interacting: bool,
         should_cancel: &dyn Fn() -> bool,
     ) -> CameraCacheResult {
+        let _text_context = self
+            .text_context
+            .as_ref()
+            .map(super::text::TextRenderContext::enter);
         if !super::camera_cache::is_gpu_canvas(canvas) {
             return super::camera_cache::fallback(
                 self, canvas, target_w, target_h, scene, viewport, page_root, inputs,
@@ -1579,6 +1610,10 @@ impl RasterRenderer {
         content_generation: u64,
         should_cancel: &dyn Fn() -> bool,
     ) -> CameraCacheResult {
+        let _text_context = self
+            .text_context
+            .as_ref()
+            .map(super::text::TextRenderContext::enter);
         if !super::camera_cache::is_gpu_canvas(canvas) {
             return CameraCacheResult {
                 metrics: RenderMetrics::default(),
@@ -1850,6 +1885,10 @@ impl RasterRenderer {
         split: Option<super::split::SplitPass<'_>>,
         should_cancel: Option<&dyn Fn() -> bool>,
     ) -> RenderMetrics {
+        let _text_context = self
+            .text_context
+            .as_ref()
+            .map(super::text::TextRenderContext::enter);
         let started = Instant::now();
         let mut metrics = RenderMetrics::default();
 
@@ -1981,6 +2020,10 @@ impl RasterRenderer {
         page_root: Option<NodeId>,
         inputs: &RenderInputs,
     ) {
+        let _text_context = self
+            .text_context
+            .as_ref()
+            .map(super::text::TextRenderContext::enter);
         if tile_w < 1.0 || tile_h < 1.0 {
             return;
         }
@@ -2042,6 +2085,10 @@ impl RasterRenderer {
         page_root: Option<NodeId>,
         inputs: &RenderInputs,
     ) {
+        let _text_context = self
+            .text_context
+            .as_ref()
+            .map(super::text::TextRenderContext::enter);
         if tile_w < 1.0 || tile_h < 1.0 {
             return;
         }
@@ -2355,6 +2402,7 @@ impl RasterRenderer {
     ///
     /// [`render`]: Self::render
     pub fn copy_rgba(&mut self) -> Vec<u8> {
+        self.whole_frame_readbacks = self.whole_frame_readbacks.saturating_add(1);
         let info = ImageInfo::new(
             (self.width as i32, self.height as i32),
             ColorType::RGBA8888,
@@ -2421,6 +2469,7 @@ impl RasterRenderer {
         let row_bytes = (self.width as usize)
             .checked_mul(4)
             .ok_or(crate::sampling::SamplingError::Readback)?;
+        self.whole_frame_readbacks = self.whole_frame_readbacks.saturating_add(1);
         if row_bytes.checked_mul(self.height as usize) != Some(pixels.len())
             || !self.surface.read_pixels(&info, pixels, row_bytes, (0, 0))
         {

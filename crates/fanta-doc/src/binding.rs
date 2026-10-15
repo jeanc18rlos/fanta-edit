@@ -38,7 +38,7 @@ pub enum BoundProp {
     StrokeColor { index: u16 },
     /// Width of `strokes[index]`.
     StrokeWidth { index: u16 },
-    /// `VectorNode.corner_radius` (vectors only).
+    /// Uniform corner radius on a vector or frame.
     CornerRadius,
     /// Node-level `opacity`.
     Opacity,
@@ -106,7 +106,7 @@ impl BoundProp {
                 .data
                 .strokes()
                 .is_some_and(|s| s.get(*index as usize).is_some()),
-            Self::CornerRadius => matches!(node.data, NodeData::Vector(_)),
+            Self::CornerRadius => matches!(node.data, NodeData::Vector(_) | NodeData::Group(_)),
             Self::Opacity | Self::Visible => true,
             Self::TextContent | Self::TextStyle => {
                 matches!(node.data, NodeData::Text(_) | NodeData::TextPath(_))
@@ -142,6 +142,10 @@ impl BoundProp {
                 NodeData::Vector(v) => v
                     .corner_radius
                     .map(|r| json!(r))
+                    .unwrap_or(serde_json::Value::Null),
+                NodeData::Group(group) => group
+                    .corner_radius
+                    .map(|radius| json!(radius))
                     .unwrap_or(serde_json::Value::Null),
                 _ => serde_json::Value::Null,
             },
@@ -190,6 +194,9 @@ impl BoundProp {
                 }),
             Self::CornerRadius => match &node.data {
                 NodeData::Vector(vector) => vector
+                    .corner_radius
+                    .map(|value| ResolvedVarValue::Float { value }),
+                NodeData::Group(group) => group
                     .corner_radius
                     .map(|value| ResolvedVarValue::Float { value }),
                 _ => None,
@@ -259,13 +266,17 @@ impl BoundProp {
                 }
                 false
             }
-            (Self::CornerRadius, ResolvedVarValue::Float { value }) => {
-                if let NodeData::Vector(v) = &mut node.data {
-                    v.corner_radius = Some(value);
-                    return true;
+            (Self::CornerRadius, ResolvedVarValue::Float { value }) => match &mut node.data {
+                NodeData::Vector(vector) => {
+                    vector.corner_radius = Some(value);
+                    true
                 }
-                false
-            }
+                NodeData::Group(group) => {
+                    group.corner_radius = Some(value);
+                    true
+                }
+                _ => false,
+            },
             (Self::Opacity, ResolvedVarValue::Float { value }) => {
                 node.opacity = UnitInterval::new(value as f32);
                 true
@@ -438,9 +449,16 @@ pub(crate) mod map_as_seq {
     pub fn deserialize<'de, D: Deserializer<'de>>(
         d: D,
     ) -> Result<BTreeMap<BoundProp, VariableId>, D::Error> {
-        Ok(Vec::<(BoundProp, VariableId)>::deserialize(d)?
-            .into_iter()
-            .collect())
+        use serde::de::Error as _;
+        let mut bindings = BTreeMap::new();
+        for (property, variable) in Vec::<(BoundProp, VariableId)>::deserialize(d)? {
+            if bindings.insert(property, variable).is_some() {
+                return Err(D::Error::custom(format!(
+                    "duplicate binding property {property:?}"
+                )));
+            }
+        }
+        Ok(bindings)
     }
 }
 
@@ -458,6 +476,27 @@ mod tests {
             10.0,
             Color::WHITE,
         )))
+    }
+
+    #[test]
+    fn uniform_corner_binding_reads_and_writes_frame_geometry() {
+        let mut node = CanvasNode::new(NodeData::Group(GroupNode {
+            corner_radius: Some(12.0),
+            ..GroupNode::default()
+        }));
+        assert!(BoundProp::CornerRadius.applies_to(&node));
+        assert_eq!(
+            BoundProp::CornerRadius.read_literal(&node),
+            serde_json::json!(12.0)
+        );
+        assert!(
+            BoundProp::CornerRadius
+                .apply_resolved(&mut node, ResolvedVarValue::Float { value: 20.0 })
+        );
+        assert_eq!(
+            BoundProp::CornerRadius.read_resolved(&node),
+            Some(ResolvedVarValue::Float { value: 20.0 })
+        );
     }
 
     #[test]

@@ -2,7 +2,10 @@
 //! [`TextBuffer`] into a [`TextLayout`].
 
 use crate::buffer::TextBuffer;
-use crate::font_resolver::{FontGenerationObserver, FontResolver, font_style};
+use crate::font_resolver::{
+    FontCoverageError, FontGenerationObserver, FontRegistration, FontRegistrationError,
+    FontResolver, font_style,
+};
 use crate::layout::align::Align;
 use crate::layout::text_layout::TextLayout;
 use crate::style::TextStyle;
@@ -96,6 +99,33 @@ impl LayoutEngine {
     /// Read registration changes from another thread without sharing this engine.
     pub fn font_generation_observer(&self) -> FontGenerationObserver {
         self.resolver.font_generation_observer()
+    }
+
+    pub fn from_fonts<'a>(
+        registrations: impl IntoIterator<Item = FontRegistration<'a>>,
+        substitutions: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Self, FontRegistrationError> {
+        let resolver = FontResolver::from_fonts(registrations, substitutions)?;
+        let mut fonts = FontCollection::new();
+        let provider: FontMgr = resolver.provider().clone().into();
+        fonts.set_asset_font_manager(Some(provider.clone()));
+        fonts.set_default_font_manager(provider, None);
+        fonts.disable_font_fallback();
+        Ok(Self { fonts, resolver })
+    }
+
+    pub fn supports_family(&self, family: &str) -> bool {
+        self.resolver.supports_family(family)
+    }
+
+    pub fn validate_text(
+        &self,
+        family: &str,
+        weight: u16,
+        italic: bool,
+        text: &str,
+    ) -> Result<(), FontCoverageError> {
+        self.resolver.validate_text(family, weight, italic, text)
     }
 
     /// Lay out `buffer` wrapping at `max_width` pixels.

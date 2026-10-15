@@ -241,6 +241,7 @@ impl WorkspaceSession {
         if report.changed.is_empty() {
             document.components = self.components.defs.clone();
             document.variables = self.shared.variables.clone();
+            document.styles = self.shared.styles.clone();
             document.active_modes = self.shared.active_modes.clone();
             document.metadata = metadata;
             return Ok(IncrementalDocApply::Applied);
@@ -278,6 +279,7 @@ impl WorkspaceSession {
 
         document.components = self.components.defs.clone();
         document.variables = self.shared.variables.clone();
+        document.styles = self.shared.styles.clone();
         document.active_modes = self.shared.active_modes.clone();
         document.metadata = metadata;
         if report

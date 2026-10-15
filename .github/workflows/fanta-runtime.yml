@@ -1,0 +1,63 @@
+name: Fanta runtime engine
+
+# The WebAssembly build, JavaScript API and browser tests live in
+# jeanc18rlos/Fanta-JS, which builds this repository's fanta-runtime crate at a
+# pinned commit. This job keeps the Rust engines it compiles tested here.
+
+on:
+  pull_request:
+    paths:
+      - 'crates/fanta-doc/**'
+      - 'crates/fanta-fnx/**'
+      - 'crates/fanta-format/**'
+      - 'crates/fanta-present/**'
+      - 'crates/fanta-render/**'
+      - 'crates/fanta-text/**'
+      - 'crates/fanta-runtime/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/fanta-runtime.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fanta-runtime-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+
+jobs:
+  runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install native Skia dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfontconfig1-dev libfreetype6-dev libegl1-mesa-dev libgl1-mesa-dev
+
+      - name: Install Rust 1.95
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component clippy --component rustfmt
+          rustup override set 1.95.0
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: fanta-runtime-rust-1.95
+
+      - name: Test the Rust design and playback engines
+        run: |
+          cargo test --locked -p fanta-doc -p fanta-fnx -p fanta-format -p fanta-present -p fanta-render -p fanta-text -p fanta-runtime --lib
+          cargo test --locked -p fanta-format --test runtime_project
+          cargo check --locked -p fanta-format --no-default-features
+          cargo build --locked -p fanta-runtime --example playback_fixture

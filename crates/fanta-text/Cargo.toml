@@ -7,6 +7,10 @@ publish.workspace = true
 license.workspace = true
 description = "Rich text model + Skia paragraph layout + font resolution (bundled faces, metric-compatible substitution, optional Google Fonts fetch)."
 
+[features]
+default = ["native-fonts"]
+native-fonts = ["dep:ureq", "dep:dirs", "dep:zip"]
+
 [dependencies]
 fanta-doc.workspace = true
 thiserror.workspace = true
@@ -19,9 +23,11 @@ serde.workspace = true
 # bundled webpki roots so there's no system-cert dependency. A timeout keeps a
 # missing/slow network from stalling layout; failures fall through to the next
 # resolution step rather than panicking.
-ureq.workspace = true
-dirs.workspace = true
-zip.workspace = true
+
+[target.'cfg(not(target_os = "emscripten"))'.dependencies]
+ureq = { workspace = true, optional = true }
+dirs = { workspace = true, optional = true }
+zip = { workspace = true, optional = true }
 
 [dev-dependencies]
 # JSON round-trip tests for the serde-derived style types. Matches fanta-doc's
