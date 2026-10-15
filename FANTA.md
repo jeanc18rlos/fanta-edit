@@ -97,6 +97,6 @@ The first feature proof should be a minimal round trip:
 - Do not add Fanta business logic until the app is safe to identify and operate
   as Fanta.
 - Do not enable Zed-hosted services by default.
-- Keep `.rules` high-signal; propose new rules in PR descriptions first unless
-  the team explicitly asks to edit them.
-- Use `./script/clippy` instead of `cargo clippy`.
+- Keep `.rules` and the crate `AGENTS.md` files high-signal; the "Rules
+  hygiene" section of `.rules` describes how rules are added.
+- Use `./script/clippy -p <crate>` instead of `cargo clippy`.
