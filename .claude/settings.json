@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(./script/check-licenses)",
+      "Bash(./script/clippy -p *)",
+      "Bash(./script/verify-fanta-release *)",
+      "Bash(cargo check *)",
+      "Bash(cargo fmt *)",
+      "Bash(cargo test *)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/guard_bash.py\" || true",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

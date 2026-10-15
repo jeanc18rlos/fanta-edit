@@ -3,7 +3,8 @@ name: gpui-test
 description: >-
   Use when writing, debugging, or reproducing GPUI tests in Fanta, including
   gpui::test arguments, TestAppContext parameters, scheduler seeds,
-  ITERATIONS/SEED reproduction, parking failures, and pending task traces.
+  ITERATIONS/SEED reproduction, parking failures, pending task traces, and
+  mounted UI regressions (focus, drag, keymap and popover-menu tests).
 ---
 
 # GPUI Test Debugging
@@ -62,7 +63,7 @@ Use these forms on `#[gpui::test(arguments)]`:
 
 - `RUST_BACKTRACE=1` or `RUST_BACKTRACE=full` — show panic backtraces.
 - `RUST_LOG=<filter>` — enable logs when the test initializes logging.
-- `zed_wsl_server=1` — forces GPUI platform guessing toward headless mode; useful for tests that otherwise interact with platform/window setup.
+- `ZED_HEADLESS=1` — forces GPUI platform guessing toward headless mode; useful for tests that otherwise interact with platform/window setup.
 
 Prefer env vars over editing the test when narrowing a reproduction.
 
@@ -150,6 +151,21 @@ The scheduler can report activity from an unexpected thread. Look for work escap
 ### Tests pass alone but fail in sweeps
 
 Use the failing seed from sweep output. Avoid assuming test order unless the runner is explicitly serial. Check globals, leaked entities/tasks, and state not reset by test initialization.
+
+Tests that retain agent thread metadata must set a unique `TestMetadataDbName` global (`crates/agent_ui/src/thread_metadata_store.rs`); otherwise scheduler iterations share in-memory SQLite rows.
+
+## Mounted UI regressions
+
+These patterns come from regressions that passed in unit form and failed in the app:
+
+- Return `()` from `#[gpui::test]` functions. The macro discards the return value, so a test returning `Err` passes silently.
+- Focus, blur and `on_focus_out` tests: activate the test window, run until parked, and assert the window is active before simulating focus transitions. An inactive window moves focus handles while suppressing the focus events under test.
+- Keyboard tests: mount `MultiWorkspace` and load the shipped keymap, so outer action bindings take part. A bound action can consume a key before a raw key listener sees it.
+- If a cached pane subtree reports no debug bounds, refresh and draw before querying them.
+- Drag tests: press, make one move beyond the drag threshold, then release, and also cover multiple moves. A drag that starts during bubble dispatch is invisible to that same move's capture-phase `on_drag_move` listener.
+- Popover menus: click items at their rendered `MENU_ITEM` bounds. The test platform does not run `on_next_frame` focus callbacks, so menu keystrokes sent immediately can reach the previously focused view.
+- Mouse controls that can be refused (for example, while a draft is pending): exercise mouse-down and mouse-up separately, because focus moves on mouse-down.
+- Mount the production owner of a component (for example, the sidebar owned by `FigView` inside a workspace) rather than constructing the component alone; a standalone instance misses entity self-update cycles.
 
 ## Writing GPUI tests
 

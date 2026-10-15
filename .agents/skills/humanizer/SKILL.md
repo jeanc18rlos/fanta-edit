@@ -1,8 +1,6 @@
 ---
 name: humanizer
 description: Remove signs of AI-generated writing from text. Use after drafting to make copy sound more natural and human-written. Based on Wikipedia's "Signs of AI writing" guide.
-allowed-tools: Read, Write, Edit, Glob, Grep, AskUserQuestion
-user-invocable: true
 ---
 
 # Humanizer: Remove AI Writing Patterns

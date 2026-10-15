@@ -98,7 +98,8 @@ cargo run -p fanta
 The executable is named `fanta`.
 
 - `cargo build -p fanta` builds the app.
-- `./script/clippy` runs the repository's lints.
+- `./script/clippy -p <crate>` runs the repository's lints for a crate; without
+  `-p` it lints the whole workspace in release mode.
 - `./script/bundle-mac` builds a local bundle and emits matching crash symbols.
   A local bundle does not establish acceptance of the public installer.
 - `./script/smoke-mcp <fanta-binary> <project-dir>` exercises the local agent
