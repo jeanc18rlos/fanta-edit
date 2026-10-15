@@ -7,6 +7,10 @@ publish.workspace = true
 license.workspace = true
 description = ".fant zip container (JSON doc + content-addressed assets), git-native .fnx project tree, schema migrations."
 
+[features]
+default = ["native"]
+native = ["dep:tempfile"]
+
 [dependencies]
 # Doc model — the thing we serialize and load.
 fanta-doc.workspace = true
@@ -20,7 +24,7 @@ tracing.workspace = true
 
 # Container format. `.fant` files are zip archives; this is the canonical Rust
 # crate for reading and writing them with broad codec support.
-zip.workspace = true
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # JSON manifest + canonical doc projection. `serde_json::Value` is also used as
 # the typed seam for schema migrations so older docs can be transformed in
@@ -39,7 +43,7 @@ sha2 = "0.10"
 
 # Source-buffer edits are persisted through a same-directory temporary file so
 # an interrupted write cannot leave the project's readable source truncated.
-tempfile = "3"
+tempfile = { version = "3", optional = true }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 # sha2 0.10 selects its runtime-detected ARM SHA instructions only with `asm`.

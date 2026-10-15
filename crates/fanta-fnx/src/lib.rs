@@ -27,6 +27,7 @@ mod parse;
 mod print;
 mod refs;
 mod source;
+mod stylesheet;
 mod sugar;
 
 #[cfg(test)]
@@ -45,3 +46,4 @@ pub use parse::{parse_doc, parse_doc_with};
 pub use print::{print_doc, print_doc_with};
 pub use refs::{RefTable, desugar_refs, sugar_refs};
 pub use source::{FnxSourceMirror, sidecar_matches_source, source_reference_nodes_with};
+pub use stylesheet::{FssDeclaration, FssRule, parse_fss, stylesheet_imports};

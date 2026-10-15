@@ -64,6 +64,12 @@ fn step(value: serde_json::Value, current: u32, next: u32) -> Result<serde_json:
                 .map_err(|error| FormatError::InvalidManifest(error.to_string()))?;
             Ok(value)
         }
+        (3, 4) => {
+            let mut value = value;
+            fanta_doc::migrate_doc_json_to(&mut value, 3, 4)
+                .map_err(|error| FormatError::InvalidManifest(error.to_string()))?;
+            Ok(value)
+        }
         _ => Err(FormatError::InvalidManifest(format!(
             "no migration registered from schema {current} to {next}"
         ))),
@@ -97,7 +103,7 @@ mod tests {
     #[test]
     fn unknown_step_is_invalid_manifest() {
         let v = serde_json::json!({});
-        let err = migrate(v, 3, 4).unwrap_err();
+        let err = migrate(v, 4, 5).unwrap_err();
         assert!(matches!(err, FormatError::InvalidManifest(_)));
     }
 

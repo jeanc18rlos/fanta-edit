@@ -175,7 +175,14 @@ fn expand_instance_inner(
             if expansion_cancelled(should_cancel) {
                 return Vec::new();
             }
-            for (property, variable) in entry.node.bindings.clone() {
+            let mut bindings = entry
+                .node
+                .bindings
+                .iter()
+                .map(|(property, variable)| (*property, *variable))
+                .collect::<Vec<_>>();
+            bindings.sort_by_key(|(property, _)| (*property != BoundProp::TextStyle, *property));
+            for (property, variable) in bindings {
                 if expansion_cancelled(should_cancel) {
                     return Vec::new();
                 }

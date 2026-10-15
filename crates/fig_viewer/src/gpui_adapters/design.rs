@@ -1903,7 +1903,12 @@ pub(crate) fn design_node(
             out.independent_corners = true;
         }
     }
-    if matches!(&node.data, NodeData::Vector(vector) if vector.corner_radii.is_none())
+    let uniform_corners = match &node.data {
+        NodeData::Vector(vector) => vector.corner_radii.is_none(),
+        NodeData::Group(group) => group.corner_radii.is_none(),
+        _ => false,
+    };
+    if uniform_corners
         && let Some(DesignPanelValue::Number(value)) =
             resolved_inspector_binding(doc, node, BoundProp::CornerRadius)
     {
@@ -11914,21 +11919,21 @@ mod tests {
         });
         let (node, _) = design_node(&document, id, &HashMap::new()).expect("projection");
         assert_eq!(
-            node.corner_radii, [9.0; 4],
-            "engine does not apply CornerRadius binding to Group"
+            node.corner_radii, [18.0; 4],
+            "a frame shows its bound uniform radius, which the engine renders"
         );
         let states = bound_states(&document.doc, id);
         let (_, state) = states
             .iter()
             .find(|(property, _)| *property == DesignPanelProperty::CornerRadius)
             .expect("radius");
-        assert_eq!(state.resolved(), Some(&DesignPanelValue::Number(9.0)));
+        assert_eq!(state.resolved(), Some(&DesignPanelValue::Number(18.0)));
         assert!(
-            state
+            !state
                 .binding()
                 .expect("binding")
                 .name()
-                .contains("unresolved; using layer fallback")
+                .contains("unresolved")
         );
     }
 

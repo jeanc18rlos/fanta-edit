@@ -38,6 +38,71 @@ impl MotionLibrary {
     pub fn evaluate(&self, clip: AnimationClipId, playhead_ms: u32) -> Option<MotionEvaluation> {
         self.clips.get(&clip).map(|clip| clip.evaluate(playhead_ms))
     }
+
+    pub fn compile(&self) -> CompiledMotionLibrary {
+        CompiledMotionLibrary {
+            clips: self
+                .clips
+                .iter()
+                .map(|(identity, clip)| {
+                    (
+                        *identity,
+                        CompiledAnimationClip {
+                            identity: *identity,
+                            duration_ms: clip.duration_ms,
+                            tracks: clip
+                                .tracks
+                                .values()
+                                .map(|track| CompiledAnimationTrack {
+                                    target: track.target,
+                                    keyframes: canonical_keyframes(track)
+                                        .into_iter()
+                                        .cloned()
+                                        .collect(),
+                                })
+                                .collect(),
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CompiledMotionLibrary {
+    clips: BTreeMap<AnimationClipId, CompiledAnimationClip>,
+}
+
+impl CompiledMotionLibrary {
+    pub fn evaluate(&self, clip: AnimationClipId, playhead_ms: u32) -> Option<MotionEvaluation> {
+        let clip = self.clips.get(&clip)?;
+        let playhead_ms = playhead_ms.min(clip.duration_ms);
+        let mut overrides = BTreeMap::new();
+        for track in &clip.tracks {
+            if let Some(value) = evaluate_keyframes(&track.keyframes, playhead_ms) {
+                overrides.insert(track.target, value);
+            }
+        }
+        Some(MotionEvaluation {
+            clip: clip.identity,
+            playhead_ms,
+            overrides,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CompiledAnimationClip {
+    identity: AnimationClipId,
+    duration_ms: u32,
+    tracks: Vec<CompiledAnimationTrack>,
+}
+
+#[derive(Debug, Clone)]
+struct CompiledAnimationTrack {
+    target: MotionTarget,
+    keyframes: Vec<Keyframe>,
 }
 
 /// A named, finite timeline containing independently-addressable tracks.
@@ -113,51 +178,63 @@ impl AnimationTrack {
     /// static type are ignored so hand-authored or forward-version data cannot
     /// poison every otherwise valid keyframe in the track.
     pub fn evaluate(&self, playhead_ms: u32) -> Option<ResolvedVarValue> {
-        let mut keyframes: Vec<&Keyframe> = self
-            .keyframes
-            .values()
-            .filter(|keyframe| self.target.property.accepts_value(&keyframe.value))
-            .collect();
-        keyframes.sort_by_key(|keyframe| (keyframe.time_ms, keyframe.id));
-        let mut canonical_keyframes: Vec<&Keyframe> = Vec::with_capacity(keyframes.len());
-        for keyframe in keyframes {
-            if let Some(previous) = canonical_keyframes.last_mut()
-                && previous.time_ms == keyframe.time_ms
-            {
-                *previous = keyframe;
-                continue;
-            }
-            canonical_keyframes.push(keyframe);
-        }
-
-        let first = canonical_keyframes.first().copied()?;
-        if playhead_ms < first.time_ms {
-            return Some(first.value.clone());
-        }
-
-        let upper_index =
-            canonical_keyframes.partition_point(|keyframe| keyframe.time_ms <= playhead_ms);
-        if upper_index == canonical_keyframes.len() {
-            return canonical_keyframes
-                .last()
-                .map(|keyframe| keyframe.value.clone());
-        }
-
-        let lower = canonical_keyframes.get(upper_index.checked_sub(1)?)?;
-        let upper = canonical_keyframes.get(upper_index)?;
-        if lower.time_ms == playhead_ms || lower.interpolation == Interpolation::Hold {
-            return Some(lower.value.clone());
-        }
-
-        let segment_ms = upper.time_ms.checked_sub(lower.time_ms)?;
-        if segment_ms == 0 {
-            return Some(upper.value.clone());
-        }
-        let elapsed_ms = playhead_ms.saturating_sub(lower.time_ms);
-        let progress = elapsed_ms as f64 / segment_ms as f64;
-        let progress = eased_progress(lower.easing, progress);
-        Some(interpolate_value(&lower.value, &upper.value, progress))
+        evaluate_keyframes(&canonical_keyframes(self), playhead_ms)
     }
+}
+
+fn canonical_keyframes(track: &AnimationTrack) -> Vec<&Keyframe> {
+    let mut keyframes: Vec<&Keyframe> = track
+        .keyframes
+        .values()
+        .filter(|keyframe| track.target.property.accepts_value(&keyframe.value))
+        .collect();
+    keyframes.sort_by_key(|keyframe| (keyframe.time_ms, keyframe.id));
+    let mut canonical: Vec<&Keyframe> = Vec::with_capacity(keyframes.len());
+    for keyframe in keyframes {
+        if let Some(previous) = canonical.last_mut()
+            && previous.time_ms == keyframe.time_ms
+        {
+            *previous = keyframe;
+        } else {
+            canonical.push(keyframe);
+        }
+    }
+    canonical
+}
+
+fn evaluate_keyframes<T: std::borrow::Borrow<Keyframe>>(
+    canonical_keyframes: &[T],
+    playhead_ms: u32,
+) -> Option<ResolvedVarValue> {
+    let first = canonical_keyframes.first()?.borrow();
+    if playhead_ms < first.time_ms {
+        return Some(first.value.clone());
+    }
+
+    let upper_index =
+        canonical_keyframes.partition_point(|keyframe| keyframe.borrow().time_ms <= playhead_ms);
+    if upper_index == canonical_keyframes.len() {
+        return canonical_keyframes
+            .last()
+            .map(|keyframe| keyframe.borrow().value.clone());
+    }
+
+    let lower = canonical_keyframes
+        .get(upper_index.checked_sub(1)?)?
+        .borrow();
+    let upper = canonical_keyframes.get(upper_index)?.borrow();
+    if lower.time_ms == playhead_ms || lower.interpolation == Interpolation::Hold {
+        return Some(lower.value.clone());
+    }
+
+    let segment_ms = upper.time_ms.checked_sub(lower.time_ms)?;
+    if segment_ms == 0 {
+        return Some(upper.value.clone());
+    }
+    let elapsed_ms = playhead_ms.saturating_sub(lower.time_ms);
+    let progress = elapsed_ms as f64 / segment_ms as f64;
+    let progress = eased_progress(lower.easing, progress);
+    Some(interpolate_value(&lower.value, &upper.value, progress))
 }
 
 /// Stable address of one animatable property on one scene node.
@@ -376,8 +453,25 @@ impl MotionEvaluation {
         let mut transform = MotionTransform::decompose(node.transform);
         let mut transform_changed = false;
 
-        for (target, value) in &self.overrides {
-            if target.node != node.id {
+        let first = MotionTarget::new(
+            node.id,
+            MotionProperty::Bound {
+                prop: BoundProp::FillColor { index: 0 },
+            },
+        );
+        let last = MotionTarget::new(node.id, MotionProperty::ScaleY);
+        let typography = MotionTarget::new(
+            node.id,
+            MotionProperty::Bound {
+                prop: BoundProp::TextStyle,
+            },
+        );
+        if let Some(value) = self.overrides.get(&typography) {
+            BoundProp::TextStyle.apply_resolved(&mut evaluated, value.clone());
+        }
+        // MotionTarget orders the node before its property, so a range avoids scanning other nodes' tracks.
+        for (target, value) in self.overrides.range(first..=last) {
+            if *target == typography {
                 continue;
             }
             match target.property {
@@ -806,5 +900,34 @@ mod tests {
         assert!(doc.redo()?);
         assert!(doc.motion.clip(clip_id).is_some());
         Ok(())
+    }
+    #[test]
+    fn compiled_motion_matches_authoring_evaluation_with_duplicate_times() {
+        let mut library = MotionLibrary::new();
+        let target = MotionTarget::new(NodeId::from_u128(7), MotionProperty::PositionX);
+        let mut track = AnimationTrack::new(AnimationTrackId::from_u128(8), target);
+        for keyframe in [
+            float_keyframe(10, 100, 30.0),
+            float_keyframe(11, 0, 0.0),
+            float_keyframe(12, 100, 100.0),
+        ] {
+            track.keyframes.insert(keyframe.id, keyframe);
+        }
+        let mut clip = AnimationClip::new(AnimationClipId::from_u128(9), "Move", 100);
+        clip.tracks.insert(track.id, track);
+        library.clips.insert(clip.id, clip);
+        let compiled = library.compile();
+        for playhead in [0, 1, 20, 50, 99, 100, 101, u32::MAX] {
+            assert_eq!(
+                compiled.evaluate(AnimationClipId::from_u128(9), playhead),
+                library.evaluate(AnimationClipId::from_u128(9), playhead)
+            );
+        }
+        library.clips.clear();
+        assert!(
+            compiled
+                .evaluate(AnimationClipId::from_u128(9), 50)
+                .is_some()
+        );
     }
 }

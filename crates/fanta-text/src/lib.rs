@@ -57,10 +57,14 @@ pub mod style;
 // `fanta-doc`'s `lib.rs`.
 pub use buffer::{StyleRun, TextBuffer, TextError};
 pub use caret::{Caret, Selection};
+#[cfg(all(feature = "native-fonts", not(target_os = "emscripten")))]
+pub use font_resolver::fetch_downloadable_font;
 pub use font_resolver::{
-    ADOBE_CLEAN_SANS_METRIC_RATIO, ADOBE_CLEAN_SERIF_METRIC_RATIO, FontGenerationObserver,
-    FontResolver, GenericFamily, INTER_FAMILY, SOURCE_CODE_FAMILY, SOURCE_SANS_FAMILY,
-    SOURCE_SERIF_FAMILY, bundled_family_names, bundled_preview_bytes, prewarm_font_downloads,
+    ADOBE_CLEAN_SANS_METRIC_RATIO, ADOBE_CLEAN_SERIF_METRIC_RATIO, FontCoverageError,
+    FontGenerationObserver, FontRegistration, FontRegistrationError, FontResolver, GenericFamily,
+    INTER_FAMILY, SOURCE_CODE_FAMILY, SOURCE_SANS_FAMILY, SOURCE_SERIF_FAMILY,
+    bundled_family_names, bundled_font_files, bundled_preview_bytes, font_family_names,
+    prewarm_font_downloads,
 };
 pub use layout::{
     LayoutEngine, LayoutOptions, LineMetrics, ShapedGlyph, ShapedGlyphError, ShapedGlyphRun,

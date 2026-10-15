@@ -89,8 +89,43 @@ impl DecodedImage {
     /// otherwise read out of bounds inside Skia, so a bad asset degrades to the
     /// placeholder instead of unsafety.
     pub fn is_well_formed(&self) -> bool {
-        self.pixels().len() == (self.width as usize) * (self.height as usize) * 4
+        (self.width as usize)
+            .checked_mul(self.height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            == Some(self.pixels().len())
     }
+}
+
+pub fn encoded_image_dimensions(bytes: &[u8]) -> Option<[u32; 2]> {
+    let image = skia_safe::Image::from_encoded(skia_safe::Data::new_copy(bytes))?;
+    Some([
+        u32::try_from(image.width()).ok()?,
+        u32::try_from(image.height()).ok()?,
+    ])
+}
+
+pub fn decode_image_bytes(bytes: &[u8]) -> Option<DecodedImage> {
+    let image = skia_safe::Image::from_encoded(skia_safe::Data::new_copy(bytes))?;
+    let width = u32::try_from(image.width()).ok()?;
+    let height = u32::try_from(image.height()).ok()?;
+    let info = skia_safe::ImageInfo::new(
+        (image.width(), image.height()),
+        skia_safe::ColorType::RGBA8888,
+        skia_safe::AlphaType::Unpremul,
+        None,
+    );
+    let row_bytes = (width as usize).checked_mul(4)?;
+    let mut pixels = vec![0u8; row_bytes.checked_mul(height as usize)?];
+    if !image.read_pixels(
+        &info,
+        &mut pixels,
+        row_bytes,
+        (0, 0),
+        skia_safe::image::CachingHint::Allow,
+    ) {
+        return None;
+    }
+    Some(DecodedImage::new(&pixels, width, height))
 }
 
 /// Resolves an [`AssetId`] to decoded pixels.

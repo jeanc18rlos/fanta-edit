@@ -34,7 +34,10 @@ pub mod raster;
 pub mod sampling;
 pub mod transform;
 
-pub use asset::{AssetResolver, DecodedImage, InMemoryAssetResolver, LazyAssetResolver};
+pub use asset::{
+    AssetResolver, DecodedImage, InMemoryAssetResolver, LazyAssetResolver, decode_image_bytes,
+    encoded_image_dimensions,
+};
 pub use bounds::visual_world_bounds;
 pub use color::{to_sk_color, to_sk_color4f};
 pub use fanta_text::FontGenerationObserver;
@@ -50,13 +53,14 @@ pub use raster::{
     RenderInputs, RenderMetrics, RetainedBuildMetrics, RetainedError, RetainedFrame,
     RetainedFrameMetrics, RetainedTranslationSession, SplitError, SplitPhase, SplitSpec,
     SvgRenderOptions, SvgRenderOutput, TextPathAffinity, TextPathCaretSegment, TextPathPosition,
-    TextPathSelectionQuad, TextPathVisualDirection, measure_text_node, rounded_rect_contains_point,
-    solve_doc_layout, solve_scene_layout, text_caret_rect, text_first_baseline, text_hit_test,
-    text_line_height, text_node_outline, text_path_caret_segment, text_path_caret_segment_at,
-    text_path_contains_point, text_path_hit_test, text_path_hit_test_position,
-    text_path_selection_quads, text_path_visual_bounds, text_path_visual_line_edge,
-    text_path_visual_neighbor, text_path_visual_selection_edge, text_selection_rects,
-    vector_contains_point, vector_outline_sk_path,
+    TextPathSelectionQuad, TextPathVisualDirection, TextRenderContext, measure_text_node,
+    rounded_rect_contains_point, solve_doc_layout, solve_scene_layout, text_caret_rect,
+    text_first_baseline, text_hit_test, text_line_height, text_node_outline,
+    text_path_caret_segment, text_path_caret_segment_at, text_path_contains_point,
+    text_path_hit_test, text_path_hit_test_position, text_path_selection_quads,
+    text_path_visual_bounds, text_path_visual_line_edge, text_path_visual_neighbor,
+    text_path_visual_selection_edge, text_selection_rects, vector_contains_point,
+    vector_outline_sk_path,
 };
 #[cfg(feature = "metal")]
 pub use raster::{GraphiteSubmissionMetrics, RetainedGpuTarget, RetainedGraphiteContext};

@@ -52,6 +52,7 @@ pub(crate) mod serde_util;
 pub mod snapshot;
 pub mod spatial;
 pub mod style;
+pub mod stylesheet;
 pub mod transform;
 pub mod value;
 pub mod variables;
@@ -67,11 +68,12 @@ pub use component::{
 pub use doc::{
     Doc, DocLoadError, DocMetadata, DocMigrationError, Flow, PresentationConfig, ProjectAsset,
     ProjectAssetKind, SCHEMA_VERSION, Viewport, migrate_doc_json, migrate_doc_json_to,
+    prepare_doc_json,
 };
 pub use history::{History, Transaction};
 pub use id::{
     AnimationClipId, AnimationTrackId, AssetId, ComponentId, ComponentPropId, DocId, IdBuildHasher,
-    IdHashMap, IdHasher, IdParseError, KeyframeId, LinkId, ModeId, NodeId, ReactionId,
+    IdHashMap, IdHasher, IdParseError, KeyframeId, LinkId, ModeId, NodeId, ReactionId, StyleId,
     VariableCollectionId, VariableId, WorkflowNodeId,
 };
 pub use index::IndexKey;
@@ -127,6 +129,9 @@ pub use style::{
     PatternHorizontalAlignment, PatternSpacing, PatternTileType, ShaderFill, ShaderGradientStop,
     ShaderPropertyAssignment, ShaderPropertyValue, Shadow, ShadowKind, Stroke, StrokeAlign,
     StrokeCap, StrokeJoin, UnitInterval, VideoFill,
+};
+pub use stylesheet::{
+    StyleAssignment, StyleDeclaration, StyleError, StyleProperty, StyleRegistry, StyleRule,
 };
 pub use transform::{Bounds, Transform2D};
 pub use value::{ResolvedVarValue, VarValue, VariableType};
