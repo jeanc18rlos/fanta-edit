@@ -11,7 +11,7 @@ type FontPicker = Picker<FontFamilyPickerDelegate>;
 type ChangeHandler = Rc<dyn Fn(SharedString, &mut Window, &mut App)>;
 type OpenHandler = Rc<dyn Fn(&mut Window, &mut App)>;
 
-/// A compact Zed-style combobox for choosing a font family.
+/// A compact Fanta-style combobox for choosing a font family.
 ///
 /// Typing only filters the popover. The document callback runs once, when a
 /// highlighted family is confirmed, so partial search queries can never become
@@ -307,14 +307,14 @@ mod tests {
     fn choices_are_trimmed_case_insensitively_deduplicated_and_sorted() {
         let choices = normalize_font_families(
             &"Inter".into(),
-            [" Zed Sans ", "inter", "Arial", "", "arial"],
+            [" Fanta Sans ", "inter", "Arial", "", "arial"],
         );
         assert_eq!(
             choices,
             vec![
                 SharedString::from("Arial"),
+                SharedString::from("Fanta Sans"),
                 SharedString::from("Inter"),
-                SharedString::from("Zed Sans"),
             ]
         );
     }

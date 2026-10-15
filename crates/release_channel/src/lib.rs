@@ -7,15 +7,15 @@ use std::{env, str::FromStr, sync::LazyLock};
 use gpui::{App, Global};
 use semver::Version;
 
-const ZED_DOCS_URL: &str = "https://fantaisa.net/docs";
+const FANTA_DOCS_URL: &str = "https://fantaisa.net/docs";
 
 /// stable | dev | nightly | preview
 pub static RELEASE_CHANNEL_NAME: LazyLock<String> = LazyLock::new(|| {
     if cfg!(debug_assertions) {
-        env::var("ZED_RELEASE_CHANNEL")
-            .unwrap_or_else(|_| include_str!("../../zed/RELEASE_CHANNEL").trim().to_string())
+        env::var("FANTA_RELEASE_CHANNEL")
+            .unwrap_or_else(|_| include_str!("../../fanta/RELEASE_CHANNEL").trim().to_string())
     } else {
-        include_str!("../../zed/RELEASE_CHANNEL").trim().to_string()
+        include_str!("../../fanta/RELEASE_CHANNEL").trim().to_string()
     }
 });
 
@@ -37,7 +37,7 @@ pub fn app_identifier() -> &'static str {
     }
 }
 
-/// The Git commit SHA that Zed was built at.
+/// The Git commit SHA that Fanta was built at.
 #[derive(Clone, Eq, Debug, PartialEq)]
 pub struct AppCommitSha(String);
 
@@ -77,7 +77,7 @@ struct GlobalAppVersion(Version);
 
 impl Global for GlobalAppVersion {}
 
-/// The version of Zed.
+/// The version of Fanta.
 pub struct AppVersion;
 
 impl AppVersion {
@@ -87,8 +87,8 @@ impl AppVersion {
         build_id: Option<&str>,
         commit_sha: Option<AppCommitSha>,
     ) -> Version {
-        let mut version: Version = if let Ok(from_env) = env::var("ZED_APP_VERSION") {
-            from_env.parse().expect("invalid ZED_APP_VERSION")
+        let mut version: Version = if let Ok(from_env) = env::var("FANTA_APP_VERSION") {
+            from_env.parse().expect("invalid FANTA_APP_VERSION")
         } else {
             pkg_version.parse().expect("invalid version in Cargo.toml")
         };
@@ -120,12 +120,12 @@ impl AppVersion {
     }
 }
 
-/// A Zed release channel.
+/// A Fanta release channel.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub enum ReleaseChannel {
     /// The development release channel.
     ///
-    /// Used for local debug builds of Zed.
+    /// Used for local debug builds of Fanta.
     #[default]
     Dev,
 
@@ -155,7 +155,7 @@ pub fn init_test(app_version: Version, release_channel: ReleaseChannel, cx: &mut
     cx.set_global(GlobalReleaseChannel(release_channel))
 }
 
-/// Returns the Zed docs URL for the current release channel for the given
+/// Returns the Fanta docs URL for the current release channel for the given
 /// `slug`.
 pub fn docs_url(slug: &str, cx: &App) -> String {
     ReleaseChannel::try_global(cx)
@@ -230,7 +230,7 @@ impl ReleaseChannel {
         }
     }
 
-    /// Returns the Zed docs URL for this [`ReleaseChannel`] for the given
+    /// Returns the Fanta docs URL for this [`ReleaseChannel`] for the given
     /// `slug`.
     pub fn docs_url(&self, slug: &str) -> String {
         let channel_path_segment = match self {
@@ -240,10 +240,10 @@ impl ReleaseChannel {
         };
 
         match channel_path_segment {
-            Some(channel) if slug.is_empty() => format!("{ZED_DOCS_URL}/{channel}"),
-            Some(channel) => format!("{ZED_DOCS_URL}/{channel}/{slug}"),
-            None if slug.is_empty() => ZED_DOCS_URL.to_string(),
-            None => format!("{ZED_DOCS_URL}/{slug}"),
+            Some(channel) if slug.is_empty() => format!("{FANTA_DOCS_URL}/{channel}"),
+            Some(channel) => format!("{FANTA_DOCS_URL}/{channel}/{slug}"),
+            None if slug.is_empty() => FANTA_DOCS_URL.to_string(),
+            None => format!("{FANTA_DOCS_URL}/{slug}"),
         }
     }
 }

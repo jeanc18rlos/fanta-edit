@@ -1,0 +1,29 @@
+name: Prepare Skia source
+description: >
+  Restores or fetches the Skia checkout used by vendor/skia-bindings so cargo builds
+  do not depend on a single, unretried googlesource.com sync.
+
+inputs:
+  offline:
+    description: >
+      Export SKIA_SOURCE_DIR so the skia-bindings build script skips its own network
+      sync. Leave false for jobs that audit the default source-build path.
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809 # v4.2.4
+      with:
+        path: vendor/skia-bindings-0.153.3/skia
+        key: skia-source-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('vendor/skia-bindings-0.153.3/Cargo.toml', 'script/prepare-skia-source') }}
+
+    - name: Fetch Skia and its dependencies
+      shell: bash
+      run: ./script/prepare-skia-source
+
+    - name: Build Skia from the prepared checkout
+      if: ${{ inputs.offline == 'true' }}
+      shell: bash
+      run: echo "SKIA_SOURCE_DIR=${GITHUB_WORKSPACE}/vendor/skia-bindings-0.153.3/skia" >> "$GITHUB_ENV"

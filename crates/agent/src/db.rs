@@ -19,7 +19,7 @@ use sqlez::{
 use std::{io::ErrorKind, path::PathBuf, sync::Arc};
 use ui::{App, SharedString};
 use util::path_list::PathList;
-use zed_env_vars::ZED_STATELESS;
+use fanta_env_vars::FANTA_STATELESS;
 
 pub type DbMessage = crate::Message;
 pub type DbSummary = crate::legacy_thread::DetailedSummaryState;
@@ -419,7 +419,7 @@ impl ThreadsDatabase {
     }
 
     pub fn new(executor: BackgroundExecutor) -> Result<Self> {
-        let connection = if *ZED_STATELESS {
+        let connection = if *FANTA_STATELESS {
             Connection::open_memory(Some("THREAD_FALLBACK_DB"))
         } else if cfg!(any(feature = "test-support", test)) {
             // rust stores the name of the test on the current thread.
@@ -979,7 +979,7 @@ mod tests {
         let database = ThreadsDatabase::new(cx.executor()).unwrap();
         let thread_id = session_id("sandbox-temp-dir-thread");
         let temp_dir = tempfile::Builder::new()
-            .prefix("zed-agent-terminal-test-")
+            .prefix("fanta-agent-terminal-test-")
             .tempdir()
             .unwrap()
             .keep();
@@ -1008,7 +1008,7 @@ mod tests {
         let database = ThreadsDatabase::new(cx.executor()).unwrap();
         let thread_id = session_id("sandbox-temp-dir-delete-thread");
         let temp_dir = tempfile::Builder::new()
-            .prefix("zed-agent-terminal-test-")
+            .prefix("fanta-agent-terminal-test-")
             .tempdir()
             .unwrap()
             .keep();

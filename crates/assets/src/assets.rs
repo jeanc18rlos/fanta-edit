@@ -1,4 +1,4 @@
-// This crate was essentially pulled out verbatim from main `zed` crate to avoid having to run RustEmbed macro whenever zed has to be rebuilt. It saves a second or two on an incremental build.
+// This crate was essentially pulled out verbatim from main `fanta` crate to avoid having to run RustEmbed macro whenever fanta has to be rebuilt. It saves a second or two on an incremental build.
 
 use anyhow::{Context as _, anyhow};
 use gpui::{App, AssetSource, Result, SharedString};
@@ -21,7 +21,7 @@ impl AssetSource for Assets {
                 return Ok(Some(file.data));
             }
         }
-        if let Some(bytes) = zed_ui_assets::Assets.load(path)? {
+        if let Some(bytes) = fanta_ui_assets::Assets.load(path)? {
             return Ok(Some(bytes));
         }
         EditorAssets::get(path)
@@ -30,7 +30,7 @@ impl AssetSource for Assets {
     }
 
     fn list(&self, path: &str) -> Result<Vec<SharedString>> {
-        let mut paths = zed_ui_assets::Assets.list(path)?;
+        let mut paths = fanta_ui_assets::Assets.list(path)?;
         for editor_path in EditorAssets::iter().filter_map(|p| {
             if p.starts_with(path) {
                 Some(p.into())
@@ -55,7 +55,7 @@ mod tests {
         let loaded = Assets
             .load("licenses.md")?
             .context("license asset is missing")?;
-        let shared = zed_ui_assets::Assets
+        let shared = fanta_ui_assets::Assets
             .load("licenses.md")?
             .context("shared license asset is missing")?;
         if let Some(editor_licenses) = EditorAssets::get("licenses.md") {

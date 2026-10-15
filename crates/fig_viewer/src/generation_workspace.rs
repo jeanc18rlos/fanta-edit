@@ -5073,9 +5073,9 @@ impl Render for GenerationWorkspace {
                         .disabled(self.task.is_some()).on_click(cx.listener(|this, _, _, cx| this.sign_in(cx)))))
                     .child(Button::new("generation-billing", "Credits & billing").on_click(|_, _window, cx| {
                         #[cfg(feature = "mac_app_store")]
-                        _window.dispatch_action(zed_actions::OpenAccountSettings.boxed_clone(), cx);
+                        _window.dispatch_action(fanta_actions::OpenAccountSettings.boxed_clone(), cx);
                         #[cfg(not(feature = "mac_app_store"))]
-                        cx.open_url(&client::zed_urls::account_url(cx));
+                        cx.open_url(&client::fanta_urls::account_url(cx));
                     }))))
             .child(h_flex().flex_shrink_0().gap_1().flex_wrap().children(GenerationMode::CREATION_MODES.into_iter().map(|mode| {
                 Button::new(("generation-mode", mode as usize), mode.label()).toggle_state(self.mode == mode)

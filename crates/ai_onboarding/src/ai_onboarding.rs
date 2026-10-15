@@ -37,20 +37,20 @@ impl From<client::Status> for SignInStatus {
 }
 
 #[derive(RegisterComponent, IntoElement)]
-pub struct ZedAiOnboarding {
+pub struct FantaAiOnboarding {
     pub sign_in_status: SignInStatus,
     pub plan: Option<Plan>,
     pub account_too_young: bool,
-    pub continue_with_zed_ai: Arc<dyn Fn(&mut Window, &mut App)>,
+    pub continue_with_fanta_ai: Arc<dyn Fn(&mut Window, &mut App)>,
     pub sign_in: Arc<dyn Fn(&mut Window, &mut App)>,
     pub dismiss_onboarding: Option<Arc<dyn Fn(&mut Window, &mut App)>>,
 }
 
-impl ZedAiOnboarding {
+impl FantaAiOnboarding {
     pub fn new(
         client: Arc<Client>,
         user_store: &Entity<UserStore>,
-        continue_with_zed_ai: Arc<dyn Fn(&mut Window, &mut App)>,
+        continue_with_fanta_ai: Arc<dyn Fn(&mut Window, &mut App)>,
         cx: &mut App,
     ) -> Self {
         let store = user_store.read(cx);
@@ -60,7 +60,7 @@ impl ZedAiOnboarding {
             sign_in_status: status.into(),
             plan: store.plan(),
             account_too_young: store.account_too_young(),
-            continue_with_zed_ai,
+            continue_with_fanta_ai,
             sign_in: Arc::new(move |_window, cx| {
                 cx.spawn({
                     let client = client.clone();
@@ -119,7 +119,7 @@ impl ZedAiOnboarding {
                 "Your Fanta account",
                 "Use your Fanta plan and credits to work with AI in this project.",
                 "Continue with Fanta",
-                self.continue_with_zed_ai.clone(),
+                self.continue_with_fanta_ai.clone(),
             ),
         };
         v_flex()
@@ -140,13 +140,13 @@ impl ZedAiOnboarding {
     }
 }
 
-impl RenderOnce for ZedAiOnboarding {
+impl RenderOnce for FantaAiOnboarding {
     fn render(self, _window: &mut ui::Window, _cx: &mut App) -> impl IntoElement {
         self.render_model_setup()
     }
 }
 
-impl Component for ZedAiOnboarding {
+impl Component for FantaAiOnboarding {
     fn scope() -> ComponentScope {
         ComponentScope::Onboarding
     }
@@ -166,11 +166,11 @@ impl Component for ZedAiOnboarding {
             .max_w(px(1100.))
             .child(
                 AgentPanelOnboardingCard::new().child(
-                    ZedAiOnboarding {
+                    FantaAiOnboarding {
                         sign_in_status: SignInStatus::SignedOut,
                         plan: None,
                         account_too_young: false,
-                        continue_with_zed_ai: Arc::new(|_, _| {}),
+                        continue_with_fanta_ai: Arc::new(|_, _| {}),
                         sign_in: Arc::new(|_, _| {}),
                         dismiss_onboarding: None,
                     }

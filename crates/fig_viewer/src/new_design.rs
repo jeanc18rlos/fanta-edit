@@ -27,7 +27,7 @@ const SUGGESTED_NAME: &str = "Untitled Design";
 /// Hook the `New Design` action up to a freshly created workspace. Called from
 /// [`crate::workspace_hooks::init`]'s `observe_new` so every window gets it.
 pub(crate) fn register(workspace: &mut Workspace) {
-    workspace.register_action(|workspace, _: &zed_actions::fanta::NewDesign, window, cx| {
+    workspace.register_action(|workspace, _: &fanta_actions::fanta::NewDesign, window, cx| {
         prompt_and_create(workspace, window, cx);
     });
 }

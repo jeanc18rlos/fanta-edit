@@ -195,7 +195,7 @@ notarization was skipped. These are test installers, and final notarization
 and clean-Mac validation remain required.
 
 GitHub Actions is enabled. **The GitHub default `main` branch is still upstream
-Zed** (`9064f26` when checked). The Fanta checkout starts at `d8610f9`, published
+Fanta** (`9064f26` when checked). The Fanta checkout starts at `d8610f9`, published
 on `perf/large-documents-ai-alignment`. Merge the release changes into the
 Fanta branch and intentionally select the Fanta release branch as the default
 before relying on the repository home page or manual release workflow.
@@ -243,7 +243,7 @@ are corrected and an end-to-end upgrade passes. On-demand SSH remote-server
 downloads are separate; this first Apple Silicon workflow has no verified
 SSH remote-server artifact.
 
-A `v*` tag must match the version in `crates/zed/Cargo.toml`. Successful tag
+A `v*` tag must match the version in `crates/fanta/Cargo.toml`. Successful tag
 builds prepare a **draft** GitHub release. Publish only after checking the DMG
 on a clean Mac: install, launch, sign in, make a design, run an AI edit, save,
 close, reopen, and sign out. Keep the separate crash-symbol artifact.

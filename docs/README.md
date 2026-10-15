@@ -32,10 +32,10 @@ step: read the files here, or on GitHub.
   [`project-schema.md`](./fanta/project-schema.md) for the editable project tree and
   [`code-first-audit.md`](./fanta/code-first-audit.md) for the architecture review, plus
   [`disabled-services-binnacle.md`](./fanta/disabled-services-binnacle.md),
-  the record of which inherited Zed services are switched off and why.
+  the record of which inherited Fanta services are switched off and why.
 - [`live-mcp-v2.md`](./live-mcp-v2.md) and
   [`live-mcp-v2-implementation.md`](./live-mcp-v2-implementation.md) — the live
   MCP server agents connect to.
 
-Zed's mdBook (`docs/src`, `docs/theme`, `book.toml`) was removed: none of it
-described Fanta.
+The inherited mdBook (`docs/src`, `docs/theme`, `book.toml`) was removed: none
+of it described Fanta.

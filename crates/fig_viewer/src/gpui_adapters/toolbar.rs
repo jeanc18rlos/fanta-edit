@@ -664,7 +664,7 @@ mod tests {
     }
 
     /// Every Lucide icon the toolbar can name must resolve through the shared
-    /// Zed asset source or the tile renders blank in the app.
+    /// Fanta asset source or the tile renders blank in the app.
     /// Enumerate the public variants from the pinned component release because
     /// the published enum does not expose an iterator.
     #[test]
@@ -780,7 +780,7 @@ mod tests {
             let bytes = assets::Assets
                 .load(path.as_ref())
                 .unwrap_or_else(|error| panic!("{path}: {error:#}"))
-                .unwrap_or_else(|| panic!("{path} is missing from shared Zed UI assets"));
+                .unwrap_or_else(|| panic!("{path} is missing from shared Fanta UI assets"));
             assert!(
                 std::str::from_utf8(&bytes).is_ok_and(|svg| svg.contains("<svg")),
                 "{path} must be an SVG document"

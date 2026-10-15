@@ -214,7 +214,7 @@ impl DockerExecConnection {
             _ => version.to_string(),
         };
         let binary_name = format!(
-            "zed-remote-server-{}-{}",
+            "fanta-remote-server-{}-{}",
             release_channel.dev_name(),
             version_str
         );
@@ -268,7 +268,7 @@ impl DockerExecConnection {
             ReleaseChannel::Nightly => Ok(None),
             ReleaseChannel::Dev => {
                 anyhow::bail!(
-                    "ZED_BUILD_REMOTE_SERVER is not set and no remote server exists at ({:?})",
+                    "FANTA_BUILD_REMOTE_SERVER is not set and no remote server exists at ({:?})",
                     dst_path
                 )
             }
@@ -472,7 +472,7 @@ impl DockerExecConnection {
         let stderr = String::from_utf8_lossy(&output.stderr);
         log::debug!("failed to change ownership for via chown: {stderr}",);
         anyhow::bail!(
-            "failed to change ownership for zed_remote_server via chown: {}",
+            "failed to change ownership for fanta_remote_server via chown: {}",
             stderr,
         );
     }
@@ -675,7 +675,7 @@ impl RemoteConnection for DockerExecConnection {
             docker_args.push("-e".to_string());
             docker_args.push(format!("{k}={v}"));
         }
-        for env_var in ["RUST_LOG", "RUST_BACKTRACE", "ZED_GENERATE_MINIDUMPS"] {
+        for env_var in ["RUST_LOG", "RUST_BACKTRACE", "FANTA_GENERATE_MINIDUMPS"] {
             if let Some(value) = std::env::var(env_var).ok() {
                 docker_args.push("-e".to_string());
                 docker_args.push(format!("{env_var}={value}"));

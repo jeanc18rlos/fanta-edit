@@ -40,7 +40,7 @@ pub struct SystemPromptTemplate<'a> {
     pub available_tools: Vec<SharedString>,
     pub model_name: Option<String>,
     pub date: String,
-    /// Contents of the user-global `~/.config/zed/AGENTS.md` file (or the
+    /// Contents of the user-global `~/.config/fanta/AGENTS.md` file (or the
     /// platform equivalent), if present and non-empty.
     pub user_agents_md: Option<SharedString>,
     /// Whether agent-run terminal commands are wrapped in an OS-level
@@ -443,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn test_system_prompt_does_not_render_legacy_zed_rules_section() {
+    fn test_system_prompt_does_not_render_legacy_fanta_rules_section() {
         let project = prompt_store::ProjectContext::default();
         let template = SystemPromptTemplate {
             project: &project,

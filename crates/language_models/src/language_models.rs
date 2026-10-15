@@ -143,7 +143,7 @@ fn register_compatible_providers(
 fn register_language_model_providers(
     registry: &mut LanguageModelRegistry,
     // The managed "Fanta" provider is served by the settings-driven
-    // `anthropic_compatible` path, not by the zed.dev cloud provider, so nothing here
+    // `anthropic_compatible` path, not by the fantaisa.net cloud provider, so nothing here
     // needs the user store. The parameter stays so `init`'s public signature is unchanged.
     _user_store: Entity<UserStore>,
     client: Arc<Client>,

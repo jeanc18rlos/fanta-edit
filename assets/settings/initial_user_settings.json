@@ -6,7 +6,7 @@
 // Reopen this file any time from Fanta > Settings > Open Settings File.
 //
 // To see all of Fanta's default settings without changing your
-// custom settings, run `zed: open default settings` from the
+// custom settings, run `fanta: open default settings` from the
 // command palette (cmd-shift-p / ctrl-shift-p)
 {
   "ui_font_size": 16,

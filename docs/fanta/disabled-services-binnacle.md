@@ -5,7 +5,7 @@ redirected during the first Fanta Edit baseline pass, why they changed, and what
 you need to own before turning them back on.
 
 The principle is simple: Fanta should not look like Fanta while silently relying
-on Zed-owned infrastructure. Local editor features can stay available, but
+on inherited third-party infrastructure. Local editor features can stay available, but
 hosted features should be enabled only when Fanta owns the endpoint, policy,
 release process, and user-facing disclosure.
 
@@ -16,8 +16,8 @@ release process, and user-facing disclosure.
 | Telemetry metrics | `"metrics": false` | Fanta does not yet own analytics ingestion, retention, dashboards, or privacy language. | Fanta has an analytics endpoint, schema validation, retention policy, opt-out UX, and docs. |
 | Diagnostics and crash upload | `"diagnostics": false` | Crash reports can contain sensitive metadata and need Fanta-owned handling. | Fanta has crash ingestion, symbolication, retention rules, alerting, and disclosure. |
 | Auto-update | `"auto_update": false` | The updater expects trusted signed artifacts and release metadata owned by the product. | Fanta has signed builds, update assets, checksums/signatures, release notes, and rollback steps. |
-| Hosted server URL | `"server_url": "https://api.fantaisa.net"` | Account, docs, release, collaboration, telemetry, and cloud routes must not target `zed.dev` by default. | `api.fantaisa.net` has compatible routes, or cloud-dependent features are gated. |
-| Managed model provider | New threads default to `Fanta`; account-backed catalog and requests use Fanta endpoints. Explicitly configured providers remain available. | The old `zed.dev` default was removed; the earlier Anthropic default is historical. | Live model execution, pricing, quotas and recovery need their own acceptance; a populated catalog is insufficient. |
+| Hosted server URL | `"server_url": "https://api.fantaisa.net"` | Account, docs, release, collaboration, telemetry, and cloud routes must not target inherited upstream hosts by default. | `api.fantaisa.net` has compatible routes, or cloud-dependent features are gated. |
+| Managed model provider | New threads default to `Fanta`; account-backed catalog and requests use Fanta endpoints. Explicitly configured providers remain available. | The inherited hosted-provider default was removed; the earlier Anthropic default is historical. | Live model execution, pricing, quotas and recovery need their own acceptance; a populated catalog is insufficient. |
 | Realtime cloud updates | `"cloud_updates_enabled": false` | The account API does not expose the inherited realtime update socket. | Fanta has a compatible realtime service and validated failure/recovery behavior. |
 
 Stable defaults target `https://api.fantaisa.net`; development/preview overrides
@@ -30,17 +30,15 @@ and configured HTTP MCP are not disabled by the realtime-cloud setting. See the
 ## Historical baseline changes
 
 - [assets/settings/default.json](../../assets/settings/default.json)
-  - The first pass changed the agent model from `zed.dev` to `anthropic`;
+  - The first pass changed the agent model from the inherited hosted provider to `anthropic`;
     current defaults instead use the managed `Fanta` provider.
   - Default telemetry diagnostics and metrics changed to `false`.
   - Default auto-update changed to `false`.
-  - Default `server_url` changed from `https://zed.dev` to `https://api.fantaisa.net`.
-  - Default `zed.dev` language model provider entry was removed.
+  - Default `server_url` changed from the inherited upstream host to `https://api.fantaisa.net`.
+  - The inherited hosted language model provider entry was removed.
 - [crates/auto_update/src/auto_update.rs](../../crates/auto_update/src/auto_update.rs)
   - Auto-update default documentation now describes Fanta's disabled baseline.
   - The default-setting test now expects auto-update to be disabled.
-- [FANTA.md](../../FANTA.md)
-  - Records the fork contract, service-safety baseline, release resources, and first feature substrate.
 
 ## Self-Hosting Binnacle
 
@@ -74,7 +72,7 @@ Implementation notes:
 
 Verification:
 
-- Fresh app launch should not call `zed.dev`.
+- Fresh app launch should not call inherited upstream hosts.
 - Fresh app launch should not call Fanta production services unless the corresponding feature is enabled.
 - A bad or unavailable Fanta service should fail visibly and recoverably.
 
@@ -185,7 +183,7 @@ Hosted gateway requirements still requiring operational verification:
 
 Verification:
 
-- New agent threads should never silently fall back to a Zed-hosted provider.
+- New agent threads should never silently fall back to an upstream-hosted provider.
 - A user without a configured provider should receive clear setup guidance.
 - Hosted Fanta model requests should be traceable to Fanta-owned logs and policies.
 
@@ -209,7 +207,7 @@ Implementation notes:
 - Keep unimplemented collaboration separate from account sign-in and billing;
   working account access does not establish shared realtime editing.
 - Preserve local editing, git, terminal, and external agent workflows independently from hosted collaboration.
-- Define keychain credential names before enabling sign-in so Fanta credentials cannot collide with Zed credentials.
+- Define keychain credential names before enabling sign-in so Fanta credentials cannot collide with credentials from other apps.
 
 ## Operational Checklist Before Enabling Any Hosted Service
 
@@ -223,9 +221,9 @@ Implementation notes:
 
 ## Recommended Next Decisions
 
-1. Choose whether project-local settings stay in `.zed/` for compatibility or move to `.fanta-edit/` for full identity separation.
-2. Choose the CLI binary name: `fanta`, `fanta-edit`, or keep `zed` temporarily for upstream compatibility.
+1. Project-local settings live in `.fanta/`.
+2. The CLI and app binary are named `fanta`.
 3. Complete production validation and policy coverage for the implemented Fanta
    gateway, while preserving explicitly configured provider alternatives.
-4. Disable or archive Zed-owned GitHub Actions and Cloudflare workers before any public CI runs.
+4. Disable or archive inherited GitHub Actions and Cloudflare workers before any public CI runs.
 5. Create a first private signed macOS build before revisiting auto-update.

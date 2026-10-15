@@ -8,7 +8,7 @@
 //! so echo loops cannot occur.
 //!
 //! Theme rule: files hosting fanta-gpui panels import
-//! `gpui_component::ActiveTheme` OR Zed's `theme::ActiveTheme`, never both.
+//! `gpui_component::ActiveTheme` OR Fanta's `theme::ActiveTheme`, never both.
 
 pub(crate) mod design;
 pub(crate) mod design_snapshot;
@@ -123,7 +123,7 @@ mod spike_tests {
 
     /// P0 go/no-go: fanta-gpui panels construct, render, and emit typed
     /// intents inside fig_viewer's crate context (inits, theme bridge, fonts)
-    /// under a Zed-style window that is NOT rooted at gpui_component::Root.
+    /// under a Fanta-style window that is NOT rooted at gpui_component::Root.
     #[gpui::test]
     fn spike_toolbar_and_pages_mount_and_emit(cx: &mut TestAppContext) {
         init_test(cx);
@@ -131,11 +131,11 @@ mod spike_tests {
         cx.run_until_parked();
 
         // Renders without panicking, and the theme bridge seeded the
-        // gpui_component palette from the Zed theme.
+        // gpui_component palette from the Fanta theme.
         cx.update(|_, app| {
-            let zed_background = theme::ActiveTheme::theme(app).colors().surface_background;
+            let fanta_background = theme::ActiveTheme::theme(app).colors().surface_background;
             let bridged = gpui_component::theme::Theme::global(app).colors.background;
-            assert_eq!(bridged, zed_background, "theme bridge applied");
+            assert_eq!(bridged, fanta_background, "theme bridge applied");
         });
 
         // Toolbar emits a typed intent from a simulated tool activation.

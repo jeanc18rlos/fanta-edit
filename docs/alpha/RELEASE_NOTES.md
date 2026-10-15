@@ -20,7 +20,7 @@ Every feature sentence below was re-checked against the working tree of
 `16309b2` — by grepping for the thing it claims. Where something was measured,
 the number is the measurement and the command that produced it, and the commit
 it was taken at. **A release binary has now been built from this tree and
-driven**: on 2026-09-09, `cargo build --release -p zed` produced
+driven**: on 2026-09-09, `cargo build --release -p fanta` produced
 `target/release/fanta` (`Fanta: v0.1.0-alpha.1+stable.8f43236…`), and it was
 driven entirely over its own live MCP server on macOS 26.6.2, aarch64, 36 GiB —
 `script/smoke-mcp` passing **18 of 18, exit 0**, two documents opened, roughly
@@ -64,7 +64,7 @@ produced.
 
 **macOS version: only one has been tested.** The build machine runs macOS
 26.6.2 and that is the only version this alpha has been launched on. The
-compiler deployment target is `10.15.7` (`crates/zed/build.rs`) and the bundle
+compiler deployment target is `10.15.7` (`crates/fanta/build.rs`) and the bundle
 declares no `LSMinimumSystemVersion`, so nothing in the build *stops* an older
 macOS from opening it — but nobody has tried, and this is not a support claim.
 
@@ -244,7 +244,7 @@ tree. [`SMOKE.md`](SMOKE.md) is the checklist that would turn those into claims.
   agent panel's settings; signing in additionally enables the managed Fanta
   provider.
 - **File > Review Changes** and **File > Commit…**
-  (`crates/zed/src/zed/app_menus.rs`) open the project diff and the commit flow
+  (`crates/fanta/src/fanta/app_menus.rs`) open the project diff and the commit flow
   on the design folder itself.
 - **A working Edit menu on the canvas**: Undo, Redo, Cut, Copy, Paste and
   Select All are wired to the canvas, not only to text editors.
@@ -261,7 +261,7 @@ repository just now, with the command that produced it.
   quoted, because it moves every time one of these documents is edited.
 - **164 of the 179 workspace members link into the app binary**, inside a
   **904-crate** total dependency graph. Re-measured just now with
-  `cargo tree -p zed --edges normal --offline`, intersected against the package
+  `cargo tree -p fanta --edges normal --offline`, intersected against the package
   name in each member's `Cargo.toml`. The fifteen members that do not link are
   `etw_tracing`, `eval_utils`, `go_to_line`, `gpui_linux`, `gpui_web`,
   `gpui_wgpu`, `gpui_windows`, `json_schema_store`, `languages`,
@@ -331,7 +331,7 @@ Both paragraphs above are history: they describe binaries built at `fe2612c`
 and `16309b2`, and they are left as written.
 
 **`perf/large-documents-ai-alignment` has now been driven too.** On 2026-09-09,
-`cargo build --release -p zed` produced `target/release/fanta` from this tree
+`cargo build --release -p fanta` produced `target/release/fanta` from this tree
 and `script/smoke-mcp` was run against it on a freshly materialised project with
 a committed baseline: **18 of 18 assertions, exit 0**. Its `tools/list`
 assertion checks that the **six** names in `REQUIRED_TOOLS` are present, not
@@ -361,22 +361,22 @@ The CLI checks below were re-run against the `16309b2` release binary, not
 carried over from the debug build.
 
 - `fanta --version` → `fanta 0.1.0-alpha.1`.
-- `fanta --help | grep -ic zed` → `0`, and `--mcp-stdio` appears in that help
+- `fanta --help | grep -ic fanta` → `0`, and `--mcp-stdio` appears in that help
   output. The flag is no longer `hide = true` — verified in the tree just now at
-  `crates/zed/src/main.rs:1598`.
+  `crates/fanta/src/main.rs:1598`.
 - `fanta --system-specs` → `Fanta System Specs (from CLI):` /
-  `Fanta: v0.1.0-alpha.1+stable.<sha> (debug build)`. No `Zed` anywhere. Still
+  `Fanta: v0.1.0-alpha.1+stable.<sha> (debug build)`. No `Fanta` anywhere. Still
   true of the release binary built from this tree on 2026-09-09, which prints
-  `Fanta: v0.1.0-alpha.1+stable.8f43236…`; the rehearsal's `Zed: v0.1.0…` on
+  `Fanta: v0.1.0-alpha.1+stable.8f43236…`; the rehearsal's `Fanta: v0.1.0…` on
   that line is gone.
 - `fanta --dump-all-actions` → **1,031** actions, of which **929** survived
-  `HIDDEN_NAMESPACES` and `hide_action_types`, **44** of those in the `zed`
+  `HIDDEN_NAMESPACES` and `hide_action_types`, **44** of those in the `fanta`
   namespace, with **zero** matches for "vim", "debugger", "project panel" or
   "new file" — and one for "terminal", `agent: new terminal thread`, which is a
   real feature rather than a leftover. This is a derivation over the action
   registry, **not** the palette as a human sees it: nobody has typed into the
   palette in a running build. What *was* re-checked in the tree just now is the
-  filter itself — `crates/zed/src/main.rs` hides the `terminal`, `terminal_panel`
+  filter itself — `crates/fanta/src/main.rs` hides the `terminal`, `terminal_panel`
   and `vim` namespaces, and `hide_action_types` names `workspace::NewFile`,
   `NewFileSplit`, `NewFileSplitHorizontal`, `NewFileSplitVertical` and
   `pane::RevealInProjectPanel`, which are exactly the four rows the rehearsal

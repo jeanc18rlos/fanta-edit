@@ -826,7 +826,7 @@ impl Render for AccountConfigurationView {
             .child(
                 Button::new("fanta-manage-account", "Manage account and billing").on_click(
                     |_, window, cx| {
-                        window.dispatch_action(zed_actions::OpenAccountSettings.boxed_clone(), cx);
+                        window.dispatch_action(fanta_actions::OpenAccountSettings.boxed_clone(), cx);
                     },
                 ),
             )

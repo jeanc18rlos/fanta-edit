@@ -10,7 +10,7 @@ use ui::{Tooltip, prelude::*};
 use util::paths::PathMatcher;
 use workspace::notifications::NotificationId;
 use workspace::{Toast, Workspace};
-pub use zed_actions::search::ToggleIncludeIgnored;
+pub use fanta_actions::search::ToggleIncludeIgnored;
 
 pub use search_status_button::SEARCH_ICON;
 
