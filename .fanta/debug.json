@@ -1,0 +1,20 @@
+[
+  {
+    "label": "Debug Fanta (CodeLLDB)",
+    "adapter": "CodeLLDB",
+    "build": {
+      "label": "Build Fanta",
+      "command": "cargo",
+      "args": ["build"]
+    }
+  },
+  {
+    "label": "Debug Fanta (GDB)",
+    "adapter": "GDB",
+    "build": {
+      "label": "Build Fanta",
+      "command": "cargo",
+      "args": ["build"]
+    }
+  }
+]

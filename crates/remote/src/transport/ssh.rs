@@ -201,7 +201,7 @@ impl MasterProcess {
 
 #[cfg(windows)]
 impl MasterProcess {
-    const CONNECTION_ESTABLISHED_MAGIC: &str = "ZED_SSH_CONNECTION_ESTABLISHED";
+    const CONNECTION_ESTABLISHED_MAGIC: &str = "FANTA_SSH_CONNECTION_ESTABLISHED";
 
     pub fn new(
         askpass_script_path: &std::ffi::OsStr,
@@ -228,7 +228,7 @@ impl MasterProcess {
             .stderr(Stdio::piped())
             .env("SSH_ASKPASS_REQUIRE", "force")
             .env("SSH_ASKPASS", askpass_script_path)
-            .env("ZED_ASKPASS_SOCKET", askpass_socket_path)
+            .env("FANTA_ASKPASS_SOCKET", askpass_socket_path)
             .args(additional_args)
             .arg(destination)
             .args(args);
@@ -446,7 +446,7 @@ impl RemoteConnection for SshRemoteConnection {
         delegate: Arc<dyn RemoteClientDelegate>,
         cx: &mut AsyncApp,
     ) -> Task<Result<i32>> {
-        const VARS: [&str; 3] = ["RUST_LOG", "RUST_BACKTRACE", "ZED_GENERATE_MINIDUMPS"];
+        const VARS: [&str; 3] = ["RUST_LOG", "RUST_BACKTRACE", "FANTA_GENERATE_MINIDUMPS"];
         delegate.set_status(Some("Starting proxy"), cx);
 
         let Some(remote_binary_path) = self.remote_binary_path.clone() else {
@@ -527,7 +527,7 @@ impl RemoteConnection for SshRemoteConnection {
 }
 
 /// Check if the user already has an active SSH ControlMaster session for the
-/// given destination. See: https://github.com/zed-industries/zed/issues/45271
+/// given destination. See: upstream issue #45271
 #[cfg(not(windows))]
 async fn find_existing_control_master(
     destination: &str,
@@ -613,7 +613,7 @@ impl SshRemoteConnection {
         let destination = connection_options.ssh_destination();
 
         let temp_dir = tempfile::Builder::new()
-            .prefix("zed-ssh-session")
+            .prefix("fanta-ssh-session")
             .tempdir()?;
 
         // On non-Windows, check if the user already has an active ControlMaster
@@ -810,7 +810,7 @@ impl SshRemoteConnection {
             _ => version.to_string(),
         };
         let binary_name = format!(
-            "zed-remote-server-{}-{}{}",
+            "fanta-remote-server-{}-{}{}",
             release_channel.dev_name(),
             version_str,
             if self.ssh_platform.os.is_windows() {
@@ -865,7 +865,7 @@ impl SshRemoteConnection {
             ReleaseChannel::Nightly => Ok(None),
             ReleaseChannel::Dev => {
                 anyhow::bail!(
-                    "ZED_BUILD_REMOTE_SERVER is not set and no remote server exists at ({:?})",
+                    "FANTA_BUILD_REMOTE_SERVER is not set and no remote server exists at ({:?})",
                     dst_path
                 )
             }
@@ -1287,7 +1287,7 @@ impl SshSocket {
             _proxy.script_path().as_ref().display().to_string(),
         );
         envs.insert(
-            "ZED_ASKPASS_SOCKET".into(),
+            "FANTA_ASKPASS_SOCKET".into(),
             _proxy.socket_path().as_ref().display().to_string(),
         );
 
@@ -1457,7 +1457,7 @@ impl SshSocket {
                 "AMD64" => RemoteArch::X86_64,
                 "ARM64" => RemoteArch::Aarch64,
                 arch => anyhow::bail!(
-                    "Prebuilt remote servers are not yet available for windows-{arch}. See https://zed.dev/docs/remote-development"
+                    "Prebuilt remote servers are not yet available for windows-{arch}. See https://fantaisa.net/docs/remote-development"
                 ),
             },
         })
@@ -2125,7 +2125,7 @@ mod tests {
     #[test]
     fn test_build_command_quotes_env_assignment() -> Result<()> {
         let mut input_env = HashMap::default();
-        input_env.insert("ZED$(echo foo)".to_string(), "value".to_string());
+        input_env.insert("FANTA$(echo foo)".to_string(), "value".to_string());
 
         let command = build_command_posix(
             Some("remote_program".to_string()),
@@ -2147,7 +2147,7 @@ mod tests {
             .last()
             .context("missing remote command argument")?;
         assert!(
-            remote_command.contains("exec env 'ZED$(echo foo)=value' remote_program"),
+            remote_command.contains("exec env 'FANTA$(echo foo)=value' remote_program"),
             "expected env assignment to be quoted, got: {remote_command}"
         );
 

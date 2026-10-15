@@ -73,7 +73,7 @@ use util::{
 use workspace::{
     CollaboratorId, MultiWorkspace, NewTerminal, PathList, Workspace, path_link::sanitize_path_text,
 };
-use zed_actions::agent::{Chat, ToggleModelSelector};
+use fanta_actions::agent::{Chat, ToggleModelSelector};
 
 use super::config_options::ConfigOptionsView;
 use super::entry_view_state::EntryViewState;
@@ -2124,7 +2124,7 @@ impl ConversationView {
         window.spawn(cx, async move |cx| {
             let mut task = login.clone();
             if let Some(cmd) = &task.command {
-                // Have "node" command use Zed's managed Node runtime by default
+                // Have "node" command use Fanta's managed Node runtime by default
                 if cmd == "node" {
                     let resolved_node_runtime = project.update(cx, |project, cx| {
                         let agent_server_store = project.agent_server_store().clone();
@@ -3171,7 +3171,7 @@ impl ConversationView {
     }
 
     fn current_model_name(&self, cx: &App) -> SharedString {
-        // For native agent (Zed Agent), use the specific model name (e.g., "Claude 3.5 Sonnet")
+        // For native agent (Fanta Agent), use the specific model name (e.g., "Claude 3.5 Sonnet")
         // For ACP agents, use the agent name (e.g., "Claude Agent", "Gemini CLI")
         // This provides better clarity about what refused the request
         if self.as_native_connection(cx).is_some() {
@@ -3295,7 +3295,7 @@ fn agent_display_name(agent_server_store: &AgentServerStore, agent_id: &AgentId)
 }
 
 fn fallback_agent_display_name(agent_id: &AgentId) -> SharedString {
-    if agent_id == &*agent::ZED_AGENT_ID {
+    if agent_id == &*agent::FANTA_AGENT_ID {
         Agent::NativeAgent.label()
     } else {
         agent_id.0.clone()
@@ -3321,11 +3321,11 @@ mod agent_display_name_tests {
     #[test]
     fn built_in_agent_uses_the_branded_display_name() {
         assert_eq!(
-            fallback_agent_display_name(&agent::ZED_AGENT_ID),
+            fallback_agent_display_name(&agent::FANTA_AGENT_ID),
             Agent::NativeAgent.label()
         );
         assert_eq!(
-            fallback_agent_display_name(&agent::ZED_AGENT_ID).as_ref(),
+            fallback_agent_display_name(&agent::FANTA_AGENT_ID).as_ref(),
             "Fanta Agent"
         );
     }
@@ -10837,7 +10837,7 @@ pub(crate) mod tests {
         cx.focus(&editor);
 
         editor.update_in(cx, |_editor, window, cx| {
-            window.dispatch_action(Box::new(zed_actions::editor::MoveUp), cx);
+            window.dispatch_action(Box::new(fanta_actions::editor::MoveUp), cx);
         });
         cx.run_until_parked();
 
@@ -10855,7 +10855,7 @@ pub(crate) mod tests {
 
         // With a non-empty editor, another MoveUp must not consume the queue.
         editor.update_in(cx, |_editor, window, cx| {
-            window.dispatch_action(Box::new(zed_actions::editor::MoveUp), cx);
+            window.dispatch_action(Box::new(fanta_actions::editor::MoveUp), cx);
         });
         cx.run_until_parked();
 

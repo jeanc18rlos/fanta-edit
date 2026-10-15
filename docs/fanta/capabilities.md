@@ -19,7 +19,7 @@ component FNX source, identity sidecars, metadata and assets. See
 [project-schema.md](project-schema.md) for the layout.
 
 Keep the manifest, source, identity sidecars and referenced assets together when
-copying a project. A received folder can open in Restricted Mode if its `.zed`
+copying a project. A received folder can open in Restricted Mode if its `.fanta`
 settings or Git configuration could run commands. Review its origin and trust
 prompt; do not remove its Git history or enable global trust just to suppress
 the prompt. Save As refuses occupied destinations. File reconciliation detects
@@ -713,8 +713,8 @@ The later build37 sign-in, six-credit image debit and cold session/history check
 above are separate positive evidence; they do not establish those remaining
 service or spending guarantees.
 
-Implementation: [account and billing UI](../../crates/zed/src/zed/settings_modal.rs),
-[MCP settings](../../crates/zed/src/zed/settings_mcp.rs),
+Implementation: [account and billing UI](../../crates/fanta/src/fanta/settings_modal.rs),
+[MCP settings](../../crates/fanta/src/fanta/settings_mcp.rs),
 [account-backed MCP](../../crates/project/src/context_server_store.rs), and
 [service defaults](../../assets/settings/default.json).
 

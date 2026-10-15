@@ -810,7 +810,7 @@ impl LspAdapter for TypeScriptLspAdapter {
         let tsdk_path = self.tsdk_path(adapter).await;
         Ok(Some(json!({
             "provideFormatter": true,
-            "hostInfo": "zed",
+            "hostInfo": "fanta",
             "tsserver": {
                 "path": tsdk_path,
             },
@@ -1099,7 +1099,7 @@ mod tests {
             crate::language("javascript", tree_sitter_typescript::LANGUAGE_TSX.into()),
         ] {
             let text = r#"
-            // Reproduction from https://github.com/zed-industries/zed/issues/48711
+            // Reproduction from upstream issue #48711
             const a = {
               p01: '01',
               fn01: () => {},
@@ -1701,19 +1701,19 @@ mod tests {
             [
                 (
                     "vitest file test".into(),
-                    Some("$ZED_CUSTOM_TYPESCRIPT_VITEST_PACKAGE_PATH".into()),
+                    Some("$FANTA_CUSTOM_TYPESCRIPT_VITEST_PACKAGE_PATH".into()),
                 ),
                 (
-                    "vitest test $ZED_SYMBOL".into(),
-                    Some("$ZED_CUSTOM_TYPESCRIPT_VITEST_PACKAGE_PATH".into()),
+                    "vitest test $FANTA_SYMBOL".into(),
+                    Some("$FANTA_CUSTOM_TYPESCRIPT_VITEST_PACKAGE_PATH".into()),
                 ),
                 (
                     "mocha file test".into(),
-                    Some("$ZED_CUSTOM_TYPESCRIPT_MOCHA_PACKAGE_PATH".into()),
+                    Some("$FANTA_CUSTOM_TYPESCRIPT_MOCHA_PACKAGE_PATH".into()),
                 ),
                 (
-                    "mocha test $ZED_SYMBOL".into(),
-                    Some("$ZED_CUSTOM_TYPESCRIPT_MOCHA_PACKAGE_PATH".into()),
+                    "mocha test $FANTA_SYMBOL".into(),
+                    Some("$FANTA_CUSTOM_TYPESCRIPT_MOCHA_PACKAGE_PATH".into()),
                 ),
                 (
                     "root/package.json > test".into(),

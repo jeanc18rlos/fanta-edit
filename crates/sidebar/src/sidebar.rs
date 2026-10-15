@@ -2,7 +2,7 @@ mod thread_switcher;
 
 use acp_thread::ThreadStatus;
 use action_log::DiffStats;
-use agent::{ThreadStore, ZED_AGENT_ID};
+use agent::{ThreadStore, FANTA_AGENT_ID};
 use agent_client_protocol::schema::v1 as acp;
 use agent_settings::AgentSettings;
 use agent_ui::terminal_thread_metadata_store::{
@@ -70,10 +70,10 @@ use workspace::{
 };
 
 use git_ui::worktree_service::{RemoteBranchName, worktree_create_targets};
-use zed_actions::editor::{MoveDown, MoveUp};
-use zed_actions::{CreateWorktree, NewWorktreeBranchTarget, OpenRecent};
+use fanta_actions::editor::{MoveDown, MoveUp};
+use fanta_actions::{CreateWorktree, NewWorktreeBranchTarget, OpenRecent};
 
-use zed_actions::agents_sidebar::{FocusSidebarFilter, ToggleThreadSwitcher};
+use fanta_actions::agents_sidebar::{FocusSidebarFilter, ToggleThreadSwitcher};
 
 use crate::thread_switcher::{
     ThreadSwitcher, ThreadSwitcherEntry, ThreadSwitcherEvent, ThreadSwitcherSelection,
@@ -6611,8 +6611,8 @@ impl Sidebar {
             ThreadEntryWorkspace::Closed { .. } => None,
         };
 
-        let is_zed_thread = thread.metadata.agent_id.as_ref() == ZED_AGENT_ID.as_ref();
-        let can_open_as_markdown = thread.is_live || is_zed_thread;
+        let is_fanta_thread = thread.metadata.agent_id.as_ref() == FANTA_AGENT_ID.as_ref();
+        let can_open_as_markdown = thread.is_live || is_fanta_thread;
         let folder_paths = thread.metadata.folder_paths().clone();
 
         right_click_menu(context_menu_id)
@@ -6648,7 +6648,7 @@ impl Sidebar {
                             }
                         });
 
-                        if is_zed_thread {
+                        if is_fanta_thread {
                             menu = menu.entry("Regenerate Thread Title", None, {
                                 let session_id = session_id.clone();
                                 let sidebar = sidebar.clone();
@@ -6693,7 +6693,7 @@ impl Sidebar {
                                         }
                                     }
 
-                                    if is_zed_thread
+                                    if is_fanta_thread
                                         && let Some(active_workspace) = &active_workspace
                                     {
                                         Self::open_closed_native_thread_as_markdown(

@@ -139,7 +139,7 @@ since. Nothing behind a mouse click has been driven — see
 The transport is a Unix socket, not the TCP + Streamable-HTTP server §1 proposes:
 `fig_viewer::live_mcp` listens on a socket in a per-launch temp dir and
 advertises it in `<data_dir>/fanta_live_mcp.json`, and `fanta --mcp-stdio`
-(`crates/zed/src/zed/mcp_stdio.rs`) bridges stdio clients onto it. The setting
+(`crates/fanta/src/fanta/mcp_stdio.rs`) bridges stdio clients onto it. The setting
 that gates it is `fanta_live_mcp.enabled`, which defaults to **true** in every
 build, not just dev ones.
 

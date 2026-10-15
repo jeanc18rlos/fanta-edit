@@ -6908,12 +6908,12 @@ mod tests {
                         &serde_json::to_string(&json!([
                             // Tagged global task that should be scheduled from the Git graph context menu.
                             {
-                                "label": "Git Show $ZED_GIT_SHA_SHORT",
+                                "label": "Git Show $FANTA_GIT_SHA_SHORT",
                                 "command": "git",
-                                "args": ["show", "$ZED_GIT_SHA"],
-                                "cwd": "$ZED_GIT_REPOSITORY_PATH",
+                                "args": ["show", "$FANTA_GIT_SHA"],
+                                "cwd": "$FANTA_GIT_REPOSITORY_PATH",
                                 "env": {
-                                    "REPOSITORY": "$ZED_GIT_REPOSITORY_NAME",
+                                    "REPOSITORY": "$FANTA_GIT_REPOSITORY_NAME",
                                 },
                                 "tags": [GIT_COMMAND_TASK_TAG],
                             },
@@ -6926,9 +6926,9 @@ mod tests {
                             // Tagged task that still should not appear because Git graph task contexts
                             // do not provide editor-specific variables.
                             {
-                                "label": "Print File $ZED_FILE",
+                                "label": "Print File $FANTA_FILE",
                                 "command": "echo",
-                                "args": ["$ZED_FILE"],
+                                "args": ["$FANTA_FILE"],
                                 "tags": [GIT_COMMAND_TASK_TAG],
                             },
                         ]))
@@ -7061,10 +7061,10 @@ mod tests {
                     Some(
                         &serde_json::to_string(&json!([
                             {
-                                "label": "Check out $ZED_GIT_REF",
+                                "label": "Check out $FANTA_GIT_REF",
                                 "command": "git",
-                                "args": ["checkout", "$ZED_GIT_REF"],
-                                "cwd": "$ZED_GIT_REPOSITORY_PATH",
+                                "args": ["checkout", "$FANTA_GIT_REF"],
+                                "cwd": "$FANTA_GIT_REPOSITORY_PATH",
                                 "tags": [GIT_COMMAND_TASK_TAG],
                             },
                         ]))

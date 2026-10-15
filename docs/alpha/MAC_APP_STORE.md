@@ -213,7 +213,7 @@ App Review remain. Approval and publication depend on Apple.
    before submission. The review account, build, and other review fields remain.
    The current uploaded capture is
    `/private/tmp/fanta-release-assets/fanta-mac-app-store-showcase-2880x1800.png`;
-   the existing `crates/zed/resources/app-icon@2x.png` is 1024 × 1024.
+   the existing `crates/fanta/resources/app-icon@2x.png` is 1024 × 1024.
    A populated original
    dashboard design is ready at
    `/private/tmp/fanta-mas-smoke-qa/MAS Smoke Design Copy`; its canvas render
@@ -262,7 +262,7 @@ App Review remain. Approval and publication depend on Apple.
    story, technology tags, website, RevenueCat project ID, and monetization
    and design answers saved. The icon and frameless screenshot confirmations
    were saved on 25 September, bringing the draft to 3 of 5 steps complete. The
-   1024 × 1024 icon is `crates/zed/resources/app-icon@2x.png`; a real app
+   1024 × 1024 icon is `crates/fanta/resources/app-icon@2x.png`; a real app
    portrait screenshot candidate is at
    `/private/tmp/fanta-release-assets/fanta-shipaton-showcase-1179x2556.png`.
    The icon and genuine Mac app screenshot were attached to the Devpost image

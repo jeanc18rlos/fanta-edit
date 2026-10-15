@@ -10,7 +10,7 @@ Status: source-of-truth proposal approved on 2026-09-23. This report records the
 | Save scheduling | `fig_viewer/src/view.rs:3505`, `fig_viewer/src/document.rs:1896` | Autosave captures a whole-document snapshot; a background task writes it. |
 | Serialize | `fanta-format/src/project/write.rs:323`, `fanta-fnx/src/print.rs:43` | Nodes are bucketed by page/component, printed as `.fnx`, with identity/order in `.ids.json`; singleton state is JSON. |
 | Write files | `fig_viewer/src/document.rs:2375`, `fanta-format/src/project/write.rs:124` | The app scaffolds first, then the writer compares projected bytes, replaces individual files atomically, and prunes unprojected files. |
-| Watch | `fig_viewer/src/document.rs:1235` | Zed worktree events are filtered, suppressed during and briefly after saves, then debounced for 300 ms. |
+| Watch | `fig_viewer/src/document.rs:1235` | Fanta worktree events are filtered, suppressed during and briefly after saves, then debounced for 300 ms. |
 | Parse | `fanta-format/src/project/read.rs:42`, `fanta-fnx/src/parse.rs:23` | The entire tree is read, `.fnx` is parsed with its sidecar, and a new `Doc` is assembled. |
 | Reconcile | `fig_viewer/src/document.rs:1327`, `fig_viewer/src/document.rs:1496` | Clean documents are replaced in full; dirty documents use a whole-document three-way merge. |
 

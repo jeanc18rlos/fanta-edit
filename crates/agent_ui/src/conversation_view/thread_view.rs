@@ -556,7 +556,7 @@ mod numbered_code_block_tests {
     #[test]
     fn parses_cat_numbered_markdown_code_block() {
         let parsed = parse_cat_numbered_markdown_code_block(
-            "```rs zed/crates/example.rs\n     2\tfn main() {\n     3\t    println!(\"hi\");\n     4\t}\n```\n",
+            "```rs fanta/crates/example.rs\n     2\tfn main() {\n     3\t    println!(\"hi\");\n     4\t}\n```\n",
         )
         .expect("cat-numbered block should parse");
 
@@ -2517,7 +2517,7 @@ impl ThreadView {
 
     fn handle_message_editor_move_up(
         &mut self,
-        _: &zed_actions::editor::MoveUp,
+        _: &fanta_actions::editor::MoveUp,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -5463,8 +5463,8 @@ impl ThreadView {
                         }))
                         .on_click(|_, window, cx| {
                             window.dispatch_action(
-                                Box::new(zed_actions::OpenSettingsAt {
-                                    path: zed_actions::AGENT_SANDBOX_SETTINGS_PATH.to_string(),
+                                Box::new(fanta_actions::OpenSettingsAt {
+                                    path: fanta_actions::AGENT_SANDBOX_SETTINGS_PATH.to_string(),
                                     target: None,
                                 }),
                                 cx,
@@ -6371,7 +6371,7 @@ impl ThreadView {
                         .handler({
                             move |window, cx| {
                                 window.dispatch_action(
-                                    zed_actions::agent::AddSelectionToThread.boxed_clone(),
+                                    fanta_actions::agent::AddSelectionToThread.boxed_clone(),
                                     cx,
                                 );
                             }
@@ -6417,13 +6417,13 @@ impl ThreadView {
         let following = self.is_following(cx);
 
         let tooltip_label = if following {
-            if self.agent_id.as_ref() == agent::ZED_AGENT_ID.as_ref() {
+            if self.agent_id.as_ref() == agent::FANTA_AGENT_ID.as_ref() {
                 format!("Stop Following the {}", self.agent_id)
             } else {
                 format!("Stop Following {}", self.agent_id)
             }
         } else {
-            if self.agent_id.as_ref() == agent::ZED_AGENT_ID.as_ref() {
+            if self.agent_id.as_ref() == agent::FANTA_AGENT_ID.as_ref() {
                 format!("Follow the {}", self.agent_id)
             } else {
                 format!("Follow {}", self.agent_id)
@@ -11571,7 +11571,7 @@ impl ThreadView {
                                 .style(ButtonStyle::Filled)
                                 .on_click(|_, window, cx| {
                                     window.dispatch_action(
-                                        zed_actions::OpenAccountSettings.boxed_clone(),
+                                        fanta_actions::OpenAccountSettings.boxed_clone(),
                                         cx,
                                     );
                                 }),
@@ -11686,7 +11686,7 @@ impl ThreadView {
             .on_click(cx.listener(|this, _, window, cx| {
                 this.clear_thread_error(cx);
                 window.dispatch_action(
-                    Box::new(zed_actions::OpenSettingsAt {
+                    Box::new(fanta_actions::OpenSettingsAt {
                         path: "llm_providers".to_string(),
                         target: None,
                     }),
@@ -11790,7 +11790,7 @@ impl ThreadView {
     }
 
     fn current_model_name(&self, cx: &App) -> SharedString {
-        // For native agent (Zed Agent), use the specific model name (e.g., "Claude 3.5 Sonnet")
+        // For native agent (Fanta Agent), use the specific model name (e.g., "Claude 3.5 Sonnet")
         // For ACP agents, use the agent name (e.g., "Claude Agent", "Gemini CLI")
         // This provides better clarity about what refused the request
         if self.as_native_connection(cx).is_some() {
@@ -11996,7 +11996,7 @@ impl ThreadView {
                     move |_, _, _window, cx| {
                         #[cfg(windows)]
                         _window.dispatch_action(
-                            zed_actions::wsl_actions::OpenWsl::default().boxed_clone(),
+                            fanta_actions::wsl_actions::OpenWsl::default().boxed_clone(),
                             cx,
                         );
                         cx.notify();

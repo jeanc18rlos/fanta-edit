@@ -137,15 +137,15 @@ members = [
     "crates/web_search_providers",
     "crates/workspace",
     "crates/worktree",
-    "crates/zed",
-    "crates/zed_actions",
+    "crates/fanta",
+    "crates/fanta_actions",
     "crates/windows_resources",
-    "crates/zed_credentials_provider",
-    "crates/zed_env_vars",
+    "crates/fanta_credentials_provider",
+    "crates/fanta_env_vars",
     "crates/zeta_prompt",
     "crates/zlog_settings",
 ]
-default-members = ["crates/zed"]
+default-members = ["crates/fanta"]
 exclude = [
     "vendor/skia-bindings-0.153.3",
     "crates/collections",
@@ -181,7 +181,7 @@ exclude = [
     "crates/ui_macros",
     "crates/util",
     "crates/util_macros",
-    "crates/zed_ui_assets",
+    "crates/fanta_ui_assets",
     "crates/zlog",
     "crates/ztracing",
     "crates/ztracing_macro",
@@ -214,7 +214,7 @@ ai_onboarding = { path = "crates/ai_onboarding" }
 anthropic = { path = "crates/anthropic" }
 askpass = { path = "crates/askpass" }
 assets = { path = "crates/assets" }
-zed_ui_assets = {package = "fanta-gpui-zed-ui-assets", version = "=0.5.0"}
+fanta_ui_assets = {package = "fanta-gpui-zed-ui-assets", version = "=0.5.0"}
 audio = { path = "crates/audio" }
 auto_update = { path = "crates/auto_update" }
 breadcrumbs = { path = "crates/breadcrumbs" }
@@ -379,10 +379,10 @@ web_search = { path = "crates/web_search" }
 web_search_providers = { path = "crates/web_search_providers" }
 workspace = { path = "crates/workspace" }
 worktree = { path = "crates/worktree" }
-zed = { path = "crates/zed" }
-zed_actions = { path = "crates/zed_actions" }
-zed_credentials_provider = { path = "crates/zed_credentials_provider" }
-zed_env_vars = { path = "crates/zed_env_vars" }
+fanta = { path = "crates/fanta" }
+fanta_actions = { path = "crates/fanta_actions" }
+fanta_credentials_provider = { path = "crates/fanta_credentials_provider" }
+fanta_env_vars = { path = "crates/fanta_env_vars" }
 zeta_prompt = { path = "crates/zeta_prompt" }
 zlog = {package = "fanta-gpui-zlog", version = "=0.5.0"}
 zlog_settings = { path = "crates/zlog_settings" }
@@ -916,7 +916,7 @@ snippet = { codegen-units = 1 }
 telemetry_events = { codegen-units = 1 }
 theme_selector = { codegen-units = 1 }
 time_format = { codegen-units = 1 }
-zed_actions = { codegen-units = 1 }
+fanta_actions = { codegen-units = 1 }
 fanta-gpui-collections = { codegen-units = 1 }
 # Keep GPUI layout and visible UI rows responsive in development builds.
 fanta-gpui-core = { opt-level = 3 }
@@ -954,7 +954,7 @@ lto = "thin"
 codegen-units = 1
 
 [profile.release.package]
-zed = { codegen-units = 16 }
+fanta = { codegen-units = 16 }
 
 [profile.release-fast]
 inherits = "release"
@@ -975,7 +975,7 @@ redundant_clone = "deny"
 disallowed_methods = "deny"
 
 # We currently do not restrict any style rules
-# as it slows down shipping code to Zed.
+# as it slows down shipping code to Fanta.
 #
 # Running ./script/clippy can take several minutes, and so it's
 # common to skip that step and let CI do it. Any unexpected failures
@@ -983,7 +983,7 @@ disallowed_methods = "deny"
 # to an old branch, manual fixing, and re-pushing.
 #
 # In the future we could improve this by either making sure
-# Zed can surface clippy errors in diagnostics (in addition to the
+# Fanta can surface clippy errors in diagnostics (in addition to the
 # rust-analyzer errors), or by having CI fix style nits automatically.
 style = { level = "allow", priority = -1 }
 

@@ -339,7 +339,7 @@ impl PickerDelegate for IconThemeSelectorDelegate {
                                 .color(Color::Muted),
                         )
                         .on_click(|_event, _window, cx| {
-                            cx.open_url("https://zed.dev/docs/icon-themes");
+                            cx.open_url("https://fantaisa.net/docs/icon-themes");
                         }),
                 )
                 .into_any_element(),
@@ -412,7 +412,7 @@ mod tests {
         workspace: &Entity<workspace::Workspace>,
         cx: &mut VisualTestContext,
     ) -> Entity<Picker<IconThemeSelectorDelegate>> {
-        cx.dispatch_action(zed_actions::icon_theme_selector::Toggle {
+        cx.dispatch_action(fanta_actions::icon_theme_selector::Toggle {
             themes_filter: None,
         });
         cx.run_until_parked();

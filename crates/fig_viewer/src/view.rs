@@ -9766,7 +9766,7 @@ impl Item for FigView {
                     return Ok(());
                 };
                 log::info!("materialized Fanta project at {}", root.display());
-                // First-class Zed integration: surface the freshly written project
+                // First-class Fanta integration: surface the freshly written project
                 // as a *visible* worktree so its fanta.json / `.fnx` / asset files
                 // show up in the project panel and open as ordinary text. A failure
                 // here (e.g. a remote project that can't adopt a local folder) must

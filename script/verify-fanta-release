@@ -168,7 +168,7 @@ for stage in "${selected_stages[@]}"; do
             run_stage "$stage" "$cargo_binary" test --locked -p fanta_ui --lib --features test-support
             ;;
         build)
-            run_stage "$stage" "$cargo_binary" check --locked -p zed -p cli
+            run_stage "$stage" "$cargo_binary" check --locked -p fanta -p cli
             ;;
         lint)
             run_stage "$stage" ./script/clippy --locked \

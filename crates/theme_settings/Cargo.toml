@@ -34,4 +34,4 @@ uuid.workspace = true
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
 settings = { workspace = true, features = ["test-support"] }
-zed_ui_assets.workspace = true
+fanta_ui_assets.workspace = true

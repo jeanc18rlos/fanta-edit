@@ -72,7 +72,7 @@ pub(crate) struct ProcessInfo {
     pub(crate) argv: Vec<String>,
 }
 
-/// Fetches Zed-relevant Pseudo-Terminal (PTY) process information
+/// Fetches Fanta-relevant Pseudo-Terminal (PTY) process information
 pub(crate) struct PtyProcessInfo {
     system: RwLock<System>,
     refresh_kind: ProcessRefreshKind,
@@ -196,7 +196,7 @@ impl PtyProcessInfo {
         self.load()
     }
 
-    /// Updates the cached process info, emitting a [`Event::TitleChanged`] event if the Zed-relevant info has changed
+    /// Updates the cached process info, emitting a [`Event::TitleChanged`] event if the Fanta-relevant info has changed
     pub(crate) fn emit_title_changed_if_changed(self: &Arc<Self>, cx: &mut Context<'_, Terminal>) {
         if self.task.lock().is_some() {
             return;
@@ -235,7 +235,7 @@ impl PtyProcessInfo {
 mod tests {
     use super::*;
 
-    /// Regression test for <https://github.com/zed-industries/zed/issues/58651>:
+    /// Regression test for upstream issue #58651:
     /// on Linux, sysinfo keeps an open `/proc/<pid>/stat` handle for every
     /// `Process` entry retained in a `System`, and never evicts entries that are
     /// absent from the refreshed pid set. The per-terminal `System` must

@@ -379,7 +379,7 @@ mod fanta_ui_visual_tests {
                                 FontFamilyPicker::new(
                                     "visual-font-family",
                                     "Source Sans 3",
-                                    ["Inter", "Source Sans 3", "Source Serif 4", "Zed Sans"],
+                                    ["Inter", "Source Sans 3", "Source Serif 4", "Fanta Sans"],
                                     |_, _, _| {},
                                 ),
                             ))

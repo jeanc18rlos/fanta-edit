@@ -51,7 +51,7 @@ use crate::variable_binding::{
 };
 
 /// Height of a boxed field / pill / control, the panel's vertical rhythm unit
-/// (the original's 30px `FIELD_BOX_H` translated to Zed density).
+/// (the original's 30px `FIELD_BOX_H` translated to Fanta density).
 const FIELD_BOX_H: f32 = 28.0;
 /// Height of one fill / stroke list row (the original's 36px `LIST_ROW_H`).
 const LIST_ROW_H: f32 = 32.0;
@@ -412,7 +412,7 @@ impl FantaPropertiesPanel {
         cell.into_any_element()
     }
 
-    /// A labeled enum-choice row: a muted caption column beside a compact Zed
+    /// A labeled enum-choice row: a muted caption column beside a compact Fanta
     /// [`DropdownMenu`]. The native equivalent of the old click-to-cycle pill.
     #[allow(clippy::too_many_arguments)]
     fn render_choice_row<T: Copy + PartialEq + 'static>(

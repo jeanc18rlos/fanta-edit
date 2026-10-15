@@ -311,7 +311,7 @@ impl context_server::types::Request for Ping {
 /// it.
 pub(crate) fn register(workspace: &mut Workspace) {
     workspace.register_action(
-        |workspace, _: &zed_actions::fanta::ConnectExternalAgent, _, cx| {
+        |workspace, _: &fanta_actions::fanta::ConnectExternalAgent, _, cx| {
             let executable = match std::env::current_exe() {
                 Ok(executable) => executable,
                 Err(error) => {
