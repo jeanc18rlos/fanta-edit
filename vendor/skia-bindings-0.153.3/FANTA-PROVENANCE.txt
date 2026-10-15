@@ -52,8 +52,9 @@ can import engine archives, then compile the local native shim and bindings.
 When FANTA_SKIA_BINARIES_DIR names an absolute directory, Graphite builds reuse
 their own outputs instead. build.rs keys an entry by the upstream binary key
 plus a hash of Cargo.toml, build.rs, build_support/, every non-Rust file in src/
-(including graphite.cpp), the compiler environment, the C/C++ compiler version
-and the macOS SDK. It imports the libraries and bindings.rs of a matching entry
+(including graphite.cpp), the bindgen, cc and clang-sys versions locked in the
+workspace Cargo.lock, the compiler environment, the C/C++ compiler version and
+the macOS SDK. It imports the libraries and bindings.rs of a matching entry
 and, after a source build, stores a new entry by atomic rename. A change to any
 keyed input selects a new entry; a failed store is only a warning. CPU-only
 builds ignore the variable and keep the upstream download behavior.

@@ -293,8 +293,8 @@ mod env {
 /// Entries live in `FANTA_SKIA_BINARIES_DIR/<key>` and hold the files of an upstream binary
 /// archive. The key extends the upstream key with a hash of every local input that changes the
 /// native libraries or `bindings.rs`: the shim sources, the bindgen and GN configuration, the
-/// compiler environment and the toolchain. Editing `src/graphite.cpp` therefore selects a new
-/// entry instead of reusing a stale shim.
+/// locked bindgen and cc versions, the compiler environment and the toolchain. Editing
+/// `src/graphite.cpp` therefore selects a new entry instead of reusing a stale shim.
 #[cfg(feature = "binary-cache")]
 mod fanta_binary_cache {
     use std::{
@@ -343,6 +343,11 @@ mod fanta_binary_cache {
         "CXXFLAGS",
         "BINDGEN_EXTRA_CLANG_ARGS",
     ];
+
+    /// Build dependencies whose versions change `bindings.rs` or the shim objects. Cargo rebuilds
+    /// and reruns this script when their locked versions change, so the key only needs to read
+    /// those versions.
+    const BUILD_DEPENDENCY_INPUTS: &[&str] = &["bindgen", "cc", "clang-sys"];
 
     pub struct Entry {
         directory: PathBuf,
@@ -457,6 +462,10 @@ mod fanta_binary_cache {
             cargo::rerun_if_file_changed(file);
         }
 
+        for locked_package in locked_build_dependencies()? {
+            hasher.write(locked_package.as_bytes());
+        }
+
         let target_triple = std::env::var("TARGET").map_err(io::Error::other)?;
         let mut variables: Vec<String> = ENVIRONMENT_INPUTS
             .iter()
@@ -520,6 +529,50 @@ mod fanta_binary_cache {
             binaries_config.key(repository_short_hash),
             hasher.finish()
         ))
+    }
+
+    /// Every locked version of `BUILD_DEPENDENCY_INPUTS`, read from the lockfile of the workspace
+    /// that vendors this package. The package's own `Cargo.lock` is upstream's and unused there.
+    /// A lockfile can hold several versions of one package; all of them are included.
+    fn locked_build_dependencies() -> io::Result<Vec<String>> {
+        let manifest_directory =
+            PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").map_err(io::Error::other)?);
+        let lockfile = manifest_directory
+            .ancestors()
+            .skip(1)
+            .map(|directory| directory.join("Cargo.lock"))
+            .find(|lockfile| lockfile.is_file())
+            .ok_or_else(|| io::Error::other("no workspace Cargo.lock above the package"))?;
+        let lock = toml::de::from_str::<toml::value::Table>(&fs::read_to_string(&lockfile)?)
+            .map_err(io::Error::other)?;
+
+        let mut locked_packages: Vec<String> = lock
+            .get("package")
+            .and_then(|packages| packages.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|package| {
+                let name = package.get("name")?.as_str()?;
+                let version = package.get("version")?.as_str()?;
+                BUILD_DEPENDENCY_INPUTS
+                    .contains(&name)
+                    .then(|| format!("{name} {version}"))
+            })
+            .collect();
+        locked_packages.sort();
+
+        for name in BUILD_DEPENDENCY_INPUTS {
+            let is_locked = locked_packages
+                .iter()
+                .any(|locked_package| locked_package.split(' ').next() == Some(*name));
+            if !is_locked {
+                return Err(io::Error::other(format!(
+                    "{} does not lock {name}",
+                    lockfile.display()
+                )));
+            }
+        }
+        Ok(locked_packages)
     }
 
     fn collect_package_files(path: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
