@@ -60,7 +60,6 @@ fn main() -> Result<(), io::Error> {
                 "Fanta's Graphite image provider is absent from upstream prebuilt binaries; FORCE_SKIA_BINARIES_DOWNLOAD is incompatible",
             ));
         }
-        println!("FANTA GRAPHITE IMAGE PROVIDER: UPSTREAM PREBUILT BINARIES DISABLED");
     }
 
     let binaries_config =
@@ -231,6 +230,12 @@ fn generate_bindings(
     target: Target,
     sysroot: Option<&str>,
 ) {
+    // Printed only here, where the shim is compiled, so a Fanta binary cache hit does not claim a
+    // source build. CI's Skia source compatibility check looks for this line.
+    if features.graphite() {
+        println!("COMPILING FANTA GRAPHITE IMAGE PROVIDER FROM SOURCE");
+    }
+
     // Emit the ninja definitions, to help debug build consistency.
     skia_bindgen::definitions::save_definitions(&definitions, &binaries_config.output_directory)
         .expect("failed to write Skia defines");
