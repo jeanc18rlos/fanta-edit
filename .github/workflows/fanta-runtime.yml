@@ -57,7 +57,7 @@ jobs:
 
       - name: Test the Rust design and playback engines
         run: |
-          cargo test --locked -p fanta-doc -p fanta-fnx -p fanta-format -p fanta-present -p fanta-render -p fanta-text -p fanta-runtime --lib
+          cargo test --locked --no-fail-fast -p fanta-doc -p fanta-fnx -p fanta-format -p fanta-present -p fanta-render -p fanta-text -p fanta-runtime --lib
           cargo test --locked -p fanta-format --test runtime_project
           cargo check --locked -p fanta-format --no-default-features
           cargo build --locked -p fanta-runtime --example playback_fixture
