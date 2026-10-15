@@ -17,7 +17,7 @@ pub use crate::known_or_unknown::*;
 pub use crate::plan::*;
 pub use crate::timestamp::Timestamp;
 
-pub const ZED_SYSTEM_ID_HEADER_NAME: &str = "x-zed-system-id";
+pub const FANTA_SYSTEM_ID_HEADER_NAME: &str = "x-fanta-system-id";
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct GetAuthenticatedUserResponse {
@@ -60,7 +60,9 @@ pub struct Organization {
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 pub struct OrganizationConfiguration {
-    pub is_zed_model_provider_enabled: bool,
+    // The account API sends this field under its original name.
+    #[serde(alias = "is_zed_model_provider_enabled")]
+    pub is_fanta_model_provider_enabled: bool,
     pub is_agent_thread_feedback_enabled: bool,
     pub is_collaboration_enabled: bool,
     pub edit_prediction: OrganizationEditPredictionConfiguration,

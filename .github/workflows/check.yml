@@ -54,7 +54,7 @@ jobs:
             2>&1 | tee "${RUNNER_TEMP}/macos-packaging-regressions.log"
 
       - name: Check the app and command line tool build
-        run: cargo check --locked -p zed -p cli
+        run: cargo check --locked -p fanta -p cli
 
       - name: Test design engines, import, editor interactions and UI components
         run: |
@@ -217,13 +217,13 @@ jobs:
           shared-key: macos-check
 
       - name: Check the Mac App Store feature build
-        run: cargo check --locked -p zed --features mac_app_store
+        run: cargo check --locked -p fanta --features mac_app_store
 
       - name: Test Store App Access settings guide
-        run: cargo test --locked -p zed --bin fanta --features mac_app_store store_app_access_guide_has_one_system_action_and_three_explanations
+        run: cargo test --locked -p fanta --bin fanta --features mac_app_store store_app_access_guide_has_one_system_action_and_three_explanations
 
       - name: Test account billing date windows
-        run: cargo test --locked -p zed --bin fanta --features mac_app_store usage_
+        run: cargo test --locked -p fanta --bin fanta --features mac_app_store usage_
 
       - name: Test Store Welcome App Access entry
         run: cargo test --locked -p workspace --lib --features mac_app_store store_welcome_links_to_app_access_guide
@@ -273,8 +273,8 @@ jobs:
           python3 - "$evidence" <<'PYCONFIG'
           import hashlib, json, pathlib, subprocess, sys
           output = pathlib.Path(sys.argv[1])
-          configuration = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".github/workflows/check.yml", "script/clippy", "crates/agent/Cargo.toml", "crates/acp_thread/Cargo.toml", "crates/language_model/Cargo.toml", "crates/zed/Cargo.toml"]
-          sources = ["crates/agent/src/thread.rs", "crates/acp_thread/src/acp_thread.rs", "crates/language_model/src/fake_provider.rs", "crates/zed/src/zed/settings_modal.rs"]
+          configuration = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".github/workflows/check.yml", "script/clippy", "crates/agent/Cargo.toml", "crates/acp_thread/Cargo.toml", "crates/language_model/Cargo.toml", "crates/fanta/Cargo.toml"]
+          sources = ["crates/agent/src/thread.rs", "crates/acp_thread/src/acp_thread.rs", "crates/language_model/src/fake_provider.rs", "crates/fanta/src/fanta/settings_modal.rs"]
           records = []
           for name in configuration + sources:
               path = pathlib.Path(name)
@@ -332,9 +332,9 @@ jobs:
         run: |
           set -uo pipefail
           evidence="${RUNNER_TEMP}/release-blocker-regressions"
-          printf '%s\n' 'cargo test --locked -p zed --bin fanta settings_window_' > "$evidence/settings-window.command.txt"
+          printf '%s\n' 'cargo test --locked -p fanta --bin fanta settings_window_' > "$evidence/settings-window.command.txt"
           set +e
-          cargo test --locked -p zed --bin fanta settings_window_ 2>&1 | tee "$evidence/settings-window.log"
+          cargo test --locked -p fanta --bin fanta settings_window_ 2>&1 | tee "$evidence/settings-window.log"
           statuses=("${PIPESTATUS[@]}")
           printf 'settings-window\t%s\t%s\n' "${statuses[0]}" "${statuses[1]}" >> "$evidence/results.tsv"
           (( statuses[0] == 0 && statuses[1] == 0 ))
@@ -410,9 +410,9 @@ jobs:
         run: |
           set -uo pipefail
           evidence="${RUNNER_TEMP}/release-blocker-regressions"
-          printf '%s\n' 'FANTA_CLIPPY_DEFAULT_FEATURES=1 ./script/clippy --locked -p agent -p acp_thread -p language_model -p zed' > "$evidence/default-clippy.command.txt"
+          printf '%s\n' 'FANTA_CLIPPY_DEFAULT_FEATURES=1 ./script/clippy --locked -p agent -p acp_thread -p language_model -p fanta' > "$evidence/default-clippy.command.txt"
           set +e
-          FANTA_CLIPPY_DEFAULT_FEATURES=1 ./script/clippy --locked -p agent -p acp_thread -p language_model -p zed 2>&1 | tee "$evidence/default-clippy.log"
+          FANTA_CLIPPY_DEFAULT_FEATURES=1 ./script/clippy --locked -p agent -p acp_thread -p language_model -p fanta 2>&1 | tee "$evidence/default-clippy.log"
           statuses=("${PIPESTATUS[@]}")
           printf 'default-clippy\t%s\t%s\n' "${statuses[0]}" "${statuses[1]}" >> "$evidence/results.tsv"
           (( statuses[0] == 0 && statuses[1] == 0 ))

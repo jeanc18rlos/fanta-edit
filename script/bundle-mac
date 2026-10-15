@@ -285,9 +285,9 @@ if [[ "$require_notarization" = true ]]; then
 fi
 
 # Get release channel
-pushd crates/zed
+pushd crates/fanta
 channel="${FANTA_RELEASE_CHANNEL:-$(<RELEASE_CHANNEL)}"
-export ZED_RELEASE_CHANNEL="${channel}"
+export FANTA_RELEASE_CHANNEL="${channel}"
 popd
 case "$channel" in
     dev|nightly|preview|stable) ;;
@@ -301,15 +301,15 @@ if [[ "$app_store" = true && "$channel" != stable ]]; then
     exit 1
 fi
 
-export ZED_BUNDLE=true
+export FANTA_BUNDLE=true
 
 # Compiled into the binary by auto_update's `option_env!`: it suppresses the
-# hourly poll of the Zed release endpoint (which this fork does not serve) and
+# hourly poll of the Fanta release endpoint (which this fork does not serve) and
 # turns "Check for Updates" into an info prompt instead of an error.
 if [[ "$app_store" = true ]]; then
-    export ZED_UPDATE_EXPLANATION='Fanta is updated through the Mac App Store.'
+    export FANTA_UPDATE_EXPLANATION='Fanta is updated through the Mac App Store.'
 else
-    export ZED_UPDATE_EXPLANATION='Alpha builds are updated by downloading a new DMG from Fanta.'
+    export FANTA_UPDATE_EXPLANATION='Alpha builds are updated by downloading a new DMG from Fanta.'
 fi
 
 # cargo bundle honours CARGO_TARGET_DIR, but the copy steps below read from the
@@ -323,16 +323,16 @@ if [[ -n "${CARGO_TARGET_DIR:-}" ]]; then
 fi
 
 if [[ "$app_store" != true ]]; then
-    bundle_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/zed/Cargo.toml)
+    bundle_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/fanta/Cargo.toml)
     if [[ -z "$bundle_version" || "$bundle_version" == *$'\n'* ]]; then
-        echo "Expected one explicit package version in crates/zed/Cargo.toml."
+        echo "Expected one explicit package version in crates/fanta/Cargo.toml."
         exit 1
     fi
 fi
 
 cargo_bundle_version=$(cargo -q bundle --help 2>&1 | head -n 1 || echo "")
 if [ "$cargo_bundle_version" != "cargo-bundle v0.6.1-zed" ]; then
-    cargo install cargo-bundle --locked --git https://github.com/zed-industries/cargo-bundle.git --rev 2be2669972dff3ddd4daf89a2cb29d2d06cad7c7
+    cargo install cargo-bundle --locked --git https://github.com/jeanc18rlos/cargo-bundle.git --rev 2be2669972dff3ddd4daf89a2cb29d2d06cad7c7
 fi
 
 # Deal with versions of macOS that don't include libstdc++ headers
@@ -369,15 +369,15 @@ fi
 
 rustup target add $target_triple
 
-echo "Compiling zed binaries"
+echo "Compiling fanta binaries"
 if [[ "$app_store" = true ]]; then
-    run_cargo_build cargo build ${build_flag} --locked --package zed --features zed/mac_app_store --target "$target_triple"
+    run_cargo_build cargo build ${build_flag} --locked --package fanta --features fanta/mac_app_store --target "$target_triple"
 else
-    run_cargo_build cargo build ${build_flag} --locked --package zed --package cli --target "$target_triple"
+    run_cargo_build cargo build ${build_flag} --locked --package fanta --package cli --target "$target_triple"
 fi
 
 echo "Creating application bundle"
-pushd crates/zed
+pushd crates/fanta
 cp Cargo.toml Cargo.toml.backup
 function restore_bundle_manifest() {
     mv Cargo.toml.backup Cargo.toml
@@ -435,7 +435,7 @@ fi
 
 # DocumentTypes.plist references CFBundleTypeIconFile "Document", so the bundle must contain Document.icns.
 # We use the app icon as a placeholder document icon for now.
-document_icon_source="crates/zed/resources/Document.icns"
+document_icon_source="crates/fanta/resources/Document.icns"
 document_icon_target="${app_path}/Contents/Resources/Document.icns"
 if [[ -f "${document_icon_source}" ]]; then
     mkdir -p "$(dirname "${document_icon_target}")"
@@ -571,7 +571,7 @@ else
 fi
 
 function sign_app_store_bundle() {
-    local entitlements="crates/zed/resources/fanta-app-store.entitlements"
+    local entitlements="crates/fanta/resources/fanta-app-store.entitlements"
     local signing_options=(--force --sign -)
     local bundled_file
     local framework
@@ -691,13 +691,13 @@ function sign_app_binaries() {
         echo "Code signing binaries with $IDENTITY"
         # sequence of codesign commands modeled after this example: https://developer.apple.com/forums/thread/701514
         /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "${app_path}/Contents/MacOS/cli" -v
-        /usr/bin/codesign --deep --force --timestamp --options runtime --entitlements crates/zed/resources/zed.entitlements --sign "$IDENTITY" "${app_path}/Contents/MacOS/fanta" -v
-        /usr/bin/codesign --force --timestamp --options runtime --entitlements crates/zed/resources/zed.entitlements --sign "$IDENTITY" "${app_path}" -v
+        /usr/bin/codesign --deep --force --timestamp --options runtime --entitlements crates/fanta/resources/fanta.entitlements --sign "$IDENTITY" "${app_path}/Contents/MacOS/fanta" -v
+        /usr/bin/codesign --force --timestamp --options runtime --entitlements crates/fanta/resources/fanta.entitlements --sign "$IDENTITY" "${app_path}" -v
     else
         echo "====== WARNING ======"
         echo "No Developer ID Application identity was found. This bundle will only be ad-hoc signed and is not ready for distribution."
         echo "====== WARNING ======"
-        codesign --force --deep --entitlements crates/zed/resources/zed.entitlements --sign - "${app_path}" -v
+        codesign --force --deep --entitlements crates/fanta/resources/fanta.entitlements --sign - "${app_path}" -v
     fi
 
     bundle_name=$(basename "$app_path")
@@ -765,7 +765,7 @@ function sign_app_binaries() {
         done
 
         # If someone runs this bundle script locally, a symlink will be placed in `dmg_source_directory`.
-        # This symlink causes CPU issues with Zed if the Zed codebase is the project being worked on, so we simply remove it for now.
+        # This symlink causes CPU issues with Fanta if the Fanta codebase is the project being worked on, so we simply remove it for now.
         echo "Removing symlink to /Applications from ${dmg_source_directory}"
         rm "${dmg_source_directory}/Applications"
 
@@ -797,7 +797,7 @@ function sign_binary() {
 
     if [[ $can_code_sign = true ]]; then
         echo "Code signing executable $binary_path"
-        /usr/bin/codesign --deep --force --timestamp --options runtime --entitlements crates/zed/resources/zed.entitlements --sign "$IDENTITY" "${binary_path}" -v
+        /usr/bin/codesign --deep --force --timestamp --options runtime --entitlements crates/fanta/resources/fanta.entitlements --sign "$IDENTITY" "${binary_path}" -v
     fi
 }
 
@@ -828,13 +828,13 @@ function upload_debug_symbols() {
     elif [[ ! -f "target/${target_triple}/${target_dir}/fanta.dwarf" ]]; then
         echo "no debug symbols were generated; skipping sentry upload."
     elif [[ -n "${SENTRY_AUTH_TOKEN:-}" ]]; then
-        echo "Uploading zed debug symbols to sentry..."
+        echo "Uploading fanta debug symbols to sentry..."
         # note: this uploads the unstripped binary which is needed because it contains
         # .eh_frame data for stack unwinding. see https://github.com/getsentry/symbolic/issues/783
         # Try uploading up to 3 times
         for attempt in 1 2 3; do
             echo "Sentry upload attempt $attempt..."
-            if sentry-cli debug-files upload --include-sources --wait -p zed -o zed-dev \
+            if sentry-cli debug-files upload --include-sources --wait -p fanta -o fanta-dev \
                 "target/${target_triple}/${target_dir}/fanta.dwarf"; then
                 break
             else

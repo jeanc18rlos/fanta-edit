@@ -5,8 +5,8 @@ fn main() {
     // Without this the cfg below only flips when the build script happens to
     // rerun for another reason, so an incremental bundle can ship a cli that
     // disagrees with the binary built alongside it.
-    println!("cargo:rerun-if-env-changed=ZED_UPDATE_EXPLANATION");
-    if std::env::var("ZED_UPDATE_EXPLANATION").is_ok() {
+    println!("cargo:rerun-if-env-changed=FANTA_UPDATE_EXPLANATION");
+    if std::env::var("FANTA_UPDATE_EXPLANATION").is_ok() {
         println!(r#"cargo:rustc-cfg=feature="no-bundled-uninstall""#);
     }
 
@@ -25,10 +25,10 @@ fn main() {
         let git_sha = String::from_utf8_lossy(&output.stdout);
         let git_sha = git_sha.trim();
 
-        println!("cargo:rustc-env=ZED_COMMIT_SHA={git_sha}");
+        println!("cargo:rustc-env=FANTA_COMMIT_SHA={git_sha}");
     }
     if let Some(build_identifier) = option_env!("GITHUB_RUN_NUMBER") {
-        println!("cargo:rustc-env=ZED_BUILD_ID={build_identifier}");
+        println!("cargo:rustc-env=FANTA_BUILD_ID={build_identifier}");
     }
 
     #[cfg(windows)]

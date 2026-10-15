@@ -15,7 +15,7 @@ use std::{
 };
 use task::{Shell, ShellBuilder, ShellKind, SpawnInTerminal};
 use terminal::{
-    TaskState, TaskStatus, Terminal, TerminalBuilder, insert_zed_terminal_env,
+    TaskState, TaskStatus, Terminal, TerminalBuilder, insert_fanta_terminal_env,
     terminal_settings::TerminalSettings,
 };
 use util::{
@@ -302,14 +302,14 @@ impl Project {
     }
 
     /// Creates a local terminal even if the project is remote.
-    /// In remote projects: opens in Zed's launch directory (bypasses SSH).
+    /// In remote projects: opens in Fanta's launch directory (bypasses SSH).
     /// In local projects: opens in the project directory (same as regular terminals).
     pub fn create_local_terminal(
         &mut self,
         cx: &mut Context<Self>,
     ) -> Task<Result<Entity<Terminal>>> {
         let working_directory = if self.remote_client.is_some() {
-            // Remote project: don't use remote paths, let shell use Zed's cwd
+            // Remote project: don't use remote paths, let shell use Fanta's cwd
             None
         } else {
             // Local project: use project directory like normal terminals
@@ -631,7 +631,7 @@ fn create_remote_shell(
     remote_client: Entity<RemoteClient>,
     cx: &mut App,
 ) -> Result<(Shell, HashMap<String, String>)> {
-    insert_zed_terminal_env(&mut env, &release_channel::AppVersion::global(cx));
+    insert_fanta_terminal_env(&mut env, &release_channel::AppVersion::global(cx));
 
     let (program, args) = match spawn_command {
         Some((program, args)) => (Some(program.clone()), args),

@@ -22,7 +22,7 @@ extend-exclude = [
     # We have some base64-encoded data that is incorrectly being flagged.
     "crates/rpc/src/auth.rs",
     # File type extensions are not typos
-    "crates/zed/resources/windows/zed.iss",
+    "crates/fanta/resources/windows/fanta.iss",
     # typos-cli doesn't understand our `vˇariable` markup
     "crates/editor/src/hover_links.rs",
     # typos-cli doesn't understand `setis` is intentional test case

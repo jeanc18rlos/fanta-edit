@@ -56,13 +56,13 @@ pub struct SandboxWrap {
     /// enforcing proxy binds a loopback port on this host, so it can only
     /// confine local commands; a remote terminal can't reach it.
     pub is_local: bool,
-    /// Windows/WSL only: `(release channel, version)` of the Linux `zed` to
+    /// Windows/WSL only: `(release channel, version)` of the Linux `fanta` to
     /// provision inside WSL as the sandbox helper (version `latest` for dev
     /// builds). Resolved by the agent (which can read the running app's release
     /// info) and forwarded to the sandbox. `None` on other platforms, or when
     /// the release can't be determined, in which case the WSL backend falls back
     /// to running bwrap without in-sandbox bind validation.
-    pub wsl_zed_release: Option<(String, String)>,
+    pub wsl_fanta_release: Option<(String, String)>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -86,7 +86,7 @@ pub enum SandboxNetworkAccess {
 pub enum LinuxWslSandboxError {
     /// No usable `bwrap` binary was found on `PATH`.
     BwrapNotFound,
-    /// The only `bwrap` found is setuid-root, which Zed refuses to run.
+    /// The only `bwrap` found is setuid-root, which Fanta refuses to run.
     SetuidRejected,
     /// `bwrap` is present but couldn't set up the sandbox (typically because
     /// unprivileged user namespaces are disabled).
@@ -117,7 +117,7 @@ impl LinuxWslSandboxError {
                     .to_string()
             }
             LinuxWslSandboxError::SetuidRejected => {
-                "The only `bwrap` available is setuid-root, which Zed refuses to run. Install \
+                "The only `bwrap` available is setuid-root, which Fanta refuses to run. Install \
                  a non-setuid Bubblewrap to let the agent sandbox terminal commands."
                     .to_string()
             }
@@ -250,11 +250,11 @@ pub(crate) async fn prepare_sandbox_wrap(
 
     let mut sandbox =
         sandbox::Sandbox::new(sandbox_wrap.to_policy()).map_err(anyhow::Error::new)?;
-    // Windows/WSL only: tell the sandbox which Linux `zed` to provision inside
+    // Windows/WSL only: tell the sandbox which Linux `fanta` to provision inside
     // WSL as its `--wsl-sandbox-helper`. A no-op (and a no-op setter) elsewhere.
     #[cfg(target_os = "windows")]
-    if let Some((channel, version)) = sandbox_wrap.wsl_zed_release.clone() {
-        sandbox.set_wsl_zed_release(channel, version);
+    if let Some((channel, version)) = sandbox_wrap.wsl_fanta_release.clone() {
+        sandbox.set_wsl_fanta_release(channel, version);
     }
     let command = sandbox::CommandAndArgs {
         program,

@@ -9,7 +9,7 @@ it from [`README.md`](./README.md).
 - Put notes about how the app works in [`fanta/`](./fanta).
 - Keep pages short and current. A stale page is worse than a missing one: if a
   change makes a page wrong, fix or delete it in the same commit.
-- Do not document inherited Zed behaviour that Fanta does not ship. When a
+- Do not document inherited Fanta behaviour that Fanta does not ship. When a
   service is deliberately off, record it in
   [`fanta/disabled-services-binnacle.md`](./fanta/disabled-services-binnacle.md)
   rather than writing a page about it.

@@ -1303,7 +1303,7 @@ pub mod simple_message_notification {
                 fn primary_action(&self) -> ErrorAction {
                     ErrorAction::link(
                         "See Docs",
-                        "https://zed.dev/docs/linux#i-cant-open-any-files",
+                        "https://fantaisa.net/docs/linux#i-cant-open-any-files",
                     )
                 }
             }

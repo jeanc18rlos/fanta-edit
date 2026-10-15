@@ -27,7 +27,7 @@ where
     let thread = new_test_thread(server(&fs, cx).await, project.clone(), "/private/tmp", cx).await;
 
     thread
-        .update(cx, |thread, cx| thread.send_raw("Hello from Zed!", cx))
+        .update(cx, |thread, cx| thread.send_raw("Hello from Fanta!", cx))
         .await
         .unwrap();
 
@@ -478,7 +478,7 @@ pub async fn run_until_first_tool_call(
     }
 }
 
-pub fn get_zed_path() -> PathBuf {
+pub fn get_fanta_path() -> PathBuf {
     let mut zed_path = std::env::current_exe().unwrap();
 
     while zed_path
@@ -490,7 +490,7 @@ pub fn get_zed_path() -> PathBuf {
         }
     }
 
-    zed_path.push("zed");
+    zed_path.push("fanta");
 
     if !zed_path.exists() {
         panic!("\n🚨 Run `cargo build` at least once before running e2e tests\n\n");

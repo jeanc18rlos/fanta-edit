@@ -18,7 +18,7 @@ Finish and release the Apple Silicon Mac app as soon as the agreed product and r
 
 Preserve the prior product decisions:
 
-- Complete the current creative feature set before release. Retain the Zed workspace structure and refine Fanta's own GPUI surfaces.
+- Complete the current creative feature set before release. Retain the Fanta workspace structure and refine Fanta's own GPUI surfaces.
 - Keep the compact floating toolbar at the **bottom of the canvas**, above the timeline/video controls. Improve spacing, typography and integration.
 - Finish Image, Video, Vector, Design and Masks, including the agreed segmentation, composition and enhancement workflows.
 - Deliver design motion and clip editing. Broader 3D, music, voice conversion and a full multitrack audio/video editor are outside this release. Utility voice dictation remains part of the existing toolbar scope.
@@ -72,7 +72,7 @@ Drive the real app through:
 - Keyframes/presets at the actual playhead, easing/track edits, timed comment placement/navigation, deleted clips and shortened durations, existing draft preservation, auto-keyframe toggles and transient editing.
 - Save/Save As/autosave/reopen throughout. Compare expected document edits and untouched media bytes.
 
-Refine shared styling in existing components: normal body weight, restrained section emphasis, subtle single borders, consistent spacing, theme-derived foreground/background/selection/focus colors, predictable icons and hit areas. Respect the user's Zed font family and scale. Keep the toolbar compact, with contextual flyouts and an explicit AI composer action, anchored to the usable canvas area as panels open or close.
+Refine shared styling in existing components: normal body weight, restrained section emphasis, subtle single borders, consistent spacing, theme-derived foreground/background/selection/focus colors, predictable icons and hit areas. Respect the user's Fanta font family and scale. Keep the toolbar compact, with contextual flyouts and an explicit AI composer action, anchored to the usable canvas area as panels open or close.
 
 Make two deliberate visual passes: first shared chrome/typography/layout, then interactions and states. After those pass, additional visual changes must fix a named acceptance defect. This bounds polish without cutting the agreed features.
 

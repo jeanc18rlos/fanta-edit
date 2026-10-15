@@ -51,7 +51,7 @@ class PackagingPreflight(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix='fanta-packaging-preflight-')
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
-        for relative in ['script/bundle-mac', 'script/lib/blob-store.sh', 'crates/zed/Cargo.toml', 'crates/zed/RELEASE_CHANNEL']:
+        for relative in ['script/bundle-mac', 'script/lib/blob-store.sh', 'crates/fanta/Cargo.toml', 'crates/fanta/RELEASE_CHANNEL']:
             destination = self.root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(ROOT / relative, destination)
@@ -110,14 +110,14 @@ class PackagingPreflight(unittest.TestCase):
                     'Unset it before bundling')
 
     def test_developer_bundle_requires_one_explicit_source_version(self):
-        manifest = self.root / 'crates/zed/Cargo.toml'
-        for content in ['[package]\nname = "zed"\n',
+        manifest = self.root / 'crates/fanta/Cargo.toml'
+        for content in ['[package]\nname = "fanta"\n',
                         '[package]\nversion = "1.0.0"\nversion = "2.0.0"\n']:
             with self.subTest(manifest=content):
                 manifest.write_text(content)
-                self.before['crates/zed/Cargo.toml'] = manifest.read_bytes()
+                self.before['crates/fanta/Cargo.toml'] = manifest.read_bytes()
                 self.reject({'FANTA_RELEASE_CHANNEL': 'stable'},
-                            'Expected one explicit package version in crates/zed/Cargo.toml')
+                            'Expected one explicit package version in crates/fanta/Cargo.toml')
 
     def test_store_and_notarization_are_incompatible(self):
         self.reject({'FANTA_REQUIRE_NOTARIZATION': 'true'}, 'Mac App Store packages are submitted to App Store Connect', ['-s'])
@@ -159,8 +159,8 @@ esac
         path.chmod(0o755)
 
     def run_producer(self, version, *, store=False):
-        manifest = self.root / 'crates/zed/Cargo.toml'
-        manifest.write_text('[package]\nname = "zed"\nversion = "' + version + '"\n\n'
+        manifest = self.root / 'crates/fanta/Cargo.toml'
+        manifest.write_text('[package]\nname = "fanta"\nversion = "' + version + '"\n\n'
                             '[package.metadata.bundle-stable]\nname = "Fanta"\n')
         original_manifest = manifest.read_bytes()
         arguments = ['-s', '-d'] if store else []
@@ -249,14 +249,14 @@ esac
         final = self.output / 'Fanta-aarch64.dmg'
         if previous_image:
             final.write_bytes(b'previous accepted image\n')
-        original_manifest = (self.root / 'crates/zed/Cargo.toml').read_bytes()
+        original_manifest = (self.root / 'crates/fanta/Cargo.toml').read_bytes()
         result = subprocess.run(['/bin/bash', 'script/bundle-mac', 'aarch64-apple-darwin'],
                                 cwd=self.root, env={**self.environment, 'FANTA_RELEASE_CHANNEL': 'stable',
                                                    'FANTA_TEST_DMG_CASE': scenario},
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0 if success else (7 if scenario == 'nonbusy' else 8 if scenario == 'near-match' else 1),
                          result.stdout + result.stderr)
-        self.assertEqual((self.root / 'crates/zed/Cargo.toml').read_bytes(), original_manifest)
+        self.assertEqual((self.root / 'crates/fanta/Cargo.toml').read_bytes(), original_manifest)
         calls = self.log.read_text().splitlines()
         for once in ['licenses', 'rustup', 'dsymutil', 'bundle-git', 'codesign']:
             self.assertEqual(calls.count(once), 1, calls)

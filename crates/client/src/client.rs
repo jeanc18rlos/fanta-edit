@@ -5,7 +5,7 @@ mod llm_token;
 mod proxy;
 pub mod telemetry;
 pub mod user;
-pub mod zed_urls;
+pub mod fanta_urls;
 
 use anyhow::{Context as _, Result, anyhow};
 use async_tungstenite::tungstenite::{
@@ -60,29 +60,29 @@ pub use rpc::*;
 pub use telemetry_events::Event;
 pub use user::*;
 
-static ZED_SERVER_URL: LazyLock<Option<String>> =
-    LazyLock::new(|| std::env::var("ZED_SERVER_URL").ok());
-static ZED_RPC_URL: LazyLock<Option<String>> = LazyLock::new(|| std::env::var("ZED_RPC_URL").ok());
+static FANTA_SERVER_URL: LazyLock<Option<String>> =
+    LazyLock::new(|| std::env::var("FANTA_SERVER_URL").ok());
+static FANTA_RPC_URL: LazyLock<Option<String>> = LazyLock::new(|| std::env::var("FANTA_RPC_URL").ok());
 
 pub static IMPERSONATE_LOGIN: LazyLock<Option<String>> = LazyLock::new(|| {
-    std::env::var("ZED_IMPERSONATE")
+    std::env::var("FANTA_IMPERSONATE")
         .ok()
         .and_then(|s| if s.is_empty() { None } else { Some(s) })
 });
 
-pub static USE_WEB_LOGIN: LazyLock<bool> = LazyLock::new(|| std::env::var("ZED_WEB_LOGIN").is_ok());
+pub static USE_WEB_LOGIN: LazyLock<bool> = LazyLock::new(|| std::env::var("FANTA_WEB_LOGIN").is_ok());
 
 pub static ADMIN_API_TOKEN: LazyLock<Option<String>> = LazyLock::new(|| {
-    std::env::var("ZED_ADMIN_API_TOKEN")
+    std::env::var("FANTA_ADMIN_API_TOKEN")
         .ok()
         .and_then(|s| if s.is_empty() { None } else { Some(s) })
 });
 
-pub static ZED_APP_PATH: LazyLock<Option<PathBuf>> =
-    LazyLock::new(|| std::env::var("ZED_APP_PATH").ok().map(PathBuf::from));
+pub static FANTA_APP_PATH: LazyLock<Option<PathBuf>> =
+    LazyLock::new(|| std::env::var("FANTA_APP_PATH").ok().map(PathBuf::from));
 
-pub static ZED_ALWAYS_ACTIVE: LazyLock<bool> =
-    LazyLock::new(|| std::env::var("ZED_ALWAYS_ACTIVE").is_ok_and(|e| !e.is_empty()));
+pub static FANTA_ALWAYS_ACTIVE: LazyLock<bool> =
+    LazyLock::new(|| std::env::var("FANTA_ALWAYS_ACTIVE").is_ok_and(|e| !e.is_empty()));
 
 pub const INITIAL_RECONNECTION_DELAY: Duration = Duration::from_millis(500);
 pub const MAX_RECONNECTION_DELAY: Duration = Duration::from_secs(30);
@@ -107,7 +107,7 @@ pub struct ClientSettings {
     /// Overrides the key used to store credentials in the system keychain.
     /// Defaults to `server_url` when unset.
     ///
-    /// Useful when running multiple Zed instances side by side without them
+    /// Useful when running multiple Fanta instances side by side without them
     /// overwriting each other's keychain entries.
     ///
     /// Note: changing this after signing in will require signing in again, as
@@ -117,7 +117,7 @@ pub struct ClientSettings {
 
 impl Settings for ClientSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
-        if let Some(server_url) = &*ZED_SERVER_URL {
+        if let Some(server_url) = &*FANTA_SERVER_URL {
             return Self {
                 server_url: server_url.clone(),
                 cloud_updates_enabled: content.cloud_updates_enabled.unwrap_or(true),
@@ -363,7 +363,7 @@ pub struct ClientCredentialsProvider {
 impl ClientCredentialsProvider {
     pub fn new(cx: &App) -> Self {
         Self {
-            provider: zed_credentials_provider::global(cx),
+            provider: fanta_credentials_provider::global(cx),
         }
     }
 
@@ -1073,7 +1073,7 @@ impl Client {
 
     /// Performs a sign-in and also (optionally) connects to Collab.
     ///
-    /// Only Zed staff automatically connect to Collab.
+    /// Only Fanta staff automatically connect to Collab.
     pub async fn sign_in_with_optional_connect(
         self: &Arc<Self>,
         try_provider: bool,
@@ -1333,7 +1333,7 @@ impl Client {
                 return Ok(url);
             }
 
-            if let Some(url) = &*ZED_RPC_URL {
+            if let Some(url) = &*FANTA_RPC_URL {
                 return Url::parse(url).context("invalid rpc url");
             }
 
@@ -1430,22 +1430,22 @@ impl Client {
                 HeaderValue::from_str(&credentials.authorization_header())?,
             );
             request_headers.insert(
-                "x-zed-protocol-version",
+                "x-fanta-protocol-version",
                 HeaderValue::from_str(&rpc::PROTOCOL_VERSION.to_string())?,
             );
-            request_headers.insert("x-zed-app-version", HeaderValue::from_str(&app_version)?);
+            request_headers.insert("x-fanta-app-version", HeaderValue::from_str(&app_version)?);
             request_headers.insert(
-                "x-zed-release-channel",
+                "x-fanta-release-channel",
                 HeaderValue::from_str(release_channel.map(|r| r.dev_name()).unwrap_or("unknown"))?,
             );
             if let Some(user_agent) = user_agent {
                 request_headers.insert(http::header::USER_AGENT, user_agent);
             }
             if let Some(system_id) = system_id {
-                request_headers.insert("x-zed-system-id", HeaderValue::from_str(&system_id)?);
+                request_headers.insert("x-fanta-system-id", HeaderValue::from_str(&system_id)?);
             }
             if let Some(metrics_id) = metrics_id {
-                request_headers.insert("x-zed-metrics-id", HeaderValue::from_str(&metrics_id)?);
+                request_headers.insert("x-fanta-metrics-id", HeaderValue::from_str(&metrics_id)?);
             }
 
             let (stream, _) = async_tungstenite::tokio::client_async_tls_with_connector_and_config(
@@ -1510,7 +1510,7 @@ impl Client {
                 .clone()
                 .spawn(async move {
                     // Generate a pair of asymmetric encryption keys. The public key will be used by the
-                    // zed server to encrypt the user's access token, so that it can'be intercepted by
+                    // fanta server to encrypt the user's access token, so that it can'be intercepted by
                     // any other app running on the user's device.
                     let (public_key, private_key) =
                         rpc::auth::keypair().context("failed to generate keypair for auth")?;
@@ -1529,7 +1529,7 @@ impl Client {
                         }
                     }
 
-                    // Start an HTTP server to receive the redirect from Zed's sign-in page.
+                    // Start an HTTP server to receive the redirect from Fanta's sign-in page.
                     let server = tiny_http::Server::http("127.0.0.1:0")
                         .map_err(|e| anyhow!(e).context("failed to bind callback port"))?;
                     let port = server
@@ -1546,8 +1546,8 @@ impl Client {
                         choose_account: u8,
                     }
 
-                    // Open the Zed sign-in page in the user's browser, with query parameters that indicate
-                    // that the user is signing in from a Zed app running on the same device.
+                    // Open the Fanta sign-in page in the user's browser, with query parameters that indicate
+                    // that the user is signing in from a Fanta app running on the same device.
                     let url = http.build_url(&format!(
                         "/native_app_signin?{}",
                         serde_urlencoded::to_string(&NativeAppSignInQueryParams {
@@ -1679,7 +1679,7 @@ impl Client {
         }
     }
 
-    /// Sends an authenticated request to the Zed LLM service, retrying once
+    /// Sends an authenticated request to the Fanta LLM service, retrying once
     /// with a refreshed token if the server signals that the cached LLM
     /// token is expired or otherwise rejected. Returns the raw response so
     /// callers can inspect headers and stream the body.
@@ -1996,33 +1996,33 @@ impl ProtoClient for Client {
     }
 }
 
-/// prefix for the zed:// url scheme
-pub const ZED_URL_SCHEME: &str = "zed";
+/// prefix for the fanta:// url scheme
+pub const FANTA_URL_SCHEME: &str = "fanta";
 
-/// A parsed Zed link that can be handled internally by the application.
+/// A parsed Fanta link that can be handled internally by the application.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ZedLink {
-    /// Join a channel: `zed.dev/channel/channel-name-123` or `zed://channel/channel-name-123`
+pub enum FantaLink {
+    /// Join a channel: `fantaisa.net/channel/channel-name-123` or `fanta://channel/channel-name-123`
     Channel { channel_id: u64 },
-    /// Open channel notes: `zed.dev/channel/channel-name-123/notes` or with heading `notes#heading`
+    /// Open channel notes: `fantaisa.net/channel/channel-name-123/notes` or with heading `notes#heading`
     ChannelNotes {
         channel_id: u64,
         heading: Option<String>,
     },
 }
 
-/// Parses the given link into a Zed link.
+/// Parses the given link into a Fanta link.
 ///
-/// Returns a [`Some`] containing the parsed link if the link is a recognized Zed link
+/// Returns a [`Some`] containing the parsed link if the link is a recognized Fanta link
 /// that should be handled internally by the application.
 /// Returns [`None`] for links that should be opened in the browser.
-pub fn parse_zed_link(link: &str, cx: &App) -> Option<ZedLink> {
+pub fn parse_fanta_link(link: &str, cx: &App) -> Option<FantaLink> {
     let server_url = &ClientSettings::get_global(cx).server_url;
     let path = link
         .strip_prefix(server_url)
         .and_then(|result| result.strip_prefix('/'))
         .or_else(|| {
-            link.strip_prefix(ZED_URL_SCHEME)
+            link.strip_prefix(FANTA_URL_SCHEME)
                 .and_then(|result| result.strip_prefix("://"))
         })?;
 
@@ -2037,18 +2037,18 @@ pub fn parse_zed_link(link: &str, cx: &App) -> Option<ZedLink> {
     let channel_id = id_str.parse::<u64>().ok()?;
 
     let Some(next) = parts.next() else {
-        return Some(ZedLink::Channel { channel_id });
+        return Some(FantaLink::Channel { channel_id });
     };
 
     if let Some(heading) = next.strip_prefix("notes#") {
-        return Some(ZedLink::ChannelNotes {
+        return Some(FantaLink::ChannelNotes {
             channel_id,
             heading: Some(heading.to_string()),
         });
     }
 
     if next == "notes" {
-        return Some(ZedLink::ChannelNotes {
+        return Some(FantaLink::ChannelNotes {
             channel_id,
             heading: None,
         });
@@ -2145,7 +2145,7 @@ mod tests {
                 .unwrap())
         });
         let client = cx.update(|cx| {
-            cx.set_global(zed_credentials_provider::ZedCredentialsProvider(
+            cx.set_global(fanta_credentials_provider::FantaCredentialsProvider(
                 provider.clone(),
             ));
             Client::new(Arc::new(FakeSystemClock::new()), http_client, cx)
@@ -2179,7 +2179,7 @@ mod tests {
                 .unwrap())
         });
         let client = cx.update(|cx| {
-            cx.set_global(zed_credentials_provider::ZedCredentialsProvider(
+            cx.set_global(fanta_credentials_provider::FantaCredentialsProvider(
                 provider.clone(),
             ));
             Client::new(Arc::new(FakeSystemClock::new()), http_client, cx)

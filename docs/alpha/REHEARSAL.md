@@ -6,7 +6,7 @@ build, driven from a terminal.
 | | |
 |---|---|
 | Commit | `6e14229` (tree clean at build time) |
-| Binary | `/Users/jeanrojas/fanta-edit/target/debug/fanta`, `cargo build -p zed`, 24s incremental relink of `cli` / `zed` / `fig_viewer` |
+| Binary | `/Users/jeanrojas/fanta-edit/target/debug/fanta`, `cargo build -p fanta`, 24s incremental relink of `cli` / `fanta` / `fig_viewer` |
 | Version | `fanta 0.1.0-alpha.1`; `--system-specs` reports `v0.1.0-alpha.1+stable.6e14229…` — release channel **stable**, not dev |
 | Project under test | `/tmp/fanta-smoke/Smoke`, materialised by opening a copy of `~/Desktop/basic.fig` (9.6 MB, 29,304 nodes) |
 | Disk | 27 GiB free of 694 GiB before and after; no release build attempted |
@@ -82,7 +82,7 @@ five seconds later the change was a git diff.
 | 6 Toolbar tools, AI box, Export PNG | Every visible tool | **NOT VERIFIED** | Needs clicks. |
 | 7 Quit and relaunch | Project back in the rail, canvas reopens | **PASS** | Killed the app, relaunched with no arguments: the log shows `opening git repository at "/private/tmp/fanta-smoke/Smoke/.git"`, and `get_editor_state` on the new process reported project `Smoke`, three pages, `Page 1` active with 29,301 nodes, `is_editable: true`, and the external edit still present. |
 | 8 Open a `.fig`, then open the folder | `.fig` renders and materialises a sibling project; folder opens onto the canvas | **PASS** (via the CLI, not the File > Open… dialog) | `fanta /tmp/fanta-smoke/Smoke.fig` rendered the document and created `/tmp/fanta-smoke/Smoke/` beside it, git-initialised. `fanta /tmp/fanta-smoke/Smoke` (the script's cold path) opened straight onto the canvas. The dialog itself was not used. |
-| 9 `nettop` over five idle minutes plus an agent turn | Only the three allowed hosts | **PARTIAL** | Over ~1 idle minute `nettop -P -x -p <pid>` reported `0` bytes in and `0` bytes out, and `lsof -nP -i` showed **no outbound connections at all** — only one listener, `TCP 127.0.0.1:44438 (LISTEN)`. Nothing reached zed.dev, github.com or npmjs.org in that window. The full five minutes and the agent turn (needs an API key) were not run. |
+| 9 `nettop` over five idle minutes plus an agent turn | Only the three allowed hosts | **PARTIAL** | Over ~1 idle minute `nettop -P -x -p <pid>` reported `0` bytes in and `0` bytes out, and `lsof -nP -i` showed **no outbound connections at all** — only one listener, `TCP 127.0.0.1:44438 (LISTEN)`. Nothing reached fantaisa.net, github.com or npmjs.org in that window. The full five minutes and the agent turn (needs an API key) were not run. |
 | 10 `Fanta.log` | No panics, no `didn't find an action` | **PASS** | Across five launches: `didn't find an action` count **0**; the only "panic" matches are `INFO [crashes] panic handler registered`. The one ERROR is the known cosmetic `agent_ui/src/message_editor.rs:601 language not found`, once per launch — pre-existing, unrelated to this work. |
 | Timing note | 128 MB community UI kit | **NOT RUN** | Data point instead: the 9.6 MB `basic.fig` took roughly 30–40s to reach a rendered canvas on this debug build, and the process settled at **5.1–6.3 GiB resident**. |
 
@@ -91,8 +91,8 @@ five seconds later the change was a git diff.
 | Row | What was checked | Outcome | Evidence / reason |
 |---|---|---|---|
 | Welcome page says "Your design is code.", has a Connect entry and no Command Palette entry | | **NOT VERIFIED** | Never rendered on screen (see row 1). `crates/workspace/src/welcome.rs` contains all three facts. |
-| Fanta > Settings > Open Settings File works from the welcome page | | **NOT VERIFIED** | Needs a menu click. `zed::OpenSettingsFile` exists and is bound to `cmd-alt-,`; the welcome page has an Open Settings entry. |
-| Command palette shows nothing for "vim" | | **NOT VERIFIED** at runtime; **likely FAIL** | `--dump-all-actions` (1,031 actions) filtered through `HIDDEN_NAMESPACES` in `crates/zed/src/main.rs` leaves `terminal::ToggleViMode` ("terminal: toggle vi mode") visible, which a fuzzy search for `vim` matches. The `vim` namespace itself is hidden and only `vim::OpenDefaultKeymap` survives in the binary. |
+| Fanta > Settings > Open Settings File works from the welcome page | | **NOT VERIFIED** | Needs a menu click. `fanta::OpenSettingsFile` exists and is bound to `cmd-alt-,`; the welcome page has an Open Settings entry. |
+| Command palette shows nothing for "vim" | | **NOT VERIFIED** at runtime; **likely FAIL** | `--dump-all-actions` (1,031 actions) filtered through `HIDDEN_NAMESPACES` in `crates/fanta/src/main.rs` leaves `terminal::ToggleViMode` ("terminal: toggle vi mode") visible, which a fuzzy search for `vim` matches. The `vim` namespace itself is hidden and only `vim::OpenDefaultKeymap` survives in the binary. |
 | Command palette shows nothing for "debugger" | | **PASS by action dump**, not clicked | All five `debugger::*` actions fall in a hidden namespace; zero visible actions match. |
 | Command palette shows nothing for "project panel" | | **FAIL by action dump**, not clicked | `pane::RevealInProjectPanel` ("pane: reveal in project panel") is in the visible `pane` namespace and is not in `hide_action_types`. |
 | Command palette shows nothing for "new file" | | **FAIL by action dump**, not clicked | Only `workspace::NewFile` is hidden. `workspace::NewFileSplit`, `workspace::NewFileSplitHorizontal` and `workspace::NewFileSplitVertical` are all still visible. |
@@ -109,9 +109,9 @@ five seconds later the change was a git diff.
 Ordered by severity.
 
 1. **The Restricted Mode modal is the first thing a tester sees, and it is
-   Zed's.** Opening `/private/tmp/fanta-smoke/Smoke` raised a blocking
+   Fanta's.** Opening `/private/tmp/fanta-smoke/Smoke` raised a blocking
    *"Unrecognized Project"* dialog — *"Untrusted projects are opened in
-   Restricted Mode to protect your system. Review .zed/settings.json for any
+   Restricted Mode to protect your system. Review .fanta/settings.json for any
    extensions or commands configured by this project"*, listing "Language
    servers from running" and "MCP Server integrations from installing", with
    *Stay in Restricted Mode* / *Trust and Continue*. `SecurityModal::on_before_dismiss`
@@ -121,15 +121,15 @@ Ordered by severity.
    `assets/settings/default.json:2559`. (The live MCP server is unaffected — the
    whole 18/18 run above happened with this modal on screen.)
 
-2. **Zed branding is visible in shipped surfaces.** Observed on screen: the
-   agent panel offers **"Try Zed Pro for Free"** and its composer placeholder
-   reads **"Message the Zed Agent, @ to include context"**. Observed on the CLI:
+2. **Fanta branding is visible in shipped surfaces.** Observed on screen: the
+   agent panel offers **"Try Fanta Pro for Free"** and its composer placeholder
+   reads **"Message the Fanta Agent, @ to include context"**. Observed on the CLI:
    `fanta --help` documents `--user-data-dir` as defaulting to
-   `~/Library/Application Support/**Zed**` (wrong as well as off-brand — it is
-   `…/Fanta`), plus "Instructs **zed** to run as a dev server", "prevents
-   **Zed** from starting" and "**zed**: copy system specs to clipboard".
-   `fanta --system-specs` prints `**Zed**: v0.1.0-alpha.1+stable.6e14229 (Fanta)
-   (Taylor's Version)`. `main.rs:390` prints `"zed is already running"` when a
+   `~/Library/Application Support/**Fanta**` (wrong as well as off-brand — it is
+   `…/Fanta`), plus "Instructs **fanta** to run as a dev server", "prevents
+   **Fanta** from starting" and "**fanta**: copy system specs to clipboard".
+   `fanta --system-specs` prints `**Fanta**: v0.1.0-alpha.1+stable.6e14229 (Fanta)
+   (Taylor's Version)`. `main.rs:390` prints `"fanta is already running"` when a
    second instance is launched — reachable, since the channel is **stable** and
    the single-instance check is live.
 
@@ -138,7 +138,7 @@ Ordered by severity.
    `pane::RevealInProjectPanel` for "project panel", and `terminal::*` (which a
    search for "vim" fuzzy-matches through "toggle vi mode"). Add them to
    `hide_action_types` / `HIDDEN_NAMESPACES` in
-   `crates/zed/src/main.rs:1434`. The project panel is unlinked, so
+   `crates/fanta/src/main.rs:1434`. The project panel is unlinked, so
    "Reveal In Project Panel" cannot do anything at all.
 
 4. **The first save after importing a `.fig` rewrites the entire page.** One
@@ -167,7 +167,7 @@ Ordered by severity.
    tool needs a byte cap and a way to ask for a slice.
 
 7. **`--mcp-stdio` is hidden from `--help`.** It is registered
-   `#[arg(long, hide = true)]` (`crates/zed/src/main.rs:1580`), so the flag the
+   `#[arg(long, hide = true)]` (`crates/fanta/src/main.rs:1580`), so the flag the
    entire "Connect Claude Code / Codex" story depends on cannot be found or
    confirmed from the CLI. `script/smoke-mcp` had to probe by running it. Drop
    the `hide`.
@@ -193,7 +193,7 @@ Ordered by severity.
 
 - One `TCP 127.0.0.1:44438 (LISTEN)` socket is open for the life of the process.
   The port matches the single-instance handshake scheme for uid 501 on the
-  stable channel (`crates/zed/src/zed/mac_only_instance.rs`), which is
+  stable channel (`crates/fanta/src/fanta/mac_only_instance.rs`), which is
   consistent with this build reporting `stable`. Worth confirming that is all it
   is before shipping.
 - The `.fig` import path is what materialises and git-inits a project on open;
@@ -216,8 +216,8 @@ separate run, of a different build, and does not amend it.
 | | |
 |---|---|
 | Tree | `perf/large-documents-ai-alignment` at `stable.8f43236` plus the staged round-two fixes. This is everything on the branch **except** the `offset`/`limit` pagination, which was written afterwards in response to what this run found |
-| Binary | `cargo build --release -p zed` → `target/release/fanta` |
-| Version | `fanta --system-specs` prints `Fanta: v0.1.0-alpha.1+stable.8f43236…` — **`Fanta:`**, where the rehearsal above recorded `Zed:` |
+| Binary | `cargo build --release -p fanta` → `target/release/fanta` |
+| Version | `fanta --system-specs` prints `Fanta: v0.1.0-alpha.1+stable.8f43236…` — **`Fanta:`**, where the rehearsal above recorded `Fanta:` |
 | Machine | macOS 26.6.2, aarch64, 36 GiB |
 | How it was driven | entirely over the app's own live MCP server. **Nothing was clicked.** No mouse, no menu, no keyboard shortcut, no drag |
 

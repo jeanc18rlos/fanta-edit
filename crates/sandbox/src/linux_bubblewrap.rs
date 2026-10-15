@@ -13,7 +13,7 @@
 //! - run a bridge process inside the sandbox that:
 //!   - listens on `localhost:<port>` and forwards reads/writes to the socket
 //!   - then, runs the untrusted command
-//! - on the zed side, we listen to the socket and forward reads/writes to the
+//! - on the fanta side, we listen to the socket and forward reads/writes to the
 //!   internal HTTP proxy
 //!
 //! If networking is fully blocked or fully allowed, we don't bother with the
@@ -40,7 +40,7 @@ use std::thread;
 /// the real command to (a) validate that bwrap bound the writable grants to the
 /// inodes we captured (the bind-source TOCTOU backstop) and (b) run the
 /// restricted-network HTTP bridge. See `README.md` for the design.
-const LAUNCHER_FLAG: &str = "--zed-linux-sandbox-launcher";
+const LAUNCHER_FLAG: &str = "--fanta-linux-sandbox-launcher";
 /// Re-exec marker for the WSL-side helper. This runs *inside WSL* (a Linux
 /// process) and does what `Sandbox::wrap` + the validation-fd sender do
 /// in-process on native Linux: capture the writable binds' `O_PATH` fds, stand
@@ -50,8 +50,8 @@ const LAUNCHER_FLAG: &str = "--zed-linux-sandbox-launcher";
 const WSL_HELPER_FLAG: &str = crate::WSL_SANDBOX_HELPER_FLAG;
 /// Sentinel argv token meaning "this optional field is absent".
 const LAUNCHER_NONE: &str = "-";
-const PROXY_SOCKET_SANDBOX_PATH_PREFIX: &str = "/tmp/zed-sandbox";
-const VALIDATION_SOCKET_SANDBOX_PATH_PREFIX: &str = "/tmp/zed-sandbox-validate";
+const PROXY_SOCKET_SANDBOX_PATH_PREFIX: &str = "/tmp/fanta-sandbox";
+const VALIDATION_SOCKET_SANDBOX_PATH_PREFIX: &str = "/tmp/fanta-sandbox-validate";
 const SANDBOX_SETUP_FAILED_EXIT_CODE: i32 = 126;
 const PUMP_BUFFER_SIZE: usize = 64 * 1024;
 /// Upper bound on writable binds validated in a single `SCM_RIGHTS` message,
@@ -104,7 +104,7 @@ impl LauncherStatus {
         match self {
             LauncherStatus::BwrapNotFound => "no usable `bwrap` binary was found on PATH",
             LauncherStatus::SetuidRejected => {
-                "the only available `bwrap` is setuid-root, which Zed refuses to run"
+                "the only available `bwrap` is setuid-root, which Fanta refuses to run"
             }
             LauncherStatus::SandboxProbeFailed => {
                 "`bwrap` is present but failed to create a sandbox (unprivileged user \
@@ -393,7 +393,7 @@ fn unique_validation_socket_host_path() -> std::io::Result<(PathBuf, PathBuf)> {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "zed-sandbox-validate-{}-{counter}",
+        "fanta-sandbox-validate-{}-{counter}",
         std::process::id()
     ));
     // Clear a stale directory left by a previous run that reused this pid; this
@@ -451,10 +451,10 @@ impl ValidationFdSender {
         let shutdown = Arc::new(AtomicBool::new(false));
 
         // We use std threading APIs here because this code is run from both the
-        // Linux zed binary and also the WSL helper, which does not have a GPUI
+        // Linux fanta binary and also the WSL helper, which does not have a GPUI
         // runtime.
         thread::Builder::new()
-            .name("zed-sandbox-validation".to_string())
+            .name("fanta-sandbox-validation".to_string())
             .spawn({
                 let shutdown = shutdown.clone();
                 let host_socket_path = host_socket_path.clone();
@@ -563,7 +563,7 @@ pub fn check_can_create_sandbox(
     prepare_sandbox(permissions).map(|_| ())
 }
 
-/// The host (Zed-side) socket paths for the in-sandbox bind validator.
+/// The host (Fanta-side) socket paths for the in-sandbox bind validator.
 #[derive(Clone, Copy)]
 pub struct ValidationSocket<'a> {
     /// Host pathname of the listener the validator connects back to.
@@ -575,7 +575,7 @@ pub struct ValidationSocket<'a> {
 
 /// Build the final command line that runs `program` inside Bubblewrap.
 ///
-/// `bridge_program` should be the current Zed executable; it is re-exec'd inside
+/// `bridge_program` should be the current Fanta executable; it is re-exec'd inside
 /// the sandbox as the launcher whenever bind validation and/or the
 /// restricted-network bridge are needed, running before the real command.
 ///
@@ -706,14 +706,14 @@ pub fn run_launcher_if_invoked() {
     let invocation = match invocation {
         Ok(invocation) => invocation,
         Err(error) => {
-            eprintln!("zed: malformed sandbox launcher invocation: {error:#}");
+            eprintln!("fanta: malformed sandbox launcher invocation: {error:#}");
             std::process::exit(127);
         }
     };
     run_launcher(invocation);
 }
 
-/// A decoded in-sandbox launcher invocation (the `--zed-linux-sandbox-launcher`
+/// A decoded in-sandbox launcher invocation (the `--fanta-linux-sandbox-launcher`
 /// re-exec). All fields are produced by the trusted host side and parsed before
 /// any untrusted command runs.
 struct LauncherInvocation {
@@ -809,7 +809,7 @@ fn run_launcher(invocation: LauncherInvocation) -> ! {
         if let Err(error) = validate_binds(socket, &invocation.validation_paths) {
             // Fail closed: a redirected (or unverifiable) writable bind means the
             // command must not run at all.
-            eprintln!("zed: sandbox bind validation failed: {error:#}");
+            eprintln!("fanta: sandbox bind validation failed: {error:#}");
             std::process::exit(SANDBOX_SETUP_FAILED_EXIT_CODE);
         }
     }
@@ -863,7 +863,7 @@ fn validate_binds(socket_path: &Path, paths: &[PathBuf]) -> Result<()> {
 /// if `exec` itself fails.
 fn exec_command(program: &OsStr, args: &[OsString]) -> ! {
     let error = Command::new(program).args(args).exec();
-    eprintln!("zed: failed to exec sandboxed command: {error}");
+    eprintln!("fanta: failed to exec sandboxed command: {error}");
     std::process::exit(SANDBOX_SETUP_FAILED_EXIT_CODE);
 }
 
@@ -875,24 +875,24 @@ fn run_bridge(socket_path: PathBuf, port: u16, program: &OsStr, program_args: &[
     let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, port)) {
         Ok(listener) => listener,
         Err(error) => {
-            eprintln!("zed: failed to bind sandbox proxy bridge: {error}");
+            eprintln!("fanta: failed to bind sandbox proxy bridge: {error}");
             std::process::exit(SANDBOX_SETUP_FAILED_EXIT_CODE);
         }
     };
 
     if let Err(error) = thread::Builder::new()
-        .name("zed-sandbox-bridge".to_string())
+        .name("fanta-sandbox-bridge".to_string())
         .stack_size(128 * 1024)
         .spawn(move || run_bridge_listener(listener, socket_path))
     {
-        eprintln!("zed: failed to spawn sandbox proxy bridge: {error}");
+        eprintln!("fanta: failed to spawn sandbox proxy bridge: {error}");
         std::process::exit(SANDBOX_SETUP_FAILED_EXIT_CODE);
     }
 
     let mut child = match Command::new(program).args(program_args).spawn() {
         Ok(child) => child,
         Err(error) => {
-            eprintln!("zed: failed to spawn sandboxed command: {error}");
+            eprintln!("fanta: failed to spawn sandboxed command: {error}");
             std::process::exit(SANDBOX_SETUP_FAILED_EXIT_CODE);
         }
     };
@@ -906,7 +906,7 @@ fn run_bridge(socket_path: PathBuf, port: u16, program: &OsStr, program_args: &[
             std::process::exit(128 + signal);
         }
         Err(error) => {
-            eprintln!("zed: failed to wait for sandboxed command: {error}");
+            eprintln!("fanta: failed to wait for sandboxed command: {error}");
             std::process::exit(SANDBOX_SETUP_FAILED_EXIT_CODE);
         }
     }
@@ -1025,7 +1025,7 @@ pub fn run_wsl_helper_if_invoked() {
     let invocation = match invocation {
         Ok(invocation) => invocation,
         Err(error) => {
-            eprintln!("zed: malformed WSL sandbox helper invocation: {error:#}");
+            eprintln!("fanta: malformed WSL sandbox helper invocation: {error:#}");
             std::process::exit(127);
         }
     };
@@ -1097,7 +1097,7 @@ fn parse_count(value: OsString, what: &str) -> Result<usize> {
 )]
 fn run_wsl_helper(invocation: WslHelperInvocation) -> ! {
     // Capture an `O_PATH` fd per writable bind *here*, inside WSL — this is the
-    // capture-at-validation step that on native Linux happens in the Zed process.
+    // capture-at-validation step that on native Linux happens in the Fanta process.
     let mut fds = Vec::with_capacity(invocation.writable_paths.len());
     for path in &invocation.writable_paths {
         match open_o_path_fd(path) {
@@ -1105,7 +1105,7 @@ fn run_wsl_helper(invocation: WslHelperInvocation) -> ! {
             Err(error) => {
                 // Fail closed: a writable bind we can't pin can't be verified.
                 eprintln!(
-                    "zed: WSL sandbox helper could not open writable bind {}: {error}",
+                    "fanta: WSL sandbox helper could not open writable bind {}: {error}",
                     path.display()
                 );
                 std::process::exit(SANDBOX_SETUP_FAILED_EXIT_CODE);
@@ -1119,7 +1119,7 @@ fn run_wsl_helper(invocation: WslHelperInvocation) -> ! {
         match ValidationFdSender::spawn(fds) {
             Ok(sender) => Some(sender),
             Err(error) => {
-                eprintln!("zed: WSL sandbox helper could not start the bind validator: {error}");
+                eprintln!("fanta: WSL sandbox helper could not start the bind validator: {error}");
                 std::process::exit(SANDBOX_SETUP_FAILED_EXIT_CODE);
             }
         }
@@ -1128,7 +1128,7 @@ fn run_wsl_helper(invocation: WslHelperInvocation) -> ! {
     let current_exe = match std::env::current_exe() {
         Ok(path) => path,
         Err(error) => {
-            eprintln!("zed: WSL sandbox helper could not resolve its own path: {error}");
+            eprintln!("fanta: WSL sandbox helper could not resolve its own path: {error}");
             std::process::exit(SANDBOX_SETUP_FAILED_EXIT_CODE);
         }
     };
@@ -1163,7 +1163,7 @@ fn run_wsl_helper(invocation: WslHelperInvocation) -> ! {
     let mut child = match Command::new(&invocation.bwrap_path).args(&args).spawn() {
         Ok(child) => child,
         Err(error) => {
-            eprintln!("zed: WSL sandbox helper could not spawn bwrap: {error}");
+            eprintln!("fanta: WSL sandbox helper could not spawn bwrap: {error}");
             std::process::exit(SANDBOX_SETUP_FAILED_EXIT_CODE);
         }
     };
@@ -1181,7 +1181,7 @@ fn run_wsl_helper(invocation: WslHelperInvocation) -> ! {
             std::process::exit(128 + signal);
         }
         Err(error) => {
-            eprintln!("zed: WSL sandbox helper failed waiting for bwrap: {error}");
+            eprintln!("fanta: WSL sandbox helper failed waiting for bwrap: {error}");
             std::process::exit(SANDBOX_SETUP_FAILED_EXIT_CODE);
         }
     }
@@ -1193,14 +1193,14 @@ fn run_bridge_listener(listener: TcpListener, socket_path: PathBuf) {
             Ok(stream) => {
                 let socket_path = socket_path.clone();
                 if let Err(error) = thread::Builder::new()
-                    .name("zed-sandbox-bridge-conn".to_string())
+                    .name("fanta-sandbox-bridge-conn".to_string())
                     .stack_size(128 * 1024)
                     .spawn(move || forward_bridge_connection(stream, socket_path))
                 {
-                    eprintln!("zed: failed to spawn sandbox bridge connection thread: {error}");
+                    eprintln!("fanta: failed to spawn sandbox bridge connection thread: {error}");
                 }
             }
-            Err(error) => eprintln!("zed: sandbox bridge accept failed: {error}"),
+            Err(error) => eprintln!("fanta: sandbox bridge accept failed: {error}"),
         }
     }
 }
@@ -1210,7 +1210,7 @@ fn forward_bridge_connection(tcp_stream: TcpStream, socket_path: PathBuf) {
         Ok(stream) => stream,
         Err(error) => {
             eprintln!(
-                "zed: sandbox bridge failed to connect to proxy socket {}: {error}",
+                "fanta: sandbox bridge failed to connect to proxy socket {}: {error}",
                 socket_path.display()
             );
             return;
@@ -1223,14 +1223,14 @@ fn copy_bidirectional(tcp_stream: TcpStream, unix_stream: UnixStream) {
     let tcp_read = match tcp_stream.try_clone() {
         Ok(stream) => stream,
         Err(error) => {
-            eprintln!("zed: sandbox bridge failed to clone TCP stream: {error}");
+            eprintln!("fanta: sandbox bridge failed to clone TCP stream: {error}");
             return;
         }
     };
     let unix_read = match unix_stream.try_clone() {
         Ok(stream) => stream,
         Err(error) => {
-            eprintln!("zed: sandbox bridge failed to clone Unix stream: {error}");
+            eprintln!("fanta: sandbox bridge failed to clone Unix stream: {error}");
             return;
         }
     };
@@ -1238,19 +1238,19 @@ fn copy_bidirectional(tcp_stream: TcpStream, unix_stream: UnixStream) {
     let tcp_write = tcp_stream;
     let unix_write = unix_stream;
     let to_proxy = match thread::Builder::new()
-        .name("zed-sandbox-bridge-out".to_string())
+        .name("fanta-sandbox-bridge-out".to_string())
         .stack_size(128 * 1024)
         .spawn(move || copy_one_way(tcp_read, unix_write))
     {
         Ok(handle) => handle,
         Err(error) => {
-            eprintln!("zed: failed to spawn sandbox bridge pump thread: {error}");
+            eprintln!("fanta: failed to spawn sandbox bridge pump thread: {error}");
             return;
         }
     };
     copy_one_way(unix_read, tcp_write);
     if to_proxy.join().is_err() {
-        eprintln!("zed: sandbox bridge pump thread panicked");
+        eprintln!("fanta: sandbox bridge pump thread panicked");
     }
 }
 
@@ -1366,7 +1366,7 @@ mod tests {
         );
         assert!(!allowed.iter().any(|arg| arg == "--unshare-net"));
 
-        let socket = PathBuf::from("/tmp/zed-proxy.sock");
+        let socket = PathBuf::from("/tmp/fanta-proxy.sock");
         let restricted = build_bwrap_args(
             &[],
             &[],
@@ -1399,10 +1399,10 @@ mod tests {
 
     #[test]
     fn test_launcher_args_round_trip_bridge_and_validation() {
-        let bridge_socket = "/tmp/zed-sandbox-1234-0.sock";
-        let validate_socket = "/tmp/zed-sandbox-validate-1234-0.sock";
+        let bridge_socket = "/tmp/fanta-sandbox-1234-0.sock";
+        let validate_socket = "/tmp/fanta-sandbox-validate-1234-0.sock";
         let argv = launcher_argv(
-            "/path/to/zed",
+            "/path/to/fanta",
             vec![
                 LAUNCHER_FLAG,
                 validate_socket,
@@ -1444,7 +1444,7 @@ mod tests {
     #[test]
     fn test_wsl_helper_args_round_trip() {
         let argv = launcher_argv(
-            "/path/to/zed",
+            "/path/to/fanta",
             vec![
                 WSL_HELPER_FLAG,
                 "/usr/bin/bwrap",
@@ -1486,9 +1486,9 @@ mod tests {
 
     #[test]
     fn test_launcher_args_round_trip_no_bridge() {
-        let validate_socket = "/tmp/zed-sandbox-validate-1234-0.sock";
+        let validate_socket = "/tmp/fanta-sandbox-validate-1234-0.sock";
         let argv = launcher_argv(
-            "/path/to/zed",
+            "/path/to/fanta",
             vec![
                 LAUNCHER_FLAG,
                 validate_socket,
@@ -1517,13 +1517,13 @@ mod tests {
 
     #[test]
     fn test_wrap_invocation_uses_bridge_for_restricted_network() {
-        let socket = PathBuf::from("/tmp/zed-proxy.sock");
+        let socket = PathBuf::from("/tmp/fanta-proxy.sock");
         let permissions = SandboxPermissions {
             network: NetworkAccess::LocalhostPort(8080),
             allow_fs_write: false,
         };
         let args = build_wrapped_args_for_test(
-            "/path/to/zed",
+            "/path/to/fanta",
             permissions,
             "/bin/sh",
             &["-c".to_string(), "echo hi".to_string()],
@@ -1539,7 +1539,7 @@ mod tests {
         assert!(windows_contains(
             &args,
             &[
-                "/path/to/zed",
+                "/path/to/fanta",
                 LAUNCHER_FLAG,
                 LAUNCHER_NONE,
                 &sandbox_destination,
@@ -1594,7 +1594,7 @@ mod tests {
     /// Returns the in-sandbox destination of the proxy socket `--bind`, if any.
     fn proxy_socket_bind_destination(args: &[String]) -> Option<String> {
         args.windows(3).find_map(|window| {
-            if window[0] == "--bind" && window[1] == "/tmp/zed-proxy.sock" {
+            if window[0] == "--bind" && window[1] == "/tmp/fanta-proxy.sock" {
                 Some(window[2].clone())
             } else {
                 None

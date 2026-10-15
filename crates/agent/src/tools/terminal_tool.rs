@@ -375,7 +375,7 @@ fn terminal_initial_title(input: Result<String, serde_json::Value>) -> SharedStr
     }
 }
 
-/// Windows only: resolve the `(release channel, version)` of the Linux `zed` to
+/// Windows only: resolve the `(release channel, version)` of the Linux `fanta` to
 /// provision inside WSL as the sandbox helper. Dev (source) builds have no
 /// matching release, so they pull the latest nightly. Nightly builds also track
 /// `latest`: nightly assets are keyed by their full build metadata
@@ -384,7 +384,7 @@ fn terminal_initial_title(input: Result<String, serde_json::Value>) -> SharedStr
 /// running version (stripped of pre-release/build metadata, which the release
 /// API doesn't key on).
 #[cfg(target_os = "windows")]
-fn wsl_zed_release(cx: &App) -> Option<(String, String)> {
+fn wsl_fanta_release(cx: &App) -> Option<(String, String)> {
     use release_channel::{AppVersion, ReleaseChannel};
     match *release_channel::RELEASE_CHANNEL {
         ReleaseChannel::Dev | ReleaseChannel::Nightly => {
@@ -402,7 +402,7 @@ fn wsl_zed_release(cx: &App) -> Option<(String, String)> {
 
 /// Non-Windows platforms don't route through WSL, so there's no helper to fetch.
 #[cfg(not(target_os = "windows"))]
-fn wsl_zed_release(_cx: &App) -> Option<(String, String)> {
+fn wsl_fanta_release(_cx: &App) -> Option<(String, String)> {
     None
 }
 
@@ -420,7 +420,7 @@ async fn run_terminal_tool(
     let selection = input.selection;
     let sandbox_input = input.sandbox.clone().unwrap_or_default();
 
-    let (working_dir, authorize, sandboxing, is_local_project, wsl_zed_release) =
+    let (working_dir, authorize, sandboxing, is_local_project, wsl_fanta_release) =
         cx.update(|cx| {
             let working_dir =
                 working_dir(&input.cd, &project, cx).map_err(|err| err.to_string())?;
@@ -431,13 +431,13 @@ async fn run_terminal_tool(
             let sandboxing =
                 input.sandbox.is_some() && sandboxing_enabled_for_project(project.read(cx), cx);
             let is_local_project = project.read(cx).is_local();
-            let wsl_zed_release = wsl_zed_release(cx);
+            let wsl_fanta_release = wsl_fanta_release(cx);
             Result::<_, String>::Ok((
                 working_dir,
                 authorize,
                 sandboxing,
                 is_local_project,
-                wsl_zed_release,
+                wsl_fanta_release,
             ))
         })?;
 
@@ -650,7 +650,7 @@ async fn run_terminal_tool(
                 network: network_request_to_sandbox_network_access(&effective.network),
                 allow_fs_write: effective.allow_fs_write_all,
                 is_local: is_local_project,
-                wsl_zed_release: wsl_zed_release.clone(),
+                wsl_fanta_release: wsl_fanta_release.clone(),
             };
 
             // The viability check runs a brief probe subprocess, so do it off
