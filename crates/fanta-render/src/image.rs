@@ -12,8 +12,8 @@ use crate::color::to_sk_color;
 use crate::paint::apply_blend_mode;
 use fanta_doc::{AssetId, BlendMode, Color, ImageAdjust, ImageFitMode};
 use skia_safe::{
-    AlphaType, Canvas, ColorFilter, ColorType, Data, FilterMode, ImageInfo, Matrix, MipmapMode,
-    Paint, Rect, SamplingOptions, TileMode, canvas::SrcRectConstraint, images,
+    AlphaType, Canvas, ColorFilter, ColorType, FilterMode, ImageInfo, Matrix, MipmapMode, Paint,
+    Rect, SamplingOptions, TileMode, canvas::SrcRectConstraint, images,
 };
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -52,24 +52,21 @@ pub struct ImageFillMods {
 /// whose first draw is a fresh cache miss; the stale entry is simply never read
 /// again (and can be dropped via [`clear`] or [`remove`] if memory matters).
 ///
+/// With a byte budget (see [`set_budget_bytes`]), the least recently drawn
+/// assets are dropped once the cache holds more; a dropped asset is resolved
+/// again on its next draw.
+///
 /// [`clear`]: Self::clear
 /// [`remove`]: Self::remove
+/// [`set_budget_bytes`]: Self::set_budget_bytes
+#[derive(Default)]
 pub struct ImageCache {
     images: HashMap<AssetId, CachedImage>,
-    budget_bytes: usize,
+    budget_bytes: Option<usize>,
+    /// Bytes of every cached image and pyramid level.
     bytes: usize,
-    tick: u64,
-}
-
-impl Default for ImageCache {
-    fn default() -> Self {
-        Self {
-            images: HashMap::new(),
-            budget_bytes: usize::MAX,
-            bytes: 0,
-            tick: 0,
-        }
-    }
+    /// Draw counter: an entry's `last_drawn` orders evictions.
+    draws: u64,
 }
 
 /// One asset's cached images: the full-resolution upload plus its display
@@ -86,9 +83,9 @@ impl Default for ImageCache {
 /// (and re-mipped) them all: ~200 ms of a 458 ms frame at 10% zoom.
 ///
 /// `levels[i]` is the full image's own mip level `i+1`, copied out as a
-/// standalone image (see [`build_pyramid_level`]) with its own mip chain — so a
-/// level's chain IS the full image's chain from that level down, texel for
-/// texel. A minified draw picks the shallowest level
+/// standalone image (see [`build_pyramid_level`]) — so the mip chain Skia
+/// builds for a level IS the full image's chain from that level down, texel
+/// for texel. A minified draw picks the shallowest level
 /// whose texel density still meets the device's (see [`minification_level`])
 /// and samples that instead: the same texels a trilinear lookup into the full
 /// image's chain would read, but the upload is `1/4^level` the size, and the
@@ -98,12 +95,13 @@ impl Default for ImageCache {
 /// Zooming back in walks up to level 0 — the untouched full upload — so export
 /// / zoom-in fidelity is unchanged.
 struct CachedImage {
-    /// The full-resolution image (with default mipmaps).
+    /// The full-resolution image.
     full: skia_safe::Image,
     /// Display pyramid, contiguous from level 1: `levels[i]` = level `i + 1`.
     levels: Vec<skia_safe::Image>,
+    /// Bytes of `full` and `levels`.
     bytes: usize,
-    last_used: u64,
+    last_drawn: u64,
 }
 
 impl ImageCache {
@@ -112,38 +110,24 @@ impl ImageCache {
         Self::default()
     }
 
-    /// The cached full-resolution image for `id`, if already built. The hot
-    /// path: callers check this before resolving/decoding pixels at all, so a
-    /// cache hit never touches the asset resolver (see [`draw_image_cached`]).
+    /// Drop the least recently drawn assets whenever the cache holds more than
+    /// `bytes`; `None` keeps everything. The asset being drawn is always kept.
+    pub fn set_budget_bytes(&mut self, bytes: Option<usize>) {
+        self.budget_bytes = bytes;
+        self.evict_over_budget(None);
+    }
+
+    /// The cached full-resolution image for `id`, if already built, marked as
+    /// just drawn. The hot path: callers check this before resolving/decoding
+    /// pixels at all, so a cache hit never touches the asset resolver (see
+    /// [`draw_image_cached`]).
     fn get(&mut self, id: AssetId) -> Option<&skia_safe::Image> {
-        self.tick = self.tick.wrapping_add(1);
-        let cached = self.images.get_mut(&id)?;
-        cached.last_used = self.tick;
-        Some(&cached.full)
-    }
-
-    pub fn set_budget_bytes(&mut self, budget_bytes: usize) {
-        self.budget_bytes = budget_bytes;
-        self.evict_to_budget(0, None);
-    }
-
-    pub fn bytes(&self) -> usize {
-        self.bytes
-    }
-
-    fn evict_to_budget(&mut self, additional: usize, protected: Option<AssetId>) {
-        while self.bytes.saturating_add(additional) > self.budget_bytes {
-            let oldest = self
-                .images
-                .iter()
-                .filter(|(identity, _)| Some(**identity) != protected)
-                .min_by_key(|(identity, image)| (image.last_used, **identity))
-                .map(|(identity, _)| *identity);
-            let Some(oldest) = oldest else {
-                break;
-            };
-            self.remove(oldest);
-        }
+        self.draws += 1;
+        let draws = self.draws;
+        self.images.get_mut(&id).map(|cached| {
+            cached.last_drawn = draws;
+            &cached.full
+        })
     }
 
     /// Return the cached full-resolution image for `id`, building and
@@ -152,28 +136,30 @@ impl ImageCache {
     /// a `None` is *not* cached, so a buffer that becomes well-formed on a
     /// later frame can still upload.
     fn get_or_build(&mut self, id: AssetId, img: &DecodedImage) -> Option<&skia_safe::Image> {
-        self.tick = self.tick.wrapping_add(1);
-        if !self.images.contains_key(&id) {
+        use std::collections::hash_map::Entry;
+        // Build only on a genuine miss. The `Vacant` arm runs `build_sk_image`
+        // exactly once; a hit never builds. We deliberately do not use
+        // `or_insert_with` because building can *fail* (a malformed buffer), and
+        // a failed build must not insert a (sentinel) entry — so the miss arm
+        // bails with `?` and leaves the slot empty for a later well-formed frame.
+        self.draws += 1;
+        if let Entry::Vacant(e) = self.images.entry(id) {
             let full = build_sk_image(img)?;
-            let bytes = mipped_image_bytes(&full);
-            if bytes > self.budget_bytes {
-                return None;
-            }
-            self.evict_to_budget(bytes, None);
+            let bytes = raster_image_bytes(&full);
             self.bytes += bytes;
-            self.images.insert(
-                id,
-                CachedImage {
-                    full,
-                    levels: Vec::new(),
-                    bytes,
-                    last_used: self.tick,
-                },
-            );
+            e.insert(CachedImage {
+                full,
+                levels: Vec::new(),
+                bytes,
+                last_drawn: self.draws,
+            });
+            self.evict_over_budget(Some(id));
         }
-        let cached = self.images.get_mut(&id)?;
-        cached.last_used = self.tick;
-        Some(&cached.full)
+        let draws = self.draws;
+        self.images.get_mut(&id).map(|cached| {
+            cached.last_drawn = draws;
+            &cached.full
+        })
     }
 
     /// The display-pyramid image for `id` at `level` (`0` = the full image;
@@ -187,33 +173,49 @@ impl ImageCache {
     /// The returned handle is a refcount bump (`skia_safe::Image` is a shared
     /// pointer), so the borrow of the cache ends here.
     fn lod_level(&mut self, id: AssetId, level: u32) -> Option<skia_safe::Image> {
-        self.tick = self.tick.wrapping_add(1);
-        let mut cached = self.images.remove(&id)?;
-        cached.last_used = self.tick;
-        if level > 0 {
-            while cached.levels.len() < level as usize {
-                let Some(next) = build_pyramid_level(&cached.full, cached.levels.len() as u32 + 1)
-                else {
-                    break;
-                };
-                let bytes = mipped_image_bytes(&next);
-                self.evict_to_budget(bytes, Some(id));
-                if self.bytes.saturating_add(bytes) > self.budget_bytes {
-                    break;
-                }
-                self.bytes += bytes;
-                cached.bytes += bytes;
-                cached.levels.push(next);
-            }
+        let cached = self.images.get_mut(&id)?;
+        if level == 0 {
+            return Some(cached.full.clone());
         }
-        let index = (level as usize).min(cached.levels.len());
-        let image = if index == 0 {
+        let mut added = 0;
+        while cached.levels.len() < level as usize {
+            let Some(next) = build_pyramid_level(&cached.full, cached.levels.len() as u32 + 1)
+            else {
+                break;
+            };
+            added += raster_image_bytes(&next);
+            cached.levels.push(next);
+        }
+        cached.bytes += added;
+        let idx = (level as usize).min(cached.levels.len());
+        let image = if idx == 0 {
             cached.full.clone()
         } else {
-            cached.levels.get(index - 1)?.clone()
+            cached.levels[idx - 1].clone()
         };
-        self.images.insert(id, cached);
+        self.bytes += added;
+        self.evict_over_budget(Some(id));
         Some(image)
+    }
+
+    /// Drop the least recently drawn entries until the cache fits its budget,
+    /// keeping `keep`.
+    fn evict_over_budget(&mut self, keep: Option<AssetId>) {
+        let Some(budget) = self.budget_bytes else {
+            return;
+        };
+        while self.bytes > budget {
+            let Some(oldest) = self
+                .images
+                .iter()
+                .filter(|(id, _)| Some(**id) != keep)
+                .min_by_key(|(_, cached)| cached.last_drawn)
+                .map(|(id, _)| *id)
+            else {
+                return;
+            };
+            self.remove(oldest);
+        }
     }
 
     /// Drop every cached image. Call when assets are bulk-invalidated (a new
@@ -225,30 +227,29 @@ impl ImageCache {
 
     /// Drop a single asset's cached image. Returns whether an entry was present.
     pub fn remove(&mut self, id: AssetId) -> bool {
-        if let Some(image) = self.images.remove(&id) {
-            self.bytes = self.bytes.saturating_sub(image.bytes);
-            true
-        } else {
-            false
+        match self.images.remove(&id) {
+            Some(cached) => {
+                self.bytes -= cached.bytes;
+                true
+            }
+            None => false,
         }
     }
 
     /// Drop every cached image whose id is NOT in `keep`, returning how many
     /// were dropped. The asset garbage collector calls this alongside the
-    /// resolver's own retain — since the cached `SkImage` is the single
-    /// long-lived CPU copy of each asset's pixels, an orphaned entry here is
-    /// exactly the memory the GC exists to reclaim.
+    /// resolver's own retain, so an orphaned asset's pixels are reclaimed.
     pub fn retain(&mut self, keep: &std::collections::HashSet<AssetId>) -> usize {
         let before = self.images.len();
-        let removed: Vec<_> = self
-            .images
-            .keys()
-            .copied()
-            .filter(|id| !keep.contains(id))
-            .collect();
-        for identity in removed {
-            self.remove(identity);
-        }
+        let mut dropped = 0;
+        self.images.retain(|id, cached| {
+            let kept = keep.contains(id);
+            if !kept {
+                dropped += cached.bytes;
+            }
+            kept
+        });
+        self.bytes -= dropped;
         before - self.images.len()
     }
 
@@ -257,20 +258,16 @@ impl ImageCache {
         self.images.len()
     }
 
+    /// CPU bytes held by the cached images and their pyramid levels. Full
+    /// images share their pixels with the decodes they wrap.
+    pub fn retained_bytes(&self) -> usize {
+        self.bytes
+    }
+
     /// Whether the cache holds no images.
     pub fn is_empty(&self) -> bool {
         self.images.is_empty()
     }
-}
-
-fn mipped_image_bytes(image: &skia_safe::Image) -> usize {
-    let pixels = (image.width().max(0) as usize).saturating_mul(image.height().max(0) as usize);
-    let bytes = pixels.saturating_mul(4);
-    bytes.saturating_add(if image.has_mipmaps() {
-        bytes.div_ceil(3)
-    } else {
-        0
-    })
 }
 
 /// A source rectangle (in asset pixels) paired with the destination rectangle
@@ -404,21 +401,25 @@ fn build_sk_image(img: &DecodedImage) -> Option<skia_safe::Image> {
         None,
     );
     let row_bytes = info.min_row_bytes();
-    // new_copy hands Skia its own owned buffer — deliberately: this SkImage is
-    // the ONE long-lived CPU copy of the pixels (the resolver does not memoize
-    // decodes; see `draw_image_cached`), and an owned buffer keeps the
-    // lifetime story trivial. skia-safe offers no release-proc Data
-    // constructor, so zero-copy sharing of the resolver's Arc would be unsafe
-    // against Skia-internal refs outliving the cache entry.
-    let data = Data::new_copy(&img.pixels_rgba);
-    let image = images::raster_from_data(&info, data, row_bytes)?;
-    // Attach the default mip chain so a zoomed-out draw can sample trilinearly
-    // (see `blit_sk_image`) instead of aliasing over the full-res pixels. Built
-    // once here because the image is cached; ~1/3 extra memory per image. If
-    // Skia declines (`None`), the un-mipped image still draws — the minified
-    // path checks `has_mipmaps` before asking for mip sampling.
-    let mipped = image.with_default_mipmaps();
-    Some(mipped.unwrap_or(image))
+    // The image wraps the decode's own buffer: the resolver's cache and this
+    // image share one copy of the pixels.
+    //
+    // No mip chain is attached. A minified draw still samples trilinearly
+    // (see `blit_sk_image`): Skia's raster pipeline builds the chain on demand
+    // into its bounded resource cache, and a GPU upload builds it for the
+    // texture with the same filter, so the texels are the ones an attached
+    // chain would hold, without keeping a third more of every image resident.
+    images::raster_from_data(&info, img.data().clone(), row_bytes)
+}
+
+/// Pixel bytes of a raster image, plus a third for its mip chain if it has one.
+fn raster_image_bytes(image: &skia_safe::Image) -> usize {
+    let base = image.image_info().compute_min_byte_size();
+    if image.has_mipmaps() {
+        base + base / 3
+    } else {
+        base
+    }
 }
 
 /// The pyramid stops halving once either dimension would drop below this
@@ -432,9 +433,9 @@ pub(crate) const IMAGE_LOD_MIN_LEVEL_PX: i32 = 1;
 /// mip level `level` and lands every device pixel centre on that level's texel
 /// centres (for even dimensions; the odd remainder is at most a one-texel
 /// drift in the last row/column of a deep level, as Skia's own chain shrinks
-/// with `dim >> 1`). The level then carries its own default mip chain, which
-/// Skia builds from those very texels — so a minified draw of the level reads
-/// exactly the texels a trilinear lookup into `full`'s chain would. `None`
+/// with `dim >> 1`). A minified draw of the level samples a chain Skia builds
+/// from those very texels — so it reads exactly the texels a trilinear lookup
+/// into `full`'s chain would. `None`
 /// when the level's dimensions would fall below [`IMAGE_LOD_MIN_LEVEL_PX`], or
 /// if Skia cannot allocate the surface.
 fn build_pyramid_level(full: &skia_safe::Image, level: u32) -> Option<skia_safe::Image> {
@@ -468,8 +469,7 @@ fn build_pyramid_level(full: &skia_safe::Image, level: u32) -> Option<skia_safe:
         SamplingOptions::new(FilterMode::Nearest, MipmapMode::Nearest),
         &paint,
     );
-    let level = surface.image_snapshot();
-    Some(level.with_default_mipmaps().unwrap_or(level))
+    Some(surface.image_snapshot())
 }
 
 /// Skia's mip-level bias: `SkMipmap::ComputeLevel` selects the level pair
@@ -718,6 +718,7 @@ pub fn draw_decoded_image(
         tint,
         opacity,
         ImageFillMods::default(),
+        true,
     )
 }
 
@@ -786,7 +787,7 @@ pub fn draw_image_cached(
         },
     };
     blit_sk_image(
-        canvas, &sk_image, nat_w, nat_h, local_size, crop, fit, tint, opacity, mods,
+        canvas, &sk_image, nat_w, nat_h, local_size, crop, fit, tint, opacity, mods, true,
     )
 }
 
@@ -842,6 +843,10 @@ fn draw_device_scale(
 /// realized here as a canvas rotation mapping the rotated frame onto the dst
 /// rect — the fit then runs against the frame's SWAPPED dimensions for 90/270°
 /// so cover/contain crops exactly like Figma's rotated fill.
+///
+/// `mip_sampling` allows minified draws to sample through a mip chain: true
+/// for raster images, whose chain Skia builds on demand; a texture without
+/// mips (a video frame) passes whether it has them.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn blit_sk_image(
     canvas: &Canvas,
@@ -854,6 +859,7 @@ pub(crate) fn blit_sk_image(
     tint: Option<Color>,
     opacity: f32,
     mods: ImageFillMods,
+    mip_sampling: bool,
 ) -> bool {
     let quarter = quarter_turns(mods.rotation);
     if quarter != 0 {
@@ -895,6 +901,7 @@ pub(crate) fn blit_sk_image(
                 rotation: None,
                 ..mods
             },
+            mip_sampling,
         );
         canvas.restore();
         return drawn;
@@ -918,7 +925,7 @@ pub(crate) fn blit_sk_image(
         // so a repeated texture doesn't shimmer; the plain linear tile
         // sampling is kept at magnification, where mip level 0 is all a
         // trilinear lookup would read anyway.
-        let sampling = if sk_image.has_mipmaps() && max_device_scale(canvas) < 1.0 {
+        let sampling = if mip_sampling && max_device_scale(canvas) < 1.0 {
             SamplingOptions::new(FilterMode::Linear, MipmapMode::Linear)
         } else {
             SamplingOptions::from(FilterMode::Linear)
@@ -958,7 +965,7 @@ pub(crate) fn blit_sk_image(
     // false negative merely keeps the conservative path.
     let src_is_whole_image = src == Rect::from_wh(nat_w as f32, nat_h as f32);
 
-    if src_is_whole_image && sk_image.has_mipmaps() && device_scale < 1.0 {
+    if src_is_whole_image && mip_sampling && device_scale < 1.0 {
         // Minified whole-image draw: sample trilinearly so a zoomed-out photo
         // averages its pixels instead of aliasing. Skia's raster pipeline
         // ignores mip levels under a Strict constraint (verified empirically),
@@ -1051,37 +1058,6 @@ fn draw_tiled(
 mod tests {
     use super::*;
 
-    #[test]
-    fn uploaded_image_budget_evicts_old_entries_and_rejects_oversized_retention() {
-        let mut cache = ImageCache::new();
-        cache.set_budget_bytes(48);
-        let first = AssetId::new();
-        let second = AssetId::new();
-        assert!(
-            cache
-                .get_or_build(first, &solid_image(2, 2, [255, 0, 0, 255]))
-                .is_some()
-        );
-        assert!(
-            cache
-                .get_or_build(second, &solid_image(2, 2, [0, 0, 255, 255]))
-                .is_some()
-        );
-        assert!(cache.bytes() <= 48);
-        cache.set_budget_bytes(24);
-        assert!(cache.get(first).is_none());
-        assert!(cache.get(second).is_some());
-        assert!(
-            cache
-                .get_or_build(AssetId::new(), &solid_image(4, 4, [0, 0, 255, 255]))
-                .is_none()
-        );
-        assert!(cache.bytes() <= 24);
-        cache.clear();
-        assert_eq!(cache.bytes(), 0);
-    }
-    use std::sync::Arc;
-
     const EPS: f32 = 1e-3;
 
     fn approx(a: [f32; 4], b: [f32; 4]) -> bool {
@@ -1094,7 +1070,7 @@ mod tests {
         for _ in 0..(w * h) {
             px.extend_from_slice(&rgba);
         }
-        DecodedImage::new(Arc::new(px), w, h)
+        DecodedImage::new(&px, w, h)
     }
 
     #[test]
@@ -1139,7 +1115,7 @@ mod tests {
         let mut cache = ImageCache::new();
         let id = AssetId::new();
         // len 7 != 2*2*4 → build_sk_image returns None and nothing is cached.
-        let bad = DecodedImage::new(Arc::new(vec![0u8; 7]), 2, 2);
+        let bad = DecodedImage::new(&[0u8; 7], 2, 2);
         assert!(cache.get_or_build(id, &bad).is_none());
         assert_eq!(cache.len(), 0, "a malformed buffer is not cached");
         // It can later succeed once a well-formed buffer for the id arrives.
@@ -1169,6 +1145,34 @@ mod tests {
     }
 
     #[test]
+    fn cache_drops_the_least_recently_drawn_images_past_its_budget() {
+        let mut cache = ImageCache::new();
+        let (a, b, c) = (AssetId::new(), AssetId::new(), AssetId::new());
+        let image = solid_image(4, 4, [1, 2, 3, 255]);
+        let one = 4 * 4 * 4;
+        cache.set_budget_bytes(Some(2 * one));
+        cache.get_or_build(a, &image).expect("a builds");
+        cache.get_or_build(b, &image).expect("b builds");
+        // Drawing `a` again makes `b` the least recently drawn.
+        assert!(cache.get(a).is_some());
+        cache.get_or_build(c, &image).expect("c builds");
+        assert!(
+            cache.get(b).is_none(),
+            "the least recently drawn image goes"
+        );
+        assert!(cache.get(a).is_some() && cache.get(c).is_some());
+        assert_eq!(cache.retained_bytes(), 2 * one);
+
+        // The image being drawn stays even when it alone exceeds the budget.
+        cache.set_budget_bytes(Some(one / 2));
+        assert_eq!(cache.len(), 0);
+        cache.get_or_build(a, &image).expect("a builds");
+        assert_eq!(cache.len(), 1);
+        cache.remove(a);
+        assert_eq!(cache.retained_bytes(), 0);
+    }
+
+    #[test]
     fn cache_retain_drops_only_unreferenced_images() {
         let mut cache = ImageCache::new();
         let a = AssetId::new();
@@ -1184,15 +1188,21 @@ mod tests {
     }
 
     #[test]
-    fn cached_image_carries_mipmaps_for_minified_sampling() {
+    fn cached_image_wraps_the_decoded_pixels_without_a_copy_or_a_resident_mip_chain() {
         let mut cache = ImageCache::new();
         let id = AssetId::new();
         let img = solid_image(4, 4, [10, 20, 30, 255]);
-        let has_mips = cache
-            .get_or_build(id, &img)
-            .expect("well-formed builds")
-            .has_mipmaps();
-        assert!(has_mips, "the cache should attach a default mip chain");
+        let built = cache.get_or_build(id, &img).expect("well-formed builds");
+        let pixels = built.peek_pixels().expect("a raster image");
+        assert_eq!(
+            pixels.addr().cast::<u8>(),
+            img.pixels().as_ptr(),
+            "the cached image must share the decode's buffer"
+        );
+        assert!(
+            !built.has_mipmaps(),
+            "minified draws build their chain on demand instead of keeping one per image"
+        );
     }
 
     #[test]
@@ -1210,7 +1220,7 @@ mod tests {
                 px.extend_from_slice(&[v, v, v, 255]);
             }
         }
-        let img = DecodedImage::new(Arc::new(px), size, size);
+        let img = DecodedImage::new(&px, size, size);
 
         let dst = 7;
         let mut surface = skia_safe::surfaces::raster_n32_premul((dst, dst)).expect("surface");
@@ -1297,8 +1307,8 @@ mod tests {
         let l1 = cache.lod_level(id, 1).unwrap();
         assert_eq!((l1.width(), l1.height()), (20, 12));
         assert!(
-            l1.has_mipmaps() && l2.has_mipmaps(),
-            "levels carry their own mip chain"
+            !l1.has_mipmaps() && !l2.has_mipmaps(),
+            "levels keep no resident mip chain; minified draws build one on demand"
         );
         // A repeat request is a hit: same handle, nothing rebuilt.
         assert_eq!(cache.lod_level(id, 2).unwrap().unique_id(), l2.unique_id());
@@ -1327,7 +1337,7 @@ mod tests {
                 px.extend_from_slice(&[r, g, b, 255]);
             }
         }
-        DecodedImage::new(Arc::new(px), size, size)
+        DecodedImage::new(&px, size, size)
     }
 
     /// Draw `img` (asset `id`, cached in `cache` if `Some`, else the uncached
@@ -1395,7 +1405,7 @@ mod tests {
                             px.extend_from_slice(&[v, v, v, 255]);
                         }
                     }
-                    DecodedImage::new(Arc::new(px), size, size)
+                    DecodedImage::new(&px, size, size)
                 }),
             ] {
                 let id = AssetId::new();
@@ -1453,7 +1463,7 @@ mod tests {
                 px.extend_from_slice(&c);
             }
         }
-        let img = DecodedImage::new(Arc::new(px), w, h);
+        let img = DecodedImage::new(&px, w, h);
         // Cover-fit into a 100×100 local square: the crop takes the middle
         // 100 px of the 200 wide asset (x 50..150), so the boundary sits at
         // 70% of the destination. Drawn at 0.2×: a 20×20 device square, the

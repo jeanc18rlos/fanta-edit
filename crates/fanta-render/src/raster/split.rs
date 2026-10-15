@@ -653,7 +653,7 @@ impl<'inputs> SplitSpec<'inputs> {
         let expected_len = (image.width as usize)
             .checked_mul(image.height as usize)
             .and_then(|pixels| pixels.checked_mul(4));
-        if image.width == 0 || image.height == 0 || expected_len != Some(image.pixels_rgba.len()) {
+        if image.width == 0 || image.height == 0 || expected_len != Some(image.pixels().len()) {
             return Err(SplitError::UnresolvedAsset(asset));
         }
         self.assets.0.insert(asset, image);
@@ -898,6 +898,26 @@ impl RetainedGraphiteContext {
             state.failed = true;
         }
         result
+    }
+
+    /// Lends the context and recorder for native calls skia-safe does not
+    /// wrap, such as Graphite's cache budgets and cleanup.
+    pub fn with_native<R>(
+        &mut self,
+        use_native: impl FnOnce(
+            &mut skia_safe::gpu::graphite::Context,
+            &mut skia_safe::gpu::graphite::Recorder,
+        ) -> R,
+    ) -> Result<R, RetainedError> {
+        let mut state = self
+            .state
+            .try_borrow_mut()
+            .map_err(|_| RetainedError::UnsupportedBackend)?;
+        state.ensure_available()?;
+        let RetainedGraphiteState {
+            recorder, context, ..
+        } = &mut *state;
+        Ok(use_native(context, recorder))
     }
 
     fn ensure_available(&self) -> Result<(), RetainedError> {
@@ -1380,7 +1400,7 @@ impl RetainedTranslationSession {
             .0
             .values()
             .try_fold(0usize, |total, image| {
-                total.checked_add(image.pixels_rgba.len())
+                total.checked_add(image.pixels().len())
             })
             .ok_or(RetainedError::MemoryLimit { limit: byte_limit })?;
         let retained_bytes = surface_bytes
@@ -1619,7 +1639,7 @@ impl RetainedTranslationSession {
                 .ok_or(RetainedError::ChangedAsset(*asset))?;
             if current.width != frozen.width
                 || current.height != frozen.height
-                || !Arc::ptr_eq(&current.pixels_rgba, &frozen.pixels_rgba)
+                || !current.shares_pixels(frozen)
             {
                 return Err(RetainedError::ChangedAsset(*asset));
             }
@@ -1893,7 +1913,7 @@ mod tests {
         impl AssetResolver for Resolver {
             fn resolve(&self, _: AssetId) -> Option<DecodedImage> {
                 self.0.fetch_add(1, Ordering::Relaxed);
-                Some(DecodedImage::new(Arc::new(vec![255; 4]), 1, 1))
+                Some(DecodedImage::new(&[255; 4], 1, 1))
             }
         }
         let mut scene = Scene::new();
@@ -2869,7 +2889,7 @@ mod retained_storage_tests {
 
             let asset = AssetId::new();
             let mut resolver = crate::asset::InMemoryAssetResolver::new();
-            resolver.insert(asset, DecodedImage::new(Arc::new(pixels), 64, 64));
+            resolver.insert(asset, DecodedImage::new(&pixels, 64, 64));
             let resolver = Arc::new(resolver);
             let mut scene = Scene::new();
             let page = scene

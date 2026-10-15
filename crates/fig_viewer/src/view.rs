@@ -49,7 +49,7 @@ use smallvec::SmallVec;
 use ui::{ContextMenu, ContextMenuEntry, Divider, IconPosition, PopoverMenu, Tooltip, prelude::*};
 use util::{ResultExt, paths::PathExt};
 use workspace::{
-    ItemSettings, MultiWorkspace, Pane, Toast,
+    ItemSettings, MultiWorkspace, Pane, Toast, Workspace,
     item::{Item, ItemEvent, ProjectItem, SaveOptions, TabContentParams},
     notifications::{NotificationId, save_io_error_detail},
 };
@@ -23375,7 +23375,7 @@ impl FigView {
 
 /// One id shared by every canvas notice, so a second click replaces the
 /// standing message instead of stacking a queue of them.
-const CANVAS_NOTICE_ID: &str = "fanta-canvas-notice";
+pub(crate) const CANVAS_NOTICE_ID: &str = "fanta-canvas-notice";
 
 /// How many selected layers a toolbar Agent prompt lists by id.
 #[cfg(feature = "fanta-gpui-ui")]
@@ -23418,8 +23418,26 @@ fn toolbar_agent_prompt_template(
 /// panels) emit intents for far more affordances than this build implements.
 /// Every one of those routes through here, because a click that only produces
 /// a log line is indistinguishable from a broken button.
+///
+/// Code that is already updating the workspace uses
+/// [`show_workspace_canvas_notice`] instead.
 pub(crate) fn show_canvas_notice(message: String, window: &mut Window, cx: &mut App) {
     show_workspace_toast(CANVAS_NOTICE_ID, message, true, window, cx);
+}
+
+/// [`show_canvas_notice`] for a workspace action handler or a
+/// `workspace.update` closure: finding the window's workspace and updating it
+/// again from there would panic, because GPUI leases an entity to one update
+/// at a time.
+pub(crate) fn show_workspace_canvas_notice(
+    workspace: &mut Workspace,
+    message: String,
+    cx: &mut Context<Workspace>,
+) {
+    workspace.show_toast(
+        Toast::new(NotificationId::named(CANVAS_NOTICE_ID.into()), message).autohide(),
+        cx,
+    );
 }
 
 fn show_workspace_toast(

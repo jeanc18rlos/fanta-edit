@@ -358,7 +358,7 @@ impl PresentSession {
     }
 
     pub fn set_render_cache_budgets(&mut self, image_bytes: usize, effect_bytes: usize) {
-        self.renderer.set_image_cache_budget_bytes(image_bytes);
+        self.renderer.set_image_cache_budget_bytes(Some(image_bytes));
         self.renderer.set_layer_cache_budget_bytes(effect_bytes);
     }
 

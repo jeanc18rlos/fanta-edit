@@ -243,10 +243,6 @@ if [[ "$app_store" = true ]]; then
         exit 1
     fi
     if [[ "$app_store_ad_hoc" != true ]]; then
-        if [[ -z "${FANTA_REVENUECAT_PUBLIC_API_KEY:-}" ]]; then
-            echo "A release Mac App Store build requires FANTA_REVENUECAT_PUBLIC_API_KEY."
-            exit 1
-        fi
         if [[ -z "${MACOS_APP_STORE_PROVISIONING_PROFILE:-}" || ! -f "${MACOS_APP_STORE_PROVISIONING_PROFILE:-}" ]]; then
             echo "A release Mac App Store build requires MACOS_APP_STORE_PROVISIONING_PROFILE to name an existing .provisionprofile file."
             exit 1
@@ -349,10 +345,6 @@ target_triple=$host_target_triple
 if [[ $# -gt 0 && -n "$1" ]]; then
     target_triple="$1"
 fi
-if [[ "$app_store" = true && "$target_triple" != "$host_target_triple" ]]; then
-    echo "Mac App Store builds require a native host target because the RevenueCat bridge is built with SwiftPM."
-    exit 1
-fi
 arch_suffix=""
 
 if [[ "$target_triple" = "x86_64-apple-darwin" ]]; then
@@ -450,16 +442,6 @@ if [[ -f "${document_icon_source}" ]]; then
     cp "${document_icon_source}" "${document_icon_target}"
 else
     echo "cargo::warning=Missing ${document_icon_source}; macOS document icons may not appear in Finder."
-fi
-
-if [[ "$app_store" = true ]]; then
-    ./crates/fanta_revenuecat/bundle-native.sh "$app_path"
-    revenuecat_license="target/revenuecat-swift/checkouts/purchases-ios-spm/LICENSE"
-    if [[ ! -s "$revenuecat_license" ]]; then
-        echo "The RevenueCat SDK license was not found in the resolved SwiftPM checkout: $revenuecat_license"
-        exit 1
-    fi
-    cp "$revenuecat_license" "${app_path}/Contents/Resources/RevenueCat-LICENSE.txt"
 fi
 
 signing_keychain_directory=""

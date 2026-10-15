@@ -425,7 +425,7 @@ impl Player {
             {
                 renderer.background = color;
             }
-            renderer.set_image_cache_budget_bytes(64 * 1024 * 1024);
+            renderer.set_image_cache_budget_bytes(Some(64 * 1024 * 1024));
             renderer.set_layer_cache_budget_bytes(64 * 1024 * 1024);
             self.renderer = Some(renderer);
         }

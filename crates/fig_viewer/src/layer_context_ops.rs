@@ -1416,10 +1416,10 @@ mod tests {
     fn layer_menu_delete_nested_masters_preserves_survivor_pixels_and_undo() {
         let (mut doc, outer, survivor, asset) = nested_component_delete_fixture(false);
         let mut resolver = fanta_render::InMemoryAssetResolver::new();
-        let bytes = std::sync::Arc::new(vec![
+        let bytes = [
             255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 128, 255, 255, 0, 200,
-        ]);
-        resolver.insert(asset, fanta_render::DecodedImage::new(bytes.clone(), 2, 2));
+        ];
+        resolver.insert(asset, fanta_render::DecodedImage::new(&bytes, 2, 2));
         let resolver = std::sync::Arc::new(resolver);
         let pixels = |doc: &Doc| {
             let mut renderer = fanta_render::RasterRenderer::new(128, 128).expect("renderer");
@@ -1463,9 +1463,8 @@ mod tests {
             assert_eq!(
                 fanta_render::AssetResolver::resolve(resolver.as_ref(), asset)
                     .expect("asset")
-                    .pixels_rgba
-                    .as_ref(),
-                bytes.as_ref()
+                    .pixels(),
+                bytes.as_slice()
             );
         });
     }
@@ -1494,11 +1493,7 @@ mod tests {
             let mut resolver = fanta_render::InMemoryAssetResolver::new();
             resolver.insert(
                 asset,
-                fanta_render::DecodedImage::new(
-                    std::sync::Arc::new([0, 0, 255, 255].repeat(4)),
-                    2,
-                    2,
-                ),
+                fanta_render::DecodedImage::new(&[0, 0, 255, 255].repeat(4), 2, 2),
             );
             let resolver = std::sync::Arc::new(resolver);
             let pixels = |doc: &Doc| {

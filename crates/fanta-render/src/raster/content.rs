@@ -474,6 +474,7 @@ fn paint_video(canvas: &Canvas, v: &VideoNode, scene_id: Option<NodeId>, ctx: &m
             None,
             1.0,
             super::ImageFillMods::default(),
+            image.has_mipmaps(),
         );
         canvas.restore();
         showing_frame = drawn;

@@ -172,7 +172,7 @@ impl SnapshotAssets {
                         .all(|value| value <= MAX_IMAGE_DIMENSION)
                 })
                 .ok_or(SamplingError::InvalidAsset(*id))?;
-            if expected != image.pixels_rgba.len() {
+            if expected != image.pixels().len() {
                 return Err(SamplingError::InvalidAsset(*id));
             }
             bytes = bytes
@@ -719,7 +719,7 @@ mod tests {
     }
 
     fn image(color: [u8; 4]) -> DecodedImage {
-        DecodedImage::new(Arc::new(color.to_vec()), 1, 1)
+        DecodedImage::new(&color, 1, 1)
     }
 
     #[test]
@@ -727,18 +727,16 @@ mod tests {
         let (mut doc, page) = document();
         let asset = AssetId::new();
         let shape = insert(&mut doc, page, bitmap(asset));
-        let mut pixels = image([255, 0, 0, 255]);
         let first = ArtworkSamplingRequest::new(
             doc.clone_for_persist(),
-            BTreeMap::from([(asset, pixels.clone())]),
+            BTreeMap::from([(asset, image([255, 0, 0, 255]))]),
             page,
             test_geometry(),
         )
         .expect("first");
-        Arc::make_mut(&mut pixels.pixels_rgba).copy_from_slice(&[0, 0, 255, 255]);
         let second = ArtworkSamplingRequest::new(
             doc.clone_for_persist(),
-            BTreeMap::from([(asset, pixels)]),
+            BTreeMap::from([(asset, image([0, 0, 255, 255]))]),
             page,
             test_geometry(),
         )
@@ -787,15 +785,15 @@ mod tests {
     fn sampling_invalid_and_over_budget_asset_snapshots_are_explicit_errors() {
         let id = AssetId::new();
         for malformed in [
-            DecodedImage::new(Arc::new(vec![0; 3]), 1, 1),
-            DecodedImage::new(Arc::new(Vec::new()), 0, 0),
-            DecodedImage::new(Arc::new(Vec::new()), u32::MAX, 1),
+            DecodedImage::new(&[0; 3], 1, 1),
+            DecodedImage::new(&Vec::new(), 0, 0),
+            DecodedImage::new(&Vec::new(), u32::MAX, 1),
         ] {
             assert!(
                 matches!(SnapshotAssets::new(BTreeMap::from([(id, malformed)])), Err(SamplingError::InvalidAsset(found)) if found == id)
             );
         }
-        let shared = DecodedImage::new(Arc::new(vec![0; 1024 * 1024]), 512, 512);
+        let shared = DecodedImage::new(&vec![0; 1024 * 1024], 512, 512);
         let images = (0..257)
             .map(|index| (AssetId::from_u128(index), shared.clone()))
             .collect();
