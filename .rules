@@ -1,6 +1,6 @@
 # Fanta Edit
 
-Fanta is a macOS design editor built as a fork of Zed. Package `zed` builds the `fanta` binary; most inherited IDE features are compiled out. When touching inherited Zed code, prefer upstream-compatible seams over rewrites.
+Fanta is a macOS design editor built as a fork of Zed. The `fanta` package builds the app; most inherited IDE features are compiled out. When touching inherited Zed code, prefer upstream-compatible seams over rewrites.
 
 | Area | Crates |
 | --- | --- |
@@ -13,7 +13,7 @@ Fanta is a macOS design editor built as a fork of Zed. Package `zed` builds the 
 | Agent seam and built-in canvas tools | `crates/design_surface`, `crates/agent/src/tools/design_*` |
 | Shared Fanta UI | `crates/fanta_ui` |
 
-GPUI and the reusable Zed UI crates are not in this repository. They come from `squidred-dev/fanta-ui`, pinned by git revision in `Cargo.toml`; read their source under `~/.cargo/git/checkouts/fanta-ui-*/<rev>/crates/`. `vendor/skia-bindings-0.153.3` carries Fanta's Graphite shim (see its `FANTA-PROVENANCE.txt`).
+GPUI and the reusable UI crates are not in this repository. They come from `squidred-dev/fanta-ui`, pinned by git revision in `Cargo.toml`; read their source under `~/.cargo/git/checkouts/fanta-ui-*/<rev>/crates/`. `vendor/skia-bindings-0.153.3` carries Fanta's Graphite shim (see its `FANTA-PROVENANCE.txt`).
 
 ## Crate rules
 
@@ -30,7 +30,7 @@ Crate rules record traps that earlier changes hit. Claude Code loads them when i
 ## Build, test and verify
 
 - Build in this checkout's own `target/` (Cargo's default). In a worktree, never point `CARGO_TARGET_DIR` or `--target-dir` at the main checkout's `target/`: the user's editor builds there, and you will wait on its lock. A fresh checkout compiles Skia from source (upstream prebuilt binaries lack the Graphite shim), so start the first build in the background.
-- Scope commands to what you touched: `cargo test --locked -p <crate> [filter]`, `cargo check --locked -p zed -p cli` for the app, `./script/clippy -p <crate>` for lints (same flags as CI). Without `-p`, `./script/clippy` runs a full-workspace release build that takes over 20 minutes.
+- Scope commands to what you touched: `cargo test --locked -p <crate> [filter]`, `cargo check --locked -p fanta -p cli` for the app, `./script/clippy -p <crate>` for lints (same flags as CI). Without `-p`, `./script/clippy` runs a full-workspace release build that takes over 20 minutes.
 - `./script/verify-fanta-release --list` prints the release suites (engine, import, source-order, editor, workspace, ui, build, lint). Run the stages that cover your change before calling it verified; the `fanta-verify` skill maps changes to stages, probes and smoke tests.
 - CI (`.github/workflows/check.yml`) requires 51 editor and workspace regressions by exact test name. If you rename or delete one of those tests, update the list in `check.yml` in the same change.
 - Regenerate golden images (`FANTA_REGEN_GOLDEN`, `UPDATE_BASELINE`) only when the user asks: a regenerated baseline turns a visual regression into a pass.

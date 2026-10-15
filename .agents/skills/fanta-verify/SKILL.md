@@ -19,10 +19,10 @@ Run the narrowest check that exercises the change, then the release stage that c
 | `fanta_ui` | stage `ui`; stage `visual` compares UI images and needs a macOS desktop |
 | Built-in agent canvas tools or prompts | `cargo test --locked -p agent --lib test_fanta_specs` and `test_design_progress` (both CI gates) |
 | Live MCP server or agent surface | the agent tests above, plus `script/smoke-mcp` against a running app (below) |
-| Anything compiled into the app | stage `build` (`cargo check --locked -p zed -p cli`) |
+| Anything compiled into the app | stage `build` (`cargo check --locked -p fanta -p cli`) |
 | Lints | `./script/clippy -p <crate>`; stage `lint` covers the release crates |
 | Packaging scripts | `bash -n <script>`, `python3 script/test-macos-release`, `./script/check-licenses` |
-| `mac_app_store` code paths | `cargo check --locked -p zed --features mac_app_store`, plus the matching tests in the `mac-app-store-runtime` job of `check.yml` |
+| `mac_app_store` code paths | `cargo check --locked -p fanta --features mac_app_store`, plus the matching tests in the `mac-app-store-runtime` job of `check.yml` |
 
 `./script/verify-fanta-release --list` prints each stage's exact command. `--stage <name>` (repeatable) runs stages and writes logs plus `results.tsv` under `target/release-verification`. The script does not validate an installer, drive the full app, contact production services or run ignored benchmarks, and it refuses to run while golden-regeneration variables are set.
 

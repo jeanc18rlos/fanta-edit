@@ -13,7 +13,7 @@ Workflow "Build macOS release" (`.github/workflows/release-macos.yml`):
 
 - `workflow_dispatch` inputs: `distribution` (`developer-id` or `app-store`), `signed` (sign and notarize; needs the Apple secrets), `build_diagnostics`.
 - Notarization is required whenever the workflow runs on a tag, even with `signed=false`. Dispatch unsigned test builds on a branch.
-- A pushed tag must equal `v<version>` from `crates/zed/Cargo.toml`, and creates a draft GitHub release.
+- A pushed tag must equal `v<version>` from `crates/fanta/Cargo.toml`, and creates a draft GitHub release.
 - Artifacts: `fanta-macos-aarch64-notarized` (or `fanta-macos-aarch64-test-only`) with `Fanta-aarch64.dmg` and `SHA256SUMS.txt`; crash symbols `fanta-symbols-aarch64-<commit>` (`fanta.dwarf`, kept 90 days); DMG verification evidence.
 
 Locally, `./script/bundle-mac aarch64-apple-darwin` builds the DMG and `fanta.dwarf` (`-i` installs it into `/Applications`; `-s` builds the Mac App Store variant instead). Local notarization needs `FANTA_REQUIRE_NOTARIZATION=true` and either a notarytool keychain profile (`APPLE_NOTARIZATION_KEYCHAIN_PROFILE`) or the API key variables. A local bundle does not establish that the public installer works.

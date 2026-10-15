@@ -5,7 +5,7 @@ description: Investigate and fix a Fanta crash, panic or hang from a macOS crash
 
 # Fanta crash investigation and fix
 
-Fanta does not upload crash reports (`"diagnostics": false`; see `docs/fanta/disabled-services-binnacle.md`). The Sentry upload in `script/bundle-mac` is inherited from Zed and targets Zed's organization; do not use it.
+Fanta does not upload crash reports (`"diagnostics": false`; see `docs/fanta/disabled-services-binnacle.md`). The Sentry upload step in `script/bundle-mac` runs only when `SENTRY_AUTH_TOKEN` is set, and Fanta has no crash ingestion yet; symbolicate from the release's symbol artifact instead.
 
 ## 1. Gather the report
 
