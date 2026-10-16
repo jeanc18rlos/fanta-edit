@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Creates Fanta's release-signing key pair, once. Run it on your own Mac:
+#
+#   script/update-signing-key
+#
+# The private key stays in ~/.config/fanta/update-signing-key.pem (mode 600) and in the
+# FANTA_UPDATE_SIGNING_KEY Actions secret, which the release workflow signs updates with. The public
+# key goes into crates/auto_update/release-signing-key.pub; commit it, and every build after that
+# checks updates against it. Keep a backup of the private key: without it, installed copies can't
+# be updated in place any more.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+key="${FANTA_UPDATE_SIGNING_KEY_FILE:-$HOME/.config/fanta/update-signing-key.pem}"
+
+uv run --quiet script/update_signing.py keygen \
+  --private-key "$key" --public-key-file crates/auto_update/release-signing-key.pub
+
+echo "Public key: crates/auto_update/release-signing-key.pub (commit it)."
+echo "Private key: $key (back it up somewhere safe)."
+echo "Give the release workflow the private key:"
+echo "  gh secret set FANTA_UPDATE_SIGNING_KEY --repo jeanc18rlos/fanta-edit < \"$key\""

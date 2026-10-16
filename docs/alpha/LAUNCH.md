@@ -235,13 +235,41 @@ Clone/push/fetch/pull regressions also passed against the packaged Git. This
 does not replace Developer ID signing, notarization, or a clean-Mac installer
 check.
 
-Packaged alpha builds use manual DMG updates. Automatic update checks are
-disabled, and the default menus and command palette do not expose a
-**Check for Updates** command. Keep automatic updates disabled until the installer’s mounted
-volume name, prerelease comparison, and compiled release-channel selection
-are corrected and an end-to-end upgrade passes. On-demand SSH remote-server
-downloads are separate; this first Apple Silicon workflow has no verified
-SSH remote-server artifact.
+From 1.1.0, Developer ID builds update in place, like Claude's and Codex's
+desktop apps. They check the release feed every hour, download the new DMG in
+the background, and install it only if two checks pass:
+- `crates/auto_update/src/verify.rs` finds the release key's signature over
+  `fanta-update-v1:{asset}:{version}:{sha256}`;
+- the new app passes strict `codesign` verification for the running app's
+  Apple team.
+
+The title bar then offers **Restart to Update**. The 1.0.0 alpha was built with
+updates disabled, so its users install 1.1.0 from the DMG once.
+
+The installer's mount point is now read from `hdiutil`, pre-release versions
+compare correctly, and release builds compile in the channel `script/bundle-mac`
+selects. On-demand SSH remote-server downloads are separate; this first Apple
+Silicon workflow has no verified SSH remote-server artifact.
+
+**One-time setup:**
+1. Run `script/update-signing-key` on your Mac, then commit
+   `crates/auto_update/release-signing-key.pub`.
+2. Store the private key as the `FANTA_UPDATE_SIGNING_KEY` Actions secret (the
+   script prints the `gh secret set` command).
+3. Add the notarization secrets (`MACOS_SIGNING_IDENTITY`,
+   `APPLE_NOTARIZATION_KEY`, `APPLE_NOTARIZATION_KEY_ID`,
+   `APPLE_NOTARIZATION_ISSUER_ID`).
+
+Tag builds fail until the key is in place.
+
+**Each release:**
+1. Push the `v*` tag.
+2. Check the draft. It carries `Fanta-aarch64.dmg`, `Fanta-aarch64.dmg.sig` and
+   `SHA256SUMS.txt`.
+3. Publish it as a full release, not a pre-release. The backend's feed
+   (`/releases/stable/latest/asset`) serves the newest published row of its
+   `releases` table, or, with `GITHUB_RELEASES_REPO=jeanc18rlos/fanta-edit`
+   set, GitHub's latest full release.
 
 A `v*` tag must match the version in `crates/fanta/Cargo.toml`. Successful tag
 builds prepare a **draft** GitHub release. Publish only after checking the DMG
