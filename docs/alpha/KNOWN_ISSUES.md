@@ -608,11 +608,14 @@ actually driven. Nothing here claims more than that record supports.
   Identifiers, the `fanta://` URL scheme, `FANTA_*` env vars and action namespaces
   are unchanged on purpose. Everything in this entry is a grep of the tree: the
   agent panel has never been opened in a build of it.
-- **This build never updates itself.** `script/bundle-mac` exports
-  `FANTA_UPDATE_EXPLANATION='Alpha builds are updated by downloading a new DMG
-  from Fanta.'`, so "Check for Updates" shows that as an information prompt
-  instead of erroring, and the poll of the Fanta release endpoint is suppressed.
-  Get new alpha builds by downloading a new DMG.
+- **1.0.0 never updates itself; 1.1.0 and later update in place.** The 1.0.0
+  alpha was bundled with `FANTA_UPDATE_EXPLANATION='Alpha builds are updated by
+  downloading a new DMG from Fanta.'`, which suppresses the poll of the release
+  feed, so 1.0.0 users install 1.1.0 from the DMG once. From 1.1.0, Developer ID
+  builds check the feed hourly, download in the background, install only
+  installers signed with the release key and Fanta's Apple team, and apply on
+  the next restart (`crates/auto_update/src/verify.rs`). App Store builds still
+  update through the App Store.
 - **The once-per-launch `language not found` ERROR is gone.** The alpha.1 line
   — `ERROR … agent_ui/src/message_editor.rs:601 language not found`, once per
   launch — did not fire once on 2026-09-09: the agent composer now asks for a

@@ -303,13 +303,14 @@ fi
 
 export FANTA_BUNDLE=true
 
-# Compiled into the binary by auto_update's `option_env!`: it suppresses the
-# hourly poll of the Fanta release endpoint (which this fork does not serve) and
-# turns "Check for Updates" into an info prompt instead of an error.
+# Compiled into the binary by auto_update's `option_env!`: App Store builds never
+# poll Fanta's release feed, and "Check for Updates" explains why. Developer ID
+# builds update themselves: they poll the feed and install only updates signed
+# with the key in crates/auto_update/release-signing-key.pub.
 if [[ "$app_store" = true ]]; then
     export FANTA_UPDATE_EXPLANATION='Fanta is updated through the Mac App Store.'
 else
-    export FANTA_UPDATE_EXPLANATION='Alpha builds are updated by downloading a new DMG from Fanta.'
+    unset FANTA_UPDATE_EXPLANATION
 fi
 
 # cargo bundle honours CARGO_TARGET_DIR, but the copy steps below read from the
