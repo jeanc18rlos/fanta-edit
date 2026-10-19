@@ -18,6 +18,16 @@ pub enum ClipPlaybackMode {
     PingPong,
 }
 
+impl From<fanta_doc::LoopMode> for ClipPlaybackMode {
+    fn from(mode: fanta_doc::LoopMode) -> Self {
+        match mode {
+            fanta_doc::LoopMode::Once => Self::Once,
+            fanta_doc::LoopMode::Repeat => Self::Repeat,
+            fanta_doc::LoopMode::PingPong => Self::PingPong,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NodeOccurrence {

@@ -604,6 +604,12 @@ impl Operation {
                 }
                 Ok(())
             }
+            Self::SetAnimationClipSettings { id, old, new } => {
+                if let Some(clip) = ctx.motion.clips.get_mut(id) {
+                    clip.settings = (**dir.pick(old, new)).clone();
+                }
+                Ok(())
+            }
             Self::SetAnimationTrack {
                 clip,
                 track,

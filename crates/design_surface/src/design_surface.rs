@@ -1499,7 +1499,7 @@ mode use canvas operations; source file mutation is unavailable.
   and place it there; do not stack new work on top of existing frames.
 
 ## Animations
-- Authored animation clips live in `doc/motion.json`, separately from page nodes. Inspect the existing JSON schema before editing clips, tracks, and keyframes. Targets use exact node ids; preserve clip, track, and keyframe identities. Save and verify screenshots at multiple `motion_clip` / `playhead_ms` samples, and check the Motion preview when available; do not invent animation attributes on page `.fnx` elements.
+- Authored animation clips live in `doc/motion.json`, separately from page nodes. Inspect the existing JSON schema before editing clips, tracks, and keyframes. Targets use exact node ids; preserve clip, track, and keyframe identities. A clip also carries `fps`, `loop_mode` (`once`, `repeat`, `ping_pong`), `scope` (its stage frame), `background` and `transform_origins` (per node, the rotation and scale pivot as a fraction of its bounds, `[0.5, 0.5]` for the centre); all are optional. Save and verify screenshots at multiple `motion_clip` / `playhead_ms` samples, and check the Motion preview when available; do not invent animation attributes on page `.fnx` elements.
 - Import generated images from their local path, URL or base64 using `import_image`; use the returned asset id/path in source edits. Generated MCP image blocks are saved automatically when possible.
 
 ## Structure

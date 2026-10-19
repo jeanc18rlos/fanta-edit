@@ -81,8 +81,9 @@ use crate::measurements::{
 };
 use crate::motion_edit::{
     MotionKeyframeDragSession, delete_keyframe_operation, evaluated_motion_value,
-    rename_clip_operation, set_clip_duration_operation, set_keyframe_easing_operation,
-    set_keyframe_interpolation_operation, upsert_motion_keyframe_operation,
+    rename_clip_operation, set_clip_duration_operation, set_clip_loop_mode_operation,
+    set_keyframe_easing_operation, set_keyframe_interpolation_operation,
+    upsert_motion_keyframe_operation,
 };
 use crate::motion_panel::{FantaMotionPanel, MotionPanelEvent};
 use crate::panel_settings::{FantaDesignPanelSettings, FantaPropertiesPanelSettings};
@@ -1622,6 +1623,9 @@ impl FigView {
 
     fn handle_timeline_event(&mut self, event: TimelineEvent, cx: &mut Context<Self>) {
         match event {
+            TimelineEvent::LoopModeChanged(loop_mode) => {
+                self.persist_motion_clip_loop_mode(loop_mode, cx);
+            }
             TimelineEvent::PlayheadChanged(_) => {
                 let current_anchor =
                     self.comment_state
@@ -2111,6 +2115,26 @@ impl FigView {
         self.apply_motion_operation(operation, "changing motion clip duration", cx);
     }
 
+    /// The timeline's loop toggles are the clip's authored loop mode, so the
+    /// runtime and exports play it the way the author previewed it.
+    fn persist_motion_clip_loop_mode(
+        &mut self,
+        loop_mode: fanta_doc::LoopMode,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_editable(cx) {
+            return;
+        }
+        let Some(clip_id) = self.active_motion_clip else {
+            return;
+        };
+        let operation =
+            self.item.read(cx).document().and_then(|document| {
+                set_clip_loop_mode_operation(&document.doc, clip_id, loop_mode)
+            });
+        self.apply_motion_operation(operation, "changing motion clip loop mode", cx);
+    }
+
     fn create_motion_clip(&mut self, cx: &mut Context<Self>) {
         self.finish_panel_edits(cx);
         self.finish_motion_keyframe_drag(cx);
@@ -2221,17 +2245,25 @@ impl FigView {
         let authoring_enabled = self.is_editable(cx)
             && self.editor_workspace(cx) == EditorWorkspace::Canvas
             && self.editor_mode(cx) == EditorMode::Motion;
-        let model = if let Some(document) = self.item.read(cx).document() {
+        let (model, loop_mode) = if let Some(document) = self.item.read(cx).document() {
             if self
                 .active_motion_clip
                 .is_none_or(|clip| document.doc.motion.clip(clip).is_none())
             {
                 self.active_motion_clip = document.doc.motion.clips.keys().next().copied();
             }
-            motion_timeline_model(&document.doc, self.active_motion_clip)
+            let loop_mode = self
+                .active_motion_clip
+                .and_then(|clip| document.doc.motion.clip(clip))
+                .map(|clip| clip.settings.loop_mode)
+                .unwrap_or_default();
+            (
+                motion_timeline_model(&document.doc, self.active_motion_clip),
+                loop_mode,
+            )
         } else {
             self.active_motion_clip = None;
-            TimelineViewModel::empty()
+            (TimelineViewModel::empty(), fanta_doc::LoopMode::Once)
         };
         if !authoring_enabled || self.active_motion_clip.is_none() {
             self.motion_auto_keyframe = false;
@@ -2245,6 +2277,7 @@ impl FigView {
                 timeline.set_authoring_enabled(authoring_enabled, cx);
             }
             timeline.set_model(model, cx);
+            timeline.set_loop_mode(loop_mode, cx);
         });
         let active_clip = self.active_motion_clip;
         let auto_keyframe = self.motion_auto_keyframe;

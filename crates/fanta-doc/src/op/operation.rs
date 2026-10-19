@@ -10,7 +10,7 @@ use crate::id::{
     VariableCollectionId, VariableId,
 };
 use crate::index::IndexKey;
-use crate::motion::{AnimationClip, AnimationTrack, Keyframe, MotionTarget};
+use crate::motion::{AnimationClip, AnimationTrack, ClipSettings, Keyframe, MotionTarget};
 use crate::node::{
     CanvasNode, Constraints, LayoutChild, MaskType, NodeData, NodeFlags, Override, Reaction,
 };
@@ -398,6 +398,14 @@ pub enum Operation {
         new: u32,
     },
 
+    /// Replace a clip's settings (frame rate, loop mode, stage, backdrop and
+    /// transform origins) as one unit. Reverts to the old settings.
+    SetAnimationClipSettings {
+        id: AnimationClipId,
+        old: Box<ClipSettings>,
+        new: Box<ClipSettings>,
+    },
+
     /// Add, replace, or remove one track. `None` represents a missing track.
     SetAnimationTrack {
         clip: AnimationClipId,
@@ -564,6 +572,7 @@ impl Operation {
             Self::DeleteAnimationClip { .. } => "Delete Animation",
             Self::SetAnimationClipName { .. } => "Rename Animation",
             Self::SetAnimationClipDuration { .. } => "Animation Duration",
+            Self::SetAnimationClipSettings { .. } => "Animation Settings",
             Self::SetAnimationTrack { .. } => "Edit Animation Track",
             Self::SetKeyframe { .. } => "Edit Keyframe",
             Self::AddReaction { .. } => "Add Interaction",

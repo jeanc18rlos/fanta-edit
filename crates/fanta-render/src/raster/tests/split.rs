@@ -680,6 +680,7 @@ fn split_rejects_static_sibling_patterns_motion_and_unsupported_media() {
         clip: fanta_doc::AnimationClipId::new(),
         playhead_ms: 0,
         overrides: Default::default(),
+        transform_origins: BTreeMap::new(),
     };
     let inputs = RenderInputs {
         motion: Some(&motion),

@@ -125,6 +125,8 @@ pub enum TimelineEditPhase {
 pub enum TimelineEvent {
     PlayheadChanged(i64),
     PlaybackChanged(bool),
+    /// The user changed how the clip loops; the view persists it on the clip.
+    LoopModeChanged(fanta_doc::LoopMode),
     CreateClip,
     AddKeyframe(TimelineProperty),
     KeyframeSelectionChanged(Option<TimelineKeyframeSelection>),
@@ -835,6 +837,7 @@ impl TimelineShell {
         }
         self.loop_playback = loop_playback;
         self.ping_pong_playback = false;
+        cx.emit(TimelineEvent::LoopModeChanged(self.loop_mode()));
         cx.notify();
     }
 
@@ -844,6 +847,28 @@ impl TimelineShell {
         }
         self.ping_pong_playback = true;
         self.loop_playback = false;
+        cx.emit(TimelineEvent::LoopModeChanged(self.loop_mode()));
+        cx.notify();
+    }
+
+    pub(crate) fn loop_mode(&self) -> fanta_doc::LoopMode {
+        if self.ping_pong_playback {
+            fanta_doc::LoopMode::PingPong
+        } else if self.loop_playback {
+            fanta_doc::LoopMode::Repeat
+        } else {
+            fanta_doc::LoopMode::Once
+        }
+    }
+
+    /// Show a clip's authored loop mode. Unlike the toggles this does not emit,
+    /// so syncing a clip never writes its own value back.
+    pub(crate) fn set_loop_mode(&mut self, mode: fanta_doc::LoopMode, cx: &mut Context<Self>) {
+        if self.loop_mode() == mode {
+            return;
+        }
+        self.loop_playback = mode == fanta_doc::LoopMode::Repeat;
+        self.ping_pong_playback = mode == fanta_doc::LoopMode::PingPong;
         cx.notify();
     }
 
@@ -1068,6 +1093,7 @@ impl TimelineShell {
     fn toggle_loop_playback(&mut self, cx: &mut Context<Self>) {
         self.loop_playback = !self.loop_playback;
         self.ping_pong_playback = false;
+        cx.emit(TimelineEvent::LoopModeChanged(self.loop_mode()));
         cx.notify();
     }
 

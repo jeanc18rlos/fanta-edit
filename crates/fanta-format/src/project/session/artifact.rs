@@ -2624,6 +2624,7 @@ pub fn artifact_op_impact(op: &Operation) -> ArtifactOpImpact {
         | DeleteAnimationClip { .. }
         | SetAnimationClipName { .. }
         | SetAnimationClipDuration { .. }
+        | SetAnimationClipSettings { .. }
         | SetAnimationTrack { .. }
         | SetKeyframe { .. } => Impact::Motion,
 

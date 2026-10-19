@@ -501,6 +501,7 @@ fn scoped_root_motion_uses_resolved_ancestor_and_root_transforms()
                 ResolvedVarValue::Float { value: 45.0 },
             ),
         ]),
+        transform_origins: BTreeMap::new(),
     };
     let mut inputs = RenderInputs::for_doc(&doc);
     inputs.motion = Some(&motion);
