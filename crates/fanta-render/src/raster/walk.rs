@@ -57,6 +57,7 @@ pub(crate) struct RenderCtx<'a> {
     /// (`world_sigma · effective_scale`) and the cull test can expand a node's
     /// world bounds by its shadow's screen-bounded blur extent.
     pub(crate) effective_scale: f32,
+    pub(crate) effective_scale_axes: [f32; 2],
     /// The render root whose solid background already cleared the whole
     /// surface (the page canvas color). `paint_group` skips this node's own
     /// background so a translucent page color is not composited twice over
@@ -235,7 +236,7 @@ fn resolved_local_bounds(ctx: &mut RenderCtx, id: NodeId) -> Option<Bounds> {
                 let child_node = ctx.scene.get(child)?;
                 let scratch = resolve_overlay(ctx, child, child_node);
                 let child_node = scratch.as_deref().unwrap_or(child_node);
-                visual_local_bounds(child_node, child_bounds, ctx.effective_scale)?
+                visual_local_bounds(child_node, child_bounds, ctx.effective_scale_axes)?
             };
             let Some(child_transform) = resolved_local_transform(ctx, child) else {
                 return None;
@@ -330,7 +331,7 @@ fn filtered_input_region(
 pub(crate) fn visual_local_bounds(
     node: &CanvasNode,
     bounds: Bounds,
-    effective_scale: f32,
+    effective_scale: impl Into<super::effects::EffectScale>,
 ) -> Option<Bounds> {
     let source =
         crate::bounds::expand_for_strokes(bounds, node.data.strokes().unwrap_or(&[]), false);
@@ -516,7 +517,7 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
     // `local.try_transformed(&world_transform)`), which trims two hash lookups
     // per visited node from the walk.
     if let Some(local) = local_bounds {
-        let expanded = visual_local_bounds(node, local, ctx.effective_scale)
+        let expanded = visual_local_bounds(node, local, ctx.effective_scale_axes)
             .and_then(|expanded| expanded.try_transformed(&world_transform));
         if expanded.is_some_and(|expanded| !expanded.intersects(&ctx.visible)) {
             ctx.metrics.nodes_culled += 1;
@@ -552,7 +553,7 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
             node,
             Some(id),
             ctx.scene,
-            ctx.effective_scale,
+            ctx.effective_scale_axes,
             boolean_silhouette.as_ref(),
         ) == super::effects::BackgroundBlurOutcome::Failed
         {
@@ -565,7 +566,7 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
     // no filter). Computed once here and threaded to both the fold and the
     // layer decision below, so an invisible effect neither forces a layer nor
     // blocks the fold (see `VisibleEffects`).
-    let visible = visible_effects(node, ctx.effective_scale);
+    let visible = visible_effects(node, ctx.effective_scale_axes);
 
     // Opacity fold: a leaf vector that emits exactly one Solid/Gradient draw and
     // needs a layer for nothing else applies its opacity as paint alpha instead
@@ -602,7 +603,7 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
             &node.effects,
             &node.blurs,
             node.flags.contains(NodeFlags::ISOLATED_BLEND),
-            ctx.effective_scale,
+            ctx.effective_scale_axes,
         )
     } else {
         None
@@ -690,8 +691,9 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
                     let paint = layer.full_paint();
                     let rec = skia_safe::canvas::SaveLayerRec::default().paint(&paint);
                     match content_bounds {
-                        Some(b) => canvas
-                            .save_layer(&rec.bounds(&padded_layer_rect(&b, ctx.effective_scale))),
+                        Some(b) => canvas.save_layer(
+                            &rec.bounds(&padded_layer_rect(&b, ctx.effective_scale_axes)),
+                        ),
                         None => canvas.save_layer(&rec),
                     };
                     paint_node_body(canvas, id, node, path_cache_id, boolean_shape.as_ref(), ctx);
@@ -707,7 +709,7 @@ fn render_node_with_clip(canvas: &Canvas, id: NodeId, ctx: &mut RenderCtx) {
         canvas,
         node,
         outer_camera_bounds,
-        ctx.effective_scale,
+        ctx.effective_scale_axes,
         ctx.metrics,
     );
     canvas.restore();
@@ -784,7 +786,7 @@ fn paint_node_body(
                 let node = ctx.scene.get(child)?;
                 let scratch = resolve_overlay(ctx, child, node);
                 let node = scratch.as_deref().unwrap_or(node);
-                visual_local_bounds(node, local, ctx.effective_scale)?
+                visual_local_bounds(node, local, ctx.effective_scale_axes)?
                     .try_transformed(&node.transform)
             },
             |canvas, ctx, &child| render_node(canvas, child, ctx),
@@ -958,7 +960,7 @@ pub(crate) fn paint_child_sequence<C, M, B, P>(
                 }
             }
             match (all_known, acc) {
-                (true, Some(b)) => Some(padded_layer_rect(&b, ctx.effective_scale)),
+                (true, Some(b)) => Some(padded_layer_rect(&b, ctx.effective_scale_axes)),
                 _ => None,
             }
         };

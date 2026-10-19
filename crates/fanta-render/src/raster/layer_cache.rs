@@ -296,7 +296,7 @@ pub(crate) struct LayerCache {
     /// populating is enabled only when the current frame repeats the scale
     /// and shifts the translation by whole device pixels (see the module
     /// docs and [`Self::begin_frame`]).
-    last_frame: Option<(u32, f64, f64)>,
+    last_frame: Option<([u32; 2], f64, f64)>,
     /// Master switch (renderer API). Off ⇒ every lookup misses and nothing
     /// is stored — the direct save-layer path, byte for byte.
     enabled: bool,
@@ -352,7 +352,7 @@ impl LayerCache {
         scene: &Scene,
         components: &ComponentLibrary,
         epoch: LayerEpoch,
-        effective_scale: f32,
+        effective_scale: impl Into<super::effects::EffectScale>,
         root_translation: (f64, f64),
     ) -> bool {
         let components_changed = !self.components.matches(components);
@@ -395,7 +395,7 @@ impl LayerCache {
         self.frame = self.frame.wrapping_add(1);
         self.populated_this_frame = 0;
         let (root_tx, root_ty) = root_translation;
-        let scale_bits = effective_scale.to_bits();
+        let scale_bits = effective_scale.into().axes().map(f32::to_bits);
         let whole_pixel_pan = |a: f64, b: f64| {
             let d = a - b;
             (d - d.round()).abs() <= f64::from(INTEGER_PAN_EPS)
@@ -649,7 +649,7 @@ pub(crate) fn render_layer_via_cache(
     if m.has_perspective() {
         return false;
     }
-    let padded = padded_layer_rect(&content_bounds, ctx.effective_scale);
+    let padded = padded_layer_rect(&content_bounds, ctx.effective_scale_axes);
     // Nothing to composite under an empty clip (fully clipped subtree).
     if canvas.device_clip_bounds().is_none() {
         return false;

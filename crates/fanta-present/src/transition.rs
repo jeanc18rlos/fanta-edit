@@ -8,12 +8,13 @@
 //!
 //! Coordinate convention for the directional styles: a [`Direction`] names the
 //! edge the content enters *from*, matching Figma's authoring UI. `Left` means
-//! the incoming frame starts one surface-width left of the viewport and travels
+//! the incoming frame starts one surface-width left of the camera and travels
 //! right. Offsets are in physical destination pixels.
 //!
 //! [`Push`]: TransitionStyle::Push
 
-use fanta_doc::{Direction, Easing, NodeId, TransitionStyle, Viewport};
+use fanta_canvas::Camera2D;
+use fanta_doc::{Direction, Easing, NodeId, TransitionStyle};
 
 const TIME_EPSILON_SECONDS: f64 = 1e-9;
 
@@ -23,9 +24,9 @@ const TIME_EPSILON_SECONDS: f64 = 1e-9;
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ActiveTransition {
     pub from_frame: NodeId,
-    pub from_viewport: Viewport,
+    pub from_camera: Camera2D,
     pub to_frame: NodeId,
-    pub to_viewport: Viewport,
+    pub to_camera: Camera2D,
     pub style: TransitionStyle,
     pub easing: Easing,
     /// Total duration in seconds (always > 0 — an instant/zero transition is a
@@ -42,6 +43,32 @@ impl ActiveTransition {
             return 1.0;
         }
         (self.elapsed / self.duration).clamp(0.0, 1.0)
+    }
+
+    pub(crate) fn camera(&self, progress: f64) -> Camera2D {
+        if progress == 0.0 {
+            return self.from_camera;
+        }
+        if progress == 1.0 {
+            return self.to_camera;
+        }
+        let interpolate = |from: f64, to: f64| from + (to - from) * progress;
+        Camera2D {
+            center: [
+                interpolate(self.from_camera.center[0], self.to_camera.center[0]),
+                interpolate(self.from_camera.center[1], self.to_camera.center[1]),
+            ],
+            scale: [
+                interpolate(self.from_camera.scale[0], self.to_camera.scale[0]).clamp(
+                    fanta_canvas::viewport::MIN_ZOOM,
+                    fanta_canvas::viewport::MAX_ZOOM,
+                ),
+                interpolate(self.from_camera.scale[1], self.to_camera.scale[1]).clamp(
+                    fanta_canvas::viewport::MIN_ZOOM,
+                    fanta_canvas::viewport::MAX_ZOOM,
+                ),
+            ],
+        }
     }
 
     /// Whether the transition has run its full duration.

@@ -13,6 +13,7 @@ gpu = ["metal"]
 metal = ["skia-safe/metal", "skia-safe/ganesh", "skia-safe/graphite"]
 
 [dependencies]
+fanta-canvas.workspace = true
 fanta-doc.workspace = true
 # Text shaping + layout over Skia. No dependency cycle: `fanta-text` depends on
 # `fanta-doc` + skia, never on `fanta-render`. The renderer converts a
@@ -35,6 +36,7 @@ serde_json = "1"
 unicode-segmentation.workspace = true
 
 [dev-dependencies]
+glam.workspace = true
 serde_json = "1"
 # Needed only to construct `VectorNode.fills` (a `SmallVec`) directly in the
 # bitmap integration tests; matches the version `fanta-doc` already uses.

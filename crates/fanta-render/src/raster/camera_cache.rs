@@ -1270,9 +1270,10 @@ pub(super) fn end_camera_node(
     canvas: &Canvas,
     node: &fanta_doc::CanvasNode,
     outer: Option<Bounds>,
-    effective_scale: f32,
+    effective_scale: impl Into<super::effects::EffectScale>,
     metrics: &mut RenderMetrics,
 ) {
+    let effective_scale = effective_scale.into();
     if !metrics.camera_recording || metrics.camera_visible.is_some() {
         return;
     }

@@ -2,6 +2,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use fanta_format::runtime::{RuntimeFont, SourceBundle};
+use fanta_present::FitMode;
 use fanta_runtime::{Runtime, RuntimeError};
 use serde_json::{Value, json};
 use skia_safe::{Surface, gpu};
@@ -277,6 +278,10 @@ fn dispatch(arguments: Value) -> Result<Value, RuntimeError> {
                 .inspect_program(number(&arguments, "program")?)
         }),
         "createPlayer" => {
+            if arguments.get("fit").is_some_and(|fit| !fit.is_string()) {
+                return Err(error("Invalid argument fit"));
+            }
+            let fit = optional(&arguments, "fit", FitMode::Contain)?;
             let start = arguments
                 .get("start")
                 .filter(|value| !value.is_null())
@@ -289,11 +294,12 @@ fn dispatch(arguments: Value) -> Result<Value, RuntimeError> {
                 runtime
                     .try_borrow_mut()
                     .map_err(|_| error("Reentrant runtime call"))?
-                    .create_player(
+                    .create_player_with_fit(
                         number(&arguments, "program")?,
                         positive(&arguments, "width")?,
                         positive(&arguments, "height")?,
                         start,
+                        fit,
                     )
             })?;
             Ok(json!({"handle":handle}))

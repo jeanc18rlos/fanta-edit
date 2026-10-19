@@ -11,7 +11,7 @@
 //! The session is **ephemeral state over an immutable [`Doc`]**: it never calls
 //! `Doc::apply`. Navigation, variable overrides, and overlays all live on the
 //! session; the document is the design and is left byte-identical. Rendering
-//! reuses the [`RasterRenderer`] and the doc's viewport/hit-test math verbatim.
+//! reuses the [`RasterRenderer`] and the doc's camera/hit-test math verbatim.
 
 #![forbid(unsafe_code)]
 
@@ -28,11 +28,15 @@ pub use playback::{
 use std::collections::{BTreeMap, HashMap};
 use std::rc::Rc;
 
-use fanta_canvas::viewport::{fit_bounds, pan, screen_to_world, zoom_at};
+use fanta_canvas::viewport::{
+    camera_screen_to_world as screen_to_world, fit_camera, pan_camera as pan, rebase_camera,
+    zoom_camera_at as zoom_at,
+};
+pub use fanta_canvas::{Camera2D, FitMode};
 use fanta_doc::{
-    Action, AnimationClipId, CompareOp, ComponentId, ComponentPropKind, Condition, Doc, ModeId,
-    MotionEvaluation, NodeData, NodeFlags, NodeId, OverlaySettings, PrototypeAnimation, ReactionId,
-    ResolvedVarValue, Scene, ScrollBehavior, ScrollDirection, Transform2D, Transition,
+    Action, AnimationClipId, Color, CompareOp, ComponentId, ComponentPropKind, Condition, Doc,
+    ModeId, MotionEvaluation, NodeData, NodeFlags, NodeId, OverlaySettings, PrototypeAnimation,
+    ReactionId, ResolvedVarValue, Scene, ScrollBehavior, ScrollDirection, Transform2D, Transition,
     TransitionStyle, Trigger, VarValue, VariableCollectionId, VariableId, VariableRegistry,
     Viewport,
 };
@@ -130,7 +134,7 @@ pub struct PresentResponse {
 #[derive(Debug, Clone)]
 struct NavEntry {
     frame: NodeId,
-    viewport: Viewport,
+    camera: Camera2D,
     /// Snapshot of scroll offsets at the time we left this frame (so Back can
     /// restore scroll position inside scrollable containers).
     scroll_snapshot: HashMap<NodeId, [f64; 2]>,
@@ -160,9 +164,9 @@ struct OverlayEntry {
     root: NodeId,
     layer: u64,
     settings: OverlaySettings,
-    /// The viewport that renders the overlay frame at the base zoom, placed per
+    /// The camera that renders the overlay frame at the base zoom, placed per
     /// `settings.position`.
-    viewport: Viewport,
+    camera: Camera2D,
     /// The overlay's rect on the present surface — decides click-outside.
     screen_rect: ScreenRect,
 }
@@ -221,7 +225,7 @@ struct ActiveVariantTransition {
 
 struct VariantLayerTransition {
     instance: NodeId,
-    viewport: Viewport,
+    camera: Camera2D,
     from_scene: Scene,
     from_root: NodeId,
     to_scene: Scene,
@@ -348,8 +352,9 @@ pub struct PlaybackSession {
     current: NodeId,
     current_layer: u64,
     next_layer: u64,
-    /// The current frame's viewport (fit to the frame; panned by `ScrollTo`).
-    viewport: Viewport,
+    /// The current frame's camera (fit to the frame; panned by `ScrollTo`).
+    camera: Camera2D,
+    fit_mode: FitMode,
     /// Navigation history for `Back`.
     back_stack: Vec<NavEntry>,
     /// Open overlays, topmost last. Empty in the common case.
@@ -412,7 +417,7 @@ pub struct PlaybackSession {
     /// Value is [scroll_x, scroll_y] (in the scrollable's local space) to apply
     /// when viewing/rending/hit-testing content inside it. Set by ScrollTo when
     /// target is descendant of a `scrollable` frame (enables prototype scrolling
-    /// inside containers without always panning the outer viewport).
+    /// inside containers without always panning the outer camera).
     scroll_offsets: HashMap<NodeId, [f64; 2]>,
 
     /// Variant overrides set during prototype playback via UpdateVariant actions.
@@ -641,7 +646,7 @@ impl PlaybackSession {
         }
         let width = (screen_size.x.max(1.0)) as u32;
         let height = (screen_size.y.max(1.0)) as u32;
-        let viewport = frame_viewport(&doc.scene, current, screen_size);
+        let camera = frame_camera(&doc.scene, current, screen_size, FitMode::Contain);
         let mut session = Self {
             doc: doc.clone(),
             screen_size,
@@ -650,7 +655,8 @@ impl PlaybackSession {
             current,
             current_layer: 1,
             next_layer: 2,
-            viewport,
+            camera,
+            fit_mode: FitMode::Contain,
             back_stack: Vec::new(),
             overlays: Vec::new(),
             variables: doc.variables.clone(),
@@ -692,10 +698,11 @@ impl PlaybackSession {
         };
         session.seed_initial_scroll_offsets(current);
         session.schedule_timers(current);
-        session.viewport = frame_viewport(
+        session.camera = frame_camera(
             &session.resolved_layer(current, false).scene,
             current,
             screen_size,
+            session.fit_mode,
         );
         Ok(session)
     }
@@ -743,7 +750,7 @@ impl PlaybackSession {
             return false;
         }
         self.current = start;
-        self.viewport = frame_viewport(&self.doc.scene, start, self.screen_size);
+        self.camera = frame_camera(&self.doc.scene, start, self.screen_size, self.fit_mode);
         self.back_stack.clear();
         self.overlays.clear();
         self.variables = self.doc.variables.clone();
@@ -775,17 +782,37 @@ impl PlaybackSession {
         self.active_scroll_animation = None;
         self.pending_url = None;
         self.schedule_timers(start);
-        self.viewport = frame_viewport(
+        self.camera = frame_camera(
             &self.resolved_layer(start, false).scene,
             start,
             self.screen_size,
+            self.fit_mode,
         );
         true
     }
 
-    /// The camera over the current frame: its world-space center and zoom.
+    /// Scalar compatibility view of the camera. For fill, zoom is the smaller axis scale.
     pub fn viewport(&self) -> Viewport {
-        self.viewport
+        self.camera.scalar_viewport()
+    }
+
+    pub fn camera(&self) -> Camera2D {
+        self.camera
+    }
+
+    pub fn fit_mode(&self) -> FitMode {
+        self.fit_mode
+    }
+
+    pub fn set_fit_mode(&mut self, mode: FitMode) -> PresentResponse {
+        if self.fit_mode == mode {
+            return PresentResponse::default();
+        }
+        self.rebase_cameras(self.screen_size, self.screen_size, self.fit_mode, mode);
+        PresentResponse {
+            needs_redraw: true,
+            ..PresentResponse::default()
+        }
     }
 
     /// Move the camera by a screen-space delta so the content follows the
@@ -794,7 +821,11 @@ impl PlaybackSession {
         if !screen_delta.is_finite() {
             return Err(PresentError::InvalidCamera);
         }
-        self.viewport = pan(&self.viewport, screen_delta);
+        let camera = pan(&self.camera, screen_delta);
+        if !camera.is_valid() {
+            return Err(PresentError::InvalidCamera);
+        }
+        self.camera = camera;
         Ok(PresentResponse {
             needs_redraw: true,
             ..PresentResponse::default()
@@ -811,7 +842,11 @@ impl PlaybackSession {
         if !screen_anchor.is_finite() || !factor.is_finite() || factor <= 0.0 {
             return Err(PresentError::InvalidCamera);
         }
-        self.viewport = zoom_at(&self.viewport, screen_anchor, factor, self.screen_size);
+        let camera = zoom_at(&self.camera, screen_anchor, factor, self.screen_size);
+        if !camera.is_valid() {
+            return Err(PresentError::InvalidCamera);
+        }
+        self.camera = camera;
         Ok(PresentResponse {
             needs_redraw: true,
             ..PresentResponse::default()
@@ -820,10 +855,11 @@ impl PlaybackSession {
 
     /// Fit the camera to the current frame again.
     pub fn fit_view(&mut self) -> PresentResponse {
-        self.viewport = frame_viewport(
+        self.camera = frame_camera(
             &self.resolved_layer(self.current, false).scene,
             self.current,
             self.screen_size,
+            self.fit_mode,
         );
         PresentResponse {
             needs_redraw: true,
@@ -861,57 +897,75 @@ impl PlaybackSession {
         if !logical_size_changed {
             return Ok(());
         }
+        self.rebase_cameras(old_screen_size, screen_size, self.fit_mode, self.fit_mode);
+        Ok(())
+    }
+
+    fn rebase_cameras(
+        &mut self,
+        old_screen_size: DVec2,
+        screen_size: DVec2,
+        old_mode: FitMode,
+        new_mode: FitMode,
+    ) {
         let current_scene =
             self.resolved_layer_with_identity(self.current, self.current_layer, false);
-        self.viewport = rebase_viewport(
+        self.camera = rebase_frame_camera(
             &current_scene.scene,
             self.current,
-            self.viewport,
+            self.camera,
             old_screen_size,
             screen_size,
+            old_mode,
+            new_mode,
         );
-        let history_viewports: Vec<_> = self
+        let history_cameras: Vec<_> = self
             .back_stack
             .iter()
             .map(|entry| {
                 let resolved = self.resolved_layer(entry.frame, false);
-                rebase_viewport(
+                rebase_frame_camera(
                     &resolved.scene,
                     entry.frame,
-                    entry.viewport,
+                    entry.camera,
                     old_screen_size,
                     screen_size,
+                    old_mode,
+                    new_mode,
                 )
             })
             .collect();
-        for (entry, viewport) in self.back_stack.iter_mut().zip(history_viewports) {
-            entry.viewport = viewport;
+        for (entry, camera) in self.back_stack.iter_mut().zip(history_cameras) {
+            entry.camera = camera;
         }
-        let transition_viewports = self.active_transition.map(|active| {
+        let transition_cameras = self.active_transition.map(|active| {
             let from = self.resolved_layer(active.from_frame, false);
             let to = self.resolved_layer(active.to_frame, false);
             (
-                rebase_viewport(
+                rebase_frame_camera(
                     &from.scene,
                     active.from_frame,
-                    active.from_viewport,
+                    active.from_camera,
                     old_screen_size,
                     screen_size,
+                    old_mode,
+                    new_mode,
                 ),
-                rebase_viewport(
+                rebase_frame_camera(
                     &to.scene,
                     active.to_frame,
-                    active.to_viewport,
+                    active.to_camera,
                     old_screen_size,
                     screen_size,
+                    old_mode,
+                    new_mode,
                 ),
             )
         });
-        if let (Some(active), Some((from, to))) =
-            (&mut self.active_transition, transition_viewports)
+        if let (Some(active), Some((from, to))) = (&mut self.active_transition, transition_cameras)
         {
-            active.from_viewport = from;
-            active.to_viewport = to;
+            active.from_camera = from;
+            active.to_camera = to;
         }
         let overlay_bounds: Vec<_> = self
             .overlays
@@ -928,32 +982,36 @@ impl PlaybackSession {
                 .world_bounds(exit.entry.root)
         });
         self.screen_size = screen_size;
+        self.fit_mode = new_mode;
 
-        let mut base_zoom = self.viewport.zoom;
+        let mut base_scale = self.camera.scale;
         for (overlay, bounds) in self.overlays.iter_mut().zip(overlay_bounds) {
             let Some(bounds) = bounds else {
                 continue;
             };
-            let (viewport, screen_rect) =
-                place_overlay(base_zoom, bounds, overlay.settings.position, screen_size);
-            overlay.viewport = viewport;
+            let (camera, screen_rect) =
+                place_overlay(base_scale, bounds, overlay.settings.position, screen_size);
+            overlay.camera = camera;
             overlay.screen_rect = screen_rect;
-            base_zoom = viewport.zoom;
+            base_scale = camera.scale;
         }
         if let (Some(exit), Some(bounds)) = (&mut self.active_overlay_exit, exit_bounds) {
-            let (viewport, screen_rect) =
-                place_overlay(base_zoom, bounds, exit.entry.settings.position, screen_size);
-            exit.entry.viewport = viewport;
+            let (camera, screen_rect) = place_overlay(
+                base_scale,
+                bounds,
+                exit.entry.settings.position,
+                screen_size,
+            );
+            exit.entry.camera = camera;
             exit.entry.screen_rect = screen_rect;
         }
-        let variant_viewport = self.active_viewport();
+        let variant_camera = self.active_camera();
         if let Some(active) = &mut self.active_variant_transition {
             for layer in &mut active.layers {
-                layer.viewport = variant_viewport;
+                layer.camera = variant_camera;
             }
         }
         self.prune_occurrence_cache(None);
-        Ok(())
     }
 
     /// Physical pixel dimensions required by the presentation adapter.
@@ -1426,7 +1484,7 @@ impl PresentSession {
                             target_parent_world,
                             target_master_opacity,
                         );
-                        self.render_scene_root_rgba(&scene, smart.root, layer.viewport, false)
+                        self.render_scene_root_rgba(&scene, smart.root, layer.camera, false)
                     } else {
                         Vec::new()
                     }
@@ -1434,7 +1492,7 @@ impl PresentSession {
                     let outgoing = self.render_scene_root_rgba(
                         &layer.from_scene,
                         layer.from_root,
-                        layer.viewport,
+                        layer.camera,
                         false,
                     );
                     let mut incoming_scene = layer.to_scene.clone();
@@ -1448,7 +1506,7 @@ impl PresentSession {
                     let incoming = self.render_scene_root_rgba(
                         &incoming_scene,
                         layer.to_root,
-                        layer.viewport,
+                        layer.camera,
                         false,
                     );
                     composite(
@@ -1470,7 +1528,12 @@ impl PresentSession {
         // Clone the (small) overlay stack so the render borrow of `self` is free.
         let overlays: Vec<OverlayEntry> = self.playback.overlays.clone();
         for (index, entry) in overlays.iter().enumerate() {
-            let over = self.render_frame_rgba(entry.root, entry.viewport);
+            let over = self.render_frame_rgba_with_motion(
+                entry.root,
+                entry.camera,
+                true,
+                Color::TRANSPARENT,
+            );
             let entering = self
                 .active_overlay_transition
                 .filter(|active| active.root == entry.root && index + 1 == overlays.len());
@@ -1500,8 +1563,12 @@ impl PresentSession {
             if exit.entry.settings.background_dim {
                 apply_scrim(&mut buffer, SCRIM_DIM * visible);
             }
-            let overlay =
-                self.render_frame_rgba_with_motion(exit.entry.root, exit.entry.viewport, false);
+            let overlay = self.render_frame_rgba_with_motion(
+                exit.entry.root,
+                exit.entry.camera,
+                false,
+                Color::TRANSPARENT,
+            );
             buffer = composite_overlay(
                 exit.clock.style,
                 visible,
@@ -1556,32 +1623,41 @@ impl PresentSession {
                     video_fill_frames: None,
                     dark_ui: false,
                 };
-                self.renderer
-                    .render_page_with(&scene, &active.to_viewport, Some(root), &inputs);
+                self.renderer.render_page_with_camera(
+                    &scene,
+                    &active.camera(eased),
+                    Some(root),
+                    &inputs,
+                );
                 return self.renderer.copy_rgba();
             }
         }
 
         // Every other style composites the two endpoint frames.
-        let outgoing =
-            self.render_frame_rgba_with_motion(active.from_frame, active.from_viewport, false);
-        let incoming = self.render_frame_rgba(active.to_frame, active.to_viewport);
+        let outgoing = self.render_frame_rgba_with_motion(
+            active.from_frame,
+            active.from_camera,
+            false,
+            self.renderer.background,
+        );
+        let incoming = self.render_frame_rgba(active.to_frame, active.to_camera);
         let width = self.renderer.width() as usize;
         let height = self.renderer.height() as usize;
         composite(active.style, eased, width, height, &outgoing, &incoming)
     }
 
-    /// Render one frame through `viewport` onto the owned surface and read back
+    /// Render one frame through `camera` onto the owned surface and read back
     /// straight-alpha RGBA8. Used to produce the two layers a transition blends.
-    fn render_frame_rgba(&mut self, frame: NodeId, viewport: Viewport) -> Vec<u8> {
-        self.render_frame_rgba_with_motion(frame, viewport, true)
+    fn render_frame_rgba(&mut self, frame: NodeId, camera: Camera2D) -> Vec<u8> {
+        self.render_frame_rgba_with_motion(frame, camera, true, self.renderer.background)
     }
 
     fn render_frame_rgba_with_motion(
         &mut self,
         frame: NodeId,
-        viewport: Viewport,
+        camera: Camera2D,
         include_motion: bool,
+        background: Color,
     ) -> Vec<u8> {
         // Built inline for the same borrow-splitting reason as `render_current`.
         let resolved = self.playback.resolved_layer(frame, include_motion);
@@ -1595,20 +1671,27 @@ impl PresentSession {
             video_fill_frames: None,
             dark_ui: false,
         };
+        let previous_background = std::mem::replace(&mut self.renderer.background, background);
         self.renderer
-            .render_page_with(&resolved.scene, &viewport, Some(frame), &inputs);
+            .render_page_with_camera(&resolved.scene, &camera, Some(frame), &inputs);
+        self.renderer.background = previous_background;
         self.renderer.copy_rgba()
     }
 
     fn render_surface_hiding(&mut self, hidden: &[NodeId]) -> Vec<u8> {
-        let mut buffer =
-            self.render_frame_rgba_hiding(self.playback.current, self.playback.viewport, hidden);
+        let mut buffer = self.render_frame_rgba_hiding(
+            self.playback.current,
+            self.playback.camera,
+            hidden,
+            self.renderer.background,
+        );
         let overlays = self.playback.overlays.clone();
         for entry in overlays {
             if entry.settings.background_dim {
                 apply_scrim(&mut buffer, SCRIM_DIM);
             }
-            let overlay = self.render_frame_rgba_hiding(entry.root, entry.viewport, hidden);
+            let overlay =
+                self.render_frame_rgba_hiding(entry.root, entry.camera, hidden, Color::TRANSPARENT);
             composite_over(&mut buffer, &overlay);
         }
         buffer
@@ -1617,8 +1700,9 @@ impl PresentSession {
     fn render_frame_rgba_hiding(
         &mut self,
         frame: NodeId,
-        viewport: Viewport,
+        camera: Camera2D,
         hidden: &[NodeId],
+        background: Color,
     ) -> Vec<u8> {
         let mut scene = self
             .build_runtime_scene(frame)
@@ -1641,8 +1725,10 @@ impl PresentSession {
             video_fill_frames: None,
             dark_ui: false,
         };
+        let previous_background = std::mem::replace(&mut self.renderer.background, background);
         self.renderer
-            .render_page_with(&scene, &viewport, Some(frame), &inputs);
+            .render_page_with_camera(&scene, &camera, Some(frame), &inputs);
+        self.renderer.background = previous_background;
         self.renderer.copy_rgba()
     }
 
@@ -1650,7 +1736,7 @@ impl PresentSession {
         &mut self,
         scene: &Scene,
         root: NodeId,
-        viewport: Viewport,
+        camera: Camera2D,
         include_motion: bool,
     ) -> Vec<u8> {
         let motion = include_motion
@@ -1666,8 +1752,11 @@ impl PresentSession {
             video_fill_frames: None,
             dark_ui: false,
         };
+        let previous_background =
+            std::mem::replace(&mut self.renderer.background, Color::TRANSPARENT);
         self.renderer
-            .render_page_with(scene, &viewport, Some(root), &inputs);
+            .render_page_with_camera(scene, &camera, Some(root), &inputs);
+        self.renderer.background = previous_background;
         self.renderer.copy_rgba()
     }
 
@@ -1695,9 +1784,9 @@ impl PresentSession {
             video_fill_frames: None,
             dark_ui: false,
         };
-        self.renderer.render_page_with(
+        self.renderer.render_page_with_camera(
             &resolved.scene,
-            &self.playback.viewport,
+            &self.playback.camera,
             Some(self.playback.current),
             &inputs,
         )
@@ -1907,9 +1996,9 @@ impl PlaybackSession {
     /// Screen-space variant of [`scroll_by`](Self::scroll_by) — the shape a
     /// host's wheel handler already has (the same coordinates
     /// [`handle_pointer`](Self::handle_pointer) takes). Converts through the
-    /// current frame's viewport and delegates.
+    /// current frame's camera and delegates.
     pub fn scroll_by_screen(&mut self, screen_point: DVec2, delta: [f64; 2]) -> Option<NodeId> {
-        let world = screen_to_world(screen_point, &self.active_viewport(), self.screen_size);
+        let world = screen_to_world(screen_point, &self.active_camera(), self.screen_size);
         self.scroll_by([world.x, world.y], delta)
     }
 
@@ -1949,7 +2038,7 @@ impl PlaybackSession {
     /// Clamp a proposed offset to `scrollable`'s authored axes and content
     /// overflow. Axes the container doesn't scroll zero out; allowed axes clamp
     /// to `[0, content_extent - viewport_extent]` (the Figma model: content
-    /// starts flush and can scroll until its far edge meets the viewport's).
+    /// starts flush and can scroll until its far edge meets the camera's).
     fn clamped_scroll_offset(&self, scrollable: NodeId, offset: [f64; 2]) -> [f64; 2] {
         let resolved = self.reaction_layer(false);
         let scene = if self.doc.scene.contains(scrollable) {
@@ -1970,7 +2059,7 @@ impl PlaybackSession {
 
         // Viewport box: the frame's own clip box (falling back to its declared
         // size). Children coordinates are relative to the frame origin.
-        let viewport = group.clip_size.or(group.local_size);
+        let camera = group.clip_size.or(group.local_size);
         // Content extent: union of the children's boxes in frame-local space.
         // World AABBs mapped through the frame's inverse world transform —
         // exact for the axis-aligned common case, conservative under rotation.
@@ -1999,10 +2088,10 @@ impl PlaybackSession {
         if !any {
             return [0.0, 0.0];
         }
-        let max_scroll = match viewport {
+        let max_scroll = match camera {
             Some([w, h]) => [(content_max[0] - w).max(0.0), (content_max[1] - h).max(0.0)],
             // No declared box (plain scrollable group): allow the raw offset on
-            // permitted axes — there is no viewport edge to clamp against.
+            // permitted axes — there is no camera edge to clamp against.
             None => [f64::MAX, f64::MAX],
         };
         [
@@ -2109,13 +2198,13 @@ impl PlaybackSession {
         self.overlays.last().map(|o| o.root).unwrap_or(self.current)
     }
 
-    /// The viewport of the layer that currently receives input — the topmost
-    /// overlay's placement viewport, else the base frame's.
-    fn active_viewport(&self) -> Viewport {
+    /// The camera of the layer that currently receives input — the topmost
+    /// overlay's placement camera, else the base frame's.
+    fn active_camera(&self) -> Camera2D {
         self.overlays
             .last()
-            .map(|o| o.viewport)
-            .unwrap_or(self.viewport)
+            .map(|o| o.camera)
+            .unwrap_or(self.camera)
     }
 
     fn physical_offset_to_screen(&self, offset: (f64, f64)) -> (f64, f64) {
@@ -2169,9 +2258,9 @@ impl PlaybackSession {
             }
             let offset = self.overlay_screen_offset(active.clock.style, eased);
             let mapped = point - DVec2::new(offset.0, offset.1);
-            return self.hit_layer_at_screen(active.root, self.active_viewport(), mapped, true);
+            return self.hit_layer_at_screen(active.root, self.active_camera(), mapped, true);
         }
-        self.hit_layer_at_screen(self.layer_root(), self.active_viewport(), point, true)
+        self.hit_layer_at_screen(self.layer_root(), self.active_camera(), point, true)
     }
 
     fn hit_navigation_transition(
@@ -2195,7 +2284,7 @@ impl PlaybackSession {
                 root,
             );
             Self::apply_motion_to_hit_scene(&mut scene, self.prototype_motion_evaluation());
-            let world = screen_to_world(point, &active.to_viewport, self.screen_size);
+            let world = screen_to_world(point, &active.camera(eased), self.screen_size);
             return scene.topmost_hit_where(world, |id| descends_from(&scene, id, root));
         }
 
@@ -2205,12 +2294,12 @@ impl PlaybackSession {
             | TransitionStyle::MoveIn { .. } => {
                 let (outgoing, incoming) = self.transition_screen_offsets(active.style, eased);
                 let incoming_point = point - DVec2::new(incoming.0, incoming.1);
-                self.hit_layer_at_screen(active.to_frame, active.to_viewport, incoming_point, true)
+                self.hit_layer_at_screen(active.to_frame, active.to_camera, incoming_point, true)
                     .or_else(|| {
                         let outgoing_point = point - DVec2::new(outgoing.0, outgoing.1);
                         self.hit_layer_at_screen(
                             active.from_frame,
-                            active.from_viewport,
+                            active.from_camera,
                             outgoing_point,
                             false,
                         )
@@ -2224,7 +2313,7 @@ impl PlaybackSession {
                 let outgoing_point = point - DVec2::new(outgoing.0, outgoing.1);
                 self.hit_layer_at_screen(
                     active.from_frame,
-                    active.from_viewport,
+                    active.from_camera,
                     outgoing_point,
                     false,
                 )
@@ -2232,7 +2321,7 @@ impl PlaybackSession {
                     let incoming_point = point - DVec2::new(incoming.0, incoming.1);
                     self.hit_layer_at_screen(
                         active.to_frame,
-                        active.to_viewport,
+                        active.to_camera,
                         incoming_point,
                         true,
                     )
@@ -2242,14 +2331,14 @@ impl PlaybackSession {
             | TransitionStyle::SmartAnimate
             | TransitionStyle::ScrollAnimate => {
                 let incoming = (eased > TIME_EPSILON_SECONDS).then(|| {
-                    self.hit_layer_at_screen(active.to_frame, active.to_viewport, point, true)
+                    self.hit_layer_at_screen(active.to_frame, active.to_camera, point, true)
                 });
                 incoming.flatten().or_else(|| {
                     (eased < 1.0 - TIME_EPSILON_SECONDS)
                         .then(|| {
                             self.hit_layer_at_screen(
                                 active.from_frame,
-                                active.from_viewport,
+                                active.from_camera,
                                 point,
                                 false,
                             )
@@ -2258,7 +2347,7 @@ impl PlaybackSession {
                 })
             }
             TransitionStyle::Instant => {
-                self.hit_layer_at_screen(active.to_frame, active.to_viewport, point, true)
+                self.hit_layer_at_screen(active.to_frame, active.to_camera, point, true)
             }
         }
     }
@@ -2275,18 +2364,18 @@ impl PlaybackSession {
                     let (outgoing, incoming) =
                         self.transition_screen_offsets(active.clock.style, eased);
                     let incoming_point = point - DVec2::new(incoming.0, incoming.1);
-                    self.hit_layer_at_screen(layer.instance, layer.viewport, incoming_point, true)
+                    self.hit_layer_at_screen(layer.instance, layer.camera, incoming_point, true)
                         .or_else(|| {
                             let outgoing_point = point - DVec2::new(outgoing.0, outgoing.1);
                             self.hit_layer_at_screen(
                                 layer.instance,
-                                layer.viewport,
+                                layer.camera,
                                 outgoing_point,
                                 false,
                             )
                         })
                 }
-                _ => self.hit_layer_at_screen(layer.instance, layer.viewport, point, true),
+                _ => self.hit_layer_at_screen(layer.instance, layer.camera, point, true),
             };
             if hit.is_some() {
                 return hit;
@@ -2294,7 +2383,7 @@ impl PlaybackSession {
         }
         self.hit_layer_at_screen_excluding(
             self.layer_root(),
-            self.active_viewport(),
+            self.active_camera(),
             point,
             true,
             &hidden,
@@ -2304,22 +2393,22 @@ impl PlaybackSession {
     fn hit_layer_at_screen(
         &self,
         layer_root: NodeId,
-        viewport: Viewport,
+        camera: Camera2D,
         point: DVec2,
         include_motion: bool,
     ) -> Option<NodeId> {
-        self.hit_layer_at_screen_excluding(layer_root, viewport, point, include_motion, &[])
+        self.hit_layer_at_screen_excluding(layer_root, camera, point, include_motion, &[])
     }
 
     fn hit_layer_at_screen_excluding(
         &self,
         layer_root: NodeId,
-        viewport: Viewport,
+        camera: Camera2D,
         point: DVec2,
         include_motion: bool,
         excluded: &[NodeId],
     ) -> Option<NodeId> {
-        let world = screen_to_world(point, &viewport, self.screen_size);
+        let world = screen_to_world(point, &camera, self.screen_size);
         if let Some(scene) = self.build_hit_scene(layer_root, include_motion) {
             scene.topmost_hit_where(world, |id| {
                 descends_from(&scene, id, layer_root)
@@ -2725,21 +2814,16 @@ impl PlaybackSession {
                     return PresentResponse::default();
                 }
                 let from_frame = self.current;
-                let from_viewport = self.viewport;
+                let from_camera = self.camera;
                 let scroll_snapshot = self.scroll_offsets.clone();
                 self.back_stack.push(NavEntry {
                     frame: from_frame,
-                    viewport: from_viewport,
+                    camera: from_camera,
                     scroll_snapshot,
                 });
                 self.enter_frame(*to);
-                let animating = self.begin_transition(
-                    from_frame,
-                    from_viewport,
-                    *to,
-                    self.viewport,
-                    transition,
-                );
+                let animating =
+                    self.begin_transition(from_frame, from_camera, *to, self.camera, transition);
                 PresentResponse {
                     needs_redraw: true,
                     navigated: true,
@@ -2750,15 +2834,15 @@ impl PlaybackSession {
             Action::Back => match self.back_stack.pop() {
                 Some(entry) => {
                     let from_frame = self.current;
-                    let from_viewport = self.viewport;
+                    let from_camera = self.camera;
                     self.enter_frame(entry.frame);
-                    self.viewport = entry.viewport;
+                    self.camera = entry.camera;
                     self.scroll_offsets = entry.scroll_snapshot;
                     let animating = self.begin_transition(
                         from_frame,
-                        from_viewport,
+                        from_camera,
                         entry.frame,
-                        entry.viewport,
+                        entry.camera,
                         transition,
                     );
                     PresentResponse {
@@ -2977,10 +3061,10 @@ impl PlaybackSession {
                         };
                     }
 
-                    // Default (no scrollable parent): pan the main viewport.
+                    // Default (no scrollable parent): pan the main camera.
                     let cx = (bounds.min_x + bounds.max_x) * 0.5;
                     let cy = (bounds.min_y + bounds.max_y) * 0.5;
-                    self.viewport.center = [cx, cy];
+                    self.camera.center = [cx, cy];
                     PresentResponse {
                         needs_redraw: true,
                         navigated: true,
@@ -3062,7 +3146,7 @@ impl PlaybackSession {
         to_instances: &HashMap<NodeId, (ComponentId, String)>,
     ) -> Vec<VariantLayerTransition> {
         let layer_root = self.layer_root();
-        let viewport = self.active_viewport();
+        let camera = self.active_camera();
         let mut layers = Vec::new();
         for instance in self.doc.scene.descendants_of(layer_root) {
             if !matches!(
@@ -3096,7 +3180,7 @@ impl PlaybackSession {
                 smart_animate::prepare_scenes(&from_scene, from_root, &to_scene, to_root);
             layers.push(VariantLayerTransition {
                 instance,
-                viewport,
+                camera,
                 from_scene,
                 from_root,
                 to_scene,
@@ -3194,16 +3278,16 @@ impl PlaybackSession {
         let Some(bounds) = resolved.scene.world_bounds(frame) else {
             return PresentResponse::default();
         };
-        let base_zoom = self.active_viewport().zoom;
-        let (viewport, screen_rect) =
-            place_overlay(base_zoom, bounds, settings.position, self.screen_size);
+        let base_scale = self.active_camera().scale;
+        let (camera, screen_rect) =
+            place_overlay(base_scale, bounds, settings.position, self.screen_size);
         self.restore_hovered_reaction();
         self.restore_pressed_reaction();
         self.overlays.push(OverlayEntry {
             root: frame,
             layer: self.next_layer,
             settings: settings.clone(),
-            viewport,
+            camera,
             screen_rect,
         });
         self.next_layer = self.next_layer.wrapping_add(1);
@@ -3341,7 +3425,7 @@ impl PlaybackSession {
         }
     }
 
-    /// Switch the current base frame and fit its viewport. Resets all pending
+    /// Switch the current base frame and fit its camera. Resets all pending
     /// timers to the new frame's `AfterDelay` reactions.
     fn enter_frame(&mut self, frame: NodeId) {
         self.restore_hovered_reaction();
@@ -3353,7 +3437,7 @@ impl PlaybackSession {
         self.dispatch_layer = None;
         self.current_layer = self.next_layer;
         self.next_layer = self.next_layer.wrapping_add(1);
-        self.viewport = frame_viewport(&self.doc.scene, frame, self.screen_size);
+        self.camera = frame_camera(&self.doc.scene, frame, self.screen_size, self.fit_mode);
         self.overlays.clear();
         self.active_overlay_transition = None;
         self.active_overlay_exit = None;
@@ -3365,10 +3449,11 @@ impl PlaybackSession {
         self.timers.clear();
         self.timer_membership.clear();
         self.schedule_timers(frame);
-        self.viewport = frame_viewport(
+        self.camera = frame_camera(
             &self.resolved_layer(frame, false).scene,
             frame,
             self.screen_size,
+            self.fit_mode,
         );
     }
 
@@ -3462,9 +3547,9 @@ impl PlaybackSession {
     fn begin_transition(
         &mut self,
         from_frame: NodeId,
-        from_viewport: Viewport,
+        from_camera: Camera2D,
         to_frame: NodeId,
-        to_viewport: Viewport,
+        to_camera: Camera2D,
         transition: Option<&Transition>,
     ) -> bool {
         self.active_overlay_transition = None;
@@ -3478,9 +3563,9 @@ impl PlaybackSession {
             }) if !matches!(style, TransitionStyle::Instant) && *duration_ms > 0 => {
                 self.active_transition = Some(ActiveTransition {
                     from_frame,
-                    from_viewport,
+                    from_camera,
                     to_frame,
-                    to_viewport,
+                    to_camera,
                     style: *style,
                     easing: *easing,
                     duration: *duration_ms as f64 / 1000.0,
@@ -3585,11 +3670,11 @@ fn descends_from(scene: &Scene, mut id: NodeId, root: NodeId) -> bool {
 }
 
 /// Fit a frame's world bounds to the present surface. A frame with no bounds
-/// (empty) falls back to the default viewport so playback never panics.
-fn frame_viewport(scene: &Scene, frame: NodeId, screen_size: DVec2) -> Viewport {
+/// (empty) falls back to the default camera so playback never panics.
+fn frame_camera(scene: &Scene, frame: NodeId, screen_size: DVec2, mode: FitMode) -> Camera2D {
     match scene.world_bounds(frame) {
-        Some(bounds) => fit_bounds(bounds, screen_size, FIT_PADDING),
-        None => Viewport::default(),
+        Some(bounds) => fit_camera(bounds, screen_size, FIT_PADDING, mode),
+        None => Camera2D::default(),
     }
 }
 
@@ -3612,31 +3697,18 @@ fn valid_display_scale(display_scale: f64) -> f64 {
     }
 }
 
-fn rebase_viewport(
+fn rebase_frame_camera(
     scene: &Scene,
     frame: NodeId,
-    viewport: Viewport,
+    camera: Camera2D,
     old_screen_size: DVec2,
     new_screen_size: DVec2,
-) -> Viewport {
-    let old_fit = frame_viewport(scene, frame, old_screen_size);
-    let new_fit = frame_viewport(scene, frame, new_screen_size);
-    let zoom_factor = if old_fit.zoom.is_finite() && old_fit.zoom.abs() > f64::EPSILON {
-        viewport.zoom / old_fit.zoom
-    } else {
-        1.0
-    };
-    let center_offset = [
-        viewport.center[0] - old_fit.center[0],
-        viewport.center[1] - old_fit.center[1],
-    ];
-    Viewport {
-        center: [
-            new_fit.center[0] + center_offset[0],
-            new_fit.center[1] + center_offset[1],
-        ],
-        zoom: (new_fit.zoom * zoom_factor).max(f64::EPSILON),
-    }
+    old_mode: FitMode,
+    new_mode: FitMode,
+) -> Camera2D {
+    let old_fit = frame_camera(scene, frame, old_screen_size, old_mode);
+    let new_fit = frame_camera(scene, frame, new_screen_size, new_mode);
+    rebase_camera(&camera, &old_fit, &new_fit)
 }
 
 fn apply_variant_override_to_instance(

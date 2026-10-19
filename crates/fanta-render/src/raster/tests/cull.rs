@@ -569,3 +569,125 @@ fn scoped_root_without_parent_and_missing_scope_keep_existing_behavior()
     assert!(renderer.copy_rgba().iter().all(|channel| *channel == 0));
     Ok(())
 }
+
+#[test]
+fn camera_visible_rect_inverts_each_axis_and_preserves_dpr() {
+    use fanta_canvas::{Camera2D, FitMode, fit_camera};
+    let bounds = Bounds::from_xywh(400.0, 60.0, 200.0, 100.0);
+    for (mode, expected) in [
+        (FitMode::Contain, [400.0, 10.0, 600.0, 210.0]),
+        (FitMode::Cover, [450.0, 60.0, 550.0, 160.0]),
+        (FitMode::Fill, [400.0, 60.0, 600.0, 160.0]),
+    ] {
+        let camera = fit_camera(bounds, glam::DVec2::splat(300.0), 0.0, mode);
+        for scale in [1.0, 2.0] {
+            let visible = crate::raster::cull::visible_world_rect_with_camera(
+                (300.0 * scale) as u32,
+                (300.0 * scale) as u32,
+                scale,
+                &camera,
+            );
+            assert_eq!(visible.min_x, expected[0] - CULL_MARGIN_WORLD);
+            assert_eq!(visible.min_y, expected[1] - CULL_MARGIN_WORLD);
+            assert_eq!(visible.max_x, expected[2] + CULL_MARGIN_WORLD);
+            assert_eq!(visible.max_y, expected[3] + CULL_MARGIN_WORLD);
+        }
+    }
+    for axes in [[0.0, 1.0], [1.0, f64::NAN], [f64::INFINITY, 1.0]] {
+        let visible = crate::raster::cull::visible_world_rect_with_camera(
+            300,
+            300,
+            1.0,
+            &Camera2D {
+                center: [0.0; 2],
+                scale: axes,
+            },
+        );
+        assert_eq!(visible.min_x, f64::NEG_INFINITY);
+        assert_eq!(visible.max_y, f64::INFINITY);
+    }
+}
+
+#[test]
+fn camera_modes_render_translated_geometry_through_cpu_and_external_canvas()
+-> Result<(), Box<dyn std::error::Error>> {
+    use fanta_canvas::{FitMode, fit_camera};
+    let mut doc = Doc::new();
+    rect_at(&mut doc, 400.0, 60.0, 200.0, 100.0, Color::BLACK);
+    let mut red = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+        480.0,
+        80.0,
+        20.0,
+        20.0,
+        Color::rgb(255, 0, 0),
+    )));
+    red.index = fanta_doc::IndexKey::after(fanta_doc::IndexKey::FIRST);
+    doc.apply(Operation::create_node(red))?;
+    for (mode, expected) in [
+        (
+            FitMode::Contain,
+            [
+                [0, 0, 0, 255],
+                [0, 0, 0, 255],
+                [255, 0, 0, 255],
+                [255, 255, 255, 255],
+            ],
+        ),
+        (
+            FitMode::Cover,
+            [
+                [255, 0, 0, 255],
+                [255, 0, 0, 255],
+                [0, 0, 0, 255],
+                [0, 0, 0, 255],
+            ],
+        ),
+        (
+            FitMode::Fill,
+            [
+                [255, 0, 0, 255],
+                [0, 0, 0, 255],
+                [0, 0, 0, 255],
+                [0, 0, 0, 255],
+            ],
+        ),
+    ] {
+        let camera = fit_camera(
+            Bounds::from_xywh(400.0, 60.0, 200.0, 100.0),
+            glam::DVec2::splat(300.0),
+            0.0,
+            mode,
+        );
+        let mut renderer = RasterRenderer::new(300, 300)?;
+        renderer.background = Color::WHITE;
+        renderer.render_page_with_camera(&doc.scene, &camera, None, &RenderInputs::for_doc(&doc));
+        let pixels = renderer.copy_rgba();
+        for ((x, y), color) in [(130, 80), (105, 80), (130, 125), (20, 20)]
+            .into_iter()
+            .zip(expected)
+        {
+            assert_eq!(rgba_at(&pixels, 300, x, y), color, "{mode:?} ({x},{y})");
+        }
+        let mut external = surfaces::raster_n32_premul((300, 300)).ok_or("external surface")?;
+        let metrics = renderer.render_to_canvas_with_camera(
+            external.canvas(),
+            300,
+            300,
+            &doc.scene,
+            &camera,
+            None,
+            &RenderInputs::for_doc(&doc),
+        );
+        assert!(!metrics.effect_failed);
+        let info = skia_safe::ImageInfo::new(
+            (300, 300),
+            skia_safe::ColorType::RGBA8888,
+            skia_safe::AlphaType::Unpremul,
+            None,
+        );
+        let mut external_pixels = vec![0; 300 * 300 * 4];
+        assert!(external.read_pixels(&info, &mut external_pixels, 300 * 4, (0, 0)));
+        assert_eq!(pixels, external_pixels, "{mode:?}: external camera path");
+    }
+    Ok(())
+}

@@ -6,6 +6,7 @@
 //!
 //! [`InstanceCache`]: InstanceCache
 use super::camera_cache::{CameraCache, CameraCacheResult};
+use super::cull::visible_world_rect_with_camera;
 use super::layer_cache::{CacheByteCounter, ComponentDependencies};
 use super::walk::render_scoped_root;
 use super::{
@@ -15,6 +16,7 @@ use super::{
     PatternCache, Rect, RenderCtx, Scene, Surface, VariableCollectionId, VariableRegistry,
     Viewport, render_node, surfaces, to_sk_color, visible_world_rect,
 };
+use fanta_canvas::Camera2D;
 use fanta_doc::AssetId;
 
 /// Errors returned by the renderer.
@@ -1372,6 +1374,16 @@ impl RasterRenderer {
         page_root: Option<NodeId>,
         inputs: &RenderInputs,
     ) -> RenderMetrics {
+        self.render_page_with_camera(scene, &Camera2D::from(*viewport), page_root, inputs)
+    }
+
+    pub fn render_page_with_camera(
+        &mut self,
+        scene: &Scene,
+        camera: &Camera2D,
+        page_root: Option<NodeId>,
+        inputs: &RenderInputs,
+    ) -> RenderMetrics {
         let _text_context = self
             .text_context
             .as_ref()
@@ -1429,7 +1441,7 @@ impl RasterRenderer {
             layer_cache,
             pixel_snap_pan,
             scene,
-            viewport,
+            camera,
             page_root,
             inputs,
             true,
@@ -1474,8 +1486,30 @@ impl RasterRenderer {
         page_root: Option<NodeId>,
         inputs: &RenderInputs,
     ) -> RenderMetrics {
-        self.render_to_canvas_configured(
-            canvas, target_w, target_h, scene, viewport, page_root, inputs, true, None, None,
+        self.render_to_canvas_with_camera(
+            canvas,
+            target_w,
+            target_h,
+            scene,
+            &Camera2D::from(*viewport),
+            page_root,
+            inputs,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_to_canvas_with_camera(
+        &mut self,
+        canvas: &Canvas,
+        target_w: u32,
+        target_h: u32,
+        scene: &Scene,
+        camera: &Camera2D,
+        page_root: Option<NodeId>,
+        inputs: &RenderInputs,
+    ) -> RenderMetrics {
+        self.render_to_canvas_configured_camera(
+            canvas, target_w, target_h, scene, camera, page_root, inputs, true, None, None,
         )
     }
 
@@ -1726,7 +1760,7 @@ impl RasterRenderer {
             &mut self.layer_cache,
             true,
             scene,
-            &viewport,
+            &Camera2D::from(viewport),
             page_root,
             inputs,
             true,
@@ -1889,6 +1923,34 @@ impl RasterRenderer {
         split: Option<super::split::SplitPass<'_>>,
         should_cancel: Option<&dyn Fn() -> bool>,
     ) -> RenderMetrics {
+        self.render_to_canvas_configured_camera(
+            canvas,
+            target_w,
+            target_h,
+            scene,
+            &Camera2D::from(*viewport),
+            page_root,
+            inputs,
+            supports_offscreen_layers,
+            split,
+            should_cancel,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_to_canvas_configured_camera(
+        &mut self,
+        canvas: &Canvas,
+        target_w: u32,
+        target_h: u32,
+        scene: &Scene,
+        camera: &Camera2D,
+        page_root: Option<NodeId>,
+        inputs: &RenderInputs,
+        supports_offscreen_layers: bool,
+        split: Option<super::split::SplitPass<'_>>,
+        should_cancel: Option<&dyn Fn() -> bool>,
+    ) -> RenderMetrics {
         let _text_context = self
             .text_context
             .as_ref()
@@ -1931,7 +1993,7 @@ impl RasterRenderer {
             layer_cache,
             pixel_snap_pan,
             scene,
-            viewport,
+            camera,
             page_root,
             inputs,
             supports_offscreen_layers,
@@ -2196,6 +2258,7 @@ impl RasterRenderer {
             resolved_local_bounds: IdHashMap::default(),
             visible,
             effective_scale,
+            effective_scale_axes: [effective_scale; 2],
             page_background_root: page_background.and(page_root),
             supports_offscreen_layers: true,
             paint_alpha: 1.0,
@@ -2241,7 +2304,7 @@ impl RasterRenderer {
         layer_cache: &mut LayerCache,
         pixel_snap_pan: bool,
         scene: &Scene,
-        viewport: &Viewport,
+        camera: &Camera2D,
         page_root: Option<NodeId>,
         inputs: &RenderInputs,
         supports_offscreen_layers: bool,
@@ -2271,7 +2334,9 @@ impl RasterRenderer {
 
         let half_w = target_w as f32 * 0.5;
         let half_h = target_h as f32 * 0.5;
-        let effective_scale = (viewport.zoom * display_scale) as f32;
+        let effective_scale_axes = camera.scale.map(|scale| (scale * display_scale) as f32);
+        let [scale_x, scale_y] = effective_scale_axes;
+        let effective_scale = scale_x.max(scale_y);
 
         // Derive the region of WORLD space the surface currently shows by
         // inverting exactly the transform applied below. See
@@ -2287,7 +2352,7 @@ impl RasterRenderer {
                 max_y: f64::INFINITY,
             }
         } else {
-            visible_world_rect(target_w, target_h, display_scale, viewport)
+            visible_world_rect_with_camera(target_w, target_h, display_scale, camera)
         };
 
         // Apply the viewport transform: translate so `viewport.center` maps to
@@ -2301,8 +2366,8 @@ impl RasterRenderer {
         // device pixels first (see `set_pixel_snap_pan`) — computed in f64 so
         // the rounding sees the same value on every frame.
         canvas.save();
-        let device_tx = f64::from(half_w) - f64::from(effective_scale) * viewport.center[0];
-        let device_ty = f64::from(half_h) - f64::from(effective_scale) * viewport.center[1];
+        let device_tx = f64::from(half_w) - f64::from(scale_x) * camera.center[0];
+        let device_ty = f64::from(half_h) - f64::from(scale_y) * camera.center[1];
         let (root_tx, root_ty) = if pixel_snap_pan {
             (device_tx.round(), device_ty.round())
         } else {
@@ -2310,11 +2375,11 @@ impl RasterRenderer {
         };
         if pixel_snap_pan {
             canvas.translate((root_tx as f32, root_ty as f32));
-            canvas.scale((effective_scale, effective_scale));
+            canvas.scale((scale_x, scale_y));
         } else {
             canvas.translate((half_w, half_h));
-            canvas.scale((effective_scale, effective_scale));
-            canvas.translate((-viewport.center[0] as f32, -viewport.center[1] as f32));
+            canvas.scale((scale_x, scale_y));
+            canvas.translate((-camera.center[0] as f32, -camera.center[1] as f32));
         }
 
         // Motion playback moves nodes
@@ -2333,7 +2398,7 @@ impl RasterRenderer {
                     asset_resolver: resolver
                         .map(|resolver| std::ptr::from_ref(resolver).cast::<()>() as usize),
                 },
-                effective_scale,
+                effective_scale_axes,
                 (root_tx, root_ty),
             );
         let layer_cache_lookups = !metrics.camera_recording
@@ -2365,6 +2430,7 @@ impl RasterRenderer {
                 .unwrap_or_default(),
             visible,
             effective_scale,
+            effective_scale_axes,
             page_background_root: page_background.and(page_root),
             supports_offscreen_layers,
             paint_alpha: 1.0,

@@ -9,7 +9,7 @@ use fanta_doc::{
     TextStyle, TextStyleRun, VarValue,
 };
 use fanta_format::runtime::{RuntimeProgram, SourceBundle};
-use fanta_present::PlaybackSession;
+use fanta_present::{FitMode, PlaybackSession};
 use fanta_render::{LazyAssetResolver, RasterRenderer, TextRenderContext, decode_image_bytes};
 use fanta_text::{FontRegistration, LayoutEngine};
 use glam::DVec2;
@@ -226,6 +226,17 @@ impl Runtime {
         height: f64,
         start: Option<NodeId>,
     ) -> Result<u32, RuntimeError> {
+        self.create_player_with_fit(program_handle, width, height, start, FitMode::Contain)
+    }
+
+    pub fn create_player_with_fit(
+        &mut self,
+        program_handle: u32,
+        width: f64,
+        height: f64,
+        start: Option<NodeId>,
+        fit: FitMode,
+    ) -> Result<u32, RuntimeError> {
         if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
             return Err(RuntimeError(
                 "Player dimensions must be finite and positive".into(),
@@ -252,7 +263,7 @@ impl Runtime {
                 })
             })
         });
-        let session = program
+        let mut session = program
             .text
             .with(|| {
                 PlaybackSession::new_with_compiled_motion(
@@ -264,7 +275,8 @@ impl Runtime {
                 )
             })
             .map_err(RuntimeError::from_error)?;
-        let handle = self.allocate_handle()?;
+        session.set_fit_mode(fit);
+        session.fit_view();
         let mut player = Player {
             session,
             renderer: None,
@@ -274,6 +286,7 @@ impl Runtime {
             validated_text: BTreeSet::new(),
         };
         player.validate_effective_text()?;
+        let handle = self.allocate_handle()?;
         self.players.insert(handle, player);
         Ok(handle)
     }
@@ -552,7 +565,24 @@ impl Player {
                     .zoom_view(DVec2::from_array(point), argument(&arguments, "factor")?)
                     .map_err(RuntimeError::from_error)?;
             }
-            "fit" => response = self.session.fit_view(),
+            "fit" => {
+                let mode = arguments
+                    .get("mode")
+                    .map(|mode| {
+                        if !mode.is_string() {
+                            return Err(RuntimeError(
+                                "fit mode must be contain, cover, or fill".into(),
+                            ));
+                        }
+                        serde_json::from_value::<FitMode>(mode.clone())
+                            .map_err(RuntimeError::from_error)
+                    })
+                    .transpose()?;
+                if let Some(mode) = mode {
+                    self.session.set_fit_mode(mode);
+                }
+                response = self.session.fit_view();
+            }
             "startFlow" => {
                 if !self.session.start_flow(argument(&arguments, "index")?) {
                     return Err(RuntimeError("Unknown flow".into()));
@@ -712,7 +742,135 @@ impl Player {
         };
         let url = self.session.take_open_url();
         Ok(
-            json!({"response":response,"state":self.session.playback_state(),"schedule":self.session.schedule(),"paused":self.paused,"openUrl":url,"events":self.session.take_playback_events(),"occurrences": if command == "state" {Some(self.session.occurrences())} else {None}, "inspection":inspection,"viewport":self.session.viewport()}),
+            json!({"response":response,"state":self.session.playback_state(),"schedule":self.session.schedule(),"paused":self.paused,"openUrl":url,"events":self.session.take_playback_events(),"occurrences": if command == "state" {Some(self.session.occurrences())} else {None}, "inspection":inspection,"viewport":self.session.viewport(),"camera":self.session.camera(),"fitMode":self.session.fit_mode()}),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fit_source() -> SourceBundle {
+        SourceBundle {
+            files: BTreeMap::from([
+                (
+                    "fanta.json".into(),
+                    br#"{"format":"fanta-project","version":6,"schema_version":4,"project_id":"d_00000000000000000000000030"}"#.to_vec(),
+                ),
+                (
+                    "doc/metadata.json".into(),
+                    br#"{"title":"Fit geometry","created_at":0,"modified_at":0}"#.to_vec(),
+                ),
+                (
+                    "doc/flow_start.json".into(),
+                    br#""00000000000000000000000002""#.to_vec(),
+                ),
+                (
+                    "pages/fit/page.json".into(),
+                    br#"{"id":"00000000000000000000000001","order":0}"#.to_vec(),
+                ),
+                (
+                    "pages/fit/page.fnx".into(),
+                    br#"<Frame id="00000000000000000000000001" name="Fit">
+  <Frame id="00000000000000000000000002" name="Wide" x={400} y={60} width={200} height={100}>
+    <Frame id="00000000000000000000000003" name="Hit" x={80} y={20} width={20} height={20} reactions={[{"id":"00000000000000000000000020","trigger":{"kind":"click"},"action":{"kind":"open_link","url":"https://example.invalid/fit"}}]} />
+  </Frame>
+</Frame>"#.to_vec(),
+                ),
+            ]),
+            ..SourceBundle::default()
+        }
+    }
+
+    #[test]
+    fn player_fit_modes_preserve_legacy_creation_and_independent_program_state()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut runtime = Runtime::default();
+        let program = runtime.compile_source(&fit_source())?;
+        let authored = runtime.to_bundle(program)?;
+        let legacy = runtime.create_player(program, 300.0, 300.0, None)?;
+        assert_eq!(
+            runtime.command(legacy, "state", json!({}))?["camera"],
+            json!({"center":[500.0,110.0],"scale":[1.5,1.5]})
+        );
+        for (mode, name, scale, hit) in [
+            (FitMode::Contain, "contain", [1.5_f64, 1.5], [130.0, 125.0]),
+            (FitMode::Cover, "cover", [3.0, 3.0], [105.0, 80.0]),
+            (FitMode::Fill, "fill", [1.5, 3.0], [130.0, 80.0]),
+        ] {
+            let player = runtime.create_player_with_fit(program, 300.0, 300.0, None, mode)?;
+            let state = runtime.command(player, "state", json!({}))?;
+            assert_eq!(state["fitMode"], name);
+            assert_eq!(
+                state["camera"],
+                json!({"center":[500.0,110.0],"scale":scale})
+            );
+            assert_eq!(state["viewport"]["zoom"], scale[0].min(scale[1]));
+            let clicked =
+                runtime.command(player, "pointer", json!({"type":"click","point":hit}))?;
+            assert_eq!(clicked["openUrl"], "https://example.invalid/fit");
+            runtime.command(player, "fit", json!({"mode":"fill"}))?;
+            assert_eq!(
+                runtime.command(legacy, "state", json!({}))?["fitMode"],
+                "contain"
+            );
+        }
+        assert_eq!(runtime.to_bundle(program)?, authored);
+        Ok(())
+    }
+
+    #[test]
+    fn fit_requests_validate_atomically_and_refit_both_axes_without_advancing_playback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut runtime = Runtime::default();
+        let program = runtime.compile_source(&fit_source())?;
+        let player = runtime.create_player_with_fit(program, 300.0, 300.0, None, FitMode::Fill)?;
+        runtime.command(player, "advanceBy", json!({"deltaMs":125.0}))?;
+        runtime.command(player, "pausePlayback", json!({}))?;
+        let zoomed = runtime.command(player, "zoom", json!({"point":[60.0,90.0],"factor":2.0}))?;
+        assert_eq!(
+            zoomed["camera"],
+            json!({"center":[470.0,100.0],"scale":[3.0,6.0]})
+        );
+        let panned = runtime.command(player, "pan", json!({"delta":[30.0,-12.0]}))?;
+        assert_eq!(
+            panned["camera"],
+            json!({"center":[460.0,102.0],"scale":[3.0,6.0]})
+        );
+        let before = runtime.command(player, "state", json!({}))?;
+        for invalid in [
+            json!(null),
+            json!(false),
+            json!(1),
+            json!([]),
+            json!({}),
+            json!({"contain":null}),
+            json!("Fill"),
+            json!("stretch"),
+        ] {
+            assert!(
+                runtime
+                    .command(player, "fit", json!({"mode":invalid}))
+                    .is_err()
+            );
+            assert_eq!(runtime.command(player, "state", json!({}))?, before);
+        }
+        let fitted = runtime.command(player, "fit", json!({}))?;
+        assert_eq!(
+            fitted["camera"],
+            json!({"center":[500.0,110.0],"scale":[1.5,3.0]})
+        );
+        assert_eq!(fitted["fitMode"], "fill");
+        assert_eq!(fitted["state"]["clockMs"], 125.0);
+        assert_eq!(fitted["schedule"], before["schedule"]);
+        let cover = runtime.command(player, "fit", json!({"mode":"cover"}))?;
+        assert_eq!(
+            cover["camera"],
+            json!({"center":[500.0,110.0],"scale":[3.0,3.0]})
+        );
+        assert_eq!(cover["fitMode"], "cover");
+        assert!(runtime.player_mut(player)?.renderer.is_none());
+        Ok(())
     }
 }

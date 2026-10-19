@@ -8,10 +8,11 @@
 //! uses to stack base → scrim → overlay(s). Like [`crate::transition`] it is
 //! pure buffer / geometry math — no Skia, no Doc mutation.
 
-use fanta_doc::{Bounds, OverlayPosition, Viewport};
+use fanta_canvas::Camera2D;
+use fanta_doc::{Bounds, OverlayPosition};
 use glam::DVec2;
 
-/// An overlay's rectangle on the present surface, in physical pixels. Used to
+/// An overlay's rectangle on the present surface, in logical pixels. Used to
 /// decide whether a click landed outside a dismissable overlay.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct ScreenRect {
@@ -30,21 +31,24 @@ impl ScreenRect {
 /// black mixed into the backdrop).
 pub(crate) const SCRIM_DIM: f64 = 0.35;
 
-/// Compute the viewport that renders `overlay_bounds` at `base_zoom`, placed per
+/// Compute the viewport that renders `overlay_bounds` at `base_scale`, placed per
 /// `position` within `screen_size`, plus the resulting on-screen rect.
 ///
-/// The overlay keeps the base frame's zoom (Figma presents overlays 1:1 with
+/// The overlay keeps the base frame's axis scales (Figma presents overlays 1:1 with
 /// the frame beneath) and is positioned by choosing the viewport center so the
 /// overlay's world min-corner maps to the desired screen top-left.
 pub(crate) fn place_overlay(
-    base_zoom: f64,
+    base_scale: [f64; 2],
     overlay_bounds: Bounds,
     position: OverlayPosition,
     screen_size: DVec2,
-) -> (Viewport, ScreenRect) {
-    let z = base_zoom.max(f64::EPSILON);
+) -> (Camera2D, ScreenRect) {
+    let scale = DVec2::from_array(base_scale).max(DVec2::splat(f64::EPSILON));
     let world_min = DVec2::new(overlay_bounds.min_x, overlay_bounds.min_y);
-    let size = DVec2::new(overlay_bounds.width() * z, overlay_bounds.height() * z);
+    let size = DVec2::new(
+        overlay_bounds.width() * scale.x,
+        overlay_bounds.height() * scale.y,
+    );
     // Free room to slide the overlay within the surface (clamped ≥ 0 so an
     // overlay larger than the screen pins to the top-left rather than jumping).
     let free = (screen_size - size).max(DVec2::ZERO);
@@ -57,21 +61,21 @@ pub(crate) fn place_overlay(
         OverlayPosition::BottomCenter => DVec2::new(free.x * 0.5, free.y),
         OverlayPosition::BottomRight => free,
         // Manual offset is measured from the surface top-left, in frame units
-        // scaled to screen pixels by the zoom.
-        OverlayPosition::Manual { offset } => DVec2::new(offset[0] * z, offset[1] * z),
+        // scaled to logical pixels on each axis.
+        OverlayPosition::Manual { offset } => DVec2::new(offset[0] * scale.x, offset[1] * scale.y),
     };
-    // world_to_screen(world_min) = (world_min - center) * z + screen/2 == top_left
-    //   ⇒ center = world_min - (top_left - screen/2) / z
-    let center = world_min - (top_left - screen_size * 0.5) / z;
-    let viewport = Viewport {
+    // world_to_screen(world_min) = (world_min - center) * scale + screen/2 == top_left
+    //   ⇒ center = world_min - (top_left - screen/2) / scale
+    let center = world_min - (top_left - screen_size * 0.5) / scale;
+    let camera = Camera2D {
         center: [center.x, center.y],
-        zoom: z,
+        scale: scale.to_array(),
     };
     let rect = ScreenRect {
         min: top_left,
         max: top_left + size,
     };
-    (viewport, rect)
+    (camera, rect)
 }
 
 /// Composite `top` over `base` in place (both equal-size straight-alpha RGBA8),
@@ -125,7 +129,7 @@ mod tests {
     fn center_places_a_small_overlay_in_the_middle() {
         let screen = DVec2::new(200.0, 200.0);
         let (_, rect) = place_overlay(
-            1.0,
+            [1.0; 2],
             bounds(1000.0, 0.0, 100.0, 100.0),
             OverlayPosition::Center,
             screen,
@@ -140,19 +144,19 @@ mod tests {
     fn corners_pin_to_the_edges() {
         let screen = DVec2::new(200.0, 200.0);
         let b = bounds(0.0, 0.0, 100.0, 100.0);
-        let (_, tl) = place_overlay(1.0, b, OverlayPosition::TopLeft, screen);
+        let (_, tl) = place_overlay([1.0; 2], b, OverlayPosition::TopLeft, screen);
         assert_eq!(tl.min, DVec2::ZERO);
-        let (_, br) = place_overlay(1.0, b, OverlayPosition::BottomRight, screen);
+        let (_, br) = place_overlay([1.0; 2], b, OverlayPosition::BottomRight, screen);
         assert_eq!(br.max, screen);
     }
 
     #[test]
     fn placement_viewport_round_trips_the_min_corner() {
-        use fanta_canvas::viewport::world_to_screen;
+        use fanta_canvas::viewport::camera_world_to_screen as world_to_screen;
         let screen = DVec2::new(200.0, 200.0);
         let b = bounds(1000.0, 0.0, 100.0, 100.0);
-        let (viewport, rect) = place_overlay(1.0, b, OverlayPosition::Center, screen);
-        let mapped = world_to_screen(DVec2::new(b.min_x, b.min_y), &viewport, screen);
+        let (camera, rect) = place_overlay([1.0; 2], b, OverlayPosition::Center, screen);
+        let mapped = world_to_screen(DVec2::new(b.min_x, b.min_y), &camera, screen);
         assert!(
             (mapped - rect.min).length() < 1e-9,
             "{mapped:?} vs {:?}",

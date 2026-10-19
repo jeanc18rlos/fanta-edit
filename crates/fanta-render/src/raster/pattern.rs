@@ -98,6 +98,7 @@ mod context_tests {
                 resolved_local_bounds: preserved.clone(),
                 visible,
                 effective_scale: page_scale,
+                effective_scale_axes: [page_scale; 2],
                 filtered_ancestor: false,
                 page_background_root: Some(source_id),
                 supports_offscreen_layers: true,
@@ -428,6 +429,13 @@ fn render_source(
             max_y: 1e18,
         },
     );
+    let old_axes = std::mem::replace(
+        &mut ctx.effective_scale_axes,
+        [
+            width as f32 / bounds.width() as f32,
+            height as f32 / bounds.height() as f32,
+        ],
+    );
     let old_scale = std::mem::replace(
         &mut ctx.effective_scale,
         width as f32 / bounds.width() as f32,
@@ -452,6 +460,7 @@ fn render_source(
     ctx.page_background_root = old_background;
     ctx.supports_offscreen_layers = old_layers;
     ctx.effective_scale = old_scale;
+    ctx.effective_scale_axes = old_axes;
     ctx.resolved_local_bounds = old_bounds;
     ctx.visible = old_visible;
     canvas.restore();
