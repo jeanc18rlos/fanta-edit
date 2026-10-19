@@ -1,5 +1,10 @@
 # Fanta Shipaton demo capture plan
 
+> Historical record of the September 2026 Mac App Store attempt. Fanta ships as a
+> notarized DMG, billing is web-based through Polar, and the RevenueCat bridge and
+> in-app purchase flow were removed from the app on 2026-10-19. Nothing below
+> describes current behaviour.
+
 Target: 110–115 seconds, public YouTube or Vimeo video, recorded from the signed Fanta 1.0 Mac release build. Keep the real app visible throughout; show a demo project with no personal or customer data.
 
 | Time | Real action to record | Optional caption |

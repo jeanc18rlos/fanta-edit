@@ -40,6 +40,34 @@ fn main() {
 
         // weak link to support Catalina
         println!("cargo:rustc-link-arg=-Wl,-weak_framework,ScreenCaptureKit");
+
+        // Skia's Graphite Metal backend calls `__isPlatformVersionAtLeast` for
+        // its `@available` checks. std defines it, but release LTO drops std's
+        // copy because no Rust code calls it, so also link clang's runtime,
+        // which defines it too.
+        match Command::new("cc")
+            .arg("-print-file-name=libclang_rt.osx.a")
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                let runtime = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if std::path::Path::new(&runtime).is_absolute() {
+                    println!("cargo:rerun-if-changed={runtime}");
+                    println!("cargo:rustc-link-arg={runtime}");
+                } else {
+                    println!(
+                        "cargo:warning=cc did not find libclang_rt.osx.a; release builds may not link Skia's availability checks"
+                    );
+                }
+            }
+            Ok(output) => println!(
+                "cargo:warning=cc could not locate clang's runtime library: {}",
+                output.status
+            ),
+            Err(error) => {
+                println!("cargo:warning=could not run cc to locate clang's runtime library: {error}")
+            }
+        }
     }
 
     // Populate git sha environment variable if git is available

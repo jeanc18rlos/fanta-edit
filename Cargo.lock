@@ -4247,7 +4247,7 @@ dependencies = [
 
 [[package]]
 name = "fanta"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "acp_tools",
  "agent",
@@ -5327,18 +5327,6 @@ dependencies = [
  "fanta-gpui-core",
  "grammars",
  "language",
-]
-
-[[package]]
-name = "fanta_revenuecat"
-version = "0.1.0"
-dependencies = [
- "futures 0.3.32",
- "libloading",
- "log",
- "serde",
- "serde_json",
- "thiserror 2.0.17",
 ]
 
 [[package]]

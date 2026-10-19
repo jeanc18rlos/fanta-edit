@@ -151,7 +151,6 @@ esac
         self.stub(self.sentinels / 'rustc', 'rustc', "printf '%s\\n' 'host: aarch64-apple-darwin'\n")
         self.stub(self.sentinels / 'rustup', 'rustup', 'exit 0\n')
         self.stub(self.root / 'script/generate-licenses', 'licenses', 'exit 0\n')
-        self.stub(self.root / 'crates/fanta_revenuecat/bundle-native.sh', 'store-boundary', 'exit 97\n')
 
     def stub(self, path, label, body):
         path.parent.mkdir(parents=True, exist_ok=True)

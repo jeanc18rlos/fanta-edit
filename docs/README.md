@@ -14,8 +14,8 @@ step: read the files here, or on GitHub.
   GitHub installer requirements for the first customer release.
 - [`alpha/AI_DESIGNER.md`](./alpha/AI_DESIGNER.md) — designer modes, project
   specifications, reasoning controls, collaboration, and asset preparation.
-- [`alpha/MAC_APP_STORE.md`](./alpha/MAC_APP_STORE.md) — Apple signing, RevenueCat,
-  App Review, and Shipaton release checklist.
+- [`alpha/MAC_APP_STORE.md`](./alpha/MAC_APP_STORE.md) — historical Apple signing,
+  App Review, and Shipaton checklist from the September 2026 App Store attempt.
 - [`alpha/RELEASE_VALIDATION.md`](./alpha/RELEASE_VALIDATION.md) — measured
   performance, completed checks, and remaining release verification.
 - [`fanta/capabilities.md`](./fanta/capabilities.md) — current editor capability

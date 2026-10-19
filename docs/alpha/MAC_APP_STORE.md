@@ -1,5 +1,10 @@
 # Fanta Mac App Store and Shipaton release
 
+> Historical record of the September 2026 Mac App Store attempt. Fanta ships as a
+> notarized DMG, billing is web-based through Polar, and the RevenueCat bridge and
+> in-app purchase flow were removed from the app on 2026-10-19. Nothing below
+> describes current behaviour.
+
 Status on 25 September 2026: the App Store build path and RevenueCat integration
 are implemented locally. The Apple app record and purchase products are created.
 The Paid Apps Agreement, bank account, and tax forms show Active in App Store
