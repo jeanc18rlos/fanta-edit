@@ -218,6 +218,14 @@ impl FigDesignSurface {
 }
 
 fn project_source_path(root: &Path, source: &Path) -> Result<PathBuf> {
+    // Windows resolves `..` before it looks a path up, so `missing/../x.fnx` names
+    // `x.fnx` there but fails on Unix. Refusing `..` gives agents one answer everywhere.
+    if source
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        bail!("agent source focus must have a project-contained path");
+    }
     let project_root = root
         .canonicalize()
         .context("resolving the design project")?;
@@ -1721,7 +1729,14 @@ fn relative_source(project_root: Option<&Path>, source: Option<PathBuf>) -> Valu
         return Value::Null;
     };
     match source.strip_prefix(project_root) {
-        Ok(relative) => json!(relative.to_string_lossy()),
+        // Project-relative paths use `/` on every platform, as the project format does.
+        Ok(relative) => json!(
+            relative
+                .components()
+                .map(|component| component.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/")
+        ),
         Err(_) => json!(source.to_string_lossy()),
     }
 }

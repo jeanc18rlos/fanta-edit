@@ -16079,7 +16079,7 @@ mod tests {
             .expect("X input")
             .center();
         visual.simulate_click(field, gpui::Modifiers::none());
-        visual.simulate_keystrokes("cmd-a");
+        visual.simulate_keystrokes("secondary-a");
         visual.simulate_input(draft);
         visual.run_until_parked();
         let focus = visual.update(|window, cx| window.focused(cx).expect("property input focus"));
@@ -16142,7 +16142,7 @@ mod tests {
             assert!(inspector.size.width >= px(MIN_INSPECTOR_SIDEBAR_WIDTH));
             assert!(field.left() >= inspector.left() && field.right() <= inspector.right());
             assert!(inspector.right() <= px(width));
-            visual.simulate_keystrokes("cmd-a cmd-c");
+            visual.simulate_keystrokes("secondary-a secondary-c");
             assert_eq!(
                 visual
                     .read_from_clipboard()

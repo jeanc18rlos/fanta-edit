@@ -688,7 +688,7 @@ pub(crate) fn render_layer_via_cache(
     );
     // The canvas's own surface props (dither etc.); the save-layer pushed
     // inside picks its pixel geometry the same way a direct save-layer does.
-    let props = canvas.top_props();
+    let props = top_surface_props(canvas);
     let Some(mut surface) = compatible_offscreen_surface(canvas, &info, Some(&props)) else {
         return false;
     };
@@ -779,6 +779,23 @@ fn canvas_cache_domain(_canvas: &Canvas) -> Option<LayerCacheDomain> {
         }
     }
     Some(LayerCacheDomain::Raster)
+}
+
+/// The surface properties of the canvas's top layer.
+pub(crate) fn top_surface_props(canvas: &Canvas) -> skia_safe::SurfaceProps {
+    // skia-safe's `top_props` calls `SkCanvas::getTopProps`, a C++ method that returns a
+    // struct by value. MSVC passes the result pointer after `this` and the binding passes it
+    // first, so on Windows the call reads a garbage canvas and crashes. `props` writes through
+    // a pointer instead. The base layer's properties it returns differ from the top layer's
+    // only in pixel geometry inside a save layer, and Fanta's raster surfaces set none.
+    #[cfg(all(target_os = "windows", target_env = "msvc"))]
+    {
+        canvas.props().unwrap_or_default()
+    }
+    #[cfg(not(all(target_os = "windows", target_env = "msvc")))]
+    {
+        canvas.top_props()
+    }
 }
 
 pub(crate) fn immutable_surface_snapshot(
