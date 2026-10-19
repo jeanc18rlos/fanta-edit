@@ -1,3 +1,17 @@
+# Fanta v2 — unreleased
+
+- Added layer-anchored AI Review findings, review drafts and explicit undoable suggested fixes.
+- Added live update controls in Settings, About, the app menu and the command palette.
+- Added enum/image variables, conditional prototype branches and variable arithmetic.
+- Added clip settings, portable Motion JSON and Figma Motion JSON exports.
+- Improved vector path joining, closing, simplification, segment bending and anchor editing.
+- Added a command-line website exporter using an explicitly supplied Fanta-JS runtime.
+- Removed the unused RevenueCat integration; current billing uses Polar on the web.
+
+Release signing setup, backend feed verification, Fanta-JS playback/packaging and
+installed-app acceptance remain required before publishing v2. Stage JSX,
+MP4/GIF, trigger inputs and the state-machine view are deferred.
+
 # Fanta 0.1.0-alpha.1
 
 > Historical September 2026 release report. Unsigned-install guidance, tool inventory and Code descriptions below apply to the dated builds. Use [Public Alpha installation](PUBLIC_ALPHA.md), the [capability guide](../fanta/capabilities.md) and [agent quickstart](../fanta/agent-quickstart.md) for current guidance. Original evidence is preserved.

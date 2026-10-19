@@ -30,6 +30,7 @@ pub fn app_menus() -> Vec<Menu> {
             disabled: false,
             items: vec![
                 MenuItem::action("About Fanta", fanta_actions::About),
+                MenuItem::action("Check for Updates…", auto_update::Check),
                 #[cfg(feature = "mac_app_store")]
                 MenuItem::action("Credits & Billing…", fanta_actions::OpenAccountSettings),
                 MenuItem::separator(),
@@ -119,6 +120,20 @@ pub fn app_menus() -> Vec<Menu> {
                     "Select All",
                     editor::actions::SelectAll,
                     OsAction::SelectAll,
+                ),
+            ],
+        },
+        Menu {
+            name: "Design".into(),
+            disabled: false,
+            items: vec![
+                MenuItem::action("AI Review…", fig_viewer::RunAiReview),
+                MenuItem::action("Ultrareview…", fig_viewer::RunUltraReview),
+                MenuItem::separator(),
+                MenuItem::action("Export Motion JSON…", fig_viewer::ExportMotionJson),
+                MenuItem::action(
+                    "Export Figma Motion JSON…",
+                    fig_viewer::ExportFigmaMotionJson,
                 ),
             ],
         },

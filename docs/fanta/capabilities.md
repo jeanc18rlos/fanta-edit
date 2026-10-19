@@ -2,7 +2,7 @@
 
 For installation and a first workflow, use the [current Public Alpha guide](../alpha/PUBLIC_ALPHA.md), [ten-minute exercise and demos](../alpha/DEMO_GUIDE.md), and [agent quickstart](agent-quickstart.md). The exercise includes reviewed footage of the accepted signed Build45 app, original sample files, screenshots and silent action GIFs. Earlier native QA images retain their original provenance. The signed package has passed notarization, stapling and tested installation, save/reopen and same-build replacement checks. Public availability remains on hold pending website review and publication checks. [Exact package identity and acceptance scope](../alpha/PUBLIC_ALPHA.md#accepted-package-and-publication-status).
 
-Source inventory updated **11 October 2026**; bounded native evidence updated
+Source inventory updated **19 October 2026**; bounded native evidence updated
 **11 October 2026**. Acceptance evidence below is dated.
 This describes the current editor implementation; release verification is tracked
 separately in
@@ -10,6 +10,30 @@ separately in
 reports describe their dated builds and can contain controls that have since
 changed. A feature listed here is not a claim that its complete installed-app
 journey has passed.
+
+## V2 implementation additions
+
+AI Review and Ultrareview prepare a manual-send draft in the Review profile.
+Agents can create anchored findings with severity, category and a review run id;
+the pin follows its layer and falls back to its saved position if the layer is
+deleted. A suggested design-op fix is applied explicitly from its thread as one
+undo step. Reviews do not edit the design automatically.
+
+Variables include enum options and image assets. Prototype actions include
+conditional branches, numeric adjustments, boolean toggles and enum cycling.
+Motion clips store frame rate, loop mode, scope and transform origins. Export
+Motion JSON or Figma Motion JSON from the Design menu; unsupported Figma tracks
+are listed as diagnostics, and physical springs are sampled at the clip's frame
+rate. The JSON contains Fanta node ids: a Figma plugin must map them to destination
+nodes with the corresponding resting placement before applying [manual tracks](https://developers.figma.com/docs/plugins/api/properties/nodes-applymanualkeyframetrack/).
+Stage JSX, MP4/GIF export, trigger inputs and a state-machine view are deferred.
+
+Draw includes joining, closing and simplifying vector paths, segment bending,
+path reversal, breaking at an anchor and curved-anchor deletion. The
+[website exporter](website-export.md) packages a saved design with an explicitly
+supplied Fanta-JS runtime. Signed updates have settings, menu and About controls;
+release setup and end-to-end installation still require a published signed feed.
+These source additions have not been exercised in the installed app.
 
 ## Projects, pages and source
 

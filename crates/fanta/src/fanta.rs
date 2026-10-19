@@ -89,9 +89,7 @@ use workspace::{
     create_and_open_local_file, notifications::simple_message_notification::MessageNotification,
     open_new,
 };
-use workspace::{
-    CloseIntent, CloseProject, CloseWindow, RestoreBanner, with_active_or_new_workspace,
-};
+use workspace::{CloseIntent, CloseProject, CloseWindow, RestoreBanner, with_active_or_new_workspace};
 use workspace::{Pane, notifications::DetachAndPromptErr};
 use fanta_actions::{
     About, OpenAccountSettings, OpenBrowser, OpenDocs, OpenServerSettings, OpenSettingsFile,
@@ -1578,6 +1576,8 @@ fn open_about_window(cx: &mut App) {
         focus_handle: FocusHandle,
         ok_entry: NavigableEntry,
         copy_entry: NavigableEntry,
+        update_entry: NavigableEntry,
+        updater: Option<Entity<auto_update::AutoUpdater>>,
         app_icon: Arc<Image>,
         message: SharedString,
         commit: Option<SharedString>,
@@ -1602,14 +1602,33 @@ fn open_about_window(cx: &mut App) {
                 .filter(|commit| !commit.is_empty())
                 .map(SharedString::from);
 
+            let updater = auto_update::AutoUpdater::get(cx);
+            if let Some(updater) = &updater {
+                cx.observe(updater, |_, _, cx| cx.notify()).detach();
+            }
+
             Self {
                 focus_handle: cx.focus_handle(),
                 ok_entry: NavigableEntry::focusable(cx),
                 copy_entry: NavigableEntry::focusable(cx),
+                update_entry: NavigableEntry::focusable(cx),
+                updater,
                 app_icon: about_window_icon(release_channel),
                 message,
                 commit,
                 full_version,
+            }
+        }
+
+        fn check_for_updates(&self, window: &mut Window, cx: &mut Context<Self>) {
+            if self
+                .updater
+                .as_ref()
+                .is_some_and(|updater| updater.read(cx).status().is_updated())
+            {
+                workspace::reload(cx);
+            } else {
+                auto_update::check(&auto_update::Check, window, cx);
             }
         }
 
@@ -1632,6 +1651,30 @@ fn open_about_window(cx: &mut App) {
         fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             let ok_is_focused = self.ok_entry.focus_handle.contains_focused(window, cx);
             let copy_is_focused = self.copy_entry.focus_handle.contains_focused(window, cx);
+            let update_is_focused = self.update_entry.focus_handle.contains_focused(window, cx);
+            let status = self
+                .updater
+                .as_ref()
+                .map(|updater| updater.read(cx).status());
+            let update_checked = self
+                .updater
+                .as_ref()
+                .is_some_and(|updater| updater.read(cx).is_up_to_date());
+            let unavailable_reason = settings_modal::update_unavailable_reason(cx);
+            let status_text = unavailable_reason.clone().unwrap_or_else(|| {
+                status
+                    .as_ref()
+                    .map(|status| settings_modal::update_status_text(status, update_checked))
+                    .unwrap_or_else(|| "Update status unavailable".into())
+            });
+            let update_label = if status
+                .as_ref()
+                .is_some_and(auto_update::AutoUpdateStatus::is_updated)
+            {
+                "Restart to update"
+            } else {
+                "Check for Updates"
+            };
 
             Navigable::new(
                 v_flex()
@@ -1669,7 +1712,30 @@ fn open_about_window(cx: &mut App) {
                                     .color(Color::Muted)
                                     .size(LabelSize::XSmall),
                             )
-                            .child(Label::new(self.full_version.clone()).size(LabelSize::Small)),
+                            .child(Label::new(self.full_version.clone()).size(LabelSize::Small))
+                            .child(Label::new(status_text).size(LabelSize::Small))
+                            .when(unavailable_reason.is_none(), |this| {
+                                this.child(
+                                    div()
+                                        .track_focus(&self.update_entry.focus_handle)
+                                        .on_action(cx.listener(
+                                            |this, _: &menu::Confirm, window, cx| {
+                                                this.check_for_updates(window, cx);
+                                            },
+                                        ))
+                                        .child(
+                                            Button::new("check-updates", update_label)
+                                                .style(ButtonStyle::OutlinedGhost)
+                                                .toggle_state(update_is_focused)
+                                                .selected_style(ButtonStyle::Tinted(
+                                                    TintColor::Accent,
+                                                ))
+                                                .on_click(cx.listener(|this, _, window, cx| {
+                                                    this.check_for_updates(window, cx);
+                                                })),
+                                        ),
+                                )
+                            }),
                     )
                     .child(
                         h_flex()
@@ -1718,6 +1784,7 @@ fn open_about_window(cx: &mut App) {
             )
             .entry(self.ok_entry.clone())
             .entry(self.copy_entry.clone())
+            .entry(self.update_entry.clone())
         }
     }
 
@@ -1744,7 +1811,7 @@ fn open_about_window(cx: &mut App) {
 
     let window_size = Size {
         width: px(440.),
-        height: px(300.),
+        height: px(380.),
     };
 
     cx.open_window(
@@ -2099,7 +2166,8 @@ fn notify_settings_errors(result: settings::SettingsParseResult, is_user: bool, 
                         .primary_message("Open Settings File")
                         .primary_icon(IconName::Settings)
                         .primary_on_click(|window, cx| {
-                            window.dispatch_action(fanta_actions::OpenSettingsFile.boxed_clone(), cx);
+                            window
+                                .dispatch_action(fanta_actions::OpenSettingsFile.boxed_clone(), cx);
                             cx.emit(DismissEvent);
                         })
                     })
