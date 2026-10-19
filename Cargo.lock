@@ -5212,7 +5212,11 @@ dependencies = [
  "fanta-canvas",
  "fanta-doc",
  "fanta-render",
+ "fanta-text",
  "glam 0.32.1",
+ "serde",
+ "serde_json",
+ "skia-safe",
  "thiserror 2.0.17",
 ]
 
@@ -5231,6 +5235,22 @@ dependencies = [
  "thiserror 2.0.17",
  "tracing",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "fanta-runtime"
+version = "0.1.0"
+dependencies = [
+ "fanta-doc",
+ "fanta-format",
+ "fanta-present",
+ "fanta-render",
+ "fanta-text",
+ "glam 0.32.1",
+ "serde",
+ "serde_json",
+ "skia-safe",
+ "thiserror 2.0.17",
 ]
 
 [[package]]

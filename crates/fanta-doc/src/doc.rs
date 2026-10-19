@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet};
 /// the `PathData` shape. v3 adds the first-class `text_path` node tag. Existing
 /// v2 documents need no structural rewrite, but the bump lets older readers
 /// reject documents containing the new enum variant cleanly.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// One Fantaisa document — the root of everything.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +95,12 @@ pub struct Doc {
     /// Design-system variables (tokens): collections, modes, and per-mode values.
     #[serde(default, skip_serializing_if = "VariableRegistry::is_empty")]
     pub variables: VariableRegistry,
+
+    #[serde(
+        default,
+        skip_serializing_if = "crate::stylesheet::StyleRegistry::is_empty"
+    )]
+    pub styles: crate::stylesheet::StyleRegistry,
 
     /// The active mode per variable collection, document-wide. A frame can pin a
     /// different mode via `GroupNode.explicit_modes`; this is the doc-level
@@ -185,6 +191,7 @@ impl Doc {
             active_page: None,
             components: ComponentLibrary::new(),
             variables: VariableRegistry::new(),
+            styles: crate::stylesheet::StyleRegistry::default(),
             active_modes: BTreeMap::new(),
             motion: MotionLibrary::new(),
             flow_start: None,
@@ -748,6 +755,7 @@ impl Doc {
             active_page: self.active_page,
             components: self.components.clone(),
             variables: self.variables.clone(),
+            styles: self.styles.clone(),
             active_modes: self.active_modes.clone(),
             motion: self.motion.clone(),
             flow_start: self.flow_start,
@@ -876,12 +884,37 @@ impl Doc {
 
     /// Serialize to the canonical `.fant.json` projection.
     pub fn to_json_string(&self) -> serde_json::Result<String> {
-        serde_json::to_string(self)
+        serde_json::to_string(&self.to_authored_json_value()?)
     }
 
     /// Pretty-printed variant for diff-friendly version control and debugging.
     pub fn to_json_pretty(&self) -> serde_json::Result<String> {
-        serde_json::to_string_pretty(self)
+        serde_json::to_string_pretty(&self.to_authored_json_value()?)
+    }
+
+    pub fn to_authored_json_value(&self) -> serde_json::Result<serde_json::Value> {
+        use serde::ser::Error as _;
+        let mut value = serde_json::to_value(self)?;
+        if let Some(nodes) = value
+            .get_mut("scene")
+            .and_then(|scene| scene.get_mut("nodes"))
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            for root in self.scene.roots() {
+                for id in self.scene.descendants_of(*root) {
+                    if let Some(node) = self.scene.get(id)
+                        && !node.style_assignment.is_empty()
+                    {
+                        let authored = self
+                            .styles
+                            .authored_node_value(node)
+                            .map_err(serde_json::Error::custom)?;
+                        nodes.insert(id.0.to_string(), authored);
+                    }
+                }
+            }
+        }
+        Ok(value)
     }
 
     /// Parse from `.fant.json`. Runs any needed schema migration on the raw JSON
@@ -894,9 +927,9 @@ impl Doc {
     }
 
     /// Load an assembled document without a JSON text round trip. Migration
-    /// updates `value` in place, retaining it for callers' error diagnostics.
-    /// Deserialization rebuilds the scene's child index and validates it just
-    /// as [`Self::from_json_str`] does.
+    /// and [`prepare_doc_json`] update `value` in place, retaining it for
+    /// callers' error diagnostics. Deserialization rebuilds the scene's child
+    /// index and validates it just as [`Self::from_json_str`] does.
     pub fn from_json_value(value: &mut serde_json::Value) -> Result<Self, DocLoadError> {
         let from = value
             .get("schema_version")
@@ -915,11 +948,115 @@ impl Doc {
         if from < SCHEMA_VERSION {
             migrate_doc_json(value, from)?;
         }
+        prepare_doc_json(value)?;
         let mut doc = Doc::deserialize(&*value)?;
         doc.scene.rebuild_child_index();
         doc.scene.validate().map_err(DocLoadError::InvalidScene)?;
         Ok(doc)
     }
+}
+
+/// Validate a migrated document's identity maps and compile each node's
+/// authored FSS style assignment into its effective properties. Shared by
+/// [`Doc::from_json_value`] and the `fanta-format` project loader, which
+/// deserializes its assembled value directly, so both load paths agree.
+pub fn prepare_doc_json(value: &mut serde_json::Value) -> Result<(), DocLoadError> {
+    validate_document_identity_maps(value)?;
+    let styles: crate::stylesheet::StyleRegistry = serde_json::from_value(
+        value
+            .get("styles")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({})),
+    )?;
+    if let Some(nodes) = value
+        .get_mut("scene")
+        .and_then(|scene| scene.get_mut("nodes"))
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for node in nodes.values_mut() {
+            let assignment: crate::stylesheet::StyleAssignment = serde_json::from_value(
+                node.get("style_assignment")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::json!({})),
+            )?;
+            if !assignment.is_empty() {
+                styles.compile_node_value(node, &assignment)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_document_identity_maps(value: &serde_json::Value) -> Result<(), DocLoadError> {
+    fn map_keys(
+        value: Option<&serde_json::Value>,
+        label: &str,
+        identified: bool,
+    ) -> Result<(), DocLoadError> {
+        let Some(entries) = value.and_then(serde_json::Value::as_object) else {
+            return Ok(());
+        };
+        let mut identities = BTreeSet::new();
+        for (key, value) in entries {
+            let identity: NodeId = serde_json::from_value(serde_json::Value::String(key.clone()))?;
+            if !identities.insert(identity) {
+                return Err(DocLoadError::InvalidIdentity(format!(
+                    "{label} contains duplicate canonical identity {key}"
+                )));
+            }
+            if identified {
+                let authored: NodeId = serde_json::from_value(
+                    value.get("id").cloned().unwrap_or(serde_json::Value::Null),
+                )?;
+                if identity != authored {
+                    return Err(DocLoadError::InvalidIdentity(format!(
+                        "{label} map key disagrees with its authored identity"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+    for (parent, field) in [
+        ("scene", "nodes"),
+        ("styles", "rules"),
+        ("components", "defs"),
+        ("components", "sets"),
+        ("variables", "collections"),
+        ("variables", "variables"),
+        ("motion", "clips"),
+    ] {
+        map_keys(
+            value.get(parent).and_then(|value| value.get(field)),
+            &format!("{parent}.{field}"),
+            true,
+        )?;
+    }
+    if let Some(clips) = value
+        .get("motion")
+        .and_then(|motion| motion.get("clips"))
+        .and_then(serde_json::Value::as_object)
+    {
+        for clip in clips.values() {
+            map_keys(clip.get("tracks"), "motion tracks", true)?;
+            if let Some(tracks) = clip.get("tracks").and_then(serde_json::Value::as_object) {
+                for track in tracks.values() {
+                    map_keys(track.get("keyframes"), "motion keyframes", true)?;
+                }
+            }
+        }
+    }
+    if let Some(variables) = value
+        .get("variables")
+        .and_then(|variables| variables.get("variables"))
+        .and_then(serde_json::Value::as_object)
+    {
+        for variable in variables.values() {
+            map_keys(variable.get("values_by_mode"), "variable modes", false)?;
+        }
+    }
+    map_keys(value.get("active_modes"), "active modes", false)?;
+    Ok(())
 }
 
 /// Migrate a raw `.fant.json` [`serde_json::Value`] in place from `from_version`
@@ -1110,6 +1247,10 @@ pub enum DocLoadError {
     Migration(#[from] DocMigrationError),
     #[error("scene failed validation: {0}")]
     InvalidScene(SceneError),
+    #[error("invalid style: {0}")]
+    InvalidStyle(#[from] crate::stylesheet::StyleError),
+    #[error("invalid document identity: {0}")]
+    InvalidIdentity(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

@@ -19,7 +19,7 @@ use std::time::SystemTime;
 use super::layout::{
     ACTIVE_MODES_JSON, ASSET_LIBRARY_JSON, ASSETS_DIR, COMPONENTS_DIR, DEF_JSON, DOC_DIR,
     FLOW_START_JSON, FLOWS_JSON, LOOSE_DIR, MASTER_FNX, MASTER_IDS, METADATA_JSON, MOTION_JSON,
-    NODES_DIR, PAGE_FNX, PAGE_IDS, PAGE_JSON, PAGES_DIR, PRESENTATION_JSON, SET_JSON,
+    NODES_DIR, PAGE_FNX, PAGE_IDS, PAGE_JSON, PAGES_DIR, PRESENTATION_JSON, SET_JSON, STYLES_JSON,
     VARIABLES_JSON, id_from_key, is_project_dir, json_key, read_json_file, read_manifest,
     sorted_entries,
 };
@@ -258,6 +258,15 @@ fn read_project_tree_with_source_override_locked(
     )?;
     root.insert("variables".to_owned(), variables.clone());
     root.insert(
+        "styles".to_owned(),
+        read_tracked_project_json(
+            &doc_dir.join(STYLES_JSON),
+            Some(json!({})),
+            json_override,
+            loaded_files.as_deref_mut(),
+        )?,
+    );
+    root.insert(
         "active_modes".to_owned(),
         read_tracked_project_json(
             &doc_dir.join(ACTIVE_MODES_JSON),
@@ -361,6 +370,8 @@ fn read_project_tree_with_source_override_locked(
         value = migrate(value, manifest.schema_version, SCHEMA_VERSION)?;
     }
     let assets = read_assets(dir, json_override, loaded_files)?;
+    fanta_doc::prepare_doc_json(&mut value)
+        .map_err(|error| FormatError::InvalidProjectTree(format!("{}: {error}", dir.display())))?;
     // Consume the assembled values so geometry JSON is released as typed
     // paths are built. The manifest gate and migration above already establish
     // the current schema; path-aware deserialization retains field diagnostics.

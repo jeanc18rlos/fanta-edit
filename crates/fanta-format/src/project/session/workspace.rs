@@ -19,8 +19,8 @@ use crate::project::layout::{
     ACTIVE_MODES_JSON, AUDIO_DIR, COMPONENTS_DIR, DEF_JSON, DOC_DIR, FANTA_JSON, FLOW_START_JSON,
     FLOWS_JSON, GRAPHICS_DIR, GRAPHICS_JSON, MASTER_IDS, METADATA_JSON, MOTION_DIR, MOTION_JSON,
     PAGE_JSON, PAGES_DIR, PRESENTATION_JSON, PROJECT_VERSION, PROTOTYPES_DIR, ProjectManifest,
-    VARIABLES_JSON, id_from_key, is_project_dir, json_bytes, read_json_file, read_json_or,
-    read_manifest, sorted_entries, write_json_file,
+    STYLES_JSON, VARIABLES_JSON, id_from_key, is_project_dir, json_bytes, read_json_file,
+    read_json_or, read_manifest, sorted_entries, write_json_file,
 };
 use crate::project::read::{component_id_of_dir, page_id_of_dir, select_design_winners};
 use fanta_doc::{
@@ -37,6 +37,7 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct WorkspaceSharedState {
     pub variables: VariableRegistry,
+    pub styles: fanta_doc::StyleRegistry,
     pub active_modes: BTreeMap<fanta_doc::VariableCollectionId, fanta_doc::ModeId>,
     pub metadata: Value,
     pub dirty: WorkspaceDirty,
@@ -49,6 +50,7 @@ impl Default for WorkspaceSharedState {
     fn default() -> Self {
         Self {
             variables: VariableRegistry::new(),
+            styles: fanta_doc::StyleRegistry::default(),
             active_modes: BTreeMap::new(),
             metadata: json!({
                 "title": "Untitled",
@@ -327,6 +329,8 @@ impl WorkspaceSession {
         decode_shared_json::<fanta_doc::DocMetadata>(&doc_dir.join(METADATA_JSON), &metadata)?;
         let variables_val = read_json_or(&doc_dir.join(VARIABLES_JSON), json!({}))?;
         let variables = decode_shared_json(&doc_dir.join(VARIABLES_JSON), &variables_val)?;
+        let styles_val = read_json_or(&doc_dir.join(STYLES_JSON), json!({}))?;
+        shared.styles = decode_shared_json(&doc_dir.join(STYLES_JSON), &styles_val)?;
         let modes_val = read_json_or(&doc_dir.join(ACTIVE_MODES_JSON), json!({}))?;
         let active_modes = decode_shared_json(&doc_dir.join(ACTIVE_MODES_JSON), &modes_val)?;
         // Hash *on-disk* bytes (not re-serialized) so TOCTOU compares apples-to-apples.
@@ -339,6 +343,7 @@ impl WorkspaceSession {
         shared.base_json = json!({
             "variables": variables_val,
             "active_modes": modes_val,
+            "styles": styles_val,
         });
 
         let mut components = ComponentCatalog::new();
@@ -679,7 +684,7 @@ impl WorkspaceSession {
             .cloned()
             .ok_or_else(|| SessionError::ArtifactNotFound(id.debug_label()))?;
         let ref_table = self.reference_table();
-        let session = load_artifact_session(
+        let mut session = load_artifact_session(
             &self.root,
             &meta,
             self.project_id,
@@ -689,6 +694,7 @@ impl WorkspaceSession {
             self.workspace_generation,
             ref_table,
         )?;
+        session.scoped.doc.styles = self.shared.styles.clone();
         self.open.insert(id.clone(), session);
         Ok(id)
     }
@@ -1623,11 +1629,13 @@ impl WorkspaceSession {
             self.artifacts.insert(id, meta);
         }
         self.shared.variables = document.variables.clone();
+        self.shared.styles = document.styles.clone();
         self.shared.active_modes = document.active_modes.clone();
         self.shared.metadata = metadata;
         self.shared.disk_hash = shared_hash;
         self.shared.base_hash = shared_hash;
-        self.shared.base_json = json!({ "variables": variables, "active_modes": modes });
+        self.shared.base_json =
+            json!({ "variables": variables, "active_modes": modes, "styles": document.styles });
         self.shared.dirty = WorkspaceDirty::Clean;
         self.schema_version = expected_manifest.schema_version;
         self.manifest = expected_manifest;
@@ -1644,12 +1652,14 @@ impl WorkspaceSession {
         let variables_changed = self.shared.variables != document.variables
             || self.shared.active_modes != document.active_modes;
         let components_changed = self.components.defs != document.components;
-        if !variables_changed && !components_changed {
+        let styles_changed = self.shared.styles != document.styles;
+        if !variables_changed && !components_changed && !styles_changed {
             return false;
         }
-        if variables_changed {
+        if variables_changed || styles_changed {
             self.shared.variables = document.variables.clone();
             self.shared.active_modes = document.active_modes.clone();
+            self.shared.styles = document.styles.clone();
             self.shared.dirty = WorkspaceDirty::DirtyShared;
         }
         if components_changed {
@@ -1713,6 +1723,19 @@ impl WorkspaceSession {
         if self.shared.dirty == WorkspaceDirty::Conflict {
             return Err(SessionError::SaveBlocked(SaveBlocked::InConflict));
         }
+        let baseline_styles: fanta_doc::StyleRegistry = serde_json::from_value(
+            self.shared
+                .base_json
+                .get("styles")
+                .cloned()
+                .unwrap_or_else(|| json!({})),
+        )
+        .map_err(|error| SessionError::InvalidSource(error.to_string()))?;
+        if baseline_styles != self.shared.styles {
+            return Err(SessionError::InvalidState(
+                "shared style changes require a coordinated whole-project save".into(),
+            ));
+        }
         let doc_dir = self.root.join(DOC_DIR);
         std::fs::create_dir_all(&doc_dir)?;
         let variables = serde_json::to_value(&self.shared.variables)
@@ -1730,7 +1753,8 @@ impl WorkspaceSession {
         let h = hash_workspace_shared_on_disk(&self.root)?;
         self.shared.disk_hash = h;
         self.shared.base_hash = h;
-        self.shared.base_json = json!({ "variables": variables, "active_modes": modes });
+        self.shared.base_json =
+            json!({ "variables": variables, "active_modes": modes, "styles": self.shared.styles });
         self.shared.dirty = WorkspaceDirty::Clean;
         Ok(SaveResult::Wrote {
             paths: vec![
@@ -1798,6 +1822,7 @@ impl WorkspaceSession {
         let generation = self.workspace_generation;
         let ref_table = self.reference_table();
         for session in self.open.values_mut() {
+            session.scoped.doc.styles = self.shared.styles.clone();
             session.sync_variables(
                 vars.clone(),
                 modes.clone(),
@@ -1871,6 +1896,7 @@ impl WorkspaceSession {
             self.shared.variables.clone(),
             self.shared.active_modes.clone(),
         )?;
+        session.scoped.doc.styles = self.shared.styles.clone();
         if matches!(outcome, ResolveOutcome::CloseDeleted) {
             self.open.remove(id);
             self.remove_artifact_index(id);
@@ -2088,7 +2114,7 @@ impl WorkspaceSession {
             .is_some_and(|session| matches!(session.state, ArtifactDirty::Clean))
         {
             let ref_table = self.reference_table();
-            Some(load_artifact_session(
+            let mut session = load_artifact_session(
                 &self.root,
                 &meta,
                 self.project_id,
@@ -2097,7 +2123,9 @@ impl WorkspaceSession {
                 self.shared.active_modes.clone(),
                 self.workspace_generation,
                 ref_table,
-            )?)
+            )?;
+            session.scoped.doc.styles = self.shared.styles.clone();
+            Some(session)
         } else {
             None
         };
@@ -2164,14 +2192,18 @@ impl WorkspaceSession {
         let metadata = read_json_or(&doc_dir.join(METADATA_JSON), self.shared.metadata.clone())?;
         decode_shared_json::<fanta_doc::DocMetadata>(&doc_dir.join(METADATA_JSON), &metadata)?;
         let variables = decode_shared_json(&doc_dir.join(VARIABLES_JSON), &variables_val)?;
+        let styles_val = read_json_or(&doc_dir.join(STYLES_JSON), json!({}))?;
+        let styles = decode_shared_json(&doc_dir.join(STYLES_JSON), &styles_val)?;
         let active_modes = decode_shared_json(&doc_dir.join(ACTIVE_MODES_JSON), &modes_val)?;
         let h = hash_workspace_shared_on_disk(&self.root)?;
         self.shared.metadata = metadata;
         self.shared.variables = variables;
+        self.shared.styles = styles;
         self.shared.active_modes = active_modes;
         self.shared.disk_hash = h;
         self.shared.base_hash = h;
-        self.shared.base_json = json!({ "variables": variables_val, "active_modes": modes_val });
+        self.shared.base_json =
+            json!({ "variables": variables_val, "active_modes": modes_val, "styles": styles_val });
         self.workspace_generation = self.workspace_generation.wrapping_add(1);
         self.sync_vars_to_open();
         Ok(())
@@ -2593,6 +2625,7 @@ fn component_sidecar_with_document_parent(
 fn singleton_disk_hashes(root: &Path) -> Result<BTreeMap<PathBuf, Option<[u8; 32]>>, SessionError> {
     let mut paths = vec![
         PathBuf::from(DOC_DIR).join(crate::project::layout::ASSET_LIBRARY_JSON),
+        PathBuf::from(DOC_DIR).join(STYLES_JSON),
         PathBuf::from(DOC_DIR).join(MOTION_JSON),
         PathBuf::from(DOC_DIR).join(FLOW_START_JSON),
         PathBuf::from(DOC_DIR).join(FLOWS_JSON),
@@ -2983,6 +3016,7 @@ fn expected_artifact_header(
 fn is_workspace_shared_path(path: &Path) -> bool {
     let s = path.to_string_lossy();
     s.contains(VARIABLES_JSON)
+        || s.contains(STYLES_JSON)
         || s.contains(ACTIVE_MODES_JSON)
         || s.contains(METADATA_JSON)
         || s.contains("workspace.fnx")
@@ -2996,6 +3030,7 @@ fn hash_workspace_shared_on_disk(root: &Path) -> Result<ContentHash, SessionErro
         format!("{DOC_DIR}/{VARIABLES_JSON}"),
         format!("{DOC_DIR}/{ACTIVE_MODES_JSON}"),
         format!("{DOC_DIR}/{METADATA_JSON}"),
+        format!("{DOC_DIR}/{STYLES_JSON}"),
     ] {
         let path = root.join(&name);
         if path.is_file() {

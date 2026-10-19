@@ -1029,7 +1029,16 @@ pub(crate) fn resolve_overlay(
         return None;
     }
     let mut scratch = node.clone();
-    for (prop, var_id) in &node.bindings {
+    for (prop, var_id) in node
+        .bindings
+        .iter()
+        .filter(|(property, _)| matches!(property, fanta_doc::BoundProp::TextStyle))
+        .chain(
+            node.bindings
+                .iter()
+                .filter(|(property, _)| !matches!(property, fanta_doc::BoundProp::TextStyle)),
+        )
+    {
         if let Some(resolved) = resolve_bound_value(
             ctx.inputs.variables,
             ctx.scene,

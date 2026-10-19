@@ -760,7 +760,10 @@ pub fn draw_image_cached(
             };
             match cache.get_or_build(id, &decoded) {
                 Some(img) => img.clone(),
-                None => return false,
+                None => match build_sk_image(&decoded) {
+                    Some(image) => image,
+                    None => return false,
+                },
             }
         }
     };

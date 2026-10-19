@@ -45,38 +45,50 @@ pub const SOURCE_SERIF_FAMILY: &str = "Source Serif 4";
 /// Canonical bundled family name for the Adobe Clean *monospace* substitute.
 pub const SOURCE_CODE_FAMILY: &str = "Source Code Pro";
 
+#[cfg(not(target_os = "emscripten"))]
 const INTER_FACES: &[&[u8]] = &[
     include_bytes!("../../assets/inter/Inter-Regular.ttf"),
     include_bytes!("../../assets/inter/Inter-Medium.ttf"),
     include_bytes!("../../assets/inter/Inter-SemiBold.ttf"),
     include_bytes!("../../assets/inter/Inter-Bold.ttf"),
 ];
+#[cfg(not(target_os = "emscripten"))]
 const INTER_ITALIC_FACES: &[&[u8]] = &[
     include_bytes!("../../assets/inter/Inter-Italic.ttf"),
     include_bytes!("../../assets/inter/Inter-MediumItalic.ttf"),
     include_bytes!("../../assets/inter/Inter-SemiBoldItalic.ttf"),
     include_bytes!("../../assets/inter/Inter-BoldItalic.ttf"),
 ];
+#[cfg(not(target_os = "emscripten"))]
 const SOURCE_SANS_UPRIGHT: &[&[u8]] = &[include_bytes!(
     "../../assets/source-sans-3/SourceSans3-Variable.ttf"
 )];
+#[cfg(not(target_os = "emscripten"))]
 const SOURCE_SANS_ITALIC: &[&[u8]] = &[include_bytes!(
     "../../assets/source-sans-3/SourceSans3-Italic-Variable.ttf"
 )];
+#[cfg(not(target_os = "emscripten"))]
 const SOURCE_SERIF_UPRIGHT: &[&[u8]] = &[include_bytes!(
     "../../assets/source-serif-4/SourceSerif4-Variable.ttf"
 )];
+#[cfg(not(target_os = "emscripten"))]
 const SOURCE_SERIF_ITALIC: &[&[u8]] = &[include_bytes!(
     "../../assets/source-serif-4/SourceSerif4-Italic-Variable.ttf"
 )];
+#[cfg(not(target_os = "emscripten"))]
 const SOURCE_CODE_UPRIGHT: &[&[u8]] = &[include_bytes!(
     "../../assets/source-code-pro/SourceCodePro-Variable.ttf"
 )];
+#[cfg(not(target_os = "emscripten"))]
 const SOURCE_CODE_ITALIC: &[&[u8]] = &[include_bytes!(
     "../../assets/source-code-pro/SourceCodePro-Italic-Variable.ttf"
 )];
 
+#[cfg(target_os = "emscripten")]
+pub(super) const BUNDLED: &[BundledFamily] = &[];
+
 /// Every family the crate vendors and registers on its asset provider.
+#[cfg(not(target_os = "emscripten"))]
 pub(super) const BUNDLED: &[BundledFamily] = &[
     BundledFamily {
         name: INTER_FAMILY,
@@ -120,6 +132,22 @@ pub fn bundled_preview_bytes(family: &str) -> Option<&'static [u8]> {
 /// in registration order. Pairs with [`bundled_preview_bytes`].
 pub fn bundled_family_names() -> impl Iterator<Item = &'static str> {
     BUNDLED.iter().map(|f| f.name)
+}
+
+/// Every vendored face file for `family` in one slant, for embedding fonts in
+/// exported documents: a variable family's single file, or Inter's static
+/// weights. Empty for a family this crate does not vendor.
+pub fn bundled_font_files(family: &str, italic: bool) -> &'static [&'static [u8]] {
+    BUNDLED
+        .iter()
+        .find(|bundled| bundled.name.eq_ignore_ascii_case(family))
+        .map_or(&[], |bundled| {
+            if italic {
+                bundled.italic
+            } else {
+                bundled.upright
+            }
+        })
 }
 
 /// Register one bundled family's faces on `provider` under its canonical name.

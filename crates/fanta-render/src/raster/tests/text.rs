@@ -2,6 +2,63 @@
 use super::*;
 use fanta_doc::{Doc, Operation};
 
+#[test]
+fn supplied_font_contexts_isolate_identical_family_names() -> Result<(), Box<dyn std::error::Error>>
+{
+    use crate::TextRenderContext;
+    use fanta_text::FontRegistration;
+    let make =
+        |bytes: &'static [u8]| -> Result<TextRenderContext, fanta_text::FontRegistrationError> {
+            Ok(TextRenderContext::new(LayoutEngine::from_fonts(
+                [FontRegistration {
+                    family: "Shared Family",
+                    weight: 400,
+                    italic: false,
+                    face_index: 0,
+                    bytes,
+                }],
+                &BTreeMap::new(),
+            )?))
+        };
+    let sans = make(include_bytes!(
+        "../../../../fanta-text/assets/inter/Inter-Regular.ttf"
+    ))?;
+    let mono = make(include_bytes!(
+        "../../../../fanta-text/assets/source-code-pro/SourceCodePro-Variable.ttf"
+    ))?;
+    let mut text = fanta_doc::TextNode::new("iiii WWWW", 400.0, 50.0);
+    text.style.font_family = "Shared Family".into();
+    text.auto_resize = TextAutoResize::WidthAndHeight;
+    let sans_width = sans.with(|| measure_text_node(&text).0);
+    let mono_width = mono.with(|| measure_text_node(&text).0);
+    assert!((sans_width - mono_width).abs() > 1.0);
+    assert_eq!(sans.cached_layouts(), 1);
+    assert_eq!(mono.cached_layouts(), 1);
+    assert_eq!(
+        sans.with(|| {
+            assert_eq!(mono.with(|| measure_text_node(&text).0), mono_width);
+            measure_text_node(&text).0
+        }),
+        sans_width
+    );
+    assert!(!sans.supports_family("An unregistered system family"));
+    let doc = text_doc("iiii WWWW", -40.0, -10.0);
+    let mut renderer = RasterRenderer::new(128, 64)?;
+    renderer.set_text_context(sans);
+    let mut scene = doc.scene.clone();
+    let identities = scene.children_of(None).to_vec();
+    for identity in identities {
+        if let Some(node) = scene.get_mut(identity) {
+            if let NodeData::Text(text) = &mut node.data {
+                text.style.font_family = "Shared Family".into();
+            }
+        }
+    }
+    renderer.render(&scene, &doc.viewport);
+    assert!(opaque_pixel_count(&renderer.copy_rgba()) > 0);
+    Ok(())
+}
+
 // -----------------------------------------------------------------------
 // Text glyph rendering
 // -----------------------------------------------------------------------

@@ -132,6 +132,7 @@ impl<'a> DocumentScopes<'a> {
                 }
             }
             let mut doc = empty_scoped_doc(document.id);
+            doc.styles = document.styles.clone();
             doc.variables = document.variables.clone();
             doc.active_modes = document.active_modes.clone();
             match kind {

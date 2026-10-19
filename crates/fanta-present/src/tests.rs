@@ -3535,3 +3535,1311 @@ fn pr8_while_hovering_variant_applies_on_entry_and_reverts_on_leave() {
     );
     assert!(!session.instance_variant_overrides.contains_key(&first_id));
 }
+
+#[test]
+fn runtime_clock_validates_input_and_reports_idle_timer_deadlines()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut document = Doc::new();
+    let mut root = frame(0.0);
+    let root_id = root.id;
+    root.reactions.push(click(
+        9000,
+        Trigger::AfterDelay { delay_ms: 100 },
+        Action::OpenLink {
+            url: "timer".into(),
+        },
+    ));
+    document.scene.insert(root)?;
+    let mut player = PresentSession::new_headless(&document, Some(root_id), DVec2::splat(200.0))?;
+    assert!(!player.schedule().continuous);
+    assert_eq!(player.schedule().next_deadline_ms, Some(100.0));
+    assert!(player.advance_by(f64::NAN).is_err());
+    assert!(player.advance_by(-1.0).is_err());
+    assert!(player.advance_by(f64::MAX).is_err());
+    assert_eq!(player.schedule().next_deadline_ms, Some(100.0));
+    assert_eq!(player.playback_state().clock_ms, 0.0);
+    player.pause_playback();
+    player.advance_by(1.0)?;
+    assert_eq!(player.playback_state().clock_ms, 0.0);
+    assert_eq!(player.schedule().next_deadline_ms, None);
+    player.resume_playback();
+    player.advance_by(0.1)?;
+    assert_eq!(player.take_open_url().as_deref(), Some("timer"));
+    assert_eq!(player.schedule().next_deadline_ms, None);
+    Ok(())
+}
+
+#[test]
+fn runtime_clip_controls_preserve_final_samples_and_validate_replacement()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut document = Doc::new();
+    let root = frame(0.0);
+    let root_id = root.id;
+    document.scene.insert(root)?;
+    let clip_id = AnimationClipId::from_u128(9001);
+    document
+        .motion
+        .clips
+        .insert(clip_id, position_clip(clip_id, root_id, 0.0, 100.0));
+    let mut player = PresentSession::new_headless(&document, Some(root_id), DVec2::splat(200.0))?;
+    player.play_clip(clip_id, None, ClipPlaybackMode::Repeat)?;
+    player.advance_by(0.15)?;
+    assert_eq!(
+        player
+            .playback_state()
+            .clip
+            .ok_or("missing clip")?
+            .playhead_ms,
+        Some(50)
+    );
+    player.pause_clip();
+    player.advance_by(0.2)?;
+    assert_eq!(
+        player
+            .playback_state()
+            .clip
+            .ok_or("missing clip")?
+            .playhead_ms,
+        Some(50)
+    );
+    assert!(!player.schedule().continuous);
+    player.resume_clip();
+    player.play_clip(clip_id, None, ClipPlaybackMode::PingPong)?;
+    player.advance_by(0.15)?;
+    assert_eq!(
+        player
+            .playback_state()
+            .clip
+            .ok_or("missing clip")?
+            .playhead_ms,
+        Some(50)
+    );
+    assert!(
+        player
+            .play_clip(
+                AnimationClipId::from_u128(9999),
+                None,
+                ClipPlaybackMode::Once
+            )
+            .is_err()
+    );
+    assert_eq!(
+        player
+            .playback_state()
+            .clip
+            .ok_or("replacement lost clip")?
+            .clip,
+        clip_id
+    );
+    player.play_clip(clip_id, None, ClipPlaybackMode::Once)?;
+    player.advance_by(0.1)?;
+    assert_eq!(
+        player
+            .playback_state()
+            .clip
+            .ok_or("missing clip")?
+            .playhead_ms,
+        Some(100)
+    );
+    assert!(!player.schedule().continuous);
+    assert!(
+        matches!(player.take_playback_events().first(),Some(PlaybackEvent::ClipCompleted { clip }) if *clip == clip_id)
+    );
+    player.advance_by(1.0)?;
+    assert!(player.take_playback_events().is_empty());
+    let clock = player.playback_state().clock_ms;
+    player.seek_clip(20.0)?;
+    assert_eq!(
+        player
+            .playback_state()
+            .clip
+            .ok_or("missing clip")?
+            .playhead_ms,
+        Some(20)
+    );
+    assert_eq!(player.playback_state().clock_ms, clock);
+    player.stop_clip();
+    assert!(player.playback_state().clip.is_none());
+    Ok(())
+}
+
+#[test]
+fn injected_compiled_motion_is_shared_and_samples_like_a_session_compiled_index()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut document = Doc::new();
+    let root = frame(0.0);
+    let root_id = root.id;
+    document.scene.insert(root)?;
+    let clip_id = AnimationClipId::from_u128(9101);
+    document
+        .motion
+        .clips
+        .insert(clip_id, position_clip(clip_id, root_id, 0.0, 100.0));
+    let shared = Rc::new(document.motion.compile());
+    let text = fanta_render::TextRenderContext::new(fanta_text::LayoutEngine::new());
+    let mut injected = PlaybackSession::new_with_compiled_motion(
+        &document,
+        Some(root_id),
+        DVec2::splat(200.0),
+        text.clone(),
+        shared.clone(),
+    )?;
+    let mut compiled_by_session = PlaybackSession::new_with_text_context(
+        &document,
+        Some(root_id),
+        DVec2::splat(200.0),
+        text,
+    )?;
+    assert!(Rc::ptr_eq(&injected.compiled_motion, &shared));
+    assert!(!Rc::ptr_eq(&compiled_by_session.compiled_motion, &shared));
+    injected.play_clip(clip_id, None, ClipPlaybackMode::Once)?;
+    compiled_by_session.play_clip(clip_id, None, ClipPlaybackMode::Once)?;
+    for (step, playhead_ms) in [(0.0, 0), (0.025, 25), (0.05, 75), (0.05, 100)] {
+        injected.advance_by(step)?;
+        compiled_by_session.advance_by(step)?;
+        let sample = injected.prototype_motion_evaluation();
+        assert!(sample.is_some(), "clip samples at {playhead_ms}ms");
+        assert_eq!(sample, compiled_by_session.prototype_motion_evaluation());
+        assert_eq!(sample, document.motion.evaluate(clip_id, playhead_ms));
+    }
+    Ok(())
+}
+
+#[test]
+fn camera_pans_with_the_pointer_zooms_around_an_anchor_and_fits_again()
+-> Result<(), Box<dyn std::error::Error>> {
+    use fanta_canvas::viewport::world_to_screen;
+    let mut document = Doc::new();
+    let root = frame(0.0);
+    let root_id = root.id;
+    document.scene.insert(root)?;
+    let size = DVec2::new(400.0, 300.0);
+    let mut player = PresentSession::new_headless(&document, Some(root_id), size)?;
+    let fitted = player.viewport();
+
+    let probe = DVec2::new(100.0, 120.0);
+    let world = screen_to_world(probe, &fitted, size);
+    let delta = DVec2::new(30.0, -10.0);
+    assert!(player.pan_view(delta)?.needs_redraw);
+    assert!((world_to_screen(world, &player.viewport(), size) - (probe + delta)).length() < 1e-9);
+    assert_eq!(player.viewport().zoom, fitted.zoom);
+
+    let anchor = DVec2::new(50.0, 60.0);
+    let anchored = screen_to_world(anchor, &player.viewport(), size);
+    let zoom = player.viewport().zoom;
+    assert!(player.zoom_view(anchor, 2.0)?.needs_redraw);
+    assert!((screen_to_world(anchor, &player.viewport(), size) - anchored).length() < 1e-9);
+    assert!((player.viewport().zoom - zoom * 2.0).abs() < 1e-9);
+
+    let moved = player.viewport();
+    for invalid in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert!(matches!(
+            player.zoom_view(anchor, invalid),
+            Err(PresentError::InvalidCamera)
+        ));
+    }
+    assert!(matches!(
+        player.pan_view(DVec2::new(f64::NAN, 0.0)),
+        Err(PresentError::InvalidCamera)
+    ));
+    assert_eq!(player.viewport(), moved);
+
+    assert!(player.fit_view().needs_redraw);
+    assert_eq!(player.viewport(), fitted);
+    player.pan_view(delta)?;
+    assert!(player.restart_at(root_id));
+    assert_eq!(player.viewport(), fitted);
+    Ok(())
+}
+
+#[test]
+fn runtime_zero_duration_clip_samples_once_without_continuous_scheduling()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut document = Doc::new();
+    let root = frame(0.0);
+    let root_id = root.id;
+    document.scene.insert(root)?;
+    let clip_id = AnimationClipId::from_u128(9002);
+    let mut clip = position_clip(clip_id, root_id, 0.0, 100.0);
+    clip.duration_ms = 0;
+    document.motion.clips.insert(clip_id, clip);
+    let mut player = PresentSession::new_headless(&document, Some(root_id), DVec2::splat(200.0))?;
+    player.play_clip(clip_id, None, ClipPlaybackMode::Repeat)?;
+    assert!(!player.schedule().continuous);
+    assert_eq!(
+        player
+            .playback_state()
+            .clip
+            .ok_or("missing clip")?
+            .playhead_ms,
+        Some(0)
+    );
+    assert_eq!(player.take_playback_events().len(), 1);
+    player.advance_by(1.0)?;
+    assert!(player.take_playback_events().is_empty());
+    Ok(())
+}
+
+#[test]
+fn runtime_timer_cycles_suspend_with_a_diagnostic() -> Result<(), Box<dyn std::error::Error>> {
+    let mut document = Doc::new();
+    let mut root = frame(0.0);
+    let root_id = root.id;
+    root.reactions.push(click(
+        9003,
+        Trigger::AfterDelay { delay_ms: 0 },
+        Action::Navigate { to: root_id },
+    ));
+    document.scene.insert(root)?;
+    let mut player = PresentSession::new_headless(&document, Some(root_id), DVec2::splat(200.0))?;
+    player.advance_by(0.0)?;
+    assert!(player.schedule().timers_suspended);
+    assert_eq!(player.schedule().next_deadline_ms, None);
+    assert!(player.take_playback_events().iter().any(|event|matches!(event,PlaybackEvent::Diagnostic {diagnostic} if diagnostic.code == "timerBudgetExceeded")));
+    player.advance_by(1.0)?;
+    assert!(player.take_playback_events().is_empty());
+    Ok(())
+}
+
+fn runtime_component_document()
+-> Result<(Doc, NodeId, NodeId, NodeId, NodeId, AnimationClipId), Box<dyn std::error::Error>> {
+    let mut document = Doc::new();
+    let master = frame_sized(1000.0, 0.0, 40.0, 40.0, Color::WHITE);
+    let master_id = master.id;
+    document.scene.insert(master)?;
+    let mut child = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+        0.0,
+        0.0,
+        10.0,
+        10.0,
+        Color::rgb(255, 0, 0),
+    )));
+    child.parent = Some(master_id);
+    child.transform = Transform2D::translation(5.0, 5.0);
+    let child_id = child.id;
+    child.reactions.push(click(
+        9010,
+        Trigger::Click,
+        Action::OpenLink {
+            url: "component-child".into(),
+        },
+    ));
+    document.scene.insert(child)?;
+    let component_id = ComponentId::from_u128(9011);
+    document.components.defs.insert(
+        component_id,
+        ComponentDef::new(component_id, master_id, "Button"),
+    );
+    let root = frame_sized(0.0, 0.0, 100.0, 50.0, Color::WHITE);
+    let root_id = root.id;
+    document.scene.insert(root)?;
+    let mut placements = Vec::new();
+    for x in [0.0, 50.0] {
+        let mut instance = CanvasNode::new(NodeData::Instance(InstanceNode {
+            component: component_id,
+            overrides: Vec::new(),
+            prop_values: BTreeMap::new(),
+            derived: Vec::new(),
+            local_size: [40.0, 40.0],
+        }));
+        instance.parent = Some(root_id);
+        instance.transform = Transform2D::translation(x, 0.0);
+        placements.push(instance.id);
+        document.scene.insert(instance)?;
+    }
+    let first = *placements.first().ok_or("missing first instance")?;
+    let second = *placements.get(1).ok_or("missing second instance")?;
+    let clip_id = AnimationClipId::from_u128(9012);
+    document
+        .motion
+        .clips
+        .insert(clip_id, position_clip(clip_id, child_id, 5.0, 25.0));
+    Ok((document, root_id, first, second, child_id, clip_id))
+}
+
+#[test]
+fn runtime_component_descendant_hits_and_motion_are_scoped_to_a_placement()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (document, root, first, second, child, clip) = runtime_component_document()?;
+    let before = document.to_json_string()?;
+    let mut player = PresentSession::new_headless(&document, Some(root), DVec2::new(100.0, 50.0))?;
+    player.handle_pointer(DVec2::new(10.0, 10.0), PointerEvent::Click);
+    assert_eq!(player.take_open_url().as_deref(), Some("component-child"));
+    let occurrences = player.occurrences();
+    assert_eq!(
+        occurrences
+            .iter()
+            .filter(|occurrence| occurrence.node == child)
+            .count(),
+        2
+    );
+    assert!(
+        player
+            .play_clip(clip, None, ClipPlaybackMode::Once)
+            .is_err()
+    );
+    let scope = occurrences
+        .iter()
+        .find(|occurrence| occurrence.node == first)
+        .cloned()
+        .ok_or("missing first scope")?;
+    player.play_clip(clip, Some(scope), ClipPlaybackMode::Once)?;
+    player.advance_by(0.1)?;
+    let resolved = player.resolved_layer(root, true);
+    let positions: BTreeMap<_, _> = resolved
+        .occurrences
+        .iter()
+        .filter(|(_, occurrence)| occurrence.node == child)
+        .filter_map(|(identity, occurrence)| {
+            resolved.scene.get(*identity).map(|node| {
+                (
+                    occurrence.instance_path.clone(),
+                    node.transform.to_components()[4],
+                )
+            })
+        })
+        .collect();
+    assert_eq!(positions.get(&vec![first]).copied(), Some(25.0));
+    assert_eq!(positions.get(&vec![second]).copied(), Some(5.0));
+    player.handle_pointer(DVec2::new(10.0, 10.0), PointerEvent::Click);
+    assert!(player.take_open_url().is_none());
+    player.handle_pointer(DVec2::new(30.0, 10.0), PointerEvent::Click);
+    assert_eq!(player.take_open_url().as_deref(), Some("component-child"));
+    assert_eq!(document.to_json_string()?, before);
+    Ok(())
+}
+
+#[test]
+fn runtime_component_keyboard_and_hidden_timers_use_resolved_descendants()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut document, root, _, _, child, _) = runtime_component_document()?;
+    let node = document
+        .scene
+        .get_mut(child)
+        .ok_or("missing component child")?;
+    node.flags.insert(NodeFlags::HIDDEN);
+    node.reactions.push(click(
+        9020,
+        Trigger::Key {
+            keys: vec!["K".into()],
+        },
+        Action::OpenLink {
+            url: "key-child".into(),
+        },
+    ));
+    node.reactions.push(click(
+        9021,
+        Trigger::AfterDelay { delay_ms: 20 },
+        Action::OpenLink {
+            url: "timer-child".into(),
+        },
+    ));
+    let mut player = PresentSession::new_headless(&document, Some(root), DVec2::new(100.0, 50.0))?;
+    player.handle_key("k", KeyEvent::Down);
+    assert_eq!(player.take_open_url().as_deref(), Some("key-child"));
+    player.advance_by(0.02)?;
+    assert_eq!(player.take_open_url().as_deref(), Some("timer-child"));
+    assert_eq!(player.schedule().next_deadline_ms, None);
+    Ok(())
+}
+
+#[test]
+fn overlapping_variant_definitions_replace_descendant_timers_and_scoped_motion()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut document, frame, instance, _) = interactive_variant_document();
+    let set = ComponentId::from_u128(800);
+    let original_root = document
+        .components
+        .defs
+        .get(&ComponentId::from_u128(801))
+        .ok_or("missing original master")?
+        .root;
+    let enclosing_root = document
+        .components
+        .defs
+        .get(&ComponentId::from_u128(802))
+        .ok_or("missing enclosing master")?
+        .root;
+    document.scene.set_parent(
+        original_root,
+        Some(enclosing_root),
+        fanta_doc::IndexKey::from_raw(0.0),
+    )?;
+    let mut child = frame_sized(0.0, 0.0, 10.0, 10.0, Color::WHITE);
+    let child_id = child.id;
+    child.parent = Some(original_root);
+    child.reactions.push(click(
+        9200,
+        Trigger::AfterDelay { delay_ms: 100 },
+        Action::OpenLink {
+            url: "descendant".into(),
+        },
+    ));
+    document.scene.insert(child)?;
+    document
+        .scene
+        .get_mut(instance)
+        .ok_or("missing placed instance")?
+        .reactions
+        .push(click(
+            9201,
+            Trigger::AfterDelay { delay_ms: 100 },
+            Action::OpenLink {
+                url: "wrapper".into(),
+            },
+        ));
+    let clip = AnimationClipId::from_u128(9202);
+    document
+        .motion
+        .clips
+        .insert(clip, position_clip(clip, child_id, 0.0, 20.0));
+    let authored = document.to_json_string()?;
+    let mut playback = PlaybackSession::new(&document, Some(frame), DVec2::new(100.0, 50.0))?;
+    let scope = playback
+        .occurrences()
+        .into_iter()
+        .find(|occurrence| occurrence.node == instance)
+        .ok_or("missing wrapper occurrence")?;
+    let original = playback
+        .occurrences()
+        .into_iter()
+        .find(|occurrence| {
+            occurrence.node == child_id && occurrence.instance_path == vec![instance]
+        })
+        .ok_or("missing original descendant")?;
+    assert_eq!(original.definition_path, vec![original_root, child_id]);
+    assert!(scope.definition_path.is_empty());
+    playback.play_clip(clip, Some(scope.clone()), ClipPlaybackMode::Once)?;
+    playback.advance_by(0.04)?;
+    let wrapper_remaining = playback
+        .timers
+        .iter()
+        .find(|timer| timer.source == instance)
+        .ok_or("missing wrapper timer")?
+        .remaining;
+    playback.set_variant_override(set, "Hover".into());
+    assert!(playback.active_prototype_animation.is_none());
+    let replacement = playback
+        .occurrences()
+        .into_iter()
+        .find(|occurrence| {
+            occurrence.node == child_id && occurrence.instance_path == vec![instance]
+        })
+        .ok_or("missing replacement descendant")?;
+    assert_eq!(
+        replacement.definition_path,
+        vec![enclosing_root, original_root, child_id]
+    );
+    assert_ne!(original, replacement);
+    assert_eq!(
+        playback
+            .timers
+            .iter()
+            .find(|timer| timer.source == instance)
+            .ok_or("missing retained wrapper timer")?
+            .remaining,
+        wrapper_remaining
+    );
+    let resolved = playback.reaction_layer(false);
+    let child_timers: Vec<_> = playback
+        .timers
+        .iter()
+        .filter(|timer| {
+            resolved
+                .occurrences
+                .get(&timer.source)
+                .is_some_and(|occurrence| occurrence.node == child_id)
+        })
+        .collect();
+    assert_eq!(child_timers.len(), 2);
+    assert!(
+        child_timers
+            .iter()
+            .all(|timer| (timer.remaining - 0.1).abs() < 1e-9)
+    );
+    playback.play_clip(clip, Some(scope), ClipPlaybackMode::Repeat)?;
+    assert!(
+        playback
+            .play_clip(clip, Some(original), ClipPlaybackMode::Once)
+            .is_err()
+    );
+    assert_eq!(
+        playback
+            .active_prototype_animation
+            .ok_or("valid clip was replaced")?
+            .mode,
+        ClipPlaybackMode::Repeat
+    );
+    assert_eq!(playback.doc.to_json_string()?, authored);
+    assert_eq!(document.to_json_string()?, authored);
+    Ok(())
+}
+
+#[test]
+fn retained_timer_order_tracks_preorder_after_variant_expansion_changes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut document, frame, _, _) = interactive_variant_document();
+    let set = ComponentId::from_u128(800);
+    let original_root = document
+        .components
+        .defs
+        .get(&ComponentId::from_u128(801))
+        .ok_or("missing original master")?
+        .root;
+    let enclosing_root = document
+        .components
+        .defs
+        .get(&ComponentId::from_u128(802))
+        .ok_or("missing enclosing master")?
+        .root;
+    document.scene.set_parent(
+        original_root,
+        Some(enclosing_root),
+        fanta_doc::IndexKey::from_raw(0.0),
+    )?;
+    document
+        .scene
+        .get_mut(original_root)
+        .ok_or("missing original root")?
+        .reactions
+        .push(click(
+            9210,
+            Trigger::AfterDelay { delay_ms: 100 },
+            Action::OpenLink {
+                url: "expanded-ancestor".into(),
+            },
+        ));
+    let mut last = frame_sized(0.0, 0.0, 10.0, 10.0, Color::WHITE);
+    let last_id = last.id;
+    last.parent = Some(frame);
+    last.index = fanta_doc::IndexKey::from_raw(1000.0);
+    last.reactions.push(click(
+        9211,
+        Trigger::AfterDelay { delay_ms: 100 },
+        Action::OpenLink {
+            url: "direct-last".into(),
+        },
+    ));
+    document.scene.insert(last)?;
+    let mut playback = PlaybackSession::new(&document, Some(frame), DVec2::new(100.0, 50.0))?;
+    let timer = playback
+        .timers
+        .iter()
+        .find(|timer| timer.source == last_id)
+        .ok_or("missing direct timer")?;
+    let initial_order = timer.order;
+    let remaining = timer.remaining;
+    playback.set_variant_override(set, "Hover".into());
+    let timer = playback
+        .timers
+        .iter()
+        .find(|timer| timer.source == last_id)
+        .ok_or("missing retained direct timer")?;
+    assert!(timer.order > initial_order);
+    assert_eq!(timer.remaining, remaining);
+    let resolved = playback.reaction_layer(false);
+    assert_eq!(
+        resolved
+            .scene
+            .descendants_of(frame)
+            .position(|identity| identity == last_id),
+        Some(timer.order)
+    );
+    playback.advance_by(0.1)?;
+    assert_eq!(playback.take_open_url().as_deref(), Some("direct-last"));
+    Ok(())
+}
+
+#[test]
+fn descendant_reaction_resolves_motion_after_its_variant_action()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut document, frame, _, _) = interactive_variant_document();
+    let set = ComponentId::from_u128(800);
+    let original_root = document
+        .components
+        .defs
+        .get(&ComponentId::from_u128(801))
+        .ok_or("missing original master")?
+        .root;
+    let selected_root = document
+        .components
+        .defs
+        .get(&ComponentId::from_u128(802))
+        .ok_or("missing selected master")?
+        .root;
+    let mut target = frame_sized(0.0, 0.0, 10.0, 10.0, Color::WHITE);
+    let target_id = target.id;
+    target.parent = Some(selected_root);
+    document.scene.insert(target)?;
+    let clip = AnimationClipId::from_u128(9220);
+    document
+        .motion
+        .clips
+        .insert(clip, position_clip(clip, target_id, 0.0, 20.0));
+    let mut source = frame_sized(0.0, 0.0, 10.0, 10.0, Color::WHITE);
+    source.parent = Some(original_root);
+    let mut reaction = click(
+        9221,
+        Trigger::Key {
+            keys: vec!["R".into()],
+        },
+        Action::UpdateVariant {
+            component: set,
+            variant: "Hover".into(),
+        },
+    );
+    reaction.animation = Some(PrototypeAnimation { clip, delay_ms: 15 });
+    source.reactions.push(reaction);
+    document.scene.insert(source)?;
+    let authored = document.to_json_string()?;
+    let mut playback = PlaybackSession::new(&document, Some(frame), DVec2::new(100.0, 50.0))?;
+    playback.handle_key("R", KeyEvent::Down);
+    let placement = playback
+        .instance_variant_overrides
+        .keys()
+        .copied()
+        .next()
+        .ok_or("variant was not selected")?;
+    assert_eq!(playback.instance_variant_overrides.len(), 1);
+    assert_eq!(
+        playback
+            .active_prototype_animation
+            .ok_or("clip did not start")?
+            .clip,
+        clip
+    );
+    assert_eq!(
+        playback
+            .active_motion_scope
+            .as_ref()
+            .ok_or("scope was lost")?
+            .node,
+        placement
+    );
+    assert_eq!(playback.active_motion_targets.len(), 1);
+    let target = playback
+        .active_motion_targets
+        .first()
+        .ok_or("missing resolved target")?;
+    assert_eq!(target.node, target_id);
+    assert_eq!(target.instance_path, vec![placement]);
+    assert_eq!(target.definition_path, vec![selected_root, target_id]);
+    assert!(playback.take_playback_events().is_empty());
+    assert_eq!(playback.doc.to_json_string()?, authored);
+    Ok(())
+}
+
+#[test]
+fn descendant_action_sequence_keeps_variant_changes_local_after_its_source_disappears()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut document, frame, _, _) = interactive_variant_document();
+    let set = ComponentId::from_u128(800);
+    let original_root = document
+        .components
+        .defs
+        .get(&ComponentId::from_u128(801))
+        .ok_or("missing original master")?
+        .root;
+    let mut source = frame_sized(0.0, 0.0, 10.0, 10.0, Color::WHITE);
+    source.parent = Some(original_root);
+    let mut reaction = click(
+        9230,
+        Trigger::Key {
+            keys: vec!["R".into()],
+        },
+        Action::UpdateVariant {
+            component: set,
+            variant: "Hover".into(),
+        },
+    );
+    reaction.extra_actions.push(Action::UpdateVariant {
+        component: set,
+        variant: "Pressed".into(),
+    });
+    source.reactions.push(reaction);
+    document.scene.insert(source)?;
+    let authored = document.to_json_string()?;
+    let mut playback = PlaybackSession::new(&document, Some(frame), DVec2::new(100.0, 50.0))?;
+    playback.handle_key("R", KeyEvent::Down);
+    assert_eq!(playback.instance_variant_overrides.len(), 1);
+    assert_eq!(
+        playback
+            .instance_variant_overrides
+            .values()
+            .next()
+            .map(|(_, value)| value.as_str()),
+        Some("Pressed")
+    );
+    assert!(!playback.variant_overrides.contains_key(&set));
+    assert!(playback.take_playback_events().is_empty());
+    assert_eq!(playback.doc.to_json_string()?, authored);
+    assert_eq!(document.to_json_string()?, authored);
+    Ok(())
+}
+
+#[test]
+fn runtime_duplicate_overlays_cancel_only_the_closed_layer_timers()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut document = Doc::new();
+    let root = frame(0.0);
+    let root_id = root.id;
+    document.scene.insert(root)?;
+    let mut overlay = frame_sized(1000.0, 0.0, 20.0, 20.0, Color::WHITE);
+    let overlay_id = overlay.id;
+    overlay.reactions.push(click(
+        9030,
+        Trigger::AfterDelay { delay_ms: 100 },
+        Action::OpenLink {
+            url: "remaining-layer".into(),
+        },
+    ));
+    document.scene.insert(overlay)?;
+    let mut player = PresentSession::new_headless(&document, Some(root_id), DVec2::splat(200.0))?;
+    let settings = OverlaySettings {
+        position: OverlayPosition::Center,
+        background_dim: false,
+        close_on_click_outside: false,
+    };
+    player.open_overlay(overlay_id, &settings, None);
+    player.advance_by(0.04)?;
+    player.open_overlay(overlay_id, &settings, None);
+    player.execute(overlay_id, &Action::Close, None);
+    assert_eq!(player.overlays.len(), 1);
+    assert_eq!(player.timers.len(), 1);
+    player.advance_by(0.06)?;
+    assert_eq!(player.take_open_url().as_deref(), Some("remaining-layer"));
+    Ok(())
+}
+
+#[test]
+fn runtime_retains_imported_component_geometry_until_layout_inputs_change()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut document, root, first, _, child, _) = runtime_component_document()?;
+    let component_root = document
+        .scene
+        .get(first)
+        .and_then(|node| match &node.data {
+            NodeData::Instance(instance) => document
+                .components
+                .def(instance.component)
+                .map(|definition| definition.root),
+            _ => None,
+        })
+        .ok_or("missing component")?;
+    if let Some(node) = document.scene.get_mut(component_root) {
+        if let NodeData::Group(group) = &mut node.data {
+            group.auto_layout = Some(fanta_doc::AutoLayout::default());
+        }
+    }
+    let node = document.scene.get_mut(first).ok_or("missing instance")?;
+    if let NodeData::Instance(instance) = &mut node.data {
+        instance.derived.push(fanta_doc::DerivedOverride {
+            path: vec![child].into(),
+            transform: Some(Transform2D::translation(23.0, 17.0)),
+            size: None,
+            fills: None,
+            path_data: None,
+            stroke_path: None,
+            stroke_weight: None,
+            text: None,
+        });
+    }
+    let player = PresentSession::new_headless(&document, Some(root), DVec2::new(100.0, 50.0))?;
+    let resolved = player.resolved_layer(root, true);
+    let identity = resolved
+        .occurrences
+        .iter()
+        .find_map(|(identity, occurrence)| {
+            (occurrence.node == child && occurrence.instance_path == vec![first])
+                .then_some(*identity)
+        })
+        .ok_or("missing imported descendant")?;
+    let transform = resolved
+        .scene
+        .get(identity)
+        .ok_or("missing resolved child")?
+        .transform
+        .to_components();
+    assert_eq!([transform[4], transform[5]], [23.0, 17.0]);
+    Ok(())
+}
+
+#[test]
+fn runtime_motion_reuses_the_scene_and_unchanged_render_geometry()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (document, root, first, _, _, clip) = runtime_component_document()?;
+    let mut player = PresentSession::new(&document, Some(root), DVec2::new(100.0, 50.0))?;
+    let scope = player
+        .occurrences()
+        .into_iter()
+        .find(|occurrence| occurrence.node == first)
+        .ok_or("missing instance")?;
+    player.play_clip(clip, Some(scope), ClipPlaybackMode::Once)?;
+    player.render_current();
+    let initial = player.resolved_layer(root, true).scene.instance_id();
+    for _ in 0..4 {
+        player.advance_by(0.02)?;
+        let metrics = player.render_current();
+        let next = player.resolved_layer(root, true).scene.instance_id();
+        assert_eq!(initial, next, "motion samples reuse the prepared tree");
+        assert!(
+            metrics.paths_built <= 1,
+            "unrelated placement geometry remains cached: {metrics:?}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn runtime_instance_typography_remains_more_specific_than_fss_leaves()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut document, root, first, second, child, _) = runtime_component_document()?;
+    let node = document
+        .scene
+        .get_mut(child)
+        .ok_or("missing text descendant")?;
+    node.data = NodeData::Text(fanta_doc::TextNode::new("Hi", 10.0, 10.0));
+    node.style_assignment.local_patch.insert(
+        fanta_doc::stylesheet::StyleProperty::FontSize,
+        fanta_doc::stylesheet::StyleDeclaration {
+            value: 24.0.into(),
+            binding: None,
+        },
+    );
+    node.style_assignment.local_patch.insert(
+        fanta_doc::stylesheet::StyleProperty::Color,
+        fanta_doc::stylesheet::StyleDeclaration {
+            value: serde_json::to_value(Color::BLACK)?,
+            binding: None,
+        },
+    );
+    let node = document
+        .scene
+        .get_mut(first)
+        .ok_or("missing first placement")?;
+    if let NodeData::Instance(instance) = &mut node.data {
+        let style = fanta_doc::TextStyle {
+            size_px: 40.0,
+            color: Color::rgb(0, 255, 0),
+            ..Default::default()
+        };
+        instance.overrides.push(fanta_doc::Override {
+            target_path: vec![child].into(),
+            target_prop: BoundProp::TextStyle,
+            value: fanta_doc::OverrideValue::Field {
+                value: serde_json::json!({"style":style}),
+            },
+        });
+    }
+    let player = PresentSession::new_headless(&document, Some(root), DVec2::new(100.0, 50.0))?;
+    let resolved = player.resolved_layer(root, true);
+    let styles: BTreeMap<_, _> = resolved
+        .occurrences
+        .iter()
+        .filter(|(_, occurrence)| occurrence.node == child)
+        .filter_map(|(identity, occurrence)| {
+            resolved
+                .scene
+                .get(*identity)
+                .and_then(|node| match &node.data {
+                    NodeData::Text(text) => {
+                        Some((occurrence.instance_path.clone(), text.style.clone()))
+                    }
+                    _ => None,
+                })
+        })
+        .collect();
+    let first_style = styles.get(&vec![first]).ok_or("missing first style")?;
+    let second_style = styles.get(&vec![second]).ok_or("missing second style")?;
+    assert_eq!(first_style.size_px, 40.0);
+    assert_eq!(first_style.color, Color::rgb(0, 255, 0));
+    assert_eq!(second_style.size_px, 24.0);
+    assert_eq!(second_style.color, Color::BLACK);
+    Ok(())
+}
+
+#[test]
+fn runtime_releases_departed_layer_occurrences() -> Result<(), Box<dyn std::error::Error>> {
+    let (document, root, _, _, _, _) = runtime_component_document()?;
+    let mut player = PresentSession::new_headless(&document, Some(root), DVec2::new(100.0, 50.0))?;
+    let settings = OverlaySettings {
+        position: OverlayPosition::Center,
+        background_dim: false,
+        close_on_click_outside: false,
+    };
+    for _ in 0..100 {
+        player.open_overlay(root, &settings, None);
+        player.execute(root, &Action::Close, None);
+        player.navigate(root);
+        let (layers, identities) = player.occurrence_cache_counts();
+        assert!(layers <= 2, "departed scene caches were released");
+        assert!(
+            identities <= 2,
+            "departed component placements were released"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn runtime_effective_occurrence_inspection_uses_authored_placement_addresses()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (document, root, first, second, child, clip) = runtime_component_document()?;
+    let mut player = PresentSession::new_headless(&document, Some(root), DVec2::new(100.0, 50.0))?;
+    let scope = player
+        .occurrences()
+        .into_iter()
+        .find(|occurrence| occurrence.node == first)
+        .ok_or("missing placement scope")?;
+    player.play_clip(clip, Some(scope), ClipPlaybackMode::Once)?;
+    player.advance_by(0.05)?;
+    let mut snapshot = Vec::new();
+    player.visit_effective_occurrences(|occurrence, node| {
+        snapshot.push((occurrence.clone(), node.transform.to_components()))
+    });
+    assert!(snapshot.iter().all(|(occurrence, _)| {
+        document.scene.contains(occurrence.node)
+            && occurrence
+                .instance_path
+                .iter()
+                .all(|node| document.scene.contains(*node))
+    }));
+    let first_child = snapshot
+        .iter()
+        .find(|(occurrence, _)| occurrence.node == child && occurrence.instance_path == vec![first])
+        .ok_or("missing first child")?;
+    let second_child = snapshot
+        .iter()
+        .find(|(occurrence, _)| {
+            occurrence.node == child && occurrence.instance_path == vec![second]
+        })
+        .ok_or("missing second child")?;
+    assert_eq!(first_child.1[4], 15.0);
+    assert_eq!(second_child.1[4], 5.0);
+    assert_ne!(first_child.0, second_child.0);
+    let mut repeated = Vec::new();
+    player.visit_effective_occurrences(|occurrence, _| repeated.push(occurrence.clone()));
+    assert_eq!(
+        snapshot
+            .into_iter()
+            .map(|(occurrence, _)| occurrence)
+            .collect::<Vec<_>>(),
+        repeated
+    );
+    assert_eq!(player.resolution_generation(), 0);
+    Ok(())
+}
+
+#[test]
+fn cancelling_pointer_capture_restores_transient_state_without_authored_reactions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut document, frame, instance, _) = interactive_variant_document();
+    let node = document.scene.get_mut(instance).ok_or("missing instance")?;
+    let destination = node
+        .reactions
+        .iter()
+        .find_map(|reaction| match reaction.action {
+            Action::Navigate { to } => Some(to),
+            _ => None,
+        })
+        .ok_or("missing click destination")?;
+    node.reactions.push(click(
+        9100,
+        Trigger::MouseLeave,
+        Action::Navigate { to: destination },
+    ));
+    node.reactions.push(click(
+        9101,
+        Trigger::Drag,
+        Action::OpenLink {
+            url: "drag-start".into(),
+        },
+    ));
+    let mut player = PresentSession::new_headless(&document, Some(frame), DVec2::new(100.0, 50.0))?;
+    let point = DVec2::new(25.0, 25.0);
+    player.handle_pointer(point, PointerEvent::Move);
+    player.handle_pointer(point, PointerEvent::Down);
+    player.handle_pointer(point, PointerEvent::DragStart);
+    assert_eq!(player.take_open_url().as_deref(), Some("drag-start"));
+    assert!(player.pressed_reaction.is_some());
+    assert!(!player.hover_chain.is_empty());
+    let cancelled = player.cancel_pointer_input();
+    assert!(cancelled.needs_redraw);
+    assert!(!cancelled.navigated && !cancelled.exited);
+    assert_eq!(player.current_frame(), frame);
+    assert!(player.take_open_url().is_none());
+    assert!(player.pressed_reaction.is_none() && player.hovered_reaction.is_none());
+    assert!(player.hover_chain.is_empty() && !player.suppress_next_click);
+    assert!(!player.instance_variant_overrides.contains_key(&instance));
+    assert!(!player.cancel_pointer_input().needs_redraw);
+    player.handle_pointer(point, PointerEvent::Move);
+    assert_eq!(
+        player
+            .instance_variant_overrides
+            .get(&instance)
+            .map(|(_, variant)| variant.as_str()),
+        Some("Hover")
+    );
+    player.handle_pointer(point, PointerEvent::Down);
+    player.handle_pointer(point, PointerEvent::Up);
+    let clicked = player.handle_pointer(point, PointerEvent::Click);
+    assert!(clicked.navigated);
+    assert_eq!(player.current_frame(), destination);
+    Ok(())
+}
+
+#[test]
+fn paused_resize_preserves_clocks_and_uses_effective_frame_bounds()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut document = Doc::new();
+    let collection = VariableCollectionId::from_u128(9110);
+    let mode = ModeId::from_u128(9111);
+    let variable = VariableId::from_u128(9112);
+    document.variables.collections.insert(
+        collection,
+        VariableCollection {
+            id: collection,
+            name: "Dimensions".into(),
+            modes: vec![Mode {
+                id: mode,
+                name: "Default".into(),
+            }],
+            default_mode: mode,
+            variable_order: vec![variable],
+        },
+    );
+    document.variables.variables.insert(
+        variable,
+        Variable {
+            id: variable,
+            name: "Width".into(),
+            collection,
+            ty: VariableType::Float,
+            values_by_mode: BTreeMap::from([(mode, VarValue::Float { value: 400.0 })]),
+            scopes: Vec::new(),
+        },
+    );
+    let mut root = frame_sized(0.0, 0.0, 200.0, 100.0, Color::WHITE);
+    let root_id = root.id;
+    root.bindings.insert(BoundProp::ClipWidth, variable);
+    root.reactions.push(click(
+        9113,
+        Trigger::AfterDelay { delay_ms: 200 },
+        Action::OpenLink {
+            url: "timer".into(),
+        },
+    ));
+    document.scene.insert(root)?;
+    let clip_id = AnimationClipId::from_u128(9114);
+    document
+        .motion
+        .clips
+        .insert(clip_id, position_clip(clip_id, root_id, 0.0, 100.0));
+    let mut player = PresentSession::new_headless(&document, Some(root_id), DVec2::splat(200.0))?;
+    assert_eq!(player.viewport.zoom, 0.5);
+    player.play_clip(clip_id, None, ClipPlaybackMode::Once)?;
+    player.advance_by(0.05)?;
+    player.pause_playback();
+    let clock = player.playback_state().clock_ms;
+    let timer = player.timers.first().ok_or("missing timer")?.remaining;
+    player.resize_with_scale(DVec2::new(400.0, 100.0), 2.0)?;
+    assert_eq!(player.viewport.zoom, 1.0);
+    assert_eq!(player.viewport.center, [200.0, 50.0]);
+    assert_eq!(player.pixel_size(), (800, 200));
+    player.advance_by(1.0)?;
+    assert_eq!(player.playback_state().clock_ms, clock);
+    assert_eq!(
+        player
+            .playback_state()
+            .clip
+            .ok_or("missing clip")?
+            .playhead_ms,
+        Some(50)
+    );
+    assert_eq!(
+        player.timers.first().ok_or("missing timer")?.remaining,
+        timer
+    );
+    assert!(player.schedule().paused && !player.schedule().continuous);
+    assert_eq!(player.schedule().next_deadline_ms, None);
+    assert!(player.take_open_url().is_none());
+    player.resume_playback();
+    player.advance_by(0.05)?;
+    assert_eq!(
+        player
+            .playback_state()
+            .clip
+            .ok_or("missing clip")?
+            .playhead_ms,
+        Some(100)
+    );
+    Ok(())
+}
+
+#[test]
+fn resizing_updates_active_variant_layers_without_advancing_their_clock()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut document, frame, instance, _) = interactive_variant_document();
+    let node = document.scene.get_mut(instance).ok_or("missing instance")?;
+    let reaction = node
+        .reactions
+        .iter_mut()
+        .find(|reaction| matches!(reaction.trigger, Trigger::Hover))
+        .ok_or("missing hover reaction")?;
+    reaction.transition = Some(Transition {
+        style: TransitionStyle::Dissolve,
+        duration_ms: 1000,
+        easing: Easing::Linear,
+    });
+    let mut player = PresentSession::new_headless(&document, Some(frame), DVec2::new(100.0, 50.0))?;
+    player.handle_pointer(DVec2::new(25.0, 25.0), PointerEvent::Move);
+    player.advance_by(0.05)?;
+    player.pause_playback();
+    let elapsed = player
+        .active_variant_transition
+        .as_ref()
+        .ok_or("missing variant transition")?
+        .clock
+        .elapsed;
+    player.resize_with_scale(DVec2::new(200.0, 100.0), 2.0)?;
+    let active = player
+        .active_variant_transition
+        .as_ref()
+        .ok_or("missing variant transition")?;
+    assert_eq!(active.clock.elapsed, elapsed);
+    assert!(
+        active
+            .layers
+            .iter()
+            .all(|layer| layer.viewport == player.viewport)
+    );
+    assert_eq!(player.viewport.zoom, 2.0);
+    Ok(())
+}
+
+#[test]
+fn headless_playback_accepts_dimensions_that_cannot_allocate_a_skia_surface()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut document = Doc::new();
+    let mut root = frame(0.0);
+    let root_id = root.id;
+    root.reactions.push(click(
+        9200,
+        Trigger::AfterDelay { delay_ms: 100 },
+        Action::OpenLink {
+            url: "headless-timer".into(),
+        },
+    ));
+    document.scene.insert(root)?;
+    let size = DVec2::new(f64::from(i32::MAX) + 1.0, 2.0);
+    let mut playback = PlaybackSession::new(&document, Some(root_id), size)?;
+    assert_eq!(playback.pixel_size(), (i32::MAX as u32 + 1, 2));
+    playback.advance_by(0.1)?;
+    assert_eq!(playback.take_open_url().as_deref(), Some("headless-timer"));
+    assert!(PresentSession::from_playback(playback).is_err());
+    Ok(())
+}
+
+#[test]
+fn native_facade_and_headless_playback_preserve_identical_command_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut document = Doc::new();
+    let mut root = frame(0.0);
+    let root_id = root.id;
+    let destination = frame(300.0);
+    let destination_id = destination.id;
+    root.reactions.push(click(
+        9201,
+        Trigger::AfterDelay { delay_ms: 250 },
+        Action::Navigate { to: destination_id },
+    ));
+    document.scene.insert_many([root, destination])?;
+    let clip_id = AnimationClipId::from_u128(9202);
+    document
+        .motion
+        .clips
+        .insert(clip_id, position_clip(clip_id, root_id, 0.0, 100.0));
+    let mut playback = PlaybackSession::new(&document, Some(root_id), DVec2::splat(200.0))?;
+    let mut presentation = PresentSession::new(&document, Some(root_id), DVec2::splat(200.0))?;
+    playback.play_clip(clip_id, None, ClipPlaybackMode::PingPong)?;
+    presentation.play_clip(clip_id, None, ClipPlaybackMode::PingPong)?;
+    playback.resize_with_scale(DVec2::new(320.0, 180.0), 2.0)?;
+    presentation.resize_with_scale(DVec2::new(320.0, 180.0), 2.0)?;
+    for elapsed in [0.05, 0.05, 0.2] {
+        let expected_response = playback.advance_by(elapsed)?;
+        let actual_response = presentation.advance_by(elapsed)?;
+        assert_eq!(expected_response, actual_response);
+        assert_eq!(
+            serde_json::to_value(playback.playback_state())?,
+            serde_json::to_value(presentation.playback_state())?
+        );
+        assert_eq!(playback.pixel_size(), presentation.pixel_size());
+    }
+    assert_eq!(playback.current_frame(), destination_id);
+    assert_eq!(presentation.current_frame(), destination_id);
+    assert_eq!(
+        serde_json::to_value(playback.take_playback_events())?,
+        serde_json::to_value(presentation.take_playback_events())?
+    );
+    Ok(())
+}
+
+#[test]
+fn attaching_and_mutating_playback_preserves_state_and_updates_the_render_adapter()
+-> Result<(), Box<dyn std::error::Error>> {
+    let mut document = Doc::new();
+    let root = frame(0.0);
+    let root_id = root.id;
+    document.scene.insert(root)?;
+    let mut playback = PlaybackSession::new(&document, Some(root_id), DVec2::splat(200.0))?;
+    playback.advance_by(0.125)?;
+    let expected_state = serde_json::to_value(playback.playback_state())?;
+    let mut presentation = PresentSession::from_playback(playback)?;
+    assert_eq!(
+        expected_state,
+        serde_json::to_value(presentation.playback_state())?
+    );
+    presentation
+        .playback
+        .resize_with_scale(DVec2::new(32.0, 18.0), 2.0)?;
+    assert_eq!(presentation.playback.pixel_size(), (64, 36));
+    let pixels = presentation.present_rgba();
+    assert_eq!(pixels.len(), 64 * 36 * 4);
+    assert_eq!(
+        (
+            presentation.renderer.width(),
+            presentation.renderer.height()
+        ),
+        (64, 36)
+    );
+    assert_eq!(presentation.renderer.display_scale, 2.0);
+    assert_eq!(presentation.playback_state().clock_ms, 125.0);
+    Ok(())
+}
+
+#[test]
+fn transition_hit_offsets_follow_rounded_physical_pixels() -> Result<(), Box<dyn std::error::Error>>
+{
+    let mut document = Doc::new();
+    let root = frame(0.0);
+    let root_id = root.id;
+    document.scene.insert(root)?;
+    let mut playback = PlaybackSession::new(&document, Some(root_id), DVec2::splat(10.0))?;
+    playback.resize_with_scale(DVec2::splat(10.0), 2.0)?;
+    let (outgoing, incoming) = playback.transition_screen_offsets(
+        TransitionStyle::Push {
+            direction: fanta_doc::Direction::Left,
+        },
+        0.13,
+    );
+    assert_eq!(outgoing, (1.5, 0.0));
+    assert_eq!(incoming, (-8.5, 0.0));
+    let overlay = playback.overlay_screen_offset(
+        TransitionStyle::MoveIn {
+            direction: fanta_doc::Direction::Left,
+        },
+        0.13,
+    );
+    assert_eq!(overlay, incoming);
+    Ok(())
+}

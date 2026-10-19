@@ -47,7 +47,8 @@ use super::layout::{
     EXPORTS_DIR, FANTA_JSON, FLOW_START_JSON, FLOWS_JSON, LOOSE_DIR, MASTER_FNX, MASTER_IDS,
     METADATA_JSON, MOTION_JSON, NODES_DIR, PAGE_FNX, PAGE_IDS, PAGE_JSON, PAGES_DIR,
     PRESENTATION_JSON, PREVIEWS_DIR, PROJECT_VERSION, ProjectManifest, SET_JSON, SETS_JSON,
-    VARIABLES_JSON, WORKSPACE_FNX, id_from_key, json_bytes, json_key, slugify, sorted_entries,
+    STYLES_JSON, VARIABLES_JSON, WORKSPACE_FNX, id_from_key, json_bytes, json_key, slugify,
+    sorted_entries,
 };
 use super::media::{ASSET_INDEX_FILE, MediaRegistry, asset_index_bytes, sniff_media};
 
@@ -701,6 +702,12 @@ fn project_files_cached_with_sources(
 /// bytes must not move when a document gains or loses its first variable.
 fn project_doc_singletons(files: &mut ProjectedFiles, doc: &Doc) -> Result<()> {
     let doc_dir = PathBuf::from(DOC_DIR);
+    if !doc.styles.is_empty() {
+        files.insert(
+            doc_dir.join(STYLES_JSON),
+            Arc::new(json_bytes(&serde_json::to_value(&doc.styles)?)?),
+        );
+    }
     let variables = if doc.variables.is_empty() {
         json!({})
     } else {
@@ -1455,6 +1462,7 @@ fn is_generated_artifact(relative: &Path) -> bool {
             METADATA_JSON,
             ASSET_LIBRARY_JSON,
             VARIABLES_JSON,
+            STYLES_JSON,
             ACTIVE_MODES_JSON,
             MOTION_JSON,
             FLOW_START_JSON,
@@ -1483,6 +1491,15 @@ fn is_generated_artifact(relative: &Path) -> bool {
             .is_some_and(|stem| stem.parse::<AssetId>().is_ok()),
         _ => false,
     }
+}
+
+pub fn is_project_managed_path(relative: &Path) -> bool {
+    relative
+        .components()
+        .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && (relative == Path::new(FANTA_JSON)
+            || relative == Path::new(WORKSPACE_FNX)
+            || is_generated_artifact(relative))
 }
 
 fn validate_source_override_keys(sources: &BTreeMap<PathBuf, (Vec<u8>, Vec<u8>)>) -> Result<()> {
@@ -1544,13 +1561,7 @@ fn slug_byte(byte: u8) -> bool {
 
 fn validate_expected_disk_paths(expected_disk: &BTreeMap<PathBuf, Option<[u8; 32]>>) -> Result<()> {
     for relative in expected_disk.keys() {
-        if !relative
-            .components()
-            .all(|component| matches!(component, std::path::Component::Normal(_)))
-            || (relative != Path::new(FANTA_JSON)
-                && relative != Path::new(WORKSPACE_FNX)
-                && !is_generated_artifact(relative))
-        {
+        if !is_project_managed_path(relative) {
             return Err(FormatError::InvalidProjectTree(format!(
                 "save precondition names an unmanaged path {}",
                 relative.display()
