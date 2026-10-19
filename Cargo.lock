@@ -5282,6 +5282,7 @@ dependencies = [
  "fanta-doc",
  "fanta-text",
  "glam 0.32.1",
+ "kurbo 0.11.3",
  "serde",
  "serde_json",
  "smallvec",

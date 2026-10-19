@@ -35,6 +35,152 @@ pub(crate) fn editable(doc: &Doc, id: NodeId) -> bool {
             .any(|node| node.flags.contains(fanta_doc::NodeFlags::LOCKED))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PathAction {
+    Close,
+    Join,
+    Simplify,
+    Reverse,
+}
+
+impl PathAction {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Close => "Close path",
+            Self::Join => "Join paths",
+            Self::Simplify => "Simplify path",
+            Self::Reverse => "Reverse path",
+        }
+    }
+}
+
+pub(crate) fn path_operations(
+    doc: &Doc,
+    action: PathAction,
+    tolerance: f64,
+) -> Result<(Vec<Operation>, Vec<NodeId>)> {
+    let selection = crate::clipboard::editable_selection_roots(doc);
+    ensure!(!selection.is_empty(), "Select an editable vector path");
+    for id in &selection {
+        ensure!(editable(doc, *id), "A selected layer is locked");
+        ensure!(
+            doc.scene
+                .get(*id)
+                .is_some_and(|node| node.data.as_vector().is_some()),
+            "Select only vector paths"
+        );
+    }
+    if action == PathAction::Join {
+        return join_path_operations(doc, &selection);
+    }
+    let mut operations = Vec::new();
+    for id in &selection {
+        let node = doc.scene.get(*id).context("The layer no longer exists")?;
+        let vector = node.data.as_vector().context("Select a vector path")?;
+        let path = match action {
+            PathAction::Close => fanta_tools::node_math::close_path(&vector.path),
+            PathAction::Reverse => fanta_tools::node_math::reverse_path(&vector.path),
+            _ => fanta_tools::node_math::simplify_path(&vector.path, tolerance),
+        };
+        if let Some(path) = path.filter(|path| *path != vector.path) {
+            operations.extend(replace_vector_path(node, path)?);
+        }
+    }
+    ensure!(
+        !operations.is_empty(),
+        "No selected path can be {}",
+        match action {
+            PathAction::Close => "closed",
+            PathAction::Reverse => "reversed",
+            _ => "simplified further",
+        }
+    );
+    Ok((operations, selection))
+}
+
+fn replace_vector_path(node: &CanvasNode, path: PathData) -> Result<Vec<Operation>> {
+    let mut vector = node
+        .data
+        .as_vector()
+        .context("Select a vector path")?
+        .clone();
+    vector.path = path;
+    vector.local_size = None;
+    vector.parametric = None;
+    let mut operations = vec![replace_data(node, NodeData::Vector(vector))];
+    let new = node.flags | fanta_doc::NodeFlags::UNCLIPPED_VECTOR;
+    if new != node.flags {
+        operations.push(Operation::SetFlags {
+            id: node.id,
+            old: node.flags,
+            new,
+        });
+    }
+    Ok(operations)
+}
+
+fn join_path_operations(doc: &Doc, selection: &[NodeId]) -> Result<(Vec<Operation>, Vec<NodeId>)> {
+    ensure!(
+        selection.len() >= 2,
+        "Select at least two open vector paths"
+    );
+    let first = *selection.first().context("Select an open vector path")?;
+    let node = doc.scene.get(first).context("The layer no longer exists")?;
+    let world = doc
+        .scene
+        .world_transform(first)
+        .context("Missing path transform")?;
+    ensure!(
+        world.is_finite() && world.0.matrix2.determinant().abs() > f64::EPSILON,
+        "The path transform is singular"
+    );
+    let inverse = world.inverse();
+    let mut paths = Vec::with_capacity(selection.len());
+    for id in selection {
+        let source = doc.scene.get(*id).context("The layer no longer exists")?;
+        ensure!(
+            source.parent == node.parent,
+            "Choose paths in the same group or frame"
+        );
+        ensure!(
+            !doc.is_component_root(*id) && doc.scene.children_of(Some(*id)).is_empty(),
+            "Detach component content before joining paths"
+        );
+        let transform = doc
+            .scene
+            .world_transform(*id)
+            .context("Missing path transform")?
+            .then(&inverse);
+        ensure!(transform.is_finite(), "The path transform is invalid");
+        let mut path = source
+            .data
+            .as_vector()
+            .context("Select only vector paths")?
+            .path
+            .clone();
+        path.map_points_mut(|point| {
+            transform
+                .transform_point(glam::DVec2::from(point))
+                .to_array()
+        });
+        paths.push(path);
+    }
+    let path = fanta_tools::node_math::join_paths(&paths)
+        .context("Each selected vector must contain one open path with at least two anchors")?;
+    let mut operations = replace_vector_path(node, path)?;
+    let mut scratch = doc.clone();
+    scratch
+        .selection
+        .replace_with(selection.iter().copied().filter(|id| *id != first));
+    let removed = *scratch
+        .selection
+        .as_slice()
+        .first()
+        .context("Select another path to join")?;
+    operations.extend(delete_layers(&scratch, removed)?);
+    Ok((operations, vec![first]))
+}
+
 pub(crate) fn is_section(node: &CanvasNode) -> bool {
     match node
         .meta
@@ -1340,6 +1486,105 @@ mod tests {
         );
         assert!(doc.redo().expect("redo"));
         verify(doc);
+    }
+
+    #[test]
+    fn draw_close_path_is_one_undo_step_and_clears_the_authored_viewport() {
+        let (mut doc, _, id) = fixture();
+        let mut path = PathData::new();
+        path.move_to(-10., 0.)
+            .line_to(10., 0.)
+            .quad_to(15., 10., 0., 20.);
+        let node = doc.scene.get_mut(id).expect("vector");
+        let vector = node.data.as_vector_mut().expect("vector");
+        vector.path = path;
+        vector.local_size = Some([10., 10.]);
+        doc.selection.select_only(id);
+        let (operations, selection) = path_operations(&doc, PathAction::Close, 0.2).expect("close");
+        assert_eq!(selection, vec![id]);
+        roundtrip(&mut doc, operations, |doc| {
+            let node = doc.scene.get(id).expect("vector");
+            let vector = node.data.as_vector().expect("vector");
+            assert!(matches!(
+                vector.path.segments.last(),
+                Some(fanta_doc::PathSegment::Close)
+            ));
+            assert_eq!(vector.local_size, None);
+            assert!(node.flags.contains(fanta_doc::NodeFlags::UNCLIPPED_VECTOR));
+        });
+    }
+
+    #[test]
+    fn draw_join_paths_preserves_transformed_geometry_and_undo_restores_both_nodes() {
+        let (mut doc, page, first) = fixture();
+        let mut path = PathData::new();
+        path.move_to(0., 0.).line_to(10., 0.);
+        let node = doc.scene.get_mut(first).expect("first");
+        node.data.as_vector_mut().expect("vector").path = path.clone();
+        node.transform = Transform2D::scale(2.).then(&Transform2D::translation(10., 20.));
+        let first_transform = node.transform;
+        let mut second_node = rect();
+        second_node.data.as_vector_mut().expect("vector").path = path;
+        second_node.transform = Transform2D::translation(50., 20.);
+        let second = insert(&mut doc, second_node, Some(page));
+        doc.selection.replace_with([first, second]);
+        let (operations, selection) = path_operations(&doc, PathAction::Join, 0.2).expect("join");
+        assert_eq!(selection, vec![first]);
+        roundtrip(&mut doc, operations, |doc| {
+            assert!(!doc.scene.contains(second));
+            let node = doc.scene.get(first).expect("joined vector");
+            assert_eq!(node.transform, first_transform);
+            let anchors = fanta_tools::node_math::enumerate_anchors(
+                &node.data.as_vector().expect("vector").path,
+            );
+            let world = doc.scene.world_transform(first).expect("world transform");
+            let positions = anchors
+                .iter()
+                .map(|anchor| world.transform_point(anchor.pos).to_array())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                positions,
+                vec![[10., 20.], [30., 20.], [50., 20.], [60., 20.]]
+            );
+        });
+    }
+
+    #[test]
+    fn draw_simplify_path_is_undoable_and_locked_selection_is_rejected() {
+        let (mut doc, _, id) = fixture();
+        let mut path = PathData::new();
+        path.move_to(0., 0.)
+            .line_to(10., 0.)
+            .line_to(20., 0.)
+            .line_to(30., 0.);
+        let segment_count = path.segments.len();
+        doc.scene
+            .get_mut(id)
+            .expect("vector")
+            .data
+            .as_vector_mut()
+            .expect("vector")
+            .path = path;
+        doc.selection.select_only(id);
+        let (operations, selection) =
+            path_operations(&doc, PathAction::Simplify, 0.2).expect("simplify");
+        assert_eq!(selection, vec![id]);
+        roundtrip(&mut doc, operations, |doc| {
+            let vector = doc
+                .scene
+                .get(id)
+                .expect("vector")
+                .data
+                .as_vector()
+                .expect("vector");
+            assert!(vector.path.segments.len() < segment_count);
+        });
+        doc.scene
+            .get_mut(id)
+            .expect("vector")
+            .flags
+            .insert(fanta_doc::NodeFlags::LOCKED);
+        assert!(path_operations(&doc, PathAction::Close, 0.2).is_err());
     }
 
     fn nested_component_delete_fixture(cyclic: bool) -> (Doc, NodeId, NodeId, fanta_doc::AssetId) {

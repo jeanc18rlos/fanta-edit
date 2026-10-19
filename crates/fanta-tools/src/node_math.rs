@@ -33,6 +33,189 @@ pub const SMOOTH_ANGLE_TOL_DEG: f64 = 1.0;
 /// folding a pen-style explicit closing segment into the first anchor.
 const COINCIDENT_EPS: f64 = 1e-9;
 
+pub fn close_path(path: &PathData) -> Option<PathData> {
+    let mut result = path.clone();
+    result.segments.clear();
+    let mut open = false;
+    let mut has_edge = false;
+    for segment in &path.segments {
+        match segment {
+            PathSegment::Move { .. } => {
+                if open && has_edge {
+                    result.segments.push(PathSegment::Close);
+                }
+                open = true;
+                has_edge = false;
+            }
+            PathSegment::Close => open = false,
+            _ => has_edge = true,
+        }
+        result.segments.push(*segment);
+    }
+    if open && has_edge {
+        result.segments.push(PathSegment::Close);
+    }
+    (result != *path).then_some(result)
+}
+
+pub fn join_paths(paths: &[PathData]) -> Option<PathData> {
+    if paths.len() < 2 {
+        return None;
+    }
+    let mut result = paths.first()?.clone();
+    result.segments.clear();
+    let mut previous_end: Option<DVec2> = None;
+    for path in paths {
+        if !path_is_finite(path) {
+            return None;
+        }
+        let (PathSegment::Move { to }, segments) = path.segments.split_first()? else {
+            return None;
+        };
+        if segments.is_empty()
+            || segments
+                .iter()
+                .any(|segment| matches!(segment, PathSegment::Move { .. } | PathSegment::Close))
+        {
+            return None;
+        }
+        let start = pt(*to);
+        if previous_end.is_none() {
+            result.segments.push(PathSegment::Move { to: *to });
+        } else if previous_end.is_some_and(|end| (end - start).length() > COINCIDENT_EPS) {
+            result.segments.push(PathSegment::Line { to: *to });
+        }
+        result.segments.extend_from_slice(segments);
+        previous_end = segments.last().and_then(|segment| match segment {
+            PathSegment::Line { to }
+            | PathSegment::Quad { to, .. }
+            | PathSegment::Cubic { to, .. } => Some(pt(*to)),
+            _ => None,
+        });
+    }
+    Some(result)
+}
+
+pub fn simplify_path(path: &PathData, tolerance: f64) -> Option<PathData> {
+    if !tolerance.is_finite() || tolerance <= 0. || !path_is_finite(path) {
+        return None;
+    }
+    // Kurbo's fitter can subdivide perfectly straight runs, so collapse
+    // redundant line anchors exactly before fitting curved portions.
+    let source = collapse_collinear_lines(path);
+    let mut bezier = kurbo::BezPath::new();
+    let mut open = false;
+    for segment in &source.segments {
+        match *segment {
+            PathSegment::Move { to } => {
+                bezier.move_to((to[0], to[1]));
+                open = true;
+            }
+            _ if !open => return None,
+            PathSegment::Line { to } => bezier.line_to((to[0], to[1])),
+            PathSegment::Quad { ctrl, to } => bezier.quad_to((ctrl[0], ctrl[1]), (to[0], to[1])),
+            PathSegment::Cubic { ctrl1, ctrl2, to } => {
+                bezier.curve_to((ctrl1[0], ctrl1[1]), (ctrl2[0], ctrl2[1]), (to[0], to[1]))
+            }
+            PathSegment::Close => {
+                bezier.close_path();
+                open = false;
+            }
+        }
+    }
+    let simplified = kurbo::simplify::simplify_bezpath(
+        bezier,
+        tolerance,
+        &kurbo::simplify::SimplifyOptions::default(),
+    );
+    let mut result = path.clone();
+    result.segments = bezier_segments(&simplified);
+    // A degenerate subpath can disappear during fitting; retain the authored
+    // path rather than shift the per-subpath fill rules onto another contour.
+    let subpath_count = |path: &PathData| {
+        path.segments
+            .iter()
+            .filter(|segment| matches!(segment, PathSegment::Move { .. }))
+            .count()
+    };
+    if subpath_count(&result) != subpath_count(path) || !path_is_finite(&result) {
+        return None;
+    }
+    Some(if result.segments.len() < source.segments.len() {
+        result
+    } else {
+        source
+    })
+}
+
+fn collapse_collinear_lines(path: &PathData) -> PathData {
+    let mut result = path.clone();
+    result.segments.clear();
+    let mut current = None;
+    let mut line_start = None;
+    for segment in &path.segments {
+        if let PathSegment::Line { to } = segment {
+            let end = pt(*to);
+            if let (Some(start), Some(previous), Some(PathSegment::Line { to })) =
+                (line_start, current, result.segments.last_mut())
+            {
+                let before: DVec2 = previous - start;
+                let after = end - previous;
+                if before.dot(after) >= 0.
+                    && before.perp_dot(after).abs()
+                        <= COINCIDENT_EPS * (before.length() * after.length()).max(1.)
+                {
+                    *to = end.to_array();
+                    current = Some(end);
+                    continue;
+                }
+            }
+            line_start = current;
+        } else {
+            line_start = None;
+        }
+        current = segment.end_point();
+        result.segments.push(*segment);
+    }
+    result
+}
+
+fn bezier_segments(path: &kurbo::BezPath) -> Vec<PathSegment> {
+    path.elements()
+        .iter()
+        .map(|element| match *element {
+            kurbo::PathEl::MoveTo(point) => PathSegment::Move {
+                to: [point.x, point.y],
+            },
+            kurbo::PathEl::LineTo(point) => PathSegment::Line {
+                to: [point.x, point.y],
+            },
+            kurbo::PathEl::QuadTo(control, point) => PathSegment::Quad {
+                ctrl: [control.x, control.y],
+                to: [point.x, point.y],
+            },
+            kurbo::PathEl::CurveTo(first, second, point) => PathSegment::Cubic {
+                ctrl1: [first.x, first.y],
+                ctrl2: [second.x, second.y],
+                to: [point.x, point.y],
+            },
+            kurbo::PathEl::ClosePath => PathSegment::Close,
+        })
+        .collect()
+}
+
+fn path_is_finite(path: &PathData) -> bool {
+    path.segments.iter().all(|segment| {
+        let mut finite = true;
+        let mut segment = *segment;
+        segment.map_points(|point| {
+            finite &= point.into_iter().all(f64::is_finite);
+            point
+        });
+        finite
+    })
+}
+
 /// Addresses one anchor: `subpath` indexes the decomposed subpath list,
 /// `index` the anchor within it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -227,6 +410,160 @@ pub fn recompose(subs: &[SubPath]) -> PathData {
         }
     }
     path
+}
+
+pub fn reverse_path(path: &PathData) -> Option<PathData> {
+    if !path_is_finite(path) {
+        return None;
+    }
+    let mut subpaths = decompose(path);
+    if !subpaths.iter().any(|subpath| subpath.anchors.len() >= 2) {
+        return None;
+    }
+    for subpath in &mut subpaths {
+        subpath.anchors.reverse();
+        if subpath.closed && !subpath.anchors.is_empty() {
+            subpath.anchors.rotate_right(1);
+        }
+        for anchor in &mut subpath.anchors {
+            std::mem::swap(&mut anchor.ctrl_in, &mut anchor.ctrl_out);
+        }
+    }
+    let mut result = recompose(&subpaths);
+    result.fill_rule = path.fill_rule;
+    result.subpath_rules = path.subpath_rules.clone();
+    Some(result)
+}
+
+pub fn break_at_anchor(path: &PathData, anchor: AnchorId) -> Option<PathData> {
+    let mut subpaths = decompose(path);
+    let subpath = subpaths.get_mut(anchor.subpath)?;
+    subpath.anchors.get(anchor.index)?;
+    if subpath.anchors.len() < 2 {
+        return None;
+    }
+    let mut rules = path.subpath_rules.clone();
+    if subpath.closed {
+        subpath.closed = false;
+        subpath.anchors.rotate_left(anchor.index);
+        let mut end = *subpath.anchors.first()?;
+        end.ctrl_out = None;
+        subpath.anchors.first_mut()?.ctrl_in = None;
+        subpath.anchors.push(end);
+    } else {
+        if anchor.index == 0 || anchor.index + 1 == subpath.anchors.len() {
+            return None;
+        }
+        let mut following = SubPath {
+            anchors: subpath.anchors.get(anchor.index..)?.to_vec(),
+            closed: false,
+        };
+        subpath.anchors.truncate(anchor.index + 1);
+        subpath.anchors.last_mut()?.ctrl_out = None;
+        following.anchors.first_mut()?.ctrl_in = None;
+        subpaths.insert(anchor.subpath + 1, following);
+        if !rules.is_empty() {
+            rules.resize(subpaths.len() - 1, path.fill_rule);
+            let rule = *rules.get(anchor.subpath)?;
+            rules.insert(anchor.subpath + 1, rule);
+        }
+    }
+    let mut result = recompose(&subpaths);
+    result.fill_rule = path.fill_rule;
+    result.subpath_rules = rules;
+    Some(result)
+}
+
+pub fn delete_anchors_preserving_shape(
+    path: &PathData,
+    anchors: &[AnchorId],
+    tolerance: f64,
+) -> Option<PathData> {
+    if !tolerance.is_finite() || tolerance <= 0. || !path_is_finite(path) {
+        return None;
+    }
+    let mut result = path.clone();
+    result.segments.clear();
+    let mut changed = false;
+    for (subpath_index, subpath) in decompose(path).iter().enumerate() {
+        let count = subpath.anchors.len();
+        let deleted = deletion_mask(subpath_index, count, anchors);
+        let delete_count = deletion_count(&deleted);
+        if delete_count == 0 || !can_delete_anchors(count, delete_count, subpath.closed) {
+            result
+                .segments
+                .extend(recompose(std::slice::from_ref(subpath)).segments);
+            continue;
+        }
+        changed = true;
+        let surviving = deleted
+            .iter()
+            .enumerate()
+            .filter_map(|(index, deleted)| (!deleted).then_some(index))
+            .collect::<Vec<_>>();
+        let first = *surviving.first()?;
+        let start = subpath.anchors.get(first)?;
+        result.move_to(start.pos.x, start.pos.y);
+        for indices in surviving.windows(2) {
+            append_preserved_gap(
+                &mut result,
+                subpath,
+                *indices.first()?,
+                *indices.get(1)?,
+                tolerance,
+            )?;
+        }
+        if subpath.closed {
+            append_preserved_gap(&mut result, subpath, *surviving.last()?, first, tolerance)?;
+            result.close();
+        }
+    }
+    (changed && path_is_finite(&result)).then_some(result)
+}
+
+fn append_preserved_gap(
+    result: &mut PathData,
+    subpath: &SubPath,
+    start: usize,
+    end: usize,
+    tolerance: f64,
+) -> Option<()> {
+    let count = subpath.anchors.len();
+    let steps = (end + count - start) % count;
+    let first = subpath.anchors.get(start)?;
+    let last = subpath.anchors.get(end)?;
+    if steps == 1 {
+        emit_edge(result, first, last);
+        return Some(());
+    }
+    let mut bezier = kurbo::BezPath::new();
+    bezier.move_to((first.pos.x, first.pos.y));
+    let mut curved = false;
+    for step in 0..steps {
+        let first = subpath.anchors.get((start + step) % count)?;
+        let second = subpath.anchors.get((start + step + 1) % count)?;
+        if first.ctrl_out.is_some() || second.ctrl_in.is_some() {
+            curved = true;
+            let control_first = first.ctrl_out.unwrap_or(first.pos);
+            let control_second = second.ctrl_in.unwrap_or(second.pos);
+            bezier.curve_to(
+                (control_first.x, control_first.y),
+                (control_second.x, control_second.y),
+                (second.pos.x, second.pos.y),
+            );
+        } else {
+            bezier.line_to((second.pos.x, second.pos.y));
+        }
+    }
+    if curved {
+        let source = kurbo::simplify::SimplifyBezPath::new(bezier);
+        let fitted = kurbo::fit_to_bezpath(&source, tolerance);
+        let segments = bezier_segments(&fitted);
+        result.segments.extend_from_slice(segments.get(1..)?);
+    } else {
+        result.line_to(last.pos.x, last.pos.y);
+    }
+    Some(())
 }
 
 /// Append the edge `a → b`: a cubic when either side carries a handle, else a
@@ -514,6 +851,69 @@ pub fn eval_segment(path: &PathData, seg_index: usize, t: f64) -> Option<DVec2> 
         }
         PathSegment::Close => Some(start.lerp(sp_start, t)),
     }
+}
+
+pub fn bend_segment(
+    path: &PathData,
+    segment_index: usize,
+    parameter: f64,
+    delta: DVec2,
+) -> Option<PathData> {
+    if !parameter.is_finite()
+        || parameter <= 0.
+        || parameter >= 1.
+        || !delta.is_finite()
+        || !path_is_finite(path)
+    {
+        return None;
+    }
+    let (start, subpath_start) = segment_start(path, segment_index)?;
+    let segment = *path.segments.get(segment_index)?;
+    let (first, second, end) = match segment {
+        PathSegment::Move { .. } => return None,
+        PathSegment::Line { to } => {
+            let end = pt(to);
+            (start.lerp(end, 1. / 3.), start.lerp(end, 2. / 3.), end)
+        }
+        PathSegment::Quad { ctrl, to } => {
+            let end = pt(to);
+            let control = pt(ctrl);
+            (
+                start + (control - start) * (2. / 3.),
+                end + (control - end) * (2. / 3.),
+                end,
+            )
+        }
+        PathSegment::Cubic { ctrl1, ctrl2, to } => (pt(ctrl1), pt(ctrl2), pt(to)),
+        PathSegment::Close => (
+            start.lerp(subpath_start, 1. / 3.),
+            start.lerp(subpath_start, 2. / 3.),
+            subpath_start,
+        ),
+    };
+    if delta == DVec2::ZERO {
+        return Some(path.clone());
+    }
+    // The two cubic control weights sum to 3t(1-t). Moving both controls
+    // by this amount keeps the grabbed point under the pointer.
+    let control_delta = delta / (3. * parameter * (1. - parameter));
+    let first = first + control_delta;
+    let second = second + control_delta;
+    if !first.is_finite() || !second.is_finite() {
+        return None;
+    }
+    let mut result = path.clone();
+    let cubic = PathSegment::Cubic {
+        ctrl1: first.to_array(),
+        ctrl2: second.to_array(),
+        to: end.to_array(),
+    };
+    if segment == PathSegment::Close {
+        result.segments.insert(segment_index, cubic);
+    } else {
+        *result.segments.get_mut(segment_index)? = cubic;
+    }
+    Some(result)
 }
 
 pub(crate) fn segment_anchors(path: &PathData, segment_index: usize) -> Option<[AnchorId; 2]> {
@@ -1475,5 +1875,330 @@ mod tests {
         }
         // And on the curve at t=0.5 the apex (50, 45) is the nearest region.
         assert!((hit.pos.x - 50.0).abs() < 2.0);
+    }
+
+    #[test]
+    fn close_path_closes_open_contours_and_preserves_fill_rules_and_curves() {
+        let mut path = PathData::new();
+        path.move_to(0., 0.).quad_to(5., 10., 10., 0.);
+        path.move_to(20., 0.)
+            .line_to(30., 0.)
+            .line_to(25., 10.)
+            .close();
+        path.move_to(40., 0.).line_to(50., 0.);
+        path.fill_rule = fanta_doc::FillRule::EvenOdd;
+        path.subpath_rules = vec![fanta_doc::FillRule::EvenOdd, fanta_doc::FillRule::NonZero];
+        let closed = close_path(&path).expect("close open contours");
+        assert_eq!(closed.fill_rule, path.fill_rule);
+        assert_eq!(closed.subpath_rules, path.subpath_rules);
+        assert_eq!(closed.segments.get(1), path.segments.get(1));
+        assert_eq!(
+            closed
+                .segments
+                .iter()
+                .filter(|segment| matches!(segment, PathSegment::Close))
+                .count(),
+            3
+        );
+        assert!(decompose(&closed).iter().all(|subpath| subpath.closed));
+        assert!(close_path(&closed).is_none());
+    }
+
+    #[test]
+    fn close_path_does_not_close_an_isolated_anchor() {
+        let mut path = PathData::new();
+        path.move_to(1., 2.);
+        assert!(close_path(&path).is_none());
+    }
+
+    #[test]
+    fn join_paths_connects_end_to_start_without_changing_curve_handles() {
+        let mut first = PathData::new();
+        first.move_to(0., 0.).quad_to(5., 10., 10., 0.);
+        first.fill_rule = fanta_doc::FillRule::EvenOdd;
+        let mut second = PathData::new();
+        second
+            .move_to(20., 0.)
+            .cubic_to(25., 10., 30., -10., 40., 0.);
+        let joined = join_paths(&[first.clone(), second.clone()]).expect("join paths");
+        assert_eq!(joined.segments.get(..2), Some(first.segments.as_slice()));
+        assert_eq!(
+            joined.segments.get(2),
+            Some(&PathSegment::Line { to: [20., 0.] })
+        );
+        assert_eq!(joined.segments.last(), second.segments.last());
+        assert_eq!(joined.fill_rule, first.fill_rule);
+        assert_eq!(decompose(&joined).len(), 1);
+        assert!(!decompose(&joined).first().expect("subpath").closed);
+    }
+
+    #[test]
+    fn join_paths_omits_coincident_connector_and_rejects_closed_or_multiple_contours() {
+        let mut first = PathData::new();
+        first.move_to(0., 0.).line_to(10., 0.);
+        let mut second = PathData::new();
+        second.move_to(10., 0.).line_to(20., 0.);
+        let joined = join_paths(&[first.clone(), second.clone()]).expect("join paths");
+        assert_eq!(joined.segments.len(), 3);
+        assert!(join_paths(&[first.clone()]).is_none());
+        second.close();
+        assert!(join_paths(&[first.clone(), second]).is_none());
+        let mut multiple = first.clone();
+        multiple.move_to(30., 0.).line_to(40., 0.);
+        assert!(join_paths(&[first, multiple]).is_none());
+    }
+
+    #[test]
+    fn simplify_path_reduces_collinear_anchors_and_preserves_corners() {
+        let mut path = PathData::new();
+        path.move_to(0., 0.)
+            .line_to(10., 0.)
+            .line_to(20., 0.)
+            .line_to(30., 0.)
+            .line_to(30., 20.);
+        let simplified = simplify_path(&path, 0.2).expect("simplify");
+        assert!(
+            simplified.segments.len() < path.segments.len(),
+            "{simplified:?}"
+        );
+        let anchors = enumerate_anchors(&simplified);
+        assert_eq!(anchors.first().expect("start").pos, v(0., 0.));
+        assert!(anchors.iter().any(|anchor| anchor.pos == v(30., 0.)));
+        assert_eq!(anchors.last().expect("end").pos, v(30., 20.));
+    }
+
+    #[test]
+    fn simplify_path_preserves_closed_contours_and_mixed_fill_rules() {
+        let mut path = PathData::rect(0., 0., 20., 20.);
+        path.segments
+            .extend(PathData::rect(5., 5., 10., 10.).segments);
+        path.fill_rule = fanta_doc::FillRule::EvenOdd;
+        path.subpath_rules = vec![fanta_doc::FillRule::NonZero, fanta_doc::FillRule::EvenOdd];
+        let simplified = simplify_path(&path, 0.2).expect("simplify");
+        assert_eq!(simplified.fill_rule, path.fill_rule);
+        assert_eq!(simplified.subpath_rules, path.subpath_rules);
+        assert_eq!(decompose(&simplified).len(), 2);
+        assert!(decompose(&simplified).iter().all(|subpath| subpath.closed));
+    }
+
+    #[test]
+    fn simplify_path_rejects_invalid_input_and_degenerate_contour_loss() {
+        let mut malformed = PathData::new();
+        malformed.line_to(10., 0.);
+        assert!(simplify_path(&malformed, 0.2).is_none());
+        let mut path = PathData::new();
+        path.move_to(0., 0.).line_to(10., 0.);
+        for tolerance in [0., -1., f64::NAN, f64::INFINITY] {
+            assert!(simplify_path(&path, tolerance).is_none());
+        }
+        let mut nonfinite = path.clone();
+        nonfinite.line_to(f64::NAN, 0.);
+        assert!(simplify_path(&nonfinite, 0.2).is_none());
+        assert!(join_paths(&[path.clone(), nonfinite]).is_none());
+        path.move_to(20., 0.);
+        assert!(simplify_path(&path, 0.2).is_none());
+    }
+
+    #[test]
+    fn bend_segment_moves_the_grabbed_point_and_keeps_all_anchors_fixed() {
+        for parameter in [0.2, 0.5, 0.8] {
+            let mut path = PathData::new();
+            path.move_to(0., 0.).line_to(100., 0.).line_to(100., 100.);
+            let original_anchors = enumerate_anchors(&path)
+                .into_iter()
+                .map(|anchor| anchor.pos)
+                .collect::<Vec<_>>();
+            let delta = v(0., 30.);
+            let bent = bend_segment(&path, 1, parameter, delta).expect("bend line");
+            let anchors = enumerate_anchors(&bent)
+                .into_iter()
+                .map(|anchor| anchor.pos)
+                .collect::<Vec<_>>();
+            assert_eq!(anchors, original_anchors);
+            let expected = eval_segment(&path, 1, parameter).expect("original point") + delta;
+            assert!(
+                (eval_segment(&bent, 1, parameter).expect("bent point") - expected).length() < 1e-9
+            );
+            assert_eq!(bent.segments.last(), path.segments.last());
+        }
+    }
+
+    #[test]
+    fn bend_segment_preserves_curved_closure_and_fill_metadata() {
+        let mut path = closed_triangle();
+        path.fill_rule = fanta_doc::FillRule::EvenOdd;
+        path.subpath_rules = vec![fanta_doc::FillRule::EvenOdd];
+        let bent = bend_segment(&path, 3, 0.5, v(-20., 10.)).expect("bend closing edge");
+        assert!(matches!(bent.segments.last(), Some(PathSegment::Close)));
+        assert_eq!(
+            enumerate_anchors(&bent).len(),
+            enumerate_anchors(&path).len()
+        );
+        assert!(decompose(&bent).first().expect("subpath").closed);
+        assert_eq!(bent.fill_rule, path.fill_rule);
+        assert_eq!(bent.subpath_rules, path.subpath_rules);
+        assert_eq!(bend_segment(&path, 3, 0.5, DVec2::ZERO), Some(path.clone()));
+        assert!(bend_segment(&path, 0, 0.5, v(0., 10.)).is_none());
+        assert!(bend_segment(&path, 1, 0., v(0., 10.)).is_none());
+    }
+
+    #[test]
+    fn reversing_paths_swaps_handles_and_preserves_closed_start_and_fill_rules() {
+        let mut path = PathData::new();
+        path.move_to(0., 0.).cubic_to(20., 60., 80., -40., 100., 0.);
+        path.fill_rule = fanta_doc::FillRule::EvenOdd;
+        path.subpath_rules = vec![fanta_doc::FillRule::EvenOdd];
+        let reversed = reverse_path(&path).expect("reverse");
+        for sample in 0..=32 {
+            let parameter = f64::from(sample) / 32.;
+            let original = eval_segment(&path, 1, 1. - parameter).expect("original point");
+            let backwards = eval_segment(&reversed, 1, parameter).expect("reversed point");
+            assert!((original - backwards).length() < 1e-9);
+        }
+        assert_eq!(reverse_path(&reversed), Some(path));
+        let closed = pen_style_closed();
+        let reversed = reverse_path(&closed).expect("reverse closed");
+        assert_eq!(
+            enumerate_anchors(&reversed).first().expect("start").pos,
+            enumerate_anchors(&closed).first().expect("start").pos
+        );
+        assert!(decompose(&reversed).first().expect("subpath").closed);
+        assert_eq!(reverse_path(&reversed), Some(closed));
+    }
+
+    #[test]
+    fn breaking_an_open_path_duplicates_the_anchor_and_its_fill_rule() {
+        let mut path = PathData::new();
+        path.move_to(0., 0.)
+            .cubic_to(10., 20., 20., 20., 30., 0.)
+            .cubic_to(40., -20., 50., -20., 60., 0.);
+        path.segments
+            .extend(PathData::rect(100., 0., 20., 20.).segments);
+        path.fill_rule = fanta_doc::FillRule::EvenOdd;
+        path.subpath_rules = vec![fanta_doc::FillRule::EvenOdd, fanta_doc::FillRule::NonZero];
+        let broken = break_at_anchor(
+            &path,
+            AnchorId {
+                subpath: 0,
+                index: 1,
+            },
+        )
+        .expect("break");
+        assert_eq!(
+            broken.subpath_rules,
+            vec![
+                fanta_doc::FillRule::EvenOdd,
+                fanta_doc::FillRule::EvenOdd,
+                fanta_doc::FillRule::NonZero
+            ]
+        );
+        let subpaths = decompose(&broken);
+        assert_eq!(subpaths.len(), 3);
+        assert_eq!(
+            subpaths
+                .first()
+                .expect("first")
+                .anchors
+                .last()
+                .expect("end")
+                .pos,
+            v(30., 0.)
+        );
+        assert_eq!(
+            subpaths
+                .get(1)
+                .expect("second")
+                .anchors
+                .first()
+                .expect("start")
+                .pos,
+            v(30., 0.)
+        );
+        assert_eq!(broken.segments.get(1), path.segments.get(1));
+        assert_eq!(broken.segments.get(3), path.segments.get(2));
+        assert!(
+            break_at_anchor(
+                &path,
+                AnchorId {
+                    subpath: 0,
+                    index: 0
+                }
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn breaking_a_closed_path_opens_it_without_dropping_the_closing_curve() {
+        let path = pen_style_closed();
+        let broken = break_at_anchor(
+            &path,
+            AnchorId {
+                subpath: 0,
+                index: 1,
+            },
+        )
+        .expect("break closed");
+        let subpaths = decompose(&broken);
+        let subpath = subpaths.first().expect("open path");
+        assert!(!subpath.closed);
+        assert_eq!(subpath.anchors.len(), enumerate_anchors(&path).len() + 1);
+        assert_eq!(
+            subpath.anchors.first().expect("start").pos,
+            subpath.anchors.last().expect("end").pos
+        );
+        for index in 0..path.segments.len() {
+            for sample in 0..=16 {
+                if let Some(point) = eval_segment(&path, index, f64::from(sample) / 16.) {
+                    assert!(
+                        closest_point_on_path(&broken, point)
+                            .expect("point on broken path")
+                            .dist
+                            < 0.01
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn deleting_a_split_curve_anchor_preserves_the_curve_instead_of_flattening_it() {
+        let mut path = PathData::new();
+        path.move_to(0., 0.).cubic_to(30., 80., 70., 80., 100., 0.);
+        let (split, _) = insert_at(&path, 1, 0.5).expect("split curve");
+        let removed = delete_anchors_preserving_shape(
+            &split,
+            &[AnchorId {
+                subpath: 0,
+                index: 1,
+            }],
+            0.05,
+        )
+        .expect("remove curve anchor");
+        assert_eq!(enumerate_anchors(&removed).len(), 2);
+        assert!(matches!(
+            removed.segments.get(1),
+            Some(PathSegment::Cubic { .. })
+        ));
+        for sample in 0..=64 {
+            let point = eval_segment(&path, 1, f64::from(sample) / 64.).expect("original point");
+            assert!(
+                closest_point_on_path(&removed, point)
+                    .expect("fitted point")
+                    .dist
+                    < 0.1
+            );
+        }
+        assert!(
+            delete_anchors_preserving_shape(
+                &split,
+                &[AnchorId {
+                    subpath: 0,
+                    index: 1
+                }],
+                0.
+            )
+            .is_none()
+        );
     }
 }

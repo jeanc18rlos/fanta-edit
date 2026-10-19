@@ -20,8 +20,9 @@ use crate::canvas::{bounds_size, precise_hit_test_screen, screen_position_in_bou
 use crate::document::DocChange;
 use crate::editor_session::EditorMode;
 use crate::view::{
-    CopySelection, CutSelection, DeleteSelection, DuplicateSelection, FigView, FrameSelection,
-    GroupSelection, PasteSelection, TextEditSeed, UngroupSelection, show_canvas_notice,
+    BreakPathAtAnchor, CopySelection, CutSelection, DeleteSelection, DuplicateSelection, FigView,
+    FrameSelection, GroupSelection, PasteSelection, TextEditSeed, UngroupSelection,
+    show_canvas_notice,
 };
 
 /// The open canvas context menu and where it opened.
@@ -156,7 +157,13 @@ impl FigView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.prototype_player.is_some() || self.editor_mode(cx) == EditorMode::Draw {
+        if self.prototype_player.is_some()
+            || (self.editor_mode(cx) == EditorMode::Draw
+                && !matches!(
+                    self.active_tool(),
+                    crate::tools::ToolKind::NodeEdit | crate::tools::ToolKind::PathSelect
+                ))
+        {
             return;
         }
         cx.stop_propagation();
@@ -191,6 +198,10 @@ impl FigView {
         };
         let view = cx.weak_entity();
         let focus = self.focus_handle.clone();
+        let editing_path = matches!(
+            self.active_tool(),
+            crate::tools::ToolKind::NodeEdit | crate::tools::ToolKind::PathSelect
+        );
         let menu = ContextMenu::build(window, cx, move |menu, _, _| {
             let mut menu = menu.context(focus);
             if doc_target != MenuTarget::Canvas {
@@ -271,6 +282,44 @@ impl FigView {
                                 }),
                         );
                     }
+                }
+            }
+            if matches!(doc_target, MenuTarget::Vector(_)) {
+                use crate::layer_context_ops::PathAction;
+                menu = menu.separator();
+                for action in [
+                    PathAction::Close,
+                    PathAction::Join,
+                    PathAction::Simplify,
+                    PathAction::Reverse,
+                ] {
+                    if single && action == PathAction::Join {
+                        continue;
+                    }
+                    let view = view.clone();
+                    menu = menu.item(
+                        ContextMenuEntry::new(action.label())
+                            .disabled(!editable)
+                            .handler(move |window, cx| {
+                                view.update(cx, |view, cx| {
+                                    view.run_path_action(action, Some(node), window, cx)
+                                })
+                                .log_err();
+                            }),
+                    );
+                }
+                if single && editing_path {
+                    menu = menu
+                        .action_disabled_when(
+                            !editable,
+                            "Break at selected anchor",
+                            Box::new(BreakPathAtAnchor),
+                        )
+                        .action_disabled_when(
+                            !editable,
+                            "Delete selected anchors",
+                            Box::new(DeleteSelection),
+                        );
                 }
             }
             menu = menu
@@ -551,6 +600,30 @@ impl FigView {
                         vec![node]
                     },
                 ))
+            },
+            window,
+            cx,
+        );
+    }
+
+    pub(crate) fn run_path_action(
+        &mut self,
+        action: crate::layer_context_ops::PathAction,
+        context_target: Option<NodeId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tolerance = self.draw_path_simplification_tolerance(cx);
+        self.apply_structure_edit(
+            action.label(),
+            move |doc| {
+                if let Some(node) = context_target {
+                    anyhow::ensure!(
+                        doc.selection.contains(node),
+                        "The context menu selection has changed"
+                    );
+                }
+                crate::layer_context_ops::path_operations(doc, action, tolerance)
             },
             window,
             cx,

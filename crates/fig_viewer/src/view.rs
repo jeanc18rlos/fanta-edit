@@ -190,6 +190,10 @@ actions!(
         ActivatePenTool,
         /// Activate the path editing tool.
         ActivateNodeEditTool,
+        /// Reverse the direction of selected vector paths.
+        ReversePath,
+        /// Break the path at the selected anchor.
+        BreakPathAtAnchor,
         /// Activate the frame tool.
         ActivateFrameTool,
         /// Activate the text tool.
@@ -8747,6 +8751,27 @@ impl Render for FigView {
             }))
             .on_action(cx.listener(|this, _: &ActivateNodeEditTool, window, cx| {
                 this.activate_tool_from_action(ToolKind::NodeEdit, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ReversePath, window, cx| {
+                this.run_path_action(
+                    crate::layer_context_ops::PathAction::Reverse,
+                    None,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &BreakPathAtAnchor, _, cx| {
+                if this.is_editable(cx)
+                    && matches!(this.tools.kind(), ToolKind::NodeEdit | ToolKind::PathSelect)
+                {
+                    this.dispatch_tool_event(
+                        fanta_tools::ToolEvent::Key(fanta_tools::KeyEvent::with_modifiers(
+                            LogicalKey::Enter,
+                            fanta_tools::ModifierKeys::SHIFT,
+                        )),
+                        cx,
+                    );
+                }
             }))
             .on_action(cx.listener(|this, _: &ActivateFrameTool, window, cx| {
                 this.activate_tool_from_action(ToolKind::Frame, window, cx);
@@ -22751,6 +22776,17 @@ impl FigView {
                     DrawToolbarAction::SelectAll => self.select_all_draw_content(cx),
                     DrawToolbarAction::Deselect => self.deselect_canvas(cx),
                     DrawToolbarAction::InvertSelection => self.invert_draw_selection(cx),
+                    DrawToolbarAction::ClosePath
+                    | DrawToolbarAction::JoinPaths
+                    | DrawToolbarAction::SimplifyPath => {
+                        use crate::layer_context_ops::PathAction;
+                        let action = match action {
+                            DrawToolbarAction::ClosePath => PathAction::Close,
+                            DrawToolbarAction::JoinPaths => PathAction::Join,
+                            _ => PathAction::Simplify,
+                        };
+                        self.run_path_action(action, None, window, cx);
+                    }
                     DrawToolbarAction::ApplyCrop if self.tools.kind() == ToolKind::Crop => {
                         if self.tools.can_apply_crop() {
                             self.dispatch_tool_event(
@@ -22770,6 +22806,26 @@ impl FigView {
             }
             ToolbarAction::CommandQueryChanged { .. } => {}
         }
+    }
+
+    pub(crate) fn draw_path_simplification_tolerance(&self, cx: &App) -> f64 {
+        #[cfg(feature = "fanta-gpui-ui")]
+        let smoothing = self
+            .gpui_properties
+            .as_ref()
+            .map(|adapter| adapter.draw.read(cx).view_data().options.smoothing)
+            .or_else(|| {
+                self.gpui_toolbar
+                    .as_ref()
+                    .map(|adapter| adapter.draw_options.smoothing)
+            })
+            .unwrap_or_default();
+        #[cfg(not(feature = "fanta-gpui-ui"))]
+        let smoothing = {
+            let _ = cx;
+            0
+        };
+        0.2 + f64::from(smoothing) * 0.058
     }
 
     #[cfg(feature = "fanta-gpui-ui")]
