@@ -4347,6 +4347,7 @@ mod panel_integration_tests {
                             },
                         )]),
                         scopes: Vec::new(),
+                        options: Vec::new(),
                     },
                 );
                 doc.scene

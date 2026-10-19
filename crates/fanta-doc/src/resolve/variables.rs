@@ -187,6 +187,7 @@ mod tests {
                     ),
                 ]),
                 scopes: Vec::new(),
+                options: Vec::new(),
             },
         );
         (reg, coll, light, dark, bg)
@@ -303,6 +304,7 @@ mod tests {
                 ty: VariableType::Color,
                 values_by_mode: BTreeMap::from([(mode, VarValue::Alias { variable: b })]),
                 scopes: Vec::new(),
+                options: Vec::new(),
             },
         );
         reg.variables.insert(
@@ -314,6 +316,7 @@ mod tests {
                 ty: VariableType::Color,
                 values_by_mode: BTreeMap::from([(mode, VarValue::Alias { variable: a })]),
                 scopes: Vec::new(),
+                options: Vec::new(),
             },
         );
         let scene = Scene::new();

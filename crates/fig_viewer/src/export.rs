@@ -1134,6 +1134,7 @@ mod tests {
                 ty: VariableType::Float,
                 values_by_mode: BTreeMap::from([(mode, VarValue::Float { value: 60.0 })]),
                 scopes: Vec::new(),
+                options: Vec::new(),
             },
         );
         doc.active_modes.insert(collection, mode);

@@ -11479,6 +11479,7 @@ mod tests {
                     ),
                 ]),
                 scopes: vec![],
+                options: Vec::new(),
             },
         );
         doc.variables.variables.insert(
@@ -11493,6 +11494,7 @@ mod tests {
                     (modes[1], VarValue::Alias { variable: color }),
                 ]),
                 scopes: vec![],
+                options: Vec::new(),
             },
         );
         let node = doc.scene.get_mut(rect).expect("rectangle");
@@ -11771,6 +11773,7 @@ mod tests {
                     ty: fanta_doc::VariableType::Boolean,
                     values_by_mode: values,
                     scopes: Vec::new(),
+                    options: Vec::new(),
                 },
             );
         }
@@ -14092,6 +14095,7 @@ mod tests {
                     },
                 )]),
                 scopes: Vec::new(),
+                options: Vec::new(),
             },
         );
         let mut master = CanvasNode::new(NodeData::Group(GroupNode {

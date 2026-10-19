@@ -223,6 +223,7 @@ pub(crate) fn build_variables(
                 ty: pv.ty,
                 values_by_mode,
                 scopes: Vec::new(),
+                options: Vec::new(),
             },
         );
         if let Some(c) = doc.variables.collections.get_mut(&coll_id) {

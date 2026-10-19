@@ -153,6 +153,7 @@ fn mixed_document() -> (Doc, BTreeMap<AssetId, Vec<u8>>) {
                 ty,
                 values_by_mode,
                 scopes: Vec::new(),
+                options: Vec::new(),
             },
         );
     }

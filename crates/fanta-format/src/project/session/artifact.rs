@@ -2612,6 +2612,7 @@ pub fn artifact_op_impact(op: &Operation) -> ArtifactOpImpact {
         | DeleteVariable { .. }
         | SetVariableValue { .. }
         | RenameVariable { .. }
+        | SetVariableOptions { .. }
         | RenameVariableCollection { .. }
         | RenameMode { .. }
         | SetActiveMode {

@@ -2092,6 +2092,7 @@ import "../../styles/other.fss";
                     ty: VariableType::Float,
                     values_by_mode: BTreeMap::from([(mode, VarValue::Float { value: 0.75 })]),
                     scopes: Vec::new(),
+                    options: Vec::new(),
                 },
             )]),
         };

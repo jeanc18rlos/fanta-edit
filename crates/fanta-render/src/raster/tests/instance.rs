@@ -860,6 +860,7 @@ fn scoped_render_scene_preserves_nested_swaps_and_ancestor_modes()
                 ),
             ]),
             scopes: Vec::new(),
+            options: Vec::new(),
         },
     );
     let mut ancestor = CanvasNode::new(NodeData::Group(GroupNode {

@@ -518,11 +518,15 @@ the user asks for an asset, then place the result once they generate it.
 
 Variables are real undoable ops: `create_variable_collection` (`name`, `modes`),
 `add_variable_mode`, `create_variable` (`collection`, `name`, `kind`, primitive
-`value`), `set_variable_value` (`variable`, `mode`, `value`), `set_variable_mode`
+`value`, and `options` for an enum), `set_variable_value` (`variable`, `mode`,
+`value`), `set_variable_options` (`variable`, `options`), `set_variable_mode`
 (`collection`, optional `mode`/`frame`), `bind_variable` / `unbind_variable`
-(`id`, `property` such as `{ "prop": "fill_color", "index": 0 }`).
-Variable values are hex colors, finite numbers, strings, booleans or TextStyle
-objects. Aliases use `{ "alias": "exact variable id or unique name" }`.
+(`id`, `property` such as `{ "prop": "fill_color", "index": 0 }` or
+`{ "prop": "image_fill", "index": 0 }` for an image variable).
+Variable kinds are `color` (hex), `float` (finite number), `string`, `boolean`,
+`typography` (a TextStyle object), `enum` (one of the variable's option names,
+also bindable to text content) and `image` (a project asset id, or null).
+Aliases use `{ "alias": "exact variable id or unique name" }`.
 Create foundations before components and prefer returned ids.
 
 A component with variants is ONE variant set: a frame named after the
@@ -832,6 +836,7 @@ fn seed_agents_md(dir: &Path) -> Result<()> {
     let previous_seeds = [
         "9b50be64e96b0a3a0dae85e78f5855821edf2969ce4ea74de0cbc8f0035a716a",
         "e9cd2913d2c9f6cb86653928d192fa1a11668fc0e9feffed2f2c2b760f4565e7",
+        "057778f31c69d024845123c01ee02d5a91d0736e2743806b47234cc99670007d",
     ];
     let should_write = match fs::read(&path) {
         Ok(contents) => {

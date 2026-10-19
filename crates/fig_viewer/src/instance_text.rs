@@ -503,6 +503,7 @@ mod tests {
                 ty,
                 values_by_mode: fixture.modes.into_iter().zip(values).collect(),
                 scopes: Vec::new(),
+                options: Vec::new(),
             },
         );
         fixture

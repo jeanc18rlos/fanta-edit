@@ -134,6 +134,7 @@ mod tests {
                 ty: VariableType::Color,
                 values_by_mode: Default::default(),
                 scopes: Vec::new(),
+                options: Vec::new(),
             },
         );
 

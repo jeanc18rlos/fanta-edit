@@ -29,6 +29,7 @@ fn bound_text_color_is_applied_after_composite_typography() -> Result<(), Box<dy
                 },
             )]),
             scopes: Vec::new(),
+            options: Vec::new(),
         },
     );
     let mut node = CanvasNode::new(NodeData::Text(fanta_doc::TextNode::new("M", 80.0, 40.0)));
@@ -125,6 +126,7 @@ fn theme_registry_white_blue() -> (VariableRegistry, VariableCollectionId, ModeI
                 ),
             ]),
             scopes: Vec::new(),
+            options: Vec::new(),
         },
     );
     (reg, coll, dark, bg)

@@ -17,7 +17,7 @@
 //! never have to handle an unresolved alias.
 
 use crate::color::Color;
-use crate::id::VariableId;
+use crate::id::{AssetId, VariableId};
 use crate::node::TextStyle;
 use serde::{Deserialize, Serialize};
 
@@ -135,6 +135,12 @@ var_values! {
     /// how Fanta models Figma "text styles": a named, reusable type style that a
     /// text node binds its whole `TextStyle` to (see `BoundProp::TextStyle`).
     TextStyle(TextStyle) => Typography,
+    /// One option, by name, out of the fixed set its variable declares in
+    /// `Variable::options` — states, variants and other closed choices.
+    Enum(String) => Enum,
+    /// A project image asset, or `None` for "no image". Image fills bind to
+    /// it, so artwork can follow a mode or a motion keyframe.
+    Image(Option<AssetId>) => Image,
 }
 
 #[cfg(test)]
@@ -175,6 +181,21 @@ mod tests {
                 "text_style",
                 "typography",
             ),
+            (
+                VarValue::Enum {
+                    value: "primary".into(),
+                },
+                "enum",
+                "enum",
+            ),
+            (
+                VarValue::Image {
+                    value: Some(AssetId::from_u128(7)),
+                },
+                "image",
+                "image",
+            ),
+            (VarValue::Image { value: None }, "image", "image"),
         ];
         for (v, kind, type_tag) in cases {
             // VarValue wire tag.

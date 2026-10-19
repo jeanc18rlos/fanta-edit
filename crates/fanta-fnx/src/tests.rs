@@ -2181,7 +2181,8 @@ fn bound_props_mirror_matches_fanta_doc() {
             | BoundProp::TextContent
             | BoundProp::TextStyle
             | BoundProp::ClipWidth
-            | BoundProp::ClipHeight => {}
+            | BoundProp::ClipHeight
+            | BoundProp::ImageFill { .. } => {}
         }
     }
 
@@ -2197,6 +2198,7 @@ fn bound_props_mirror_matches_fanta_doc() {
         BoundProp::TextStyle,
         BoundProp::ClipWidth,
         BoundProp::ClipHeight,
+        BoundProp::ImageFill { index: 0 },
     ];
     assert_eq!(variants.len(), crate::refs::BOUND_PROPS.len());
     let mut sorted = variants;

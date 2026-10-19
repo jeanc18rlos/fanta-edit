@@ -315,6 +315,13 @@ pub enum Operation {
         new: String,
     },
 
+    /// Replace an enum variable's option list. Reverts to the old list.
+    SetVariableOptions {
+        id: VariableId,
+        old: Vec<String>,
+        new: Vec<String>,
+    },
+
     /// Rename a variable collection. Reverts to the old name.
     RenameVariableCollection {
         id: VariableCollectionId,
@@ -547,6 +554,7 @@ impl Operation {
             Self::DeleteVariable { .. } => "Delete Variable",
             Self::SetVariableValue { .. } => "Set Variable",
             Self::RenameVariable { .. } => "Rename Variable",
+            Self::SetVariableOptions { .. } => "Variable Options",
             Self::RenameVariableCollection { .. } => "Rename Collection",
             Self::RenameMode { .. } => "Rename Mode",
             Self::BindProperty { .. } => "Bind",

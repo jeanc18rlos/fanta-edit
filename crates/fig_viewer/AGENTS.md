@@ -38,6 +38,10 @@ PR numbers point at the change that found each trap (`gh pr view <n>`).
 - A control that can refuse a mode or workspace change because a draft is pending must keep the editor's focus on mouse-down until the change is admitted (see `draft_preserving_toolbar_focus_scope`). A clickable child inherits its ancestor's focus transfer, so a check in `on_click` runs after blur has already committed the draft. (#7)
 - Canvas popovers are painted with `deferred(..)`. Sibling order inside `fig-container` does not lift them above ancestor workspace tabs, and they must stay inside the canvas content mask. Check new popovers against the floating toolbar and the workspace tabs. (#3)
 
+## Variables
+
+- The Variables workspace maps `VariableType` onto the external `fanta_gpui` `VariableKind` (Color, Number, String, Boolean) in `screen_variable_kind`, and skips every variable that maps to `None`. A new kind must map onto one of those four or it vanishes from the tab, as Typography does today; adding a glyph or editor means a `fanta-ui` change. (#140)
+
 ## Tests
 
 - Mount the real UI. Sidebar regressions mount the sidebar owned by `FigView` inside a workspace and click its visible control. Keyboard regressions mount `MultiWorkspace` with the shipped keymap, because a bound action can consume a key before a raw listener sees it. (#6, #7)

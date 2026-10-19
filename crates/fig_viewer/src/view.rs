@@ -14474,6 +14474,7 @@ mod tests {
                     },
                 )]),
                 scopes: Vec::new(),
+                options: Vec::new(),
             },
         );
         let mut node = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
@@ -16652,6 +16653,7 @@ mod tests {
                     ty: VariableType::Float,
                     values_by_mode: BTreeMap::from([(mode, VarValue::Float { value: 0.4 })]),
                     scopes: Vec::new(),
+                    options: Vec::new(),
                 },
             );
             doc.components
@@ -18625,6 +18627,7 @@ mod tests {
                     },
                 )]),
                 scopes: Vec::new(),
+                options: Vec::new(),
             },
         );
         doc.scene

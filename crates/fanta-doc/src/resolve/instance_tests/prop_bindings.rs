@@ -84,6 +84,7 @@ fn text_variable_registry() -> (
                     ),
                 ]),
                 scopes: Vec::new(),
+                options: Vec::new(),
             },
         )]),
     };
@@ -297,6 +298,7 @@ fn node_text_tokens_use_instance_ancestor_mode_before_layout_without_changing_ma
                 ),
             ]),
             scopes: Vec::new(),
+            options: Vec::new(),
         },
     );
     registry
@@ -403,6 +405,7 @@ fn separately_bound_glyph_color_wins_over_composite_typography_in_instances() {
                 (dark, VarValue::TextStyle { value: style }),
             ]),
             scopes: Vec::new(),
+            options: Vec::new(),
         },
     );
     registry.variables.insert(
@@ -427,6 +430,7 @@ fn separately_bound_glyph_color_wins_over_composite_typography_in_instances() {
                 ),
             ]),
             scopes: Vec::new(),
+            options: Vec::new(),
         },
     );
     let label_node = scene.get_mut(label).expect("label");

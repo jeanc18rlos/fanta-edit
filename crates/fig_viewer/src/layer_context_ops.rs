@@ -1562,6 +1562,7 @@ mod tests {
                                 .into_iter()
                                 .collect(),
                             scopes: Vec::new(),
+                            options: Vec::new(),
                         },
                     );
                     doc.scene

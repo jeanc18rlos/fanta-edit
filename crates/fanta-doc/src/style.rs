@@ -351,6 +351,44 @@ impl Fill {
         }
     }
 
+    /// The image asset this fill paints, for image fills only.
+    pub fn image_asset(&self) -> Option<AssetId> {
+        match self {
+            Self::Image { asset, .. } => Some(*asset),
+            Self::Solid { .. }
+            | Self::Gradient { .. }
+            | Self::Video { .. }
+            | Self::Pattern { .. }
+            | Self::Shader { .. } => None,
+        }
+    }
+
+    /// Point this fill at `asset`. An image fill keeps its fit, crop,
+    /// adjustments and blend; any other paint becomes a plain filling image, so
+    /// an image binding or keyframe always lands. Exhaustive like
+    /// [`set_solid_color`](Self::set_solid_color).
+    pub fn set_image_asset(&mut self, asset: AssetId) {
+        match self {
+            Self::Image { asset: current, .. } => *current = asset,
+            Self::Solid { .. }
+            | Self::Gradient { .. }
+            | Self::Video { .. }
+            | Self::Pattern { .. }
+            | Self::Shader { .. } => {
+                *self = Self::Image {
+                    asset,
+                    mode: ImageFitMode::Fill,
+                    opacity: default_opacity(),
+                    crop: None,
+                    scale: None,
+                    rotation: None,
+                    blend: BlendMode::Normal,
+                    adjust: ImageAdjust::default(),
+                }
+            }
+        }
+    }
+
     /// Overwrite this fill with a solid of `color`, preserving the paint's blend
     /// mode. A gradient/image fill is replaced wholesale (its blend resets to
     /// Normal) — binding a color to a non-solid paint is unusual, but clobbering

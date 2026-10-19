@@ -79,6 +79,7 @@ pub(crate) const BOUND_PROPS: &[(&str, bool)] = &[
     ("text_style", false),
     ("clip_width", false),
     ("clip_height", false),
+    ("image_fill", true),
 ];
 
 // ---------------------------------------------------------------------------

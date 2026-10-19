@@ -3310,6 +3310,7 @@ mod tests {
                 ty: VariableType::Float,
                 values_by_mode: BTreeMap::from([(mode_id, VarValue::Float { value: 8.0 })]),
                 scopes: Vec::new(),
+                options: Vec::new(),
             },
         );
         doc.history = fanta_doc::History::new();
