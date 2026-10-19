@@ -505,9 +505,14 @@ copy-reference cases have operation and Undo/Redo coverage; their native
 acceptance remains tracked in the release report.
 
 The Variables workspace supports collections, modes, typed values, aliases,
-rename/delete and compatible property bindings. Modes can apply at project,
-page and parent scopes. Unbinding bakes the resolved value. Shared styles and
-imported bindings participate in rendering and source persistence.
+rename/delete and compatible property bindings. Variable kinds are color,
+float, string, boolean, typography, enum (one of the variable's options, also
+bindable to text content) and image (a project asset, bindable to a fill's
+artwork); enum and image values edit as text in the workspace, and agents
+create them through `create_variable` and `set_variable_options`. Modes can
+apply at project, page and parent scopes. Unbinding bakes the resolved value.
+Shared styles and imported bindings participate in rendering and source
+persistence.
 
 Bound solid fills show their resolved mode color and variable name in the
 inspector and picker. Alpha is read-only while the variable controls the full

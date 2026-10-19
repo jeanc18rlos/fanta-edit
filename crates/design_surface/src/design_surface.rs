@@ -69,6 +69,10 @@ pub enum DesignVariableType {
     String,
     Boolean,
     Typography,
+    /// One option out of the fixed set declared in `CreateVariable.options`.
+    Enum,
+    /// A project image asset id, or null for "no image"; binds to image fills.
+    Image,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -104,6 +108,11 @@ pub enum VariableBindingProperty {
     TextStyle,
     ClipWidth,
     ClipHeight,
+    /// The artwork of `fills[index]`; takes an image variable.
+    ImageFill {
+        #[serde(default)]
+        index: u16,
+    },
 }
 
 /// The flow direction of an auto-layout frame; `none` turns auto layout off
@@ -363,7 +372,9 @@ pub enum DesignShape {
 /// `get_editor_state` so a planner never sends an op the editor lacks. Each op
 /// is named on its own (`op:<name>`; `op:set_stroke` covers `sides`, `dash`,
 /// `cap` and `join`; `op:set_auto_layout` the `grid` direction and
-/// `align_content`; `op:set_layout_child` the grid cell fields).
+/// `align_content`; `op:set_layout_child` the grid cell fields;
+/// `op:set_variable_options` the `enum` and `image` variable kinds and
+/// `create_variable`'s `options`).
 pub const DESIGN_OP_CAPABILITIES: &[&str] = &[
     "op:set_effects",
     "op:set_fill",
@@ -378,6 +389,7 @@ pub const DESIGN_OP_CAPABILITIES: &[&str] = &[
     "op:remove_variant",
     "op:arrange_variants",
     "op:rename_component",
+    "op:set_variable_options",
     "batch_get:detail",
 ];
 
@@ -721,18 +733,27 @@ pub enum DesignOp {
         collection: String,
         name: String,
     },
-    /// Primitive value: hex color, finite number, string, boolean, or TextStyle object for typography.
+    /// Primitive value: hex color, finite number, string, boolean, TextStyle object for typography,
+    /// one of `options` for enum, or an asset id (or null) for image.
     CreateVariable {
         collection: String,
         name: String,
         kind: DesignVariableType,
         value: serde_json::Value,
+        /// The option names an enum variable may take, in display order. Enum only.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        options: Vec<String>,
     },
     /// Value also accepts {"alias":"exact variable id or unique name"}.
     SetVariableValue {
         variable: String,
         mode: String,
         value: serde_json::Value,
+    },
+    /// Replace an enum variable's option list. Values that name a removed option keep their text.
+    SetVariableOptions {
+        variable: String,
+        options: Vec<String>,
     },
     /// Pin a mode document-wide or on a frame. Omit mode to clear the pin.
     SetVariableMode {
@@ -1501,7 +1522,9 @@ mode use canvas operations; source file mutation is unavailable.
 - Inspect `design_system` / `get_design_system` before inventing tokens or
   components. Collections own named modes; variables have typed values per
   mode. Create foundations with `create_variable_collection` and
-  `create_variable`, bind applicable properties with `bind_variable`, then
+  `create_variable` (color, float, string, boolean, typography, an `enum` with
+  its `options`, or an `image` asset), bind applicable properties with
+  `bind_variable` (`image_fill` takes an image variable), then
   reuse component instances. Source equivalents are `doc/variables.json`,
   `doc/active_modes.json` and component master FNX; preserve ids.
 - Reusable component APIs include combine_variants, create_component_property,

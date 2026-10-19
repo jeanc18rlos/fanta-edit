@@ -108,6 +108,10 @@ pub struct Variable {
     /// round-trip). Empty = "all scopes".
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scopes: Vec<VariableScope>,
+    /// The option names a [`VariableType::Enum`] variable may take, in display
+    /// order. Its values name one of these; every other type leaves it empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
 }
 
 impl Variable {
@@ -173,6 +177,7 @@ mod tests {
                     },
                 )]),
                 scopes: vec![VariableScope::AllFills],
+                options: Vec::new(),
             },
         );
         (reg, coll_id, light, var_id)
@@ -200,6 +205,39 @@ mod tests {
         assert!(reg.is_empty());
         let j = serde_json::to_string(&reg).unwrap();
         assert_eq!(j, "{}");
+    }
+
+    #[test]
+    fn enum_options_round_trip_and_stay_off_the_wire_when_empty() {
+        let (mut reg, coll_id, light, var_id) = fixture();
+        let plain = serde_json::to_value(&reg).unwrap();
+        assert!(plain["variables"][var_id.to_string()].get("options").is_none());
+
+        let state_id = VariableId::from_u128(101);
+        reg.variables.insert(
+            state_id,
+            Variable {
+                id: state_id,
+                collection: coll_id,
+                name: "state".into(),
+                ty: VariableType::Enum,
+                values_by_mode: BTreeMap::from([(
+                    light,
+                    VarValue::Enum {
+                        value: "hover".into(),
+                    },
+                )]),
+                scopes: Vec::new(),
+                options: vec!["idle".into(), "hover".into(), "pressed".into()],
+            },
+        );
+        let j = serde_json::to_string(&reg).unwrap();
+        let back: VariableRegistry = serde_json::from_str(&j).unwrap();
+        assert_eq!(reg, back);
+        assert_eq!(
+            back.variable(state_id).unwrap().options,
+            vec!["idle", "hover", "pressed"]
+        );
     }
 
     #[test]

@@ -1452,10 +1452,34 @@ fn variable_type(kind: DesignVariableType) -> VariableType {
         DesignVariableType::String => VariableType::String,
         DesignVariableType::Boolean => VariableType::Boolean,
         DesignVariableType::Typography => VariableType::Typography,
+        DesignVariableType::Enum => VariableType::Enum,
+        DesignVariableType::Image => VariableType::Image,
     }
 }
 
-fn parse_variable_value(doc: &Doc, kind: VariableType, value: &Value) -> Result<VarValue> {
+/// Trim and validate an enum's option list: non-empty, no blank or repeated names.
+fn enum_options(options: &[String]) -> Result<Vec<String>> {
+    let options: Vec<String> = options.iter().map(|option| option.trim().to_owned()).collect();
+    if options.is_empty() {
+        bail!("an enum variable needs at least one option");
+    }
+    if options.iter().any(String::is_empty) {
+        bail!("enum options cannot be blank");
+    }
+    let mut seen = HashSet::new();
+    if let Some(repeated) = options.iter().find(|option| !seen.insert(option.as_str())) {
+        bail!("enum option {repeated:?} is listed twice");
+    }
+    Ok(options)
+}
+
+/// `options` are the enum's choices when `kind` is an enum (empty = unchecked).
+fn parse_variable_value(
+    doc: &Doc,
+    kind: VariableType,
+    options: &[String],
+    value: &Value,
+) -> Result<VarValue> {
     if let Some(alias) = value.get("alias").and_then(Value::as_str) {
         let target = find_variable(doc, alias)?;
         if target.ty != kind {
@@ -1494,6 +1518,30 @@ fn parse_variable_value(doc: &Doc, kind: VariableType, value: &Value) -> Result<
             }
             VarValue::TextStyle { value: style }
         }
+        VariableType::Enum => {
+            let option = value
+                .as_str()
+                .map(str::trim)
+                .filter(|option| !option.is_empty())
+                .context("enum requires one of the variable's option names")?;
+            if !options.is_empty() && !options.iter().any(|candidate| candidate == option) {
+                bail!("enum value {option:?} is not one of the options {options:?}");
+            }
+            VarValue::Enum {
+                value: option.to_owned(),
+            }
+        }
+        VariableType::Image => {
+            let asset = match value {
+                Value::Null => None,
+                Value::String(id) => Some(
+                    id.parse::<AssetId>()
+                        .context("image requires a project asset id such as a_…, or null")?,
+                ),
+                _ => bail!("image requires a project asset id such as a_…, or null"),
+            };
+            VarValue::Image { value: asset }
+        }
     })
 }
 
@@ -1509,6 +1557,7 @@ fn binding_property(property: VariableBindingProperty) -> BoundProp {
         VariableBindingProperty::TextStyle => BoundProp::TextStyle,
         VariableBindingProperty::ClipWidth => BoundProp::ClipWidth,
         VariableBindingProperty::ClipHeight => BoundProp::ClipHeight,
+        VariableBindingProperty::ImageFill { index } => BoundProp::ImageFill { index },
     }
 }
 
@@ -2393,6 +2442,7 @@ fn design_operation_is_variable(operation: &DesignOp) -> bool {
             | DesignOp::AddVariableMode { .. }
             | DesignOp::CreateVariable { .. }
             | DesignOp::SetVariableValue { .. }
+            | DesignOp::SetVariableOptions { .. }
             | DesignOp::SetVariableMode { .. }
     )
 }
@@ -3618,6 +3668,7 @@ fn apply_one(
             name,
             kind,
             value,
+            options,
         } => {
             let collection = find_collection(doc, collection)?;
             let name = required_name(name)?;
@@ -3633,7 +3684,14 @@ fn apply_one(
                 bail!("add a mode before creating variables");
             }
             let ty = variable_type(*kind);
-            let value = parse_variable_value(doc, ty, value)?;
+            let options = if ty == VariableType::Enum {
+                enum_options(options)?
+            } else if options.is_empty() {
+                Vec::new()
+            } else {
+                bail!("only enum variables take options");
+            };
+            let value = parse_variable_value(doc, ty, &options, value)?;
             let variable = Variable {
                 id: VariableId::new(),
                 collection: collection.id,
@@ -3645,6 +3703,7 @@ fn apply_one(
                     .map(|mode| (mode.id, value.clone()))
                     .collect(),
                 scopes: Vec::new(),
+                options,
             };
             let detail = json!({"variable": variable.id.to_string()});
             doc.apply(Operation::CreateVariable {
@@ -3666,7 +3725,7 @@ fn apply_one(
                 .collection_of(variable.id)
                 .context("variable collection is missing")?;
             let mode = find_mode(collection, mode)?;
-            let value = parse_variable_value(doc, variable.ty, value)?;
+            let value = parse_variable_value(doc, variable.ty, &variable.options, value)?;
             let operation = crate::variables_workspace::set_variable_value_operation(
                 doc,
                 variable.id,
@@ -3675,6 +3734,26 @@ fn apply_one(
             )
             .map_err(|error| anyhow!(error))?;
             apply_all(doc, operation.into_iter().collect())
+        }
+        DesignOp::SetVariableOptions { variable, options } => {
+            let variable = find_variable(doc, variable)?;
+            if variable.ty != VariableType::Enum {
+                bail!("only enum variables take options");
+            }
+            let id = variable.id;
+            let old = variable.options.clone();
+            let new = enum_options(options)?;
+            if old == new {
+                return Ok(Applied::Content {
+                    created: None,
+                    detail: Some(json!({"variable": id.to_string()})),
+                });
+            }
+            doc.apply(Operation::SetVariableOptions { id, old, new })?;
+            Ok(Applied::Content {
+                created: None,
+                detail: Some(json!({"variable": id.to_string()})),
+            })
         }
         DesignOp::SetVariableMode {
             collection,
@@ -4155,7 +4234,7 @@ fn apply_one(
                 .default_value()
                 .variable_type()
                 .context("component property has no concrete type")?;
-            let mut new = parse_variable_value(doc, kind, value)?;
+            let mut new = parse_variable_value(doc, kind, &[], value)?;
             if let fanta_doc::ComponentPropKind::Variant { axis } = &property.kind {
                 let set = definition
                     .variant_of
@@ -5350,6 +5429,91 @@ mod tests {
         assert!(doc.active_modes.is_empty());
         assert!(doc.scene.get(node).context("node")?.bindings.is_empty());
         assert_eq!(find_collection(&doc, "Theme")?.modes.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn agent_enum_and_image_variables_carry_options_and_bind() -> Result<()> {
+        let (mut doc, _) = doc_with_page();
+        let result = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op":"create_variable_collection","name":"Theme","modes":["Light","Dark"]},
+                {"op":"create_variable","collection":"Theme","name":"state","kind":"enum","value":"idle","options":["idle","hover"]},
+                {"op":"create_variable","collection":"Theme","name":"hero","kind":"image","value":null},
+                {"op":"create_node","node_type":"rectangle","x":0,"y":0,"width":128,"height":48,"fill":"#FFFFFF"}
+            ])),
+            "Create enum and image tokens",
+        );
+        assert_eq!(result.value["applied"], true);
+        let node = created_id(&result, 0);
+        let state = find_variable(&doc, "state")?;
+        assert_eq!(state.ty, VariableType::Enum);
+        assert_eq!(state.options, vec!["idle", "hover"]);
+        assert_eq!(find_variable(&doc, "hero")?.ty, VariableType::Image);
+
+        // A value outside the option list is refused, so the batch rolls back.
+        let result = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op":"set_variable_value","variable":"state","mode":"Dark","value":"pressed"}
+            ])),
+            "Unknown option",
+        );
+        assert_eq!(result.value["applied"], false);
+
+        let asset = fanta_doc::AssetId::new().to_string();
+        let result = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op":"set_variable_options","variable":"state","options":["idle","hover","pressed"]},
+                {"op":"set_variable_value","variable":"state","mode":"Dark","value":"pressed"},
+                {"op":"set_variable_value","variable":"hero","mode":"Dark","value":asset},
+                {"op":"bind_variable","id":node.to_string(),"property":{"prop":"image_fill","index":0},"variable":"hero"}
+            ])),
+            "Options, values and an image binding",
+        );
+        assert_eq!(result.value["applied"], true);
+        let dark = find_mode(find_collection(&doc, "Theme")?, "Dark")?;
+        let state = find_variable(&doc, "state")?;
+        assert_eq!(state.options, vec!["idle", "hover", "pressed"]);
+        assert_eq!(
+            state.values_by_mode.get(&dark),
+            Some(&VarValue::Enum {
+                value: "pressed".into()
+            })
+        );
+        let hero = find_variable(&doc, "hero")?;
+        assert_eq!(
+            hero.values_by_mode.get(&dark),
+            Some(&VarValue::Image {
+                value: Some(asset.parse()?)
+            })
+        );
+        assert_eq!(
+            existing_node(&doc, node)?
+                .bindings
+                .get(&BoundProp::ImageFill { index: 0 }),
+            Some(&hero.id)
+        );
+
+        // Options belong to enums only, and an enum needs at least one.
+        let result = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op":"create_variable","collection":"Theme","name":"size","kind":"float","value":8,"options":["a"]}
+            ])),
+            "Options on a float",
+        );
+        assert_eq!(result.value["applied"], false);
+        let result = run_batch(
+            &mut doc,
+            &ops(json!([
+                {"op":"create_variable","collection":"Theme","name":"empty","kind":"enum","value":"x"}
+            ])),
+            "Enum without options",
+        );
+        assert_eq!(result.value["applied"], false);
         Ok(())
     }
 

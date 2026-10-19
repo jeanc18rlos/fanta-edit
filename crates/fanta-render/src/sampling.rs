@@ -995,6 +995,7 @@ mod tests {
                     ),
                 ]),
                 scopes: Vec::new(),
+                options: Vec::new(),
             },
         );
         doc.scene

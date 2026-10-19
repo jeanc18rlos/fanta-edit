@@ -530,6 +530,7 @@ mod tests {
                 ty: VariableType::Color,
                 values_by_mode: BTreeMap::new(),
                 scopes: vec![],
+                options: Vec::new(),
             }),
         };
         create_variable.apply(&mut d.ctx()).unwrap();
@@ -588,6 +589,7 @@ mod tests {
                 ty: VariableType::Color,
                 values_by_mode: BTreeMap::new(),
                 scopes: vec![],
+                options: Vec::new(),
             }),
         }
         .apply(&mut d.ctx())

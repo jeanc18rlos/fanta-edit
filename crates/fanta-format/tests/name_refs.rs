@@ -66,6 +66,7 @@ fn fixture() -> Fixture {
             ty: VariableType::Color,
             values_by_mode: BTreeMap::new(),
             scopes: Vec::new(),
+            options: Vec::new(),
         },
     );
 

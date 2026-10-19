@@ -386,6 +386,7 @@ mod tests {
                     ty,
                     values_by_mode: BTreeMap::new(),
                     scopes: Vec::new(),
+                    options: Vec::new(),
                 },
             );
         }

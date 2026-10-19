@@ -221,6 +221,7 @@ fn motion_bound_property_overrides_the_resolved_variable_value() {
                     },
                 )]),
                 scopes: Vec::new(),
+                options: Vec::new(),
             },
         )]),
     };

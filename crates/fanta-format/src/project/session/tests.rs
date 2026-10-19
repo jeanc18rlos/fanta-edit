@@ -3154,6 +3154,7 @@ fn shared_reference_fixture() -> SharedReferenceFixture {
             .into_iter()
             .collect(),
             scopes: Vec::new(),
+            options: Vec::new(),
         },
     );
     document.active_modes.insert(collection, modes[0]);

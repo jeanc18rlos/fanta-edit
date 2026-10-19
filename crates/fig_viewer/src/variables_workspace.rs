@@ -891,6 +891,7 @@ fn create_variable_operation(
             ty: variable_type,
             values_by_mode,
             scopes: Vec::new(),
+            options: Vec::new(),
         }),
     })
 }
@@ -996,6 +997,10 @@ fn default_variable_value(variable_type: VariableType) -> VarValue {
         VariableType::Typography => VarValue::TextStyle {
             value: fanta_doc::TextStyle::default(),
         },
+        VariableType::Enum => VarValue::Enum {
+            value: String::new(),
+        },
+        VariableType::Image => VarValue::Image { value: None },
     }
 }
 
@@ -1027,6 +1032,24 @@ fn parse_primitive_value(
             _ => Err("Enter true or false"),
         },
         VariableType::Typography => Err("Typography values are not editable here yet"),
+        VariableType::Enum => {
+            let option = text.trim();
+            if option.is_empty() {
+                return Err("Enter one of the variable's options");
+            }
+            Ok(VarValue::Enum {
+                value: option.to_owned(),
+            })
+        }
+        VariableType::Image => {
+            let text = text.trim();
+            if text.is_empty() {
+                return Ok(VarValue::Image { value: None });
+            }
+            text.parse::<fanta_doc::AssetId>()
+                .map(|asset| VarValue::Image { value: Some(asset) })
+                .map_err(|_| "Enter a project asset id such as a_…, or leave it empty")
+        }
     }
 }
 
@@ -1036,6 +1059,8 @@ fn editor_variable_value(value: Option<&VarValue>, _variable_type: VariableType)
         Some(VarValue::Float { value }) => value.to_string(),
         Some(VarValue::String { value }) => value.clone(),
         Some(VarValue::Boolean { value }) => value.to_string(),
+        Some(VarValue::Enum { value }) => value.clone(),
+        Some(VarValue::Image { value }) => crate::properties_snapshot::image_value_label(*value),
         _ => "Unresolved".to_owned(),
     }
 }
@@ -1145,6 +1170,8 @@ fn screen_variable_kind(kind: VariableType) -> Option<VariableKind> {
         VariableType::String => Some(VariableKind::String),
         VariableType::Boolean => Some(VariableKind::Boolean),
         VariableType::Typography => None,
+        // The screen has no glyph for these yet; their values edit as text.
+        VariableType::Enum | VariableType::Image => Some(VariableKind::String),
     }
 }
 
@@ -1329,12 +1356,14 @@ fn screen_operation(
                 .variables
                 .get(&id)
                 .ok_or("The variable no longer exists")?;
-            set_variable_value_operation(
-                doc,
-                id,
-                mode_id(mode)?,
-                parse_primitive_value(variable.ty, value)?,
-            )
+            let parsed = parse_primitive_value(variable.ty, value)?;
+            if let VarValue::Enum { value: option } = &parsed
+                && !variable.options.is_empty()
+                && !variable.options.iter().any(|candidate| candidate == option)
+            {
+                return Err("Enter one of the variable's options");
+            }
+            set_variable_value_operation(doc, id, mode_id(mode)?, parsed)
         }
         VariablesAction::AliasChanged {
             variable_id: id,
@@ -1617,6 +1646,7 @@ mod tests {
                     ty: VariableType::String,
                     values_by_mode: BTreeMap::new(),
                     scopes: Vec::new(),
+                    options: Vec::new(),
                 },
             );
         }
@@ -1655,6 +1685,7 @@ mod tests {
                         },
                     )]),
                     scopes: Vec::new(),
+                    options: Vec::new(),
                 },
             );
             order.push(id);

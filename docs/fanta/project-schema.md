@@ -17,7 +17,7 @@ path.
 | `components/<slug>/def.json` | Component identity and definition | Keep IDs and root consistent |
 | `components/<slug>/master.fnx` | One component master's tree | Yes |
 | `components/<slug>/master.ids.json` | Legacy identity and sibling order record | Keep with its FNX file |
-| `doc/variables.json`, `doc/active_modes.json` | Tokens and current modes | Yes, as valid JSON |
+| `doc/variables.json`, `doc/active_modes.json` | Tokens (`color`, `float`, `string`, `boolean`, `typography`, `enum` with its `options`, `image` asset ids) and current modes | Yes, as valid JSON |
 | `doc/metadata.json`, `doc/motion.json`, `doc/flow_start.json` | Project metadata, animation, prototype start | Yes, as valid JSON |
 | `assets/<family>/<AssetId>.<ext>` | Binary source assets | Add through an importer when possible |
 | `assets/index.json` | Full SHA-256 digest and size for each asset | Update together with any binary file |

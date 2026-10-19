@@ -271,6 +271,7 @@ fn typography_and_content_modes_reflow_cards_without_rewriting_literals() {
                 (dark, VarValue::TextStyle { value: large }),
             ]),
             scopes: Vec::new(),
+            options: Vec::new(),
         },
     );
     doc.variables.variables.insert(
@@ -295,6 +296,7 @@ fn typography_and_content_modes_reflow_cards_without_rewriting_literals() {
                 ),
             ]),
             scopes: Vec::new(),
+            options: Vec::new(),
         },
     );
     let mut paragraph = TextNode::new("Authored fallback", 400.0, 1.0);

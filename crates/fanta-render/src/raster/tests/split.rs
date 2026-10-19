@@ -2058,6 +2058,7 @@ fn add_instance_theme(doc: &mut Doc) -> InstanceTheme {
                 ty,
                 values_by_mode: BTreeMap::from([(theme.light, light), (theme.dark, dark)]),
                 scopes: Vec::new(),
+                options: Vec::new(),
             },
         );
     }

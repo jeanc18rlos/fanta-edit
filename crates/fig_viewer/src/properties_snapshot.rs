@@ -1283,8 +1283,15 @@ pub(crate) fn prop_value_snapshot(kind: &ComponentPropKind, value: &VarValue) ->
             PropValueSnapshot::Display(if *value { "On" } else { "Off" }.into())
         }
         (_, VarValue::TextStyle { .. }) => PropValueSnapshot::Display("Text style".into()),
+        (_, VarValue::Enum { value }) => PropValueSnapshot::Display(value.clone().into()),
+        (_, VarValue::Image { value }) => PropValueSnapshot::Display(image_value_label(*value).into()),
         (_, VarValue::Alias { .. }) => PropValueSnapshot::Display("Variable".into()),
     }
+}
+
+/// The asset an image value names, or "No image".
+pub(crate) fn image_value_label(asset: Option<fanta_doc::AssetId>) -> String {
+    asset.map_or_else(|| "No image".to_string(), |asset| asset.to_string())
 }
 
 pub(crate) fn master_section(doc: &Doc, component: ComponentId) -> Option<MasterSection> {
@@ -1396,6 +1403,8 @@ pub(crate) fn prop_default_label(value: &VarValue) -> String {
         VarValue::String { value } => value.clone(),
         VarValue::Color { value } => value.to_hex(),
         VarValue::TextStyle { .. } => "Text style".to_string(),
+        VarValue::Enum { value } => value.clone(),
+        VarValue::Image { value } => image_value_label(*value),
         VarValue::Alias { .. } => "Variable".to_string(),
     }
 }
@@ -1452,6 +1461,7 @@ pub(crate) fn bound_prop_label(prop: &BoundProp) -> String {
         BoundProp::TextStyle => "Text style".to_string(),
         BoundProp::ClipWidth => "Width".to_string(),
         BoundProp::ClipHeight => "Height".to_string(),
+        BoundProp::ImageFill { index } => format!("Fill {} image", index + 1),
     }
 }
 

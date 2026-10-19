@@ -1281,6 +1281,10 @@ fn default_variable_value(variable_type: VariableType) -> VarValue {
         VariableType::Typography => VarValue::TextStyle {
             value: crate::node::TextStyle::default(),
         },
+        VariableType::Enum => VarValue::Enum {
+            value: String::new(),
+        },
+        VariableType::Image => VarValue::Image { value: None },
     }
 }
 
@@ -1537,6 +1541,7 @@ mod tests {
                     ),
                 ]),
                 scopes: Vec::new(),
+                options: Vec::new(),
             },
         );
         doc.variables.variables.insert(
@@ -1561,6 +1566,7 @@ mod tests {
                     ),
                 ]),
                 scopes: Vec::new(),
+                options: Vec::new(),
             },
         );
         let mut node = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
@@ -1668,6 +1674,7 @@ mod tests {
                     },
                 )]),
                 scopes: Vec::new(),
+                options: Vec::new(),
             },
         );
         doc.active_modes.insert(collection_id, original_mode);

@@ -2154,6 +2154,10 @@ fn variable_literal_default(doc: &Doc, variable: VariableId) -> Option<VarValue>
             VariableType::Typography => VarValue::TextStyle {
                 value: fanta_doc::TextStyle::default(),
             },
+            VariableType::Enum => VarValue::Enum {
+                value: variable.options.first().cloned().unwrap_or_default(),
+            },
+            VariableType::Image => VarValue::Image { value: None },
         })
     })
 }
@@ -2351,6 +2355,29 @@ fn parse_variable_literal(doc: &Doc, variable: VariableId, text: &str) -> Result
         VariableType::Typography => {
             Err("Typography action values are not editable as text".to_owned())
         }
+        VariableType::Enum => {
+            let option = text.trim();
+            if option.is_empty() {
+                return Err("Enter one of the variable's options".to_owned());
+            }
+            if !variable.options.is_empty()
+                && !variable.options.iter().any(|candidate| candidate == option)
+            {
+                return Err(format!("Enter one of: {}", variable.options.join(", ")));
+            }
+            Ok(VarValue::Enum {
+                value: option.to_owned(),
+            })
+        }
+        VariableType::Image => {
+            let text = text.trim();
+            if text.is_empty() {
+                return Ok(VarValue::Image { value: None });
+            }
+            text.parse::<fanta_doc::AssetId>()
+                .map(|asset| VarValue::Image { value: Some(asset) })
+                .map_err(|_| "Enter a project asset id such as a_…, or leave it empty".to_owned())
+        }
     }
 }
 
@@ -2361,6 +2388,11 @@ fn variable_value_text(value: &VarValue) -> (String, bool) {
         VarValue::String { value } => (value.clone(), true),
         VarValue::Boolean { value } => (value.to_string(), true),
         VarValue::TextStyle { .. } => ("Typography value".to_owned(), false),
+        VarValue::Enum { value } => (value.clone(), true),
+        VarValue::Image { value } => (
+            value.map(|asset| asset.to_string()).unwrap_or_default(),
+            true,
+        ),
         VarValue::Alias { .. } => ("Variable alias".to_owned(), false),
     }
 }
@@ -3157,6 +3189,7 @@ mod tests {
                 ty: VariableType::Float,
                 values_by_mode: BTreeMap::from([(mode, VarValue::Float { value })]),
                 scopes: Vec::new(),
+                options: Vec::new(),
             },
         );
         variable

@@ -479,6 +479,12 @@ impl Operation {
                 }
                 Ok(())
             }
+            Self::SetVariableOptions { id, old, new } => {
+                if let Some(v) = ctx.variables.variables.get_mut(id) {
+                    v.options = dir.pick(old, new).clone();
+                }
+                Ok(())
+            }
             Self::RenameVariableCollection { id, old, new } => {
                 if let Some(c) = ctx.variables.collections.get_mut(id) {
                     c.name = dir.pick(old, new).clone();

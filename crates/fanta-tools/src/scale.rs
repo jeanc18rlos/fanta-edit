@@ -1400,6 +1400,7 @@ mod tests {
                 ty: VariableType::Float,
                 values_by_mode: BTreeMap::from([(mode, VarValue::Float { value: 8. })]),
                 scopes: vec![],
+                options: Vec::new(),
             },
         );
         let mut shape = rectangle(100., 50.);
@@ -1674,6 +1675,7 @@ mod tests {
                         (active_mode, VarValue::Float { value: large }),
                     ]),
                     scopes: vec![],
+                    options: Vec::new(),
                 },
             );
         }

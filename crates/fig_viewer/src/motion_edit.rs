@@ -1377,6 +1377,7 @@ mod tests {
                 ty: VariableType::Float,
                 values_by_mode: BTreeMap::from([(mode_id, VarValue::Float { value: 0.35 })]),
                 scopes: Vec::new(),
+                options: Vec::new(),
             },
         );
         doc.variables.variables.insert(
@@ -1393,6 +1394,7 @@ mod tests {
                     },
                 )]),
                 scopes: Vec::new(),
+                options: Vec::new(),
             },
         );
         let node = doc.scene.get_mut(node_id).expect("bound node");

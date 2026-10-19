@@ -1675,6 +1675,7 @@ mod cache_tests {
                     ty,
                     values_by_mode: BTreeMap::from([(mode, value)]),
                     scopes: Vec::new(),
+                    options: Vec::new(),
                 },
             );
         }

@@ -622,6 +622,7 @@ fn set_variable_rebinds_a_bound_fill_without_touching_the_doc() {
                 },
             )]),
             scopes: Vec::new(),
+            options: Vec::new(),
         },
     );
 
@@ -711,6 +712,7 @@ fn set_variable_uses_the_active_layers_innermost_mode_override() {
                 (dark_mode, VarValue::Float { value: 2.0 }),
             ]),
             scopes: Vec::new(),
+            options: Vec::new(),
         },
     );
     let frame = frame(0.0);
@@ -3229,6 +3231,7 @@ fn pr5_multi_action_sets_the_variable_then_navigates_in_one_click() {
             ty: VariableType::Boolean,
             values_by_mode: BTreeMap::from([(mode, VarValue::Boolean { value: false })]),
             scopes: Vec::new(),
+            options: Vec::new(),
         },
     );
 
@@ -4617,6 +4620,7 @@ fn paused_resize_preserves_clocks_and_uses_effective_frame_bounds()
             ty: VariableType::Float,
             values_by_mode: BTreeMap::from([(mode, VarValue::Float { value: 400.0 })]),
             scopes: Vec::new(),
+            options: Vec::new(),
         },
     );
     let mut root = frame_sized(0.0, 0.0, 200.0, 100.0, Color::WHITE);

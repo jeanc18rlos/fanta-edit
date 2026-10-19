@@ -57,6 +57,14 @@ pub enum BoundProp {
     ClipWidth,
     /// Clip height — `GroupNode.clip_size[1]` (frames only).
     ClipHeight,
+    /// The image asset painted by `fills[index]`, bound to a
+    /// [`VariableType::Image`] variable ([`VarValue::Image`]) so artwork can
+    /// follow a mode or a motion keyframe. Vectors, booleans and frames only.
+    /// Declared last so existing binding order on the wire is unchanged.
+    ///
+    /// [`VariableType::Image`]: crate::value::VariableType::Image
+    /// [`VarValue::Image`]: crate::value::VarValue::Image
+    ImageFill { index: u16 },
 }
 
 impl BoundProp {
@@ -74,11 +82,18 @@ impl BoundProp {
             Self::Visible => VariableType::Boolean,
             Self::TextContent => VariableType::String,
             Self::TextStyle => VariableType::Typography,
+            Self::ImageFill { .. } => VariableType::Image,
         }
     }
 
+    /// Whether a variable of `variable_type` may be bound here. Text content
+    /// also takes an enum, whose option name is shown as the text.
     pub fn accepts_variable_type(self, variable_type: VariableType) -> bool {
         self.variable_type() == variable_type
+            || matches!(
+                (self, variable_type),
+                (Self::TextContent, VariableType::Enum)
+            )
     }
 
     /// Whether this property is addressable on `node` — i.e. the slot it names
@@ -114,6 +129,7 @@ impl BoundProp {
             Self::ClipWidth | Self::ClipHeight => {
                 matches!(&node.data, NodeData::Group(g) if g.clip_size.is_some())
             }
+            Self::ImageFill { index } => node_fill(node, *index).is_some(),
         }
     }
 
@@ -170,6 +186,10 @@ impl BoundProp {
                 .unwrap_or(serde_json::Value::Null),
             Self::ClipHeight => clip_size(node)
                 .map(|s| json!(s[1]))
+                .unwrap_or(serde_json::Value::Null),
+            Self::ImageFill { index } => node_fill(node, *index)
+                .and_then(Fill::image_asset)
+                .map(|asset| json!(asset))
                 .unwrap_or(serde_json::Value::Null),
         }
     }
@@ -231,6 +251,11 @@ impl BoundProp {
             Self::ClipHeight => {
                 clip_size(node).map(|size| ResolvedVarValue::Float { value: size[1] })
             }
+            Self::ImageFill { index } => node_fill(node, *index).map(|fill| {
+                ResolvedVarValue::Image {
+                    value: fill.image_asset(),
+                }
+            }),
         }
     }
 
@@ -286,7 +311,10 @@ impl BoundProp {
                 node.flags.set(NodeFlags::HIDDEN, !value);
                 true
             }
-            (Self::TextContent, ResolvedVarValue::String { value }) => {
+            (
+                Self::TextContent,
+                ResolvedVarValue::String { value } | ResolvedVarValue::Enum { value },
+            ) => {
                 match &mut node.data {
                     NodeData::Text(text) => text.content = value,
                     NodeData::TextPath(text) => text.content = value,
@@ -314,6 +342,15 @@ impl BoundProp {
             (Self::ClipHeight, ResolvedVarValue::Float { value }) => {
                 if let Some(size) = clip_size_mut(node) {
                     size[1] = value;
+                    return true;
+                }
+                false
+            }
+            // "No image" leaves the paint as it is rather than erasing it, so a
+            // keyframe or mode without artwork cannot blank a fill.
+            (Self::ImageFill { index }, ResolvedVarValue::Image { value: Some(asset) }) => {
+                if let Some(fill) = node_fill_mut(node, *index) {
+                    fill.set_image_asset(asset);
                     return true;
                 }
                 false
@@ -379,6 +416,26 @@ fn set_node_fill_color(node: &mut CanvasNode, index: u16, color: Color) -> bool 
 
 fn fill_color(fill: Option<&Fill>) -> Option<Color> {
     fill?.solid_color()
+}
+
+/// The paint slot an image binding addresses: vector, boolean and frame fills.
+/// Text has no paint slot an image could land in.
+fn node_fill(node: &CanvasNode, index: u16) -> Option<&Fill> {
+    match &node.data {
+        NodeData::Vector(v) => v.fills.get(index as usize),
+        NodeData::Boolean(boolean) => boolean.fills.get(index as usize),
+        NodeData::Group(g) => group_fill(g, index),
+        _ => None,
+    }
+}
+
+fn node_fill_mut(node: &mut CanvasNode, index: u16) -> Option<&mut Fill> {
+    match &mut node.data {
+        NodeData::Vector(v) => v.fills.get_mut(index as usize),
+        NodeData::Boolean(boolean) => boolean.fills.get_mut(index as usize),
+        NodeData::Group(g) => group_fill_mut(g, index),
+        _ => None,
+    }
 }
 
 fn group_fill(group: &crate::node::GroupNode, index: u16) -> Option<&Fill> {
@@ -476,6 +533,85 @@ mod tests {
             10.0,
             Color::WHITE,
         )))
+    }
+
+    #[test]
+    fn image_fill_binding_reads_and_writes_the_paint_asset() {
+        use crate::id::AssetId;
+        use crate::style::{Fill, ImageFitMode};
+
+        let mut node = rect();
+        let prop = BoundProp::ImageFill { index: 0 };
+        assert_eq!(prop.variable_type(), VariableType::Image);
+        assert!(prop.applies_to(&node));
+        assert!(!BoundProp::ImageFill { index: 1 }.applies_to(&node));
+        // A solid slot reads as "no image" and is left alone by "no image".
+        assert_eq!(prop.read_literal(&node), serde_json::Value::Null);
+        assert_eq!(
+            prop.read_resolved(&node),
+            Some(ResolvedVarValue::Image { value: None })
+        );
+        assert!(!prop.apply_resolved(&mut node, ResolvedVarValue::Image { value: None }));
+        assert!(BoundProp::FillColor { index: 0 }.read_resolved(&node).is_some());
+
+        let asset = AssetId::from_u128(42);
+        assert!(prop.apply_resolved(&mut node, ResolvedVarValue::Image { value: Some(asset) }));
+        assert_eq!(
+            prop.read_resolved(&node),
+            Some(ResolvedVarValue::Image { value: Some(asset) })
+        );
+        assert_eq!(prop.read_literal(&node), serde_json::json!(asset));
+
+        // Rebinding keeps the image paint's own settings.
+        let NodeData::Vector(vector) = &mut node.data else {
+            panic!("rect is a vector");
+        };
+        let Some(Fill::Image { mode, crop, .. }) = vector.fills.get_mut(0) else {
+            panic!("the fill is an image now");
+        };
+        *mode = ImageFitMode::Fit;
+        *crop = Some(Box::new([0.1, 0.1, 0.5, 0.5]));
+        let other = AssetId::from_u128(43);
+        assert!(prop.apply_resolved(&mut node, ResolvedVarValue::Image { value: Some(other) }));
+        let NodeData::Vector(vector) = &node.data else {
+            panic!("rect is a vector");
+        };
+        assert!(matches!(
+            vector.fills.first(),
+            Some(Fill::Image { asset, mode: ImageFitMode::Fit, crop: Some(_), .. }) if *asset == other
+        ));
+
+        // Text has no paint slot an image could fill.
+        let mut text = CanvasNode::new(NodeData::Text(crate::node::TextNode::new("x", 100.0, 20.0)));
+        assert!(!prop.applies_to(&text));
+        assert!(!prop.apply_resolved(&mut text, ResolvedVarValue::Image { value: Some(asset) }));
+    }
+
+    #[test]
+    fn enum_values_land_in_text_content_and_nowhere_else() {
+        let mut text = CanvasNode::new(NodeData::Text(crate::node::TextNode::new("idle", 100.0, 20.0)));
+        assert!(BoundProp::TextContent.accepts_variable_type(VariableType::Enum));
+        assert!(BoundProp::TextContent.accepts_variable_type(VariableType::String));
+        assert!(!BoundProp::Opacity.accepts_variable_type(VariableType::Enum));
+        assert!(BoundProp::TextContent.apply_resolved(
+            &mut text,
+            ResolvedVarValue::Enum {
+                value: "hover".into(),
+            },
+        ));
+        assert_eq!(
+            BoundProp::TextContent.read_resolved(&text),
+            Some(ResolvedVarValue::String {
+                value: "hover".into()
+            })
+        );
+        let mut node = rect();
+        assert!(!BoundProp::Opacity.apply_resolved(
+            &mut node,
+            ResolvedVarValue::Enum {
+                value: "hover".into(),
+            },
+        ));
     }
 
     #[test]

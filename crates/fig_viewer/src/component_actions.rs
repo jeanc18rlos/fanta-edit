@@ -262,6 +262,7 @@ pub(crate) mod tests {
                     ),
                 ]),
                 scopes: Vec::new(),
+                options: Vec::new(),
             },
         );
         doc.active_modes.insert(collection, modes[1]);
