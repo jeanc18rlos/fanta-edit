@@ -176,6 +176,22 @@ jobs:
           cd target/aarch64-apple-darwin/release
           shasum -a 256 Fanta-aarch64.dmg > SHA256SUMS.txt
 
+      # Installed copies update themselves only with installers this key signed
+      # (crates/auto_update/src/verify.rs). The signature ships next to the DMG.
+      - name: Sign the installer for in-place updates
+        if: env.FANTA_APP_STORE != 'true' && env.FANTA_REQUIRE_NOTARIZATION == 'true'
+        env:
+          FANTA_UPDATE_SIGNING_KEY: ${{ secrets.FANTA_UPDATE_SIGNING_KEY }}
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/fanta/Cargo.toml)
+          python3 -m venv "$RUNNER_TEMP/update-signing"
+          "$RUNNER_TEMP/update-signing/bin/pip" install --quiet 'cryptography>=42'
+          "$RUNNER_TEMP/update-signing/bin/python" script/update_signing.py sign \
+            --asset Fanta-aarch64.dmg --version "$version" \
+            --file target/aarch64-apple-darwin/release/Fanta-aarch64.dmg \
+            --public-key-file crates/auto_update/release-signing-key.pub \
+            > target/aarch64-apple-darwin/release/Fanta-aarch64.dmg.sig
+
       - name: Verify Mac App Store package and record checksums
         if: env.FANTA_APP_STORE == 'true'
         env:
@@ -218,6 +234,7 @@ jobs:
           name: fanta-macos-aarch64-${{ env.FANTA_REQUIRE_NOTARIZATION == 'true' && 'notarized' || 'test-only' }}
           path: |
             target/aarch64-apple-darwin/release/Fanta-aarch64.dmg
+            target/aarch64-apple-darwin/release/Fanta-aarch64.dmg.sig
             target/aarch64-apple-darwin/release/SHA256SUMS.txt
           if-no-files-found: error
           compression-level: 0
@@ -277,5 +294,8 @@ jobs:
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then
             prerelease=(--prerelease)
           fi
-          gh release create "$GITHUB_REF_NAME" release/Fanta-aarch64.dmg release/SHA256SUMS.txt \
+          # The .sig is what installed copies check before updating in place.
+          test -s release/Fanta-aarch64.dmg.sig
+          gh release create "$GITHUB_REF_NAME" release/Fanta-aarch64.dmg release/Fanta-aarch64.dmg.sig \
+            release/SHA256SUMS.txt \
             --draft --verify-tag --generate-notes --title "Fanta ${GITHUB_REF_NAME}" "${prerelease[@]}"

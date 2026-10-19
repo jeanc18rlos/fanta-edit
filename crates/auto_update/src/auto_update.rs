@@ -32,6 +32,8 @@ use std::{
 use util::command::new_command;
 use workspace::Workspace;
 
+mod verify;
+
 const SHOULD_SHOW_UPDATE_NOTIFICATION_KEY: &str = "auto-updater-should-show-updated-notification";
 
 #[derive(Debug)]
@@ -187,6 +189,12 @@ pub struct AutoUpdater {
 pub struct ReleaseAsset {
     pub version: String,
     pub url: String,
+    /// The installer's SHA-256 and Fanta's signature over it (see `verify`). Feeds that don't
+    /// send a signature publish it next to the installer, at `{url}.sig`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 struct MacOsUnmounter<'a> {
@@ -228,7 +236,7 @@ struct AutoUpdateSetting(bool);
 
 /// Whether or not to automatically check for updates.
 ///
-/// Default: false in Fanta Edit until Fanta owns signed release assets.
+/// Default: true. Builds without a release-signing key never check (see `verify`).
 impl Settings for AutoUpdateSetting {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         Self(content.auto_update.unwrap())
@@ -261,6 +269,7 @@ pub fn init(client: Arc<Client>, cx: &mut App) {
         if option_env!("FANTA_UPDATE_EXPLANATION").is_none()
             && env::var("FANTA_UPDATE_EXPLANATION").is_err()
             && poll_for_updates
+            && release_key(cx).is_some()
         {
             let mut update_subscription = AutoUpdateSetting::get_global(cx)
                 .0
@@ -283,6 +292,16 @@ pub fn init(client: Arc<Client>, cx: &mut App) {
     cx.set_global(GlobalAutoUpdate(Some(auto_updater)));
 }
 
+/// The key updates must be signed with: the one compiled into this build, or a test's.
+fn release_key(cx: &App) -> Option<String> {
+    #[cfg(test)]
+    if let Some(key) = cx.try_global::<tests::ReleaseKeyOverride>() {
+        return Some(key.0.clone());
+    }
+    let _ = cx;
+    verify::compiled_release_key().map(str::to_owned)
+}
+
 pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
     if let Some(message) = option_env!("FANTA_UPDATE_EXPLANATION")
         .map(ToOwned::to_owned)
@@ -302,6 +321,17 @@ pub fn check(_: &Check, window: &mut Window, cx: &mut App) {
         .map(|channel| channel.poll_for_updates())
         .unwrap_or(false)
     {
+        return;
+    }
+
+    if release_key(cx).is_none() {
+        drop(window.prompt(
+            gpui::PromptLevel::Info,
+            "This build of Fanta can't update itself.",
+            Some("It has no release-signing key to verify updates with. Download the latest version from fantaisa.net."),
+            &["OK"],
+            cx,
+        ));
         return;
     }
 
@@ -334,7 +364,9 @@ pub fn release_notes_url(cx: &mut App) -> Option<String> {
         ReleaseChannel::Nightly => {
             "https://github.com/jeanc18rlos/fanta-edit/commits/nightly/".to_string()
         }
-        ReleaseChannel::Dev => "https://github.com/jeanc18rlos/fanta-edit/commits/main/".to_string(),
+        ReleaseChannel::Dev => {
+            "https://github.com/jeanc18rlos/fanta-edit/commits/main/".to_string()
+        }
     };
     Some(url)
 }
@@ -729,16 +761,20 @@ impl AutoUpdater {
             cx.notify();
         });
 
+        let key = cx
+            .update(|cx| release_key(cx))
+            .context("this build has no release-signing key")?;
         let installer_dir = InstallerDir::new()
             .await
             .context("Failed to create installer dir")?;
         let target_path = Self::target_path(&installer_dir).await?;
         let progress_entity = this.clone();
         let mut progress_cx = cx.clone();
+        let release = fetched_release_data.clone();
         download_release(
             &target_path,
             fetched_release_data,
-            client,
+            client.clone(),
             move |progress| {
                 progress_entity.update(&mut progress_cx, |this, cx| {
                     if let AutoUpdateStatus::Downloading {
@@ -754,6 +790,24 @@ impl AutoUpdater {
         )
         .await
         .with_context(|| format!("Failed to download update to {}", target_path.display()))?;
+
+        let signature = match release.signature.clone() {
+            Some(signature) => signature,
+            None => fetch_detached_signature(&client, &release.url).await?,
+        };
+        if let Err(error) = verify::verify_download(
+            &target_path,
+            &verify::update_asset_name(OS, ARCH),
+            &release.version,
+            release.sha256.as_deref(),
+            &signature,
+            &key,
+        )
+        .await
+        {
+            smol::fs::remove_file(&target_path).await.ok();
+            return Err(error.context("The update could not be verified, so it was not installed"));
+        }
 
         this.update(cx, |this, cx| {
             this.status = AutoUpdateStatus::Installing {
@@ -896,11 +950,12 @@ impl AutoUpdater {
 
     fn check_if_fetched_version_is_newer_non_nightly(
         mut installed_version: Version,
-        fetched_version: Version,
+        mut fetched_version: Version,
     ) -> Option<Version> {
-        // For non-nightly releases, ignore build and pre-release fields as they're not provided by our endpoints right now.
-        installed_version.pre = semver::Prerelease::EMPTY;
+        // Build metadata (channel, build id, commit) never orders releases; pre-release tags do,
+        // so 1.1.0-beta.2 is newer than 1.1.0-beta.1 and 1.1.0 is newer than both.
         installed_version.build = semver::BuildMetadata::EMPTY;
+        fetched_version.build = semver::BuildMetadata::EMPTY;
         (fetched_version > installed_version).then_some(fetched_version)
     }
 
@@ -1008,6 +1063,21 @@ async fn cleanup_remote_server_cache(
     }
 
     Ok(())
+}
+
+/// The signature published next to an installer, at `{url}.sig`, for feeds that don't send one.
+async fn fetch_detached_signature(client: &HttpClientWithUrl, url: &str) -> Result<String> {
+    let mut response = client
+        .get(&format!("{url}.sig"), Default::default(), true)
+        .await?;
+    let mut body = String::new();
+    response.body_mut().read_to_string(&mut body).await?;
+    anyhow::ensure!(
+        response.status().is_success() && !body.trim().is_empty(),
+        "the update has no signature (status {:?})",
+        response.status()
+    );
+    Ok(body.trim().to_owned())
 }
 
 async fn download_release(
@@ -1137,16 +1207,8 @@ async fn install_release_macos(
     running_app_path: PathBuf,
     background_executor: &BackgroundExecutor,
 ) -> Result<Option<PathBuf>> {
-    let running_app_filename = running_app_path
-        .file_name()
-        .with_context(|| format!("invalid running app path {running_app_path:?}"))?;
-
-    let mount_path = temp_dir.path().join("Fanta");
-    let mut mounted_app_path: OsString = mount_path.join(running_app_filename).into();
-
-    mounted_app_path.push("/");
     let mut cmd = new_command("hdiutil");
-    cmd.args(["attach", "-nobrowse"])
+    cmd.args(["attach", "-nobrowse", "-noautoopen", "-plist"])
         .arg(&downloaded_dmg)
         .arg("-mountroot")
         .arg(temp_dir.path());
@@ -1160,6 +1222,9 @@ async fn install_release_macos(
         "failed to mount: {:?}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // Wherever the image actually mounted (its volume name is the DMG's, not ours to assume).
+    let mount_path = dmg_mount_point(&String::from_utf8_lossy(&output.stdout))
+        .context("the update's disk image mounted nowhere")?;
 
     // Create an MacOsUnmounter that will be dropped (and thus unmount the disk) when this function exits
     let _unmounter = MacOsUnmounter {
@@ -1167,9 +1232,14 @@ async fn install_release_macos(
         background_executor,
     };
 
+    let new_app = app_bundle_in(&mount_path).await?;
+    verify::check_macos_code_signature(&new_app, &running_app_path).await?;
+
+    let mut source: OsString = new_app.into();
+    source.push("/");
     let mut cmd = new_command("rsync");
     cmd.args(["-av", "--delete", "--exclude", "Icon?"])
-        .arg(&mounted_app_path)
+        .arg(&source)
         .arg(&running_app_path);
     let output = cmd
         .output()
@@ -1183,6 +1253,37 @@ async fn install_release_macos(
     );
 
     Ok(None)
+}
+
+/// The `mount-point` in `hdiutil attach -plist` output.
+fn dmg_mount_point(plist: &str) -> Option<PathBuf> {
+    let mut rest = plist;
+    while let Some(at) = rest.find("<key>mount-point</key>") {
+        rest = &rest[at + "<key>mount-point</key>".len()..];
+        let value = rest.trim_start().strip_prefix("<string>")?;
+        let value = &value[..value.find("</string>")?];
+        if !value.is_empty() {
+            return Some(PathBuf::from(value));
+        }
+    }
+    None
+}
+
+/// The one app bundle at the top of a mounted update image.
+async fn app_bundle_in(mount_path: &Path) -> Result<PathBuf> {
+    let mut apps = Vec::new();
+    let mut entries = smol::fs::read_dir(mount_path).await?;
+    while let Some(entry) = entries.next().await {
+        let path = entry?.path();
+        if path.extension() == Some(OsStr::new("app")) {
+            apps.push(path);
+        }
+    }
+    match apps.as_slice() {
+        [app] => Ok(app.clone()),
+        [] => anyhow::bail!("the update's disk image has no app"),
+        _ => anyhow::bail!("the update's disk image has more than one app"),
+    }
 }
 
 async fn cleanup_windows() -> Result<()> {
@@ -1272,8 +1373,12 @@ mod tests {
     pub(super) struct InstallOverride(pub Rc<dyn Fn(&Path, &AsyncApp) -> Result<Option<PathBuf>>>);
     impl Global for InstallOverride {}
 
+    /// The release key a test's updater checks downloads against.
+    pub(super) struct ReleaseKeyOverride(pub String);
+    impl Global for ReleaseKeyOverride {}
+
     #[gpui::test]
-    fn test_auto_update_defaults_to_false(cx: &mut TestAppContext) {
+    fn test_auto_update_defaults_to_true(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let mut store = SettingsStore::new(cx, &settings::default_settings());
             store
@@ -1283,7 +1388,7 @@ mod tests {
                 .set_user_settings("{}", cx)
                 .expect("Unable to set user settings");
             cx.set_global(store);
-            assert!(!AutoUpdateSetting::get_global(cx).0);
+            assert!(AutoUpdateSetting::get_global(cx).0);
         });
     }
 
@@ -1294,9 +1399,16 @@ mod tests {
         let release_available = Arc::new(AtomicBool::new(false));
 
         let (dmg_tx, dmg_rx) = oneshot::channel::<String>();
+        let (public_key, sign) = verify::test_support::release_key();
+        let signature = sign(
+            &verify::update_asset_name(OS, ARCH),
+            "0.100.1",
+            &verify::test_support::sha256_hex(b"<fake-fanta-update>"),
+        );
 
         cx.update(|cx| {
             settings::init(cx);
+            cx.set_global(ReleaseKeyOverride(public_key));
 
             let current_version = semver::Version::new(0, 100, 0);
             release_channel::init_test(current_version, ReleaseChannel::Stable, cx);
@@ -1307,6 +1419,7 @@ mod tests {
             let fake_client_http = FakeHttpClient::create(move |req| {
                 let release_available = release_available.load(atomic::Ordering::Relaxed);
                 let dmg_rx = dmg_rx.clone();
+                let signature = signature.clone();
                 async move {
                 if req.uri().path() == "/releases/stable/latest/asset" {
                     if release_available {
@@ -1323,6 +1436,8 @@ mod tests {
                         let dmg_rx = dmg_rx.lock().take().unwrap();
                         dmg_rx.await.unwrap().into()
                     }).unwrap());
+                } else if req.uri().path() == "/new-download.sig" {
+                    return Ok(Response::builder().status(200).body(signature.into()).unwrap());
                 }
                 Ok(Response::builder().status(404).body("".into()).unwrap())
                 }
@@ -1394,7 +1509,85 @@ mod tests {
         cx.update(|cx| cx.restart());
         let path = will_restart.await.unwrap().unwrap();
         assert_eq!(path, tmp_dir.path().join("fanta"));
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "<fake-fanta-update>");
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "<fake-fanta-update>"
+        );
+    }
+
+    #[gpui::test]
+    async fn test_auto_update_refuses_a_download_that_fails_verification(cx: &mut TestAppContext) {
+        cx.background_executor.allow_parking();
+        zlog::init_test();
+        let (public_key, sign) = verify::test_support::release_key();
+        // Signed for the real build, but the server hands out different bytes.
+        let signature = sign(
+            &verify::update_asset_name(OS, ARCH),
+            "0.100.1",
+            &verify::test_support::sha256_hex(b"<fake-fanta-update>"),
+        );
+        let release_available = Arc::new(AtomicBool::new(false));
+        let installed = Arc::new(AtomicBool::new(false));
+
+        cx.update(|cx| {
+            settings::init(cx);
+            cx.set_global(ReleaseKeyOverride(public_key));
+            let installed = installed.clone();
+            cx.set_global(InstallOverride(Rc::new(move |_, _| {
+                installed.store(true, atomic::Ordering::SeqCst);
+                Ok(None)
+            })));
+            release_channel::init_test(semver::Version::new(0, 100, 0), ReleaseChannel::Stable, cx);
+            let release_available = release_available.clone();
+            let fake_client_http = FakeHttpClient::create(move |req| {
+                let signature = signature.clone();
+                let version = if release_available.load(atomic::Ordering::SeqCst) {
+                    "0.100.1"
+                } else {
+                    "0.100.0"
+                };
+                async move {
+                    let body = match req.uri().path() {
+                        "/releases/stable/latest/asset" => format!(
+                            r#"{{"version":"{version}","url":"https://test.example/new-download"}}"#
+                        ),
+                        "/new-download" => "<tampered-update>".to_owned(),
+                        "/new-download.sig" => signature,
+                        _ => return Ok(Response::builder().status(404).body("".into()).unwrap()),
+                    };
+                    Ok(Response::builder().status(200).body(body.into()).unwrap())
+                }
+            });
+            let client = Client::new(Arc::new(FakeSystemClock::new()), fake_client_http, cx);
+            crate::init(client, cx);
+        });
+
+        // The automatic check at start finds nothing new. A manual check (which, unlike automatic
+        // ones, reports its errors) then finds 0.100.1 and must refuse the tampered download.
+        let auto_updater = cx.update(|cx| AutoUpdater::get(cx).expect("auto updater should exist"));
+        cx.run_until_parked();
+        release_available.store(true, atomic::Ordering::SeqCst);
+        auto_updater.update(cx, |updater, cx| updater.poll(UpdateCheckType::Manual, cx));
+        let mut status = AutoUpdateStatus::Idle;
+        for _ in 0..10_000 {
+            cx.background_executor.timer(Duration::from_millis(0)).await;
+            cx.run_until_parked();
+            status = auto_updater.read_with(cx, |updater, _| updater.status());
+            if matches!(
+                status,
+                AutoUpdateStatus::Errored { .. } | AutoUpdateStatus::Updated { .. }
+            ) {
+                break;
+            }
+        }
+        let AutoUpdateStatus::Errored { error } = status else {
+            panic!("a tampered download must not install, got {status:?}");
+        };
+        assert!(
+            format!("{error:#}").contains("could not be verified"),
+            "{error:#}"
+        );
+        assert!(!installed.load(atomic::Ordering::SeqCst));
     }
 
     #[gpui::test]
@@ -1423,6 +1616,8 @@ mod tests {
         let release = ReleaseAsset {
             version: "1.0.0".to_string(),
             url: "https://test.example/download".to_string(),
+            sha256: None,
+            signature: None,
         };
 
         let reported = Rc::new(std::cell::RefCell::new(Vec::<f32>::new()));
@@ -1483,6 +1678,8 @@ mod tests {
         let release = ReleaseAsset {
             version: "1.0.0".to_string(),
             url: "https://test.example/download".to_string(),
+            sha256: None,
+            signature: None,
         };
 
         let reported = Rc::new(std::cell::RefCell::new(Vec::<Option<f32>>::new()));
@@ -1503,6 +1700,57 @@ mod tests {
 
         let downloaded_len = std::fs::metadata(&target_path).unwrap().len();
         assert_eq!(downloaded_len, content_length as u64);
+    }
+
+    #[test]
+    fn test_prerelease_versions_order_and_build_metadata_does_not() {
+        let newer = |installed: &str, fetched: &str| {
+            AutoUpdater::check_if_fetched_version_is_newer_non_nightly(
+                installed.parse().unwrap(),
+                fetched.parse().unwrap(),
+            )
+            .is_some()
+        };
+        assert!(newer("1.1.0-beta.1", "1.1.0-beta.2"));
+        assert!(newer("1.1.0-beta.2", "1.1.0"));
+        assert!(newer("1.0.0+stable.42.abc", "1.1.0"));
+        assert!(!newer("1.1.0", "1.1.0-beta.9"));
+        assert!(!newer("1.1.0+stable.1.abc", "1.1.0+stable.2.def"));
+    }
+
+    #[test]
+    fn test_dmg_mount_point_is_read_from_hdiutil() {
+        let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict><key>system-entities</key><array>
+<dict><key>content-hint</key><string>GUID_partition_scheme</string><key>dev-entry</key><string>/dev/disk9</string></dict>
+<dict><key>content-hint</key><string>Apple_HFS</string><key>dev-entry</key><string>/dev/disk9s1</string>
+<key>mount-point</key>
+<string>/private/var/folders/x/T/.tmpAbc/Fanta 1.1.0</string></dict>
+</array></dict></plist>"#;
+        assert_eq!(
+            dmg_mount_point(plist),
+            Some(PathBuf::from(
+                "/private/var/folders/x/T/.tmpAbc/Fanta 1.1.0"
+            ))
+        );
+        assert_eq!(dmg_mount_point("<plist><dict></dict></plist>"), None);
+    }
+
+    #[test]
+    fn test_the_update_image_must_hold_exactly_one_app() {
+        let dir = tempdir().unwrap();
+        smol::block_on(async {
+            assert!(app_bundle_in(dir.path()).await.is_err());
+            std::fs::create_dir(dir.path().join("Fanta.app")).unwrap();
+            std::fs::create_dir(dir.path().join(".background")).unwrap();
+            std::fs::write(dir.path().join("Applications"), b"").unwrap();
+            assert_eq!(
+                app_bundle_in(dir.path()).await.unwrap(),
+                dir.path().join("Fanta.app")
+            );
+            std::fs::create_dir(dir.path().join("Other.app")).unwrap();
+            assert!(app_bundle_in(dir.path()).await.is_err());
+        });
     }
 
     #[test]
