@@ -178,6 +178,7 @@ impl AutoUpdateStatus {
 pub struct AutoUpdater {
     status: AutoUpdateStatus,
     current_version: Version,
+    up_to_date: bool,
     client: Arc<Client>,
     pending_poll: Option<Task<Option<()>>>,
     quit_subscription: Option<gpui::Subscription>,
@@ -455,6 +456,7 @@ impl AutoUpdater {
         Self {
             status: AutoUpdateStatus::Idle,
             current_version,
+            up_to_date: false,
             client,
             pending_poll: None,
             quit_subscription,
@@ -503,6 +505,7 @@ impl AutoUpdater {
             return;
         }
         self.update_check_type = check_type;
+        self.up_to_date = false;
 
         cx.notify();
 
@@ -510,10 +513,11 @@ impl AutoUpdater {
             let result = Self::update(this.upgrade()?, cx).await;
             this.update(cx, |this, cx| {
                 this.pending_poll = None;
+                this.up_to_date = result.is_ok() && matches!(this.status, AutoUpdateStatus::Idle);
                 if let Err(error) = result {
                     let is_missing_dependency =
                         error.downcast_ref::<MissingDependencyError>().is_some();
-                    this.status = match check_type {
+                    this.status = match this.update_check_type {
                         UpdateCheckType::Automatic if is_missing_dependency => {
                             log::warn!("auto-update: {}", error);
                             AutoUpdateStatus::Errored {
@@ -532,12 +536,15 @@ impl AutoUpdater {
                             }
                         }
                     };
-
-                    cx.notify();
                 }
+                cx.notify();
             })
             .ok()
         }));
+    }
+
+    pub fn is_up_to_date(&self) -> bool {
+        self.up_to_date
     }
 
     pub fn current_version(&self) -> Version {
@@ -562,6 +569,7 @@ impl AutoUpdater {
             return false;
         }
         self.status = AutoUpdateStatus::Idle;
+        self.up_to_date = false;
         cx.notify();
         true
     }
@@ -1390,6 +1398,76 @@ mod tests {
             cx.set_global(store);
             assert!(AutoUpdateSetting::get_global(cx).0);
         });
+    }
+
+    #[gpui::test]
+    fn test_up_to_date_requires_a_successful_completed_check(cx: &mut TestAppContext) {
+        cx.background_executor.allow_parking();
+        let fail_request = Arc::new(AtomicBool::new(false));
+        let updater = cx.update(|cx| {
+            settings::init(cx);
+            release_channel::init_test(Version::new(2, 0, 0), ReleaseChannel::Stable, cx);
+            let fail_request = fail_request.clone();
+            let http_client = FakeHttpClient::create(move |_| {
+                let fail_request = fail_request.load(atomic::Ordering::SeqCst);
+                async move {
+                    if fail_request {
+                        anyhow::bail!("offline");
+                    }
+                    Ok(Response::builder()
+                        .status(200)
+                        .body(
+                            r#"{"version":"2.0.0","url":"https://test.example/Fanta.dmg"}"#.into(),
+                        )
+                        .expect("release response"))
+                }
+            });
+            let client = Client::new(Arc::new(FakeSystemClock::new()), http_client, cx);
+            cx.new(|cx| AutoUpdater::new(Version::new(2, 0, 0), client, cx))
+        });
+        assert!(!updater.read_with(cx, |updater, _| updater.is_up_to_date()));
+        updater.update(cx, |updater, cx| {
+            updater.poll(UpdateCheckType::Automatic, cx)
+        });
+        assert!(!updater.read_with(cx, |updater, _| updater.is_up_to_date()));
+        cx.run_until_parked();
+        assert!(updater.read_with(cx, |updater, _| updater.is_up_to_date()));
+        fail_request.store(true, atomic::Ordering::SeqCst);
+        updater.update(cx, |updater, cx| {
+            updater.poll(UpdateCheckType::Automatic, cx)
+        });
+        assert!(!updater.read_with(cx, |updater, _| updater.is_up_to_date()));
+        cx.run_until_parked();
+        updater.read_with(cx, |updater, _| {
+            assert_eq!(updater.status(), AutoUpdateStatus::Idle);
+            assert!(
+                !updater.is_up_to_date(),
+                "a failed automatic request is not an up-to-date result"
+            );
+        });
+        updater.update(cx, |updater, cx| updater.poll(UpdateCheckType::Manual, cx));
+        cx.run_until_parked();
+        updater.update(cx, |updater, cx| {
+            assert!(matches!(updater.status(), AutoUpdateStatus::Errored { .. }));
+            assert!(!updater.is_up_to_date());
+            assert!(updater.dismiss(cx));
+            assert!(
+                !updater.is_up_to_date(),
+                "dismissing an error does not complete a check"
+            );
+        });
+        updater.update(cx, |updater, cx| {
+            updater.poll(UpdateCheckType::Automatic, cx);
+            updater.poll(UpdateCheckType::Manual, cx);
+        });
+        cx.run_until_parked();
+        assert!(
+            updater.read_with(cx, |updater, _| matches!(
+                updater.status(),
+                AutoUpdateStatus::Errored { .. }
+            )),
+            "a manual check during an automatic request must surface its error"
+        );
     }
 
     #[gpui::test]

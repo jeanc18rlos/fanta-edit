@@ -1457,7 +1457,6 @@ fn stdout_is_a_pty() -> bool {
 /// is a silent no-op until that call installs the global.
 fn hide_unshipped_actions_from_command_palette(cx: &mut App) {
     const HIDDEN_NAMESPACES: &[&str] = &[
-        "auto_update",
         "call",
         "channel",
         "chat_panel",

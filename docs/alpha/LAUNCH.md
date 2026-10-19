@@ -235,7 +235,7 @@ Clone/push/fetch/pull regressions also passed against the packaged Git. This
 does not replace Developer ID signing, notarization, or a clean-Mac installer
 check.
 
-From 1.1.0, Developer ID builds update in place, like Claude's and Codex's
+From 2.0.0, Developer ID builds update in place, like Claude's and Codex's
 desktop apps. They check the release feed every hour, download the new DMG in
 the background, and install it only if two checks pass:
 - `crates/auto_update/src/verify.rs` finds the release key's signature over
@@ -244,7 +244,7 @@ the background, and install it only if two checks pass:
   Apple team.
 
 The title bar then offers **Restart to Update**. The 1.0.0 alpha was built with
-updates disabled, so its users install 1.1.0 from the DMG once.
+updates disabled, so its users install 2.0.0 from the DMG once.
 
 The installer's mount point is now read from `hdiutil`, pre-release versions
 compare correctly, and release builds compile in the channel `script/bundle-mac`
@@ -263,7 +263,7 @@ Silicon workflow has no verified SSH remote-server artifact.
 Tag builds fail until the key is in place.
 
 **Each release:**
-1. Push the `v*` tag.
+1. Push the full-release tag `v2.0.0` (no hyphen or prerelease suffix).
 2. Check the draft. It carries `Fanta-aarch64.dmg`, `Fanta-aarch64.dmg.sig` and
    `SHA256SUMS.txt`.
 3. Publish it as a full release, not a pre-release. The backend's feed

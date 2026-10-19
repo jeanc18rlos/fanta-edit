@@ -5,6 +5,15 @@
 > in-app purchase flow were removed from the app on 2026-10-19. Nothing below
 > describes current behaviour.
 
+## Current billing
+
+Fanta v2 uses web billing through Polar. The RevenueCat crate, native bridge,
+release secret wiring and purchase stub have been removed. The retained
+`mac_app_store` feature and Apple billing display support backend-reported Apple
+subscriptions; they do not initialize RevenueCat or perform native purchases.
+Use the [current account workflow](../fanta/capabilities.md#accounts-models-and-connected-tools)
+for billing configuration. The dated App Store work below is historical.
+
 Status on 25 September 2026: the App Store build path and RevenueCat integration
 are implemented locally. The Apple app record and purchase products are created.
 The Paid Apps Agreement, bank account, and tax forms show Active in App Store

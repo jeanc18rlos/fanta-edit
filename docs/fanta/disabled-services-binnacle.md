@@ -15,7 +15,7 @@ release process, and user-facing disclosure.
 | --- | --- | --- | --- |
 | Telemetry metrics | `"metrics": false` | Fanta does not yet own analytics ingestion, retention, dashboards, or privacy language. | Fanta has an analytics endpoint, schema validation, retention policy, opt-out UX, and docs. |
 | Diagnostics and crash upload | `"diagnostics": false` | Crash reports can contain sensitive metadata and need Fanta-owned handling. | Fanta has crash ingestion, symbolication, retention rules, alerting, and disclosure. |
-| Auto-update | `"auto_update": false` | The updater expects trusted signed artifacts and release metadata owned by the product. | Fanta has signed builds, update assets, checksums/signatures, release notes, and rollback steps. |
+| Auto-update | `"auto_update": true` for v2 direct-distribution builds | Downloads require a trusted release signature and matching Apple signing team. | Configure the release public key and secrets, publish a full signed release, and verify the backend feed and end-to-end installation. |
 | Hosted server URL | `"server_url": "https://api.fantaisa.net"` | Account, docs, release, collaboration, telemetry, and cloud routes must not target inherited upstream hosts by default. | `api.fantaisa.net` has compatible routes, or cloud-dependent features are gated. |
 | Managed model provider | New threads default to `Fanta`; account-backed catalog and requests use Fanta endpoints. Explicitly configured providers remain available. | The inherited hosted-provider default was removed; the earlier Anthropic default is historical. | Live model execution, pricing, quotas and recovery need their own acceptance; a populated catalog is insufficient. |
 | Realtime cloud updates | `"cloud_updates_enabled": false` | The account API does not expose the inherited realtime update socket. | Fanta has a compatible realtime service and validated failure/recovery behavior. |
@@ -37,8 +37,7 @@ and configured HTTP MCP are not disabled by the realtime-cloud setting. See the
   - Default `server_url` changed from the inherited upstream host to `https://api.fantaisa.net`.
   - The inherited hosted language model provider entry was removed.
 - [crates/auto_update/src/auto_update.rs](../../crates/auto_update/src/auto_update.rs)
-  - Auto-update default documentation now describes Fanta's disabled baseline.
-  - The default-setting test now expects auto-update to be disabled.
+  - V2 supersedes the disabled baseline with signed updates enabled by default for direct distribution. Mac App Store builds use store-managed updates.
 
 ## Self-Hosting Binnacle
 
@@ -130,6 +129,19 @@ Verification:
 
 ## 4. Auto-Update And Release Assets
 
+V2 implements signed in-place macOS updates. General settings exposes automatic
+updates, live download/install status, Check now and Restart to update; the app
+menu and About window expose manual checks. Initial status does not claim that
+a check has completed. The title bar offers restart after installation.
+
+Release setup remains required: generate the release signing key with
+`script/update-signing-key`, commit the public key, configure the private key
+and notarization secrets, and publish `v2.0.0` as a full release. The backend
+must serve the stable asset feed, with the GitHub fallback configured for
+`jeanc18rlos/fanta-edit`. The updater refuses untrusted downloads. See the
+[release steps](../alpha/LAUNCH.md) for setup and publication.
+
+
 Minimum resources:
 
 - Signed app artifacts.
@@ -151,7 +163,7 @@ Recommended rollout:
 2. Produce signed private builds.
 3. Add a private update channel.
 4. Exercise update, rollback, and failed-download paths.
-5. Enable auto-update by default only after the private channel is boring.
+5. Verify the enabled v2 default against the signed stable feed before publication.
 
 ## 5. Model Gateway Or Bring-Your-Own-Key
 

@@ -1,6 +1,5 @@
+use auto_update::{AutoUpdateStatus, AutoUpdater};
 use client::{Client, ClientSettings, TelemetrySettings};
-#[cfg(feature = "mac_app_store")]
-use fanta_gpui::settings::SettingsTone;
 use fanta_gpui::{
     billing::{
         BillingAction, BillingActionState, BillingActions, BillingLoadState, BillingUsageRange,
@@ -9,7 +8,7 @@ use fanta_gpui::{
     settings::{
         SETTINGS_SCREEN_MIN_HEIGHT, SETTINGS_SCREEN_MIN_WIDTH, SettingsAccountSummary,
         SettingsAction, SettingsChoice, SettingsControl, SettingsGroup, SettingsItem, SettingsPage,
-        SettingsPageData, SettingsScreen, SettingsViewData,
+        SettingsPageData, SettingsScreen, SettingsTone, SettingsViewData,
     },
 };
 use fs::Fs;
@@ -186,7 +185,119 @@ fn app_access_settings_group() -> SettingsGroup {
     .description("How macOS controls Fanta's access to files, saved sign-in, and the network.")
 }
 
-fn preference_pages(cx: &App, host_workspace: Option<&Entity<Workspace>>) -> Vec<SettingsPageData> {
+pub(super) fn update_status_text(status: &AutoUpdateStatus, checked: bool) -> SharedString {
+    match status {
+        AutoUpdateStatus::Idle if !checked => "Ready to check for updates".into(),
+        AutoUpdateStatus::Idle => {
+            format!("Fanta {} is up to date", env!("CARGO_PKG_VERSION")).into()
+        }
+        AutoUpdateStatus::Checking => "Checking for updates…".into(),
+        AutoUpdateStatus::Downloading { version, progress } => match progress {
+            Some(progress) => format!(
+                "Downloading {version} ({:.0}%)",
+                progress.clamp(0.0, 1.0) * 100.0
+            )
+            .into(),
+            None => format!("Downloading {version}…").into(),
+        },
+        AutoUpdateStatus::Installing { version } => format!("Installing {version}…").into(),
+        AutoUpdateStatus::Updated { version } => {
+            format!("Restart to update to Fanta {version}").into()
+        }
+        AutoUpdateStatus::Errored { error } => format!("Could not update Fanta: {error:#}").into(),
+    }
+}
+
+pub(super) fn update_unavailable_reason(cx: &App) -> Option<SharedString> {
+    if let Some(explanation) = option_env!("FANTA_UPDATE_EXPLANATION")
+        .map(str::to_owned)
+        .or_else(|| std::env::var("FANTA_UPDATE_EXPLANATION").ok())
+    {
+        return Some(explanation.into());
+    }
+    release_channel::ReleaseChannel::try_global(cx)
+        .filter(|channel| !channel.poll_for_updates())
+        .map(|_| "This development build does not check for updates.".into())
+}
+
+fn updates_settings_group(cx: &mut App) -> SettingsGroup {
+    if let Some(reason) = update_unavailable_reason(cx) {
+        return SettingsGroup::new(
+            "Updates",
+            vec![SettingsItem::new(
+                "update_status",
+                "Update status",
+                reason,
+                SettingsControl::Status {
+                    label: "Managed separately".into(),
+                    tone: SettingsTone::Neutral,
+                },
+            )],
+        );
+    }
+    let updater = AutoUpdater::get(cx);
+    let status = updater.as_ref().map(|updater| updater.read(cx).status());
+    let checked = updater
+        .as_ref()
+        .is_some_and(|updater| updater.read(cx).is_up_to_date());
+    let enabled = cx
+        .global::<SettingsStore>()
+        .merged_settings()
+        .auto_update
+        .unwrap_or(true);
+    let status_text = status
+        .as_ref()
+        .map(|status| update_status_text(status, checked))
+        .unwrap_or_else(|| "Update status unavailable".into());
+    let (label, tone) = match status.as_ref() {
+        Some(AutoUpdateStatus::Idle) if checked => ("Up to date", SettingsTone::Neutral),
+        Some(AutoUpdateStatus::Idle) => ("Ready to check", SettingsTone::Neutral),
+        Some(AutoUpdateStatus::Checking) => ("Checking", SettingsTone::Neutral),
+        Some(AutoUpdateStatus::Downloading { .. }) => ("Downloading", SettingsTone::Accent),
+        Some(AutoUpdateStatus::Installing { .. }) => ("Installing", SettingsTone::Accent),
+        Some(AutoUpdateStatus::Updated { .. }) => ("Restart required", SettingsTone::Success),
+        Some(AutoUpdateStatus::Errored { .. }) => ("Update failed", SettingsTone::Danger),
+        None => ("Unavailable", SettingsTone::Neutral),
+    };
+    let mut items = vec![
+        toggle(
+            "auto_update",
+            "Automatic updates",
+            "Check for and download new Fanta versions automatically.",
+            enabled,
+        ),
+        SettingsItem::new(
+            "update_status",
+            "Update status",
+            status_text,
+            SettingsControl::Status {
+                label: label.into(),
+                tone,
+            },
+        ),
+        action(
+            "check_updates",
+            "Check for updates",
+            "Look for the latest version of Fanta.",
+            "Check now",
+        ),
+    ];
+    if status.as_ref().is_some_and(AutoUpdateStatus::is_updated) {
+        items.push(action(
+            "restart_to_update",
+            "Install downloaded update",
+            "Restart Fanta to use the new version.",
+            "Restart to update",
+        ));
+    }
+    SettingsGroup::new("Updates", items)
+}
+
+fn preference_pages(
+    cx: &mut App,
+    host_workspace: Option<&Entity<Workspace>>,
+) -> Vec<SettingsPageData> {
+    let updates = updates_settings_group(cx);
     let workspace = WorkspaceSettings::get_global(cx);
     let editor = editor::EditorSettings::get_global(cx);
     let theme = ThemeSettings::get_global(cx);
@@ -236,41 +347,44 @@ fn preference_pages(cx: &App, host_workspace: Option<&Entity<Workspace>>) -> Vec
     vec![
         SettingsPageData::new(
             SettingsPage::General,
-            vec![SettingsGroup::new(
-                "Startup & files",
-                vec![
-                    choice(
-                        "restore_on_startup",
-                        "On launch",
-                        "Choose what Fanta opens on launch.",
-                        startup,
-                        &[
-                            ("last_session", "Last session"),
-                            ("last_workspace", "Last workspace"),
-                            ("empty_tab", "Empty tab"),
-                            ("launchpad", "Welcome"),
-                        ],
-                    ),
-                    toggle(
-                        "autosave",
-                        "Autosave",
-                        "Save edited files when focus moves away.",
-                        !matches!(workspace.autosave, AutosaveSetting::Off),
-                    ),
-                    toggle(
-                        "confirm_quit",
-                        "Confirm before quitting",
-                        "Ask before closing Fanta.",
-                        workspace.confirm_quit,
-                    ),
-                    toggle(
-                        "native_dialogs",
-                        "Use system file dialogs",
-                        "Use native Open and Save dialogs.",
-                        workspace.use_system_path_prompts,
-                    ),
-                ],
-            )],
+            vec![
+                SettingsGroup::new(
+                    "Startup & files",
+                    vec![
+                        choice(
+                            "restore_on_startup",
+                            "On launch",
+                            "Choose what Fanta opens on launch.",
+                            startup,
+                            &[
+                                ("last_session", "Last session"),
+                                ("last_workspace", "Last workspace"),
+                                ("empty_tab", "Empty tab"),
+                                ("launchpad", "Welcome"),
+                            ],
+                        ),
+                        toggle(
+                            "autosave",
+                            "Autosave",
+                            "Save edited files when focus moves away.",
+                            !matches!(workspace.autosave, AutosaveSetting::Off),
+                        ),
+                        toggle(
+                            "confirm_quit",
+                            "Confirm before quitting",
+                            "Ask before closing Fanta.",
+                            workspace.confirm_quit,
+                        ),
+                        toggle(
+                            "native_dialogs",
+                            "Use system file dialogs",
+                            "Use native Open and Save dialogs.",
+                            workspace.use_system_path_prompts,
+                        ),
+                    ],
+                ),
+                updates,
+            ],
         ),
         SettingsPageData::new(
             SettingsPage::Appearance,
@@ -533,6 +647,7 @@ fn apply_toggle_setting(settings: &mut SettingsContent, id: &str, value: bool) -
                 AutosaveSetting::Off
             });
         }
+        "auto_update" => settings.auto_update = Some(value),
         "confirm_quit" => settings.workspace.confirm_quit = Some(value),
         "native_dialogs" => settings.workspace.use_system_path_prompts = Some(value),
         "cursor_blink" => settings.editor.cursor_blink = Some(value),
@@ -694,7 +809,7 @@ impl SettingsWindow {
             notice: None,
         };
         let screen = cx.new(|cx| SettingsScreen::new("fanta-settings", data.clone(), window, cx));
-        let subscriptions = vec![
+        let mut subscriptions = vec![
             cx.subscribe_in(
                 &screen,
                 window,
@@ -704,6 +819,9 @@ impl SettingsWindow {
             ),
             cx.observe_global::<SettingsStore>(|this, cx| this.refresh_local(cx)),
         ];
+        if let Some(updater) = AutoUpdater::get(cx) {
+            subscriptions.push(cx.observe(&updater, |this, _, cx| this.refresh_local(cx)));
+        }
         let server_subscription = workspace.upgrade().map(|workspace| {
             let server_store = workspace.read(cx).project().read(cx).context_server_store();
             cx.subscribe(
@@ -965,6 +1083,7 @@ impl SettingsWindow {
         if !matches!(
             id.as_ref(),
             "autosave"
+                | "auto_update"
                 | "confirm_quit"
                 | "native_dialogs"
                 | "cursor_blink"
@@ -1051,12 +1170,14 @@ impl SettingsWindow {
         }
     }
 
-    fn handle_action_request(&mut self, id: &str, cx: &mut Context<Self>) {
+    fn handle_action_request(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(url) = legal_document_url(id) {
             cx.open_url(url);
             return;
         }
         match id {
+            "check_updates" => auto_update::check(&auto_update::Check, window, cx),
+            "restart_to_update" => workspace::reload(cx),
             "settings_json" | "configure_providers" => {
                 self.dispatch_to_workspace(Box::new(fanta_actions::OpenSettingsFile), cx)
             }
@@ -1073,7 +1194,9 @@ impl SettingsWindow {
             "inspector" => {
                 self.dispatch_to_workspace(Box::new(fig_viewer::ToggleInspectorSidebar), cx)
             }
-            "files" => self.dispatch_to_workspace(Box::new(fanta_actions::project_panel::Toggle), cx),
+            "files" => {
+                self.dispatch_to_workspace(Box::new(fanta_actions::project_panel::Toggle), cx)
+            }
             "git" => self.dispatch_to_workspace(Box::new(git_ui::git_panel::Toggle), cx),
             "threads" => {
                 self.dispatch_to_workspace(Box::new(workspace::ToggleWorkspaceSidebar), cx)
@@ -1102,7 +1225,7 @@ impl SettingsWindow {
             SettingsAction::PageSelected(page) => self.select_page(page, window, cx),
             SettingsAction::ToggleRequested { id, value } => self.persist_toggle(id, value, cx),
             SettingsAction::ChoiceRequested { id, value } => self.persist_choice(id, value, cx),
-            SettingsAction::ActionRequested { id } => self.handle_action_request(&id, cx),
+            SettingsAction::ActionRequested { id } => self.handle_action_request(&id, window, cx),
             SettingsAction::BillingActionRequested(action) => match action {
                 BillingAction::TabSelected(tab) => {
                     let page = match tab {
@@ -1426,6 +1549,63 @@ mod tests {
                 .all(|item| matches!(&item.control, SettingsControl::Status { .. }))
         );
         assert!(FILES_AND_FOLDERS_SETTINGS_URL.starts_with("x-apple.systempreferences:"));
+    }
+
+    #[test]
+    fn updates_toggle_writes_auto_update_setting() {
+        let mut content = SettingsContent::default();
+        assert!(apply_toggle_setting(&mut content, "auto_update", false));
+        assert_eq!(content.auto_update, Some(false));
+        assert!(apply_toggle_setting(&mut content, "auto_update", true));
+        assert_eq!(content.auto_update, Some(true));
+    }
+
+    #[test]
+    fn update_status_reports_progress_restart_and_errors() {
+        let version = semver::Version::new(2, 0, 1);
+        assert_eq!(
+            update_status_text(&AutoUpdateStatus::Idle, false).as_ref(),
+            "Ready to check for updates"
+        );
+        assert_eq!(
+            update_status_text(&AutoUpdateStatus::Idle, true).as_ref(),
+            concat!("Fanta ", env!("CARGO_PKG_VERSION"), " is up to date")
+        );
+        assert_eq!(
+            update_status_text(
+                &AutoUpdateStatus::Downloading {
+                    version: version.clone(),
+                    progress: Some(0.45),
+                },
+                true
+            )
+            .as_ref(),
+            "Downloading 2.0.1 (45%)"
+        );
+        assert_eq!(
+            update_status_text(
+                &AutoUpdateStatus::Downloading {
+                    version: version.clone(),
+                    progress: None,
+                },
+                true
+            )
+            .as_ref(),
+            "Downloading 2.0.1…"
+        );
+        assert_eq!(
+            update_status_text(&AutoUpdateStatus::Updated { version }, true).as_ref(),
+            "Restart to update to Fanta 2.0.1"
+        );
+        assert!(
+            update_status_text(
+                &AutoUpdateStatus::Errored {
+                    error: std::sync::Arc::new(anyhow::anyhow!("Signature verification failed")),
+                },
+                true
+            )
+            .contains("Signature verification failed")
+        );
     }
 
     #[test]
