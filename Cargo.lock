@@ -4312,6 +4312,7 @@ dependencies = [
  "markdown 0.1.0",
  "migrator",
  "mimalloc",
+ "net",
  "node_runtime",
  "notifications",
  "parking_lot",

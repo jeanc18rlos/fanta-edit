@@ -1,0 +1,69 @@
+name: Windows
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/windows.yml'
+      - '.cargo/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'assets/**'
+      - 'crates/**'
+      - 'vendor/**'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
+  RUST_BACKTRACE: '1'
+
+jobs:
+  windows:
+    name: Build and test on Windows
+    runs-on: windows-2025
+    timeout-minutes: 240
+    steps:
+      # Skia and the Rust target tree nest deeply enough to pass MAX_PATH.
+      - name: Allow long paths
+        run: git config --system core.longpaths true
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.95
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component clippy --component rustfmt
+          rustup override set 1.95.0
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: fanta-windows-rust-1.95
+          cache-on-failure: true
+
+      # --keep-going reports every crate that fails, not just the first.
+      - name: Check the app and command-line tool
+        run: cargo check --locked --keep-going -p fanta -p cli
+
+      - name: Compile the canvas tests
+        if: ${{ !cancelled() }}
+        run: cargo test --locked --no-run -p fig_viewer --lib
+
+      - name: Test the design engine crates
+        if: ${{ !cancelled() }}
+        run: >-
+          cargo test --locked --no-fail-fast --lib
+          -p fanta-doc -p fanta-fnx -p fanta-format -p fanta-canvas -p fanta-tools
+          -p fanta-present -p fanta-render -p fanta-text -p design_surface
