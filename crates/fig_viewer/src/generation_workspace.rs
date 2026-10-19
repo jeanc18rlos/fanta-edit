@@ -14,11 +14,12 @@ use futures::{AsyncReadExt as _, StreamExt as _};
 #[cfg(feature = "mac_app_store")]
 use gpui::Action as _;
 use gpui::{
-    App, AppContext as _, Bounds, Context, DispatchPhase, Entity, EventEmitter, FocusHandle,
-    Focusable, Image, ImageFormat, MouseButton, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    PathPromptOptions, Pixels, Render, SharedString, Subscription, Task, WeakEntity, Window,
-    actions, canvas, img, px,
+    App, AppContext as _, Bounds, Context, Entity, EventEmitter, FocusHandle, Focusable, Image,
+    ImageFormat, MouseButton, ObjectFit, PathPromptOptions, Pixels, Render, SharedString,
+    Subscription, Task, WeakEntity, Window, actions, canvas, img, px,
 };
+#[cfg(target_os = "macos")]
+use gpui::{DispatchPhase, MouseMoveEvent, MouseUpEvent};
 use http_client::{AsyncBody, HttpClient as _, Method, Request};
 #[cfg(target_os = "macos")]
 use rodio::Source as _;
