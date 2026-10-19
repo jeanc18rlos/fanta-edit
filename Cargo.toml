@@ -48,6 +48,7 @@ members = [
     "crates/fanta-present",
     "crates/fanta-render",
     "crates/fanta-runtime",
+    "crates/fanta-site",
     "crates/fanta-text",
     "crates/fanta-tools",
     "crates/fanta_languages",
@@ -259,6 +260,7 @@ fanta-canvas = { path = "crates/fanta-canvas" }
 fanta-present = { path = "crates/fanta-present" }
 fanta-render = { path = "crates/fanta-render" }
 fanta-runtime = { path = "crates/fanta-runtime" }
+fanta-site = { path = "crates/fanta-site" }
 fanta-tools = { path = "crates/fanta-tools" }
 fanta-text = { path = "crates/fanta-text" }
 fs = { path = "crates/fs" }

@@ -5258,6 +5258,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanta-site"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "fanta-doc",
+ "fanta-format",
+ "fanta-runtime",
+ "fanta-text",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.17",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "fanta-text"
 version = "0.1.0"
 dependencies = [
