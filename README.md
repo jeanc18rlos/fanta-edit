@@ -92,19 +92,20 @@ for exact tool names and a bounded first task.
 ## Build from source
 
 ```sh
-cargo run -p zed
+cargo run -p fanta
 ```
 
 The executable is named `fanta`.
 
-- `cargo build -p zed` builds the app.
-- `./script/clippy` runs the repository's lints.
+- `cargo build -p fanta` builds the app.
+- `./script/clippy -p <crate>` runs the repository's lints for a crate; without
+  `-p` it lints the whole workspace in release mode.
 - `./script/bundle-mac` builds a local bundle and emits matching crash symbols.
   A local bundle does not establish acceptance of the public installer.
 - `./script/smoke-mcp <fanta-binary> <project-dir>` exercises the local agent
   bridge against a running application.
 
-The design engine lives in `crates/fanta-*`. Reusable GPUI and Zed UI packages
+The design engine lives in `crates/fanta-*`. Reusable GPUI and Fanta UI packages
 come from [fanta-ui](https://github.com/squidred-dev/fanta-ui). `Cargo.lock` records
 its dependency revisions.
 
@@ -126,6 +127,6 @@ before attaching them. Send private account or billing reports to
 
 ## License
 
-GPL-3.0-or-later. Fanta is a fork of Zed. See `NOTICE.md` and `LICENSE-GPL`.
+GPL-3.0-or-later. See `NOTICE.md` and `LICENSE-GPL`.
 The editor and vendored engine source are in this repository. The GPUI fork and
 reusable components are published from [fanta-ui](https://github.com/squidred-dev/fanta-ui).

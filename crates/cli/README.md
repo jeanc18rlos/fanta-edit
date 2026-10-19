@@ -2,14 +2,14 @@
 
 ## Testing
 
-You can test your changes to the `cli` crate by first building the main zed binary:
+You can test your changes to the `cli` crate by first building the main fanta binary:
 
 ```
-cargo build -p zed
+cargo build -p fanta
 ```
 
 And then building and running the `cli` crate with the following parameters:
 
 ```
- cargo run -p cli -- --zed ./target/debug/fanta.exe
+ cargo run -p cli -- --fanta ./target/debug/fanta.exe
 ```

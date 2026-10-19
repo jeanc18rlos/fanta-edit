@@ -8,7 +8,7 @@
 //! alongside the storage so the sidebar's preview rendering can't drift from
 //! the format we persist.
 
-use agent::ZED_AGENT_ID;
+use agent::FANTA_AGENT_ID;
 use agent_client_protocol::schema::v1 as acp;
 use anyhow::Context as _;
 use db::kvp::KeyValueStore;
@@ -171,7 +171,7 @@ pub fn empty_draft_placeholder_label(
     agent_id: &AgentId,
     cx: &App,
 ) -> SharedString {
-    let agent_name = if agent_id.as_ref() == ZED_AGENT_ID.as_ref() {
+    let agent_name = if agent_id.as_ref() == FANTA_AGENT_ID.as_ref() {
         // The persisted id predates the rebrand; display the Fanta name.
         SharedString::from("Fanta Agent")
     } else {

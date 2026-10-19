@@ -1,9 +1,9 @@
-//! Seeds `gpui_component`'s theme from the active Zed theme so fanta-gpui
+//! Seeds `gpui_component`'s theme from the active Fanta theme so fanta-gpui
 //! panels paint with the application palette, and re-applies whenever
 //! settings change.
 //!
 //! Import discipline: never `use` both `ActiveTheme` traits in one file —
-//! Zed theme access here is fully qualified, gpui_component's stays behind
+//! Fanta theme access here is fully qualified, gpui_component's stays behind
 //! its own types.
 
 use gpui::{App, Hsla};
@@ -17,8 +17,8 @@ pub fn init(cx: &mut App) {
 }
 
 fn apply(cx: &mut App) {
-    let zed = theme::ActiveTheme::theme(cx).clone();
-    let mode = match zed.appearance() {
+    let fanta = theme::ActiveTheme::theme(cx).clone();
+    let mode = match fanta.appearance() {
         theme::Appearance::Dark => ThemeMode::Dark,
         theme::Appearance::Light => ThemeMode::Light,
     };
@@ -26,8 +26,8 @@ fn apply(cx: &mut App) {
     // so anything not mapped below still matches the mode.
     Theme::change(mode, None, cx);
 
-    let colors = zed.colors().clone();
-    let status = zed.status().clone();
+    let colors = fanta.colors().clone();
+    let status = fanta.status().clone();
     let (ui_family, ui_size, mono_family, mono_size) = {
         let settings = theme_settings(cx);
         (

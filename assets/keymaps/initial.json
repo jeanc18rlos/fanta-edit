@@ -5,7 +5,7 @@
 //
 // Reopen this file any time from Fanta > Settings > Open Keymap File.
 //
-// To see the default key bindings run `zed: open default keymap`
+// To see the default key bindings run `fanta: open default keymap`
 // from the command palette.
 [
   {

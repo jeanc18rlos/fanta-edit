@@ -252,6 +252,7 @@ dependencies = [
  "fanta-gpui-ui",
  "fanta-gpui-util",
  "fanta-gpui-zlog",
+ "fanta_env_vars",
  "feature_flags",
  "fs",
  "futures 0.3.32",
@@ -298,7 +299,6 @@ dependencies = [
  "uuid",
  "watch",
  "web_search",
- "zed_env_vars",
  "zstd 0.11.2+zstd.1.5.2",
 ]
 
@@ -371,6 +371,7 @@ dependencies = [
  "fanta-gpui-reqwest-client",
  "fanta-gpui-ui",
  "fanta-gpui-util",
+ "fanta_credentials_provider",
  "feature_flags",
  "fs",
  "futures 0.3.32",
@@ -392,7 +393,6 @@ dependencies = [
  "thiserror 2.0.17",
  "uuid",
  "watch",
- "zed_credentials_provider",
 ]
 
 [[package]]
@@ -476,6 +476,7 @@ dependencies = [
  "fanta-gpui-ui",
  "fanta-gpui-ui-input",
  "fanta-gpui-util",
+ "fanta_actions",
  "feature_flags",
  "fs",
  "futures 0.3.32",
@@ -540,7 +541,6 @@ dependencies = [
  "vim",
  "watch",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -576,11 +576,11 @@ dependencies = [
  "fanta-gpui-component",
  "fanta-gpui-core",
  "fanta-gpui-ui",
+ "fanta_actions",
  "language_model",
  "serde",
  "smallvec",
  "telemetry",
- "zed_actions",
 ]
 
 [[package]]
@@ -2166,6 +2166,7 @@ dependencies = [
  "fanta-gpui-http-client-tls",
  "fanta-gpui-smol",
  "fanta-gpui-util",
+ "fanta_credentials_provider",
  "feature_flags",
  "fs",
  "futures 0.3.32",
@@ -2199,7 +2200,6 @@ dependencies = [
  "url",
  "windows 0.61.3",
  "worktree",
- "zed_credentials_provider",
 ]
 
 [[package]]
@@ -2392,6 +2392,7 @@ dependencies = [
  "fanta-gpui-theme",
  "fanta-gpui-ui",
  "fanta-gpui-util",
+ "fanta_actions",
  "fuzzy_nucleo",
  "go_to_line",
  "language",
@@ -2405,7 +2406,6 @@ dependencies = [
  "theme_settings",
  "time",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -3352,6 +3352,7 @@ dependencies = [
  "anyhow",
  "fanta-gpui-core",
  "fanta-gpui-util",
+ "fanta_env_vars",
  "indoc",
  "inventory",
  "log",
@@ -3361,7 +3362,6 @@ dependencies = [
  "sqlez_macros",
  "tempfile",
  "uuid",
- "zed_env_vars",
 ]
 
 [[package]]
@@ -3770,6 +3770,7 @@ dependencies = [
  "fanta-gpui-util",
  "fanta-gpui-zlog",
  "fanta-gpui-ztracing",
+ "fanta_actions",
  "feature_flags",
  "fs",
  "futures 0.3.32",
@@ -3825,7 +3826,6 @@ dependencies = [
  "uuid",
  "vim_mode_setting",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -4239,6 +4239,125 @@ dependencies = [
  "bit-set 0.8.0",
  "regex-automata",
  "regex-syntax",
+]
+
+[[package]]
+name = "fanta"
+version = "1.0.0"
+dependencies = [
+ "acp_tools",
+ "agent",
+ "agent_settings",
+ "agent_ui",
+ "anyhow",
+ "ashpd",
+ "askpass",
+ "assets",
+ "audio",
+ "auto_update",
+ "breadcrumbs",
+ "channel",
+ "chrono",
+ "clap",
+ "cli",
+ "client",
+ "command_palette",
+ "command_palette_hooks",
+ "context_server",
+ "crashes",
+ "db",
+ "editor",
+ "etw_tracing",
+ "fanta-gpui",
+ "fanta-gpui-collections",
+ "fanta-gpui-component",
+ "fanta-gpui-components",
+ "fanta-gpui-core",
+ "fanta-gpui-gpui-platform",
+ "fanta-gpui-gpui-tokio",
+ "fanta-gpui-http-client",
+ "fanta-gpui-menu",
+ "fanta-gpui-reqwest-client",
+ "fanta-gpui-smol",
+ "fanta-gpui-theme",
+ "fanta-gpui-ui",
+ "fanta-gpui-util",
+ "fanta-gpui-zlog",
+ "fanta-gpui-ztracing",
+ "fanta_actions",
+ "fanta_env_vars",
+ "fanta_languages",
+ "feature_flags",
+ "fig_viewer",
+ "fs",
+ "futures 0.3.32",
+ "git",
+ "git_hosting_providers",
+ "git_ui",
+ "hdrhistogram",
+ "image",
+ "image_viewer",
+ "input_latency_ui",
+ "install_cli",
+ "itertools 0.14.0",
+ "language",
+ "language_model",
+ "language_models",
+ "libc",
+ "log",
+ "markdown 0.1.0",
+ "migrator",
+ "mimalloc",
+ "node_runtime",
+ "notifications",
+ "parking_lot",
+ "paths",
+ "pkg-config",
+ "profiling",
+ "project",
+ "project_panel",
+ "prompt_store",
+ "proto",
+ "rayon",
+ "recent_projects",
+ "release_channel",
+ "remote",
+ "rope",
+ "sandbox",
+ "search",
+ "semver",
+ "serde",
+ "serde_json",
+ "session",
+ "settings",
+ "shellexpand",
+ "sidebar",
+ "snippet_provider",
+ "sysinfo 0.37.2",
+ "system_specs",
+ "task",
+ "telemetry",
+ "telemetry_events",
+ "terminal_view",
+ "theme_selector",
+ "theme_settings",
+ "time",
+ "time_format",
+ "title_bar",
+ "tracing",
+ "ui_prompt",
+ "url",
+ "urlencoding",
+ "uuid",
+ "vim_mode_setting",
+ "watch",
+ "web_search",
+ "web_search_providers",
+ "windows 0.61.3",
+ "windows_resources",
+ "workspace",
+ "zed-reqwest",
+ "zlog_settings",
 ]
 
 [[package]]
@@ -5166,6 +5285,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanta_actions"
+version = "0.1.0"
+dependencies = [
+ "fanta-gpui-core",
+ "fanta-gpui-util",
+ "schemars 1.0.4",
+ "serde",
+]
+
+[[package]]
+name = "fanta_credentials_provider"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "credentials_provider",
+ "fanta-gpui-core",
+ "fanta_env_vars",
+ "futures 0.3.32",
+ "paths",
+ "release_channel",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "fanta_env_vars"
+version = "0.1.0"
+dependencies = [
+ "env_var",
+]
+
+[[package]]
 name = "fanta_languages"
 version = "0.1.0"
 dependencies = [
@@ -5315,6 +5466,7 @@ dependencies = [
  "fanta-render",
  "fanta-text",
  "fanta-tools",
+ "fanta_actions",
  "fanta_ui",
  "foreign-types 0.5.0",
  "fs",
@@ -5346,7 +5498,6 @@ dependencies = [
  "uuid",
  "workspace",
  "worktree",
- "zed_actions",
 ]
 
 [[package]]
@@ -5999,6 +6150,7 @@ dependencies = [
  "fanta-gpui-util",
  "fanta-gpui-zlog",
  "fanta-gpui-ztracing",
+ "fanta_actions",
  "fs",
  "futures 0.3.32",
  "futures-lite 1.13.0",
@@ -6042,7 +6194,6 @@ dependencies = [
  "watch",
  "windows 0.61.3",
  "workspace",
- "zed_actions",
  "zeroize",
 ]
 
@@ -7690,6 +7841,7 @@ dependencies = [
  "fanta-gpui-ui",
  "fanta-gpui-ui-input",
  "fanta-gpui-util",
+ "fanta_actions",
  "feature_flags",
  "fs",
  "futures 0.3.32",
@@ -7700,7 +7852,6 @@ dependencies = [
  "serde_json",
  "settings",
  "strum 0.27.2",
- "zed_actions",
 ]
 
 [[package]]
@@ -8267,6 +8418,7 @@ dependencies = [
  "fanta-gpui-theme",
  "fanta-gpui-ui",
  "fanta-gpui-util",
+ "fanta_actions",
  "fs",
  "language",
  "log",
@@ -8278,7 +8430,6 @@ dependencies = [
  "theme_settings",
  "urlencoding",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -8905,11 +9056,11 @@ dependencies = [
  "fanta-gpui-sum-tree",
  "fanta-gpui-ui",
  "fanta-gpui-util",
+ "fanta_actions",
  "futures-lite 1.13.0",
  "rpc",
  "time",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -9705,6 +9856,7 @@ dependencies = [
  "fanta-gpui-theme",
  "fanta-gpui-ui",
  "fanta-gpui-util",
+ "fanta_actions",
  "futures 0.3.32",
  "fuzzy_nucleo",
  "indoc",
@@ -9717,7 +9869,6 @@ dependencies = [
  "settings",
  "theme_settings",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -9735,6 +9886,7 @@ dependencies = [
  "fanta-gpui-theme",
  "fanta-gpui-ui",
  "fanta-gpui-util",
+ "fanta_actions",
  "futures 0.3.32",
  "fuzzy",
  "itertools 0.14.0",
@@ -9752,7 +9904,6 @@ dependencies = [
  "theme_settings",
  "workspace",
  "worktree",
- "zed_actions",
 ]
 
 [[package]]
@@ -10567,6 +10718,7 @@ dependencies = [
  "fanta-gpui-ui",
  "fanta-gpui-ui-input",
  "fanta-gpui-util",
+ "fanta_actions",
  "language",
  "project",
  "schemars 1.0.4",
@@ -10575,7 +10727,6 @@ dependencies = [
  "settings",
  "theme_settings",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -10683,13 +10834,13 @@ dependencies = [
  "fanta-gpui-core",
  "fanta-gpui-theme",
  "fanta-gpui-ui",
+ "fanta_actions",
  "project",
  "settings",
  "smallvec",
  "theme_settings",
  "windows 0.61.3",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -11051,6 +11202,7 @@ dependencies = [
  "fanta-gpui-util",
  "fanta-gpui-zlog",
  "fanta-gpui-ztracing",
+ "fanta_credentials_provider",
  "fs",
  "futures 0.3.32",
  "fuzzy",
@@ -11100,7 +11252,6 @@ dependencies = [
  "wax",
  "which 6.0.3",
  "worktree",
- "zed_credentials_provider",
  "zeroize",
 ]
 
@@ -11121,6 +11272,7 @@ dependencies = [
  "fanta-gpui-theme",
  "fanta-gpui-ui",
  "fanta-gpui-util",
+ "fanta_actions",
  "feature_flags",
  "fs",
  "futures 0.3.32",
@@ -11146,7 +11298,6 @@ dependencies = [
  "theme_settings",
  "workspace",
  "worktree",
- "zed_actions",
 ]
 
 [[package]]
@@ -11688,6 +11839,7 @@ dependencies = [
  "fanta-gpui-ui",
  "fanta-gpui-ui-input",
  "fanta-gpui-util",
+ "fanta_actions",
  "fs",
  "futures 0.3.32",
  "fuzzy_nucleo",
@@ -11707,7 +11859,6 @@ dependencies = [
  "telemetry",
  "windows-registry 0.6.1",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -12563,6 +12714,7 @@ dependencies = [
  "fanta-gpui-util",
  "fanta-gpui-util-macros",
  "fanta-gpui-ztracing",
+ "fanta_actions",
  "fs",
  "futures 0.3.32",
  "itertools 0.14.0",
@@ -12581,7 +12733,6 @@ dependencies = [
  "tracing",
  "unindent",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -13055,6 +13206,7 @@ dependencies = [
  "fanta-gpui-theme",
  "fanta-gpui-ui",
  "fanta-gpui-util",
+ "fanta_actions",
  "feature_flags",
  "fs",
  "git",
@@ -13081,7 +13233,6 @@ dependencies = [
  "theme_settings",
  "unicode-segmentation",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -13978,6 +14129,7 @@ dependencies = [
  "fanta-gpui-collections",
  "fanta-gpui-core",
  "fanta-gpui-util",
+ "fanta_actions",
  "futures 0.3.32",
  "hex",
  "log",
@@ -13990,7 +14142,6 @@ dependencies = [
  "serde_json_lenient",
  "sha2",
  "shellexpand",
- "zed_actions",
 ]
 
 [[package]]
@@ -14117,6 +14268,7 @@ dependencies = [
  "fanta-gpui-theme",
  "fanta-gpui-ui",
  "fanta-gpui-util",
+ "fanta_actions",
  "futures 0.3.32",
  "itertools 0.14.0",
  "language",
@@ -14138,7 +14290,6 @@ dependencies = [
  "terminal",
  "theme_settings",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -14171,6 +14322,7 @@ dependencies = [
  "fanta-gpui-theme",
  "fanta-gpui-ui",
  "fanta-gpui-util",
+ "fanta_actions",
  "fs",
  "fuzzy",
  "log",
@@ -14182,7 +14334,6 @@ dependencies = [
  "telemetry",
  "theme_settings",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -14412,6 +14563,7 @@ dependencies = [
  "fanta-gpui-theme",
  "fanta-gpui-ui",
  "fanta-gpui-util",
+ "fanta_actions",
  "fs",
  "git_ui",
  "notifications",
@@ -14429,7 +14581,6 @@ dependencies = [
  "telemetry",
  "windows 0.61.3",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -15483,6 +15634,7 @@ dependencies = [
  "fanta-gpui-ui",
  "fanta-gpui-util",
  "fanta-gpui-util-macros",
+ "fanta_actions",
  "futures 0.3.32",
  "fuzzy",
  "git_ui",
@@ -15513,7 +15665,6 @@ dependencies = [
  "tokio",
  "vim_mode_setting",
  "workspace",
- "zed_actions",
 ]
 
 [[package]]
@@ -17339,6 +17490,7 @@ dependencies = [
  "fanta-gpui-ui-input",
  "fanta-gpui-util",
  "fanta-gpui-zlog",
+ "fanta_actions",
  "fs",
  "futures 0.3.32",
  "futures-lite 1.13.0",
@@ -17371,7 +17523,6 @@ dependencies = [
  "url",
  "uuid",
  "windows 0.61.3",
- "zed_actions",
 ]
 
 [[package]]
@@ -17777,125 +17928,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "zed"
-version = "1.0.0"
-dependencies = [
- "acp_tools",
- "agent",
- "agent_settings",
- "agent_ui",
- "anyhow",
- "ashpd",
- "askpass",
- "assets",
- "audio",
- "auto_update",
- "breadcrumbs",
- "channel",
- "chrono",
- "clap",
- "cli",
- "client",
- "command_palette",
- "command_palette_hooks",
- "context_server",
- "crashes",
- "db",
- "editor",
- "etw_tracing",
- "fanta-gpui",
- "fanta-gpui-collections",
- "fanta-gpui-component",
- "fanta-gpui-components",
- "fanta-gpui-core",
- "fanta-gpui-gpui-platform",
- "fanta-gpui-gpui-tokio",
- "fanta-gpui-http-client",
- "fanta-gpui-menu",
- "fanta-gpui-reqwest-client",
- "fanta-gpui-smol",
- "fanta-gpui-theme",
- "fanta-gpui-ui",
- "fanta-gpui-util",
- "fanta-gpui-zlog",
- "fanta-gpui-ztracing",
- "fanta_languages",
- "feature_flags",
- "fig_viewer",
- "fs",
- "futures 0.3.32",
- "git",
- "git_hosting_providers",
- "git_ui",
- "hdrhistogram",
- "image",
- "image_viewer",
- "input_latency_ui",
- "install_cli",
- "itertools 0.14.0",
- "language",
- "language_model",
- "language_models",
- "libc",
- "log",
- "markdown 0.1.0",
- "migrator",
- "mimalloc",
- "node_runtime",
- "notifications",
- "parking_lot",
- "paths",
- "pkg-config",
- "profiling",
- "project",
- "project_panel",
- "prompt_store",
- "proto",
- "rayon",
- "recent_projects",
- "release_channel",
- "remote",
- "rope",
- "sandbox",
- "search",
- "semver",
- "serde",
- "serde_json",
- "session",
- "settings",
- "shellexpand",
- "sidebar",
- "snippet_provider",
- "sysinfo 0.37.2",
- "system_specs",
- "task",
- "telemetry",
- "telemetry_events",
- "terminal_view",
- "theme_selector",
- "theme_settings",
- "time",
- "time_format",
- "title_bar",
- "tracing",
- "ui_prompt",
- "url",
- "urlencoding",
- "uuid",
- "vim_mode_setting",
- "watch",
- "web_search",
- "web_search_providers",
- "windows 0.61.3",
- "windows_resources",
- "workspace",
- "zed-reqwest",
- "zed_actions",
- "zed_env_vars",
- "zlog_settings",
-]
-
-[[package]]
 name = "zed-font-kit"
 version = "0.14.1-zed"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -18016,38 +18048,6 @@ dependencies = [
  "x11rb",
  "xim-ctext",
  "xim-parser",
-]
-
-[[package]]
-name = "zed_actions"
-version = "0.1.0"
-dependencies = [
- "fanta-gpui-core",
- "fanta-gpui-util",
- "schemars 1.0.4",
- "serde",
-]
-
-[[package]]
-name = "zed_credentials_provider"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "credentials_provider",
- "fanta-gpui-core",
- "futures 0.3.32",
- "paths",
- "release_channel",
- "serde",
- "serde_json",
- "zed_env_vars",
-]
-
-[[package]]
-name = "zed_env_vars"
-version = "0.1.0"
-dependencies = [
- "env_var",
 ]
 
 [[package]]

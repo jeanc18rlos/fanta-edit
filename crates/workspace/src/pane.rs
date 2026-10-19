@@ -2050,7 +2050,7 @@ impl Pane {
             let path = item.project_path(cx);
             // Put the currently active item at the end, because if the currently active item is not closed last
             // closing the currently active item will cause the focus to switch to another item
-            // This will cause Zed to expand the content of the currently active item
+            // This will cause Fanta to expand the content of the currently active item
             //
             // Beyond that sort in order of project path, with untitled files and multibuffers coming last.
             // A view-owned preview must settle before another view saves or reloads its model.
@@ -3450,7 +3450,7 @@ impl Pane {
                                 .when_some(entry_abs_path, |menu, abs_path| {
                                     menu.entry(
                                         "Copy Path",
-                                        Some(Box::new(zed_actions::workspace::CopyPath)),
+                                        Some(Box::new(fanta_actions::workspace::CopyPath)),
                                         window.handler_for(&pane, move |_, _, cx| {
                                             cx.write_to_clipboard(ClipboardItem::new_string(
                                                 abs_path.to_string_lossy().into_owned(),
@@ -3461,7 +3461,7 @@ impl Pane {
                                 .when_some(relative_path, |menu, relative_path| {
                                     menu.entry(
                                         "Copy Relative Path",
-                                        Some(Box::new(zed_actions::workspace::CopyRelativePath)),
+                                        Some(Box::new(fanta_actions::workspace::CopyRelativePath)),
                                         window.handler_for(&pane, move |this, _, cx| {
                                             let Some(project) = this.project.upgrade() else {
                                                 return;
@@ -3479,7 +3479,7 @@ impl Pane {
                                         menu.separator().entry(
                                             ui::utils::reveal_in_file_manager_label(is_remote),
                                             Some(Box::new(
-                                                zed_actions::editor::RevealInFileManager,
+                                                fanta_actions::editor::RevealInFileManager,
                                             )),
                                             window.handler_for(&pane, move |pane, _, cx| {
                                                 if let Some(project) = pane.project.upgrade() {
@@ -3611,7 +3611,7 @@ impl Pane {
             log::warn!(
                 "Pinned tab count ({}) exceeds actual tab count ({}). \
                 This should not happen. If possible, add reproduction steps, \
-                in a comment, to https://github.com/zed-industries/zed/issues/33342",
+                in a comment, to https://github.com/jeanc18rlos/fanta-edit/issues/33342",
                 self.pinned_tab_count,
                 tab_count
             );
@@ -4375,7 +4375,7 @@ fn default_render_tab_bar_buttons(
                 .with_handle(pane.new_item_context_menu_handle.clone())
                 .menu(move |window, cx| {
                     Some(ContextMenu::build(window, cx, |menu, _, _| {
-                        menu.action("New Design…", zed_actions::fanta::NewDesign.boxed_clone())
+                        menu.action("New Design…", fanta_actions::fanta::NewDesign.boxed_clone())
                             .action("Open…", Open::DEFAULT.boxed_clone())
                             .separator()
                             .action("Search Project", DeploySearch::default().boxed_clone())
@@ -7199,15 +7199,15 @@ mod tests {
             cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
         let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane().clone());
 
-        // The real NewDesign handler lives in the zed crate, which isn't initialized
+        // The real NewDesign handler lives in the fanta crate, which isn't initialized
         // in workspace tests. Register a global action handler that sets a flag so
         // we can verify the action is dispatched without depending on that crate.
-        // TODO: If the zed crate's handler is ever available in workspace tests,
+        // TODO: If the fanta crate's handler is ever available in workspace tests,
         // remove this flag and assert the resulting tab bar state directly instead.
         let new_design_dispatched = Rc::new(Cell::new(false));
         cx.update(|_, cx| {
             let new_design_dispatched = new_design_dispatched.clone();
-            cx.on_action(move |_: &zed_actions::fanta::NewDesign, _cx| {
+            cx.on_action(move |_: &fanta_actions::fanta::NewDesign, _cx| {
                 new_design_dispatched.set(true);
             });
         });
@@ -7249,7 +7249,7 @@ mod tests {
 
         cx.run_until_parked();
 
-        // TODO: If the zed crate's handler is ever available in workspace tests,
+        // TODO: If the fanta crate's handler is ever available in workspace tests,
         // replace this with an assert_item_labels check that verifies a new tab
         // is actually created.
         assert!(

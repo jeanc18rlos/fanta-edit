@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+
+# Populates vendor/skia-bindings-*/skia, the checkout that the skia-bindings build
+# script would otherwise download and sync itself. That build script makes a single
+# attempt against googlesource.com, which intermittently answers HTTP 503 and fails
+# the whole cargo build, so CI fetches here with retries and caches the result.
+
+set -euo pipefail
+
+repository_root="$(cd "$(dirname "$0")/.." && pwd)"
+crate_directory="$repository_root/vendor/skia-bindings-0.153.3"
+skia_directory="$crate_directory/skia"
+attempts=5
+
+revision="$(sed -n 's/^skia = "\(.*\)"$/\1/p' "$crate_directory/Cargo.toml")"
+if [[ -z "$revision" ]]; then
+    echo "error: no [package.metadata] skia revision in $crate_directory/Cargo.toml" >&2
+    exit 1
+fi
+
+if [[ ! -f "$skia_directory/DEPS" ]]; then
+    echo "Downloading Skia $revision"
+    download_directory="$(mktemp -d)"
+    trap 'rm -rf "$download_directory"' EXIT
+    curl --fail --location --silent --show-error \
+        --retry "$attempts" --retry-all-errors --retry-delay 10 \
+        --output "$download_directory/skia.tar.gz" \
+        "https://codeload.github.com/rust-skia/skia/tar.gz/$revision"
+    # infra/ holds very long paths and is not needed for the build, matching the
+    # filter the build script applies.
+    tar -xzf "$download_directory/skia.tar.gz" -C "$download_directory" --exclude '*/infra/*'
+    rm -rf "$skia_directory"
+    mv "$download_directory/skia-$revision" "$skia_directory"
+fi
+
+for attempt in $(seq 1 "$attempts"); do
+    echo "Synchronizing Skia dependencies (attempt $attempt of $attempts)"
+    if (cd "$crate_directory" &&
+        GIT_SYNC_DEPS_PATH=skia/DEPS GIT_SYNC_DEPS_SKIP_EMSDK=1 GIT_SYNC_DEPS_QUIET=1 \
+            python3 skia/tools/git-sync-deps); then
+        test -x "$skia_directory/bin/gn"
+        echo "Skia source ready at $skia_directory"
+        exit 0
+    fi
+    if [[ "$attempt" -lt "$attempts" ]]; then
+        sleep $((attempt * 30))
+    fi
+done
+
+echo "error: Skia dependencies did not synchronize after $attempts attempts" >&2
+exit 1

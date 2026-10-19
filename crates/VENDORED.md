@@ -117,7 +117,7 @@ belong here; GPUI and reusable UI changes belong in fanta-ui.
 ## External GPUI dependencies
 
 The workspace consumes the GPUI framework, supporting libraries, and reusable
-Fanta components and the Zed UI foundation externally. The workspace uses the
+Fanta components and the Fanta UI foundation externally. The workspace uses the
 coordinated crates.io release `=0.5.0`. Dependency aliases preserve existing
 Rust imports, and `Cargo.lock` records the exact source. The shared Variables
 screen includes project titles, mode selectors, layer bindings, and input

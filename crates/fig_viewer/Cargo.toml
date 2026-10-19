@@ -74,7 +74,7 @@ util.workspace = true
 usvg.workspace = true
 uuid.workspace = true
 workspace.workspace = true
-zed_actions.workspace = true
+fanta_actions.workspace = true
 worktree.workspace = true
 
 [dev-dependencies]

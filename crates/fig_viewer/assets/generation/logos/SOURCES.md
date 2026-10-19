@@ -19,7 +19,7 @@ particular model version. Retrieved 2026-09-27.
 | `starvector.jpg` | StarVector 8B | [StarVector GitHub organization avatar](https://github.com/starvector.png?size=256), from the [official StarVector organization](https://github.com/starvector) | StarVector project mark |
 | `claude.png` | Claude Sonnet / Haiku | [Claude's official site icon](https://claude.com/icon.png), referenced in [claude.com](https://claude.com)'s favicon and structured data | Orange Claude product symbol on a transparent background |
 
-The workspace's Zed asset bundle also provides `icons/ai_claude.svg`, but that
+The workspace's Fanta asset bundle also provides `icons/ai_claude.svg`, but that
 monochrome dark path disappears on Ayu Dark surfaces. The official orange icon
 above is the dark-background Fanta Edit variant.
 # Additional hosted-model provider marks
@@ -37,5 +37,5 @@ for a particular model version. They remain trademarks of their owners.
 | `meta.png` | [Meta GitHub organization](https://github.com/facebook) avatar |
 | `xai.png` | [xAI GitHub organization](https://github.com/xai-org) avatar |
 | `kling.png` | [Kling AI Research GitHub organization](https://github.com/KlingAIResearch) avatar (JPEG content) |
-| `openai.svg` | OpenAI provider glyph from the vendored Zed UI asset bundle (`ai_open_ai.svg`), licensed with Fanta GPUI |
+| `openai.svg` | OpenAI provider glyph from the vendored Fanta UI asset bundle (`ai_open_ai.svg`), licensed with Fanta GPUI |
 | `quiverai.png` | [QuiverAI verified GitHub organization](https://github.com/quiverai) avatar, identifying the creator of Arrow SVG models |

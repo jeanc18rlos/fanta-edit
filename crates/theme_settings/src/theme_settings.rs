@@ -2,7 +2,7 @@
 
 //! # Theme Settings
 //!
-//! This crate provides theme settings integration for Zed,
+//! This crate provides theme settings integration for Fanta,
 //! bridging the theme system with the settings infrastructure.
 
 mod schema;
@@ -214,7 +214,7 @@ pub fn reload_icon_theme(cx: &mut App) {
     cx.refresh_windows();
 }
 
-/// Loads the themes bundled with the Zed binary into the registry.
+/// Loads the themes bundled with the Fanta binary into the registry.
 pub fn load_bundled_themes(registry: &ThemeRegistry) {
     let theme_paths = registry
         .assets()
@@ -452,11 +452,11 @@ mod bundled_theme_tests {
 
     #[test]
     fn standalone_decoder_matches_editor_refinement() -> Result<()> {
-        for path in zed_ui_assets::Assets.list("themes/")? {
+        for path in fanta_ui_assets::Assets.list("themes/")? {
             if !path.ends_with(".json") {
                 continue;
             }
-            let bytes = zed_ui_assets::Assets
+            let bytes = fanta_ui_assets::Assets
                 .load(&path)?
                 .with_context(|| format!("missing bundled theme {path}"))?;
             let editor = refine_theme_family(deserialize_user_theme(&bytes)?);

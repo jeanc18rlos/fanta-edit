@@ -23,9 +23,9 @@ use serde::{Deserialize, Serialize};
 use settings::{DefaultOpenBehavior, Settings};
 use ui::{ButtonLike, Divider, DividerColor, KeyBinding, Vector, VectorName, prelude::*};
 use util::ResultExt;
-use zed_actions::OpenSettings;
+use fanta_actions::OpenSettings;
 #[cfg(not(feature = "mac_app_store"))]
-use zed_actions::assistant::ToggleFocus;
+use fanta_actions::assistant::ToggleFocus;
 
 #[derive(PartialEq, Clone, Debug, Deserialize, Serialize, JsonSchema, Action)]
 #[action(namespace = welcome)]
@@ -35,7 +35,7 @@ pub struct OpenRecentProject {
 }
 
 actions!(
-    zed,
+    fanta,
     [
         /// Show the Fanta welcome screen
         ShowWelcome
@@ -44,7 +44,7 @@ actions!(
 
 #[cfg(feature = "mac_app_store")]
 actions!(
-    zed,
+    fanta,
     [
         /// Open the macOS App Access guide in Fanta settings.
         OpenAppAccess
@@ -220,7 +220,7 @@ const CONTENT: (Section<3>, Section<1>) = (
             SectionEntry {
                 icon: IconName::Plus,
                 title: "New Design...",
-                action: &zed_actions::fanta::NewDesign,
+                action: &fanta_actions::fanta::NewDesign,
                 visibility_guard: SectionVisibility::Always,
             },
             SectionEntry {
@@ -232,7 +232,7 @@ const CONTENT: (Section<3>, Section<1>) = (
             SectionEntry {
                 icon: IconName::AiClaude,
                 title: "Connect Claude Code / Codex",
-                action: &zed_actions::fanta::ConnectExternalAgent,
+                action: &fanta_actions::fanta::ConnectExternalAgent,
                 visibility_guard: SectionVisibility::Always,
             },
         ],
@@ -256,7 +256,7 @@ const CONTENT: (Section<3>, Section<2>) = (
             SectionEntry {
                 icon: IconName::Plus,
                 title: "New Design...",
-                action: &zed_actions::fanta::NewDesign,
+                action: &fanta_actions::fanta::NewDesign,
                 visibility_guard: SectionVisibility::Always,
             },
             SectionEntry {
@@ -268,7 +268,7 @@ const CONTENT: (Section<3>, Section<2>) = (
             SectionEntry {
                 icon: IconName::BoltOutlined,
                 title: "Credits & Billing",
-                action: &zed_actions::OpenAccountSettings,
+                action: &fanta_actions::OpenAccountSettings,
                 visibility_guard: SectionVisibility::Always,
             },
         ],
@@ -394,7 +394,7 @@ impl WelcomePage {
                 self.locate_recent_project(workspace, window, cx);
             }
         } else {
-            use zed_actions::OpenRecent;
+            use fanta_actions::OpenRecent;
             window.dispatch_action(OpenRecent::default().boxed_clone(), cx);
         }
     }
@@ -1002,8 +1002,8 @@ mod tests {
     #[test]
     fn test_project_name_multiple() {
         // PathList sorts lexicographically, so filenames appear in alpha order
-        let paths = PathList::new(&["/home/user/zed", "/home/user/api"]);
-        assert_eq!(project_name(&paths), "api, zed");
+        let paths = PathList::new(&["/home/user/fanta", "/home/user/api"]);
+        assert_eq!(project_name(&paths), "api, fanta");
     }
 
     #[test]

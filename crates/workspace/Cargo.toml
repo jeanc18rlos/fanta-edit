@@ -73,7 +73,7 @@ ui_input.workspace = true
 url.workspace = true
 util.workspace = true
 uuid.workspace = true
-zed_actions.workspace = true
+fanta_actions.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2.workspace = true

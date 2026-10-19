@@ -5,18 +5,18 @@ set -euxo pipefail
 if [[ $# -gt 0 ]]; then
   echo "
   Usage: ${0##*/}
-  Builds and installs zed onto your system into ~/.local, making it available as ~/.local/bin/zed.
+  Builds and installs fanta onto your system into ~/.local, making it available as ~/.local/bin/fanta.
 
   Before running this you should ensure you have all the build dependencies installed with `./script/linux`.
   "
   exit 1
 fi
-export ZED_CHANNEL=$(<crates/zed/RELEASE_CHANNEL)
-export ZED_UPDATE_EXPLANATION="You need to fetch and rebuild zed in $(pwd)"
+export FANTA_CHANNEL=$(<crates/fanta/RELEASE_CHANNEL)
+export FANTA_UPDATE_EXPLANATION="You need to fetch and rebuild fanta in $(pwd)"
 script/bundle-linux
 
 arch="$(uname -m)"
 commit=$(git rev-parse HEAD | cut -c 1-7)
-archive="zed-linux-${arch}.tar.gz"
-export ZED_BUNDLE_PATH="${CARGO_TARGET_DIR:-target}/release/${archive}"
+archive="fanta-linux-${arch}.tar.gz"
+export FANTA_BUNDLE_PATH="${CARGO_TARGET_DIR:-target}/release/${archive}"
 script/install.sh

@@ -40,7 +40,7 @@ if ($needsInstall) {
 Write-Host "Generating cargo licenses"
 
 $failFlag = $env:ALLOW_MISSING_LICENSES ? "--fail" : ""
-$args = @('about', 'generate', $failFlag, '-c', 'script/licenses/zed-licenses.toml', $templateFile, '-o', $outputFile) | Where-Object { $_ }
+$args = @('about', 'generate', $failFlag, '-c', 'script/licenses/fanta-licenses.toml', $templateFile, '-o', $outputFile) | Where-Object { $_ }
 cargo @args
 
 Write-Host "Applying replacements"

@@ -5,13 +5,21 @@ use crate::{KnownOrUnknown, Timestamp};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Plan {
+    // The aliases accept the plan ids sent by the account API, which keeps
+    // them stable for the 1.0.0 alpha clients already installed.
     #[default]
-    ZedFree,
-    ZedPro,
-    ZedProTrial,
-    ZedBusiness,
-    ZedVip,
-    ZedStudent,
+    #[serde(alias = "zed_free")]
+    FantaFree,
+    #[serde(alias = "zed_pro")]
+    FantaPro,
+    #[serde(alias = "zed_pro_trial")]
+    FantaProTrial,
+    #[serde(alias = "zed_business")]
+    FantaBusiness,
+    #[serde(alias = "zed_vip")]
+    FantaVip,
+    #[serde(alias = "zed_student")]
+    FantaStudent,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
@@ -32,7 +40,7 @@ impl PlanInfo {
             KnownOrUnknown::Known(plan) => *plan,
             KnownOrUnknown::Unknown(_) => {
                 // If we get a plan that we don't recognize, fall back to the Free plan.
-                Plan::ZedFree
+                Plan::FantaFree
             }
         }
     }
@@ -53,16 +61,19 @@ mod tests {
 
     #[test]
     fn test_plan_deserialize_snake_case() {
-        let plan = serde_json::from_value::<Plan>(json!("zed_free")).unwrap();
-        assert_eq!(plan, Plan::ZedFree);
+        let plan = serde_json::from_value::<Plan>(json!("fanta_free")).unwrap();
+        assert_eq!(plan, Plan::FantaFree);
+
+        let plan = serde_json::from_value::<Plan>(json!("fanta_pro")).unwrap();
+        assert_eq!(plan, Plan::FantaPro);
+
+        let plan = serde_json::from_value::<Plan>(json!("fanta_pro_trial")).unwrap();
+        assert_eq!(plan, Plan::FantaProTrial);
+
+        let plan = serde_json::from_value::<Plan>(json!("fanta_student")).unwrap();
+        assert_eq!(plan, Plan::FantaStudent);
 
         let plan = serde_json::from_value::<Plan>(json!("zed_pro")).unwrap();
-        assert_eq!(plan, Plan::ZedPro);
-
-        let plan = serde_json::from_value::<Plan>(json!("zed_pro_trial")).unwrap();
-        assert_eq!(plan, Plan::ZedProTrial);
-
-        let plan = serde_json::from_value::<Plan>(json!("zed_student")).unwrap();
-        assert_eq!(plan, Plan::ZedStudent);
+        assert_eq!(plan, Plan::FantaPro);
     }
 }

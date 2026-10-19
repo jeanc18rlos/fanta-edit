@@ -21,7 +21,7 @@ use itertools::Itertools;
 use project::{AgentId, ProjectItem};
 use serde::{Deserialize, Serialize};
 
-use zed_actions::{
+use fanta_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
     agent::{
         AddSelectionToThread, ConflictContent, LogoutAgent, OpenSettings, ReauthenticateAgent,
@@ -974,7 +974,7 @@ pub struct CreateThreadOptions {
     /// Agent to use. Defaults to the panel's selected agent.
     pub agent: Option<Agent>,
     /// Model override, as `provider/model-id`. Only applied when the thread
-    /// uses the native Zed agent.
+    /// uses the native Fanta agent.
     pub model: Option<String>,
     /// Working directories to attach to the new thread (e.g., the path of a
     /// freshly-created sibling worktree). When `None`, the thread inherits
@@ -4906,7 +4906,7 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
         cx.spawn(async move |cx| {
             let agent_choice = match request.agent_id.as_deref() {
                 None => None,
-                Some(id) if id == agent::ZED_AGENT_ID.as_ref() => Some(Agent::NativeAgent),
+                Some(id) if id == agent::FANTA_AGENT_ID.as_ref() => Some(Agent::NativeAgent),
                 Some(id) => {
                     // Reject unknown agent ids up front so the model gets a
                     // structured error pointing at `list_agents_and_models`,
@@ -4968,12 +4968,12 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
                 // detached HEAD state — the agent can attach to a branch via
                 // git afterwards.
                 let branch_target = match request.base_ref.as_ref() {
-                    Some(ref_name) => zed_actions::NewWorktreeBranchTarget::ExistingBranch {
+                    Some(ref_name) => fanta_actions::NewWorktreeBranchTarget::ExistingBranch {
                         name: ref_name.clone(),
                     },
-                    None => zed_actions::NewWorktreeBranchTarget::CurrentBranch,
+                    None => fanta_actions::NewWorktreeBranchTarget::CurrentBranch,
                 };
-                let action = zed_actions::CreateWorktree {
+                let action = fanta_actions::CreateWorktree {
                     worktree_name: request.worktree_name.clone(),
                     branch_target,
                 };
@@ -5055,7 +5055,7 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
 
         let mut agents = Vec::new();
 
-        // Native Zed agent — always available, and we can enumerate models
+        // Native Fanta agent — always available, and we can enumerate models
         // directly from the language model registry.
         let native_models = {
             let registry = LanguageModelRegistry::read_global(cx);
@@ -5082,7 +5082,7 @@ impl agent::SiblingThreadHost for AgentPanelSiblingHost {
             models
         };
         agents.push(agent::AvailableAgent {
-            id: agent::ZED_AGENT_ID.to_string(),
+            id: agent::FANTA_AGENT_ID.to_string(),
             name: Agent::NativeAgent.label(),
             is_native: true,
             models: native_models,
@@ -5840,7 +5840,7 @@ impl AgentPanel {
                                 .action("Add Remote Server…", Box::new(AddRemoteContextServer))
                                 .action(
                                     "Edit Server Settings",
-                                    Box::new(zed_actions::OpenSettingsFile),
+                                    Box::new(fanta_actions::OpenSettingsFile),
                                 )
                                 .separator()
                                 .header("Context")
@@ -5911,7 +5911,7 @@ impl AgentPanel {
 
                         menu = menu.action(
                             "Credits & Billing",
-                            Box::new(zed_actions::OpenAccountSettings),
+                            Box::new(fanta_actions::OpenAccountSettings),
                         );
 
                         if has_auth_methods || supports_logout {
@@ -6183,7 +6183,7 @@ impl AgentPanel {
                                     .handler({
                                         move |window, cx| {
                                             window.dispatch_action(
-                                                Box::new(zed_actions::AcpRegistry),
+                                                Box::new(fanta_actions::AcpRegistry),
                                                 cx,
                                             )
                                         }
@@ -6383,7 +6383,7 @@ impl AgentPanel {
 
         let user_store = self.user_store.read(cx);
 
-        if user_store.plan().is_some_and(|plan| plan == Plan::ZedPro)
+        if user_store.plan().is_some_and(|plan| plan == Plan::FantaPro)
             && user_store
                 .subscription_period()
                 .and_then(|period| period.0.checked_add_days(chrono::Days::new(1)))
@@ -6398,12 +6398,12 @@ impl AgentPanel {
             return false;
         }
 
-        let has_configured_non_zed_providers = LanguageModelRegistry::read_global(cx)
+        let has_configured_non_fanta_providers = LanguageModelRegistry::read_global(cx)
             .visible_providers()
             .iter()
             .any(|provider| {
                 provider.is_authenticated(cx)
-                    && provider.id() != language_model::ZED_CLOUD_PROVIDER_ID
+                    && provider.id() != language_model::FANTA_CLOUD_PROVIDER_ID
             });
 
         match &self.base_view {
@@ -6411,7 +6411,7 @@ impl AgentPanel {
             BaseView::AgentThread { conversation_view } => {
                 if conversation_view.read(cx).as_native_thread(cx).is_some() {
                     let history_is_empty = ThreadStore::global(cx).read(cx).is_empty();
-                    history_is_empty || !has_configured_non_zed_providers
+                    history_is_empty || !has_configured_non_fanta_providers
                 } else {
                     false
                 }
@@ -7078,7 +7078,7 @@ mod tests {
 
     impl AgentConnection for SessionTrackingConnection {
         fn agent_id(&self) -> AgentId {
-            agent::ZED_AGENT_ID.clone()
+            agent::FANTA_AGENT_ID.clone()
         }
 
         fn telemetry_id(&self) -> SharedString {
@@ -8452,8 +8452,8 @@ mod tests {
             "resource text should be the raw conflict"
         );
         assert!(
-            uri.starts_with("zed:///agent/merge-conflict"),
-            "URI should use the zed merge-conflict scheme, got: {uri}"
+            uri.starts_with("fanta:///agent/merge-conflict"),
+            "URI should use the fanta merge-conflict scheme, got: {uri}"
         );
         assert!(uri.contains("utils.rs"), "URI should encode the file path");
     }
@@ -12892,7 +12892,7 @@ mod tests {
 
     impl AgentConnection for DisassociationTrackingConnection {
         fn agent_id(&self) -> AgentId {
-            agent::ZED_AGENT_ID.clone()
+            agent::FANTA_AGENT_ID.clone()
         }
 
         fn telemetry_id(&self) -> SharedString {

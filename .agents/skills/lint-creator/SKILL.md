@@ -1,7 +1,6 @@
 ---
 name: lint-creator
 description: An auxiliary skill to add more dylints to `tooling/lints`
-disable-model-invocation: false
 ---
 
 # Lint RULES

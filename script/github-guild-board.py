@@ -36,8 +36,8 @@ MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 5
 
 GITHUB_API_URL = "https://api.github.com"
-REPO_OWNER = "zed-industries"
-REPO_NAME = "zed"
+REPO_OWNER = "jeanc18rlos"
+REPO_NAME = "fanta-edit"
 GUILD_TEAM_SLUG = "guild-cohort-2"
 
 STATUS_FIELD = "Status"

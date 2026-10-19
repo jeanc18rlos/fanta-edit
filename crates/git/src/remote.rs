@@ -40,28 +40,28 @@ mod tests {
     fn test_parsing_valid_remote_urls() {
         let valid_urls = vec![
             (
-                "https://github.com/octocat/zed.git",
+                "https://github.com/octocat/fanta.git",
                 "https",
                 "github.com",
-                "/octocat/zed.git",
+                "/octocat/fanta.git",
             ),
             (
-                "https://jlannister@github.com/octocat/zed.git",
+                "https://jlannister@github.com/octocat/fanta.git",
                 "https",
                 "github.com",
-                "/octocat/zed.git",
+                "/octocat/fanta.git",
             ),
             (
-                "git@github.com:octocat/zed.git",
+                "git@github.com:octocat/fanta.git",
                 "ssh",
                 "github.com",
-                "/octocat/zed.git",
+                "/octocat/fanta.git",
             ),
             (
-                "org-000000@github.com:octocat/zed.git",
+                "org-000000@github.com:octocat/fanta.git",
                 "ssh",
                 "github.com",
-                "/octocat/zed.git",
+                "/octocat/fanta.git",
             ),
             (
                 "first.last@gitlab.example.com:group/repo.git",
@@ -70,16 +70,16 @@ mod tests {
                 "/group/repo.git",
             ),
             (
-                "ssh://git@github.com/octocat/zed.git",
+                "ssh://git@github.com/octocat/fanta.git",
                 "ssh",
                 "github.com",
-                "/octocat/zed.git",
+                "/octocat/fanta.git",
             ),
             (
-                "file:///path/to/local/zed",
+                "file:///path/to/local/fanta",
                 "file",
                 "",
-                "/path/to/local/zed",
+                "/path/to/local/fanta",
             ),
         ];
 

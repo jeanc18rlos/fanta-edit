@@ -12,7 +12,7 @@ standing, and entries that only a human at the keyboard could confirm are
 labelled as source readings.
 
 **A release binary has now been built from this tree and driven.** On
-2026-09-09, `cargo build --release -p zed` produced `target/release/fanta`,
+2026-09-09, `cargo build --release -p fanta` produced `target/release/fanta`,
 reporting `Fanta: v0.1.0-alpha.1+stable.8f43236…`, and it was driven over its
 own live MCP server on macOS 26.6.2, aarch64, 36 GiB. Two documents were
 opened: the 9.6 MB, 29,301-node, 3-page `basic.fig` the previous rehearsal used,
@@ -54,9 +54,9 @@ actually driven. Nothing here claims more than that record supports.
   around by re-downloading.
 - **A folder that is not a design project still raises a Restricted Mode
   prompt.** Design projects normally do not: `auto_trust_design_projects`
-  (`crates/zed/src/zed.rs:453`) trusts a lone `.fig`/`.fnx` file, and trusts a
+  (`crates/fanta/src/fanta.rs:453`) trusts a lone `.fig`/`.fnx` file, and trusts a
   directory only when **all** of these hold — it has `fanta.json` at its root,
-  it has no `.zed` directory, and `git_repository_cannot_execute_anything`
+  it has no `.fanta` directory, and `git_repository_cannot_execute_anything`
   finds no `.git` at all, **or** a `.git` that is a genuine directory with no
   hooks beyond git's own `.sample` files and a config every line of which is on
   a short **allowlist** of keys known to be inert (`git_setting_is_inert`:
@@ -70,11 +70,11 @@ actually driven. Nothing here claims more than that record supports.
   Every other uncertainty — an unreadable config, a `.git` file or symlink
   pointing elsewhere, an unexpected hook — falls back to asking too.
   Open anything else — a plain git checkout, a downloads folder — and you get
-  the inherited blocking *"Unrecognized Project"* dialog, in Zed's wording,
+  the inherited blocking *"Unrecognized Project"* dialog, in Fanta's wording,
   which **cannot be dismissed with Escape**; the title bar then reads
   *Restricted Mode* for the rest of the session.
   `"trust_all_worktrees"` is deliberately still `false`
-  (`assets/settings/default.json:2565`): a worktree's own `.zed/settings.json`
+  (`assets/settings/default.json:2565`): a worktree's own `.fanta/settings.json`
   can name a context-server command that this build will spawn, and trusting a
   worktree also un-suppresses git hooks, `diff.external` and credential helpers.
   Flipping it globally would have been a real security regression, so the guard
@@ -88,16 +88,16 @@ actually driven. Nothing here claims more than that record supports.
   you get the prompt. If a shared project prompts, either answer the prompt
   yourself or delete the copied `.git` and re-`git init` it.
 - **Open Project Settings is hidden from the command palette on purpose.**
-  `zed::OpenProjectSettingsFile` and `zed_actions::OpenProjectSettings` are in
-  `hide_action_types` (`crates/zed/src/main.rs`) because both write a
-  `.zed/settings.json` into the open design, which permanently disqualifies it
+  `fanta::OpenProjectSettingsFile` and `fanta_actions::OpenProjectSettings` are in
+  `hide_action_types` (`crates/fanta/src/main.rs`) because both write a
+  `.fanta/settings.json` into the open design, which permanently disqualifies it
   from the auto-trust above and leaves you facing the unescapable prompt on
   every later open. There is no in-app way to set project-local settings for a
   design; use the user settings file.
 - Launching a second `fanta <dir>` while the app is running prints
   `Fanta is already running` and exits without opening the project
-  (`crates/zed/src/main.rs:390`; the single-instance check is live because
-  `crates/zed/RELEASE_CHANNEL` is `stable`). Open the folder from the running
+  (`crates/fanta/src/main.rs:390`; the single-instance check is live because
+  `crates/fanta/RELEASE_CHANNEL` is `stable`). Open the folder from the running
   app instead.
 - **`fanta` with no arguments restores your last session, so you may never see
   the welcome page again.** The rehearsal hit this: after a project had been
@@ -558,27 +558,26 @@ actually driven. Nothing here claims more than that record supports.
   carries the full allow-list, each host cited to the file that names it.
 - One `TCP 127.0.0.1:<port> (LISTEN)` socket stays open for the life of the
   process. The port matches the stable-channel single-instance handshake
-  (`crates/zed/src/zed/mac_only_instance.rs`). Over roughly one idle minute the
+  (`crates/fanta/src/fanta/mac_only_instance.rs`). Over roughly one idle minute the
   rehearsal saw zero bytes in or out and no outbound connections at all; the
   full five-minute idle test and the agent-turn test were never run.
 
-## Leftovers from the Zed fork
+## Inherited leftovers
 
-- **Palette entries are still prefixed `zed:`.** The prefix is the action
-  namespace, deliberately not renamed for the alpha — renaming namespaces breaks
-  keymaps and every `zed::` action path in the tree. The filter lists in
-  `crates/zed/src/main.rs` were tightened after the alpha.1 count: the `dev`,
+- **Palette entries are prefixed `fanta:`.** The prefix is the action
+  namespace. The 1.0.0 alpha still used the inherited namespace; it was renamed
+  after the alpha, so keymaps written for 1.0.0 need the new prefix. The filter lists in
+  `crates/fanta/src/main.rs` were tightened after the alpha.1 count: the `dev`,
   `feedback` and `remote_debug` namespaces are hidden, and so are
-  `zed: open zed url`, `zed: open account settings`, `zed: open server settings`,
-  `zed: open telemetry log`, `zed: show update notification`,
-  `zed: open performance profiler`, `zed: extensions`, `zed: reset database`,
-  `zed: debug elements`, `zed: test crash` and `zed: test panic` (the last two
+  `fanta: open fanta url`, `fanta: open account settings`, `fanta: open server settings`,
+  `fanta: open telemetry log`, `fanta: show update notification`,
+  `fanta: open performance profiler`, `fanta: extensions`, `fanta: reset database`,
+  `fanta: debug elements`, `fanta: test crash` and `fanta: test panic` (the last two
   were only ever handled behind the server-side `PanicFeatureFlag`).
-  `zed: about`, `zed: quit`, `zed: open settings` and
-  `zed: copy system specs into clipboard` stay visible. This is the largest
-  remaining branding leak and it is a deliberate deferral, not an oversight.
+  `fanta: about`, `fanta: quit`, `fanta: open settings` and
+  `fanta: copy system specs into clipboard` stay visible.
   Two caveats: the alpha.1 derivation (**929 of 1,031 actions visible, 44 in
-  the `zed` namespace**, from `fanta --dump-all-actions` on a binary built at
+  the `fanta` namespace**, from `fanta --dump-all-actions` on a binary built at
   `493e364`) has not been re-derived against the tightened lists, and it is a
   filter-list derivation, not the palette as rendered — nobody has typed into
   the palette in a running build of this tree.
@@ -589,30 +588,30 @@ actually driven. Nothing here claims more than that record supports.
   otherwise hidden, so nothing else matches. Searches for "vim", "debugger",
   "project panel" and "new file" return **zero** visible actions by the same
   derivation.
-- **The CLI no longer says `Zed`, and that is now an observation.** On the
+- **The CLI identifies itself as Fanta, and that is now an observation.** On the
   release binary built from this tree, `fanta --system-specs` prints
   `Fanta: v0.1.0-alpha.1+stable.8f43236…`. The rehearsal recorded that same line
-  as `Zed: v0.1.0-alpha.1+stable.6e14229 (Fanta)`; that leak is gone.
+  with the inherited product name appended; that leak is gone.
 - **The two wrong agent-panel strings from alpha.1 are gone from the tree, and
   the panel itself still has not been looked at.** `crates/agent_ui/src/ui/end_trial_upsell.rs`
   (*"Upgrade to Fanta Pro"*, *"Your Fanta Pro Trial has expired"* — for a
   subscription that does not exist) was deleted together with its mount in the
   agent panel, and the free-usage-limit callout lost its "Upgrade" button. The
   authentication callout now resolves the built-in agent's id
-  (`ZED_AGENT_ID = AgentId::new("Zed Agent")`, `crates/agent/src/agent.rs`)
+  (`FANTA_AGENT_ID = AgentId::new("Fanta Agent")`, `crates/agent/src/agent.rs`)
   through its display label (`agent_display_name` in
   `crates/agent_ui/src/conversation_view.rs`, unit-tested), so
-  *"Authenticate to Zed Agent"* can no longer render. The rest of the CLI and
+  *"Authenticate to Fanta Agent"* can no longer render. The rest of the CLI and
   the agent composer were de-branded in the earlier fix pass — `--user-data-dir`
-  documents `~/Library/Application Support/Fanta`, and there is no "Try Zed Pro
-  for Free" or "Message the Zed Agent" string left in `crates/agent_ui`.
-  Identifiers, the `zed://` URL scheme, `ZED_*` env vars and action namespaces
+  documents `~/Library/Application Support/Fanta`, and there is no "Try Fanta Pro
+  for Free" or "Message the Fanta Agent" string left in `crates/agent_ui`.
+  Identifiers, the `fanta://` URL scheme, `FANTA_*` env vars and action namespaces
   are unchanged on purpose. Everything in this entry is a grep of the tree: the
   agent panel has never been opened in a build of it.
 - **This build never updates itself.** `script/bundle-mac` exports
-  `ZED_UPDATE_EXPLANATION='Alpha builds are updated by downloading a new DMG
+  `FANTA_UPDATE_EXPLANATION='Alpha builds are updated by downloading a new DMG
   from Fanta.'`, so "Check for Updates" shows that as an information prompt
-  instead of erroring, and the poll of the Zed release endpoint is suppressed.
+  instead of erroring, and the poll of the Fanta release endpoint is suppressed.
   Get new alpha builds by downloading a new DMG.
 - **The once-per-launch `language not found` ERROR is gone.** The alpha.1 line
   — `ERROR … agent_ui/src/message_editor.rs:601 language not found`, once per
@@ -652,7 +651,7 @@ actually driven. Nothing here claims more than that record supports.
   this alpha was built on `aarch64-apple-darwin`; no Intel or universal DMG is
   produced.
 - **Only one macOS version has been tested: 26.6.2, the build machine's.** The
-  compiler deployment target is `10.15.7` (`crates/zed/build.rs`) and the bundle
+  compiler deployment target is `10.15.7` (`crates/fanta/build.rs`) and the bundle
   sets no `LSMinimumSystemVersion`, so nothing in the build refuses an older
   system — but nothing has been run on one either. Windows and Linux are not
   supported.

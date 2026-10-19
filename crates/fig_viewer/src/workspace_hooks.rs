@@ -39,7 +39,7 @@ pub fn init(cx: &mut App) {
         };
         crate::new_design::register(workspace);
         workspace.register_action(
-            |workspace, _: &zed_actions::fanta::RevealProjectInFileManager, _, cx| {
+            |workspace, _: &fanta_actions::fanta::RevealProjectInFileManager, _, cx| {
                 let root = workspace
                     .active_item_as::<FigView>(cx)
                     .and_then(|view| {
@@ -324,7 +324,7 @@ mod tests {
 
         cx.dispatch_action(
             window.into(),
-            zed_actions::fanta::RevealProjectInFileManager,
+            fanta_actions::fanta::RevealProjectInFileManager,
         );
         cx.run_until_parked();
 
@@ -346,7 +346,7 @@ mod tests {
                 content.fanta_live_mcp.get_or_insert_default().enabled = Some(false);
             });
         });
-        cx.dispatch_action(window.into(), zed_actions::fanta::ConnectExternalAgent);
+        cx.dispatch_action(window.into(), fanta_actions::fanta::ConnectExternalAgent);
         cx.run_until_parked();
         assert!(
             shows_canvas_notice(&workspace, cx),
@@ -365,7 +365,7 @@ mod tests {
                 content.fanta_live_mcp.get_or_insert_default().enabled = Some(true);
             });
         });
-        cx.dispatch_action(window.into(), zed_actions::fanta::ConnectExternalAgent);
+        cx.dispatch_action(window.into(), fanta_actions::fanta::ConnectExternalAgent);
         cx.run_until_parked();
         let copied = cx
             .read_from_clipboard()
@@ -385,7 +385,7 @@ mod tests {
         let occupied = tempfile::tempdir().expect("tempdir");
         std::fs::write(occupied.path().join("notes.txt"), b"mine").expect("occupy the folder");
 
-        cx.dispatch_action(window.into(), zed_actions::fanta::NewDesign);
+        cx.dispatch_action(window.into(), fanta_actions::fanta::NewDesign);
         cx.run_until_parked();
         cx.simulate_new_path_selection(|_| Some(occupied.path().to_path_buf()));
         cx.run_until_parked();
