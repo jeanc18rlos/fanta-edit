@@ -236,6 +236,14 @@ actions!(
         ExportMotionJson,
         /// Export the selected animation as Figma Motion JSON.
         ExportFigmaMotionJson,
+        /// Export the selected animation as a Claude Motion Stage project.
+        ExportMotionStage,
+        /// Export the selected animation as an MP4 video.
+        ExportMotionVideo,
+        /// Export the selected animation as an animated GIF.
+        ExportMotionGif,
+        /// Export the selected animation as a folder of PNG frames.
+        ExportMotionFrames,
         /// Apply the suggested design change in the open comment thread.
         ApplySuggestedFix,
         /// Show or hide the embedded layers sidebar.
@@ -8846,10 +8854,22 @@ impl Render for FigView {
                 this.activate_tool_from_action(ToolKind::Crop, window, cx);
             }))
             .on_action(cx.listener(|this, _: &ExportMotionJson, _, cx| {
-                this.export_selected_motion(false, cx);
+                this.export_selected_motion(crate::export::ExportFormat::MotionJson, cx);
             }))
             .on_action(cx.listener(|this, _: &ExportFigmaMotionJson, _, cx| {
-                this.export_selected_motion(true, cx);
+                this.export_selected_motion(crate::export::ExportFormat::FigmaMotionJson, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ExportMotionStage, _, cx| {
+                this.export_selected_motion(crate::export::ExportFormat::MotionStage, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ExportMotionVideo, _, cx| {
+                this.export_selected_motion(crate::export::ExportFormat::MotionVideo, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ExportMotionGif, _, cx| {
+                this.export_selected_motion(crate::export::ExportFormat::MotionGif, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ExportMotionFrames, _, cx| {
+                this.export_selected_motion(crate::export::ExportFormat::MotionFrames, cx);
             }))
             .on_action(cx.listener(|this, _: &RunAiReview, window, cx| {
                 this.run_ai_review(crate::review::ReviewDepth::Standard, window, cx);

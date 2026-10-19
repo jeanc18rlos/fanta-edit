@@ -1,12 +1,17 @@
 use anyhow::{Context as _, Result, ensure};
 use fanta_doc::{
-    Color, Doc, MotionSpec, MotionTransform, NodeId, SpecEasing, SpecEasingCurve, SpecKeyframe,
+    AnimationClip, Color, Doc, MotionSpec, MotionTransform, NodeId, SpecEasing, SpecEasingCurve,
+    SpecKeyframe,
 };
 use gpui::{AppContext as _, Context};
+
+use crate::export::{ExportArtifact, ExportFormat, ExportSizing};
 use serde_json::{Map, Value, json};
 
 impl crate::view::FigView {
-    pub(crate) fn export_selected_motion(&mut self, figma: bool, cx: &mut Context<Self>) {
+    /// Export the active animation clip (or the document's only clip) into the
+    /// project's `exports` folder, from the Design menu.
+    pub(crate) fn export_selected_motion(&mut self, format: ExportFormat, cx: &mut Context<Self>) {
         let prepared = (|| {
             let item = self.item.read(cx);
             let directory = item
@@ -27,20 +32,16 @@ impl crate::view::FigView {
                 .motion
                 .clip(clip)
                 .context("the selected animation no longer exists")?;
-            let name = crate::export::sanitize_file_name(&animation.name);
             let filename = format!(
-                "{name}.{}",
-                if figma {
-                    "figma-motion.json"
-                } else {
-                    "motion.json"
-                }
+                "{}.{}",
+                crate::export::sanitize_file_name(&animation.name),
+                format.extension()
             );
             let mut doc = document.doc.clone();
             doc.motion.clips.retain(|id, _| *id == clip);
-            Ok::<_, anyhow::Error>((doc, directory, filename))
+            Ok::<_, anyhow::Error>((doc, document.asset_resolver.clone(), directory, filename))
         })();
-        let (doc, directory, filename) = match prepared {
+        let (doc, resolver, directory, filename) = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
                 crate::view::show_canvas_notice_deferred(
@@ -50,19 +51,42 @@ impl crate::view::FigView {
                 return;
             }
         };
+        crate::view::show_canvas_notice_deferred(format!("Exporting {}…", format.label()), cx);
         cx.spawn(async move |_, cx| {
             let exported = cx
                 .background_spawn(async move {
-                    let bytes = export_motion(&doc, None, figma)?;
+                    let artifact = match format {
+                        ExportFormat::MotionJson | ExportFormat::FigmaMotionJson => {
+                            ExportArtifact::file(export_motion(
+                                &doc,
+                                None,
+                                format == ExportFormat::FigmaMotionJson,
+                            )?)
+                        }
+                        _ => crate::motion_video::export_motion_media(
+                            &doc,
+                            resolver,
+                            None,
+                            format,
+                            ExportSizing::Scale(design_menu_scale(format)),
+                        )?,
+                    };
                     std::fs::create_dir_all(&directory)
                         .context("creating the exports directory")?;
-                    crate::export::write_export_atomically(&directory, &filename, &bytes)
+                    crate::export::write_export_artifact(&directory, &filename, format, artifact)
                 })
                 .await;
             cx.update(|cx| {
                 crate::view::show_canvas_notice_deferred(
                     match exported {
-                        Ok(path) => format!("Exported motion to {}", path.display()),
+                        Ok((path, notes)) => {
+                            let mut message = format!("Exported motion to {}", path.display());
+                            for note in notes {
+                                message.push(' ');
+                                message.push_str(&note);
+                            }
+                            message
+                        }
                         Err(error) => format!("Could not export motion: {error:#}"),
                     },
                     cx,
@@ -73,7 +97,30 @@ impl crate::view::FigView {
     }
 }
 
+/// Pixel density for Design menu exports: crisp video and sprites, and GIFs
+/// at design size to keep them light.
+fn design_menu_scale(format: ExportFormat) -> f64 {
+    match format {
+        ExportFormat::MotionGif => 1.0,
+        _ => 2.0,
+    }
+}
+
 pub(crate) fn export_motion(doc: &Doc, root: Option<NodeId>, figma: bool) -> Result<Vec<u8>> {
+    let clip = clip_for_target(doc, root)?;
+    let spec = MotionSpec::from_clip(doc, clip)?;
+    let value = if figma {
+        figma_motion(doc, &spec)?
+    } else {
+        serde_json::to_value(spec)?
+    };
+    Ok(serde_json::to_vec_pretty(&value)?)
+}
+
+/// The single animation clip `root` contains completely: its stage frame and
+/// every track target lie inside `root`. Without a root, the document must hold
+/// exactly one clip.
+pub(crate) fn clip_for_target(doc: &Doc, root: Option<NodeId>) -> Result<&AnimationClip> {
     let contains = |node| {
         root.is_none_or(|root| {
             node == root
@@ -110,15 +157,9 @@ pub(crate) fn export_motion(doc: &Doc, root: Option<NodeId>, figma: bool) -> Res
                 .tracks
                 .values()
                 .all(|track| contains(track.target.node)),
-        "the animation extends beyond this selection; export the complete scoped frame or use Design > Export Motion JSON"
+        "the animation extends beyond this selection; export the complete scoped frame or use the Design menu's motion exports"
     );
-    let spec = MotionSpec::from_clip(doc, clip)?;
-    let value = if figma {
-        figma_motion(doc, &spec)?
-    } else {
-        serde_json::to_value(spec)?
-    };
-    Ok(serde_json::to_vec_pretty(&value)?)
+    Ok(*clip)
 }
 
 fn figma_value(value: &Value) -> Result<Value> {

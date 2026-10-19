@@ -2065,23 +2065,16 @@ impl FantaPropertiesPanel {
                 }
                 this.export_task = None;
                 match result {
-                    Ok(paths) => {
-                        for path in &paths {
+                    Ok(outcome) => {
+                        for path in &outcome.paths {
                             log::info!("Fanta export written to {}", path.display());
                         }
-                        let message = if let [path] = paths.as_slice() {
-                            format!("Exported {}", path.display())
-                        } else {
-                            let directory = paths
-                                .first()
-                                .and_then(|path| path.parent())
-                                .map(|path| path.display().to_string())
-                                .unwrap_or_else(|| "the exports directory".to_string());
-                            format!("Exported {} files to {directory}", paths.len())
-                        };
+                        for note in &outcome.notes {
+                            log::info!("Fanta export note: {note}");
+                        }
                         this.set_export_feedback(
                             ExportFeedback {
-                                message: message.into(),
+                                message: outcome.summary().into(),
                                 kind: ExportFeedbackKind::Success,
                             },
                             show_canvas_feedback,

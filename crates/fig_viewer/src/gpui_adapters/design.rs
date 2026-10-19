@@ -3524,22 +3524,14 @@ impl FigView {
                 .await;
             this.update_in(cx, |_, window, cx| {
                 let message = match result {
-                    Ok(paths) => {
-                        for path in &paths {
+                    Ok(outcome) => {
+                        for path in &outcome.paths {
                             log::info!("Fanta export written to {}", path.display());
                         }
-                        match paths.as_slice() {
-                            [path] => format!("Exported {}", path.display()),
-                            [first, ..] => format!(
-                                "Exported {} files to {}",
-                                paths.len(),
-                                first.parent().map_or_else(
-                                    || "export folder".to_string(),
-                                    |path| path.display().to_string()
-                                )
-                            ),
-                            [] => "Nothing was exported.".to_string(),
+                        for note in &outcome.notes {
+                            log::info!("Fanta export note: {note}");
                         }
+                        outcome.summary()
                     }
                     Err(error) => {
                         log::error!("Fanta export failed: {error:#}");

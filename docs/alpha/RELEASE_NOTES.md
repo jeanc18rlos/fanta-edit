@@ -4,13 +4,14 @@
 - Added live update controls in Settings, About, the app menu and the command palette.
 - Added enum/image variables, conditional prototype branches and variable arithmetic.
 - Added clip settings, portable Motion JSON and Figma Motion JSON exports.
+- Added motion exports as a Claude Motion Stage package, MP4 (with ffmpeg), GIF and PNG frames.
 - Improved vector path joining, closing, simplification, segment bending and anchor editing.
 - Added a command-line website exporter using an explicitly supplied Fanta-JS runtime.
 - Removed the unused RevenueCat integration; current billing uses Polar on the web.
 
 Release signing setup, backend feed verification, Fanta-JS playback/packaging and
-installed-app acceptance remain required before publishing v2. Stage JSX,
-MP4/GIF, trigger inputs and the state-machine view are deferred.
+installed-app acceptance remain required before publishing v2. Trigger inputs
+and the state-machine view are deferred.
 
 # Fanta 0.1.0-alpha.1
 
