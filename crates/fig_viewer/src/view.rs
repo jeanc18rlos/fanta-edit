@@ -232,6 +232,10 @@ actions!(
         RunAiReview,
         /// Prepare a multi-pass AI review of every page.
         RunUltraReview,
+        /// Export the selected animation as portable Motion JSON.
+        ExportMotionJson,
+        /// Export the selected animation as Figma Motion JSON.
+        ExportFigmaMotionJson,
         /// Apply the suggested design change in the open comment thread.
         ApplySuggestedFix,
         /// Show or hide the embedded layers sidebar.
@@ -2372,7 +2376,6 @@ impl FigView {
             .map(|_| clip)
     }
 
-    #[cfg(test)]
     pub(crate) fn active_motion_clip_id(&self) -> Option<AnimationClipId> {
         self.active_motion_clip
     }
@@ -8841,6 +8844,12 @@ impl Render for FigView {
             }))
             .on_action(cx.listener(|this, _: &ActivateCropTool, window, cx| {
                 this.activate_tool_from_action(ToolKind::Crop, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ExportMotionJson, _, cx| {
+                this.export_selected_motion(false, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ExportFigmaMotionJson, _, cx| {
+                this.export_selected_motion(true, cx);
             }))
             .on_action(cx.listener(|this, _: &RunAiReview, window, cx| {
                 this.run_ai_review(crate::review::ReviewDepth::Standard, window, cx);

@@ -22,6 +22,8 @@ pub(crate) enum ExportFormat {
     Jpeg,
     Svg,
     Pdf,
+    MotionJson,
+    FigmaMotionJson,
 }
 
 impl ExportFormat {
@@ -31,6 +33,8 @@ impl ExportFormat {
             Self::Jpeg => "JPG",
             Self::Svg => "SVG",
             Self::Pdf => "PDF",
+            Self::MotionJson => "Motion JSON",
+            Self::FigmaMotionJson => "Figma Motion JSON",
         }
     }
 
@@ -40,6 +44,8 @@ impl ExportFormat {
             Self::Jpeg => "jpg",
             Self::Svg => "svg",
             Self::Pdf => "pdf",
+            Self::MotionJson => "motion.json",
+            Self::FigmaMotionJson => "figma-motion.json",
         }
     }
 
@@ -53,6 +59,8 @@ pub(crate) const EXPORT_FORMATS: &[(ExportFormat, &str)] = &[
     (ExportFormat::Jpeg, "JPG"),
     (ExportFormat::Svg, "SVG"),
     (ExportFormat::Pdf, "PDF"),
+    (ExportFormat::MotionJson, "Motion JSON"),
+    (ExportFormat::FigmaMotionJson, "Figma Motion JSON"),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -367,6 +375,12 @@ fn render_export(
         ExportFormat::Jpeg => render_jpeg(batch, document, target, request.sizing),
         ExportFormat::Svg => render_svg(batch, document, target),
         ExportFormat::Pdf => render_pdf(batch, document, target),
+        ExportFormat::MotionJson => {
+            crate::motion_export::export_motion(&batch.doc, target.root, false)
+        }
+        ExportFormat::FigmaMotionJson => {
+            crate::motion_export::export_motion(&batch.doc, target.root, true)
+        }
     }
 }
 
@@ -616,7 +630,11 @@ fn checked_vector_dimension(value: f64, axis: &str) -> Result<u32> {
     Ok((value.ceil() as u32).max(1))
 }
 
-fn write_export_atomically(directory: &Path, file_name: &str, bytes: &[u8]) -> Result<PathBuf> {
+pub(crate) fn write_export_atomically(
+    directory: &Path,
+    file_name: &str,
+    bytes: &[u8],
+) -> Result<PathBuf> {
     let mut temporary = NamedTempFile::new_in(directory)
         .with_context(|| format!("creating a temporary export in {}", directory.display()))?;
     if let Err(error) = temporary.write_all(bytes) {
@@ -733,7 +751,7 @@ fn unique_export_names<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec<Stri
         .collect()
 }
 
-fn sanitize_file_name(name: &str) -> String {
+pub(crate) fn sanitize_file_name(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .map(|character| {

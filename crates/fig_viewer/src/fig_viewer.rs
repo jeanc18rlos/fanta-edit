@@ -36,6 +36,7 @@ mod live_mcp;
 mod measurements;
 mod mode_overrides;
 mod motion_edit;
+mod motion_export;
 mod motion_panel;
 mod new_design;
 mod panel_settings;
@@ -86,8 +87,9 @@ pub use timeline::{
 pub use tools::ToolKind;
 pub use variables_workspace::FantaVariablesWorkspace;
 pub use view::{
-    FigView, FigViewEvent, FitToView, ResetZoom, RunAiReview, RunUltraReview, SelectAll,
-    ToggleInspectorSidebar, ToggleLayersSidebar, ZoomIn, ZoomOut, ZoomToSelection,
+    ExportFigmaMotionJson, ExportMotionJson, FigView, FigViewEvent, FitToView, ResetZoom,
+    RunAiReview, RunUltraReview, SelectAll, ToggleInspectorSidebar, ToggleLayersSidebar, ZoomIn,
+    ZoomOut, ZoomToSelection,
 };
 
 pub fn init(cx: &mut App) {
