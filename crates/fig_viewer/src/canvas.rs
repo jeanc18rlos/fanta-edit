@@ -7528,6 +7528,14 @@ mod geometry_tests {
                         count: 1,
                     }),
                 );
+                tool.handle_event(
+                    &mut context,
+                    ToolEvent::Pointer(PointerEvent::Release {
+                        screen: near.to_array(),
+                        button: Button::Primary,
+                        modifiers: ModifierKeys::empty(),
+                    }),
+                );
                 assert_eq!(tool.target(), Some(underneath_id));
                 assert_eq!(context.doc.scene.get(clipped_id), Some(&clipped_before));
                 assert_eq!(context.doc.history.undo_depth(), 1);
