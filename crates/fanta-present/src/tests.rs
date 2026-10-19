@@ -3386,23 +3386,23 @@ fn resize_rebases_history_and_an_in_flight_transition() {
     session.resize_with_scale(new_size, 2.0).unwrap();
     let active = session.active_transition.unwrap();
     assert_eq!(
-        active.from_viewport,
-        frame_viewport(&doc.scene, source_id, new_size)
+        active.from_camera,
+        frame_camera(&doc.scene, source_id, new_size, FitMode::Contain)
     );
     assert_eq!(
-        active.to_viewport,
-        frame_viewport(&doc.scene, destination_id, new_size)
+        active.to_camera,
+        frame_camera(&doc.scene, destination_id, new_size, FitMode::Contain)
     );
     assert_eq!(active.elapsed, elapsed);
     assert_eq!(
-        session.back_stack[0].viewport,
-        frame_viewport(&doc.scene, source_id, new_size)
+        session.back_stack[0].camera,
+        frame_camera(&doc.scene, source_id, new_size, FitMode::Contain)
     );
     session.handle_pointer(DVec2::new(200.0, 100.0), PointerEvent::Click);
     assert_eq!(session.current_frame(), source_id);
     assert_eq!(
-        session.viewport,
-        frame_viewport(&doc.scene, source_id, new_size)
+        session.camera,
+        frame_camera(&doc.scene, source_id, new_size, FitMode::Contain)
     );
 }
 
@@ -4137,7 +4137,7 @@ fn injected_compiled_motion_is_shared_and_samples_like_a_session_compiled_index(
 #[test]
 fn camera_pans_with_the_pointer_zooms_around_an_anchor_and_fits_again()
 -> Result<(), Box<dyn std::error::Error>> {
-    use fanta_canvas::viewport::world_to_screen;
+    use fanta_canvas::viewport::{screen_to_world, world_to_screen};
     let mut document = Doc::new();
     let root = frame(0.0);
     let root_id = root.id;
@@ -5116,16 +5116,26 @@ fn paused_resize_preserves_clocks_and_uses_effective_frame_bounds()
         .clips
         .insert(clip_id, position_clip(clip_id, root_id, 0.0, 100.0));
     let mut player = PresentSession::new_headless(&document, Some(root_id), DVec2::splat(200.0))?;
-    assert_eq!(player.viewport.zoom, 0.5);
+    assert_eq!(player.camera.scale, [0.5, 0.5]);
     player.play_clip(clip_id, None, ClipPlaybackMode::Once)?;
     player.advance_by(0.05)?;
     player.pause_playback();
     let clock = player.playback_state().clock_ms;
     let timer = player.timers.first().ok_or("missing timer")?.remaining;
+    let paused_state = serde_json::to_value(player.playback_state())?;
+    let variables = serde_json::to_value(player.runtime_variables())?;
+    let modes = player.runtime_active_modes().clone();
+    player.set_fit_mode(FitMode::Cover);
+    assert_eq!(player.camera().scale, [2.0, 2.0]);
+    player.set_fit_mode(FitMode::Fill);
+    assert_eq!(player.camera().scale, [0.5, 2.0]);
     player.resize_with_scale(DVec2::new(400.0, 100.0), 2.0)?;
-    assert_eq!(player.viewport.zoom, 1.0);
-    assert_eq!(player.viewport.center, [200.0, 50.0]);
+    assert_eq!(player.camera.scale, [1.0, 1.0]);
+    assert_eq!(player.camera.center, [200.0, 50.0]);
     assert_eq!(player.pixel_size(), (800, 200));
+    assert_eq!(serde_json::to_value(player.playback_state())?, paused_state);
+    assert_eq!(serde_json::to_value(player.runtime_variables())?, variables);
+    assert_eq!(player.runtime_active_modes(), &modes);
     player.advance_by(1.0)?;
     assert_eq!(player.playback_state().clock_ms, clock);
     assert_eq!(
@@ -5191,9 +5201,23 @@ fn resizing_updates_active_variant_layers_without_advancing_their_clock()
         active
             .layers
             .iter()
-            .all(|layer| layer.viewport == player.viewport)
+            .all(|layer| layer.camera == player.camera)
     );
-    assert_eq!(player.viewport.zoom, 2.0);
+    assert_eq!(player.camera.scale, [2.0, 2.0]);
+    player.set_fit_mode(FitMode::Fill);
+    player.resize_with_scale(DVec2::splat(200.0), 2.0)?;
+    let active = player
+        .active_variant_transition
+        .as_ref()
+        .ok_or("missing rebased variant transition")?;
+    assert_eq!(active.clock.elapsed, elapsed);
+    assert!(
+        active
+            .layers
+            .iter()
+            .all(|layer| layer.camera == player.camera())
+    );
+    assert_eq!(player.camera().scale, [2.0, 4.0]);
     Ok(())
 }
 
@@ -5214,6 +5238,13 @@ fn headless_playback_accepts_dimensions_that_cannot_allocate_a_skia_surface()
     let size = DVec2::new(f64::from(i32::MAX) + 1.0, 2.0);
     let mut playback = PlaybackSession::new(&document, Some(root_id), size)?;
     assert_eq!(playback.pixel_size(), (i32::MAX as u32 + 1, 2));
+    let original_state = serde_json::to_value(playback.playback_state())?;
+    assert!(playback.set_fit_mode(FitMode::Fill).needs_redraw);
+    assert_eq!(playback.fit_mode(), FitMode::Fill);
+    assert_eq!(
+        serde_json::to_value(playback.playback_state())?,
+        original_state
+    );
     playback.advance_by(0.1)?;
     assert_eq!(playback.take_open_url().as_deref(), Some("headless-timer"));
     assert!(PresentSession::from_playback(playback).is_err());
@@ -5224,10 +5255,17 @@ fn headless_playback_accepts_dimensions_that_cannot_allocate_a_skia_surface()
 fn native_facade_and_headless_playback_preserve_identical_command_state()
 -> Result<(), Box<dyn std::error::Error>> {
     let mut document = Doc::new();
-    let mut root = frame(0.0);
+    let mut root = frame_sized(0.0, 0.0, 200.0, 100.0, Color::WHITE);
     let root_id = root.id;
-    let destination = frame(300.0);
+    let mut destination = frame_sized(300.0, 0.0, 100.0, 200.0, Color::WHITE);
     let destination_id = destination.id;
+    destination.reactions.push(click(
+        9203,
+        Trigger::Key {
+            keys: vec!["Backspace".into()],
+        },
+        Action::Back,
+    ));
     root.reactions.push(click(
         9201,
         Trigger::AfterDelay { delay_ms: 250 },
@@ -5241,6 +5279,45 @@ fn native_facade_and_headless_playback_preserve_identical_command_state()
         .insert(clip_id, position_clip(clip_id, root_id, 0.0, 100.0));
     let mut playback = PlaybackSession::new(&document, Some(root_id), DVec2::splat(200.0))?;
     let mut presentation = PresentSession::new(&document, Some(root_id), DVec2::splat(200.0))?;
+    let assert_same_state = |playback: &PlaybackSession,
+                             presentation: &PresentSession|
+     -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(playback.camera(), presentation.camera());
+        assert_eq!(playback.viewport(), presentation.viewport());
+        assert_eq!(playback.fit_mode(), presentation.fit_mode());
+        assert_eq!(playback.pixel_size(), presentation.pixel_size());
+        assert_eq!(
+            serde_json::to_value(playback.playback_state())?,
+            serde_json::to_value(presentation.playback_state())?
+        );
+        assert_eq!(
+            serde_json::to_value(playback.runtime_variables())?,
+            serde_json::to_value(presentation.runtime_variables())?
+        );
+        assert_eq!(
+            playback.runtime_active_modes(),
+            presentation.runtime_active_modes()
+        );
+        assert_eq!(playback.variant_overrides, presentation.variant_overrides);
+        assert_eq!(
+            playback.instance_variant_overrides,
+            presentation.instance_variant_overrides
+        );
+        Ok(())
+    };
+    for mode in [FitMode::Cover, FitMode::Fill] {
+        assert_eq!(playback.set_fit_mode(mode), presentation.set_fit_mode(mode));
+        assert_same_state(&playback, &presentation)?;
+    }
+    assert_eq!(
+        playback.pan_view(DVec2::new(12.0, -24.0))?,
+        presentation.pan_view(DVec2::new(12.0, -24.0))?
+    );
+    assert_eq!(
+        playback.zoom_view(DVec2::new(40.0, 80.0), 2.0)?,
+        presentation.zoom_view(DVec2::new(40.0, 80.0), 2.0)?
+    );
+    assert_same_state(&playback, &presentation)?;
     playback.play_clip(clip_id, None, ClipPlaybackMode::PingPong)?;
     presentation.play_clip(clip_id, None, ClipPlaybackMode::PingPong)?;
     playback.resize_with_scale(DVec2::new(320.0, 180.0), 2.0)?;
@@ -5254,9 +5331,26 @@ fn native_facade_and_headless_playback_preserve_identical_command_state()
             serde_json::to_value(presentation.playback_state())?
         );
         assert_eq!(playback.pixel_size(), presentation.pixel_size());
+        assert_same_state(&playback, &presentation)?;
     }
     assert_eq!(playback.current_frame(), destination_id);
     assert_eq!(presentation.current_frame(), destination_id);
+    playback.pause_playback();
+    presentation.pause_playback();
+    assert_eq!(playback.advance_by(1.0)?, presentation.advance_by(1.0)?);
+    assert_same_state(&playback, &presentation)?;
+    assert_eq!(
+        playback.handle_key("Backspace", KeyEvent::Down),
+        presentation.handle_key("Backspace", KeyEvent::Down)
+    );
+    assert_eq!(playback.current_frame(), root_id);
+    assert_same_state(&playback, &presentation)?;
+    assert_eq!(playback.fit_view(), presentation.fit_view());
+    assert_same_state(&playback, &presentation)?;
+    assert!(playback.restart_at(root_id));
+    assert!(presentation.restart_at(root_id));
+    assert_eq!(playback.fit_mode(), FitMode::Fill);
+    assert_same_state(&playback, &presentation)?;
     assert_eq!(
         serde_json::to_value(playback.take_playback_events())?,
         serde_json::to_value(presentation.take_playback_events())?
@@ -5321,5 +5415,903 @@ fn transition_hit_offsets_follow_rounded_physical_pixels() -> Result<(), Box<dyn
         0.13,
     );
     assert_eq!(overlay, incoming);
+
+    playback.set_fit_mode(FitMode::Fill);
+    playback.resize_with_scale(DVec2::new(301.0, 199.0), 1.25)?;
+    assert_eq!(playback.pixel_size(), (376, 249));
+    assert_ne!(playback.camera().scale[0], playback.camera().scale[1]);
+    let (outgoing, incoming) = playback.transition_screen_offsets(
+        TransitionStyle::Push {
+            direction: Direction::Left,
+        },
+        0.13,
+    );
+    assert_eq!(outgoing, (39.2, 0.0));
+    assert_eq!(incoming, (-261.6, 0.0));
+    Ok(())
+}
+
+fn fit_transition_document(
+    style: TransitionStyle,
+) -> Result<(Doc, NodeId, NodeId), Box<dyn std::error::Error>> {
+    let mut document = Doc::new();
+    document.presentation = Some(fanta_doc::PresentationConfig {
+        frame_color: Some(Color::WHITE),
+        ..Default::default()
+    });
+    let mut destination = frame_sized(900.0, 60.0, 100.0, 200.0, Color::BLACK);
+    let destination_id = destination.id;
+    destination.reactions.push(click(
+        9300,
+        Trigger::Key {
+            keys: vec!["Backspace".into()],
+        },
+        Action::Back,
+    ));
+    let mut source = frame_sized(400.0, 60.0, 200.0, 100.0, Color::BLACK);
+    let source_id = source.id;
+    let mut navigate = click(
+        9301,
+        Trigger::Key {
+            keys: vec!["Enter".into()],
+        },
+        Action::Navigate { to: destination_id },
+    );
+    navigate.transition = Some(Transition {
+        style,
+        duration_ms: 1000,
+        easing: Easing::Linear,
+    });
+    source.reactions.push(navigate);
+    document.scene.insert_many([source, destination])?;
+    for (parent, position, color, name, url, reaction_id) in [
+        (
+            source_id,
+            [80.0, 40.0],
+            Color::rgb(255, 0, 0),
+            "Source marker",
+            "fit-source",
+            9302,
+        ),
+        (
+            destination_id,
+            [40.0, 80.0],
+            Color::rgb(0, 0, 255),
+            "Destination marker",
+            "fit-destination",
+            9303,
+        ),
+    ] {
+        let mut marker = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0, 0.0, 20.0, 20.0, color,
+        )));
+        marker.parent = Some(parent);
+        marker.name = name.into();
+        marker.transform = Transform2D::translation(position[0], position[1]);
+        marker.reactions.push(click(
+            reaction_id,
+            Trigger::Click,
+            Action::OpenLink { url: url.into() },
+        ));
+        document.scene.insert(marker)?;
+    }
+    Ok((document, source_id, destination_id))
+}
+
+#[test]
+fn fit_modes_render_and_hit_their_own_geometry_without_changing_the_document()
+-> Result<(), Box<dyn std::error::Error>> {
+    let red = [255, 0, 0, 255];
+    let black = [0, 0, 0, 255];
+    let white = [255, 255, 255, 255];
+    for origin in [[400.0, 60.0], [-700.0, -260.0]] {
+        let mut document = Doc::new();
+        document.presentation = Some(fanta_doc::PresentationConfig {
+            frame_color: Some(Color::WHITE),
+            ..Default::default()
+        });
+        let mut root = frame_sized(origin[0], origin[1], 200.0, 100.0, Color::BLACK);
+        let root_id = root.id;
+        root.reactions.push(click(
+            9310,
+            Trigger::Click,
+            Action::OpenLink {
+                url: "fit-frame".into(),
+            },
+        ));
+        document.scene.insert(root)?;
+        for (position, color, url, reaction_id) in [
+            ([80.0, 20.0], Color::rgb(255, 0, 0), "fit-a", 9311),
+            ([0.0, 0.0], Color::rgb(0, 0, 255), "fit-cropped", 9312),
+        ] {
+            let mut marker = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+                position[0],
+                position[1],
+                20.0,
+                20.0,
+                color,
+            )));
+            marker.parent = Some(root_id);
+            marker.reactions.push(click(
+                reaction_id,
+                Trigger::Click,
+                Action::OpenLink { url: url.into() },
+            ));
+            document.scene.insert(marker)?;
+        }
+        let original = serde_json::to_vec(&document)?;
+        let mut untouched = PlaybackSession::new(&document, Some(root_id), DVec2::splat(300.0))?;
+        assert_eq!(untouched.fit_mode(), FitMode::Contain);
+        for (mode, scale, colors, links, cropped_link) in [
+            (
+                FitMode::Contain,
+                [1.5, 1.5],
+                [black, black, red, white],
+                [Some("fit-frame"), Some("fit-frame"), Some("fit-a"), None],
+                "fit-cropped",
+            ),
+            (
+                FitMode::Cover,
+                [3.0, 3.0],
+                [red, red, black, black],
+                [
+                    Some("fit-a"),
+                    Some("fit-a"),
+                    Some("fit-frame"),
+                    Some("fit-frame"),
+                ],
+                "fit-frame",
+            ),
+            (
+                FitMode::Fill,
+                [1.5, 3.0],
+                [red, black, black, black],
+                [
+                    Some("fit-a"),
+                    Some("fit-frame"),
+                    Some("fit-frame"),
+                    Some("fit-frame"),
+                ],
+                "fit-frame",
+            ),
+        ] {
+            let mut session = PresentSession::new(&document, Some(root_id), DVec2::splat(300.0))?;
+            session.set_fit_mode(mode);
+            assert_eq!(session.fit_mode(), mode);
+            assert_eq!(session.camera().scale, scale);
+            assert_eq!(
+                session.camera().center,
+                [origin[0] + 100.0, origin[1] + 50.0]
+            );
+            assert_eq!(session.viewport().center, session.camera().center);
+            assert_eq!(session.viewport().zoom, scale[0].min(scale[1]));
+            let pixels = session.present_rgba();
+            for ((x, y), (color, link)) in [(130, 80), (105, 80), (130, 125), (50, 20)]
+                .into_iter()
+                .zip(colors.into_iter().zip(links))
+            {
+                assert_eq!(pixel_at(&pixels, 300, x, y), color, "{mode:?} at {x},{y}");
+                session.handle_pointer(DVec2::new(x as f64, y as f64), PointerEvent::Click);
+                assert_eq!(
+                    session.take_open_url().as_deref(),
+                    link,
+                    "{mode:?} at {x},{y}"
+                );
+            }
+            session.handle_pointer(DVec2::new(15.0, 90.0), PointerEvent::Click);
+            assert_eq!(session.take_open_url().as_deref(), Some(cropped_link));
+            session.fit_view();
+            session.restart_at(root_id);
+            assert_eq!(serde_json::to_vec(session.document())?, original);
+        }
+        assert_eq!(untouched.camera().scale, [1.5, 1.5]);
+        assert_eq!(untouched.fit_mode(), FitMode::Contain);
+        assert!(untouched.take_playback_events().is_empty());
+        assert_eq!(serde_json::to_vec(untouched.document())?, original);
+        assert_eq!(serde_json::to_vec(&document)?, original);
+    }
+    Ok(())
+}
+
+#[test]
+fn fill_camera_preserves_anchor_ratio_and_manual_offset_across_mode_and_resize()
+-> Result<(), Box<dyn std::error::Error>> {
+    use fanta_canvas::viewport::{MAX_ZOOM, MIN_ZOOM, camera_screen_to_world};
+
+    let mut document = Doc::new();
+    let root = frame_sized(400.0, 60.0, 200.0, 100.0, Color::BLACK);
+    let root_id = root.id;
+    document.scene.insert(root)?;
+    let size = DVec2::splat(300.0);
+    let mut session = PlaybackSession::new(&document, Some(root_id), size)?;
+    assert!(session.set_fit_mode(FitMode::Fill).needs_redraw);
+    let fitted = session.camera();
+    let anchor = DVec2::new(60.0, 90.0);
+    assert_eq!(
+        camera_screen_to_world(anchor, &fitted, size),
+        DVec2::new(440.0, 90.0)
+    );
+    session.zoom_view(anchor, 2.0)?;
+    assert_eq!(
+        session.camera(),
+        Camera2D {
+            center: [470.0, 100.0],
+            scale: [3.0, 6.0]
+        }
+    );
+    assert_eq!(
+        camera_screen_to_world(anchor, &session.camera(), size),
+        DVec2::new(440.0, 90.0)
+    );
+    session.pan_view(DVec2::new(30.0, -12.0))?;
+    assert_eq!(
+        session.camera(),
+        Camera2D {
+            center: [460.0, 102.0],
+            scale: [3.0, 6.0]
+        }
+    );
+    let moved = session.camera();
+    for factor in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert!(matches!(
+            session.zoom_view(anchor, factor),
+            Err(PresentError::InvalidCamera)
+        ));
+    }
+    for invalid in [DVec2::new(f64::NAN, 0.0), DVec2::new(0.0, f64::INFINITY)] {
+        assert!(matches!(
+            session.pan_view(invalid),
+            Err(PresentError::InvalidCamera)
+        ));
+        assert!(matches!(
+            session.zoom_view(invalid, 2.0),
+            Err(PresentError::InvalidCamera)
+        ));
+    }
+    assert_eq!(session.camera(), moved);
+    assert_eq!(
+        session.set_fit_mode(FitMode::Fill),
+        PresentResponse::default()
+    );
+    session.set_fit_mode(FitMode::Cover);
+    assert_eq!(
+        session.camera(),
+        Camera2D {
+            center: [460.0, 102.0],
+            scale: [6.0, 6.0]
+        }
+    );
+    session.set_fit_mode(FitMode::Contain);
+    assert_eq!(session.camera().scale, [3.0, 3.0]);
+    session.set_fit_mode(FitMode::Fill);
+    assert_eq!(session.camera(), moved);
+    session.resize_with_scale(DVec2::new(400.0, 200.0), 2.0)?;
+    assert_eq!(session.pixel_size(), (800, 400));
+    assert_eq!(
+        session.camera(),
+        Camera2D {
+            center: [460.0, 102.0],
+            scale: [4.0, 4.0]
+        }
+    );
+    let resized = session.camera();
+    session.resize_with_scale(DVec2::new(400.0, 200.0), 1.25)?;
+    assert_eq!(session.camera(), resized);
+    session.resize(size)?;
+    session.fit_view();
+    assert_eq!(session.camera(), fitted);
+    for factor in [1e30, 1e-30] {
+        session.zoom_view(anchor, factor)?;
+        let scale = session.camera().scale;
+        assert!((scale[1] / scale[0] - 2.0).abs() < 1e-12);
+        assert!(
+            scale
+                .into_iter()
+                .all(|axis| (MIN_ZOOM..=MAX_ZOOM).contains(&axis))
+        );
+    }
+    assert!(session.restart_at(root_id));
+    assert_eq!(session.fit_mode(), FitMode::Fill);
+    assert_eq!(session.camera(), fitted);
+    assert_eq!(session.playback_state().clock_ms, 0.0);
+    Ok(())
+}
+
+#[test]
+fn fill_dissolve_fits_different_aspect_endpoints_before_blending()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (document, source, destination) = fit_transition_document(TransitionStyle::Dissolve)?;
+    let mut session = PresentSession::new(&document, Some(source), DVec2::splat(300.0))?;
+    session.set_fit_mode(FitMode::Fill);
+    let source_pixels = session.present_rgba();
+    assert_eq!(pixel_at(&source_pixels, 300, 130, 160), [255, 0, 0, 255]);
+    assert_eq!(pixel_at(&source_pixels, 300, 160, 130), [0, 0, 0, 255]);
+    let response = session.handle_key("Enter", KeyEvent::Down);
+    assert!(response.navigated && response.animating);
+    assert_eq!(session.current_frame(), destination);
+    assert_eq!(session.camera().scale, [3.0, 1.5]);
+    assert_eq!(session.present_rgba(), source_pixels);
+    session.advance_by(0.5)?;
+    let midpoint = session.present_rgba();
+    for (point, expected) in [
+        ((130, 160), [128_u8, 0, 0, 255]),
+        ((160, 130), [0, 0, 128, 255]),
+        ((130, 130), [128, 0, 128, 255]),
+    ] {
+        let actual = pixel_at(&midpoint, 300, point.0, point.1);
+        assert!(
+            actual
+                .into_iter()
+                .zip(expected)
+                .all(|(actual, expected)| actual.abs_diff(expected) <= 1),
+            "{point:?}: {actual:?}"
+        );
+    }
+    session.advance_by(0.5)?;
+    let completed = session.present_rgba();
+    assert_eq!(pixel_at(&completed, 300, 130, 160), [0, 0, 0, 255]);
+    assert_eq!(pixel_at(&completed, 300, 160, 130), [0, 0, 255, 255]);
+    session.handle_key("Backspace", KeyEvent::Down);
+    assert_eq!(session.current_frame(), source);
+    assert_eq!(session.camera().scale, [1.5, 3.0]);
+    assert_eq!(session.present_rgba(), source_pixels);
+    Ok(())
+}
+
+#[test]
+fn fill_directional_transitions_move_pixels_and_hits_in_surface_space()
+-> Result<(), Box<dyn std::error::Error>> {
+    for style in [
+        TransitionStyle::MoveIn {
+            direction: Direction::Left,
+        },
+        TransitionStyle::Push {
+            direction: Direction::Left,
+        },
+        TransitionStyle::MoveOut {
+            direction: Direction::Left,
+        },
+    ] {
+        let (document, source, destination) = fit_transition_document(style)?;
+        let mut session = PresentSession::new(&document, Some(source), DVec2::splat(300.0))?;
+        session.set_fit_mode(FitMode::Fill);
+        session.handle_key("Enter", KeyEvent::Down);
+        session.handle_pointer(DVec2::new(160.0, 135.0), PointerEvent::Click);
+        assert!(
+            session.take_open_url().is_none(),
+            "{style:?} destination starts covered or offscreen"
+        );
+        session.advance_by(0.5)?;
+        assert_eq!(session.current_frame(), destination);
+        let pixels = session.present_rgba();
+        let incoming = if matches!(style, TransitionStyle::MoveOut { .. }) {
+            DVec2::new(160.0, 135.0)
+        } else {
+            DVec2::new(15.0, 135.0)
+        };
+        assert_eq!(
+            pixel_at(&pixels, 300, incoming.x as usize, incoming.y as usize),
+            [0, 0, 255, 255],
+            "{style:?}"
+        );
+        session.handle_pointer(incoming, PointerEvent::Click);
+        assert_eq!(
+            session.take_open_url().as_deref(),
+            Some("fit-destination"),
+            "{style:?}"
+        );
+        if !matches!(style, TransitionStyle::MoveOut { .. }) {
+            session.handle_pointer(DVec2::new(160.0, 135.0), PointerEvent::Click);
+            assert!(
+                session.take_open_url().is_none(),
+                "{style:?} eventual destination bounds are not clickable yet"
+            );
+        }
+        if matches!(style, TransitionStyle::Push { .. }) {
+            assert_eq!(pixel_at(&pixels, 300, 280, 160), [255, 0, 0, 255]);
+        }
+        session.advance_by(0.5)?;
+        assert_eq!(
+            pixel_at(&session.present_rgba(), 300, 160, 135),
+            [0, 0, 255, 255]
+        );
+    }
+    Ok(())
+}
+
+fn fit_overlay_document(
+    position: OverlayPosition,
+    transition: Option<Transition>,
+) -> Result<(Doc, NodeId, NodeId, NodeId), Box<dyn std::error::Error>> {
+    let mut document = Doc::new();
+    document.presentation = Some(fanta_doc::PresentationConfig {
+        frame_color: Some(Color::WHITE),
+        ..Default::default()
+    });
+    let mut nested = frame_sized(1800.0, 60.0, 20.0, 10.0, Color::rgb(0, 0, 255));
+    let nested_id = nested.id;
+    nested.reactions.extend([
+        click(
+            9320,
+            Trigger::Click,
+            Action::OpenLink {
+                url: "fit-nested".into(),
+            },
+        ),
+        click(
+            9321,
+            Trigger::Key {
+                keys: vec!["Backspace".into()],
+            },
+            Action::Close,
+        ),
+    ]);
+    let mut overlay = frame_sized(1400.0, 60.0, 40.0, 20.0, Color::rgb(0, 255, 0));
+    let overlay_id = overlay.id;
+    overlay.reactions.extend([
+        click(
+            9322,
+            Trigger::Click,
+            Action::OpenLink {
+                url: "fit-overlay".into(),
+            },
+        ),
+        click(
+            9323,
+            Trigger::Key {
+                keys: vec!["Backspace".into()],
+            },
+            Action::Close,
+        ),
+        click(
+            9324,
+            Trigger::Key {
+                keys: vec!["N".into()],
+            },
+            Action::OpenOverlay {
+                frame: nested_id,
+                overlay: OverlaySettings {
+                    position: OverlayPosition::Center,
+                    background_dim: false,
+                    close_on_click_outside: true,
+                },
+            },
+        ),
+    ]);
+    let mut root = frame_sized(400.0, 60.0, 200.0, 100.0, Color::BLACK);
+    let root_id = root.id;
+    root.reactions.push(click(
+        9325,
+        Trigger::Click,
+        Action::OpenLink {
+            url: "fit-base".into(),
+        },
+    ));
+    let mut open = click(
+        9326,
+        Trigger::Key {
+            keys: vec!["Enter".into()],
+        },
+        Action::OpenOverlay {
+            frame: overlay_id,
+            overlay: OverlaySettings {
+                position,
+                background_dim: false,
+                close_on_click_outside: true,
+            },
+        },
+    );
+    open.transition = transition;
+    root.reactions.push(open);
+    document.scene.insert_many([root, overlay, nested])?;
+    Ok((document, root_id, overlay_id, nested_id))
+}
+
+#[test]
+fn fill_overlays_inherit_axes_for_placement_nested_hits_and_resize()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (position, minimum, maximum) in [
+        (OverlayPosition::Center, [120.0, 120.0], [180.0, 180.0]),
+        (OverlayPosition::TopRight, [240.0, 0.0], [300.0, 60.0]),
+        (
+            OverlayPosition::Manual {
+                offset: [20.0, 10.0],
+            },
+            [30.0, 30.0],
+            [90.0, 90.0],
+        ),
+    ] {
+        let (document, root, overlay, nested) = fit_overlay_document(position, None)?;
+        let mut session = PresentSession::new(&document, Some(root), DVec2::splat(300.0))?;
+        session.set_fit_mode(FitMode::Fill);
+        assert!(session.handle_key("Enter", KeyEvent::Down).navigated);
+        let entry = session.overlays.last().ok_or("missing overlay")?;
+        assert_eq!(entry.root, overlay);
+        assert_eq!(entry.camera.scale, [1.5, 3.0]);
+        assert_eq!(entry.screen_rect.min.to_array(), minimum);
+        assert_eq!(entry.screen_rect.max.to_array(), maximum);
+        let inside = DVec2::new(minimum[0] + 30.0, minimum[1] + 55.0);
+        assert_eq!(
+            pixel_at(
+                &session.present_rgba(),
+                300,
+                inside.x as usize,
+                inside.y as usize
+            ),
+            [0, 255, 0, 255]
+        );
+        session.handle_pointer(inside, PointerEvent::Click);
+        assert_eq!(session.take_open_url().as_deref(), Some("fit-overlay"));
+        if matches!(position, OverlayPosition::Center) {
+            session.handle_key("N", KeyEvent::Down);
+            let entry = session.overlays.last().ok_or("missing nested overlay")?;
+            assert_eq!(entry.root, nested);
+            assert_eq!(entry.camera.scale, [1.5, 3.0]);
+            assert_eq!(entry.screen_rect.min.to_array(), [135.0, 135.0]);
+            assert_eq!(entry.screen_rect.max.to_array(), [165.0, 165.0]);
+            assert_eq!(
+                pixel_at(&session.present_rgba(), 300, 150, 160),
+                [0, 0, 255, 255]
+            );
+            session.handle_pointer(DVec2::new(150.0, 160.0), PointerEvent::Click);
+            assert_eq!(session.take_open_url().as_deref(), Some("fit-nested"));
+            session.handle_key("Backspace", KeyEvent::Down);
+            assert_eq!(session.playback_state().overlay_frames, vec![overlay]);
+            session.resize_with_scale(DVec2::new(400.0, 200.0), 2.0)?;
+            let entry = session.overlays.last().ok_or("missing resized overlay")?;
+            assert_eq!(entry.camera.scale, [2.0, 2.0]);
+            assert_eq!(entry.screen_rect.min.to_array(), [160.0, 80.0]);
+            assert_eq!(entry.screen_rect.max.to_array(), [240.0, 120.0]);
+            assert_eq!(
+                pixel_at(&session.present_rgba(), 800, 470, 230),
+                [0, 255, 0, 255]
+            );
+            session.handle_pointer(DVec2::new(235.0, 115.0), PointerEvent::Click);
+            assert_eq!(session.take_open_url().as_deref(), Some("fit-overlay"));
+            let before = session.camera();
+            session.set_fit_mode(FitMode::Contain);
+            assert_eq!(session.camera(), before);
+            assert_eq!(session.playback_state().overlay_frames, vec![overlay]);
+            assert!(
+                session
+                    .handle_pointer(DVec2::new(150.0, 115.0), PointerEvent::Click)
+                    .navigated
+            );
+        } else {
+            assert!(
+                session
+                    .handle_pointer(DVec2::new(150.0, 150.0), PointerEvent::Click)
+                    .navigated
+            );
+        }
+        assert!(
+            session.take_open_url().is_none(),
+            "outside dismissal must not click the base frame"
+        );
+        assert!(session.playback_state().overlay_frames.is_empty());
+        session.handle_pointer(DVec2::new(150.0, 150.0), PointerEvent::Click);
+        assert_eq!(session.take_open_url().as_deref(), Some("fit-base"));
+    }
+    Ok(())
+}
+
+#[test]
+fn fill_overlay_transition_hit_testing_follows_its_displayed_axes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (document, root, overlay, _) = fit_overlay_document(
+        OverlayPosition::Center,
+        Some(Transition {
+            style: TransitionStyle::MoveIn {
+                direction: Direction::Left,
+            },
+            duration_ms: 1000,
+            easing: Easing::Linear,
+        }),
+    )?;
+    let mut session = PresentSession::new(&document, Some(root), DVec2::splat(300.0))?;
+    session.set_fit_mode(FitMode::Fill);
+    session.handle_key("Enter", KeyEvent::Down);
+    session.handle_pointer(DVec2::new(150.0, 150.0), PointerEvent::Click);
+    assert!(session.take_open_url().is_none());
+    session.advance_by(0.5)?;
+    assert_eq!(
+        pixel_at(&session.present_rgba(), 300, 15, 175),
+        [0, 255, 0, 255]
+    );
+    session.handle_pointer(DVec2::new(15.0, 175.0), PointerEvent::Click);
+    assert_eq!(session.take_open_url().as_deref(), Some("fit-overlay"));
+    session.handle_pointer(DVec2::new(150.0, 150.0), PointerEvent::Click);
+    assert!(session.take_open_url().is_none());
+    assert_eq!(session.playback_state().overlay_frames, vec![overlay]);
+    Ok(())
+}
+
+#[test]
+fn changing_fit_and_resizing_a_paused_transition_preserves_history_and_clocks()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut document, source, destination) = fit_transition_document(TransitionStyle::Dissolve)?;
+    document
+        .scene
+        .get_mut(destination)
+        .ok_or("missing destination")?
+        .reactions
+        .push(click(
+            9330,
+            Trigger::AfterDelay { delay_ms: 1000 },
+            Action::OpenLink {
+                url: "fit-timer".into(),
+            },
+        ));
+    let mut session = PlaybackSession::new(&document, Some(source), DVec2::splat(300.0))?;
+    session.set_fit_mode(FitMode::Fill);
+    session.zoom_view(DVec2::splat(150.0), 2.0)?;
+    session.pan_view(DVec2::new(30.0, -12.0))?;
+    assert_eq!(
+        session.camera(),
+        Camera2D {
+            center: [490.0, 112.0],
+            scale: [3.0, 6.0]
+        }
+    );
+    session.handle_key("Enter", KeyEvent::Down);
+    session.advance_by(0.25)?;
+    session.pause_playback();
+    let state = serde_json::to_value(session.playback_state())?;
+    let timer = session
+        .timers
+        .first()
+        .ok_or("missing destination timer")?
+        .remaining;
+    let variants = session.variant_overrides.clone();
+    let variables = serde_json::to_value(session.runtime_variables())?;
+    let modes = session.runtime_active_modes().clone();
+    session.set_fit_mode(FitMode::Cover);
+    session.set_fit_mode(FitMode::Fill);
+    session.resize_with_scale(DVec2::new(400.0, 200.0), 2.0)?;
+    assert_eq!(
+        session.camera(),
+        Camera2D {
+            center: [950.0, 160.0],
+            scale: [4.0, 1.0]
+        }
+    );
+    let active = session
+        .active_transition
+        .ok_or("missing paused transition")?;
+    assert_eq!(active.elapsed, 0.25);
+    assert_eq!(
+        active.from_camera,
+        Camera2D {
+            center: [490.0, 112.0],
+            scale: [4.0, 4.0]
+        }
+    );
+    assert_eq!(active.to_camera, session.camera());
+    assert_eq!(
+        session.back_stack.first().ok_or("missing history")?.camera,
+        active.from_camera
+    );
+    assert_eq!(session.pixel_size(), (800, 400));
+    session.advance_by(10.0)?;
+    assert_eq!(serde_json::to_value(session.playback_state())?, state);
+    assert_eq!(
+        session
+            .timers
+            .first()
+            .ok_or("missing paused timer")?
+            .remaining,
+        timer
+    );
+    assert_eq!(session.variant_overrides, variants);
+    assert_eq!(
+        serde_json::to_value(session.runtime_variables())?,
+        variables
+    );
+    assert_eq!(session.runtime_active_modes(), &modes);
+    assert!(session.take_open_url().is_none());
+    session.handle_key("Backspace", KeyEvent::Down);
+    assert_eq!(session.current_frame(), source);
+    assert_eq!(session.camera(), active.from_camera);
+    session.fit_view();
+    assert_eq!(
+        session.camera(),
+        Camera2D {
+            center: [500.0, 110.0],
+            scale: [2.0, 2.0]
+        }
+    );
+    Ok(())
+}
+
+fn presentation_canvas_pixels(
+    session: &mut PresentSession,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let (width, height) = session.pixel_size();
+    let mut surface = skia_safe::surfaces::raster_n32_premul((width as i32, height as i32))
+        .ok_or("test presentation surface allocation failed")?;
+    let metrics =
+        session.render_to_canvas(surface.canvas(), width, height, session.display_scale())?;
+    assert_eq!(metrics.whole_frame_readbacks, 0);
+    assert!(!metrics.render.effect_failed && !metrics.render.incomplete_artwork);
+    let info = skia_safe::ImageInfo::new(
+        (width as i32, height as i32),
+        skia_safe::ColorType::RGBA8888,
+        skia_safe::AlphaType::Unpremul,
+        None,
+    );
+    let mut pixels = vec![0; info.min_row_bytes() * height as usize];
+    if !surface.read_pixels(&info, &mut pixels, info.min_row_bytes(), (0, 0)) {
+        return Err("test presentation surface readback failed".into());
+    }
+    Ok(pixels)
+}
+
+#[test]
+fn fit_pixels_match_the_external_canvas_path_for_transitions_and_overlays()
+-> Result<(), Box<dyn std::error::Error>> {
+    for mode in [FitMode::Contain, FitMode::Cover, FitMode::Fill] {
+        for style in [
+            TransitionStyle::Dissolve,
+            TransitionStyle::Push {
+                direction: Direction::Left,
+            },
+        ] {
+            let (document, source, _) = fit_transition_document(style)?;
+            let mut session = PresentSession::new(&document, Some(source), DVec2::splat(300.0))?;
+            session.set_fit_mode(mode);
+            assert_eq!(
+                presentation_canvas_pixels(&mut session)?,
+                session.present_rgba(),
+                "{mode:?} initial"
+            );
+            session.handle_key("Enter", KeyEvent::Down);
+            session.advance_by(0.5)?;
+            let native = session.present_rgba();
+            let direct = presentation_canvas_pixels(&mut session)?;
+            assert!(
+                native
+                    .iter()
+                    .zip(&direct)
+                    .all(|(native, direct)| native.abs_diff(*direct) <= 1),
+                "{mode:?} {style:?} midpoint"
+            );
+            assert_eq!(native.len(), direct.len());
+            session.advance_by(0.5)?;
+            assert_eq!(
+                presentation_canvas_pixels(&mut session)?,
+                session.present_rgba(),
+                "{mode:?} endpoint"
+            );
+        }
+        let (document, source, _, _) = fit_overlay_document(OverlayPosition::Center, None)?;
+        let mut session = PresentSession::new(&document, Some(source), DVec2::splat(300.0))?;
+        session.set_fit_mode(mode);
+        session.handle_key("Enter", KeyEvent::Down);
+        assert_eq!(
+            presentation_canvas_pixels(&mut session)?,
+            session.present_rgba(),
+            "{mode:?} overlay"
+        );
+        session.resize_with_scale(DVec2::new(400.0, 200.0), 2.0)?;
+        assert_eq!(
+            presentation_canvas_pixels(&mut session)?,
+            session.present_rgba(),
+            "{mode:?} resized overlay"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn fill_smart_animate_renders_matched_scratch_layers_with_both_camera_axes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut document, source, destination) =
+        fit_transition_document(TransitionStyle::SmartAnimate)?;
+    let markers: Vec<_> = document
+        .scene
+        .descendants_of(source)
+        .chain(document.scene.descendants_of(destination))
+        .filter(|id| {
+            document
+                .scene
+                .get(*id)
+                .is_some_and(|node| matches!(node.data, NodeData::Vector(_)))
+        })
+        .collect();
+    for marker in markers {
+        let node = document
+            .scene
+            .get_mut(marker)
+            .ok_or("missing matched marker")?;
+        node.name = "Matched marker".into();
+        node.data = NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            20.0,
+            20.0,
+            Color::rgb(0, 255, 0),
+        ));
+        if node.parent == Some(source) {
+            node.transform = Transform2D::translation(20.0, 40.0);
+        }
+    }
+    let mut session = PresentSession::new(&document, Some(source), DVec2::splat(300.0))?;
+    session.set_fit_mode(FitMode::Fill);
+    let source_pixels = session.present_rgba();
+    assert_eq!(pixel_at(&source_pixels, 300, 45, 150), [0, 255, 0, 255]);
+    session.handle_key("Enter", KeyEvent::Down);
+    assert!(session.smart_animate.is_some());
+    assert_eq!(session.present_rgba(), source_pixels);
+    session.advance_by(0.5)?;
+    let midpoint = session.present_rgba();
+    assert_eq!(pixel_at(&midpoint, 300, 70, 135), [0, 255, 0, 255]);
+    assert_eq!(pixel_at(&midpoint, 300, 120, 105), [0, 0, 0, 255]);
+    session.handle_pointer(DVec2::new(70.0, 135.0), PointerEvent::Click);
+    assert_eq!(session.take_open_url().as_deref(), Some("fit-destination"));
+    session.handle_pointer(DVec2::new(120.0, 105.0), PointerEvent::Click);
+    assert!(session.take_open_url().is_none());
+    assert_eq!(presentation_canvas_pixels(&mut session)?, midpoint);
+    session.advance_by(0.5)?;
+    let completed = session.present_rgba();
+    assert_eq!(pixel_at(&completed, 300, 160, 130), [0, 255, 0, 255]);
+    assert_eq!(pixel_at(&completed, 300, 130, 160), [0, 0, 0, 255]);
+    Ok(())
+}
+
+#[test]
+fn fill_variant_transitions_preserve_anisotropic_instance_and_sibling_geometry()
+-> Result<(), Box<dyn std::error::Error>> {
+    for style in [TransitionStyle::Dissolve, TransitionStyle::SmartAnimate] {
+        let (mut document, root, first, second) = interactive_variant_document();
+        document
+            .scene
+            .get_mut(first)
+            .ok_or("missing first instance")?
+            .reactions = vec![click_with(
+            9340,
+            Action::UpdateVariant {
+                component: ComponentId::from_u128(800),
+                variant: "Hover".into(),
+            },
+            Transition {
+                style,
+                duration_ms: 1000,
+                easing: Easing::Linear,
+            },
+        )];
+        let mut session = PresentSession::new(&document, Some(root), DVec2::splat(100.0))?;
+        session.set_fit_mode(FitMode::Fill);
+        assert_eq!(session.camera().scale, [1.0, 2.0]);
+        let before = session.present_rgba();
+        assert_eq!(pixel_at(&before, 100, 25, 80), [255, 0, 0, 255]);
+        assert!(
+            session
+                .handle_pointer(DVec2::new(25.0, 75.0), PointerEvent::Click)
+                .animating
+        );
+        assert_eq!(session.present_rgba(), before);
+        session.advance_by(0.5)?;
+        let midpoint = session.present_rgba();
+        let changing = pixel_at(&midpoint, 100, 25, 80);
+        assert!(
+            changing[0] > 80 && changing[1] > 80 && changing[2] == 0,
+            "{style:?}: {changing:?}"
+        );
+        assert_eq!(pixel_at(&midpoint, 100, 75, 80), [255, 0, 0, 255]);
+        let direct = presentation_canvas_pixels(&mut session)?;
+        assert!(
+            midpoint
+                .iter()
+                .zip(&direct)
+                .all(|(native, direct)| native.abs_diff(*direct) <= 1)
+        );
+        assert_eq!(midpoint.len(), direct.len());
+        session.advance_by(0.5)?;
+        assert_eq!(
+            pixel_at(&session.present_rgba(), 100, 25, 80),
+            [0, 255, 0, 255]
+        );
+        assert!(!session.instance_variant_overrides.contains_key(&second));
+    }
     Ok(())
 }

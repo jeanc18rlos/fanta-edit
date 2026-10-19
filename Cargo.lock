@@ -5228,8 +5228,10 @@ dependencies = [
 name = "fanta-render"
 version = "0.1.0"
 dependencies = [
+ "fanta-canvas",
  "fanta-doc",
  "fanta-text",
+ "glam 0.32.1",
  "image",
  "lru",
  "metal",

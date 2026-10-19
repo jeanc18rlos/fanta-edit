@@ -19,6 +19,147 @@
 use fanta_doc::{Bounds, Viewport};
 use glam::DVec2;
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum FitMode {
+    #[default]
+    Contain,
+    Cover,
+    Fill,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Camera2D {
+    pub center: [f64; 2],
+    pub scale: [f64; 2],
+}
+
+impl Default for Camera2D {
+    fn default() -> Self {
+        Viewport::default().into()
+    }
+}
+
+impl From<Viewport> for Camera2D {
+    fn from(viewport: Viewport) -> Self {
+        Self {
+            center: viewport.center,
+            scale: [viewport.zoom; 2],
+        }
+    }
+}
+
+impl Camera2D {
+    pub fn is_valid(&self) -> bool {
+        self.center.into_iter().all(f64::is_finite)
+            && self
+                .scale
+                .into_iter()
+                .all(|scale| scale.is_finite() && scale > 0.0)
+    }
+
+    /// A scalar cannot represent fill's independent axes; this explicit projection
+    /// keeps legacy camera inspection useful without being used for rendering.
+    pub fn scalar_viewport(&self) -> Viewport {
+        Viewport {
+            center: self.center,
+            zoom: self.scale[0].min(self.scale[1]),
+        }
+    }
+}
+
+pub fn camera_screen_to_world(screen: DVec2, camera: &Camera2D, screen_size: DVec2) -> DVec2 {
+    (screen - screen_size * 0.5) / DVec2::from(camera.scale) + DVec2::from(camera.center)
+}
+
+pub fn camera_world_to_screen(world: DVec2, camera: &Camera2D, screen_size: DVec2) -> DVec2 {
+    (world - DVec2::from(camera.center)) * DVec2::from(camera.scale) + screen_size * 0.5
+}
+
+pub fn pan_camera(camera: &Camera2D, screen_delta: DVec2) -> Camera2D {
+    if !camera.is_valid() || !screen_delta.is_finite() {
+        return *camera;
+    }
+    let panned = Camera2D {
+        center: (DVec2::from(camera.center) - screen_delta / DVec2::from(camera.scale)).to_array(),
+        ..*camera
+    };
+    if panned.is_valid() { panned } else { *camera }
+}
+
+pub fn zoom_camera_at(
+    camera: &Camera2D,
+    screen_anchor: DVec2,
+    factor: f64,
+    screen_size: DVec2,
+) -> Camera2D {
+    if !camera.is_valid()
+        || !screen_anchor.is_finite()
+        || !screen_size.is_finite()
+        || !factor.is_finite()
+        || factor <= 0.0
+    {
+        return *camera;
+    }
+    let minimum_factor = (MIN_ZOOM / camera.scale[0]).max(MIN_ZOOM / camera.scale[1]);
+    let maximum_factor = (MAX_ZOOM / camera.scale[0]).min(MAX_ZOOM / camera.scale[1]);
+    if minimum_factor > maximum_factor {
+        return *camera;
+    }
+    let factor = factor.clamp(minimum_factor, maximum_factor);
+    let scale = DVec2::from(camera.scale) * factor;
+    let world_before = camera_screen_to_world(screen_anchor, camera, screen_size);
+    Camera2D {
+        center: (world_before - (screen_anchor - screen_size * 0.5) / scale).to_array(),
+        scale: scale.to_array(),
+    }
+}
+
+/// Extreme aspect ratios clamp each fitted axis to the legacy projection limits;
+/// subsequent gestures preserve that bounded ratio with a common zoom factor.
+pub fn fit_camera(bounds: Bounds, screen_size: DVec2, padding_px: f64, mode: FitMode) -> Camera2D {
+    let center = bounds.center();
+    if !center.is_finite() || !bounds.width().is_finite() || !bounds.height().is_finite() {
+        return Camera2D::default();
+    }
+    let size = DVec2::new(
+        bounds.width().max(f64::EPSILON),
+        bounds.height().max(f64::EPSILON),
+    );
+    let usable = (screen_size - DVec2::splat(2.0 * padding_px)).max(DVec2::ONE);
+    let ratios = usable / size;
+    let scale = match mode {
+        FitMode::Contain => DVec2::splat(ratios.min_element()),
+        FitMode::Cover => DVec2::splat(ratios.max_element()),
+        FitMode::Fill => ratios,
+    }
+    .clamp(DVec2::splat(MIN_ZOOM), DVec2::splat(MAX_ZOOM));
+    Camera2D {
+        center: center.to_array(),
+        scale: scale.to_array(),
+    }
+}
+
+pub fn rebase_camera(camera: &Camera2D, old_fit: &Camera2D, new_fit: &Camera2D) -> Camera2D {
+    if !camera.is_valid() || !old_fit.is_valid() || !new_fit.is_valid() {
+        return *new_fit;
+    }
+    let minimum_factor = (MIN_ZOOM / new_fit.scale[0]).max(MIN_ZOOM / new_fit.scale[1]);
+    let maximum_factor = (MAX_ZOOM / new_fit.scale[0]).min(MAX_ZOOM / new_fit.scale[1]);
+    if minimum_factor > maximum_factor {
+        return *new_fit;
+    }
+    let factor = (camera.scale[0] / old_fit.scale[0])
+        .min(camera.scale[1] / old_fit.scale[1])
+        .clamp(minimum_factor, maximum_factor);
+    Camera2D {
+        center: (DVec2::from(new_fit.center)
+            + (DVec2::from(camera.center) - DVec2::from(old_fit.center)))
+        .to_array(),
+        scale: (DVec2::from(new_fit.scale) * factor).to_array(),
+    }
+}
+
 /// Convert a screen-pixel position into world-space coordinates.
 ///
 /// The screen origin is the top-left of the viewport rectangle of size
@@ -241,5 +382,187 @@ mod tests {
         let p = pan(&v, DVec2::new(50.0, -20.0));
         assert!((p.center[0] - (-25.0)).abs() < 1e-9);
         assert!((p.center[1] - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn camera_fit_modes_map_translated_frame_corners_and_round_trip() {
+        let bounds = Bounds::from_xywh(400.0, 60.0, 200.0, 100.0);
+        let size = DVec2::splat(300.0);
+        for (mode, scale, origin, corner) in [
+            (FitMode::Contain, [1.5, 1.5], [0.0, 75.0], [300.0, 225.0]),
+            (FitMode::Cover, [3.0, 3.0], [-150.0, 0.0], [450.0, 300.0]),
+            (FitMode::Fill, [1.5, 3.0], [0.0, 0.0], [300.0, 300.0]),
+        ] {
+            let camera = fit_camera(bounds, size, 0.0, mode);
+            assert_eq!(camera.center, [500.0, 110.0]);
+            assert_eq!(camera.scale, scale);
+            assert_eq!(
+                camera_world_to_screen(DVec2::new(400.0, 60.0), &camera, size).to_array(),
+                origin
+            );
+            assert_eq!(
+                camera_world_to_screen(DVec2::new(600.0, 160.0), &camera, size).to_array(),
+                corner
+            );
+            for point in [DVec2::ZERO, DVec2::new(105.0, 80.0), size] {
+                let world = camera_screen_to_world(point, &camera, size);
+                assert!((camera_world_to_screen(world, &camera, size) - point).length() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn camera_contain_and_uniform_adapters_preserve_scalar_math() {
+        let bounds = Bounds::from_xywh(-150.0, 200.0, 170.0, 430.0);
+        let size = DVec2::new(600.0, 400.0);
+        let viewport = fit_bounds(bounds, size, 25.0);
+        let camera = fit_camera(bounds, size, 25.0, FitMode::Contain);
+        assert_eq!(camera, Camera2D::from(viewport));
+        assert_eq!(camera.scalar_viewport(), viewport);
+        let point = DVec2::new(132.0, 255.0);
+        assert_eq!(
+            camera_world_to_screen(point, &camera, size),
+            world_to_screen(point, &viewport, size)
+        );
+        assert!(
+            (camera_screen_to_world(point, &camera, size)
+                - screen_to_world(point, &viewport, size))
+            .length()
+                < 1e-12
+        );
+    }
+
+    #[test]
+    fn camera_fill_anchored_zoom_and_pan_preserve_both_axes() {
+        let size = DVec2::splat(300.0);
+        let camera = fit_camera(
+            Bounds::from_xywh(400.0, 60.0, 200.0, 100.0),
+            size,
+            0.0,
+            FitMode::Fill,
+        );
+        let anchor = DVec2::new(60.0, 90.0);
+        assert_eq!(
+            camera_screen_to_world(anchor, &camera, size),
+            DVec2::new(440.0, 90.0)
+        );
+        let zoomed = zoom_camera_at(&camera, anchor, 2.0, size);
+        assert_eq!(zoomed.center, [470.0, 100.0]);
+        assert_eq!(zoomed.scale, [3.0, 6.0]);
+        assert_eq!(
+            camera_screen_to_world(anchor, &zoomed, size),
+            DVec2::new(440.0, 90.0)
+        );
+        let panned = pan_camera(&zoomed, DVec2::new(30.0, -12.0));
+        assert_eq!(panned.center, [460.0, 102.0]);
+        assert_eq!(panned.scale, [3.0, 6.0]);
+        assert_eq!(
+            camera_world_to_screen(DVec2::new(440.0, 90.0), &panned, size),
+            anchor + DVec2::new(30.0, -12.0)
+        );
+    }
+
+    #[test]
+    fn camera_zoom_clamps_jointly_without_changing_the_axis_ratio() {
+        let camera = Camera2D {
+            center: [25.0, -50.0],
+            scale: [1.5, 3.0],
+        };
+        let size = DVec2::splat(300.0);
+        let anchor = DVec2::new(73.0, 129.0);
+        let world = camera_screen_to_world(anchor, &camera, size);
+        for factor in [1e-100, 1e100] {
+            let changed = zoom_camera_at(&camera, anchor, factor, size);
+            assert_eq!(changed.scale[1] / changed.scale[0], 2.0);
+            assert!(
+                changed
+                    .scale
+                    .into_iter()
+                    .all(|axis| (MIN_ZOOM..=MAX_ZOOM).contains(&axis))
+            );
+            assert!((camera_screen_to_world(anchor, &changed, size) - world).length() < 1e-7);
+        }
+        for factor in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(zoom_camera_at(&camera, anchor, factor, size), camera);
+        }
+        assert_eq!(pan_camera(&camera, DVec2::new(f64::NAN, 0.0)), camera);
+    }
+
+    #[test]
+    fn camera_rebase_preserves_manual_zoom_and_world_center_displacement() {
+        let bounds = Bounds::from_xywh(400.0, 60.0, 200.0, 100.0);
+        let old_fit = fit_camera(bounds, DVec2::splat(300.0), 0.0, FitMode::Fill);
+        let camera = Camera2D {
+            center: [470.0, 100.0],
+            scale: [3.0, 6.0],
+        };
+        let new_fit = fit_camera(bounds, DVec2::new(400.0, 200.0), 0.0, FitMode::Fill);
+        let rebased = rebase_camera(&camera, &old_fit, &new_fit);
+        assert_eq!(rebased.center, [470.0, 100.0]);
+        assert_eq!(rebased.scale, [4.0, 4.0]);
+        let cover = fit_camera(bounds, DVec2::splat(300.0), 0.0, FitMode::Cover);
+        assert_eq!(rebase_camera(&camera, &old_fit, &cover).scale, [6.0, 6.0]);
+    }
+
+    #[test]
+    fn camera_degenerate_bounds_stay_finite_and_serialization_is_transient()
+    -> Result<(), serde_json::Error> {
+        for mode in [FitMode::Contain, FitMode::Cover, FitMode::Fill] {
+            let camera = fit_camera(
+                Bounds::from_xywh(-5.0, 7.0, 0.0, 0.0),
+                DVec2::splat(300.0),
+                0.0,
+                mode,
+            );
+            assert!(camera.is_valid());
+            assert_eq!(camera.center, [-5.0, 7.0]);
+            assert_eq!(camera.scale, [MAX_ZOOM; 2]);
+        }
+        assert_eq!(serde_json::to_string(&FitMode::Fill)?, "\"fill\"");
+        let viewport = vp(1.0, 2.0, 3.0);
+        assert_eq!(
+            serde_json::to_value(viewport)?,
+            serde_json::json!({"center":[1.0,2.0],"zoom":3.0})
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn camera_rebase_jointly_clamps_manual_zoom_at_extreme_resize_and_mode_change() {
+        let old_fit = Camera2D {
+            center: [100.0, 50.0],
+            scale: [1.5, 3.0],
+        };
+        let camera = Camera2D {
+            center: [90.0, 55.0],
+            scale: [3.0, 6.0],
+        };
+        let new_fit = Camera2D {
+            center: [100.0, 50.0],
+            scale: [1024.0, 3072.0],
+        };
+        let rebased = rebase_camera(&camera, &old_fit, &new_fit);
+        assert_eq!(rebased.center, [90.0, 55.0]);
+        assert_eq!(rebased.scale[1], MAX_ZOOM);
+        assert!((rebased.scale[1] / rebased.scale[0] - 3.0).abs() < 1e-12);
+        let tiny_fit = Camera2D {
+            center: [100.0, 50.0],
+            scale: [MIN_ZOOM, MIN_ZOOM * 3.0],
+        };
+        let zoomed_out = Camera2D {
+            center: old_fit.center,
+            scale: [0.75, 1.5],
+        };
+        assert_eq!(
+            rebase_camera(&zoomed_out, &old_fit, &tiny_fit).scale,
+            tiny_fit.scale
+        );
+        let extreme = fit_camera(
+            Bounds::from_xywh(0.0, 0.0, 1e20, 1e-20),
+            DVec2::splat(300.0),
+            0.0,
+            FitMode::Fill,
+        );
+        assert_eq!(extreme.scale, [MIN_ZOOM, MAX_ZOOM]);
     }
 }

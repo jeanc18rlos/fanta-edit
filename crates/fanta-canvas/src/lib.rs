@@ -43,7 +43,9 @@ pub use snap::{
     SnapThresholds,
 };
 pub use viewport::{
-    MAX_ZOOM, MIN_ZOOM, fit_bounds, pan, screen_to_world, world_to_screen, zoom_at,
+    Camera2D, FitMode, MAX_ZOOM, MIN_ZOOM, camera_screen_to_world, camera_world_to_screen,
+    fit_bounds, fit_camera, pan, pan_camera, rebase_camera, screen_to_world, world_to_screen,
+    zoom_at, zoom_camera_at,
 };
 
 /// Measurement helpers for annotations, guides, and Figma-like measurements.

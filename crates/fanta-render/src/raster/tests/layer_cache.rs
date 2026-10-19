@@ -884,3 +884,47 @@ fn layer_cache_component_guard_comparison_diagnostic() -> Result<(), Box<dyn std
     }
     Ok(())
 }
+
+#[test]
+fn anisotropic_cache_keys_both_axes_and_matches_fresh_render_after_pan_and_swap()
+-> Result<(), Box<dyn std::error::Error>> {
+    use fanta_canvas::Camera2D;
+    let (doc, _) = sampler_doc();
+    let mut cached = RasterRenderer::new(W, H)?;
+    cached.set_pixel_snap_pan(true);
+    for axes in [[1.5, 3.0], [3.0, 1.5], [1.5, 3.0]] {
+        let camera = Camera2D {
+            center: [0.0; 2],
+            scale: axes,
+        };
+        let mut direct = RasterRenderer::new(W, H)?;
+        direct.set_layer_cache_enabled(false);
+        direct.set_pixel_snap_pan(true);
+        direct.render_page_with_camera(&doc.scene, &camera, None, &RenderInputs::for_doc(&doc));
+        let first =
+            cached.render_page_with_camera(&doc.scene, &camera, None, &RenderInputs::for_doc(&doc));
+        assert_eq!(
+            first.layer_cache_hits, 0,
+            "axis change must not reuse stale layers"
+        );
+        assert_eq!(max_diff(&cached.copy_rgba(), &direct.copy_rgba()), 0);
+        cached.render_page_with_camera(&doc.scene, &camera, None, &RenderInputs::for_doc(&doc));
+        let panned = Camera2D {
+            center: [4.0 / axes[0], -6.0 / axes[1]],
+            scale: axes,
+        };
+        let hit =
+            cached.render_page_with_camera(&doc.scene, &panned, None, &RenderInputs::for_doc(&doc));
+        assert!(
+            hit.layer_cache_hits > 0,
+            "nonuniform whole-pixel pan must reuse exact layers"
+        );
+        direct.render_page_with_camera(&doc.scene, &panned, None, &RenderInputs::for_doc(&doc));
+        assert_eq!(
+            max_diff(&cached.copy_rgba(), &direct.copy_rgba()),
+            0,
+            "axis pair {axes:?}"
+        );
+    }
+    Ok(())
+}

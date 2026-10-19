@@ -303,7 +303,8 @@ fn paint_group(
     // non-clipping group keeps the exact geometry (no clip to confine a
     // bleed, and nothing to seam against).
     let bleed = if clipping {
-        let scale = f64::from(ctx.effective_scale);
+        let [scale_x, scale_y] = ctx.effective_scale_axes;
+        let scale = f64::from(scale_x.min(scale_y));
         if scale.is_finite() && scale > 0.0 {
             1.0 / scale
         } else {

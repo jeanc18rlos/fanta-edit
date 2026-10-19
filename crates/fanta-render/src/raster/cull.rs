@@ -54,8 +54,27 @@ pub(crate) fn visible_world_rect(
     display_scale: f64,
     viewport: &Viewport,
 ) -> Bounds {
-    let effective_scale = viewport.zoom * display_scale;
-    if effective_scale.is_nan() || effective_scale <= 0.0 {
+    visible_world_rect_with_camera(
+        width,
+        height,
+        display_scale,
+        &fanta_canvas::Camera2D::from(*viewport),
+    )
+}
+
+pub(crate) fn visible_world_rect_with_camera(
+    width: u32,
+    height: u32,
+    display_scale: f64,
+    camera: &fanta_canvas::Camera2D,
+) -> Bounds {
+    let [scale_x, scale_y] = camera.scale.map(|scale| scale * display_scale);
+    if !camera.is_valid()
+        || !scale_x.is_finite()
+        || !scale_y.is_finite()
+        || scale_x <= 0.0
+        || scale_y <= 0.0
+    {
         // NaN or non-positive: disable culling with an all-encompassing rect.
         return Bounds {
             min_x: f64::NEG_INFINITY,
@@ -64,10 +83,10 @@ pub(crate) fn visible_world_rect(
             max_y: f64::INFINITY,
         };
     }
-    let half_w_world = (width as f64 * 0.5) / effective_scale;
-    let half_h_world = (height as f64 * 0.5) / effective_scale;
-    let cx = viewport.center[0];
-    let cy = viewport.center[1];
+    let half_w_world = (width as f64 * 0.5) / scale_x;
+    let half_h_world = (height as f64 * 0.5) / scale_y;
+    let cx = camera.center[0];
+    let cy = camera.center[1];
     Bounds {
         min_x: cx - half_w_world - CULL_MARGIN_WORLD,
         min_y: cy - half_h_world - CULL_MARGIN_WORLD,

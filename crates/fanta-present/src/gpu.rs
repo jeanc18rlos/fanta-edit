@@ -178,7 +178,7 @@ impl GpuPresenter {
                                 height,
                                 &scene,
                                 smart.root,
-                                layer.viewport,
+                                layer.camera,
                                 false,
                                 &mut metrics,
                             )?;
@@ -197,7 +197,7 @@ impl GpuPresenter {
                                 height,
                                 &layer.from_scene,
                                 layer.from_root,
-                                layer.viewport,
+                                layer.camera,
                                 false,
                                 &mut metrics,
                             )?;
@@ -216,7 +216,7 @@ impl GpuPresenter {
                                 height,
                                 &incoming_scene,
                                 layer.to_root,
-                                layer.viewport,
+                                layer.camera,
                                 false,
                                 &mut metrics,
                             )?;
@@ -262,7 +262,7 @@ impl GpuPresenter {
                         width,
                         height,
                         entry.root,
-                        entry.viewport,
+                        entry.camera,
                         Some(entry.layer),
                         true,
                         &[],
@@ -282,7 +282,7 @@ impl GpuPresenter {
                         width,
                         height,
                         exit.entry.root,
-                        exit.entry.viewport,
+                        exit.entry.camera,
                         Some(exit.entry.layer),
                         false,
                         &[],
@@ -358,7 +358,8 @@ impl PresentSession {
     }
 
     pub fn set_render_cache_budgets(&mut self, image_bytes: usize, effect_bytes: usize) {
-        self.renderer.set_image_cache_budget_bytes(Some(image_bytes));
+        self.renderer
+            .set_image_cache_budget_bytes(Some(image_bytes));
         self.renderer.set_layer_cache_budget_bytes(effect_bytes);
     }
 
@@ -495,7 +496,7 @@ fn render_scene(
     height: u32,
     scene: &Scene,
     root: NodeId,
-    viewport: Viewport,
+    camera: Camera2D,
     include_motion: bool,
     metrics: &mut GpuPresentationMetrics,
 ) -> Result<Image, GpuPresentationError> {
@@ -514,12 +515,12 @@ fn render_scene(
         video_fill_frames: None,
         dark_ui: false,
     };
-    let rendered = session.renderer.render_to_canvas(
+    let rendered = session.renderer.render_to_canvas_with_camera(
         surface.canvas(),
         width,
         height,
         scene,
-        &viewport,
+        &camera,
         Some(root),
         &inputs,
     );
@@ -534,7 +535,7 @@ fn render_frame(
     width: u32,
     height: u32,
     root: NodeId,
-    viewport: Viewport,
+    camera: Camera2D,
     layer: Option<u64>,
     include_motion: bool,
     hidden: &[NodeId],
@@ -570,12 +571,12 @@ fn render_frame(
         video_fill_frames: None,
         dark_ui: false,
     };
-    let rendered = session.renderer.render_to_canvas(
+    let rendered = session.renderer.render_to_canvas_with_camera(
         surface.canvas(),
         width,
         height,
         hidden_scene.as_ref().unwrap_or(&resolved.scene),
-        &viewport,
+        &camera,
         Some(root),
         &inputs,
     );
@@ -597,7 +598,7 @@ fn render_backdrop(
         width,
         height,
         session.current,
-        session.viewport,
+        session.camera,
         Some(session.current_layer),
         true,
         hidden,
@@ -614,7 +615,7 @@ fn render_backdrop(
             width,
             height,
             entry.root,
-            entry.viewport,
+            entry.camera,
             Some(entry.layer),
             true,
             hidden,
@@ -639,7 +640,7 @@ fn render_base(
             width,
             height,
             session.current,
-            session.viewport,
+            session.camera,
             Some(session.current_layer),
             true,
             &[],
@@ -670,7 +671,7 @@ fn render_base(
                 height,
                 &scene,
                 root,
-                active.to_viewport,
+                active.camera(eased),
                 true,
                 metrics,
             )?;
@@ -684,7 +685,7 @@ fn render_base(
         width,
         height,
         active.from_frame,
-        active.from_viewport,
+        active.from_camera,
         None,
         false,
         &[],
@@ -696,7 +697,7 @@ fn render_base(
         width,
         height,
         active.to_frame,
-        active.to_viewport,
+        active.to_camera,
         Some(session.current_layer),
         true,
         &[],

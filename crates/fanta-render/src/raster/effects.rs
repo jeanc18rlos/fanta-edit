@@ -10,6 +10,60 @@ use super::{
     text_path_outline, to_sk_color, to_sk_fill_path,
 };
 
+#[derive(Clone, Copy)]
+pub(crate) struct EffectScale([f32; 2]);
+
+impl From<f32> for EffectScale {
+    fn from(scale: f32) -> Self {
+        Self([scale; 2])
+    }
+}
+
+impl From<[f32; 2]> for EffectScale {
+    fn from(scale: [f32; 2]) -> Self {
+        Self(scale)
+    }
+}
+
+impl EffectScale {
+    pub(crate) fn axes(self) -> [f32; 2] {
+        self.0
+    }
+
+    fn minimum(self) -> f32 {
+        self.0[0].min(self.0[1])
+    }
+
+    fn maximum(self) -> f32 {
+        self.0[0].max(self.0[1])
+    }
+
+    fn render_sigmas(self, world_sigma: f64) -> (f32, f32) {
+        (
+            capped_render_sigma(world_sigma, self.0[0]),
+            capped_render_sigma(world_sigma, self.0[1]),
+        )
+    }
+
+    fn valid_axes(self) -> [f32; 2] {
+        self.0.map(|scale| {
+            if scale.is_finite() && scale > 0.0 {
+                scale
+            } else {
+                1.0
+            }
+        })
+    }
+
+    fn device_sigmas(self, world_sigma: f64) -> (f32, f32) {
+        let sigma = self.valid_axes().map(|scale| {
+            let sigma = (world_sigma as f32 * scale).clamp(0.0, SIGMA_SCREEN_MAX);
+            if sigma < SIGMA_SCREEN_MIN { 0.0 } else { sigma }
+        });
+        (sigma[0], sigma[1])
+    }
+}
+
 /// Which of a node's authored effects actually PAINT at the frame's
 /// `effective_scale` — its zoom-effective effect set.
 ///
@@ -58,7 +112,11 @@ impl VisibleEffects {
 /// [`VisibleEffects`]). Cheap: a node with no effects and no blurs — the
 /// overwhelming majority — returns the all-false default after two `is_empty`
 /// checks.
-pub(crate) fn visible_effects(node: &CanvasNode, effective_scale: f32) -> VisibleEffects {
+pub(crate) fn visible_effects(
+    node: &CanvasNode,
+    effective_scale: impl Into<EffectScale>,
+) -> VisibleEffects {
+    let effective_scale = effective_scale.into();
     let mut visible = VisibleEffects::default();
     for shadow in &node.effects {
         match shadow.kind {
@@ -77,7 +135,8 @@ pub(crate) fn visible_effects(node: &CanvasNode, effective_scale: f32) -> Visibl
 /// Whether a drop shadow paints at all at `effective_scale`: a non-zero
 /// alpha AND not sub-pixel (see [`shadow_is_subpixel`]). The single predicate
 /// [`build_drop_shadow_filter`] and [`visible_effects`] share.
-pub(crate) fn drop_shadow_paints(shadow: &Shadow, effective_scale: f32) -> bool {
+pub(crate) fn drop_shadow_paints(shadow: &Shadow, effective_scale: impl Into<EffectScale>) -> bool {
+    let effective_scale = effective_scale.into();
     shadow.kind == ShadowKind::Drop
         && shadow.color.a != 0
         && !shadow_is_subpixel(shadow, effective_scale)
@@ -86,7 +145,11 @@ pub(crate) fn drop_shadow_paints(shadow: &Shadow, effective_scale: f32) -> bool 
 /// Whether an inner shadow paints at all at `effective_scale` — the same
 /// alpha + sub-pixel test as a drop shadow's; shared by [`draw_inner_shadows`]
 /// and [`visible_effects`].
-pub(crate) fn inner_shadow_paints(shadow: &Shadow, effective_scale: f32) -> bool {
+pub(crate) fn inner_shadow_paints(
+    shadow: &Shadow,
+    effective_scale: impl Into<EffectScale>,
+) -> bool {
+    let effective_scale = effective_scale.into();
     shadow.kind == ShadowKind::Inner
         && shadow.color.a != 0
         && !shadow_is_subpixel(shadow, effective_scale)
@@ -110,9 +173,13 @@ pub(crate) fn layer_blur_world_sigma(blurs: &[Blur]) -> f64 {
 /// i.e. its capped on-screen sigma clears [`SIGMA_SCREEN_MIN`] (see
 /// [`capped_render_sigma`]). Shared by [`build_layer_blur_filter`] and
 /// [`visible_effects`].
-pub(crate) fn layer_blur_paints(blurs: &[Blur], effective_scale: f32) -> bool {
+pub(crate) fn layer_blur_paints(blurs: &[Blur], effective_scale: impl Into<EffectScale>) -> bool {
+    let effective_scale = effective_scale.into();
     let world_sigma = layer_blur_world_sigma(blurs);
-    world_sigma > 0.0 && capped_render_sigma(world_sigma, effective_scale) > 0.0
+    world_sigma > 0.0 && {
+        let (sigma_x, sigma_y) = effective_scale.render_sigmas(world_sigma);
+        sigma_x > 0.0 || sigma_y > 0.0
+    }
 }
 
 /// Whether a node's `opacity < 1` can be applied as **paint alpha** instead of
@@ -235,9 +302,10 @@ pub(crate) fn begin_effects_layer(
     effects: &[Shadow],
     blurs: &[Blur],
     isolate: bool,
-    effective_scale: f32,
+    effective_scale: impl Into<EffectScale>,
     content_bounds: Option<Bounds>,
 ) -> bool {
+    let effective_scale = effective_scale.into();
     let Some(layer) = effects_layer_paint(
         opacity,
         blend_mode,
@@ -328,8 +396,9 @@ pub(crate) fn effects_layer_paint(
     effects: &[Shadow],
     blurs: &[Blur],
     isolate: bool,
-    effective_scale: f32,
+    effective_scale: impl Into<EffectScale>,
 ) -> Option<EffectsLayerPaint> {
+    let effective_scale = effective_scale.into();
     // Drop shadow(s) first; then a LAYER blur chained on top so the node's
     // content AND its shadow are Gaussian-blurred together (Figma's layer-blur
     // semantics — the whole composited layer is blurred). Background blurs are
@@ -358,8 +427,12 @@ pub(crate) fn effects_layer_paint(
 /// at any zoom without re-deriving per-node stroke reach. Shared by the
 /// effects layer and the mask layers so both bound their offscreens
 /// identically.
-pub(crate) fn padded_layer_rect(b: &Bounds, effective_scale: f32) -> skia_safe::Rect {
-    let scale = f64::from(effective_scale);
+pub(crate) fn padded_layer_rect(
+    b: &Bounds,
+    effective_scale: impl Into<EffectScale>,
+) -> skia_safe::Rect {
+    let effective_scale = effective_scale.into();
+    let scale = f64::from(effective_scale.minimum());
     let pad = if scale.is_finite() && scale > 0.0 {
         LAYER_BOUNDS_PAD_DEVICE_PX / scale
     } else {
@@ -480,9 +553,10 @@ pub(crate) fn apply_background_blur(
     node: &CanvasNode,
     scene_id: Option<NodeId>,
     scene: &Scene,
-    effective_scale: f32,
+    effective_scale: impl Into<EffectScale>,
     silhouette: Option<&skia_safe::Path>,
 ) -> BackgroundBlurOutcome {
+    let effective_scale = effective_scale.into();
     use skia_safe::{Bitmap, IRect, M44, image_filters};
     // Combine background-blur radii in quadrature, like layer blurs.
     let mut sigma_sq = 0.0f64;
@@ -501,13 +575,9 @@ pub(crate) fn apply_background_blur(
     // sigma directly — not the world sigma `capped_render_sigma` returns (which
     // assumes the canvas re-applies `effective_scale`). Same clamp + sub-pixel
     // floor as every other blur so the cost stays bounded as you zoom.
-    let scale = if effective_scale.is_finite() && effective_scale > 0.0 {
-        effective_scale
-    } else {
-        1.0
-    };
-    let sigma = (sigma_sq.sqrt() as f32 * scale).clamp(0.0, SIGMA_SCREEN_MAX);
-    if sigma < SIGMA_SCREEN_MIN {
+    let [scale_x, scale_y] = effective_scale.valid_axes();
+    let sigma = effective_scale.device_sigmas(sigma_sq.sqrt());
+    if sigma.0 == 0.0 && sigma.1 == 0.0 {
         return BackgroundBlurOutcome::NoOp;
     }
     // Confine the frosted region to the node's shape so only the backdrop behind
@@ -524,14 +594,15 @@ pub(crate) fn apply_background_blur(
     // real backdrop (not decal) right up to the silhouette edge, then clamped to
     // the surface. A degenerate (off-surface / empty) rect frosts nothing.
     let (dev_rect, _) = canvas.local_to_device_as_3x3().map_rect(path.bounds());
-    let pad = (sigma * SHADOW_BLUR_REACH_SIGMAS as f32).ceil() as i32;
+    let pad_x = (sigma.0 * SHADOW_BLUR_REACH_SIGMAS as f32).ceil() as i32;
+    let pad_y = (sigma.1 * SHADOW_BLUR_REACH_SIGMAS as f32).ceil() as i32;
     let info = canvas.image_info();
     let surface_rect = IRect::from_wh(info.width(), info.height());
     let want = IRect::from_ltrb(
-        dev_rect.left.floor() as i32 - pad,
-        dev_rect.top.floor() as i32 - pad,
-        dev_rect.right.ceil() as i32 + pad,
-        dev_rect.bottom.ceil() as i32 + pad,
+        dev_rect.left.floor() as i32 - pad_x,
+        dev_rect.top.floor() as i32 - pad_y,
+        dev_rect.right.ceil() as i32 + pad_x,
+        dev_rect.bottom.ceil() as i32 + pad_y,
     );
     let Some(src) = IRect::intersect(&want, &surface_rect) else {
         return BackgroundBlurOutcome::NoOp;
@@ -553,13 +624,9 @@ pub(crate) fn apply_background_blur(
         // layer is bounded to the silhouette so the copy is node-sized, not
         // viewport-sized. Restoring the (empty) layer composites the blurred
         // backdrop copy back in place — nothing else is drawn into it.
-        let world_sigma = sigma / scale;
-        let Some(blur) = image_filters::blur(
-            (world_sigma, world_sigma),
-            skia_safe::TileMode::Clamp,
-            None,
-            None,
-        ) else {
+        let world_sigma = (sigma.0 / scale_x, sigma.1 / scale_y);
+        let Some(blur) = image_filters::blur(world_sigma, skia_safe::TileMode::Clamp, None, None)
+        else {
             return BackgroundBlurOutcome::Failed;
         };
         canvas.save();
@@ -590,8 +657,7 @@ pub(crate) fn apply_background_blur(
 
     // Clamp tile so the blur samples the snapshot's edge pixels (a frosted panel
     // flush against the surface edge stays frosted rather than fading out).
-    let Some(blur) = image_filters::blur((sigma, sigma), skia_safe::TileMode::Clamp, None, None)
-    else {
+    let Some(blur) = image_filters::blur(sigma, skia_safe::TileMode::Clamp, None, None) else {
         return BackgroundBlurOutcome::Failed;
     };
     let mut paint = Paint::default();
@@ -727,9 +793,14 @@ pub(crate) const SHADOW_SUBPIXEL_MAX_PX: f64 = 0.75;
 /// at `effective_scale` (see [`SHADOW_SUBPIXEL_MAX_PX`]). Uses the blur's 3σ
 /// visible support and |spread| (negative spread shrinks the silhouette — also
 /// invisible once sub-pixel). A degenerate scale never skips (safe default).
-pub(crate) fn shadow_is_subpixel(shadow: &Shadow, effective_scale: f32) -> bool {
-    let scale = f64::from(effective_scale);
-    if !scale.is_finite() || scale <= 0.0 {
+pub(crate) fn shadow_is_subpixel(shadow: &Shadow, effective_scale: impl Into<EffectScale>) -> bool {
+    let effective_scale = effective_scale.into();
+    let scale = f64::from(effective_scale.maximum());
+    if !effective_scale
+        .axes()
+        .into_iter()
+        .all(|axis| axis.is_finite() && axis > 0.0)
+    {
         return false;
     }
     let offset = shadow.offset[0].abs().max(shadow.offset[1].abs());
@@ -802,9 +873,10 @@ pub(crate) fn blur_world_sigma(blur: &Blur) -> f64 {
 /// can't blow up the CPU Gaussian's cost.
 pub(crate) fn build_layer_blur_filter(
     blurs: &[Blur],
-    effective_scale: f32,
+    effective_scale: impl Into<EffectScale>,
     input: Option<skia_safe::ImageFilter>,
 ) -> Option<skia_safe::ImageFilter> {
+    let effective_scale = effective_scale.into();
     use skia_safe::image_filters;
     // Combine layer-blur radii in quadrature (independent Gaussians). The
     // sub-pixel skip below is the same test `layer_blur_paints` applies for
@@ -813,13 +885,13 @@ pub(crate) fn build_layer_blur_filter(
     if world_sigma <= 0.0 {
         return input;
     }
-    let sigma = capped_render_sigma(world_sigma, effective_scale);
-    if sigma <= 0.0 {
+    let sigma = effective_scale.render_sigmas(world_sigma);
+    if sigma.0 <= 0.0 && sigma.1 <= 0.0 {
         return input;
     }
     // Decal tile mode (Skia's default) so the layer fades at its edge rather
     // than smearing the boundary texel outward.
-    image_filters::blur((sigma, sigma), None, input, None)
+    image_filters::blur(sigma, None, input, None)
 }
 
 /// A Gaussian's visible support is ≈3σ (≈99.7% of the contribution); beyond it
@@ -899,8 +971,9 @@ pub(crate) fn shadow_expanded_local_bounds(
     local: Bounds,
     effects: &[Shadow],
     blurs: &[Blur],
-    effective_scale: f32,
+    effective_scale: impl Into<EffectScale>,
 ) -> Bounds {
+    let effective_scale = effective_scale.into();
     if !shadow_expansion_needed(effects, blurs) {
         return local;
     }
@@ -909,7 +982,7 @@ pub(crate) fn shadow_expanded_local_bounds(
     // Convert the on-screen sigma cap back to world units (the ceiling on a
     // shadow's/blur's painted sigma in this frame). A degenerate scale disables
     // the ceiling (infinite), so the reach falls back to the uncapped sigma.
-    let scale = effective_scale as f64;
+    let scale = f64::from(effective_scale.minimum());
     let world_sigma_cap = if scale.is_finite() && scale > 0.0 {
         SIGMA_SCREEN_MAX as f64 / scale
     } else {
@@ -1021,8 +1094,9 @@ pub(crate) fn capped_render_sigma(world_sigma: f64, effective_scale: f32) -> f32
 /// Inner shadows are skipped (see [`begin_effects_layer`]).
 pub(crate) fn build_drop_shadow_filter(
     effects: &[Shadow],
-    effective_scale: f32,
+    effective_scale: impl Into<EffectScale>,
 ) -> Option<skia_safe::ImageFilter> {
+    let effective_scale = effective_scale.into();
     use skia_safe::image_filters;
 
     // One shadow-only filter per visible drop shadow, in `effects` order.
@@ -1041,7 +1115,7 @@ pub(crate) fn build_drop_shadow_filter(
         // and the negligible-blur floor (see `capped_render_sigma`). Below the
         // cap this equals the faithful blur/2 sigma, so normal-zoom output is
         // byte-for-byte unchanged.
-        let sigma = capped_render_sigma(shadow_world_sigma(shadow), effective_scale);
+        let sigma = effective_scale.render_sigmas(shadow_world_sigma(shadow));
         // Spread dilates/erodes the silhouette before the offset+blur. The
         // morphology takes the source bitmap (`None` input) and feeds the
         // grown/shrunk silhouette into the shadow filter. A zero spread skips the
@@ -1051,7 +1125,7 @@ pub(crate) fn build_drop_shadow_filter(
         // (via the merge below) rather than re-stamping the content per shadow.
         if let Some(f) = image_filters::drop_shadow_only(
             (shadow.offset[0] as f32, shadow.offset[1] as f32),
-            (sigma, sigma),
+            sigma,
             crate::color::to_sk_color4f(shadow.color),
             None,         // default color space
             spread_input, // the spread-morphed silhouette (or the source bitmap)
@@ -1218,7 +1292,7 @@ pub(crate) fn draw_inner_shadows(
     if !node
         .effects
         .iter()
-        .any(|s| inner_shadow_paints(s, ctx.effective_scale))
+        .any(|s| inner_shadow_paints(s, ctx.effective_scale_axes))
     {
         return;
     }
@@ -1232,10 +1306,11 @@ pub(crate) fn draw_inner_shadows(
     for shadow in &node.effects {
         // Zoom-out LOD, mirroring the drop-shadow skip: a sub-pixel inner ring
         // is invisible, so don't build its filter DAG.
-        if !inner_shadow_paints(shadow, ctx.effective_scale) {
+        if !inner_shadow_paints(shadow, ctx.effective_scale_axes) {
             continue;
         }
-        let sigma = capped_render_sigma(shadow_world_sigma(shadow), ctx.effective_scale);
+        let sigma =
+            EffectScale::from(ctx.effective_scale_axes).render_sigmas(shadow_world_sigma(shadow));
         // background = the silhouette (source), optionally spread-morphed, then
         // offset and blurred. Inner spread is INVERTED (positive ⇒ erode the
         // copy so more interior is vacated for the SrcOut color to fill). `offset`
@@ -1247,7 +1322,7 @@ pub(crate) fn draw_inner_shadows(
             spread_input,
             None,
         );
-        let background = image_filters::blur((sigma, sigma), None, offset, None);
+        let background = image_filters::blur(sigma, None, offset, None);
         // foreground = the source silhouette itself (drawn in the shadow color
         // below), so `SrcOut` paints that color in the ring the background has
         // vacated. `None` foreground == source bitmap.
@@ -1268,5 +1343,132 @@ pub(crate) fn draw_inner_shadows(
         canvas.draw_path(&path, &paint);
         canvas.restore();
         ctx.metrics.nodes_drawn += 1;
+    }
+}
+
+#[cfg(test)]
+mod camera_scale_tests {
+    use super::*;
+
+    #[test]
+    fn anisotropic_blur_sigmas_and_caps_follow_their_own_device_axes() {
+        let scale = EffectScale::from([3.0, 6.0]);
+        assert_eq!(scale.device_sigmas(4.0), (12.0, 24.0));
+        assert_eq!(scale.render_sigmas(4.0), (4.0, 4.0));
+        let (sigma_x, sigma_y) = scale.render_sigmas(200.0);
+        assert!((sigma_x * 3.0 - SIGMA_SCREEN_MAX).abs() < 1e-5);
+        assert!((sigma_y * 6.0 - SIGMA_SCREEN_MAX).abs() < 1e-5);
+        assert_eq!(
+            scale.device_sigmas(200.0),
+            (SIGMA_SCREEN_MAX, SIGMA_SCREEN_MAX)
+        );
+        let only_vertical = EffectScale::from([0.01, 2.0]);
+        assert_eq!(only_vertical.device_sigmas(1.0), (0.0, 2.0));
+        assert!(layer_blur_paints(&[Blur::layer(2.0)], only_vertical));
+    }
+
+    #[test]
+    fn anisotropic_effect_padding_protects_the_less_magnified_axis() {
+        let bounds = Bounds::from_xywh(0.0, 0.0, 10.0, 20.0);
+        let padding = padded_layer_rect(&bounds, [0.25, 4.0]);
+        assert_eq!(padding.left, -128.0);
+        assert_eq!(padding.top, -128.0);
+        assert_eq!(padding.right, 138.0);
+        assert_eq!(padding.bottom, 148.0);
+        let shadow = Shadow {
+            kind: ShadowKind::Drop,
+            color: fanta_doc::Color::BLACK,
+            blur: 2.0,
+            spread: 0.0,
+            offset: [0.0, 1.0],
+            show_behind_node: false,
+        };
+        assert!(drop_shadow_paints(&shadow, [0.01, 2.0]));
+        assert!(drop_shadow_paints(&shadow, [2.0, 0.01]));
+    }
+
+    #[test]
+    fn anisotropic_background_blur_matches_independent_device_space_filter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use skia_safe::{AlphaType, ColorType, ImageInfo, Rect, image_filters};
+        fn backdrop(canvas: &Canvas) {
+            canvas.clear(skia_safe::Color::BLACK);
+            let mut paint = Paint::default();
+            for (rect, color) in [
+                (
+                    Rect::from_xywh(64.0, 0.0, 64.0, 64.0),
+                    skia_safe::Color::RED,
+                ),
+                (
+                    Rect::from_xywh(0.0, 64.0, 64.0, 64.0),
+                    skia_safe::Color::BLUE,
+                ),
+                (
+                    Rect::from_xywh(64.0, 64.0, 64.0, 64.0),
+                    skia_safe::Color::WHITE,
+                ),
+            ] {
+                paint.set_color(color);
+                canvas.draw_rect(rect, &paint);
+            }
+        }
+        fn pixels(surface: &mut skia_safe::Surface) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+            let info = ImageInfo::new((128, 128), ColorType::RGBA8888, AlphaType::Premul, None);
+            let mut pixels = vec![0; 128 * 128 * 4];
+            if !surface.read_pixels(&info, &mut pixels, 128 * 4, (0, 0)) {
+                return Err("surface readback failed".into());
+            }
+            Ok(pixels)
+        }
+        let mut reference =
+            skia_safe::surfaces::raster_n32_premul((128, 128)).ok_or("reference")?;
+        backdrop(reference.canvas());
+        let image = reference.image_snapshot();
+        let mut paint = Paint::default();
+        paint.set_image_filter(
+            image_filters::blur((6.0, 12.0), skia_safe::TileMode::Clamp, None, None)
+                .ok_or("reference blur")?,
+        );
+        reference
+            .canvas()
+            .clip_rect(Rect::from_xywh(40.0, 40.0, 48.0, 48.0), None, true);
+        reference.canvas().draw_image(&image, (0, 0), Some(&paint));
+        let expected = pixels(&mut reference)?;
+        let probe = (70 * 128 + 70) * 4;
+        assert!(
+            expected[probe] > expected[probe + 2] + 10,
+            "oracle must distinguish horizontal and vertical sigma"
+        );
+        let mut node = CanvasNode::new(NodeData::Vector(fanta_doc::VectorNode::rect_solid(
+            0.0,
+            0.0,
+            32.0,
+            16.0,
+            fanta_doc::Color::WHITE,
+        )));
+        node.blurs.push(Blur::background(8.0));
+        let scene = Scene::new();
+        for native_backdrop in [false, true] {
+            let mut actual = skia_safe::surfaces::raster_n32_premul((128, 128)).ok_or("actual")?;
+            backdrop(actual.canvas());
+            actual.canvas().translate((40.0, 40.0));
+            actual.canvas().scale((1.5, 3.0));
+            let outcome = with_background_blur_backdrop(native_backdrop, || {
+                apply_background_blur(actual.canvas(), &node, None, &scene, [1.5, 3.0], None)
+            });
+            assert_eq!(outcome, BackgroundBlurOutcome::Applied);
+            let actual = pixels(&mut actual)?;
+            let maximum = (44..84)
+                .flat_map(|y| (44..84).map(move |x| (y * 128 + x) * 4))
+                .flat_map(|offset| (0..4).map(move |channel| offset + channel))
+                .map(|offset| actual[offset].abs_diff(expected[offset]))
+                .max()
+                .ok_or("no pixel probes")?;
+            assert!(
+                maximum <= 2,
+                "native backdrop {native_backdrop}: channel error {maximum}"
+            );
+        }
+        Ok(())
     }
 }

@@ -140,19 +140,18 @@ pub(crate) fn prepare_scenes(
     for id in to_scene.descendants_of(to_frame) {
         let key = key_path(to_scene, to_frame, id)?;
 
+        // Tweening the world-space root together with its camera preserves both
+        // endpoints when frames have different sizes or authored placements.
         if id == to_frame {
-            // The frame is the shared origin: static, positioned at its real
-            // world transform, never tweened.
-            let node = scene.get_mut(id)?;
-            node.parent = None;
-            node.transform = to_scene
-                .world_transform(to_frame)
-                .unwrap_or(Transform2D::IDENTITY);
-            continue;
+            scene.get_mut(id)?.parent = None;
         }
 
         let node = to_scene.get(id)?;
-        let to_transform = node.transform.to_components();
+        let to_transform = if id == to_frame {
+            to_scene.world_transform(to_frame)?.to_components()
+        } else {
+            node.transform.to_components()
+        };
         let to_opacity = node.opacity.get();
         let (to_clip, to_local_size, to_corner, to_corners, to_smoothing) = match &node.data {
             NodeData::Group(g) => (
@@ -182,10 +181,16 @@ pub(crate) fn prepare_scenes(
                 from_corners,
                 from_smoothing,
             )) => {
-                matched_layers += 1;
+                if id != to_frame {
+                    matched_layers += 1;
+                }
                 LayerTween {
                     node: id,
-                    from_transform: from_transform.to_components(),
+                    from_transform: if id == to_frame {
+                        from_scene.world_transform(from_frame)?.to_components()
+                    } else {
+                        from_transform.to_components()
+                    },
                     to_transform,
                     from_opacity: *from_opacity,
                     to_opacity,

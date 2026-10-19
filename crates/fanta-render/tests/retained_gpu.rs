@@ -904,3 +904,75 @@ fn retained_gpu_rechecks_context_after_caller_asset_resolution() -> TestResult<(
         Ok(())
     })
 }
+
+#[test]
+#[ignore = "requires actual macOS Metal; run explicitly with --features metal --test retained_gpu -- --ignored --test-threads=1"]
+fn anisotropic_camera_layer_cache_matches_direct_metal_after_axis_swap_and_pan() -> TestResult<()> {
+    metal::objc::rc::autoreleasepool(|| {
+        let mut case = fixture(false, 1.0, false)?;
+        case.doc
+            .scene
+            .get_mut(case.moving)
+            .ok_or("moving layer")?
+            .blurs
+            .push(fanta_doc::Blur::layer(8.0));
+        let before = case.doc.to_json_pretty()?;
+        let mut owner = MetalOwner::new()?;
+        let mut direct_target = owner.target(SIZE, ColorType::BGRA8888, None)?;
+        let mut cached_target = owner.target(SIZE, ColorType::BGRA8888, None)?;
+        let mut direct = renderer(&case)?;
+        direct.set_layer_cache_enabled(false);
+        let mut cached = renderer(&case)?;
+        let mut hits = 0;
+        for axes in [[1.5, 3.0], [3.0, 1.5], [1.5, 3.0]] {
+            for frame in 0..3 {
+                let center = if frame == 2 {
+                    [4.0 / axes[0], -6.0 / axes[1]]
+                } else {
+                    [0.0; 2]
+                };
+                let camera = fanta_canvas::Camera2D {
+                    center,
+                    scale: axes,
+                };
+                let inputs = RenderInputs::for_doc(&case.doc);
+                complete(&direct.render_to_canvas_with_camera(
+                    direct_target.target.canvas()?,
+                    SIZE.0,
+                    SIZE.1,
+                    &case.doc.scene,
+                    &camera,
+                    Some(case.page),
+                    &inputs,
+                ))?;
+                let actual = cached.render_to_canvas_with_camera(
+                    cached_target.target.canvas()?,
+                    SIZE.0,
+                    SIZE.1,
+                    &case.doc.scene,
+                    &camera,
+                    Some(case.page),
+                    &inputs,
+                );
+                complete(&actual)?;
+                if frame == 0 {
+                    assert_eq!(
+                        actual.layer_cache_hits, 0,
+                        "changed axis pair reused pixels"
+                    );
+                }
+                hits += actual.layer_cache_hits;
+                let expected = direct_target.pixels(&mut owner)?;
+                let pixels = cached_target.pixels(&mut owner)?;
+                assert_parity(
+                    &expected,
+                    &pixels,
+                    &format!("actual Metal axes {axes:?}, frame {frame}"),
+                )?;
+            }
+        }
+        assert!(hits > 0, "hardware path must exercise cached effect layers");
+        assert_eq!(case.doc.to_json_pretty()?, before);
+        Ok(())
+    })
+}

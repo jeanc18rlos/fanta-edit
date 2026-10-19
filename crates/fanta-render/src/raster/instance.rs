@@ -529,7 +529,7 @@ fn render_expanded_inner(
             _ => None,
         };
         if let Some(local) = local {
-            let painted = super::walk::visual_local_bounds(node, local, ctx.effective_scale)
+            let painted = super::walk::visual_local_bounds(node, local, ctx.effective_scale_axes)
                 .map(super::camera_cache::bounds_rect);
             if painted.is_some_and(|painted| painted.is_finite() && canvas.quick_reject(&painted)) {
                 ctx.metrics.nodes_culled += 1;
@@ -618,7 +618,7 @@ fn render_expanded_inner(
             node,
             None,
             ctx.scene,
-            ctx.effective_scale,
+            ctx.effective_scale_axes,
             boolean_silhouette.as_ref().or(group_silhouette.as_ref()),
         ) == super::effects::BackgroundBlurOutcome::Failed
         {
@@ -633,7 +633,7 @@ fn render_expanded_inner(
     // Zoom-effective effects (see `VisibleEffects`): same fold/layer gating as
     // the live walk, so a sub-pixel blur or shadow inside a component neither
     // forces a layer nor blocks the fold in its instances.
-    let visible = visible_effects(node, ctx.effective_scale);
+    let visible = visible_effects(node, ctx.effective_scale_axes);
     let folded_opacity = opacity < 1.0 && opacity_folds_into_paint(node, has_children, visible);
     let needs_layer = !folded_opacity
         && ctx.supports_offscreen_layers
@@ -650,7 +650,7 @@ fn render_expanded_inner(
             &node.effects,
             &node.blurs,
             node.flags.contains(NodeFlags::ISOLATED_BLEND),
-            ctx.effective_scale,
+            ctx.effective_scale_axes,
             // Transient clone: no scene entry, so the box comes from the node's
             // own geometry (clip box / path bounds / local_size); an unclipped
             // transient group falls back to the union of its transient children so
@@ -740,7 +740,7 @@ fn render_expanded_inner(
                     NodeData::Text(text) => super::walk::text_visual_bounds(text),
                     _ => child.data.local_bounds(),
                 }?;
-                super::walk::visual_local_bounds(child, local, ctx.effective_scale)?
+                super::walk::visual_local_bounds(child, local, ctx.effective_scale_axes)?
                     .try_transformed(&child.transform)
             },
             |canvas, ctx, &i| {
@@ -777,7 +777,7 @@ fn render_expanded_inner(
         canvas,
         node,
         outer_camera_bounds,
-        ctx.effective_scale,
+        ctx.effective_scale_axes,
         ctx.metrics,
     );
     canvas.restore();
