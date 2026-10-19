@@ -1,0 +1,2 @@
+# Fanta's release-signing public key: raw ed25519, base64, on the first non-comment line.
+# `script/update-signing-key` writes it. A build without a key never checks for updates.

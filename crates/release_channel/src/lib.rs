@@ -10,12 +10,20 @@ use semver::Version;
 const FANTA_DOCS_URL: &str = "https://fantaisa.net/docs";
 
 /// stable | dev | nightly | preview
+///
+/// Release builds use the channel `script/bundle-mac` compiled in (`FANTA_RELEASE_CHANNEL` at
+/// build time), else `crates/fanta/RELEASE_CHANNEL`, so the updater polls the channel the bundle
+/// was made for. Debug builds also honor the variable at run time.
 pub static RELEASE_CHANNEL_NAME: LazyLock<String> = LazyLock::new(|| {
+    let compiled = option_env!("FANTA_RELEASE_CHANNEL")
+        .map(str::trim)
+        .filter(|channel| !channel.is_empty())
+        .unwrap_or(include_str!("../../fanta/RELEASE_CHANNEL").trim())
+        .to_string();
     if cfg!(debug_assertions) {
-        env::var("FANTA_RELEASE_CHANNEL")
-            .unwrap_or_else(|_| include_str!("../../fanta/RELEASE_CHANNEL").trim().to_string())
+        env::var("FANTA_RELEASE_CHANNEL").unwrap_or(compiled)
     } else {
-        include_str!("../../fanta/RELEASE_CHANNEL").trim().to_string()
+        compiled
     }
 });
 

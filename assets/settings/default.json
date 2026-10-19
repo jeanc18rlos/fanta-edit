@@ -1736,9 +1736,11 @@
   //
   // Default: false
   "disable_ai": false,
-  // Automatically update Fanta. This setting may be ignored on Linux if
-  // installed through a package manager.
-  "auto_update": false,
+  // Automatically update Fanta: new versions download in the background,
+  // are verified against Fanta's release key and Apple team, and apply on the
+  // next restart. Mac App Store builds update through the App Store instead.
+  // This setting may be ignored on Linux if installed through a package manager.
+  "auto_update": true,
   // How to render LSP `textDocument/documentColor` colors in the editor.
   //
   // Possible values:
