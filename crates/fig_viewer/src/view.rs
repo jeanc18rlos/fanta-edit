@@ -228,6 +228,12 @@ actions!(
         ActivateTextPathTool,
         /// Activate the comment tool (click the canvas to pin a comment).
         ActivateCommentTool,
+        /// Prepare an AI design review of the active page.
+        RunAiReview,
+        /// Prepare a multi-pass AI review of every page.
+        RunUltraReview,
+        /// Apply the suggested design change in the open comment thread.
+        ApplySuggestedFix,
         /// Show or hide the embedded layers sidebar.
         ToggleLayersSidebar,
         /// Show or hide the embedded inspector sidebar.
@@ -6696,13 +6702,25 @@ impl FigView {
             .map(|document| document_comment_rows(&document.doc, &document.pages))
             .unwrap_or_default();
         let view = cx.weak_entity();
-        FantaCommentsPanel::new(rows, move |page_root, comment_id, window, cx| {
-            view.update(cx, |view, cx| {
-                view.show_comment_thread_on_page(page_root, comment_id, window, cx);
-            })
-            .log_err();
-        })
-        .into_any_element()
+        v_flex()
+            .size_full()
+            .child(
+                Button::new("comments-ai-review", "AI Review…").on_click(cx.listener(
+                    |this, _, window, cx| {
+                        this.run_ai_review(crate::review::ReviewDepth::Standard, window, cx);
+                    },
+                )),
+            )
+            .child(FantaCommentsPanel::new(
+                rows,
+                move |page_root, comment_id, window, cx| {
+                    view.update(cx, |view, cx| {
+                        view.show_comment_thread_on_page(page_root, comment_id, window, cx);
+                    })
+                    .log_err();
+                },
+            ))
+            .into_any_element()
     }
 
     fn render_source_edit_lock_banner(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -8823,6 +8841,15 @@ impl Render for FigView {
             }))
             .on_action(cx.listener(|this, _: &ActivateCropTool, window, cx| {
                 this.activate_tool_from_action(ToolKind::Crop, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RunAiReview, window, cx| {
+                this.run_ai_review(crate::review::ReviewDepth::Standard, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RunUltraReview, window, cx| {
+                this.run_ai_review(crate::review::ReviewDepth::Ultra, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ApplySuggestedFix, _, cx| {
+                this.apply_open_comment_suggested_fix(cx);
             }))
             .on_action(cx.listener(|this, _: &ActivateCommentTool, window, cx| {
                 this.activate_tool_from_action(ToolKind::Comment, window, cx);
@@ -22551,11 +22578,14 @@ impl FigView {
         cx: &mut Context<Self>,
     ) {
         use crate::gpui_adapters::toolbar::{
-            CHROME_ADD_CANVAS_CONTEXT, CHROME_FIT_TO_VIEW, CHROME_TOGGLE_INSPECTOR_SIDEBAR,
-            CHROME_TOGGLE_LAYERS_SIDEBAR,
+            CHROME_ADD_CANVAS_CONTEXT, CHROME_FIT_TO_VIEW, CHROME_RUN_AI_REVIEW,
+            CHROME_TOGGLE_INSPECTOR_SIDEBAR, CHROME_TOGGLE_LAYERS_SIDEBAR,
         };
         match id {
             CHROME_ADD_CANVAS_CONTEXT => self.open_toolbar_agent_attachment(window, cx),
+            CHROME_RUN_AI_REVIEW => {
+                self.run_ai_review(crate::review::ReviewDepth::Standard, window, cx)
+            }
             CHROME_FIT_TO_VIEW => self.fit_to_view(&FitToView, window, cx),
             CHROME_TOGGLE_LAYERS_SIDEBAR => {
                 self.toggle_layers_sidebar(&ToggleLayersSidebar, window, cx)

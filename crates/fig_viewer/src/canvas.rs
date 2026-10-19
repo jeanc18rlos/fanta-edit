@@ -5521,6 +5521,7 @@ pub(crate) struct CommentPin {
     pub(crate) resolved: bool,
     pub(crate) from_agent: bool,
     pub(crate) message_count: usize,
+    pub(crate) severity: Option<crate::comments::CommentSeverity>,
 }
 
 impl CanvasElement {
@@ -5707,12 +5708,16 @@ impl CanvasElement {
             data.comment_pins = crate::comments::read_comments(doc, page)
                 .into_iter()
                 .filter(|comment| crate::comments::comment_is_visible(comment, active_motion_clip))
-                .map(|comment| CommentPin {
-                    world: DVec2::new(comment.world[0], comment.world[1]),
-                    author: comment.author.clone(),
-                    resolved: comment.resolved,
-                    from_agent: comment.from_agent,
-                    message_count: comment.message_count(),
+                .map(|comment| {
+                    let [x, y] = crate::comments::resolve_world(doc, &comment);
+                    CommentPin {
+                        world: DVec2::new(x, y),
+                        author: comment.author.clone(),
+                        resolved: comment.resolved,
+                        from_agent: comment.from_agent,
+                        message_count: comment.message_count(),
+                        severity: comment.severity,
+                    }
                 })
                 .collect();
         }
@@ -6217,10 +6222,21 @@ impl CanvasElement {
             // and a message-count chip. Screen-fixed size across zoom.
             for pin in &data.comment_pins {
                 let anchor = project(pin.world);
-                let fill = if pin.from_agent {
-                    accent
-                } else {
-                    avatar_color(&pin.author)
+                // Review findings read by weight before by author: red for a
+                // blocker, orange for major, amber for minor, the accent for info.
+                let fill = match pin.severity {
+                    Some(crate::comments::CommentSeverity::Blocker) => {
+                        gpui::hsla(0.0, 0.78, 0.5, 1.0)
+                    }
+                    Some(crate::comments::CommentSeverity::Major) => {
+                        gpui::hsla(0.07, 0.9, 0.5, 1.0)
+                    }
+                    Some(crate::comments::CommentSeverity::Minor) => {
+                        gpui::hsla(0.12, 0.85, 0.48, 1.0)
+                    }
+                    Some(crate::comments::CommentSeverity::Info) => accent,
+                    None if pin.from_agent => accent,
+                    None => avatar_color(&pin.author),
                 };
                 let fill = if pin.resolved {
                     fill.opacity(0.5)

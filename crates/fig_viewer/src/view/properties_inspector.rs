@@ -366,6 +366,15 @@ impl FigView {
                         crate::comments::read_comments(&document.doc, root)
                             .into_iter()
                             .map(|thread| {
+                                let location = [
+                                    thread.severity.map(|severity| severity.label()),
+                                    thread.category.map(|category| category.label()),
+                                    Some(page.name.as_ref()),
+                                ]
+                                .into_iter()
+                                .flatten()
+                                .collect::<Vec<_>>()
+                                .join(" · ");
                                 let mut messages = vec![InspectorComment {
                                     id: thread.id.clone().into(),
                                     author: thread.author.into(),
@@ -384,7 +393,7 @@ impl FigView {
                                 ));
                                 InspectorCommentThread {
                                     id: thread.id.into(),
-                                    location: page.name.clone(),
+                                    location: location.into(),
                                     resolved: thread.resolved,
                                     unread: false,
                                     comments: messages,

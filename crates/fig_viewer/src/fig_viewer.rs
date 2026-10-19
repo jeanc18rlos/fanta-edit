@@ -46,6 +46,7 @@ mod properties_render;
 mod properties_snapshot;
 mod prototype_panel;
 mod prototype_player;
+mod review;
 mod structure;
 mod text_edit;
 #[cfg(feature = "fanta-gpui-ui")]
@@ -85,8 +86,8 @@ pub use timeline::{
 pub use tools::ToolKind;
 pub use variables_workspace::FantaVariablesWorkspace;
 pub use view::{
-    FigView, FigViewEvent, FitToView, ResetZoom, SelectAll, ToggleInspectorSidebar,
-    ToggleLayersSidebar, ZoomIn, ZoomOut, ZoomToSelection,
+    FigView, FigViewEvent, FitToView, ResetZoom, RunAiReview, RunUltraReview, SelectAll,
+    ToggleInspectorSidebar, ToggleLayersSidebar, ZoomIn, ZoomOut, ZoomToSelection,
 };
 
 pub fn init(cx: &mut App) {

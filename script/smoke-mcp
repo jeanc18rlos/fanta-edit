@@ -49,6 +49,7 @@ REQUIRED_TOOLS = [
     "batch_design",
     "get_screenshot",
     "read_fnx_source",
+    "add_comment",
 ]
 PROTOCOL_VERSION = "2025-06-18"
 RECTANGLE_NAME = "smoke-mcp rectangle"

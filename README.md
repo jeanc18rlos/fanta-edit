@@ -82,7 +82,7 @@ Use the copied project-scoped instructions: they identify the running executable
 and its user-data directory. Keep that Fanta instance open, restart your agent,
 check its MCP connection and call `get_editor_state` before editing.
 
-The local bridge exposes the focused design, project source inspection and
+The local bridge exposes 14 tools for the focused design, project source inspection and
 validation, bounded design operations, screenshots and comments. It runs over a
 local Unix socket. External file edits enter through the project's reconciliation
 path. Built-in agent tools and hosted media generation have separate configuration

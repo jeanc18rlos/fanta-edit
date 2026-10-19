@@ -46,7 +46,7 @@ pub(crate) fn document_comment_rows(
                 .or_else(|| comment.replies.iter().rev().find_map(|reply| reply.skill));
             rows.push(DocumentCommentRow {
                 page_root,
-                page_name: page.name.clone(),
+                page_name: comment.location_label(doc, &page.name).into(),
                 id: comment.id,
                 author: if comment.author.trim().is_empty() {
                     "Unknown".into()

@@ -9,10 +9,12 @@ use language_model::LanguageModelToolResultContent;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Read canvas comments or reply to a comment using its exact id.
-/// In Review mode, read unresolved comments, address each actionable request
-/// in the review, and reply with findings. Resolve a comment only after the
-/// requested work is verified. Plan mode permits reading comments only.
+/// Read canvas comments, reply to a comment using its exact id, or create a
+/// new comment with `create`. In Review mode, read unresolved comments, post
+/// each finding as its own anchored comment (`create` with `node`, `severity`,
+/// `category` and the run's `review_run_id`), and reply to the original
+/// comments with a summary. Resolve a comment only after the requested work is
+/// verified. Plan mode permits reading comments only.
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
 pub struct DesignCommentsToolInput {
     #[serde(default)]
@@ -26,6 +28,9 @@ pub struct DesignCommentsToolInput {
     pub body: Option<String>,
     #[serde(default)]
     pub resolve: bool,
+    /// A new comment to place: `text` plus a `node` (and optional `offset`) or a `world` position.
+    #[serde(default)]
+    pub create: Option<design_surface::CommentDraft>,
 }
 
 pub struct DesignCommentsTool;
@@ -46,6 +51,7 @@ impl AgentTool for DesignCommentsTool {
         _cx: &mut App,
     ) -> SharedString {
         match input {
+            Ok(input) if input.create.is_some() => "Add canvas comment".into(),
             Ok(input) if input.comment_id.is_some() => "Reply to canvas comment".into(),
             _ => "Read canvas comments".into(),
         }
@@ -70,7 +76,20 @@ impl AgentTool for DesignCommentsTool {
                         None,
                         cx,
                     );
-                    if let Some(comment_id) = input.comment_id {
+                    if let Some(mut draft) = input.create {
+                        if event_stream.profile_id(cx).as_deref() == Some(builtin_profiles::PLAN) {
+                            anyhow::bail!("Plan mode permits reading comments, but cannot add them");
+                        }
+                        anyhow::ensure!(input.comment_id.is_none() && input.body.is_none() && !input.resolve, "create places a new comment; omit comment_id, body and resolve");
+                        if draft.author.is_none() {
+                            let (_, agent_name) = event_stream.agent_identity(cx);
+                            draft.author = Some(agent_name);
+                        }
+                        if draft.page.is_none() {
+                            draft.page = input.page;
+                        }
+                        surface.add_comment(draft, cx)
+                    } else if let Some(comment_id) = input.comment_id {
                         if event_stream.profile_id(cx).as_deref() == Some(builtin_profiles::PLAN) {
                             anyhow::bail!("Plan mode permits reading comments, but cannot reply or resolve them");
                         }

@@ -140,6 +140,45 @@ pub(crate) fn apply_ops_to_item(
     })
 }
 
+pub(crate) fn apply_comment_suggested_fix(
+    item: &Entity<FigItem>,
+    page: NodeId,
+    comment_id: &str,
+    cx: &mut App,
+) -> Result<()> {
+    let operations = {
+        let document = item
+            .read(cx)
+            .document()
+            .context("the design is still loading")?;
+        let comment = crate::comments::read_comments(&document.doc, page)
+            .into_iter()
+            .find(|comment| comment.id == comment_id)
+            .context("the comment no longer exists")?;
+        let fix = comment
+            .suggested_fix
+            .context("the comment has no suggested fix")?;
+        fix.ops
+            .into_iter()
+            .map(serde_json::from_value::<DesignOp>)
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    anyhow::ensure!(
+        !operations.iter().any(design_operation_is_presence),
+        "suggested fixes must change design content; selection and viewport operations cannot be undone"
+    );
+    let result = apply_ops_to_item(item, &operations, "Apply suggested fix", cx)?;
+    anyhow::ensure!(
+        result["applied"] == true,
+        "{}",
+        result
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("the suggested fix could not be applied")
+    );
+    Ok(())
+}
+
 /// The active page's top-level layers (up to `limit`, `depth` levels deep) in
 /// the style projection with world bounds: what `batch_get` returns for a page
 /// listing with `detail: "style"`, and what the v2 agent sessions read.
@@ -337,8 +376,47 @@ impl DesignSurface for FigDesignSurface {
         let comments = crate::comments::read_comments(&document.doc, root)
             .into_iter()
             .filter(|comment| include_resolved || !comment.resolved)
-            .collect::<Vec<_>>();
+            .map(|comment| {
+                let resolved_world = crate::comments::resolve_world(&document.doc, &comment);
+                let mut value = serde_json::to_value(&comment)?;
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("resolved_world".into(), json!(resolved_world));
+                    if let Some(anchor) = comment.anchor {
+                        object.insert(
+                            "anchor".into(),
+                            json!({"node": anchor.node.to_string(), "offset": anchor.offset}),
+                        );
+                    }
+                }
+                Ok(value)
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(json!({ "page": page_index, "comments": comments }))
+    }
+
+    fn add_comment(&self, draft: design_surface::CommentDraft, cx: &mut App) -> Result<Value> {
+        let item = self.item()?;
+        item.update(cx, |item, cx| {
+            if !item.is_editable() {
+                bail!("save or discard source edits and wait for the canvas to load before adding comments");
+            }
+            item.with_document(cx, |document| {
+                let result = (|| {
+                    let page_index = resolve_page_index(document, draft.page)?;
+                    let root = document.pages.get(page_index).and_then(|page| page.root)
+                        .context("the page has no root node")?;
+                    let (id, operation) = crate::comments::agent_add_comment_op(&document.doc, root, &draft)?;
+                    document.doc.apply(operation)?;
+                    let world = crate::comments::read_comments(&document.doc, root)
+                        .into_iter()
+                        .find(|comment| comment.id == id)
+                        .map(|comment| comment.world);
+                    Ok(json!({ "page": page_index, "comment_id": id, "created": true, "world": world }))
+                })();
+                let change = if result.is_ok() { DocChange::Content } else { DocChange::None };
+                (result, change)
+            }).context("the document is still loading")?
+        })
     }
 
     fn reply_comment(
@@ -4903,6 +4981,61 @@ mod tests {
             active: Rc::new(RefCell::new(Some(item.downgrade()))),
         };
         (item, surface, project)
+    }
+
+    #[gpui::test]
+    async fn add_comment_tool_creates_anchored_agent_comment_and_fix_undo(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let (item, surface, _project) = streamed_design_fixture(cx).await;
+        let page = item.read_with(cx, |item, _| {
+            item.doc().expect("doc").active_page().expect("page")
+        });
+        let created = cx
+            .update(|cx| {
+                surface.add_comment(design_surface::CommentDraft {
+            node: Some(page.to_string()), text: "Rename this frame".into(),
+            severity: Some("minor".into()), category: Some("content".into()),
+            review_run_id: Some("test-review".into()),
+            suggested_fix: Some(design_surface::SuggestedFixDraft {
+                summary: "Give the frame a clear name".into(),
+                ops: vec![json!({"op":"set_props", "id":page.to_string(), "name":"Reviewed page"})],
+            }), ..Default::default()
+        }, cx)
+            })
+            .expect("create comment");
+        let comment_id = created["comment_id"].as_str().expect("comment id");
+        let comments = cx
+            .update(|cx| surface.comments(None, false, cx))
+            .expect("comments");
+        assert_eq!(comments["comments"][0]["anchor"]["node"], page.to_string());
+        assert_eq!(comments["comments"][0]["review_run_id"], "test-review");
+        assert_eq!(comments["comments"][0]["resolved_world"], json!([0.0, 0.0]));
+        let undo_depth =
+            item.read_with(cx, |item, _| item.doc().expect("doc").history.undo_depth());
+        cx.update(|cx| apply_comment_suggested_fix(&item, page, comment_id, cx))
+            .expect("apply fix");
+        item.update(cx, |item, cx| {
+            item.with_document(cx, |document| {
+                assert_eq!(
+                    document.doc.scene.get(page).expect("page").name,
+                    "Reviewed page"
+                );
+                assert_eq!(document.doc.history.undo_depth(), undo_depth + 1);
+                assert!(document.doc.undo().expect("undo"));
+                assert_ne!(
+                    document.doc.scene.get(page).expect("page").name,
+                    "Reviewed page"
+                );
+                assert_eq!(crate::comments::read_comments(&document.doc, page).len(), 1);
+                assert!(document.doc.redo().expect("redo"));
+                assert_eq!(
+                    document.doc.scene.get(page).expect("page").name,
+                    "Reviewed page"
+                );
+                ((), DocChange::Content)
+            })
+        });
     }
 
     #[gpui::test]
