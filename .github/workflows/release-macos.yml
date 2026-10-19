@@ -91,9 +91,8 @@ jobs:
           MACOS_APP_STORE_INSTALLER_CERTIFICATE: ${{ secrets.MACOS_APP_STORE_INSTALLER_CERTIFICATE }}
           MACOS_APP_STORE_INSTALLER_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_APP_STORE_INSTALLER_CERTIFICATE_PASSWORD }}
           MACOS_APP_STORE_PROFILE: ${{ secrets.MACOS_APP_STORE_PROFILE }}
-          FANTA_REVENUECAT_PUBLIC_API_KEY: ${{ secrets.FANTA_REVENUECAT_PUBLIC_API_KEY }}
         run: |
-          for name in MACOS_APP_STORE_CERTIFICATE MACOS_APP_STORE_CERTIFICATE_PASSWORD MACOS_APP_STORE_INSTALLER_CERTIFICATE MACOS_APP_STORE_INSTALLER_CERTIFICATE_PASSWORD MACOS_APP_STORE_PROFILE FANTA_REVENUECAT_PUBLIC_API_KEY; do
+          for name in MACOS_APP_STORE_CERTIFICATE MACOS_APP_STORE_CERTIFICATE_PASSWORD MACOS_APP_STORE_INSTALLER_CERTIFICATE MACOS_APP_STORE_INSTALLER_CERTIFICATE_PASSWORD MACOS_APP_STORE_PROFILE; do
             if [[ -z "${!name}" ]]; then
               echo "::error::Configure the ${name} repository secret before building a Mac App Store package."
               exit 1
@@ -204,9 +203,6 @@ jobs:
           test ! -e "$app_path/Contents/MacOS/cli"
           test ! -e "$app_path/Contents/MacOS/git"
           test ! -e "$app_path/Contents/Resources/git"
-          test ! -e "$app_path/Contents/Frameworks/libFantaRevenueCatBridge.dylib"
-          test ! -e "$app_path/Contents/Resources/RevenueCat_RevenueCat.bundle"
-          test ! -e "$app_path/Contents/Resources/RevenueCat-LICENSE.txt"
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app_path/Contents/Info.plist")" = dev.fanta.Fanta
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app_path/Contents/Info.plist")" = 1.0
           test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app_path/Contents/Info.plist")" = "$EXPECTED_BUILD_NUMBER"
