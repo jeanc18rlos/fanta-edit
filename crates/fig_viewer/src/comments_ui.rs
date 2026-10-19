@@ -370,6 +370,18 @@ impl FigView {
         Some((min, min + DVec2::new(PIN_SIZE, PIN_SIZE)))
     }
 
+    /// Where a comment's pin is now: its layer's current placement when it is
+    /// anchored, otherwise the authored position.
+    fn comment_world(&self, comment: &Comment, cx: &App) -> DVec2 {
+        let [x, y] = self
+            .item
+            .read(cx)
+            .document()
+            .map(|document| comments::resolve_world(&document.doc, comment))
+            .unwrap_or(comment.world);
+        DVec2::new(x, y)
+    }
+
     /// The comment whose pin contains `screen`, topmost (last painted) first.
     pub(crate) fn comment_pin_at(&self, screen: DVec2, cx: &App) -> Option<String> {
         let comments = self.visible_page_comments(cx);
@@ -377,7 +389,7 @@ impl FigView {
             .iter()
             .rev()
             .find(|comment| {
-                self.pin_screen_rect(DVec2::new(comment.world[0], comment.world[1]))
+                self.pin_screen_rect(self.comment_world(comment, cx))
                     .is_some_and(|(min, max)| {
                         screen.x >= min.x
                             && screen.x <= max.x
@@ -1135,6 +1147,34 @@ impl FigView {
         }
     }
 
+    pub(crate) fn apply_open_comment_suggested_fix(&mut self, cx: &mut Context<Self>) {
+        let result = (|| {
+            let origin = self
+                .comment_state
+                .open_thread_origin
+                .ok_or_else(|| anyhow::anyhow!("open a comment thread first"))?;
+            let id = self
+                .comment_state
+                .open_thread
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("open a comment thread first"))?;
+            anyhow::ensure!(
+                self.item
+                    .read(cx)
+                    .document()
+                    .is_some_and(|document| document_has_comment_origin(&document.doc, origin)),
+                "the comment document is no longer open"
+            );
+            crate::agent_surface::apply_comment_suggested_fix(&self.item, origin.page, id, cx)
+        })();
+        if let Err(error) = result {
+            crate::view::show_canvas_notice_deferred(
+                format!("Could not apply suggested fix: {error:#}"),
+                cx,
+            );
+        }
+    }
+
     fn route_comment_skill_prompt(
         &mut self,
         prompt: Option<String>,
@@ -1342,7 +1382,7 @@ impl FigView {
         comment: &Comment,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let world = DVec2::new(comment.world[0], comment.world[1]);
+        let world = self.comment_world(comment, cx);
         let viewport = self.viewport?;
         let author: SharedString = display_author(comment).into();
         let when: SharedString = relative_time(comment.created).into();
@@ -1408,7 +1448,7 @@ impl FigView {
         comment: &Comment,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let world = DVec2::new(comment.world[0], comment.world[1]);
+        let world = self.comment_world(comment, cx);
         let viewport = self.viewport?;
         let resolve_id = comment.id.clone();
         let delete_id = comment.id.clone();
@@ -1551,7 +1591,29 @@ impl FigView {
                                 ),
                         ),
                 )
+                .child(
+                    Label::new(
+                        comment.location_label(&self.item.read(cx).document()?.doc, "Canvas"),
+                    )
+                    .size(LabelSize::XSmall),
+                )
                 .child(messages)
+                .when_some(comment.suggested_fix.as_ref(), |thread, fix| {
+                    thread.child(
+                        v_flex()
+                            .px_3p5()
+                            .py_2()
+                            .gap_1()
+                            .child(Label::new(fix.summary.clone()).size(LabelSize::Small))
+                            .child(
+                                Button::new("apply-comment-suggested-fix", "Apply suggested fix")
+                                    .disabled(read_only)
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.apply_open_comment_suggested_fix(cx)
+                                    })),
+                            ),
+                    )
+                })
                 .when(read_only, |thread| {
                     thread.child(
                         h_flex()

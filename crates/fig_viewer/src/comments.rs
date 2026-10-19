@@ -10,6 +10,7 @@
 //! [`meta`]: fanta_doc::CanvasNode::meta
 
 use fanta_doc::{AnimationClipId, Doc, NodeId, Operation};
+use glam::DVec2;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -75,7 +76,7 @@ impl CommentSkill {
                 "Rewrite or format the requested content so it is clear, consistent, and ready to use. Preserve the original meaning and call out any ambiguity that needs a decision."
             }
             Self::Review => {
-                "Review the design on the referenced page with its unresolved canvas comments. Inspect the actual source and a canvas screenshot, identify actionable visual or interaction issues, and reply to the original comments with findings. Do not change scene content during review."
+                "Review the design on the referenced page with its unresolved canvas comments. Inspect the actual source and a canvas screenshot, identify actionable visual or interaction issues, post each finding as its own canvas comment with add_comment / design_comments create (anchored to the layer it concerns, with a severity and a category), and reply to the original comments with a summary. Do not change scene content during review."
             }
         }
     }
@@ -108,6 +109,76 @@ pub(crate) struct MotionCommentAnchor {
     pub(crate) time_ms: u32,
 }
 
+/// Where a comment sits on a layer: the node and a point in its local units,
+/// so the pin follows the layer when it moves. [`Comment::world`] keeps the
+/// authored position for readers that do not resolve anchors.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub(crate) struct CommentAnchor {
+    pub(crate) node: NodeId,
+    pub(crate) offset: [f64; 2],
+}
+
+/// How much a review finding matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CommentSeverity {
+    Info,
+    Minor,
+    Major,
+    Blocker,
+}
+
+impl CommentSeverity {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Info => "Info",
+            Self::Minor => "Minor",
+            Self::Major => "Major",
+            Self::Blocker => "Blocker",
+        }
+    }
+}
+
+/// What a review finding is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CommentCategory {
+    Layout,
+    Typography,
+    Color,
+    Accessibility,
+    Consistency,
+    Content,
+    Interaction,
+    Motion,
+    Other,
+}
+
+impl CommentCategory {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Layout => "Layout",
+            Self::Typography => "Typography",
+            Self::Color => "Color",
+            Self::Accessibility => "Accessibility",
+            Self::Consistency => "Consistency",
+            Self::Content => "Content",
+            Self::Interaction => "Interaction",
+            Self::Motion => "Motion",
+            Self::Other => "Other",
+        }
+    }
+}
+
+/// A change that would address a finding: a `design_edit` / `batch_design`
+/// ops list the user can apply from the thread. Kept as JSON so a comment
+/// written by a newer build still loads.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SuggestedFix {
+    pub(crate) summary: String,
+    pub(crate) ops: Vec<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Comment {
     /// Stable identity for panel rows and pin hit-testing.
@@ -136,9 +207,38 @@ pub(crate) struct Comment {
     pub(crate) question: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) motion_anchor: Option<MotionCommentAnchor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) anchor: Option<CommentAnchor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) severity: Option<CommentSeverity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) category: Option<CommentCategory>,
+    /// Groups the findings one review run produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) review_run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) suggested_fix: Option<SuggestedFix>,
 }
 
 impl Comment {
+    pub(crate) fn location_label(&self, doc: &Doc, page_name: &str) -> String {
+        let mut labels = Vec::new();
+        if let Some(severity) = self.severity {
+            labels.push(severity.label());
+        }
+        if let Some(category) = self.category {
+            labels.push(category.label());
+        }
+        labels.push(
+            self.anchor
+                .and_then(|anchor| doc.scene.get(anchor.node))
+                .map(|node| node.name.as_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or(page_name),
+        );
+        labels.join(" · ")
+    }
+
     pub(crate) fn message_count(&self) -> usize {
         1 + self.replies.len()
     }
@@ -179,6 +279,41 @@ pub(crate) fn read_comments(doc: &Doc, page: NodeId) -> Vec<Comment> {
         .unwrap_or_default()
 }
 
+/// The layer under `world` on `page`, with the point in its local units, so a
+/// pin placed on a layer follows it. Hit testing skips groups and frames, so a
+/// pin on empty background stays a page position.
+pub(crate) fn anchor_for_world(doc: &Doc, page: NodeId, world: [f64; 2]) -> Option<CommentAnchor> {
+    let point = DVec2::new(world[0], world[1]);
+    let node = doc.scene.topmost_hit_where(point, |candidate| {
+        doc.scene
+            .ancestors_of(candidate)
+            .any(|ancestor| ancestor.id == page)
+    })?;
+    let local = doc
+        .scene
+        .world_transform(node)?
+        .inverse()
+        .transform_point(point);
+    (local.x.is_finite() && local.y.is_finite()).then_some(CommentAnchor {
+        node,
+        offset: [local.x, local.y],
+    })
+}
+
+/// The pin's current position: the anchored layer's placement of the stored
+/// offset, or the authored position when there is no anchor or the layer is
+/// gone.
+pub(crate) fn resolve_world(doc: &Doc, comment: &Comment) -> [f64; 2] {
+    comment
+        .anchor
+        .and_then(|anchor| {
+            let transform = doc.scene.world_transform(anchor.node)?;
+            let point = transform.transform_point(DVec2::new(anchor.offset[0], anchor.offset[1]));
+            (point.x.is_finite() && point.y.is_finite()).then_some([point.x, point.y])
+        })
+        .unwrap_or(comment.world)
+}
+
 fn merge_comment_value(
     original_value: &serde_json::Value,
     original: &Comment,
@@ -215,6 +350,17 @@ fn merge_comment_value(
     replace_if_changed("attachments", original.attachments != comment.attachments);
     replace_if_changed("skill", original.skill != comment.skill);
     replace_if_changed("question", original.question != comment.question);
+    replace_if_changed("anchor", original.anchor != comment.anchor);
+    replace_if_changed("severity", original.severity != comment.severity);
+    replace_if_changed("category", original.category != comment.category);
+    replace_if_changed(
+        "review_run_id",
+        original.review_run_id != comment.review_run_id,
+    );
+    replace_if_changed(
+        "suggested_fix",
+        original.suggested_fix != comment.suggested_fix,
+    );
 
     if original.replies != comment.replies {
         let preserved_prefix = if comment.replies.starts_with(&original.replies) {
@@ -370,8 +516,166 @@ pub(crate) fn add_comment_full_op(
         skill,
         question: false,
         motion_anchor,
+        anchor: anchor_for_world(doc, page, world),
+        severity: None,
+        category: None,
+        review_run_id: None,
+        suggested_fix: None,
     });
     set_comments_op(doc, page, &comments).map(|op| (id, op))
+}
+
+/// Place a comment as an agent: a review finding, a question or a note. With
+/// `node`, the pin anchors to that layer at `offset` (its centre by default);
+/// otherwise `world` is required and the layer under it, if any, becomes the
+/// anchor. Returns the new comment's id with the operation.
+pub(crate) fn agent_add_comment_op(
+    doc: &Doc,
+    page: NodeId,
+    draft: &design_surface::CommentDraft,
+) -> anyhow::Result<(String, Operation)> {
+    let text = draft.text.trim();
+    anyhow::ensure!(!text.is_empty(), "a comment must contain text");
+    anyhow::ensure!(
+        doc.scene.get(page).is_some(),
+        "the comment page no longer exists"
+    );
+    let (world, anchor) = match draft.node.as_deref() {
+        Some(key) => {
+            let node = key
+                .parse::<NodeId>()
+                .map_err(|_| anyhow::anyhow!("{key:?} is not a node id"))?;
+            let canvas_node = doc
+                .scene
+                .get(node)
+                .ok_or_else(|| anyhow::anyhow!("node {key} does not exist"))?;
+            anyhow::ensure!(
+                node == page
+                    || doc
+                        .scene
+                        .ancestors_of(node)
+                        .any(|ancestor| ancestor.id == page),
+                "node {key} is not on the comment page"
+            );
+            let offset = draft.offset.unwrap_or_else(|| {
+                canvas_node
+                    .data
+                    .local_bounds()
+                    .map(|bounds| {
+                        let centre = bounds.center();
+                        [centre.x, centre.y]
+                    })
+                    .unwrap_or([0.0, 0.0])
+            });
+            anyhow::ensure!(
+                offset.iter().all(|value| value.is_finite()),
+                "the comment offset must be finite"
+            );
+            let transform = doc
+                .scene
+                .world_transform(node)
+                .ok_or_else(|| anyhow::anyhow!("node {key} has no placement yet"))?;
+            let point = transform.transform_point(DVec2::new(offset[0], offset[1]));
+            ([point.x, point.y], Some(CommentAnchor { node, offset }))
+        }
+        None => {
+            let world = draft
+                .world
+                .ok_or_else(|| anyhow::anyhow!("a comment needs a node or a world position"))?;
+            anyhow::ensure!(
+                world.iter().all(|value| value.is_finite()),
+                "the comment position must be finite"
+            );
+            (world, anchor_for_world(doc, page, world))
+        }
+    };
+    anyhow::ensure!(
+        world.iter().all(|value| value.is_finite()),
+        "the comment position must be finite"
+    );
+    let severity = draft
+        .severity
+        .as_deref()
+        .map(|severity| {
+            serde_json::from_value::<CommentSeverity>(serde_json::Value::String(
+                severity.trim().to_ascii_lowercase(),
+            ))
+            .map_err(|_| anyhow::anyhow!("severity must be info, minor, major or blocker"))
+        })
+        .transpose()?;
+    let category = draft
+        .category
+        .as_deref()
+        .map(|category| {
+            serde_json::from_value::<CommentCategory>(serde_json::Value::String(
+                category.trim().to_ascii_lowercase(),
+            ))
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "category must be layout, typography, color, accessibility, consistency, content, interaction, motion or other"
+                )
+            })
+        })
+        .transpose()?;
+    let suggested_fix = draft
+        .suggested_fix
+        .as_ref()
+        .map(|fix| {
+            anyhow::ensure!(
+                !fix.summary.trim().is_empty(),
+                "a suggested fix needs a summary"
+            );
+            anyhow::ensure!(!fix.ops.is_empty(), "a suggested fix needs at least one op");
+            for (index, op) in fix.ops.iter().enumerate() {
+                let operation = serde_json::from_value::<design_surface::DesignOp>(op.clone()).map_err(
+                    |error| anyhow::anyhow!("suggested fix op {index} is invalid: {error}"),
+                )?;
+                anyhow::ensure!(!matches!(operation, design_surface::DesignOp::Select { .. } | design_surface::DesignOp::SetViewport { .. }),
+                    "suggested fixes must change design content; selection and viewport operations cannot be undone");
+            }
+            Ok(SuggestedFix {
+                summary: clean_context_line(fix.summary.trim()),
+                ops: fix.ops.clone(),
+            })
+        })
+        .transpose()?;
+    let author = draft
+        .author
+        .as_deref()
+        .map(str::trim)
+        .filter(|author| !author.is_empty())
+        .map(clean_context_line)
+        .unwrap_or_else(|| "Fanta Agent".to_string());
+    let mut comments = read_comments(doc, page);
+    let id = fanta_doc::NodeId::new().to_string();
+    comments.push(Comment {
+        id: id.clone(),
+        world,
+        author,
+        text: text.to_string(),
+        created: now_secs(),
+        resolved: false,
+        from_agent: true,
+        mentions: mentions_for_body(doc, page, text),
+        attachments: Vec::new(),
+        replies: Vec::new(),
+        skill: None,
+        question: false,
+        motion_anchor: None,
+        anchor,
+        severity,
+        category,
+        review_run_id: draft
+            .review_run_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|run| !run.is_empty())
+            .map(clean_context_line),
+        suggested_fix,
+    });
+    set_comments_op(doc, page, &comments)
+        .map(|op| (id, op))
+        .ok_or_else(|| anyhow::anyhow!("the comment could not be saved"))
 }
 
 /// Static comments are visible on every canvas surface. Motion comments are
@@ -972,6 +1276,199 @@ mod tests {
 
     /// Comments written by the placeholder v1 (id/world/text/resolved only)
     /// must keep deserializing after the model grew author/replies/etc.
+    fn page_with_rect() -> (Doc, NodeId, NodeId) {
+        use fanta_doc::{Transform2D, VectorNode};
+        let (mut doc, page) = doc_with_page();
+        let mut rect = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            50.0,
+            50.0,
+            fanta_doc::color::Color::WHITE,
+        )));
+        rect.name = "Card".into();
+        rect.parent = Some(page);
+        rect.transform = Transform2D::translation(10.0, 10.0);
+        let rect_id = rect.id;
+        doc.apply(Operation::create_node(rect)).expect("rect");
+        (doc, page, rect_id)
+    }
+
+    #[test]
+    fn anchored_comment_follows_its_node_and_falls_back_when_it_is_gone() {
+        use fanta_doc::Transform2D;
+        let (mut doc, page, rect) = page_with_rect();
+        let (id, op) = add_comment_op(&doc, page, [20.0, 30.0], "on the card").expect("add");
+        doc.apply(op).expect("apply add");
+        let comment = read_comments(&doc, page).remove(0);
+        assert_eq!(comment.id, id);
+        assert_eq!(
+            comment.anchor,
+            Some(CommentAnchor {
+                node: rect,
+                offset: [10.0, 20.0]
+            })
+        );
+        assert_eq!(resolve_world(&doc, &comment), [20.0, 30.0]);
+
+        let old = doc.scene.get(rect).expect("rect").transform;
+        doc.apply(Operation::SetTransform {
+            id: rect,
+            old,
+            new: Transform2D::translation(110.0, 10.0),
+        })
+        .expect("move");
+        let comment = read_comments(&doc, page).remove(0);
+        assert_eq!(comment.world, [20.0, 30.0], "the authored position is kept");
+        assert_eq!(
+            resolve_world(&doc, &comment),
+            [120.0, 30.0],
+            "the pin follows the layer"
+        );
+
+        let orphan = Comment {
+            anchor: Some(CommentAnchor {
+                node: NodeId::from_u128(999),
+                offset: [1.0, 1.0],
+            }),
+            ..comment
+        };
+        assert_eq!(
+            resolve_world(&doc, &orphan),
+            [20.0, 30.0],
+            "a missing layer falls back"
+        );
+
+        doc.apply(Operation::DeleteSubtree {
+            snapshot: vec![doc.scene.get(rect).expect("rect").clone()],
+        })
+        .expect("delete anchored layer");
+        let stored = read_comments(&doc, page).remove(0);
+        assert_eq!(resolve_world(&doc, &stored), [20.0, 30.0]);
+        assert!(doc.undo().expect("undo deletion"));
+        assert_eq!(resolve_world(&doc, &stored), [120.0, 30.0]);
+
+        let (_, off_canvas) = add_comment_op(&doc, page, [500.0, 500.0], "empty").expect("add");
+        doc.apply(off_canvas).expect("apply");
+        assert!(
+            read_comments(&doc, page)[1].anchor.is_none(),
+            "empty background has no anchor"
+        );
+    }
+
+    #[test]
+    fn agent_comments_carry_severity_category_run_id_and_fix_and_undo() {
+        let (mut doc, page, rect) = page_with_rect();
+        let draft = design_surface::CommentDraft {
+            node: Some(rect.to_string()),
+            text: "  Contrast is too low on @Card  ".into(),
+            severity: Some("Major".into()),
+            category: Some("accessibility".into()),
+            review_run_id: Some("run-1".into()),
+            suggested_fix: Some(design_surface::SuggestedFixDraft {
+                summary: "Darken the fill".into(),
+                ops: vec![
+                    serde_json::json!({"op":"set_props","id":rect.to_string(),"props":{"fill":"#111111"}}),
+                ],
+            }),
+            ..Default::default()
+        };
+        let (id, op) = agent_add_comment_op(&doc, page, &draft).expect("agent comment");
+        doc.apply(op).expect("apply");
+        let comment = read_comments(&doc, page).remove(0);
+        assert_eq!(comment.id, id);
+        assert!(comment.from_agent);
+        assert_eq!(comment.author, "Fanta Agent");
+        assert_eq!(comment.text, "Contrast is too low on @Card");
+        assert_eq!(comment.severity, Some(CommentSeverity::Major));
+        assert_eq!(comment.category, Some(CommentCategory::Accessibility));
+        assert_eq!(comment.review_run_id.as_deref(), Some("run-1"));
+        assert_eq!(
+            comment.anchor,
+            Some(CommentAnchor {
+                node: rect,
+                offset: [25.0, 25.0]
+            }),
+            "a node anchor defaults to the layer's centre"
+        );
+        assert_eq!(comment.world, [35.0, 35.0]);
+        assert_eq!(
+            comment
+                .mentions
+                .iter()
+                .map(|mention| &mention.target)
+                .collect::<Vec<_>>(),
+            vec![&MentionTarget::Node(rect)]
+        );
+        assert_eq!(
+            comment
+                .suggested_fix
+                .as_ref()
+                .map(|fix| fix.summary.as_str()),
+            Some("Darken the fill")
+        );
+        let json = serde_json::to_value(&comment).expect("json");
+        assert_eq!(json["severity"], "major");
+        assert_eq!(json["category"], "accessibility");
+        assert!(doc.undo().expect("undo"));
+        assert!(read_comments(&doc, page).is_empty());
+
+        let bad = design_surface::CommentDraft {
+            world: Some([1.0, 1.0]),
+            text: "x".into(),
+            severity: Some("urgent".into()),
+            ..Default::default()
+        };
+        assert!(agent_add_comment_op(&doc, page, &bad).is_err());
+        let bad_fix = design_surface::CommentDraft {
+            world: Some([1.0, 1.0]),
+            text: "x".into(),
+            suggested_fix: Some(design_surface::SuggestedFixDraft {
+                summary: "nope".into(),
+                ops: vec![serde_json::json!({"op":"teleport"})],
+            }),
+            ..Default::default()
+        };
+        assert!(agent_add_comment_op(&doc, page, &bad_fix).is_err());
+        let presence_fix = design_surface::CommentDraft {
+            world: Some([1.0, 1.0]),
+            text: "x".into(),
+            suggested_fix: Some(design_surface::SuggestedFixDraft {
+                summary: "Move the camera".into(),
+                ops: vec![serde_json::json!({"op":"set_viewport", "center":[0,0],"zoom":1})],
+            }),
+            ..Default::default()
+        };
+        assert!(agent_add_comment_op(&doc, page, &presence_fix).is_err());
+        let nowhere = design_surface::CommentDraft {
+            text: "x".into(),
+            ..Default::default()
+        };
+        assert!(agent_add_comment_op(&doc, page, &nowhere).is_err());
+    }
+
+    #[test]
+    fn review_fields_merge_into_existing_comment_values() {
+        let (mut doc, page, _) = page_with_rect();
+        let (id, op) = add_comment_op(&doc, page, [5.0, 5.0], "note").expect("add");
+        doc.apply(op).expect("apply");
+        let mut comments = read_comments(&doc, page);
+        comments[0].severity = Some(CommentSeverity::Minor);
+        comments[0].category = Some(CommentCategory::Layout);
+        comments[0].suggested_fix = Some(SuggestedFix {
+            summary: "Nudge".into(),
+            ops: vec![serde_json::json!({"op":"set_props","id":"n_x","props":{"x":1}})],
+        });
+        doc.apply(set_comments_op(&doc, page, &comments).expect("edit"))
+            .expect("apply edit");
+        let stored = read_comments(&doc, page).remove(0);
+        assert_eq!(stored.id, id);
+        assert_eq!(stored.severity, Some(CommentSeverity::Minor));
+        assert_eq!(stored.category, Some(CommentCategory::Layout));
+        assert_eq!(stored.suggested_fix, comments[0].suggested_fix);
+        assert_eq!(stored.anchor, comments[0].anchor);
+    }
+
     #[test]
     fn legacy_minimal_comments_still_deserialize() {
         let (mut doc, page) = doc_with_page();

@@ -582,10 +582,20 @@ and file path. Use those references in source edits. Generated image blocks
 returned by MCP tools are imported automatically when possible; an import
 failure is shown in chat.
 
-**`list_comments`** reads a page's unresolved comments. **`reply_comment`**
-posts an attributed agent reply to an exact comment id; resolve only after
-verifying the requested work. Review mode reads designs and replies to
-comments without changing scene content. Plan mode is read-only.
+**`list_comments`** reads a page's unresolved comments, each with its
+`resolved_world` pin position. **`reply_comment`** posts an attributed agent
+reply to an exact comment id; resolve only after verifying the requested
+work. **`add_comment`** places a new comment: anchor it to a layer with
+`node` (and an optional `offset` in the layer's units) so the pin follows the
+layer, or give a `world` position; review findings carry `severity` (info,
+minor, major, blocker), `category` (layout, typography, color, accessibility,
+consistency, content, interaction, motion, other), the run's
+`review_run_id` and, when a concrete change would address them, a
+`suggested_fix` with `summary` and content-editing `batch_design` `ops`.
+Omit `select` and `set_viewport` from suggested fixes because they are not
+undoable. Review mode reads
+designs, posts findings and replies to comments without changing scene
+content. Plan mode is read-only.
 
 **`report_agent_activity`** reports a stable agent id, mage name, action,
 page/node/world focus, `source_path` and `workspace` (`canvas`, `variables`,
@@ -840,10 +850,12 @@ fn seed_agents_md(dir: &Path) -> Result<()> {
     let path = dir.join(AGENTS_MD_NAME);
     // Upgrade only the exact previous seed; edited guides remain user-owned.
     let previous_seeds = [
+        "7d239070095503e6e0fbbe308376d50d5e75043e7f86041addcf69288ec0c340",
         "9b50be64e96b0a3a0dae85e78f5855821edf2969ce4ea74de0cbc8f0035a716a",
         "e9cd2913d2c9f6cb86653928d192fa1a11668fc0e9feffed2f2c2b760f4565e7",
         "057778f31c69d024845123c01ee02d5a91d0736e2743806b47234cc99670007d",
         "71d49782238e8e17464761de73b4b71a807e1d9346582a1c00e38f00e7993065",
+        "b95dd139e72304af8d38947f10b594bb70c455db8c75f2332ff45b33423ec756",
     ];
     let should_write = match fs::read(&path) {
         Ok(contents) => {

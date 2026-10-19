@@ -42,12 +42,12 @@ use gpui::{
 };
 use heck::ToSnakeCase as _;
 use language_model::{
-    CompletionIntent, LanguageModel, LanguageModelCompletionError, LanguageModelCompletionEvent,
-    LanguageModelId, LanguageModelImage, LanguageModelProviderId, LanguageModelRegistry,
-    LanguageModelRequest, LanguageModelRequestMessage, LanguageModelRequestTool,
-    LanguageModelToolResult, LanguageModelToolResultContent, LanguageModelToolSchemaFormat,
-    LanguageModelToolUse, LanguageModelToolUseId, MessageContent, Role, SelectedModel, Speed,
-    StopReason, TokenUsage, FANTA_CLOUD_PROVIDER_ID,
+    CompletionIntent, FANTA_CLOUD_PROVIDER_ID, LanguageModel, LanguageModelCompletionError,
+    LanguageModelCompletionEvent, LanguageModelId, LanguageModelImage, LanguageModelProviderId,
+    LanguageModelRegistry, LanguageModelRequest, LanguageModelRequestMessage,
+    LanguageModelRequestTool, LanguageModelToolResult, LanguageModelToolResultContent,
+    LanguageModelToolSchemaFormat, LanguageModelToolUse, LanguageModelToolUseId, MessageContent,
+    Role, SelectedModel, Speed, StopReason, TokenUsage,
 };
 use project::{Project, trusted_worktrees::TrustedWorktrees};
 use prompt_store::ProjectContext;
@@ -4860,7 +4860,7 @@ impl Thread {
                 "\n\nPlan mode is selected. Inspect the actual project files, canvas state, screenshots, and canvas comments. Produce a concrete plan with scope, dependencies, and verification. Do not edit files, the design, comments, or Git state. Delegated agents inherit this restriction. End with the plan ready for implementation."
             }
             builtin_profiles::REVIEW => {
-                "\n\nReview mode is selected. Inspect the actual project files and design, take canvas comments into account, and verify findings with screenshots and node state. Read unresolved comments with design_comments and reply to actionable comments with findings or completed verification. Do not edit design content, files, or Git state. Do not resolve comments whose requested work is still outstanding. Delegated agents inherit this restriction. Report actionable issues with concrete locations and avoid claiming the review is complete until all delegated reviews finish."
+                "\n\nReview mode is selected. Inspect the actual project files and design, take canvas comments into account, and verify findings with screenshots and node state. Read unresolved comments with design_comments, post each new finding as its own anchored canvas comment with design_comments create (node, severity, category, review_run_id), and reply to actionable comments with findings or completed verification. Do not edit design content, files, or Git state. Do not resolve comments whose requested work is still outstanding. Delegated agents inherit this restriction. Report actionable issues with concrete locations and avoid claiming the review is complete until all delegated reviews finish."
             }
             _ => "",
         }
@@ -7823,6 +7823,14 @@ mod tests {
             Ok(json!({"x": 0, "y": 0}))
         }
 
+        fn add_comment(
+            &self,
+            draft: design_surface::CommentDraft,
+            _: &mut App,
+        ) -> Result<serde_json::Value> {
+            Ok(json!({"created": true, "text": draft.text}))
+        }
+
         fn reply_comment(
             &self,
             _: Option<usize>,
@@ -8241,6 +8249,7 @@ mod tests {
                             comment_id: Some("canvas-comment".into()),
                             body: Some("Verified spacing against the screenshot".into()),
                             resolve: false,
+                            create: None,
                         }),
                         event_stream,
                         cx,
@@ -8251,6 +8260,47 @@ mod tests {
                 result.is_ok(),
                 reply_allowed,
                 "unexpected comment permissions in {profile}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    async fn test_plan_blocks_comment_creation_and_review_allows_it(cx: &mut TestAppContext) {
+        let (thread, _) = setup_thread_for_test(cx).await;
+        cx.update(|cx| design_surface::register(Rc::new(TestDesignSurface::Overview), cx));
+        for (profile, allowed) in [
+            (builtin_profiles::PLAN, false),
+            (builtin_profiles::REVIEW, true),
+        ] {
+            thread.update(cx, |thread, cx| {
+                thread.set_profile(AgentProfileId(profile.into()), cx)
+            });
+            let (mut event_stream, _) = ToolCallEventStream::test();
+            event_stream.thread = Some(thread.downgrade());
+            let result = cx
+                .update(|cx| {
+                    Arc::new(DesignCommentsTool).run(
+                        ToolInput::resolved(crate::DesignCommentsToolInput {
+                            page: None,
+                            include_resolved: false,
+                            comment_id: None,
+                            body: None,
+                            resolve: false,
+                            create: Some(design_surface::CommentDraft {
+                                text: "Verified finding".into(),
+                                world: Some([0.0, 0.0]),
+                                ..Default::default()
+                            }),
+                        }),
+                        event_stream,
+                        cx,
+                    )
+                })
+                .await;
+            assert_eq!(
+                result.is_ok(),
+                allowed,
+                "unexpected comment creation permission in {profile}"
             );
         }
     }

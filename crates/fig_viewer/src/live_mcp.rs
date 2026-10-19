@@ -84,6 +84,7 @@ macro_rules! live_tools {
             ImportImageTool,
             ListCommentsTool,
             ReplyCommentTool,
+            AddCommentTool,
             ReportActivityTool
         )
     };
@@ -630,6 +631,37 @@ impl McpServerTool for ReplyCommentTool {
                 cx,
             )
         })?;
+        Ok(text_response(value))
+    }
+}
+
+/// Place a new canvas comment as an agent: a review finding, a question or a
+/// note. Anchor it to a layer with `node` (prefixed id; `offset` in the node's
+/// local units, its centre by default) so the pin follows the layer, or give a
+/// `world` position. Review findings carry `severity` (info, minor, major,
+/// blocker), `category` (layout, typography, color, accessibility,
+/// consistency, content, interaction, motion, other), the run's
+/// `review_run_id`, and optionally a `suggested_fix` (`summary` plus the
+/// content-editing batch_design `ops` that would address it, excluding select
+/// and set_viewport) the user can apply.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+struct AddCommentArgs {
+    #[serde(flatten)]
+    draft: design_surface::CommentDraft,
+}
+
+#[derive(Clone)]
+struct AddCommentTool;
+
+impl McpServerTool for AddCommentTool {
+    type Input = AddCommentArgs;
+    type Output = ();
+    const NAME: &'static str = "add_comment";
+    fn annotations(&self) -> ToolAnnotations {
+        non_destructive_write()
+    }
+    async fn run(&self, input: Self::Input, cx: &mut AsyncApp) -> Result<ToolResponse<()>> {
+        let value = with_surface(cx, move |surface, cx| surface.add_comment(input.draft, cx))?;
         Ok(text_response(value))
     }
 }
@@ -1294,7 +1326,7 @@ mod tests {
             };
         }
         let tools = live_tools!(descriptions!());
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 14);
         for (name, description) in tools {
             let description = description.unwrap_or_default();
             assert!(

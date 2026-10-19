@@ -30,7 +30,7 @@ the bridge fails visibly instead of claiming a connection.
 
 ## Tool scopes
 
-The inspected source registers these **13 local MCP tools**. Their target is the
+The inspected source registers these **14 local MCP tools**. Their target is the
 focused open design. A tool listing is an interface inventory, not proof every
 end-to-end use has passed on a particular installer.
 
@@ -46,8 +46,9 @@ end-to-end use has passed on a particular installer.
 | `batch_design` | Apply typed design operations as one undoable content transaction |
 | `import_image` | Register an image in the open project's asset workflow |
 | `prepare_design_asset` | Open a composer for user review; does not submit generation |
-| `list_comments` | Read project comments |
+| `list_comments` | Read project comments with their current pin positions |
 | `reply_comment` | Add a reply to an existing comment |
+| `add_comment` | Place a new comment, anchored to a layer, with review severity and category |
 | `report_agent_activity` | Report stable agent identity, activity and location |
 
 `batch_get` defaults to at most 200 direct children, with `offset` and `limit`
@@ -83,3 +84,7 @@ is enabled, and the copied user-data directory matches. Recopy the instructions
 after an app-path change. Ask in [Fanta Community](https://discord.gg/qrFtymBYxk)
 for connection and workflow help. Send private credential/account problems to
 [support@fantaisa.net](mailto:support@fantaisa.net).
+
+AI Review findings may include a suggested fix. Its ops must change design content;
+`select` and `set_viewport` are excluded because those changes are not undoable.
+Apply the fix explicitly from its comment thread to create one undo step.

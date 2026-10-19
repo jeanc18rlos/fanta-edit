@@ -86,6 +86,45 @@ pub enum DesignComponentPropertyKind {
     Variant,
 }
 
+/// A canvas comment an agent places: a review finding, a question or a note.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct CommentDraft {
+    /// Page index; the active page when omitted.
+    #[serde(default)]
+    pub page: Option<usize>,
+    /// Anchor the pin to this node (prefixed id) so it follows the layer.
+    #[serde(default)]
+    pub node: Option<String>,
+    /// Point on the node in its local units; its centre when omitted.
+    #[serde(default)]
+    pub offset: Option<[f64; 2]>,
+    /// World position when no node is given; the layer under it becomes the anchor.
+    #[serde(default)]
+    pub world: Option<[f64; 2]>,
+    pub text: String,
+    #[serde(default)]
+    pub author: Option<String>,
+    /// info, minor, major or blocker.
+    #[serde(default)]
+    pub severity: Option<String>,
+    /// layout, typography, color, accessibility, consistency, content, interaction, motion or other.
+    #[serde(default)]
+    pub category: Option<String>,
+    /// Groups the findings of one review run.
+    #[serde(default)]
+    pub review_run_id: Option<String>,
+    /// A change that would address the finding, as a design ops list the user applies.
+    #[serde(default)]
+    pub suggested_fix: Option<SuggestedFixDraft>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct SuggestedFixDraft {
+    pub summary: String,
+    /// Content edits from `batch_design` / `design_edit`; omit `select` and `set_viewport`.
+    pub ops: Vec<serde_json::Value>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "prop", rename_all = "snake_case")]
 pub enum VariableBindingProperty {
@@ -1431,6 +1470,11 @@ pub trait DesignSurface: 'static {
         anyhow::bail!("this design surface cannot read comments")
     }
 
+    /// Place a new comment on the canvas as an agent.
+    fn add_comment(&self, _draft: CommentDraft, _cx: &mut App) -> Result<serde_json::Value> {
+        anyhow::bail!("this design surface cannot add comments")
+    }
+
     fn reply_comment(
         &self,
         _page: Option<usize>,
@@ -1571,8 +1615,9 @@ mode use canvas operations; source file mutation is unavailable.
 ## Working method
 - Prioritize visible progress: build one component or screen section at a time with small streamed canvas batches. Keep each new component visible on the current page or its own named component page, then place an instance on the screen before starting the next component. Use small complete FNX source edits when they help, preserving identities; save and verify each milestone. Never claim missing tool access without trying the available tools and reporting the real error.
 - Read unresolved comments with `list_comments` / `design_comments`, use them during reviews, and reply in their original canvas threads. Only resolve verified requests.
+- Post review findings as their own comments with `add_comment` (native: `design_comments` with `create`): anchor each to the layer it concerns (`node`), give it a `severity` (info, minor, major, blocker) and a `category` (layout, typography, color, accessibility, consistency, content, interaction, motion, other), the run's `review_run_id`, and a `suggested_fix` ops list when a concrete change would address it. Suggested fixes contain content edits only; omit select and set_viewport. Finish a review with one summary comment. A review never edits the design.
 - Report agent focus with `report_agent_activity` (stable agent id, mage name, action, page and node/world position); update it for every placement or adjustment. Include `workspace` (canvas, variables or code) and `source_path` when moving between files or tabs so Follow can track your actual work. External MCP agents must pass the same identity in `batch_design.activity` to preserve Follow through each streamed placement. Clear it with `active: false` when done.
-- Native Full Access and Ultra initialize Git when needed at the verified local Fanta project root, create a task branch, and save durable before/after snapshots. External unattended agents should create a task branch and preserve progress without altering user changes or their staged index; create ordinary commits only when requested. Plan mode is read-only; Review mode can reply to comments but cannot edit scene content.
+- Native Full Access and Ultra initialize Git when needed at the verified local Fanta project root, create a task branch, and save durable before/after snapshots. External unattended agents should create a task branch and preserve progress without altering user changes or their staged index; create ordinary commits only when requested. Plan mode is read-only; Review mode can create and reply to comments but cannot edit scene content.
 1. Read state first (`design_state` / `get_editor_state`), then the page tree
    with `depth` 1–2; fetch nodes by id for detail. A page listing returns at
    most 200 of the page's direct children at a time and reports `child_count`,

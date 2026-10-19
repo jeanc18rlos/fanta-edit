@@ -85,6 +85,8 @@ pub use agent_diff::{AgentDiffPane, AgentDiffToolbar};
 pub use conversation_view::open_markdown_in_workspace;
 pub use conversation_view::{ConversationView, StateChange};
 pub use external_source_prompt::ExternalSourcePrompt;
+use fanta_actions;
+pub use fanta_actions::{CreateWorktree, NewWorktreeBranchTarget, SwitchWorktree};
 pub(crate) use mode_selector::ModeSelector;
 pub(crate) use model_selector::ModelSelector;
 pub(crate) use model_selector_popover::ModelSelectorPopover;
@@ -92,8 +94,6 @@ pub use thread_import::{
     AcpThreadImportOnboarding, CrossChannelImportOnboarding, ThreadImportModal,
     channels_with_threads, import_threads_from_other_channels,
 };
-use fanta_actions;
-pub use fanta_actions::{CreateWorktree, NewWorktreeBranchTarget, SwitchWorktree};
 
 pub fn configure_existing_context_server(
     workspace: Entity<Workspace>,
@@ -120,6 +120,25 @@ pub fn open_external_prompt_for_review(
     window: &mut Window,
     cx: &mut App,
 ) -> anyhow::Result<()> {
+    open_external_prompt(workspace, prompt, false, window, cx)
+}
+
+pub fn open_design_review_prompt(
+    workspace: Entity<Workspace>,
+    prompt: &str,
+    window: &mut Window,
+    cx: &mut App,
+) -> anyhow::Result<()> {
+    open_external_prompt(workspace, prompt, true, window, cx)
+}
+
+fn open_external_prompt(
+    workspace: Entity<Workspace>,
+    prompt: &str,
+    review_profile: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> anyhow::Result<()> {
     let prompt = ExternalSourcePrompt::new(prompt)
         .ok_or_else(|| anyhow::anyhow!("the generated agent prompt was empty"))?;
     if workspace.read(cx).root_paths(cx).is_empty() {
@@ -136,7 +155,11 @@ pub fn open_external_prompt_for_review(
         workspace.reveal_panel::<AgentPanel>(window, cx);
     });
     panel.update(cx, |panel, cx| {
-        panel.new_agent_thread_with_external_source_prompt(Some(prompt), window, cx);
+        if review_profile {
+            panel.new_design_review_thread(prompt, window, cx);
+        } else {
+            panel.new_agent_thread_with_external_source_prompt(Some(prompt), window, cx);
+        }
     });
     workspace.update(cx, |workspace, cx| {
         workspace.focus_panel::<AgentPanel>(window, cx);

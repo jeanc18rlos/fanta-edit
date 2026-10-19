@@ -4536,6 +4536,58 @@ impl AgentPanel {
         })
     }
 
+    pub(crate) fn new_design_review_thread(
+        &mut self,
+        prompt: ExternalSourcePrompt,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let thread = self.create_agent_thread_with_server(
+            Agent::NativeAgent,
+            None,
+            None,
+            None,
+            None,
+            Some(AgentInitialContent::from(prompt)),
+            None,
+            AgentThreadSource::AgentPanel,
+            window,
+            cx,
+        );
+        let conversation = thread.conversation_view.clone();
+        if let Some(native) = conversation.read(cx).as_native_thread(cx) {
+            native.update(cx, |thread, cx| {
+                thread.set_profile(
+                    agent_settings::AgentProfileId(agent_settings::builtin_profiles::REVIEW.into()),
+                    cx,
+                )
+            });
+        } else {
+            let applied = Cell::new(false);
+            cx.subscribe(
+                &conversation,
+                move |_, conversation, _: &RootThreadUpdated, cx| {
+                    if applied.get() {
+                        return;
+                    }
+                    if let Some(native) = conversation.read(cx).as_native_thread(cx) {
+                        native.update(cx, |thread, cx| {
+                            thread.set_profile(
+                                agent_settings::AgentProfileId(
+                                    agent_settings::builtin_profiles::REVIEW.into(),
+                                ),
+                                cx,
+                            )
+                        });
+                        applied.set(true);
+                    }
+                },
+            )
+            .detach();
+        }
+        self.set_base_view(thread.into(), true, window, cx);
+    }
+
     pub fn new_agent_thread_with_external_source_prompt(
         &mut self,
         external_source_prompt: Option<ExternalSourcePrompt>,
@@ -13059,6 +13111,54 @@ mod tests {
                 assert!(thread_view.show_external_source_prompt_warning);
                 assert!(thread_view.thread.read(cx).entries().is_empty());
             });
+        });
+    }
+
+    #[gpui::test]
+    async fn test_design_review_route_initializes_native_review_profile_without_sending(
+        cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| {
+            cx.set_global(crate::thread_metadata_store::TestMetadataDbName(format!(
+                "design-review-{}",
+                uuid::Uuid::new_v4()
+            )))
+        });
+        let (workspace, panel, mut cx) = setup_workspace_panel(cx).await;
+        panel.update(&mut cx, |panel, _| panel.selected_agent = Agent::Stub);
+        let prompt = "Review every frame and post actionable canvas comments";
+        cx.update(|window, cx| {
+            crate::open_design_review_prompt(workspace.clone(), prompt, window, cx)
+                .expect("review prompt routes to the registered panel");
+        });
+        panel.read_with(&cx, |panel, cx| {
+            let conversation = panel
+                .active_conversation_view()
+                .expect("review conversation");
+            assert_eq!(conversation.read(cx).agent_key(), &Agent::NativeAgent);
+        });
+        cx.run_until_parked();
+        assert!(cx.update(|_, cx| AgentPanel::is_visible(&workspace, cx)));
+        panel.read_with(&cx, |panel, cx| {
+            let conversation = panel
+                .active_conversation_view()
+                .expect("review conversation");
+            let native = conversation
+                .read(cx)
+                .as_native_thread(cx)
+                .expect("native thread initialized asynchronously");
+            assert_eq!(
+                native.read(cx).profile().as_str(),
+                agent_settings::builtin_profiles::REVIEW
+            );
+            let view = panel.active_thread_view(cx).expect("review composer");
+            let view = view.read(cx);
+            assert_eq!(view.message_editor.read(cx).text(cx), prompt);
+            assert!(view.show_external_source_prompt_warning);
+            assert!(
+                view.thread.read(cx).entries().is_empty(),
+                "review stays a draft until the user sends it"
+            );
         });
     }
 

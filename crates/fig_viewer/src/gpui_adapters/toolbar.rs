@@ -19,6 +19,7 @@ use crate::view::FigView;
 /// toolbar echoes them verbatim in `ToolbarAction::ChromeControlInvoked`.
 pub(crate) const CHROME_FIT_TO_VIEW: &str = "fit-to-view";
 pub(crate) const CHROME_ADD_CANVAS_CONTEXT: &str = "add-canvas-context";
+pub(crate) const CHROME_RUN_AI_REVIEW: &str = "run-ai-review";
 pub(crate) const CHROME_TOGGLE_LAYERS_SIDEBAR: &str = "toggle-layers-sidebar";
 pub(crate) const CHROME_TOGGLE_INSPECTOR_SIDEBAR: &str = "toggle-inspector-sidebar";
 
@@ -215,11 +216,14 @@ pub(crate) fn chrome_controls(
     _inspector_sidebar_visible: bool,
     _fit_to_view_shortcut: Option<SharedString>,
 ) -> Vec<ToolbarChromeControl> {
-    vec![ToolbarChromeControl::new(
-        CHROME_ADD_CANVAS_CONTEXT,
-        IconName::Plus,
-        "Add canvas context",
-    )]
+    vec![
+        ToolbarChromeControl::new(
+            CHROME_ADD_CANVAS_CONTEXT,
+            IconName::Plus,
+            "Add canvas context",
+        ),
+        ToolbarChromeControl::new(CHROME_RUN_AI_REVIEW, IconName::Eye, "AI Review"),
+    ]
 }
 
 /// Total: every canvas tool has a toolbar face.
@@ -661,7 +665,7 @@ mod tests {
     #[test]
     fn toolbar_does_not_duplicate_sidebar_or_zoom_controls() {
         let controls = chrome_controls(true, true, Some("⇧1".into()));
-        assert_eq!(controls.len(), 1);
+        assert_eq!(controls.len(), 2);
         assert_eq!(controls[0].id, CHROME_ADD_CANVAS_CONTEXT);
         assert_eq!(controls, chrome_controls(false, false, None));
     }
@@ -2561,7 +2565,7 @@ mod echo_tests {
                     .iter()
                     .map(|control| control.id.as_ref())
                     .collect::<Vec<_>>(),
-                [CHROME_ADD_CANVAS_CONTEXT]
+                [CHROME_ADD_CANVAS_CONTEXT, CHROME_RUN_AI_REVIEW]
             )
         });
         let toggle = cx
@@ -2582,7 +2586,7 @@ mod echo_tests {
                     .iter()
                     .map(|control| control.id.as_ref())
                     .collect::<Vec<_>>(),
-                [CHROME_ADD_CANVAS_CONTEXT]
+                [CHROME_ADD_CANVAS_CONTEXT, CHROME_RUN_AI_REVIEW]
             )
         });
     }
@@ -2631,7 +2635,7 @@ mod echo_tests {
                     .iter()
                     .map(|control| control.id.as_ref())
                     .collect::<Vec<_>>(),
-                [CHROME_ADD_CANVAS_CONTEXT]
+                [CHROME_ADD_CANVAS_CONTEXT, CHROME_RUN_AI_REVIEW]
             )
         });
     }
