@@ -100,6 +100,12 @@ pub struct CanvasNode {
     /// Stable identity. Unique across the whole document.
     pub id: NodeId,
 
+    #[serde(
+        default,
+        skip_serializing_if = "crate::stylesheet::StyleAssignment::is_empty"
+    )]
+    pub style_assignment: crate::stylesheet::StyleAssignment,
+
     /// Parent node id, or `None` for root-level children. Children are derived
     /// by [`Scene`] from this field — there is no `children: Vec<NodeId>`,
     /// because storing the inverse relationship would double-write on every
@@ -233,6 +239,7 @@ impl CanvasNode {
         let name = data.default_name().to_owned();
         Self {
             id: NodeId::new(),
+            style_assignment: crate::stylesheet::StyleAssignment::default(),
             parent: None,
             index: IndexKey::FIRST,
             name,

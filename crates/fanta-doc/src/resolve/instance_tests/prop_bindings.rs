@@ -375,6 +375,86 @@ fn node_text_tokens_use_instance_ancestor_mode_before_layout_without_changing_ma
 }
 
 #[test]
+fn separately_bound_glyph_color_wins_over_composite_typography_in_instances() {
+    let mut scene = Scene::new();
+    let (library, component, _root, label) = master(&mut scene);
+    let (mut registry, collection, light, dark, _caption) = text_variable_registry();
+    let typography = VariableId::new();
+    let color = VariableId::new();
+    let style = crate::TextStyle {
+        size_px: 31.0,
+        color: Color::BLACK,
+        ..Default::default()
+    };
+    registry.variables.insert(
+        typography,
+        Variable {
+            id: typography,
+            collection,
+            name: "Typography".into(),
+            ty: VariableType::Typography,
+            values_by_mode: BTreeMap::from([
+                (
+                    light,
+                    VarValue::TextStyle {
+                        value: style.clone(),
+                    },
+                ),
+                (dark, VarValue::TextStyle { value: style }),
+            ]),
+            scopes: Vec::new(),
+        },
+    );
+    registry.variables.insert(
+        color,
+        Variable {
+            id: color,
+            collection,
+            name: "Glyph color".into(),
+            ty: VariableType::Color,
+            values_by_mode: BTreeMap::from([
+                (
+                    light,
+                    VarValue::Color {
+                        value: Color::rgb(0, 180, 0),
+                    },
+                ),
+                (
+                    dark,
+                    VarValue::Color {
+                        value: Color::WHITE,
+                    },
+                ),
+            ]),
+            scopes: Vec::new(),
+        },
+    );
+    let label_node = scene.get_mut(label).expect("label");
+    label_node.bindings.insert(BoundProp::TextStyle, typography);
+    label_node
+        .bindings
+        .insert(BoundProp::FillColor { index: 0 }, color);
+    let instance = instance(component, BTreeMap::new());
+    let placed = CanvasNode::new(NodeData::Instance(instance.clone()));
+    let placed_id = placed.id;
+    scene.insert(placed).expect("placed instance");
+    let active_modes = BTreeMap::from([(collection, light)]);
+    let context = InstanceExpansionContext::new(&registry, &active_modes, placed_id);
+    let expanded = expand_instance_with_context(&scene, &library, &instance, &context);
+    let node = label_clone(&expanded, label);
+    let NodeData::Text(text) = &node.data else {
+        panic!("text label");
+    };
+    assert_eq!(text.style.size_px, 31.0);
+    assert_eq!(text.style.color, Color::rgb(0, 180, 0));
+    assert!(node.bindings.is_empty());
+    let NodeData::Text(authored) = &scene.get(label).expect("authored label").data else {
+        panic!("text label");
+    };
+    assert_eq!(authored.style.color, Color::BLACK);
+}
+
+#[test]
 fn alias_backed_instance_prop_value_uses_the_active_mode() {
     let mut scene = Scene::new();
     let (mut library, component, _root, label) = master(&mut scene);

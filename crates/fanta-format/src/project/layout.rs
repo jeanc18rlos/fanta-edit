@@ -91,6 +91,7 @@ pub(crate) const LOOSE_DIR: &str = "_loose";
 pub(crate) const METADATA_JSON: &str = "metadata.json";
 pub(crate) const ASSET_LIBRARY_JSON: &str = "asset_library.json";
 pub(crate) const VARIABLES_JSON: &str = "variables.json";
+pub(crate) const STYLES_JSON: &str = "styles.json";
 pub(crate) const ACTIVE_MODES_JSON: &str = "active_modes.json";
 pub(crate) const MOTION_JSON: &str = "motion.json";
 pub(crate) const FLOW_START_JSON: &str = "flow_start.json";

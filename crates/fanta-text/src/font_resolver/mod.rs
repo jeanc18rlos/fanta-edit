@@ -58,7 +58,9 @@
 //! geometry never disagrees with what's drawn.
 
 mod bundled;
+#[cfg(all(feature = "native-fonts", not(target_os = "emscripten")))]
 mod download;
+#[cfg(all(feature = "native-fonts", not(target_os = "emscripten")))]
 mod external;
 mod generic;
 mod resolver;
@@ -66,11 +68,22 @@ mod substitute;
 
 pub use bundled::{
     INTER_FAMILY, SOURCE_CODE_FAMILY, SOURCE_SANS_FAMILY, SOURCE_SERIF_FAMILY,
-    bundled_family_names, bundled_preview_bytes,
+    bundled_family_names, bundled_font_files, bundled_preview_bytes,
 };
 pub use generic::GenericFamily;
-pub use resolver::{FontGenerationObserver, FontResolver};
+pub use resolver::{
+    FontCoverageError, FontGenerationObserver, FontRegistration, FontRegistrationError,
+    FontResolver, font_family_names,
+};
 pub use substitute::{ADOBE_CLEAN_SANS_METRIC_RATIO, ADOBE_CLEAN_SERIF_METRIC_RATIO};
+
+/// The open-licensed face the resolver would download for `family`, served
+/// from the shared disk cache when present. `None` offline or when the font
+/// bank does not carry the family.
+#[cfg(all(feature = "native-fonts", not(target_os = "emscripten")))]
+pub fn fetch_downloadable_font(family: &str) -> Option<Vec<u8>> {
+    download::fetch_google_font(family)
+}
 
 /// Pre-download (to the on-disk cache) every family a document uses that isn't
 /// bundled or covered by a proprietary→open substitute, WITHOUT constructing a
@@ -83,6 +96,7 @@ pub use substitute::{ADOBE_CLEAN_SANS_METRIC_RATIO, ADOBE_CLEAN_SERIF_METRIC_RAT
 /// Returns the families actually fetched this call, deduped. Offline-safe and
 /// idempotent: a family that can't be downloaded — or has no network — is
 /// skipped, and repeat calls are memoized.
+#[cfg(all(feature = "native-fonts", not(target_os = "emscripten")))]
 pub fn prewarm_font_downloads<'a>(families: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     let mut fetched: Vec<String> = Vec::new();
     let mut seen: Vec<String> = Vec::new();
@@ -106,6 +120,11 @@ pub fn prewarm_font_downloads<'a>(families: impl IntoIterator<Item = &'a str>) -
         }
     }
     fetched
+}
+
+#[cfg(not(all(feature = "native-fonts", not(target_os = "emscripten"))))]
+pub fn prewarm_font_downloads<'a>(_families: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    Vec::new()
 }
 
 pub(crate) use resolver::font_style;

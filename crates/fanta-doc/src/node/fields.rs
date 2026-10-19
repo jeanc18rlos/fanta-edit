@@ -60,6 +60,9 @@ fn build_table() -> BTreeMap<String, BTreeSet<String>> {
 /// field populated, so every wrapper key serializes.
 fn maximal_node(data: NodeData) -> CanvasNode {
     let mut node = CanvasNode::new(data);
+    node.style_assignment
+        .style_ids
+        .push(crate::StyleId::from_u128(1));
     node.parent = Some(crate::id::NodeId::new());
     node.transform = crate::transform::Transform2D::translation(1.0, 2.0);
     node.constraints = Some(Constraints::default());
@@ -408,6 +411,7 @@ mod tests {
                 "bindings",
                 "reactions",
                 "layout_child",
+                "style_assignment",
             ]) {
                 assert!(fields.contains(name), "{tag} sample omitted {name}");
             }

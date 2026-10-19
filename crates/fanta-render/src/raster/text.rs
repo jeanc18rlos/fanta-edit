@@ -1,5 +1,6 @@
-//! Text rendering: the per-thread [`LayoutEngine`] cache and the
-//! [`draw_text_node`] glyph shaping/painting + doc→engine style/align mapping.
+//! Text rendering: the per-program [`TextRenderContext`] (font engine plus
+//! shaped-text caches) and the [`draw_text_node`] glyph shaping/painting +
+//! doc→engine style/align mapping.
 use super::{
     Align, Canvas, CanvasNode, LayoutEngine, Rect, RefCell, TextAlign, TextAutoResize, TextBuffer,
     TextNode, TextStyle, Transform2D, VAlign,
@@ -14,34 +15,118 @@ use std::num::NonZeroUsize;
 // Text rendering
 // ---------------------------------------------------------------------------
 
-thread_local! {
-    /// One [`LayoutEngine`] per render thread, built lazily on first text draw.
+/// A program's font collection and shaped-text caches. All text geometry
+/// queries inside `with` use this context, so measurement, painting and hit
+/// testing cannot mix faces or cached layouts from different programs.
+#[derive(Clone)]
+pub struct TextRenderContext(std::rc::Rc<TextContextInner>);
+
+struct TextContextInner {
+    /// The engine owns a Skia `FontCollection` + font manager; building those
+    /// scans the installed fonts and is the dominant per-text cost, so one
+    /// engine services every node the context measures or paints.
+    engine: LayoutEngine,
+    /// Shaped [`TextLayout`]s, keyed by a hash of the inputs that determine
+    /// SHAPING (content + resolved style + wrap width + horizontal align).
+    /// Building a Skia paragraph is the dominant per-frame cost — a fit-zoom
+    /// view draws thousands of text nodes, and re-shaping each one EVERY frame
+    /// took ~seconds (0.2 fps). The scene is static between edits, so identical
+    /// runs re-shape identically frame after frame; caching the shaped result
+    /// turns steady-state frames into pure paint. It is content-addressed, so an
+    /// edit changing text/style/width keys to a fresh entry — never a stale
+    /// paint. Vertical align + box height affect only the paint offset
+    /// (computed per call), so they are NOT part of the key.
     ///
-    /// The engine owns a Skia `FontCollection` + system `FontMgr`; building
-    /// those scans the installed fonts and is the dominant per-text cost — a
-    /// document with thousands of `TextNode`s would thrash if it rebuilt them on
-    /// every glyph draw. Mirrors the `FONT_CTX` thread-local in
-    /// `fanta-app`'s `overlays.rs`: construct once, reuse for every node. The
-    /// engine is `Clone` (its collection is reference-counted), but we never
-    /// even need to clone it — `layout_aligned` borrows `&self`, so a single
-    /// shared instance services the whole frame. `RefCell` because the engine is
-    /// stored behind a thread-local and accessed by shared reference.
-    static LAYOUT_ENGINE: RefCell<Option<LayoutEngine>> = const { RefCell::new(None) };
+    /// This cache is **shared between measure and draw** ([`with_shaped_layout`]):
+    /// the auto-layout solver measures a page's text through `measure_text_node`,
+    /// which PRE-WARMS the very entries the subsequent render paints — so a
+    /// first-visit page switch shapes each run ONCE (in the measure pass) instead
+    /// of twice (measure + cold draw). The key is computed identically on both
+    /// paths so they genuinely share entries.
+    layouts: RefCell<LruCache<u64, CachedTextLayout>>,
+    layout_font_generation: std::cell::Cell<Option<u64>>,
+    geometry: RefCell<TextGeometryCache>,
 }
 
-/// Run `f` with a reference to this thread's cached [`LayoutEngine`], building
-/// it on first use.
-pub(crate) fn with_layout_engine<R>(f: impl FnOnce(&LayoutEngine) -> R) -> R {
-    LAYOUT_ENGINE.with(|cell| {
-        {
-            let mut slot = cell.borrow_mut();
-            if slot.is_none() {
-                *slot = Some(LayoutEngine::new());
-            }
-        }
-        let slot = cell.borrow();
-        f(slot.as_ref().expect("just populated"))
+thread_local! {
+    static ACTIVE_TEXT_CONTEXT: RefCell<Option<TextRenderContext>> = const { RefCell::new(None) };
+    static DEFAULT_TEXT_CONTEXT: RefCell<Option<TextRenderContext>> = const { RefCell::new(None) };
+}
+
+pub(crate) struct TextContextGuard(Option<TextRenderContext>);
+
+impl Drop for TextContextGuard {
+    fn drop(&mut self) {
+        ACTIVE_TEXT_CONTEXT.with(|active| *active.borrow_mut() = self.0.take());
+    }
+}
+
+impl TextRenderContext {
+    pub fn new(engine: LayoutEngine) -> Self {
+        Self::with_capacity(engine, LAYOUT_CACHE_CAP.get())
+    }
+
+    pub fn with_capacity(engine: LayoutEngine, capacity: usize) -> Self {
+        Self(std::rc::Rc::new(TextContextInner {
+            engine,
+            layouts: RefCell::new(LruCache::new(
+                NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::MIN),
+            )),
+            layout_font_generation: std::cell::Cell::new(None),
+            geometry: RefCell::new(TextGeometryCache::default()),
+        }))
+    }
+
+    pub fn with<R>(&self, operation: impl FnOnce() -> R) -> R {
+        let _guard = self.enter();
+        operation()
+    }
+
+    pub fn clear(&self) {
+        self.0.layouts.borrow_mut().clear();
+        *self.0.geometry.borrow_mut() = TextGeometryCache::default();
+    }
+
+    pub fn cached_layouts(&self) -> usize {
+        self.0.layouts.borrow().len()
+    }
+
+    pub fn supports_family(&self, family: &str) -> bool {
+        self.0.engine.supports_family(family)
+    }
+
+    pub fn validate_text(
+        &self,
+        family: &str,
+        weight: u16,
+        italic: bool,
+        text: &str,
+    ) -> Result<(), fanta_text::FontCoverageError> {
+        self.0.engine.validate_text(family, weight, italic, text)
+    }
+
+    pub(crate) fn enter(&self) -> TextContextGuard {
+        let previous = ACTIVE_TEXT_CONTEXT.with(|active| active.replace(Some(self.clone())));
+        TextContextGuard(previous)
+    }
+}
+
+/// The entered context, or this thread's default context (system and bundled
+/// fonts) built lazily on first use.
+fn current_text_context() -> TextRenderContext {
+    if let Some(context) = ACTIVE_TEXT_CONTEXT.with(|active| active.borrow().clone()) {
+        return context;
+    }
+    DEFAULT_TEXT_CONTEXT.with(|default| {
+        default
+            .borrow_mut()
+            .get_or_insert_with(|| TextRenderContext::new(LayoutEngine::new()))
+            .clone()
     })
+}
+
+pub(crate) fn with_layout_engine<R>(operation: impl FnOnce(&LayoutEngine) -> R) -> R {
+    operation(&current_text_context().0.engine)
 }
 
 /// Keep recently measured or painted runs warm when new text exceeds the cap.
@@ -117,29 +202,6 @@ impl TextGeometryCache {
             self.bytes = self.bytes.saturating_sub(previous.bytes);
         }
     }
-}
-
-thread_local! {
-    /// Per-thread cache of shaped [`TextLayout`]s, keyed by a hash of the
-    /// inputs that determine SHAPING (content + resolved style + wrap width +
-    /// horizontal align). Building a Skia paragraph is the dominant per-frame
-    /// cost — a fit-zoom view draws thousands of text nodes, and re-shaping each
-    /// one EVERY frame took ~seconds (0.2 fps). The scene is static between
-    /// edits, so identical runs re-shape identically frame after frame; caching
-    /// the shaped result turns steady-state frames into pure paint. It is
-    /// content-addressed, so an edit changing text/style/width keys to a fresh
-    /// entry — never a stale paint. Vertical align + box height affect only the
-    /// paint offset (computed per call), so they are NOT part of the key.
-    ///
-    /// This cache is **shared between measure and draw** ([`with_shaped_layout`]):
-    /// the auto-layout solver measures a page's text through `measure_text_node`,
-    /// which PRE-WARMS the very entries the subsequent render paints — so a
-    /// first-visit page switch shapes each run ONCE (in the measure pass) instead
-    /// of twice (measure + cold draw). The key is computed identically on both
-    /// paths so they genuinely share entries.
-    static LAYOUT_CACHE: RefCell<LruCache<u64, CachedTextLayout>> = RefCell::new(LruCache::new(LAYOUT_CACHE_CAP));
-    static LAYOUT_FONT_GENERATION: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-    static TEXT_GEOMETRY_CACHE: RefCell<TextGeometryCache> = RefCell::new(TextGeometryCache::default());
 }
 
 /// Compute the `(wrap_width, align)` a [`TextNode`] shapes at. Shared by measure
@@ -287,43 +349,41 @@ fn shape_layout(node: &TextNode) -> TextLayout {
 /// first-visit page switch shapes each run ONCE, not twice.
 ///
 /// `node.content` is assumed non-empty (callers special-case the empty string).
-/// Past [`LAYOUT_CACHE_CAP`] distinct runs, evict only the least recently used
-/// layout so measuring or painting a hot run keeps it resident.
+/// Past the context's capacity (by default [`LAYOUT_CACHE_CAP`]) distinct runs,
+/// evict only the least recently used layout so measuring or painting a hot
+/// run keeps it resident.
 pub(crate) fn with_shaped_layout<R>(node: &TextNode, f: impl FnOnce(&TextLayout) -> R) -> R {
     let (wrap_width, align) = shape_params(node);
     let key = shape_key(node, wrap_width, align);
-    let font_generation = with_layout_engine(LayoutEngine::font_generation);
+    let context = current_text_context();
+    let font_generation = context.0.engine.font_generation();
     if font_generation.is_none() {
         return f(&shape_layout(node));
     }
-    LAYOUT_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        LAYOUT_FONT_GENERATION.with(|previous| {
-            // A registered face may change fallback metrics even for a run
-            // that does not name that family, so invalidate every paragraph.
-            if previous.get() != font_generation {
-                cache.clear();
-                previous.set(font_generation);
-            }
-        });
-        if let Some(entry) = cache.get(&key)
-            && shaping_inputs_match(&entry.node, node)
-        {
-            return f(&entry.layout);
-        }
-        let layout = shape_layout(node);
-        let result = f(&layout);
-        if with_layout_engine(LayoutEngine::font_generation) == font_generation {
-            drop(cache.put(
-                key,
-                CachedTextLayout {
-                    node: node.clone(),
-                    layout,
-                },
-            ));
-        }
-        result
-    })
+    let mut cache = context.0.layouts.borrow_mut();
+    // A registered face may change fallback metrics even for a run that does
+    // not name that family, so invalidate every paragraph.
+    if context.0.layout_font_generation.get() != font_generation {
+        cache.clear();
+        context.0.layout_font_generation.set(font_generation);
+    }
+    if let Some(entry) = cache.get(&key)
+        && shaping_inputs_match(&entry.node, node)
+    {
+        return f(&entry.layout);
+    }
+    let layout = shape_layout(node);
+    let result = f(&layout);
+    if context.0.engine.font_generation() == font_generation {
+        drop(cache.put(
+            key,
+            CachedTextLayout {
+                node: node.clone(),
+                layout,
+            },
+        ));
+    }
+    result
 }
 
 fn shaping_inputs_match(previous: &TextNode, node: &TextNode) -> bool {
@@ -362,7 +422,7 @@ pub(crate) fn vertical_paint_offset(node: &TextNode, layout_height: f64) -> f64 
 /// measure and draw collapse onto ONE entry for identical inputs.
 #[cfg(test)]
 pub(crate) fn layout_cache_len() -> usize {
-    LAYOUT_CACHE.with(|c| c.borrow().len())
+    current_text_context().cached_layouts()
 }
 
 // ---------------------------------------------------------------------------
@@ -472,44 +532,43 @@ fn with_text_geometry<R>(
             paint_bounds: Ok(None),
         });
     }
-    let font_generation = with_layout_engine(LayoutEngine::font_generation);
+    let context = current_text_context();
+    let font_generation = context.0.engine.font_generation();
     let key = text_geometry_key(node);
-    TEXT_GEOMETRY_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(font_generation) = font_generation
-            && let Some(geometry) = cache.get(key, node, font_generation)
-            && (!include_outline || geometry.outline.is_some())
-        {
-            return query(geometry);
+    let mut cache = context.0.geometry.borrow_mut();
+    if let Some(font_generation) = font_generation
+        && let Some(geometry) = cache.get(key, node, font_generation)
+        && (!include_outline || geometry.outline.is_some())
+    {
+        return query(geometry);
+    }
+    let geometry = build_text_geometry(node, include_outline);
+    let result = query(&geometry);
+    // Font resolution can register a downloaded face while shaping. An
+    // overlapping registration cannot certify the result's font epoch.
+    if let Some(font_generation) = font_generation
+        && context.0.engine.font_generation() == Some(font_generation)
+    {
+        let source_bytes = text_source_heap_bytes(node);
+        let geometry_bytes = text_geometry_heap_bytes(&geometry);
+        if source_bytes.saturating_add(geometry_bytes) <= cache.maximum_bytes {
+            let node = node.clone();
+            let bytes = std::mem::size_of::<TextGeometryEntry>()
+                .saturating_add(64)
+                .saturating_add(text_source_heap_bytes(&node))
+                .saturating_add(geometry_bytes);
+            cache.insert(
+                key,
+                TextGeometryEntry {
+                    node,
+                    font_generation,
+                    geometry,
+                    bytes,
+                },
+            );
         }
-        let geometry = build_text_geometry(node, include_outline);
-        let result = query(&geometry);
-        // Font resolution can register a downloaded face while shaping. An
-        // overlapping registration cannot certify the result's font epoch.
-        if let Some(font_generation) = font_generation
-            && with_layout_engine(LayoutEngine::font_generation) == Some(font_generation)
-        {
-            let source_bytes = text_source_heap_bytes(node);
-            let geometry_bytes = text_geometry_heap_bytes(&geometry);
-            if source_bytes.saturating_add(geometry_bytes) <= cache.maximum_bytes {
-                let node = node.clone();
-                let bytes = std::mem::size_of::<TextGeometryEntry>()
-                    .saturating_add(64)
-                    .saturating_add(text_source_heap_bytes(&node))
-                    .saturating_add(geometry_bytes);
-                cache.insert(
-                    key,
-                    TextGeometryEntry {
-                        node,
-                        font_generation,
-                        geometry,
-                        bytes,
-                    },
-                );
-            }
-        }
-        result
-    })
+    }
+    result
 }
 
 fn text_source_heap_bytes(node: &TextNode) -> usize {
@@ -663,7 +722,7 @@ fn paragraph_paint_bounds(
 /// same thread.
 #[cfg(test)]
 pub(crate) fn clear_layout_cache() {
-    LAYOUT_CACHE.with(|c| c.borrow_mut().clear());
+    current_text_context().0.layouts.borrow_mut().clear();
 }
 
 /// Shape and paint a [`TextNode`] at the canvas's current local origin (0, 0).
@@ -778,18 +837,23 @@ mod cache_tests {
     impl GeometryCacheScope {
         fn new() -> Self {
             Self {
-                previous: TEXT_GEOMETRY_CACHE
-                    .with(|cache| std::mem::take(&mut *cache.borrow_mut())),
+                previous: geometry(std::mem::take),
             }
         }
     }
 
     impl Drop for GeometryCacheScope {
         fn drop(&mut self) {
-            TEXT_GEOMETRY_CACHE.with(|cache| {
-                std::mem::swap(&mut *cache.borrow_mut(), &mut self.previous);
-            });
+            geometry(|cache| std::mem::swap(cache, &mut self.previous));
         }
+    }
+
+    fn geometry<R>(operation: impl FnOnce(&mut TextGeometryCache) -> R) -> R {
+        operation(&mut current_text_context().0.geometry.borrow_mut())
+    }
+
+    fn layouts<R>(operation: impl FnOnce(&mut LruCache<u64, CachedTextLayout>) -> R) -> R {
+        operation(&mut current_text_context().0.layouts.borrow_mut())
     }
 
     fn geometry_entry(node: &TextNode, font_generation: u64) -> TextGeometryEntry {
@@ -853,14 +917,11 @@ mod cache_tests {
             assert_eq!(text_node_outline(&node), expected.outline.clone().flatten());
             assert_eq!(text_node_paint_bounds(&node), expected.paint_bounds);
             assert_eq!(text_node_outline(&node), expected.outline.clone().flatten());
-            let count = TEXT_GEOMETRY_CACHE.with(|cache| cache.borrow().entries.len());
+            let count = geometry(|cache| cache.entries.len());
             for _ in 0..8 {
                 assert_eq!(text_node_paint_bounds(&node), expected.paint_bounds);
             }
-            assert_eq!(
-                TEXT_GEOMETRY_CACHE.with(|cache| cache.borrow().entries.len()),
-                count
-            );
+            assert_eq!(geometry(|cache| cache.entries.len()), count);
         }
         let mut indented = node.clone();
         indented.paragraph_indent = 7.0;
@@ -924,21 +985,19 @@ mod cache_tests {
     impl CacheScope {
         fn new(capacity: NonZeroUsize) -> Self {
             Self {
-                previous: LAYOUT_CACHE.with(|cache| {
-                    std::mem::replace(&mut *cache.borrow_mut(), LruCache::new(capacity))
-                }),
-                previous_font_generation: LAYOUT_FONT_GENERATION
-                    .with(|generation| generation.get()),
+                previous: layouts(|cache| std::mem::replace(cache, LruCache::new(capacity))),
+                previous_font_generation: current_text_context().0.layout_font_generation.get(),
             }
         }
     }
 
     impl Drop for CacheScope {
         fn drop(&mut self) {
-            LAYOUT_CACHE.with(|cache| {
-                std::mem::swap(&mut *cache.borrow_mut(), &mut self.previous);
-            });
-            LAYOUT_FONT_GENERATION.with(|generation| generation.set(self.previous_font_generation));
+            layouts(|cache| std::mem::swap(cache, &mut self.previous));
+            current_text_context()
+                .0
+                .layout_font_generation
+                .set(self.previous_font_generation);
         }
     }
 
@@ -956,7 +1015,10 @@ mod cache_tests {
         let pixels = renderer.copy_rgba();
         let generation =
             with_layout_engine(LayoutEngine::font_generation).expect("unsaturated fonts");
-        LAYOUT_FONT_GENERATION.with(|previous| previous.set(Some(generation.wrapping_add(1))));
+        current_text_context()
+            .0
+            .layout_font_generation
+            .set(Some(generation.wrapping_add(1)));
         assert_eq!(
             crate::raster::instance::measure_text_node(&first),
             measurement
@@ -985,24 +1047,26 @@ mod cache_tests {
         let other = TextNode::new("I", 220.0, 80.0);
         let expected = build_text_geometry(&target, true).paint_bounds;
         let generation = with_layout_engine(LayoutEngine::font_generation);
-        LAYOUT_FONT_GENERATION.with(|previous| previous.set(generation));
-        LAYOUT_CACHE.with(|cache| {
-            drop(cache.borrow_mut().put(
+        current_text_context()
+            .0
+            .layout_font_generation
+            .set(generation);
+        let other_layout = shape_layout(&other);
+        layouts(|cache| {
+            drop(cache.put(
                 key(&target),
                 CachedTextLayout {
                     node: other.clone(),
-                    layout: shape_layout(&other),
+                    layout: other_layout,
                 },
             ));
         });
         assert_eq!(text_node_paint_bounds(&target), expected);
-        LAYOUT_CACHE.with(|cache| {
-            let cache = cache.borrow();
+        layouts(|cache| {
             let cached = cache.peek(&key(&target)).expect("cached paragraph");
             assert!(shaping_inputs_match(&cached.node, &target));
         });
-        TEXT_GEOMETRY_CACHE.with(|cache| {
-            let cache = cache.borrow();
+        geometry(|cache| {
             let cached = cache
                 .entries
                 .peek(&text_geometry_key(&target))
@@ -1091,8 +1155,7 @@ mod cache_tests {
                 assert!(count > 0, "paragraph {index} paints at scale {scale}");
             }
             assert_eq!(text_node_paint_bounds(&node), Ok(Some(bounds)));
-            TEXT_GEOMETRY_CACHE.with(|cache| {
-                let cache = cache.borrow();
+            geometry(|cache| {
                 let cached = cache
                     .entries
                     .peek(&text_geometry_key(&node))
@@ -1140,8 +1203,7 @@ mod cache_tests {
                 .any(|pixel| pixel.last().copied() != Some(0))
         );
         crate::raster::instance::measure_text_node(&fourth);
-        LAYOUT_CACHE.with(|cache| {
-            let cache = cache.borrow();
+        layouts(|cache| {
             assert_eq!(cache.len(), 3);
             assert!(cache.contains(&key(&first)));
             assert!(!cache.contains(&key(&second)));
@@ -1152,8 +1214,7 @@ mod cache_tests {
         assert_eq!(measured, crate::raster::instance::measure_text_node(&first));
         crate::raster::instance::measure_text_node(&third);
         crate::raster::instance::measure_text_node(&second);
-        LAYOUT_CACHE.with(|cache| {
-            let cache = cache.borrow();
+        layouts(|cache| {
             assert_eq!(cache.len(), 3);
             assert!(cache.contains(&key(&first)));
             assert!(cache.contains(&key(&third)));
@@ -1183,7 +1244,7 @@ mod cache_tests {
         for content in ["Another run", "One more run"] {
             crate::raster::instance::measure_text_node(&TextNode::new(content, 120.0, 64.0));
         }
-        LAYOUT_CACHE.with(|cache| assert!(!cache.borrow().contains(&key(&target))));
+        layouts(|cache| assert!(!cache.contains(&key(&target))));
         assert_eq!(
             measured,
             crate::raster::instance::measure_text_node(&target)

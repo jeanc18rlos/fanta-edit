@@ -244,6 +244,65 @@ pub(crate) fn overlay_offset(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TransitionComposition {
+    Incoming,
+    Crossfade {
+        incoming_weight: f64,
+    },
+    Layers {
+        outgoing_offset: (f64, f64),
+        incoming_offset: (f64, f64),
+        outgoing_on_top: bool,
+    },
+}
+
+impl TransitionComposition {
+    pub fn new(style: TransitionStyle, progress: f64, width: f64, height: f64) -> Self {
+        match style {
+            TransitionStyle::Instant => Self::Incoming,
+            TransitionStyle::Dissolve
+            | TransitionStyle::SmartAnimate
+            | TransitionStyle::ScrollAnimate => Self::Crossfade {
+                incoming_weight: progress.clamp(0.0, 1.0),
+            },
+            TransitionStyle::SlideIn { direction }
+            | TransitionStyle::Push { direction }
+            | TransitionStyle::MoveIn { direction }
+            | TransitionStyle::SlideOut { direction }
+            | TransitionStyle::MoveOut { direction } => {
+                let (outgoing_offset, incoming_offset) =
+                    directional_offsets(style, direction, progress, width, height);
+                Self::Layers {
+                    outgoing_offset,
+                    incoming_offset,
+                    outgoing_on_top: is_out_style(style),
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct OverlayComposition {
+    pub offset: (f64, f64),
+    pub opacity: f64,
+}
+
+impl OverlayComposition {
+    pub fn new(style: TransitionStyle, visible: f64, width: f64, height: f64) -> Self {
+        Self {
+            offset: overlay_offset(style, visible, width, height),
+            opacity: match style {
+                TransitionStyle::Dissolve
+                | TransitionStyle::SmartAnimate
+                | TransitionStyle::ScrollAnimate => visible.clamp(0.0, 1.0),
+                _ => 1.0,
+            },
+        }
+    }
+}
+
 /// Composite the outgoing and incoming rasters (both `width * height * 4`
 /// straight-alpha RGBA8) into a new buffer at eased progress `e`. `Instant`
 /// returns the incoming frame unchanged (it should not reach here — the session
@@ -262,32 +321,30 @@ pub(crate) fn composite(
         return incoming.to_vec();
     }
 
-    match style {
-        TransitionStyle::Instant => incoming.to_vec(),
+    match TransitionComposition::new(style, e, width as f64, height as f64) {
+        TransitionComposition::Incoming => incoming.to_vec(),
         // The session uses a matched-layer scratch scene when one can be
         // prepared. A dissolve is the safe visual fallback for state/overlay
         // transitions and malformed documents that cannot produce that plan.
         // ScrollAnimate has no frame-vs-frame geometry of its own (its real
         // effect is the eased scroll offset the session animates); a document
         // that authored it on a NAVIGATION degrades to the same safe dissolve.
-        TransitionStyle::SmartAnimate
-        | TransitionStyle::Dissolve
-        | TransitionStyle::ScrollAnimate => crossfade(e, expected, outgoing, incoming),
-        TransitionStyle::SlideIn { direction }
-        | TransitionStyle::Push { direction }
-        | TransitionStyle::MoveIn { direction } => {
-            let (out_off, in_off) =
-                directional_offsets(style, direction, e, width as f64, height as f64);
-            slide(width, height, out_off, in_off, outgoing, incoming)
+        TransitionComposition::Crossfade { incoming_weight } => {
+            crossfade(incoming_weight, expected, outgoing, incoming)
         }
+        TransitionComposition::Layers {
+            outgoing_offset: out_off,
+            incoming_offset: in_off,
+            outgoing_on_top: false,
+        } => slide(width, height, out_off, in_off, outgoing, incoming),
         // Out styles mirror the layer roles: the OUTGOING frame is the moving
         // top layer, revealing the incoming beneath — so the two rasters swap
         // seats in `slide` (whose second pair is composited on top).
-        TransitionStyle::SlideOut { direction } | TransitionStyle::MoveOut { direction } => {
-            let (out_off, in_off) =
-                directional_offsets(style, direction, e, width as f64, height as f64);
-            slide(width, height, in_off, out_off, incoming, outgoing)
-        }
+        TransitionComposition::Layers {
+            outgoing_offset: out_off,
+            incoming_offset: in_off,
+            outgoing_on_top: true,
+        } => slide(width, height, in_off, out_off, incoming, outgoing),
     }
 }
 
