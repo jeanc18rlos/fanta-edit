@@ -6,6 +6,69 @@ use fanta_doc::{
     VariableCollectionId, VariableId, VariableRegistry, VectorNode,
 };
 
+#[test]
+fn bound_text_color_is_applied_after_composite_typography() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (mut registry, collection, dark, color) = theme_registry_white_blue();
+    let typography = VariableId::new();
+    registry.variables.insert(
+        typography,
+        Variable {
+            id: typography,
+            collection,
+            name: "Typography".into(),
+            ty: fanta_doc::VariableType::Typography,
+            values_by_mode: BTreeMap::from([(
+                dark,
+                fanta_doc::VarValue::TextStyle {
+                    value: fanta_doc::TextStyle {
+                        color: Color::rgb(255, 0, 0),
+                        size_px: 24.0,
+                        ..Default::default()
+                    },
+                },
+            )]),
+            scopes: Vec::new(),
+        },
+    );
+    let mut node = CanvasNode::new(NodeData::Text(fanta_doc::TextNode::new("M", 80.0, 40.0)));
+    node.transform = Transform2D::translation(-20.0, -12.0);
+    node.bindings
+        .insert(fanta_doc::BoundProp::TextStyle, typography);
+    node.bindings
+        .insert(fanta_doc::BoundProp::FillColor { index: 0 }, color);
+    let source = node.clone();
+    let mut document = Doc::new();
+    document.scene.insert(node)?;
+    let modes = BTreeMap::from([(collection, dark)]);
+    let library = ComponentLibrary::new();
+    let inputs = RenderInputs {
+        components: &library,
+        variables: &registry,
+        active_modes: &modes,
+        mode_generation: 1,
+        motion: None,
+        playback: None,
+        video_fill_frames: None,
+        dark_ui: false,
+    };
+    let mut renderer = RasterRenderer::new(64, 64)?;
+    renderer.render_with(&document.scene, &document.viewport, &inputs);
+    let pixels = renderer.copy_rgba();
+    let painted: Vec<_> = pixels
+        .chunks_exact(4)
+        .filter(|pixel| pixel.get(3).copied().unwrap_or(0) > 200)
+        .collect();
+    assert!(!painted.is_empty());
+    assert!(
+        painted
+            .iter()
+            .all(|pixel| pixel[2] > 200 && pixel[0] < 40 && pixel[1] < 40)
+    );
+    assert_eq!(document.scene.get(source.id), Some(&source));
+    Ok(())
+}
+
 // -----------------------------------------------------------------------
 // Variable-resolution overlay (bound fill follows the active mode)
 // -----------------------------------------------------------------------

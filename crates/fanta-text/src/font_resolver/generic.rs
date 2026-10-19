@@ -63,7 +63,7 @@ impl GenericFamily {
     /// The canonical bundled Source family that substitutes for a proprietary
     /// family of this class (step 4). All three are Adobe's own open fonts,
     /// metrically close to Adobe Clean.
-    pub(super) fn source_substitute(self) -> &'static str {
+    pub fn source_substitute(self) -> &'static str {
         match self {
             GenericFamily::Serif => SOURCE_SERIF_FAMILY,
             GenericFamily::Monospace => SOURCE_CODE_FAMILY,

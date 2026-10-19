@@ -280,7 +280,16 @@ fn resolve_overlay(doc: &Doc, scene: &Scene, id: NodeId, node: &CanvasNode) -> O
         return None;
     }
     let mut scratch = node.clone();
-    for (prop, var_id) in &node.bindings {
+    let bindings = node
+        .bindings
+        .iter()
+        .filter(|(property, _)| **property == crate::BoundProp::TextStyle)
+        .chain(
+            node.bindings
+                .iter()
+                .filter(|(property, _)| **property != crate::BoundProp::TextStyle),
+        );
+    for (prop, var_id) in bindings {
         if let Some(resolved) =
             resolve_bound_value(&doc.variables, scene, id, &doc.active_modes, *var_id)
         {

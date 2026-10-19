@@ -59,9 +59,11 @@ impl Drop for DocMutGuard<'_> {
         // N13 hard guarantee: tools may call Doc::apply with var ops; restore.
         if self.session.scoped.doc.variables != self.ws.variables
             || self.session.scoped.doc.active_modes != self.ws.active_modes
+            || self.session.scoped.doc.styles != self.ws.styles
         {
             self.session.scoped.doc.variables = self.ws.variables.clone();
             self.session.scoped.doc.active_modes = self.ws.active_modes.clone();
+            self.session.scoped.doc.styles = self.ws.styles.clone();
         }
         let history_changed =
             self.session.scoped.doc.history.undo_depth() != self.enter_history_depth;

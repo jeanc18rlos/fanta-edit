@@ -84,7 +84,7 @@ pub use source_edit::{
     validate_project_source_edit, validate_project_source_edit_with_diagnostics,
 };
 pub use write::{
-    ProjectUpgrade, ProjectWriteCache, WriteReport, projected_design_dirs,
+    ProjectUpgrade, ProjectWriteCache, WriteReport, is_project_managed_path, projected_design_dirs,
     stage_new_project_tree_cached, upgrade_project, write_project_tree, write_project_tree_cached,
     write_project_tree_cached_with_media_registry, write_project_tree_cached_with_sources,
     write_project_tree_cached_with_sources_and_media_registry,

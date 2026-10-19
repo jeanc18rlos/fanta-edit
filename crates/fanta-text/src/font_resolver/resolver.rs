@@ -1,7 +1,7 @@
 //! The resolver itself: owns the asset provider, builds the ordered family
 //! list, exposes the metric-adjust ratio, and runs the best-effort download.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
@@ -13,8 +13,12 @@ use skia_safe::{
     textlayout::TypefaceFontProvider,
 };
 
-use super::bundled::{BUNDLED, INSTANCE_WEIGHTS, instance_at_weight, register_bundled};
+#[cfg(any(test, all(feature = "native-fonts", not(target_os = "emscripten"))))]
+use super::bundled::INSTANCE_WEIGHTS;
+use super::bundled::{BUNDLED, instance_at_weight, register_bundled};
+#[cfg(all(feature = "native-fonts", not(target_os = "emscripten")))]
 use super::download::{download_cache, fetch_google_font};
+#[cfg(all(feature = "native-fonts", not(target_os = "emscripten")))]
 use super::external::register_external_font_dirs;
 use super::generic::GenericFamily;
 use super::substitute::{proprietary_substitute, substitute_metric_ratio};
@@ -36,6 +40,40 @@ impl FontGenerationObserver {
     pub fn same_provider(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.generation, &other.generation)
     }
+}
+
+#[derive(Clone, Copy)]
+pub struct FontRegistration<'a> {
+    pub family: &'a str,
+    pub weight: u16,
+    pub italic: bool,
+    pub face_index: u32,
+    pub bytes: &'a [u8],
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum FontCoverageError {
+    #[error("missing supplied font family {family:?}")]
+    MissingFamily { family: String },
+    #[error("missing supplied face for {family:?}, weight {weight}, italic {italic}")]
+    MissingFace {
+        family: String,
+        weight: u16,
+        italic: bool,
+    },
+    #[error("supplied font {family:?} cannot render U+{character:04X}")]
+    MissingGlyph { family: String, character: u32 },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum FontRegistrationError {
+    #[error("invalid font registration for {family:?}: {reason}")]
+    Invalid {
+        family: String,
+        reason: &'static str,
+    },
+    #[error("font substitution {family:?} names an unregistered face {replacement:?}")]
+    MissingSubstitute { family: String, replacement: String },
 }
 
 /// Resolves font-family names to an ordered Skia family list, owning the asset
@@ -60,11 +98,13 @@ pub struct FontResolver {
     system: FontMgr,
     /// Families already decoded and registered into `provider`, with the name
     /// they were registered under (`None` when the download failed).
+    #[cfg(all(feature = "native-fonts", not(target_os = "emscripten")))]
     registered: Arc<Mutex<HashMap<String, Option<String>>>>,
     /// Memoized [`resolve_families`](Self::resolve_families) results.
     families: Arc<Mutex<HashMap<String, Vec<String>>>>,
     /// Memoized [`is_installed_exact`](Self::is_installed_exact) probes.
     installed: Arc<Mutex<HashMap<String, bool>>>,
+    supplied_families: Option<Arc<BTreeMap<String, String>>>,
 }
 
 impl FontResolver {
@@ -75,14 +115,17 @@ impl FontResolver {
         for fam in BUNDLED {
             register_bundled(&mut provider, &mgr, fam);
         }
+        #[cfg(all(feature = "native-fonts", not(target_os = "emscripten")))]
         register_external_font_dirs(&mut provider, &mgr);
         Self {
             provider,
             generation: Arc::new(AtomicU64::new(0)),
             system: mgr,
+            #[cfg(all(feature = "native-fonts", not(target_os = "emscripten")))]
             registered: Arc::new(Mutex::new(HashMap::new())),
             families: Arc::new(Mutex::new(HashMap::new())),
             installed: Arc::new(Mutex::new(HashMap::new())),
+            supplied_families: None,
         }
     }
 
@@ -98,6 +141,142 @@ impl FontResolver {
         FontGenerationObserver {
             generation: self.generation.clone(),
         }
+    }
+
+    pub fn from_fonts<'a>(
+        registrations: impl IntoIterator<Item = FontRegistration<'a>>,
+        substitutions: &BTreeMap<String, String>,
+    ) -> Result<Self, FontRegistrationError> {
+        let decoder = FontMgr::default();
+        let mut provider = TypefaceFontProvider::new();
+        let mut families = BTreeMap::new();
+        let mut registered_faces = std::collections::BTreeSet::new();
+        for registration in registrations {
+            let family = registration.family;
+            let invalid = |reason| FontRegistrationError::Invalid {
+                family: family.to_owned(),
+                reason,
+            };
+            if family.trim().is_empty()
+                || family.contains('\0')
+                || !(1..=1000).contains(&registration.weight)
+            {
+                return Err(invalid("family and weight must be valid"));
+            }
+            if !registered_faces.insert((
+                family.to_ascii_lowercase(),
+                registration.weight,
+                registration.italic,
+            )) {
+                return Err(invalid("duplicate face registration"));
+            }
+            let face_count = collection_face_count(registration.bytes)
+                .ok_or_else(|| invalid("invalid font collection header"))?;
+            if registration.face_index >= face_count {
+                return Err(invalid("face index is outside the font collection"));
+            }
+            let face = decoder
+                .new_from_data(
+                    skia_safe::Data::new_copy(registration.bytes),
+                    Some(registration.face_index),
+                )
+                .ok_or_else(|| invalid("font bytes could not be decoded"))?;
+            if (face.font_style().slant() != Slant::Upright) != registration.italic {
+                return Err(invalid(
+                    "italic registration disagrees with the supplied face",
+                ));
+            }
+            let face = instance_at_weight(&face, i32::from(registration.weight))
+                .ok_or_else(|| invalid("font weight could not be instantiated"))?;
+            if *face.font_style().weight() != i32::from(registration.weight) {
+                return Err(invalid(
+                    "weight registration disagrees with the supplied face",
+                ));
+            }
+            provider.register_typeface(face, family);
+            families.insert(family.to_ascii_lowercase(), family.to_owned());
+        }
+        let supplied_names = families.clone();
+        for (family, replacement) in substitutions {
+            if family.trim().is_empty() || family.contains('\0') {
+                return Err(FontRegistrationError::Invalid {
+                    family: family.clone(),
+                    reason: "invalid substitute name",
+                });
+            }
+            let canonical = supplied_names
+                .get(&replacement.to_ascii_lowercase())
+                .cloned()
+                .ok_or_else(|| FontRegistrationError::MissingSubstitute {
+                    family: family.clone(),
+                    replacement: replacement.clone(),
+                })?;
+            families.insert(family.to_ascii_lowercase(), canonical);
+        }
+        Ok(Self {
+            provider,
+            generation: Arc::new(AtomicU64::new(0)),
+            system: FontMgr::empty(),
+            #[cfg(all(feature = "native-fonts", not(target_os = "emscripten")))]
+            registered: Arc::new(Mutex::new(HashMap::new())),
+            families: Arc::new(Mutex::new(HashMap::new())),
+            installed: Arc::new(Mutex::new(HashMap::new())),
+            supplied_families: Some(Arc::new(families)),
+        })
+    }
+
+    pub fn supports_family(&self, family: &str) -> bool {
+        self.supplied_families.as_ref().map_or_else(
+            || self.is_resolved_exact(family),
+            |families| families.contains_key(&family.to_ascii_lowercase()),
+        )
+    }
+
+    pub(crate) fn supplied_only(&self) -> bool {
+        self.supplied_families.is_some()
+    }
+
+    pub fn validate_text(
+        &self,
+        family: &str,
+        weight: u16,
+        italic: bool,
+        text: &str,
+    ) -> Result<(), FontCoverageError> {
+        let manager: FontMgr = self.provider.clone().into();
+        let requested = font_style(weight, italic);
+        let face = self
+            .resolve_families(family)
+            .iter()
+            .find_map(|resolved| manager.match_family_style(resolved, requested))
+            .ok_or_else(|| FontCoverageError::MissingFamily {
+                family: family.to_owned(),
+            })?;
+        if *face.font_style().weight() != i32::from(weight)
+            || (face.font_style().slant() != Slant::Upright) != italic
+        {
+            return Err(FontCoverageError::MissingFace {
+                family: family.to_owned(),
+                weight,
+                italic,
+            });
+        }
+        for character in text.chars() {
+            // Controls, joiners and variation selectors guide shaping without
+            // requiring a standalone glyph in the selected face.
+            if character.is_control()
+                || matches!(character as u32, 0x200B..=0x200D | 0x2060 | 0xFE00..=0xFE0F | 0xE0100..=0xE01EF)
+            {
+                continue;
+            }
+            if face.unichar_to_glyph(character as i32) == 0 {
+                return Err(FontCoverageError::MissingGlyph {
+                    family: family.to_owned(),
+                    character: character as u32,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The asset font provider, to install on a Skia `FontCollection` as its
@@ -188,6 +367,13 @@ impl FontResolver {
     }
 
     fn resolve_families_uncached(&self, requested: &str) -> Vec<String> {
+        if let Some(families) = &self.supplied_families {
+            return families
+                .get(&requested.to_ascii_lowercase())
+                .cloned()
+                .into_iter()
+                .collect();
+        }
         let class = GenericFamily::classify(requested);
         let mut out: Vec<String> = Vec::new();
         let mut push = |name: &str| {
@@ -266,6 +452,9 @@ impl FontResolver {
     /// applies it on the single `TextStyle` used for both), so auto-layout
     /// widths and painted glyphs never disagree.
     pub fn metric_ratio_for(&self, requested: &str) -> f32 {
+        if self.supplied_only() {
+            return 1.0;
+        }
         match substitute_metric_ratio(requested) {
             // A known substitution candidate — but skip the adjust if the real
             // face is installed under its exact name (then the requested-name-
@@ -338,7 +527,11 @@ impl FontResolver {
     /// Fonts or non-OFL), decode error — so the caller falls through. Each
     /// distinct family is attempted at most once per process
     /// ([`download_cache`]) so a miss doesn't repeatedly stall layout.
+    #[cfg(all(feature = "native-fonts", not(target_os = "emscripten")))]
     fn try_download(&self, requested: &str) -> Option<String> {
+        if self.supplied_only() {
+            return None;
+        }
         // Per-resolver memo first: once a family is registered into this
         // provider (or known to be unobtainable) there is nothing left to do.
         if let Some(known) = self
@@ -390,11 +583,13 @@ impl FontResolver {
     /// shares the same underlying Skia object, so the registration is visible to
     /// the engine's collection. This is the same reference-counted handle Skia
     /// itself mutates.
+    #[cfg(all(feature = "native-fonts", not(target_os = "emscripten")))]
     fn download_and_register(&self, requested: &str) -> Option<String> {
         let bytes = fetch_google_font(requested)?;
         self.register_downloaded_bytes(requested, &bytes)
     }
 
+    #[cfg(any(test, all(feature = "native-fonts", not(target_os = "emscripten"))))]
     fn register_downloaded_bytes(&self, requested: &str, bytes: &[u8]) -> Option<String> {
         let base = self
             .system
@@ -424,6 +619,11 @@ impl FontResolver {
         }
         Some(requested.to_string())
     }
+
+    #[cfg(not(all(feature = "native-fonts", not(target_os = "emscripten"))))]
+    fn try_download(&self, _requested: &str) -> Option<String> {
+        None
+    }
 }
 
 impl Default for FontResolver {
@@ -451,6 +651,36 @@ fn legacy_source_pro_family(requested: &str) -> bool {
     lower.contains("source sans pro") || lower.contains("source serif pro")
 }
 
+/// The number of faces in a font file: its collection header count, or one for
+/// a single font. `None` when a collection header is truncated.
+fn collection_face_count(bytes: &[u8]) -> Option<u32> {
+    if bytes.get(..4) == Some(b"ttcf") {
+        bytes
+            .get(8..12)
+            .and_then(|count| <[u8; 4]>::try_from(count).ok())
+            .map(u32::from_be_bytes)
+    } else {
+        Some(1)
+    }
+}
+
+/// The family name of each decodable face in a font file or collection, with
+/// its face index.
+pub fn font_family_names(bytes: &[u8]) -> Vec<(u32, String)> {
+    let Some(face_count) = collection_face_count(bytes) else {
+        return Vec::new();
+    };
+    let decoder = FontMgr::default();
+    let data = skia_safe::Data::new_copy(bytes);
+    (0..face_count)
+        .filter_map(|index| {
+            decoder
+                .new_from_data(data.clone(), Some(index))
+                .map(|face| (index, face.family_name()))
+        })
+        .collect()
+}
+
 /// Translate a (weight, italic) pair into a Skia [`FontStyle`]. Shared so the
 /// layout engine and the resolver agree on what a run's style resolves to.
 pub(crate) fn font_style(weight: u16, italic: bool) -> FontStyle {
@@ -465,6 +695,65 @@ pub(crate) fn font_style(weight: u16, italic: bool) -> FontStyle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn supplied_faces_require_valid_bytes_and_explicit_substitutions()
+    -> Result<(), FontRegistrationError> {
+        let registration = FontRegistration {
+            family: "Explicit",
+            weight: 400,
+            italic: false,
+            face_index: 0,
+            bytes: include_bytes!("../../assets/inter/Inter-Regular.ttf"),
+        };
+        let substitutions = BTreeMap::from([("Alias".to_owned(), "Explicit".to_owned())]);
+        let resolver = FontResolver::from_fonts([registration], &substitutions)?;
+        assert_eq!(resolver.resolve_families("Alias"), ["Explicit"]);
+        assert!(resolver.resolve_families("Inter").is_empty());
+        assert_eq!(resolver.metric_ratio_for("Adobe Clean"), 1.0);
+        assert!(
+            resolver
+                .validate_text("Alias", 400, false, "Hello\nWorld")
+                .is_ok()
+        );
+        assert!(matches!(
+            resolver.validate_text("Alias", 700, false, "Hello"),
+            Err(FontCoverageError::MissingFace { .. })
+        ));
+        assert!(matches!(
+            resolver.validate_text("Alias", 400, false, "🚀"),
+            Err(FontCoverageError::MissingGlyph { .. })
+        ));
+        assert!(FontResolver::from_fonts([registration, registration], &BTreeMap::new()).is_err());
+        assert!(
+            FontResolver::from_fonts(
+                [FontRegistration {
+                    bytes: b"invalid",
+                    ..registration
+                }],
+                &BTreeMap::new()
+            )
+            .is_err()
+        );
+        assert!(
+            FontResolver::from_fonts(
+                [FontRegistration {
+                    face_index: 1,
+                    ..registration
+                }],
+                &BTreeMap::new()
+            )
+            .is_err()
+        );
+        assert!(
+            FontResolver::from_fonts(
+                [registration],
+                &BTreeMap::from([("Alias".into(), "Missing".into())])
+            )
+            .is_err()
+        );
+        Ok(())
+    }
     use crate::font_resolver::{
         INTER_FAMILY, SOURCE_CODE_FAMILY, SOURCE_SANS_FAMILY, SOURCE_SERIF_FAMILY,
     };
