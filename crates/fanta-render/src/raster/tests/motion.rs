@@ -25,6 +25,7 @@ fn motion_overlay_moves_an_offscreen_node_without_mutating_the_scene() {
         clip: AnimationClipId::new(),
         playhead_ms: 500,
         overrides: BTreeMap::from([(target, ResolvedVarValue::Float { value: 0.0 })]),
+        transform_origins: BTreeMap::new(),
     };
     let mut inputs = RenderInputs::for_doc(&doc);
     inputs.motion = Some(&motion);
@@ -84,6 +85,7 @@ fn motion_overlay_uses_moved_bounds_for_mask_effect_layer_and_culling() {
             (mask_target, ResolvedVarValue::Float { value: 220.0 }),
             (rectangle_target, ResolvedVarValue::Float { value: 220.0 }),
         ]),
+        transform_origins: BTreeMap::new(),
     };
     let mut inputs = RenderInputs::for_doc(&doc);
     inputs.motion = Some(&motion);
@@ -124,6 +126,7 @@ fn motion_bounds_include_children_overflowing_a_non_clipping_group_box() {
         clip: AnimationClipId::new(),
         playhead_ms: 500,
         overrides: BTreeMap::new(),
+        transform_origins: BTreeMap::new(),
     };
     let mut inputs = RenderInputs::for_doc(&doc);
     inputs.motion = Some(&motion);
@@ -175,6 +178,7 @@ fn disabled_frame_clipping_keeps_off_box_overflow_visible_for_normal_and_motion_
         clip: AnimationClipId::new(),
         playhead_ms: 500,
         overrides: BTreeMap::new(),
+        transform_origins: BTreeMap::new(),
     };
     let mut inputs = RenderInputs::for_doc(&doc);
     inputs.motion = Some(&motion);
@@ -253,6 +257,7 @@ fn motion_bound_property_overrides_the_resolved_variable_value() {
                 value: Color::rgb(255, 0, 0),
             },
         )]),
+        transform_origins: BTreeMap::new(),
     };
     let components = ComponentLibrary::new();
     let inputs = RenderInputs {

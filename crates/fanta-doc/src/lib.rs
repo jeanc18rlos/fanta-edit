@@ -41,6 +41,7 @@ pub mod index;
 pub mod journal;
 pub mod layout;
 pub mod motion;
+pub mod motion_spec;
 pub mod node;
 pub mod op;
 pub mod path;
@@ -86,8 +87,12 @@ pub use layout::{
     solve_auto_layout_with_variables, solve_expanded, solve_expanded_cancellable,
 };
 pub use motion::{
-    AnimationClip, AnimationTrack, Interpolation, Keyframe, MotionEvaluation, MotionLibrary,
-    MotionProperty, MotionTarget, MotionTransform,
+    AnimationClip, AnimationTrack, ClipSettings, Interpolation, Keyframe, LoopMode,
+    MotionEvaluation, MotionLibrary, MotionProperty, MotionTarget, MotionTransform,
+};
+pub use motion_spec::{
+    MotionSpec, MotionSpecError, SpecEasing, SpecEasingCurve, SpecEasingName, SpecKeyframe,
+    SpecLayer, SpecLoop,
 };
 pub use node::fields::known_fields;
 pub use node::{

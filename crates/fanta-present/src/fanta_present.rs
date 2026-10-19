@@ -2641,7 +2641,13 @@ impl PlaybackSession {
             clip: animation.clip,
             delay: f64::from(animation.delay_ms) / 1000.0,
             elapsed: 0.0,
-            mode: ClipPlaybackMode::Once,
+            mode: self
+                .doc
+                .motion
+                .clip(animation.clip)
+                .map_or(ClipPlaybackMode::Once, |clip| {
+                    clip.settings.loop_mode.into()
+                }),
             paused: false,
             completion_emitted: false,
         };

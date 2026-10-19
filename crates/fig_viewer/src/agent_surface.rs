@@ -525,6 +525,8 @@ impl DesignSurface for FigDesignSurface {
                 json!({
                     "id": clip.id.to_string(), "name": clip.name, "duration_ms": clip.duration_ms,
                     "track_count": clip.tracks.len(),
+                    "fps": clip.settings.fps, "loop_mode": clip.settings.loop_mode,
+                    "scope": clip.settings.scope.map(|scope| scope.to_string()),
                 })
             })
             .collect::<Vec<_>>();

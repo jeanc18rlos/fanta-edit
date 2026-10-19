@@ -602,6 +602,25 @@ pub(crate) fn set_clip_duration_operation(
     })
 }
 
+pub(crate) fn set_clip_loop_mode_operation(
+    doc: &Doc,
+    clip: AnimationClipId,
+    loop_mode: fanta_doc::LoopMode,
+) -> Option<Operation> {
+    let clip = doc.motion.clip(clip)?;
+    if clip.settings.loop_mode == loop_mode {
+        return None;
+    }
+    Some(Operation::SetAnimationClipSettings {
+        id: clip.id,
+        old: Box::new(clip.settings.clone()),
+        new: Box::new(fanta_doc::ClipSettings {
+            loop_mode,
+            ..clip.settings.clone()
+        }),
+    })
+}
+
 fn timeline_us_to_ms(time_us: i64, duration_ms: u32) -> u32 {
     let rounded_ms = time_us
         .max(0)
@@ -794,7 +813,7 @@ mod tests {
 
     #[test]
     fn delete_rename_and_duration_use_existing_motion_operations() {
-        let (doc, clip_id, track_id, keyframe_id, selection) = motion_doc();
+        let (mut doc, clip_id, track_id, keyframe_id, selection) = motion_doc();
         assert!(matches!(
             delete_keyframe_operation(&doc, clip_id, &selection),
             Some(Operation::SetKeyframe {
@@ -817,6 +836,28 @@ mod tests {
                 ..
             })
         ));
+        assert!(
+            set_clip_loop_mode_operation(&doc, clip_id, fanta_doc::LoopMode::Once).is_none(),
+            "the authored mode is a no-op"
+        );
+        let looped = set_clip_loop_mode_operation(&doc, clip_id, fanta_doc::LoopMode::PingPong)
+            .expect("loop change");
+        assert!(matches!(
+            &looped,
+            Operation::SetAnimationClipSettings { old, new, .. }
+                if old.loop_mode == fanta_doc::LoopMode::Once
+                    && new.loop_mode == fanta_doc::LoopMode::PingPong
+        ));
+        doc.apply(looped).expect("apply loop mode");
+        assert_eq!(
+            doc.motion.clip(clip_id).map(|clip| clip.settings.loop_mode),
+            Some(fanta_doc::LoopMode::PingPong)
+        );
+        doc.undo().expect("undo loop mode");
+        assert_eq!(
+            doc.motion.clip(clip_id).map(|clip| clip.settings.loop_mode),
+            Some(fanta_doc::LoopMode::Once)
+        );
     }
 
     #[test]

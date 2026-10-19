@@ -7806,6 +7806,7 @@ mod geometry_tests {
             clip: AnimationClipId::from_u128(2),
             playhead_ms: 0,
             overrides: BTreeMap::new(),
+            transform_origins: BTreeMap::new(),
         };
         assert_eq!(
             evaluated_hit_test(
@@ -7876,6 +7877,7 @@ mod geometry_tests {
                 MotionTarget::new(node, MotionProperty::PositionX),
                 ResolvedVarValue::Float { value: x },
             )]),
+            transform_origins: BTreeMap::new(),
         }
     }
 

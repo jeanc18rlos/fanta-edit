@@ -622,13 +622,22 @@ impl Player {
                         serde_json::from_value(value.clone()).map_err(RuntimeError::from_error)
                     })
                     .transpose()?;
-                let mode = arguments.get("mode").cloned().unwrap_or(json!("once"));
+                // The authored loop mode is the default; the host may override it.
+                let mode = match arguments.get("mode").filter(|value| !value.is_null()) {
+                    Some(mode) => {
+                        serde_json::from_value(mode.clone()).map_err(RuntimeError::from_error)?
+                    }
+                    None => self
+                        .session
+                        .document()
+                        .motion
+                        .clip(clip)
+                        .map_or(fanta_present::ClipPlaybackMode::Once, |clip| {
+                            clip.settings.loop_mode.into()
+                        }),
+                };
                 self.session
-                    .play_clip(
-                        clip,
-                        scope,
-                        serde_json::from_value(mode).map_err(RuntimeError::from_error)?,
-                    )
+                    .play_clip(clip, scope, mode)
                     .map_err(RuntimeError::from_error)?;
                 response.needs_redraw = true;
             }

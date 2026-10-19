@@ -50,6 +50,7 @@ impl MotionLibrary {
                         CompiledAnimationClip {
                             identity: *identity,
                             duration_ms: clip.duration_ms,
+                            settings: clip.settings.clone(),
                             tracks: clip
                                 .tracks
                                 .values()
@@ -88,7 +89,12 @@ impl CompiledMotionLibrary {
             clip: clip.identity,
             playhead_ms,
             overrides,
+            transform_origins: clip.settings.transform_origins.clone(),
         })
+    }
+
+    pub fn settings(&self, clip: AnimationClipId) -> Option<&ClipSettings> {
+        self.clips.get(&clip).map(|clip| &clip.settings)
     }
 }
 
@@ -96,6 +102,7 @@ impl CompiledMotionLibrary {
 struct CompiledAnimationClip {
     identity: AnimationClipId,
     duration_ms: u32,
+    settings: ClipSettings,
     tracks: Vec<CompiledAnimationTrack>,
 }
 
@@ -103,6 +110,49 @@ struct CompiledAnimationClip {
 struct CompiledAnimationTrack {
     target: MotionTarget,
     keyframes: Vec<Keyframe>,
+}
+
+/// How a clip plays when the host does not say otherwise: the authored
+/// default the timeline, the runtime and exporters start from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoopMode {
+    #[default]
+    Once,
+    Repeat,
+    PingPong,
+}
+
+impl LoopMode {
+    pub fn is_once(&self) -> bool {
+        *self == Self::Once
+    }
+}
+
+/// Clip-level settings that are not the timeline itself. They flatten into
+/// the clip's JSON and are all absent at their defaults, so a document that
+/// never set them serializes exactly as before; one operation edits them as a
+/// unit.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ClipSettings {
+    /// Frame rate for frame-based export and sampling. `None` leaves the
+    /// exporter's default (30).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<u16>,
+    #[serde(default, skip_serializing_if = "LoopMode::is_once")]
+    pub loop_mode: LoopMode,
+    /// The top-level frame this clip animates, the stage an export renders.
+    /// Figma keeps one timeline per top-level frame; Fanta records the frame.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<NodeId>,
+    /// Backdrop behind the stage in exports with no frame background.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background: Option<Color>,
+    /// Per node, the pivot that rotation and scale tracks turn about, as a
+    /// fraction of the node's local bounds (`[0.5, 0.5]` is the centre).
+    /// Absent, channels keep turning about the local origin.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub transform_origins: BTreeMap<NodeId, [f64; 2]>,
 }
 
 /// A named, finite timeline containing independently-addressable tracks.
@@ -113,6 +163,8 @@ pub struct AnimationClip {
     /// Timeline length. Evaluation clamps a later playhead to this boundary.
     #[serde(default)]
     pub duration_ms: u32,
+    #[serde(flatten)]
+    pub settings: ClipSettings,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tracks: BTreeMap<AnimationTrackId, AnimationTrack>,
 }
@@ -123,6 +175,7 @@ impl AnimationClip {
             id,
             name: name.into(),
             duration_ms,
+            settings: ClipSettings::default(),
             tracks: BTreeMap::new(),
         }
     }
@@ -144,11 +197,23 @@ impl AnimationClip {
             clip: self.id,
             playhead_ms,
             overrides,
+            transform_origins: self.settings.transform_origins.clone(),
         }
     }
 
     pub fn track_for_target(&self, target: MotionTarget) -> Option<&AnimationTrack> {
         self.tracks.values().find(|track| track.target == target)
+    }
+
+    #[cfg(test)]
+    fn compile_settings_for_test(&self) -> ClipSettings {
+        let mut library = MotionLibrary::new();
+        library.clips.insert(self.id, self.clone());
+        library
+            .compile()
+            .settings(self.id)
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -430,6 +495,8 @@ pub struct MotionEvaluation {
     /// The duration-clamped playhead that was actually sampled.
     pub playhead_ms: u32,
     pub overrides: BTreeMap<MotionTarget, ResolvedVarValue>,
+    /// The clip's declared pivots (see [`ClipSettings::transform_origins`]).
+    pub transform_origins: BTreeMap<NodeId, [f64; 2]>,
 }
 
 impl MotionEvaluation {
@@ -486,12 +553,65 @@ impl MotionEvaluation {
             }
         }
 
-        if transform_changed && let Some(transform) = transform.and_then(MotionTransform::recompose)
-        {
-            evaluated.transform = transform;
+        if transform_changed && let Some(animated) = transform {
+            let recomposed = match self.transform_origins.get(&node.id) {
+                Some(origin) => pivoted_transform(node, animated, *origin),
+                None => animated.recompose(),
+            };
+            if let Some(transform) = recomposed {
+                evaluated.transform = transform;
+            }
         }
         evaluated
     }
+}
+
+/// Recompose animated channels so rotation and scale turn about `origin`, a
+/// fraction of the node's local bounds.
+///
+/// Keyframes stay absolute, so the animated rotation and scale are applied as
+/// the change from the authored channels, about the pivot, on top of the
+/// authored matrix (with any animated position): `T(pos) · R0 · S0 · T(p) ·
+/// R(Δθ) · S(ΔS) · T(-p)`. At the authored values this is exactly the
+/// committed transform, so a clip never jumps where it starts.
+fn pivoted_transform(
+    node: &CanvasNode,
+    animated: MotionTransform,
+    origin: [f64; 2],
+) -> Option<Transform2D> {
+    let authored = MotionTransform::decompose(node.transform)?;
+    let bounds = node.data.local_bounds();
+    let pivot = bounds.map_or([0.0, 0.0], |bounds| {
+        [
+            bounds.min_x + origin[0] * bounds.width(),
+            bounds.min_y + origin[1] * bounds.height(),
+        ]
+    });
+    let delta_rotation = animated.rotation_radians - authored.rotation_radians;
+    let delta_scale = [
+        animated.scale[0] / authored.scale[0],
+        animated.scale[1] / authored.scale[1],
+    ];
+    if !pivot
+        .iter()
+        .chain(&delta_scale)
+        .all(|value| value.is_finite())
+        || !delta_rotation.is_finite()
+    {
+        return None;
+    }
+    let base = MotionTransform {
+        position: animated.position,
+        rotation_radians: authored.rotation_radians,
+        scale: authored.scale,
+    }
+    .recompose()?;
+    let local = Transform2D::translation(pivot[0], pivot[1]).0
+        * Transform2D::rotation(delta_rotation).0
+        * Transform2D::scale_xy(delta_scale[0], delta_scale[1]).0
+        * Transform2D::translation(-pivot[0], -pivot[1]).0;
+    let transform = Transform2D(base.0 * local);
+    transform.is_finite().then_some(transform)
 }
 
 fn interpolate_value(
@@ -635,6 +755,98 @@ mod tests {
         let mut clip = AnimationClip::new(clip_id, "Entrance", 1_000);
         clip.tracks.insert(track.id, track);
         (clip, target)
+    }
+
+    #[test]
+    fn clip_settings_round_trip_and_stay_off_the_wire_when_default() -> serde_json::Result<()> {
+        let node = NodeId::from_u128(20);
+        let (clip, _) = position_clip(node);
+        let plain = serde_json::to_value(&clip)?;
+        for key in [
+            "fps",
+            "loop_mode",
+            "scope",
+            "background",
+            "transform_origins",
+        ] {
+            assert!(
+                plain.get(key).is_none(),
+                "{key} must be absent at its default"
+            );
+        }
+
+        let mut clip = clip;
+        clip.settings = ClipSettings {
+            fps: Some(24),
+            loop_mode: LoopMode::PingPong,
+            scope: Some(NodeId::from_u128(9)),
+            background: Some(Color::BLACK),
+            transform_origins: BTreeMap::from([(node, [0.5, 0.5])]),
+        };
+        let json = serde_json::to_value(&clip)?;
+        assert_eq!(json["fps"], 24);
+        assert_eq!(json["loop_mode"], "ping_pong");
+        let key = serde_json::to_value(node)?;
+        let key = key.as_str().expect("ids serialize as strings");
+        assert_eq!(
+            json["transform_origins"][key],
+            serde_json::json!([0.5, 0.5])
+        );
+        let restored: AnimationClip = serde_json::from_value(json)?;
+        assert_eq!(restored, clip);
+        assert_eq!(clip.compile_settings_for_test(), clip.settings);
+        Ok(())
+    }
+
+    #[test]
+    fn rotation_about_a_declared_origin_keeps_the_pivot_in_place() {
+        use crate::node::GroupNode;
+        use glam::DVec2;
+
+        let mut node = CanvasNode::new(NodeData::Group(GroupNode {
+            clip_size: Some([100.0, 50.0]),
+            ..GroupNode::default()
+        }));
+        node.transform = Transform2D::translation(10.0, 20.0);
+        let clip_id = AnimationClipId::from_u128(1);
+        let target = MotionTarget::new(node.id, MotionProperty::Rotation);
+        let mut track = AnimationTrack::new(AnimationTrackId::from_u128(2), target);
+        let turned = float_keyframe(3, 0, std::f64::consts::FRAC_PI_2);
+        track.keyframes.insert(turned.id, turned);
+        let mut clip = AnimationClip::new(clip_id, "Spin", 1_000);
+        clip.tracks.insert(track.id, track);
+
+        let centre = DVec2::new(50.0, 25.0);
+        let before = node.transform.transform_point(centre);
+        let about_origin = clip.evaluate(0).apply_to_node(&node);
+        let moved = about_origin.transform.transform_point(centre);
+        assert!(
+            (moved - before).length() > 1.0,
+            "turning about the local origin moves the centre: {moved:?}"
+        );
+
+        clip.settings.transform_origins.insert(node.id, [0.5, 0.5]);
+        let about_centre = clip.evaluate(0).apply_to_node(&node);
+        let kept = about_centre.transform.transform_point(centre);
+        assert!(
+            (kept - before).length() < 1e-9,
+            "turning about the centre keeps it at {before:?}, got {kept:?}"
+        );
+        let corner = about_centre.transform.transform_point(DVec2::ZERO);
+        assert!(
+            (corner - DVec2::new(85.0, -5.0)).length() < 1e-9,
+            "a quarter turn about the centre puts the corner at (85, -5), got {corner:?}"
+        );
+        let mut library = MotionLibrary::new();
+        library.clips.insert(clip_id, clip);
+        assert_eq!(
+            library
+                .compile()
+                .evaluate(clip_id, 0)
+                .map(|evaluation| evaluation.apply_to_node(&node).transform),
+            Some(about_centre.transform),
+            "the compiled library applies the same pivot"
+        );
     }
 
     #[test]
@@ -817,6 +1029,7 @@ mod tests {
             clip: AnimationClipId::from_u128(1),
             playhead_ms: 0,
             overrides,
+            transform_origins: BTreeMap::new(),
         };
 
         let evaluated = evaluation.apply_to_node(&node);

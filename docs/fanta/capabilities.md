@@ -534,6 +534,11 @@ Implementation: [component actions](../../crates/fig_viewer/src/component_action
 - **Motion:** clips, node/property tracks, keyframes, scrubbing, playback,
   looping, timeline zoom, animation presets and custom easing. Live keyframe
   and numeric edits retain their identity and become undoable transactions.
+  A clip's loop mode persists with it and is the default the prototype and web
+  runtimes play it with; clips can also declare a frame rate, a stage frame, a
+  backdrop and per-node transform origins (rotation and scale pivots). The
+  seconds-and-degrees motion spec (`fanta_doc::MotionSpec`) is the portable
+  form exporters and other motion tools read.
 - **Prototype:** starting frames, interactions, destinations, transitions,
   overlays, supported links and property-animation bindings. Presentation
   provides frame navigation/restart and restores the editor viewport on exit.

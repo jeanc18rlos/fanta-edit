@@ -615,6 +615,12 @@ keyframes targeting exact node ids. Preserve existing identities and verify
 multiple `get_screenshot` samples using `motion_clip` and `playhead_ms`
 after saving, then check playback in the Motion workspace when available. `motion/<slug>/` directories
 are index stubs; their presence alone does not create playable animations.
+Besides `duration_ms` and `tracks`, a clip may set `fps`, `loop_mode`
+(`once`, `repeat`, `ping_pong`), `scope` (the stage frame it animates),
+`background` (a hex backdrop) and `transform_origins` (per node id, the pivot
+rotation and scale turn about as a fraction of its bounds; `[0.5, 0.5]` is the
+centre). Rotation keyframes are radians; the portable motion spec that exports
+read uses degrees and seconds.
 
 The built-in Fanta agent uses the same surface through its native tools
 `design_state` (= `get_editor_state` + `batch_get`, with `empty_space`),
@@ -837,6 +843,7 @@ fn seed_agents_md(dir: &Path) -> Result<()> {
         "9b50be64e96b0a3a0dae85e78f5855821edf2969ce4ea74de0cbc8f0035a716a",
         "e9cd2913d2c9f6cb86653928d192fa1a11668fc0e9feffed2f2c2b760f4565e7",
         "057778f31c69d024845123c01ee02d5a91d0736e2743806b47234cc99670007d",
+        "71d49782238e8e17464761de73b4b71a807e1d9346582a1c00e38f00e7993065",
     ];
     let should_write = match fs::read(&path) {
         Ok(contents) => {
