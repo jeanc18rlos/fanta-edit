@@ -5,7 +5,7 @@ step: read the files here, or on GitHub.
 
 - [`alpha/PUBLIC_ALPHA.md`](./alpha/PUBLIC_ALPHA.md) — current 1.0.0 installation, requirements, manual updates, limitations and support.
 - [`alpha/DEMO_GUIDE.md`](./alpha/DEMO_GUIDE.md) — three launch demos and the common ten-minute exercise.
-- [`fanta/agent-quickstart.md`](./fanta/agent-quickstart.md) — current local connection, 13-tool interface, scopes and a bounded first task.
+- [`fanta/agent-quickstart.md`](./fanta/agent-quickstart.md) — current local connection, 14-tool interface, scopes and a bounded first task.
 
 - [`alpha/`](./alpha) — what ships in the alpha: [`SMOKE.md`](./alpha/SMOKE.md)
   (the manual pass before a build goes out), [`RELEASE_NOTES.md`](./alpha/RELEASE_NOTES.md)
@@ -30,7 +30,8 @@ step: read the files here, or on GitHub.
   review findings, reproduced failures, completed Sol work, and remaining gaps.
 - [`fanta/`](./fanta) — notes on the app itself, including
   [`project-schema.md`](./fanta/project-schema.md) for the editable project tree and
-  [`website-export.md`](./fanta/website-export.md) for publishing a static viewer, and
+  [`website-export.md`](./fanta/website-export.md) for publishing a static viewer,
+  [`windows-development.md`](./fanta/windows-development.md) for building and testing on Windows, and
   [`code-first-audit.md`](./fanta/code-first-audit.md) for the architecture review, plus
   [`disabled-services-binnacle.md`](./fanta/disabled-services-binnacle.md),
   the record of which inherited Fanta services are switched off and why.
