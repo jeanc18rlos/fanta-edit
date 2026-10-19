@@ -10,6 +10,7 @@ on:
       - 'rust-toolchain.toml'
       - 'assets/**'
       - 'crates/**'
+      - 'script/test-isolated.ps1'
       - 'vendor/**'
   push:
     branches: [main]
@@ -57,10 +58,6 @@ jobs:
       - name: Check the app and command-line tool
         run: cargo check --locked --keep-going -p fanta -p cli
 
-      - name: Compile the canvas tests
-        if: ${{ !cancelled() }}
-        run: cargo test --locked --no-run -p fig_viewer --lib
-
       - name: Test the design engine crates
         if: ${{ !cancelled() }}
         run: >-
@@ -68,28 +65,14 @@ jobs:
           -p fanta-doc -p fanta-fnx -p fanta-format -p fanta-canvas -p fanta-tools
           -p fanta-present -p fanta-text -p design_surface
 
-      # A native crash in Skia ends the whole test process and hides the tests after it.
-      # After a failure, every test runs again in its own process to name each one that fails.
+      # Skia runs in these tests. After a failure the script reruns each test in its own
+      # process, so a native crash names every failing test instead of hiding the rest.
       - name: Test the renderer
         if: ${{ !cancelled() }}
         shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Continue'
-          cargo test --locked --lib -p fanta-render
-          if ($LASTEXITCODE -eq 0) { exit 0 }
-          $binary = cargo test --locked --lib -p fanta-render --no-run --message-format=json |
-            ConvertFrom-Json |
-            Where-Object { $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'fanta_render' -and $_.profile.test } |
-            Select-Object -Last 1 -ExpandProperty executable
-          $failed = @()
-          foreach ($line in & $binary --list --format terse) {
-            if ($line -notmatch '^(.+): test$') { continue }
-            $name = $Matches[1]
-            & $binary --exact $name *> $null
-            if ($LASTEXITCODE -ne 0) {
-              $failed += '{0} (exit code 0x{1:X8})' -f $name, $LASTEXITCODE
-            }
-          }
-          Write-Output "Renderer tests that fail in their own process: $($failed.Count)"
-          $failed | ForEach-Object { Write-Output "  $_" }
-          exit 1
+        run: .\script\test-isolated.ps1 -Package fanta-render
+
+      - name: Test the canvas
+        if: ${{ !cancelled() }}
+        shell: pwsh
+        run: .\script\test-isolated.ps1 -Package fig_viewer

@@ -4,8 +4,8 @@ Fanta ships for macOS, but the repository builds, runs and tests on Windows so
 you can work on it there. The `Windows` workflow
 ([`.github/workflows/windows.yml`](../../.github/workflows/windows.yml)) keeps it
 that way: on every pull request that touches code it checks the app and the
-command-line tool, compiles the canvas tests and runs the design engine tests on
-`windows-2025`.
+command-line tool and runs the tests of the canvas, the renderer and the design
+engine crates on `windows-2025`.
 
 ## What is different from a Mac
 
@@ -13,9 +13,11 @@ command-line tool, compiles the canvas tests and runs the design engine tests on
   GPU tile cache built on them, are macOS-only. Windows draws the canvas with the
   CPU raster renderer that also produces exports and agent screenshots, so very
   large documents pan more slowly than on a Mac.
-- **No media playback.** Video and audio playback use AVFoundation. On Windows,
-  video layers and video fills show their saved poster frame and audio does not
-  play.
+- **No media playback.** Video playback and poster frames use AVFoundation, and
+  the generation workspace's audio preview is macOS-only. On Windows, video
+  layers and video fills show the poster frame saved with the project (a video
+  placed on Windows has none), and audio previews do not play. Placing video
+  and audio on the canvas works on both.
 - **No release packaging.** `script/bundle-mac`, signing, notarization and the
   in-app updater are macOS-only. `script/bundle-windows.ps1` comes from upstream
   and has not been validated for Fanta.
@@ -63,6 +65,14 @@ are incremental.
 cargo test -p fanta-doc -p fanta-fnx -p fanta-format -p fanta-canvas -p fanta-tools -p fanta-present -p fanta-render -p fanta-text -p design_surface --lib
 cargo test -p fig_viewer --lib
 .\script\clippy.ps1 -p fig_viewer
+```
+
+A native crash inside Skia ends the whole test process and hides the tests
+after it. `script\test-isolated.ps1` runs a crate's tests and, after a failure,
+reruns each test in its own process to list every test that fails:
+
+```powershell
+.\script\test-isolated.ps1 -Package fanta-render
 ```
 
 `script\clippy.ps1` uses the same flags as `script/clippy`. The other scripts in
