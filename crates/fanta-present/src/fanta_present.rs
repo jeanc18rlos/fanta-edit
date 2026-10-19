@@ -34,9 +34,9 @@ use fanta_canvas::viewport::{
 };
 pub use fanta_canvas::{Camera2D, FitMode};
 use fanta_doc::{
-    Action, AnimationClipId, CompareOp, ComponentId, ComponentPropKind, Condition, Doc, ModeId,
-    MotionEvaluation, NodeData, NodeFlags, NodeId, OverlaySettings, PrototypeAnimation, ReactionId,
-    ResolvedVarValue, Scene, ScrollBehavior, ScrollDirection, Transform2D, Transition,
+    Action, AnimationClipId, Color, CompareOp, ComponentId, ComponentPropKind, Condition, Doc,
+    ModeId, MotionEvaluation, NodeData, NodeFlags, NodeId, OverlaySettings, PrototypeAnimation,
+    ReactionId, ResolvedVarValue, Scene, ScrollBehavior, ScrollDirection, Transform2D, Transition,
     TransitionStyle, Trigger, VarValue, VariableCollectionId, VariableId, VariableRegistry,
     Viewport,
 };
@@ -1528,7 +1528,12 @@ impl PresentSession {
         // Clone the (small) overlay stack so the render borrow of `self` is free.
         let overlays: Vec<OverlayEntry> = self.playback.overlays.clone();
         for (index, entry) in overlays.iter().enumerate() {
-            let over = self.render_frame_rgba(entry.root, entry.camera);
+            let over = self.render_frame_rgba_with_motion(
+                entry.root,
+                entry.camera,
+                true,
+                Color::TRANSPARENT,
+            );
             let entering = self
                 .active_overlay_transition
                 .filter(|active| active.root == entry.root && index + 1 == overlays.len());
@@ -1558,8 +1563,12 @@ impl PresentSession {
             if exit.entry.settings.background_dim {
                 apply_scrim(&mut buffer, SCRIM_DIM * visible);
             }
-            let overlay =
-                self.render_frame_rgba_with_motion(exit.entry.root, exit.entry.camera, false);
+            let overlay = self.render_frame_rgba_with_motion(
+                exit.entry.root,
+                exit.entry.camera,
+                false,
+                Color::TRANSPARENT,
+            );
             buffer = composite_overlay(
                 exit.clock.style,
                 visible,
@@ -1625,8 +1634,12 @@ impl PresentSession {
         }
 
         // Every other style composites the two endpoint frames.
-        let outgoing =
-            self.render_frame_rgba_with_motion(active.from_frame, active.from_camera, false);
+        let outgoing = self.render_frame_rgba_with_motion(
+            active.from_frame,
+            active.from_camera,
+            false,
+            self.renderer.background,
+        );
         let incoming = self.render_frame_rgba(active.to_frame, active.to_camera);
         let width = self.renderer.width() as usize;
         let height = self.renderer.height() as usize;
@@ -1636,7 +1649,7 @@ impl PresentSession {
     /// Render one frame through `camera` onto the owned surface and read back
     /// straight-alpha RGBA8. Used to produce the two layers a transition blends.
     fn render_frame_rgba(&mut self, frame: NodeId, camera: Camera2D) -> Vec<u8> {
-        self.render_frame_rgba_with_motion(frame, camera, true)
+        self.render_frame_rgba_with_motion(frame, camera, true, self.renderer.background)
     }
 
     fn render_frame_rgba_with_motion(
@@ -1644,6 +1657,7 @@ impl PresentSession {
         frame: NodeId,
         camera: Camera2D,
         include_motion: bool,
+        background: Color,
     ) -> Vec<u8> {
         // Built inline for the same borrow-splitting reason as `render_current`.
         let resolved = self.playback.resolved_layer(frame, include_motion);
@@ -1657,20 +1671,27 @@ impl PresentSession {
             video_fill_frames: None,
             dark_ui: false,
         };
+        let previous_background = std::mem::replace(&mut self.renderer.background, background);
         self.renderer
             .render_page_with_camera(&resolved.scene, &camera, Some(frame), &inputs);
+        self.renderer.background = previous_background;
         self.renderer.copy_rgba()
     }
 
     fn render_surface_hiding(&mut self, hidden: &[NodeId]) -> Vec<u8> {
-        let mut buffer =
-            self.render_frame_rgba_hiding(self.playback.current, self.playback.camera, hidden);
+        let mut buffer = self.render_frame_rgba_hiding(
+            self.playback.current,
+            self.playback.camera,
+            hidden,
+            self.renderer.background,
+        );
         let overlays = self.playback.overlays.clone();
         for entry in overlays {
             if entry.settings.background_dim {
                 apply_scrim(&mut buffer, SCRIM_DIM);
             }
-            let overlay = self.render_frame_rgba_hiding(entry.root, entry.camera, hidden);
+            let overlay =
+                self.render_frame_rgba_hiding(entry.root, entry.camera, hidden, Color::TRANSPARENT);
             composite_over(&mut buffer, &overlay);
         }
         buffer
@@ -1681,6 +1702,7 @@ impl PresentSession {
         frame: NodeId,
         camera: Camera2D,
         hidden: &[NodeId],
+        background: Color,
     ) -> Vec<u8> {
         let mut scene = self
             .build_runtime_scene(frame)
@@ -1703,8 +1725,10 @@ impl PresentSession {
             video_fill_frames: None,
             dark_ui: false,
         };
+        let previous_background = std::mem::replace(&mut self.renderer.background, background);
         self.renderer
             .render_page_with_camera(&scene, &camera, Some(frame), &inputs);
+        self.renderer.background = previous_background;
         self.renderer.copy_rgba()
     }
 
@@ -1728,8 +1752,11 @@ impl PresentSession {
             video_fill_frames: None,
             dark_ui: false,
         };
+        let previous_background =
+            std::mem::replace(&mut self.renderer.background, Color::TRANSPARENT);
         self.renderer
             .render_page_with_camera(scene, &camera, Some(root), &inputs);
+        self.renderer.background = previous_background;
         self.renderer.copy_rgba()
     }
 

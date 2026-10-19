@@ -179,6 +179,7 @@ impl GpuPresenter {
                                 &scene,
                                 smart.root,
                                 layer.camera,
+                                Color::TRANSPARENT,
                                 false,
                                 &mut metrics,
                             )?;
@@ -198,6 +199,7 @@ impl GpuPresenter {
                                 &layer.from_scene,
                                 layer.from_root,
                                 layer.camera,
+                                Color::TRANSPARENT,
                                 false,
                                 &mut metrics,
                             )?;
@@ -217,6 +219,7 @@ impl GpuPresenter {
                                 &incoming_scene,
                                 layer.to_root,
                                 layer.camera,
+                                Color::TRANSPARENT,
                                 false,
                                 &mut metrics,
                             )?;
@@ -263,6 +266,7 @@ impl GpuPresenter {
                         height,
                         entry.root,
                         entry.camera,
+                        Color::TRANSPARENT,
                         Some(entry.layer),
                         true,
                         &[],
@@ -283,6 +287,7 @@ impl GpuPresenter {
                         height,
                         exit.entry.root,
                         exit.entry.camera,
+                        Color::TRANSPARENT,
                         Some(exit.entry.layer),
                         false,
                         &[],
@@ -497,6 +502,7 @@ fn render_scene(
     scene: &Scene,
     root: NodeId,
     camera: Camera2D,
+    background: Color,
     include_motion: bool,
     metrics: &mut GpuPresentationMetrics,
 ) -> Result<Image, GpuPresentationError> {
@@ -515,6 +521,7 @@ fn render_scene(
         video_fill_frames: None,
         dark_ui: false,
     };
+    let previous_background = std::mem::replace(&mut session.renderer.background, background);
     let rendered = session.renderer.render_to_canvas_with_camera(
         surface.canvas(),
         width,
@@ -524,6 +531,7 @@ fn render_scene(
         Some(root),
         &inputs,
     );
+    session.renderer.background = previous_background;
     collect_metrics(metrics, rendered);
     Ok(surface.image_snapshot())
 }
@@ -536,6 +544,7 @@ fn render_frame(
     height: u32,
     root: NodeId,
     camera: Camera2D,
+    background: Color,
     layer: Option<u64>,
     include_motion: bool,
     hidden: &[NodeId],
@@ -571,6 +580,7 @@ fn render_frame(
         video_fill_frames: None,
         dark_ui: false,
     };
+    let previous_background = std::mem::replace(&mut session.renderer.background, background);
     let rendered = session.renderer.render_to_canvas_with_camera(
         surface.canvas(),
         width,
@@ -580,6 +590,7 @@ fn render_frame(
         Some(root),
         &inputs,
     );
+    session.renderer.background = previous_background;
     collect_metrics(metrics, rendered);
     Ok(surface.image_snapshot())
 }
@@ -599,6 +610,7 @@ fn render_backdrop(
         height,
         session.current,
         session.camera,
+        session.renderer.background,
         Some(session.current_layer),
         true,
         hidden,
@@ -616,6 +628,7 @@ fn render_backdrop(
             height,
             entry.root,
             entry.camera,
+            Color::TRANSPARENT,
             Some(entry.layer),
             true,
             hidden,
@@ -641,6 +654,7 @@ fn render_base(
             height,
             session.current,
             session.camera,
+            session.renderer.background,
             Some(session.current_layer),
             true,
             &[],
@@ -672,6 +686,7 @@ fn render_base(
                 &scene,
                 root,
                 active.camera(eased),
+                session.renderer.background,
                 true,
                 metrics,
             )?;
@@ -686,6 +701,7 @@ fn render_base(
         height,
         active.from_frame,
         active.from_camera,
+        session.renderer.background,
         None,
         false,
         &[],
@@ -698,6 +714,7 @@ fn render_base(
         height,
         active.to_frame,
         active.to_camera,
+        session.renderer.background,
         Some(session.current_layer),
         true,
         &[],

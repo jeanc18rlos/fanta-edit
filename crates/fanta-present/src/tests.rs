@@ -5932,6 +5932,12 @@ fn fill_overlays_inherit_axes_for_placement_nested_hits_and_resize()
         assert_eq!(entry.screen_rect.max.to_array(), maximum);
         let inside = DVec2::new(minimum[0] + 30.0, minimum[1] + 55.0);
         assert_eq!(
+            pixel_at(&session.present_rgba(), 300, 150, 115),
+            [0, 0, 0, 255],
+            "overlay margins must preserve the black base"
+        );
+        assert_eq!(session.renderer.background, Color::WHITE);
+        assert_eq!(
             pixel_at(
                 &session.present_rgba(),
                 300,
@@ -5953,10 +5959,18 @@ fn fill_overlays_inherit_axes_for_placement_nested_hits_and_resize()
                 pixel_at(&session.present_rgba(), 300, 150, 160),
                 [0, 0, 255, 255]
             );
+            let nested_pixels = session.present_rgba();
+            assert_eq!(pixel_at(&nested_pixels, 300, 125, 150), [0, 255, 0, 255]);
+            assert_eq!(pixel_at(&nested_pixels, 300, 150, 115), [0, 0, 0, 255]);
+            assert_eq!(presentation_canvas_pixels(&mut session)?, nested_pixels);
             session.handle_pointer(DVec2::new(150.0, 160.0), PointerEvent::Click);
             assert_eq!(session.take_open_url().as_deref(), Some("fit-nested"));
             session.handle_key("Backspace", KeyEvent::Down);
             assert_eq!(session.playback_state().overlay_frames, vec![overlay]);
+            assert_eq!(
+                pixel_at(&session.present_rgba(), 300, 150, 115),
+                [0, 0, 0, 255]
+            );
             session.resize_with_scale(DVec2::new(400.0, 200.0), 2.0)?;
             let entry = session.overlays.last().ok_or("missing resized overlay")?;
             assert_eq!(entry.camera.scale, [2.0, 2.0]);
@@ -5965,6 +5979,10 @@ fn fill_overlays_inherit_axes_for_placement_nested_hits_and_resize()
             assert_eq!(
                 pixel_at(&session.present_rgba(), 800, 470, 230),
                 [0, 255, 0, 255]
+            );
+            assert_eq!(
+                pixel_at(&session.present_rgba(), 800, 300, 200),
+                [0, 0, 0, 255]
             );
             session.handle_pointer(DVec2::new(235.0, 115.0), PointerEvent::Click);
             assert_eq!(session.take_open_url().as_deref(), Some("fit-overlay"));
@@ -5998,7 +6016,7 @@ fn fill_overlays_inherit_axes_for_placement_nested_hits_and_resize()
 #[test]
 fn fill_overlay_transition_hit_testing_follows_its_displayed_axes()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (document, root, overlay, _) = fit_overlay_document(
+    let (mut document, root, overlay, _) = fit_overlay_document(
         OverlayPosition::Center,
         Some(Transition {
             style: TransitionStyle::MoveIn {
@@ -6008,6 +6026,19 @@ fn fill_overlay_transition_hit_testing_follows_its_displayed_axes()
             easing: Easing::Linear,
         }),
     )?;
+    let close = document
+        .scene
+        .get_mut(overlay)
+        .ok_or("missing overlay")?
+        .reactions
+        .iter_mut()
+        .find(|reaction| matches!(reaction.action, Action::Close))
+        .ok_or("missing overlay close reaction")?;
+    close.transition = Some(Transition {
+        style: TransitionStyle::Dissolve,
+        duration_ms: 1000,
+        easing: Easing::Linear,
+    });
     let mut session = PresentSession::new(&document, Some(root), DVec2::splat(300.0))?;
     session.set_fit_mode(FitMode::Fill);
     session.handle_key("Enter", KeyEvent::Down);
@@ -6018,11 +6049,41 @@ fn fill_overlay_transition_hit_testing_follows_its_displayed_axes()
         pixel_at(&session.present_rgba(), 300, 15, 175),
         [0, 255, 0, 255]
     );
+    let entering_pixels = session.present_rgba();
+    assert_eq!(pixel_at(&entering_pixels, 300, 150, 115), [0, 0, 0, 255]);
+    assert_eq!(pixel_at(&entering_pixels, 300, 150, 175), [0, 0, 0, 255]);
+    assert_eq!(presentation_canvas_pixels(&mut session)?, entering_pixels);
     session.handle_pointer(DVec2::new(15.0, 175.0), PointerEvent::Click);
     assert_eq!(session.take_open_url().as_deref(), Some("fit-overlay"));
     session.handle_pointer(DVec2::new(150.0, 150.0), PointerEvent::Click);
     assert!(session.take_open_url().is_none());
     assert_eq!(session.playback_state().overlay_frames, vec![overlay]);
+    session.advance_by(0.5)?;
+    assert!(session.handle_key("Backspace", KeyEvent::Down).animating);
+    session.advance_by(0.5)?;
+    let exiting_pixels = session.present_rgba();
+    assert_eq!(pixel_at(&exiting_pixels, 300, 150, 115), [0, 0, 0, 255]);
+    let fading_green = pixel_at(&exiting_pixels, 300, 150, 175);
+    assert_eq!(
+        [fading_green[0], fading_green[2], fading_green[3]],
+        [0, 0, 255]
+    );
+    assert!((127..=128).contains(&fading_green[1]));
+    let exiting_canvas = presentation_canvas_pixels(&mut session)?;
+    assert_eq!(exiting_canvas.len(), exiting_pixels.len());
+    assert!(
+        exiting_canvas
+            .iter()
+            .zip(&exiting_pixels)
+            .all(|(canvas, native)| canvas.abs_diff(*native) <= 1)
+    );
+    session.advance_by(0.5)?;
+    assert!(session.playback_state().overlay_frames.is_empty());
+    assert_eq!(
+        pixel_at(&session.present_rgba(), 300, 150, 175),
+        [0, 0, 0, 255]
+    );
+    assert_eq!(session.renderer.background, Color::WHITE);
     Ok(())
 }
 
@@ -6187,9 +6248,15 @@ fn fit_pixels_match_the_external_canvas_path_for_transitions_and_overlays()
         let mut session = PresentSession::new(&document, Some(source), DVec2::splat(300.0))?;
         session.set_fit_mode(mode);
         session.handle_key("Enter", KeyEvent::Down);
+        let overlay_pixels = session.present_rgba();
+        assert_eq!(pixel_at(&overlay_pixels, 300, 150, 115), [0, 0, 0, 255]);
+        if mode == FitMode::Contain {
+            assert_eq!(pixel_at(&overlay_pixels, 300, 5, 5), [255, 255, 255, 255]);
+        }
+        assert_eq!(session.renderer.background, Color::WHITE);
         assert_eq!(
             presentation_canvas_pixels(&mut session)?,
-            session.present_rgba(),
+            overlay_pixels,
             "{mode:?} overlay"
         );
         session.resize_with_scale(DVec2::new(400.0, 200.0), 2.0)?;
@@ -6263,6 +6330,10 @@ fn fill_variant_transitions_preserve_anisotropic_instance_and_sibling_geometry()
 -> Result<(), Box<dyn std::error::Error>> {
     for style in [TransitionStyle::Dissolve, TransitionStyle::SmartAnimate] {
         let (mut document, root, first, second) = interactive_variant_document();
+        document.presentation = Some(fanta_doc::PresentationConfig {
+            frame_color: Some(Color::WHITE),
+            ..Default::default()
+        });
         document
             .scene
             .get_mut(first)
@@ -6298,6 +6369,8 @@ fn fill_variant_transitions_preserve_anisotropic_instance_and_sibling_geometry()
             "{style:?}: {changing:?}"
         );
         assert_eq!(pixel_at(&midpoint, 100, 75, 80), [255, 0, 0, 255]);
+        assert_eq!(pixel_at(&midpoint, 100, 50, 50), [255, 255, 255, 255]);
+        assert_eq!(session.renderer.background, Color::WHITE);
         let direct = presentation_canvas_pixels(&mut session)?;
         assert!(
             midpoint
