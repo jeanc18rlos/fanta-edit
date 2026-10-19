@@ -806,6 +806,17 @@ impl PlaybackSession {
                             }
                         }
                         motion.overrides = mapped;
+                        let mut mapped_origins = BTreeMap::new();
+                        for (node, origin) in motion.transform_origins {
+                            for identity in self.motion_candidates(
+                                &resolved,
+                                node,
+                                self.active_motion_scope.as_ref(),
+                            ) {
+                                mapped_origins.insert(identity, origin);
+                            }
+                        }
+                        motion.transform_origins = mapped_origins;
                         resolved
                             .sampled_nodes
                             .extend(motion.overrides.keys().map(|target| target.node));

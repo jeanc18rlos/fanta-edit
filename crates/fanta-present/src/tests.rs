@@ -587,6 +587,286 @@ fn close_at_base_level_exits() {
 }
 
 #[test]
+fn conditional_navigates_on_matching_variable() -> Result<(), Box<dyn std::error::Error>> {
+    use fanta_doc::{CompareOp, Condition, ConditionalBranch};
+
+    let (mut document, root, variable, mode) =
+        prototype_variable_document(VarValue::Float { value: 1.0 }, Vec::new())?;
+    let destination = frame(500.0);
+    let destination_id = destination.id;
+    document.scene.insert(destination)?;
+    let condition = Condition::All {
+        conditions: vec![
+            Condition::Any {
+                conditions: vec![
+                    Condition::Compare {
+                        variable,
+                        op: CompareOp::Greater,
+                        value: VarValue::Float { value: 0.0 },
+                    },
+                    Condition::Compare {
+                        variable,
+                        op: CompareOp::Equal,
+                        value: VarValue::Float { value: 0.0 },
+                    },
+                ],
+            },
+            Condition::Not {
+                condition: Box::new(Condition::Compare {
+                    variable,
+                    op: CompareOp::Equal,
+                    value: VarValue::Float { value: 2.0 },
+                }),
+            },
+        ],
+    };
+    let mut reaction = click(
+        9201,
+        Trigger::Click,
+        Action::Conditional {
+            branches: vec![ConditionalBranch {
+                condition,
+                actions: vec![
+                    Action::AdjustVariable {
+                        variable,
+                        delta: 1.0,
+                    },
+                    Action::Navigate { to: destination_id },
+                    Action::OpenLink {
+                        url: "after-navigation".into(),
+                    },
+                ],
+            }],
+            otherwise: vec![Action::OpenLink {
+                url: "otherwise".into(),
+            }],
+        },
+    );
+    reaction.extra_actions.push(Action::OpenLink {
+        url: "after-conditional".into(),
+    });
+    document
+        .scene
+        .get_mut(root)
+        .ok_or("missing root")?
+        .reactions
+        .push(reaction);
+    let mut playback = PlaybackSession::new(&document, Some(root), DVec2::splat(200.0))?;
+    let response = playback.handle_pointer(DVec2::splat(100.0), PointerEvent::Click);
+    assert!(response.navigated);
+    assert_eq!(playback.current_frame(), destination_id);
+    assert!(playback.take_open_url().is_none());
+    assert_eq!(
+        playback
+            .runtime_variables()
+            .variable(variable)
+            .and_then(|variable| variable.value_for_mode(mode)),
+        Some(&VarValue::Float { value: 2.0 })
+    );
+    assert_eq!(
+        document
+            .variables
+            .variable(variable)
+            .and_then(|variable| variable.value_for_mode(mode)),
+        Some(&VarValue::Float { value: 1.0 })
+    );
+    Ok(())
+}
+
+fn prototype_variable_document(
+    value: VarValue,
+    options: Vec<String>,
+) -> Result<(Doc, NodeId, VariableId, ModeId), Box<dyn std::error::Error>> {
+    let mut document = Doc::new();
+    let collection = VariableCollectionId::new();
+    let mode = ModeId::new();
+    let variable = VariableId::new();
+    document.variables.collections.insert(
+        collection,
+        VariableCollection {
+            id: collection,
+            name: "Prototype".into(),
+            modes: vec![Mode {
+                id: mode,
+                name: "Default".into(),
+            }],
+            default_mode: mode,
+            variable_order: vec![variable],
+        },
+    );
+    document.variables.variables.insert(
+        variable,
+        Variable {
+            id: variable,
+            collection,
+            name: "Value".into(),
+            ty: value
+                .variable_type()
+                .ok_or("fixture requires a concrete value")?,
+            values_by_mode: BTreeMap::from([(mode, value)]),
+            scopes: Vec::new(),
+            options,
+        },
+    );
+    let root = frame(0.0);
+    let root_id = root.id;
+    document.scene.insert(root)?;
+    Ok((document, root_id, variable, mode))
+}
+
+#[test]
+fn conditional_uses_first_matching_branch_and_otherwise() -> Result<(), Box<dyn std::error::Error>>
+{
+    use fanta_doc::{CompareOp, Condition, ConditionalBranch};
+
+    let (document, root, variable, _) =
+        prototype_variable_document(VarValue::Float { value: 1.0 }, Vec::new())?;
+    let mut playback = PlaybackSession::new(&document, Some(root), DVec2::splat(200.0))?;
+    let branch = |value, url: &str| ConditionalBranch {
+        condition: Condition::Compare {
+            variable,
+            op: CompareOp::Equal,
+            value: VarValue::Float { value },
+        },
+        actions: vec![Action::OpenLink { url: url.into() }],
+    };
+    let action = Action::Conditional {
+        branches: vec![branch(1.0, "first"), branch(1.0, "second")],
+        otherwise: vec![Action::OpenLink {
+            url: "fallback".into(),
+        }],
+    };
+    playback.execute(root, &action, None);
+    assert_eq!(playback.take_open_url().as_deref(), Some("first"));
+    playback.set_runtime_variable(variable, VarValue::Float { value: 2.0 })?;
+    playback.execute(root, &action, None);
+    assert_eq!(playback.take_open_url().as_deref(), Some("fallback"));
+    assert!(!playback.condition_matches(
+        root,
+        &Condition::Compare {
+            variable: VariableId::new(),
+            op: CompareOp::NotEqual,
+            value: VarValue::Float { value: 1.0 },
+        }
+    ));
+    assert!(!playback.condition_matches(
+        root,
+        &Condition::Compare {
+            variable,
+            op: CompareOp::NotEqual,
+            value: VarValue::String { value: "2".into() },
+        }
+    ));
+    Ok(())
+}
+
+#[test]
+fn adjust_variable_increments_float() -> Result<(), Box<dyn std::error::Error>> {
+    let (document, root, variable, mode) =
+        prototype_variable_document(VarValue::Float { value: 1.0 }, Vec::new())?;
+    let mut playback = PlaybackSession::new(&document, Some(root), DVec2::splat(200.0))?;
+    assert!(
+        playback
+            .execute(
+                root,
+                &Action::AdjustVariable {
+                    variable,
+                    delta: 2.5
+                },
+                None
+            )
+            .needs_redraw
+    );
+    for delta in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(
+            !playback
+                .execute(root, &Action::AdjustVariable { variable, delta }, None)
+                .needs_redraw
+        );
+    }
+    assert_eq!(
+        playback
+            .runtime_variables()
+            .variable(variable)
+            .and_then(|variable| variable.value_for_mode(mode)),
+        Some(&VarValue::Float { value: 3.5 })
+    );
+    assert!(
+        !playback
+            .execute(root, &Action::ToggleVariable { variable }, None)
+            .needs_redraw
+    );
+    assert!(
+        !playback
+            .execute(root, &Action::CycleVariable { variable }, None)
+            .needs_redraw
+    );
+    Ok(())
+}
+
+#[test]
+fn toggle_variable_flips_boolean() -> Result<(), Box<dyn std::error::Error>> {
+    let (document, root, variable, mode) =
+        prototype_variable_document(VarValue::Boolean { value: false }, Vec::new())?;
+    let mut playback = PlaybackSession::new(&document, Some(root), DVec2::splat(200.0))?;
+    for expected in [true, false] {
+        assert!(
+            playback
+                .execute(root, &Action::ToggleVariable { variable }, None)
+                .needs_redraw
+        );
+        assert_eq!(
+            playback
+                .runtime_variables()
+                .variable(variable)
+                .and_then(|variable| variable.value_for_mode(mode)),
+            Some(&VarValue::Boolean { value: expected })
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn cycle_variable_wraps_enum_options() -> Result<(), Box<dyn std::error::Error>> {
+    let (document, root, variable, mode) = prototype_variable_document(
+        VarValue::Enum {
+            value: "First".into(),
+        },
+        vec!["First".into(), "Second".into()],
+    )?;
+    let mut playback = PlaybackSession::new(&document, Some(root), DVec2::splat(200.0))?;
+    for expected in ["Second", "First"] {
+        assert!(
+            playback
+                .execute(root, &Action::CycleVariable { variable }, None)
+                .needs_redraw
+        );
+        assert_eq!(
+            playback
+                .runtime_variables()
+                .variable(variable)
+                .and_then(|variable| variable.value_for_mode(mode)),
+            Some(&VarValue::Enum {
+                value: expected.into()
+            })
+        );
+    }
+    let (empty, root, variable, _) = prototype_variable_document(
+        VarValue::Enum {
+            value: "Unknown".into(),
+        },
+        Vec::new(),
+    )?;
+    let mut playback = PlaybackSession::new(&empty, Some(root), DVec2::splat(200.0))?;
+    assert!(
+        !playback
+            .execute(root, &Action::CycleVariable { variable }, None)
+            .needs_redraw
+    );
+    Ok(())
+}
+
+#[test]
 fn set_variable_rebinds_a_bound_fill_without_touching_the_doc() {
     // A one-mode collection with a Color variable `bg` = white; a frame whose
     // background fill is bound to `bg`; a click that sets `bg` to red.
@@ -2620,6 +2900,152 @@ fn interactive_variant_document() -> (Doc, NodeId, NodeId, NodeId) {
 }
 
 #[test]
+fn conditional_hover_and_press_variants_remain_transient() -> Result<(), Box<dyn std::error::Error>>
+{
+    use fanta_doc::{Condition, ConditionalBranch};
+
+    let (mut document, root, first, _) = interactive_variant_document();
+    let instance = document.scene.get_mut(first).ok_or("missing instance")?;
+    for reaction in &mut instance.reactions {
+        if matches!(reaction.trigger, Trigger::Hover | Trigger::WhilePressing) {
+            let action = reaction.action.clone();
+            reaction.action = Action::Conditional {
+                branches: vec![ConditionalBranch {
+                    condition: Condition::Any {
+                        conditions: Vec::new(),
+                    },
+                    actions: vec![Action::UpdateVariant {
+                        component: ComponentId::from_u128(800),
+                        variant: "Default".into(),
+                    }],
+                }],
+                otherwise: vec![action],
+            };
+        }
+    }
+    let mut playback = PlaybackSession::new(&document, Some(root), DVec2::new(100.0, 50.0))?;
+    playback.handle_pointer(DVec2::splat(25.0), PointerEvent::Move);
+    assert_eq!(
+        playback.instance_variant_overrides.get(&first),
+        Some(&(ComponentId::from_u128(800), "Hover".into()))
+    );
+    playback.handle_pointer(DVec2::splat(25.0), PointerEvent::Down);
+    assert_eq!(
+        playback.instance_variant_overrides.get(&first),
+        Some(&(ComponentId::from_u128(800), "Pressed".into()))
+    );
+    playback.handle_pointer(DVec2::splat(25.0), PointerEvent::Up);
+    assert_eq!(
+        playback.instance_variant_overrides.get(&first),
+        Some(&(ComponentId::from_u128(800), "Hover".into()))
+    );
+    playback.handle_pointer(DVec2::new(95.0, 45.0), PointerEvent::Move);
+    assert!(!playback.instance_variant_overrides.contains_key(&first));
+    Ok(())
+}
+
+#[test]
+fn conditional_press_navigation_suppresses_the_following_click()
+-> Result<(), Box<dyn std::error::Error>> {
+    use fanta_doc::{Condition, ConditionalBranch};
+
+    let mut document = Doc::new();
+    let mut destination = frame(500.0);
+    let destination_id = destination.id;
+    destination
+        .reactions
+        .push(click(9301, Trigger::Click, Action::Back));
+    document.scene.insert(destination)?;
+    let mut source = frame(0.0);
+    let source_id = source.id;
+    source.reactions.push(click(
+        9302,
+        Trigger::WhilePressing,
+        Action::Conditional {
+            branches: vec![ConditionalBranch {
+                condition: Condition::All {
+                    conditions: Vec::new(),
+                },
+                actions: vec![Action::Navigate { to: destination_id }],
+            }],
+            otherwise: Vec::new(),
+        },
+    ));
+    document.scene.insert(source)?;
+    let mut playback = PlaybackSession::new(&document, Some(source_id), DVec2::splat(200.0))?;
+    let response = playback.handle_pointer(DVec2::splat(100.0), PointerEvent::Down);
+    assert!(response.suppress_click && response.navigated);
+    playback.handle_pointer(DVec2::splat(100.0), PointerEvent::Up);
+    playback.handle_pointer(DVec2::splat(100.0), PointerEvent::Click);
+    assert_eq!(playback.current_frame(), destination_id);
+    Ok(())
+}
+
+#[test]
+fn conditional_press_suppression_uses_the_branch_selected_after_variable_writes()
+-> Result<(), Box<dyn std::error::Error>> {
+    use fanta_doc::{CompareOp, Condition, ConditionalBranch};
+
+    for matching_value in [0.0, 1.0] {
+        let (mut document, source, variable, _) =
+            prototype_variable_document(VarValue::Float { value: 0.0 }, Vec::new())?;
+        let mut destination = frame(500.0);
+        let destination_id = destination.id;
+        destination
+            .reactions
+            .push(click(9401, Trigger::Click, Action::Back));
+        document.scene.insert(destination)?;
+        let mut press = click(
+            9402,
+            Trigger::WhilePressing,
+            Action::AdjustVariable {
+                variable,
+                delta: 1.0,
+            },
+        );
+        press.extra_actions.push(Action::Conditional {
+            branches: vec![ConditionalBranch {
+                condition: Condition::Compare {
+                    variable,
+                    op: CompareOp::Equal,
+                    value: VarValue::Float {
+                        value: matching_value,
+                    },
+                },
+                actions: vec![Action::Navigate { to: destination_id }],
+            }],
+            otherwise: Vec::new(),
+        });
+        let source_node = document
+            .scene
+            .get_mut(source)
+            .ok_or("missing source frame")?;
+        source_node.reactions.push(press);
+        source_node.reactions.push(click(
+            9403,
+            Trigger::Click,
+            Action::OpenLink {
+                url: "clicked".into(),
+            },
+        ));
+        let mut playback = PlaybackSession::new(&document, Some(source), DVec2::splat(200.0))?;
+        let response = playback.handle_pointer(DVec2::splat(100.0), PointerEvent::Down);
+        assert_eq!(response.suppress_click, matching_value == 1.0);
+        assert_eq!(response.navigated, matching_value == 1.0);
+        playback.handle_pointer(DVec2::splat(100.0), PointerEvent::Up);
+        playback.handle_pointer(DVec2::splat(100.0), PointerEvent::Click);
+        if matching_value == 1.0 {
+            assert_eq!(playback.current_frame(), destination_id);
+            assert!(playback.take_open_url().is_none());
+        } else {
+            assert_eq!(playback.current_frame(), source);
+            assert_eq!(playback.take_open_url().as_deref(), Some("clicked"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn hover_and_press_variants_are_instance_local_and_transient() {
     let (doc, frame_id, first_id, _) = interactive_variant_document();
     let mut session = PresentSession::new(&doc, Some(frame_id), DVec2::new(100.0, 50.0)).unwrap();
@@ -3858,6 +4284,56 @@ fn runtime_component_document()
         .clips
         .insert(clip_id, position_clip(clip_id, child_id, 5.0, 25.0));
     Ok((document, root_id, first, second, child_id, clip_id))
+}
+
+#[test]
+fn runtime_component_motion_keeps_its_transform_origin_after_occurrence_mapping()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut document, root, first, second, child, clip_id) = runtime_component_document()?;
+    let clip = document
+        .motion
+        .clips
+        .get_mut(&clip_id)
+        .ok_or("missing clip")?;
+    clip.settings.transform_origins.insert(child, [0.5, 0.5]);
+    let mut rotation = AnimationTrack::new(
+        AnimationTrackId::new(),
+        MotionTarget::new(child, MotionProperty::Rotation),
+    );
+    for (time, value) in [(0, 0.0), (100, std::f64::consts::PI)] {
+        let keyframe = Keyframe::new(KeyframeId::new(), time, ResolvedVarValue::Float { value });
+        rotation.keyframes.insert(keyframe.id, keyframe);
+    }
+    clip.tracks.insert(rotation.id, rotation);
+    let mut player = PresentSession::new_headless(&document, Some(root), DVec2::new(100.0, 50.0))?;
+    let scope = player
+        .occurrences()
+        .into_iter()
+        .find(|occurrence| occurrence.node == first)
+        .ok_or("missing instance scope")?;
+    player.play_clip(clip_id, Some(scope), ClipPlaybackMode::Once)?;
+    player.advance_by(0.1)?;
+    let resolved = player.resolved_layer(root, true);
+    let centers: BTreeMap<_, _> = resolved
+        .occurrences
+        .iter()
+        .filter(|(_, occurrence)| occurrence.node == child)
+        .filter_map(|(identity, occurrence)| {
+            resolved.scene.get(*identity).map(|node| {
+                (
+                    occurrence.instance_path.clone(),
+                    node.transform.transform_point(DVec2::splat(5.0)),
+                )
+            })
+        })
+        .collect();
+    assert!(
+        (centers.get(&vec![first]).ok_or("missing animated child")? - DVec2::new(30.0, 10.0))
+            .length()
+            < 1e-9
+    );
+    assert_eq!(centers.get(&vec![second]), Some(&DVec2::splat(10.0)));
+    Ok(())
 }
 
 #[test]

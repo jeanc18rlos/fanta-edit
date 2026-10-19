@@ -65,8 +65,9 @@ pub use layout::{
     LayoutMode, PrimaryAlign,
 };
 pub use prototype::{
-    Action, Direction, Easing, OverlayPosition, OverlaySettings, PrototypeAnimation, Reaction,
-    Transition, TransitionStyle, Trigger, spring_progress,
+    Action, CompareOp, Condition, ConditionalBranch, Direction, Easing, OverlayPosition,
+    OverlaySettings, PrototypeAnimation, Reaction, Transition, TransitionStyle, Trigger,
+    spring_progress,
 };
 pub use variants::{
     AiArtifactNode, AudioNode, BitmapNode, BooleanBakedGeometry, BooleanNode, BooleanOp, Camera3d,

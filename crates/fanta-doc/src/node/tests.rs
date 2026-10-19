@@ -564,6 +564,49 @@ fn bindings_and_reactions_round_trip_and_skip_when_empty() {
 /// the guarantee that shipping multi-action support does not rewrite (or even
 /// re-noise) documents that never used it.
 #[test]
+fn conditional_and_variable_actions_round_trip_with_nested_conditions()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::{CompareOp, Condition, ConditionalBranch};
+
+    let variable = VariableId::new();
+    let action = Action::Conditional {
+        branches: vec![ConditionalBranch {
+            condition: Condition::All {
+                conditions: vec![Condition::Not {
+                    condition: Box::new(Condition::Any {
+                        conditions: vec![Condition::Compare {
+                            variable,
+                            op: CompareOp::GreaterOrEqual,
+                            value: VarValue::Float { value: 3.0 },
+                        }],
+                    }),
+                }],
+            },
+            actions: vec![Action::AdjustVariable {
+                variable,
+                delta: 1.0,
+            }],
+        }],
+        otherwise: vec![
+            Action::ToggleVariable { variable },
+            Action::CycleVariable { variable },
+        ],
+    };
+    let encoded = serde_json::to_value(&action)?;
+    assert_eq!(encoded["kind"], "conditional");
+    assert_eq!(
+        encoded["branches"][0]["actions"][0]["kind"],
+        "adjust_variable"
+    );
+    assert_eq!(encoded["otherwise"][0]["kind"], "toggle_variable");
+    assert_eq!(encoded["otherwise"][1]["kind"], "cycle_variable");
+    assert_eq!(serde_json::from_value::<Action>(encoded)?, action);
+    assert!(action.references_variable(variable));
+    assert!(!action.references_variable(VariableId::new()));
+    Ok(())
+}
+
+#[test]
 fn reaction_without_extra_actions_round_trips_byte_identical() {
     // The exact JSON envelope a pre-multi-action document stores (field order
     // is declaration order; `serde_json` preserves it). The id is interpolated

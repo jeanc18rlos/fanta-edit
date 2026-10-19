@@ -97,15 +97,15 @@ pub use motion_spec::{
 pub use node::fields::known_fields;
 pub use node::{
     Action, AiArtifactNode, AudioNode, AutoLayout, AxisSizing, BitmapNode, BooleanBakedGeometry,
-    BooleanNode, BooleanOp, Camera3d, CanvasNode, ConstraintH, ConstraintV, Constraints,
-    CounterAlign, DerivedOverride, Direction, Easing, EmbedNode, FontVariation, GenerationStatus,
-    GridAlign, GridCell, GridLayout, GridTrack, GroupNode, InstanceNode, LayoutChild, LayoutMode,
-    Link, MaskType, Model3dNode, NodeData, NodeFlags, NodeGraph, NodeGraphNode, OverlayPosition,
-    OverlaySettings, Override, OverridePath, OverrideValue, ParametricShape, PrimaryAlign,
-    PrototypeAnimation, Reaction, ScrollBehavior, ScrollDirection, TextAlign, TextAutoResize,
-    TextNode, TextPathAlignment, TextPathDirection, TextPathNode, TextPathSide, TextPathStart,
-    TextStyle, TextStyleRun, Transition, TransitionStyle, Trigger, VAlign, VectorNode, VideoNode,
-    WorkflowNode, spring_progress,
+    BooleanNode, BooleanOp, Camera3d, CanvasNode, CompareOp, Condition, ConditionalBranch,
+    ConstraintH, ConstraintV, Constraints, CounterAlign, DerivedOverride, Direction, Easing,
+    EmbedNode, FontVariation, GenerationStatus, GridAlign, GridCell, GridLayout, GridTrack,
+    GroupNode, InstanceNode, LayoutChild, LayoutMode, Link, MaskType, Model3dNode, NodeData,
+    NodeFlags, NodeGraph, NodeGraphNode, OverlayPosition, OverlaySettings, Override, OverridePath,
+    OverrideValue, ParametricShape, PrimaryAlign, PrototypeAnimation, Reaction, ScrollBehavior,
+    ScrollDirection, TextAlign, TextAutoResize, TextNode, TextPathAlignment, TextPathDirection,
+    TextPathNode, TextPathSide, TextPathStart, TextStyle, TextStyleRun, Transition,
+    TransitionStyle, Trigger, VAlign, VectorNode, VideoNode, WorkflowNode, spring_progress,
 };
 pub use op::{ModeScope, OpCtx, Operation};
 pub use path::{

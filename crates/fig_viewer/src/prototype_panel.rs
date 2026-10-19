@@ -1,8 +1,9 @@
 use editor::{Editor, EditorEvent, actions::SelectAll};
 use fanta_doc::{
-    Action, AnimationClipId, Color as FantaColor, ComponentId, Direction, Doc, Easing, NodeData,
-    NodeId, Operation, OverlayPosition, OverlaySettings, PrototypeAnimation, Reaction, ReactionId,
-    Transition, TransitionStyle, Trigger, VarValue, VariableId, VariableType,
+    Action, AnimationClipId, Color as FantaColor, CompareOp, ComponentId, Condition,
+    ConditionalBranch, Direction, Doc, Easing, NodeData, NodeId, Operation, OverlayPosition,
+    OverlaySettings, PrototypeAnimation, Reaction, ReactionId, Transition, TransitionStyle,
+    Trigger, VarValue, VariableId, VariableType,
 };
 use gpui::{
     AnyElement, App, Context, ElementId, Entity, EventEmitter, FocusHandle, Focusable,
@@ -31,6 +32,8 @@ struct PrototypeTarget {
 struct PrototypeVariable {
     id: VariableId,
     name: SharedString,
+    ty: VariableType,
+    has_options: bool,
 }
 
 #[derive(Clone)]
@@ -118,17 +121,25 @@ enum ActionChoice {
     OpenOverlay,
     ScrollTo,
     SetVariable,
+    AdjustVariable,
+    ToggleVariable,
+    CycleVariable,
+    Conditional,
     UpdateVariant,
     OpenLink,
     Back,
     Close,
 }
 
-const ACTION_CHOICES: [(ActionChoice, &str); 8] = [
+const ACTION_CHOICES: [(ActionChoice, &str); 12] = [
     (ActionChoice::Navigate, "Navigate to"),
     (ActionChoice::OpenOverlay, "Open overlay"),
     (ActionChoice::ScrollTo, "Scroll to"),
     (ActionChoice::SetVariable, "Set variable"),
+    (ActionChoice::AdjustVariable, "Adjust number"),
+    (ActionChoice::ToggleVariable, "Toggle boolean"),
+    (ActionChoice::CycleVariable, "Cycle enum option"),
+    (ActionChoice::Conditional, "Conditional"),
     (ActionChoice::UpdateVariant, "Change variant"),
     (ActionChoice::OpenLink, "Open link"),
     (ActionChoice::Back, "Back"),
@@ -142,6 +153,10 @@ impl ActionChoice {
             Action::OpenOverlay { .. } => Some(Self::OpenOverlay),
             Action::ScrollTo { .. } => Some(Self::ScrollTo),
             Action::SetVariable { .. } => Some(Self::SetVariable),
+            Action::AdjustVariable { .. } => Some(Self::AdjustVariable),
+            Action::ToggleVariable { .. } => Some(Self::ToggleVariable),
+            Action::CycleVariable { .. } => Some(Self::CycleVariable),
+            Action::Conditional { .. } => Some(Self::Conditional),
             Action::UpdateVariant { .. } => Some(Self::UpdateVariant),
             Action::OpenLink { .. } => Some(Self::OpenLink),
             Action::Back => Some(Self::Back),
@@ -201,11 +216,28 @@ enum ParameterKind {
     AnimationDelay,
     Keys,
     VariableValue,
+    VariableDelta,
+    ConditionValue(usize),
     Variant,
     Url,
     OverlayOffsetX,
     OverlayOffsetY,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConditionalActionSlot {
+    Branch(usize),
+    Otherwise,
+}
+
+const COMPARISON_CHOICES: [(CompareOp, &str); 6] = [
+    (CompareOp::Equal, "Equals"),
+    (CompareOp::NotEqual, "Does not equal"),
+    (CompareOp::Less, "Less than"),
+    (CompareOp::LessOrEqual, "At most"),
+    (CompareOp::Greater, "Greater than"),
+    (CompareOp::GreaterOrEqual, "At least"),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReactionParameter {
@@ -778,8 +810,8 @@ impl FantaPrototypePanel {
         build: impl FnOnce(&Doc) -> Option<Operation>,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.editing_parameter.is_some() {
-            self.finish_parameter_edit(cx);
+        if self.editing_parameter.is_some() && !self.commit_parameter_edit_value(cx) {
+            return false;
         }
         let operation = {
             let item = self.item.read(cx);
@@ -862,9 +894,10 @@ impl FantaPrototypePanel {
     ) {
         self.apply_operation(
             |doc| {
-                let value = variable_literal_default(doc, variable)?;
+                let current = &reaction_by_id(doc, node, reaction)?.action;
+                let action = variable_action_with_variable(doc, current, variable)?;
                 set_reaction_operation(doc, node, reaction, |reaction| {
-                    reaction.action = Action::SetVariable { variable, value };
+                    reaction.action = action;
                 })
             },
             cx,
@@ -990,6 +1023,9 @@ impl FantaPrototypePanel {
         choice: TransitionChoice,
         cx: &mut Context<Self>,
     ) {
+        // A transition choice ends the parameter edit so its undo step cannot
+        // capture a valid preview left behind by an invalid draft.
+        self.finish_parameter_edit(cx);
         self.apply_operation(
             |doc| {
                 set_reaction_operation(doc, node, reaction, |reaction| {
@@ -1143,6 +1179,474 @@ impl FantaPrototypePanel {
             .into_any_element()
     }
 
+    fn prepare_conditional_edit(
+        &mut self,
+        node: NodeId,
+        expected: &Reaction,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.commit_parameter_edit_value(cx) {
+            return false;
+        }
+        let unchanged = self.item.read(cx).document().is_some_and(|document| {
+            reaction_by_id(&document.doc, node, expected.id) == Some(expected)
+        });
+        if !unchanged {
+            self.parameter_error =
+                Some("The interaction changed elsewhere; reopen the control to continue".into());
+            cx.notify();
+        }
+        unchanged
+    }
+
+    fn set_condition_variable(
+        &mut self,
+        node: NodeId,
+        reaction: ReactionId,
+        index: usize,
+        variable: VariableId,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_operation(
+            |doc| {
+                let Action::Conditional { branches, .. } =
+                    &reaction_by_id(doc, node, reaction)?.action
+                else {
+                    return None;
+                };
+                let Condition::Compare {
+                    variable: current, ..
+                } = &branches.get(index)?.condition
+                else {
+                    return None;
+                };
+                let ty = doc.variables.variables.get(&variable)?.ty;
+                if *current == variable || ty == VariableType::Typography {
+                    return None;
+                }
+                let value = variable_literal_default(doc, variable)?;
+                set_reaction_operation(doc, node, reaction, |reaction| {
+                    let Action::Conditional { branches, .. } = &mut reaction.action else {
+                        return;
+                    };
+                    let Some(branch) = branches.get_mut(index) else {
+                        return;
+                    };
+                    let Condition::Compare {
+                        variable: current,
+                        op,
+                        value: current_value,
+                    } = &mut branch.condition
+                    else {
+                        return;
+                    };
+                    *current = variable;
+                    *current_value = value;
+                    if ty != VariableType::Float
+                        && !matches!(op, CompareOp::Equal | CompareOp::NotEqual)
+                    {
+                        *op = CompareOp::Equal;
+                    }
+                })
+            },
+            cx,
+        );
+    }
+
+    fn set_condition_comparison(
+        &mut self,
+        node: NodeId,
+        reaction: ReactionId,
+        index: usize,
+        comparison: CompareOp,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_operation(
+            |doc| {
+                let Action::Conditional { branches, .. } =
+                    &reaction_by_id(doc, node, reaction)?.action
+                else {
+                    return None;
+                };
+                let Condition::Compare { variable, .. } = &branches.get(index)?.condition else {
+                    return None;
+                };
+                let ty = doc.variables.variables.get(variable)?.ty;
+                if ty != VariableType::Float
+                    && !matches!(comparison, CompareOp::Equal | CompareOp::NotEqual)
+                {
+                    return None;
+                }
+                set_reaction_operation(doc, node, reaction, |reaction| {
+                    let Action::Conditional { branches, .. } = &mut reaction.action else {
+                        return;
+                    };
+                    let Some(branch) = branches.get_mut(index) else {
+                        return;
+                    };
+                    if let Condition::Compare { op, .. } = &mut branch.condition {
+                        *op = comparison;
+                    }
+                })
+            },
+            cx,
+        );
+    }
+
+    fn set_conditional_action(
+        &mut self,
+        node: NodeId,
+        reaction: ReactionId,
+        slot: ConditionalActionSlot,
+        choice: Option<ActionChoice>,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_operation(
+            |doc| {
+                let actions =
+                    conditional_actions(&reaction_by_id(doc, node, reaction)?.action, slot)?;
+                if (choice.is_none() && actions.len() > 1)
+                    || actions.first().and_then(ActionChoice::from_action) == choice
+                {
+                    return None;
+                }
+                let action = match choice {
+                    Some(choice) => Some(action_for_choice(doc, node, choice)?),
+                    None => None,
+                };
+                set_reaction_operation(doc, node, reaction, |reaction| {
+                    let Some(actions) = conditional_actions_mut(&mut reaction.action, slot) else {
+                        return;
+                    };
+                    match action {
+                        Some(action) => match actions.first_mut() {
+                            Some(current) => *current = action,
+                            None => actions.push(action),
+                        },
+                        None => actions.clear(),
+                    }
+                })
+            },
+            cx,
+        );
+    }
+
+    fn set_conditional_target(
+        &mut self,
+        node: NodeId,
+        reaction: ReactionId,
+        slot: ConditionalActionSlot,
+        target: NodeId,
+        cx: &mut Context<Self>,
+    ) {
+        self.apply_operation(
+            |doc| {
+                let action =
+                    conditional_actions(&reaction_by_id(doc, node, reaction)?.action, slot)?
+                        .first()?;
+                let targets = match action {
+                    Action::ScrollTo { .. } => prototype_scroll_targets(doc, node),
+                    Action::Navigate { .. } | Action::OpenOverlay { .. } => {
+                        prototype_frame_targets(doc, node)
+                    }
+                    _ => return None,
+                };
+                if !targets.iter().any(|candidate| candidate.id == target) {
+                    return None;
+                }
+                set_reaction_operation(doc, node, reaction, |reaction| {
+                    let Some(actions) = conditional_actions_mut(&mut reaction.action, slot) else {
+                        return;
+                    };
+                    match actions.first_mut() {
+                        Some(Action::Navigate { to }) => *to = target,
+                        Some(Action::OpenOverlay { frame, .. }) => *frame = target,
+                        Some(Action::ScrollTo { target: current }) => *current = target,
+                        _ => {}
+                    }
+                })
+            },
+            cx,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_conditional_dropdown<T: Clone + PartialEq + 'static>(
+        &self,
+        key: &'static str,
+        node: NodeId,
+        reaction: &Reaction,
+        slot: ConditionalActionSlot,
+        label: SharedString,
+        current: Option<T>,
+        options: Vec<(SharedString, T)>,
+        editable: bool,
+        apply: impl Fn(&mut Self, T, &mut Context<Self>) + Clone + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let panel = cx.weak_entity();
+        let reaction_id = reaction.id;
+        let expected = reaction.clone();
+        let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
+            for (name, value) in &options {
+                let panel = panel.clone();
+                let apply = apply.clone();
+                let selected = current.as_ref() == Some(value);
+                let value = value.clone();
+                let expected = expected.clone();
+                menu.push_item(
+                    ContextMenuEntry::new(name.clone())
+                        .toggleable(IconPosition::End, selected)
+                        .handler(move |_, cx| {
+                            panel
+                                .update(cx, |panel, cx| {
+                                    if panel.prepare_conditional_edit(node, &expected, cx) {
+                                        apply(panel, value.clone(), cx);
+                                    }
+                                })
+                                .log_err();
+                        }),
+                );
+            }
+            menu
+        });
+        DropdownMenu::new(conditional_element_id(key, reaction_id, slot), label, menu)
+            .style(DropdownStyle::Outlined)
+            .trigger_size(ButtonSize::Compact)
+            .full_width(true)
+            .disabled(!editable)
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_conditional_branch(
+        &self,
+        node: NodeId,
+        reaction: &Reaction,
+        index: usize,
+        branch: &ConditionalBranch,
+        variables: &[PrototypeVariable],
+        frame_targets: &[PrototypeTarget],
+        scroll_targets: &[PrototypeTarget],
+        editable: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let reaction_id = reaction.id;
+        let slot = ConditionalActionSlot::Branch(index);
+        let mut content = v_flex().gap_2().child(
+            Label::new(if index == 0 {
+                "If".to_owned()
+            } else {
+                format!("Else if {}", index + 1)
+            })
+            .size(LabelSize::Small),
+        );
+        match &branch.condition {
+            Condition::Compare {
+                variable,
+                op,
+                value,
+            } => {
+                let definition = variables.iter().find(|candidate| candidate.id == *variable);
+                let label = definition
+                    .map(|variable| variable.name.clone())
+                    .unwrap_or_else(|| "Missing variable".into());
+                let options = variables
+                    .iter()
+                    .filter(|variable| variable.ty != VariableType::Typography)
+                    .map(|variable| (variable.name.clone(), variable.id))
+                    .collect();
+                content = content.child(self.render_labeled_row(
+                    "Variable",
+                    self.render_conditional_dropdown(
+                        "fanta-prototype-condition-variable",
+                        node,
+                        reaction,
+                        slot,
+                        label,
+                        Some(*variable),
+                        options,
+                        editable,
+                        move |panel, variable, cx| {
+                            panel.set_condition_variable(node, reaction_id, index, variable, cx)
+                        },
+                        window,
+                        cx,
+                    ),
+                ));
+                let label = COMPARISON_CHOICES
+                    .iter()
+                    .find(|(candidate, _)| candidate == op)
+                    .map(|(_, label)| *label)
+                    .unwrap_or("Equals")
+                    .into();
+                let numeric = definition.is_some_and(|variable| variable.ty == VariableType::Float);
+                let comparisons = COMPARISON_CHOICES
+                    .iter()
+                    .filter(|(comparison, _)| {
+                        numeric || matches!(comparison, CompareOp::Equal | CompareOp::NotEqual)
+                    })
+                    .map(|(comparison, label)| ((*label).into(), *comparison))
+                    .collect();
+                content = content.child(self.render_labeled_row(
+                    "Comparison",
+                    self.render_conditional_dropdown(
+                        "fanta-prototype-condition-comparison",
+                        node,
+                        reaction,
+                        slot,
+                        label,
+                        Some(*op),
+                        comparisons,
+                        editable,
+                        move |panel, comparison, cx| {
+                            panel.set_condition_comparison(node, reaction_id, index, comparison, cx)
+                        },
+                        window,
+                        cx,
+                    ),
+                ));
+                let (text, value_editable) = variable_value_text(value);
+                content = content.child(self.render_labeled_row(
+                    "Value",
+                    self.render_inline_parameter(
+                        index,
+                        node,
+                        reaction_id,
+                        ParameterKind::ConditionValue(index),
+                        text,
+                        "Enter value",
+                        editable && value_editable,
+                        cx,
+                    ),
+                ));
+            }
+            condition => {
+                let label = match condition {
+                    Condition::All { conditions } => {
+                        format!("All of {} conditions", conditions.len())
+                    }
+                    Condition::Any { conditions } => {
+                        format!("Any of {} conditions", conditions.len())
+                    }
+                    Condition::Not { .. } => "Negated condition".to_owned(),
+                    Condition::Compare { .. } => "Variable comparison".to_owned(),
+                };
+                content = content.child(Label::new(label).size(LabelSize::Small));
+            }
+        }
+        content
+            .child(self.render_conditional_actions(
+                node,
+                reaction,
+                slot,
+                &branch.actions,
+                frame_targets,
+                scroll_targets,
+                editable,
+                window,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_conditional_actions(
+        &self,
+        node: NodeId,
+        reaction: &Reaction,
+        slot: ConditionalActionSlot,
+        actions: &[Action],
+        frame_targets: &[PrototypeTarget],
+        scroll_targets: &[PrototypeTarget],
+        editable: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let reaction_id = reaction.id;
+        let current = actions.first();
+        let mut choices = Vec::new();
+        if actions.len() <= 1 {
+            choices.push(("Do nothing".into(), None));
+        }
+        for (choice, label) in ACTION_CHOICES {
+            let available = match choice {
+                ActionChoice::Navigate | ActionChoice::OpenOverlay => !frame_targets.is_empty(),
+                ActionChoice::ScrollTo => !scroll_targets.is_empty(),
+                ActionChoice::Back | ActionChoice::Close => true,
+                _ => false,
+            };
+            if available {
+                choices.push((label.into(), Some(choice)));
+            }
+        }
+        let label = current.map(action_label).unwrap_or("Do nothing").into();
+        let mut content = v_flex().gap_2().child(self.render_labeled_row(
+            if slot == ConditionalActionSlot::Otherwise {
+                "Otherwise"
+            } else {
+                "Then"
+            },
+            self.render_conditional_dropdown(
+                "fanta-prototype-conditional-action",
+                node,
+                reaction,
+                slot,
+                label,
+                Some(current.and_then(ActionChoice::from_action)),
+                choices,
+                editable,
+                move |panel, choice, cx| {
+                    panel.set_conditional_action(node, reaction_id, slot, choice, cx)
+                },
+                window,
+                cx,
+            ),
+        ));
+        if let Some(target) = current.and_then(action_target) {
+            let targets = if matches!(current, Some(Action::ScrollTo { .. })) {
+                scroll_targets
+            } else {
+                frame_targets
+            };
+            let label = targets
+                .iter()
+                .find(|candidate| candidate.id == target)
+                .map(|target| target.name.clone())
+                .unwrap_or_else(|| "Missing target".into());
+            let choices = targets
+                .iter()
+                .map(|target| (target.name.clone(), target.id))
+                .collect();
+            content = content.child(self.render_labeled_row(
+                "Destination",
+                self.render_conditional_dropdown(
+                    "fanta-prototype-conditional-target",
+                    node,
+                    reaction,
+                    slot,
+                    label,
+                    Some(target),
+                    choices,
+                    editable,
+                    move |panel, target, cx| {
+                        panel.set_conditional_target(node, reaction_id, slot, target, cx)
+                    },
+                    window,
+                    cx,
+                ),
+            ));
+        }
+        if actions.len() > 1 {
+            content = content.child(
+                Label::new(format!("{} more actions", actions.len() - 1)).size(LabelSize::XSmall),
+            );
+        }
+        content.into_any_element()
+    }
+
     fn render_target_dropdown(
         &self,
         _index: usize,
@@ -1280,10 +1784,7 @@ impl FantaPrototypePanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let Action::SetVariable { variable, .. } = &reaction.action else {
-            return None;
-        };
-        let current = *variable;
+        let current = action_variable(&reaction.action)?;
         let label = variables
             .iter()
             .find(|variable| variable.id == current)
@@ -1291,7 +1792,16 @@ impl FantaPrototypePanel {
             .unwrap_or_else(|| "Missing variable".into());
         let panel = cx.weak_entity();
         let reaction_id = reaction.id;
-        let choices = variables.to_vec();
+        let choices: Vec<_> = variables
+            .iter()
+            .filter(|variable| {
+                variable_type_supports_action(&reaction.action, variable.ty)
+                    && (!matches!(reaction.action, Action::CycleVariable { .. })
+                        || variable.has_options)
+            })
+            .cloned()
+            .collect();
+        let choices_empty = choices.is_empty();
         let menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
             for variable in &choices {
                 let panel = panel.clone();
@@ -1319,7 +1829,7 @@ impl FantaPrototypePanel {
             .style(DropdownStyle::Outlined)
             .trigger_size(ButtonSize::Compact)
             .full_width(true)
-            .disabled(!editable || variables.is_empty())
+            .disabled(!editable || choices_empty)
             .aria_label("Prototype variable")
             .into_any_element(),
         )
@@ -1397,12 +1907,11 @@ impl FantaPrototypePanel {
             reaction,
             kind,
         };
-        let key = parameter_key(kind);
         if self.editing_parameter == Some(parameter)
             && let Some(editor) = self.parameter_editor.as_ref()
         {
             return div()
-                .id(reaction_element_id(key, reaction))
+                .id(parameter_element_id(kind, reaction))
                 .h(px(28.0))
                 .w_full()
                 .px_1()
@@ -1418,7 +1927,7 @@ impl FantaPrototypePanel {
         } else {
             current.clone().into()
         };
-        Button::new(reaction_element_id(key, reaction), display)
+        Button::new(parameter_element_id(kind, reaction), display)
             .style(ButtonStyle::Subtle)
             .size(ButtonSize::Compact)
             .full_width()
@@ -1617,6 +2126,52 @@ impl FantaPrototypePanel {
                     editable && value_editable,
                     cx,
                 ),
+            ));
+        }
+        if let Action::AdjustVariable { delta, .. } = &reaction.action {
+            card = card.child(self.render_labeled_row(
+                "Amount",
+                self.render_inline_parameter(
+                    index,
+                    node,
+                    reaction.id,
+                    ParameterKind::VariableDelta,
+                    format_number(*delta),
+                    "1",
+                    editable,
+                    cx,
+                ),
+            ));
+        }
+        if let Action::Conditional {
+            branches,
+            otherwise,
+        } = &reaction.action
+        {
+            for (branch_index, branch) in branches.iter().enumerate() {
+                card = card.child(self.render_conditional_branch(
+                    node,
+                    reaction,
+                    branch_index,
+                    branch,
+                    variables,
+                    frame_targets,
+                    scroll_targets,
+                    editable,
+                    window,
+                    cx,
+                ));
+            }
+            card = card.child(self.render_conditional_actions(
+                node,
+                reaction,
+                ConditionalActionSlot::Otherwise,
+                otherwise,
+                frame_targets,
+                scroll_targets,
+                editable,
+                window,
+                cx,
             ));
         }
         if let Some(component) =
@@ -2039,6 +2594,52 @@ fn action_for_choice(doc: &Doc, node: NodeId, choice: ActionChoice) -> Option<Ac
                 value: variable_literal_default(doc, variable.id)?,
             })
         }
+        ActionChoice::AdjustVariable
+        | ActionChoice::ToggleVariable
+        | ActionChoice::CycleVariable => {
+            let ty = match choice {
+                ActionChoice::AdjustVariable => VariableType::Float,
+                ActionChoice::ToggleVariable => VariableType::Boolean,
+                _ => VariableType::Enum,
+            };
+            let variable = doc.variables.variables.values().find(|variable| {
+                variable.ty == ty && (ty != VariableType::Enum || !variable.options.is_empty())
+            })?;
+            Some(match choice {
+                ActionChoice::AdjustVariable => Action::AdjustVariable {
+                    variable: variable.id,
+                    delta: 1.0,
+                },
+                ActionChoice::ToggleVariable => Action::ToggleVariable {
+                    variable: variable.id,
+                },
+                _ => Action::CycleVariable {
+                    variable: variable.id,
+                },
+            })
+        }
+        ActionChoice::Conditional => {
+            let variable = doc
+                .variables
+                .variables
+                .values()
+                .find(|variable| variable.ty != VariableType::Typography)?;
+            let action = prototype_frame_targets(doc, node)
+                .first()
+                .map(|target| Action::Navigate { to: target.id })
+                .unwrap_or(Action::Back);
+            Some(Action::Conditional {
+                branches: vec![ConditionalBranch {
+                    condition: Condition::Compare {
+                        variable: variable.id,
+                        op: CompareOp::Equal,
+                        value: variable_literal_default(doc, variable.id)?,
+                    },
+                    actions: vec![action],
+                }],
+                otherwise: Vec::new(),
+            })
+        }
         ActionChoice::UpdateVariant => {
             let component = doc.components.sets.keys().next().copied().or_else(|| {
                 doc.components
@@ -2092,6 +2693,8 @@ fn prototype_variables(doc: &Doc) -> Vec<PrototypeVariable> {
             PrototypeVariable {
                 id: variable.id,
                 name: name.into(),
+                ty: variable.ty,
+                has_options: !variable.options.is_empty(),
             }
         })
         .collect()
@@ -2273,6 +2876,33 @@ fn parameter_reaction_from_text(
             };
             *value = parse_variable_literal(doc, *variable, text)?;
         }
+        ParameterKind::VariableDelta => {
+            let delta = text
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .ok_or_else(|| "Enter a finite amount to add or subtract".to_owned())?;
+            let Action::AdjustVariable { delta: current, .. } = &mut reaction.action else {
+                return Err("This interaction no longer adjusts a number".to_owned());
+            };
+            *current = delta;
+        }
+        ParameterKind::ConditionValue(index) => {
+            let Action::Conditional { branches, .. } = &mut reaction.action else {
+                return Err("This interaction no longer uses a condition".to_owned());
+            };
+            let branch = branches
+                .get_mut(index)
+                .ok_or_else(|| "This condition no longer exists".to_owned())?;
+            let Condition::Compare {
+                variable, value, ..
+            } = &mut branch.condition
+            else {
+                return Err("This condition is not a variable comparison".to_owned());
+            };
+            *value = parse_variable_literal(doc, *variable, text)?;
+        }
         ParameterKind::Variant => {
             let variant = text.trim();
             if variant.is_empty() {
@@ -2407,10 +3037,108 @@ fn parameter_key(kind: ParameterKind) -> &'static str {
         ParameterKind::AnimationDelay => "fanta-prototype-animation-delay",
         ParameterKind::Keys => "fanta-prototype-keys",
         ParameterKind::VariableValue => "fanta-prototype-variable-value",
+        ParameterKind::VariableDelta => "fanta-prototype-variable-delta",
+        ParameterKind::ConditionValue(_) => "fanta-prototype-condition-value",
         ParameterKind::Variant => "fanta-prototype-variant",
         ParameterKind::Url => "fanta-prototype-url",
         ParameterKind::OverlayOffsetX => "fanta-prototype-overlay-offset-x",
         ParameterKind::OverlayOffsetY => "fanta-prototype-overlay-offset-y",
+    }
+}
+
+fn parameter_element_id(kind: ParameterKind, reaction: ReactionId) -> ElementId {
+    match kind {
+        ParameterKind::ConditionValue(index) => conditional_element_id(
+            parameter_key(kind),
+            reaction,
+            ConditionalActionSlot::Branch(index),
+        ),
+        _ => reaction_element_id(parameter_key(kind), reaction),
+    }
+}
+
+fn conditional_element_id(
+    key: &'static str,
+    reaction: ReactionId,
+    slot: ConditionalActionSlot,
+) -> ElementId {
+    (ElementId::from(key), format!("{reaction}-{slot:?}")).into()
+}
+
+fn action_variable(action: &Action) -> Option<VariableId> {
+    match action {
+        Action::SetVariable { variable, .. }
+        | Action::AdjustVariable { variable, .. }
+        | Action::ToggleVariable { variable }
+        | Action::CycleVariable { variable } => Some(*variable),
+        _ => None,
+    }
+}
+
+fn variable_type_supports_action(action: &Action, ty: VariableType) -> bool {
+    match action {
+        Action::SetVariable { .. } => ty != VariableType::Typography,
+        Action::AdjustVariable { .. } => ty == VariableType::Float,
+        Action::ToggleVariable { .. } => ty == VariableType::Boolean,
+        Action::CycleVariable { .. } => ty == VariableType::Enum,
+        _ => false,
+    }
+}
+
+fn variable_action_with_variable(
+    doc: &Doc,
+    action: &Action,
+    variable: VariableId,
+) -> Option<Action> {
+    let definition = doc.variables.variables.get(&variable)?;
+    if !variable_type_supports_action(action, definition.ty) {
+        return None;
+    }
+    Some(match action {
+        Action::SetVariable { .. } => Action::SetVariable {
+            variable,
+            value: variable_literal_default(doc, variable)?,
+        },
+        Action::AdjustVariable { delta, .. } => Action::AdjustVariable {
+            variable,
+            delta: *delta,
+        },
+        Action::ToggleVariable { .. } => Action::ToggleVariable { variable },
+        Action::CycleVariable { .. } if !definition.options.is_empty() => {
+            Action::CycleVariable { variable }
+        }
+        _ => return None,
+    })
+}
+
+fn conditional_actions(action: &Action, slot: ConditionalActionSlot) -> Option<&[Action]> {
+    let Action::Conditional {
+        branches,
+        otherwise,
+    } = action
+    else {
+        return None;
+    };
+    match slot {
+        ConditionalActionSlot::Branch(index) => Some(&branches.get(index)?.actions),
+        ConditionalActionSlot::Otherwise => Some(otherwise),
+    }
+}
+
+fn conditional_actions_mut(
+    action: &mut Action,
+    slot: ConditionalActionSlot,
+) -> Option<&mut Vec<Action>> {
+    let Action::Conditional {
+        branches,
+        otherwise,
+    } = action
+    else {
+        return None;
+    };
+    match slot {
+        ConditionalActionSlot::Branch(index) => Some(&mut branches.get_mut(index)?.actions),
+        ConditionalActionSlot::Otherwise => Some(otherwise),
     }
 }
 
@@ -2655,6 +3383,10 @@ fn action_label(action: &Action) -> &'static str {
         Action::OpenOverlay { .. } => "Open overlay",
         Action::ScrollTo { .. } => "Scroll to",
         Action::SetVariable { .. } => "Set variable",
+        Action::AdjustVariable { .. } => "Adjust number",
+        Action::ToggleVariable { .. } => "Toggle boolean",
+        Action::CycleVariable { .. } => "Cycle enum option",
+        Action::Conditional { .. } => "Conditional",
         Action::UpdateVariant { .. } => "Change variant",
         Action::OpenLink { .. } => "Open link",
     }
@@ -3030,6 +3762,10 @@ mod tests {
                 ActionChoice::OpenOverlay,
                 ActionChoice::ScrollTo,
                 ActionChoice::SetVariable,
+                ActionChoice::AdjustVariable,
+                ActionChoice::ToggleVariable,
+                ActionChoice::CycleVariable,
+                ActionChoice::Conditional,
                 ActionChoice::UpdateVariant,
             ]
         );
@@ -3344,6 +4080,347 @@ mod tests {
             action_for_choice(&doc, first, ActionChoice::OpenLink),
             Some(Action::OpenLink { url: String::new() })
         );
+    }
+
+    #[gpui::test]
+    async fn conditional_controls_preserve_settings_stale_branches_and_invalid_drafts(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let (mut doc, first, second) = document_with_two_frames();
+        let variable = add_float_variable(&mut doc, 1.0);
+        let baseline = Reaction {
+            id: ReactionId::new(),
+            trigger: Trigger::Click,
+            action: Action::Conditional {
+                branches: vec![ConditionalBranch {
+                    condition: Condition::Compare {
+                        variable,
+                        op: CompareOp::Greater,
+                        value: VarValue::Float { value: 8.0 },
+                    },
+                    actions: vec![
+                        Action::OpenOverlay {
+                            frame: second,
+                            overlay: OverlaySettings {
+                                position: OverlayPosition::Manual {
+                                    offset: [15.0, 25.0],
+                                },
+                                ..default_overlay_settings()
+                            },
+                        },
+                        Action::Back,
+                    ],
+                }],
+                otherwise: vec![Action::Close],
+            },
+            extra_actions: vec![Action::AdjustVariable {
+                variable,
+                delta: 1.0,
+            }],
+            transition: None,
+            animation: None,
+        };
+        doc.apply(Operation::AddReaction {
+            node: first,
+            reaction: baseline.clone(),
+        })
+        .expect("add conditional reaction");
+        doc.history = Default::default();
+        let project = Project::test(FakeFs::new(cx.executor()), [], cx).await;
+        let item = ready_item_for_test(
+            &project,
+            PathBuf::from("/tmp/ConditionalControlPreservation.fanta"),
+            doc,
+            cx,
+        );
+        let (panel, visual) = cx.add_window_view({
+            let item = item.clone();
+            move |_, cx| FantaPrototypePanel::new(item, cx)
+        });
+        panel.update(visual, |panel, cx| {
+            panel.set_condition_variable(first, baseline.id, 0, variable, cx);
+            panel.set_conditional_action(
+                first,
+                baseline.id,
+                ConditionalActionSlot::Branch(0),
+                Some(ActionChoice::OpenOverlay),
+                cx,
+            );
+            panel.set_conditional_action(
+                first,
+                baseline.id,
+                ConditionalActionSlot::Branch(0),
+                None,
+                cx,
+            );
+        });
+        item.read_with(visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(reaction_by_id(doc, first, baseline.id), Some(&baseline));
+            assert_eq!(
+                doc.history.undo_depth(),
+                0,
+                "reselecting current settings keeps values and action tails"
+            );
+        });
+        item.update(visual, |item, cx| {
+            let operation = set_reaction_operation(
+                item.doc().expect("document"),
+                first,
+                baseline.id,
+                |reaction| {
+                    if let Action::Conditional { branches, .. } = &mut reaction.action {
+                        branches.insert(
+                            0,
+                            ConditionalBranch {
+                                condition: Condition::All {
+                                    conditions: Vec::new(),
+                                },
+                                actions: vec![Action::Back],
+                            },
+                        );
+                    }
+                },
+            )
+            .expect("insert branch elsewhere");
+            item.apply(operation, cx)
+                .expect("apply concurrent branch insertion");
+        });
+        panel.update(visual, |panel, cx| {
+            assert!(
+                !panel.prepare_conditional_edit(first, &baseline, cx),
+                "a menu for an old branch index must refuse the changed reaction"
+            );
+        });
+        item.read_with(visual, |item, _| {
+            let doc = item.doc().expect("document");
+            let Action::Conditional { branches, .. } = &reaction_by_id(doc, first, baseline.id)
+                .expect("reaction")
+                .action
+            else {
+                panic!("conditional reaction");
+            };
+            assert_eq!(branches.len(), 2);
+            assert!(matches!(
+                branches.first().expect("inserted branch").condition,
+                Condition::All { .. }
+            ));
+            assert_eq!(doc.history.undo_depth(), 1);
+        });
+        assert!(
+            item.update(visual, |item, cx| item.undo(cx))
+                .expect("undo concurrent insertion")
+        );
+        visual.update(|window, cx| {
+            panel.update(cx, |panel, cx| {
+                panel.ensure_parameter_editor(window, cx);
+                panel.start_parameter_edit(
+                    ReactionParameter {
+                        node: first,
+                        reaction: baseline.id,
+                        kind: ParameterKind::ConditionValue(0),
+                    },
+                    "8".into(),
+                    window,
+                    cx,
+                );
+                panel
+                    .parameter_editor
+                    .clone()
+                    .expect("comparison editor")
+                    .update(cx, |editor, cx| editor.set_text("invalid", window, cx));
+                panel.preview_parameter_edit(cx);
+                panel.set_condition_comparison(first, baseline.id, 0, CompareOp::Equal, cx);
+            })
+        });
+        panel.read_with(visual, |panel, cx| {
+            assert!(panel.editing_parameter.is_some());
+            assert!(panel.parameter_error.is_some());
+            assert_eq!(
+                panel
+                    .parameter_editor
+                    .as_ref()
+                    .expect("comparison editor")
+                    .read(cx)
+                    .text(cx),
+                "invalid"
+            );
+        });
+        item.read_with(visual, |item, _| {
+            let doc = item.doc().expect("document");
+            assert_eq!(reaction_by_id(doc, first, baseline.id), Some(&baseline));
+            assert_eq!(
+                doc.history.undo_depth(),
+                0,
+                "an invalid draft prevents a second control from changing the reaction"
+            );
+        });
+    }
+
+    #[test]
+    fn prototype_arithmetic_choices_require_matching_variable_types() {
+        let (mut doc, first, _) = document_with_two_frames();
+        let number = add_float_variable(&mut doc, 4.0);
+        assert_eq!(
+            action_for_choice(&doc, first, ActionChoice::AdjustVariable),
+            Some(Action::AdjustVariable {
+                variable: number,
+                delta: 1.0
+            })
+        );
+        assert!(action_for_choice(&doc, first, ActionChoice::ToggleVariable).is_none());
+        assert!(action_for_choice(&doc, first, ActionChoice::CycleVariable).is_none());
+
+        let boolean = add_float_variable(&mut doc, 0.0);
+        let definition = doc
+            .variables
+            .variables
+            .get_mut(&boolean)
+            .expect("boolean definition");
+        definition.ty = VariableType::Boolean;
+        for value in definition.values_by_mode.values_mut() {
+            *value = VarValue::Boolean { value: false };
+        }
+        assert_eq!(
+            action_for_choice(&doc, first, ActionChoice::ToggleVariable),
+            Some(Action::ToggleVariable { variable: boolean })
+        );
+        assert!(
+            variable_action_with_variable(
+                &doc,
+                &Action::ToggleVariable { variable: boolean },
+                number
+            )
+            .is_none()
+        );
+
+        let option = add_float_variable(&mut doc, 0.0);
+        let definition = doc
+            .variables
+            .variables
+            .get_mut(&option)
+            .expect("enum definition");
+        definition.ty = VariableType::Enum;
+        definition.options = vec!["Small".into(), "Large".into()];
+        for value in definition.values_by_mode.values_mut() {
+            *value = VarValue::Enum {
+                value: "Small".into(),
+            };
+        }
+        assert_eq!(
+            action_for_choice(&doc, first, ActionChoice::CycleVariable),
+            Some(Action::CycleVariable { variable: option })
+        );
+    }
+
+    #[test]
+    fn prototype_delta_editor_accepts_subtraction_and_rejects_non_finite_values() {
+        let (mut doc, _, _) = document_with_two_frames();
+        let variable = add_float_variable(&mut doc, 4.0);
+        let baseline = Reaction {
+            id: ReactionId::new(),
+            trigger: Trigger::Click,
+            action: Action::AdjustVariable {
+                variable,
+                delta: 1.0,
+            },
+            extra_actions: vec![Action::Back],
+            transition: None,
+            animation: None,
+        };
+        let changed =
+            parameter_reaction_from_text(&doc, &baseline, ParameterKind::VariableDelta, "-2.5")
+                .expect("finite subtraction amount");
+        assert_eq!(
+            changed.action,
+            Action::AdjustVariable {
+                variable,
+                delta: -2.5
+            }
+        );
+        assert_eq!(changed.id, baseline.id);
+        assert_eq!(changed.extra_actions, baseline.extra_actions);
+        assert!(
+            parameter_reaction_from_text(&doc, &baseline, ParameterKind::VariableDelta, "NaN")
+                .is_err()
+        );
+        assert!(
+            parameter_reaction_from_text(&doc, &baseline, ParameterKind::VariableDelta, "inf")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn prototype_condition_edit_preserves_other_branches_and_undoes_as_one_step() {
+        let (mut doc, first, second) = document_with_two_frames();
+        let variable = add_float_variable(&mut doc, 1.0);
+        let baseline = Reaction {
+            id: ReactionId::new(),
+            trigger: Trigger::Click,
+            action: Action::Conditional {
+                branches: vec![
+                    ConditionalBranch {
+                        condition: Condition::Compare {
+                            variable,
+                            op: CompareOp::GreaterOrEqual,
+                            value: VarValue::Float { value: 1.0 },
+                        },
+                        actions: vec![
+                            Action::Navigate { to: second },
+                            Action::AdjustVariable {
+                                variable,
+                                delta: 1.0,
+                            },
+                        ],
+                    },
+                    ConditionalBranch {
+                        condition: Condition::Not {
+                            condition: Box::new(Condition::All {
+                                conditions: Vec::new(),
+                            }),
+                        },
+                        actions: vec![Action::Close],
+                    },
+                ],
+                otherwise: vec![Action::Back],
+            },
+            extra_actions: vec![Action::AdjustVariable {
+                variable,
+                delta: -1.0,
+            }],
+            transition: None,
+            animation: None,
+        };
+        doc.apply(Operation::AddReaction {
+            node: first,
+            reaction: baseline.clone(),
+        })
+        .expect("add conditional reaction");
+        doc.history = Default::default();
+        let changed =
+            parameter_reaction_from_text(&doc, &baseline, ParameterKind::ConditionValue(0), "3")
+                .expect("edit comparison threshold");
+        let mut expected = baseline.clone();
+        if let Action::Conditional { branches, .. } = &mut expected.action {
+            if let Condition::Compare { value, .. } =
+                &mut branches.first_mut().expect("first branch").condition
+            {
+                *value = VarValue::Float { value: 3.0 };
+            }
+        }
+        assert_eq!(changed, expected);
+        assert!(
+            parameter_reaction_from_text(&doc, &baseline, ParameterKind::ConditionValue(1), "3")
+                .is_err()
+        );
+        let operation =
+            set_reaction_operation(&doc, first, baseline.id, |reaction| *reaction = changed)
+                .expect("changed condition produces an operation");
+        doc.apply(operation).expect("apply conditional edit");
+        assert_eq!(doc.history.undo_depth(), 1);
+        assert!(doc.undo().expect("undo conditional edit"));
+        assert_eq!(reaction_by_id(&doc, first, baseline.id), Some(&baseline));
     }
 
     #[test]

@@ -1113,7 +1113,9 @@ fn resolve_component_prop_value(
 
 fn variant_value_string(value: &ResolvedVarValue) -> Option<String> {
     match value {
-        ResolvedVarValue::String { value } => Some(value.clone()),
+        ResolvedVarValue::String { value } | ResolvedVarValue::Enum { value } => {
+            Some(value.clone())
+        }
         ResolvedVarValue::Boolean { value } => {
             Some(if *value { "True" } else { "False" }.to_owned())
         }

@@ -145,6 +145,79 @@ fn expand_set_instance_selects_matching_variant() {
 }
 
 #[test]
+fn enum_values_and_aliases_select_matching_variant() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::{Mode, ModeId, Variable, VariableCollection, VariableCollectionId, VariableId};
+
+    let mut scene = Scene::new();
+    let (library, set, _, _, property) = variant_set(&mut scene);
+    let mut instance = InstanceNode {
+        component: set,
+        overrides: Vec::new(),
+        prop_values: BTreeMap::from([(
+            property,
+            VarValue::Enum {
+                value: "Large".into(),
+            },
+        )]),
+        derived: Vec::new(),
+        local_size: [40.0, 40.0],
+    };
+    let expanded = expand_instance(&scene, &library, &instance);
+    assert!(expanded.iter().any(|expanded| {
+        matches!(&expanded.node.data, NodeData::Text(text) if text.content == "L")
+    }));
+
+    let collection = VariableCollectionId::new();
+    let mode = ModeId::new();
+    let variable = VariableId::new();
+    let registry = crate::VariableRegistry {
+        collections: BTreeMap::from([(
+            collection,
+            VariableCollection {
+                id: collection,
+                name: "State".into(),
+                modes: vec![Mode {
+                    id: mode,
+                    name: "Default".into(),
+                }],
+                default_mode: mode,
+                variable_order: vec![variable],
+            },
+        )]),
+        variables: BTreeMap::from([(
+            variable,
+            Variable {
+                id: variable,
+                collection,
+                name: "Size".into(),
+                ty: crate::VariableType::Enum,
+                values_by_mode: BTreeMap::from([(
+                    mode,
+                    VarValue::Enum {
+                        value: "Large".into(),
+                    },
+                )]),
+                scopes: Vec::new(),
+                options: vec!["Small".into(), "Large".into()],
+            },
+        )]),
+    };
+    instance
+        .prop_values
+        .insert(property, VarValue::Alias { variable });
+    let placed = CanvasNode::new(NodeData::Instance(instance.clone()));
+    let placed_id = placed.id;
+    scene.insert(placed)?;
+    let active_modes = BTreeMap::new();
+    let context = InstanceExpansionContext::new(&registry, &active_modes, placed_id);
+    let expanded = expand_instance_with_context(&scene, &library, &instance, &context);
+    assert!(expanded.iter().any(|expanded| {
+        matches!(&expanded.node.data, NodeData::Text(text) if text.content == "L")
+    }));
+    Ok(())
+}
+
+#[test]
 fn expand_set_instance_selects_boolean_variant_axis() {
     use crate::component::{
         ComponentPropDef, ComponentPropKind, ComponentSet, ComponentSetMembership, VariantAxis,

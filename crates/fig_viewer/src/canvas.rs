@@ -5484,6 +5484,36 @@ fn authored_selection_bounds(doc: &fanta_doc::Doc, id: NodeId) -> Option<fanta_d
     authored_local_bounds(&doc.scene, id)
 }
 
+fn prototype_action_targets(action: &Action) -> Vec<NodeId> {
+    let mut pending = vec![action];
+    let mut targets = Vec::new();
+    while let Some(action) = pending.pop() {
+        match action {
+            Action::Navigate { to } => targets.push(*to),
+            Action::OpenOverlay { frame, .. } => targets.push(*frame),
+            Action::ScrollTo { target } => targets.push(*target),
+            Action::Conditional {
+                branches,
+                otherwise,
+            } => {
+                pending.extend(otherwise);
+                for branch in branches {
+                    pending.extend(&branch.actions);
+                }
+            }
+            Action::Back
+            | Action::Close
+            | Action::SetVariable { .. }
+            | Action::AdjustVariable { .. }
+            | Action::ToggleVariable { .. }
+            | Action::CycleVariable { .. }
+            | Action::UpdateVariant { .. }
+            | Action::OpenLink { .. } => {}
+        }
+    }
+    targets
+}
+
 /// Prepaint snapshot of one comment pin (owned, so paint holds no doc borrow).
 pub(crate) struct CommentPin {
     pub(crate) world: DVec2,
@@ -5704,20 +5734,15 @@ impl CanvasElement {
                 );
                 data.prototype_handle = Some(source_point);
                 if let Some(node) = doc.scene.get(source) {
-                    for reaction in &node.reactions {
-                        let target = match &reaction.action {
-                            Action::Navigate { to } => Some(*to),
-                            Action::OpenOverlay { frame, .. } => Some(*frame),
-                            Action::ScrollTo { target } => Some(*target),
-                            Action::Back
-                            | Action::Close
-                            | Action::SetVariable { .. }
-                            | Action::UpdateVariant { .. }
-                            | Action::OpenLink { .. } => None,
-                        };
-                        let Some(target_bounds) = target.and_then(|target| {
+                    for target in node
+                        .reactions
+                        .iter()
+                        .flat_map(|reaction| reaction.actions())
+                        .flat_map(prototype_action_targets)
+                    {
+                        let Some(target_bounds) =
                             evaluated_world_bounds(&doc.scene, target, motion.as_ref())
-                        }) else {
+                        else {
                             continue;
                         };
                         let target_point = DVec2::new(

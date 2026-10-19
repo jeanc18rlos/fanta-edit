@@ -1430,6 +1430,10 @@ pub(crate) fn reaction_summary(reaction: &Reaction) -> SharedString {
         Action::OpenOverlay { .. } => "open overlay",
         Action::ScrollTo { .. } => "scroll to",
         Action::SetVariable { .. } => "set variable",
+        Action::AdjustVariable { .. } => "adjust variable",
+        Action::ToggleVariable { .. } => "toggle variable",
+        Action::CycleVariable { .. } => "cycle variable",
+        Action::Conditional { .. } => "conditional",
         Action::UpdateVariant { .. } => "change variant",
         Action::OpenLink { .. } => "open link",
     };
