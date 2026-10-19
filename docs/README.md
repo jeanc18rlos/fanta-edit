@@ -30,6 +30,7 @@ step: read the files here, or on GitHub.
   review findings, reproduced failures, completed Sol work, and remaining gaps.
 - [`fanta/`](./fanta) — notes on the app itself, including
   [`project-schema.md`](./fanta/project-schema.md) for the editable project tree and
+  [`website-export.md`](./fanta/website-export.md) for publishing a static viewer, and
   [`code-first-audit.md`](./fanta/code-first-audit.md) for the architecture review, plus
   [`disabled-services-binnacle.md`](./fanta/disabled-services-binnacle.md),
   the record of which inherited Fanta services are switched off and why.

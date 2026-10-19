@@ -1,0 +1,33 @@
+[package]
+name = "fanta-site"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Static website export: a read-only page per design page, rendered in the browser by the @fanta/runtime WASM engine."
+
+[lib]
+path = "src/site.rs"
+
+[[bin]]
+name = "fanta-site"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+fanta-doc.workspace = true
+fanta-format.workspace = true
+fanta-runtime.workspace = true
+fanta-text.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true
