@@ -211,7 +211,11 @@ mod tests {
     fn enum_options_round_trip_and_stay_off_the_wire_when_empty() {
         let (mut reg, coll_id, light, var_id) = fixture();
         let plain = serde_json::to_value(&reg).unwrap();
-        assert!(plain["variables"][var_id.to_string()].get("options").is_none());
+        assert!(
+            plain["variables"][var_id.to_string()]
+                .get("options")
+                .is_none()
+        );
 
         let state_id = VariableId::from_u128(101);
         reg.variables.insert(

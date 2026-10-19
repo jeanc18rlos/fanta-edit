@@ -1284,7 +1284,9 @@ pub(crate) fn prop_value_snapshot(kind: &ComponentPropKind, value: &VarValue) ->
         }
         (_, VarValue::TextStyle { .. }) => PropValueSnapshot::Display("Text style".into()),
         (_, VarValue::Enum { value }) => PropValueSnapshot::Display(value.clone().into()),
-        (_, VarValue::Image { value }) => PropValueSnapshot::Display(image_value_label(*value).into()),
+        (_, VarValue::Image { value }) => {
+            PropValueSnapshot::Display(image_value_label(*value).into())
+        }
         (_, VarValue::Alias { .. }) => PropValueSnapshot::Display("Variable".into()),
     }
 }

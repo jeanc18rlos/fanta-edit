@@ -251,11 +251,11 @@ impl BoundProp {
             Self::ClipHeight => {
                 clip_size(node).map(|size| ResolvedVarValue::Float { value: size[1] })
             }
-            Self::ImageFill { index } => node_fill(node, *index).map(|fill| {
-                ResolvedVarValue::Image {
+            Self::ImageFill { index } => {
+                node_fill(node, *index).map(|fill| ResolvedVarValue::Image {
                     value: fill.image_asset(),
-                }
-            }),
+                })
+            }
         }
     }
 
@@ -552,7 +552,11 @@ mod tests {
             Some(ResolvedVarValue::Image { value: None })
         );
         assert!(!prop.apply_resolved(&mut node, ResolvedVarValue::Image { value: None }));
-        assert!(BoundProp::FillColor { index: 0 }.read_resolved(&node).is_some());
+        assert!(
+            BoundProp::FillColor { index: 0 }
+                .read_resolved(&node)
+                .is_some()
+        );
 
         let asset = AssetId::from_u128(42);
         assert!(prop.apply_resolved(&mut node, ResolvedVarValue::Image { value: Some(asset) }));
@@ -582,14 +586,17 @@ mod tests {
         ));
 
         // Text has no paint slot an image could fill.
-        let mut text = CanvasNode::new(NodeData::Text(crate::node::TextNode::new("x", 100.0, 20.0)));
+        let mut text =
+            CanvasNode::new(NodeData::Text(crate::node::TextNode::new("x", 100.0, 20.0)));
         assert!(!prop.applies_to(&text));
         assert!(!prop.apply_resolved(&mut text, ResolvedVarValue::Image { value: Some(asset) }));
     }
 
     #[test]
     fn enum_values_land_in_text_content_and_nowhere_else() {
-        let mut text = CanvasNode::new(NodeData::Text(crate::node::TextNode::new("idle", 100.0, 20.0)));
+        let mut text = CanvasNode::new(NodeData::Text(crate::node::TextNode::new(
+            "idle", 100.0, 20.0,
+        )));
         assert!(BoundProp::TextContent.accepts_variable_type(VariableType::Enum));
         assert!(BoundProp::TextContent.accepts_variable_type(VariableType::String));
         assert!(!BoundProp::Opacity.accepts_variable_type(VariableType::Enum));

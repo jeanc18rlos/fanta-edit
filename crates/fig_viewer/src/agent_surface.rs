@@ -1459,7 +1459,10 @@ fn variable_type(kind: DesignVariableType) -> VariableType {
 
 /// Trim and validate an enum's option list: non-empty, no blank or repeated names.
 fn enum_options(options: &[String]) -> Result<Vec<String>> {
-    let options: Vec<String> = options.iter().map(|option| option.trim().to_owned()).collect();
+    let options: Vec<String> = options
+        .iter()
+        .map(|option| option.trim().to_owned())
+        .collect();
     if options.is_empty() {
         bail!("an enum variable needs at least one option");
     }
