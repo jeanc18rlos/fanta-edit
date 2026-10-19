@@ -501,9 +501,7 @@ impl Doc {
                 for (index, reaction) in node.reactions.iter().enumerate().rev() {
                     let mut remaining: Vec<Action> = reaction
                         .actions()
-                        .filter(|action| {
-                            !matches!(action, Action::SetVariable { variable, .. } if *variable == id)
-                        })
+                        .filter(|action| !action.references_variable(id))
                         .cloned()
                         .collect();
                     if remaining.len() == reaction.extra_actions.len() + 1 {
@@ -1593,7 +1591,32 @@ mod tests {
                     value: Color::BLACK,
                 },
             },
-            extra_actions: vec![Action::Back],
+            extra_actions: vec![
+                Action::Conditional {
+                    branches: vec![crate::ConditionalBranch {
+                        condition: crate::Condition::Compare {
+                            variable: target_id,
+                            op: crate::CompareOp::Equal,
+                            value: VarValue::Color {
+                                value: Color::BLACK,
+                            },
+                        },
+                        actions: vec![Action::Back],
+                    }],
+                    otherwise: Vec::new(),
+                },
+                Action::AdjustVariable {
+                    variable: target_id,
+                    delta: 1.0,
+                },
+                Action::ToggleVariable {
+                    variable: target_id,
+                },
+                Action::CycleVariable {
+                    variable: target_id,
+                },
+                Action::Back,
+            ],
             transition: None,
             animation: None,
         });

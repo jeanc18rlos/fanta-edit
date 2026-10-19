@@ -105,7 +105,9 @@ pub enum Trigger {
 pub enum Action {
     /// Navigate to another frame. A stale `to` (frame deleted) is tolerated —
     /// present-mode hit-testing simply does nothing; `validate` warns.
-    Navigate { to: NodeId },
+    Navigate {
+        to: NodeId,
+    },
     /// Go back to the previously-navigated frame.
     Back,
     /// Close the current overlay (or exit present mode at the top level).
@@ -116,11 +118,28 @@ pub enum Action {
         overlay: OverlaySettings,
     },
     /// Scroll the named target into view.
-    ScrollTo { target: NodeId },
+    ScrollTo {
+        target: NodeId,
+    },
     /// Set a design-system variable to a value (the typed-value reuse point).
     SetVariable {
         variable: VariableId,
         value: VarValue,
+    },
+    AdjustVariable {
+        variable: VariableId,
+        delta: f64,
+    },
+    ToggleVariable {
+        variable: VariableId,
+    },
+    CycleVariable {
+        variable: VariableId,
+    },
+    Conditional {
+        branches: Vec<ConditionalBranch>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        otherwise: Vec<Action>,
     },
     /// Update a component variant (for prototype variant switching).
     UpdateVariant {
@@ -128,7 +147,92 @@ pub enum Action {
         variant: String, // or more structured
     },
     /// Open external link (for prototype web actions).
-    OpenLink { url: String },
+    OpenLink {
+        url: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConditionalBranch {
+    pub condition: Condition,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<Action>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Condition {
+    Compare {
+        variable: VariableId,
+        op: CompareOp,
+        value: VarValue,
+    },
+    All {
+        conditions: Vec<Condition>,
+    },
+    Any {
+        conditions: Vec<Condition>,
+    },
+    Not {
+        condition: Box<Condition>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompareOp {
+    Equal,
+    NotEqual,
+    Less,
+    LessOrEqual,
+    Greater,
+    GreaterOrEqual,
+}
+
+impl Action {
+    pub fn references_variable(&self, identifier: VariableId) -> bool {
+        match self {
+            Self::SetVariable { variable, value } => {
+                *variable == identifier
+                    || matches!(value, VarValue::Alias { variable } if *variable == identifier)
+            }
+            Self::AdjustVariable { variable, .. }
+            | Self::ToggleVariable { variable }
+            | Self::CycleVariable { variable } => *variable == identifier,
+            Self::Conditional {
+                branches,
+                otherwise,
+            } => {
+                branches.iter().any(|branch| {
+                    branch.condition.references_variable(identifier)
+                        || branch
+                            .actions
+                            .iter()
+                            .any(|action| action.references_variable(identifier))
+                }) || otherwise
+                    .iter()
+                    .any(|action| action.references_variable(identifier))
+            }
+            _ => false,
+        }
+    }
+}
+
+impl Condition {
+    pub fn references_variable(&self, identifier: VariableId) -> bool {
+        match self {
+            Self::Compare {
+                variable, value, ..
+            } => {
+                *variable == identifier
+                    || matches!(value, VarValue::Alias { variable } if *variable == identifier)
+            }
+            Self::All { conditions } | Self::Any { conditions } => conditions
+                .iter()
+                .any(|condition| condition.references_variable(identifier)),
+            Self::Not { condition } => condition.references_variable(identifier),
+        }
+    }
 }
 
 /// Animation applied while a navigation/overlay action plays out.

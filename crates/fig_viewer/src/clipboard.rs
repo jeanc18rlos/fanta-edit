@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::{Context as _, Result, bail};
 use fanta_doc::{
-    Action, AnimationClipId, AnimationTrack, AnimationTrackId, CanvasNode, Doc, DocId, IndexKey,
-    KeyframeId, NodeData, NodeId, Operation, Transform2D,
+    Action, AnimationClipId, AnimationTrack, AnimationTrackId, CanvasNode, ClipSettings, Doc,
+    DocId, IndexKey, KeyframeId, NodeData, NodeId, Operation, Transform2D,
 };
 use serde::{Deserialize, Serialize};
 
@@ -31,6 +31,8 @@ struct ClipboardRoot {
 struct ClipboardMotionTrack {
     clip: AnimationClipId,
     track: AnimationTrack,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    transform_origin: Option<[f64; 2]>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +46,7 @@ pub(crate) struct PastedNodes {
     pub(crate) nodes: Vec<CanvasNode>,
     pub(crate) roots: Vec<NodeId>,
     motion_tracks: Vec<ClipboardMotionTrack>,
+    clip_settings: BTreeMap<AnimationClipId, (ClipSettings, ClipSettings)>,
 }
 
 impl CanvasClipboard {
@@ -98,7 +101,15 @@ impl CanvasClipboard {
                     .values()
                     .filter(|track| captured_ids.contains(&track.target.node))
                     .cloned()
-                    .map(|track| ClipboardMotionTrack { clip: *clip, track })
+                    .map(|track| ClipboardMotionTrack {
+                        clip: *clip,
+                        transform_origin: animation
+                            .settings
+                            .transform_origins
+                            .get(&track.target.node)
+                            .copied(),
+                        track,
+                    })
             })
             .collect();
         let mut components = fanta_doc::ComponentLibrary::new();
@@ -274,6 +285,7 @@ impl CanvasClipboard {
         }
 
         let mut pasted_motion_tracks = Vec::with_capacity(self.motion_tracks.len());
+        let mut clip_settings = BTreeMap::new();
         for captured in &self.motion_tracks {
             let mut track = captured.track.clone();
             let Some(target) = remap.get(&track.target.node).copied() else {
@@ -288,9 +300,18 @@ impl CanvasClipboard {
                 keyframes.insert(keyframe.id, keyframe);
             }
             track.keyframes = keyframes;
+            if let Some(origin) = captured.transform_origin
+                && let Some(clip) = doc.motion.clip(captured.clip)
+            {
+                let (_, new) = clip_settings
+                    .entry(captured.clip)
+                    .or_insert_with(|| (clip.settings.clone(), clip.settings.clone()));
+                new.transform_origins.insert(target, origin);
+            }
             pasted_motion_tracks.push(ClipboardMotionTrack {
                 clip: captured.clip,
                 track,
+                transform_origin: captured.transform_origin,
             });
         }
 
@@ -298,6 +319,7 @@ impl CanvasClipboard {
             nodes: pasted_nodes,
             roots: pasted_roots,
             motion_tracks: pasted_motion_tracks,
+            clip_settings,
         })
     }
 }
@@ -501,6 +523,13 @@ pub(crate) fn create_operations(pasted: &PastedNodes) -> Vec<Operation> {
                 new: Some(Box::new(captured.track.clone())),
             }),
     );
+    operations.extend(pasted.clip_settings.iter().map(|(id, (old, new))| {
+        Operation::SetAnimationClipSettings {
+            id: *id,
+            old: Box::new(old.clone()),
+            new: Box::new(new.clone()),
+        }
+    }));
     operations
 }
 
@@ -543,16 +572,7 @@ pub(crate) fn editable_selection_roots(doc: &Doc) -> Vec<NodeId> {
 fn remap_node_references(node: &mut CanvasNode, remap: &HashMap<NodeId, NodeId>) {
     for reaction in &mut node.reactions {
         for action in std::iter::once(&mut reaction.action).chain(&mut reaction.extra_actions) {
-            match action {
-                Action::Navigate { to } => remap_reference(to, remap),
-                Action::OpenOverlay { frame, .. } => remap_reference(frame, remap),
-                Action::ScrollTo { target } => remap_reference(target, remap),
-                Action::Back
-                | Action::Close
-                | Action::SetVariable { .. }
-                | Action::UpdateVariant { .. }
-                | Action::OpenLink { .. } => {}
-            }
+            remap_action_references(action, remap);
         }
     }
     if let NodeData::AiArtifact(artifact) = &mut node.data {
@@ -562,6 +582,34 @@ fn remap_node_references(node: &mut CanvasNode, remap: &HashMap<NodeId, NodeId>)
         if let Some(parent) = &mut artifact.lineage_parent {
             remap_reference(parent, remap);
         }
+    }
+}
+
+fn remap_action_references(action: &mut Action, remap: &HashMap<NodeId, NodeId>) {
+    match action {
+        Action::Navigate { to } => remap_reference(to, remap),
+        Action::OpenOverlay { frame, .. } => remap_reference(frame, remap),
+        Action::ScrollTo { target } => remap_reference(target, remap),
+        Action::Conditional {
+            branches,
+            otherwise,
+        } => {
+            for action in branches
+                .iter_mut()
+                .flat_map(|branch| &mut branch.actions)
+                .chain(otherwise)
+            {
+                remap_action_references(action, remap);
+            }
+        }
+        Action::Back
+        | Action::Close
+        | Action::SetVariable { .. }
+        | Action::AdjustVariable { .. }
+        | Action::ToggleVariable { .. }
+        | Action::CycleVariable { .. }
+        | Action::UpdateVariant { .. }
+        | Action::OpenLink { .. } => {}
     }
 }
 
@@ -578,6 +626,49 @@ mod tests {
         AnimationClip, Color, ComponentDef, ComponentId, GroupNode, MotionProperty, MotionTarget,
         TextNode, VectorNode,
     };
+
+    #[test]
+    fn conditional_clipboard_actions_remap_nested_node_references() {
+        use fanta_doc::{Condition, ConditionalBranch};
+
+        let original = NodeId::new();
+        let copied = NodeId::new();
+        let external = NodeId::new();
+        let mut action = Action::Conditional {
+            branches: vec![ConditionalBranch {
+                condition: Condition::All {
+                    conditions: Vec::new(),
+                },
+                actions: vec![Action::Conditional {
+                    branches: Vec::new(),
+                    otherwise: vec![Action::Navigate { to: original }],
+                }],
+            }],
+            otherwise: vec![
+                Action::ScrollTo { target: original },
+                Action::Navigate { to: external },
+            ],
+        };
+        remap_action_references(&mut action, &HashMap::from([(original, copied)]));
+        assert_eq!(
+            action,
+            Action::Conditional {
+                branches: vec![ConditionalBranch {
+                    condition: Condition::All {
+                        conditions: Vec::new()
+                    },
+                    actions: vec![Action::Conditional {
+                        branches: Vec::new(),
+                        otherwise: vec![Action::Navigate { to: copied }],
+                    }],
+                }],
+                otherwise: vec![
+                    Action::ScrollTo { target: copied },
+                    Action::Navigate { to: external },
+                ],
+            }
+        );
+    }
 
     fn subtree_doc() -> (Doc, NodeId, NodeId, NodeId) {
         let mut doc = Doc::new();
@@ -1002,6 +1093,10 @@ mod tests {
         let (mut doc, frame_id, first_id, _) = subtree_doc();
         let clip_id = AnimationClipId::new();
         let mut clip = AnimationClip::new(clip_id, "Entrance", 1_000);
+        clip.settings.fps = Some(60);
+        clip.settings
+            .transform_origins
+            .insert(first_id, [0.5, 0.25]);
         let track_id = AnimationTrackId::new();
         clip.tracks.insert(
             track_id,
@@ -1010,6 +1105,7 @@ mod tests {
                 MotionTarget::new(first_id, MotionProperty::PositionX),
             ),
         );
+        let original_clip = clip.clone();
         doc.motion.clips.insert(clip_id, clip);
         doc.selection.select_only(frame_id);
         let payload = CanvasClipboard::capture(&doc).expect("capture animated frame");
@@ -1024,11 +1120,27 @@ mod tests {
         assert!(apply_transaction(&mut doc, "Duplicate", create_operations(&pasted)).unwrap());
         let clip = doc.motion.clip(clip_id).expect("motion clip");
         assert_eq!(clip.tracks.len(), 2);
+        assert_eq!(clip.settings.fps, Some(60));
+        assert_eq!(
+            clip.settings.transform_origins.get(&first_id),
+            Some(&[0.5, 0.25])
+        );
+        assert_eq!(
+            clip.settings.transform_origins.get(&remapped_target),
+            Some(&[0.5, 0.25])
+        );
         assert!(
             clip.tracks
                 .values()
                 .any(|track| track.target.node == remapped_target)
         );
+        let copied_clip = clip.clone();
+        assert!(doc.undo().expect("undo duplication"));
+        assert_eq!(doc.motion.clip(clip_id), Some(&original_clip));
+        assert!(!doc.scene.contains(remapped_target));
+        assert!(doc.redo().expect("redo duplication"));
+        assert_eq!(doc.motion.clip(clip_id), Some(&copied_clip));
+        assert!(doc.scene.contains(remapped_target));
     }
 
     #[test]

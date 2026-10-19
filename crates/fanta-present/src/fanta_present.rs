@@ -30,10 +30,11 @@ use std::rc::Rc;
 
 use fanta_canvas::viewport::{fit_bounds, pan, screen_to_world, zoom_at};
 use fanta_doc::{
-    Action, AnimationClipId, ComponentId, ComponentPropKind, Doc, ModeId, MotionEvaluation,
-    NodeData, NodeFlags, NodeId, OverlaySettings, PrototypeAnimation, ReactionId, Scene,
-    ScrollBehavior, ScrollDirection, Transform2D, Transition, TransitionStyle, Trigger, VarValue,
-    VariableCollectionId, VariableId, VariableRegistry, Viewport,
+    Action, AnimationClipId, CompareOp, ComponentId, ComponentPropKind, Condition, Doc, ModeId,
+    MotionEvaluation, NodeData, NodeFlags, NodeId, OverlaySettings, PrototypeAnimation, ReactionId,
+    ResolvedVarValue, Scene, ScrollBehavior, ScrollDirection, Transform2D, Transition,
+    TransitionStyle, Trigger, VarValue, VariableCollectionId, VariableId, VariableRegistry,
+    Viewport,
 };
 use fanta_render::{RasterRenderer, RenderError, RenderInputs, RenderMetrics};
 use glam::DVec2;
@@ -326,7 +327,7 @@ impl ActiveScrollAnimation {
 struct ActivePointerReaction {
     source: NodeId,
     reaction: ReactionId,
-    variant_restore: Option<InstanceVariantRestore>,
+    variant_restores: Vec<InstanceVariantRestore>,
 }
 
 #[derive(Debug, Clone)]
@@ -428,6 +429,7 @@ pub struct PlaybackSession {
     hovered_reaction: Option<ActivePointerReaction>,
     pressed_reaction: Option<ActivePointerReaction>,
     suppress_next_click: bool,
+    recording_pointer_press: bool,
 
     /// The ancestor chain of the node currently under the pointer (hit node
     /// first, walking up to the root), updated on every Move. This is the
@@ -683,6 +685,7 @@ impl PlaybackSession {
             hovered_reaction: None,
             pressed_reaction: None,
             suppress_next_click: false,
+            recording_pointer_press: false,
             hover_chain: Vec::new(),
             active_scroll_animation: None,
             pending_url: None,
@@ -1036,9 +1039,6 @@ impl PlaybackSession {
             PointerEvent::Down => {
                 let reaction = self.matching_reaction(hit, TriggerKind::WhilePressing);
                 let has_reaction = reaction.is_some();
-                let consumed = reaction.as_ref().is_some_and(|(_, _, actions, _, _)| {
-                    actions.iter().any(down_action_suppresses_click)
-                });
                 let mut restored = self.restore_pressed_reaction();
                 if has_reaction {
                     restored = merge_responses(restored, self.restore_hovered_reaction());
@@ -1046,9 +1046,11 @@ impl PlaybackSession {
                 self.pressed_reaction = reaction
                     .as_ref()
                     .map(|reaction| self.active_pointer_reaction(reaction));
-                self.suppress_next_click = consumed;
+                self.suppress_next_click = false;
+                self.recording_pointer_press = true;
                 let mut response = merge_responses(restored, self.execute_matching(reaction));
-                response.suppress_click = consumed;
+                self.recording_pointer_press = false;
+                response.suppress_click = self.suppress_next_click;
                 response
             }
             PointerEvent::Up => {
@@ -2491,23 +2493,45 @@ impl PlaybackSession {
 
     fn active_pointer_reaction(&self, reaction: &MatchedReaction) -> ActivePointerReaction {
         let (source, reaction_id, actions, _, _) = reaction;
-        // The transient hover/press effect that gets reverted on leave/release
-        // is the variant swap; the first UpdateVariant in the sequence is the
-        // one whose pre-state we must remember.
-        let variant_restore = actions.iter().find_map(|action| match action {
-            Action::UpdateVariant { component, variant } => self
-                .source_instance(*source, *component)
-                .map(|instance| InstanceVariantRestore {
-                    instance,
-                    previous: self.instance_variant_overrides.get(&instance).cloned(),
-                    applied: (*component, variant.clone()),
-                }),
-            _ => None,
-        });
+        let mut variant_restores = Vec::new();
+        self.capture_variant_restores(*source, actions, &mut variant_restores);
         ActivePointerReaction {
             source: *source,
             reaction: *reaction_id,
-            variant_restore,
+            variant_restores,
+        }
+    }
+
+    fn capture_variant_restores(
+        &self,
+        source: NodeId,
+        actions: &[Action],
+        restores: &mut Vec<InstanceVariantRestore>,
+    ) {
+        for action in actions {
+            match action {
+                Action::UpdateVariant { component, variant } => {
+                    if let Some(instance) = self.source_instance(source, *component) {
+                        restores.push(InstanceVariantRestore {
+                            instance,
+                            previous: self.instance_variant_overrides.get(&instance).cloned(),
+                            applied: (*component, variant.clone()),
+                        });
+                    }
+                }
+                Action::Conditional {
+                    branches,
+                    otherwise,
+                } => {
+                    // An earlier action may change the selected branch, so capture
+                    // every candidate before executing any actions.
+                    for branch in branches {
+                        self.capture_variant_restores(source, &branch.actions, restores);
+                    }
+                    self.capture_variant_restores(source, otherwise, restores);
+                }
+                _ => {}
+            }
         }
     }
 
@@ -2525,20 +2549,29 @@ impl PlaybackSession {
         &mut self,
         active: Option<ActivePointerReaction>,
     ) -> PresentResponse {
-        let Some(restore) = active.and_then(|active| active.variant_restore) else {
+        let Some(active) = active else {
             return PresentResponse::default();
         };
-        if self.instance_variant_overrides.get(&restore.instance) != Some(&restore.applied) {
-            return PresentResponse::default();
+        let mut changed = false;
+        for restore in active.variant_restores.into_iter().rev() {
+            if self.instance_variant_overrides.get(&restore.instance) != Some(&restore.applied)
+                || restore.previous.as_ref() == Some(&restore.applied)
+            {
+                continue;
+            }
+            match restore.previous {
+                Some(previous) => {
+                    self.instance_variant_overrides
+                        .insert(restore.instance, previous);
+                }
+                None => {
+                    self.instance_variant_overrides.remove(&restore.instance);
+                }
+            }
+            changed = true;
         }
-        match restore.previous {
-            Some(previous) => {
-                self.instance_variant_overrides
-                    .insert(restore.instance, previous);
-            }
-            None => {
-                self.instance_variant_overrides.remove(&restore.instance);
-            }
+        if !changed {
+            return PresentResponse::default();
         }
         self.active_variant_transition = None;
         self.refresh_layer_timers();
@@ -2596,6 +2629,9 @@ impl PlaybackSession {
                 source
             };
             let frame_before = self.current;
+            if self.recording_pointer_press && down_action_suppresses_click(action) {
+                self.suppress_next_click = true;
+            }
             action_response = merge_responses(
                 action_response,
                 self.execute(action_source, action, transition),
@@ -2788,6 +2824,72 @@ impl PlaybackSession {
                 } else {
                     PresentResponse::default()
                 }
+            }
+            Action::AdjustVariable { variable, delta } => {
+                let Some(ResolvedVarValue::Float { value }) =
+                    self.runtime_variable_value(source, *variable)
+                else {
+                    return PresentResponse::default();
+                };
+                let value = value + delta;
+                if !delta.is_finite() || !value.is_finite() {
+                    return PresentResponse::default();
+                }
+                let needs_redraw = self.set_variable(source, *variable, VarValue::Float { value });
+                PresentResponse {
+                    needs_redraw,
+                    ..PresentResponse::default()
+                }
+            }
+            Action::ToggleVariable { variable } => {
+                let Some(ResolvedVarValue::Boolean { value }) =
+                    self.runtime_variable_value(source, *variable)
+                else {
+                    return PresentResponse::default();
+                };
+                let needs_redraw =
+                    self.set_variable(source, *variable, VarValue::Boolean { value: !value });
+                PresentResponse {
+                    needs_redraw,
+                    ..PresentResponse::default()
+                }
+            }
+            Action::CycleVariable { variable } => {
+                let Some(ResolvedVarValue::Enum { value }) =
+                    self.runtime_variable_value(source, *variable)
+                else {
+                    return PresentResponse::default();
+                };
+                let Some(options) = self
+                    .variables
+                    .variable(*variable)
+                    .map(|variable| &variable.options)
+                    .filter(|options| !options.is_empty())
+                else {
+                    return PresentResponse::default();
+                };
+                let next = options
+                    .iter()
+                    .position(|option| *option == value)
+                    .map_or(0, |index| (index + 1) % options.len());
+                let Some(value) = options.get(next).cloned() else {
+                    return PresentResponse::default();
+                };
+                let needs_redraw = self.set_variable(source, *variable, VarValue::Enum { value });
+                PresentResponse {
+                    needs_redraw,
+                    ..PresentResponse::default()
+                }
+            }
+            Action::Conditional {
+                branches,
+                otherwise,
+            } => {
+                let actions = branches
+                    .iter()
+                    .find(|branch| self.condition_matches(source, &branch.condition))
+                    .map_or(otherwise.as_slice(), |branch| branch.actions.as_slice());
+                self.execute_reaction(source, actions, transition, None)
             }
             Action::OpenOverlay { frame, overlay } => {
                 self.open_overlay(*frame, overlay, transition)
@@ -3122,18 +3224,90 @@ impl PlaybackSession {
         }
     }
 
+    fn runtime_variable_source(&self, source: NodeId) -> NodeId {
+        let resolved = self.reaction_layer(false);
+        resolved
+            .occurrences
+            .get(&source)
+            .map(|source| source.instance_path.first().copied().unwrap_or(source.node))
+            .unwrap_or(source)
+    }
+
+    fn runtime_variable_value(
+        &self,
+        source: NodeId,
+        variable: VariableId,
+    ) -> Option<ResolvedVarValue> {
+        fanta_doc::resolve_bound_value(
+            &self.variables,
+            &self.doc.scene,
+            self.runtime_variable_source(source),
+            &self.active_modes,
+            variable,
+        )
+    }
+
+    fn condition_matches(&self, source: NodeId, condition: &Condition) -> bool {
+        match condition {
+            Condition::Compare {
+                variable,
+                op,
+                value,
+            } => {
+                let Some(actual) = self.runtime_variable_value(source, *variable) else {
+                    return false;
+                };
+                let expected = match value {
+                    VarValue::Alias { variable } => self.runtime_variable_value(source, *variable),
+                    value => value.as_resolved(),
+                };
+                let Some(expected) = expected else {
+                    return false;
+                };
+                if actual.variable_type() != expected.variable_type() {
+                    return false;
+                }
+                let order = match (&actual, &expected) {
+                    (
+                        ResolvedVarValue::Float { value: actual },
+                        ResolvedVarValue::Float { value: expected },
+                    ) if actual.is_finite() && expected.is_finite() => actual.partial_cmp(expected),
+                    (
+                        ResolvedVarValue::String { value: actual },
+                        ResolvedVarValue::String { value: expected },
+                    )
+                    | (
+                        ResolvedVarValue::Enum { value: actual },
+                        ResolvedVarValue::Enum { value: expected },
+                    ) => Some(actual.cmp(expected)),
+                    _ => None,
+                };
+                match op {
+                    CompareOp::Equal => actual == expected,
+                    CompareOp::NotEqual => actual != expected,
+                    CompareOp::Less => order.is_some_and(|order| order.is_lt()),
+                    CompareOp::LessOrEqual => order.is_some_and(|order| order.is_le()),
+                    CompareOp::Greater => order.is_some_and(|order| order.is_gt()),
+                    CompareOp::GreaterOrEqual => order.is_some_and(|order| order.is_ge()),
+                }
+            }
+            Condition::All { conditions } => conditions
+                .iter()
+                .all(|condition| self.condition_matches(source, condition)),
+            Condition::Any { conditions } => conditions
+                .iter()
+                .any(|condition| self.condition_matches(source, condition)),
+            Condition::Not { condition } => !self.condition_matches(source, condition),
+        }
+    }
+
     /// Override a variable's value for the session (never the doc). Writes into
     /// the collection's currently-effective mode of the session-local registry
     /// clone and bumps `mode_generation` so the render + instance cache pick up
     /// the new value. Returns `false` (a no-op) for an unknown variable or one
     /// whose collection is missing.
     fn set_variable(&mut self, source: NodeId, variable: VariableId, value: VarValue) -> bool {
-        let resolved = self.reaction_layer(false);
-        let source = resolved
-            .occurrences
-            .get(&source)
-            .map(|source| source.instance_path.first().copied().unwrap_or(source.node))
-            .unwrap_or(source);
+        let source = self.runtime_variable_source(source);
         let Some((collection_id, variable_type)) = self
             .variables
             .variable(variable)
