@@ -16,7 +16,10 @@ use std::{
 use anyhow::{Context as _, Result};
 use fanta_doc::{AssetId, Doc, NodeId, Operation, Viewport};
 use fanta_fig_interop::{fig_to_doc, read_fig};
-use fanta_render::{AssetResolver, DecodedImage, asset::LazyAssetResolver};
+use fanta_render::{
+    AssetResolver, DecodeListener, DecodedImage, LevelLookup, LeveledImage,
+    asset::LazyAssetResolver,
+};
 use futures::{FutureExt as _, StreamExt as _, channel::mpsc};
 use gpui::{
     App, AppContext as _, Context, Entity, EntityId, EventEmitter, Image, ImageFormat,
@@ -523,10 +526,22 @@ pub(crate) struct PagePrewarm {
 }
 
 impl PagePrewarm {
+    /// Longer side, in pixels, of the previews a macOS page prewarm decodes:
+    /// a tile-sized image on a Retina display draws from it directly, and a
+    /// page of photos holds about a megabyte of RGBA per image.
+    const PREVIEW_SIDE: u32 = 512;
+
     /// Decode the page's images into the shared resolver. Safe to run on any
-    /// thread; a frame that draws one of them first decodes it or waits for
-    /// the decode already under way.
+    /// thread.
     ///
+    /// On macOS the canvas never decodes on its render thread: it draws a
+    /// placeholder or a coarser level and asks the resolver's own workers for
+    /// the level it needs. So the prewarm only queues previews, and returns at
+    /// once; the page's first frame finds something to draw without every
+    /// image held at full resolution.
+    ///
+    /// Elsewhere a frame that draws an image decodes it or waits for the
+    /// decode already under way, so the prewarm decodes at full resolution.
     /// Each thread decodes one asset at a time, stopping as soon as this task
     /// is the last owner of the resolver. The document that owns it can be replaced while
     /// the walk runs — a reload or a merge installs a brand-new `FigDocument`
@@ -539,6 +554,14 @@ impl PagePrewarm {
     /// stay ahead of the render thread's walk. The resolver lets each caller
     /// wait for an asset another thread is decoding instead of repeating it.
     pub(crate) fn run(self) {
+        if Arc::strong_count(&self.resolver) <= 1 {
+            return;
+        }
+        if cfg!(target_os = "macos") {
+            self.resolver
+                .prewarm_previews(self.assets.iter().copied(), Self::PREVIEW_SIDE);
+            return;
+        }
         let workers = std::thread::available_parallelism()
             .map_or(1, std::num::NonZeroUsize::get)
             .saturating_sub(2)
@@ -576,6 +599,11 @@ impl PagePrewarm {
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.assets.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resolver(&self) -> Arc<LazyAssetResolver> {
+        self.resolver.clone()
     }
 }
 
@@ -745,9 +773,10 @@ impl FigDocument {
                 let gpui_images = decode_gpui_images(&raw_assets);
                 crate::report_slow("document load: gpui thumbnails", started);
                 let embedded_assets = (!raw_assets.is_empty()).then(|| {
-                    Arc::new(LazyAssetResolver::new(
+                    Arc::new(LazyAssetResolver::with_size_reader(
                         raw_assets.clone(),
                         Arc::new(decode_embedded_image),
+                        Arc::new(embedded_image_size),
                     ))
                 });
                 let asset_resolver = embedded_assets
@@ -1386,6 +1415,48 @@ impl AssetResolver for OverlayAssetResolver {
             return Some(bytes.clone());
         }
         self.base.as_ref()?.resolve_bytes(id)
+    }
+
+    fn image_size(&self, id: AssetId) -> Option<[u32; 2]> {
+        if let Some(image) = self
+            .added
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&id)
+        {
+            return Some([image.width, image.height]);
+        }
+        self.base.as_ref()?.image_size(id)
+    }
+
+    fn resolve_level_nonblocking(&self, id: AssetId, level: u32) -> LevelLookup {
+        if let Some(image) = self
+            .added
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&id)
+        {
+            return LevelLookup::Decoded(LeveledImage {
+                image: image.clone(),
+                level: 0,
+            });
+        }
+        match &self.base {
+            Some(base) => base.resolve_level_nonblocking(id, level),
+            None => LevelLookup::Unavailable,
+        }
+    }
+
+    fn decode_generation(&self) -> u64 {
+        self.base
+            .as_ref()
+            .map_or(0, |base| base.decode_generation())
+    }
+
+    fn subscribe_decodes(&self, listener: std::sync::Weak<dyn DecodeListener>) {
+        if let Some(base) = &self.base {
+            base.subscribe_decodes(listener);
+        }
     }
 }
 
@@ -5124,6 +5195,18 @@ fn decode_embedded_image(asset_id: AssetId, bytes: &[u8]) -> Option<DecodedImage
     }
 }
 
+/// An embedded image's natural size, read from its header. The canvas picks
+/// the level to decode from it before decoding anything, and Skia, which the
+/// resolver reads sizes with by default, is built without WebP.
+fn embedded_image_size(bytes: &[u8]) -> Option<[u32; 2]> {
+    let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()?;
+    Some([width, height])
+}
+
 /// The image assets drawn somewhere under `page_root`: every bitmap's asset,
 /// every video's poster frame, and every image paint in a fill, stroke, or
 /// frame background. An instance draws its component master's subtree, which
@@ -6490,6 +6573,24 @@ mod tests {
     }
 
     #[test]
+    fn the_document_resolver_sizes_webp_assets_without_decoding_them() {
+        let mut webp = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut webp)
+            .encode(&[90u8; 6 * 4 * 4], 6, 4, image::ExtendedColorType::Rgba8)
+            .expect("encode webp");
+        assert_eq!(embedded_image_size(&webp), Some([6, 4]));
+
+        let id = AssetId::from_u128(1);
+        let resolver = LazyAssetResolver::with_size_reader(
+            Arc::new(BTreeMap::from([(id, webp)])),
+            Arc::new(decode_embedded_image),
+            Arc::new(embedded_image_size),
+        );
+        assert_eq!(resolver.image_size(id), Some([6, 4]));
+        assert_eq!(resolver.decoded_bytes(), 0, "sizing decodes nothing");
+    }
+
+    #[test]
     fn a_page_prewarm_stops_once_the_document_that_owns_its_resolver_is_gone() {
         use fanta_render::DecodedImage;
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -6529,6 +6630,7 @@ mod tests {
             assets: assets.clone().into(),
         }
         .run();
+        live.wait_for_background_decodes();
         assert_eq!(decodes.load(Ordering::SeqCst), assets.len());
         drop(live);
     }

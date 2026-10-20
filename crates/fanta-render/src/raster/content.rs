@@ -3,10 +3,11 @@
 //! so a component instance renders pixel-identically to the same subtree
 //! placed directly in the scene.
 use super::{
-    AudioNode, Bounds, Canvas, CanvasNode, Color, Fill, GroupNode, Model3dNode, NodeData, NodeId,
-    Rect, RenderCtx, Scene, VideoNode, bounds_to_f32, draw_image_cached, draw_pattern_fill,
-    draw_placeholder, draw_shader_fill, draw_text_node, draw_text_path_node, draw_vector,
-    draw_video_fill, fill_to_paint, rounded_rect_path, stroke_box_path,
+    AudioNode, Bounds, Canvas, CanvasNode, Color, Fill, GroupNode, ImageDraw, Model3dNode,
+    NodeData, NodeId, Rect, RenderCtx, Scene, VideoNode, bounds_to_f32, draw_image_cached,
+    draw_pattern_fill, draw_placeholder, draw_shader_fill, draw_text_node, draw_text_path_node,
+    draw_vector, draw_video_fill, fill_to_paint, pending_image_paint, rounded_rect_path,
+    stroke_box_path,
 };
 
 /// This node's live playback position (0..=1) from the app-playback→render seam,
@@ -144,12 +145,12 @@ pub(crate) fn paint_node_content(
             // falls through to the placeholder so a missing image is *visible*
             // and never panics — the deferred-output contract of
             // `AssetResolver`.
-            let resolver = ctx.resolver;
+            let images = ctx.image_source();
             let drawn = draw_image_cached(
                 canvas,
                 ctx.cache,
                 b.asset,
-                || resolver.and_then(|r| r.resolve(b.asset)),
+                images,
                 b.local_size,
                 b.crop,
                 b.fit,
@@ -157,13 +158,25 @@ pub(crate) fn paint_node_content(
                 1.0,
                 super::ImageFillMods::default(),
             );
-            if !drawn {
+            if drawn.incomplete() {
                 ctx.metrics.incomplete_artwork = true;
                 // The asset may still be decoding: what this painted can
                 // change with no scene edit, so an enclosing effects layer
                 // must not be cached from it.
                 ctx.layer_volatile = true;
-                draw_placeholder(canvas, b.local_size, Color::rgba(120, 200, 255, 100));
+            }
+            match drawn {
+                ImageDraw::Exact | ImageDraw::Coarser => {}
+                ImageDraw::Pending => {
+                    let [width, height] = b.local_size;
+                    canvas.draw_rect(
+                        Rect::from_xywh(0.0, 0.0, width as f32, height as f32),
+                        &pending_image_paint(),
+                    );
+                }
+                ImageDraw::Missing => {
+                    draw_placeholder(canvas, b.local_size, Color::rgba(120, 200, 255, 100));
+                }
             }
             ctx.metrics.nodes_drawn += 1;
             ContentPaintState::default()
@@ -388,9 +401,8 @@ fn paint_group(
                 adjust,
             } = fill
             {
-                // Hoisted so the resolve closure captures a local, not
-                // `ctx`, which `ctx.cache` borrows mutably.
-                let resolver = ctx.resolver;
+                // Hoisted: `ctx.cache` borrows `ctx` mutably below.
+                let images = ctx.image_source();
                 canvas.save();
                 canvas.clip_path(path, None, true);
                 canvas.translate((b.min_x as f32, b.min_y as f32));
@@ -399,7 +411,7 @@ fn paint_group(
                     canvas,
                     ctx.cache,
                     *asset,
-                    || resolver.and_then(|r| r.resolve(*asset)),
+                    images,
                     [b.width(), b.height()],
                     crop_rect,
                     *mode,
@@ -413,14 +425,22 @@ fn paint_group(
                     },
                 );
                 canvas.restore();
-                if !drawn {
+                if drawn.incomplete() {
                     ctx.metrics.incomplete_artwork = true;
-                    // Unresolved asset or malformed buffer: the same
-                    // placeholder paint as before, outside the clip. The
-                    // asset may still be decoding — see `layer_volatile`.
+                    // The asset may still be decoding — see `layer_volatile`.
                     ctx.layer_volatile = true;
-                    let paint = fill_to_paint(fill, bounds_to_f32(&b));
-                    canvas.draw_path(path, &paint);
+                }
+                match drawn {
+                    ImageDraw::Exact | ImageDraw::Coarser => {}
+                    ImageDraw::Pending => {
+                        canvas.draw_path(path, &pending_image_paint());
+                    }
+                    ImageDraw::Missing => {
+                        // Unresolved asset or malformed buffer: the same
+                        // placeholder paint as before, outside the clip.
+                        let paint = fill_to_paint(fill, bounds_to_f32(&b));
+                        canvas.draw_path(path, &paint);
+                    }
                 }
                 ctx.metrics.nodes_drawn += 1;
             } else {
@@ -453,7 +473,7 @@ fn paint_video(canvas: &Canvas, v: &VideoNode, scene_id: Option<NodeId>, ctx: &m
     // is clipped to the shared card radius and sits on the same shadow as
     // its siblings; the film-strip card is the fallback when neither a
     // frame nor a poster is available (e.g. ffmpeg unavailable).
-    let resolver = ctx.resolver;
+    let images = ctx.image_source();
     let pb = scene_id.and_then(|id| ctx.inputs.playback.and_then(|m| m.get(&id)));
     let frame = pb.and_then(|p| p.frame);
     super::media::draw_media_shadow(canvas, v.local_size);
@@ -494,14 +514,15 @@ fn paint_video(canvas: &Canvas, v: &VideoNode, scene_id: Option<NodeId>, ctx: &m
             canvas,
             ctx.cache,
             asset,
-            || resolver.and_then(|r| r.resolve(asset)),
+            images,
             v.local_size,
             None,
             v.fit,
             None,
             1.0,
             super::ImageFillMods::default(),
-        );
+        )
+        .drew();
         canvas.restore();
         if ok {
             drawn = true;

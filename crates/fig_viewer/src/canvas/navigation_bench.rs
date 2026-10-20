@@ -340,6 +340,7 @@ impl Bench {
         let (jobs, job_rx) = mpsc::channel();
         let (reply_tx, replies) = mpsc::channel();
         let signal = Arc::new(WakeSignal::default());
+        let decode_listener = signal.clone();
         let presentation = Arc::new(Mutex::new(PresentationPool::default()));
         let thread_presentation = presentation.clone();
         let render_thread = std::thread::Builder::new()
@@ -347,8 +348,15 @@ impl Bench {
             .spawn(move || {
                 render_thread_main(render_size, job_rx, reply_tx, signal, thread_presentation)
             })?;
-        let gpu =
-            GpuCanvas::with_channels(None, jobs, replies, Task::ready(()), None, presentation);
+        let gpu = GpuCanvas::with_channels(
+            None,
+            jobs,
+            replies,
+            Task::ready(()),
+            None,
+            presentation,
+            decode_listener,
+        );
         let mut bench = Self {
             document,
             gpu,
@@ -410,12 +418,15 @@ impl Bench {
         }
         if let Some(prewarm) = self.document.take_page_prewarm(root) {
             let assets = prewarm.len();
+            let resolver = prewarm.resolver();
             let origin = self.origin;
             std::thread::Builder::new()
                 .name("navigation-bench-prewarm".into())
                 .spawn(move || {
                     let started = Instant::now();
                     prewarm.run();
+                    // On macOS the prewarm only queues decodes.
+                    resolver.wait_for_background_decodes();
                     eprintln!(
                         "prewarmed {assets} page images in {:.1} ms (finished at {:.1} ms)",
                         started.elapsed().as_secs_f64() * 1000.0,

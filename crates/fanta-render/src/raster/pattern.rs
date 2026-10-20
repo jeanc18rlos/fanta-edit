@@ -85,6 +85,7 @@ mod context_tests {
                 split: None,
                 scene: &doc.scene,
                 resolver: None,
+                image_decode: crate::image::ImageDecode::Blocking,
                 cache: &mut images,
                 instance_cache: &mut instances,
                 boolean_cache: &mut booleans,

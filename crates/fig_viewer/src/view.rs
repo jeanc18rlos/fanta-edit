@@ -5947,8 +5947,8 @@ impl FigView {
             return;
         };
         if let Some(prewarm) = prewarm {
-            // Decoding the page's images inside its first frame would stall
-            // the render thread; the walk waits only for decodes under way.
+            // Start the page's image decodes before its first frame asks for
+            // them (see `PagePrewarm::run`).
             cx.background_spawn(async move { prewarm.run() }).detach();
         }
         let changed_for_view = self.last_seen_root != root;

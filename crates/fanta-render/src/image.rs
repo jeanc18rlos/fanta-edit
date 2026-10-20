@@ -7,7 +7,7 @@
 //! `specs/03-media-3d-and-node-workflows.md` §1's test plan asks. The Skia
 //! glue ([`draw_decoded_image`]) is thin on top of it.
 
-use crate::asset::DecodedImage;
+use crate::asset::{AssetResolver, DecodedImage, LevelLookup, LeveledImage};
 use crate::color::to_sk_color;
 use crate::paint::apply_blend_mode;
 use fanta_doc::{AssetId, BlendMode, Color, ImageAdjust, ImageFitMode};
@@ -69,8 +69,8 @@ pub struct ImageCache {
     draws: u64,
 }
 
-/// One asset's cached images: the full-resolution upload plus its display
-/// pyramid.
+/// One asset's cached images: the finest level on hand plus the display
+/// pyramid derived from it.
 ///
 /// ## Why a pyramid (image zoom-out LOD)
 ///
@@ -82,24 +82,32 @@ pub struct ImageCache {
 /// blows the 256 MB default budget, so every frame purged and re-uploaded
 /// (and re-mipped) them all: ~200 ms of a 458 ms frame at 10% zoom.
 ///
-/// `levels[i]` is the full image's own mip level `i+1`, copied out as a
+/// `levels[i]` is the base image's own mip level `i+1`, copied out as a
 /// standalone image (see [`build_pyramid_level`]) — so the mip chain Skia
-/// builds for a level IS the full image's chain from that level down, texel
+/// builds for a level IS the base image's chain from that level down, texel
 /// for texel. A minified draw picks the shallowest level
 /// whose texel density still meets the device's (see [`minification_level`])
-/// and samples that instead: the same texels a trilinear lookup into the full
-/// image's chain would read, but the upload is `1/4^level` the size, and the
-/// full-resolution texture is never touched while zoomed out. Levels are built
-/// on first need (a cheap CPU raster draw, `1/4^level` of the asset's pixels)
-/// and kept: total extra CPU memory ≤ 1/3 of the full image, like a mip chain.
-/// Zooming back in walks up to level 0 — the untouched full upload — so export
-/// / zoom-in fidelity is unchanged.
+/// and samples that instead: the same texels a trilinear lookup into the base
+/// image's chain would read, but the upload is `1/4^level` the size. Levels are
+/// built on first need (a cheap CPU raster draw, `1/4^level` of the base's
+/// pixels) and kept: total extra CPU memory ≤ 1/3 of the base, like a mip
+/// chain.
+///
+/// A blocking draw's base is the natural-resolution image, so export / zoom-in
+/// fidelity is unchanged. A background draw's base is the level the resolver
+/// decoded for it, which is how a photo shown as a thumbnail never holds its
+/// full-resolution pixels.
 struct CachedImage {
-    /// The full-resolution image.
-    full: skia_safe::Image,
-    /// Display pyramid, contiguous from level 1: `levels[i]` = level `i + 1`.
+    /// The finest image on hand, at pyramid `level` (`0` = natural resolution).
+    base: skia_safe::Image,
+    level: u32,
+    /// Natural size in pixels. The level choice runs against it whatever level
+    /// the base is.
+    natural: [u32; 2],
+    /// Display pyramid below the base, contiguous: `levels[i]` is pyramid level
+    /// `level + i + 1`.
     levels: Vec<skia_safe::Image>,
-    /// Bytes of `full` and `levels`.
+    /// Bytes of `base` and `levels`.
     bytes: usize,
     last_drawn: u64,
 }
@@ -117,69 +125,109 @@ impl ImageCache {
         self.evict_over_budget(None);
     }
 
-    /// The cached full-resolution image for `id`, if already built, marked as
-    /// just drawn. The hot path: callers check this before resolving/decoding
-    /// pixels at all, so a cache hit never touches the asset resolver (see
-    /// [`draw_image_cached`]).
+    /// The cached base image for `id`, if already built, marked as just drawn.
+    #[cfg(test)]
     fn get(&mut self, id: AssetId) -> Option<&skia_safe::Image> {
         self.draws += 1;
         let draws = self.draws;
         self.images.get_mut(&id).map(|cached| {
             cached.last_drawn = draws;
-            &cached.full
+            &cached.base
         })
     }
 
-    /// Return the cached full-resolution image for `id`, building and
-    /// inserting it from `img` on a miss. Returns `None` only when the buffer
-    /// is malformed / Skia rejects it (the caller then draws its placeholder);
-    /// a `None` is *not* cached, so a buffer that becomes well-formed on a
-    /// later frame can still upload.
-    fn get_or_build(&mut self, id: AssetId, img: &DecodedImage) -> Option<&skia_safe::Image> {
-        use std::collections::hash_map::Entry;
-        // Build only on a genuine miss. The `Vacant` arm runs `build_sk_image`
-        // exactly once; a hit never builds. We deliberately do not use
-        // `or_insert_with` because building can *fail* (a malformed buffer), and
-        // a failed build must not insert a (sentinel) entry — so the miss arm
-        // bails with `?` and leaves the slot empty for a later well-formed frame.
+    /// The level and natural size `id` is cached at, marked as just drawn.
+    fn touch(&mut self, id: AssetId) -> Option<(u32, [u32; 2])> {
         self.draws += 1;
-        if let Entry::Vacant(e) = self.images.entry(id) {
-            let full = build_sk_image(img)?;
-            let bytes = raster_image_bytes(&full);
-            self.bytes += bytes;
-            e.insert(CachedImage {
-                full,
-                levels: Vec::new(),
-                bytes,
-                last_drawn: self.draws,
-            });
-            self.evict_over_budget(Some(id));
+        let draws = self.draws;
+        self.images.get_mut(&id).map(|cached| {
+            cached.last_drawn = draws;
+            (cached.level, cached.natural)
+        })
+    }
+
+    /// Return the cached natural-resolution image for `id`, building and
+    /// inserting it from `img` when the cache holds none. Returns `None` only
+    /// when the buffer is malformed / Skia rejects it (the caller then draws
+    /// its placeholder); a `None` is *not* cached, so a buffer that becomes
+    /// well-formed on a later frame can still upload.
+    fn get_or_build(&mut self, id: AssetId, img: &DecodedImage) -> Option<&skia_safe::Image> {
+        self.draws += 1;
+        // Build only when no natural-resolution entry exists. Building can
+        // *fail* (a malformed buffer), and a failed build must not insert a
+        // sentinel entry, so it bails with `?` and leaves the slot for a later
+        // well-formed frame.
+        if self.images.get(&id).is_none_or(|cached| cached.level > 0) {
+            let base = build_sk_image(img)?;
+            self.insert(id, base, 0, [img.width, img.height]);
         }
         let draws = self.draws;
         self.images.get_mut(&id).map(|cached| {
             cached.last_drawn = draws;
-            &cached.full
+            &cached.base
         })
     }
 
-    /// The display-pyramid image for `id` at `level` (`0` = the full image;
-    /// level `k` = the full image box-downscaled by `2^k`), building the
-    /// missing levels on demand. A `level` deeper than the pyramid can go
-    /// (a dimension would drop below [`IMAGE_LOD_MIN_LEVEL_PX`]) returns the
-    /// deepest level that exists — always at least the device resolution the
-    /// caller asked for, since the caller only asks for a level whose texel
-    /// density still meets the device's. `None` when `id` is not cached.
+    /// Keep `image` as the base for `id` unless the cache already holds its
+    /// level or a finer one.
+    fn adopt(&mut self, id: AssetId, image: &LeveledImage, natural: [u32; 2]) {
+        if self
+            .images
+            .get(&id)
+            .is_some_and(|cached| cached.level <= image.level)
+        {
+            return;
+        }
+        if let Some(base) = build_sk_image(&image.image) {
+            self.insert(id, base, image.level, natural);
+        }
+    }
+
+    fn insert(&mut self, id: AssetId, base: skia_safe::Image, level: u32, natural: [u32; 2]) {
+        self.remove(id);
+        let bytes = raster_image_bytes(&base);
+        self.bytes += bytes;
+        self.images.insert(
+            id,
+            CachedImage {
+                base,
+                level,
+                natural,
+                levels: Vec::new(),
+                bytes,
+                last_drawn: self.draws,
+            },
+        );
+        self.evict_over_budget(Some(id));
+    }
+
+    /// The display-pyramid image for `id` at `level`, building the missing
+    /// levels below the base on demand.
+    #[cfg(test)]
+    fn lod_level(&mut self, id: AssetId, level: u32) -> Option<skia_safe::Image> {
+        self.lod(id, level).map(|(image, _)| image)
+    }
+
+    /// The display-pyramid image for `id` at `level` (`0` = natural
+    /// resolution; level `k` = box-downscaled by `2^k`) and the level it really
+    /// is. A level finer than the base returns the base. A level deeper than
+    /// the pyramid can go (a dimension would drop below
+    /// [`IMAGE_LOD_MIN_LEVEL_PX`]) returns the deepest level that exists —
+    /// always at least the device resolution the caller asked for, since the
+    /// caller only asks for a level whose texel density still meets the
+    /// device's. `None` when `id` is not cached.
     ///
     /// The returned handle is a refcount bump (`skia_safe::Image` is a shared
     /// pointer), so the borrow of the cache ends here.
-    fn lod_level(&mut self, id: AssetId, level: u32) -> Option<skia_safe::Image> {
+    fn lod(&mut self, id: AssetId, level: u32) -> Option<(skia_safe::Image, u32)> {
         let cached = self.images.get_mut(&id)?;
-        if level == 0 {
-            return Some(cached.full.clone());
+        if level <= cached.level {
+            return Some((cached.base.clone(), cached.level));
         }
+        let below = (level - cached.level) as usize;
         let mut added = 0;
-        while cached.levels.len() < level as usize {
-            let Some(next) = build_pyramid_level(&cached.full, cached.levels.len() as u32 + 1)
+        while cached.levels.len() < below {
+            let Some(next) = build_pyramid_level(&cached.base, cached.levels.len() as u32 + 1)
             else {
                 break;
             };
@@ -187,15 +235,18 @@ impl ImageCache {
             cached.levels.push(next);
         }
         cached.bytes += added;
-        let idx = (level as usize).min(cached.levels.len());
-        let image = if idx == 0 {
-            cached.full.clone()
+        let index = below.min(cached.levels.len());
+        let found = if index == 0 {
+            (cached.base.clone(), cached.level)
         } else {
-            cached.levels[idx - 1].clone()
+            (
+                cached.levels[index - 1].clone(),
+                cached.level + index as u32,
+            )
         };
         self.bytes += added;
         self.evict_over_budget(Some(id));
-        Some(image)
+        Some(found)
     }
 
     /// Drop the least recently drawn entries until the cache fits its budget,
@@ -258,7 +309,7 @@ impl ImageCache {
         self.images.len()
     }
 
-    /// CPU bytes held by the cached images and their pyramid levels. Full
+    /// CPU bytes held by the cached images and their pyramid levels. Base
     /// images share their pixels with the decodes they wrap.
     pub fn retained_bytes(&self) -> usize {
         self.bytes
@@ -470,6 +521,55 @@ fn build_pyramid_level(full: &skia_safe::Image, level: u32) -> Option<skia_safe:
         &paint,
     );
     Some(surface.image_snapshot())
+}
+
+/// `full` box-downscaled to pyramid `level` as straight-alpha pixels: the
+/// texels a draw-time pyramid level holds, built off the drawing thread so a
+/// background decode can keep just the level a canvas draws. Clamped to the
+/// deepest level the image has. `None` when Skia cannot build or read it back.
+pub(crate) fn decoded_pyramid_level(full: &DecodedImage, level: u32) -> Option<LeveledImage> {
+    if level == 0 {
+        return Some(LeveledImage {
+            image: full.clone(),
+            level: 0,
+        });
+    }
+    let base = build_sk_image(full)?;
+    let Some((image, level)) = (1..=level)
+        .rev()
+        .find_map(|level| build_pyramid_level(&base, level).map(|image| (image, level)))
+    else {
+        return Some(LeveledImage {
+            image: full.clone(),
+            level: 0,
+        });
+    };
+    let (width, height) = (image.width(), image.height());
+    let info = ImageInfo::new(
+        (width, height),
+        ColorType::RGBA8888,
+        AlphaType::Unpremul,
+        None,
+    );
+    let row_bytes = info.min_row_bytes();
+    let mut pixels = vec![0u8; row_bytes.checked_mul(usize::try_from(height).ok()?)?];
+    if !image.read_pixels(
+        &info,
+        &mut pixels,
+        row_bytes,
+        (0, 0),
+        skia_safe::image::CachingHint::Disallow,
+    ) {
+        return None;
+    }
+    Some(LeveledImage {
+        image: DecodedImage::new(
+            &pixels,
+            u32::try_from(width).ok()?,
+            u32::try_from(height).ok()?,
+        ),
+        level,
+    })
 }
 
 /// Skia's mip-level bias: `SkMipmap::ComputeLevel` selects the level pair
@@ -722,73 +822,162 @@ pub fn draw_decoded_image(
     )
 }
 
+/// How a draw obtains pixels for an asset it has not cached yet.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ImageDecode {
+    /// Decode on the drawing thread, at natural resolution, so the frame is
+    /// complete. Exports, sampling and tests draw this way.
+    #[default]
+    Blocking,
+    /// Never decode on the drawing thread: draw the level on hand or a
+    /// placeholder, and let a background decode deliver the level the draw
+    /// needs for a later frame. The interactive canvas draws this way, so a
+    /// page of large photos costs its first frames placeholders instead of
+    /// seconds of decoding.
+    Background,
+}
+
+/// Where a draw finds pixels for the assets it has not cached.
+#[derive(Clone, Copy)]
+pub struct ImageSource<'a> {
+    pub resolver: Option<&'a dyn AssetResolver>,
+    pub decode: ImageDecode,
+}
+
+/// What a cached image draw painted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageDraw {
+    /// The image, with texels at least as dense as the device's.
+    Exact,
+    /// The image at a coarser level, while a finer one decodes in the
+    /// background.
+    Coarser,
+    /// Nothing yet: the image is decoding in the background.
+    Pending,
+    /// Nothing: the asset is unknown, or cannot be decoded or built.
+    Missing,
+}
+
+impl ImageDraw {
+    /// Whether the image itself was painted.
+    pub fn drew(self) -> bool {
+        matches!(self, Self::Exact | Self::Coarser)
+    }
+
+    /// Whether a later frame can paint something else without any edit, so
+    /// nothing built from this one may be cached.
+    pub fn incomplete(self) -> bool {
+        self != Self::Exact
+    }
+}
+
+/// What a draw paints where an image is still decoding: a quiet neutral wash,
+/// unlike the loud placeholders that mark a missing or broken asset.
+const PENDING_IMAGE_COLOR: Color = Color::rgba(128, 128, 128, 40);
+
+/// The fill a still-decoding image's shape gets, in [`PENDING_IMAGE_COLOR`].
+pub(crate) fn pending_image_paint() -> Paint {
+    let mut paint = Paint::default();
+    paint.set_anti_alias(true);
+    paint.set_color(to_sk_color(PENDING_IMAGE_COLOR));
+    paint
+}
+
 /// Cache-aware variant of [`draw_decoded_image`]: looks the built
-/// [`skia_safe::Image`] up in `cache` by `id`, calling `resolve` for the
-/// decoded pixels ONLY on a cache miss. This is the path the renderer uses
-/// for bitmap nodes and image fills; the bare [`draw_decoded_image`] (no
-/// `id`, no cache) stays for one-shot callers and the pure fit-math tests.
+/// [`skia_safe::Image`] up in `cache` by `id`, asking `source` for pixels ONLY
+/// on a cache miss. This is the path the renderer uses for bitmap nodes and
+/// image fills; the bare [`draw_decoded_image`] (no `id`, no cache) stays for
+/// one-shot callers and the pure fit-math tests.
 ///
-/// Resolving lazily — rather than taking a `&DecodedImage` — is what lets the
-/// cached `SkImage` (which owns its own pixel buffer) be the *single*
-/// long-lived CPU copy of each asset: on the hot cache-hit path no decoded
-/// pixels exist at all, so the resolver is free to decode fresh per miss
-/// instead of memoizing a permanent second copy of every image.
-///
-/// Returns `true` if it drew the real image, `false` if the pixels could not
-/// be resolved or the image could not be built (caller draws the placeholder).
+/// A [`ImageDecode::Blocking`] source resolves the natural-resolution pixels
+/// and the cache derives the pyramid level the draw samples. A
+/// [`ImageDecode::Background`] source asks the resolver for that level without
+/// decoding here, and draws a coarser level, or nothing, until it lands.
 #[allow(clippy::too_many_arguments)]
 pub fn draw_image_cached(
     canvas: &Canvas,
     cache: &mut ImageCache,
     id: AssetId,
-    resolve: impl FnOnce() -> Option<DecodedImage>,
+    source: ImageSource<'_>,
     local_size: [f64; 2],
     crop: Option<[f32; 4]>,
     fit: ImageFitMode,
     tint: Option<Color>,
     opacity: f32,
     mods: ImageFillMods,
-) -> bool {
-    // Clone the handle out so the cache borrow ends before we draw.
-    // `skia_safe::Image` is a refcounted handle (an `SkImage` smart pointer),
-    // so the clone is a refcount bump, not a pixel copy.
-    let sk_image = match cache.get(id).cloned() {
-        Some(img) => img,
-        None => {
-            let Some(decoded) = resolve() else {
-                return false;
+) -> ImageDraw {
+    let needed_level = |natural: [u32; 2]| {
+        draw_device_scale(canvas, natural[0], natural[1], local_size, crop, fit, mods)
+            .map_or(0, minification_level)
+    };
+    let (image, level, needed) = match source.decode {
+        ImageDecode::Blocking => {
+            let natural = match cache.touch(id) {
+                Some((0, natural)) => natural,
+                _ => {
+                    let Some(decoded) = source.resolver.and_then(|resolver| resolver.resolve(id))
+                    else {
+                        return ImageDraw::Missing;
+                    };
+                    if cache.get_or_build(id, &decoded).is_none() {
+                        return ImageDraw::Missing;
+                    }
+                    [decoded.width, decoded.height]
+                }
             };
-            match cache.get_or_build(id, &decoded) {
-                Some(img) => img.clone(),
-                None => match build_sk_image(&decoded) {
-                    Some(image) => image,
-                    None => return false,
-                },
+            let needed = needed_level(natural);
+            let Some((image, level)) = cache.lod(id, needed) else {
+                return ImageDraw::Missing;
+            };
+            (image, level, needed)
+        }
+        ImageDecode::Background => {
+            let cached = cache.touch(id);
+            let natural = cached
+                .map(|(_, natural)| natural)
+                .or_else(|| source.resolver.and_then(|resolver| resolver.image_size(id)));
+            let needed = natural.map_or(0, needed_level);
+            let held = cached.map(|(level, _)| level);
+            if held.is_none_or(|held| held > needed) {
+                let lookup = source
+                    .resolver
+                    .map_or(LevelLookup::Unavailable, |resolver| {
+                        resolver.resolve_level_nonblocking(id, needed)
+                    });
+                match lookup {
+                    LevelLookup::Decoded(found) => {
+                        let natural = natural.unwrap_or_else(|| {
+                            [found.image.width, found.image.height]
+                                .map(|side| side.saturating_mul(1 << found.level.min(31)))
+                        });
+                        cache.adopt(id, &found, natural);
+                    }
+                    LevelLookup::Pending if held.is_none() => return ImageDraw::Pending,
+                    LevelLookup::Unavailable if held.is_none() => return ImageDraw::Missing,
+                    LevelLookup::Pending | LevelLookup::Unavailable => {}
+                }
             }
+            let Some((image, level)) = cache.lod(id, needed) else {
+                return ImageDraw::Missing;
+            };
+            (image, level, needed)
         }
     };
-    // The upload preserves dimensions, so the SkImage's size IS the asset's
-    // natural size — the crop math needs no DecodedImage on the hit path.
-    let (nat_w, nat_h) = (sk_image.width() as u32, sk_image.height() as u32);
     // Zoom-out LOD: a minified draw samples the display-pyramid level whose
     // texel density still meets the device's instead of the full upload (see
     // `CachedImage`). The crop/fit math is normalized, so the level's own
     // dimensions stand in for the natural size below.
-    let level = draw_device_scale(canvas, nat_w, nat_h, local_size, crop, fit, mods)
-        .map_or(0, minification_level);
-    let (sk_image, nat_w, nat_h) = match level {
-        0 => (sk_image, nat_w, nat_h),
-        level => match cache.lod_level(id, level) {
-            Some(lod) => {
-                let (w, h) = (lod.width() as u32, lod.height() as u32);
-                (lod, w, h)
-            }
-            None => (sk_image, nat_w, nat_h),
-        },
-    };
-    blit_sk_image(
-        canvas, &sk_image, nat_w, nat_h, local_size, crop, fit, tint, opacity, mods, true,
-    )
+    let (width, height) = (image.width() as u32, image.height() as u32);
+    if !blit_sk_image(
+        canvas, &image, width, height, local_size, crop, fit, tint, opacity, mods, true,
+    ) {
+        return ImageDraw::Missing;
+    }
+    if level > needed {
+        ImageDraw::Coarser
+    } else {
+        ImageDraw::Exact
+    }
 }
 
 /// Device pixels per SOURCE texel for a draw of a `nat_w × nat_h` image into
@@ -1356,19 +1545,25 @@ mod tests {
         let canvas = surface.canvas();
         canvas.clear(skia_safe::Color::WHITE);
         canvas.scale((dst as f32 / local[0] as f32, dst as f32 / local[1] as f32));
+        let mut resolver = crate::asset::InMemoryAssetResolver::new();
+        resolver.insert(id, img.clone());
         let drawn = match cache {
             Some(cache) => draw_image_cached(
                 canvas,
                 cache,
                 id,
-                || Some(img.clone()),
+                ImageSource {
+                    resolver: Some(&resolver),
+                    decode: ImageDecode::Blocking,
+                },
                 local,
                 crop,
                 fit,
                 None,
                 1.0,
                 ImageFillMods::default(),
-            ),
+            )
+            .drew(),
             None => draw_decoded_image(canvas, img, local, crop, fit, None, 1.0),
         };
         assert!(drawn);
@@ -1510,6 +1705,238 @@ mod tests {
                 );
             }
         }
+    }
+
+    // -------------------------------------------------------------------
+    // Background decoding: the drawing thread never decodes
+    // -------------------------------------------------------------------
+
+    fn png_bytes(img: &DecodedImage) -> Vec<u8> {
+        build_sk_image(img)
+            .expect("well-formed")
+            .encode(None, skia_safe::EncodedImageFormat::PNG, 100)
+            .expect("png")
+            .as_bytes()
+            .to_vec()
+    }
+
+    /// A resolver over `assets` that decodes through Skia and records the
+    /// thread of every decode.
+    fn background_resolver(
+        assets: &[(AssetId, Vec<u8>)],
+    ) -> (
+        crate::asset::LazyAssetResolver,
+        std::sync::Arc<std::sync::Mutex<Vec<std::thread::ThreadId>>>,
+    ) {
+        use std::sync::{Arc, Mutex};
+        let threads = Arc::new(Mutex::new(Vec::new()));
+        let decoder = {
+            let threads = threads.clone();
+            Arc::new(move |_id, bytes: &[u8]| {
+                threads
+                    .lock()
+                    .expect("decode log")
+                    .push(std::thread::current().id());
+                crate::asset::decode_image_bytes(bytes)
+            })
+        };
+        let encoded = assets.iter().cloned().collect();
+        (
+            crate::asset::LazyAssetResolver::new(Arc::new(encoded), decoder),
+            threads,
+        )
+    }
+
+    fn decodes(
+        threads: &std::sync::Mutex<Vec<std::thread::ThreadId>>,
+    ) -> Vec<std::thread::ThreadId> {
+        threads.lock().expect("decode log").clone()
+    }
+
+    /// Draw asset `id` whole into a white `dst × dst` surface at CTM scale
+    /// `dst / side`, returning what the draw reports and the RGBA bytes.
+    fn draw_scaled(
+        cache: &mut ImageCache,
+        id: AssetId,
+        source: ImageSource<'_>,
+        side: u32,
+        dst: i32,
+    ) -> (ImageDraw, Vec<u8>) {
+        let mut surface = skia_safe::surfaces::raster_n32_premul((dst, dst)).expect("surface");
+        let canvas = surface.canvas();
+        canvas.clear(skia_safe::Color::WHITE);
+        let scale = dst as f32 / side as f32;
+        canvas.scale((scale, scale));
+        let drawn = draw_image_cached(
+            canvas,
+            cache,
+            id,
+            source,
+            [side as f64, side as f64],
+            None,
+            ImageFitMode::Stretch,
+            None,
+            1.0,
+            ImageFillMods::default(),
+        );
+        let info = ImageInfo::new((dst, dst), ColorType::RGBA8888, AlphaType::Unpremul, None);
+        let row_bytes = info.min_row_bytes();
+        let mut buf = vec![0u8; row_bytes * dst as usize];
+        assert!(surface.read_pixels(&info, &mut buf, row_bytes, (0, 0)));
+        (drawn, buf)
+    }
+
+    #[test]
+    fn background_draw_decodes_only_the_drawn_level_off_the_drawing_thread() {
+        let id = AssetId::new();
+        let img = gradient_image(64);
+        let (resolver, threads) = background_resolver(&[(id, png_bytes(&img))]);
+        let background = ImageSource {
+            resolver: Some(&resolver),
+            decode: ImageDecode::Background,
+        };
+        let mut cache = ImageCache::new();
+
+        // An eighth of the natural size samples pyramid level 2.
+        let (first, untouched) = draw_scaled(&mut cache, id, background, 64, 8);
+        assert_eq!(
+            first,
+            ImageDraw::Pending,
+            "nothing to draw before the decode"
+        );
+        assert!(untouched.iter().all(|channel| *channel == 255));
+        assert!(cache.is_empty());
+
+        resolver.wait_for_background_decodes();
+        let (settled, pixels) = draw_scaled(&mut cache, id, background, 64, 8);
+        assert_eq!(settled, ImageDraw::Exact);
+        assert_eq!(
+            (cache.images[&id].level, cache.images[&id].natural),
+            (2, [64, 64]),
+            "the cache holds the drawn level, not the natural image"
+        );
+        assert_eq!(cache.retained_bytes(), 16 * 16 * 4);
+        let decode_threads = decodes(&threads);
+        assert_eq!(decode_threads.len(), 1);
+        assert_ne!(decode_threads[0], std::thread::current().id());
+
+        // The same pixels a blocking draw samples from the natural image.
+        let mut in_memory = crate::asset::InMemoryAssetResolver::new();
+        in_memory.insert(id, img);
+        let blocking = ImageSource {
+            resolver: Some(&in_memory),
+            decode: ImageDecode::Blocking,
+        };
+        let (drawn, expected) = draw_scaled(&mut ImageCache::new(), id, blocking, 64, 8);
+        assert_eq!(drawn, ImageDraw::Exact);
+        assert_eq!(pixels, expected);
+    }
+
+    #[test]
+    fn background_draw_shows_a_coarser_level_until_the_finer_one_lands() {
+        let id = AssetId::new();
+        let (resolver, threads) = background_resolver(&[(id, png_bytes(&gradient_image(64)))]);
+        let background = ImageSource {
+            resolver: Some(&resolver),
+            decode: ImageDecode::Background,
+        };
+        let mut cache = ImageCache::new();
+
+        // Zoomed far out: level 3.
+        draw_scaled(&mut cache, id, background, 64, 4);
+        resolver.wait_for_background_decodes();
+        assert_eq!(
+            draw_scaled(&mut cache, id, background, 64, 4).0,
+            ImageDraw::Exact
+        );
+        assert_eq!(cache.images[&id].level, 3);
+
+        // Zoomed in to 1:1, the coarse level stands in while level 0 decodes.
+        let (zoomed_in, pixels) = draw_scaled(&mut cache, id, background, 64, 64);
+        assert_eq!(zoomed_in, ImageDraw::Coarser);
+        assert_ne!(
+            &pixels[..4],
+            &[255, 255, 255, 255],
+            "the coarse level was drawn"
+        );
+        resolver.wait_for_background_decodes();
+        assert_eq!(
+            draw_scaled(&mut cache, id, background, 64, 64).0,
+            ImageDraw::Exact
+        );
+        assert_eq!(cache.images[&id].level, 0);
+
+        // Zooming back out samples the cache's own pyramid without decoding.
+        assert_eq!(
+            draw_scaled(&mut cache, id, background, 64, 4).0,
+            ImageDraw::Exact
+        );
+        resolver.wait_for_background_decodes();
+        assert_eq!(decodes(&threads).len(), 2);
+    }
+
+    #[test]
+    fn background_draw_reports_unknown_and_undecodable_assets_as_missing() {
+        let corrupt = AssetId::new();
+        let (resolver, threads) = background_resolver(&[(corrupt, vec![1, 2, 3])]);
+        let background = ImageSource {
+            resolver: Some(&resolver),
+            decode: ImageDecode::Background,
+        };
+        let mut cache = ImageCache::new();
+
+        let unknown = draw_scaled(&mut cache, AssetId::new(), background, 64, 8).0;
+        assert_eq!(unknown, ImageDraw::Missing);
+        let no_resolver = ImageSource {
+            resolver: None,
+            decode: ImageDecode::Background,
+        };
+        assert_eq!(
+            draw_scaled(&mut cache, corrupt, no_resolver, 64, 8).0,
+            ImageDraw::Missing
+        );
+
+        assert_eq!(
+            draw_scaled(&mut cache, corrupt, background, 64, 8).0,
+            ImageDraw::Pending,
+            "the bytes are only known to be corrupt once decoded"
+        );
+        resolver.wait_for_background_decodes();
+        for _ in 0..2 {
+            assert_eq!(
+                draw_scaled(&mut cache, corrupt, background, 64, 8).0,
+                ImageDraw::Missing
+            );
+        }
+        resolver.wait_for_background_decodes();
+        assert_eq!(decodes(&threads).len(), 1, "a failure is not retried");
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn blocking_draw_upgrades_a_background_level_to_natural_resolution() {
+        let id = AssetId::new();
+        let (resolver, _threads) = background_resolver(&[(id, png_bytes(&gradient_image(64)))]);
+        let mut cache = ImageCache::new();
+        let background = ImageSource {
+            resolver: Some(&resolver),
+            decode: ImageDecode::Background,
+        };
+        draw_scaled(&mut cache, id, background, 64, 8);
+        resolver.wait_for_background_decodes();
+        draw_scaled(&mut cache, id, background, 64, 8);
+        assert_eq!(cache.images[&id].level, 2);
+
+        // An export of the same asset needs the natural resolution.
+        let blocking = ImageSource {
+            resolver: Some(&resolver),
+            decode: ImageDecode::Blocking,
+        };
+        assert_eq!(
+            draw_scaled(&mut cache, id, blocking, 64, 64).0,
+            ImageDraw::Exact
+        );
+        assert_eq!(cache.images[&id].level, 0);
     }
 
     #[test]

@@ -5,6 +5,7 @@
 - Added enum/image variables, conditional prototype branches and variable arithmetic.
 - Added clip settings, portable Motion JSON and Figma Motion JSON exports.
 - Improved vector path joining, closing, simplification, segment bending and anchor editing.
+- Improved canvas speed on image-heavy pages: images decode off the render thread, at the size they are drawn.
 - Added a command-line website exporter using an explicitly supplied Fanta-JS runtime.
 - Removed the unused RevenueCat integration; current billing uses Polar on the web.
 

@@ -6,11 +6,11 @@ use super::effects::{effects_layer_paint, group_clips_children};
 use super::layer_cache::{LayerCache, LayerLookup, render_layer_via_cache};
 use super::{
     AssetResolver, BlendMode, BooleanCache, Bounds, Canvas, CanvasNode, Fill, IdHashMap,
-    ImageCache, InstanceCache, MaskType, NodeData, NodeFlags, NodeId, Paint, PathCache,
-    PatternCache, RenderInputs, RenderMetrics, Scene, Transform2D, apply_background_blur,
-    draw_inner_shadows, effects_layer_bounds, opacity_folds_into_paint, padded_layer_rect,
-    paint_node_content, paint_node_foreground, render_instance, resolve_bound_value,
-    text_path_bounds, to_sk_matrix, visible_effects,
+    ImageCache, ImageDecode, ImageSource, InstanceCache, MaskType, NodeData, NodeFlags, NodeId,
+    Paint, PathCache, PatternCache, RenderInputs, RenderMetrics, Scene, Transform2D,
+    apply_background_blur, draw_inner_shadows, effects_layer_bounds, opacity_folds_into_paint,
+    padded_layer_rect, paint_node_content, paint_node_foreground, render_instance,
+    resolve_bound_value, text_path_bounds, to_sk_matrix, visible_effects,
 };
 
 // ---------------------------------------------------------------------------
@@ -26,6 +26,8 @@ pub(crate) struct RenderCtx<'a> {
     pub(crate) split: Option<super::split::SplitPass<'a>>,
     pub(crate) scene: &'a Scene,
     pub(crate) resolver: Option<&'a dyn AssetResolver>,
+    /// Whether an image the cache lacks may be decoded during this walk.
+    pub(crate) image_decode: ImageDecode,
     pub(crate) cache: &'a mut ImageCache,
     /// Cross-frame instance-expansion memo (see [`InstanceCache`]).
     pub(crate) instance_cache: &'a mut InstanceCache,
@@ -92,6 +94,16 @@ pub(crate) struct RenderCtx<'a> {
     /// store a volatile layer; nested layers propagate it outward.
     pub(crate) layer_volatile: bool,
     pub(crate) metrics: &'a mut RenderMetrics,
+}
+
+impl<'a> RenderCtx<'a> {
+    /// Where this walk's image draws find pixels their cache lacks.
+    pub(crate) fn image_source(&self) -> ImageSource<'a> {
+        ImageSource {
+            resolver: self.resolver,
+            decode: self.image_decode,
+        }
+    }
 }
 
 fn subtree_has_live_video_fill(ctx: &mut RenderCtx, id: NodeId) -> bool {

@@ -12,8 +12,8 @@ use super::walk::render_scoped_root;
 use super::{
     AlphaType, Arc, AssetResolver, BTreeMap, Canvas, Color, ColorType, ComponentLibrary,
     EncodedImageFormat, ExpandedNode, Fill, Hash, HashMap, Hasher, IdHashMap, ImageCache,
-    ImageInfo, InstanceNode, Instant, LayerCache, LayerEpoch, ModeId, NodeData, NodeId,
-    PatternCache, Rect, RenderCtx, Scene, Surface, VariableCollectionId, VariableRegistry,
+    ImageDecode, ImageInfo, InstanceNode, Instant, LayerCache, LayerEpoch, ModeId, NodeData,
+    NodeId, PatternCache, Rect, RenderCtx, Scene, Surface, VariableCollectionId, VariableRegistry,
     Viewport, render_node, surfaces, to_sk_color, visible_world_rect,
 };
 use fanta_canvas::Camera2D;
@@ -897,6 +897,9 @@ pub struct RasterRenderer {
     /// [`AssetId`]: fanta_doc::AssetId
     /// [`set_asset_resolver`]: Self::set_asset_resolver
     asset_resolver: Option<Arc<dyn AssetResolver>>,
+    /// Whether a draw may decode an image the cache lacks. See
+    /// [`Self::set_image_decode`].
+    image_decode: ImageDecode,
 
     /// Uploaded-image cache, keyed by [`AssetId`]. Bitmap nodes and image fills
     /// build their [`skia_safe::Image`] once and reuse it across frames instead
@@ -993,6 +996,7 @@ impl RasterRenderer {
             background: Color::TRANSPARENT,
             display_scale: 1.0,
             asset_resolver: None,
+            image_decode: ImageDecode::Blocking,
             image_cache: ImageCache::new(),
             instance_cache: InstanceCache::default(),
             boolean_cache: BooleanCache::default(),
@@ -1084,6 +1088,15 @@ impl RasterRenderer {
     /// Install the asset resolver used to turn an `AssetId` into decoded pixels
     /// for bitmap nodes and image fills. Replaces any previously-set resolver.
     /// Cheap — stores an [`Arc`] clone; no decode happens here.
+    /// How draws obtain images their cache lacks. The default,
+    /// [`ImageDecode::Blocking`], decodes them during the frame so every frame
+    /// is complete. The interactive canvas sets [`ImageDecode::Background`]:
+    /// its frames draw placeholders or coarser levels while images decode on
+    /// the resolver's own threads.
+    pub fn set_image_decode(&mut self, decode: ImageDecode) {
+        self.image_decode = decode;
+    }
+
     pub fn set_asset_resolver(&mut self, resolver: Arc<dyn AssetResolver>) {
         if self
             .asset_resolver
@@ -1433,6 +1446,7 @@ impl RasterRenderer {
             background,
             display_scale,
             resolver_ref,
+            self.image_decode,
             cache,
             instance_cache,
             boolean_cache,
@@ -1752,6 +1766,7 @@ impl RasterRenderer {
             self.background,
             self.display_scale,
             self.asset_resolver.as_deref(),
+            self.image_decode,
             &mut self.image_cache,
             &mut self.instance_cache,
             &mut self.boolean_cache,
@@ -1985,6 +2000,7 @@ impl RasterRenderer {
             background,
             display_scale,
             resolver_ref,
+            self.image_decode,
             cache,
             instance_cache,
             boolean_cache,
@@ -2119,6 +2135,7 @@ impl RasterRenderer {
             background,
             display_scale,
             resolver.as_deref(),
+            self.image_decode,
             cache,
             instance_cache,
             boolean_cache,
@@ -2178,6 +2195,7 @@ impl RasterRenderer {
             background,
             display_scale,
             resolver.as_deref(),
+            self.image_decode,
             cache,
             instance_cache,
             boolean_cache,
@@ -2207,6 +2225,7 @@ impl RasterRenderer {
         background: Option<Color>,
         display_scale: f64,
         resolver: Option<&dyn AssetResolver>,
+        image_decode: ImageDecode,
         cache: &mut ImageCache,
         instance_cache: &mut InstanceCache,
         boolean_cache: &mut BooleanCache,
@@ -2245,6 +2264,7 @@ impl RasterRenderer {
             split: None,
             scene,
             resolver,
+            image_decode,
             cache,
             instance_cache,
             boolean_cache,
@@ -2296,6 +2316,7 @@ impl RasterRenderer {
         background: Color,
         display_scale: f64,
         resolver: Option<&dyn AssetResolver>,
+        image_decode: ImageDecode,
         cache: &mut ImageCache,
         instance_cache: &mut InstanceCache,
         boolean_cache: &mut BooleanCache,
@@ -2414,6 +2435,7 @@ impl RasterRenderer {
             split,
             scene,
             resolver,
+            image_decode,
             cache,
             instance_cache,
             boolean_cache,
