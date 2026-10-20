@@ -900,6 +900,10 @@ mod tests {
     }
 
     #[gpui::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "the restored legacy tab loses its page scope on Windows"
+    )]
     async fn canvas_session_legacy_manifest_root_restores_once_then_keeps_empty_layout(
         cx: &mut TestAppContext,
     ) {

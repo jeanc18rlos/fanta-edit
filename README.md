@@ -95,7 +95,8 @@ for exact tool names and a bounded first task.
 cargo run -p fanta
 ```
 
-The executable is named `fanta`.
+The executable is named `fanta`. To build and test on Windows, see
+[Developing Fanta on Windows](docs/fanta/windows-development.md).
 
 - `cargo build -p fanta` builds the app.
 - `./script/clippy -p <crate>` runs the repository's lints for a crate; without

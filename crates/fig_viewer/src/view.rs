@@ -13449,6 +13449,7 @@ mod tests {
 
     /// A failing autosave is reported once, however many debounced retries
     /// keep failing, and the report clears when a save succeeds.
+    #[cfg(unix)]
     #[gpui::test]
     async fn a_failing_autosave_is_reported_until_a_save_succeeds(cx: &mut TestAppContext) {
         use std::os::unix::fs::PermissionsExt as _;
@@ -13625,6 +13626,7 @@ mod tests {
         view.update(cx, |view, cx| view.report_save_failure(&error, cx));
     }
 
+    #[cfg(unix)]
     #[gpui::test]
     async fn save_failure_notice_real_write_error_is_concise_and_recovery_is_scoped(
         cx: &mut TestAppContext,
@@ -13840,10 +13842,12 @@ mod tests {
         result.expect("queued notification work reconciles current document ownership and successful-save state");
     }
 
+    #[cfg(unix)]
     struct AutosaveDirectoryFault {
         permissions: Vec<(std::path::PathBuf, std::fs::Permissions)>,
     }
 
+    #[cfg(unix)]
     impl AutosaveDirectoryFault {
         fn apply(root: &std::path::Path) -> Result<Self> {
             use std::os::unix::fs::PermissionsExt as _;
@@ -13888,6 +13892,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     impl Drop for AutosaveDirectoryFault {
         fn drop(&mut self) {
             for (directory, permissions) in &self.permissions {
@@ -13929,6 +13934,7 @@ mod tests {
         Ok(files)
     }
 
+    #[cfg(unix)]
     fn assert_autosave_persisted_draft(
         root: &std::path::Path,
         item: &Entity<FigItem>,
@@ -13946,6 +13952,7 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     fn settle_autosave_and_resync(cx: &mut TestAppContext) {
         // Advance several separate deadlines so the resync's Edited event can
         // expose a re-armed debounce, rather than only testing the first timer.
@@ -13955,6 +13962,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[gpui::test]
     async fn unchanged_failed_autosave_stays_dirty_without_repeated_writes(
         cx: &mut TestAppContext,
@@ -14021,6 +14029,7 @@ mod tests {
         result.expect("an unchanged failed autosave retains its draft and notice without looping");
     }
 
+    #[cfg(unix)]
     #[gpui::test]
     async fn explicit_save_retries_the_unchanged_failed_autosave(cx: &mut TestAppContext) {
         let result: Result<()> = async {
@@ -14073,6 +14082,7 @@ mod tests {
         result.expect("explicit Save bypasses the failure stamp and success restores autosaving");
     }
 
+    #[cfg(unix)]
     #[gpui::test]
     async fn new_edit_retries_after_an_autosave_failure(cx: &mut TestAppContext) {
         let result: Result<()> = async {
@@ -14104,6 +14114,7 @@ mod tests {
         result.expect("a new committed edit remains eligible for automatic persistence");
     }
 
+    #[cfg(unix)]
     #[gpui::test]
     async fn newer_edit_during_failed_autosave_remains_eligible(cx: &mut TestAppContext) {
         let result: Result<()> = async {
@@ -14145,6 +14156,7 @@ mod tests {
         result.expect("an older failed snapshot must not suppress newer in-flight edits");
     }
 
+    #[cfg(unix)]
     #[gpui::test]
     async fn queued_identical_autosave_is_suppressed_after_the_first_failure(
         cx: &mut TestAppContext,
@@ -16067,7 +16079,7 @@ mod tests {
             .expect("X input")
             .center();
         visual.simulate_click(field, gpui::Modifiers::none());
-        visual.simulate_keystrokes("cmd-a");
+        visual.simulate_keystrokes("secondary-a");
         visual.simulate_input(draft);
         visual.run_until_parked();
         let focus = visual.update(|window, cx| window.focused(cx).expect("property input focus"));
@@ -16130,7 +16142,7 @@ mod tests {
             assert!(inspector.size.width >= px(MIN_INSPECTOR_SIDEBAR_WIDTH));
             assert!(field.left() >= inspector.left() && field.right() <= inspector.right());
             assert!(inspector.right() <= px(width));
-            visual.simulate_keystrokes("cmd-a cmd-c");
+            visual.simulate_keystrokes("secondary-a secondary-c");
             assert_eq!(
                 visual
                     .read_from_clipboard()

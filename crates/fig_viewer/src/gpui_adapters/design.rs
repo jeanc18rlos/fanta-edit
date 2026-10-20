@@ -15,6 +15,8 @@ use fanta_doc::{
     StrokeAlign, StrokeCap, StrokeJoin, TextAlign, TextAutoResize, TextPathAlignment,
     TextPathDirection, TextPathSide, TextPathStart, Transform2D, VAlign as TextVAlign, VarValue,
 };
+#[cfg(target_os = "macos")]
+use fanta_gpui::design::DesignVideoPreviewAction;
 use fanta_gpui::design::{
     DesignArcData, DesignArrangeOperation, DesignAutoLayoutItem, DesignBaselineAlignment,
     DesignBlendMode, DesignBooleanOperation, DesignColor, DesignComponentContext,
@@ -50,8 +52,8 @@ use fanta_gpui::design::{
     DesignTextHorizontalAlignment, DesignTextPathDirection, DesignTextPathOrientation,
     DesignTextPathPlacement, DesignTextPathStartData, DesignTextPathViewData, DesignTextResize,
     DesignTextVerticalAlignment, DesignTransformOperation, DesignTypography,
-    DesignTypographyTarget, DesignVideoPreviewAction, DesignVideoPreviewState,
-    DesignViewerPropertiesViewData, DesignViewerPropertyRow, DesignViewerPropertySection,
+    DesignTypographyTarget, DesignVideoPreviewState, DesignViewerPropertiesViewData,
+    DesignViewerPropertyRow, DesignViewerPropertySection,
 };
 use gpui::{
     AppContext as _, ClipboardItem, Context, Entity, SharedString, Subscription, TaskExt as _,
@@ -2724,7 +2726,8 @@ impl FigView {
         } else {
             None
         };
-        let mut video_previews = HashMap::new();
+        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+        let mut video_previews = HashMap::<String, DesignVideoPreviewState>::new();
         #[cfg(target_os = "macos")]
         for asset in self.selected_canvas_video_fill_assets(cx) {
             video_previews.insert(

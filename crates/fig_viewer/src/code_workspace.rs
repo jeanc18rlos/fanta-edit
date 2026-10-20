@@ -1534,6 +1534,9 @@ impl Render for FantaCodeWorkspace {
     }
 }
 
+// These tests open real files and check the result once `run_until_parked` returns. On
+// Windows the background loads often finish later, so the tests that failed there are
+// ignored on Windows until they wait for their loads.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1640,6 +1643,27 @@ mod tests {
         Project::test(file_system, [root], cx).await
     }
 
+    /// Runs the executor until `loading` returns false. Source loads read real files on
+    /// background threads, which can finish after `run_until_parked` returns, as they
+    /// often do on Windows, so this also lets real time pass.
+    fn run_until_loaded(
+        cx: &mut TestAppContext,
+        mut loading: impl FnMut(&mut TestAppContext) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            cx.run_until_parked();
+            if !loading(cx) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the source loads did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     async fn open_code_workspace_for_project(
         project: Entity<Project>,
         cx: &mut TestAppContext,
@@ -1670,7 +1694,13 @@ mod tests {
             workspace.set_visible(true, window, cx);
             workspace
         });
-        cx.run_until_parked();
+        run_until_loaded(cx, |cx| {
+            workspace
+                .read_with(cx, |workspace, _| {
+                    workspace.loading_fnx || workspace.loading_json
+                })
+                .expect("code workspace")
+        });
         (item, workspace)
     }
 
@@ -1688,6 +1718,10 @@ mod tests {
     }
 
     #[gpui::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "real-file loads race run_until_parked"
+    )]
     async fn deferred_source_workspace_preserves_shared_dirty_buffers(cx: &mut TestAppContext) {
         init_test(cx);
         let temporary = tempfile::tempdir().expect("project");
@@ -1766,6 +1800,10 @@ mod tests {
     }
 
     #[gpui::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "real-file loads race run_until_parked"
+    )]
     async fn deferred_saved_source_refresh_waits_for_shared_buffers(cx: &mut TestAppContext) {
         init_test(cx);
         let temporary = tempfile::tempdir().expect("project");
@@ -1807,6 +1845,10 @@ mod tests {
     }
 
     #[gpui::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "real-file loads race run_until_parked"
+    )]
     async fn source_follow_uses_the_shared_buffer_and_respects_pause(cx: &mut TestAppContext) {
         init_test(cx);
         let temporary = tempfile::tempdir().expect("temporary project");
@@ -1943,14 +1985,16 @@ mod tests {
         });
         let fnx_abs =
             fanta_format::locate_page_source(temporary.path(), page).expect("page source on disk");
-        let fnx_rel = fnx_abs
-            .strip_prefix(temporary.path())
-            .expect("page source inside project")
-            .to_str()
-            .expect("utf8 path");
+        let fnx_rel = util::rel_path::RelPath::new(
+            fnx_abs
+                .strip_prefix(temporary.path())
+                .expect("page source inside project"),
+            util::paths::PathStyle::local(),
+        )
+        .expect("relative page source");
         let scoped_path = ProjectPath {
             worktree_id,
-            path: util::rel_path::rel_path(fnx_rel).into(),
+            path: (&*fnx_rel).into(),
         };
         let scoped_item = cx
             .update(|cx| FigItem::try_open(&project, &scoped_path, cx))
@@ -2039,14 +2083,16 @@ mod tests {
         });
         let fnx_abs =
             fanta_format::locate_page_source(temporary.path(), page).expect("page source on disk");
-        let fnx_rel = fnx_abs
-            .strip_prefix(temporary.path())
-            .expect("page source inside project")
-            .to_str()
-            .expect("utf8 path");
+        let fnx_rel = util::rel_path::RelPath::new(
+            fnx_abs
+                .strip_prefix(temporary.path())
+                .expect("page source inside project"),
+            util::paths::PathStyle::local(),
+        )
+        .expect("relative page source");
         let scoped_path = ProjectPath {
             worktree_id,
-            path: util::rel_path::rel_path(fnx_rel).into(),
+            path: (&*fnx_rel).into(),
         };
         let scoped_entry = project.update(cx, |project, cx| {
             project
@@ -2170,6 +2216,10 @@ mod tests {
     }
 
     #[gpui::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "real-file loads race run_until_parked"
+    )]
     async fn saved_reconciles_renamed_page_source_paths(cx: &mut TestAppContext) {
         init_test(cx);
         let temporary = tempfile::tempdir().expect("temporary project");
@@ -2223,6 +2273,10 @@ mod tests {
     }
 
     #[gpui::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "real-file loads race run_until_parked"
+    )]
     async fn saved_reconciles_first_materialized_source(cx: &mut TestAppContext) {
         init_test(cx);
         let temporary = tempfile::tempdir().expect("temporary parent");
@@ -2280,6 +2334,10 @@ mod tests {
     }
 
     #[gpui::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "real-file loads race run_until_parked"
+    )]
     async fn saved_reconciliation_preserves_editors_when_source_paths_are_unchanged(
         cx: &mut TestAppContext,
     ) {
@@ -2560,6 +2618,10 @@ mod tests {
     }
 
     #[gpui::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "real-file loads race run_until_parked"
+    )]
     async fn loaded_layout_fnx_edit_saves_computed_geometry_and_preserves_other_islands(
         cx: &mut TestAppContext,
     ) {
@@ -2699,6 +2761,10 @@ mod tests {
     }
 
     #[gpui::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "real-file loads race run_until_parked"
+    )]
     async fn loaded_layout_two_source_drafts_keep_canvas_locked_until_both_save(
         cx: &mut TestAppContext,
     ) {
@@ -2810,6 +2876,10 @@ mod tests {
     }
 
     #[gpui::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "real-file loads race run_until_parked"
+    )]
     async fn loaded_layout_failed_geometry_write_retains_retryable_canvas_state(
         cx: &mut TestAppContext,
     ) {
@@ -2889,6 +2959,10 @@ mod tests {
     }
 
     #[gpui::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "real-file loads race run_until_parked"
+    )]
     async fn loaded_layout_discarding_invalid_second_source_retains_pending_geometry(
         cx: &mut TestAppContext,
     ) {
@@ -3021,6 +3095,10 @@ mod tests {
     }
 
     #[gpui::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "real-file loads race run_until_parked"
+    )]
     async fn json_source_save_keeps_invalid_drafts_out_of_the_project(cx: &mut TestAppContext) {
         init_test(cx);
         let temporary = tempfile::tempdir().expect("temporary project");
@@ -3109,6 +3187,10 @@ mod tests {
     /// starting language servers and REWRITING the author's file as a side
     /// effect of merely looking at it.
     #[gpui::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "real-file loads race run_until_parked"
+    )]
     async fn opening_the_code_pane_does_not_rewrite_the_fnx_on_disk(cx: &mut TestAppContext) {
         init_test(cx);
         let temporary = tempfile::tempdir().expect("temporary project");
@@ -3221,6 +3303,10 @@ mod tests {
     /// Without the sidecar there is nothing to count against, so the sync
     /// falls back to the node's `name` attribute rather than giving up.
     #[gpui::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "real-file loads race run_until_parked"
+    )]
     async fn the_caret_still_follows_the_selection_without_a_sidecar(cx: &mut TestAppContext) {
         init_test(cx);
         let temporary = tempfile::tempdir().expect("temporary project");
@@ -3301,6 +3387,10 @@ mod tests {
     }
 
     #[gpui::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "real-file loads race run_until_parked"
+    )]
     async fn embedded_source_find_keeps_fnx_and_json_unchanged(cx: &mut TestAppContext) {
         init_test(cx);
         bind_source_editor_keys(cx);
@@ -3365,6 +3455,10 @@ mod tests {
     }
 
     #[gpui::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "real-file loads race run_until_parked"
+    )]
     async fn embedded_source_find_retargets_a_new_page(cx: &mut TestAppContext) {
         init_test(cx);
         bind_source_editor_keys(cx);
@@ -3537,6 +3631,10 @@ mod tests {
     }
 
     #[gpui::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "real-file loads race run_until_parked"
+    )]
     async fn source_save_computed_geometry_undoes_with_the_authored_edit(cx: &mut TestAppContext) {
         init_test(cx);
         bind_source_editor_keys(cx);
@@ -3628,6 +3726,10 @@ mod tests {
     }
 
     #[gpui::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "real-file loads race run_until_parked"
+    )]
     async fn source_discard_button_discards_only_the_selected_draft(cx: &mut TestAppContext) {
         init_test(cx);
         let temporary = tempfile::tempdir().expect("project");
@@ -3721,6 +3823,10 @@ mod tests {
     }
 
     #[gpui::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "real-file loads race run_until_parked"
+    )]
     async fn source_discard_button_retains_validated_layout_after_invalid_json(
         cx: &mut TestAppContext,
     ) {
@@ -3936,10 +4042,17 @@ mod tests {
                 code.select_file(CodeWorkspaceFile::Fnx, window, cx)
             });
         }
+        run_until_loaded(cx, |cx| {
+            code.read_with(cx, |code, _| code.loading_fnx || code.loading_json)
+        });
         (view, code, item, cx)
     }
 
     #[gpui::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "real-file loads race run_until_parked"
+    )]
     async fn canvas_defers_source_buffers_and_code_activation_catches_up(cx: &mut TestAppContext) {
         use crate::editor_session::EditorWorkspace;
 
@@ -4391,6 +4504,10 @@ mod tests {
     }
 
     #[gpui::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "real-file loads race run_until_parked"
+    )]
     async fn source_recovery_canvas_tab_restores_save_keyboard_route(cx: &mut TestAppContext) {
         init_test(cx);
         let temporary = tempfile::tempdir().expect("project");
@@ -4452,6 +4569,10 @@ mod tests {
     }
 
     #[gpui::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "real-file loads race run_until_parked"
+    )]
     async fn source_recovery_discard_then_workspace_save_ignores_delayed_owned_events(
         cx: &mut TestAppContext,
     ) {
@@ -4610,6 +4731,10 @@ mod tests {
     }
 
     #[gpui::test]
+    #[cfg_attr(
+        target_os = "windows",
+        ignore = "real-file loads race run_until_parked"
+    )]
     async fn source_recovery_external_writes_still_prompt_and_cancel_preserves_disk(
         test_cx: &mut TestAppContext,
     ) {

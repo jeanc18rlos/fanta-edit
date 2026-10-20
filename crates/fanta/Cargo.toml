@@ -78,6 +78,7 @@ markdown.workspace = true
 menu.workspace = true
 migrator.workspace = true
 mimalloc = { version = "0.1", optional = true }
+net.workspace = true
 node_runtime.workspace = true
 notifications.workspace = true
 parking_lot.workspace = true

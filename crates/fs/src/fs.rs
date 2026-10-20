@@ -672,7 +672,7 @@ impl Fs for RealFs {
 
         #[cfg(windows)]
         if smol::fs::metadata(&target).await?.is_dir() {
-            let status = new_command("cmd")
+            let status = util::command::new_command("cmd")
                 .args(["/C", "mklink", "/J"])
                 .args([path, target.as_path()])
                 .status()
