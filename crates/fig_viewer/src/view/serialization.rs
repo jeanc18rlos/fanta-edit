@@ -900,16 +900,15 @@ mod tests {
     }
 
     #[gpui::test]
-    #[cfg_attr(
-        target_os = "windows",
-        ignore = "the restored legacy tab loses its page scope on Windows"
-    )]
     async fn canvas_session_legacy_manifest_root_restores_once_then_keeps_empty_layout(
         cx: &mut TestAppContext,
     ) {
         let fixture = fixture(cx).await;
         let original_bytes = project_bytes(fixture.directory.path());
-        let manifest = fixture.directory.path().join("Original/fanta.json");
+        // The legacy root is saved with this exact spelling, and restore looks the session up
+        // by the text of each canonicalized root. On Windows `join("Original/fanta.json")`
+        // keeps a `/` that canonicalization turns into `\`, and restore misses the session.
+        let manifest = fixture.directory.path().join("Original").join("fanta.json");
         let (window, workspace) = manifest_workspace(&fixture, cx).await;
         close_canvas(window, &workspace, cx).await;
         let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());
