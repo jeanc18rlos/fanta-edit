@@ -22,9 +22,7 @@ engine crates on `windows-2025`.
   in-app updater are macOS-only. `script/bundle-windows.ps1` comes from upstream
   and has not been validated for Fanta.
 - Tests that need Unix permission bits or symbolic links are `#[cfg(unix)]` and
-  are skipped. Most code workspace tests and one session-restore test are
-  ignored on Windows: they read real files and check the result before Windows
-  has finished loading them.
+  are skipped.
 
 Everything else, including the document engine, import, saving, the agent panel
 and the live MCP server, is the same code.
