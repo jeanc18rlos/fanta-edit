@@ -21,12 +21,20 @@ undo step. Reviews do not edit the design automatically.
 
 Variables include enum options and image assets. Prototype actions include
 conditional branches, numeric adjustments, boolean toggles and enum cycling.
-Motion clips store frame rate, loop mode, scope and transform origins. Export
-Motion JSON or Figma Motion JSON from the Design menu; unsupported Figma tracks
-are listed as diagnostics, and physical springs are sampled at the clip's frame
-rate. The JSON contains Fanta node ids: a Figma plugin must map them to destination
+Motion clips store frame rate, loop mode, scope and transform origins. The
+Design menu exports the active clip as Motion JSON, Figma Motion JSON, a Claude
+Motion Stage package, an MP4 video, a GIF or PNG frames. Figma Motion JSON lists
+unsupported Figma tracks as diagnostics and samples physical springs at the
+clip's frame rate. The JSON contains Fanta node ids: a Figma plugin must map them to destination
 nodes with the corresponding resting placement before applying [manual tracks](https://developers.figma.com/docs/plugins/api/properties/nodes-applymanualkeyframetrack/).
-Stage JSX, MP4/GIF export, trigger inputs and a state-machine view are deferred.
+Fanta renders the MP4, GIF and PNG frames itself, so they match the timeline.
+The MP4 needs `ffmpeg` on `PATH` or at `FANTA_FFMPEG`; without it the export
+writes the video's frames and the command that encodes them. The Stage package
+is a folder whose `index.html` is a `<Stage>` project for Claude Motion and
+[claude-video-export](https://github.com/dawoodtrumboo/claude-video-export), and
+whose `preview.html` plays offline. Its animated layers are bitmaps moved by a
+port of Fanta's keyframe evaluator, and its `README.md` lists what it cannot
+represent. Trigger inputs and a state-machine view are deferred.
 
 Draw includes joining, closing and simplifying vector paths, segment bending,
 path reversal, breaking at an anchor and curved-anchor deletion. The

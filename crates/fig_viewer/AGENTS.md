@@ -42,6 +42,10 @@ PR numbers point at the change that found each trap (`gh pr view <n>`).
 
 - The Variables workspace maps `VariableType` onto the external `fanta_gpui` `VariableKind` (Color, Number, String, Boolean) in `screen_variable_kind`, and skips every variable that maps to `None`. A new kind must map onto one of those four or it vanishes from the tab, as Typography does today; adding a glyph or editor means a `fanta-ui` change. (#140)
 
+## Exports
+
+- The default build's Design-mode inspector is fanta-gpui's `DesignPanel`, whose export formats are fanta-ui's `DesignExportFormat` (PNG, JPG, SVG, PDF). `EXPORT_FORMATS` reaches only the legacy inspector (`FANTA_GPUI_DESIGN=0`). A new export format therefore needs a Design menu action, or a `fanta-ui` change, before the shipped app can use it. (#150)
+
 ## Tests
 
 - Mount the real UI. Sidebar regressions mount the sidebar owned by `FigView` inside a workspace and click its visible control. Keyboard regressions mount `MultiWorkspace` with the shipped keymap, because a bound action can consume a key before a raw listener sees it. (#6, #7)

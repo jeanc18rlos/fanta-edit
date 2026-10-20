@@ -24,6 +24,10 @@ pub(crate) enum ExportFormat {
     Pdf,
     MotionJson,
     FigmaMotionJson,
+    MotionStage,
+    MotionVideo,
+    MotionGif,
+    MotionFrames,
 }
 
 impl ExportFormat {
@@ -35,10 +39,14 @@ impl ExportFormat {
             Self::Pdf => "PDF",
             Self::MotionJson => "Motion JSON",
             Self::FigmaMotionJson => "Figma Motion JSON",
+            Self::MotionStage => "Claude Motion Stage",
+            Self::MotionVideo => "MP4 Video",
+            Self::MotionGif => "GIF",
+            Self::MotionFrames => "PNG Frames",
         }
     }
 
-    fn extension(self) -> &'static str {
+    pub(crate) fn extension(self) -> &'static str {
         match self {
             Self::Png => "png",
             Self::Jpeg => "jpg",
@@ -46,11 +54,28 @@ impl ExportFormat {
             Self::Pdf => "pdf",
             Self::MotionJson => "motion.json",
             Self::FigmaMotionJson => "figma-motion.json",
+            Self::MotionStage => "stage",
+            Self::MotionVideo => "mp4",
+            Self::MotionGif => "gif",
+            Self::MotionFrames => "frames",
         }
     }
 
     pub(crate) fn is_raster(self) -> bool {
         matches!(self, Self::Png | Self::Jpeg)
+    }
+
+    /// Rendered from an animation clip over time, on the clip's stage frame.
+    pub(crate) fn is_motion_media(self) -> bool {
+        matches!(
+            self,
+            Self::MotionStage | Self::MotionVideo | Self::MotionGif | Self::MotionFrames
+        )
+    }
+
+    /// Whether the export setting's scale applies to this format's pixels.
+    pub(crate) fn uses_scale(self) -> bool {
+        self.is_raster() || self.is_motion_media()
     }
 }
 
@@ -61,6 +86,10 @@ pub(crate) const EXPORT_FORMATS: &[(ExportFormat, &str)] = &[
     (ExportFormat::Pdf, "PDF"),
     (ExportFormat::MotionJson, "Motion JSON"),
     (ExportFormat::FigmaMotionJson, "Figma Motion JSON"),
+    (ExportFormat::MotionStage, "Claude Motion Stage"),
+    (ExportFormat::MotionVideo, "MP4 Video"),
+    (ExportFormat::MotionGif, "GIF"),
+    (ExportFormat::MotionFrames, "PNG Frames"),
 ];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -139,7 +168,7 @@ impl From<ExportScale> for ExportSizing {
 }
 
 impl ExportSizing {
-    fn zoom(self, bounds: Bounds) -> Result<f64> {
+    pub(crate) fn zoom(self, bounds: Bounds) -> Result<f64> {
         let zoom = match self {
             Self::Scale(scale) => scale,
             Self::Width(width) => width / bounds.width(),
@@ -185,7 +214,7 @@ pub(crate) fn prepare_export_jobs(
         .map(|preset| ExportRequest {
             format: preset.format,
             sizing: preset.scale.into(),
-            suffix: if preset.format.is_raster() {
+            suffix: if preset.format.uses_scale() {
                 preset.scale.file_suffix().to_string()
             } else {
                 String::new()
@@ -269,7 +298,7 @@ pub(crate) fn prepare_export_requests(
     })
 }
 
-fn resolve_export_bindings(document: &Doc) -> Cow<'_, Doc> {
+pub(crate) fn resolve_export_bindings(document: &Doc) -> Cow<'_, Doc> {
     let bound_nodes = document
         .scene
         .roots()
@@ -322,7 +351,7 @@ impl ExportBatch {
     pub(crate) fn format_summary(&self) -> String {
         let mut labels = Vec::new();
         for request in &self.requests {
-            let label = if request.format.is_raster() {
+            let label = if request.format.uses_scale() {
                 format!("{} {}", request.format.label(), request.sizing.label())
             } else {
                 request.format.label().to_string()
@@ -335,7 +364,67 @@ impl ExportBatch {
     }
 }
 
-pub(crate) fn run_export_jobs(batch: ExportBatch) -> Result<Vec<PathBuf>> {
+/// What one export request produced: a file, or a folder of files such as a
+/// Stage package or a PNG frame sequence.
+pub(crate) enum ExportPayload {
+    File(Vec<u8>),
+    Directory(Vec<ExportEntry>),
+}
+
+/// One file of a folder export, at a relative `/`-separated path.
+pub(crate) struct ExportEntry {
+    pub(crate) path: String,
+    pub(crate) bytes: Vec<u8>,
+}
+
+pub(crate) struct ExportArtifact {
+    pub(crate) payload: ExportPayload,
+    /// Replaces the format's extension when the output changed kind, as when
+    /// an MP4 export falls back to PNG frames without ffmpeg.
+    pub(crate) extension: Option<&'static str>,
+    /// Fidelity notes and fallbacks the user should read.
+    pub(crate) notes: Vec<String>,
+}
+
+impl ExportArtifact {
+    pub(crate) fn file(bytes: Vec<u8>) -> Self {
+        Self {
+            payload: ExportPayload::File(bytes),
+            extension: None,
+            notes: Vec::new(),
+        }
+    }
+}
+
+pub(crate) struct ExportOutcome {
+    pub(crate) paths: Vec<PathBuf>,
+    pub(crate) notes: Vec<String>,
+}
+
+impl ExportOutcome {
+    /// The written path or count, followed by the first note and how many more.
+    pub(crate) fn summary(&self) -> String {
+        let written = match self.paths.as_slice() {
+            [path] => format!("Exported {}", path.display()),
+            [first, ..] => format!(
+                "Exported {} files to {}",
+                self.paths.len(),
+                first.parent().map_or_else(
+                    || "the exports directory".to_string(),
+                    |path| path.display().to_string()
+                )
+            ),
+            [] => "Nothing was exported.".to_string(),
+        };
+        match self.notes.as_slice() {
+            [] => written,
+            [note] => format!("{written}. {note}"),
+            [note, rest @ ..] => format!("{written}. {note} (+{} more notes)", rest.len()),
+        }
+    }
+}
+
+pub(crate) fn run_export_jobs(batch: ExportBatch) -> Result<ExportOutcome> {
     if batch.targets.is_empty() || batch.requests.is_empty() {
         bail!("there is nothing to export");
     }
@@ -346,6 +435,7 @@ pub(crate) fn run_export_jobs(batch: ExportBatch) -> Result<Vec<PathBuf>> {
     let file_names = output_file_names(&batch.targets, &batch.requests);
     let mut file_names = file_names.into_iter();
     let mut paths = Vec::with_capacity(batch.len());
+    let mut notes = Vec::new();
 
     for target in &batch.targets {
         let document = render_document_for_target(&batch.doc, target)?;
@@ -353,15 +443,44 @@ pub(crate) fn run_export_jobs(batch: ExportBatch) -> Result<Vec<PathBuf>> {
             let file_name = file_names
                 .next()
                 .context("export filename generation was incomplete")?;
-            let bytes = render_export(&batch, &document, target, request).with_context(|| {
-                format!("exporting {} as {}", target.name, request.format.label())
-            })?;
-            let path = write_export_atomically(exports_dir, &file_name, &bytes)
-                .with_context(|| format!("writing {file_name}"))?;
+            let artifact =
+                render_export(&batch, &document, target, request).with_context(|| {
+                    format!("exporting {} as {}", target.name, request.format.label())
+                })?;
+            let (path, artifact_notes) =
+                write_export_artifact(exports_dir, &file_name, request.format, artifact)?;
+            notes.extend(artifact_notes);
             paths.push(path);
         }
     }
-    Ok(paths)
+    Ok(ExportOutcome { paths, notes })
+}
+
+/// Write one artifact under `file_name`, swapping in the artifact's own
+/// extension when it overrides the format's.
+pub(crate) fn write_export_artifact(
+    directory: &Path,
+    file_name: &str,
+    format: ExportFormat,
+    artifact: ExportArtifact,
+) -> Result<(PathBuf, Vec<String>)> {
+    let file_name = match artifact.extension {
+        Some(extension) => {
+            let stem = file_name
+                .strip_suffix(format.extension())
+                .unwrap_or(file_name);
+            format!("{stem}{extension}")
+        }
+        None => file_name.to_string(),
+    };
+    let path = match &artifact.payload {
+        ExportPayload::File(bytes) => write_export_atomically(directory, &file_name, bytes),
+        ExportPayload::Directory(entries) => {
+            write_export_directory_atomically(directory, &file_name, entries)
+        }
+    }
+    .with_context(|| format!("writing {file_name}"))?;
+    Ok((path, artifact.notes))
 }
 
 fn render_export(
@@ -369,19 +488,37 @@ fn render_export(
     document: &Doc,
     target: &ExportTarget,
     request: &ExportRequest,
-) -> Result<Vec<u8>> {
-    match request.format {
-        ExportFormat::Png => render_png(batch, document, target, request.sizing),
-        ExportFormat::Jpeg => render_jpeg(batch, document, target, request.sizing),
-        ExportFormat::Svg => render_svg(batch, document, target),
-        ExportFormat::Pdf => render_pdf(batch, document, target),
-        ExportFormat::MotionJson => {
-            crate::motion_export::export_motion(&batch.doc, target.root, false)
+) -> Result<ExportArtifact> {
+    Ok(match request.format {
+        ExportFormat::Png => {
+            ExportArtifact::file(render_png(batch, document, target, request.sizing)?)
         }
-        ExportFormat::FigmaMotionJson => {
-            crate::motion_export::export_motion(&batch.doc, target.root, true)
+        ExportFormat::Jpeg => {
+            ExportArtifact::file(render_jpeg(batch, document, target, request.sizing)?)
         }
-    }
+        ExportFormat::Svg => ExportArtifact::file(render_svg(batch, document, target)?),
+        ExportFormat::Pdf => ExportArtifact::file(render_pdf(batch, document, target)?),
+        ExportFormat::MotionJson => ExportArtifact::file(crate::motion_export::export_motion(
+            &batch.doc,
+            target.root,
+            false,
+        )?),
+        ExportFormat::FigmaMotionJson => ExportArtifact::file(crate::motion_export::export_motion(
+            &batch.doc,
+            target.root,
+            true,
+        )?),
+        ExportFormat::MotionStage
+        | ExportFormat::MotionVideo
+        | ExportFormat::MotionGif
+        | ExportFormat::MotionFrames => crate::motion_video::export_motion_media(
+            &batch.doc,
+            batch.asset_resolver.clone(),
+            target.root,
+            request.format,
+            request.sizing,
+        )?,
+    })
 }
 
 fn render_png(
@@ -577,6 +714,10 @@ fn page_visual_bounds(document: &Doc, root: Option<NodeId>) -> Option<Bounds> {
 fn validate_export_requests(targets: &[ExportTarget], requests: &[ExportRequest]) -> Result<()> {
     for target in targets {
         for request in requests {
+            if request.format.is_motion_media() {
+                // Sized from the clip's stage frame, which is only known when rendering.
+                continue;
+            }
             if request.format.is_raster() {
                 raster_dimensions(target.bounds, request.sizing, &target.name)?;
             } else {
@@ -588,7 +729,7 @@ fn validate_export_requests(targets: &[ExportTarget], requests: &[ExportRequest]
     Ok(())
 }
 
-fn raster_dimensions(
+pub(crate) fn raster_dimensions(
     bounds: Bounds,
     sizing: impl Into<ExportSizing>,
     name: &str,
@@ -676,6 +817,89 @@ pub(crate) fn write_export_atomically(
                 return Err(discard_failed_temporary(error.file, primary));
             }
         }
+    }
+}
+
+/// Stage `entries` in a hidden folder beside the destination, then rename it
+/// into place under the first free collision name, so an export folder never
+/// appears half written or overwrites an earlier one.
+pub(crate) fn write_export_directory_atomically(
+    directory: &Path,
+    directory_name: &str,
+    entries: &[ExportEntry],
+) -> Result<PathBuf> {
+    let staging = tempfile::Builder::new()
+        .prefix(".fanta-export-")
+        .tempdir_in(directory)
+        .with_context(|| {
+            format!(
+                "creating a temporary export folder in {}",
+                directory.display()
+            )
+        })?;
+    for entry in entries {
+        let relative = Path::new(&entry.path);
+        if relative.as_os_str().is_empty()
+            || !relative
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_)))
+        {
+            bail!("export entry {:?} is not a relative file path", entry.path);
+        }
+        let path = staging.path().join(relative);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let mut file =
+            std::fs::File::create(&path).with_context(|| format!("creating {}", path.display()))?;
+        file.write_all(&entry.bytes)
+            .with_context(|| format!("writing {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing {}", path.display()))?;
+    }
+
+    let staged = staging.keep();
+    let mut attempt = 1_usize;
+    loop {
+        let destination = match collision_path(directory, directory_name, attempt) {
+            Ok(destination) => destination,
+            Err(error) => return Err(discard_staged_directory(&staged, error)),
+        };
+        if std::fs::symlink_metadata(&destination).is_err() {
+            match std::fs::rename(&staged, &destination) {
+                Ok(()) => return Ok(destination),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::DirectoryNotEmpty
+                    ) => {}
+                Err(error) => {
+                    let primary = anyhow::Error::new(error)
+                        .context(format!("publishing {}", destination.display()));
+                    return Err(discard_staged_directory(&staged, primary));
+                }
+            }
+        }
+        attempt = match attempt.checked_add(1) {
+            Some(attempt) => attempt,
+            None => {
+                return Err(discard_staged_directory(
+                    &staged,
+                    anyhow::anyhow!("too many colliding export folder names"),
+                ));
+            }
+        };
+    }
+}
+
+fn discard_staged_directory(staged: &Path, primary: anyhow::Error) -> anyhow::Error {
+    match std::fs::remove_dir_all(staged) {
+        Ok(()) => primary,
+        Err(cleanup) => anyhow::anyhow!(
+            "{primary:#}; also failed to remove the temporary export folder {}: {cleanup}",
+            staged.display()
+        ),
     }
 }
 
@@ -830,7 +1054,9 @@ mod tests {
         assert_eq!(batch.len(), 8);
         assert_eq!(batch.targets[0].name, "Card");
         assert_eq!(batch.targets[1].name, "card-2");
-        let paths = run_export_jobs(batch).expect("batch exports without collisions");
+        let paths = run_export_jobs(batch)
+            .expect("batch exports without collisions")
+            .paths;
         assert_eq!(
             paths
                 .iter()
@@ -868,7 +1094,9 @@ mod tests {
         let batch = prepare_export_jobs(&doc, None, None, directory.path().to_path_buf(), &presets)
             .expect("frame is exportable");
 
-        let paths = run_export_jobs(batch).expect("raster export succeeds");
+        let paths = run_export_jobs(batch)
+            .expect("raster export succeeds")
+            .paths;
         assert_eq!(paths.len(), 2);
         assert_eq!(
             paths[0].file_name().and_then(|name| name.to_str()),
@@ -962,7 +1190,7 @@ mod tests {
             batch.targets.first().context("bitmap target")?.bounds,
             Bounds::from_xywh(320.0, 120.0, 220.0, 160.0)
         );
-        let paths = run_export_jobs(batch)?;
+        let paths = run_export_jobs(batch)?.paths;
         let png_path = exports.join("B01 BITMAP 100% - mixed target.png");
         let jpeg_path = exports.join("B01 BITMAP 100% - mixed target-2.jpg");
         assert_eq!(paths, [png_path.clone(), jpeg_path.clone()]);
@@ -1071,7 +1299,9 @@ mod tests {
         ];
         let batch = prepare_export_requests(&doc, None, None, output_directory.clone(), &requests)
             .expect("inspector requests are valid");
-        let paths = run_export_jobs(batch).expect("each requested file is written");
+        let paths = run_export_jobs(batch)
+            .expect("each requested file is written")
+            .paths;
         assert_eq!(
             paths,
             [
@@ -1173,7 +1403,9 @@ mod tests {
         )
         .expect("bound frame is exportable");
         assert_eq!(batch.targets[0].bounds.width(), 60.0);
-        let paths = run_export_jobs(batch).expect("bound frame export succeeds");
+        let paths = run_export_jobs(batch)
+            .expect("bound frame export succeeds")
+            .paths;
         assert_eq!(
             image::open(&paths[0])
                 .expect("bound frame PNG is decodable")
@@ -1206,7 +1438,7 @@ mod tests {
         )
         .expect("frame is exportable");
 
-        let paths = run_export_jobs(batch).expect("SVG export succeeds");
+        let paths = run_export_jobs(batch).expect("SVG export succeeds").paths;
         assert_eq!(
             paths[0].file_name().and_then(|name| name.to_str()),
             Some("Vector.svg")
@@ -1298,7 +1530,7 @@ mod tests {
         .expect("arrow has exportable bounds");
         let target = batch.targets.first().expect("arrow export target");
         let export_viewport = target_viewport(target, 2.0);
-        let paths = run_export_jobs(batch).expect("export arrow");
+        let paths = run_export_jobs(batch).expect("export arrow").paths;
         let raster = image::open(paths.first().expect("PNG output"))
             .expect("decode exported arrow")
             .to_rgba8();
@@ -1401,7 +1633,7 @@ mod tests {
             )
             .expect("prepare actual page export");
             let bounds = batch.targets.first().expect("page export target").bounds;
-            let files = run_export_jobs(batch).expect("write PNG and SVG");
+            let files = run_export_jobs(batch).expect("write PNG and SVG").paths;
             let raster = image::open(files.first().expect("PNG file"))
                 .expect("decode exported PNG")
                 .to_rgba8();
@@ -1553,7 +1785,9 @@ mod tests {
             )
             .expect("prepare actual page export");
             let bounds = batch.targets.first().expect("page export target").bounds;
-            let files = run_export_jobs(batch).expect("write annotated PNG and SVG");
+            let files = run_export_jobs(batch)
+                .expect("write annotated PNG and SVG")
+                .paths;
             let raster = image::open(files.first().expect("PNG file"))
                 .expect("decode exported PNG")
                 .to_rgba8();
@@ -1788,7 +2022,9 @@ mod tests {
             batch.targets[0].bounds,
             Bounds::from_xywh(-10.0, -10.0, 35.0, 30.0)
         );
-        let paths = run_export_jobs(batch).expect("paint-bounds export succeeds");
+        let paths = run_export_jobs(batch)
+            .expect("paint-bounds export succeeds")
+            .paths;
         assert_eq!(
             image::open(&paths[0])
                 .expect("paint-bounds PNG is decodable")
@@ -1819,7 +2055,9 @@ mod tests {
         )
         .expect("frame is exportable");
 
-        let paths = run_export_jobs(batch).expect("collision-safe export succeeds");
+        let paths = run_export_jobs(batch)
+            .expect("collision-safe export succeeds")
+            .paths;
         assert_eq!(paths, [exports.join("Frame-2.png")]);
         assert_eq!(
             std::fs::read(exports.join("Frame.png")).expect("original remains"),
@@ -1837,6 +2075,118 @@ mod tests {
             .collect::<Vec<_>>();
         names.sort();
         assert_eq!(names, ["Frame-2.png", "Frame.png"]);
+    }
+
+    #[test]
+    fn motion_formats_export_a_selected_frame_through_the_inspector_batch() {
+        let directory = tempfile::tempdir().expect("temporary export project");
+        let fixture = crate::motion_video::tests::animated_stage();
+        let mut doc = fixture.doc;
+        doc.selection.select_only(fixture.frame);
+        let presets = [
+            ExportPreset {
+                format: ExportFormat::MotionGif,
+                scale: ExportScale::One,
+            },
+            ExportPreset {
+                format: ExportFormat::MotionStage,
+                scale: ExportScale::One,
+            },
+        ];
+        let batch = prepare_export_jobs(&doc, None, None, directory.path().to_path_buf(), &presets)
+            .expect("the animated frame is exportable");
+        let outcome = run_export_jobs(batch).expect("motion exports succeed");
+        let exports = directory.path().join("exports");
+        assert_eq!(
+            outcome.paths,
+            [exports.join("Stage.gif"), exports.join("Stage.stage")]
+        );
+        assert!(outcome.paths[1].join("index.html").is_file());
+        assert!(outcome.paths[1].join("assets/background.png").is_file());
+        assert!(outcome.notes.is_empty(), "{:?}", outcome.notes);
+        assert_eq!(
+            outcome.summary(),
+            format!("Exported 2 files to {}", exports.display())
+        );
+    }
+
+    #[test]
+    fn folder_exports_never_replace_an_existing_folder() {
+        let directory = tempfile::tempdir().expect("temporary exports");
+        let entries = [
+            ExportEntry {
+                path: "index.html".to_string(),
+                bytes: b"first".to_vec(),
+            },
+            ExportEntry {
+                path: "assets/layer.png".to_string(),
+                bytes: b"png".to_vec(),
+            },
+        ];
+        let first = write_export_directory_atomically(directory.path(), "Hero.stage", &entries)
+            .expect("first folder export");
+        let second = write_export_directory_atomically(
+            directory.path(),
+            "Hero.stage",
+            &[ExportEntry {
+                path: "index.html".to_string(),
+                bytes: b"second".to_vec(),
+            }],
+        )
+        .expect("second folder export");
+        assert_eq!(first, directory.path().join("Hero.stage"));
+        assert_eq!(second, directory.path().join("Hero-2.stage"));
+        assert_eq!(
+            std::fs::read(first.join("index.html")).expect("first"),
+            b"first"
+        );
+        assert_eq!(
+            std::fs::read(first.join("assets/layer.png")).expect("asset"),
+            b"png"
+        );
+        assert_eq!(
+            std::fs::read(second.join("index.html")).expect("second"),
+            b"second"
+        );
+
+        let escaping = [ExportEntry {
+            path: "../outside.txt".to_string(),
+            bytes: Vec::new(),
+        }];
+        assert!(
+            write_export_directory_atomically(directory.path(), "Bad.stage", &escaping).is_err()
+        );
+        let mut names = std::fs::read_dir(directory.path())
+            .expect("read exports")
+            .map(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        names.sort();
+        assert_eq!(
+            names,
+            ["Hero-2.stage", "Hero.stage"],
+            "no staging folder is left behind"
+        );
+    }
+
+    #[test]
+    fn export_summary_names_the_first_note_and_counts_the_rest() {
+        let outcome = ExportOutcome {
+            paths: vec![PathBuf::from("/exports/Hero.stage")],
+            notes: vec![
+                "README.md lists 2 fidelity notes.".to_string(),
+                "Video layers export their poster frame.".to_string(),
+            ],
+        };
+        assert_eq!(
+            outcome.summary(),
+            "Exported /exports/Hero.stage. README.md lists 2 fidelity notes. (+1 more notes)"
+        );
     }
 }
 
@@ -1863,7 +2213,12 @@ pub(crate) fn render_layer(
         .requests
         .first()
         .context("The layer has no export request")?;
-    render_export(&batch, resolved.as_ref(), target, request)
+    match render_export(&batch, resolved.as_ref(), target, request)?.payload {
+        ExportPayload::File(bytes) => Ok(bytes),
+        ExportPayload::Directory(_) => {
+            anyhow::bail!("{} exports a folder, not a layer image", format.label())
+        }
+    }
 }
 
 #[cfg(feature = "fanta-gpui-ui")]
