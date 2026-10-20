@@ -3471,7 +3471,7 @@ impl FantaPropertiesPanel {
             .disabled(!controls_enabled)
             .aria_label("Export format");
 
-            let scale = if preset.format.is_raster() {
+            let scale = if preset.format.uses_scale() {
                 let panel = cx.weak_entity();
                 let scale_menu = ContextMenu::build(window, cx, move |mut menu, _, _| {
                     for (scale, label) in EXPORT_SCALES {
@@ -3551,7 +3551,7 @@ impl FantaPropertiesPanel {
             self.export_presets
                 .iter()
                 .map(|preset| {
-                    if preset.format.is_raster() {
+                    if preset.format.uses_scale() {
                         format!("{} {}", preset.format.label(), preset.scale.label())
                     } else {
                         preset.format.label().to_string()

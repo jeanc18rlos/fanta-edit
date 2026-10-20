@@ -1534,6 +1534,9 @@ impl Render for FantaCodeWorkspace {
     }
 }
 
+// These tests open real files and check the result once `run_until_parked` returns. On
+// Windows the background loads often finish later, so the tests that failed there are
+// ignored on Windows until they wait for their loads.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1640,6 +1643,39 @@ mod tests {
         Project::test(file_system, [root], cx).await
     }
 
+    /// Runs the executor until `loading` returns false, letting real time pass. Opening a
+    /// buffer reads file metadata, and on Windows `RealFs::metadata` reads the file id on
+    /// smol's blocking threads, outside the test scheduler, so the open can finish after
+    /// `run_until_parked` returns.
+    fn run_until_loaded(
+        cx: &mut TestAppContext,
+        mut loading: impl FnMut(&mut TestAppContext) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            cx.run_until_parked();
+            if !loading(cx) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the source loads did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Runs the executor until `workspace` has opened the FNX and JSON buffers it asked
+    /// for. Showing the workspace, switching pages and saving a renamed or new page all
+    /// open buffers.
+    fn run_until_sources_open(workspace: &Entity<FantaCodeWorkspace>, cx: &mut TestAppContext) {
+        run_until_loaded(cx, |cx| {
+            workspace.read_with(cx, |workspace, _| {
+                workspace.loading_fnx || workspace.loading_json
+            })
+        });
+    }
+
     async fn open_code_workspace_for_project(
         project: Entity<Project>,
         cx: &mut TestAppContext,
@@ -1670,7 +1706,7 @@ mod tests {
             workspace.set_visible(true, window, cx);
             workspace
         });
-        cx.run_until_parked();
+        run_until_sources_open(&workspace.entity(cx).expect("code workspace"), cx);
         (item, workspace)
     }
 
@@ -1749,7 +1785,7 @@ mod tests {
                 workspace.set_visible(true, window, cx);
             })
             .expect("activate deferred source");
-        cx.run_until_parked();
+        run_until_sources_open(&deferred.entity(cx).expect("deferred workspace"), cx);
         deferred
             .read_with(cx, |workspace, cx| {
                 assert_eq!(workspace.fnx_source_buffer.as_ref(), Some(&dirty_buffer));
@@ -1795,7 +1831,7 @@ mod tests {
                 assert!(workspace.saved_sources_pending);
             })
             .expect("activate deferred source");
-        cx.run_until_parked();
+        run_until_sources_open(&deferred.entity(cx).expect("deferred workspace"), cx);
         deferred
             .read_with(cx, |workspace, cx| {
                 assert_eq!(workspace.fnx_source_buffer.as_ref(), Some(&cached));
@@ -1943,14 +1979,16 @@ mod tests {
         });
         let fnx_abs =
             fanta_format::locate_page_source(temporary.path(), page).expect("page source on disk");
-        let fnx_rel = fnx_abs
-            .strip_prefix(temporary.path())
-            .expect("page source inside project")
-            .to_str()
-            .expect("utf8 path");
+        let fnx_rel = util::rel_path::RelPath::new(
+            fnx_abs
+                .strip_prefix(temporary.path())
+                .expect("page source inside project"),
+            util::paths::PathStyle::local(),
+        )
+        .expect("relative page source");
         let scoped_path = ProjectPath {
             worktree_id,
-            path: util::rel_path::rel_path(fnx_rel).into(),
+            path: (&*fnx_rel).into(),
         };
         let scoped_item = cx
             .update(|cx| FigItem::try_open(&project, &scoped_path, cx))
@@ -2039,14 +2077,16 @@ mod tests {
         });
         let fnx_abs =
             fanta_format::locate_page_source(temporary.path(), page).expect("page source on disk");
-        let fnx_rel = fnx_abs
-            .strip_prefix(temporary.path())
-            .expect("page source inside project")
-            .to_str()
-            .expect("utf8 path");
+        let fnx_rel = util::rel_path::RelPath::new(
+            fnx_abs
+                .strip_prefix(temporary.path())
+                .expect("page source inside project"),
+            util::paths::PathStyle::local(),
+        )
+        .expect("relative page source");
         let scoped_path = ProjectPath {
             worktree_id,
-            path: util::rel_path::rel_path(fnx_rel).into(),
+            path: (&*fnx_rel).into(),
         };
         let scoped_entry = project.update(cx, |project, cx| {
             project
@@ -2192,7 +2232,7 @@ mod tests {
         })
         .await
         .expect("save renamed page");
-        cx.run_until_parked();
+        run_until_sources_open(&workspace.entity(cx).expect("code workspace"), cx);
         let current_path = page_source_path(temporary.path(), page);
         assert_ne!(
             current_path, original_path,
@@ -2267,7 +2307,7 @@ mod tests {
             .await
             .expect("materialize the saved snapshot")
             .expect("new project root");
-        cx.run_until_parked();
+        run_until_sources_open(&workspace.entity(cx).expect("code workspace"), cx);
         workspace
             .read_with(cx, |workspace, _| {
                 assert_eq!(workspace.fnx_path, Some(page_source_path(&root, page_id)));
@@ -3395,7 +3435,7 @@ mod tests {
                 ((), crate::document::DocChange::Selection)
             });
         });
-        cx.run_until_parked();
+        run_until_sources_open(&workspace, cx);
         let editor = workspace.update_in(cx, |workspace, window, cx| {
             assert_eq!(workspace.requested_page, Some(other_page));
             assert_ne!(workspace.requested_page, Some(page));
@@ -3931,11 +3971,13 @@ mod tests {
                     )
                 });
             cx.simulate_click(button.center(), gpui::Modifiers::none());
-            cx.run_until_parked();
+            // Selecting a file focuses its editor, which exists once its buffer opens.
+            run_until_sources_open(&code, cx);
             code.update_in(cx, |code, window, cx| {
                 code.select_file(CodeWorkspaceFile::Fnx, window, cx)
             });
         }
+        cx.run_until_parked();
         (view, code, item, cx)
     }
 
@@ -3989,7 +4031,7 @@ mod tests {
                 window.refresh();
                 window.draw(cx).clear();
             });
-            cx.run_until_parked();
+            run_until_sources_open(&code, cx);
         };
         set_workspace(EditorWorkspace::Code, cx);
         let (fnx_buffer, json_buffer, fnx_editor) = code.read_with(cx, |code, _| {
@@ -4652,7 +4694,7 @@ mod tests {
             let external_path = match external_target {
                 "fnx" => path.clone(),
                 "sidecar" => path.with_file_name("page.ids.json"),
-                _ => temporary.path().join("doc/metadata.json"),
+                _ => temporary.path().join("doc").join("metadata.json"),
             };
             let mut external_bytes = std::fs::read(&external_path).expect("external baseline");
             external_bytes.extend_from_slice(b"\n ");

@@ -135,6 +135,10 @@ pub fn app_menus() -> Vec<Menu> {
                     "Export Figma Motion JSON…",
                     fig_viewer::ExportFigmaMotionJson,
                 ),
+                MenuItem::action("Export Claude Motion Stage…", fig_viewer::ExportMotionStage),
+                MenuItem::action("Export MP4 Video…", fig_viewer::ExportMotionVideo),
+                MenuItem::action("Export GIF…", fig_viewer::ExportMotionGif),
+                MenuItem::action("Export PNG Frames…", fig_viewer::ExportMotionFrames),
             ],
         },
         Menu {

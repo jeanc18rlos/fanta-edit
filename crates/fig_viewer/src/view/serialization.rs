@@ -905,7 +905,10 @@ mod tests {
     ) {
         let fixture = fixture(cx).await;
         let original_bytes = project_bytes(fixture.directory.path());
-        let manifest = fixture.directory.path().join("Original/fanta.json");
+        // The legacy root is saved with this exact spelling, and restore looks the session up
+        // by the text of each canonicalized root. On Windows `join("Original/fanta.json")`
+        // keeps a `/` that canonicalization turns into `\`, and restore misses the session.
+        let manifest = fixture.directory.path().join("Original").join("fanta.json");
         let (window, workspace) = manifest_workspace(&fixture, cx).await;
         close_canvas(window, &workspace, cx).await;
         let project = workspace.read_with(cx, |workspace, _| workspace.project().clone());

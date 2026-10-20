@@ -21,6 +21,7 @@ Run the narrowest check that exercises the change, then the release stage that c
 | Live MCP server or agent surface | the agent tests above, plus `script/smoke-mcp` against a running app (below) |
 | Anything compiled into the app | stage `build` (`cargo check --locked -p fanta -p cli`) |
 | Lints | `./script/clippy -p <crate>`; stage `lint` covers the release crates |
+| Platform-specific code (`cfg(target_os)`, `std::os::unix`, per-OS keymaps) | the `Windows` workflow (`.github/workflows/windows.yml`). On Windows, run `.\script\clippy.ps1` and the `cargo` commands directly; the other scripts are Bash ([guide](../../../docs/fanta/windows-development.md)) |
 | Packaging scripts | `bash -n <script>`, `python3 script/test-macos-release`, `./script/check-licenses` |
 | `mac_app_store` code paths | `cargo check --locked -p fanta --features mac_app_store`, plus the matching tests in the `mac-app-store-runtime` job of `check.yml` |
 

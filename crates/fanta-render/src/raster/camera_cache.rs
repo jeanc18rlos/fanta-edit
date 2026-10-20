@@ -1,4 +1,4 @@
-use super::layer_cache::immutable_surface_snapshot;
+use super::layer_cache::{immutable_surface_snapshot, top_surface_props};
 use super::{
     Bounds, Canvas, Color, ComponentLibrary, ImageInfo, NodeId, RasterRenderer, RenderInputs,
     RenderMetrics, Scene, VariableRegistry, Viewport, to_sk_color,
@@ -273,7 +273,7 @@ impl CameraCache {
             background,
             domain,
             color_info: canvas.image_info().color_info().clone(),
-            properties: canvas.top_props(),
+            properties: top_surface_props(canvas),
         };
         let dependencies_changed = self.components != *inputs.components
             || self.variables != *inputs.variables
@@ -736,7 +736,7 @@ impl CameraCache {
             background: renderer.camera_background(scene, page, inputs),
             domain,
             color_info: canvas.image_info().color_info().clone(),
-            properties: canvas.top_props(),
+            properties: top_surface_props(canvas),
         };
         // Maintenance only augments an already presented, validated recording;
         // it cannot create a scene generation or paint into the output target.
@@ -1370,7 +1370,7 @@ fn compatible_surface(canvas: &Canvas, width: i32, height: i32) -> Option<skia_s
         AlphaType::Premul,
         canvas.image_info().color_space(),
     );
-    let properties = canvas.top_props();
+    let properties = top_surface_props(canvas);
     let mut surface = canvas.new_surface(&info, Some(&properties))?;
     if cache_domain(surface.canvas()) != cache_domain(canvas) {
         return None;

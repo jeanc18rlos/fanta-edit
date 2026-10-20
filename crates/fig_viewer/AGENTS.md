@@ -42,8 +42,16 @@ PR numbers point at the change that found each trap (`gh pr view <n>`).
 
 - The Variables workspace maps `VariableType` onto the external `fanta_gpui` `VariableKind` (Color, Number, String, Boolean) in `screen_variable_kind`, and skips every variable that maps to `None`. A new kind must map onto one of those four or it vanishes from the tab, as Typography does today; adding a glyph or editor means a `fanta-ui` change. (#140)
 
+## Exports
+
+- The default build's Design-mode inspector is fanta-gpui's `DesignPanel`, whose export formats are fanta-ui's `DesignExportFormat` (PNG, JPG, SVG, PDF). `EXPORT_FORMATS` reaches only the legacy inspector (`FANTA_GPUI_DESIGN=0`). A new export format therefore needs a Design menu action, or a `fanta-ui` change, before the shipped app can use it. (#150)
+
 ## Tests
 
 - Mount the real UI. Sidebar regressions mount the sidebar owned by `FigView` inside a workspace and click its visible control. Keyboard regressions mount `MultiWorkspace` with the shipped keymap, because a bound action can consume a key before a raw listener sees it. (#6, #7)
 - The `gpui-test` skill covers focus, drag and popover-menu test patterns.
+- Simulate platform shortcuts with `secondary-`, which is Command on macOS and Control elsewhere; a `cmd-` keystroke does nothing on Windows. Build a `RelPath` from a native path with `RelPath::new(path, PathStyle::local())`: `rel_path(path.to_str())` keeps Windows backslashes inside one component. (#149)
+- Wait for real-file work with a condition, not `run_until_parked`. On Windows `RealFs::metadata` reads the file id on smol's blocking threads, outside the test scheduler, so opening a buffer or refreshing a worktree entry finishes after `run_until_parked` returns; on macOS it finishes inside it. In the code workspace tests, call `run_until_sources_open` after anything that opens source buffers: showing the workspace, switching pages, saving a renamed or new page. To reproduce on a Mac, add a `smol::unblock` sleep to `RealFs::metadata`. (#151)
+- Build test paths one component at a time: `join("Original").join("fanta.json")`. On Windows `join("Original/fanta.json")` keeps a `/`, a worktree created from it keeps that spelling, and session restore, which looks saved sessions up by the text of canonicalized roots, misses the session. (#151)
+- The crate must compile and test off macOS: the Windows workflow checks the app and runs this crate's tests. Gate tests that use `std::os::unix` (permission bits, symlinks) with `#[cfg(unix)]`, together with any helper only they use, and give every new `#[cfg(target_os = "macos")]` path a non-macOS branch. Use a crate from the macOS-only dependency table only inside macOS-gated code: audio placement called `rodio` ungated and broke the Windows build. (#149)
 - Stage `editor` of `script/verify-fanta-release` runs `cargo test --locked -p fig_viewer --lib --example drag_bench`. CI also requires specific tests from this crate by name (see the root rules).
