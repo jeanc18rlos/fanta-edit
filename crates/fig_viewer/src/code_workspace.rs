@@ -1643,6 +1643,27 @@ mod tests {
         Project::test(file_system, [root], cx).await
     }
 
+    /// Runs the executor until `loading` returns false. Source loads read real files on
+    /// background threads, which can finish after `run_until_parked` returns, as they
+    /// often do on Windows, so this also lets real time pass.
+    fn run_until_loaded(
+        cx: &mut TestAppContext,
+        mut loading: impl FnMut(&mut TestAppContext) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            cx.run_until_parked();
+            if !loading(cx) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the source loads did not finish"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     async fn open_code_workspace_for_project(
         project: Entity<Project>,
         cx: &mut TestAppContext,
@@ -1673,7 +1694,13 @@ mod tests {
             workspace.set_visible(true, window, cx);
             workspace
         });
-        cx.run_until_parked();
+        run_until_loaded(cx, |cx| {
+            workspace
+                .read_with(cx, |workspace, _| {
+                    workspace.loading_fnx || workspace.loading_json
+                })
+                .expect("code workspace")
+        });
         (item, workspace)
     }
 
@@ -4015,6 +4042,9 @@ mod tests {
                 code.select_file(CodeWorkspaceFile::Fnx, window, cx)
             });
         }
+        run_until_loaded(cx, |cx| {
+            code.read_with(cx, |code, _| code.loading_fnx || code.loading_json)
+        });
         (view, code, item, cx)
     }
 
