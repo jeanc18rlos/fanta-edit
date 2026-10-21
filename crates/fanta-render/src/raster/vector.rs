@@ -2,10 +2,10 @@
 //! stroke alignment (incl. per-side borders), the vector-fill draw path, and
 //! the debug placeholder / unresolved-instance outline helpers.
 use super::{
-    Bounds, CachedVectorPaths, Canvas, Color, Fill, ImageFillMods, NodeId, Paint, Rect, RenderCtx,
-    draw_image_cached, draw_pattern_fill, draw_shader_fill, draw_video_fill, fill_to_paint,
-    pattern_paint, scale_paint_alpha, shader_paint, stroke_to_paint, to_sk_color, to_sk_fill_path,
-    to_sk_path,
+    Bounds, CachedVectorPaths, Canvas, Color, Fill, ImageDraw, ImageFillMods, NodeId, Paint, Rect,
+    RenderCtx, draw_image_cached, draw_pattern_fill, draw_shader_fill, draw_video_fill,
+    fill_to_paint, pattern_paint, pending_image_paint, scale_paint_alpha, shader_paint,
+    stroke_to_paint, to_sk_color, to_sk_fill_path, to_sk_path,
 };
 use lru::LruCache;
 use std::collections::hash_map::DefaultHasher;
@@ -347,14 +347,18 @@ pub(crate) fn stroke_sk_path(
         // reusing the same decode/fit path as an image FILL. A missing asset
         // falls through to the placeholder stroke below, so it stays visible.
         if matches!(stroke.paint, Fill::Image { .. }) {
-            if draw_image_stroke(canvas, sk_path, stroke, local_bounds_f32, ctx) {
+            let drawn = draw_image_stroke(canvas, sk_path, stroke, local_bounds_f32, ctx);
+            if drawn.incomplete() {
+                // No enclosing effects layer may be cached from this frame.
+                ctx.layer_volatile = true;
+                ctx.metrics.incomplete_artwork = true;
+            }
+            // A still-decoding stroke stays quiet; a missing asset falls
+            // through to the placeholder stroke below.
+            if drawn != ImageDraw::Missing {
                 ctx.metrics.nodes_drawn += 1;
                 continue;
             }
-            // Missing / still-decoding asset: placeholder stroke below, and
-            // no enclosing effects layer may be cached from this frame.
-            ctx.layer_volatile = true;
-            ctx.metrics.incomplete_artwork = true;
         }
         if matches!(stroke.paint, Fill::Video { .. }) {
             ctx.metrics.non_artwork_content = true;
@@ -426,7 +430,7 @@ fn draw_image_stroke(
     stroke: &fanta_doc::Stroke,
     local_bounds_f32: [f32; 4],
     ctx: &mut RenderCtx,
-) -> bool {
+) -> ImageDraw {
     let Fill::Image {
         asset,
         mode,
@@ -438,7 +442,7 @@ fn draw_image_stroke(
         adjust,
     } = &stroke.paint
     else {
-        return false;
+        return ImageDraw::Missing;
     };
 
     // Geometry-only stroke paint (its color/shader is unused — we take just the
@@ -452,11 +456,11 @@ fn draw_image_stroke(
     }
     let mut outline = skia_safe::PathBuilder::new();
     if !skia_safe::path_utils::fill_path_with_paint(sk_path, &geom, &mut outline, None, None) {
-        return false;
+        return ImageDraw::Missing;
     }
     let outline = outline.detach();
 
-    let resolver = ctx.resolver;
+    let images = ctx.image_source();
     let [bx, by, bw, bh] = local_bounds_f32;
     canvas.save();
     canvas.clip_path(&outline, skia_safe::ClipOp::Intersect, true);
@@ -477,7 +481,7 @@ fn draw_image_stroke(
         canvas,
         ctx.cache,
         *asset,
-        || resolver.and_then(|r| r.resolve(*asset)),
+        images,
         [bw as f64, bh as f64],
         crop.as_deref().copied(),
         *mode,
@@ -1294,7 +1298,7 @@ pub(crate) fn paint_path_fills(
         {
             // Hoisted so the resolve closure captures a local, not `ctx`,
             // which `ctx.cache` borrows mutably.
-            let resolver = ctx.resolver;
+            let images = ctx.image_source();
             canvas.save();
             canvas.clip_path(fill_path, None, true);
             // The image fits the path's bounding box; the clip restricts it to
@@ -1308,7 +1312,7 @@ pub(crate) fn paint_path_fills(
                 canvas,
                 ctx.cache,
                 *asset,
-                || resolver.and_then(|r| r.resolve(*asset)),
+                images,
                 local_size,
                 crop_rect,
                 *mode,
@@ -1322,15 +1326,25 @@ pub(crate) fn paint_path_fills(
                 },
             );
             canvas.restore();
-            if drawn {
+            if drawn.incomplete() {
+                // The asset may still be decoding, so an enclosing effects
+                // layer must not be cached from this frame (see
+                // `layer_volatile`).
+                ctx.layer_volatile = true;
+                ctx.metrics.incomplete_artwork = true;
+            }
+            if drawn.drew() {
                 ctx.metrics.nodes_drawn += 1;
                 continue;
             }
-            // Fall through to the placeholder paint for a missing asset —
-            // which may still be decoding, so an enclosing effects layer
-            // must not be cached from this frame (see `layer_volatile`).
-            ctx.layer_volatile = true;
-            ctx.metrics.incomplete_artwork = true;
+            if drawn == ImageDraw::Pending {
+                let mut paint = pending_image_paint();
+                scale_paint_alpha(&mut paint, ctx.paint_alpha);
+                canvas.draw_path(fill_path, &paint);
+                ctx.metrics.nodes_drawn += 1;
+                continue;
+            }
+            // A missing asset falls through to the placeholder paint.
         }
         let mut paint = fill_to_paint(fill, local_bounds_f32);
         // 1.0 unless the walk folded this leaf's node opacity into its single

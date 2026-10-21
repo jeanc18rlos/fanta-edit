@@ -1,4 +1,4 @@
-use super::{Bounds, Canvas, ImageFillMods, RenderCtx, draw_image_cached};
+use super::{Bounds, Canvas, ImageDraw, ImageFillMods, RenderCtx, draw_image_cached};
 use fanta_doc::{BlendMode, VideoFill};
 
 pub(crate) fn draw_video_fill(
@@ -26,13 +26,13 @@ pub(crate) fn draw_video_fill(
     if frame.is_some() {
         ctx.layer_volatile = true;
     }
-    let resolver = ctx.resolver;
+    let images = ctx.image_source();
 
     canvas.save();
     canvas.clip_path(path, None, true);
     canvas.translate((bounds.min_x as f32, bounds.min_y as f32));
     let drawn = if let Some(frame) = frame {
-        crate::image::blit_sk_image(
+        let blitted = crate::image::blit_sk_image(
             canvas,
             frame,
             frame.width() as u32,
@@ -44,26 +44,22 @@ pub(crate) fn draw_video_fill(
             opacity,
             mods,
             frame.has_mipmaps(),
-        )
+        );
+        if blitted {
+            ImageDraw::Exact
+        } else {
+            ImageDraw::Missing
+        }
     } else if let Some(poster) = video.poster {
         draw_image_cached(
-            canvas,
-            ctx.cache,
-            poster,
-            || resolver.and_then(|resolver| resolver.resolve(poster)),
-            local_size,
-            crop,
-            video.mode,
-            None,
-            opacity,
-            mods,
+            canvas, ctx.cache, poster, images, local_size, crop, video.mode, None, opacity, mods,
         )
     } else {
-        false
+        ImageDraw::Missing
     };
     canvas.restore();
-    if !drawn {
+    if drawn.incomplete() {
         ctx.layer_volatile = true;
     }
-    drawn
+    drawn.drew()
 }

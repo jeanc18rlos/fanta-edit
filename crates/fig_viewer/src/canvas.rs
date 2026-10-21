@@ -1925,6 +1925,10 @@ struct FrameProgress {
     cancelled: bool,
     pipeline: FramePipelineTiming,
     font_generation: Option<u64>,
+    /// The resolver's decode generation, for a frame whose artwork was
+    /// incomplete: an image still decoding, or drawn at a coarser level. The
+    /// frame is stale once a decode lands and the generation moves.
+    images_pending: Option<u64>,
 }
 
 #[cfg(target_os = "macos")]
@@ -1995,6 +1999,15 @@ impl WakeSignal {
 
     fn wait(&self) -> WakeWait<'_> {
         WakeWait(self)
+    }
+}
+
+/// A landed image decode repaints the view like a render reply does; paint
+/// then re-renders a frame that drew the image as a placeholder.
+#[cfg(target_os = "macos")]
+impl fanta_render::DecodeListener for WakeSignal {
+    fn images_decoded(&self) {
+        self.wake();
     }
 }
 
@@ -2280,6 +2293,11 @@ impl MacGpuRenderer {
         // blurred/shadowed subtree per frame.
         raster_renderer.set_pixel_snap_pan(true);
         raster_renderer.set_image_cache_budget_bytes(Some(Self::IMAGE_CACHE_BUDGET_BYTES));
+        // Decoding on this thread cost photo-heavy pages seconds per frame. A
+        // frame draws the image level on hand or a placeholder instead, the
+        // resolver's workers decode the level it needs, and the frame is drawn
+        // again once that lands (see `FrameProgress::images_pending`).
+        raster_renderer.set_image_decode(fanta_render::ImageDecode::Background);
 
         Ok(Self {
             translation: WorkerTranslation::default(),
@@ -2516,6 +2534,7 @@ impl MacGpuRenderer {
         let mut path = FramePath::Normal;
         let mut retained_metrics = None;
         let mut build_wall_us = None;
+        let images_generation = resolver.map_or(0, |resolver| resolver.decode_generation());
         let mut progress = FrameProgress {
             needs_refresh: false,
             complete_detail: true,
@@ -2523,6 +2542,7 @@ impl MacGpuRenderer {
             cancelled: false,
             pipeline,
             font_generation: None,
+            images_pending: None,
         };
         let mut camera_cache = None;
         if let Some(gesture) = request.translation
@@ -2660,6 +2680,7 @@ impl MacGpuRenderer {
                 cancelled: rendered.cancelled,
                 pipeline,
                 font_generation: None,
+                images_pending: None,
             };
             camera_cache = Some(rendered.cache);
             Some(rendered.metrics)
@@ -2681,6 +2702,11 @@ impl MacGpuRenderer {
         progress.pipeline = pipeline;
         progress.font_generation = font_generation
             .filter(|generation| RasterRenderer::current_font_generation() == Some(*generation));
+        progress.images_pending = metrics
+            .as_ref()
+            .or(retained_metrics.as_ref().map(|metrics| &metrics.middle))
+            .is_some_and(|metrics| metrics.incomplete_artwork)
+            .then_some(images_generation);
         progress.cancelled |= request.camera.as_ref().is_some_and(abandoned);
         let flush_duration = flush_started.map(|started| started.elapsed());
         let normal_cost = normal_started.map(|started| started.elapsed());
@@ -3080,6 +3106,11 @@ pub(crate) struct GpuCanvas {
     cost: RenderCost,
     epoch: u64,
     presentation: PresentationTracker,
+    /// Raised when an image decode lands; the reply task waits on it.
+    decode_listener: Arc<WakeSignal>,
+    /// The resolver `decode_listener` is subscribed to. Held weakly, which
+    /// also keeps a later resolver from reusing its address.
+    decode_source: Option<std::sync::Weak<dyn AssetResolver>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -3104,6 +3135,7 @@ impl GpuCanvas {
         let (reply_tx, replies) = mpsc::channel();
         let signal = Arc::new(WakeSignal::default());
         let thread_signal = signal.clone();
+        let decode_listener = signal.clone();
         let presentation = Arc::new(Mutex::new(PresentationPool::default()));
         let thread_presentation = presentation.clone();
         let spawned = std::thread::Builder::new()
@@ -3134,6 +3166,7 @@ impl GpuCanvas {
             reply_task,
             failed,
             presentation,
+            decode_listener,
         )
     }
 
@@ -3144,6 +3177,7 @@ impl GpuCanvas {
         reply_task: Task<()>,
         failed: Option<String>,
         presentation: Arc<Mutex<PresentationPool>>,
+        decode_listener: Arc<WakeSignal>,
     ) -> Self {
         Self {
             gesture_perf,
@@ -3177,6 +3211,8 @@ impl GpuCanvas {
             cost: RenderCost::Unknown,
             epoch: 0,
             presentation: PresentationTracker::new(presentation),
+            decode_listener,
+            decode_source: None,
         }
     }
 
@@ -3184,7 +3220,15 @@ impl GpuCanvas {
     pub(crate) fn for_test() -> Self {
         let (jobs, _) = mpsc::channel();
         let (_, replies) = mpsc::channel();
-        Self::with_channels(None, jobs, replies, Task::ready(()), None, Arc::default())
+        Self::with_channels(
+            None,
+            jobs,
+            replies,
+            Task::ready(()),
+            None,
+            Arc::default(),
+            Arc::default(),
+        )
     }
 
     #[cfg(test)]
@@ -3195,6 +3239,24 @@ impl GpuCanvas {
     /// The GPU path is usable (the render thread came up and keeps working).
     pub(crate) fn is_available(&self) -> bool {
         self.failed.is_none()
+    }
+
+    /// Wake the view when the document's resolver lands a decode, subscribing
+    /// once per resolver.
+    fn watch_decodes(&mut self, document: &FigDocument) {
+        let Some(resolver) = &document.asset_resolver else {
+            return;
+        };
+        if self
+            .decode_source
+            .as_ref()
+            .is_some_and(|source| std::ptr::addr_eq(source.as_ptr(), Arc::as_ptr(resolver)))
+        {
+            return;
+        }
+        self.decode_source = Some(Arc::downgrade(resolver));
+        let listener: Arc<dyn fanta_render::DecodeListener> = self.decode_listener.clone();
+        resolver.subscribe_decodes(Arc::downgrade(&listener));
     }
 
     /// Force the next paint to render anew even if nothing else changed.
@@ -3700,6 +3762,11 @@ impl GpuCanvas {
         camera_interacting: bool,
     ) -> Result<(Option<GpuFrame>, bool)> {
         self.sync_translation(translation);
+        self.watch_decodes(document);
+        let images_generation = document
+            .asset_resolver
+            .as_ref()
+            .map_or(0, |resolver| resolver.decode_generation());
         let key = SurfaceKey {
             size,
             viewport_center: viewport.center,
@@ -3776,6 +3843,10 @@ impl GpuCanvas {
                     .dependency_proof
                     .as_ref()
                     .is_none_or(|proof| proof.matches(fingerprint, self.worker_fonts.as_ref()))
+                && frame
+                    .progress
+                    .images_pending
+                    .is_none_or(|generation| generation == images_generation)
         });
         let plan = plan_paint(
             newest.map(|frame| &frame.key),

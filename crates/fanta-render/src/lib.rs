@@ -35,14 +35,15 @@ pub mod sampling;
 pub mod transform;
 
 pub use asset::{
-    AssetResolver, DecodedImage, InMemoryAssetResolver, LazyAssetResolver, decode_image_bytes,
-    encoded_image_dimensions,
+    AssetResolver, DecodeListener, DecodedImage, InMemoryAssetResolver, LazyAssetResolver,
+    LevelLookup, LeveledImage, decode_image_bytes, encoded_image_dimensions,
 };
 pub use bounds::visual_world_bounds;
 pub use color::{to_sk_color, to_sk_color4f};
 pub use fanta_text::FontGenerationObserver;
 pub use image::{
-    FitRects, ImageCache, crop_to_pixels, draw_decoded_image, draw_image_cached, fit_src_dst,
+    FitRects, ImageCache, ImageDecode, ImageDraw, ImageSource, crop_to_pixels, draw_decoded_image,
+    draw_image_cached, fit_src_dst,
 };
 pub use paint::{fill_to_paint, stroke_to_paint};
 pub use path::to_sk_path;

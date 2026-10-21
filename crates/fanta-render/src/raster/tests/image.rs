@@ -414,3 +414,52 @@ fn image_adjust_cache_is_exercised_on_render() {
         "adjusted image fill should produce visible pixels"
     );
 }
+
+/// The interactive canvas renders with `ImageDecode::Background`: a frame
+/// drawn before an image decodes paints a neutral wash and reports incomplete
+/// artwork, so nothing caches it, and the same render after the decode lands
+/// paints the asset.
+#[test]
+fn background_decoding_renders_a_pending_wash_then_the_decoded_asset() {
+    use crate::asset::{AssetResolver, LazyAssetResolver, decode_image_bytes};
+    use crate::image::ImageDecode;
+    use std::collections::BTreeMap;
+
+    let mut surface = skia_safe::surfaces::raster_n32_premul((2, 2)).expect("surface");
+    surface
+        .canvas()
+        .clear(skia_safe::Color::from_rgb(200, 30, 30));
+    let png = surface
+        .image_snapshot()
+        .encode(None, skia_safe::EncodedImageFormat::PNG, 100)
+        .expect("png")
+        .as_bytes()
+        .to_vec();
+    let id = fanta_doc::AssetId::new();
+    let resolver = Arc::new(LazyAssetResolver::new(
+        Arc::new(BTreeMap::from([(id, png)])),
+        Arc::new(|_id, bytes: &[u8]| decode_image_bytes(bytes)),
+    ));
+    let doc = bitmap_doc(id);
+    let mut r = RasterRenderer::new(48, 48).unwrap();
+    r.set_image_decode(ImageDecode::Background);
+    r.set_asset_resolver(resolver.clone());
+
+    let pending = r.render(&doc.scene, &doc.viewport);
+    assert!(pending.incomplete_artwork);
+    let wash = rgba_at(&r.copy_rgba(), 48, 24, 24);
+    assert!(
+        wash[3] > 0 && wash[0] == wash[1] && wash[1] == wash[2],
+        "a neutral wash, not the asset or the missing-image placeholder: {wash:?}"
+    );
+
+    resolver.wait_for_background_decodes();
+    assert!(resolver.decode_generation() > 0);
+    let decoded = r.render(&doc.scene, &doc.viewport);
+    assert!(!decoded.incomplete_artwork);
+    let c = rgba_at(&r.copy_rgba(), 48, 24, 24);
+    assert!(
+        c[0] > 150 && c[1] < 80 && c[2] < 80,
+        "the decoded asset: {c:?}"
+    );
+}

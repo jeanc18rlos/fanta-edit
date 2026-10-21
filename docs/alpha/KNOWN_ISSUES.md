@@ -373,22 +373,24 @@ actually driven. Nothing here claims more than that record supports.
     every unchanged design file for the overrides and disk preconditions.
   These are heap figures from a counting allocator, not resident size, and the
   canvas's own memory is not in them.
-- **The first frame of a page may decode its images.** Images are decoded
-  lazily: `LazyAssetResolver::resolve` (`crates/fanta-render/src/asset.rs`)
-  decodes an asset the first time the renderer asks for it, on whichever thread
-  is rendering. The page a document opens on is prewarmed on the background load
-  thread (`FigDocument::prewarm_default_page_assets`, called from both
-  `load_fig_document` and `load_project_document`), so its first frame should
-  not stall; every other page pays on first draw. Decoded pixels are kept under
-  `DEFAULT_DECODED_BUDGET_BYTES` (1.5 GiB) with least-recently-used eviction,
-  so on a document with more image pixels than that, scrolling back to an
-  evicted image decodes it again; a single image larger than the whole budget is
-  kept rather than re-decoded every frame. A corrupt image logs `failed to
-  decode embedded .fig image asset …` at WARN **once** — the failure is cached —
-  and draws as missing from then on. Unit-tested in `asset.rs`; the only
-  rendering asked of this build is `get_screenshot`, which returned valid PNGs
-  of both test documents on 2026-09-09 — no window has been watched, and no
-  document with more image pixels than the budget has been paged through.
+- **Images can show a light grey wash, or look soft, for a moment.** The
+  macOS canvas never decodes on its render thread (`ImageDecode::Background`,
+  `crates/fanta-render/src/image.rs`). A frame draws each image at the
+  pyramid level already decoded, or a light grey wash, and the worker threads
+  of `LazyAssetResolver` (`crates/fanta-render/src/asset.rs`) decode the level
+  the frame needs; the canvas draws again once it lands. Opening a page queues
+  512-pixel previews of its images (`PagePrewarm::run`), so zooming in past a
+  preview shows it soft until the finer level arrives. Each image is held at
+  one level, the finest any frame needed so far, under
+  `DEFAULT_DECODED_BUDGET_BYTES` (256 MiB) with least-recently-used eviction.
+  Exports, agent screenshots and the CPU fallback canvas still decode at natural
+  resolution on their own thread, as does the canvas on other platforms. A
+  corrupt image logs `failed to decode embedded .fig image asset …` at WARN
+  once, and draws as missing from then on. Measured on 2026-10-20 with release
+  builds on a page of 24 photos (2048×2048 lossless WebP): the slowest canvas
+  render went from 1.9 s to 64 ms, and every image was drawn within 370 ms of
+  each zoom or pan. Not measured: pages whose images at drawn size exceed the
+  budget.
 
 ## Agents
 

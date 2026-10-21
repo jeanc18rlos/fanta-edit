@@ -6,6 +6,7 @@
 - Added clip settings, portable Motion JSON and Figma Motion JSON exports.
 - Added motion exports as a Claude Motion Stage package, MP4 (with ffmpeg), GIF and PNG frames.
 - Improved vector path joining, closing, simplification, segment bending and anchor editing.
+- Improved canvas speed on image-heavy pages: images decode off the render thread, at the size they are drawn.
 - Added a command-line website exporter using an explicitly supplied Fanta-JS runtime.
 - Removed the unused RevenueCat integration; current billing uses Polar on the web.
 

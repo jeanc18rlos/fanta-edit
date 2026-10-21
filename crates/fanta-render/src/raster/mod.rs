@@ -179,7 +179,10 @@ pub(crate) use text::{clear_layout_cache, layout_cache_len};
 // `use super::*;` resolves the same names the monolith's top-of-file `use`s did.
 pub(crate) use crate::asset::AssetResolver;
 pub(crate) use crate::color::to_sk_color;
-pub(crate) use crate::image::{ImageCache, ImageFillMods, draw_image_cached};
+pub(crate) use crate::image::{
+    ImageCache, ImageDecode, ImageDraw, ImageFillMods, ImageSource, draw_image_cached,
+    pending_image_paint,
+};
 pub(crate) use crate::paint::{
     apply_blend_mode, fill_to_paint, scale_paint_alpha, stroke_to_paint,
 };

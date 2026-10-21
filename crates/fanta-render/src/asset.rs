@@ -34,7 +34,8 @@
 
 use fanta_doc::AssetId;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 
 /// Decoded, ready-to-upload image pixels.
 ///
@@ -128,22 +129,51 @@ pub fn decode_image_bytes(bytes: &[u8]) -> Option<DecodedImage> {
     Some(DecodedImage::new(&pixels, width, height))
 }
 
+/// Pixels decoded at one level of an asset's display pyramid.
+#[derive(Clone)]
+pub struct LeveledImage {
+    pub image: DecodedImage,
+    /// `0` is the natural resolution; level `k` is box-downscaled by `2^k`.
+    pub level: u32,
+}
+
+/// What a non-blocking lookup found for an asset.
+pub enum LevelLookup {
+    /// The finest decode on hand. It can be coarser than the level asked for
+    /// while a finer one decodes in the background.
+    Decoded(LeveledImage),
+    /// Nothing decoded yet; a background decode is under way.
+    Pending,
+    /// The asset is unknown, or its bytes are not a decodable image.
+    Unavailable,
+}
+
+/// Told when a background decode lands, so a view that drew a placeholder
+/// can draw again.
+pub trait DecodeListener: Send + Sync {
+    /// Runs on the decoding thread before the decode counts as finished, so
+    /// it must return quickly and never resolve images itself.
+    fn images_decoded(&self);
+}
+
 /// Resolves an [`AssetId`] to decoded pixels.
 ///
 /// Implemented by the app over a `FantaFile`; faked in renderer tests. The
 /// renderer never touches `fanta-format` directly — it only knows this trait.
 ///
-/// `resolve` is **non-blocking** by contract: a cache miss should kick off a
-/// background decode and return `None` *this* frame (the node draws a
-/// placeholder), with the pixels available on a later frame. Returning `None`
-/// for an unknown or still-decoding asset is the single deferred-output
-/// pattern the rest of the media pipeline (video frames, waveforms, AI
-/// outputs) reuses — bitmap is its simplest instance.
+/// [`Self::resolve`] decodes on the calling thread when it must, for callers
+/// that need complete output (export, sampling, thumbnails). Interactive
+/// drawing uses [`Self::resolve_level_nonblocking`] instead: a miss starts a
+/// background decode and the frame draws a placeholder, with the pixels
+/// available on a later frame. Returning nothing for a still-decoding asset is
+/// the deferred-output pattern the rest of the media pipeline (video frames,
+/// waveforms, AI outputs) reuses — bitmap is its simplest instance.
 ///
 /// `Send + Sync` so the resolver can be shared across the render thread and a
 /// background decode pool behind an [`Arc`].
 pub trait AssetResolver: Send + Sync {
-    /// Decoded RGBA8 pixels for `id`, or `None` if unknown / still decoding.
+    /// Decoded RGBA8 pixels for `id` at natural resolution, or `None` if
+    /// unknown or undecodable.
     fn resolve(&self, id: AssetId) -> Option<DecodedImage>;
 
     /// Raw, undecoded source bytes for `id` (WAV / glTF / MP4 / …), or `None`.
@@ -159,6 +189,35 @@ pub trait AssetResolver: Send + Sync {
     fn held_bytes(&self) -> Option<usize> {
         None
     }
+
+    /// The asset's natural size in pixels, read from its header when that
+    /// avoids a decode.
+    fn image_size(&self, id: AssetId) -> Option<[u32; 2]> {
+        self.resolve(id).map(|image| [image.width, image.height])
+    }
+
+    /// The finest decode of `id` this resolver holds, without decoding on the
+    /// calling thread. When nothing as fine as `level` is held, a background
+    /// decode of `level` starts, and [`Self::decode_generation`] moves once it
+    /// lands.
+    ///
+    /// The default suits resolvers whose pixels are already in memory. A
+    /// resolver that decodes must override it, or drawing threads decode.
+    fn resolve_level_nonblocking(&self, id: AssetId, _level: u32) -> LevelLookup {
+        match self.resolve(id) {
+            Some(image) => LevelLookup::Decoded(LeveledImage { image, level: 0 }),
+            None => LevelLookup::Unavailable,
+        }
+    }
+
+    /// Moves whenever a decode lands. A frame drawn before the change may show
+    /// a placeholder or a coarser level, so it belongs to the frame's identity.
+    fn decode_generation(&self) -> u64 {
+        0
+    }
+
+    /// Wake `listener` after each decode lands, for as long as it is alive.
+    fn subscribe_decodes(&self, _listener: Weak<dyn DecodeListener>) {}
 }
 
 /// A trivial [`AssetResolver`] backed by an in-memory map.
@@ -216,6 +275,10 @@ pub const DEFAULT_DECODED_BUDGET_BYTES: usize = 256 * 1024 * 1024;
 /// — see the module docs on why no decoder lives in this crate.
 pub type ImageDecoder = dyn Fn(AssetId, &[u8]) -> Option<DecodedImage> + Send + Sync;
 
+/// Reads an image's natural size from its encoded header without decoding its
+/// pixels, or `None` for a format it does not know.
+pub type ImageSizeReader = dyn Fn(&[u8]) -> Option<[u32; 2]> + Send + Sync;
+
 /// An [`AssetResolver`] over a document's encoded assets that decodes each
 /// image the first time something asks for it and keeps the decoded pixels
 /// under a byte budget.
@@ -226,21 +289,45 @@ pub type ImageDecoder = dyn Fn(AssetId, &[u8]) -> Option<DecodedImage> + Send + 
 /// the assets actually drawn — plus whatever the loader [`prewarm`]s — cost
 /// pixels; the encoded bytes stay shared with the save path.
 ///
-/// Shared between the render thread, prewarm threads and the UI thread
-/// (screenshots, export), so it is `Send + Sync`, and the lock is never held
-/// across a decode: a miss decodes outside the lock and inserts afterwards. A
-/// resolve that finds the asset already being decoded waits for that decode
-/// instead of repeating it, so a page prewarm racing the first frame's walk
-/// never decodes the same image twice.
+/// Each asset is held at one pyramid level: the finest any caller needed so
+/// far. A canvas asks for the level it draws, so a photo shown as a thumbnail
+/// costs a thumbnail's pixels rather than the full image's. Before this, a page
+/// of 24 full-size photos needed more than the budget, and every frame evicted
+/// and re-decoded the photos it was about to draw.
+///
+/// Shared between the render thread, its own background decode workers,
+/// prewarm threads and the UI thread (screenshots, export), so it is
+/// `Send + Sync`, and the lock is never held across a decode: a miss decodes
+/// outside the lock and inserts afterwards. A blocking resolve that finds the
+/// asset already being decoded waits for that decode instead of repeating it.
 ///
 /// [`prewarm`]: Self::prewarm
 pub struct LazyAssetResolver {
+    shared: Arc<LazyShared>,
+}
+
+struct LazyShared {
     encoded: Arc<BTreeMap<AssetId, Vec<u8>>>,
     decoder: Arc<ImageDecoder>,
+    size_reader: Arc<ImageSizeReader>,
     budget_bytes: usize,
     cache: Mutex<DecodedCache>,
     /// Notified whenever an in-flight decode finishes (or unwinds).
     decoded: Condvar,
+    queue: Mutex<DecodeQueue>,
+    /// Wakes idle background workers.
+    work: Condvar,
+    generation: AtomicU64,
+    listeners: Mutex<Vec<Weak<dyn DecodeListener>>>,
+}
+
+#[derive(Default)]
+struct DecodeQueue {
+    /// Newest request last. Workers take from the end, so the frame that asked
+    /// most recently is served first while a zoom keeps changing the level.
+    jobs: Vec<(AssetId, u32)>,
+    workers: usize,
+    shutdown: bool,
 }
 
 #[derive(Default)]
@@ -261,24 +348,27 @@ struct DecodedCache {
     shared_bytes: HashMap<AssetId, Arc<Vec<u8>>>,
     /// Bytes held by [`Self::shared_bytes`].
     shared_bytes_total: usize,
-    /// Assets some thread is decoding right now.
-    in_flight: HashSet<AssetId>,
+    /// Decodes queued or running, by asset and pyramid level.
+    in_flight: HashSet<(AssetId, u32)>,
+    /// Natural sizes, from headers or from finished decodes.
+    sizes: HashMap<AssetId, [u32; 2]>,
 }
 
 struct CacheEntry {
     /// `None` records a decode failure so the asset is not retried per frame.
     image: Option<DecodedImage>,
+    level: u32,
     tick: u64,
 }
 
 impl DecodedCache {
-    fn touch(&mut self, id: AssetId) -> Option<Option<DecodedImage>> {
+    fn touch(&mut self, id: AssetId) -> Option<(Option<DecodedImage>, u32)> {
         let entry = self.entries.get_mut(&id)?;
         self.recency.remove(&entry.tick);
         entry.tick = self.next_tick;
         self.next_tick += 1;
         self.recency.insert(entry.tick, id);
-        Some(entry.image.clone())
+        Some((entry.image.clone(), entry.level))
     }
 
     /// Everything the cache holds on top of the document's own copy: decoded
@@ -287,16 +377,47 @@ impl DecodedCache {
         self.decoded_bytes + self.shared_bytes_total
     }
 
-    fn insert(&mut self, id: AssetId, image: Option<DecodedImage>, budget_bytes: usize) {
-        if self.entries.contains_key(&id) {
-            return;
+    /// Whether a decode at `level` or finer is queued or running for `id`.
+    fn decoding(&self, id: AssetId, level: u32) -> bool {
+        (0..=level).any(|finer| self.in_flight.contains(&(id, finer)))
+    }
+
+    /// Record a decode of `id` at `level`, keeping whatever is already finer.
+    /// Returns whether the cache changed.
+    fn insert(
+        &mut self,
+        id: AssetId,
+        image: Option<DecodedImage>,
+        level: u32,
+        budget_bytes: usize,
+    ) -> bool {
+        if let Some(existing) = self.entries.get(&id) {
+            let keep = match (&existing.image, &image) {
+                (None, _) | (Some(_), None) => true,
+                (Some(_), Some(_)) => existing.level <= level,
+            };
+            if keep {
+                return false;
+            }
+            self.remove(id);
         }
         let tick = self.next_tick;
         self.next_tick += 1;
         self.decoded_bytes += image.as_ref().map_or(0, |image| image.pixels().len());
-        self.entries.insert(id, CacheEntry { image, tick });
+        self.entries.insert(id, CacheEntry { image, level, tick });
         self.recency.insert(tick, id);
         self.evict_to(budget_bytes, Some(id));
+        true
+    }
+
+    fn remove(&mut self, id: AssetId) {
+        if let Some(removed) = self.entries.remove(&id) {
+            self.recency.remove(&removed.tick);
+            self.decoded_bytes -= removed
+                .image
+                .as_ref()
+                .map_or(0, |image| image.pixels().len());
+        }
     }
 
     /// Drop cached bytes until the cache is back inside `budget_bytes`,
@@ -320,27 +441,170 @@ impl DecodedCache {
             });
         }
         while self.held_bytes() > budget_bytes {
-            let Some((&oldest_tick, &oldest)) = self.recency.iter().next() else {
+            let Some((_, &oldest)) = self.recency.iter().next() else {
                 break;
             };
             if Some(oldest) == keep {
                 break;
             }
-            self.recency.remove(&oldest_tick);
-            if let Some(evicted) = self.entries.remove(&oldest) {
-                self.decoded_bytes -= evicted
-                    .image
-                    .as_ref()
-                    .map_or(0, |image| image.pixels().len());
+            self.remove(oldest);
+        }
+    }
+}
+
+impl LazyShared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, DecodedCache> {
+        // The cache holds no invariant a panicking holder could break
+        // half-way (each mutation is a single insert/evict step), so a
+        // poisoned lock is still safe to keep using.
+        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn lock_queue(&self) -> std::sync::MutexGuard<'_, DecodeQueue> {
+        self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Decoding is CPU-bound; leave cores for the render and UI threads.
+    fn max_workers() -> usize {
+        std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .saturating_sub(2)
+            .clamp(1, 4)
+    }
+
+    /// Queue a background decode the caller already marked in flight.
+    fn enqueue(shared: &Arc<Self>, id: AssetId, level: u32) {
+        let mut queue = shared.lock_queue();
+        queue.jobs.push((id, level));
+        if queue.workers < Self::max_workers() {
+            let worker = Arc::clone(shared);
+            match std::thread::Builder::new()
+                .name("fanta-image-decode".into())
+                .spawn(move || worker.work())
+            {
+                Ok(_) => queue.workers += 1,
+                Err(error) => {
+                    tracing::warn!(%error, "starting an image decode thread failed");
+                    if queue.workers == 0 {
+                        // Nobody would ever take the job: forget it, so a
+                        // later draw asks again instead of waiting forever.
+                        queue.jobs.clear();
+                        drop(queue);
+                        shared.lock().in_flight.retain(|job| *job != (id, level));
+                        shared.decoded.notify_all();
+                        return;
+                    }
+                }
             }
+        }
+        drop(queue);
+        shared.work.notify_one();
+    }
+
+    fn work(self: Arc<Self>) {
+        loop {
+            let (id, level) = {
+                let mut queue = self.lock_queue();
+                loop {
+                    if queue.shutdown {
+                        return;
+                    }
+                    if let Some(job) = queue.jobs.pop() {
+                        break job;
+                    }
+                    queue = self
+                        .work
+                        .wait(queue)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+            };
+            self.decode_in_background(id, level);
+        }
+    }
+
+    fn decode_in_background(&self, id: AssetId, level: u32) {
+        let in_flight = InFlightDecode {
+            shared: self,
+            id,
+            level,
+        };
+        // A decode at least this fine may have landed while the job waited.
+        let held = self
+            .lock()
+            .entries
+            .get(&id)
+            .map(|entry| (entry.image.is_some(), entry.level));
+        if held.is_some_and(|(decoded, held)| !decoded || held <= level) {
+            return;
+        }
+        let Some(bytes) = self.encoded.get(&id) else {
+            return;
+        };
+        let decoded = (self.decoder)(id, bytes).map(|full| {
+            let natural = [full.width, full.height];
+            let leveled =
+                crate::image::decoded_pyramid_level(&full, level).unwrap_or(LeveledImage {
+                    image: full,
+                    level: 0,
+                });
+            (natural, leveled)
+        });
+        // A recorded failure counts as a change too: the frame that drew the
+        // pending wash must redraw to show the missing-image placeholder.
+        let changed = {
+            let mut cache = self.lock();
+            match decoded {
+                Some((natural, leveled)) => {
+                    cache.sizes.insert(id, natural);
+                    cache.insert(id, Some(leveled.image), leveled.level, self.budget_bytes)
+                }
+                None => cache.insert(id, None, 0, self.budget_bytes),
+            }
+        };
+        // Waiters see the decode finish only after the generation moved, so
+        // whoever waited also finds the listeners woken.
+        if changed {
+            self.landed();
+        }
+        drop(in_flight);
+    }
+
+    /// A decode changed what drawing threads can find: move the generation
+    /// and wake the listeners that drew without it.
+    fn landed(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        let live: Vec<Arc<dyn DecodeListener>> = {
+            let mut listeners = self
+                .listeners
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            listeners.retain(|listener| listener.strong_count() > 0);
+            listeners.iter().filter_map(Weak::upgrade).collect()
+        };
+        for listener in live {
+            listener.images_decoded();
         }
     }
 }
 
 impl LazyAssetResolver {
-    /// Resolver over `encoded` with the [`DEFAULT_DECODED_BUDGET_BYTES`] cap.
+    /// Resolver over `encoded` with the [`DEFAULT_DECODED_BUDGET_BYTES`] cap,
+    /// reading natural sizes through Skia's codecs.
     pub fn new(encoded: Arc<BTreeMap<AssetId, Vec<u8>>>, decoder: Arc<ImageDecoder>) -> Self {
         Self::with_budget(encoded, decoder, DEFAULT_DECODED_BUDGET_BYTES)
+    }
+
+    /// Like [`Self::new`], reading natural sizes with `size_reader`. A
+    /// background draw picks the level to decode from the natural size, so a
+    /// decoder that handles formats this crate's Skia build cannot parse
+    /// (WebP) needs a reader for them too, or those images decode at full
+    /// resolution.
+    pub fn with_size_reader(
+        encoded: Arc<BTreeMap<AssetId, Vec<u8>>>,
+        decoder: Arc<ImageDecoder>,
+        size_reader: Arc<ImageSizeReader>,
+    ) -> Self {
+        Self::build(encoded, decoder, size_reader, DEFAULT_DECODED_BUDGET_BYTES)
     }
 
     /// Resolver over `encoded` keeping at most `budget_bytes` of decoded RGBA
@@ -350,134 +614,264 @@ impl LazyAssetResolver {
         decoder: Arc<ImageDecoder>,
         budget_bytes: usize,
     ) -> Self {
-        Self {
+        Self::build(
             encoded,
             decoder,
+            Arc::new(encoded_image_dimensions),
             budget_bytes,
-            cache: Mutex::new(DecodedCache::default()),
-            decoded: Condvar::new(),
+        )
+    }
+
+    fn build(
+        encoded: Arc<BTreeMap<AssetId, Vec<u8>>>,
+        decoder: Arc<ImageDecoder>,
+        size_reader: Arc<ImageSizeReader>,
+        budget_bytes: usize,
+    ) -> Self {
+        Self {
+            shared: Arc::new(LazyShared {
+                encoded,
+                decoder,
+                size_reader,
+                budget_bytes,
+                cache: Mutex::new(DecodedCache::default()),
+                decoded: Condvar::new(),
+                queue: Mutex::new(DecodeQueue::default()),
+                work: Condvar::new(),
+                generation: AtomicU64::new(0),
+                listeners: Mutex::new(Vec::new()),
+            }),
         }
     }
 
-    /// Decode `ids` now (skipping ones already decoded, being decoded, or
-    /// unknown), so the first frame that draws them does not pay the decode.
-    /// Meant for background tasks, e.g. with the assets of a page that opens.
+    /// Decode `ids` at natural resolution now (skipping ones already decoded,
+    /// being decoded, or unknown), so the first blocking frame that draws them
+    /// does not pay the decode. Meant for background tasks, e.g. with the
+    /// assets of a page that opens.
     pub fn prewarm(&self, ids: impl IntoIterator<Item = AssetId>) {
         for id in ids {
-            self.decode_and_insert(id, false);
+            self.decode_full(id, false);
+        }
+    }
+
+    /// Queue background decodes of `ids` at the coarsest level whose longer
+    /// side still reaches `max_side` pixels, and return at once. A canvas then
+    /// has something to draw on its first frame and asks for finer levels
+    /// only where it shows an image larger than that.
+    pub fn prewarm_previews(&self, ids: impl IntoIterator<Item = AssetId>, max_side: u32) {
+        for id in ids {
+            let level = self.image_size(id).map_or(0, |[width, height]| {
+                preview_level(width.max(height), max_side)
+            });
+            self.lookup(id, level);
+        }
+    }
+
+    /// Block until no decode is queued or running. Tests and benchmarks use it
+    /// to measure settled frames.
+    pub fn wait_for_background_decodes(&self) {
+        let mut cache = self.shared.lock();
+        while !cache.in_flight.is_empty() {
+            cache = self
+                .shared
+                .decoded
+                .wait(cache)
+                .unwrap_or_else(PoisonError::into_inner);
         }
     }
 
     /// Bytes of decoded RGBA currently held.
     pub fn decoded_bytes(&self) -> usize {
-        self.lock().decoded_bytes
+        self.shared.lock().decoded_bytes
     }
 
     /// Everything the cache holds on top of the document's own copy of the
     /// assets: decoded pixels plus the encoded bytes `resolve_bytes` shares.
     /// This is what [`Self::budget_bytes`] caps.
     pub fn held_bytes(&self) -> usize {
-        self.lock().held_bytes()
+        self.shared.lock().held_bytes()
     }
 
     /// The cap this resolver evicts down to.
     pub fn budget_bytes(&self) -> usize {
-        self.budget_bytes
+        self.shared.budget_bytes
     }
 
     /// Number of encoded assets this resolver knows about.
     pub fn len(&self) -> usize {
-        self.encoded.len()
+        self.shared.encoded.len()
     }
 
     /// Whether there are no encoded assets at all.
     pub fn is_empty(&self) -> bool {
-        self.encoded.is_empty()
+        self.shared.encoded.is_empty()
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, DecodedCache> {
-        // The cache holds no invariant a panicking holder could break
-        // half-way (each mutation is a single insert/evict step), so a
-        // poisoned lock is still safe to keep using.
-        self.cache.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Decode `id` unless it is cached. When another thread is already
-    /// decoding it, `wait` waits for that decode; otherwise this returns
-    /// `None` at once (a prewarm has nothing to add).
-    fn decode_and_insert(&self, id: AssetId, wait: bool) -> Option<DecodedImage> {
-        let bytes = self.encoded.get(&id)?;
+    /// Decode `id` at natural resolution unless it is cached. When another
+    /// thread is already decoding it, `wait` waits for that decode; otherwise
+    /// this returns `None` at once (a prewarm has nothing to add).
+    fn decode_full(&self, id: AssetId, wait: bool) -> Option<DecodedImage> {
+        let shared = &*self.shared;
+        let bytes = shared.encoded.get(&id)?;
         {
-            let mut cache = self.lock();
+            let mut cache = shared.lock();
             loop {
-                if let Some(cached) = cache.touch(id) {
-                    return cached;
+                match cache.touch(id) {
+                    Some((None, _)) => return None,
+                    Some((Some(image), 0)) => return Some(image),
+                    _ => {}
                 }
-                if !cache.in_flight.contains(&id) {
+                if !cache.in_flight.contains(&(id, 0)) {
                     break;
                 }
                 if !wait {
                     return None;
                 }
-                cache = self
+                cache = shared
                     .decoded
                     .wait(cache)
                     .unwrap_or_else(PoisonError::into_inner);
             }
-            cache.in_flight.insert(id);
+            cache.in_flight.insert((id, 0));
         }
-        let in_flight = InFlightDecode { resolver: self, id };
-        let image = (self.decoder)(id, bytes);
-        let mut cache = self.lock();
-        cache.insert(id, image, self.budget_bytes);
-        let image = cache.touch(id).flatten();
+        let in_flight = InFlightDecode {
+            shared,
+            id,
+            level: 0,
+        };
+        let image = (shared.decoder)(id, bytes);
+        let mut cache = shared.lock();
+        if let Some(image) = &image {
+            cache.sizes.insert(id, [image.width, image.height]);
+        }
+        let changed = cache.insert(id, image, 0, shared.budget_bytes);
+        let image = match cache.touch(id) {
+            Some((image, 0)) => image,
+            _ => None,
+        };
         drop(cache);
+        if changed {
+            shared.landed();
+        }
         drop(in_flight);
         image
     }
+
+    /// The finest decode of `id` on hand, queuing a background decode of
+    /// `level` when nothing that fine is held or coming.
+    fn lookup(&self, id: AssetId, level: u32) -> LevelLookup {
+        if !self.shared.encoded.contains_key(&id) {
+            return LevelLookup::Unavailable;
+        }
+        let mut cache = self.shared.lock();
+        let mut held = match cache.touch(id) {
+            Some((None, _)) => return LevelLookup::Unavailable,
+            Some((Some(image), held)) => Some(LeveledImage { image, level: held }),
+            None => None,
+        };
+        if let Some(fine_enough) = held.take_if(|held| held.level <= level) {
+            return LevelLookup::Decoded(fine_enough);
+        }
+        let queue = !cache.decoding(id, level);
+        if queue {
+            cache.in_flight.insert((id, level));
+        }
+        drop(cache);
+        if queue {
+            LazyShared::enqueue(&self.shared, id, level);
+        }
+        match held {
+            Some(held) => LevelLookup::Decoded(held),
+            None => LevelLookup::Pending,
+        }
+    }
 }
 
-/// Clears an asset's in-flight mark when its decode ends — including by
-/// unwinding out of a panicking decoder, so waiters never block forever.
+impl Drop for LazyAssetResolver {
+    fn drop(&mut self) {
+        self.shared.lock_queue().shutdown = true;
+        self.shared.work.notify_all();
+    }
+}
+
+/// The coarsest pyramid level of an image whose longer side is `side` that
+/// still keeps at least `max_side` pixels on that side.
+fn preview_level(side: u32, max_side: u32) -> u32 {
+    let mut level = 0;
+    while max_side > 0 && (side >> (level + 1)) >= max_side {
+        level += 1;
+    }
+    level
+}
+
+/// Clears a decode's in-flight mark when it ends — including by unwinding out
+/// of a panicking decoder, so waiters never block forever.
 struct InFlightDecode<'a> {
-    resolver: &'a LazyAssetResolver,
+    shared: &'a LazyShared,
     id: AssetId,
+    level: u32,
 }
 
 impl Drop for InFlightDecode<'_> {
     fn drop(&mut self) {
-        self.resolver.lock().in_flight.remove(&self.id);
-        self.resolver.decoded.notify_all();
+        self.shared.lock().in_flight.remove(&(self.id, self.level));
+        self.shared.decoded.notify_all();
     }
 }
 
 impl AssetResolver for LazyAssetResolver {
     fn resolve(&self, id: AssetId) -> Option<DecodedImage> {
-        self.decode_and_insert(id, true)
+        self.decode_full(id, true)
     }
 
     fn resolve_bytes(&self, id: AssetId) -> Option<Arc<Vec<u8>>> {
-        if let Some(shared) = self.lock().shared_bytes.get(&id) {
-            return Some(Arc::clone(shared));
+        let shared = &*self.shared;
+        if let Some(bytes) = shared.lock().shared_bytes.get(&id) {
+            return Some(Arc::clone(bytes));
         }
-        let bytes = Arc::new(self.encoded.get(&id)?.clone());
+        let bytes = Arc::new(shared.encoded.get(&id)?.clone());
         // The copy happened outside the lock; a racing caller's copy is
         // equally valid, so whichever landed first is the one kept.
-        let mut cache = self.lock();
-        let shared = match cache.shared_bytes.get(&id) {
-            Some(shared) => Arc::clone(shared),
+        let mut cache = shared.lock();
+        let handed_out = match cache.shared_bytes.get(&id) {
+            Some(existing) => Arc::clone(existing),
             None => {
                 cache.shared_bytes_total += bytes.len();
                 cache.shared_bytes.insert(id, Arc::clone(&bytes));
                 bytes
             }
         };
-        cache.evict_to(self.budget_bytes, Some(id));
-        Some(shared)
+        cache.evict_to(shared.budget_bytes, Some(id));
+        Some(handed_out)
     }
 
     fn held_bytes(&self) -> Option<usize> {
         Some(LazyAssetResolver::held_bytes(self))
+    }
+
+    fn image_size(&self, id: AssetId) -> Option<[u32; 2]> {
+        if let Some(size) = self.shared.lock().sizes.get(&id) {
+            return Some(*size);
+        }
+        let size = (self.shared.size_reader)(self.shared.encoded.get(&id)?)?;
+        self.shared.lock().sizes.insert(id, size);
+        Some(size)
+    }
+
+    fn resolve_level_nonblocking(&self, id: AssetId, level: u32) -> LevelLookup {
+        self.lookup(id, level)
+    }
+
+    fn decode_generation(&self) -> u64 {
+        self.shared.generation.load(Ordering::Acquire)
+    }
+
+    fn subscribe_decodes(&self, listener: Weak<dyn DecodeListener>) {
+        self.shared
+            .listeners
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(listener);
     }
 }
 
@@ -753,5 +1147,218 @@ mod tests {
                 "a live handout must stay the one shared allocation"
             );
         }
+    }
+
+    // ---- Background decoding -------------------------------------------------
+
+    /// A real PNG, so header reads and Skia decoding work: a `side`-pixel
+    /// square of horizontal opaque stripes.
+    fn png(side: u32) -> Vec<u8> {
+        let mut surface =
+            skia_safe::surfaces::raster_n32_premul((side as i32, side as i32)).expect("surface");
+        let canvas = surface.canvas();
+        canvas.clear(skia_safe::Color::from_rgb(40, 120, 200));
+        let mut paint = skia_safe::Paint::default();
+        paint.set_color(skia_safe::Color::from_rgb(250, 200, 30));
+        for row in (0..side).step_by(4) {
+            canvas.draw_rect(
+                skia_safe::Rect::from_xywh(0.0, row as f32, side as f32, 2.0),
+                &paint,
+            );
+        }
+        surface
+            .image_snapshot()
+            .encode(None, skia_safe::EncodedImageFormat::PNG, 100)
+            .expect("png")
+            .as_bytes()
+            .to_vec()
+    }
+
+    /// Decodes through Skia, recording each decode's thread.
+    fn recording_decoder(threads: Arc<Mutex<Vec<std::thread::ThreadId>>>) -> Arc<ImageDecoder> {
+        Arc::new(move |_id, bytes: &[u8]| {
+            threads
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(std::thread::current().id());
+            decode_image_bytes(bytes)
+        })
+    }
+
+    #[derive(Default)]
+    struct CountingListener(AtomicUsize);
+
+    impl DecodeListener for CountingListener {
+        fn images_decoded(&self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn background(
+        assets: &[(AssetId, Vec<u8>)],
+    ) -> (LazyAssetResolver, Arc<Mutex<Vec<std::thread::ThreadId>>>) {
+        let threads = Arc::new(Mutex::new(Vec::new()));
+        let encoded: BTreeMap<AssetId, Vec<u8>> = assets.iter().cloned().collect();
+        let resolver =
+            LazyAssetResolver::new(Arc::new(encoded), recording_decoder(threads.clone()));
+        (resolver, threads)
+    }
+
+    fn decoded_at(lookup: LevelLookup) -> Option<(u32, [u32; 2])> {
+        match lookup {
+            LevelLookup::Decoded(found) => {
+                Some((found.level, [found.image.width, found.image.height]))
+            }
+            LevelLookup::Pending | LevelLookup::Unavailable => None,
+        }
+    }
+
+    #[test]
+    fn background_lookup_decodes_off_the_calling_thread_and_keeps_only_the_level() {
+        let id = AssetId::new();
+        let (resolver, threads) = background(&[(id, png(64))]);
+        let listener = Arc::new(CountingListener::default());
+        let weak: Weak<CountingListener> = Arc::downgrade(&listener);
+        resolver.subscribe_decodes(weak);
+        assert_eq!(
+            resolver.image_size(id),
+            Some([64, 64]),
+            "read from the header"
+        );
+        assert!(matches!(
+            resolver.resolve_level_nonblocking(id, 2),
+            LevelLookup::Pending
+        ));
+        resolver.wait_for_background_decodes();
+
+        let decode_threads = threads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        assert_eq!(decode_threads.len(), 1);
+        assert_ne!(
+            decode_threads[0],
+            std::thread::current().id(),
+            "the caller never decodes"
+        );
+        assert!(
+            listener.0.load(Ordering::SeqCst) >= 1,
+            "the landing wakes listeners"
+        );
+        assert!(resolver.decode_generation() > 0);
+        assert_eq!(
+            decoded_at(resolver.resolve_level_nonblocking(id, 2)),
+            Some((2, [16, 16]))
+        );
+        assert_eq!(
+            resolver.decoded_bytes(),
+            16 * 16 * 4,
+            "only the drawn level is held, not the 64-pixel image"
+        );
+    }
+
+    #[test]
+    fn background_lookup_serves_a_coarser_level_while_a_finer_one_decodes() {
+        let id = AssetId::new();
+        let (resolver, threads) = background(&[(id, png(64))]);
+        resolver.resolve_level_nonblocking(id, 3);
+        resolver.wait_for_background_decodes();
+        assert_eq!(
+            decoded_at(resolver.resolve_level_nonblocking(id, 1)),
+            Some((3, [8, 8])),
+            "the coarser level answers at once"
+        );
+        resolver.wait_for_background_decodes();
+        assert_eq!(
+            decoded_at(resolver.resolve_level_nonblocking(id, 1)),
+            Some((1, [32, 32]))
+        );
+        assert_eq!(
+            decoded_at(resolver.resolve_level_nonblocking(id, 3)),
+            Some((1, [32, 32])),
+            "a finer decode serves coarser draws without another decode"
+        );
+        assert_eq!(
+            threads.lock().unwrap_or_else(PoisonError::into_inner).len(),
+            2
+        );
+        assert_eq!(
+            resolver.decoded_bytes(),
+            32 * 32 * 4,
+            "the finer level replaced the coarser"
+        );
+    }
+
+    #[test]
+    fn blocking_resolve_upgrades_a_background_level_to_natural_resolution() {
+        let id = AssetId::new();
+        let (resolver, _threads) = background(&[(id, png(64))]);
+        resolver.resolve_level_nonblocking(id, 2);
+        resolver.wait_for_background_decodes();
+        let full = resolver.resolve(id).expect("decodes at natural size");
+        assert_eq!([full.width, full.height], [64, 64]);
+        assert_eq!(
+            decoded_at(resolver.resolve_level_nonblocking(id, 2)),
+            Some((0, [64, 64]))
+        );
+    }
+
+    #[test]
+    fn a_failed_background_decode_is_remembered() {
+        let corrupt = AssetId::new();
+        let (resolver, threads) = background(&[(corrupt, vec![1, 2, 3])]);
+        assert!(matches!(
+            resolver.resolve_level_nonblocking(corrupt, 0),
+            LevelLookup::Pending
+        ));
+        resolver.wait_for_background_decodes();
+        assert!(matches!(
+            resolver.resolve_level_nonblocking(corrupt, 0),
+            LevelLookup::Unavailable
+        ));
+        resolver.wait_for_background_decodes();
+        assert_eq!(
+            threads.lock().unwrap_or_else(PoisonError::into_inner).len(),
+            1
+        );
+        assert!(matches!(
+            resolver.resolve_level_nonblocking(AssetId::new(), 0),
+            LevelLookup::Unavailable
+        ));
+    }
+
+    #[test]
+    fn an_injected_size_reader_sizes_formats_skia_cannot_parse() {
+        let id = AssetId::new();
+        let encoded = Arc::new(BTreeMap::from([(id, b"RIFF\0\0\0\0WEBPVP8L".to_vec())]));
+        let decoder: Arc<ImageDecoder> = Arc::new(|_, _| None);
+        let skia_only = LazyAssetResolver::new(encoded.clone(), decoder.clone());
+        assert_eq!(skia_only.image_size(id), None);
+        let resolver = LazyAssetResolver::with_size_reader(
+            encoded,
+            decoder,
+            Arc::new(|_bytes: &[u8]| Some([2048, 1024])),
+        );
+        assert_eq!(resolver.image_size(id), Some([2048, 1024]));
+    }
+
+    #[test]
+    fn preview_prewarm_queues_the_coarsest_level_that_keeps_the_preview_size() {
+        assert_eq!(preview_level(2048, 512), 2);
+        assert_eq!(preview_level(300, 512), 0);
+        assert_eq!(preview_level(1024, 0), 0);
+
+        let id = AssetId::new();
+        let (resolver, threads) = background(&[(id, png(64))]);
+        resolver.prewarm_previews([id], 16);
+        resolver.wait_for_background_decodes();
+        assert_eq!(
+            decoded_at(resolver.resolve_level_nonblocking(id, 2)),
+            Some((2, [16, 16]))
+        );
+        assert_eq!(
+            threads.lock().unwrap_or_else(PoisonError::into_inner).len(),
+            1
+        );
     }
 }
