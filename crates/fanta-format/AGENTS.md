@@ -22,7 +22,7 @@ PR numbers point at the change that found each trap (`gh pr view <n>`).
 
 ## Portable runtime compiler
 
-- `RuntimeProgram::compile` (`src/runtime.rs`) reads the project tree a second time, without `std::fs`, for website export and the browser runtime. Whatever the native reader tolerates must compile there too, or projects that open in Fanta fail to export. Share the native logic through modules outside the `native` feature, as `src/sidecar.rs` does, rather than reimplementing it. Finder's `.DS_Store` in `assets/` and `.ids.json` sidecars outgrown by edited source both broke export this way.
+- `RuntimeProgram::compile` (`src/runtime.rs`) reads the project tree a second time, without `std::fs`, for website export and the browser runtime. Whatever the native reader tolerates must compile there too, or projects that open in Fanta fail to export. Share the native logic through modules outside the `native` feature, as `src/sidecar.rs` does, rather than reimplementing it. Finder's `.DS_Store` in `assets/` and `.ids.json` sidecars outgrown by edited source both broke export this way. (#153)
 
 ## Seeded project guide
 
