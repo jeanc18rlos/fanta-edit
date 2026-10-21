@@ -150,14 +150,19 @@ jobs:
             eval "$(xdotool getwindowgeometry --shell "$window")"
             xdotool mousemove --window "$window" $((WIDTH / 2)) $((HEIGHT / 2))
             before=$(resident_mb)
-            for _ in 1 2 3; do
+            xdotool click --repeat 25 --delay 40 5
+            sleep 1
+            import -window root "$smoke/screenshot-panned.png"
+            # ImageMagick prints the number of differing pixels and exits 1 when there are any.
+            moved=$(compare -metric AE "$smoke/screenshot.png" "$smoke/screenshot-panned.png" null: 2>&1 || true)
+            xdotool click --repeat 25 --delay 40 4
+            for _ in 1 2; do
               xdotool click --repeat 25 --delay 40 5
               xdotool click --repeat 25 --delay 40 4
             done
             sleep 5
             after=$(resident_mb)
-            import -window root "$smoke/screenshot-after-panning.png"
-            echo "Resident memory of the editor: ${before} MB, then ${after} MB after 150 canvas pans." |
+            echo "Editor resident memory: ${before} MB, then ${after} MB after 150 canvas pans. The first 25 pans changed ${moved} screen pixels." |
               tee -a "$GITHUB_STEP_SUMMARY" "$smoke/memory.txt"
           else
             echo "::warning::Could not find the Fanta window, so canvas memory was not measured."
