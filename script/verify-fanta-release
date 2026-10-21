@@ -142,7 +142,7 @@ for stage in "${selected_stages[@]}"; do
     case "$stage" in
         engine)
             run_stage "$stage" "$cargo_binary" test --locked \
-                -p fanta-doc -p fanta-fnx -p fanta-format -p fanta-canvas \
+                -p fanta-bundle -p fanta-doc -p fanta-fnx -p fanta-format -p fanta-canvas \
                 -p fanta-tools -p fanta-render -p fanta-present -p fanta-text \
                 -p fanta-design-ops -p fanta-headless -p fanta-engine
             ;;
@@ -157,7 +157,7 @@ for stage in "${selected_stages[@]}"; do
             ;;
         source-order)
             run_stage "$stage" "$cargo_binary" test --locked \
-                -p fanta-fnx -p fanta-format --lib --features serde_json/preserve_order
+                -p fanta-bundle -p fanta-fnx -p fanta-format --lib --features serde_json/preserve_order
             ;;
         editor)
             run_stage "$stage" "$cargo_binary" test --locked -p fig_viewer --lib --example drag_bench
@@ -173,7 +173,7 @@ for stage in "${selected_stages[@]}"; do
             ;;
         lint)
             run_stage "$stage" ./script/clippy --locked \
-                -p fanta-doc -p fanta-fnx -p fanta-format -p fanta-canvas \
+                -p fanta-bundle -p fanta-doc -p fanta-fnx -p fanta-format -p fanta-canvas \
                 -p fanta-tools -p fanta-render -p fanta-fig-interop \
                 -p fanta-present -p fanta-text -p fanta-design-ops -p fanta-headless \
                 -p fanta-engine -p fig_viewer -p workspace -p fanta_ui

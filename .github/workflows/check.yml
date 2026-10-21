@@ -199,7 +199,7 @@ jobs:
           cargo test --locked -p agent --lib test_design_progress
 
       - name: Test design source validation and saves
-        run: cargo test --locked -p fanta-fnx -p fanta-format --lib
+        run: cargo test --locked -p fanta-bundle -p fanta-fnx -p fanta-format --lib
 
       - name: Test sidebar behavior and project ownership
         run: cargo test --locked -p sidebar --lib

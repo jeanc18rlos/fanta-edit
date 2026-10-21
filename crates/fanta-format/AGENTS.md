@@ -20,6 +20,10 @@ PR numbers point at the change that found each trap (`gh pr view <n>`).
 - Geometry signatures stored in project data use the source format's numeric normalization and stable object ordering. Otherwise a save, or a change in serde feature unification, invalidates preserved imported artwork. (#41)
 - Move owned JSON fragments as `Value::Object`/`Value::Array`. `json!` serializes its arguments by reference and copies large geometry. (#126)
 
+## Runtime bundles
+
+- `src/runtime.rs` is the source compiler (`SourceBundle::compile`); the bundle format and `RuntimeProgram` live in `crates/fanta-bundle`, which must stay parser-free. `fanta-runtime`, the WebAssembly player, depends on `fanta-bundle` and never on this crate or `fanta-fnx`: the `fanta-runtime` workflow fails if either appears in its normal dependency tree. Sources are compiled by the `fanta-compile` binary in `crates/fanta-site`, and runtime tests compile fixtures through a dev-dependency.
+
 ## Seeded project guide
 
 - `AGENTS_MD` in `src/project/layout.rs` is written into every project. Only the exact previous seed is upgraded, so when you change `AGENTS_MD`, add the SHA-256 of the text you are replacing to `previous_seeds` in `seed_agents_md`. Otherwise existing projects keep the old guide, because any other content counts as user-customized. See `crates/design_surface/AGENTS.md` for the other places agent guidance lives.

@@ -6388,3 +6388,115 @@ fn fill_variant_transitions_preserve_anisotropic_instance_and_sibling_geometry()
     }
     Ok(())
 }
+
+#[test]
+fn transient_variable_writes_revert_on_release_and_leave() -> Result<(), Box<dyn std::error::Error>>
+{
+    // WhileHovering and WhilePressing undo the variables they wrote, not only
+    // variant swaps: leaving restores the hover value and releasing restores
+    // the press value, each to what it replaced.
+    let (mut document, root, variable, mode) =
+        prototype_variable_document(VarValue::Float { value: 1.0 }, Vec::new())?;
+    let mut target = frame_sized(10.0, 10.0, 40.0, 20.0, Color::rgba(0, 0, 255, 255));
+    target.parent = Some(root);
+    target.reactions.push(click(
+        401,
+        Trigger::WhileHovering,
+        Action::SetVariable {
+            variable,
+            value: VarValue::Float { value: 0.5 },
+        },
+    ));
+    target.reactions.push(click(
+        402,
+        Trigger::WhilePressing,
+        Action::AdjustVariable {
+            variable,
+            delta: -0.25,
+        },
+    ));
+    document.scene.insert(target)?;
+    let mut playback = PlaybackSession::new(&document, Some(root), DVec2::splat(200.0))?;
+    let value = |playback: &PlaybackSession| {
+        playback
+            .runtime_variables()
+            .variable(variable)
+            .and_then(|variable| variable.value_for_mode(mode))
+            .cloned()
+    };
+    playback.handle_pointer(DVec2::new(20.0, 20.0), PointerEvent::Move);
+    assert_eq!(value(&playback), Some(VarValue::Float { value: 0.5 }));
+    // Pressing first restores the hover effect, then applies the press effect
+    // on top of the restored value.
+    playback.handle_pointer(DVec2::new(20.0, 20.0), PointerEvent::Down);
+    assert_eq!(value(&playback), Some(VarValue::Float { value: 0.75 }));
+    // Release restores the press write, then re-applies the hover write
+    // because the pointer is still inside.
+    playback.handle_pointer(DVec2::new(20.0, 20.0), PointerEvent::Up);
+    assert_eq!(
+        value(&playback),
+        Some(VarValue::Float { value: 0.5 }),
+        "release restores the press write and keeps hovering"
+    );
+    playback.handle_pointer(DVec2::new(20.0, 20.0), PointerEvent::Move);
+    assert_eq!(value(&playback), Some(VarValue::Float { value: 0.5 }));
+    playback.handle_pointer(DVec2::new(150.0, 150.0), PointerEvent::Move);
+    playback.handle_pointer(DVec2::new(20.0, 20.0), PointerEvent::Move);
+    assert_eq!(
+        value(&playback),
+        Some(VarValue::Float { value: 0.5 }),
+        "re-entering re-applies the hover write"
+    );
+    playback.handle_pointer(DVec2::new(150.0, 150.0), PointerEvent::Move);
+    assert_eq!(
+        value(&playback),
+        Some(VarValue::Float { value: 1.0 }),
+        "leaving restores the hover write"
+    );
+    Ok(())
+}
+
+#[test]
+fn transient_variable_revert_keeps_a_value_a_click_changed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (mut document, root, variable, mode) =
+        prototype_variable_document(VarValue::Float { value: 1.0 }, Vec::new())?;
+    let mut target = frame_sized(10.0, 10.0, 40.0, 20.0, Color::rgba(0, 0, 255, 255));
+    target.parent = Some(root);
+    target.reactions.push(click(
+        403,
+        Trigger::WhileHovering,
+        Action::SetVariable {
+            variable,
+            value: VarValue::Float { value: 0.5 },
+        },
+    ));
+    target.reactions.push(click(
+        404,
+        Trigger::Click,
+        Action::SetVariable {
+            variable,
+            value: VarValue::Float { value: 0.9 },
+        },
+    ));
+    document.scene.insert(target)?;
+    let mut playback = PlaybackSession::new(&document, Some(root), DVec2::splat(200.0))?;
+    let value = |playback: &PlaybackSession| {
+        playback
+            .runtime_variables()
+            .variable(variable)
+            .and_then(|variable| variable.value_for_mode(mode))
+            .cloned()
+    };
+    playback.handle_pointer(DVec2::new(20.0, 20.0), PointerEvent::Move);
+    assert_eq!(value(&playback), Some(VarValue::Float { value: 0.5 }));
+    playback.handle_pointer(DVec2::new(20.0, 20.0), PointerEvent::Click);
+    assert_eq!(value(&playback), Some(VarValue::Float { value: 0.9 }));
+    playback.handle_pointer(DVec2::new(150.0, 150.0), PointerEvent::Move);
+    assert_eq!(
+        value(&playback),
+        Some(VarValue::Float { value: 0.9 }),
+        "a value another reaction wrote survives the hover revert"
+    );
+    Ok(())
+}

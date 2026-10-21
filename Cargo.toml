@@ -40,6 +40,7 @@ members = [
     "crates/extension",
     "crates/feature_flags",
     "crates/feature_flags_macros",
+    "crates/fanta-bundle",
     "crates/fanta-canvas",
     "crates/fanta-design-ops",
     "crates/fanta-doc",
@@ -261,6 +262,7 @@ fanta-fig-interop = { path = "crates/fanta-fig-interop" }
 fanta-fnx = { path = "crates/fanta-fnx" }
 fanta-format = { path = "crates/fanta-format" }
 fanta-headless = { path = "crates/fanta-headless" }
+fanta-bundle = { path = "crates/fanta-bundle" }
 fanta-canvas = { path = "crates/fanta-canvas" }
 fanta-present = { path = "crates/fanta-present" }
 fanta-render = { path = "crates/fanta-render" }
@@ -963,6 +965,20 @@ codegen-units = 1
 
 [profile.release.package]
 fanta = { codegen-units = 16 }
+
+# The web runtime (`fanta-runtime` for wasm32-unknown-emscripten): size first.
+# The vendored Skia build compiles its C++ with this opt-level too, so `s`
+# shrinks Skia as well as the Rust crates. `debug = false` is what drops the
+# WebAssembly `name` section: rustc maps the debuginfo level to emcc's `-g`
+# flag, and the editor's `release` profile keeps names for backtraces.
+[profile.release-runtime]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+debug = false
+strip = true
+panic = "abort"
 
 [profile.release-fast]
 inherits = "release"

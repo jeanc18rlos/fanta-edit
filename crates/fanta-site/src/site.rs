@@ -121,6 +121,17 @@ pub enum FontSource {
     },
 }
 
+impl std::fmt::Display for FontSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File { path } => write!(formatter, "file {}", path.display()),
+            Self::Bundled => formatter.write_str("bundled"),
+            Self::Downloaded => formatter.write_str("downloaded"),
+            Self::Substituted { family } => write!(formatter, "substituted with {family}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EmbeddedFace {
     pub family: String,
@@ -192,7 +203,7 @@ pub fn export_project(
     assets: &RuntimeAssets,
     options: &SiteOptions,
 ) -> Result<SiteReport, SiteError> {
-    let compiled = RuntimeProgram::compile(&project_source(project)?)?;
+    let compiled = project_source(project)?.compile()?;
     export_document(
         compiled.document().clone(),
         compiled.resources().clone(),
@@ -273,28 +284,13 @@ pub fn export_document(
     assets: &RuntimeAssets,
     options: &SiteOptions,
 ) -> Result<SiteReport, SiteError> {
-    let title = [
-        options.title.as_deref(),
-        Some(document.metadata.title.as_str()),
-    ]
-    .into_iter()
-    .flatten()
-    .map(str::trim)
-    .find(|title| !title.is_empty())
-    .unwrap_or("Untitled")
-    .to_owned();
-    let pages = site_pages(&document)?;
-    let (registrations, fonts) = FontLibrary::new(options)?.embed(&requested_faces(&document)?)?;
-    let program =
-        RuntimeProgram::from_document(document, resources, registrations, BTreeMap::new())?;
-    let bundle = program.to_bundle()?;
-    validate_pages(&bundle, &pages)?;
-    let document = program.document();
+    let compiled = compile_site(document, resources, options)?;
+    let document = compiled.program.document();
     let manifest = Manifest {
         format: SITE_FORMAT,
         version: SITE_VERSION,
-        title: title.clone(),
-        pages: pages.clone(),
+        title: compiled.title.clone(),
+        pages: compiled.pages.clone(),
         flows: document
             .flows
             .iter()
@@ -313,14 +309,91 @@ pub fn export_document(
                 duration_ms: clip.duration_ms,
             })
             .collect(),
-        fonts: fonts.clone(),
+        fonts: compiled.fonts.clone(),
     };
-    write_site(output, assets, &bundle, &manifest)?;
-    Ok(SiteReport {
+    write_site(output, assets, &compiled.bundle, &manifest)?;
+    Ok(compiled.report())
+}
+
+/// Compile the project directory at `project` into one runtime bundle written
+/// to `output`. Fonts are embedded exactly as for a website, so the file is
+/// self-contained: `fanta-runtime` loads it with `loadBundle` and has no
+/// compiler of its own.
+pub fn export_bundle(
+    project: &Path,
+    output: &Path,
+    options: &SiteOptions,
+) -> Result<SiteReport, SiteError> {
+    let compiled = project_source(project)?.compile()?;
+    let compiled = compile_site(
+        compiled.document().clone(),
+        compiled.resources().clone(),
+        options,
+    )?;
+    if let Some(parent) = output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        create_directory(parent)?;
+    }
+    write(output, &compiled.bundle)?;
+    Ok(compiled.report())
+}
+
+/// Split a `--substitute FAMILY=REPLACEMENT` argument into its trimmed parts.
+pub fn parse_substitution(argument: &str) -> Option<(String, String)> {
+    let (family, replacement) = argument.split_once('=')?;
+    Some((family.trim().to_owned(), replacement.trim().to_owned()))
+}
+
+struct CompiledSite {
+    title: String,
+    pages: Vec<SitePage>,
+    fonts: Vec<EmbeddedFace>,
+    program: RuntimeProgram,
+    bundle: Vec<u8>,
+}
+
+impl CompiledSite {
+    fn report(&self) -> SiteReport {
+        SiteReport {
+            title: self.title.clone(),
+            pages: self.pages.clone(),
+            fonts: self.fonts.clone(),
+            bundle_bytes: self.bundle.len(),
+        }
+    }
+}
+
+/// Embed the fonts, build the deterministic bundle and prove every page loads
+/// in the native runtime before anything is written.
+fn compile_site(
+    document: Doc,
+    resources: BTreeMap<AssetId, Vec<u8>>,
+    options: &SiteOptions,
+) -> Result<CompiledSite, SiteError> {
+    let title = [
+        options.title.as_deref(),
+        Some(document.metadata.title.as_str()),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|title| !title.is_empty())
+    .unwrap_or("Untitled")
+    .to_owned();
+    let pages = site_pages(&document)?;
+    let (registrations, fonts) = FontLibrary::new(options)?.embed(&requested_faces(&document)?)?;
+    let program =
+        RuntimeProgram::from_document(document, resources, registrations, BTreeMap::new())?;
+    let bundle = program.to_bundle()?;
+    validate_pages(&bundle, &pages)?;
+    Ok(CompiledSite {
         title,
         pages,
         fonts,
-        bundle_bytes: bundle.len(),
+        program,
+        bundle,
     })
 }
 
@@ -967,6 +1040,36 @@ mod tests {
             download_fonts: false,
             ..SiteOptions::default()
         }
+    }
+
+    #[test]
+    fn bundle_export_writes_one_loadable_file_with_embedded_fonts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut document = Doc::new();
+        document.metadata.title = "Bundle".into();
+        let home = page(&mut document, "Home")?;
+        text(&mut document, home, "Welcome", "Inter", 400)?;
+        let source = project(&document)?;
+        let output = tempfile::tempdir()?;
+        let target = output.path().join("dist").join("program.fanta");
+        let report = export_bundle(source.path(), &target, &options())?;
+        assert_eq!(report.title, "Bundle");
+        assert_eq!(report.pages.len(), 1);
+        let bundle = std::fs::read(&target)?;
+        assert_eq!(report.bundle_bytes, bundle.len());
+        assert_eq!(std::fs::read_dir(output.path().join("dist"))?.count(), 1);
+        let program = RuntimeProgram::load_bundle(&bundle)?;
+        assert_eq!(program.document().metadata.title, "Bundle");
+        assert!(program.fonts().iter().any(|font| font.family == "Inter"));
+        assert_eq!(
+            report
+                .fonts
+                .iter()
+                .map(|face| face.family.as_str())
+                .collect::<Vec<_>>(),
+            ["Inter"]
+        );
+        Ok(())
     }
 
     #[test]

@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
-use fanta_format::runtime::{RuntimeFont, SourceBundle};
 use fanta_present::FitMode;
 use fanta_runtime::{Runtime, RuntimeError};
 use serde_json::{Value, json};
@@ -129,54 +128,6 @@ fn optional<T: serde::de::DeserializeOwned>(
     }
 }
 
-fn source(arguments: &Value) -> Result<SourceBundle, RuntimeError> {
-    let mut files = BTreeMap::new();
-    for (path, value) in arguments
-        .get("files")
-        .and_then(Value::as_object)
-        .ok_or_else(|| error("Missing source files"))?
-    {
-        let pointer = value
-            .as_u64()
-            .and_then(|value| u32::try_from(value).ok())
-            .ok_or_else(|| error("Invalid source buffer"))?;
-        files.insert(path.clone(), read_buffer(pointer)?);
-    }
-    let mut fonts = Vec::new();
-    if let Some(font_values) = arguments.get("fonts") {
-        let registrations = font_values
-            .as_array()
-            .ok_or_else(|| error("fonts must be an array"))?;
-        for registration in registrations {
-            let bytes = read_buffer(number(registration, "bytes")?)?;
-            let family = registration
-                .get("family")
-                .and_then(Value::as_str)
-                .ok_or_else(|| error("Missing font family"))?
-                .to_owned();
-            fonts.push(RuntimeFont {
-                family,
-                weight: optional(registration, "weight", 400_u16)?,
-                italic: optional(registration, "italic", false)?,
-                face_index: optional(registration, "faceIndex", 0_u32)?,
-                bytes,
-            });
-        }
-    }
-    let font_substitutions = serde_json::from_value(
-        arguments
-            .get("fontSubstitutions")
-            .cloned()
-            .unwrap_or(json!({})),
-    )
-    .map_err(|failure| error(failure.to_string()))?;
-    Ok(SourceBundle {
-        files,
-        fonts,
-        font_substitutions,
-    })
-}
-
 impl Graphics {
     fn new(width: u32, height: u32) -> Result<Self, RuntimeError> {
         let interface = gpu::gl::Interface::new_native()
@@ -242,16 +193,6 @@ fn dispatch(arguments: Value) -> Result<Value, RuntimeError> {
         .and_then(Value::as_str)
         .ok_or_else(|| error("Missing bridge operation"))?;
     match operation {
-        "compileSource" => {
-            let source = source(&arguments)?;
-            RUNTIME.with(|runtime| {
-                let mut runtime = runtime
-                    .try_borrow_mut()
-                    .map_err(|_| error("Reentrant runtime call"))?;
-                let handle = runtime.compile_source(&source)?;
-                runtime.program_info(handle)
-            })
-        }
         "loadBundle" => {
             let bytes = read_buffer(number(&arguments, "bytes")?)?;
             RUNTIME.with(|runtime| {
@@ -261,15 +202,6 @@ fn dispatch(arguments: Value) -> Result<Value, RuntimeError> {
                 let handle = runtime.load_bundle(&bytes)?;
                 runtime.program_info(handle)
             })
-        }
-        "toBundle" => {
-            let bytes = RUNTIME.with(|runtime| {
-                runtime
-                    .try_borrow()
-                    .map_err(|_| error("Reentrant runtime call"))?
-                    .to_bundle(number(&arguments, "program")?)
-            })?;
-            Ok(json!({"buffer":buffer(bytes)?}))
         }
         "inspectProgram" => RUNTIME.with(|runtime| {
             runtime

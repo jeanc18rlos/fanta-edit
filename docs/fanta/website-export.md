@@ -5,6 +5,9 @@ gets a URL with a canvas viewer, page navigation, pan and zoom. The pages use th
 same Rust rendering engine as Fanta through `@fanta/runtime` WebAssembly.
 Prototype interactions and motion playback are disabled in this read-only
 viewer. Trigger inputs and a state-machine view are deferred to v2.1.
+The exporter compiles the project natively and ships only the resulting
+bundle; [`runtime-bundle.md`](./runtime-bundle.md) produces the same bundle for
+a page of your own.
 
 Build the runtime in the separate `Fanta-JS` repository first. Pass its
 `packages/runtime` directory to the exporter; all five files must be present:

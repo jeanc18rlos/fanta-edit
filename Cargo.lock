@@ -4365,6 +4365,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanta-bundle"
+version = "0.1.0"
+dependencies = [
+ "fanta-doc",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 2.0.17",
+ "zip",
+]
+
+[[package]]
 name = "fanta-canvas"
 version = "0.1.0"
 dependencies = [
@@ -4446,6 +4458,7 @@ name = "fanta-format"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fanta-bundle",
  "fanta-doc",
  "fanta-fnx",
  "serde",
@@ -5291,6 +5304,8 @@ dependencies = [
 name = "fanta-runtime"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "fanta-bundle",
  "fanta-doc",
  "fanta-format",
  "fanta-present",
