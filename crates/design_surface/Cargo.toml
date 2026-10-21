@@ -14,9 +14,8 @@ doctest = false
 
 [dependencies]
 anyhow.workspace = true
+fanta-design-ops.workspace = true
 gpui.workspace = true
-schemars.workspace = true
-serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]

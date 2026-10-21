@@ -3474,9 +3474,8 @@ name = "design_surface"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "fanta-design-ops",
  "fanta-gpui-core",
- "schemars 1.0.4",
- "serde",
  "serde_json",
 ]
 
@@ -4378,6 +4377,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fanta-design-ops"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "schemars 1.0.4",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "fanta-doc"
 version = "0.1.0"
 dependencies = [
@@ -4389,6 +4398,21 @@ dependencies = [
  "smallvec",
  "thiserror 2.0.17",
  "ulid",
+]
+
+[[package]]
+name = "fanta-engine"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "clap",
+ "fanta-design-ops",
+ "fanta-doc",
+ "fanta-headless",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -5209,6 +5233,17 @@ dependencies = [
 name = "fanta-gpui-ztracing-macro"
 version = "0.5.0"
 source = "git+https://github.com/squidred-dev/fanta-ui.git?rev=d4e410cfdf00f09e3cd2de35c87e58d89fa97090#d4e410cfdf00f09e3cd2de35c87e58d89fa97090"
+
+[[package]]
+name = "fanta-headless"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fanta-design-ops",
+ "fanta-doc",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "fanta-present"
