@@ -42,7 +42,9 @@ pub struct Player {
     validated_text: BTreeSet<(String, u16, bool, String)>,
 }
 
-const MAX_PROGRAM_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+/// The most a program's input may hold: a source bundle's files and fonts
+/// together, or a runtime bundle both as an archive and expanded.
+pub const MAX_PROGRAM_INPUT_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Default)]
 pub struct Runtime {

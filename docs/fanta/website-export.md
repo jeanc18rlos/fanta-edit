@@ -42,6 +42,11 @@ If no embedded face can render the text, the exporter reports the missing
 glyphs instead of creating a broken page. `--title "My site"` overrides the
 document title.
 
+The web runtime loads bundles of at most 64 MiB, compressed or expanded. The
+bundle holds every asset in the project at full size, including assets no page
+uses. A larger export fails with the bundle's size, the limit and its largest
+resources, so you know which images to make smaller.
+
 Upload the complete output directory to a static host. For a local preview,
 serve the directory over HTTP, for example `python3 -m http.server --directory
 "/path/to/site-output" 8000`. The site loads its JavaScript, WebAssembly and
@@ -49,5 +54,6 @@ bundle from the generated `fanta/` directory. Live video and audio playback are
 not exported; the runtime uses their authored posters.
 
 The Rust export tests cover page naming, HTML escaping, font registration,
-native bundle loading, re-export and refusal to overwrite an unrelated folder.
+native bundle loading, re-export, refusal to overwrite an unrelated folder,
+Finder metadata, source edited outside Fanta and the size report.
 Browser playback is validated in the `Fanta-JS` repository.

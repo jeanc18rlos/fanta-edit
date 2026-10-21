@@ -19,6 +19,7 @@ anyhow.workspace = true
 clap.workspace = true
 fanta-doc.workspace = true
 fanta-format.workspace = true
+fanta-render.workspace = true
 fanta-runtime.workspace = true
 fanta-text.workspace = true
 serde.workspace = true
