@@ -177,7 +177,17 @@ impl EngineInfo {
                 .unwrap_or("unknown")
                 .to_owned(),
             schema_version: fanta_doc::SCHEMA_VERSION,
-            capabilities: Vec::new(),
+            capabilities: [
+                "inspect",
+                "create_page",
+                "add_comments",
+                "project",
+                "render",
+                "changeset",
+            ]
+            .into_iter()
+            .map(|step| format!("step:{step}"))
+            .collect(),
         }
     }
 }
@@ -397,7 +407,12 @@ pub fn run_in(request: &RunRequest, work_dir: &Path) -> Result<RunResponse, Engi
     Ok(RunResponse {
         request_id: request.request_id.clone(),
         engine: EngineInfo::current(),
-        source: SourceInfo::default(),
+        source: SourceInfo {
+            sha: None,
+            project_id: Some(project.doc().id.to_string()),
+            warnings: project.warnings().to_vec(),
+            fonts: FontReport::default(),
+        },
         results,
     })
 }
@@ -584,6 +599,90 @@ mod tests {
             "overlay": {"files": [{"path": "big.bin",
                 "content_b64": "A".repeat(MAX_OVERLAY_BYTES / 3 * 4 + 8)}]}});
         assert_eq!(code(large), Err(ErrorCode::PayloadTooLarge));
+    }
+
+    #[test]
+    fn a_review_run_answers_every_step_on_a_real_project() {
+        use fanta_doc::{
+            CanvasNode, Doc, GroupNode, NodeData, Operation, Transform2D, VectorNode, color::Color,
+        };
+        let mut doc = Doc::new();
+        let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page.name = "Home".into();
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page)).expect("page");
+        doc.add_page(page_id);
+        let mut card = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            120.0,
+            80.0,
+            Color::WHITE,
+        )));
+        card.name = "Card".into();
+        card.parent = Some(page_id);
+        card.transform = Transform2D::translation(10.0, 10.0);
+        let card_id = card.id;
+        doc.apply(Operation::create_node(card)).expect("card");
+        let directory = tempfile::tempdir().expect("project directory");
+        fanta_format::write_project_tree(directory.path(), &doc, &Default::default())
+            .expect("write the project");
+
+        let response = run_in(
+            &request(json!({
+                "request_id": "rev_2",
+                "deadline_ms": 60000,
+                "source": {"kind": "dir", "dir": directory.path()},
+                "steps": [
+                    {"step": "inspect"},
+                    {"step": "add_comments", "label": "AI Review", "comments": [
+                        {"page": 0, "node": card_id.to_string(), "text": "Too faint",
+                         "author": "Fanta Review", "severity": "minor", "category": "color"}
+                    ]},
+                    {"step": "project", "page": {"index": 0}},
+                    {"step": "render", "targets": [
+                        {"id": "home", "page": {"index": 0}, "max_dimension": 200}
+                    ]},
+                    {"step": "changeset", "contents": true, "ops": true}
+                ]
+            })),
+            directory.path(),
+        )
+        .expect("the run answers");
+        assert!(
+            response.results.iter().all(|result| result.ok),
+            "{:?}",
+            response.results
+        );
+        assert_eq!(response.source.project_id, Some(doc.id.to_string()));
+        let result = |index: usize| {
+            response.results[index]
+                .result
+                .clone()
+                .expect("a successful step has a result")
+        };
+        assert_eq!(result(0)["pages"][0]["name"], "Home");
+        assert_eq!(result(1)["comments"][0]["ok"], true);
+        assert_eq!(result(2)["nodes"][0]["id"], card_id.to_string());
+        let image = &result(3)["images"][0];
+        assert_eq!(image["target_id"], "home");
+        let png = base64::engine::general_purpose::STANDARD
+            .decode(image["png_b64"].as_str().expect("png_b64"))
+            .expect("base64");
+        assert!(png.starts_with(b"\x89PNG"));
+        let changeset = result(4);
+        let page_file = changeset["files"]
+            .as_array()
+            .expect("files")
+            .iter()
+            .find(|file| file["path"] == "pages/home/page.fnx")
+            .expect("the commented page changed");
+        assert_eq!(page_file["status"], "modified");
+        let source = base64::engine::general_purpose::STANDARD
+            .decode(page_file["content_b64"].as_str().expect("content_b64"))
+            .expect("base64");
+        assert!(String::from_utf8_lossy(&source).contains("Too faint"));
+        assert_eq!(changeset["ops"][0]["op"], "set_meta");
     }
 
     #[test]

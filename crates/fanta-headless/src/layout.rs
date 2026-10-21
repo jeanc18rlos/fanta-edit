@@ -1,3 +1,7 @@
+//! Incremental auto-layout solving: which layout islands an edit invalidated,
+//! and the geometry operations that settle them. The editor solves after every
+//! edit; the headless engine solves after each step that edits.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
@@ -6,17 +10,17 @@ use fanta_doc::{
     TextAutoResize, TextNode, VariableCollectionId, VariableRegistry,
 };
 
-pub(super) struct LayoutState {
+pub struct LayoutState {
     scene: Scene,
     source_instance: u64,
     revision: u64,
     variables: VariableRegistry,
     active_modes: BTreeMap<VariableCollectionId, ModeId>,
-    pub(super) history_generation: u64,
+    pub history_generation: u64,
 }
 
 impl LayoutState {
-    pub(super) fn new(document: &Doc) -> Self {
+    pub fn new(document: &Doc) -> Self {
         Self {
             scene: document.scene.clone(),
             source_instance: document.scene.instance_id(),
@@ -27,7 +31,7 @@ impl LayoutState {
         }
     }
 
-    pub(super) fn changed_roots(&self, document: &Doc) -> BTreeSet<NodeId> {
+    pub fn changed_roots(&self, document: &Doc) -> BTreeSet<NodeId> {
         let mut candidates = BTreeSet::new();
         if self.source_instance == document.scene.instance_id()
             && let Some(delta) = document.scene.changes_since(self.revision)
@@ -114,7 +118,16 @@ impl LayoutState {
         roots
     }
 
-    pub(super) fn refresh(&mut self, document: &Doc) -> Result<()> {
+    /// Move the baseline up to `document`, rebuilding it when the change log
+    /// cannot say what changed.
+    pub fn catch_up(&mut self, document: &Doc) {
+        if let Err(error) = self.refresh(document) {
+            log::error!("refreshing layout inputs: {error:#}");
+            *self = Self::new(document);
+        }
+    }
+
+    pub fn refresh(&mut self, document: &Doc) -> Result<()> {
         if self.source_instance == document.scene.instance_id()
             && let Some(delta) = document.scene.changes_since(self.revision)
         {
@@ -188,7 +201,7 @@ fn minimal_roots(scene: &Scene, roots: BTreeSet<NodeId>) -> BTreeSet<NodeId> {
         .collect()
 }
 
-pub(super) fn pending_roots(document: &Doc) -> BTreeSet<NodeId> {
+pub fn pending_roots(document: &Doc) -> BTreeSet<NodeId> {
     let mut roots = BTreeSet::new();
     for id in &document.pending_layout {
         if let Some(node) = document.scene.get(*id) {
@@ -273,7 +286,7 @@ fn stroke_layout_inputs(strokes: &[fanta_doc::Stroke]) -> Vec<([f64; 4], fanta_d
         .collect()
 }
 
-pub(super) fn geometry_operations(document: &Doc, roots: &BTreeSet<NodeId>) -> Vec<Operation> {
+pub fn geometry_operations(document: &Doc, roots: &BTreeSet<NodeId>) -> Vec<Operation> {
     let mut operations = Vec::new();
     for root in minimal_roots(&document.scene, roots.clone()) {
         let Some(mut solved) = document.scene.extract_subtree(root) else {
@@ -350,7 +363,7 @@ pub(super) fn geometry_operations(document: &Doc, roots: &BTreeSet<NodeId>) -> V
     operations
 }
 
-pub(super) fn apply_without_history(
+pub fn apply_without_history(
     document: &mut Doc,
     operations: Vec<Operation>,
 ) -> Result<BTreeSet<NodeId>> {
@@ -371,4 +384,34 @@ pub(super) fn apply_without_history(
         }
     }
     Ok(changed)
+}
+
+/// Solve the geometry the project's sources leave out, as a load does: written
+/// without history, and reported so the next save writes it. Clears the
+/// document's pending list once solved.
+pub fn solve_pending(document: &mut Doc) -> Result<BTreeSet<NodeId>> {
+    let roots = pending_roots(document);
+    let operations = geometry_operations(document, &roots);
+    let changed = apply_without_history(document, operations)?;
+    document.pending_layout.clear();
+    Ok(changed)
+}
+
+/// Solve the layout islands whose inputs changed since `state` last caught up,
+/// then catch it up. Geometry solved right after an edit joins that edit's
+/// transaction, so one undo restores both; otherwise it is written without
+/// history, like geometry solved at load.
+pub fn settle(document: &mut Doc, state: &mut LayoutState) -> Result<()> {
+    let roots = state.changed_roots(document);
+    let operations = geometry_operations(document, &roots);
+    if !operations.is_empty() {
+        let generation = document.history.edit_generation();
+        if generation != state.history_generation {
+            document.apply_derived_operations(operations, generation)?;
+        } else {
+            apply_without_history(document, operations)?;
+        }
+    }
+    state.catch_up(document);
+    Ok(())
 }

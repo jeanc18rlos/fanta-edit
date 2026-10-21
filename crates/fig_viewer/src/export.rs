@@ -6,11 +6,12 @@ use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
 use fanta_doc::{Bounds, Doc, NodeId, Viewport, resolve_bound_value, resolve_effective_mode};
-use fanta_render::{AssetResolver, RasterRenderer, RenderInputs, visual_world_bounds};
+use fanta_render::{AssetResolver, RasterRenderer, visual_world_bounds};
 use image::codecs::jpeg::JpegEncoder;
 use tempfile::NamedTempFile;
 
 use crate::document::{FigPage, page_bounds};
+pub(crate) use fanta_headless::render::render_inputs;
 
 const MAX_EXPORT_PIXELS: u32 = 8192;
 const MAX_EXPORT_TOTAL_PIXELS: u64 = 16 * 1024 * 1024;
@@ -631,19 +632,6 @@ fn render_pdf(batch: &ExportBatch, document: &Doc, target: &ExportTarget) -> Res
         page.end_page().close();
     }
     Ok(pdf)
-}
-
-pub(crate) fn render_inputs(document: &Doc) -> RenderInputs<'_> {
-    RenderInputs {
-        components: &document.components,
-        variables: &document.variables,
-        active_modes: &document.active_modes,
-        mode_generation: 0,
-        motion: None,
-        playback: None,
-        video_fill_frames: None,
-        dark_ui: false,
-    }
 }
 
 fn target_viewport(target: &ExportTarget, zoom: f64) -> Viewport {

@@ -30,7 +30,19 @@ use fanta_doc::{
     UnitInterval, VarValue, Variable, VariableCollection, VariableCollectionId, VariableId,
     VariableType, VectorNode, Viewport,
 };
-use fanta_render::{AssetResolver, RasterRenderer, visual_world_bounds};
+use fanta_headless::scene::{
+    COMPONENT_OVERVIEW_LIMIT, bounds_json, check_page_listing_budget, components_json,
+    content_bounds, design_system_json, empty_space, find_collection, paginated_node_summary,
+    relative_source, union_bounds,
+};
+#[cfg(test)]
+use fanta_headless::scene::{
+    EMPTY_SPACE_MARGIN, PAGE_LISTING_NODE_BUDGET, SUMMARY_TEXT_CHARS, page_area_is_empty,
+};
+pub(crate) use fanta_headless::scene::{
+    SUMMARY_LABEL_CHARS, node_summary, truncate_summary_string, world_bounds_json,
+};
+use fanta_render::AssetResolver;
 use gpui::{App, AppContext as _, Entity, Global, Task, WeakEntity};
 use serde_json::{Value, json};
 use std::sync::Arc;
@@ -39,9 +51,8 @@ use util::ResultExt as _;
 use crate::clipboard::{create_operations, duplicate_operations};
 use crate::document::{
     AssetStores, DocChange, FigDocument, FigItem, FigItemEvent, FigPage, MAX_IMAGE_SOURCE_BYTES,
-    PreparedImage, SaveKind, page_bounds,
+    PreparedImage, SaveKind,
 };
-use crate::export::render_inputs;
 use crate::properties_ops::{
     DEFAULT_FILL_COLOR, blurs_operations, create_component_operations, default_shadow,
     effects_operations, parse_color, replace_data_operation, resize_operations,
@@ -184,23 +195,9 @@ pub(crate) fn apply_comment_suggested_fix(
 /// listing with `detail: "style"`, and what the v2 agent sessions read.
 pub(crate) fn page_scene(item: &FigItem, depth: u32, limit: usize) -> Result<Vec<Value>> {
     let document = ready_document(item)?;
-    let doc = &document.doc;
     let page = &document.pages[resolve_page_index(document, None)?];
     let root = page.root.context("the page has no root node")?;
-    let mut depth = depth.min(16);
-    loop {
-        match check_page_listing_budget(doc, root, Some(depth), 0, limit) {
-            Ok(()) => break,
-            Err(_) if depth > 1 => depth -= 1,
-            Err(error) => return Err(error),
-        }
-    }
-    let mut listing = paginated_node_summary(doc, root, Some(depth), true, 0, limit);
-    crate::agent_style::attach_styles(doc, &mut listing);
-    Ok(match listing.get_mut("children").map(Value::take) {
-        Some(Value::Array(children)) => children,
-        _ => Vec::new(),
-    })
+    fanta_headless::scene::page_scene(&document.doc, root, depth, limit)
 }
 
 struct FigDesignSurface {
@@ -1363,113 +1360,12 @@ fn pages_json(
         .collect()
 }
 
-const COMPONENT_OVERVIEW_LIMIT: usize = 100;
-
-/// Component masters are not pages, so their sources live in their own list
-/// rather than overloading `pages`.
-fn components_json(
-    doc: &Doc,
-    project_root: Option<&Path>,
-    offset: usize,
-    limit: usize,
-    source: impl Fn(fanta_format::ScopedDesign) -> Option<PathBuf>,
-) -> Vec<Value> {
-    doc.components
-        .defs
-        .values()
-        .skip(offset)
-        .take(limit)
-        .map(|def| {
-            let source = source(fanta_format::ScopedDesign::Component(def.id));
-            json!({
-                "id": def.id.to_string(),
-                "name": truncate_summary_string(&def.name, SUMMARY_LABEL_CHARS),
-                "root": def.root.to_string(),
-                "source": relative_source(project_root, source),
-                "properties": def.props,
-                "variant_of": def.variant_of,
-            })
-        })
-        .collect()
-}
-
-fn design_system_json(
-    doc: &Doc,
-    project_root: Option<&Path>,
-    query: DesignSystemQuery,
-    source: impl Fn(fanta_format::ScopedDesign) -> Option<PathBuf>,
-) -> Result<Value> {
-    let collection = query
-        .collection
-        .as_deref()
-        .map(|key| find_collection(doc, key).map(|collection| collection.id))
-        .transpose()?;
-    let variables = doc
-        .variables
-        .variables
-        .values()
-        .filter(|variable| collection.is_none_or(|id| variable.collection == id))
-        .collect::<Vec<_>>();
-    let offset = query.offset.unwrap_or(0);
-    let limit = query.limit.unwrap_or(100).clamp(1, 200);
-    let bindings = if query.include_bindings {
-        doc.selection.iter().take(200).filter_map(|id| doc.scene.get(*id)).map(|node| {
-            json!({"node": node.id.to_string(), "bindings": node.bindings.iter().map(|(property, variable)| json!({"property":property,"variable":variable.to_string()})).collect::<Vec<_>>()})
-        }).collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    Ok(json!({
-        "collections": doc.variables.collections.values().filter(|current| collection.is_none_or(|id| current.id == id)).collect::<Vec<_>>(),
-        "active_modes": doc.active_modes,
-        "variables": variables.iter().skip(offset).take(limit).collect::<Vec<_>>(),
-        "variable_count": variables.len(), "offset": offset, "limit": limit,
-        "more_variables": offset.saturating_add(limit) < variables.len(),
-        "components": components_json(doc, project_root, offset, limit, source),
-        "component_count": doc.components.defs.len(),
-        "components_offset": offset, "components_limit": limit,
-        "more_components": offset.saturating_add(limit) < doc.components.defs.len(),
-        "component_sets": doc.components.sets.values().skip(offset).take(limit).collect::<Vec<_>>(),
-        "component_set_count": doc.components.sets.len(),
-        "component_sets_offset": offset, "component_sets_limit": limit,
-        "more_component_sets": offset.saturating_add(limit) < doc.components.sets.len(),
-        "selection_bindings": bindings,
-        "source_files": ["doc/variables.json", "doc/active_modes.json", "components/<set>/set.json"],
-        "hints": ["The same offset and limit page variables, components, and component sets independently; collection filters variables only. Continue while the corresponding more_* flag is true.",
-          "Create semantic variables before components, bind properties, then reuse component instances.",
-          "Names are exact and must be unique when used instead of ids. Prefer returned ids for follow-up edits.",
-          "Variables use per-mode values. set_variable_mode selects a collection mode document-wide or pins a frame."]
-    }))
-}
-
 fn required_name(name: &str) -> Result<&str> {
     let name = name.trim();
     if name.is_empty() || name.len() > 512 {
         bail!("names must contain 1–512 bytes");
     }
     Ok(name)
-}
-
-fn find_collection<'a>(doc: &'a Doc, key: &str) -> Result<&'a VariableCollection> {
-    if let Ok(id) = key.parse::<VariableCollectionId>() {
-        return doc
-            .variables
-            .collections
-            .get(&id)
-            .context("variable collection id does not exist");
-    }
-    let mut matches = doc
-        .variables
-        .collections
-        .values()
-        .filter(|collection| collection.name == key);
-    let collection = matches
-        .next()
-        .context("variable collection name does not exist")?;
-    if matches.next().is_some() {
-        bail!("ambiguous collection name; use its exact id");
-    }
-    Ok(collection)
 }
 
 fn find_variable<'a>(doc: &'a Doc, key: &str) -> Result<&'a Variable> {
@@ -1721,38 +1617,6 @@ fn counter_alignment(alignment: CrossAxisAlignment) -> CounterAlign {
     }
 }
 
-/// A located source as the project sees it — `pages/<slug>/page.fnx` — which
-/// is the form an agent pastes into a file tool. `null` when the document has
-/// no project on disk yet (an unsaved `.fig` import).
-fn relative_source(project_root: Option<&Path>, source: Option<PathBuf>) -> Value {
-    let (Some(project_root), Some(source)) = (project_root, source) else {
-        return Value::Null;
-    };
-    match source.strip_prefix(project_root) {
-        // Project-relative paths use `/` on every platform, as the project format does.
-        Ok(relative) => json!(
-            relative
-                .components()
-                .map(|component| component.as_os_str().to_string_lossy())
-                .collect::<Vec<_>>()
-                .join("/")
-        ),
-        Err(_) => json!(source.to_string_lossy()),
-    }
-}
-
-pub(crate) fn world_bounds_json(doc: &Doc, id: NodeId) -> Value {
-    match doc.scene.world_bounds(id) {
-        Some(bounds) => json!({
-            "x": bounds.min_x,
-            "y": bounds.min_y,
-            "width": bounds.width(),
-            "height": bounds.height(),
-        }),
-        None => Value::Null,
-    }
-}
-
 /// What every state read tells the model up front, because the mistakes
 /// these prevent (guessed ids, y-up math, unverified results) are the common
 /// ones.
@@ -1766,86 +1630,6 @@ const STATE_HINTS: [&str; 8] = [
     "Import generated image files into project assets with import_project_image (native) or import_image (MCP); use the returned asset id/path when authoring the design.",
     "Verify substantive edits with a screenshot of the changed frame before reporting done.",
 ];
-
-fn bounds_json(bounds: Option<Bounds>) -> Value {
-    match bounds {
-        Some(bounds) => json!({
-            "x": bounds.min_x,
-            "y": bounds.min_y,
-            "width": bounds.width(),
-            "height": bounds.height(),
-        }),
-        None => Value::Null,
-    }
-}
-
-/// Union of the world bounds of `ids` (nodes without bounds are skipped).
-fn union_bounds(doc: &Doc, ids: &[NodeId]) -> Option<Bounds> {
-    ids.iter()
-        .filter_map(|id| doc.scene.world_bounds(*id))
-        .filter(Bounds::is_finite)
-        .reduce(|union, bounds| union.union(&bounds))
-}
-
-/// Union of the top-level content of `page` (`None` for an empty page or a
-/// document without pages).
-fn content_bounds(doc: &Doc, page: Option<NodeId>) -> Option<Bounds> {
-    let root = page?;
-    union_bounds(doc, doc.scene.children_of(Some(root)))
-}
-
-/// Gap kept between existing content and a newly placed frame.
-const EMPTY_SPACE_MARGIN: f64 = 100.0;
-
-/// A free top-left for a `width` x `height` box on `page`: the origin on an
-/// empty page, otherwise the first spot to the right of, then below, the
-/// page's content (stepping further out until nothing on the page overlaps).
-fn empty_space(doc: &Doc, page: NodeId, width: f64, height: f64) -> glam::DVec2 {
-    let Some(content) = content_bounds(doc, Some(page)) else {
-        return glam::DVec2::ZERO;
-    };
-    let mut candidates = Vec::new();
-    for step in 1..=8 {
-        let offset = EMPTY_SPACE_MARGIN * f64::from(step);
-        candidates.push(glam::DVec2::new(content.max_x + offset, content.min_y));
-        candidates.push(glam::DVec2::new(content.min_x, content.max_y + offset));
-    }
-    for candidate in &candidates {
-        let rect = Bounds::from_xywh(candidate.x, candidate.y, width, height);
-        if page_area_is_empty(doc, page, rect) {
-            return *candidate;
-        }
-    }
-    // The page's content is wider than eight margins of overlap allows;
-    // fall back to the far right, which the union bounds guarantee is free.
-    glam::DVec2::new(
-        content.max_x + EMPTY_SPACE_MARGIN,
-        content.max_y + EMPTY_SPACE_MARGIN,
-    )
-}
-
-/// Whether nothing on `page` overlaps `rect`. The spatial index answers for
-/// leaves across every page, so hits are filtered to this page's subtree;
-/// empty frames (groups, which the index never reports) are checked against
-/// the page's top-level children directly.
-fn page_area_is_empty(doc: &Doc, page: NodeId, rect: Bounds) -> bool {
-    let on_page = |id: NodeId| {
-        doc.scene
-            .ancestors_of(id)
-            .any(|ancestor| ancestor.id == page)
-    };
-    let leaf_hits = doc
-        .scene
-        .rect_query_where(rect, |id, bounds| bounds.intersects(&rect) && on_page(id));
-    if !leaf_hits.is_empty() {
-        return false;
-    }
-    !doc.scene
-        .children_of(Some(page))
-        .iter()
-        .filter_map(|child| doc.scene.world_bounds(*child))
-        .any(|bounds| bounds.intersects(&rect))
-}
 
 /// Explicit page indices error when out of range; `None` falls back to the
 /// active page like the canvas does.
@@ -1872,251 +1656,6 @@ fn resolve_page_index(document: &FigDocument, page: Option<usize>) -> Result<usi
         .context("the document has no pages")
 }
 
-const PAGE_LISTING_NODE_BUDGET: usize = 1_000;
-
-// A depth limit does not bound wide imported frames; check with a bounded,
-// iterative walk before allocating JSON or asking for every node's geometry.
-fn check_page_listing_budget(
-    doc: &Doc,
-    root: NodeId,
-    depth: Option<u32>,
-    offset: usize,
-    limit: usize,
-) -> Result<()> {
-    if depth == Some(0) {
-        return Ok(());
-    }
-    let children = doc.scene.children_of(Some(root));
-    let end = offset.saturating_add(limit).min(children.len());
-    let window = children.get(offset..end).unwrap_or_default();
-    let error = || {
-        anyhow!(
-            "the page listing exceeds the {PAGE_LISTING_NODE_BUDGET}-node traversal limit; \
-         lower depth, reduce limit with offset to page top-level layers, or fetch relevant nodes by ids"
-        )
-    };
-    if window.len().saturating_add(1) > PAGE_LISTING_NODE_BUDGET {
-        return Err(error());
-    }
-    let child_depth = depth.map(|depth| depth.saturating_sub(1));
-    let mut pending = window
-        .iter()
-        .map(|child| (*child, child_depth))
-        .collect::<Vec<_>>();
-    let mut visited = 1usize;
-    while let Some((node, depth)) = pending.pop() {
-        visited += 1;
-        if depth == Some(0) {
-            continue;
-        }
-        let children = doc.scene.children_of(Some(node));
-        if visited
-            .saturating_add(pending.len())
-            .saturating_add(children.len())
-            > PAGE_LISTING_NODE_BUDGET
-        {
-            return Err(error());
-        }
-        let child_depth = depth.map(|depth| depth.saturating_sub(1));
-        pending.extend(children.iter().map(|child| (*child, child_depth)));
-    }
-    Ok(())
-}
-
-/// [`node_summary`] with the listed node's direct children windowed to
-/// `offset..offset + limit`, reporting the facts a caller needs to continue:
-/// `child_count`, `children_offset`, `children_limit` and `more_children`.
-///
-/// A page of a real imported `.fig` can hold thousands of top-level nodes, so
-/// the whole child list does not fit in one response — and listing is the only
-/// way to discover node ids, so refusing the whole answer would leave no way
-/// in. Only this top level is windowed; the depth-limited subtrees below each
-/// windowed child are unchanged.
-fn paginated_node_summary(
-    doc: &Doc,
-    id: NodeId,
-    depth: Option<u32>,
-    include_geometry: bool,
-    offset: usize,
-    limit: usize,
-) -> Value {
-    let mut value = node_summary(doc, id, Some(0), include_geometry);
-    let Some(object) = value.as_object_mut() else {
-        return value;
-    };
-    let children = doc.scene.children_of(Some(id));
-    object.insert("child_count".into(), json!(children.len()));
-    if depth == Some(0) {
-        return value;
-    }
-    let end = offset.saturating_add(limit).min(children.len());
-    let window = children.get(offset..end).unwrap_or_default();
-    let child_depth = depth.map(|depth| depth - 1);
-    object.insert(
-        "children".into(),
-        Value::Array(
-            window
-                .iter()
-                .map(|child| node_summary(doc, *child, child_depth, include_geometry))
-                .collect(),
-        ),
-    );
-    object.insert("children_offset".into(), json!(offset));
-    object.insert("children_limit".into(), json!(limit));
-    object.insert("more_children".into(), json!(end < children.len()));
-    value
-}
-
-/// A compact node-tree projection for page listings: enough for the model to
-/// navigate and target nodes without the full serde payload (fetch specific
-/// ids for that).
-pub(crate) fn node_summary(
-    doc: &Doc,
-    id: NodeId,
-    depth: Option<u32>,
-    include_geometry: bool,
-) -> Value {
-    let Some(node) = doc.scene.get(id) else {
-        return Value::Null;
-    };
-    let mut object = serde_json::Map::new();
-    object.insert("id".into(), json!(id.to_string()));
-    object.insert("kind".into(), json!(node.data.kind_tag()));
-    object.insert(
-        "name".into(),
-        json!(truncate_summary_string(&node.name, SUMMARY_LABEL_CHARS)),
-    );
-    if node.flags.contains(NodeFlags::HIDDEN) {
-        object.insert("hidden".into(), json!(true));
-    }
-    if node.flags.contains(NodeFlags::LOCKED) {
-        object.insert("locked".into(), json!(true));
-    }
-    summarize_kind(doc, node, &mut object);
-    if include_geometry {
-        object.insert("world_bounds".into(), world_bounds_json(doc, id));
-    }
-    let children = doc.scene.children_of(Some(id));
-    if !children.is_empty() {
-        if depth == Some(0) {
-            object.insert("child_count".into(), json!(children.len()));
-        } else {
-            let child_depth = depth.map(|depth| depth - 1);
-            object.insert(
-                "children".into(),
-                Value::Array(
-                    children
-                        .iter()
-                        .map(|child| node_summary(doc, *child, child_depth, include_geometry))
-                        .collect(),
-                ),
-            );
-        }
-    }
-    Value::Object(object)
-}
-
-/// Characters of a text node's content a compact listing carries; longer
-/// content is cut there and reported with its full `text_length`, so a page
-/// listing stays bounded per node (fetch the node by id for the whole text).
-const SUMMARY_TEXT_CHARS: usize = 120;
-pub(crate) const SUMMARY_LABEL_CHARS: usize = 160;
-
-pub(crate) fn truncate_summary_string(value: &str, max_chars: usize) -> String {
-    let mut characters = value.chars();
-    let mut truncated = characters.by_ref().take(max_chars).collect::<String>();
-    if characters.next().is_some() {
-        truncated.push('…');
-    }
-    truncated
-}
-
-/// Kind-specific facts a model needs to reason about a node without fetching
-/// it in full: a frame's size and layout mode, a text's font and (truncated)
-/// content, a shape's fill, an instance's component. Only present facts are
-/// emitted so large page listings stay compact.
-fn summarize_kind(doc: &Doc, node: &CanvasNode, object: &mut serde_json::Map<String, Value>) {
-    match &node.data {
-        NodeData::Group(group) => {
-            if let Some([width, height]) = group.clip_size {
-                object.insert("size".into(), json!([width, height]));
-            }
-            if let Some(layout) = &group.auto_layout {
-                let mode = match layout.mode {
-                    LayoutMode::Horizontal => "horizontal",
-                    LayoutMode::Vertical => "vertical",
-                    LayoutMode::Grid => "grid",
-                };
-                object.insert("auto_layout".into(), json!(mode));
-            }
-            if let Some(color) = group.background.as_ref().and_then(Fill::solid_color) {
-                object.insert("fill".into(), json!(color.to_hex()));
-            }
-        }
-        NodeData::Text(text) => {
-            summarize_text(&text.content, &text.style, object);
-        }
-        NodeData::TextPath(text_path) => {
-            summarize_text(&text_path.content, &text_path.style, object);
-        }
-        NodeData::Vector(vector) => {
-            if let Some(color) = vector.fills.first().and_then(Fill::solid_color) {
-                object.insert("fill".into(), json!(color.to_hex()));
-            }
-        }
-        NodeData::Boolean(boolean) => {
-            if let Some(color) = boolean.fills.first().and_then(Fill::solid_color) {
-                object.insert("fill".into(), json!(color.to_hex()));
-            }
-        }
-        NodeData::Instance(instance) => {
-            object.insert(
-                "component".into(),
-                json!(
-                    doc.components
-                        .def(instance.component)
-                        .map(|def| def.name.as_str())
-                        .unwrap_or("(missing)")
-                ),
-            );
-        }
-        NodeData::Bitmap(_)
-        | NodeData::Video(_)
-        | NodeData::Audio(_)
-        | NodeData::NodeGraph(_)
-        | NodeData::Model3d(_)
-        | NodeData::AiArtifact(_)
-        | NodeData::Embed(_) => {}
-    }
-}
-
-fn summarize_text(
-    content: &str,
-    style: &fanta_doc::TextStyle,
-    object: &mut serde_json::Map<String, Value>,
-) {
-    let text_length = content.chars().count();
-    if text_length > SUMMARY_TEXT_CHARS {
-        let preview: String = content
-            .chars()
-            .take(SUMMARY_TEXT_CHARS)
-            .chain(std::iter::once('…'))
-            .collect();
-        object.insert("text".into(), json!(preview));
-        object.insert("text_length".into(), json!(text_length));
-    } else {
-        object.insert("text".into(), json!(content));
-    }
-    object.insert(
-        "font".into(),
-        json!({
-            "family": style.font_family,
-            "size": style.size_px,
-            "weight": style.weight,
-        }),
-    );
-}
-
 fn render_surface_screenshot(
     doc: &Doc,
     asset_resolver: Option<Arc<dyn AssetResolver>>,
@@ -2124,70 +1663,8 @@ fn render_surface_screenshot(
     node: Option<NodeId>,
     target: ScreenshotTarget,
 ) -> Result<Vec<u8>> {
-    // Larger screenshots consume the gateway's request budget without adding
-    // detail after the model's image downscaling.
-    let max_dimension = f64::from(target.max_dimension.unwrap_or(768).clamp(16, 1568));
-    let motion = match target.motion_clip {
-        Some(raw) => {
-            let clip = raw
-                .parse::<fanta_doc::AnimationClipId>()
-                .map_err(|_| anyhow!("{raw} is not a valid animation clip id"))?;
-            Some(
-                doc.motion
-                    .evaluate(clip, target.playhead_ms.unwrap_or(0))
-                    .with_context(|| format!("animation clip {raw} does not exist"))?,
-            )
-        }
-        None if target.playhead_ms.is_some() => bail!("playhead_ms requires motion_clip"),
-        None => None,
-    };
-    let motion_scene = motion.as_ref().map(|motion| {
-        let mut scene = doc.scene.clone();
-        let affected = motion
-            .overrides
-            .keys()
-            .map(|target| target.node)
-            .collect::<HashSet<_>>();
-        for id in affected {
-            if let Some(node) = scene.get_mut(id) {
-                *node = motion.apply_to_node(node);
-            }
-        }
-        scene
-    });
-    let bounds_scene = motion_scene.as_ref().unwrap_or(&doc.scene);
-    let bounds = match node {
-        Some(node) => visual_world_bounds(bounds_scene, node, 0.0)
-            .context("the node has no visible bounds")?,
-        None if motion_scene.is_some() => page_root
-            .and_then(|root| visual_world_bounds(bounds_scene, root, 0.0))
-            .unwrap_or_else(|| page_bounds(doc, page_root)),
-        None => page_bounds(doc, page_root),
-    };
-    if !bounds.is_finite() || bounds.width() <= 0.0 || bounds.height() <= 0.0 {
-        bail!("the screenshot target has invalid or empty bounds");
-    }
-    // Fit within the dimension cap; allow mild upscale so small nodes
-    // (icons) stay legible without ballooning the surface.
-    let zoom = (max_dimension / bounds.width().max(bounds.height())).min(2.0);
-    let width = (bounds.width() * zoom).ceil().max(1.0) as u32;
-    let height = (bounds.height() * zoom).ceil().max(1.0) as u32;
-    let mut renderer = RasterRenderer::new(width, height)
-        .map_err(|error| anyhow!("creating {width}x{height} screenshot surface: {error}"))?;
-    if let Some(asset_resolver) = asset_resolver {
-        renderer.set_asset_resolver(asset_resolver);
-    }
-    let center = bounds.center();
-    let viewport = Viewport {
-        center: [center.x, center.y],
-        zoom,
-    };
-    let mut inputs = render_inputs(doc);
-    inputs.motion = motion.as_ref();
-    renderer.render_page_with(&doc.scene, &viewport, page_root, &inputs);
-    renderer
-        .encode_png()
-        .map_err(|error| anyhow!("encoding screenshot PNG: {error}"))
+    fanta_headless::render::render_screenshot(doc, asset_resolver, page_root, node, target)
+        .map(|screenshot| screenshot.png)
 }
 
 #[allow(clippy::type_complexity)]
@@ -8077,5 +7554,87 @@ mod tests {
         );
         assert!(doc.undo().unwrap());
         assert!(doc.scene.get(rect).unwrap().constraints.is_none());
+    }
+
+    /// The cloud engine renders through `fanta_headless`. A project it opens
+    /// must render exactly as the editor's screenshot tool renders the same
+    /// files after the editor opens them.
+    #[test]
+    fn headless_engine_renders_match_editor_screenshots() -> Result<()> {
+        use fanta_doc::{TextNode, color::Color};
+        let mut doc = Doc::new();
+        let mut page = CanvasNode::new(NodeData::Group(GroupNode::default()));
+        page.name = "Home".into();
+        let page_id = page.id;
+        doc.apply(Operation::create_node(page))?;
+        doc.add_page(page_id);
+        let mut card = CanvasNode::new(NodeData::Vector(VectorNode::rect_solid(
+            0.0,
+            0.0,
+            160.0,
+            90.0,
+            Color::BLACK,
+        )));
+        card.parent = Some(page_id);
+        card.transform = Transform2D::translation(20.0, 10.0);
+        let card_id = card.id;
+        doc.apply(Operation::create_node(card))?;
+        let mut label = CanvasNode::new(NodeData::Text(TextNode::new("Review me", 140.0, 24.0)));
+        label.parent = Some(page_id);
+        label.transform = Transform2D::translation(30.0, 40.0);
+        doc.apply(Operation::create_node(label))?;
+        let mut pixels = Vec::new();
+        image::RgbaImage::from_pixel(8, 8, image::Rgba([220, 40, 40, 255])).write_to(
+            &mut std::io::Cursor::new(&mut pixels),
+            image::ImageFormat::Png,
+        )?;
+        let asset = fanta_format::asset_id_for_bytes(&pixels);
+        let mut photo = CanvasNode::new(NodeData::Bitmap(BitmapNode {
+            asset,
+            natural_size: [8, 8],
+            local_size: [40.0, 40.0],
+            crop: None,
+            fit: ImageFitMode::Fill,
+            tint: None,
+        }));
+        photo.parent = Some(page_id);
+        photo.transform = Transform2D::translation(130.0, 60.0);
+        doc.apply(Operation::create_node(photo))?;
+        let directory = tempfile::tempdir()?;
+        fanta_format::write_project_tree(
+            directory.path(),
+            &doc,
+            &std::collections::BTreeMap::from([(asset, pixels)]),
+        )?;
+
+        let editor = crate::document::load_project_document(directory.path())?;
+        let mut engine = fanta_headless::HeadlessProject::open(directory.path())?;
+        for node in [None, Some(card_id)] {
+            let editor_png = render_surface_screenshot(
+                &editor.doc,
+                editor.asset_resolver.clone(),
+                Some(page_id),
+                node,
+                ScreenshotTarget {
+                    max_dimension: Some(400),
+                    ..Default::default()
+                },
+            )?;
+            let engine_png = engine
+                .render(&fanta_headless::RenderTarget {
+                    id: "page".into(),
+                    page: fanta_headless::PageRef::Index { index: 0 },
+                    node: node.map(|node| node.to_string()),
+                    max_dimension: 400,
+                    motion_clip: None,
+                    playhead_ms: None,
+                })?
+                .png;
+            assert!(
+                editor_png == engine_png,
+                "the engine and the editor render {node:?} differently"
+            );
+        }
+        Ok(())
     }
 }

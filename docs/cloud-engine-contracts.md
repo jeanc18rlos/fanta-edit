@@ -97,13 +97,13 @@ position in the editor's page list, which `inspect` reports and
 
 | Step | Fields | Result |
 | --- | --- | --- |
-| `inspect` | — | `pages` (index, id, name, hidden, top-level frames with ids, names and world bounds), `components`, `design_system`, `rules` (the project's `fanta.md`, or `null`), `motion` clips and prototype `flows`. |
+| `inspect` | — | `project_id`, `schema_version`, `pages` (index, id, name, hidden, active, source file, up to 200 top-level layers with ids, kinds, names and world bounds, and `frame_count`), `active_page`, `components` (first 100) and `component_count`, `design_system`, `rules` (the project's `fanta.md`, or `null` with `rules_error` when it cannot be read), `motion` clips, prototype `flows` and `fonts` (the families the text names). |
 | `create_page` | `name` | `{"page": {"id": "n_…"}}` |
 | `apply` | `page?` (`PageRef`, where parentless ops land), `label`, `ops` (`DesignOp[]`, the `batch_design` vocabulary), `commit` (default `true`; `false` checks the batch and rolls it back) | The `batch_design` result: `applied`, per-op status and `created` ids. |
-| `add_comments` | `label`, `comments` (`CommentDraft[]`) | `{"comments": [{"ok": true, "id": "…"} \| {"ok": false, "error": "…"}]}`, one entry per draft. Each page's accepted drafts land as one undo step. |
+| `add_comments` | `label`, `comments` (`CommentDraft[]`; a draft without `page` goes on the active page) | `{"comments": [{"ok": true, "id": "…"} \| {"ok": false, "error": "…"}]}`, one entry per draft. The accepted drafts land as one undo step. |
 | `project` | `page` (`PageRef`), `depth` (default 8), `limit` (default 50) | `{"nodes": […]}`: the page's top-level layers in the style projection of `batch_get` with `detail: "style"`. |
 | `render` | `targets`: 1 to 8 of `{id, page, node?, max_dimension (default and maximum 1568), motion_clip?, playhead_ms?}` | `{"images": [{"target_id", "png_b64", "width", "height", "bounds": [x, y, width, height]}]}` |
-| `changeset` | `contents` (default `false`), `ops` (default `false`) | Saves the document, then `{"files": [{"path", "status": "added" \| "modified" \| "deleted", "sha256" (hex, `null` when deleted), "content_b64"?}], "ops"?: Operation[]}`. `ops` is the `fanta_doc::Operation` journal the app replays. |
+| `changeset` | `contents` (default `false`), `ops` (default `false`) | Saves the document, then `{"files": [{"path", "status": "added" \| "modified" \| "deleted", "sha256" (hex, `null` when deleted), "content_b64"?}], "ops"?: Operation[]}`. `ops` is the `fanta_doc::Operation` journal the app replays. Every edit stamps `doc/metadata.json` with its time, as the editor does, so that file is usually listed too. |
 
 #### Response
 
@@ -157,6 +157,9 @@ engine produce the same document.
 
 ```rust
 HeadlessProject::open(root) -> Result<HeadlessProject>
+    .doc() -> &Doc
+    .warnings() -> &[String]
+    .font_families() -> BTreeSet<String>
     .inspect() -> Result<Value>
     .resolve_page(&PageRef) -> Result<NodeId>
     .create_page(name) -> Result<NodeId>
