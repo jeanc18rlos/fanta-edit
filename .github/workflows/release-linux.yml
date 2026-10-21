@@ -245,7 +245,12 @@ jobs:
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then
             prerelease=(--prerelease)
           fi
-          if ! gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+          if is_draft=$(gh release view "$GITHUB_REF_NAME" --json isDraft --jq .isDraft 2> /dev/null); then
+            if [[ "$is_draft" != true ]]; then
+              echo "::error::${GITHUB_REF_NAME} is already published, so its installers stay as they are."
+              exit 1
+            fi
+          else
             gh release create "$GITHUB_REF_NAME" --draft --verify-tag --generate-notes \
               --title "Fanta ${GITHUB_REF_NAME}" "${prerelease[@]}"
           fi
