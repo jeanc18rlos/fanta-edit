@@ -1,0 +1,263 @@
+name: Build Linux release
+
+on:
+  push:
+    tags: ['v*']
+  # Pull requests that change the packaging build and launch the tarball, but never sign or
+  # publish it.
+  pull_request:
+    paths:
+      - '.github/workflows/release-linux.yml'
+      - 'crates/fanta/resources/fanta-mime.xml'
+      - 'crates/fanta/resources/fanta.desktop.in'
+      - 'script/bundle-linux'
+      - 'script/install.sh'
+  workflow_dispatch:
+    inputs:
+      signed:
+        description: Sign the tarball for in-place updates (requires FANTA_UPDATE_SIGNING_KEY)
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-linux-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  FANTA_RELEASE_CHANNEL: stable
+  FANTA_SIGN_UPDATE: ${{ startsWith(github.ref, 'refs/tags/') || inputs.signed || false }}
+
+jobs:
+  build:
+    name: Build x86_64 tarball
+    # Binaries built here run on glibc 2.35 and newer.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Validate release version
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/fanta/Cargo.toml)
+          if [[ "$GITHUB_REF_NAME" != "v${version}" ]]; then
+            echo "::error::Release tag must match crates/fanta/Cargo.toml: v${version}"
+            exit 1
+          fi
+
+      # A release build of the workspace outgrows the runner's free disk.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Install Linux dependencies
+        run: ./script/linux
+
+      # No build cache: tag builds can restore only caches saved on main, which never runs this
+      # workflow, and the repository's caches are already at GitHub's limit.
+      - name: Install Rust 1.95
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup override set 1.95.0
+
+      - name: Build and package Fanta
+        env:
+          FANTA_CLIENT_CHECKSUM_SEED: ${{ secrets.FANTA_CLIENT_CHECKSUM_SEED }}
+        run: ./script/bundle-linux
+
+      - name: Record checksum
+        working-directory: target/release
+        run: sha256sum fanta-linux-x86_64.tar.gz > SHA256SUMS-linux-x86_64.txt
+
+      # Installed copies update themselves only with tarballs this key signed
+      # (crates/auto_update/src/verify.rs). The signature ships next to the tarball.
+      - name: Sign the tarball for in-place updates
+        if: env.FANTA_SIGN_UPDATE == 'true'
+        env:
+          FANTA_UPDATE_SIGNING_KEY: ${{ secrets.FANTA_UPDATE_SIGNING_KEY }}
+        run: |
+          if [[ -z "$FANTA_UPDATE_SIGNING_KEY" ]]; then
+            echo "::warning::FANTA_UPDATE_SIGNING_KEY is not set, so this tarball is unsigned and installed copies will not update to it."
+            exit 0
+          fi
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/fanta/Cargo.toml)
+          python3 -m venv "$RUNNER_TEMP/update-signing"
+          "$RUNNER_TEMP/update-signing/bin/pip" install --quiet 'cryptography>=42'
+          "$RUNNER_TEMP/update-signing/bin/python" script/update_signing.py sign \
+            --asset fanta-linux-x86_64.tar.gz --version "$version" \
+            --file target/release/fanta-linux-x86_64.tar.gz \
+            --public-key-file crates/auto_update/release-signing-key.pub \
+            > target/release/fanta-linux-x86_64.tar.gz.sig
+
+      # Installs the tarball the way users do, then opens the sample project under Xvfb with
+      # Mesa's software Vulkan, so a startup panic or a broken bundle fails the build.
+      - name: Install and launch the tarball
+        run: |
+          sudo apt-get install -y xvfb dbus mesa-vulkan-drivers libgl1-mesa-dri libegl1 x11-utils xdotool \
+            imagemagick desktop-file-utils xdg-utils rsync
+          smoke="$RUNNER_TEMP/smoke"
+          mkdir -p "$smoke"
+          FANTA_BUNDLE_PATH="$PWD/target/release/fanta-linux-x86_64.tar.gz" sh script/install.sh
+
+          # The auto-updater replaces this directory and restarts libexec/fanta-editor.
+          app="$HOME/.local/fanta.app"
+          test -x "$app/libexec/fanta-editor"
+          test -x "$HOME/.local/bin/fanta"
+          if ldd "$app/libexec/fanta-editor" | grep 'not found'; then
+            echo "::error::The bundled editor is missing shared libraries"
+            exit 1
+          fi
+          "$HOME/.local/bin/fanta" --version | tee "$smoke/version.txt"
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/fanta/Cargo.toml)
+          if ! grep -q "^Fanta ${version} " "$smoke/version.txt"; then
+            echo "::error::The command-line tool did not report the stable channel and version ${version}"
+            exit 1
+          fi
+          desktop-file-validate "$HOME/.local/share/applications/dev.fanta.Fanta.desktop"
+          for type in application/x-figma text/x-fanta-fnx; do
+            handler=$(xdg-mime query default "$type")
+            if [[ "$handler" != dev.fanta.Fanta.desktop ]]; then
+              echo "::error::$type opens with '$handler' after install.sh, not Fanta"
+              exit 1
+            fi
+          done
+
+          unzip -q docs/samples/Fanta-launch-card-sample.zip -d "$smoke"
+          Xvfb :99 -screen 0 1440x900x24 &
+          export DISPLAY=:99
+          sleep 2
+          dbus-run-session -- "$app/libexec/fanta-editor" "$smoke/Fanta Launch Card" > "$smoke/editor.log" 2>&1 &
+          editor=$!
+          sleep 60
+          import -window root "$smoke/screenshot.png"
+          xwininfo -root -tree > "$smoke/windows.txt"
+
+          # Every pan paints a new CPU frame, which stays in GPUI's sprite atlas unless the
+          # canvas drops it. Software Vulkan keeps the atlas in process memory.
+          window=$(xdotool search --onlyvisible --class 'dev\.fanta\.Fanta' | head -1 || true)
+          if [[ -n "$window" ]] && kill -0 "$editor"; then
+            editor_pid=$(pgrep -f libexec/fanta-editor | head -1)
+            resident_mb() { awk '/^VmRSS/ { print int($2 / 1024) }' "/proc/$editor_pid/status"; }
+            eval "$(xdotool getwindowgeometry --shell "$window")"
+            xdotool mousemove --window "$window" $((WIDTH / 2)) $((HEIGHT / 2))
+            before=$(resident_mb)
+            for _ in 1 2 3; do
+              xdotool click --repeat 25 --delay 40 5
+              xdotool click --repeat 25 --delay 40 4
+            done
+            sleep 5
+            after=$(resident_mb)
+            import -window root "$smoke/screenshot-after-panning.png"
+            echo "Resident memory of the editor: ${before} MB, then ${after} MB after 150 canvas pans." |
+              tee -a "$GITHUB_STEP_SUMMARY" "$smoke/memory.txt"
+          else
+            echo "::warning::Could not find the Fanta window, so canvas memory was not measured."
+          fi
+
+          cp "$HOME/.local/share/fanta/logs/Fanta.log" "$smoke/" || echo "Fanta.log is missing"
+          if ! kill -0 "$editor"; then
+            wait "$editor" || echo "Fanta exited with status $?"
+            cat "$smoke/editor.log"
+            echo "::error::Fanta exited within a minute of launching"
+            exit 1
+          fi
+          pkill -f libexec/fanta-editor
+          if grep -n 'panicked' "$smoke/editor.log" "$smoke/Fanta.log"; then
+            echo "::error::Fanta panicked during launch"
+            exit 1
+          fi
+          if ! grep -i 'fanta' "$smoke/windows.txt"; then
+            cat "$smoke/windows.txt"
+            echo "::error::Fanta did not open a window"
+            exit 1
+          fi
+
+      - name: Preserve launch evidence
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fanta-linux-launch-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/smoke/*.*
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fanta-linux-x86_64
+          path: |
+            target/release/fanta-linux-x86_64.tar.gz
+            target/release/fanta-linux-x86_64.tar.gz.sig
+            target/release/SHA256SUMS-linux-x86_64.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload crash symbols
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fanta-symbols-linux-x86_64-${{ github.sha }}
+          path: target/x86_64-unknown-linux-gnu/release/fanta.dbg
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Summarize build
+        run: |
+          if [[ -s target/release/fanta-linux-x86_64.tar.gz.sig ]]; then
+            signing='Signed for in-place updates.'
+          else
+            signing='Unsigned: installed copies will not update to this tarball.'
+          fi
+          printf '### Fanta for Linux (x86_64)\n\n%s\n\nCommit: `%s`\n\nThe tarball, its signature and checksum are in this run’s `fanta-linux-x86_64` artifact. Crash symbols are stored separately.\n' "$signing" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+  draft-release:
+    name: Add to the draft release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    # Shared with the other platforms' release workflows, so only one of them creates the draft.
+    concurrency:
+      group: draft-release-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: fanta-linux-x86_64
+          path: release
+
+      - name: Upload the tarball to the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          prerelease=()
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            prerelease=(--prerelease)
+          fi
+          if ! gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --draft --verify-tag --generate-notes \
+              --title "Fanta ${GITHUB_REF_NAME}" "${prerelease[@]}"
+          fi
+          assets=(release/fanta-linux-x86_64.tar.gz release/SHA256SUMS-linux-x86_64.txt)
+          # The .sig is what installed copies check before updating in place.
+          if [[ -s release/fanta-linux-x86_64.tar.gz.sig ]]; then
+            assets+=(release/fanta-linux-x86_64.tar.gz.sig)
+          else
+            echo "::warning::The tarball is unsigned, so installed copies will not update to it."
+            # A signature from an earlier upload would not match this tarball.
+            if gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets[].name' | grep -qx 'fanta-linux-x86_64.tar.gz.sig'; then
+              gh release delete-asset "$GITHUB_REF_NAME" fanta-linux-x86_64.tar.gz.sig --yes
+            fi
+          fi
+          gh release upload "$GITHUB_REF_NAME" "${assets[@]}" --clobber

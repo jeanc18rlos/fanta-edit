@@ -273,6 +273,10 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/') && inputs.distribution != 'app-store'
     needs: build
     runs-on: ubuntu-latest
+    # Shared with the other platforms' release workflows, so only one of them creates the draft.
+    concurrency:
+      group: draft-release-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -281,7 +285,7 @@ jobs:
           name: fanta-macos-aarch64-notarized
           path: release
 
-      - name: Create draft with verified installer
+      - name: Add the verified installer to the draft
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -292,6 +296,9 @@ jobs:
           fi
           # The .sig is what installed copies check before updating in place.
           test -s release/Fanta-aarch64.dmg.sig
-          gh release create "$GITHUB_REF_NAME" release/Fanta-aarch64.dmg release/Fanta-aarch64.dmg.sig \
-            release/SHA256SUMS.txt \
-            --draft --verify-tag --generate-notes --title "Fanta ${GITHUB_REF_NAME}" "${prerelease[@]}"
+          if ! gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1; then
+            gh release create "$GITHUB_REF_NAME" --draft --verify-tag --generate-notes \
+              --title "Fanta ${GITHUB_REF_NAME}" "${prerelease[@]}"
+          fi
+          gh release upload "$GITHUB_REF_NAME" release/Fanta-aarch64.dmg release/Fanta-aarch64.dmg.sig \
+            release/SHA256SUMS.txt --clobber

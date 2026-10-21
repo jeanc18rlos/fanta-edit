@@ -10,7 +10,10 @@ on:
       - 'rust-toolchain.toml'
       - 'assets/**'
       - 'crates/**'
+      - 'script/bundle-linux'
+      - 'script/install.sh'
       - 'script/linux'
+      - 'script/uninstall.sh'
       - 'vendor/**'
   push:
     branches: [main]
@@ -54,8 +57,46 @@ jobs:
           cache-on-failure: true
 
       - name: Check release scripts
-        run: bash -n script/bundle-linux script/install.sh script/linux
+        run: |
+          bash -n script/bundle-linux script/linux
+          sh -n script/install.sh
+          sh -n script/uninstall.sh
+
+      # GIO resolves a file type the way file managers do: the .fig glob is shared with XFig,
+      # so the type comes from the zip parent type or the fig-kiwi magic.
+      - name: Check the desktop entry and file types
+        run: |
+          sudo apt-get install -y desktop-file-utils shared-mime-info libglib2.0-bin
+          APP_NAME=Fanta APP_CLI=fanta APP_ICON=fanta APP_ARGS=%U DO_STARTUP_NOTIFY=true \
+            envsubst < crates/fanta/resources/fanta.desktop.in > "$RUNNER_TEMP/dev.fanta.Fanta.desktop"
+          desktop-file-validate "$RUNNER_TEMP/dev.fanta.Fanta.desktop"
+
+          data="$RUNNER_TEMP/share"
+          mkdir -p "$data/mime/packages"
+          cp crates/fanta/resources/fanta-mime.xml "$data/mime/packages/dev.fanta.Fanta.xml"
+          update-mime-database "$data/mime"
+
+          samples="$RUNNER_TEMP/samples"
+          mkdir -p "$samples"
+          printf 'export default function Home() {}\n' > "$samples/home.fnx"
+          printf 'fig-kiwi\x0f\x00\x00\x00' > "$samples/stream.fig"
+          python3 -c 'import sys, zipfile; z = zipfile.ZipFile(sys.argv[1], "w"); z.writestr("canvas.fig", b"fig-kiwi"); z.close()' \
+            "$samples/archive.fig"
+          printf '#FIG 3.2  Produced by xfig\n' > "$samples/drawing.fig"
+          check() {
+            actual=$(XDG_DATA_HOME="$data" XDG_DATA_DIRS=/usr/share gio info -a standard::content-type "$samples/$1" |
+              sed -n 's/.*standard::content-type: //p')
+            if [[ "$actual" != "$2" ]]; then
+              echo "::error::$1 resolved to '$actual', expected $2"
+              exit 1
+            fi
+          }
+          check home.fnx text/x-fanta-fnx
+          check stream.fig application/x-figma
+          check archive.fig application/x-figma
+          check drawing.fig image/x-xfig
 
       # --keep-going reports every crate that fails, not just the first.
       - name: Check the app and command-line tool
+        if: ${{ !cancelled() }}
         run: cargo check --locked --keep-going -p fanta -p cli
