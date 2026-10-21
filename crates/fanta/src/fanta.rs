@@ -3,7 +3,6 @@ mod app_menus;
 mod app_store_billing;
 #[cfg(target_os = "macos")]
 pub(crate) mod mac_only_instance;
-#[cfg(unix)]
 pub mod mcp_stdio;
 mod migrate;
 #[cfg(all(target_os = "macos", not(feature = "mac_app_store")))]
