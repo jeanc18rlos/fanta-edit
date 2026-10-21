@@ -29,6 +29,13 @@ const program = await runtime.loadBundle(bytes);
 const player = await runtime.createPlayer({program, canvas});
 ```
 
+[`docs/samples/auth-wizard`](../samples/auth-wizard/README.md) is a complete
+sample: component variants with Smart Animate hover, press and focus, labels
+driven by variables, conditional submits, transitions, an overlay, clips and
+keyboard interactions. Its `example/index.html` loads the compiled bundle and
+can drive every interaction itself. An integration test compiles it with both
+the editor's project loader and this compiler.
+
 Recompile whenever the project changes. The bundle records the document schema
 version it was compiled with, and a runtime rejects a bundle from a newer
 schema instead of guessing.

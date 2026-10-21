@@ -582,3 +582,56 @@ fn native_scoped_sessions_keep_the_shared_style_registry_on_open_and_save() {
         );
     }
 }
+
+/// The auth wizard sample under `docs/samples` opens in the editor and compiles
+/// for the runtime from the same files, so a change to either loader, or to
+/// the sample, that breaks the other shows up here.
+#[test]
+fn auth_wizard_sample_loads_in_the_editor_and_compiles_for_the_runtime() {
+    let sample = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/samples/auth-wizard");
+    let (editor, _) =
+        fanta_format::read_project_tree(&sample).expect("the editor loads the sample");
+    let mut files = BTreeMap::new();
+    collect_files(&sample, &sample, &mut files).expect("sample files");
+    files.retain(|path, _| !path.starts_with("example/") && !path.ends_with(".md"));
+    let program = SourceBundle {
+        files,
+        ..SourceBundle::default()
+    }
+    .compile()
+    .expect("the portable compiler accepts the sample");
+    let runtime = program.document();
+    assert_eq!(runtime.pages, editor.pages);
+    assert_eq!(
+        runtime
+            .scene
+            .roots()
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        editor
+            .scene
+            .roots()
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>(),
+        "both loaders see the same page and master roots"
+    );
+    assert_eq!(runtime.components.sets.len(), 5, "five variant sets");
+    assert_eq!(
+        runtime.components.defs.len(),
+        13,
+        "thirteen variant masters"
+    );
+    assert_eq!(
+        runtime.variables.variables.len(),
+        editor.variables.variables.len()
+    );
+    assert_eq!(
+        runtime.motion.clips.len(),
+        4,
+        "three shakes and the ring pulse"
+    );
+    assert_eq!(runtime.flows.len(), 1);
+    let bytes = program.to_bundle().expect("bundle");
+    let loaded = RuntimeProgram::load_bundle(&bytes).expect("the runtime loads the bundle");
+    assert_eq!(loaded.to_bundle().expect("rebundle"), bytes);
+}
