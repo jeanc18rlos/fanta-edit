@@ -145,7 +145,8 @@ jobs:
           # canvas drops it. Software Vulkan keeps the atlas in process memory.
           window=$(xdotool search --onlyvisible --class 'dev\.fanta\.Fanta' | head -1 || true)
           if [[ -n "$window" ]] && kill -0 "$editor"; then
-            editor_pid=$(pgrep -f libexec/fanta-editor | head -1)
+            # By name: dbus-run-session's command line also contains the editor's path.
+            editor_pid=$(pgrep -x fanta-editor | head -1)
             resident_mb() { awk '/^VmRSS/ { print int($2 / 1024) }' "/proc/$editor_pid/status"; }
             eval "$(xdotool getwindowgeometry --shell "$window")"
             xdotool mousemove --window "$window" $((WIDTH / 2)) $((HEIGHT / 2))
@@ -175,7 +176,7 @@ jobs:
             echo "::error::Fanta exited within a minute of launching"
             exit 1
           fi
-          pkill -f libexec/fanta-editor
+          pkill -x fanta-editor
           if grep -n 'panicked' "$smoke/editor.log" "$smoke/Fanta.log"; then
             echo "::error::Fanta panicked during launch"
             exit 1
