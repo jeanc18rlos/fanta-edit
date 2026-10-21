@@ -966,6 +966,20 @@ codegen-units = 1
 [profile.release.package]
 fanta = { codegen-units = 16 }
 
+# The web runtime (`fanta-runtime` for wasm32-unknown-emscripten): size first.
+# The vendored Skia build compiles its C++ with this opt-level too, so `s`
+# shrinks Skia as well as the Rust crates. `debug = false` is what drops the
+# WebAssembly `name` section: rustc maps the debuginfo level to emcc's `-g`
+# flag, and the editor's `release` profile keeps names for backtraces.
+[profile.release-runtime]
+inherits = "release"
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+debug = false
+strip = true
+panic = "abort"
+
 [profile.release-fast]
 inherits = "release"
 debug = "full"
