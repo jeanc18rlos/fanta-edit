@@ -1,0 +1,282 @@
+name: Build Windows release
+
+on:
+  push:
+    tags: ['v*']
+  # Packaging changes build the installer before they merge. Nothing is signed or published.
+  pull_request:
+    paths:
+      - '.github/workflows/release-windows.yml'
+      - 'script/bundle-windows.ps1'
+      - 'script/generate-licenses.ps1'
+      - 'script/lib/workspace.ps1'
+      - 'crates/fanta/resources/windows/**'
+      - 'crates/auto_update_helper/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-windows-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  # Tags and manual runs are release builds: their installer gets an update signature.
+  FANTA_SIGN_UPDATE: ${{ github.event_name != 'pull_request' }}
+
+jobs:
+  build:
+    name: Build x86_64 installer
+    runs-on: windows-2025
+    timeout-minutes: 330
+    steps:
+      # Skia and the Rust target tree nest deeply enough to pass MAX_PATH.
+      - name: Allow long paths
+        run: git config --system core.longpaths true
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Validate release version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/fanta/Cargo.toml)
+          if [[ "$GITHUB_REF_NAME" != "v${version}" ]]; then
+            echo "::error::Release tag must match crates/fanta/Cargo.toml: v${version}"
+            exit 1
+          fi
+
+      - name: Install Rust 1.95
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup override set 1.95.0
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: fanta-windows-release-x86_64
+          cache-on-failure: true
+
+      - name: Install Inno Setup
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build and package Fanta
+        shell: pwsh
+        run: .\script\bundle-windows.ps1 -Architecture x86_64
+
+      # Installed copies update themselves only with installers this key signed
+      # (crates/auto_update/src/verify.rs). The signature ships next to the installer.
+      - name: Sign the installer for in-place updates
+        if: env.FANTA_SIGN_UPDATE == 'true'
+        shell: bash
+        env:
+          FANTA_UPDATE_SIGNING_KEY: ${{ secrets.FANTA_UPDATE_SIGNING_KEY }}
+        run: |
+          if [[ -z "$FANTA_UPDATE_SIGNING_KEY" ]]; then
+            echo "::warning::FANTA_UPDATE_SIGNING_KEY is not set, so this installer has no update signature and installed copies won't update to it in place."
+            exit 0
+          fi
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/fanta/Cargo.toml)
+          python -m venv "$RUNNER_TEMP/update-signing"
+          "$RUNNER_TEMP/update-signing/Scripts/python" -m pip install --quiet 'cryptography>=42'
+          "$RUNNER_TEMP/update-signing/Scripts/python" script/update_signing.py sign \
+            --asset Fanta-x86_64.exe --version "$version" \
+            --file target/Fanta-x86_64.exe \
+            --public-key-file crates/auto_update/release-signing-key.pub \
+            > target/Fanta-x86_64.exe.sig
+
+      - name: Record checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 target\Fanta-x86_64.exe).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText("$PWD\target\SHA256SUMS-windows-x86_64.txt", "$hash  Fanta-x86_64.exe`n")
+          Get-Content target\SHA256SUMS-windows-x86_64.txt
+
+      - name: Upload installer
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fanta-windows-x86_64
+          path: |
+            target/Fanta-x86_64.exe
+            target/Fanta-x86_64.exe.sig
+            target/SHA256SUMS-windows-x86_64.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload debug symbols
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fanta-windows-symbols-x86_64-${{ github.sha }}
+          path: target/x86_64-pc-windows-msvc/release/fanta-*.dbg.zip
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Summarize build
+        shell: bash
+        run: |
+          if [[ -s target/Fanta-x86_64.exe.sig ]]; then
+            update='It has an update signature, so installed copies can update to it in place.'
+          else
+            update='It has no update signature, so installed copies will not update to it in place.'
+          fi
+          printf '### Fanta for Windows (x86_64)\n\nUnsigned installer: Windows SmartScreen warns on first run. %s\n\nCommit: `%s`\n' "$update" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+  # The build proves the installer builds; this proves it installs, updates in place the way
+  # the app does and uninstalls. It packages the real update helper with stand-in app
+  # binaries, so it finishes in minutes instead of waiting for the app to build.
+  smoke-test:
+    name: Install, update in place and uninstall
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Allow long paths
+        run: git config --system core.longpaths true
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Rust 1.95
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup override set 1.95.0
+
+      - name: Install Inno Setup
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build the update helper
+        run: cargo build --release --locked -p auto_update_helper --target x86_64-pc-windows-msvc
+
+      - name: Package two installers with stand-in app binaries
+        run: |
+          $standInOut = "$PWD\target\x86_64-pc-windows-msvc\release"
+          # Replaces only the bundle script's `cargo build`; every other cargo call is real.
+          function global:cargo {
+            if ($args[0] -eq 'build') {
+              Copy-Item $env:STAND_IN_APP "$standInOut\fanta.exe" -Force
+              Copy-Item C:\Windows\System32\where.exe "$standInOut\cli.exe" -Force
+              'stand-in' | Set-Content "$standInOut\fanta.pdb"
+              'stand-in' | Set-Content "$standInOut\cli.pdb"
+              return
+            }
+            & cargo.exe @args
+          }
+          $env:STAND_IN_APP = "C:\Windows\System32\PING.EXE"
+          .\script\bundle-windows.ps1 -Architecture x86_64
+          if ($LASTEXITCODE -ne 0) { throw "bundling the first installer failed" }
+          Copy-Item target\Fanta-x86_64.exe "$env:RUNNER_TEMP\Fanta-v1.exe"
+          $env:STAND_IN_APP = "C:\Windows\System32\HOSTNAME.EXE"
+          .\script\bundle-windows.ps1 -Architecture x86_64
+          if ($LASTEXITCODE -ne 0) { throw "bundling the second installer failed" }
+          Copy-Item target\Fanta-x86_64.exe "$env:RUNNER_TEMP\Fanta-v2.exe"
+
+      - name: Install, update in place and uninstall
+        run: |
+          function Assert($condition, $message) {
+            if (-not $condition) { throw "FAILED: $message" }
+            Write-Output "ok: $message"
+          }
+          function Get-Sha256($path) { (Get-FileHash -Algorithm SHA256 $path).Hash }
+          $v1 = Get-Sha256 C:\Windows\System32\PING.EXE
+          $v2 = Get-Sha256 C:\Windows\System32\HOSTNAME.EXE
+          $app = "$env:LOCALAPPDATA\Programs\Fanta"
+
+          $p = Start-Process "$env:RUNNER_TEMP\Fanta-v1.exe" -ArgumentList '/verysilent', '/suppressmsgboxes', '/norestart', "/LOG=$env:RUNNER_TEMP\install.log" -Wait -PassThru
+          Assert ($p.ExitCode -eq 0) "the first version installs (exit $($p.ExitCode))"
+          foreach ($file in 'Fanta.exe', 'bin\fanta.exe', 'bin\fanta', 'tools\auto_update_helper.exe', 'conpty.dll', 'x64\OpenConsole.exe', 'arm64\OpenConsole.exe') {
+            Assert (Test-Path "$app\$file") "$file is installed"
+          }
+          Assert ((Get-Sha256 "$app\Fanta.exe") -eq $v1) "Fanta.exe is the first version"
+          Assert ((Get-ItemProperty 'HKCU:\Software\Classes\.fnx').'(default)' -eq 'Fanta.fnx') ".fnx opens with Fanta.fnx"
+          Assert ($null -ne (Get-ItemProperty 'HKCU:\Software\Classes\.fig\OpenWithProgids').'Fanta.fig') ".fig lists Fanta.fig under Open with"
+          Assert ($null -eq (Get-ItemProperty 'HKCU:\Software\Classes\.fig' -ErrorAction SilentlyContinue).'(default)') ".fig keeps its default app"
+          $command = (Get-ItemProperty 'HKCU:\Software\Classes\Fanta.fnx\shell\open\command').'(default)'
+          Assert ($command -eq "`"$app\Fanta.exe`" `"%1`"") ".fnx open command is $command"
+          Assert ((Get-ItemProperty 'HKCU:\Environment').Path -like "*$app\bin*") "bin is on the user PATH"
+
+          # An in-app update: the running app downloads the installer into updates\ and runs it
+          # with install_release_windows's arguments (crates/auto_update/src/auto_update.rs).
+          $running = Start-Process "$app\Fanta.exe" -ArgumentList '-n', '900', '127.0.0.1' -PassThru -WindowStyle Hidden
+          New-Item "$app\updates" -ItemType Directory -Force | Out-Null
+          Copy-Item "$env:RUNNER_TEMP\Fanta-v2.exe" "$app\updates\Fanta.exe"
+          $p = Start-Process "$app\updates\Fanta.exe" -ArgumentList '/verysilent', '/update=true', '/MERGETASKS=!desktopicon', "/LOG=$env:RUNNER_TEMP\update.log" -Wait -PassThru
+          Assert ($p.ExitCode -eq 0) "the update installer succeeds (exit $($p.ExitCode))"
+          Assert (-not $running.HasExited) "the update installer leaves the running app open"
+          Assert ((Get-Sha256 "$app\Fanta.exe") -eq $v1) "the running Fanta.exe is untouched"
+          Assert ((Get-Sha256 "$app\install\Fanta.exe") -eq $v2) "the new version is staged in install\"
+          Assert (Test-Path "$app\updates\versions.txt") "the installer wrote updates\versions.txt"
+
+          # Quitting runs the helper with --launch false (finalize_auto_update_on_quit).
+          Stop-Process -Id $running.Id
+          $running.WaitForExit()
+          $helper = Start-Process "$app\tools\auto_update_helper.exe" -ArgumentList '--launch', 'false' -PassThru
+          $finished = $helper.WaitForExit(120000)
+          Get-Content "$app\tools\auto_update_helper.log"
+          Assert $finished "the helper finishes"
+          Assert ($helper.ExitCode -eq 0) "the helper exits 0"
+          Assert ((Get-Sha256 "$app\Fanta.exe") -eq $v2) "Fanta.exe is the new version after the swap"
+          foreach ($dir in 'install', 'old', 'updates') {
+            Assert (-not (Test-Path "$app\$dir")) "$dir\ is cleaned up"
+          }
+          foreach ($file in 'bin\fanta.exe', 'bin\fanta', 'conpty.dll', 'x64\OpenConsole.exe', 'arm64\OpenConsole.exe') {
+            Assert (Test-Path "$app\$file") "$file survives the swap"
+          }
+
+          $p = Start-Process "$app\unins000.exe" -ArgumentList '/verysilent', '/suppressmsgboxes', '/norestart' -Wait -PassThru
+          Assert ($p.ExitCode -eq 0) "uninstall succeeds (exit $($p.ExitCode))"
+          # The uninstaller finishes from a copy of itself in %TEMP%.
+          Start-Sleep -Seconds 10
+          Assert (-not (Test-Path "$app\Fanta.exe")) "uninstall removes Fanta.exe"
+          Assert (-not (Test-Path 'HKCU:\Software\Classes\Fanta.fnx')) "uninstall removes the Fanta.fnx ProgID"
+          Assert (-not ((Get-ItemProperty 'HKCU:\Environment').Path -like "*$app\bin*")) "uninstall removes bin from PATH"
+
+      - name: Show installer logs
+        if: ${{ !cancelled() }}
+        run: |
+          foreach ($log in Get-ChildItem "$env:RUNNER_TEMP\*.log" -ErrorAction SilentlyContinue) {
+            Write-Output "===== $($log.Name)"
+            Get-Content $log.FullName
+          }
+
+  draft-release:
+    name: Add the installer to the draft release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, smoke-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # Each platform's release workflow uses this group, so they add to one draft in turn.
+    concurrency:
+      group: draft-release-${{ github.ref_name }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: fanta-windows-x86_64
+          path: release
+
+      - name: Upload to the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          assets=(release/Fanta-x86_64.exe release/SHA256SUMS-windows-x86_64.txt)
+          # The .sig is what installed copies check before updating in place.
+          if [[ -s release/Fanta-x86_64.exe.sig ]]; then
+            assets+=(release/Fanta-x86_64.exe.sig)
+          else
+            echo "::warning::Publishing the Windows installer without an update signature; installed copies won't update to it."
+          fi
+          script/upload-draft-release "$GITHUB_REF_NAME" "${assets[@]}"
