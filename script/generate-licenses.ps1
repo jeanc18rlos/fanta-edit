@@ -39,9 +39,15 @@ if ($needsInstall) {
 
 Write-Host "Generating cargo licenses"
 
-$failFlag = $env:ALLOW_MISSING_LICENSES ? "--fail" : ""
-$args = @('about', 'generate', $failFlag, '-c', 'script/licenses/fanta-licenses.toml', $templateFile, '-o', $outputFile) | Where-Object { $_ }
-cargo @args
+# As in script/generate-licenses: a crate without an accepted license fails the build unless
+# ALLOW_MISSING_LICENSES is set.
+$failFlag = $env:ALLOW_MISSING_LICENSES ? "" : "--fail"
+# cargo-about's -o replaces the file, which would drop the theme and icon licenses above.
+$codeLicenses = New-TemporaryFile
+$aboutArgs = @('about', 'generate', $failFlag, '-c', 'script/licenses/fanta-licenses.toml', $templateFile, '-o', $codeLicenses.FullName) | Where-Object { $_ }
+cargo @aboutArgs
+Get-Content $codeLicenses.FullName | Add-Content -Path $outputFile
+Remove-Item $codeLicenses.FullName
 
 Write-Host "Applying replacements"
 $replacements = @{
