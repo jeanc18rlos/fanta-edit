@@ -4,7 +4,9 @@ $PSNativeCommandUseErrorActionPreference = $true
 $CARGO_ABOUT_VERSION="0.8.2"
 $outputFile=$args[0] ? $args[0] : "$(Get-Location)/assets/licenses.md"
 $templateFile="script/licenses/template.md.hbs"
-$metadata = cargo metadata --format-version 1 --locked | ConvertFrom-Json
+# Some crates have features whose names differ only in case (USB and usb), which
+# ConvertFrom-Json rejects unless it builds case-sensitive hashtables.
+$metadata = cargo metadata --format-version 1 --locked | ConvertFrom-Json -AsHashtable
 if ($LASTEXITCODE -ne 0) { throw "Cargo metadata failed" }
 $assetPackage = $metadata.packages | Where-Object { $_.name -eq 'fanta-gpui-zed-ui-assets' } | Select-Object -First 1
 if (-not $assetPackage) { throw "fanta-gpui-zed-ui-assets is missing from Cargo metadata" }
