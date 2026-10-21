@@ -2,7 +2,10 @@ use std::{
     ffi::OsStr,
     os::windows::ffi::OsStrExt,
     path::Path,
-    sync::LazyLock,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -43,21 +46,29 @@ impl Job {
     }
 
     pub fn mkdir_if_exists(name: &'static Path, check: &'static Path) -> Self {
+        // An install already has x64 and arm64, and the earlier jobs' rollbacks move
+        // OpenConsole.exe back into them, so rollback removes only a directory this job created.
+        let created = Arc::new(AtomicBool::new(false));
         Job {
-            apply: Box::new(move |app_dir| {
-                let dir = app_dir.join(name);
-                let check = app_dir.join(check);
+            apply: Box::new({
+                let created = created.clone();
+                move |app_dir| {
+                    let dir = app_dir.join(name);
+                    let check = app_dir.join(check);
 
-                if check.exists() {
-                    std::fs::create_dir_all(&dir)
-                        .context(format!("Failed to create directory {}", dir.display()))?
+                    let create = check.exists() && !dir.exists();
+                    if create {
+                        std::fs::create_dir_all(&dir)
+                            .context(format!("Failed to create directory {}", dir.display()))?
+                    }
+                    created.store(create, Ordering::SeqCst);
+                    Ok(())
                 }
-                Ok(())
             }),
             rollback: Box::new(move |app_dir| {
                 let dir = app_dir.join(name);
 
-                if dir.exists() {
+                if created.load(Ordering::SeqCst) && dir.exists() {
                     std::fs::remove_dir_all(&dir)
                         .context(format!("Failed to remove directory {}", dir.display()))?
                 }
@@ -435,7 +446,28 @@ pub(crate) fn perform_update(app_dir: &Path, hwnd: Option<isize>, launch: bool) 
 
 #[cfg(test)]
 mod test {
-    use super::perform_update;
+    use std::path::Path;
+
+    use super::{Job, perform_update};
+
+    #[test]
+    fn test_mkdir_if_exists_rollback_keeps_an_existing_directory() {
+        let app_dir = tempfile::tempdir().unwrap();
+        let app_dir = app_dir.path();
+        std::fs::create_dir_all(app_dir.join("x64")).unwrap();
+        std::fs::create_dir_all(app_dir.join("install\\x64")).unwrap();
+
+        let existing = Job::mkdir_if_exists(Path::new("x64"), Path::new("install\\x64"));
+        (existing.apply)(app_dir).unwrap();
+        (existing.rollback)(app_dir).unwrap();
+        assert!(app_dir.join("x64").is_dir());
+
+        let created = Job::mkdir_if_exists(Path::new("arm64"), Path::new("install\\x64"));
+        (created.apply)(app_dir).unwrap();
+        assert!(app_dir.join("arm64").is_dir());
+        (created.rollback)(app_dir).unwrap();
+        assert!(!app_dir.join("arm64").exists());
+    }
 
     #[test]
     fn test_perform_update() {
