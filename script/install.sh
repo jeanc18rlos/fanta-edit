@@ -138,6 +138,21 @@ linux() {
     fi
     sed -i "s|Icon=fanta|Icon=$HOME/.local/fanta$suffix.app/share/icons/hicolor/512x512/apps/fanta.png|g" "${desktop_file_path}"
     sed -i "s|Exec=fanta|Exec=$HOME/.local/fanta$suffix.app/bin/fanta|g" "${desktop_file_path}"
+
+    # Register the .fnx and .fig file types, then the desktop entry that opens them
+    mime_file="$HOME/.local/fanta$suffix.app/share/mime/packages/${appid}.xml"
+    if [ -f "$mime_file" ]; then
+        mkdir -p "$HOME/.local/share/mime/packages"
+        cp "$mime_file" "$HOME/.local/share/mime/packages/${appid}.xml"
+        if command -v update-mime-database >/dev/null 2>&1; then
+            update-mime-database "$HOME/.local/share/mime" ||
+                echo "Could not update the MIME database, so .fnx and .fig files may not open in Fanta."
+        fi
+    fi
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$HOME/.local/share/applications" ||
+            echo "Could not update the desktop database, so Fanta may be missing from 'Open With' menus."
+    fi
 }
 
 macos() {

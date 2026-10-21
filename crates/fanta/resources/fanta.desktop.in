@@ -2,20 +2,18 @@
 Version=1.0
 Type=Application
 Name=$APP_NAME
-GenericName=Text Editor
-Comment=A high-performance, multiplayer code editor.
+GenericName=Design Editor
+Comment=An agent-native design editor
 TryExec=$APP_CLI
 StartupNotify=$DO_STARTUP_NOTIFY
 Exec=$APP_CLI $APP_ARGS
 Icon=$APP_ICON
-Categories=Utility;TextEditor;Development;IDE;
-Keywords=fanta;
-# To add Fanta to "Open Folder With..." context menu, add `inode/directory` to the MimeType field (semicolon separated)
-# Arch linux users have reported this setting Fanta as default file browser. See upstream PR #39076 and related issues.
-# If this happens to you, an unconfirmed fix may be to install Arch's `gnome-defaults-list` package.
-MimeType=text/plain;application/x-zerosize;x-scheme-handler/fanta;
-Actions=NewWorkspace;
+Categories=Graphics;VectorGraphics;Development;GUIDesigner;
+Keywords=fanta;design;figma;fig;fnx;prototype;ui;ux;
+# fanta-mime.xml defines the .fnx and .fig types.
+MimeType=text/x-fanta-fnx;application/x-figma;x-scheme-handler/fanta;
+Actions=NewWindow;
 
-[Desktop Action NewWorkspace]
+[Desktop Action NewWindow]
 Exec=$APP_CLI --new $APP_ARGS
-Name=Open a new workspace
+Name=New Window

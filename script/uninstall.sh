@@ -88,6 +88,19 @@ linux() {
 
     # Remove the .desktop file
     rm -f "$HOME/.local/share/applications/${appid}.desktop"
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database "$HOME/.local/share/applications" ||
+            echo "Could not update the desktop database."
+    fi
+
+    # Remove the file types install.sh registered
+    if [ -f "$HOME/.local/share/mime/packages/${appid}.xml" ]; then
+        rm -f "$HOME/.local/share/mime/packages/${appid}.xml"
+        if command -v update-mime-database >/dev/null 2>&1; then
+            update-mime-database "$HOME/.local/share/mime" ||
+                echo "Could not update the MIME database."
+        fi
+    fi
 
     # Remove the database directory for this channel
     rm -rf "$HOME/.local/share/fanta/db/0-$db_suffix"
