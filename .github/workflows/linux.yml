@@ -1,0 +1,61 @@
+name: Linux
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/linux.yml'
+      - '.cargo/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'assets/**'
+      - 'crates/**'
+      - 'script/linux'
+      - 'vendor/**'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  RUST_BACKTRACE: '1'
+
+jobs:
+  linux:
+    name: Check on Linux
+    # The release builds on 22.04 for its glibc 2.35 floor; check against the same system.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Install Linux dependencies
+        run: ./script/linux
+
+      - name: Install Rust 1.95
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component clippy --component rustfmt
+          rustup override set 1.95.0
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: fanta-linux-rust-1.95
+          cache-on-failure: true
+
+      - name: Check release scripts
+        run: bash -n script/bundle-linux script/install.sh script/linux
+
+      # --keep-going reports every crate that fails, not just the first.
+      - name: Check the app and command-line tool
+        run: cargo check --locked --keep-going -p fanta -p cli
