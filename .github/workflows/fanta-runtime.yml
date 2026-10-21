@@ -62,6 +62,7 @@ jobs:
           cargo test --locked --no-fail-fast -p fanta-bundle -p fanta-doc -p fanta-fnx -p fanta-format -p fanta-present -p fanta-render -p fanta-text -p fanta-runtime --lib
           cargo test --locked -p fanta-format --test runtime_project
           cargo check --locked -p fanta-format --no-default-features
+          cargo check --locked -p fanta-bundle
           cargo build --locked -p fanta-runtime --example playback_fixture
           cargo test --locked -p fanta-site
           cargo check --locked -p fanta-site

@@ -19,9 +19,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 sha2 = "0.10"
 thiserror.workspace = true
-# `deflate-flate2` alone: the `deflate` umbrella also links zopfli, an encoder
-# the runtime never uses.
-zip = { version = "2", default-features = false, features = ["deflate-flate2"] }
+# `deflate` is the smallest feature that enables the flate2 inflate backend:
+# `deflate-flate2` alone references flate2 without turning the dependency on,
+# which only compiles when another crate in the graph (fanta-text on native
+# targets) enables it. The WebAssembly runtime has no such crate. zopfli comes
+# along but is unreachable from the player and drops out at link time.
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(target_arch = "aarch64")'.dependencies]
 # sha2 0.10 selects its runtime-detected ARM SHA instructions only with `asm`.
