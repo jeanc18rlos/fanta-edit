@@ -582,3 +582,130 @@ fn native_scoped_sessions_keep_the_shared_style_registry_on_open_and_save() {
         );
     }
 }
+
+fn source_bundle(directory: &Path) -> SourceBundle {
+    let mut source = SourceBundle::default();
+    collect_files(directory, directory, &mut source.files).expect("project bytes");
+    source
+}
+
+#[test]
+fn finder_metadata_in_assets_is_skipped_like_the_native_reader() {
+    let (document, resources) = mixed_document();
+    let directory = tempfile::tempdir().expect("project directory");
+    fanta_format::write_project_tree(directory.path(), &document, &resources)
+        .expect("save native project");
+    // Finder leaves `.DS_Store` in every folder a person opens, and copies on
+    // non-Mac volumes gain `._` AppleDouble twins of each file.
+    let mut folders = vec![directory.path().join("assets")];
+    let mut metadata = Vec::new();
+    while let Some(folder) = folders.pop() {
+        metadata.push(folder.join(".DS_Store"));
+        for entry in std::fs::read_dir(&folder).expect("asset folder") {
+            let path = entry.expect("asset entry").path();
+            if path.is_dir() {
+                folders.push(path);
+            } else if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                metadata.push(path.with_file_name(format!("._{name}")));
+            }
+        }
+    }
+    assert!(
+        metadata.len() > 2,
+        "the fixture has asset files: {metadata:?}"
+    );
+    for path in &metadata {
+        std::fs::write(path, b"\0\0\0\x01Bud1").expect("finder metadata");
+    }
+
+    let (opened, opened_resources) =
+        fanta_format::read_project_tree(directory.path()).expect("native open");
+    assert_eq!(opened_resources, resources);
+    let compiled =
+        RuntimeProgram::compile(&source_bundle(directory.path())).expect("portable compilation");
+    assert_eq!(compiled.resources(), &resources);
+    assert_eq!(
+        compiled
+            .document()
+            .to_authored_json_value()
+            .expect("portable authored"),
+        opened.to_authored_json_value().expect("native authored")
+    );
+}
+
+#[test]
+fn outgrown_identity_sidecars_mint_the_ids_the_native_reader_mints() {
+    let mut document = Doc::new();
+    document.id = DocId::from_u128(9);
+    document.metadata.created_at = 0;
+    document.metadata.modified_at = 0;
+    let page = node(
+        &mut document,
+        9000,
+        None,
+        NodeData::Group(GroupNode::default()),
+    );
+    document.add_page(page);
+    node(
+        &mut document,
+        9001,
+        Some(page),
+        NodeData::Group(GroupNode {
+            clip_size: Some([100.0, 50.0]),
+            ..GroupNode::default()
+        }),
+    );
+    let directory = tempfile::tempdir().expect("project directory");
+    fanta_format::write_project_tree(directory.path(), &document, &BTreeMap::new())
+        .expect("save native project");
+    // Source rewritten outside Fanta, as an agent would: new layers carry no
+    // ids, and the sidecar still lists only the page.
+    let source = fanta_format::locate_page_source(directory.path(), page).expect("page source");
+    std::fs::write(
+        &source,
+        format!(
+            r#"<Frame id="{}" name="Home">
+  <Frame name="Hero" x={{0}} y={{0}} width={{320}} height={{200}}>
+    <Frame name="Badge" x={{8}} y={{8}} width={{40}} height={{20}} />
+  </Frame>
+  <Frame name="Footer" x={{0}} y={{240}} width={{320}} height={{40}} />
+</Frame>"#,
+            page.0
+        ),
+    )
+    .expect("edited source");
+    std::fs::write(
+        source.with_file_name("page.ids.json"),
+        serde_json::to_vec(&json!({
+            "ids": [{"id": page.0.to_string(), "index": 1.0, "name": "Home", "tag": "Frame"}]
+        }))
+        .expect("sidecar JSON"),
+    )
+    .expect("outgrown sidecar");
+
+    let (opened, _) = fanta_format::read_project_tree(directory.path()).expect("native open");
+    let layers: Vec<_> = opened
+        .scene
+        .descendants_of(page)
+        .filter_map(|id| opened.scene.get(id))
+        .map(|node| node.name.as_str())
+        .collect();
+    assert_eq!(layers, ["Home", "Hero", "Badge", "Footer"]);
+    let source = source_bundle(directory.path());
+    let compiled = RuntimeProgram::compile(&source).expect("portable compilation");
+    assert_eq!(
+        compiled
+            .document()
+            .to_authored_json_value()
+            .expect("portable authored"),
+        opened.to_authored_json_value().expect("native authored")
+    );
+    assert_eq!(
+        RuntimeProgram::compile(&source)
+            .expect("repeat compilation")
+            .to_bundle()
+            .expect("repeat bundle"),
+        compiled.to_bundle().expect("bundle"),
+        "minted ids are deterministic"
+    );
+}

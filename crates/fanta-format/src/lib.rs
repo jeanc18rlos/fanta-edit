@@ -53,6 +53,7 @@ mod migrate;
 #[cfg(feature = "native")]
 mod project;
 pub mod runtime;
+mod sidecar;
 
 #[cfg(feature = "native")]
 pub use container::{FantaFile, asset_id_for_bytes};
