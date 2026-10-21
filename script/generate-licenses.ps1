@@ -15,11 +15,11 @@ $assetDirectory = Join-Path (Split-Path $assetPackage.manifest_path) 'assets'
 New-Item -Path "$outputFile" -ItemType File -Value "" -Force
 
 @(
-    "# ###### THEME LICENSES ######\n"
+    "# ###### THEME LICENSES ######`n"
     Get-Content (Join-Path $assetDirectory 'themes/LICENSES')
-    "\n# ###### ICON LICENSES ######\n"
+    "`n# ###### ICON LICENSES ######`n"
     Get-Content (Join-Path $assetDirectory 'icons/LICENSES')
-    "\n# ###### CODE LICENSES ######\n"
+    "`n# ###### CODE LICENSES ######`n"
 ) | Add-Content -Path $outputFile
 
 $needsInstall = $false
