@@ -43,4 +43,5 @@ Workflow "Build Windows release" (`.github/workflows/release-windows.yml`) runs 
 - The installer, `Fanta-x86_64.exe`, is not Authenticode-signed (`FANTA_WINDOWS_SIGN=1` turns signing on once Azure Trusted Signing is set up), so SmartScreen warns on first run.
 - Tag and dispatch builds sign `Fanta-x86_64.exe.sig` for in-app updates. Without the `FANTA_UPDATE_SIGNING_KEY` secret the step only warns, and installed copies will not update to that build.
 - Artifacts: `fanta-windows-x86_64` (installer, `.sig`, `SHA256SUMS-windows-x86_64.txt`) and `fanta-windows-symbols-x86_64-<commit>` (PDBs, kept 90 days).
+- The `smoke-test` job installs, updates in place and uninstalls an installer built from the real update helper and stand-in app binaries, in about 20 minutes. When the bundle script, `fanta.iss` or the helper change, read it first: the full build takes hours.
 - Every platform adds its assets to the tag's one draft through `script/upload-draft-release`, in the concurrency group `draft-release-<tag>`. Don't call `gh release create` for a tag directly: GitHub allows several drafts with the same tag.
