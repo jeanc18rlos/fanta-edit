@@ -29,8 +29,13 @@ use project::{Project, ProjectPath};
 use sha2::{Digest as _, Sha256};
 use worktree::{PathChange, ProjectEntryId, UpdatedEntriesSet, WorktreeId};
 
-#[path = "document_layout.rs"]
-mod layout;
+use fanta_headless::layout;
+use fanta_headless::pages::{default_page_root, visible_page_roots};
+use fanta_headless::render::{decode_embedded_image, embedded_image_size};
+pub(crate) use fanta_headless::render::{page_bounds, try_page_bounds};
+use fanta_headless::save::{
+    changed_artifact_ids, changed_artifact_ids_from_baseline, extend_artifact_owners,
+};
 
 /// How long to let a burst of external writes (an agent rewriting several
 /// project files) settle before reloading from disk.
@@ -746,14 +751,8 @@ impl FigDocument {
                     .map(|definition| definition.root),
             )
             .collect();
-        let roots = layout::pending_roots(&doc);
-        let operations = layout::geometry_operations(&doc, &roots);
-        let pending_layout_output_nodes = match layout::apply_without_history(&mut doc, operations)
-        {
-            Ok(changed) => {
-                doc.pending_layout.clear();
-                changed
-            }
+        let pending_layout_output_nodes = match layout::solve_pending(&mut doc) {
+            Ok(changed) => changed,
             Err(error) => {
                 log::error!("computing omitted source geometry: {error:#}");
                 BTreeSet::new()
@@ -1055,22 +1054,10 @@ impl FigDocument {
         if self.doc.pages().is_empty() {
             return Ok(None);
         }
-        let mut node =
-            fanta_doc::CanvasNode::new(fanta_doc::NodeData::Group(fanta_doc::GroupNode::default()));
-        node.name = format!("Page {}", visible_page_roots(&self.doc).len() + 1);
-        node.index = self.doc.scene.next_root_index();
-        let root = node.id;
-        let old_pages = self.doc.pages().to_vec();
-        let mut new_pages = old_pages.clone();
-        new_pages.push(root);
-        let index = new_pages.len() - 1;
-        let registry = Operation::SetPageRegistry {
-            old_pages,
-            new_pages,
-            old_active_page: self.doc.active_page(),
-            new_active_page: Some(root),
-        };
-        self.apply_page_transaction("Add Page", vec![Operation::create_node(node), registry])?;
+        let name = format!("Page {}", visible_page_roots(&self.doc).len() + 1);
+        let (_, operations) = fanta_headless::pages::add_page_operations(&self.doc, name);
+        let index = self.doc.pages().len();
+        self.apply_page_transaction("Add Page", operations)?;
         Ok(Some(index))
     }
 
@@ -1333,33 +1320,19 @@ impl FigDocument {
     /// Recompute only the layout islands whose inputs changed, retaining the
     /// imported geometry of every unaffected island.
     fn resolve_after_edit(&mut self, page_root: Option<NodeId>) {
-        let roots = self.layout_state.changed_roots(&self.doc);
-        let operations = layout::geometry_operations(&self.doc, &roots);
-        if !operations.is_empty() {
-            let generation = self.doc.history.edit_generation();
-            let result = if generation != self.layout_state.history_generation {
-                self.doc
-                    .apply_derived_operations(operations, generation)
-                    .map_err(anyhow::Error::from)
-            } else {
-                layout::apply_without_history(&mut self.doc, operations).map(|_| ())
-            };
-            if let Err(error) = result {
-                log::error!("applying computed layout: {error:#}");
-                return;
-            }
+        if let Err(error) = layout::settle(&mut self.doc, &mut self.layout_state) {
+            log::error!("applying computed layout: {error:#}");
+            return;
         }
-        self.refresh_layout_baseline();
-        if let Some(index) = self.page_index_for_root(page_root) {
-            self.refresh_page_bounds(index);
+        for root in [self.doc.active_page(), page_root] {
+            if let Some(index) = self.page_index_for_root(root) {
+                self.refresh_page_bounds(index);
+            }
         }
     }
 
     pub(crate) fn refresh_layout_baseline(&mut self) {
-        if let Err(error) = self.layout_state.refresh(&self.doc) {
-            log::error!("refreshing layout inputs: {error:#}");
-            self.layout_state = layout::LayoutState::new(&self.doc);
-        }
+        self.layout_state.catch_up(&self.doc);
         if let Some(index) = self.page_index_for_root(self.doc.active_page()) {
             self.refresh_page_bounds(index);
         }
@@ -4593,183 +4566,6 @@ fn watcher_directory_matches_hashes(
     expected_children.is_empty()
 }
 
-fn all_artifact_ids(document: &Doc) -> BTreeSet<fanta_format::ArtifactId> {
-    document
-        .pages()
-        .iter()
-        .copied()
-        .map(fanta_format::ArtifactId::Page)
-        .chain(
-            document
-                .components
-                .defs
-                .keys()
-                .copied()
-                .map(fanta_format::ArtifactId::Component),
-        )
-        .collect()
-}
-
-fn changed_artifact_ids(
-    document: &Doc,
-    base: Option<&Doc>,
-    watermark: Option<(u64, u64)>,
-) -> BTreeSet<fanta_format::ArtifactId> {
-    let Some((instance, revision)) = watermark else {
-        return all_artifact_ids(document);
-    };
-    if instance != document.scene.instance_id() {
-        return all_artifact_ids(document);
-    }
-    changed_artifact_ids_from_baseline(document, base, document.scene.changes_since(revision))
-}
-
-fn changed_artifact_ids_from_baseline(
-    document: &Doc,
-    base: Option<&Doc>,
-    scene_delta: Option<fanta_doc::scene::SceneDelta>,
-) -> BTreeSet<fanta_format::ArtifactId> {
-    let all = || all_artifact_ids(document);
-    let Some(base) = base else {
-        return all();
-    };
-    if base.pages() != document.pages()
-        || base.variables != document.variables
-        || base.active_modes != document.active_modes
-        || base.components.sets != document.components.sets
-        || base.components.defs.len() != document.components.defs.len()
-    {
-        return all();
-    }
-    let mut changed = BTreeSet::new();
-    for (id, definition) in &document.components.defs {
-        let Some(previous) = base.components.defs.get(id) else {
-            return all();
-        };
-        if previous == definition {
-            continue;
-        }
-        // Master edits bump expansion revisions without changing reference names.
-        // They do not require retaining source/IR sessions for unrelated masters.
-        let mut previous = previous.clone();
-        previous.rev = definition.rev;
-        previous.preview_rev = definition.preview_rev;
-        if &previous != definition {
-            return all();
-        }
-        changed.insert(fanta_format::ArtifactId::Component(*id));
-    }
-    if let Some(delta) = scene_delta {
-        extend_artifact_owners(
-            document,
-            &mut changed,
-            delta.nodes.into_iter().chain(delta.transforms),
-        );
-    } else {
-        // Master placement and registry changes can affect source ownership
-        // outside a changed subtree; retain the conservative path for them.
-        for definition in document.components.defs.values() {
-            match (
-                base.scene.get(definition.root),
-                document.scene.get(definition.root),
-            ) {
-                (Some(previous), Some(current))
-                    if previous.parent == current.parent && previous.index == current.index => {}
-                _ => return all(),
-            }
-        }
-        let Some(previous_nodes) = changed_structural_nodes(base, document) else {
-            return all();
-        };
-        let Some(current_nodes) = changed_structural_nodes(document, base) else {
-            return all();
-        };
-        // Deleted and moved layers still belong to their previous source as
-        // well as their destination. Only looking at the live scene misses it.
-        extend_artifact_owners(base, &mut changed, previous_nodes);
-        extend_artifact_owners(document, &mut changed, current_nodes);
-    }
-    changed
-}
-
-fn changed_structural_nodes(document: &Doc, other: &Doc) -> Option<Vec<NodeId>> {
-    let artifact_roots: HashSet<_> = document
-        .pages()
-        .iter()
-        .copied()
-        .chain(
-            document
-                .components
-                .defs
-                .values()
-                .map(|definition| definition.root),
-        )
-        .collect();
-    if artifact_roots
-        .iter()
-        .any(|root| !document.scene.contains(*root))
-    {
-        return None;
-    }
-    let mut pending = Vec::new();
-    for root in document.scene.roots() {
-        if !artifact_roots.contains(root) {
-            return None;
-        }
-        pending.push((*root, None));
-    }
-    let mut visited = HashSet::with_capacity(document.scene.len());
-    let mut changed = Vec::new();
-    while let Some((id, parent)) = pending.pop() {
-        let node = document.scene.get(id)?;
-        if node.id != id || node.parent != parent || !visited.insert(id) {
-            return None;
-        }
-        if !document.scene.shares_node(&other.scene, id) {
-            changed.push(id);
-        }
-        if !node.can_have_children() && !document.scene.children_of(Some(id)).is_empty() {
-            return None;
-        }
-        pending.extend(
-            document
-                .scene
-                .children_of(Some(id))
-                .iter()
-                .map(|child| (*child, Some(id))),
-        );
-    }
-    (visited.len() == document.scene.len()).then_some(changed)
-}
-
-fn extend_artifact_owners(
-    document: &Doc,
-    changed: &mut BTreeSet<fanta_format::ArtifactId>,
-    nodes: impl IntoIterator<Item = NodeId>,
-) {
-    let component_roots: HashMap<NodeId, fanta_doc::ComponentId> = document
-        .components
-        .defs
-        .iter()
-        .map(|(id, definition)| (definition.root, *id))
-        .collect();
-    let page_roots: HashSet<NodeId> = document.pages().iter().copied().collect();
-    for node in nodes {
-        let mut current = Some(node);
-        while let Some(id) = current {
-            if let Some(component) = component_roots.get(&id) {
-                changed.insert(fanta_format::ArtifactId::Component(*component));
-                break;
-            }
-            if page_roots.contains(&id) {
-                changed.insert(fanta_format::ArtifactId::Page(id));
-                break;
-            }
-            current = document.scene.get(id).and_then(|node| node.parent);
-        }
-    }
-}
-
 fn is_fanta_manifest(path: &Path) -> bool {
     path.file_name()
         .is_some_and(|name| name.eq_ignore_ascii_case("fanta.json"))
@@ -5034,42 +4830,6 @@ fn load_changed_project_document(
     Ok(Some((document, session)))
 }
 
-fn visible_page_roots(doc: &Doc) -> Vec<NodeId> {
-    doc.pages()
-        .iter()
-        .copied()
-        .filter(|page| {
-            doc.scene
-                .get(*page)
-                .and_then(|node| node.meta.get("hidden_page"))
-                .and_then(|value| value.as_bool())
-                != Some(true)
-        })
-        .collect()
-}
-
-fn default_page_root(doc: &Doc, visible_page_roots: &[NodeId]) -> Option<NodeId> {
-    if visible_page_roots.is_empty() {
-        return None;
-    }
-
-    let active_page = doc
-        .active_page()
-        .filter(|page| visible_page_roots.contains(page));
-    if let Some(active_page) = active_page
-        && page_content_area(doc, Some(active_page)) > 1.0
-    {
-        return Some(active_page);
-    }
-
-    visible_page_roots
-        .iter()
-        .copied()
-        .map(|root| (root, page_content_area(doc, Some(root))))
-        .max_by(|(_, left_area), (_, right_area)| left_area.total_cmp(right_area))
-        .map(|(root, _)| root)
-}
-
 fn collect_pages(
     doc: &Doc,
     registry: &PageRegistryIndex,
@@ -5130,81 +4890,6 @@ fn update_page_metadata(
     }
     page.hidden = hidden;
     changed
-}
-
-fn page_content_area(doc: &Doc, page_root: Option<NodeId>) -> f64 {
-    try_page_bounds(doc, page_root)
-        .map(|bounds| bounds.width() * bounds.height())
-        .unwrap_or(0.0)
-}
-
-pub(crate) fn page_bounds(doc: &Doc, page_root: Option<NodeId>) -> fanta_doc::Bounds {
-    try_page_bounds(doc, page_root)
-        .unwrap_or_else(|| fanta_doc::Bounds::from_xywh(0.0, 0.0, 1024.0, 768.0))
-}
-
-pub(crate) fn try_page_bounds(doc: &Doc, page_root: Option<NodeId>) -> Option<fanta_doc::Bounds> {
-    let mut bounds: Option<fanta_doc::Bounds> = None;
-    let mut include = |node_id| {
-        if let Some(node_bounds) = doc.scene.world_bounds(node_id)
-            && node_bounds.is_finite()
-            && node_bounds.width() > 0.0
-            && node_bounds.height() > 0.0
-        {
-            bounds = Some(match bounds {
-                Some(bounds) => bounds.union(&node_bounds),
-                None => node_bounds,
-            });
-        }
-    };
-
-    if let Some(page_root) = page_root {
-        for node_id in doc.scene.descendants_of(page_root) {
-            if node_id != page_root {
-                include(node_id);
-            }
-        }
-    } else {
-        for root in doc.scene.roots() {
-            for node_id in doc.scene.descendants_of(*root) {
-                include(node_id);
-            }
-        }
-    }
-
-    bounds
-}
-
-/// Decode one embedded asset to the straight-alpha RGBA8 the canvas renderer
-/// draws. Installed in the document's [`LazyAssetResolver`], which calls it
-/// the first time an image is drawn (or prewarmed) and remembers a failure
-/// so a corrupt asset is logged once, not once per frame.
-fn decode_embedded_image(asset_id: AssetId, bytes: &[u8]) -> Option<DecodedImage> {
-    match image::load_from_memory(bytes) {
-        Ok(image) => {
-            // `into_rgba8` moves an RGBA8 decode instead of cloning it, so the
-            // copy into the shared buffer is the only one made.
-            let image = image.into_rgba8();
-            let (width, height) = image.dimensions();
-            Some(DecodedImage::new(image.as_raw(), width, height))
-        }
-        Err(error) => {
-            log::warn!("failed to decode embedded .fig image asset {asset_id}: {error}");
-            None
-        }
-    }
-}
-
-/// An embedded image's natural size, read from its header. The canvas picks
-/// the level to decode from it before decoding anything, and Skia, which the
-/// resolver reads sizes with by default, is built without WebP.
-fn embedded_image_size(bytes: &[u8]) -> Option<[u32; 2]> {
-    let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
-        .with_guessed_format()
-        .ok()?
-        .into_dimensions()
-        .ok()?;
-    Some([width, height])
 }
 
 /// The image assets drawn somewhere under `page_root`: every bitmap's asset,

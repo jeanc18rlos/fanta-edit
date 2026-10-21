@@ -15,8 +15,17 @@ doctest = false
 anyhow.workspace = true
 fanta-design-ops.workspace = true
 fanta-doc.workspace = true
+fanta-format.workspace = true
+fanta-render.workspace = true
+glam.workspace = true
+image.workspace = true
+log.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

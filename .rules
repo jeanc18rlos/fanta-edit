@@ -25,6 +25,7 @@ Crate rules record traps that earlier changes hit. Claude Code loads them when i
 - `crates/fanta-format/AGENTS.md`
 - `crates/fanta-fnx/AGENTS.md`
 - `crates/fanta-render/AGENTS.md`
+- `crates/fanta-headless/AGENTS.md`
 - `crates/design_surface/AGENTS.md`: also covers `crates/fanta-design-ops` (linked there), `crates/agent/src/tools/design_*`, `fig_viewer`'s `agent_surface.rs` and `live_mcp.rs`, and the guide seeded into new projects
 - `docs/AGENTS.md`: writing docs
 

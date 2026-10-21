@@ -4409,6 +4409,7 @@ dependencies = [
  "clap",
  "fanta-design-ops",
  "fanta-doc",
+ "fanta-format",
  "fanta-headless",
  "serde",
  "serde_json",
@@ -5241,8 +5242,15 @@ dependencies = [
  "anyhow",
  "fanta-design-ops",
  "fanta-doc",
+ "fanta-format",
+ "fanta-render",
+ "glam 0.32.1",
+ "image",
+ "log",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
@@ -5510,6 +5518,7 @@ dependencies = [
  "fanta-gpui-ui-input",
  "fanta-gpui-util",
  "fanta-gpui-zlog",
+ "fanta-headless",
  "fanta-present",
  "fanta-render",
  "fanta-text",

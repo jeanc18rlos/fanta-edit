@@ -1,7 +1,7 @@
 //! The `style` projection agents read nodes through (`batch_get` /
 //! `design_state` with `detail: "style"`, and by id by default).
 //!
-//! It speaks the vocabulary of the ops agents write with (`design_surface::DesignOp`):
+//! It speaks the vocabulary of the ops agents write with (`fanta_design_ops::DesignOp`):
 //! a value read here can be sent back unchanged — `auto_layout` takes the
 //! fields of `set_auto_layout`, `fills` the paints of `set_fill`, `effects`
 //! the layers of `set_effects`, and so on. The raw node record (`detail:
@@ -17,7 +17,7 @@ use fanta_doc::{
 use serde_json::{Map, Value, json};
 
 /// The style of `id`, or `null` when the node does not exist.
-pub(crate) fn node_style(doc: &Doc, id: NodeId) -> Value {
+pub fn node_style(doc: &Doc, id: NodeId) -> Value {
     let Some(node) = doc.scene.get(id) else {
         return Value::Null;
     };
@@ -30,10 +30,7 @@ pub(crate) fn node_style(doc: &Doc, id: NodeId) -> Value {
         json!(node.parent.map(|parent| parent.to_string())),
     );
     // World bounds: the same space `set_props` x/y/width/height write in.
-    style.insert(
-        "bounds".into(),
-        crate::agent_surface::world_bounds_json(doc, id),
-    );
+    style.insert("bounds".into(), crate::scene::world_bounds_json(doc, id));
     let [a, b, ..] = node.transform.to_components();
     let rotation = b.atan2(a).to_degrees();
     if rotation.abs() > 1e-6 {
@@ -112,7 +109,7 @@ pub(crate) fn node_style(doc: &Doc, id: NodeId) -> Value {
 /// `node_summary` builds), so each entry is one flat node: the listing's own
 /// keys plus its style. Style wins where both name a key (`auto_layout` grows
 /// from the mode string to the full layout); the listing's `fill` hex stays.
-pub(crate) fn attach_styles(doc: &Doc, listing: &mut Value) {
+pub fn attach_styles(doc: &Doc, listing: &mut Value) {
     let Some(object) = listing.as_object_mut() else {
         return;
     };
