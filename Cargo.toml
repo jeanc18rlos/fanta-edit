@@ -40,6 +40,7 @@ members = [
     "crates/extension",
     "crates/feature_flags",
     "crates/feature_flags_macros",
+    "crates/fanta-bundle",
     "crates/fanta-canvas",
     "crates/fanta-design-ops",
     "crates/fanta-doc",
@@ -261,6 +262,7 @@ fanta-fig-interop = { path = "crates/fanta-fig-interop" }
 fanta-fnx = { path = "crates/fanta-fnx" }
 fanta-format = { path = "crates/fanta-format" }
 fanta-headless = { path = "crates/fanta-headless" }
+fanta-bundle = { path = "crates/fanta-bundle" }
 fanta-canvas = { path = "crates/fanta-canvas" }
 fanta-present = { path = "crates/fanta-present" }
 fanta-render = { path = "crates/fanta-render" }

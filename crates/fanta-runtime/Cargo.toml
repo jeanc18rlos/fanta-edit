@@ -14,8 +14,8 @@ name = "fanta-runtime-wasm"
 path = "src/wasm.rs"
 
 [dependencies]
+fanta-bundle.workspace = true
 fanta-doc.workspace = true
-fanta-format = { path = "../fanta-format", default-features = false }
 fanta-present.workspace = true
 fanta-render.workspace = true
 fanta-text.workspace = true
@@ -23,6 +23,12 @@ glam.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+
+# The source compiler stays out of the runtime: tests and the parity fixture
+# compile fixtures natively, then load the bundle like any host would.
+[dev-dependencies]
+base64.workspace = true
+fanta-format.workspace = true
 
 [target.'cfg(target_os = "emscripten")'.dependencies]
 skia-safe = { workspace = true, features = ["gl"] }

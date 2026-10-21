@@ -4,11 +4,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use fanta_bundle::RuntimeProgram;
 use fanta_doc::{
     AnimationClipId, AssetId, BoundProp, MotionProperty, NodeData, NodeId, ResolvedVarValue,
     TextStyle, TextStyleRun, VarValue,
 };
-use fanta_format::runtime::{RuntimeProgram, SourceBundle};
 use fanta_present::{FitMode, PlaybackSession};
 use fanta_render::{LazyAssetResolver, RasterRenderer, TextRenderContext, decode_image_bytes};
 use fanta_text::{FontRegistration, LayoutEngine};
@@ -52,23 +52,6 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    pub fn compile_source(&mut self, source: &SourceBundle) -> Result<u32, RuntimeError> {
-        let size = source
-            .files
-            .values()
-            .map(|bytes| bytes.len() as u64)
-            .chain(source.fonts.iter().map(|font| font.bytes.len() as u64))
-            .try_fold(0_u64, u64::checked_add)
-            .ok_or_else(|| RuntimeError("Source bundle size overflow".into()))?;
-        if size > MAX_PROGRAM_INPUT_BYTES {
-            return Err(RuntimeError(
-                "Source bundle exceeds the 64 MiB expanded input budget".into(),
-            ));
-        }
-        let program = RuntimeProgram::compile(source).map_err(RuntimeError::from_error)?;
-        self.insert_program(program)
-    }
-
     pub fn load_bundle(&mut self, bytes: &[u8]) -> Result<u32, RuntimeError> {
         let program = RuntimeProgram::load_bundle_with_limit(bytes, MAX_PROGRAM_INPUT_BYTES)
             .map_err(RuntimeError::from_error)?;
@@ -207,15 +190,6 @@ impl Runtime {
             .get(&handle)
             .ok_or_else(|| RuntimeError("Program was disposed or does not exist".into()))?;
         serde_json::to_value(program.compiled.document().clone_for_persist())
-            .map_err(RuntimeError::from_error)
-    }
-
-    pub fn to_bundle(&self, handle: u32) -> Result<Vec<u8>, RuntimeError> {
-        self.programs
-            .get(&handle)
-            .ok_or_else(|| RuntimeError("Program was disposed or does not exist".into()))?
-            .compiled
-            .to_bundle()
             .map_err(RuntimeError::from_error)
     }
 
@@ -750,6 +724,11 @@ impl Player {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fanta_format::runtime::SourceBundle;
+
+    fn fit_bundle() -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        Ok(fit_source().compile()?.to_bundle()?)
+    }
 
     fn fit_source() -> SourceBundle {
         SourceBundle {
@@ -787,8 +766,7 @@ mod tests {
     fn player_fit_modes_preserve_legacy_creation_and_independent_program_state()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut runtime = Runtime::default();
-        let program = runtime.compile_source(&fit_source())?;
-        let authored = runtime.to_bundle(program)?;
+        let program = runtime.load_bundle(&fit_bundle()?)?;
         let legacy = runtime.create_player(program, 300.0, 300.0, None)?;
         assert_eq!(
             runtime.command(legacy, "state", json!({}))?["camera"],
@@ -816,7 +794,6 @@ mod tests {
                 "contain"
             );
         }
-        assert_eq!(runtime.to_bundle(program)?, authored);
         Ok(())
     }
 
@@ -824,7 +801,7 @@ mod tests {
     fn fit_requests_validate_atomically_and_refit_both_axes_without_advancing_playback()
     -> Result<(), Box<dyn std::error::Error>> {
         let mut runtime = Runtime::default();
-        let program = runtime.compile_source(&fit_source())?;
+        let program = runtime.load_bundle(&fit_bundle()?)?;
         let player = runtime.create_player_with_fit(program, 300.0, 300.0, None, FitMode::Fill)?;
         runtime.command(player, "advanceBy", json!({"deltaMs":125.0}))?;
         runtime.command(player, "pausePlayback", json!({}))?;

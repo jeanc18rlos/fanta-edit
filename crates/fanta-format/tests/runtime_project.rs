@@ -448,7 +448,7 @@ fn mixed_document_native_source_and_deployment_bundle_preserve_authored_state_ex
         .expect("save native project");
     let mut source = SourceBundle::default();
     collect_files(directory.path(), directory.path(), &mut source.files).expect("project bytes");
-    let compiled = RuntimeProgram::compile(&source).expect("portable compilation");
+    let compiled = source.compile().expect("portable compilation");
     assert_eq!(
         compiled
             .document()

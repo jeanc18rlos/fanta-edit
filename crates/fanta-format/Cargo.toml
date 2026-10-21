@@ -15,6 +15,10 @@ native = ["dep:tempfile"]
 # Doc model — the thing we serialize and load.
 fanta-doc.workspace = true
 
+# Runtime bundles — the parser-free program format the compiler in
+# `runtime.rs` produces and `fanta-runtime` loads.
+fanta-bundle.workspace = true
+
 # The `.fnx` design-as-source codec — the per-page/per-component node encoding.
 fanta-fnx.workspace = true
 

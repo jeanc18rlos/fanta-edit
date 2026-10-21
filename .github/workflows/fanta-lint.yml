@@ -11,6 +11,7 @@ on:
       - 'vendor/skia-bindings-0.153.3/**'
       - 'rust-toolchain.toml'
       - '.cargo/**'
+      - 'crates/fanta-bundle/**'
       - 'crates/fanta-doc/**'
       - 'crates/fanta-fnx/**'
       - 'crates/fanta-format/**'
