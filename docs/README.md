@@ -38,6 +38,9 @@ step: read the files here, or on GitHub.
 - [`live-mcp-v2.md`](./live-mcp-v2.md) and
   [`live-mcp-v2-implementation.md`](./live-mcp-v2-implementation.md) — the live
   MCP server agents connect to.
+- [`cloud-engine-contracts.md`](./cloud-engine-contracts.md) — the frozen
+  interfaces between the app, the v2 API and the cloud engine worker for cloud
+  review and generation.
 
 The inherited mdBook (`docs/src`, `docs/theme`, `book.toml`) was removed: none
 of it described Fanta.

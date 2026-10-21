@@ -467,7 +467,7 @@ actually driven. Nothing here claims more than that record supports.
 - **`batch_design` (and the built-in agent's `design_edit`) accept fourteen new
   ops; twelve of them have now been driven, two have not.** The shared
   vocabulary is
-  `design_surface::DesignOp` (`crates/design_surface/src/design_surface.rs`,
+  `design_surface::DesignOp` (`crates/fanta-design-ops/src/fanta_design_ops.rs`,
   tagged by `"op"`): `create_instance`, `set_stroke`, `set_shadow`,
   `set_text_style`, `set_auto_layout`, `set_index`, `rotate`, `align`,
   `distribute`, `group`, `frame_selection`, `ungroup`, `duplicate` and

@@ -143,7 +143,8 @@ for stage in "${selected_stages[@]}"; do
         engine)
             run_stage "$stage" "$cargo_binary" test --locked \
                 -p fanta-doc -p fanta-fnx -p fanta-format -p fanta-canvas \
-                -p fanta-tools -p fanta-render -p fanta-present -p fanta-text
+                -p fanta-tools -p fanta-render -p fanta-present -p fanta-text \
+                -p fanta-design-ops -p fanta-headless -p fanta-engine
             ;;
         import)
             # Spectrum integration binaries return success without a fixture;
@@ -174,7 +175,8 @@ for stage in "${selected_stages[@]}"; do
             run_stage "$stage" ./script/clippy --locked \
                 -p fanta-doc -p fanta-fnx -p fanta-format -p fanta-canvas \
                 -p fanta-tools -p fanta-render -p fanta-fig-interop \
-                -p fanta-present -p fanta-text -p fig_viewer -p workspace -p fanta_ui
+                -p fanta-present -p fanta-text -p fanta-design-ops -p fanta-headless \
+                -p fanta-engine -p fig_viewer -p workspace -p fanta_ui
             run_stage lint-default env FANTA_CLIPPY_DEFAULT_FEATURES=1 \
                 ./script/clippy --locked -p fanta-format -p fig_viewer -p fs
             ;;

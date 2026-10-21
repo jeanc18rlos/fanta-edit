@@ -1,6 +1,6 @@
 # Agent surface rules
 
-`design_surface` is the seam between agents and the canvas: the `DesignSurface` trait, `DesignOp` and query types, and `DESIGN_GUIDELINES`. It is implemented by `crates/fig_viewer/src/agent_surface.rs`, served to external agents by `crates/fig_viewer/src/live_mcp.rs`, and used by the built-in agent's tools in `crates/agent/src/tools/design_*_tool.rs` and `place_generation_tool.rs`. Read these rules before changing any of those files.
+`design_surface` is the seam between agents and the canvas: the `DesignSurface` trait, plus the `DesignOp` and query types and `DESIGN_GUIDELINES`, which live in `crates/fanta-design-ops` so the headless engine shares them, and are re-exported here. It is implemented by `crates/fig_viewer/src/agent_surface.rs`, served to external agents by `crates/fig_viewer/src/live_mcp.rs`, and used by the built-in agent's tools in `crates/agent/src/tools/design_*_tool.rs` and `place_generation_tool.rs`. Read these rules before changing any of those files.
 
 PR numbers point at the change that found each trap (`gh pr view <n>`).
 
@@ -8,7 +8,7 @@ PR numbers point at the change that found each trap (`gh pr view <n>`).
 
 Agent-facing behavior is described in several places that nothing checks against each other. When you add, rename or change a `DesignOp`, an MCP tool or a tool's arguments, update in the same change:
 
-1. `DESIGN_GUIDELINES` in `src/design_surface.rs` (served by `get_guidelines`).
+1. `DESIGN_GUIDELINES` in `crates/fanta-design-ops/src/fanta_design_ops.rs` (served by `get_guidelines`).
 2. The live MCP tool in `crates/fig_viewer/src/live_mcp.rs` and the built-in tool in `crates/agent/src/tools/`, as applicable.
 3. The seeded project guide `AGENTS_MD` in `crates/fanta-format/src/project/layout.rs`. Add the SHA-256 of the replaced text to `previous_seeds`, or existing projects keep the old guide.
 4. The tool table and tool count in `docs/fanta/agent-quickstart.md`, and `README.md` ("Connect an agent") if the count changes.

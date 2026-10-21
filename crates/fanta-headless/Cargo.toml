@@ -1,0 +1,22 @@
+[package]
+name = "fanta-headless"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+description = "Fanta's design engine without the app: open, edit, render and save a project directory."
+
+[lib]
+path = "src/fanta_headless.rs"
+doctest = false
+
+[dependencies]
+anyhow.workspace = true
+fanta-design-ops.workspace = true
+fanta-doc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
