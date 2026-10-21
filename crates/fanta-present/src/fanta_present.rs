@@ -332,6 +332,17 @@ struct ActivePointerReaction {
     source: NodeId,
     reaction: ReactionId,
     variant_restores: Vec<InstanceVariantRestore>,
+    variable_restores: Vec<VariableRestore>,
+}
+
+/// A session variable a transient (hover or press) reaction wrote, with the
+/// value it replaced, so leaving or releasing can put it back.
+#[derive(Debug, Clone)]
+struct VariableRestore {
+    variable: VariableId,
+    mode: ModeId,
+    previous: Option<VarValue>,
+    applied: VarValue,
 }
 
 #[derive(Debug, Clone)]
@@ -2584,11 +2595,111 @@ impl PlaybackSession {
         let (source, reaction_id, actions, _, _) = reaction;
         let mut variant_restores = Vec::new();
         self.capture_variant_restores(*source, actions, &mut variant_restores);
+        let mut variable_restores = Vec::new();
+        self.capture_variable_restores(*source, actions, &mut variable_restores);
         ActivePointerReaction {
             source: *source,
             reaction: *reaction_id,
             variant_restores,
+            variable_restores,
         }
+    }
+
+    /// The value each variable action would store, computed before any of
+    /// them runs, so a release or leave can tell a value it applied from one
+    /// another reaction changed in the meantime.
+    fn capture_variable_restores(
+        &self,
+        source: NodeId,
+        actions: &[Action],
+        restores: &mut Vec<VariableRestore>,
+    ) {
+        for action in actions {
+            let (variable, applied) = match action {
+                Action::SetVariable { variable, value } => (*variable, value.clone()),
+                Action::AdjustVariable { variable, delta } => {
+                    let Some(ResolvedVarValue::Float { value }) =
+                        self.runtime_variable_value(source, *variable)
+                    else {
+                        continue;
+                    };
+                    let value = value + delta;
+                    if !value.is_finite() {
+                        continue;
+                    }
+                    (*variable, VarValue::Float { value })
+                }
+                Action::ToggleVariable { variable } => {
+                    let Some(ResolvedVarValue::Boolean { value }) =
+                        self.runtime_variable_value(source, *variable)
+                    else {
+                        continue;
+                    };
+                    (*variable, VarValue::Boolean { value: !value })
+                }
+                Action::CycleVariable { variable } => {
+                    let Some(ResolvedVarValue::Enum { value }) =
+                        self.runtime_variable_value(source, *variable)
+                    else {
+                        continue;
+                    };
+                    let Some(options) = self
+                        .variables
+                        .variable(*variable)
+                        .map(|variable| &variable.options)
+                        .filter(|options| !options.is_empty())
+                    else {
+                        continue;
+                    };
+                    let next = options
+                        .iter()
+                        .position(|option| *option == value)
+                        .map_or(0, |index| (index + 1) % options.len());
+                    let Some(value) = options.get(next).cloned() else {
+                        continue;
+                    };
+                    (*variable, VarValue::Enum { value })
+                }
+                Action::Conditional {
+                    branches,
+                    otherwise,
+                } => {
+                    for branch in branches {
+                        self.capture_variable_restores(source, &branch.actions, restores);
+                    }
+                    self.capture_variable_restores(source, otherwise, restores);
+                    continue;
+                }
+                _ => continue,
+            };
+            let Some(mode) = self.variable_mode(source, variable) else {
+                continue;
+            };
+            let previous = self
+                .variables
+                .variable(variable)
+                .and_then(|variable| variable.values_by_mode.get(&mode).cloned());
+            restores.push(VariableRestore {
+                variable,
+                mode,
+                previous,
+                applied,
+            });
+        }
+    }
+
+    /// The mode a variable write from `source` lands in: the same resolution
+    /// [`Self::set_variable`] uses.
+    fn variable_mode(&self, source: NodeId, variable: VariableId) -> Option<ModeId> {
+        let source = self.runtime_variable_source(source);
+        let collection = self.variables.variable(variable)?.collection;
+        let collection = self.variables.collections.get(&collection)?;
+        Some(fanta_doc::resolve_effective_mode(
+            &self.doc.scene,
+            source,
+            collection,
+            &self.active_modes,
+        ))
     }
 
     fn capture_variant_restores(
@@ -2659,10 +2770,39 @@ impl PlaybackSession {
             }
             changed = true;
         }
+        let variant_changed = changed;
+        for restore in active.variable_restores.into_iter().rev() {
+            let current = self
+                .variables
+                .variable(restore.variable)
+                .and_then(|variable| variable.values_by_mode.get(&restore.mode));
+            // Only undo the value this reaction applied; a click or another
+            // reaction that wrote the variable since keeps its value.
+            if current != Some(&restore.applied)
+                || restore.previous.as_ref() == Some(&restore.applied)
+            {
+                continue;
+            }
+            let Some(variable) = self.variables.variables.get_mut(&restore.variable) else {
+                continue;
+            };
+            match restore.previous {
+                Some(previous) => {
+                    variable.values_by_mode.insert(restore.mode, previous);
+                }
+                None => {
+                    variable.values_by_mode.remove(&restore.mode);
+                }
+            }
+            self.mode_generation = self.mode_generation.wrapping_add(1);
+            changed = true;
+        }
         if !changed {
             return PresentResponse::default();
         }
-        self.active_variant_transition = None;
+        if variant_changed {
+            self.active_variant_transition = None;
+        }
         self.refresh_layer_timers();
         PresentResponse {
             needs_redraw: true,
