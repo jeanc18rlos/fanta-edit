@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Adds a platform's release assets to the draft GitHub release for a tag:
+#
+#   script/upload-draft-release v2.1.0 release/Fanta-x86_64.exe release/Fanta-x86_64.exe.sig
+#
+# Each platform's release workflow calls this when its build finishes. The first one creates
+# the draft and the others upload to it: `gh release create --draft` would make a second draft
+# with the same tag, because GitHub doesn't keep draft tag names unique. Run it in the
+# concurrency group draft-release-<tag>, so two platforms can't both create the draft.
+# Needs GH_TOKEN and GH_REPO.
+set -euo pipefail
+
+if [[ $# -lt 2 ]]; then
+    echo "usage: $0 <tag> <file>..." >&2
+    exit 2
+fi
+tag="$1"
+shift
+
+if is_draft=$(gh release view "$tag" --json isDraft --jq .isDraft 2>&1); then
+    if [[ "$is_draft" != true ]]; then
+        echo "::error::The release for $tag is already published; refusing to change its assets."
+        exit 1
+    fi
+    gh release upload "$tag" "$@" --clobber
+elif [[ "$is_draft" == *"release not found"* ]]; then
+    options=(--draft --verify-tag --generate-notes --title "Fanta ${tag}")
+    if [[ "$tag" == *-* ]]; then
+        options+=(--prerelease)
+    fi
+    gh release create "$tag" "$@" "${options[@]}"
+else
+    # Any other failure (auth, network) must not create a second draft.
+    echo "$is_draft" >&2
+    exit 1
+fi

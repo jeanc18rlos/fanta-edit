@@ -1,0 +1,162 @@
+name: Build Windows release
+
+on:
+  push:
+    tags: ['v*']
+  # Packaging changes build the installer before they merge. Nothing is signed or published.
+  pull_request:
+    paths:
+      - '.github/workflows/release-windows.yml'
+      - 'script/bundle-windows.ps1'
+      - 'script/generate-licenses.ps1'
+      - 'script/lib/workspace.ps1'
+      - 'crates/fanta/resources/windows/**'
+      - 'crates/auto_update_helper/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-windows-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  # Tags and manual runs are release builds: their installer gets an update signature.
+  FANTA_SIGN_UPDATE: ${{ github.event_name != 'pull_request' }}
+
+jobs:
+  build:
+    name: Build x86_64 installer
+    runs-on: windows-2025
+    timeout-minutes: 330
+    steps:
+      # Skia and the Rust target tree nest deeply enough to pass MAX_PATH.
+      - name: Allow long paths
+        run: git config --system core.longpaths true
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Validate release version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/fanta/Cargo.toml)
+          if [[ "$GITHUB_REF_NAME" != "v${version}" ]]; then
+            echo "::error::Release tag must match crates/fanta/Cargo.toml: v${version}"
+            exit 1
+          fi
+
+      - name: Install Rust 1.95
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal
+          rustup override set 1.95.0
+
+      - uses: Swatinem/rust-cache@49a0bdc70d2e1b713ca9e2869b211fcce03d3c1c # v2
+        with:
+          shared-key: fanta-windows-release-x86_64
+          cache-on-failure: true
+
+      - name: Install Inno Setup
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build and package Fanta
+        shell: pwsh
+        run: .\script\bundle-windows.ps1 -Architecture x86_64
+
+      # Installed copies update themselves only with installers this key signed
+      # (crates/auto_update/src/verify.rs). The signature ships next to the installer.
+      - name: Sign the installer for in-place updates
+        if: env.FANTA_SIGN_UPDATE == 'true'
+        shell: bash
+        env:
+          FANTA_UPDATE_SIGNING_KEY: ${{ secrets.FANTA_UPDATE_SIGNING_KEY }}
+        run: |
+          if [[ -z "$FANTA_UPDATE_SIGNING_KEY" ]]; then
+            echo "::warning::FANTA_UPDATE_SIGNING_KEY is not set, so this installer has no update signature and installed copies won't update to it in place."
+            exit 0
+          fi
+          version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/fanta/Cargo.toml)
+          python -m venv "$RUNNER_TEMP/update-signing"
+          "$RUNNER_TEMP/update-signing/Scripts/python" -m pip install --quiet 'cryptography>=42'
+          "$RUNNER_TEMP/update-signing/Scripts/python" script/update_signing.py sign \
+            --asset Fanta-x86_64.exe --version "$version" \
+            --file target/Fanta-x86_64.exe \
+            --public-key-file crates/auto_update/release-signing-key.pub \
+            > target/Fanta-x86_64.exe.sig
+
+      - name: Record checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 target\Fanta-x86_64.exe).Hash.ToLowerInvariant()
+          [IO.File]::WriteAllText("$PWD\target\SHA256SUMS-windows-x86_64.txt", "$hash  Fanta-x86_64.exe`n")
+          Get-Content target\SHA256SUMS-windows-x86_64.txt
+
+      - name: Upload installer
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fanta-windows-x86_64
+          path: |
+            target/Fanta-x86_64.exe
+            target/Fanta-x86_64.exe.sig
+            target/SHA256SUMS-windows-x86_64.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Upload debug symbols
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fanta-windows-symbols-x86_64-${{ github.sha }}
+          path: target/x86_64-pc-windows-msvc/release/fanta-*.dbg.zip
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Summarize build
+        shell: bash
+        run: |
+          if [[ -s target/Fanta-x86_64.exe.sig ]]; then
+            update='It has an update signature, so installed copies can update to it in place.'
+          else
+            update='It has no update signature, so installed copies will not update to it in place.'
+          fi
+          printf '### Fanta for Windows (x86_64)\n\nUnsigned installer: Windows SmartScreen warns on first run. %s\n\nCommit: `%s`\n' "$update" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+  draft-release:
+    name: Add the installer to the draft release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # Each platform's release workflow uses this group, so they add to one draft in turn.
+    concurrency:
+      group: draft-release-${{ github.ref_name }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: fanta-windows-x86_64
+          path: release
+
+      - name: Upload to the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          assets=(release/Fanta-x86_64.exe release/SHA256SUMS-windows-x86_64.txt)
+          # The .sig is what installed copies check before updating in place.
+          if [[ -s release/Fanta-x86_64.exe.sig ]]; then
+            assets+=(release/Fanta-x86_64.exe.sig)
+          else
+            echo "::warning::Publishing the Windows installer without an update signature; installed copies won't update to it."
+          fi
+          script/upload-draft-release "$GITHUB_REF_NAME" "${assets[@]}"
