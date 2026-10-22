@@ -1249,6 +1249,17 @@ impl ThreadView {
             PromptLocalCommand::ThumbsDown => {
                 self.handle_feedback_click(ThreadFeedback::Negative, window, cx);
             }
+            // The workspace owns review threads; dispatching (rather than
+            // calling the panel) runs after this thread view's update ends.
+            PromptLocalCommand::ReviewDesign => {
+                window.dispatch_action(Box::new(fanta_actions::agent::ReviewDesign), cx)
+            }
+            PromptLocalCommand::UltrareviewDesign => {
+                window.dispatch_action(Box::new(fanta_actions::agent::UltrareviewDesign), cx)
+            }
+            PromptLocalCommand::PlanAndBuildDesign => {
+                window.dispatch_action(Box::new(fanta_actions::agent::PlanAndBuildDesign), cx)
+            }
         }
     }
 
@@ -7633,6 +7644,11 @@ impl ThreadView {
         if self.is_thread_feedback_enabled(cx) {
             commands.push(PromptLocalCommand::ThumbsUp);
             commands.push(PromptLocalCommand::ThumbsDown);
+        }
+        if design_surface::active(cx).is_some_and(|surface| surface.has_open_design(cx)) {
+            commands.push(PromptLocalCommand::PlanAndBuildDesign);
+            commands.push(PromptLocalCommand::ReviewDesign);
+            commands.push(PromptLocalCommand::UltrareviewDesign);
         }
 
         commands

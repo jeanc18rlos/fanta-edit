@@ -120,25 +120,6 @@ pub fn open_external_prompt_for_review(
     window: &mut Window,
     cx: &mut App,
 ) -> anyhow::Result<()> {
-    open_external_prompt(workspace, prompt, false, window, cx)
-}
-
-pub fn open_design_review_prompt(
-    workspace: Entity<Workspace>,
-    prompt: &str,
-    window: &mut Window,
-    cx: &mut App,
-) -> anyhow::Result<()> {
-    open_external_prompt(workspace, prompt, true, window, cx)
-}
-
-fn open_external_prompt(
-    workspace: Entity<Workspace>,
-    prompt: &str,
-    review_profile: bool,
-    window: &mut Window,
-    cx: &mut App,
-) -> anyhow::Result<()> {
     let prompt = ExternalSourcePrompt::new(prompt)
         .ok_or_else(|| anyhow::anyhow!("the generated agent prompt was empty"))?;
     if workspace.read(cx).root_paths(cx).is_empty() {
@@ -155,11 +136,7 @@ fn open_external_prompt(
         workspace.reveal_panel::<AgentPanel>(window, cx);
     });
     panel.update(cx, |panel, cx| {
-        if review_profile {
-            panel.new_design_review_thread(prompt, window, cx);
-        } else {
-            panel.new_agent_thread_with_external_source_prompt(Some(prompt), window, cx);
-        }
+        panel.new_agent_thread_with_external_source_prompt(Some(prompt), window, cx);
     });
     workspace.update(cx, |workspace, cx| {
         workspace.focus_panel::<AgentPanel>(window, cx);

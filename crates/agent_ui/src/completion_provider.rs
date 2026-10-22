@@ -199,6 +199,12 @@ impl PromptContextAction {
 pub enum PromptLocalCommand {
     ThumbsUp,
     ThumbsDown,
+    /// Review the open design's active page; offered while a design is open.
+    ReviewDesign,
+    /// Review every page of the open design in focused passes.
+    UltrareviewDesign,
+    /// Plan changes to the open design, then build them with Apply plan.
+    PlanAndBuildDesign,
 }
 
 impl PromptLocalCommand {
@@ -206,6 +212,9 @@ impl PromptLocalCommand {
         match self {
             Self::ThumbsUp => "helpful",
             Self::ThumbsDown => "not-helpful",
+            Self::ReviewDesign => "review-design",
+            Self::UltrareviewDesign => "ultrareview",
+            Self::PlanAndBuildDesign => "plan-build",
         }
     }
 
@@ -213,6 +222,9 @@ impl PromptLocalCommand {
         match self {
             Self::ThumbsUp => "Positive Feedback",
             Self::ThumbsDown => "Negative Feedback",
+            Self::ReviewDesign => "AI Review",
+            Self::UltrareviewDesign => "Ultrareview",
+            Self::PlanAndBuildDesign => "Plan & Build",
         }
     }
 
@@ -224,6 +236,15 @@ impl PromptLocalCommand {
             Self::ThumbsDown => {
                 "Rate this response as not helpful. Sends the current conversation to the Fanta team."
             }
+            Self::ReviewDesign => {
+                "Review the open design's active page and post findings as canvas comments. Opens a Review draft you send."
+            }
+            Self::UltrareviewDesign => {
+                "Review every page in focused passes and post verified findings as canvas comments. Opens a Review draft you send."
+            }
+            Self::PlanAndBuildDesign => {
+                "Plan a change to the open design, then build it on the canvas with Apply plan. Opens a Plan thread."
+            }
         }
     }
 
@@ -231,6 +252,9 @@ impl PromptLocalCommand {
         match self {
             Self::ThumbsUp => IconName::ThumbsUp,
             Self::ThumbsDown => IconName::ThumbsDown,
+            Self::ReviewDesign => IconName::Eye,
+            Self::UltrareviewDesign => IconName::CheckDouble,
+            Self::PlanAndBuildDesign => IconName::ListTodo,
         }
     }
 }

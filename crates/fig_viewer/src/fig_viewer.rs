@@ -42,7 +42,6 @@ mod motion_stage;
 mod motion_video;
 mod new_design;
 mod panel_settings;
-mod plan_build;
 mod properties_ops;
 mod properties_panel;
 mod properties_render;
@@ -90,9 +89,8 @@ pub use tools::ToolKind;
 pub use variables_workspace::FantaVariablesWorkspace;
 pub use view::{
     ExportFigmaMotionJson, ExportMotionFrames, ExportMotionGif, ExportMotionJson,
-    ExportMotionStage, ExportMotionVideo, FigView, FigViewEvent, FitToView, ResetZoom, RunAiReview,
-    RunUltraReview, SelectAll, ToggleInspectorSidebar, ToggleLayersSidebar, ZoomIn, ZoomOut,
-    ZoomToSelection,
+    ExportMotionStage, ExportMotionVideo, FigView, FigViewEvent, FitToView, ResetZoom, SelectAll,
+    SubmitComment, ToggleInspectorSidebar, ToggleLayersSidebar, ZoomIn, ZoomOut, ZoomToSelection,
 };
 
 pub fn init(cx: &mut App) {

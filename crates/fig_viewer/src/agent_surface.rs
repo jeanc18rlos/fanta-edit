@@ -190,16 +190,6 @@ pub(crate) fn apply_comment_suggested_fix(
     Ok(())
 }
 
-/// The active page's top-level layers (up to `limit`, `depth` levels deep) in
-/// the style projection with world bounds: what `batch_get` returns for a page
-/// listing with `detail: "style"`, and what the v2 agent sessions read.
-pub(crate) fn page_scene(item: &FigItem, depth: u32, limit: usize) -> Result<Vec<Value>> {
-    let document = ready_document(item)?;
-    let page = &document.pages[resolve_page_index(document, None)?];
-    let root = page.root.context("the page has no root node")?;
-    fanta_headless::scene::page_scene(&document.doc, root, depth, limit)
-}
-
 struct FigDesignSurface {
     active: Rc<RefCell<Option<WeakEntity<FigItem>>>>,
 }
@@ -397,6 +387,25 @@ impl DesignSurface for FigDesignSurface {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(json!({ "page": page_index, "comments": comments }))
+    }
+
+    fn has_open_design(&self, _cx: &App) -> bool {
+        self.item().is_ok()
+    }
+
+    fn design_review_prompt(&self, ultra: bool, cx: &mut App) -> Result<String> {
+        let item = self.item()?;
+        let document = ready_document(item.read(cx))?;
+        let page = document
+            .doc
+            .active_page()
+            .context("select a page to review")?;
+        let depth = if ultra {
+            crate::review::ReviewDepth::Ultra
+        } else {
+            crate::review::ReviewDepth::Standard
+        };
+        crate::review::review_prompt(&document.doc, page, depth, &NodeId::new().to_string())
     }
 
     fn add_comment(&self, draft: design_surface::CommentDraft, cx: &mut App) -> Result<Value> {
@@ -4426,6 +4435,14 @@ mod tests {
 
     fn ops(value: Value) -> Vec<DesignOp> {
         serde_json::from_value(value).expect("ops JSON matches the DesignOp schema")
+    }
+
+    /// The active page's scene as the headless engine's planner reads it.
+    fn page_scene(item: &FigItem, depth: u32, limit: usize) -> Result<Vec<Value>> {
+        let document = ready_document(item)?;
+        let page = &document.pages[resolve_page_index(document, None)?];
+        let root = page.root.context("the page has no root node")?;
+        fanta_headless::scene::page_scene(&document.doc, root, depth, limit)
     }
 
     fn doc_with_page() -> (Doc, NodeId) {

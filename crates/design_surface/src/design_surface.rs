@@ -323,6 +323,18 @@ pub trait DesignSurface: 'static {
         anyhow::bail!("this design surface cannot read comments")
     }
 
+    /// Whether a design is open for [`design_review_prompt`](Self::design_review_prompt).
+    fn has_open_design(&self, _cx: &App) -> bool {
+        false
+    }
+
+    /// The prompt for an AI design review of the open design: its active
+    /// page, or every page when `ultra` is set. The agent panel opens it as a
+    /// Review-profile draft that the user sends.
+    fn design_review_prompt(&self, _ultra: bool, _cx: &mut App) -> Result<String> {
+        anyhow::bail!("this design surface cannot prepare design reviews")
+    }
+
     /// Place a new comment on the canvas as an agent.
     fn add_comment(&self, _draft: CommentDraft, _cx: &mut App) -> Result<serde_json::Value> {
         anyhow::bail!("this design surface cannot add comments")
